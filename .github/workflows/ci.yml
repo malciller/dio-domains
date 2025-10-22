@@ -20,7 +20,7 @@ jobs:
 
       - uses: ocaml/setup-ocaml@v2
         with:
-          ocaml-compiler: '4.14.2'
+          ocaml-compiler: '5.2.0'
           dune-cache: false # Disable built-in dune cache
 
       - name: Restore Dune cache
