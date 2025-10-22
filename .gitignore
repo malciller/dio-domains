@@ -9,6 +9,9 @@
 *.cmxa
 *.log
 *.sh
+*.csv
+*.html
+
 
 
 # Files containing detailed information about the compilation (generated
