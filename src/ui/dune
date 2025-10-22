@@ -1,0 +1,20 @@
+(library
+ (name dio_ui)
+ (public_name dio.ui)
+ (libraries
+  lwt
+  lwt.unix
+  notty
+  nottui
+  nottui-lwt
+  lwd
+  dio_engine
+  dio.ui_types
+  dio.ui.telemetry
+  dio.ui.system
+  dio.ui.logs
+  dio.ui.balance
+  unix
+  str)
+ (preprocess
+  (pps lwt_ppx)))

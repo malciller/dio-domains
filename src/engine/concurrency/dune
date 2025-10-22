@@ -1,0 +1,7 @@
+(library
+ (name concurrency)
+ (public_name dio.concurrency)
+ (libraries lwt lwt.unix)
+ (modules Event_bus Event_registry)
+)
+

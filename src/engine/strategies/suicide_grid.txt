@@ -1,0 +1,33 @@
+Core Goal: Run a "suicide" grid that buys on every dip (accumulating via resets) and sells on reversals (using layered sells for profit). Maintain exactly one open buy order grid_interval below current price. Place a new sell grid_interval above on resets, leaving prior sells open (multiples OK for layering). Use sell positions only as reference points for buy placement/amendment—never branch logic on sell existence. Always enforce exactly 2x grid_interval distance from the buy to the closest sell above it (if any). Trail the buy upward on rises to tighten, but only if the proposed position has a sell within the 2x grid space above it (for post-only safety) and current price is within that 2x span.Why "Suicide"? Relentless buying on downtrends (new lows trigger buys/resets), but trails up resiliently on reversals, using existing sells as anchors to lock profits without chasing.Parameters (From Config):grid_interval: Fixed price step (e.g., $0.01).
+qty: Quantity for buys.
+sell_mult: Multiplier for sells (quantity = qty * sell_mult).
+All orders: Post-only limit, GTC (reject/cross-book protection; good 'til cancelled).
+
+Direct Instructions (Execute in Exact Order on Every Trigger):
+Triggers: Price tick/update, order event (fill/cancel/amend), or scan (e.g., every 5 seconds).Emergency Buy Cleanup (Always First):If >1 open buy for this asset: Cancel all open buys.
+Proceed to Step 2 (next trigger replaces if needed).
+Stop if cancelled.
+
+Check/Place Open Buy (Aim for Exactly One Active/Unfilled Buy Below Current Price):NO OPEN BUY (filled, cancelled, absent, or cleaned):Place SELL ORDER: Price = current_price + grid_interval, quantity = qty * sell_mult.
+Place BUY ORDER: Price = current_price - grid_interval, quantity = qty.
+Enforce 2x Grid: Find closest sell above buy (use new one if no others). Amend buy/sell to exactly 2x grid_interval distance (prefer shifting buy up/down as needed).If current price outside 2x span from closest sell: Set buy to current_price - grid_interval, then enforce 2x relative to that closest sell.
+
+Stop. Re-trigger next event.
+
+EXACTLY ONE OPEN BUY:Find closest sell above buy (lowest open sell > buy price; multiples OK for reference).
+Measure distance: closest_sell_price - buy_price.If distance > 2x grid_interval (closest sell too far for safe grid; ideal grid has current price centered, allowing ±grid_interval movement to trigger either order):Calculate proposed buy: current_price - grid_interval (trail up to close gap).
+Check if proposed buy would respect grid: closest_sell_price - proposed_buy <= 2x grid_interval`` (i.e., new distance fits safe 2x span, anchoring the grid).Yes (proposed position anchors to closest sell): If current price within 2x span of closest sell (ensures post-only amend won't cross book): Amend buy to proposed position, then enforce exactly 2x (e.g., nudge buy slightly up toward sell if needed, but never compress <2x).
+No (proposed exceeds 2x to closest sell) or current price outside 2x span: Hold buy steady—no amend. Wait for further price rise to bring current price into span (progressively trail on next triggers until gap closes enough to respect grid_interval-based grid).
+
+If closest sell fills (removed): Re-find new closest sell above buy. Re-apply distance check/amend above.
+
+Stop. Re-trigger next event.
+
+Immediate Buy Event Handling (Overrides Other Steps):Buy Fills: Treat as "no open buy." Jump to Step 2 (place new sell + buy, enforce 2x).
+Buy Cancels/Expires: Treat as "no open buy." Jump to Step 2 (place new sell + buy, enforce 2x).
+
+Maintenance Rules (Apply Last, After Every Action/Event):2x Grid Lock: Always re-measure buy to closest sell above. Amend to exactly 2x grid_interval if off (shift buy primarily; touch sell only if no choice). Skip if post-only risk.
+Post-Only Guard: Pre-place/amend: Buy ≤ current bid? Sell ≥ current ask? Skip if no.
+No Clutter: Cancel duplicates at same price. Enforce single buy; allow multiple sells (they're just anchors).
+Sell Reference Only: Never place/amend sells except on buy reset—use existing ones purely for buy positioning (no "if sell exists" branches).
+

@@ -1,0 +1,18 @@
+(library
+ (name dio_ui_system)
+ (public_name dio.ui.system)
+ (libraries
+  lwt
+  lwt.unix
+  notty
+  nottui
+  nottui-lwt
+  lwd
+  dio_engine
+  dio.ui_types
+  unix
+  str
+  cpuid)
+ (modules system_view system_cache)
+ (preprocess
+  (pps lwt_ppx)))

@@ -1,0 +1,9 @@
+(library
+ (name ui_types)
+ (public_name dio.ui_types)
+ (libraries
+  dio_engine
+  )
+ (modules ui_types)
+ (preprocess
+  (pps lwt_ppx)))

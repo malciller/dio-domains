@@ -1,0 +1,41 @@
+Overview: This is an automated market-making strategy focused on capturing the top of the order book with the tightest profitable spread possible. It places matching buy and sell orders (post-only, GTC) at or near the best levels, adjusted for maker fees to ensure profitability. The strategy prioritizes low-risk execution by checking exposure and balance limits before acting. It maintains exactly one buy order per asset (cancelling multiples) and pairs it with a sell order of equal size. Pause/resume logic protects against over-exposure. Execution is purely event-driven—react only to specified triggers. Execute exactly as specified—no inferences.Parameters (From Config):qty: Fixed order quantity for both buys and sells.
+maker_fee: Asset-specific maker fee rate (e.g., 0.001 for 0.1%; fetch dynamically via instrument cache).
+max_exposure: Maximum USD-equivalent value to hold in asset balance (e.g., $1000).
+min_usd_balance: Minimum USD balance required to continue (e.g., $500).
+All orders: Post-only limit, GTC (reject if they'd cross the book; good 'til cancelled).
+
+Direct Instructions (Execute in Exact Order on Every Trigger):
+Triggers: Order book update, order event (fill/cancel/amend), or balance change.Fetch Current Market Data (Always First):Get latest order book: best_bid (top buy level), best_ask (top sell level).
+Fetch current maker_fee from instrument cache.
+Calculate current balances: asset_balance (held quantity of asset), usd_balance (available USD).
+Compute exposure_value = asset_balance * current_price (mid-price or best_bid).
+
+Exposure & Balance Checks (Pause/Protect if Failed):If exposure_value >= max_exposure OR usd_balance < min_usd_balance:Pause strategy: Cancel all open buy orders for this asset.
+Place/ensure sell orders for all held asset_balance at or above best_ask (e.g., at best_ask + spread if needed for profitability).
+Stop execution for this trigger. Re-check on next trigger—resume only if both thresholds met.
+
+If both checks pass: Proceed to Step 3.
+
+Buy Order Management (Aim for Exactly One Active Buy at Profitable Level):Count open buy orders for this asset.If >1 open buy: Cancel all open buys. Stop—next trigger will replace.
+If 0 open buys:Determine buy price based on fee:If maker_fee == 0: Buy price = best_bid (top of book).
+If maker_fee > 0: Buy price = best_ask - (2 * maker_fee + 0.0001) (0.01% = 0.0001; ensures spread covers round-trip fees + buffer).
+
+Place SELL ORDER first: Price = best_ask, quantity = qty.
+Then place BUY ORDER: Price = calculated buy price (above), quantity = qty.
+Stop. Re-trigger on next event.
+
+If exactly 1 open buy:Check if current buy price matches required level (re-calculate as in "0 open buys").If mismatched (e.g., book moved or fee changed): Amend buy to the required price.
+If matched: No action needed.
+
+Stop. Re-trigger on next event.
+
+Handle Order Events (Immediate, Overrides Other Steps):Buy Fills: Treat as "0 open buys"—jump to Step 3 to replace with new pair.
+Sell Fills: No immediate action (strategy is maker-focused; re-evaluate on next trigger for re-placement).
+Any Cancel/Expiry: Re-run full flow from Step 1.
+
+Maintenance Rules (Apply Last, After Every Action/Event):Profitability Guard: Never place/amend if calculated spread < required (2x fee + 0.01%). Skip and log.
+Post-Only Safety: Before place/amend: Ensure buy ≤ best_bid, sell ≥ best_ask. If violation, skip/retry next trigger.
+No Duplicates: Cancel any orders at the exact same price level before placing/amending.
+Balance Monitoring: On resume (post-pause), place only if qty fits within min_usd_balance and doesn't exceed max_exposure.
+Logging Only: Record actions (e.g., "Amended buy to $X.YY; spread=0.02%; reason=book shift"). Use for debug—never alter logic.
+

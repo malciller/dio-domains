@@ -1,0 +1,17 @@
+(library
+ (name dio_ui_logs)
+ (public_name dio.ui.logs)
+ (libraries
+  lwt
+  lwt.unix
+  notty
+  nottui
+  nottui-lwt
+  lwd
+  dio_engine
+  dio.ui_types
+  unix
+  str)
+ (modules logs_view logs_cache)
+ (preprocess
+  (pps lwt_ppx)))

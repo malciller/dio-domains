@@ -1,0 +1,39 @@
+(test
+ (name test_kraken_actions)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_balances_feed)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_common_types)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_executions_feed)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_generate_auth_token)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_get_fee)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_instruments_feed)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_orderbook_feed)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_ticker_feed)
+ (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_trading_client)
+ (libraries dio.kraken alcotest))

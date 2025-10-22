@@ -1,0 +1,5 @@
+(library
+ (name dio_strategies)
+ (public_name dio.strategies)
+ (libraries yojson logging telemetry dio.kraken)
+ (modules Strategy_common Suicide_grid Market_maker))

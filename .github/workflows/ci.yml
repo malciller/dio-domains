@@ -1,0 +1,41 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prep system deps for OCaml action
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+               bubblewrap darcs g++-multilib gcc-multilib m4 make mercurial \
+               musl-tools rsync
+
+      - uses: ocaml/setup-ocaml@v2
+        with:
+          ocaml-compiler: '4.14.2'
+          dune-cache: false # Disable built-in dune cache
+
+      - name: Restore Dune cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/dune
+          key: ${{ runner.os }}-dune-cache-${{ hashFiles('**/*.opam', 'dune-project', 'dune') }}
+          restore-keys: |
+            ${{ runner.os }}-dune-cache-
+
+      - name: Install opam deps
+        run: opam install . --deps-only --with-test -y
+
+      - name: Build
+        run: opam exec -- dune build @all
+
+      - name: Run tests
+        run: opam exec -- dune runtest
