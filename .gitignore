@@ -7,6 +7,7 @@
 *.cmx
 *.cmxs
 *.cmxa
+*.log
 
 # Files containing detailed information about the compilation (generated
 # by `ocamlc`/`ocamlopt` when invoked using the option `-bin-annot`).
@@ -34,3 +35,6 @@ setup.log
 
 # Local OPAM switch
 _opam/
+
+# env file
+.env
