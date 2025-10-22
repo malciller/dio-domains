@@ -28,7 +28,7 @@ KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_API_SECRET=your_kraken_api_secret
 ```
 
-Edit `_config.json` (example):
+Edit `config.json` (example):
 ```json
 {
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
