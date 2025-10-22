@@ -40,3 +40,4 @@ _opam/
 
 # env file
 .env
+.DS_Store
