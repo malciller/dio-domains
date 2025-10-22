@@ -278,7 +278,7 @@ let aggregate_orders_by_symbol orders =
 (** Create balances view widget *)
 let balances_view balance_snapshot _state =
   (* Header *)
-  let timestamp_str = Printf.sprintf "(Updated: %s)"
+  let timestamp_str = Printf.sprintf "Updated: %s"
     (if balance_snapshot.timestamp > 0.0 then
        let tm = Unix.localtime balance_snapshot.timestamp in
        Printf.sprintf "%02d:%02d:%02d"
