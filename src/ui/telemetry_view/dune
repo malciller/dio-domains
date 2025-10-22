@@ -1,0 +1,17 @@
+(library
+ (name dio_ui_telemetry)
+ (public_name dio.ui.telemetry)
+ (libraries
+  lwt
+  lwt.unix
+  notty
+  nottui
+  nottui-lwt
+  lwd
+  dio_engine
+  dio.ui_types
+  unix
+  str)
+ (modules telemetry_view telemetry_cache)
+ (preprocess
+  (pps lwt_ppx)))

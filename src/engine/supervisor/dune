@@ -1,0 +1,7 @@
+(library
+ (name supervisor)
+ (public_name dio.supervisor)
+ (modules supervisor)
+ (libraries logging telemetry threads lwt.unix dio.engine dio.kraken)
+)
+
