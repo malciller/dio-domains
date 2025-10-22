@@ -328,6 +328,7 @@ let run () : unit Lwt.t =
   let _telemetry_sub = Lwt.async (fun () ->
     let stream = Dio_ui_telemetry.Telemetry_cache.subscribe_telemetry_snapshot () in
     Lwt_stream.iter (fun snapshot ->
+      Logging.debug_f ~section:"dashboard" "Received telemetry snapshot update at %.3f" (Unix.time ());
       if not !telemetry_loaded then (
         telemetry_loaded := true;
         check_all_loaded ()

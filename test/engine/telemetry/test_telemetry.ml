@@ -103,7 +103,7 @@ let test_common_metrics () =
 
 let test_asset_metrics () =
   (* Test asset-specific metric helpers *)
-  let btc_counter = Telemetry.asset_counter "asset_trades" "BTC" in
+  let btc_counter = Telemetry.asset_counter "asset_trades" "BTC" () in
   let eth_gauge = Telemetry.asset_gauge "asset_balance" "ETH" in
   let ada_hist = Telemetry.asset_histogram "asset_latency" "ADA" in
 

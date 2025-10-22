@@ -2,9 +2,29 @@
 
 let section = "telemetry"
 
+(** Sliding window counter for high-frequency metrics *)
+type sliding_counter = {
+  window_size: int;  (* Maximum number of samples to keep *)
+  current_window: (float * int) list ref;  (* (timestamp, increment) pairs *)
+  total_count: int ref;  (* Running total within window *)
+  last_cleanup: float ref;  (* Last time we cleaned old entries *)
+}
+
+(** Rate tracking for counters *)
+type rate_sample = {
+  timestamp: float;
+  value: int;
+}
+
+type rate_tracker = {
+  samples: rate_sample list ref;
+  window_seconds: float;
+}
+
 (** Metric types *)
-type metric_type = 
+type metric_type =
   | Counter of int ref
+  | SlidingCounter of sliding_counter
   | Gauge of float ref
   | Histogram of float list ref
 
@@ -14,6 +34,8 @@ type metric = {
   labels: (string * string) list;
   created_at: float;
   mutable last_updated: float;
+  rate_tracker: rate_tracker option;
+  mutable cached_rate: float;  (* Cached rate for UI display *)
 }
 
 (** Global metrics store *)
@@ -31,20 +53,144 @@ let metric_key name labels =
   in
   if label_str = "" then name else name ^ "{" ^ label_str ^ "}"
 
-(** Counter - incrementing metric *)
-let counter name ?(labels=[]) () =
+(** Sliding window counter for high-frequency metrics *)
+let sliding_counter name ?(labels=[]) ?(window_size=1000) ?(track_rate=false) ?(rate_window=10.0) () =
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
-  let metric = 
+  let metric =
     match Hashtbl.find_opt metrics key with
     | Some m -> m
     | None ->
+        let rate_tracker = if track_rate then
+          Some {
+            samples = ref [];
+            window_seconds = rate_window;
+          }
+        else None in
+        let sliding = {
+          window_size;
+          current_window = ref [];
+          total_count = ref 0;
+          last_cleanup = ref (Unix.time ());
+        } in
+        let m = {
+          name;
+          metric_type = SlidingCounter sliding;
+          labels;
+          created_at = Unix.time ();
+          last_updated = Unix.time ();
+          rate_tracker;
+          cached_rate = 0.0;
+        } in
+        Hashtbl.add metrics key m;
+        m
+  in
+  Mutex.unlock metrics_mutex;
+  metric
+
+(** Increment sliding window counter with automatic cleanup *)
+let inc_sliding_counter metric ?(value=1) () =
+  match metric.metric_type with
+  | SlidingCounter sliding ->
+      (* Fast path: just increment without cleanup most of the time *)
+      Mutex.lock metrics_mutex;
+      let now = Unix.time () in
+
+      (* Add new increment to window *)
+      sliding.current_window := (now, value) :: !(sliding.current_window);
+      sliding.total_count := !(sliding.total_count) + value;
+      metric.last_updated <- now;
+
+      (* Update rate tracker if enabled *)
+      (match metric.rate_tracker with
+       | Some tracker ->
+           let sample = { timestamp = now; value = !(sliding.total_count) } in
+           tracker.samples := sample :: !(tracker.samples);
+           (* Keep only samples within the time window *)
+           let cutoff = now -. tracker.window_seconds in
+           tracker.samples := List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples)
+       | None -> ());
+
+      (* Check if cleanup is needed - do this quickly *)
+      let should_cleanup = now -. !(sliding.last_cleanup) > 60.0 ||
+                          List.length !(sliding.current_window) > sliding.window_size * 2 in
+
+      Mutex.unlock metrics_mutex;
+
+      (* Do expensive cleanup outside of the main mutex if needed *)
+      if should_cleanup then
+        begin
+          Mutex.lock metrics_mutex;
+          (* Re-check condition in case another thread already cleaned up *)
+          let now_check = Unix.time () in
+          if now_check -. !(sliding.last_cleanup) > 60.0 ||
+             List.length !(sliding.current_window) > sliding.window_size * 2 then
+            begin
+              sliding.last_cleanup := now_check;
+              let cutoff = now_check -. 3600.0 in  (* Keep last hour of data *)
+              let new_window = ref [] in
+              let new_total = ref 0 in
+
+              List.iter (fun (timestamp, count) ->
+                if timestamp >= cutoff then begin
+                  new_window := (timestamp, count) :: !new_window;
+                  new_total := !new_total + count;
+                end
+              ) !(sliding.current_window);
+
+              sliding.current_window := !new_window;
+              sliding.total_count := !new_total;
+
+              (* If still too many entries, keep only the most recent ones *)
+              if List.length !new_window > sliding.window_size then begin
+                let sorted = List.sort (fun (t1, _) (t2, _) -> Float.compare t2 t1) !new_window in
+                let recent = ref [] in
+                let count = ref 0 in
+                List.iter (fun (timestamp, inc) ->
+                  if !count < sliding.window_size then begin
+                    recent := (timestamp, inc) :: !recent;
+                    count := !count + inc;
+                  end
+                ) sorted;
+                sliding.current_window := !recent;
+                sliding.total_count := !count;
+              end
+            end;
+          Mutex.unlock metrics_mutex;
+        end;
+
+      Lwt_condition.broadcast metrics_changed_condition ()
+  | _ -> ()
+
+(** Get current value of sliding window counter *)
+let get_sliding_counter metric =
+  match metric.metric_type with
+  | SlidingCounter sliding -> !(sliding.total_count)
+  | _ -> 0
+
+
+(** Counter - incrementing metric *)
+let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
+  let key = metric_key name labels in
+  Mutex.lock metrics_mutex;
+  let metric =
+    match Hashtbl.find_opt metrics key with
+    | Some m -> m
+    | None ->
+        let rate_tracker = if track_rate then
+          Some {
+            samples = ref [];
+            window_seconds = rate_window;
+          }
+        else None in
         let m = {
           name;
           metric_type = Counter (ref 0);
           labels;
           created_at = Unix.time ();
           last_updated = Unix.time ();
+          rate_tracker;
+          cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
         m
@@ -56,22 +202,93 @@ let inc_counter metric ?(value=1) () =
   match metric.metric_type with
   | Counter r ->
       Mutex.lock metrics_mutex;
+      let now = Unix.time () in
       r := !r + value;
-      metric.last_updated <- Unix.time ();
+      metric.last_updated <- now;
+
+      (* Update rate tracker if enabled *)
+      (match metric.rate_tracker with
+       | Some tracker ->
+           let sample = { timestamp = now; value = !r } in
+           tracker.samples := sample :: !(tracker.samples);
+           (* Keep only samples within the time window *)
+           let cutoff = now -. tracker.window_seconds in
+           tracker.samples := List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples)
+       | None -> ());
+
       Mutex.unlock metrics_mutex;
       Lwt_condition.broadcast metrics_changed_condition ()
+  | SlidingCounter _ ->
+      inc_sliding_counter metric ~value ()
   | _ -> ()
 
 let get_counter metric =
   match metric.metric_type with
   | Counter r -> !r
+  | SlidingCounter sliding -> !(sliding.total_count)
   | _ -> 0
+
+(** Update cached rates and snapshot values for all metrics (called during snapshot creation) *)
+let update_cached_rates () =
+  Mutex.lock metrics_mutex;
+  Hashtbl.iter (fun _ metric ->
+    (* Cache current sliding counter values and rates for UI snapshots *)
+    (match metric.metric_type with
+     | SlidingCounter sliding ->
+         (* Calculate rate from sliding window data for display *)
+         let window = !(sliding.current_window) in
+         let rate = if window = [] then 0.0
+                   else
+                     let total_increments = List.fold_left (fun acc (_, inc) -> acc + inc) 0 window in
+                     let earliest_time = List.fold_left (fun acc (t, _) -> min acc t) (fst (List.hd window)) window in
+                     let latest_time = List.fold_left (fun acc (t, _) -> max acc t) earliest_time window in
+                     let time_span = max 1.0 (latest_time -. earliest_time) in  (* Avoid division by zero *)
+                     float_of_int total_increments /. time_span in
+         metric.cached_rate <- rate
+     | _ -> ());
+
+    (* Update rate calculations *)
+    match metric.metric_type, metric.rate_tracker with
+    | Counter _, Some tracker ->
+        let samples = !(tracker.samples) in
+        if samples = [] then ()
+        else if List.length samples = 1 then ()  (* Need at least 2 samples for rate *)
+        else
+          (* Find min and max timestamps efficiently without full sort *)
+          let min_sample = ref (List.hd samples) in
+          let max_sample = ref (List.hd samples) in
+          List.iter (fun sample ->
+            if sample.timestamp < (!min_sample).timestamp then min_sample := sample;
+            if sample.timestamp > (!max_sample).timestamp then max_sample := sample;
+          ) samples;
+          let time_diff = (!max_sample).timestamp -. (!min_sample).timestamp in
+          let value_diff = (!max_sample).value - (!min_sample).value in
+          if time_diff > 0.0 && time_diff <= tracker.window_seconds then
+            metric.cached_rate <- float_of_int value_diff /. time_diff
+    | SlidingCounter _, Some tracker ->
+        (* For sliding counters with rate tracking, calculate rate from samples *)
+        let samples = !(tracker.samples) in
+        if samples <> [] && List.length samples >= 2 then
+          let sorted_samples = List.sort (fun s1 s2 -> Float.compare s1.timestamp s2.timestamp) samples in
+          let earliest = List.hd sorted_samples in
+          let latest = List.hd (List.rev sorted_samples) in
+          let time_diff = latest.timestamp -. earliest.timestamp in
+          let value_diff = latest.value - earliest.value in
+          if time_diff > 0.0 && time_diff <= tracker.window_seconds then
+            metric.cached_rate <- float_of_int value_diff /. time_diff
+    | _ -> ()
+  ) metrics;
+  Mutex.unlock metrics_mutex
+
+(** Calculate current rate for a counter with rate tracking enabled *)
+let get_counter_rate metric =
+  metric.cached_rate
 
 (** Gauge - arbitrary value that can go up or down *)
 let gauge name ?(labels=[]) () =
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
-  let metric = 
+  let metric =
     match Hashtbl.find_opt metrics key with
     | Some m -> m
     | None ->
@@ -81,6 +298,8 @@ let gauge name ?(labels=[]) () =
           labels;
           created_at = Unix.time ();
           last_updated = Unix.time ();
+          rate_tracker = None;
+          cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
         m
@@ -117,7 +336,7 @@ let get_gauge metric =
 let histogram name ?(labels=[]) () =
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
-  let metric = 
+  let metric =
     match Hashtbl.find_opt metrics key with
     | Some m -> m
     | None ->
@@ -127,6 +346,8 @@ let histogram name ?(labels=[]) () =
           labels;
           created_at = Unix.time ();
           last_updated = Unix.time ();
+          rate_tracker = None;
+          cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
         m
@@ -210,6 +431,7 @@ let categorize_metric metric =
 let format_metric_value metric =
   match metric.metric_type with
   | Counter r -> Printf.sprintf "%d" !r
+  | SlidingCounter sliding -> Printf.sprintf "%d" !(sliding.total_count)
   | Gauge r -> Printf.sprintf "%.1f" !r
   | Histogram _ ->
       let (_, p50, _, _, count) = histogram_stats metric in
@@ -259,8 +481,8 @@ let report_metrics () =
 
           (* Special handling for domain_cycles rate *)
           match metric.metric_type, metric.name with
-          | Counter r, "domain_cycles" when uptime > 0.0 ->
-              let rate = float_of_int !r /. uptime in
+          | Counter _, "domain_cycles" ->
+              let rate = get_counter_rate metric in
               Logging.info_f ~section "    └─ %.0f cycles/sec" rate
           | _ -> ()
         ) sorted_metrics;
@@ -287,13 +509,13 @@ module Common = struct
   let orders_placed = counter "orders_placed" ()
   let orders_failed = counter "orders_failed" ()
 
-  
-  let domain_cycles = counter "domain_cycles" ()
+
+  let domain_cycles = sliding_counter "domain_cycles" ~window_size:10000 () ~track_rate:true ~rate_window:10.0
   let domain_errors = counter "domain_errors" ()
 end
 
 (** Per-asset metrics helper *)
-let asset_counter name asset = counter name ~labels:["asset", asset] ()
+let asset_counter name asset ?(track_rate=false) ?(rate_window=10.0) () = counter name ~labels:["asset", asset] ~track_rate ~rate_window ()
 let asset_gauge name asset = gauge name ~labels:["asset", asset] ()
 let asset_histogram name asset = histogram name ~labels:["asset", asset] ()
 
