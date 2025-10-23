@@ -510,8 +510,6 @@ module Common = struct
   let orders_failed = counter "orders_failed" ()
 
 
-  let domain_cycles = sliding_counter "domain_cycles" ~window_size:10000 () ~track_rate:true ~rate_window:10.0
-  let domain_errors = counter "domain_errors" ()
 end
 
 (** Per-asset metrics helper *)

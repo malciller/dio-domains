@@ -4,6 +4,7 @@
  (libraries
   lwt
   lwt.unix
+  yojson
   notty
   nottui
   nottui-lwt
