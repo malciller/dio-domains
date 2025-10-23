@@ -79,6 +79,205 @@ module Cpu_info = struct
           with _ -> None
 end
 
+(* Temperature monitoring module *)
+module Temperature = struct
+  (** Try to get temperature from macOS *)
+  let get_macos_temps () =
+    try
+      (* Try osx-cpu-temp if installed *)
+      let cmd = Unix.open_process_in "osx-cpu-temp 2>/dev/null" in
+      let output = String.trim (input_line cmd) in
+      ignore (Unix.close_process_in cmd);
+      
+      (* Parse output like "61.2°C" - extract digits before the degree symbol *)
+      let temp_str = 
+        let parts = Str.split (Str.regexp "[°C]") output in
+        match parts with
+        | temp :: _ -> String.trim temp
+        | [] -> output
+      in
+      let temp = float_of_string temp_str in
+      Some (Some temp, None, [])
+    with _ ->
+      (* Try powermetrics (requires sudo, so may fail) *)
+      try
+        let cmd = Unix.open_process_in "powermetrics --samplers smc -i1 -n1 2>/dev/null | grep -i 'CPU die temperature'" in
+        let line = input_line cmd in
+        ignore (Unix.close_process_in cmd);
+        
+        (* Parse line like "CPU die temperature: 45.67 C" *)
+        let parts = String.split_on_char ':' line in
+        if List.length parts >= 2 then
+          let temp_part = List.nth parts 1 |> String.trim in
+          let temp_str = String.split_on_char ' ' temp_part |> List.hd |> String.trim in
+          let temp = float_of_string temp_str in
+          Some (Some temp, None, [])
+        else
+          None
+      with _ ->
+        (* Try istats if installed *)
+        try
+          let cmd = Unix.open_process_in "istats cpu temp 2>/dev/null" in
+          let line = input_line cmd in
+          ignore (Unix.close_process_in cmd);
+          
+          (* Parse output like "CPU temp: 45.5°C" *)
+          let parts = String.split_on_char ':' line in
+          if List.length parts >= 2 then
+            let temp_part = List.nth parts 1 |> String.trim in
+            let temp_str = 
+              let parts = Str.split (Str.regexp "[°C]") temp_part in
+              match parts with
+              | temp :: _ -> String.trim temp
+              | [] -> temp_part
+            in
+            let temp = float_of_string temp_str in
+            Some (Some temp, None, [])
+          else
+            None
+        with _ -> None
+
+  (** Try to get temperature from Linux thermal zones *)
+  let get_linux_temps () =
+    try
+      let thermal_zones = Sys.readdir "/sys/class/thermal" |> Array.to_list in
+      let zones = List.filter (fun name -> String.starts_with ~prefix:"thermal_zone" name) thermal_zones in
+      
+      let read_zone zone =
+        try
+          let type_path = Printf.sprintf "/sys/class/thermal/%s/type" zone in
+          let temp_path = Printf.sprintf "/sys/class/thermal/%s/temp" zone in
+          
+          let ic_type = open_in type_path in
+          let zone_type = String.trim (input_line ic_type) in
+          close_in ic_type;
+          
+          let ic_temp = open_in temp_path in
+          let temp_millic = String.trim (input_line ic_temp) in
+          close_in ic_temp;
+          
+          let temp = float_of_string temp_millic /. 1000.0 in
+          Some (zone_type, temp)
+        with _ -> None
+      in
+      
+      let temps = List.filter_map read_zone zones in
+      
+      (* Try to identify CPU and GPU temperatures *)
+      let cpu_temp = List.find_opt (fun (name, _) ->
+        let lower = String.lowercase_ascii name in
+        String.contains lower 'c' && String.contains lower 'p' && String.contains lower 'u' ||
+        String.starts_with ~prefix:"x86_pkg_temp" lower ||
+        String.starts_with ~prefix:"coretemp" lower ||
+        String.starts_with ~prefix:"k10temp" lower
+      ) temps |> Option.map snd in
+      
+      let gpu_temp = List.find_opt (fun (name, _) ->
+        let lower = String.lowercase_ascii name in
+        String.contains lower 'g' && String.contains lower 'p' && String.contains lower 'u'
+      ) temps |> Option.map snd in
+      
+      Some (cpu_temp, gpu_temp, temps)
+    with _ ->
+      (* Fallback: try lm-sensors command *)
+      try
+        let cmd = Unix.open_process_in "sensors 2>/dev/null" in
+        let rec read_sensors cpu_temp gpu_temp all_temps =
+          try
+            let line = input_line cmd in
+            
+            (* Look for temperature lines like "Core 0:        +45.0°C" or "temp1:        +50.0°C" *)
+            if String.contains line ':' && String.contains line '+' then
+              let parts = String.split_on_char ':' line in
+              match parts with
+              | name :: value_part :: _ ->
+                  let name = String.trim name in
+                  let value_str = String.trim value_part in
+                  
+                  (* Extract temperature value - look for pattern like "+45.0" *)
+                  let temp_opt = try
+                    let temp_start = String.index value_str '+' in
+                    (* Find the end of the number - could be space, degree symbol, or end of string *)
+                    let rec find_number_end str pos =
+                      if pos >= String.length str then pos
+                      else match str.[pos] with
+                      | '0'..'9' | '.' -> find_number_end str (pos + 1)
+                      | _ -> pos
+                    in
+                    let temp_end = find_number_end value_str (temp_start + 1) in
+                    let temp_str = String.sub value_str (temp_start + 1) (temp_end - temp_start - 1) in
+                    Some (float_of_string temp_str)
+                  with _ -> None
+                  in
+                  
+                  (match temp_opt with
+                   | Some temp ->
+                       let lower = String.lowercase_ascii name in
+                       let new_cpu = if cpu_temp = None && (String.contains lower 'c' || String.contains lower 'p') then Some temp else cpu_temp in
+                       let new_gpu = if gpu_temp = None && String.contains lower 'g' then Some temp else gpu_temp in
+                       let new_all = (name, temp) :: all_temps in
+                       read_sensors new_cpu new_gpu new_all
+                   | None -> read_sensors cpu_temp gpu_temp all_temps)
+              | _ -> read_sensors cpu_temp gpu_temp all_temps
+            else
+              read_sensors cpu_temp gpu_temp all_temps
+          with End_of_file ->
+            ignore (Unix.close_process_in cmd);
+            (cpu_temp, gpu_temp, List.rev all_temps)
+        in
+        let cpu, gpu, all = read_sensors None None [] in
+        Some (cpu, gpu, all)
+      with _ -> None
+
+  (** Try to get temperature from Windows (via WMI) *)
+  let get_windows_temps () =
+    try
+      (* Try using wmic to query temperature sensors *)
+      let cmd = Unix.open_process_in "wmic /namespace:\\\\\\\\root\\\\wmi PATH MSAcpi_ThermalZoneTemperature get CurrentTemperature 2>nul" in
+      let rec read_temps temps =
+        try
+          let line = input_line cmd in
+          let trimmed = String.trim line in
+          (* WMI returns temperature in tenths of Kelvin, convert to Celsius *)
+          if trimmed <> "" && trimmed <> "CurrentTemperature" then
+            try
+              let temp_tenths_k = float_of_string trimmed in
+              let temp_c = (temp_tenths_k /. 10.0) -. 273.15 in
+              read_temps (temp_c :: temps)
+            with _ -> read_temps temps
+          else
+            read_temps temps
+        with End_of_file ->
+          ignore (Unix.close_process_in cmd);
+          List.rev temps
+      in
+      let temps = read_temps [] in
+      match temps with
+      | [] -> None
+      | cpu_temp :: _ ->
+          (* First temp is usually CPU, but we don't have GPU info from this method *)
+          Some (Some cpu_temp, None, List.mapi (fun i t -> (Printf.sprintf "Sensor%d" i, t)) temps)
+    with _ -> None
+
+  (** Get system temperatures for current platform *)
+  let get_temperatures () =
+    match Sys.os_type with
+    | "Unix" ->
+        (* Try to detect which Unix variant *)
+        (try
+          let uname_cmd = Unix.open_process_in "uname 2>/dev/null" in
+          let uname = String.trim (input_line uname_cmd) in
+          ignore (Unix.close_process_in uname_cmd);
+          
+          match uname with
+          | "Darwin" -> get_macos_temps ()
+          | "Linux" -> get_linux_temps ()
+          | _ -> get_linux_temps ()  (* Default to Linux method *)
+        with _ -> get_linux_temps ())  (* Default to Linux method *)
+    | "Win32" -> get_windows_temps ()
+    | _ -> None
+end
+
 (** Event bus for system stats *)
 module SystemStatsEventBus = Event_bus.Make(struct
   type t = Ui_types.system_stats
@@ -392,10 +591,15 @@ let create_system_stats_lwt () : system_stats option Lwt.t =
   let cpu_cores = Cpu_info.get_cpu_cores () in
   let cpu_vendor = Cpu_info.get_cpu_vendor () in
   let cpu_model = Cpu_info.get_cpu_model () in
+  let temp_data = Temperature.get_temperatures () in
 
   match cpu_stats, mem_stats, load_stats, proc_count with
   | Some (total_cpu_usage, core_usages), Some (mem_total, mem_used, mem_free, swap_total, swap_used),
     Some (load1, load5, load15), Some processes ->
+      let (cpu_temp, gpu_temp, temps) = match temp_data with
+        | Some (cpu, gpu, all) -> (cpu, gpu, all)
+        | None -> (None, None, [])
+      in
       Lwt.return_some {
         cpu_usage = total_cpu_usage;
         core_usages = core_usages;
@@ -411,6 +615,9 @@ let create_system_stats_lwt () : system_stats option Lwt.t =
         load_avg_5 = load5;
         load_avg_15 = load15;
         processes = processes;
+        cpu_temp = cpu_temp;
+        gpu_temp = gpu_temp;
+        temps = temps;
       }
   | _ -> Lwt.return_none
 
@@ -463,6 +670,9 @@ let current_system_stats () =
               load_avg_5 = 0.0;
               load_avg_15 = 0.0;
               processes = 0;
+              cpu_temp = None;
+              gpu_temp = None;
+              temps = [];
             }
       )
 

@@ -145,8 +145,65 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
     proc_text;
   ] in
 
+  (* Temperature Section *)
+  let temp_section = 
+    match stats.cpu_temp, stats.gpu_temp with
+    | None, None -> empty  (* No temperature data available *)
+    | _, _ ->
+        let temp_title = string ~attr:Notty.A.(st bold ++ fg cyan) "Temperature" in
+        let temp_lines = [] in
+        
+        (* Add CPU temperature *)
+        let temp_lines = match stats.cpu_temp with
+          | Some temp ->
+              let temp_color = 
+                if temp > 90.0 then Notty.A.(fg red)
+                else if temp > 75.0 then Notty.A.(fg yellow)
+                else Notty.A.(fg green)
+              in
+              let cpu_temp_text = string ~attr:temp_color (Printf.sprintf "CPU: %.1f°C" temp) in
+              temp_lines @ [cpu_temp_text]
+          | None -> temp_lines
+        in
+        
+        (* Add GPU temperature *)
+        let temp_lines = match stats.gpu_temp with
+          | Some temp ->
+              let temp_color = 
+                if temp > 85.0 then Notty.A.(fg red)
+                else if temp > 70.0 then Notty.A.(fg yellow)
+                else Notty.A.(fg green)
+              in
+              let gpu_temp_text = string ~attr:temp_color (Printf.sprintf "GPU: %.1f°C" temp) in
+              temp_lines @ [gpu_temp_text]
+          | None -> temp_lines
+        in
+        
+        (* Add other sensors if we have them and neither CPU nor GPU was found *)
+        let temp_lines = 
+          if stats.cpu_temp = None && stats.gpu_temp = None && List.length stats.temps > 0 then
+            (* Show first few sensors as fallback *)
+            let sensor_lines = List.filteri (fun i _ -> i < 3) stats.temps |> List.map (fun (name, temp) ->
+              let temp_color = 
+                if temp > 80.0 then Notty.A.(fg red)
+                else if temp > 65.0 then Notty.A.(fg yellow)
+                else Notty.A.(fg green)
+              in
+              string ~attr:temp_color (Printf.sprintf "%s: %.1f°C" name temp)
+            ) in
+            temp_lines @ sensor_lines
+          else
+            temp_lines
+        in
+        
+        if temp_lines = [] then
+          empty
+        else
+          vcat (temp_title :: temp_lines)
+  in
+
   (* Combine all sections *)
-  vcat [
+  let sections = [
     header;
     string ~attr:Notty.A.empty "";
     cpu_section;
@@ -156,8 +213,16 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
     swap_section;
     string ~attr:Notty.A.empty "";
     proc_section;
-    string ~attr:Notty.A.empty "";
-  ]
+  ] in
+  
+  (* Only add temperature section if it's not empty *)
+  let sections = if temp_section <> empty then
+    sections @ [string ~attr:Notty.A.empty ""; temp_section]
+  else
+    sections
+  in
+  
+  vcat (sections @ [string ~attr:Notty.A.empty ""])
 
 (** Create reactive system view with shared stats and snapshot variables *)
 let make_system_view stats_var snapshot_var =
