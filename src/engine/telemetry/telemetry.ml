@@ -514,6 +514,8 @@ end
 
 (** Per-asset metrics helper *)
 let asset_counter name asset ?(track_rate=false) ?(rate_window=10.0) () = counter name ~labels:["asset", asset] ~track_rate ~rate_window ()
+let asset_sliding_counter name asset ?(window_size=1000000) ?(track_rate=false) ?(rate_window=10.0) () = 
+  sliding_counter name ~labels:["asset", asset] ~window_size ~track_rate ~rate_window ()
 let asset_gauge name asset = gauge name ~labels:["asset", asset] ()
 let asset_histogram name asset = histogram name ~labels:["asset", asset] ()
 

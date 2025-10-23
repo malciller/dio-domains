@@ -58,9 +58,17 @@ let metric_row metric _is_expanded _snapshot =
     (* Skip the generic domain_cycles counter when it's 0 and has no labels *)
     match metric.Telemetry.metric_type, metric.Telemetry.name, metric.Telemetry.labels with
     | Telemetry.Counter r, "domain_cycles", [] when !r = 0 ->
-        empty  (* Don't display the generic domain_cycles when it's 0 *)
+empty  (* Don't display the generic domain_cycles when it's 0 *)
     | _ ->
-        let (value_str, color) = format_metric_value_ui metric in
+        (* Special handling for domain_cycles: only show rate, not total count *)
+        let (value_str, color, skip_value) = 
+          if metric.Telemetry.name = "domain_cycles" then
+            (* For domain_cycles, we'll only show the rate, so mark to skip the value *)
+            ("", Notty.A.(fg green), true)
+          else
+            let (v, c) = format_metric_value_ui metric in
+            (v, c, false)
+        in
 
         let label_str =
           if metric.Telemetry.labels = [] then ""
@@ -69,27 +77,37 @@ let metric_row metric _is_expanded _snapshot =
 
         let name_attr = Notty.A.(fg white) in  (* Primary text for metric names *)
         let name_widget = string ~attr:name_attr (name ^ ":") in
-        let value_widget = string ~attr:color value_str in
         let label_widget = string ~attr:Notty.A.(fg (gray 2)) label_str in  (* Dim gray for labels *)
-
-        let row = hcat [name_widget; string ~attr:Notty.A.empty " "; value_widget; label_widget] in
 
         (* Add special handling for domain_cycles rate *)
         match metric.Telemetry.metric_type, metric.Telemetry.name with
         | Telemetry.Counter _, "domain_cycles" ->
             let rate = Telemetry.get_counter_rate metric in
             let rate = if rate < 0.0 || rate > 1_000_000.0 then 0.0 else rate in  (* Validate rate *)
-            let rate_attr = Notty.A.(fg cyan) in  (* Cyan for accent/special info *)
-            let rate_widget = string ~attr:rate_attr (Printf.sprintf " (%.0f cycles/sec)" rate) in
-            hcat [row; rate_widget]
+            let rate_color = 
+              if rate > 50000.0 then Notty.A.(fg red ++ st bold)
+              else if rate > 20000.0 then Notty.A.(fg yellow ++ st bold)
+              else Notty.A.(fg green ++ st bold)
+            in
+            let rate_widget = string ~attr:rate_color (Printf.sprintf "%.0f cycles/sec" rate) in
+            hcat [name_widget; string ~attr:Notty.A.empty " "; rate_widget; label_widget]
         | Telemetry.SlidingCounter _, "domain_cycles" ->
             (* Use rate tracker samples for more stable rate calculation *)
             let rate = Telemetry.get_counter_rate metric in
             let rate = if rate < 0.0 || rate > 1_000_000.0 then 0.0 else rate in  (* Validate rate *)
-            let rate_attr = Notty.A.(fg cyan) in  (* Cyan for accent/special info *)
-            let rate_widget = string ~attr:rate_attr (Printf.sprintf " (%.0f cycles/sec)" rate) in
-            hcat [row; rate_widget]
-        | _ -> row
+            let rate_color = 
+              if rate > 50000.0 then Notty.A.(fg red ++ st bold)
+              else if rate > 20000.0 then Notty.A.(fg yellow ++ st bold)
+              else Notty.A.(fg green ++ st bold)
+            in
+            let rate_widget = string ~attr:rate_color (Printf.sprintf "%.0f cycles/sec" rate) in
+            hcat [name_widget; string ~attr:Notty.A.empty " "; rate_widget; label_widget]
+        | _ -> 
+            if skip_value then
+              hcat [name_widget; label_widget]
+            else
+              let value_widget = string ~attr:color value_str in
+              hcat [name_widget; string ~attr:Notty.A.empty " "; value_widget; label_widget]
   with exn ->
     Logging.error_f ~section:"telemetry_view" "Exception creating metric row for %s: %s" metric.Telemetry.name (Printexc.to_string exn);
     let error_attr = Notty.A.(fg red ++ st bold) in

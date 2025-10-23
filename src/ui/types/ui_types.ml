@@ -26,4 +26,7 @@ type system_stats = {
   load_avg_5: float;
   load_avg_15: float;
   processes: int;
+  cpu_temp: float option;     (* CPU temperature in Celsius *)
+  gpu_temp: float option;     (* GPU temperature in Celsius *)
+  temps: (string * float) list;  (* Additional temperature sensors (name, temp in C) *)
 }

@@ -148,6 +148,9 @@ let make_dashboard () =
     load_avg_5 = 0.0;
     load_avg_15 = 0.0;
     processes = 0;
+    cpu_temp = None;
+    gpu_temp = None;
+    temps = [];
   } in
 
   let empty_telemetry_snapshot = {
