@@ -301,7 +301,7 @@ end)
 
 (** Per-symbol orderbook storage and readiness signalling *)
 type store = {
-  buffer: orderbook RingBuffer.t;
+  mutable buffer: orderbook RingBuffer.t;
   mutable bids: (string * string * float * float) PriceMap.t;
   mutable asks: (string * string * float * float) PriceMap.t;
   ready: bool Atomic.t;
@@ -783,6 +783,8 @@ let clear_all_stores () =
     Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
     store.bids <- PriceMap.empty;
     store.asks <- PriceMap.empty;
+    (* Replace ring buffer with fresh empty one to clear any stale data *)
+    store.buffer <- RingBuffer.create ring_buffer_size;
     Atomic.set store.ready false
   ) stores
 

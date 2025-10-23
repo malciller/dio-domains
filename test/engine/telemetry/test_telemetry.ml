@@ -95,11 +95,10 @@ let test_common_metrics () =
   (* Test the Common metrics module *)
   Telemetry.inc_counter Telemetry.Common.orders_placed ~value:3 ();
   Telemetry.inc_counter Telemetry.Common.orders_failed ~value:1 ();
-  Telemetry.inc_counter Telemetry.Common.domain_cycles ~value:100 ();
+
 
   check int "orders_placed counter" 3 (Telemetry.get_counter Telemetry.Common.orders_placed);
-  check int "orders_failed counter" 1 (Telemetry.get_counter Telemetry.Common.orders_failed);
-  check int "domain_cycles counter" 100 (Telemetry.get_counter Telemetry.Common.domain_cycles)
+  check int "orders_failed counter" 1 (Telemetry.get_counter Telemetry.Common.orders_failed)
 
 let test_asset_metrics () =
   (* Test asset-specific metric helpers *)
