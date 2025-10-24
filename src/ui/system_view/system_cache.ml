@@ -469,24 +469,21 @@ let read_cpu_stats () =
       | _ -> read_cores cores
     with End_of_file ->
       close_in ic;
-      cores
+      List.rev cores (* Return in correct order cpu, cpu0, cpu1... *)
   in
   read_cores []
 
-(** Get CPU usage and per-core usage using proper time-interval sampling (Lwt-friendly) *)
-let get_cpu_usage_lwt () =
+(** Cache for previous CPU stats *)
+let last_cpu_stats = ref None
+
+(** Get CPU usage and per-core usage *)
+let get_cpu_usage () =
   try
-    (* Take first reading *)
-    let stats1 = read_cpu_stats () in
-
-    (* Sleep for 100ms to get a meaningful time interval *)
-    let%lwt () = Lwt_unix.sleep 0.1 in
-
-    (* Take second reading *)
-    let stats2 = read_cpu_stats () in
-
-    match stats1, stats2 with
-    | (busy1, total1) :: core_stats1, (busy2, total2) :: core_stats2 ->
+    let current_stats = read_cpu_stats () in
+    match !last_cpu_stats, current_stats with
+    | Some ((busy1, total1) :: core_stats1), (busy2, total2) :: core_stats2 ->
+        last_cpu_stats := Some current_stats; (* Update cache *)
+        
         (* Calculate total CPU usage over the interval *)
         let busy_delta = busy2 -. busy1 in
         let total_delta = total2 -. total1 in
@@ -494,52 +491,109 @@ let get_cpu_usage_lwt () =
 
         (* Calculate per-core usage over the interval *)
         let core_percentages =
-          List.map2 (fun (busy1, total1) (busy2, total2) ->
-            let busy_delta = busy2 -. busy1 in
-            let total_delta = total2 -. total1 in
-            if total_delta > 0.0 then (busy_delta /. total_delta) *. 100.0 else 0.0
-          ) core_stats1 core_stats2
+          try
+            List.map2 (fun (busy1, total1) (busy2, total2) ->
+              let busy_delta = busy2 -. busy1 in
+              let total_delta = total2 -. total1 in
+              if total_delta > 0.0 then (busy_delta /. total_delta) *. 100.0 else 0.0
+            ) core_stats1 core_stats2
+          with Invalid_argument _ -> [] (* Handle case where core counts mismatch *)
         in
 
         Lwt.return_some (total_percentage, core_percentages)
-    | _ -> Lwt.return_none
+    | _ ->
+        (* First run, or one of the stats lists was empty. Just populate cache and wait for next call. *)
+        last_cpu_stats := Some current_stats;
+        Lwt.return_none
   with _ ->
     (* macOS implementation using top command *)
+    (* Helper function to check if substring exists - case insensitive *)
+    let contains_substring haystack needle =
+      let needle_len = String.length needle in
+      if needle_len = 0 then true else
+      try
+        let start_pos = String.index_from haystack 0 needle.[0] in
+        let rec check_from pos =
+          if pos + needle_len > String.length haystack then false
+          else
+            let rec match_chars i =
+              if i >= needle_len then true
+              else if haystack.[pos + i] = needle.[i] then match_chars (i + 1)
+              else false
+            in
+            if match_chars 0 then true
+            else check_from (pos + 1)
+        in
+        check_from start_pos
+      with Not_found -> false
+    in 
     try
-      let top_cmd = Unix.open_process_in "top -l 1 -n 0 | grep 'CPU usage'" in
+      let top_cmd = Unix.open_process_in "top -l 1 -n 0 | grep -i 'cpu usage'" in
       let line = input_line top_cmd in
       ignore (Unix.close_process_in top_cmd);
 
       (* Parse line like: "CPU usage: 15.23% user, 12.45% sys, 72.32% idle" *)
-      let parts = String.split_on_char ',' line in
-      let rec parse_usage parts user_sys =
+      let clean_line = String.trim line in
+      Logging.debug_f ~section:"system_cache" "Parsing top output: '%s'" clean_line;
+      
+      let parts = String.split_on_char ',' clean_line in
+      let rec parse_usage parts user_pct sys_pct =
         match parts with
-        | [] -> user_sys
+        | [] -> (user_pct, sys_pct)
         | part :: rest ->
+            let trimmed = String.trim part in
             try
-              if String.contains part '%' then
-                let percent_part = String.trim part in
-                let percent_str = String.trim (List.hd (String.split_on_char '%' percent_part)) in
+              if String.contains trimmed '%' then
+                (* Extract the percentage number *)
+                let percent_str = 
+                  let idx = String.index trimmed '%' in
+                  String.sub trimmed 0 idx |> String.trim
+                in
                 let percent = float_of_string percent_str in
-                if String.contains percent_part 'i' && String.contains percent_part 'd' &&
-                   String.contains percent_part 'l' && String.contains percent_part 'e' then
-                  parse_usage rest user_sys  (* Don't add idle time *)
+                
+                (* Check for keywords - case insensitive *)
+                let lower_part = String.lowercase_ascii trimmed in
+                if contains_substring lower_part "user" then
+                  parse_usage rest percent sys_pct
+                else if contains_substring lower_part "sys" then
+                  parse_usage rest user_pct percent
+                else if contains_substring lower_part "idle" then
+                  parse_usage rest user_pct sys_pct  (* Ignore idle *)
                 else
-                  parse_usage rest (user_sys +. percent)  (* Add user/sys time *)
+                  (* Unknown percentage, log and ignore *)
+                  let () = Logging.debug_f ~section:"system_cache" "Unknown percentage part: '%s' (%.2f%%)" trimmed percent in
+                  parse_usage rest user_pct sys_pct
               else
-                parse_usage rest user_sys
-            with _ -> parse_usage rest user_sys
+                parse_usage rest user_pct sys_pct
+            with e ->
+              Logging.debug_f ~section:"system_cache" "Failed to parse part '%s': %s" trimmed (Printexc.to_string e);
+              parse_usage rest user_pct sys_pct
       in
-      let user_sys_usage = parse_usage parts 0.0 in
-      let total_usage = min 100.0 user_sys_usage in  (* User + sys time, capped at 100% *)
-
-      (* For macOS, we can't easily get per-core data, so show total as single core *)
-      let core_usages = [total_usage] in
-
-      Lwt.return_some (total_usage, core_usages)
-    with _ ->
-      (* Unable to collect CPU usage *)
-      Lwt.return_none
+      
+      let user_pct, sys_pct = parse_usage parts 0.0 0.0 in
+      let total_usage = min 100.0 (user_pct +. sys_pct) in
+      
+      if total_usage > 0.0 then begin
+        Logging.debug_f ~section:"system_cache" "CPU usage parsed: user=%.2f%%, sys=%.2f%%, total=%.2f%%" 
+          user_pct sys_pct total_usage;
+        Lwt.return_some (total_usage, [total_usage])
+      end else begin
+        Logging.warn_f ~section:"system_cache" "Failed to parse valid CPU usage from: %s" clean_line;
+        Lwt.return_none
+      end
+    with
+    | End_of_file -> 
+        Logging.debug_f ~section:"system_cache" "No output from top command";
+        Lwt.return_none
+    | Unix.Unix_error (err, _, _) -> 
+        Logging.warn_f ~section:"system_cache" "Unix error running top: %s" (Unix.error_message err);
+        Lwt.return_none
+    | Failure msg -> 
+        Logging.warn_f ~section:"system_cache" "Parse failure: %s" msg;
+        Lwt.return_none
+    | e -> 
+        Logging.error_f ~section:"system_cache" "Unexpected error in CPU parsing: %s" (Printexc.to_string e);
+        Lwt.return_none
 
 (** Get system load averages *)
 let get_load_avg () =
@@ -584,7 +638,7 @@ let get_process_count () =
 
 (** Create a fresh system stats snapshot (Lwt-friendly) *)
 let create_system_stats_lwt () : system_stats option Lwt.t =
-  let%lwt cpu_stats = get_cpu_usage_lwt () in
+  let%lwt cpu_stats = get_cpu_usage () in
   let mem_stats = get_memory_stats () in
   let load_stats = get_load_avg () in
   let proc_count = get_process_count () in
