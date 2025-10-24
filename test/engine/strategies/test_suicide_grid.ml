@@ -93,14 +93,15 @@ let test_state_management () =
   check bool "same state for same symbol" true (state1 == state2)
 
 let test_userref_generation () =
-  (* Test userref generation - should create unique values *)
-  let userref1 = Dio_strategies.Suicide_grid.generate_userref "BTC/USD" in
-  let userref2 = Dio_strategies.Suicide_grid.generate_userref "ETH/USD" in
-
-  (* Should be positive integers *)
-  check bool "userref1 positive" true (userref1 > 0);
-  check bool "userref2 positive" true (userref2 > 0);
-  check bool "userrefs unique" true (userref1 <> userref2)
+  (* Test userref tagging - Grid strategy should use userref=1 *)
+  let strategy_userref = Dio_strategies.Strategy_common.strategy_userref_grid in
+  check int "grid strategy userref" 1 strategy_userref;
+  
+  (* Test that is_strategy_order correctly identifies Grid orders *)
+  check bool "userref 1 matches grid" true 
+    (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 1);
+  check bool "userref 2 doesn't match grid" false 
+    (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 2)
 
 let test_balance_checking () =
   (* Test balance checking logic *)

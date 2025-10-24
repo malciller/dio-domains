@@ -103,7 +103,8 @@ let test_execution_event_structure () =
     last_price = None;
     fee = None;
     trade_id = None;
-    order_userref = Some 12345;
+    order_userref = Some 1;
+    cl_ord_id = None;
     timestamp = Unix.time ();
   } in
 
@@ -121,7 +122,7 @@ let test_execution_event_structure () =
   Alcotest.(check bool) "execution event last_price is none" true (Option.is_none test_event.last_price);
   Alcotest.(check bool) "execution event fee is none" true (Option.is_none test_event.fee);
   Alcotest.(check bool) "execution event trade_id is none" true (Option.is_none test_event.trade_id);
-  Alcotest.(check (option int)) "execution event order_userref" (Some 12345) test_event.order_userref;
+  Alcotest.(check (option int)) "execution event order_userref" (Some 1) test_event.order_userref;
   Alcotest.(check bool) "execution event timestamp is positive" true (test_event.timestamp > 0.0)
 
 let test_open_order_structure () =
@@ -137,7 +138,8 @@ let test_open_order_structure () =
     avg_price = 2995.0;
     cum_cost = 8985.0;
     order_status = Kraken.Kraken_executions_feed.PartiallyFilledStatus;
-    order_userref = Some 67890;
+    order_userref = Some 2;
+    cl_ord_id = None;
     last_updated = Unix.time ();
   } in
 

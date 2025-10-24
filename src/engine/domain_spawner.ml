@@ -265,9 +265,9 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
       end
     end;
 
-    (* Get open orders for strategy sync - include side to avoid price-based classification *)
+    (* Get open orders for strategy sync - include side and cl_ord_id for strategy filtering *)
     (* IMPORTANT: Get orders first, then calculate counts from the SAME snapshot to avoid race conditions *)
-    let open_orders =
+    let all_open_orders =
       if asset_with_fees.exchange = "kraken" then begin
         let orders = Kraken.Kraken_executions_feed.get_open_orders asset_with_fees.symbol in
         List.filter_map (fun (order : Kraken.Kraken_executions_feed.open_order) ->
@@ -277,18 +277,58 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
                 | Kraken.Kraken_executions_feed.Buy -> "buy"
                 | Kraken.Kraken_executions_feed.Sell -> "sell"
               in
-              Some (order.order_id, price, order.remaining_qty, side_str)
+              Some (order.order_id, price, order.remaining_qty, side_str, order.order_userref)
           | None -> None
         ) orders
       end else
         []
     in
 
-    (* Calculate buy/sell counts from the synchronized open_orders list to avoid race conditions *)
-    let (open_buy_count, open_sell_count) =
-      List.fold_left (fun (buys, sells) (_, _, _, side_str) ->
+    (* Filter orders by strategy based on userref *)
+    let filter_orders_by_strategy strategy_name strategy_userref =
+      (* Always log for first few cycles to debug filtering *)
+      let should_log = !cycle_count < 10 || !cycle_count mod 100000 = 0 in
+      
+      if should_log && List.length all_open_orders > 0 then
+        Logging.debug_f ~section "Filtering %d total orders on %s for %s strategy (userref=%d)"
+          (List.length all_open_orders) asset_with_fees.symbol strategy_name strategy_userref;
+      
+      let filtered = List.filter (fun (order_id, _, _, _, userref_opt) ->
+        match userref_opt with
+        | Some userref -> 
+            let matches = Dio_strategies.Strategy_common.is_strategy_order strategy_userref userref in
+            if should_log then
+              Logging.debug_f ~section "Order %s: userref=%d, matches=%B"
+                order_id userref matches;
+            matches
+        | None -> 
+            if should_log then
+              Logging.debug_f ~section "Order %s has no userref, ignoring for strategy filtering" order_id;
+            false  (* Orders without userref are ignored - likely manual orders *)
+      ) all_open_orders in
+      
+      if should_log then
+        Logging.debug_f ~section "Filtered %d orders for %s strategy from %d total orders on %s"
+          (List.length filtered) strategy_name (List.length all_open_orders) asset_with_fees.symbol;
+      filtered
+    in
+
+    (* Get strategy-specific open orders *)
+    let grid_open_orders = filter_orders_by_strategy "Grid" Dio_strategies.Strategy_common.strategy_userref_grid in
+    let mm_open_orders = filter_orders_by_strategy "MM" Dio_strategies.Strategy_common.strategy_userref_mm in
+
+    (* Calculate buy/sell counts from grid strategy orders *)
+    let (grid_open_buy_count, grid_open_sell_count) =
+      List.fold_left (fun (buys, sells) (_, _, _, side_str, _) ->
         if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1)
-      ) (0, 0) open_orders
+      ) (0, 0) grid_open_orders
+    in
+
+    (* Calculate buy/sell counts from MM strategy orders *)
+    let (mm_open_buy_count, mm_open_sell_count) =
+      List.fold_left (fun (buys, sells) (_, _, _, side_str, _) ->
+        if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1)
+      ) (0, 0) mm_open_orders
     in
 
     (* Lock-free balance queries *)
@@ -305,15 +345,19 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
       else None
     in
 
-    (* Execute strategy based on type *)
+    (* Execute strategy based on type - pass strategy-specific orders *)
     (match grid_strategy_asset with
      | Some asset ->
-         Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance open_buy_count open_sell_count open_orders !cycle_count
+         Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count grid_open_orders !cycle_count
      | None -> ());
     (match mm_strategy_asset with
      | Some asset ->
-         Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance open_buy_count open_sell_count open_orders !cycle_count
+         Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
      | None -> ());
+    
+    (* Calculate total order counts across all strategies for logging *)
+    let total_open_buy_count = grid_open_buy_count + mm_open_buy_count in
+    let total_open_sell_count = grid_open_sell_count + mm_open_sell_count in
     
     (* Simulate some trading logic variations *)
     let cycle = !cycle_count in
@@ -324,19 +368,19 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
           Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
             asset_with_fees.exchange asset_with_fees.symbol cycle price
             bid_price ask_price base_asset asset_bal quote_currency quote_bal
-            open_buy_count open_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
+            total_open_buy_count total_open_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
       | Some price, Some (bid_price, _bid_size, ask_price, _ask_size), _, _ ->
           Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %d buy / %d sell%s"
             asset_with_fees.exchange asset_with_fees.symbol cycle price
-            bid_price ask_price open_buy_count open_sell_count
+            bid_price ask_price total_open_buy_count total_open_sell_count
             (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
       | Some price, None, _, _ ->
           Logging.info_f ~section "[%s/%s] C#%d - $%.2f (orderbook loading...) | %d buy / %d sell%s"
-            asset_with_fees.exchange asset_with_fees.symbol cycle price open_buy_count open_sell_count
+            asset_with_fees.exchange asset_with_fees.symbol cycle price total_open_buy_count total_open_sell_count
             (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
       | None, _, _, _ ->
           Logging.info_f ~section "[%s/%s] C#%d - no price/orderbook data yet | %d buy / %d sell%s"
-            asset_with_fees.exchange asset_with_fees.symbol cycle open_buy_count open_sell_count
+            asset_with_fees.exchange asset_with_fees.symbol cycle total_open_buy_count total_open_sell_count
             (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy))
     end;
     (match asset_with_fees.maker_fee, asset_with_fees.taker_fee with

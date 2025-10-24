@@ -2,7 +2,7 @@
 let create_test_order ?(operation=Dio_strategies.Strategy_common.Place)
     ?(order_id=None) ?(symbol="BTC/USD") ?(side=Dio_strategies.Strategy_common.Buy)
     ?(order_type="limit") ?(qty=0.001) ?(price=Some 50000.0)
-    ?(time_in_force="GTC") ?(post_only=true) ?(userref=Some 12345) ?(strategy="MM") () =
+    ?(time_in_force="GTC") ?(post_only=true) ?(userref=Some 2) ?(strategy="MM") () =
   {
     Dio_strategies.Strategy_common.operation;
     order_id;

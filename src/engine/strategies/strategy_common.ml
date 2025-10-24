@@ -5,6 +5,21 @@
   order processing in the supervisor regardless of which strategy generates them.
 *)
 
+(** Strategy userref values - simple integers to tag orders by strategy
+    These are non-unique identifiers that group all orders from a strategy together *)
+let strategy_userref_grid = 1  (* Grid strategy *)
+let strategy_userref_mm = 2    (* Market maker strategy *)
+let strategy_userref_arb = 3   (* Arbitrage strategy *)
+
+(** Legacy aliases for backward compatibility *)
+let strategy_prefix_grid = strategy_userref_grid
+let strategy_prefix_mm = strategy_userref_mm
+let strategy_prefix_arb = strategy_userref_arb
+
+(** Check if a userref matches a specific strategy *)
+let is_strategy_order strategy_userref order_userref =
+  strategy_userref = order_userref
+
 (** Order side - buy or sell *)
 type order_side = Buy | Sell
 
@@ -34,7 +49,7 @@ type strategy_order = {
   price: float option;
   time_in_force: string;  (* "GTC", "IOC", "FOK" *)
   post_only: bool;
-  userref: int option;  (* For tracking strategy orders *)
+  userref: int option;  (* Strategy identifier: 1=GRID, 2=MM, 3=ARB *)
   strategy: string;     (* Strategy name for order processing *)
 }
 

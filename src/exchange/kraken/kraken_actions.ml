@@ -160,6 +160,7 @@ let place_order
     ?post_only
     ?margin
     ?reduce_only
+    ?order_userref
     ?cl_ord_id
     ?trigger_price
     ?trigger_price_type
@@ -207,8 +208,10 @@ let place_order
       | Some ro -> add_to_assoc params ("reduce_only", `Bool ro)
       | None -> params
     in
-    (* Note: order_userref is not a valid request parameter for Kraken WebSocket v2 API *)
-    (* Userrefs are only returned in responses for internal tracking *)
+    let params = match order_userref with
+      | Some userref -> add_to_assoc params ("order_userref", `Int userref)
+      | None -> params
+    in
     let params = match cl_ord_id with
       | Some id -> add_to_assoc params ("cl_ord_id", `String id)
       | None -> params
