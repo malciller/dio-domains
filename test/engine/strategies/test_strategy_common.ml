@@ -35,7 +35,7 @@ let test_operation_type_conversion () =
 
 let test_strategy_order_creation () =
   (* Test strategy order record creation *)
-  let order = create_test_order () in
+  let order = create_test_order ~userref:(Some 12345) () in
 
   Alcotest.(check bool) "order operation" true (order.operation = Dio_strategies.Strategy_common.Place);
   Alcotest.(check (option string)) "order id" None order.order_id;
