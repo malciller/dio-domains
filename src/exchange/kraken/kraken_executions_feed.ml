@@ -107,6 +107,7 @@ type execution_event = {
   fee: float option;
   trade_id: int64 option;
   order_userref: int option;
+  cl_ord_id: string option;
   timestamp: float;
 }
 
@@ -122,7 +123,8 @@ type open_order = {
   avg_price: float;
   cum_cost: float;
   order_status: order_status;
-  order_userref: int option;
+  order_userref: int option;  (* Optional numeric identifier for strategy filtering *)
+  cl_ord_id: string option;   (* Client order ID for additional tracking *)
   last_updated: float;
 }
 
@@ -388,6 +390,7 @@ let update_open_orders store (event : execution_event) =
       cum_cost = event.cum_cost;
       order_status = event.order_status;
       order_userref = event.order_userref;
+      cl_ord_id = event.cl_ord_id;
       last_updated = event.timestamp;
     } in
     
@@ -573,6 +576,15 @@ let parse_execution_event json =
            | None -> None)
     in
     
+    let cl_ord_id = 
+      match member "cl_ord_id" json |> to_string_option with
+      | Some _ as c -> c
+      | None ->
+          (match existing_order with
+           | Some order -> order.cl_ord_id
+           | None -> None)
+    in
+    
     let _timestamp_str = member "timestamp" json |> to_string in
     (* Use current time for event timestamp - proper RFC3339 parsing can be added later if needed *)
     let timestamp = Unix.gettimeofday () in
@@ -598,6 +610,7 @@ let parse_execution_event json =
       fee;
       trade_id;
       order_userref;
+      cl_ord_id;
       timestamp;
     }
   with exn ->

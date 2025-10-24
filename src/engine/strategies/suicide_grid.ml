@@ -122,12 +122,6 @@ let can_place_buy_order (_qty : float) quote_balance quote_needed =
 let can_place_sell_order (_qty : float) (_sell_mult : float) asset_balance asset_needed =
   asset_balance >= asset_needed
 
-(** Generate a unique userref for tracking strategy orders *)
-let generate_userref (_asset_symbol : string) =
-  let timestamp = Unix.time () *. 1000.0 |> int_of_float in
-  let random_component = Random.int 1000 in
-  timestamp * 1000 + random_component
-
 (** Create a strategy order for placing a new order *)
 let create_place_order asset_symbol side qty price post_only strategy =
   {
@@ -140,7 +134,7 @@ let create_place_order asset_symbol side qty price post_only strategy =
     price;
     time_in_force = "GTC";
     post_only;
-    userref = Some (generate_userref asset_symbol);
+    userref = Some Strategy_common.strategy_userref_grid;  (* Tag order as Grid strategy *)
     strategy;
   }
 
@@ -156,7 +150,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy =
     price;
     time_in_force = "GTC";
     post_only;
-    userref = Some (generate_userref asset_symbol);
+    userref = None;  (* Amends don't set userref *)
     strategy;
   }
 
@@ -172,7 +166,7 @@ let create_cancel_order order_id asset_symbol strategy =
     price = None;
     time_in_force = "GTC";  (* Not relevant for cancel *)
     post_only = false;
-    userref = Some (generate_userref asset_symbol);
+    userref = None;  (* Cancels don't set userref *)
     strategy;
   }
 
@@ -209,8 +203,10 @@ let push_order order =
       (* Handle different operations *)
       (match order.operation with
        | Place ->
-           (* Track order as pending - use userref as temporary order_id until we get the real one *)
-           let temp_order_id = match order.userref with Some ur -> string_of_int ur | None -> "unknown" in
+           (* Track order as pending - generate temporary ID until we get the real one from exchange *)
+           let temp_order_id = Printf.sprintf "pending_%s_%.2f" 
+             (string_of_order_side order.side) 
+             (Option.value order.price ~default:0.0) in
            let order_price = Option.value order.price ~default:0.0 in
            state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
            Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
@@ -219,14 +215,15 @@ let push_order order =
            (* Track sell orders in state for grid logic *)
            (match order.side, order.price with
             | Sell, Some price ->
-                (* Add sell order to tracking list - use userref as order_id for now *)
-                let order_id = match order.userref with Some ur -> string_of_int ur | None -> "unknown" in
+                (* Add sell order to tracking list - use temporary ID for now *)
+                let order_id = temp_order_id in
                 state.open_sell_orders <- (order_id, price) :: state.open_sell_orders;
                 Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" order_id price order.symbol
             | _ -> ())
        | Amend ->
            (* For amendments, track as pending but don't add to sell orders yet *)
-           let temp_order_id = match order.userref with Some ur -> string_of_int ur | None -> "unknown" in
+           let temp_order_id = Printf.sprintf "pending_amend_%s" 
+             (Option.value order.order_id ~default:"unknown") in
            let order_price = Option.value order.price ~default:0.0 in
            state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
            Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
@@ -250,7 +247,7 @@ let execute_strategy
     (quote_balance : float option)
     (open_buy_count : int)
     (_open_sell_count : int)
-    (open_orders : (string * float * float * string) list)  (* order_id, price, remaining_qty, side *)
+    (open_orders : (string * float * float * string * int option) list)  (* order_id, price, remaining_qty, side, userref *)
     (cycle : int) =
 
   (* Only execute strategy periodically to avoid excessive order generation *)
@@ -279,12 +276,12 @@ let execute_strategy
         now -. timestamp < 30.0
       ) state.cancelled_orders;
 
-      (* Update with real orders from exchange - open_orders is (order_id, price, qty, side) list *)
+      (* Update with real orders from exchange - open_orders is (order_id, price, qty, side, userref) list *)
       (* Filter out recently cancelled orders to avoid race condition *)
       let buy_orders = ref [] in
       let sell_orders = ref [] in
 
-      List.iter (fun (order_id, order_price, qty, side_str) ->
+      List.iter (fun (order_id, order_price, qty, side_str, _userref) ->
         (* Skip if this order was recently cancelled *)
         let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
         if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)

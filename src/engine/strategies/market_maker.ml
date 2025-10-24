@@ -130,12 +130,6 @@ let meets_min_qty symbol qty =
       Logging.warn_f ~section "No qty_min found for %s, assuming qty %.8f is valid" symbol qty;
       true  (* If we can't find min_qty, assume it's valid to avoid blocking *)
 
-(** Generate a unique userref for tracking strategy orders *)
-let generate_userref (_asset_symbol : string) =
-  let timestamp = Unix.time () *. 1000.0 |> int_of_float in
-  let random_component = Random.int 1000 in
-  timestamp * 1000 + random_component
-
 (** Create a strategy order for placing a new order *)
 let create_place_order asset_symbol side qty price post_only strategy =
   {
@@ -148,7 +142,7 @@ let create_place_order asset_symbol side qty price post_only strategy =
     price;
     time_in_force = "GTC";
     post_only;
-    userref = Some (generate_userref asset_symbol);
+    userref = Some Strategy_common.strategy_userref_mm;  (* Tag order as MM strategy *)
     strategy;
   }
 
@@ -164,7 +158,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy =
     price;
     time_in_force = "GTC";
     post_only;
-    userref = Some (generate_userref asset_symbol);
+    userref = None;  (* Amends don't set userref *)
     strategy;
   }
 
@@ -180,7 +174,7 @@ let create_cancel_order order_id asset_symbol strategy =
     price = None;
     time_in_force = "GTC";  (* Not relevant for cancel *)
     post_only = false;
-    userref = Some (generate_userref asset_symbol);
+    userref = None;  (* Cancels don't set userref *)
     strategy;
   }
 
@@ -213,8 +207,10 @@ let push_order order =
       (* Handle different operations *)
       (match order.operation with
        | Place ->
-           (* Track order as pending - use userref as temporary order_id until we get the real one *)
-           let temp_order_id = match order.userref with Some ur -> string_of_int ur | None -> "unknown" in
+           (* Track order as pending - generate temporary ID until we get the real one from exchange *)
+           let temp_order_id = Printf.sprintf "pending_%s_%.2f" 
+             (string_of_order_side order.side) 
+             (Option.value order.price ~default:0.0) in
            let order_price = Option.value order.price ~default:0.0 in
            state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
            Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
@@ -229,7 +225,8 @@ let push_order order =
             | _ -> ())
        | Amend ->
            (* For amendments, track as pending but don't add to sell orders yet *)
-           let temp_order_id = match order.userref with Some ur -> string_of_int ur | None -> "unknown" in
+           let temp_order_id = Printf.sprintf "pending_amend_%s" 
+             (Option.value order.order_id ~default:"unknown") in
            let order_price = Option.value order.price ~default:0.0 in
            state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
            Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
@@ -253,7 +250,7 @@ let execute_strategy
     (quote_balance : float option)
     (_open_buy_count : int)
     (_open_sell_count : int)
-    (open_orders : (string * float * float * string) list)  (* order_id, price, remaining_qty, side *)
+    (open_orders : (string * float * float * string * int option) list)  (* order_id, price, remaining_qty, side, userref *)
     (cycle : int) =
 
   (* Only execute strategy periodically to avoid excessive order generation *)
@@ -320,7 +317,7 @@ let execute_strategy
         let available_asset_balance = match asset_balance with
           | Some total_balance ->
               (* Subtract remaining quantities from open sell orders *)
-              let locked_in_sells = List.fold_left (fun acc (_, _, remaining_qty, side_str) ->
+              let locked_in_sells = List.fold_left (fun acc (_, _, remaining_qty, side_str, _) ->
                 if side_str = "sell" then acc +. remaining_qty else acc
               ) 0.0 open_orders in
               Some (total_balance -. locked_in_sells)
@@ -330,7 +327,7 @@ let execute_strategy
         let available_quote_balance = match quote_balance with
           | Some total_balance ->
               (* Subtract remaining value from open buy orders *)
-              let locked_in_buys = List.fold_left (fun acc (_, order_price, remaining_qty, side_str) ->
+              let locked_in_buys = List.fold_left (fun acc (_, order_price, remaining_qty, side_str, _) ->
                 if side_str = "buy" then acc +. (order_price *. remaining_qty) else acc
               ) 0.0 open_orders in
               Some (total_balance -. locked_in_buys)
@@ -397,7 +394,7 @@ let execute_strategy
           state.last_sell_order_price <- None;
           state.last_sell_order_id <- None;
 
-          List.iter (fun (order_id, order_price, qty, side_str) ->
+          List.iter (fun (order_id, order_price, qty, side_str, _) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
             if not is_cancelled && qty > 0.0 then
               if side_str = "buy" then
@@ -440,7 +437,7 @@ let execute_strategy
           state.last_sell_order_price <- None;
           state.last_sell_order_id <- None;
 
-          List.iter (fun (order_id, order_price, qty, side_str) ->
+          List.iter (fun (order_id, order_price, qty, side_str, _) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
             if not is_cancelled && qty > 0.0 then
               if side_str = "buy" then
@@ -452,7 +449,7 @@ let execute_strategy
           ) open_orders;
 
           (* Count open buy orders for this asset *)
-          let open_buy_orders = List.filter (fun (order_id, _, qty, side_str) ->
+          let open_buy_orders = List.filter (fun (order_id, _, qty, side_str, _) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
             side_str = "buy" && not is_cancelled && qty > 0.0
           ) open_orders in
@@ -465,7 +462,7 @@ let execute_strategy
           if open_buy_count > 1 then begin
             (* If >1 open buy: Cancel all open buys. Stop—next trigger will replace. *)
             if should_log then Logging.debug_f ~section "Cancelling %d excess buy orders for %s" open_buy_count asset.symbol;
-            List.iter (fun (order_id, _, _, _) ->
+            List.iter (fun (order_id, _, _, _, _) ->
               let cancel_order = create_cancel_order order_id asset.symbol "MM" in
               push_order cancel_order
             ) open_buy_orders;

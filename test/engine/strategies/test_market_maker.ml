@@ -85,14 +85,15 @@ let test_state_management () =
   check bool "same state for same symbol" true (state1 == state2)
 
 let test_userref_generation () =
-  (* Test userref generation - should create unique values *)
-  let userref1 = Dio_strategies.Market_maker.generate_userref "BTC/USD" in
-  let userref2 = Dio_strategies.Market_maker.generate_userref "ETH/USD" in
-
-  (* Should be positive integers *)
-  check bool "userref1 positive" true (userref1 > 0);
-  check bool "userref2 positive" true (userref2 > 0);
-  check bool "userrefs unique" true (userref1 <> userref2)
+  (* Test userref tagging - MM strategy should use userref=2 *)
+  let strategy_userref = Dio_strategies.Strategy_common.strategy_userref_mm in
+  check int "mm strategy userref" 2 strategy_userref;
+  
+  (* Test that is_strategy_order correctly identifies MM orders *)
+  check bool "userref 2 matches mm" true 
+    (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 2);
+  check bool "userref 1 doesn't match mm" false 
+    (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 1)
 
 let test_order_acknowledgment () =
   (* Test order acknowledgment handling *)

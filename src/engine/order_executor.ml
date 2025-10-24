@@ -204,6 +204,7 @@ let place_order
                 ?post_only:request.post_only
                 ?margin:request.margin
                 ?reduce_only:request.reduce_only
+                ?order_userref:request.order_userref
                 ?cl_ord_id:request.cl_ord_id
                 ?trigger_price:request.trigger_price
                 ?trigger_price_type:request.trigger_price_type
