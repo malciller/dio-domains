@@ -138,7 +138,7 @@ let test_open_order_structure () =
     avg_price = 2995.0;
     cum_cost = 8985.0;
     order_status = Kraken.Kraken_executions_feed.PartiallyFilledStatus;
-    order_userref = Some 2;
+    order_userref = Some 67890;
     cl_ord_id = None;
     last_updated = Unix.time ();
   } in
