@@ -314,14 +314,25 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
     in
 
     (* Get strategy-specific open orders *)
-    let grid_open_orders = filter_orders_by_strategy "Grid" Dio_strategies.Strategy_common.strategy_userref_grid in
+
+    (* TODO: currently passing all open sell orders since most don't have tags. fresh run would use this instead of all_open_orders, will revert
+    once all orders cycle if I remember  *)
+    (* let grid_open_orders = filter_orders_by_strategy "Grid" Dio_strategies.Strategy_common.strategy_userref_grid in *)
     let mm_open_orders = filter_orders_by_strategy "MM" Dio_strategies.Strategy_common.strategy_userref_mm in
 
     (* Calculate buy/sell counts from grid strategy orders *)
+    (* For Grid strategy: only count grid-tagged BUY orders, but count ALL sell orders for positioning *)
     let (grid_open_buy_count, grid_open_sell_count) =
-      List.fold_left (fun (buys, sells) (_, _, _, side_str, _) ->
-        if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1)
-      ) (0, 0) grid_open_orders
+      List.fold_left (fun (buys, sells) (_, _, _, side_str, userref_opt) ->
+        if side_str = "buy" then
+          (* Only count buy orders with grid tag *)
+          (match userref_opt with
+           | Some userref when Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref -> (buys + 1, sells)
+           | _ -> (buys, sells))
+        else
+          (* Count ALL sell orders regardless of tag *)
+          (buys, sells + 1)
+      ) (0, 0) all_open_orders
     in
 
     (* Calculate buy/sell counts from MM strategy orders *)
@@ -348,7 +359,8 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
     (* Execute strategy based on type - pass strategy-specific orders *)
     (match grid_strategy_asset with
      | Some asset ->
-         Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count grid_open_orders !cycle_count
+         (* Pass ALL open orders to Grid strategy so it can see all sell orders for positioning *)
+         Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
      | None -> ());
     (match mm_strategy_asset with
      | Some asset ->

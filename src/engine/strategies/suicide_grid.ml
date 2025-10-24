@@ -281,14 +281,19 @@ let execute_strategy
       let buy_orders = ref [] in
       let sell_orders = ref [] in
 
-      List.iter (fun (order_id, order_price, qty, side_str, _userref) ->
+      List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         (* Skip if this order was recently cancelled *)
         let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
         if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
-            buy_orders := (order_id, order_price) :: !buy_orders
+            (* For buy orders, only include those with the grid tag *)
+            (match userref_opt with
+             | Some userref when userref = Strategy_common.strategy_userref_grid ->
+                 buy_orders := (order_id, order_price) :: !buy_orders
+             | _ -> ())
           else
+            (* For sell orders, include ALL open sell orders regardless of tag *)
             sell_orders := (order_id, order_price) :: !sell_orders
       ) open_orders;
 
