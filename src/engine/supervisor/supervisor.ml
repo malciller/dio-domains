@@ -442,6 +442,14 @@ let monitor_loop () =
       (* Report full telemetry metrics every minute (every 6th check) for testing *)
       if !cycle_count mod 6 = 0 then begin
         Telemetry.report_metrics ()
+      end;
+
+      (* Periodic event bus cleanup and monitoring (every 30 seconds, every 3rd check) *)
+      if !cycle_count mod 3 = 0 then begin
+        (* Clean up stale subscribers in telemetry event buses *)
+        (* Note: Event buses are created by various modules, so we rely on their periodic cleanup *)
+        (* Add monitoring for any known event buses here if needed *)
+        ()
       end
     with exn ->
       Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);

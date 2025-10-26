@@ -16,10 +16,28 @@ type rate_sample = {
   value: int;
 }
 
+(** Bounded circular buffer for rate samples to prevent memory leaks *)
+type rate_buffer = {
+  buffer_type: [`Rate];
+  data: rate_sample option array;
+  mutable write_pos: int;
+  mutable size: int;
+  capacity: int;
+}
+
 type rate_tracker = {
-  samples: rate_sample list ref;
+  samples: rate_buffer;
   window_seconds: float;
   mutable samples_since_cleanup: int;  (* Track samples added since last cleanup *)
+}
+
+(** Bounded circular buffer for histogram samples *)
+type histogram_buffer = {
+  hist_type: [`Histogram];
+  hist_data: float option array;
+  mutable hist_write_pos: int;
+  mutable hist_size: int;
+  hist_capacity: int;
 }
 
 (** Metric types *)
@@ -27,7 +45,7 @@ type metric_type =
   | Counter of int ref
   | SlidingCounter of sliding_counter
   | Gauge of float ref
-  | Histogram of float list ref
+  | Histogram of histogram_buffer
 
 type metric = {
   name: string;
@@ -43,6 +61,64 @@ type metric = {
 let metrics : (string, metric) Hashtbl.t = Hashtbl.create 128
 let metrics_mutex = Mutex.create ()
 let metrics_changed_condition = Lwt_condition.create ()
+
+(** Rate buffer management functions *)
+let create_rate_buffer capacity : rate_buffer = {
+  buffer_type = `Rate;
+  data = Array.make capacity None;
+  write_pos = 0;
+  size = 0;
+  capacity;
+}
+
+let add_rate_sample buffer sample =
+  buffer.data.(buffer.write_pos) <- Some sample;
+  buffer.write_pos <- (buffer.write_pos + 1) mod buffer.capacity;
+  if buffer.size < buffer.capacity then
+    buffer.size <- buffer.size + 1
+
+let get_rate_samples buffer =
+  let rec collect acc pos remaining =
+    if remaining = 0 then acc
+    else
+      let actual_pos = (buffer.write_pos - remaining) mod buffer.capacity in
+      if actual_pos < 0 then
+        collect acc pos (remaining - 1)  (* Wrap around *)
+      else
+        match buffer.data.(actual_pos) with
+        | Some sample -> collect (sample :: acc) pos (remaining - 1)
+        | None -> collect acc pos (remaining - 1)
+  in
+  collect [] 0 buffer.size
+
+(** Histogram buffer management functions *)
+let create_histogram_buffer capacity : histogram_buffer = {
+  hist_type = `Histogram;
+  hist_data = Array.make capacity None;
+  hist_write_pos = 0;
+  hist_size = 0;
+  hist_capacity = capacity;
+}
+
+let add_histogram_sample buffer sample =
+  buffer.hist_data.(buffer.hist_write_pos) <- Some sample;
+  buffer.hist_write_pos <- (buffer.hist_write_pos + 1) mod buffer.hist_capacity;
+  if buffer.hist_size < buffer.hist_capacity then
+    buffer.hist_size <- buffer.hist_size + 1
+
+let get_histogram_samples buffer =
+  let rec collect acc pos remaining =
+    if remaining = 0 then acc
+    else
+      let actual_pos = (buffer.hist_write_pos - remaining) mod buffer.hist_capacity in
+      if actual_pos < 0 then
+        collect acc pos (remaining - 1)  (* Wrap around *)
+      else
+        match buffer.hist_data.(actual_pos) with
+        | Some sample -> collect (sample :: acc) pos (remaining - 1)
+        | None -> collect acc pos (remaining - 1)
+  in
+  collect [] 0 buffer.hist_size
 
 (** Helper to generate metric key *)
 let metric_key name labels =
@@ -64,7 +140,7 @@ let sliding_counter name ?(labels=[]) ?(window_size=1000) ?(track_rate=false) ?(
     | None ->
         let rate_tracker = if track_rate then
           Some {
-            samples = ref [];
+            samples = create_rate_buffer 200;  (* Fixed capacity of 200 samples *)
             window_seconds = rate_window;
             samples_since_cleanup = 0;
           }
@@ -107,18 +183,19 @@ let inc_sliding_counter metric ?(value=1) () =
       (match metric.rate_tracker with
        | Some tracker ->
            let sample = { timestamp = now; value = !(sliding.total_count) } in
-           tracker.samples := sample :: !(tracker.samples);
+           add_rate_sample tracker.samples sample;
            tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
-           (* Only filter periodically to avoid expensive operations on every increment *)
+           (* Filter old samples periodically *)
            if tracker.samples_since_cleanup >= 100 then begin
              tracker.samples_since_cleanup <- 0;
-             (* Keep only samples within the time window and limit to 200 samples max *)
+             (* Remove samples older than window_seconds *)
              let cutoff = now -. tracker.window_seconds in
-             let filtered = List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples) in
-             let limited = if List.length filtered > 200 then
-               List.rev (List.tl (List.rev filtered))  (* Keep most recent 200 *)
-             else filtered in
-             tracker.samples := limited
+             let samples = get_rate_samples tracker.samples in
+             let filtered = List.filter (fun s -> s.timestamp >= cutoff) samples in
+             (* Rebuild buffer with only recent samples *)
+             tracker.samples.size <- 0;
+             tracker.samples.write_pos <- 0;
+             List.iter (add_rate_sample tracker.samples) (List.rev filtered)
            end
        | None -> ());
 
@@ -190,7 +267,7 @@ let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
     | None ->
         let rate_tracker = if track_rate then
           Some {
-            samples = ref [];
+            samples = create_rate_buffer 200;  (* Fixed capacity of 200 samples *)
             window_seconds = rate_window;
             samples_since_cleanup = 0;
           }
@@ -222,25 +299,24 @@ let inc_counter metric ?(value=1) () =
       (match metric.rate_tracker with
        | Some tracker ->
            let sample = { timestamp = now; value = !r } in
-           tracker.samples := sample :: !(tracker.samples);
+           add_rate_sample tracker.samples sample;
            tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
-           (* Only filter periodically to avoid expensive operations on every increment *)
+           (* Filter old samples periodically *)
            if tracker.samples_since_cleanup >= 100 then begin
              tracker.samples_since_cleanup <- 0;
-             (* Keep only samples within the time window and limit to 200 samples max *)
+             (* Remove samples older than window_seconds *)
              let cutoff = now -. tracker.window_seconds in
-             let filtered = List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples) in
-             let limited = if List.length filtered > 200 then
-               List.rev (List.tl (List.rev filtered))  (* Keep most recent 200 *)
-             else filtered in
-             tracker.samples := limited
+             let samples = get_rate_samples tracker.samples in
+             let filtered = List.filter (fun s -> s.timestamp >= cutoff) samples in
+             (* Rebuild buffer with only recent samples *)
+             tracker.samples.size <- 0;
+             tracker.samples.write_pos <- 0;
+             List.iter (add_rate_sample tracker.samples) (List.rev filtered)
            end
        | None -> ());
 
       Mutex.unlock metrics_mutex;
       Lwt_condition.broadcast metrics_changed_condition ()
-  | SlidingCounter _ ->
-      inc_sliding_counter metric ~value ()
   | _ -> ()
 
 let get_counter metric =
@@ -271,7 +347,7 @@ let update_cached_rates () =
     (* Update rate calculations *)
     match metric.metric_type, metric.rate_tracker with
     | Counter _, Some tracker ->
-        let samples = !(tracker.samples) in
+        let samples = get_rate_samples tracker.samples in
         if samples = [] then ()
         else if List.length samples = 1 then ()  (* Need at least 2 samples for rate *)
         else
@@ -288,7 +364,7 @@ let update_cached_rates () =
             metric.cached_rate <- float_of_int value_diff /. time_diff
     | SlidingCounter _, Some tracker ->
         (* For sliding counters with rate tracking, calculate rate from samples *)
-        let samples = !(tracker.samples) in
+        let samples = get_rate_samples tracker.samples in
         if samples <> [] && List.length samples >= 2 then
           let sorted_samples = List.sort (fun s1 s2 -> Float.compare s1.timestamp s2.timestamp) samples in
           let earliest = List.hd sorted_samples in
@@ -363,7 +439,7 @@ let histogram name ?(labels=[]) () =
     | None ->
         let m = {
           name;
-          metric_type = Histogram (ref []);
+          metric_type = Histogram (create_histogram_buffer 1000);  (* Fixed capacity of 1000 samples *)
           labels;
           created_at = Unix.time ();
           last_updated = Unix.time ();
@@ -378,12 +454,9 @@ let histogram name ?(labels=[]) () =
 
 let observe_histogram metric value =
   match metric.metric_type with
-  | Histogram r ->
+  | Histogram buffer ->
       Mutex.lock metrics_mutex;
-      r := value :: !r;
-      (* Keep only most recent 1000 samples to avoid memory bloat *)
-      if List.length !r > 1000 then
-        r := List.filteri (fun i _ -> i < 1000) !r;  (* Keep first 1000 elements (most recent since we prepend) *)
+      add_histogram_sample buffer value;
       metric.last_updated <- Unix.time ();
       Mutex.unlock metrics_mutex;
       Lwt_condition.broadcast metrics_changed_condition ()
@@ -391,8 +464,8 @@ let observe_histogram metric value =
 
 let histogram_stats metric =
   match metric.metric_type with
-  | Histogram r ->
-      let values = !r in
+  | Histogram buffer ->
+      let values = get_histogram_samples buffer in
       if values = [] then (0.0, 0.0, 0.0, 0.0, 0)
       else
         let sorted = List.sort Float.compare values in
@@ -463,6 +536,11 @@ let format_metric_value metric =
 (** Report all metrics organized by category *)
 let report_metrics () =
   Mutex.lock metrics_mutex;
+
+  (* Update memory monitoring metrics first *)
+  (* TODO: Enable when function visibility issue is resolved *)
+  (* update_memory_monitoring_metrics (); *)
+
   let now = Unix.time () in
   let uptime = now -. !start_time in
 
@@ -545,6 +623,108 @@ let update_system_metrics () =
   let uptime_metric = gauge "uptime_seconds" () in
   let uptime = Unix.time () -. !start_time in
   set_gauge uptime_metric uptime
+
+(** Update memory monitoring metrics - TODO: Fix function ordering *)
+(* let update_memory_monitoring_metrics () =
+  (* Calculate and update internal telemetry buffer sizes *)
+  let rate_buffer_total = Hashtbl.fold (fun _ metric acc ->
+    match metric.metric_type with
+    | Counter _ when Option.is_some metric.rate_tracker ->
+        acc + (Option.get metric.rate_tracker).samples.size
+    | SlidingCounter _ when Option.is_some metric.rate_tracker ->
+        acc + (Option.get metric.rate_tracker).samples.size
+    | _ -> acc
+  ) metrics 0 in
+
+  let histogram_buffer_total = Hashtbl.fold (fun _ metric acc ->
+    match metric.metric_type with
+    | Histogram buffer -> acc + buffer.hist_size
+    | _ -> acc
+  ) metrics 0 in
+
+  set_telemetry_rate_buffers_size rate_buffer_total;
+  set_telemetry_histogram_buffers_size histogram_buffer_total;
+  () *)
+
+(** Memory monitoring gauge metrics - created on demand *)
+let strategy_pending_orders_gauge = ref None
+let strategy_cancelled_orders_gauge = ref None
+let logs_dropped_gauge = ref None
+let event_bus_subscribers_total_gauge = ref None
+let event_bus_subscribers_active_gauge = ref None
+let telemetry_rate_buffers_gauge = ref None
+let telemetry_histogram_buffers_gauge = ref None
+
+(** Helper functions to update memory monitoring metrics *)
+let set_strategy_pending_orders_count count =
+  let metric = match !strategy_pending_orders_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "strategy_pending_orders_total" () in
+        strategy_pending_orders_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int count)
+
+let set_strategy_cancelled_orders_count count =
+  let metric = match !strategy_cancelled_orders_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "strategy_cancelled_orders_total" () in
+        strategy_cancelled_orders_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int count)
+
+let set_logs_dropped_count count =
+  let metric = match !logs_dropped_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "logs_dropped_total" () in
+        logs_dropped_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int count)
+
+let set_event_bus_subscribers_total count =
+  let metric = match !event_bus_subscribers_total_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "event_bus_subscribers_total" () in
+        event_bus_subscribers_total_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int count)
+
+let set_event_bus_subscribers_active count =
+  let metric = match !event_bus_subscribers_active_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "event_bus_subscribers_active" () in
+        event_bus_subscribers_active_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int count)
+
+let set_telemetry_rate_buffers_size size =
+  let metric = match !telemetry_rate_buffers_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "telemetry_rate_buffers_total_size" () in
+        telemetry_rate_buffers_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+let set_telemetry_histogram_buffers_size size =
+  let metric = match !telemetry_histogram_buffers_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "telemetry_histogram_buffers_total_size" () in
+        telemetry_histogram_buffers_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
 
 (** Wait for metric changes (event-driven) *)
 let wait_for_metric_changes () = Lwt_condition.wait metrics_changed_condition
