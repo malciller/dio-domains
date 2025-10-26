@@ -14,6 +14,11 @@ let log_interval = 1000000
 (** Use common types from Strategy_common module *)
 open Strategy_common
 
+(** Utility function to take first n elements from a list *)
+let rec take n = function
+  | [] -> []
+  | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
+
 (** Trading configuration type (local definition for strategies) *)
 type trading_config = {
   exchange: string;
@@ -265,20 +270,50 @@ let execute_strategy
   let now = Unix.time () in
   if now -. state.last_order_time < 2.0 then () else begin
 
-  (* Clean up stale pending orders (older than 10 seconds) to prevent indefinite stalling *)
+  (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
+  let original_count = List.length state.pending_orders in
   state.pending_orders <- List.filter (fun (order_id, _, _) ->
     let age = now -. state.last_order_time in
-    if age > 10.0 then begin
+    if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
       if should_log then Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
       false
     end else
       true
   ) state.pending_orders;
 
-  (* Clean up old cancelled orders from blacklist (older than 30 seconds) *)
+  (* Enforce hard limit of 50 pending orders to prevent memory growth *)
+  if List.length state.pending_orders > 50 then begin
+    let excess = List.length state.pending_orders - 50 in
+    state.pending_orders <- take 50 state.pending_orders;  (* Keep most recent 50 *)
+    if should_log then Logging.warn_f ~section "Truncated %d excess pending orders for %s (kept 50)" excess asset.symbol;
+  end;
+
+  (* Log if we cleaned up many orders *)
+  let cleaned_count = original_count - List.length state.pending_orders in
+  if cleaned_count > 0 && should_log then
+    Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_count asset.symbol;
+
+  (* Update memory monitoring metrics *)
+  Telemetry.set_strategy_pending_orders_count (List.length state.pending_orders);
+  Telemetry.set_strategy_cancelled_orders_count (List.length state.cancelled_orders);
+
+  (* Clean up old cancelled orders from blacklist (older than 15 seconds) and enforce hard limit *)
+  let original_cancelled_count = List.length state.cancelled_orders in
   state.cancelled_orders <- List.filter (fun (_, timestamp) ->
-    now -. timestamp < 30.0
+    now -. timestamp < 15.0  (* Reduced from 30 to 15 seconds *)
   ) state.cancelled_orders;
+
+  (* Enforce hard limit of 20 cancelled orders to prevent memory growth *)
+  if List.length state.cancelled_orders > 20 then begin
+    let excess = List.length state.cancelled_orders - 20 in
+    state.cancelled_orders <- take 20 state.cancelled_orders;  (* Keep most recent 20 *)
+    if should_log then Logging.warn_f ~section "Truncated %d excess cancelled orders for %s (kept 20)" excess asset.symbol;
+  end;
+
+  (* Log if we cleaned up many cancelled orders *)
+  let cleaned_cancelled_count = original_cancelled_count - List.length state.cancelled_orders in
+  if cleaned_cancelled_count > 0 && should_log then
+    Logging.debug_f ~section "Cleaned up %d cancelled orders for %s" cleaned_cancelled_count asset.symbol;
 
   if state.pending_orders <> [] then begin
     (* Wait for pending orders before placing new ones *)

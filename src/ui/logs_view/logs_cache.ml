@@ -157,6 +157,21 @@ let get_sections () =
   ) cache.log_entries;
   "ALL" :: (Hashtbl.fold (fun section _ acc -> section :: acc) sections [])
 
+(** Get and reset dropped logs counter (for monitoring) *)
+let get_and_reset_dropped_logs () =
+  Mutex.lock pending_logs_mutex;
+  let count = cache.dropped_logs in
+  cache.dropped_logs <- 0;
+  Mutex.unlock pending_logs_mutex;
+  count
+
+(** Get current dropped logs count without resetting *)
+let get_dropped_logs_count () =
+  Mutex.lock pending_logs_mutex;
+  let count = cache.dropped_logs in
+  Mutex.unlock pending_logs_mutex;
+  count
+
 (** Start background logs updater *)
 let start_logs_updater () =
   let needs_ui_update = ref false in
@@ -200,6 +215,17 @@ let start_logs_updater () =
       ui_update_loop ()
     in
     ui_update_loop ()
+  );
+
+  (* Periodic memory monitoring update *)
+  Lwt.async (fun () ->
+    let rec monitoring_loop () =
+      let%lwt () = Lwt_unix.sleep 10.0 in (* Update every 10 seconds *)
+      let dropped_count = get_dropped_logs_count () in
+      Telemetry.set_logs_dropped_count dropped_count;
+      monitoring_loop ()
+    in
+    monitoring_loop ()
   )
 
 (** Initialize the logs cache system *)
