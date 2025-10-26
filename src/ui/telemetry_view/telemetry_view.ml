@@ -84,10 +84,10 @@ empty  (* Don't display the generic domain_cycles when it's 0 *)
         | Telemetry.Counter _, "domain_cycles" ->
             let rate = Telemetry.get_counter_rate metric in
             let rate = if rate < 0.0 || rate > 1_000_000.0 then 0.0 else rate in  (* Validate rate *)
-            let rate_color = 
-              if rate > 50000.0 then Notty.A.(fg red ++ st bold)
-              else if rate > 20000.0 then Notty.A.(fg yellow ++ st bold)
-              else Notty.A.(fg green ++ st bold)
+            let rate_color =
+              if rate >= 100000.0 then Notty.A.(fg green ++ st bold)
+              else if rate >= 50000.0 then Notty.A.(fg yellow ++ st bold)
+              else Notty.A.(fg red ++ st bold)
             in
             let rate_widget = string ~attr:rate_color (Printf.sprintf "%.0f cycles/sec" rate) in
             hcat [name_widget; string ~attr:Notty.A.empty " "; rate_widget; label_widget]
@@ -95,10 +95,10 @@ empty  (* Don't display the generic domain_cycles when it's 0 *)
             (* Use rate tracker samples for more stable rate calculation *)
             let rate = Telemetry.get_counter_rate metric in
             let rate = if rate < 0.0 || rate > 1_000_000.0 then 0.0 else rate in  (* Validate rate *)
-            let rate_color = 
-              if rate > 50000.0 then Notty.A.(fg red ++ st bold)
-              else if rate > 20000.0 then Notty.A.(fg yellow ++ st bold)
-              else Notty.A.(fg green ++ st bold)
+            let rate_color =
+              if rate >= 100000.0 then Notty.A.(fg green ++ st bold)
+              else if rate >= 50000.0 then Notty.A.(fg yellow ++ st bold)
+              else Notty.A.(fg red ++ st bold)
             in
             let rate_widget = string ~attr:rate_color (Printf.sprintf "%.0f cycles/sec" rate) in
             hcat [name_widget; string ~attr:Notty.A.empty " "; rate_widget; label_widget]
@@ -131,7 +131,29 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state =
     let updated_attr = Notty.A.(fg (gray 2)) in  (* Dim gray for secondary info *)
     let tm = Unix.localtime (Unix.time ()) in
     let updated = string ~attr:updated_attr (Printf.sprintf "Updated: %02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec) in
-    let header = updated in
+
+    (* Add memory pressure indicator *)
+    let memory_pressure_info =
+      try
+        let mem_low_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_low") snapshot.metrics in
+        let mem_med_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_medium") snapshot.metrics in
+        let mem_high_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_high") snapshot.metrics in
+
+        let (pressure_text, pressure_color) =
+          match mem_high_metric, mem_med_metric, mem_low_metric with
+          | Some _, _, _ -> ("HIGH", Notty.A.(fg red ++ st bold))
+          | _, Some _, _ -> ("MED", Notty.A.(fg yellow ++ st bold))
+          | _, _, Some _ -> ("LOW", Notty.A.(fg green ++ st bold))
+          | _ -> ("UNK", Notty.A.(fg (gray 2)))
+        in
+        let mem_attr = Notty.A.(fg white ++ st bold) in
+        let mem_label = string ~attr:mem_attr "Mem:" in
+        let pressure_widget = string ~attr:pressure_color pressure_text in
+        hcat [mem_label; string ~attr:Notty.A.empty " "; pressure_widget]
+      with _ -> string ~attr:Notty.A.(fg (gray 2)) "Mem:UNK"
+    in
+
+    let header = hcat [updated; string ~attr:Notty.A.empty " | "; memory_pressure_info] in
 
     (* Categories list - limit processing to prevent hangs *)
     let categories_widgets =

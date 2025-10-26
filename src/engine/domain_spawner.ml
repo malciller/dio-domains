@@ -142,7 +142,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   let cycle_count = ref 0 in
   let telemetry_batch = ref 0 in
   while Atomic.get state.is_running do
-    let cycle_start = Telemetry.start_timer () in
+    let cycle_start = Telemetry.start_timer_v2 () in
     incr cycle_count;
     incr telemetry_batch;
     
@@ -403,10 +403,13 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
      | None, Some t -> Logging.debug_f ~section "Asset [%s/%s]: Cached taker fee %.4f%% (maker unknown)" 
          asset_with_fees.exchange asset_with_fees.symbol (t *. 100.)
      | None, None -> ());
-    
+
+    (* Record individual cycle duration for accurate timing analysis *)
+    let _ = Telemetry.record_duration_v2 cycle_duration_hist cycle_start in
+
     (* Batch telemetry updates every 1000 cycles to minimize overhead *)
     if !telemetry_batch >= 1000 then begin
-      let (open_buy_count, open_sell_count) = 
+      let (open_buy_count, open_sell_count) =
         if asset_with_fees.exchange = "kraken" then
           Kraken.Kraken_executions_feed.count_open_orders_by_side asset_with_fees.symbol
         else
@@ -415,7 +418,6 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
       Telemetry.inc_counter cycles_counter ~value:1000 ();
       Telemetry.set_gauge open_buy_orders_gauge (float_of_int open_buy_count);
       Telemetry.set_gauge open_sell_orders_gauge (float_of_int open_sell_count);
-      let _ = Telemetry.record_duration cycle_duration_hist cycle_start in
       telemetry_batch := 0
     end;
 

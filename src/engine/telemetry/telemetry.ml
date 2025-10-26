@@ -40,6 +40,98 @@ type histogram_buffer = {
   hist_capacity: int;
 }
 
+(** Memory-aware buffer capacity management *)
+type memory_pressure = Low | Medium | High
+
+type memory_config = {
+  mutable rate_buffer_capacity: int;
+  mutable histogram_capacity: int;
+  mutable last_adjustment: float;
+}
+
+let memory_config = {
+  rate_buffer_capacity = 200;
+  histogram_capacity = 1000;
+  last_adjustment = 0.0;
+}
+
+(** Get current memory pressure level based on OCaml heap usage *)
+let get_memory_pressure () : memory_pressure =
+  let stat = Gc.stat () in
+  let heap_words = stat.heap_words in
+  let word_size = Sys.word_size / 8 in  (* bytes per word *)
+  let heap_mb = float_of_int (heap_words * word_size) /. (1024.0 *. 1024.0) in
+  let heap_percent = heap_mb /. 1024.0 *. 100.0 in  (* Assume 1GB max heap for calculation *)
+  if heap_percent < 60.0 then Low
+  else if heap_percent < 80.0 then Medium
+  else High
+
+(** Rate buffer management functions *)
+let create_rate_buffer () : rate_buffer = {
+  buffer_type = `Rate;
+  data = Array.make memory_config.rate_buffer_capacity None;
+  write_pos = 0;
+  size = 0;
+  capacity = memory_config.rate_buffer_capacity;
+}
+
+let add_rate_sample buffer sample =
+  let was_full = buffer.size >= buffer.capacity in
+  buffer.data.(buffer.write_pos) <- Some sample;
+  buffer.write_pos <- (buffer.write_pos + 1) mod buffer.capacity;
+  if buffer.size < buffer.capacity then
+    buffer.size <- buffer.size + 1
+  else if was_full then
+    (* Buffer was already full, oldest sample was overwritten *)
+    Logging.debug ~section:"telemetry" "Rate buffer overflow: overwriting oldest sample"
+
+let get_rate_samples buffer =
+  let rec collect acc pos remaining =
+    if remaining = 0 then acc
+    else
+      let actual_pos = (buffer.write_pos - remaining) mod buffer.capacity in
+      if actual_pos < 0 then
+        collect acc pos (remaining - 1)  (* Wrap around *)
+      else
+        match buffer.data.(actual_pos) with
+        | Some sample -> collect (sample :: acc) pos (remaining - 1)
+        | None -> collect acc pos (remaining - 1)
+  in
+  collect [] 0 buffer.size
+
+(** Histogram buffer management functions *)
+let create_histogram_buffer () : histogram_buffer = {
+  hist_type = `Histogram;
+  hist_data = Array.make memory_config.histogram_capacity None;
+  hist_write_pos = 0;
+  hist_size = 0;
+  hist_capacity = memory_config.histogram_capacity;
+}
+
+let add_histogram_sample buffer sample =
+  let was_full = buffer.hist_size >= buffer.hist_capacity in
+  buffer.hist_data.(buffer.hist_write_pos) <- Some sample;
+  buffer.hist_write_pos <- (buffer.hist_write_pos + 1) mod buffer.hist_capacity;
+  if buffer.hist_size < buffer.hist_capacity then
+    buffer.hist_size <- buffer.hist_size + 1
+  else if was_full then
+    (* Buffer was already full, oldest sample was overwritten *)
+    Logging.debug ~section:"telemetry" "Histogram buffer overflow: overwriting oldest sample"
+
+let get_histogram_samples buffer =
+  let rec collect acc pos remaining =
+    if remaining = 0 then acc
+    else
+      let actual_pos = (buffer.hist_write_pos - remaining) mod buffer.hist_capacity in
+      if actual_pos < 0 then
+        collect acc pos (remaining - 1)  (* Wrap around *)
+      else
+        match buffer.hist_data.(actual_pos) with
+        | Some sample -> collect (sample :: acc) pos (remaining - 1)
+        | None -> collect acc pos (remaining - 1)
+  in
+  collect [] 0 buffer.hist_size
+
 (** Metric types *)
 type metric_type =
   | Counter of int ref
@@ -62,63 +154,6 @@ let metrics : (string, metric) Hashtbl.t = Hashtbl.create 128
 let metrics_mutex = Mutex.create ()
 let metrics_changed_condition = Lwt_condition.create ()
 
-(** Rate buffer management functions *)
-let create_rate_buffer capacity : rate_buffer = {
-  buffer_type = `Rate;
-  data = Array.make capacity None;
-  write_pos = 0;
-  size = 0;
-  capacity;
-}
-
-let add_rate_sample buffer sample =
-  buffer.data.(buffer.write_pos) <- Some sample;
-  buffer.write_pos <- (buffer.write_pos + 1) mod buffer.capacity;
-  if buffer.size < buffer.capacity then
-    buffer.size <- buffer.size + 1
-
-let get_rate_samples buffer =
-  let rec collect acc pos remaining =
-    if remaining = 0 then acc
-    else
-      let actual_pos = (buffer.write_pos - remaining) mod buffer.capacity in
-      if actual_pos < 0 then
-        collect acc pos (remaining - 1)  (* Wrap around *)
-      else
-        match buffer.data.(actual_pos) with
-        | Some sample -> collect (sample :: acc) pos (remaining - 1)
-        | None -> collect acc pos (remaining - 1)
-  in
-  collect [] 0 buffer.size
-
-(** Histogram buffer management functions *)
-let create_histogram_buffer capacity : histogram_buffer = {
-  hist_type = `Histogram;
-  hist_data = Array.make capacity None;
-  hist_write_pos = 0;
-  hist_size = 0;
-  hist_capacity = capacity;
-}
-
-let add_histogram_sample buffer sample =
-  buffer.hist_data.(buffer.hist_write_pos) <- Some sample;
-  buffer.hist_write_pos <- (buffer.hist_write_pos + 1) mod buffer.hist_capacity;
-  if buffer.hist_size < buffer.hist_capacity then
-    buffer.hist_size <- buffer.hist_size + 1
-
-let get_histogram_samples buffer =
-  let rec collect acc pos remaining =
-    if remaining = 0 then acc
-    else
-      let actual_pos = (buffer.hist_write_pos - remaining) mod buffer.hist_capacity in
-      if actual_pos < 0 then
-        collect acc pos (remaining - 1)  (* Wrap around *)
-      else
-        match buffer.hist_data.(actual_pos) with
-        | Some sample -> collect (sample :: acc) pos (remaining - 1)
-        | None -> collect acc pos (remaining - 1)
-  in
-  collect [] 0 buffer.hist_size
 
 (** Helper to generate metric key *)
 let metric_key name labels =
@@ -130,200 +165,8 @@ let metric_key name labels =
   in
   if label_str = "" then name else name ^ "{" ^ label_str ^ "}"
 
-(** Sliding window counter for high-frequency metrics *)
-let sliding_counter name ?(labels=[]) ?(window_size=1000) ?(track_rate=false) ?(rate_window=10.0) () =
-  let key = metric_key name labels in
-  Mutex.lock metrics_mutex;
-  let metric =
-    match Hashtbl.find_opt metrics key with
-    | Some m -> m
-    | None ->
-        let rate_tracker = if track_rate then
-          Some {
-            samples = create_rate_buffer 200;  (* Fixed capacity of 200 samples *)
-            window_seconds = rate_window;
-            samples_since_cleanup = 0;
-          }
-        else None in
-        let sliding = {
-          window_size;
-          current_window = ref [];
-          total_count = ref 0;
-          last_cleanup = ref (Unix.time ());
-        } in
-        let m = {
-          name;
-          metric_type = SlidingCounter sliding;
-          labels;
-          created_at = Unix.time ();
-          last_updated = Unix.time ();
-          rate_tracker;
-          cached_rate = 0.0;
-        } in
-        Hashtbl.add metrics key m;
-        m
-  in
-  Mutex.unlock metrics_mutex;
-  metric
-
-(** Increment sliding window counter with automatic cleanup *)
-let inc_sliding_counter metric ?(value=1) () =
-  match metric.metric_type with
-  | SlidingCounter sliding ->
-      (* Fast path: just increment without cleanup most of the time *)
-      Mutex.lock metrics_mutex;
-      let now = Unix.time () in
-
-      (* Add new increment to window *)
-      sliding.current_window := (now, value) :: !(sliding.current_window);
-      sliding.total_count := !(sliding.total_count) + value;
-      metric.last_updated <- now;
-
-      (* Update rate tracker if enabled *)
-      (match metric.rate_tracker with
-       | Some tracker ->
-           let sample = { timestamp = now; value = !(sliding.total_count) } in
-           add_rate_sample tracker.samples sample;
-           tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
-           (* Filter old samples periodically *)
-           if tracker.samples_since_cleanup >= 100 then begin
-             tracker.samples_since_cleanup <- 0;
-             (* Remove samples older than window_seconds *)
-             let cutoff = now -. tracker.window_seconds in
-             let samples = get_rate_samples tracker.samples in
-             let filtered = List.filter (fun s -> s.timestamp >= cutoff) samples in
-             (* Rebuild buffer with only recent samples *)
-             tracker.samples.size <- 0;
-             tracker.samples.write_pos <- 0;
-             List.iter (add_rate_sample tracker.samples) (List.rev filtered)
-           end
-       | None -> ());
-
-      (* Check if cleanup is needed - do this quickly *)
-      let should_cleanup = now -. !(sliding.last_cleanup) > 10.0 ||
-                          List.length !(sliding.current_window) > sliding.window_size in
-
-      Mutex.unlock metrics_mutex;
-
-      (* Do expensive cleanup outside of the main mutex if needed *)
-      if should_cleanup then
-        begin
-          Mutex.lock metrics_mutex;
-          (* Re-check condition in case another thread already cleaned up *)
-          let now_check = Unix.time () in
-          if now_check -. !(sliding.last_cleanup) > 10.0 ||
-             List.length !(sliding.current_window) > sliding.window_size then
-            begin
-              sliding.last_cleanup := now_check;
-              let cutoff = now_check -. 30.0 in  (* Keep last 30 seconds for rate calculation *)
-              let new_window = ref [] in
-              let new_total = ref 0 in
-
-              List.iter (fun (timestamp, count) ->
-                if timestamp >= cutoff then begin
-                  new_window := (timestamp, count) :: !new_window;
-                  new_total := !new_total + count;
-                end
-              ) !(sliding.current_window);
-
-              sliding.current_window := !new_window;
-              sliding.total_count := !new_total;
-
-              (* If still too many entries, keep only the most recent ones *)
-              if List.length !new_window > sliding.window_size then begin
-                let sorted = List.sort (fun (t1, _) (t2, _) -> Float.compare t2 t1) !new_window in
-                let recent = ref [] in
-                let count = ref 0 in
-                List.iter (fun (timestamp, inc) ->
-                  if !count < sliding.window_size then begin
-                    recent := (timestamp, inc) :: !recent;
-                    count := !count + inc;
-                  end
-                ) sorted;
-                sliding.current_window := !recent;
-                sliding.total_count := !count;
-              end
-            end;
-          Mutex.unlock metrics_mutex;
-        end;
-
-      Lwt_condition.broadcast metrics_changed_condition ()
-  | _ -> ()
-
-(** Get current value of sliding window counter *)
-let get_sliding_counter metric =
-  match metric.metric_type with
-  | SlidingCounter sliding -> !(sliding.total_count)
-  | _ -> 0
 
 
-(** Counter - incrementing metric *)
-let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
-  let key = metric_key name labels in
-  Mutex.lock metrics_mutex;
-  let metric =
-    match Hashtbl.find_opt metrics key with
-    | Some m -> m
-    | None ->
-        let rate_tracker = if track_rate then
-          Some {
-            samples = create_rate_buffer 200;  (* Fixed capacity of 200 samples *)
-            window_seconds = rate_window;
-            samples_since_cleanup = 0;
-          }
-        else None in
-        let m = {
-          name;
-          metric_type = Counter (ref 0);
-          labels;
-          created_at = Unix.time ();
-          last_updated = Unix.time ();
-          rate_tracker;
-          cached_rate = 0.0;
-        } in
-        Hashtbl.add metrics key m;
-        m
-  in
-  Mutex.unlock metrics_mutex;
-  metric
-
-let inc_counter metric ?(value=1) () =
-  match metric.metric_type with
-  | Counter r ->
-      Mutex.lock metrics_mutex;
-      let now = Unix.time () in
-      r := !r + value;
-      metric.last_updated <- now;
-
-      (* Update rate tracker if enabled *)
-      (match metric.rate_tracker with
-       | Some tracker ->
-           let sample = { timestamp = now; value = !r } in
-           add_rate_sample tracker.samples sample;
-           tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
-           (* Filter old samples periodically *)
-           if tracker.samples_since_cleanup >= 100 then begin
-             tracker.samples_since_cleanup <- 0;
-             (* Remove samples older than window_seconds *)
-             let cutoff = now -. tracker.window_seconds in
-             let samples = get_rate_samples tracker.samples in
-             let filtered = List.filter (fun s -> s.timestamp >= cutoff) samples in
-             (* Rebuild buffer with only recent samples *)
-             tracker.samples.size <- 0;
-             tracker.samples.write_pos <- 0;
-             List.iter (add_rate_sample tracker.samples) (List.rev filtered)
-           end
-       | None -> ());
-
-      Mutex.unlock metrics_mutex;
-      Lwt_condition.broadcast metrics_changed_condition ()
-  | _ -> ()
-
-let get_counter metric =
-  match metric.metric_type with
-  | Counter r -> !r
-  | SlidingCounter sliding -> !(sliding.total_count)
-  | _ -> 0
 
 (** Update cached rates and snapshot values for all metrics (called during snapshot creation) *)
 let update_cached_rates () =
@@ -394,7 +237,7 @@ let gauge name ?(labels=[]) () =
           metric_type = Gauge (ref 0.0);
           labels;
           created_at = Unix.time ();
-          last_updated = Unix.time ();
+          last_updated = Unix.gettimeofday ();
           rate_tracker = None;
           cached_rate = 0.0;
         } in
@@ -409,7 +252,7 @@ let set_gauge metric value =
   | Gauge r ->
       Mutex.lock metrics_mutex;
       r := value;
-      metric.last_updated <- Unix.time ();
+      metric.last_updated <- Unix.gettimeofday ();
       Mutex.unlock metrics_mutex;
       Lwt_condition.broadcast metrics_changed_condition ()
   | _ -> ()
@@ -419,7 +262,7 @@ let inc_gauge metric value =
   | Gauge r ->
       Mutex.lock metrics_mutex;
       r := !r +. value;
-      metric.last_updated <- Unix.time ();
+      metric.last_updated <- Unix.gettimeofday ();
       Mutex.unlock metrics_mutex;
       Lwt_condition.broadcast metrics_changed_condition ()
   | _ -> ()
@@ -428,6 +271,62 @@ let get_gauge metric =
   match metric.metric_type with
   | Gauge r -> !r
   | _ -> 0.0
+
+(** Adjust buffer capacities based on memory pressure *)
+let adjust_buffer_capacities () =
+  let now = Unix.gettimeofday () in
+  let pressure = get_memory_pressure () in
+
+  (* Only adjust capacities every 60 seconds to avoid excessive churn *)
+  let time_since_last = now -. memory_config.last_adjustment in
+  if time_since_last >= 60.0 then begin
+    let old_rate_capacity = memory_config.rate_buffer_capacity in
+    let old_histogram_capacity = memory_config.histogram_capacity in
+
+    (match pressure with
+     | Low ->
+         (* Increase capacities up to max limits *)
+         memory_config.rate_buffer_capacity <- min 500 (memory_config.rate_buffer_capacity * 6 / 5);
+         memory_config.histogram_capacity <- min 5000 (memory_config.histogram_capacity * 6 / 5)
+     | Medium ->
+         (* Keep current capacities *)
+         ()
+     | High ->
+         (* Decrease capacities with minimum limits *)
+         memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity * 7 / 10);
+         memory_config.histogram_capacity <- max 200 (memory_config.histogram_capacity * 7 / 10);
+
+         (* Trigger garbage collection when memory is high *)
+         Gc.full_major ();
+
+         Logging.debug_f ~section:"telemetry" "Reduced buffer capacities due to high memory pressure: rate %d->%d, histogram %d->%d"
+           old_rate_capacity memory_config.rate_buffer_capacity
+           old_histogram_capacity memory_config.histogram_capacity
+    );
+
+    memory_config.last_adjustment <- now;
+  end;
+
+  (* Always update metrics (outside throttle) *)
+  let rate_capacity_metric = gauge "telemetry_rate_buffer_capacity" () in
+  let histogram_capacity_metric = gauge "telemetry_histogram_buffer_capacity" () in
+
+  (* Reset ALL pressure gauges to 0, then set current to 1 *)
+  let mem_low = gauge "telemetry_memory_pressure_low" () in
+  let mem_med = gauge "telemetry_memory_pressure_medium" () in
+  let mem_high = gauge "telemetry_memory_pressure_high" () in
+
+  set_gauge mem_low 0.0;
+  set_gauge mem_med 0.0;
+  set_gauge mem_high 0.0;
+
+  (match pressure with
+   | Low -> set_gauge mem_low 1.0
+   | Medium -> set_gauge mem_med 1.0
+   | High -> set_gauge mem_high 1.0);
+
+  set_gauge rate_capacity_metric (float_of_int memory_config.rate_buffer_capacity);
+  set_gauge histogram_capacity_metric (float_of_int memory_config.histogram_capacity)
 
 (** Histogram - track distribution of values *)
 let histogram name ?(labels=[]) () =
@@ -439,10 +338,10 @@ let histogram name ?(labels=[]) () =
     | None ->
         let m = {
           name;
-          metric_type = Histogram (create_histogram_buffer 1000);  (* Fixed capacity of 1000 samples *)
+          metric_type = Histogram (create_histogram_buffer ());  (* Capacity managed by memory_config *)
           labels;
           created_at = Unix.time ();
-          last_updated = Unix.time ();
+          last_updated = Unix.gettimeofday ();
           rate_tracker = None;
           cached_rate = 0.0;
         } in
@@ -457,7 +356,7 @@ let observe_histogram metric value =
   | Histogram buffer ->
       Mutex.lock metrics_mutex;
       add_histogram_sample buffer value;
-      metric.last_updated <- Unix.time ();
+      metric.last_updated <- Unix.gettimeofday ();
       Mutex.unlock metrics_mutex;
       Lwt_condition.broadcast metrics_changed_condition ()
   | _ -> ()
@@ -492,10 +391,224 @@ let record_duration metric start_time =
   observe_histogram metric duration;
   duration
 
+(** Hybrid timing utilities for high-precision performance measurement *)
+type timer = {
+  start_mtime: Mtime.t;
+  start_unix: float;
+}
+
+let start_timer_v2 () = {
+  start_mtime = Mtime_clock.now ();
+  start_unix = Unix.gettimeofday ();
+}
+
+let record_duration_v2 metric timer =
+  let now_mtime = Mtime_clock.now () in
+  let duration_ns = Mtime.span timer.start_mtime now_mtime |> Mtime.Span.to_uint64_ns in
+  let duration_seconds = Int64.to_float duration_ns /. 1_000_000_000.0 in
+  observe_histogram metric duration_seconds;
+  duration_seconds
+
 (** Global start time *)
 let start_time = ref (Unix.time ())
 
-let () = start_time := Unix.time ()
+(** Sliding window counter for high-frequency metrics *)
+let sliding_counter name ?(labels=[]) ?(window_size=1000) ?(track_rate=false) ?(rate_window=10.0) () =
+  let key = metric_key name labels in
+  Mutex.lock metrics_mutex;
+  let metric =
+    match Hashtbl.find_opt metrics key with
+    | Some m -> m
+    | None ->
+        let rate_tracker = if track_rate then
+          Some {
+            samples = create_rate_buffer ();  (* Capacity managed by memory_config *)
+            window_seconds = rate_window;
+            samples_since_cleanup = 0;
+          }
+        else None in
+        let sliding = {
+          window_size;
+          current_window = ref [];
+          total_count = ref 0;
+          last_cleanup = ref (Unix.time ());
+        } in
+        let m = {
+          name;
+          metric_type = SlidingCounter sliding;
+          labels;
+          created_at = Unix.time ();
+          last_updated = Unix.gettimeofday ();
+          rate_tracker;
+          cached_rate = 0.0;
+        } in
+        Hashtbl.add metrics key m;
+        m
+  in
+  Mutex.unlock metrics_mutex;
+  metric
+
+(** Increment sliding window counter with automatic cleanup *)
+let inc_sliding_counter metric ?(value=1) () =
+  match metric.metric_type with
+  | SlidingCounter sliding ->
+      (* Fast path: just increment without cleanup most of the time *)
+      Mutex.lock metrics_mutex;
+      let now = Unix.gettimeofday () in
+
+      (* Add new increment to window *)
+      sliding.current_window := (now, value) :: !(sliding.current_window);
+      sliding.total_count := !(sliding.total_count) + value;
+      metric.last_updated <- now;
+
+      (* Update rate tracker if enabled *)
+      (match metric.rate_tracker with
+       | Some tracker ->
+           let sample = { timestamp = now; value = !(sliding.total_count) } in
+           add_rate_sample tracker.samples sample;
+           tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
+           (* Filter old samples periodically *)
+           if tracker.samples_since_cleanup >= 100 then begin
+             tracker.samples_since_cleanup <- 0;
+             (* Remove samples older than window_seconds *)
+             let cutoff = now -. tracker.window_seconds in
+             let samples = get_rate_samples tracker.samples in
+             let filtered = List.filter (fun s -> s.timestamp >= cutoff) samples in
+             (* Rebuild buffer with only recent samples *)
+             tracker.samples.size <- 0;
+             tracker.samples.write_pos <- 0;
+             List.iter (add_rate_sample tracker.samples) (List.rev filtered)
+           end
+       | None -> ());
+
+      (* Check if cleanup is needed - do this quickly *)
+      let window_len = List.length !(sliding.current_window) in
+      let should_cleanup = now -. !(sliding.last_cleanup) > 10.0 ||
+                          window_len > sliding.window_size ||
+                          window_len > sliding.window_size * 2 in
+
+      Mutex.unlock metrics_mutex;
+
+      (* Do expensive cleanup outside of the main mutex if needed *)
+      if should_cleanup then
+        begin
+          Mutex.lock metrics_mutex;
+          (* Re-check condition in case another thread already cleaned up *)
+          let now_check = Unix.time () in
+          let window_len_check = List.length !(sliding.current_window) in
+          if now_check -. !(sliding.last_cleanup) > 10.0 ||
+             window_len_check > sliding.window_size ||
+             window_len_check > sliding.window_size * 2 then
+            begin
+              sliding.last_cleanup := now_check;
+              let cutoff = now_check -. 30.0 in  (* Keep last 30 seconds for rate calculation *)
+              let new_window = ref [] in
+              let new_total = ref 0 in
+
+              List.iter (fun (timestamp, count) ->
+                if timestamp >= cutoff then begin
+                  new_window := (timestamp, count) :: !new_window;
+                  new_total := !new_total + count;
+                end
+              ) !(sliding.current_window);
+
+              sliding.current_window := !new_window;
+              sliding.total_count := !new_total;
+
+              (* If still too many entries, keep only the most recent ones *)
+              if List.length !new_window > sliding.window_size then begin
+                let sorted = List.sort (fun (t1, _) (t2, _) -> Float.compare t2 t1) !new_window in
+                let recent = ref [] in
+                let count = ref 0 in
+                List.iter (fun (timestamp, inc) ->
+                  if !count < sliding.window_size then begin
+                    recent := (timestamp, inc) :: !recent;
+                    count := !count + inc;
+                  end
+                ) sorted;
+                sliding.current_window := !recent;
+                sliding.total_count := !count;
+              end
+            end;
+          Mutex.unlock metrics_mutex;
+        end;
+
+      Lwt_condition.broadcast metrics_changed_condition ()
+  | _ -> ()
+
+(** Get current value of sliding window counter *)
+let get_sliding_counter metric =
+  match metric.metric_type with
+  | SlidingCounter sliding -> !(sliding.total_count)
+  | _ -> 0
+
+(** Counter - incrementing metric *)
+let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
+  let key = metric_key name labels in
+  Mutex.lock metrics_mutex;
+  let metric =
+    match Hashtbl.find_opt metrics key with
+    | Some m -> m
+    | None ->
+        let rate_tracker = if track_rate then
+          Some {
+            samples = create_rate_buffer ();  (* Capacity managed by memory_config *)
+            window_seconds = rate_window;
+            samples_since_cleanup = 0;
+          }
+        else None in
+        let m = {
+          name;
+          metric_type = Counter (ref 0);
+          labels;
+          created_at = Unix.time ();
+          last_updated = Unix.gettimeofday ();
+          rate_tracker;
+          cached_rate = 0.0;
+        } in
+        Hashtbl.add metrics key m;
+        m
+  in
+  Mutex.unlock metrics_mutex;
+  metric
+
+let inc_counter metric ?(value=1) () =
+  match metric.metric_type with
+  | Counter r ->
+      Mutex.lock metrics_mutex;
+      let now = Unix.gettimeofday () in
+      r := !r + value;
+      metric.last_updated <- now;
+
+      (* Update rate tracker if enabled *)
+      (match metric.rate_tracker with
+       | Some tracker ->
+           let sample = { timestamp = now; value = !r } in
+           add_rate_sample tracker.samples sample;
+           tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
+           (* Filter old samples periodically *)
+           if tracker.samples_since_cleanup >= 100 then begin
+             tracker.samples_since_cleanup <- 0;
+             (* Remove samples older than window_seconds *)
+             let cutoff = now -. tracker.window_seconds in
+             let samples = get_rate_samples tracker.samples in
+             let filtered = List.filter (fun s -> s.timestamp >= cutoff) samples in
+             (* Rebuild buffer with only recent samples *)
+             tracker.samples.size <- 0;
+             tracker.samples.write_pos <- 0;
+             List.iter (add_rate_sample tracker.samples) (List.rev filtered)
+           end
+       | None -> ());
+
+      Mutex.unlock metrics_mutex;
+      Lwt_condition.broadcast metrics_changed_condition ()
+  | _ -> ()
+
+let get_counter metric =
+  match metric.metric_type with
+  | Counter r -> !r
+  | SlidingCounter sliding -> !(sliding.total_count)
+  | _ -> 0
 
 (** Initialize basic system metrics *)
 let () =
@@ -533,65 +646,6 @@ let format_metric_value metric =
         Printf.sprintf "%d samples, p50=%.1fµs" count (p50 *. 1_000_000.0)
       else "no samples"
 
-(** Report all metrics organized by category *)
-let report_metrics () =
-  Mutex.lock metrics_mutex;
-
-  (* Update memory monitoring metrics first *)
-  (* TODO: Enable when function visibility issue is resolved *)
-  (* update_memory_monitoring_metrics (); *)
-
-  let now = Unix.time () in
-  let uptime = now -. !start_time in
-
-  (* Collect all metrics by category *)
-  let categories = Hashtbl.create 16 in
-  Hashtbl.iter (fun _key metric ->
-    let category = categorize_metric metric in
-    let existing = Hashtbl.find_opt categories category |> Option.value ~default:[] in
-    Hashtbl.replace categories category (metric :: existing)
-  ) metrics;
-
-  Logging.info ~section "=== Telemetry Report ===";
-  Logging.info_f ~section "System uptime: %.0f seconds" uptime;
-  Logging.info ~section "";
-
-  (* Define category order *)
-  let category_order = ["Connections"; "Trading"; "Positions"; "Domains"; "Market Data"; "Other"] in
-
-  List.iter (fun category ->
-    match Hashtbl.find_opt categories category with
-    | Some metrics_list when metrics_list <> [] ->
-        Logging.info_f ~section "[%s]" category;
-        let separator = String.make (String.length category + 3) '-' in
-        Logging.info_f ~section "%s" separator;
-
-        (* Sort metrics within category by name *)
-        let sorted_metrics = List.sort (fun m1 m2 -> String.compare m1.name m2.name) metrics_list in
-
-        List.iter (fun metric ->
-          let label_str =
-            if metric.labels = [] then ""
-            else " (" ^ (metric.labels |> List.map (fun (k, v) -> k ^ "=" ^ v) |> String.concat ", ") ^ ")"
-          in
-
-          let value_str = format_metric_value metric in
-          Logging.info_f ~section "  %-25s %s%s" (metric.name ^ ":") value_str label_str;
-
-          (* Special handling for domain_cycles rate *)
-          match metric.metric_type, metric.name with
-          | Counter _, "domain_cycles" ->
-              let rate = get_counter_rate metric in
-              Logging.info_f ~section "    └─ %.0f cycles/sec" rate
-          | _ -> ()
-        ) sorted_metrics;
-        Logging.info ~section ""
-    | _ -> ()
-  ) category_order;
-
-  Logging.info ~section "=== End Report ===";
-  Mutex.unlock metrics_mutex
-
 (** Reset all metrics *)
 let reset_metrics () =
   Mutex.lock metrics_mutex;
@@ -622,29 +676,10 @@ let asset_histogram name asset = histogram name ~labels:["asset", asset] ()
 let update_system_metrics () =
   let uptime_metric = gauge "uptime_seconds" () in
   let uptime = Unix.time () -. !start_time in
-  set_gauge uptime_metric uptime
+  set_gauge uptime_metric uptime;
 
-(** Update memory monitoring metrics - TODO: Fix function ordering *)
-(* let update_memory_monitoring_metrics () =
-  (* Calculate and update internal telemetry buffer sizes *)
-  let rate_buffer_total = Hashtbl.fold (fun _ metric acc ->
-    match metric.metric_type with
-    | Counter _ when Option.is_some metric.rate_tracker ->
-        acc + (Option.get metric.rate_tracker).samples.size
-    | SlidingCounter _ when Option.is_some metric.rate_tracker ->
-        acc + (Option.get metric.rate_tracker).samples.size
-    | _ -> acc
-  ) metrics 0 in
-
-  let histogram_buffer_total = Hashtbl.fold (fun _ metric acc ->
-    match metric.metric_type with
-    | Histogram buffer -> acc + buffer.hist_size
-    | _ -> acc
-  ) metrics 0 in
-
-  set_telemetry_rate_buffers_size rate_buffer_total;
-  set_telemetry_histogram_buffers_size histogram_buffer_total;
-  () *)
+  (* Update memory pressure and buffer capacity metrics *)
+  adjust_buffer_capacities ()
 
 (** Memory monitoring gauge metrics - created on demand *)
 let strategy_pending_orders_gauge = ref None
@@ -725,6 +760,86 @@ let set_telemetry_histogram_buffers_size size =
         m
   in
   set_gauge metric (float_of_int size)
+
+(** Update memory monitoring metrics *)
+let update_memory_monitoring_metrics () =
+  (* Calculate and update internal telemetry buffer sizes *)
+  let rate_buffer_total = Hashtbl.fold (fun _ metric acc ->
+    match metric.metric_type with
+    | Counter _ when Option.is_some metric.rate_tracker ->
+        acc + (Option.get metric.rate_tracker).samples.size
+    | SlidingCounter _ when Option.is_some metric.rate_tracker ->
+        acc + (Option.get metric.rate_tracker).samples.size
+    | _ -> acc
+  ) metrics 0 in
+
+  let histogram_buffer_total = Hashtbl.fold (fun _ metric acc ->
+    match metric.metric_type with
+    | Histogram buffer -> acc + buffer.hist_size
+    | _ -> acc
+  ) metrics 0 in
+
+  set_telemetry_rate_buffers_size rate_buffer_total;
+  set_telemetry_histogram_buffers_size histogram_buffer_total;
+  ()
+
+(** Report all metrics organized by category *)
+let report_metrics () =
+  Mutex.lock metrics_mutex;
+
+  (* Update memory monitoring metrics first *)
+   update_memory_monitoring_metrics ();
+
+  let now = Unix.time () in
+  let uptime = now -. !start_time in
+
+  (* Collect all metrics by category *)
+  let categories = Hashtbl.create 16 in
+  Hashtbl.iter (fun _key metric ->
+    let category = categorize_metric metric in
+    let existing = Hashtbl.find_opt categories category |> Option.value ~default:[] in
+    Hashtbl.replace categories category (metric :: existing)
+  ) metrics;
+
+  Logging.info ~section "=== Telemetry Report ===";
+  Logging.info_f ~section "System uptime: %.0f seconds" uptime;
+  Logging.info ~section "";
+
+  (* Define category order *)
+  let category_order = ["Connections"; "Trading"; "Positions"; "Domains"; "Market Data"; "Other"] in
+
+  List.iter (fun category ->
+    match Hashtbl.find_opt categories category with
+    | Some metrics_list when metrics_list <> [] ->
+        Logging.info_f ~section "[%s]" category;
+        let separator = String.make (String.length category + 3) '-' in
+        Logging.info_f ~section "%s" separator;
+
+        (* Sort metrics within category by name *)
+        let sorted_metrics = List.sort (fun m1 m2 -> String.compare m1.name m2.name) metrics_list in
+
+        List.iter (fun metric ->
+          let label_str =
+            if metric.labels = [] then ""
+            else " (" ^ (metric.labels |> List.map (fun (k, v) -> k ^ "=" ^ v) |> String.concat ", ") ^ ")"
+          in
+
+          let value_str = format_metric_value metric in
+          Logging.info_f ~section "  %-25s %s%s" (metric.name ^ ":") value_str label_str;
+
+          (* Special handling for domain_cycles rate *)
+          match metric.metric_type, metric.name with
+          | Counter _, "domain_cycles" ->
+              let rate = get_counter_rate metric in
+              Logging.info_f ~section "    └─ %.0f cycles/sec" rate
+          | _ -> ()
+        ) sorted_metrics;
+        Logging.info ~section ""
+    | _ -> ()
+  ) category_order;
+
+  Logging.info ~section "=== End Report ===";
+  Mutex.unlock metrics_mutex
 
 (** Wait for metric changes (event-driven) *)
 let wait_for_metric_changes () = Lwt_condition.wait metrics_changed_condition
