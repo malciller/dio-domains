@@ -343,12 +343,21 @@ let execute_strategy
         if should_log then Logging.debug_f ~section "DEBUG Asset [%s/%s]: spread=%.8f, spread_pct=%.8f, fee=%.8f, exposure=%.2f"
           asset.exchange asset.symbol spread spread_pct fee exposure_value;
 
+        (* Count open buy orders for this asset - needed for balance check *)
+        let open_buy_orders = List.filter (fun (order_id, _, qty, side_str, _) ->
+          let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
+          side_str = "buy" && not is_cancelled && qty > 0.0
+        ) open_orders in
+
+        let open_buy_count = List.length open_buy_orders in
+
         (* Check balance limits - PAUSE/RESUME LOGIC (only apply constraints if parameters are provided) *)
         (* Consider if we can actually place orders without violating constraints *)
         let usd_balance_ok = match min_usd_balance_opt, available_quote_balance with
           | Some min_balance, Some qb ->
               (* Check if we can place a buy order without going below minimum *)
-              let buy_cost = bid *. qty in
+              (* If we already have a buy order open, don't double-count its cost *)
+              let buy_cost = if open_buy_count > 0 then 0.0 else bid *. qty in
               qb -. buy_cost >= min_balance
           | Some _, None -> false  (* If min_balance is set but we have no quote balance data, fail *)
           | None, _ -> true        (* If no min_balance constraint, always pass *)
@@ -373,8 +382,8 @@ let execute_strategy
           | None -> None
         in
 
-        if should_log then Logging.info_f ~section "Strategy check for %s: current_exposure=%.2f, projected_sell_exposure=%s, max_exposure=%s, current_usd=%s, projected_buy_usd=%s, min_usd=%s, exposure_ok=%B, usd_ok=%B"
-          asset.symbol exposure_value
+        if should_log then Logging.info_f ~section "Strategy check for %s: open_buy_count=%d, current_exposure=%.2f, projected_sell_exposure=%s, max_exposure=%s, current_usd=%s, projected_buy_usd=%s, min_usd=%s, exposure_ok=%B, usd_ok=%B"
+          asset.symbol open_buy_count exposure_value
           (match projected_sell_exposure with Some pe -> Printf.sprintf "%.2f" pe | None -> "N/A")
           (match max_exposure_opt with Some me -> Printf.sprintf "%.2f" me | None -> "unlimited")
           (match available_quote_balance with Some qb -> string_of_float qb | None -> "None")
@@ -448,14 +457,7 @@ let execute_strategy
                  state.last_sell_order_id <- Some order_id)
           ) open_orders;
 
-          (* Count open buy orders for this asset *)
-          let open_buy_orders = List.filter (fun (order_id, _, qty, side_str, _) ->
-            let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            side_str = "buy" && not is_cancelled && qty > 0.0
-          ) open_orders in
-
-          let open_buy_count = List.length open_buy_orders in
-
+          (* open_buy_count already calculated earlier for balance checks *)
           if should_log then Logging.debug_f ~section "Buy order management for %s: open_buy_count=%d" asset.symbol open_buy_count;
 
           (* BUY ORDER MANAGEMENT - Aim for Exactly One Active Buy at Profitable Level *)
