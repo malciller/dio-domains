@@ -19,6 +19,7 @@ type rate_sample = {
 type rate_tracker = {
   samples: rate_sample list ref;
   window_seconds: float;
+  mutable samples_since_cleanup: int;  (* Track samples added since last cleanup *)
 }
 
 (** Metric types *)
@@ -65,6 +66,7 @@ let sliding_counter name ?(labels=[]) ?(window_size=1000) ?(track_rate=false) ?(
           Some {
             samples = ref [];
             window_seconds = rate_window;
+            samples_since_cleanup = 0;
           }
         else None in
         let sliding = {
@@ -106,14 +108,23 @@ let inc_sliding_counter metric ?(value=1) () =
        | Some tracker ->
            let sample = { timestamp = now; value = !(sliding.total_count) } in
            tracker.samples := sample :: !(tracker.samples);
-           (* Keep only samples within the time window *)
-           let cutoff = now -. tracker.window_seconds in
-           tracker.samples := List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples)
+           tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
+           (* Only filter periodically to avoid expensive operations on every increment *)
+           if tracker.samples_since_cleanup >= 100 then begin
+             tracker.samples_since_cleanup <- 0;
+             (* Keep only samples within the time window and limit to 200 samples max *)
+             let cutoff = now -. tracker.window_seconds in
+             let filtered = List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples) in
+             let limited = if List.length filtered > 200 then
+               List.rev (List.tl (List.rev filtered))  (* Keep most recent 200 *)
+             else filtered in
+             tracker.samples := limited
+           end
        | None -> ());
 
       (* Check if cleanup is needed - do this quickly *)
-      let should_cleanup = now -. !(sliding.last_cleanup) > 60.0 ||
-                          List.length !(sliding.current_window) > sliding.window_size * 2 in
+      let should_cleanup = now -. !(sliding.last_cleanup) > 10.0 ||
+                          List.length !(sliding.current_window) > sliding.window_size in
 
       Mutex.unlock metrics_mutex;
 
@@ -123,11 +134,11 @@ let inc_sliding_counter metric ?(value=1) () =
           Mutex.lock metrics_mutex;
           (* Re-check condition in case another thread already cleaned up *)
           let now_check = Unix.time () in
-          if now_check -. !(sliding.last_cleanup) > 60.0 ||
-             List.length !(sliding.current_window) > sliding.window_size * 2 then
+          if now_check -. !(sliding.last_cleanup) > 10.0 ||
+             List.length !(sliding.current_window) > sliding.window_size then
             begin
               sliding.last_cleanup := now_check;
-              let cutoff = now_check -. 3600.0 in  (* Keep last hour of data *)
+              let cutoff = now_check -. 30.0 in  (* Keep last 30 seconds for rate calculation *)
               let new_window = ref [] in
               let new_total = ref 0 in
 
@@ -181,6 +192,7 @@ let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
           Some {
             samples = ref [];
             window_seconds = rate_window;
+            samples_since_cleanup = 0;
           }
         else None in
         let m = {
@@ -211,9 +223,18 @@ let inc_counter metric ?(value=1) () =
        | Some tracker ->
            let sample = { timestamp = now; value = !r } in
            tracker.samples := sample :: !(tracker.samples);
-           (* Keep only samples within the time window *)
-           let cutoff = now -. tracker.window_seconds in
-           tracker.samples := List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples)
+           tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
+           (* Only filter periodically to avoid expensive operations on every increment *)
+           if tracker.samples_since_cleanup >= 100 then begin
+             tracker.samples_since_cleanup <- 0;
+             (* Keep only samples within the time window and limit to 200 samples max *)
+             let cutoff = now -. tracker.window_seconds in
+             let filtered = List.filter (fun s -> s.timestamp >= cutoff) !(tracker.samples) in
+             let limited = if List.length filtered > 200 then
+               List.rev (List.tl (List.rev filtered))  (* Keep most recent 200 *)
+             else filtered in
+             tracker.samples := limited
+           end
        | None -> ());
 
       Mutex.unlock metrics_mutex;
@@ -360,9 +381,9 @@ let observe_histogram metric value =
   | Histogram r ->
       Mutex.lock metrics_mutex;
       r := value :: !r;
-      (* Keep only last 1000 samples to avoid memory bloat *)
+      (* Keep only most recent 1000 samples to avoid memory bloat *)
       if List.length !r > 1000 then
-        r := List.filteri (fun i _ -> i < 1000) !r;
+        r := List.filteri (fun i _ -> i < 1000) !r;  (* Keep first 1000 elements (most recent since we prepend) *)
       metric.last_updated <- Unix.time ();
       Mutex.unlock metrics_mutex;
       Lwt_condition.broadcast metrics_changed_condition ()
@@ -514,7 +535,7 @@ end
 
 (** Per-asset metrics helper *)
 let asset_counter name asset ?(track_rate=false) ?(rate_window=10.0) () = counter name ~labels:["asset", asset] ~track_rate ~rate_window ()
-let asset_sliding_counter name asset ?(window_size=1000000) ?(track_rate=false) ?(rate_window=10.0) () = 
+let asset_sliding_counter name asset ?(window_size=10000) ?(track_rate=false) ?(rate_window=10.0) () =
   sliding_counter name ~labels:["asset", asset] ~window_size ~track_rate ~rate_window ()
 let asset_gauge name asset = gauge name ~labels:["asset", asset] ()
 let asset_histogram name asset = histogram name ~labels:["asset", asset] ()
