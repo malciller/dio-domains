@@ -42,7 +42,8 @@
    notty
    nottui
    nottui-lwt
-   cpuid)
+   cpuid
+   mtime)
  (tags
    ("trading" "finance" "multicore" "ocaml" "domains")))
 

@@ -34,6 +34,7 @@ depends: [
   "nottui"
   "nottui-lwt"
   "cpuid"
+  "mtime"
   "odoc" {with-doc}
 ]
 build: [

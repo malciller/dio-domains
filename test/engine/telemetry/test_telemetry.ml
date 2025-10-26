@@ -145,6 +145,62 @@ let test_metric_persistence () =
   check int "persistence counter1" 8 (Telemetry.get_counter counter1);
   check int "persistence counter2" 8 (Telemetry.get_counter counter2)
 
+let test_hybrid_timing () =
+  (* Test new hybrid timing functions *)
+  let timer = Telemetry.start_timer_v2 () in
+  (* Simulate some work *)
+  sleepf 0.01;  (* 10ms delay *)
+  let hist = Telemetry.histogram "hybrid_timing_test" () in
+  let duration = Telemetry.record_duration_v2 hist timer in
+
+  (* Duration should be around 0.01 seconds *)
+  check bool "hybrid duration in range" true (duration >= 0.005 && duration <= 0.1);
+
+  (* Check that histogram recorded the value *)
+  let (_, _, _, _, count) = Telemetry.histogram_stats hist in
+  check int "hybrid timing histogram count" 1 count
+
+let test_memory_pressure () =
+  (* Test memory pressure detection - this is hard to test deterministically *)
+  (* We can at least test that the function doesn't crash *)
+  let pressure = Telemetry.get_memory_pressure () in
+  (* Should be one of the three valid values *)
+  match pressure with
+  | Telemetry.Low | Telemetry.Medium | Telemetry.High -> ()
+
+let test_buffer_capacity_adjustment () =
+  (* Test buffer capacity adjustment *)
+  let original_rate_capacity = Telemetry.memory_config.rate_buffer_capacity in
+  let original_histogram_capacity = Telemetry.memory_config.histogram_capacity in
+
+  (* Force a capacity increase by setting low memory pressure simulation *)
+  (* This is tricky to test directly, so we'll just ensure the function doesn't crash *)
+  Telemetry.adjust_buffer_capacities ();
+
+  (* Capacities should not be zero *)
+  check bool "rate capacity > 0" true (Telemetry.memory_config.rate_buffer_capacity > 0);
+  check bool "histogram capacity > 0" true (Telemetry.memory_config.histogram_capacity > 0);
+
+  (* Restore original values for test isolation *)
+  Telemetry.memory_config.rate_buffer_capacity <- original_rate_capacity;
+  Telemetry.memory_config.histogram_capacity <- original_histogram_capacity
+
+let test_buffer_overflow_protection () =
+  (* Test buffer overflow protection *)
+  let buffer = Telemetry.create_rate_buffer () in
+
+  (* Fill the buffer *)
+  for i = 1 to Telemetry.memory_config.rate_buffer_capacity do
+    Telemetry.add_rate_sample buffer { Telemetry.timestamp = Unix.time (); value = i }
+  done;
+
+  (* Add one more sample - should not crash and should overwrite oldest *)
+  let final_sample = { Telemetry.timestamp = Unix.time (); value = 999 } in
+  Telemetry.add_rate_sample buffer final_sample;
+
+  (* Buffer should still be valid *)
+  check int "buffer size after overflow" Telemetry.memory_config.rate_buffer_capacity buffer.Telemetry.size
+
 let () =
   run "Telemetry" [
     "counters", [
@@ -170,5 +226,13 @@ let () =
     ];
     "persistence", [
       test_case "metric persistence" `Quick test_metric_persistence;
+    ];
+    "hybrid_timing", [
+      test_case "hybrid timing operations" `Quick test_hybrid_timing;
+    ];
+    "memory", [
+      test_case "memory pressure detection" `Quick test_memory_pressure;
+      test_case "buffer capacity adjustment" `Quick test_buffer_capacity_adjustment;
+      test_case "buffer overflow protection" `Quick test_buffer_overflow_protection;
     ];
   ]
