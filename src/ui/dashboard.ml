@@ -21,23 +21,33 @@ type dashboard_state = {
   is_loading: bool;
 }
 
-(** Create bordered panel with title that dynamically scales *)
-let create_panel ~title ~content ~focused =
+(** Create bordered panel with title that dynamically scales and respects size constraints *)
+let create_panel ~title ~content ~focused ?max_width ?max_height () =
   let open Nottui.Ui in
   let border_char = "|" in
-  let top_left = "/" in
-  let top_right = "\\" in
-  let bottom_left = "\\" in
-  let bottom_right = "/" in
+
+  (* Adaptive border characters based on available space *)
+  let (top_left, top_right, bottom_left, bottom_right) = match max_width with
+    | Some w when w < 20 -> ("+", "+", "+", "+")  (* Simple borders for narrow panels *)
+    | _ -> ("/", "\\", "\\", "/")  (* Fancy borders for wider panels *)
+  in
 
   let title_attr = if focused then Notty.A.(st bold ++ st reverse ++ bg cyan ++ fg black)
                    else Notty.A.(st bold ++ fg white) in  (* Use cyan for focus, dim gray for inactive *)
   let border_attr = if focused then Notty.A.(fg cyan) else Notty.A.(fg (gray 2)) in
 
-  let title_with_spaces = " " ^ title ^ " " in
-  let title_display = string ~attr:title_attr title_with_spaces in
+  (* Adaptive title - truncate if too long for available space *)
+  let title_base = " " ^ title ^ " " in
+  let title_display = match max_width with
+    | Some max_w when String.length title_base > max_w - 4 ->
+        (* Leave space for borders, truncate title *)
+        let available_title_space = max 3 (max_w - 4) in
+        let truncated_title = Ui_types.truncate_string (available_title_space - 2) title in
+        string ~attr:title_attr (" " ^ truncated_title ^ " ")
+    | _ -> string ~attr:title_attr title_base
+  in
 
-  (* Create border lines - the pane system will handle width allocation *)
+  (* Create border lines *)
   let top_border = hcat [
     string ~attr:border_attr top_left;
     title_display;
@@ -49,11 +59,27 @@ let create_panel ~title ~content ~focused =
     string ~attr:border_attr bottom_right;
   ] in
 
-  (* Content with side borders - content will expand to fill allocated space *)
+  (* Apply size constraints to content if specified *)
+  let constrained_content = match max_width, max_height with
+    | Some w, Some h ->
+        (* Constrain both dimensions *)
+        resize ~w ~h content
+    | Some w, None ->
+        (* Constrain width only *)
+        resize ~w content
+    | None, Some h ->
+        (* Constrain height only - let width expand *)
+        resize ~h content
+    | None, None ->
+        (* No constraints *)
+        content
+  in
+
+  (* Content with side borders *)
   let content_with_borders = hcat [
     string ~attr:border_attr border_char;
     string ~attr:Notty.A.empty " ";
-    content;
+    constrained_content;
     string ~attr:Notty.A.empty " ";
     string ~attr:border_attr border_char;
   ] in
@@ -61,64 +87,128 @@ let create_panel ~title ~content ~focused =
   (* Stack vertically: top border, content, bottom border *)
   vcat [top_border; content_with_borders; bottom_border]
 
-(** Create top status bar with system info *)
-let create_status_bar system_stats is_loading =
+(** Create top status bar with system info - adaptive to screen size *)
+let create_status_bar system_stats is_loading screen_size =
   let open Nottui.Ui in
   let primary_attr = Notty.A.(fg white ++ st bold) in  (* Primary text for status bar *)
   let separator_attr = Notty.A.(fg (gray 2)) in     (* Dim gray for separators *)
   let loading_attr = Notty.A.(fg yellow ++ st bold) in (* Yellow for loading indicator *)
 
-  let title_text = if is_loading then " DIO TRADING TERMINAL (LOADING...) " else " DIO TRADING TERMINAL " in
+  (* Adaptive title based on screen size *)
+  let title_text = match screen_size with
+    | Ui_types.Mobile -> if is_loading then "DIO (LOAD)" else "DIO"
+    | Ui_types.Small -> if is_loading then "DIO (LOAD)" else "DIO"
+    | Ui_types.Medium -> if is_loading then "DIO TRADING (LOAD)" else "DIO TRADING"
+    | Ui_types.Large -> if is_loading then " DIO TRADING TERMINAL (LOADING...) " else " DIO TRADING TERMINAL "
+  in
   let title = string ~attr:(if is_loading then loading_attr else primary_attr) title_text in
 
-  let uptime_str = Printf.sprintf "UPTIME: %s"
-    (let uptime = Unix.time () -. !Telemetry.start_time in
-     let days = int_of_float (uptime /. 86400.0) in
-     let hours = int_of_float (uptime /. 3600.0) mod 24 in
-     let mins = int_of_float (uptime /. 60.0) mod 60 in
-     let secs = int_of_float uptime mod 60 in
-     if days > 0 then Printf.sprintf "%dd %02d:%02d:%02d" days hours mins secs
-     else Printf.sprintf "%02d:%02d:%02d" hours mins secs) in
-  let uptime = hcat [string ~attr:separator_attr " │ "; string ~attr:primary_attr uptime_str] in
+  (* Adaptive uptime display *)
+  let uptime_str = match screen_size with
+    | Ui_types.Mobile -> 
+        let uptime = Unix.time () -. !Telemetry.start_time in
+        let hours = int_of_float (uptime /. 3600.0) in
+        Printf.sprintf "%dh" hours
+    | Ui_types.Small ->
+        let uptime = Unix.time () -. !Telemetry.start_time in
+        let hours = int_of_float (uptime /. 3600.0) mod 24 in
+        let mins = int_of_float (uptime /. 60.0) mod 60 in
+        Printf.sprintf "%02d:%02d" hours mins
+    | Ui_types.Medium | Ui_types.Large ->
+        let uptime = Unix.time () -. !Telemetry.start_time in
+        let days = int_of_float (uptime /. 86400.0) in
+        let hours = int_of_float (uptime /. 3600.0) mod 24 in
+        let mins = int_of_float (uptime /. 60.0) mod 60 in
+        if days > 0 then Printf.sprintf "%dd %02d:%02d" days hours mins
+        else Printf.sprintf "%02d:%02d" hours mins
+  in
+  let uptime = hcat [string ~attr:separator_attr " │ "; string ~attr:primary_attr ("UP:" ^ uptime_str)] in
 
-  let cpu_str = Printf.sprintf "CPU: %.1f%%" system_stats.cpu_usage in
+  (* Adaptive CPU display *)
+  let cpu_str = Printf.sprintf "%.0f%%" system_stats.cpu_usage in
   let cpu_color = if system_stats.cpu_usage > 90.0 then Notty.A.(fg red) else if system_stats.cpu_usage > 70.0 then Notty.A.(fg yellow) else Notty.A.(fg green) in
-  let cpu = hcat [string ~attr:separator_attr " │ "; string ~attr:cpu_color cpu_str] in
+  let cpu = hcat [string ~attr:separator_attr " │ "; string ~attr:cpu_color ("CPU:" ^ cpu_str)] in
 
-  let mem_usage_pct = (float_of_int system_stats.memory_used /. float_of_int system_stats.memory_total) *. 100.0 in
-  let mem_str = Printf.sprintf "MEM: %d/%d MB"
-    (system_stats.memory_used / 1024) (system_stats.memory_total / 1024) in
-  let mem_color = if mem_usage_pct > 90.0 then Notty.A.(fg red) else if mem_usage_pct > 70.0 then Notty.A.(fg yellow) else Notty.A.(fg green) in
-  let mem = hcat [string ~attr:separator_attr " │ "; string ~attr:mem_color mem_str] in
+  (* Adaptive memory display - hide on very small screens *)
+  let mem_part = match screen_size with
+    | Ui_types.Mobile -> empty  (* No memory info on mobile *)
+    | Ui_types.Small | Ui_types.Medium | Ui_types.Large ->
+        let mem_usage_pct = (float_of_int system_stats.memory_used /. float_of_int system_stats.memory_total) *. 100.0 in
+        let mem_str = match screen_size with
+          | Ui_types.Small -> Printf.sprintf "%.0f%%" mem_usage_pct
+          | Ui_types.Medium -> Printf.sprintf "%dM" (system_stats.memory_used / 1024)
+          | Ui_types.Large -> Printf.sprintf "%d/%d MB" (system_stats.memory_used / 1024) (system_stats.memory_total / 1024)
+          | _ -> ""
+        in
+        let mem_color = if mem_usage_pct > 90.0 then Notty.A.(fg red) else if mem_usage_pct > 70.0 then Notty.A.(fg yellow) else Notty.A.(fg green) in
+        hcat [string ~attr:separator_attr " │ "; string ~attr:mem_color ("MEM:" ^ mem_str)]
+  in
 
-  let timestamp_str = Printf.sprintf "LAST UPDATE: %s"
-    (let tm = Unix.localtime (Unix.time ()) in
-     Printf.sprintf "%02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec) in
+  (* Adaptive timestamp - simplified on small screens *)
+  let timestamp_str = match screen_size with
+    | Ui_types.Mobile -> 
+        let tm = Unix.localtime (Unix.time ()) in
+        Printf.sprintf "%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min
+    | Ui_types.Small | Ui_types.Medium | Ui_types.Large ->
+        let tm = Unix.localtime (Unix.time ()) in
+        Printf.sprintf "%02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
+  in
   let timestamp = hcat [string ~attr:separator_attr " │ "; string ~attr:primary_attr timestamp_str] in
 
-  hcat [title; uptime; cpu; mem; timestamp]
+  (* Combine elements based on screen size *)
+  match screen_size with
+  | Ui_types.Mobile -> hcat [title; uptime; cpu]
+  | Ui_types.Small -> hcat [title; uptime; cpu; mem_part]
+  | Ui_types.Medium -> hcat [title; uptime; cpu; mem_part; timestamp]
+  | Ui_types.Large -> hcat [title; uptime; cpu; mem_part; timestamp]
 
-(** Create bottom status bar with navigation hints *)
-let create_bottom_bar focused_panel =
+(** Create bottom status bar with navigation hints - adaptive to screen size *)
+let create_bottom_bar focused_panel screen_size =
   let open Nottui.Ui in
   let inactive_attr = Notty.A.(fg (gray 2)) in      (* Dim gray for inactive panels *)
-  let active_attr = Notty.A.(fg cyan ++ st bold) in      (* Cyan for active/focused panel *)
-  let primary_attr = Notty.A.(fg white) in               (* Primary text for general hints *)
-  let separator_attr = Notty.A.(fg (gray 2)) in      (* Dim gray for separators *)
+  let active_attr = Notty.A.(fg cyan ++ st bold) in (* Cyan for active/focused panel *)
+  let primary_attr = Notty.A.(fg white) in          (* Primary text for general hints *)
+  let separator_attr = Notty.A.(fg (gray 2)) in     (* Dim gray for separators *)
 
-  let s_hint = string ~attr:(if focused_panel = SystemPanel then active_attr else inactive_attr) " S:SYSTEM " in
-  let b_hint = string ~attr:(if focused_panel = BalancesPanel then active_attr else inactive_attr) " B:BALANCES " in
-  let t_hint = string ~attr:(if focused_panel = TelemetryPanel then active_attr else inactive_attr) " T:TELEMETRY " in
-  let l_hint = string ~attr:(if focused_panel = LogsPanel then active_attr else inactive_attr) " L:LOGS " in
-  let refresh_hint = if focused_panel = BalancesPanel then
-    hcat [string ~attr:primary_attr " R:REFRESH "; string ~attr:separator_attr "│ "]
-  else
-    empty in
-  let quit_hint = string ~attr:primary_attr " Q:QUIT " in
+  (* Adaptive panel hints based on screen size *)
+  let (s_hint, b_hint, t_hint, l_hint, spacer, refresh_hint, quit_hint) = match screen_size with
+    | Ui_types.Mobile ->
+        (* Minimal hints for mobile - just single letters *)
+        let s = string ~attr:(if focused_panel = SystemPanel then active_attr else inactive_attr) "S" in
+        let b = string ~attr:(if focused_panel = BalancesPanel then active_attr else inactive_attr) "B" in
+        let t = string ~attr:(if focused_panel = TelemetryPanel then active_attr else inactive_attr) "T" in
+        let l = string ~attr:(if focused_panel = LogsPanel then active_attr else inactive_attr) "L" in
+        let r = if focused_panel = BalancesPanel then string ~attr:primary_attr "R" else empty in
+        let q = string ~attr:primary_attr "Q" in
+        (s, b, t, l, string ~attr:separator_attr "|", r, q)
+    | Ui_types.Small ->
+        (* Short hints for small screens *)
+        let s = string ~attr:(if focused_panel = SystemPanel then active_attr else inactive_attr) "S:Sys" in
+        let b = string ~attr:(if focused_panel = BalancesPanel then active_attr else inactive_attr) "B:Bal" in
+        let t = string ~attr:(if focused_panel = TelemetryPanel then active_attr else inactive_attr) "T:Tel" in
+        let l = string ~attr:(if focused_panel = LogsPanel then active_attr else inactive_attr) "L:Log" in
+        let r = if focused_panel = BalancesPanel then string ~attr:primary_attr "R:Ref" else empty in
+        let q = string ~attr:primary_attr "Q:Quit" in
+        (s, b, t, l, string ~attr:separator_attr " | ", r, q)
+    | Ui_types.Medium | Ui_types.Large ->
+        (* Full hints for larger screens *)
+        let s = string ~attr:(if focused_panel = SystemPanel then active_attr else inactive_attr) " S:SYSTEM " in
+        let b = string ~attr:(if focused_panel = BalancesPanel then active_attr else inactive_attr) " B:BALANCES " in
+        let t = string ~attr:(if focused_panel = TelemetryPanel then active_attr else inactive_attr) " T:TELEMETRY " in
+        let l = string ~attr:(if focused_panel = LogsPanel then active_attr else inactive_attr) " L:LOGS " in
+        let r = if focused_panel = BalancesPanel then
+          hcat [string ~attr:primary_attr " R:REFRESH "; string ~attr:separator_attr "│ "]
+        else empty in
+        let q = string ~attr:primary_attr " Q:QUIT " in
+        (s, b, t, l, string ~attr:separator_attr " │ ", r, q)
+  in
 
-  let spacer = string ~attr:separator_attr " │ " in
-
-  hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
+  (* Combine elements - adapt spacing based on screen size *)
+  match screen_size with
+  | Ui_types.Mobile -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
+  | Ui_types.Small -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
+  | Ui_types.Medium -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
+  | Ui_types.Large -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
 
 
 let handle_navigation_key focused_panel = function
@@ -131,6 +221,9 @@ let handle_navigation_key focused_panel = function
 
 let make_dashboard () =
   let open Nottui.Ui in
+
+  (* Terminal size tracking *)
+  let terminal_size_var = Lwd.var (80, 24) in  (* Default size *)
 
   (* Shared system stats and telemetry snapshot variables - start with empty defaults *)
   let empty_system_stats = {
@@ -179,9 +272,9 @@ let make_dashboard () =
     update_time ()
   );
 
-  (* Pre-create views - telemetry, system, balances, and logs views are reactive *)
+  (* Pre-create views - telemetry, system, balances, and logs views are reactive and size-aware *)
   let telemetry_ui, telemetry_handler = Dio_ui_telemetry.Telemetry_view.make_telemetry_view telemetry_snapshot_var in
-  let system_ui, system_handler = Dio_ui_system.System_view.make_system_view system_stats_var telemetry_snapshot_var in
+  let system_ui, system_handler = Dio_ui_system.System_view.make_system_view system_stats_var telemetry_snapshot_var ~available_width:80 ~available_height:24 in
   let balances_ui, balances_handler = Dio_ui_balance.Balance_view.make_balances_view balance_snapshot_var in
   let log_entries_var = Dio_ui_logs.Logs_cache.get_log_entries_var () in
   let logs_ui, logs_handler = Dio_ui_logs.Logs_view.make_logs_view log_entries_var in
@@ -192,50 +285,71 @@ let make_dashboard () =
   (* Create reactive status bar *)
   let status_bar_ui = Lwd.map2
     (Lwd.map2 (Lwd.get system_stats_var) (Lwd.get time_var) ~f:(fun ss t -> (ss, t)))
-    (Lwd.get state_var)
-    ~f:(fun (system_stats, _) state ->
-      create_status_bar system_stats state.is_loading
+    (Lwd.map2 (Lwd.get state_var) (Lwd.get terminal_size_var) ~f:(fun state (w, h) ->
+      (state, Ui_types.classify_screen_size w h)))
+    ~f:(fun (system_stats, _) (state, screen_size) ->
+      create_status_bar system_stats state.is_loading screen_size
     ) in
 
   (* Create reactive panels with focus indication *)
   let system_panel_ui = Lwd.map2 (Lwd.get state_var) system_ui
     ~f:(fun state system_content ->
-      create_panel ~title:"SYSTEM" ~content:system_content ~focused:(state.focused_panel = SystemPanel)
+      create_panel ~title:"SYSTEM" ~content:system_content ~focused:(state.focused_panel = SystemPanel) ()
     ) in
 
   let balances_panel_ui = Lwd.map2 (Lwd.get state_var) balances_ui
     ~f:(fun state balances_content ->
-      create_panel ~title:"BALANCES" ~content:balances_content ~focused:(state.focused_panel = BalancesPanel)
+      create_panel ~title:"BALANCES" ~content:balances_content ~focused:(state.focused_panel = BalancesPanel) ()
     ) in
 
   let telemetry_panel_ui = Lwd.map2 (Lwd.get state_var) telemetry_ui
     ~f:(fun state telemetry_content ->
-      create_panel ~title:"TELEMETRY" ~content:telemetry_content ~focused:(state.focused_panel = TelemetryPanel)
+      create_panel ~title:"TELEMETRY" ~content:telemetry_content ~focused:(state.focused_panel = TelemetryPanel) ()
     ) in
 
   let logs_panel_ui = Lwd.map2 (Lwd.get state_var) logs_ui
     ~f:(fun state logs_content ->
-      create_panel ~title:"LOGS" ~content:logs_content ~focused:(state.focused_panel = LogsPanel)
+      create_panel ~title:"LOGS" ~content:logs_content ~focused:(state.focused_panel = LogsPanel) ()
     ) in
 
   (* Create reactive bottom bar *)
-  let bottom_bar_ui = Lwd.map (Lwd.get state_var) ~f:(fun state ->
-    create_bottom_bar state.focused_panel
+  let bottom_bar_ui = Lwd.map2 (Lwd.get state_var) (Lwd.get terminal_size_var) ~f:(fun state (w, h) ->
+    create_bottom_bar state.focused_panel (Ui_types.classify_screen_size w h)
   ) in
 
-  (* Create main panel layout - three panels in top row, logs full-width in bottom row *)
+  (* Create adaptive main panel layout based on terminal size *)
   let main_panels_ui = Lwd.map2
-    (Lwd.map2 (Lwd.map2 system_panel_ui balances_panel_ui ~f:(fun sp bp -> (sp, bp)))
-              telemetry_panel_ui ~f:(fun (sp, bp) tp -> (sp, bp, tp)))
-    logs_panel_ui
-    ~f:(fun (system_panel, balances_panel, telemetry_panel) logs_panel ->
-      (* Create top row with three panels side by side *)
-      let top_row = hcat [system_panel; balances_panel; telemetry_panel] in
-      (* Create bottom row with logs panel taking full width *)
-      let bottom_row = logs_panel in
-      (* Create vertical split between rows *)
-      vcat [top_row; bottom_row]
-    ) in
+    (Lwd.map2
+      (Lwd.map2 (Lwd.get terminal_size_var)
+                (Lwd.map2 (Lwd.map2 system_panel_ui balances_panel_ui ~f:(fun sp bp -> (sp, bp)))
+                          telemetry_panel_ui ~f:(fun (sp, bp) tp -> (sp, bp, tp)))
+                ~f:(fun (w, h) (system_panel, balances_panel, telemetry_panel) ->
+                  let screen_size = Ui_types.classify_screen_size w h in
+                  (screen_size, system_panel, balances_panel, telemetry_panel)))
+      logs_panel_ui
+      ~f:(fun (screen_size, system_panel, balances_panel, telemetry_panel) logs_panel ->
+        match screen_size with
+        | Ui_types.Mobile ->
+            (* Stack all panels vertically on mobile *)
+            vcat [system_panel; balances_panel; telemetry_panel; logs_panel]
+        | Ui_types.Small ->
+            (* Two columns: System+Balance on left, Telemetry+Logs on right *)
+            let left_column = vcat [system_panel; balances_panel] in
+            let right_column = vcat [telemetry_panel; logs_panel] in
+            hcat [left_column; right_column]
+        | Ui_types.Medium ->
+            (* Two columns: System+Balance on left, Telemetry+Logs on right *)
+            let left_column = vcat [system_panel; balances_panel] in
+            let right_column = vcat [telemetry_panel; logs_panel] in
+            hcat [left_column; right_column]
+        | Ui_types.Large ->
+            (* Original layout: three panels on top, logs full-width below *)
+            let top_row = hcat [system_panel; balances_panel; telemetry_panel] in
+            let bottom_row = logs_panel in
+            vcat [top_row; bottom_row]
+      ))
+    (Lwd.get terminal_size_var)
+    ~f:(fun layout _ -> layout) in
 
   (* Combine all UI elements *)
   let ui = Lwd.map2 status_bar_ui
@@ -293,7 +407,7 @@ let make_dashboard () =
       | _ -> `Continue
   in
 
-  (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var)
+  (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var)
 
 (** Initialize and run the dashboard *)
 let run () : unit Lwt.t =
@@ -308,7 +422,7 @@ let run () : unit Lwt.t =
   );
 
   (* Create dashboard and reactive variables first *)
-  let (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var) = make_dashboard () in
+  let (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var) = make_dashboard () in
 
   (* Create quit promise *)
   let quit_promise, quit_resolver = Lwt.wait () in
@@ -404,6 +518,17 @@ let run () : unit Lwt.t =
       (* Run the UI using render directly *)
       let size = Notty_lwt.Term.size term in
       let image_stream = Nottui_lwt.render ~quit:quit_promise ~size custom_event_stream ui in
+
+      (* Start size monitoring thread *)
+      let _ = Lwt.async (fun () ->
+        let rec monitor_size () =
+          let%lwt () = Lwt_unix.sleep 0.5 in  (* Check size every 500ms *)
+          let current_size = Notty_lwt.Term.size term in
+          Lwd.set terminal_size_var current_size;
+          monitor_size ()
+        in
+        monitor_size ()
+      ) in
 
       Lwt.finalize
         (fun () ->
