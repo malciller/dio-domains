@@ -231,8 +231,8 @@ let start_logs_updater () =
   Lwt.async (fun () ->
     let rec monitoring_loop () =
       let%lwt () = Lwt_unix.sleep 10.0 in (* Update every 10 seconds *)
-      let dropped_count = get_dropped_logs_count () in
-      Telemetry.set_logs_dropped_count dropped_count;
+      let _dropped_count = get_dropped_logs_count () in
+      (* set_logs_dropped_count removed, replaced with no-op *)
       monitoring_loop ()
     in
     monitoring_loop ()
