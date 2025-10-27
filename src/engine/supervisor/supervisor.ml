@@ -617,12 +617,12 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Logging.info ~section "Step 8: Fetching trading fees for all assets...";
 
   (* Convert fee fetching to promise-based operations *)
-  let%lwt configs_with_fees = Lwt_list.map_p (fun asset ->
+  let%lwt configs_with_fees = Lwt_list.map_s (fun asset ->
     try
       if asset.Dio_engine.Config.exchange = "kraken" then begin
         Logging.debug_f ~section "Fetching fees for %s..." asset.Dio_engine.Config.symbol;
         let%lwt fee_info_opt = Kraken.Kraken_get_fee.get_fee_info asset.Dio_engine.Config.symbol in
-        match fee_info_opt with
+        let%lwt result = match fee_info_opt with
         | Some fee_info ->
             Logging.debug_f ~section "Retrieved fees for %s: maker=%.4f%% taker=%.4f%%"
               asset.Dio_engine.Config.symbol
@@ -633,7 +633,10 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
               Dio_engine.Config.taker_fee = fee_info.Kraken.Kraken_get_fee.taker_fee }
         | None ->
             Logging.warn_f ~section "Failed to fetch fees for %s, using defaults" asset.Dio_engine.Config.symbol;
-            Lwt.return asset
+            Lwt.return asset in
+        (* Add small delay between requests to ensure unique nonces *)
+        let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
+        Lwt.return result
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s" asset.Dio_engine.Config.exchange;
         Lwt.return asset
