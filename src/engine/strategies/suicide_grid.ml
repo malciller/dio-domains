@@ -411,7 +411,7 @@ let execute_strategy
     if state.pending_orders <> [] then begin
         (* Only log every 100,000 iterations to avoid spam *)
         if cycle mod 100000 = 0 then begin
-          Logging.info_f ~section "Waiting for %d pending orders before placing new orders for %s: [%s]"
+          Logging.debug_f ~section "Waiting for %d pending orders before placing new orders for %s: [%s]"
             (List.length state.pending_orders) asset.symbol
             (String.concat "; " (List.map (fun (order_id, side, price) ->
               Printf.sprintf "%s %s@%.2f" (string_of_order_side side) order_id price
@@ -421,7 +421,7 @@ let execute_strategy
         state.last_cycle <- cycle
       end else if open_buy_count > 1 then begin
         (* Case 0: Multiple buy orders exist - cancel all buy orders to maintain single buy order policy *)
-        Logging.info_f ~section "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order policy"
+        Logging.debug_f ~section "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order policy"
           open_buy_count asset.symbol;
 
         (* Cancel all buy orders *)
@@ -445,7 +445,7 @@ let execute_strategy
         (* Place sell order - attempt regardless of balance *)
         let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true in
         push_order sell_order;
-        Logging.info_f ~section "Placed sell order for %s: %.8f @ %.2f"
+        Logging.debug_f ~section "Placed sell order for %s: %.8f @ %.2f"
           asset.symbol (qty *. sell_mult) sell_price;
 
         (* Place buy order *)
@@ -454,7 +454,7 @@ let execute_strategy
              let order = create_order asset.symbol Buy qty (Some buy_price) true in
              push_order order;
              state.last_buy_order_price <- Some buy_price;
-             Logging.info_f ~section "Placed buy order for %s: %.8f @ %.2f"
+             Logging.debug_f ~section "Placed buy order for %s: %.8f @ %.2f"
                asset.symbol qty buy_price;
              
              (* Enforce exactly 2x grid_interval spacing *)
@@ -475,7 +475,7 @@ let execute_strategy
                   let min_move_threshold = get_price_increment asset.symbol in
                   
                   if abs_float (target_buy -. buy_price) > min_move_threshold then
-                    Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
+                    Logging.debug_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
                       asset.symbol buy_price target_buy cs_price
               | None -> ())
          | Some quote_bal ->
@@ -536,7 +536,7 @@ let execute_strategy
                          push_order order;
                          state.last_buy_order_price <- Some target_buy_price;
                          let target_distance = sell_price -. target_buy_price in
-                         Logging.info_f ~section "Amended buy %s for %s (trailing upward): sell@%.2f, buy@%.2f -> %.2f (dist: %.2f -> %.2f, 2x: %.2f)"
+                         Logging.debug_f ~section "Amended buy %s for %s (trailing upward): sell@%.2f, buy@%.2f -> %.2f (dist: %.2f -> %.2f, 2x: %.2f)"
                            buy_order_id asset.symbol sell_price current_buy_price target_buy_price distance target_distance double_grid_interval
                      | Some quote_bal ->
                          Logging.warn_f ~section "Insufficient quote balance to trail %s: need %.2f, have %.2f"
@@ -560,7 +560,7 @@ let execute_strategy
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" in
                        push_order order;
                        state.last_buy_order_price <- Some exact_target;
-                       Logging.info_f ~section "Amended buy %s for %s (enforcing 2x): sell@%.2f, buy@%.2f -> %.2f (dist: %.2f <= 2x: %.2f)"
+                       Logging.debug_f ~section "Amended buy %s for %s (enforcing 2x): sell@%.2f, buy@%.2f -> %.2f (dist: %.2f <= 2x: %.2f)"
                          buy_order_id asset.symbol sell_price current_buy_price exact_target distance double_grid_interval
                    | Some quote_bal ->
                        Logging.warn_f ~section "Insufficient quote balance for %s: need %.2f, have %.2f"
@@ -612,7 +612,7 @@ let execute_strategy
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" in
                        push_order order;
                        state.last_buy_order_price <- Some target_buy_price;
-                       Logging.info_f ~section "Trailing buy %s for %s: %.2f -> %.2f (no sell anchors)"
+                       Logging.debug_f ~section "Trailing buy %s for %s: %.2f -> %.2f (no sell anchors)"
                          buy_order_id asset.symbol current_buy_price target_buy_price
                    | Some quote_bal ->
                        Logging.warn_f ~section "Insufficient quote balance to trail buy: need %.2f, have %.2f"
@@ -689,7 +689,7 @@ let handle_order_cancelled asset_symbol order_id =
    | Some buy_id when buy_id = order_id ->
        state.last_buy_order_id <- None;
        state.last_buy_order_price <- None;
-       Logging.info_f ~section "Cancelled buy order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
+       Logging.debug_f ~section "Cancelled buy order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
    | _ -> ());
   
   (* Remove from sell orders list *)
@@ -699,7 +699,7 @@ let handle_order_cancelled asset_symbol order_id =
   ) state.open_sell_orders;
   let removed_sell = original_sell_count - List.length state.open_sell_orders in
   
-  Logging.info_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
+  Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
     order_id asset_symbol removed_pending removed_sell
 
 (** Get pending orders from ringbuffer for processing *)
@@ -724,7 +724,7 @@ let get_pending_orders max_orders =
 
 (** Initialize strategy module *)
 let init () =
-  Logging.info_f ~section "Suicide Grid strategy initialized with order buffer size 4096";
+  Logging.debug_f ~section "Suicide Grid strategy initialized with order buffer size 4096";
   Random.self_init ()
 
 (** Strategy module interface *)
