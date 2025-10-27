@@ -1,5 +1,7 @@
 (** Lightweight Telemetry System for Performance Tracking *)
 
+open Lwt.Infix
+
 let section = "telemetry"
 
 (** Sliding window counter for high-frequency metrics *)
@@ -55,6 +57,9 @@ let memory_config = {
   last_adjustment = 0.0;
 }
 
+(** Mutex to protect memory_config access from race conditions *)
+let memory_config_mutex = Mutex.create ()
+
 (** Get current memory pressure level based on OCaml heap usage *)
 let get_memory_pressure () : memory_pressure =
   let stat = Gc.stat () in
@@ -67,13 +72,17 @@ let get_memory_pressure () : memory_pressure =
   else High
 
 (** Rate buffer management functions *)
-let create_rate_buffer () : rate_buffer = {
-  buffer_type = `Rate;
-  data = Array.make memory_config.rate_buffer_capacity None;
-  write_pos = 0;
-  size = 0;
-  capacity = memory_config.rate_buffer_capacity;
-}
+let create_rate_buffer () : rate_buffer =
+  Mutex.lock memory_config_mutex;
+  let capacity = memory_config.rate_buffer_capacity in
+  Mutex.unlock memory_config_mutex;
+  {
+    buffer_type = `Rate;
+    data = Array.make capacity None;
+    write_pos = 0;
+    size = 0;
+    capacity;
+  }
 
 let add_rate_sample buffer sample =
   let was_full = buffer.size >= buffer.capacity in
@@ -100,13 +109,17 @@ let get_rate_samples buffer =
   collect [] 0 buffer.size
 
 (** Histogram buffer management functions *)
-let create_histogram_buffer () : histogram_buffer = {
-  hist_type = `Histogram;
-  hist_data = Array.make memory_config.histogram_capacity None;
-  hist_write_pos = 0;
-  hist_size = 0;
-  hist_capacity = memory_config.histogram_capacity;
-}
+let create_histogram_buffer () : histogram_buffer =
+  Mutex.lock memory_config_mutex;
+  let capacity = memory_config.histogram_capacity in
+  Mutex.unlock memory_config_mutex;
+  {
+    hist_type = `Histogram;
+    hist_data = Array.make capacity None;
+    hist_write_pos = 0;
+    hist_size = 0;
+    hist_capacity = capacity;
+  }
 
 let add_histogram_sample buffer sample =
   let was_full = buffer.hist_size >= buffer.hist_capacity in
@@ -278,8 +291,11 @@ let adjust_buffer_capacities () =
   let pressure = get_memory_pressure () in
 
   (* Only adjust capacities every 60 seconds to avoid excessive churn *)
+  Mutex.lock memory_config_mutex;
   let time_since_last = now -. memory_config.last_adjustment in
   if time_since_last >= 60.0 then begin
+    Logging.warn_f ~section:"telemetry" "Adjusting buffer capacities (pressure: %s)"
+      (match pressure with Low -> "Low" | Medium -> "Medium" | High -> "High");
     let old_rate_capacity = memory_config.rate_buffer_capacity in
     let old_histogram_capacity = memory_config.histogram_capacity in
 
@@ -296,9 +312,6 @@ let adjust_buffer_capacities () =
          memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity * 7 / 10);
          memory_config.histogram_capacity <- max 200 (memory_config.histogram_capacity * 7 / 10);
 
-         (* Trigger garbage collection when memory is high *)
-         Gc.full_major ();
-
          Logging.debug_f ~section:"telemetry" "Reduced buffer capacities due to high memory pressure: rate %d->%d, histogram %d->%d"
            old_rate_capacity memory_config.rate_buffer_capacity
            old_histogram_capacity memory_config.histogram_capacity
@@ -306,6 +319,11 @@ let adjust_buffer_capacities () =
 
     memory_config.last_adjustment <- now;
   end;
+
+  (* Get current capacities for metrics (within mutex) *)
+  let current_rate_capacity = memory_config.rate_buffer_capacity in
+  let current_histogram_capacity = memory_config.histogram_capacity in
+  Mutex.unlock memory_config_mutex;
 
   (* Always update metrics (outside throttle) *)
   let rate_capacity_metric = gauge "telemetry_rate_buffer_capacity" () in
@@ -325,8 +343,32 @@ let adjust_buffer_capacities () =
    | Medium -> set_gauge mem_med 1.0
    | High -> set_gauge mem_high 1.0);
 
-  set_gauge rate_capacity_metric (float_of_int memory_config.rate_buffer_capacity);
-  set_gauge histogram_capacity_metric (float_of_int memory_config.histogram_capacity)
+  set_gauge rate_capacity_metric (float_of_int current_rate_capacity);
+  set_gauge histogram_capacity_metric (float_of_int current_histogram_capacity)
+
+(** Start event-driven capacity adjustment loop *)
+let start_capacity_adjuster () =
+  Lwt.async (fun () ->
+    let rec adjustment_loop () =
+      (* Wait for any metric change *)
+      Lwt_condition.wait metrics_changed_condition >>= fun () ->
+
+      (* Check if 60 seconds have passed since last adjustment *)
+      let now = Unix.gettimeofday () in
+      Mutex.lock memory_config_mutex;
+      let time_since_last = now -. memory_config.last_adjustment in
+      Mutex.unlock memory_config_mutex;
+
+      if time_since_last >= 60.0 then begin
+        (* Perform adjustment *)
+        adjust_buffer_capacities ()
+      end;
+
+      (* Continue listening *)
+      adjustment_loop ()
+    in
+    adjustment_loop ()
+  )
 
 (** Histogram - track distribution of values *)
 let histogram name ?(labels=[]) () =
@@ -617,6 +659,9 @@ let () =
   ignore (gauge "uptime_seconds" ());
   ignore (counter "dashboard_views" ())
 
+(** Start capacity adjustment loop *)
+let () = start_capacity_adjuster ()
+
 (** Group metrics by category for better organization *)
 let categorize_metric metric =
   let name = metric.name in
@@ -676,10 +721,7 @@ let asset_histogram name asset = histogram name ~labels:["asset", asset] ()
 let update_system_metrics () =
   let uptime_metric = gauge "uptime_seconds" () in
   let uptime = Unix.time () -. !start_time in
-  set_gauge uptime_metric uptime;
-
-  (* Update memory pressure and buffer capacity metrics *)
-  adjust_buffer_capacities ()
+  set_gauge uptime_metric uptime
 
 (** Memory monitoring gauge metrics - created on demand *)
 let strategy_pending_orders_gauge = ref None

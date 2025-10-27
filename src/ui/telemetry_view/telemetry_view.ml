@@ -140,11 +140,21 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state =
         let mem_high_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_high") snapshot.metrics in
 
         let (pressure_text, pressure_color) =
-          match mem_high_metric, mem_med_metric, mem_low_metric with
-          | Some _, _, _ -> ("HIGH", Notty.A.(fg red ++ st bold))
-          | _, Some _, _ -> ("MED", Notty.A.(fg yellow ++ st bold))
-          | _, _, Some _ -> ("LOW", Notty.A.(fg green ++ st bold))
-          | _ -> ("UNK", Notty.A.(fg (gray 2)))
+          let get_gauge_value metric_opt =
+            match metric_opt with
+            | Some m -> (match m.Telemetry.metric_type with
+                         | Telemetry.Gauge r -> !r
+                         | _ -> 0.0)
+            | None -> 0.0
+          in
+          let high_val = get_gauge_value mem_high_metric in
+          let med_val = get_gauge_value mem_med_metric in
+          let low_val = get_gauge_value mem_low_metric in
+
+          if high_val > 0.5 then ("HIGH", Notty.A.(fg red ++ st bold))
+          else if med_val > 0.5 then ("MED", Notty.A.(fg yellow ++ st bold))
+          else if low_val > 0.5 then ("LOW", Notty.A.(fg green ++ st bold))
+          else ("UNK", Notty.A.(fg (gray 2)))
         in
         let mem_attr = Notty.A.(fg white ++ st bold) in
         let mem_label = string ~attr:mem_attr "Mem:" in
