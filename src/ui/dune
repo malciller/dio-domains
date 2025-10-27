@@ -16,5 +16,6 @@
   dio.ui.balance
   unix
   str)
+ (modules dashboard)
  (preprocess
   (pps lwt_ppx)))

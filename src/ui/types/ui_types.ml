@@ -1,6 +1,124 @@
-(** Common UI types shared across UI modules *)
+(** Common UI types and responsive utilities shared across UI modules *)
 
 open Telemetry
+
+(** Screen size classification based on terminal dimensions *)
+type screen_size =
+  | Mobile    (* < 60 cols or < 20 rows - minimal content *)
+  | Small     (* 60-80 cols or 20-30 rows - reduced content *)
+  | Medium    (* 80-120 cols or 30-40 rows - moderate content *)
+  | Large     (* 120+ cols or 40+ rows - full content *)
+
+(** Classify screen size based on width and height *)
+let classify_screen_size width height =
+  if width < 60 || height < 20 then Mobile
+  else if width < 80 || height < 30 then Small
+  else if width < 120 || height < 40 then Medium
+  else Large
+
+(** Truncate string to maximum length with ellipsis *)
+let truncate_string max_len str =
+  if String.length str <= max_len then str
+  else String.sub str 0 (max_len - 3) ^ "..."
+
+(** Get adaptive progress bar width based on screen size *)
+let adaptive_progress_bar_width = function
+  | Mobile -> 8   (* Very narrow bars for phones *)
+  | Small -> 10   (* Short bars for small screens *)
+  | Medium -> 15  (* Medium bars for tablets/laptops *)
+  | Large -> 20   (* Full width bars for large monitors *)
+
+(** Get adaptive decimal places for numeric display based on screen size *)
+let adaptive_decimal_places = function
+  | Mobile -> 2   (* Minimal precision for small screens *)
+  | Small -> 4    (* Moderate precision *)
+  | Medium -> 6   (* Good precision *)
+  | Large -> 8    (* Full precision *)
+
+(** Get adaptive column width ratios for balance display *)
+let adaptive_balance_column_widths screen_size =
+  match screen_size with
+  | Mobile -> (6, 8, 8, 0, 0)  (* Asset, Total, Current only *)
+  | Small -> (8, 10, 10, 0, 0)  (* Asset, Total, Current only *)
+  | Medium -> (8, 12, 12, 12, 12)  (* All columns but narrower *)
+  | Large -> (8, 15, 12, 15, 12)  (* Full width columns *)
+
+(** Get adaptive order column width ratios *)
+let adaptive_order_column_widths screen_size =
+  match screen_size with
+  | Mobile -> (0, 0, 0, 0, 0, 0, 0)  (* No order details, just summary *)
+  | Small -> (4, 6, 8, 0, 0, 6, 8)   (* Simplified columns *)
+  | Medium -> (6, 8, 10, 8, 10, 6, 11) (* Most columns *)
+  | Large -> (6, 10, 10, 6, 10, 6, 11) (* Full columns *)
+
+(** Calculate maximum visible entries based on available height and screen size *)
+let max_visible_entries screen_size available_height header_footer_height =
+  let base_entries = match screen_size with
+    | Mobile -> 5   (* Very limited for phones *)
+    | Small -> 8    (* Limited for small screens *)
+    | Medium -> 15  (* Moderate for tablets *)
+    | Large -> 25   (* Many for large screens *)
+  in
+  max 1 (available_height - header_footer_height - base_entries)
+
+(** Get adaptive metric limit per category based on screen size *)
+let max_metrics_per_category = function
+  | Mobile -> 5   (* Very few metrics for phones *)
+  | Small -> 10   (* Limited metrics *)
+  | Medium -> 20  (* Moderate metrics *)
+  | Large -> 50   (* Full metrics *)
+
+(** Get adaptive category limit based on screen size and available height *)
+let max_visible_categories screen_size available_height header_footer_height =
+  let base_categories = match screen_size with
+    | Mobile -> 2   (* Very few categories *)
+    | Small -> 3    (* Limited categories *)
+    | Medium -> 5   (* Moderate categories *)
+    | Large -> 8    (* Many categories *)
+  in
+  max 1 (available_height - header_footer_height - base_categories)
+
+(** Get adaptive log view height based on screen size and available space *)
+let adaptive_log_view_height screen_size available_height header_footer_height =
+  let base_height = match screen_size with
+    | Mobile -> 5   (* Very small log area *)
+    | Small -> 8    (* Small log area *)
+    | Medium -> 15  (* Moderate log area *)
+    | Large -> 30   (* Large log area *)
+  in
+  max 3 (available_height - header_footer_height - base_height)
+
+(** Check if temperature section should be shown *)
+let should_show_temperature screen_size =
+  match screen_size with
+  | Mobile -> false  (* No temperature on phones *)
+  | Small -> false   (* No temperature on small screens *)
+  | Medium -> true   (* Show temperature on tablets *)
+  | Large -> true    (* Show temperature on large screens *)
+
+(** Get adaptive timestamp format based on screen size *)
+let adaptive_timestamp_format screen_size =
+  match screen_size with
+  | Mobile -> "%M:%S"      (* Minutes:Seconds only *)
+  | Small -> "%H:%M:%S"    (* Hours:Minutes:Seconds *)
+  | Medium -> "%H:%M:%S"   (* Full timestamp *)
+  | Large -> "%Y-%m-%d %H:%M:%S"  (* Full date and time *)
+
+(** Get adaptive CPU model display width *)
+let adaptive_cpu_model_width screen_size =
+  match screen_size with
+  | Mobile -> 15   (* Very short model name *)
+  | Small -> 20    (* Short model name *)
+  | Medium -> 30   (* Medium model name *)
+  | Large -> 50    (* Full model name *)
+
+(** Check if per-core CPU display should be shown *)
+let should_show_cpu_cores screen_size =
+  match screen_size with
+  | Mobile -> false  (* No per-core display on phones *)
+  | Small -> false   (* No per-core display on small screens *)
+  | Medium -> true   (* Show cores on tablets *)
+  | Large -> true    (* Show cores on large screens *)
 
 (** Cached telemetry snapshot for UI consumption *)
 type telemetry_snapshot = {
