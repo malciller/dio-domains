@@ -28,7 +28,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   
   (* Create telemetry metrics for this asset *)
   let asset_label = asset_with_fees.exchange ^ "/" ^ asset_with_fees.symbol in
-  let cycles_counter = Telemetry.asset_counter "domain_cycles" asset_label ~track_rate:true ~rate_window:10.0 () in
+  let cycles_counter = Telemetry.asset_counter "domain_cycles" asset_label ~track_rate:true ~rate_window:30.0 () in
   let cycle_duration_hist = Telemetry.asset_histogram "domain_cycle_duration_seconds" asset_label in
   let open_buy_orders_gauge = Telemetry.asset_gauge "open_buy_orders" asset_label in
   let open_sell_orders_gauge = Telemetry.asset_gauge "open_sell_orders" asset_label in
@@ -141,6 +141,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
 
   let cycle_count = ref 0 in
   let telemetry_batch = ref 0 in
+  let cycle_sample_counter = ref 0 in
   while Atomic.get state.is_running do
     let cycle_start = Telemetry.start_timer_v2 () in
     incr cycle_count;
@@ -405,7 +406,10 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
      | None, None -> ());
 
     (* Record individual cycle duration for accurate timing analysis *)
-    let _ = Telemetry.record_duration_v2 cycle_duration_hist cycle_start in
+    (* Sample only 1 in 100 cycles to manage memory at 200k/sec rate *)
+    cycle_sample_counter := (!cycle_sample_counter + 1) mod 100;
+    if !cycle_sample_counter = 0 then
+      Telemetry.record_duration_v2 cycle_duration_hist cycle_start |> ignore;
 
     (* Batch telemetry updates every 1000 cycles to minimize overhead *)
     if !telemetry_batch >= 1000 then begin

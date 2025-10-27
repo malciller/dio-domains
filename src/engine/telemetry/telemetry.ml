@@ -53,7 +53,7 @@ type memory_config = {
 
 let memory_config = {
   rate_buffer_capacity = 200;
-  histogram_capacity = 1000;
+  histogram_capacity = 3000;
   last_adjustment = 0.0;
 }
 
@@ -303,7 +303,7 @@ let adjust_buffer_capacities () =
      | Low ->
          (* Increase capacities up to max limits *)
          memory_config.rate_buffer_capacity <- min 500 (memory_config.rate_buffer_capacity * 6 / 5);
-         memory_config.histogram_capacity <- min 5000 (memory_config.histogram_capacity * 6 / 5)
+         memory_config.histogram_capacity <- min 10000 (memory_config.histogram_capacity * 6 / 5)
      | Medium ->
          (* Keep current capacities *)
          ()
