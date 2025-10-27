@@ -42,10 +42,16 @@ let format_metric_value_ui metric =
     | Telemetry.Histogram _ ->
         let (mean, p50, p95, p99, count) = Telemetry.histogram_stats metric in  (* Safe since we're accessing from cache snapshot *)
         let color =
-          (* Color based on average runtime for all histogram metrics *)
-          if mean >= 0.0001 then Notty.A.(fg red ++ st bold)  (* >= 100µs *)
-          else if mean >= 0.00001 then Notty.A.(fg yellow ++ st bold)  (* >= 10µs *)
-          else Notty.A.(fg green ++ st bold)  (* < 10µs *)
+          (* Special coloring for domain_cycle_duration_seconds *)
+          if metric.Telemetry.name = "domain_cycle_duration_seconds" then
+            if mean >= 0.0001 then Notty.A.(fg red ++ st bold)  (* >= 100µs *)
+            else if mean >= 0.00002 then Notty.A.(fg yellow ++ st bold)  (* >= 20µs *)
+            else Notty.A.(fg green ++ st bold)  (* < 20µs *)
+          else
+            (* Color based on average runtime for all other histogram metrics *)
+            if mean >= 0.0001 then Notty.A.(fg red ++ st bold)  (* >= 100µs *)
+            else if mean >= 0.00001 then Notty.A.(fg yellow ++ st bold)  (* >= 10µs *)
+            else Notty.A.(fg green ++ st bold)  (* < 10µs *)
         in
         if count > 0 then
           (Printf.sprintf "%d samples | avg=%.1fµs p50=%.1fµs p95=%.1fµs p99=%.1fµs"
