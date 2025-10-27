@@ -655,9 +655,7 @@ let get_counter metric =
 (** Initialize basic system metrics *)
 let () =
   (* Create some initial metrics to ensure the dashboard has data *)
-  ignore (counter "system_startups" ());
-  ignore (gauge "uptime_seconds" ());
-  ignore (counter "dashboard_views" ())
+  ignore (gauge "uptime_seconds" ())
 
 (** Start capacity adjustment loop *)
 let () = start_capacity_adjuster ()
