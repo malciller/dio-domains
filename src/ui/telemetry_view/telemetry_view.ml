@@ -40,10 +40,21 @@ let format_metric_value_ui metric =
         let color = if value > 100.0 then Notty.A.(fg red ++ st bold) else if value > 10.0 then Notty.A.(fg yellow ++ st bold) else Notty.A.(fg green ++ st bold) in
         (Printf.sprintf "%.1f" value, color)
     | Telemetry.Histogram _ ->
-        let (_, p50, _, _, count) = Telemetry.histogram_stats metric in  (* Safe since we're accessing from cache snapshot *)
-        let color = if count > 1000 then Notty.A.(fg red ++ st bold) else if count > 100 then Notty.A.(fg yellow ++ st bold) else Notty.A.(fg green ++ st bold) in
+        let (mean, p50, p95, p99, count) = Telemetry.histogram_stats metric in  (* Safe since we're accessing from cache snapshot *)
+        let color =
+          (* Color based on average runtime for all histogram metrics *)
+          if mean >= 0.0001 then Notty.A.(fg red ++ st bold)  (* >= 100µs *)
+          else if mean >= 0.00001 then Notty.A.(fg yellow ++ st bold)  (* >= 10µs *)
+          else Notty.A.(fg green ++ st bold)  (* < 10µs *)
+        in
         if count > 0 then
-          (Printf.sprintf "%d samples, p50=%.1fµs" count (p50 *. 1_000_000.0), color)
+          (Printf.sprintf "%d samples | avg=%.1fµs p50=%.1fµs p95=%.1fµs p99=%.1fµs"
+             count
+             (mean *. 1_000_000.0)
+             (p50 *. 1_000_000.0)
+             (p95 *. 1_000_000.0)
+             (p99 *. 1_000_000.0),
+           color)
         else
           ("no samples", Notty.A.(fg (gray 2)))  (* Dim gray for no data *)
   with exn ->
