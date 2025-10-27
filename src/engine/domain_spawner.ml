@@ -29,7 +29,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   (* Create telemetry metrics for this asset *)
   let asset_label = asset_with_fees.exchange ^ "/" ^ asset_with_fees.symbol in
   let cycles_counter = Telemetry.asset_counter "domain_cycles" asset_label ~track_rate:true ~rate_window:30.0 () in
-  let cycle_duration_hist = Telemetry.asset_histogram "domain_cycle_duration_seconds" asset_label in
+  let cycle_duration_hist = Telemetry.asset_histogram "domain_cycle_duration_seconds" asset_label () in
   let open_buy_orders_gauge = Telemetry.asset_gauge "open_buy_orders" asset_label in
   let open_sell_orders_gauge = Telemetry.asset_gauge "open_sell_orders" asset_label in
   let execution_events_consumed_counter = Telemetry.asset_counter "execution_events_consumed" asset_label () in
