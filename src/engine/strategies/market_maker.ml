@@ -533,13 +533,17 @@ let execute_strategy
                   | None, _ -> true        (* No constraint *)
                 in
 
-                let can_place_sell = match max_exposure_opt, available_asset_balance with
-                  | Some _, Some ab ->
-                      (* For selling, ensure we have enough available asset balance and quantity meets minimum *)
-                      ab >= qty && meets_min_qty asset.symbol qty
-                  | Some _, None -> false  (* Can't check if no asset balance data *)
-                  | None, Some ab -> ab >= qty && meets_min_qty asset.symbol qty  (* Check we have enough and meets min qty *)
-                  | None, None -> false   (* No data available *)
+                let can_place_sell = match max_exposure_opt with
+                  | Some max_exp ->
+                      (* Only check if we'd violate max_exposure constraint after selling *)
+                      (match available_asset_balance with
+                       | Some ab ->
+                           let projected_exposure = (ab -. qty) *. mid_price in
+                           projected_exposure <= max_exp && meets_min_qty asset.symbol qty
+                       | None -> false)  (* Can't check without balance data *)
+                  | None ->
+                      (* No max_exposure constraint: always place sell order *)
+                      meets_min_qty asset.symbol qty
                 in
 
                 (* Try to place buy order if possible, regardless of sell order status *)
