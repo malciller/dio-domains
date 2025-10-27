@@ -355,8 +355,9 @@ let perform_memory_maintenance () =
   (* Check for memory leaks *)
   check_memory_leak ()
 
-(** Initialization guard *)
+(** Initialization guard with mutex protection *)
 let initialized = ref false
+let init_mutex = Mutex.create ()
 
 (** Get system memory information *)
 let get_memory_stats () =
@@ -758,13 +759,29 @@ let start_system_updater () =
   ) in
   ()
 
-(** Initialize the system cache *)
+(** Initialize the system cache with double-checked locking *)
 let init () =
+  (* First check without locking (fast path) *)
   if !initialized then (
     Logging.debug ~section:"system_cache" "System cache already initialized, skipping";
     ()
   ) else (
-    initialized := true;
-    start_system_updater ();
-    Logging.info ~section:"system_cache" "System cache initialized"
+    (* Acquire lock for initialization *)
+    Mutex.lock init_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock init_mutex)
+      (fun () ->
+        (* Double-check after acquiring lock *)
+        if !initialized then (
+          Logging.debug ~section:"system_cache" "System cache already initialized during lock acquisition";
+          ()
+        ) else (
+          initialized := true;
+          try
+            start_system_updater ();
+            Logging.info ~section:"system_cache" "System cache initialized"
+          with exn ->
+            Logging.error_f ~section:"system_cache" "Failed to initialize system cache: %s" (Printexc.to_string exn);
+            Logging.debug ~section:"system_cache" "System cache initialization failed"
+        )
+      )
   )

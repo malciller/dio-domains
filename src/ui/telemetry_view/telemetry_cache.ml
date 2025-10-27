@@ -37,8 +37,20 @@ let cache = {
   backoff_until = 0.0;
 }
 
-(** Initialization guard *)
+(** Initialization guard with mutex protection *)
 let initialized = ref false
+let init_mutex = Mutex.create ()
+
+(** System initialization ready barrier *)
+let system_ready = ref false
+let system_ready_condition = Lwt_condition.create ()
+
+(** Signal that system is ready for cache access *)
+let signal_system_ready () =
+  if not !system_ready then (
+    system_ready := true;
+    Lwt_condition.broadcast system_ready_condition ()
+  )
 
 (** Create a fresh telemetry snapshot *)
 let create_telemetry_snapshot () : telemetry_snapshot =
@@ -118,6 +130,15 @@ let start_telemetry_updater () =
 
   (* Start periodic polling updater *)
   Lwt.async (fun () ->
+    Logging.debug_f ~section:"telemetry_cache" "Starting telemetry polling updater";
+
+    (* Wait for system to be ready before starting polling *)
+    (if !system_ready then
+      Lwt.return_unit
+    else
+      Lwt_condition.wait system_ready_condition) >>= fun () ->
+    Logging.debug_f ~section:"telemetry_cache" "Telemetry polling updater starting after system ready";
+
     let rec polling_loop () =
       let now = Unix.time () in
       let time_since_last = now -. cache.last_update in
@@ -149,16 +170,32 @@ let start_telemetry_updater () =
         Lwt_unix.sleep 1.0 >>= polling_loop (* Poll every second *)
       )
     in
-    Lwt_unix.sleep 1.0 >>= polling_loop (* Initial delay *)
+    polling_loop () (* No initial delay once system is ready *)
   )
 
-(** Initialize the telemetry cache system *)
+(** Initialize the telemetry cache system with double-checked locking *)
 let init () =
+  (* First check without locking (fast path) *)
   if !initialized then (
     Logging.debug ~section:"telemetry_cache" "Telemetry cache already initialized, skipping";
     ()
   ) else (
-    initialized := true;
-    start_telemetry_updater ();
-    Logging.info ~section:"telemetry_cache" "Telemetry cache initialized"
+    (* Acquire lock for initialization *)
+    Mutex.lock init_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock init_mutex)
+      (fun () ->
+        (* Double-check after acquiring lock *)
+        if !initialized then (
+          Logging.debug ~section:"telemetry_cache" "Telemetry cache already initialized during lock acquisition";
+          ()
+        ) else (
+          initialized := true;
+          try
+            start_telemetry_updater ();
+            Logging.info ~section:"telemetry_cache" "Telemetry cache initialized"
+          with exn ->
+            Logging.error_f ~section:"telemetry_cache" "Failed to initialize telemetry cache: %s" (Printexc.to_string exn);
+            Logging.debug ~section:"telemetry_cache" "Telemetry cache initialization failed"
+        )
+      )
   )

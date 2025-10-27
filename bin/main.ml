@@ -78,15 +78,19 @@ let () =
     Logging.info ~section:"main" "Starting in dashboard mode...";
 
     try
-      (* Initialize trading engine and order executor in the background *)
-      Lwt.async (fun () ->
-        let _configs = init_trading_engine_sync () in
-        let%lwt () = init_order_executor_async () in
-        Lwt.return_unit
-      );
+      (* Initialize trading engine synchronously before starting dashboard *)
+      Logging.info ~section:"main" "Initializing trading engine...";
+      let _configs = init_trading_engine_sync () in
 
-      (* Run dashboard immediately *)
-      Logging.info ~section:"main" "Trading engine is initializing in the background, starting dashboard...";
+      (* Initialize order executor asynchronously - this can run in background *)
+      let _order_executor_promise = init_order_executor_async () in
+
+      (* Signal that feeds are ready for cache initialization *)
+      Dio_ui_balance.Balance_cache.signal_feeds_ready ();
+      Dio_ui_telemetry.Telemetry_cache.signal_system_ready ();
+
+      (* Now run dashboard with trading engine fully initialized *)
+      Logging.info ~section:"main" "Trading engine ready, starting dashboard...";
       Lwt_main.run (Dio_ui.Dashboard.run ());
 
       Logging.info ~section:"main" "Dashboard closed, shutting down..."

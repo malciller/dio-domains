@@ -407,7 +407,7 @@ let monitor_loop () =
   done
 
 (** Initialize all websocket feeds and connections *)
-let initialize_feeds () =
+let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.t) =
   Logging.info ~section "Initializing websocket feeds...";
 
   (* Get trading configurations *)
@@ -422,18 +422,20 @@ let initialize_feeds () =
 
   Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
 
+  (* Start initialization sequence as a promise chain *)
+
   (* Initialize data stores for websocket feeds *)
   Logging.info ~section "Step 1: Initializing ticker feed stores...";
   Kraken.Kraken_ticker_feed.initialize kraken_symbols;
 
   Logging.info ~section "Step 2: Initializing instruments feed stores...";
-  Lwt_main.run (Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols);
+  let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
 
   Logging.info ~section "Step 3: Initializing orderbook feed stores...";
-  Lwt_main.run (Kraken.Kraken_orderbook_feed.initialize kraken_symbols);
+  let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
 
   Logging.info ~section "Step 4: Getting authentication token...";
-  let auth_token = Lwt_main.run (Kraken.Kraken_generate_auth_token.get_token ()) in
+  let%lwt auth_token = Kraken.Kraken_generate_auth_token.get_token () in
   Logging.info ~section "Authentication token obtained";
 
   (* Store token globally for reuse by order executor *)
@@ -446,12 +448,12 @@ let initialize_feeds () =
                   |> List.map (fun symbol -> String.split_on_char '/' symbol |> List.hd)  (* Get base asset *)
                   |> List.sort_uniq String.compare
                   |> fun assets -> "USD" :: assets in  (* Add USD as quote currency *)
-  let _ = try
+  let () = try
     Kraken.Kraken_balances_feed.initialize all_assets;
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
-  in ();
+  in
 
   Logging.info ~section "Step 6: Initializing executions feed stores...";
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
@@ -572,7 +574,7 @@ let initialize_feeds () =
 
   (* Wait for executions data FIRST to avoid race condition *)
   Logging.info ~section "Waiting for executions feed to be ready...";
-  let executions_ready = Lwt_main.run (Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0) in
+  let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
   if not executions_ready then
     Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
   else
@@ -582,28 +584,28 @@ let initialize_feeds () =
   Logging.info ~section "Waiting for initial market data from all feeds...";
 
   (* Wait for ticker data *)
-  let ticker_ready = Lwt_main.run (Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0) in
+  let%lwt ticker_ready = Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0 in
   if not ticker_ready then
     Logging.warn ~section "Timeout waiting for ticker data, continuing anyway..."
   else
     Logging.info ~section "✓ Ticker feed ready";
 
   (* Wait for orderbook data *)
-  let orderbook_ready = Lwt_main.run (Kraken.Kraken_orderbook_feed.wait_for_orderbook_data kraken_symbols 10.0) in
+  let%lwt orderbook_ready = Kraken.Kraken_orderbook_feed.wait_for_orderbook_data kraken_symbols 10.0 in
   if not orderbook_ready then
     Logging.warn ~section "Timeout waiting for orderbook data, continuing anyway..."
   else
     Logging.info ~section "✓ Orderbook feed ready";
 
   (* Wait for executions data again *)
-  let executions_ready = Lwt_main.run (Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0) in
+  let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
   if not executions_ready then
     Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
   else
     Logging.info ~section "✓ Executions feed ready";
 
   (* Wait for balance data *)
-  let balances_ready = Lwt_main.run (Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0) in
+  let%lwt balances_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
   if not balances_ready then
     Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
   else
@@ -613,33 +615,36 @@ let initialize_feeds () =
 
   (* Fetch fees for all assets *)
   Logging.info ~section "Step 8: Fetching trading fees for all assets...";
-  let configs_with_fees = configs |> List.map (fun asset ->
+
+  (* Convert fee fetching to promise-based operations *)
+  let%lwt configs_with_fees = Lwt_list.map_p (fun asset ->
     try
       if asset.Dio_engine.Config.exchange = "kraken" then begin
         Logging.debug_f ~section "Fetching fees for %s..." asset.Dio_engine.Config.symbol;
-        match Lwt_main.run (Kraken.Kraken_get_fee.get_fee_info asset.Dio_engine.Config.symbol) with
+        let%lwt fee_info_opt = Kraken.Kraken_get_fee.get_fee_info asset.Dio_engine.Config.symbol in
+        match fee_info_opt with
         | Some fee_info ->
             Logging.debug_f ~section "Retrieved fees for %s: maker=%.4f%% taker=%.4f%%"
               asset.Dio_engine.Config.symbol
               (Option.value fee_info.Kraken.Kraken_get_fee.maker_fee ~default:0. *. 100.)
               (Option.value fee_info.Kraken.Kraken_get_fee.taker_fee ~default:0. *. 100.);
-            { asset with
+            Lwt.return { asset with
               Dio_engine.Config.maker_fee = fee_info.Kraken.Kraken_get_fee.maker_fee;
               Dio_engine.Config.taker_fee = fee_info.Kraken.Kraken_get_fee.taker_fee }
         | None ->
             Logging.warn_f ~section "Failed to fetch fees for %s, using defaults" asset.Dio_engine.Config.symbol;
-            asset
+            Lwt.return asset
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s" asset.Dio_engine.Config.exchange;
-        asset
+        Lwt.return asset
       end
     with exn ->
       Logging.warn_f ~section "Exception during fee fetching for %s: %s, using defaults"
         asset.Dio_engine.Config.symbol (Printexc.to_string exn);
-      asset
-  ) in
+      Lwt.return asset
+  ) configs in
 
-  (configs_with_fees, auth_token)
+  Lwt.return (configs_with_fees, auth_token)
 
 (** Order processing loop - consumes orders from strategy ring buffers *)
 let order_processing_loop () =
@@ -1238,7 +1243,8 @@ let start_monitoring () =
   let _order_thread = Thread.create order_processing_loop () in
 
   (* Initialize all feeds and get configs with fees and token *)
-  let (configs_with_fees, _auth_token) = initialize_feeds () in
+  (* Use Lwt_main.run here to handle the promise from initialize_feeds *)
+  let (configs_with_fees, _auth_token) = Lwt_main.run (initialize_feeds ()) in
 
   configs_with_fees
 
