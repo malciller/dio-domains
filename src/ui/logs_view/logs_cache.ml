@@ -92,8 +92,12 @@ let add_log_entry level section message =
   cache.next_id <- id + 1;
   let entry = { id; timestamp; level; section; message; color } in
   if Queue.length pending_logs_queue >= max_pending_logs then (
-    ignore (Queue.take pending_logs_queue);
-    cache.dropped_logs <- cache.dropped_logs + 1;
+    try
+      ignore (Queue.take pending_logs_queue);
+      cache.dropped_logs <- cache.dropped_logs + 1;
+    with Queue.Empty ->
+      (* Queue was unexpectedly empty, just continue *)
+      ()
   );
   Queue.push entry pending_logs_queue;
   Mutex.unlock pending_logs_mutex;
@@ -186,7 +190,13 @@ let start_logs_updater () =
       Mutex.lock pending_logs_mutex;
       let batch_size = 200 in
       let count = min batch_size (Queue.length pending_logs_queue) in
-      let entries_to_process = if count > 0 then List.init count (fun _ -> Queue.take pending_logs_queue) else [] in
+      let entries_to_process =
+        if count > 0 then
+          List.init count (fun _ ->
+            try Some (Queue.take pending_logs_queue)
+            with Queue.Empty -> None
+          ) |> List.filter_map Fun.id
+        else [] in
       Mutex.unlock pending_logs_mutex;
 
       if entries_to_process <> [] then (

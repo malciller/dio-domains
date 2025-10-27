@@ -29,7 +29,7 @@ type supervised_connection = {
   mutable last_disconnected: float option;
   mutable last_data_received: float option;  (* For heartbeat monitoring *)
   mutable last_ping_sent: float option;  (* For ping/pong monitoring *)
-  mutable ping_failures: int;  (* Consecutive ping failures *)
+  ping_failures: int Atomic.t;  (* Consecutive ping failures *)
   mutable reconnect_attempts: int;
   mutable total_connections: int;
   mutable circuit_breaker: circuit_breaker_state;
@@ -42,6 +42,9 @@ type supervised_connection = {
 (** Registry of supervised connections *)
 let connections : (string, supervised_connection) Hashtbl.t = Hashtbl.create 16
 let registry_mutex = Mutex.create ()
+
+(** Shutdown flag for graceful termination *)
+let shutdown_requested = Atomic.make false
 
 (** Global authentication token for reuse across modules *)
 module Token_store = struct
@@ -64,7 +67,7 @@ let register ~name ~connect_fn =
     last_disconnected = Some (Unix.time ());  (* Set to now to prevent immediate auto-restart *)
     last_data_received = None;
     last_ping_sent = None;
-    ping_failures = 0;
+    ping_failures = Atomic.make 0;
     reconnect_attempts = 0;
     total_connections = 0;
     circuit_breaker = Closed;
@@ -88,7 +91,7 @@ let register_for_monitoring ~name =
     last_disconnected = None;
     last_data_received = Some (Unix.time ());  (* Assume data was recently received *)
     last_ping_sent = None;
-    ping_failures = 0;
+    ping_failures = Atomic.make 0;
     reconnect_attempts = 0;
     total_connections = 1;
     circuit_breaker = Closed;
@@ -113,7 +116,7 @@ let set_state conn new_state =
       conn.last_connected <- Some (Unix.time ());
       conn.last_data_received <- Some (Unix.time ());  (* Reset data heartbeat on connect *)
       conn.last_ping_sent <- None;  (* Reset ping tracking on connect *)
-      conn.ping_failures <- 0;  (* Reset ping failures on connect *)
+      Atomic.set conn.ping_failures 0;  (* Reset ping failures on connect *)
       conn.reconnect_attempts <- 0;
       conn.total_connections <- conn.total_connections + 1;
       Telemetry.set_gauge (Telemetry.gauge "connection_state" ~labels:[("name", conn.name)] ()) (1.0);
@@ -358,34 +361,32 @@ let monitor_loop () =
                     Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
                     if response.success then begin
                       Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
-                      conn.ping_failures <- 0;  (* Reset failure count on success *)
+                      Atomic.set conn.ping_failures 0;  (* Reset failure count on success *)
                       update_data_heartbeat conn;  (* Update heartbeat since we got a response *)
                       Lwt.return_unit
                     end else begin
                       Logging.warn_f ~section "[%s] Ping failed: %s" conn.name
                         (match response.error with Some e -> e | None -> "unknown error");
-                      conn.ping_failures <- conn.ping_failures + 1;
-                      (* If ping fails 3 times in a row, consider connection unhealthy *)
-                      if conn.ping_failures >= 3 then begin
-                        Logging.error_f ~section "[%s] Ping failed %d times, marking connection as failed"
-                          conn.name conn.ping_failures;
-                        set_state conn (Failed "ping timeout");
-                      end;
+                      Atomic.incr conn.ping_failures;
+                      (* Note: State transition will be handled by main monitor loop *)
                       Lwt.return_unit
                     end
                   )
                   (fun exn ->
                     Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
-                    conn.ping_failures <- conn.ping_failures + 1;
-                    (* If ping fails 3 times in a row, consider connection unhealthy *)
-                    if conn.ping_failures >= 3 then begin
-                      Logging.error_f ~section "[%s] Ping failed %d times, marking connection as failed"
-                        conn.name conn.ping_failures;
-                      set_state conn (Failed "ping exception");
-                    end;
+                    Atomic.incr conn.ping_failures;
+                    (* Note: State transition will be handled by main monitor loop *)
                     Lwt.return_unit
                   )
               )
+            end;
+
+            (* Check for ping failures - done here to avoid mutex deadlock in async callback *)
+            let ping_failures = Atomic.get conn.ping_failures in
+            if ping_failures >= 3 then begin
+              Logging.error_f ~section "[%s] Ping failed %d times, marking connection as failed"
+                conn.name ping_failures;
+              set_state conn (Failed "ping timeout");
             end
           end else begin
             (* For non-trading connections, monitor data heartbeat *)
@@ -399,58 +400,7 @@ let monitor_loop () =
       | _ -> ()
     ) conn_list;
     
-    (* Update telemetry metrics for all connections every 30 seconds (every 3rd check) *)
-    if !cycle_count mod 3 = 0 then begin
-      List.iter (fun conn ->
-        Mutex.lock conn.mutex;
-
-        (* Update uptime gauge *)
-        let uptime = match conn.last_connected, conn.state with
-          | Some t, Connected -> Unix.time () -. t
-          | _ -> 0.0
-        in
-        Telemetry.set_gauge (Telemetry.gauge "connection_uptime_seconds" ~labels:[("name", conn.name)] ()) uptime;
-
-        (* Update heartbeat status (1.0 = active, 0.0 = inactive) *)
-        let heartbeat_active = match conn.state with
-          | Connected -> 1.0
-          | _ -> 0.0
-        in
-        Telemetry.set_gauge (Telemetry.gauge "connection_heartbeat_active" ~labels:[("name", conn.name)] ()) heartbeat_active;
-
-        (* Update circuit breaker state (0.0 = closed, 1.0 = open, 0.5 = half-open) *)
-        let cb_state = match conn.circuit_breaker with
-          | Closed -> 0.0
-          | Open -> 1.0
-          | HalfOpen -> 0.5
-        in
-        Telemetry.set_gauge (Telemetry.gauge "circuit_breaker_state" ~labels:[("name", conn.name)] ()) cb_state;
-
-        (* Update circuit breaker failure count *)
-        Telemetry.set_gauge (Telemetry.gauge "circuit_breaker_failures" ~labels:[("name", conn.name)] ()) (float_of_int conn.circuit_breaker_failures);
-
-        (* Update reconnect attempts *)
-        Telemetry.set_gauge (Telemetry.gauge "connection_reconnect_attempts" ~labels:[("name", conn.name)] ()) (float_of_int conn.reconnect_attempts);
-
-        (* Update total connections *)
-        Telemetry.set_gauge (Telemetry.gauge "connection_total_count" ~labels:[("name", conn.name)] ()) (float_of_int conn.total_connections);
-
-        Mutex.unlock conn.mutex
-      ) conn_list;
-    end;
-
-      (* Report full telemetry metrics every minute (every 6th check) for testing *)
-      if !cycle_count mod 6 = 0 then begin
-        Telemetry.report_metrics ()
-      end;
-
-      (* Periodic event bus cleanup and monitoring (every 30 seconds, every 3rd check) *)
-      if !cycle_count mod 3 = 0 then begin
-        (* Clean up stale subscribers in telemetry event buses *)
-        (* Note: Event buses are created by various modules, so we rely on their periodic cleanup *)
-        (* Add monitoring for any known event buses here if needed *)
-        ()
-      end
+    (* Telemetry updates are handled by supervisor_cache event-driven updates *)
     with exn ->
       Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);
       Logging.error_f ~section "Monitor loop continuing after exception..."
@@ -698,10 +648,17 @@ let order_processing_loop () =
   let orders_placed = ref 0 in
   let order_mutex = Mutex.create () in
 
-  while true do
+  while not (Atomic.get shutdown_requested) do
     Thread.delay 1.0;  (* Process orders every second *)
     incr cycle_count;
 
+    (* Check if trading WebSocket is connected *)
+    if not (Kraken.Kraken_trading_client.is_connected ()) then begin
+      Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
+      (* Clear any pending orders to avoid stale amendments *)
+      ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);
+      ignore (Dio_strategies.Market_maker.Strategy.get_pending_orders 1000)
+    end else begin
     try
       (* Get pending orders from suicide grid strategy *)
       let pending_grid_orders = Dio_strategies.Suicide_grid.Strategy.get_pending_orders 100 in
@@ -1266,6 +1223,7 @@ let order_processing_loop () =
 
     with exn ->
       Logging.error_f ~section "Exception in order processing loop: %s" (Printexc.to_string exn);
+    end;
 
   done
 
@@ -1315,8 +1273,15 @@ let get_all_connections () =
   Mutex.unlock registry_mutex;
   conns
 
+(** Stop order processing loop *)
+let stop_order_processing () =
+  Atomic.set shutdown_requested true;
+  Logging.info ~section "Order processing loop shutdown requested"
+
 (** Stop all connections *)
 let stop_all () =
+  stop_order_processing ();
+  Thread.delay 0.5;  (* Give order processing thread time to finish current iteration *)
   Logging.warn ~section "Stopping all supervised connections";
   Mutex.lock registry_mutex;
   Hashtbl.iter (fun _name conn ->

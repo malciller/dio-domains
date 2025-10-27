@@ -231,7 +231,11 @@ let get_symbol_store symbol =
 let notify_ready store =
   if not (Atomic.get store.ready) then begin
     Atomic.set store.ready true;
-    Lwt_condition.broadcast ready_condition ()
+    (try
+      Lwt_condition.broadcast ready_condition ()
+    with Invalid_argument _ ->
+      (* Ignore - some waiters may have timed out or been cancelled *)
+      ())
   end
 
 (** Check if we have execution data for a symbol *)

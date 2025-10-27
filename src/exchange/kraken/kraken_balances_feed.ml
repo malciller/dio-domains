@@ -145,7 +145,11 @@ let get_all_assets () =
 
 (** Notify listeners that balance data is available *)
 let notify_ready () =
-  Lwt_condition.broadcast ready_condition ()
+  (try
+    Lwt_condition.broadcast ready_condition ()
+  with Invalid_argument _ ->
+    (* Ignore - some waiters may have timed out or been cancelled *)
+    ())
 
 (** Wait until balance data is available for assets *)
 let wait_for_balance_data_lwt assets timeout_seconds =

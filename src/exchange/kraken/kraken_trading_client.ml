@@ -140,7 +140,11 @@ let resolve_response req_id response =
     Lwt.return wakener_opt
   ) >>= function
   | Some wak ->
-      Lwt.return (Lwt.wakeup_later wak response)
+      (try
+        Lwt.wakeup_later wak response
+      with Invalid_argument _ ->
+        Logging.warn_f ~section "Attempted to wake already-resolved promise for req_id=%d" req_id);
+      Lwt.return_unit
   | None ->
       Logging.debug ~section (Printf.sprintf "No waiter found for req_id=%d" req_id);
       Lwt.return_unit
@@ -153,7 +157,12 @@ let fail_all_pending reason =
       Lwt.return wakers
     )
   in
-  pending >|= List.iter (fun wak -> Lwt.wakeup_later_exn wak (Failure reason))
+  pending >|= List.iter (fun wak ->
+    try
+      Lwt.wakeup_later_exn wak (Failure reason)
+    with Invalid_argument _ ->
+      Logging.debug ~section "Attempted to wake already-resolved promise during fail_all_pending"
+  )
 
 let reset_state conn ~notify_failure reason =
   Lwt_mutex.with_lock state.mutex (fun () ->
@@ -177,7 +186,12 @@ let reset_state conn ~notify_failure reason =
   if not should_reset then Lwt.return_unit
   else
     Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
-    List.iter (fun wak -> Lwt.wakeup_later_exn wak (Failure reason)) pending;
+    List.iter (fun wak ->
+      try
+        Lwt.wakeup_later_exn wak (Failure reason)
+      with Invalid_argument _ ->
+        Logging.debug ~section "Attempted to wake already-resolved promise during reset_state"
+    ) pending;
     notify_connection (`Disconnected reason);
     (match failure_cb with Some f -> f reason | None -> ());
     Lwt.return_unit
