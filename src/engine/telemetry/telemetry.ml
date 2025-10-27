@@ -53,7 +53,7 @@ type memory_config = {
 
 let memory_config = {
   rate_buffer_capacity = 200;
-  histogram_capacity = 3000;
+  histogram_capacity = 15000;
   last_adjustment = 0.0;
 }
 
@@ -303,14 +303,15 @@ let adjust_buffer_capacities () =
      | Low ->
          (* Increase capacities up to max limits *)
          memory_config.rate_buffer_capacity <- min 500 (memory_config.rate_buffer_capacity * 6 / 5);
-         memory_config.histogram_capacity <- min 10000 (memory_config.histogram_capacity * 6 / 5)
+         memory_config.histogram_capacity <- min 30000 (memory_config.histogram_capacity * 6 / 5)
      | Medium ->
          (* Keep current capacities *)
          ()
      | High ->
-         (* Decrease capacities with minimum limits *)
+         (* Decrease capacities with minimum limits - ensure enough samples for smooth metrics *)
+         (* At 2k samples/sec (1/100 sampling), 10000 samples = ~5s, 15000 samples = ~7.5s *)
          memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity * 7 / 10);
-         memory_config.histogram_capacity <- max 200 (memory_config.histogram_capacity * 7 / 10);
+         memory_config.histogram_capacity <- max 10000 (memory_config.histogram_capacity * 7 / 10);
 
          Logging.debug_f ~section:"telemetry" "Reduced buffer capacities due to high memory pressure: rate %d->%d, histogram %d->%d"
            old_rate_capacity memory_config.rate_buffer_capacity
@@ -713,7 +714,7 @@ let asset_counter name asset ?(track_rate=false) ?(rate_window=10.0) () = counte
 let asset_sliding_counter name asset ?(window_size=10000) ?(track_rate=false) ?(rate_window=10.0) () =
   sliding_counter name ~labels:["asset", asset] ~window_size ~track_rate ~rate_window ()
 let asset_gauge name asset = gauge name ~labels:["asset", asset] ()
-let asset_histogram name asset = histogram name ~labels:["asset", asset] ()
+let asset_histogram name asset () = histogram name ~labels:["asset", asset] ()
 
 (** Update system metrics *)
 let update_system_metrics () =
