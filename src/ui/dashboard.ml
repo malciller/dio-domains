@@ -409,6 +409,21 @@ let make_dashboard () =
 
   (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var)
 
+(** Verify that all required caches are initialized *)
+let verify_cache_initialization () =
+  let telemetry_initialized = try Dio_ui_telemetry.Telemetry_cache.init (); true with _ -> false in
+  let system_initialized = try Dio_ui_system.System_cache.init (); true with _ -> false in
+  let balance_initialized = try Dio_ui_balance.Balance_cache.init (); true with _ -> false in
+
+  if not telemetry_initialized then
+    Logging.warn ~section:"dashboard" "Telemetry cache initialization failed";
+  if not system_initialized then
+    Logging.warn ~section:"dashboard" "System cache initialization failed";
+  if not balance_initialized then
+    Logging.warn ~section:"dashboard" "Balance cache initialization failed";
+
+  telemetry_initialized && system_initialized && balance_initialized
+
 (** Initialize and run the dashboard *)
 let run () : unit Lwt.t =
   Logging.info ~section:"dashboard" "Starting Dio Dashboard...";
@@ -420,6 +435,11 @@ let run () : unit Lwt.t =
     (* Don't re-raise in dashboard mode to prevent crashes *)
     Logging.error_f ~section:"dashboard" "Async exception caught: %s" (Printexc.to_string exn)
   );
+
+  (* Verify that all caches are initialized before proceeding *)
+  let caches_ready = verify_cache_initialization () in
+  if not caches_ready then
+    Logging.warn ~section:"dashboard" "Some caches failed to initialize, dashboard may not function correctly";
 
   (* Create dashboard and reactive variables first *)
   let (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var) = make_dashboard () in
@@ -441,50 +461,66 @@ let run () : unit Lwt.t =
       )
   in
 
-  (* Subscribe to event streams for real-time updates *)
+  (* Subscribe to event streams for real-time updates with defensive checks *)
   let _telemetry_sub = Lwt.async (fun () ->
-    let stream = Dio_ui_telemetry.Telemetry_cache.subscribe_telemetry_snapshot () in
-    Lwt_stream.iter (fun snapshot ->
-      Logging.debug_f ~section:"dashboard" "Received telemetry snapshot update at %.3f" (Unix.time ());
-      if not !telemetry_loaded then (
-        telemetry_loaded := true;
-        check_all_loaded ()
-      );
-      Lwd.set telemetry_snapshot_var snapshot
-    ) stream
+    try
+      let stream = Dio_ui_telemetry.Telemetry_cache.subscribe_telemetry_snapshot () in
+      Lwt_stream.iter (fun snapshot ->
+        Logging.debug_f ~section:"dashboard" "Received telemetry snapshot update at %.3f" (Unix.time ());
+        if not !telemetry_loaded then (
+          telemetry_loaded := true;
+          check_all_loaded ()
+        );
+        Lwd.set telemetry_snapshot_var snapshot
+      ) stream
+    with exn ->
+      Logging.error_f ~section:"dashboard" "Failed to subscribe to telemetry updates: %s" (Printexc.to_string exn);
+      Lwt.return_unit
   ) in
 
   let _system_stats_sub = Lwt.async (fun () ->
-    let stream = Dio_ui_system.System_cache.subscribe_system_stats () in
-    Lwt_stream.iter (fun stats ->
-      if not !system_loaded then (
-        system_loaded := true;
-        check_all_loaded ()
-      );
-      Lwd.set system_stats_var stats
-    ) stream
+    try
+      let stream = Dio_ui_system.System_cache.subscribe_system_stats () in
+      Lwt_stream.iter (fun stats ->
+        if not !system_loaded then (
+          system_loaded := true;
+          check_all_loaded ()
+        );
+        Lwd.set system_stats_var stats
+      ) stream
+    with exn ->
+      Logging.error_f ~section:"dashboard" "Failed to subscribe to system stats updates: %s" (Printexc.to_string exn);
+      Lwt.return_unit
   ) in
 
   let _balance_sub = Lwt.async (fun () ->
-    let stream = Dio_ui_balance.Balance_cache.subscribe_balance_snapshot () in
-    let update_counter = ref 0 in
-    Lwt_stream.iter (fun snapshot ->
-      (* Only consider balances loaded when we have actual balance data, not just empty snapshots *)
-      if not !balance_loaded && snapshot.balances <> [] then (
-        balance_loaded := true;
-        check_all_loaded ()
-      );
-      incr update_counter;
-      Lwd.set balance_snapshot_var (snapshot, !update_counter)
-    ) stream
+    try
+      let stream = Dio_ui_balance.Balance_cache.subscribe_balance_snapshot () in
+      let update_counter = ref 0 in
+      Lwt_stream.iter (fun snapshot ->
+        (* Only consider balances loaded when we have actual balance data, not just empty snapshots *)
+        if not !balance_loaded && snapshot.balances <> [] then (
+          balance_loaded := true;
+          check_all_loaded ()
+        );
+        incr update_counter;
+        Lwd.set balance_snapshot_var (snapshot, !update_counter)
+      ) stream
+    with exn ->
+      Logging.error_f ~section:"dashboard" "Failed to subscribe to balance updates: %s" (Printexc.to_string exn);
+      Lwt.return_unit
   ) in
 
   (* Initialize subsystems in the background to not block the UI *)
   Lwt.async (fun () ->
-    Dio_ui_telemetry.Telemetry_cache.init ();
-    Dio_ui_system.System_cache.init ();
-    Dio_ui_balance.Balance_cache.init ();
-    Lwt.return_unit
+    try
+      Dio_ui_telemetry.Telemetry_cache.init ();
+      Dio_ui_system.System_cache.init ();
+      Dio_ui_balance.Balance_cache.init ();
+      Lwt.return_unit
+    with exn ->
+      Logging.error_f ~section:"dashboard" "Failed to initialize subsystems: %s" (Printexc.to_string exn);
+      Lwt.return_unit
   );
 
   (* Wait asynchronously for cache initialization to complete *)

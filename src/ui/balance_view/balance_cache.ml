@@ -71,8 +71,20 @@ let cache = {
   backoff_until = 0.0;
 }
 
-(** Initialization guard *)
+(** Initialization guard with mutex protection *)
 let initialized = ref false
+let init_mutex = Mutex.create ()
+
+(** Kraken feeds ready barrier *)
+let kraken_feeds_ready = ref false
+let kraken_feeds_condition = Lwt_condition.create ()
+
+(** Signal that Kraken feeds are ready for cache access *)
+let signal_feeds_ready () =
+  if not !kraken_feeds_ready then (
+    kraken_feeds_ready := true;
+    Lwt_condition.broadcast kraken_feeds_condition ()
+  )
 
 (** Subscribe to balance snapshot updates *)
 let subscribe_balance_snapshot () = BalanceSnapshotEventBus.subscribe cache.balance_snapshot_event_bus
@@ -234,9 +246,14 @@ let start_balance_updater () =
   (* Start periodic balance updater - mirrors telemetry polling pattern *)
   let _polling_updater = Lwt.async (fun () ->
     Logging.debug_f ~section:"balance_cache" "Starting balance polling updater";
-    (* Wait a bit before starting polling to let Kraken feeds initialize *)
-    Lwt_unix.sleep 1.0 >>= fun () ->
-    Logging.debug_f ~section:"balance_cache" "Balance polling updater starting after initial delay";
+
+    (* Wait for Kraken feeds to be ready before starting polling *)
+    (if !kraken_feeds_ready then
+      Lwt.return_unit
+    else
+      Lwt_condition.wait kraken_feeds_condition) >>= fun () ->
+    Logging.debug_f ~section:"balance_cache" "Balance polling updater starting after feeds ready";
+
     let rec polling_loop () =
       Logging.debug_f ~section:"balance_cache" "Balance polling loop iteration";
       let now = Unix.time () in
@@ -286,19 +303,30 @@ let start_balance_updater () =
   (* Balance cache updates itself periodically - no external triggers needed *)
   ()
 
-(** Initialize the balance cache system - mirrors telemetry cache pattern *)
+(** Initialize the balance cache system with double-checked locking *)
 let init () =
+  (* First check without locking (fast path) *)
   if !initialized then (
     Logging.debug ~section:"balance_cache" "Balance cache already initialized, skipping";
     ()
   ) else (
-    Logging.debug_f ~section:"balance_cache" "Initializing balance cache";
-    initialized := true;
-    (try
-      start_balance_updater ();
-      Logging.debug_f ~section:"balance_cache" "Balance cache initialized successfully"
-    with exn ->
-      Logging.error_f ~section:"balance_cache" "Failed to initialize balance cache: %s" (Printexc.to_string exn);
-      Logging.debug_f ~section:"balance_cache" "Balance cache initialization failed - using empty cache"
-    )
+    (* Acquire lock for initialization *)
+    Mutex.lock init_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock init_mutex)
+      (fun () ->
+        (* Double-check after acquiring lock *)
+        if !initialized then (
+          Logging.debug ~section:"balance_cache" "Balance cache already initialized during lock acquisition";
+          ()
+        ) else (
+          Logging.debug_f ~section:"balance_cache" "Initializing balance cache";
+          initialized := true;
+          try
+            start_balance_updater ();
+            Logging.debug_f ~section:"balance_cache" "Balance cache initialized successfully"
+          with exn ->
+            Logging.error_f ~section:"balance_cache" "Failed to initialize balance cache: %s" (Printexc.to_string exn);
+            Logging.debug_f ~section:"balance_cache" "Balance cache initialization failed - using empty cache"
+        )
+      )
   )
