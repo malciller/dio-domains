@@ -23,6 +23,10 @@ type cache_entry = {
 let fee_cache : (string * string, cache_entry) Hashtbl.t = Hashtbl.create 32
 let cache_mutex = Mutex.create ()
 
+(** In-flight fetches: (exchange, symbol) -> unit promise *)
+let in_flight : (string * string, unit Lwt.t) Hashtbl.t = Hashtbl.create 32
+let in_flight_mutex = Mutex.create ()
+
 (** Default TTL for cache entries (10 minutes) *)
 let default_ttl = 600.0
 
@@ -57,28 +61,67 @@ let store_fee ~exchange ~symbol ~fee ~ttl_seconds =
   Mutex.unlock cache_mutex;
   Logging.debug_f ~section "Cached fee for %s/%s: %.6f (TTL: %.0fs)" exchange symbol fee ttl_seconds
 
-(** Async refresh of fee for a symbol *)
+(** Async refresh of fee for a symbol - with in-flight guard *)
 let refresh_async symbol =
-  Lwt.async (fun () ->
-    Lwt.catch (fun () ->
-      Kraken_get_fee.get_fee_info symbol >>= fun fee_opt ->
-      (match fee_opt with
-       | Some { maker_fee = Some maker_fee; exchange; _ } ->
-           store_fee ~exchange ~symbol ~fee:maker_fee ~ttl_seconds:default_ttl;
-           Logging.debug_f ~section "Refreshed fee for %s: %.6f" symbol maker_fee;
-           Lwt.return_unit
-       | Some { exchange; _ } ->
-           Logging.debug_f ~section "No maker fee available for %s/%s" exchange symbol;
-           Lwt.return_unit
-       | None ->
-           Logging.debug_f ~section "Failed to fetch fee for %s" symbol;
-           Lwt.return_unit
-      )
-    ) (fun exn ->
-      Logging.warn_f ~section "Error refreshing fee for %s: %s" symbol (Printexc.to_string exn);
-      Lwt.return_unit
-    )
-  )
+  (* Check if we have a valid cached entry first *)
+  Mutex.lock cache_mutex;
+  let has_valid_entry =
+    match Hashtbl.find_opt fee_cache ("kraken", symbol) with
+    | Some entry when is_valid entry -> true
+    | _ -> false
+  in
+  Mutex.unlock cache_mutex;
+
+  if has_valid_entry then
+    Lwt.return_unit  (* Already have valid cached fee *)
+  else begin
+    (* Check if fetch is already in-flight *)
+    Mutex.lock in_flight_mutex;
+    let existing_promise = Hashtbl.find_opt in_flight ("kraken", symbol) in
+    let promise = match existing_promise with
+      | Some p -> p  (* Reuse existing in-flight fetch *)
+      | None ->
+          (* Start new fetch *)
+          let p = Lwt.catch (fun () ->
+            Kraken_get_fee.get_fee_info symbol >>= fun fee_opt ->
+            (match fee_opt with
+             | Some { maker_fee = Some maker_fee; exchange; _ } ->
+                 store_fee ~exchange ~symbol ~fee:maker_fee ~ttl_seconds:default_ttl;
+                 Logging.info_f ~section "Fetched and cached maker fee for %s: %.6f" symbol maker_fee;
+                 Lwt.return_unit
+             | Some { exchange; _ } ->
+                 Logging.debug_f ~section "No maker fee available for %s/%s" exchange symbol;
+                 Lwt.return_unit
+             | None ->
+                 Logging.debug_f ~section "Failed to fetch fee for %s" symbol;
+                 Lwt.return_unit
+            )
+          ) (fun exn ->
+            Logging.warn_f ~section "Error fetching fee for %s: %s" symbol (Printexc.to_string exn);
+            Lwt.return_unit
+          ) in
+          Hashtbl.replace in_flight ("kraken", symbol) p;
+          p
+    in
+    Mutex.unlock in_flight_mutex;
+
+    (* Clean up in-flight table when promise completes *)
+    Lwt.on_any promise
+      (fun () ->
+         Mutex.lock in_flight_mutex;
+         Hashtbl.remove in_flight ("kraken", symbol);
+         Mutex.unlock in_flight_mutex)
+      (fun _ ->
+         Mutex.lock in_flight_mutex;
+         Hashtbl.remove in_flight ("kraken", symbol);
+         Mutex.unlock in_flight_mutex);
+
+    promise
+  end
+
+(** Refresh fee only if not already cached (for startup use) *)
+let refresh_if_missing symbol =
+  ignore (Lwt.async (fun () -> refresh_async symbol))
 
 (** Initialize cache - called once at startup *)
 let init () =
@@ -87,7 +130,7 @@ let init () =
 (** Prime cache with initial symbols - optional pre-population *)
 let prime symbols =
   List.iter (fun symbol ->
-    refresh_async symbol;
+    ignore (Lwt.async (fun () -> refresh_async symbol));
     Logging.debug_f ~section "Priming fee cache for %s" symbol
   ) symbols
 

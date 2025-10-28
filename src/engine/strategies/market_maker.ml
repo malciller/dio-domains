@@ -351,9 +351,6 @@ let execute_strategy
           | None -> get_fee_for_asset asset
         in
 
-        (* Trigger async fee refresh if not recently done *)
-        Fee_cache.refresh_async asset.symbol;
-
         (* Calculate current spread and exposure *)
         let spread = ask -. bid in
         let mid_price = (bid +. ask) /. 2.0 in

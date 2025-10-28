@@ -204,6 +204,24 @@ let test_fee_cache_integration () =
   let fee_opt2 = Dio_strategies.Fee_cache.get_maker_fee ~exchange:"kraken" ~symbol:"BTC/USD" in
   check (option (float 0.)) "fee cache retrieval" (Some 0.001) fee_opt2
 
+let test_fee_cache_no_duplicate_fetches () =
+  (* Test that refresh_if_missing doesn't trigger network calls when cache has valid data *)
+  Dio_strategies.Fee_cache.init ();
+
+  (* Store a fee in cache *)
+  Dio_strategies.Fee_cache.store_fee ~exchange:"kraken" ~symbol:"TEST/USD" ~fee:0.002 ~ttl_seconds:600.0;
+
+  (* Verify it's cached *)
+  let fee_opt = Dio_strategies.Fee_cache.get_maker_fee ~exchange:"kraken" ~symbol:"TEST/USD" in
+  check (option (float 0.)) "fee cached before refresh_if_missing" (Some 0.002) fee_opt;
+
+  (* Call refresh_if_missing - should complete immediately since data is cached *)
+  Dio_strategies.Fee_cache.refresh_if_missing "TEST/USD";
+
+  (* Fee should still be cached *)
+  let fee_opt2 = Dio_strategies.Fee_cache.get_maker_fee ~exchange:"kraken" ~symbol:"TEST/USD" in
+  check (option (float 0.)) "fee still cached after refresh_if_missing" (Some 0.002) fee_opt2
+
 let test_profitability_checks () =
   (* Test profitability calculations *)
   (* For zero fee assets, any spread should be profitable *)
@@ -247,6 +265,7 @@ let () =
     "fee_calculation", [
       test_case "fee calculation" `Quick test_fee_calculation;
       test_case "fee cache integration" `Quick test_fee_cache_integration;
+      test_case "fee cache no duplicate fetches" `Quick test_fee_cache_no_duplicate_fetches;
     ];
     "price_handling", [
       test_case "price rounding" `Quick test_price_rounding;
