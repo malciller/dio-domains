@@ -655,8 +655,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             Dio_strategies.Fee_cache.store_fees 
               ~exchange:asset.Dio_engine.Config.exchange 
               ~symbol:asset.Dio_engine.Config.symbol 
-              ~maker_fee:0.0016 
-              ~taker_fee:0.0026 
+              ~maker_fee:0.0025 
+              ~taker_fee:0.0040 
               ~ttl_seconds:600.0;
             Lwt.return { asset with
               Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
@@ -973,15 +973,41 @@ let order_processing_loop () =
                             Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
                             Telemetry.inc_counter (Telemetry.counter "orders_cancelled" ()) ~value:count ();
 
+                            (* Clean up pending cancellation tracking *)
+                            (match order.strategy with
+                             | "Grid" ->
+                                 Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | "MM" ->
+                                 Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | _ -> ());
+
                             (* For cancellations, we don't notify the strategy about acknowledgements *)
                             Lwt.return_unit
                         | Error err ->
                             Logging.error_f ~section "✗ Order cancellation failed: %s - %s" target_order_id err;
                             Telemetry.inc_counter Telemetry.Common.orders_failed ();
+
+                            (* Clean up pending cancellation tracking on failure *)
+                            (match order.strategy with
+                             | "Grid" ->
+                                 Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | "MM" ->
+                                 Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | _ -> ());
+
                             Lwt.return_unit
                       ) (fun exn ->
                         Logging.error_f ~section "✗ Exception cancelling order %s: %s" target_order_id (Printexc.to_string exn);
                         Telemetry.inc_counter Telemetry.Common.orders_failed ();
+
+                        (* Clean up pending cancellation tracking on exception *)
+                        (match order.strategy with
+                         | "Grid" ->
+                             Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                         | "MM" ->
+                             Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                         | _ -> ());
+
                         Lwt.return_unit
                       )
                     )
@@ -1247,15 +1273,41 @@ let order_processing_loop () =
                             Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
                             Telemetry.inc_counter (Telemetry.counter "orders_cancelled" ()) ~value:count ();
 
+                            (* Clean up pending cancellation tracking *)
+                            (match order.strategy with
+                             | "Grid" ->
+                                 Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | "MM" ->
+                                 Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | _ -> ());
+
                             (* For cancellations, we don't notify the strategy about acknowledgements *)
                             Lwt.return_unit
                         | Error err ->
                             Logging.error_f ~section "✗ Order cancellation failed: %s - %s" target_order_id err;
                             Telemetry.inc_counter Telemetry.Common.orders_failed ();
+
+                            (* Clean up pending cancellation tracking on failure *)
+                            (match order.strategy with
+                             | "Grid" ->
+                                 Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | "MM" ->
+                                 Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                             | _ -> ());
+
                             Lwt.return_unit
                       ) (fun exn ->
                         Logging.error_f ~section "✗ Exception cancelling order %s: %s" target_order_id (Printexc.to_string exn);
                         Telemetry.inc_counter Telemetry.Common.orders_failed ();
+
+                        (* Clean up pending cancellation tracking on exception *)
+                        (match order.strategy with
+                         | "Grid" ->
+                             Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                         | "MM" ->
+                             Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                         | _ -> ());
+
                         Lwt.return_unit
                       )
                     )

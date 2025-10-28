@@ -49,6 +49,7 @@ type strategy_state = {
   mutable last_cycle: int;
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
+  mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
 }
 
 (** Global strategy state store *)
@@ -70,6 +71,7 @@ let get_strategy_state asset_symbol =
           last_cycle = 0;
           last_order_time = 0.0;
           cancelled_orders = [];
+          pending_cancellations = Hashtbl.create 16;
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
         new_state
@@ -187,61 +189,102 @@ let push_order order =
     | Cancel -> "cancel"
   in
 
-  Mutex.lock order_buffer_mutex;
-  let write_result = OrderRingBuffer.write order_buffer order in
-  Mutex.unlock order_buffer_mutex;
+  (* Check for duplicate cancellations before pushing *)
+  (match order.operation with
+   | Cancel ->
+       let state = get_strategy_state order.symbol in
+       (match order.order_id with
+        | Some target_order_id ->
+            if Hashtbl.mem state.pending_cancellations target_order_id then begin
+              Logging.debug_f ~section "Skipping duplicate cancellation for order %s (already pending)" target_order_id;
+              (* Return early without pushing - duplicate cancellation *)
+              ()
+            end else begin
+              (* Not a duplicate, proceed with pushing *)
+              Mutex.lock order_buffer_mutex;
+              let write_result = OrderRingBuffer.write order_buffer order in
+              Mutex.unlock order_buffer_mutex;
 
-  match write_result with
-  | Some () ->
-      Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
-        operation_str
-        (string_of_order_side order.side)
-        order.symbol
-        order.qty
-        (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
-      Telemetry.inc_counter (Telemetry.counter "strategy_orders_generated" ()) ();
+              match write_result with
+              | Some () ->
+                  Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
+                    operation_str
+                    (string_of_order_side order.side)
+                    order.symbol
+                    order.qty
+                    (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+                  Telemetry.inc_counter (Telemetry.counter "strategy_orders_generated" ()) ();
 
-      (* Update strategy state *)
-      let state = get_strategy_state order.symbol in
-      state.last_order_time <- Unix.time ();
+                  (* Update strategy state *)
+                  state.last_order_time <- Unix.time ();
+                  (* Add to pending cancellations tracking *)
+                  Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
+                  Logging.debug_f ~section "Cancelling order for %s (target: %s)"
+                    order.symbol target_order_id
+              | None ->
+                  Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
+                    operation_str (string_of_order_side order.side) order.symbol;
+                  Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
+            end
+        | None ->
+            Logging.warn_f ~section "Cancel operation missing order_id for %s" order.symbol;
+            (* Return early without pushing *)
+            ())
+   | _ ->
+       (* For Place and Amend operations, proceed normally *)
+       Mutex.lock order_buffer_mutex;
+       let write_result = OrderRingBuffer.write order_buffer order in
+       Mutex.unlock order_buffer_mutex;
 
-      (* Handle different operations *)
-      (match order.operation with
-       | Place ->
-           (* Track order as pending - generate temporary ID until we get the real one from exchange *)
-           let temp_order_id = Printf.sprintf "pending_%s_%.2f" 
-             (string_of_order_side order.side) 
-             (Option.value order.price ~default:0.0) in
-           let order_price = Option.value order.price ~default:0.0 in
-           state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
-           Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
-             (string_of_order_side order.side) temp_order_id order_price order.symbol;
+       match write_result with
+       | Some () ->
+           Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
+             operation_str
+             (string_of_order_side order.side)
+             order.symbol
+             order.qty
+             (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+           Telemetry.inc_counter (Telemetry.counter "strategy_orders_generated" ()) ();
 
-           (* Track sell orders in state for grid logic *)
-           (match order.side, order.price with
-            | Sell, Some price ->
-                (* Add sell order to tracking list - use temporary ID for now *)
-                let order_id = temp_order_id in
-                state.open_sell_orders <- (order_id, price) :: state.open_sell_orders;
-                Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" order_id price order.symbol
-            | _ -> ())
-       | Amend ->
-           (* For amendments, track as pending but don't add to sell orders yet *)
-           let temp_order_id = Printf.sprintf "pending_amend_%s" 
-             (Option.value order.order_id ~default:"unknown") in
-           let order_price = Option.value order.price ~default:0.0 in
-           state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
-           Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
-             (string_of_order_side order.side) temp_order_id order_price order.symbol
-             (Option.value order.order_id ~default:"unknown")
-       | Cancel ->
-           (* For cancellations, do NOT track as pending - cancellations should not block new order placement *)
-           Logging.debug_f ~section "Cancelling order for %s (target: %s)"
-             order.symbol (Option.value order.order_id ~default:"unknown"))
-  | None ->
-      Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
-        operation_str (string_of_order_side order.side) order.symbol;
-      Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
+           (* Update strategy state *)
+           let state = get_strategy_state order.symbol in
+           state.last_order_time <- Unix.time ();
+
+           (* Handle different operations *)
+           (match order.operation with
+            | Place ->
+                (* Track order as pending - generate temporary ID until we get the real one from exchange *)
+                let temp_order_id = Printf.sprintf "pending_%s_%.2f"
+                  (string_of_order_side order.side)
+                  (Option.value order.price ~default:0.0) in
+                let order_price = Option.value order.price ~default:0.0 in
+                state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
+                Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
+                  (string_of_order_side order.side) temp_order_id order_price order.symbol;
+
+                (* Track sell orders in state for grid logic *)
+                (match order.side, order.price with
+                 | Sell, Some price ->
+                     (* Add sell order to tracking list - use temporary ID for now *)
+                     let order_id = temp_order_id in
+                     state.open_sell_orders <- (order_id, price) :: state.open_sell_orders;
+                     Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" order_id price order.symbol
+                 | _ -> ())
+            | Amend ->
+                (* For amendments, track as pending but don't add to sell orders yet *)
+                let temp_order_id = Printf.sprintf "pending_amend_%s"
+                  (Option.value order.order_id ~default:"unknown") in
+                let order_price = Option.value order.price ~default:0.0 in
+                state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
+                Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
+                  (string_of_order_side order.side) temp_order_id order_price order.symbol
+                  (Option.value order.order_id ~default:"unknown")
+            | Cancel -> (* Already handled above *)
+                ())
+       | None ->
+           Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
+             operation_str (string_of_order_side order.side) order.symbol;
+           Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ())
 
 (** Main strategy execution function *)
 let execute_strategy
@@ -287,6 +330,21 @@ let execute_strategy
         state.cancelled_orders <- take 20 state.cancelled_orders;  (* Keep most recent 20 *)
         Logging.warn_f ~section "Truncated %d excess cancelled orders for %s (kept 20)" excess asset.symbol;
       end;
+
+      (* Clean up old pending cancellations (older than 30 seconds) *)
+      let pending_cancellations = Hashtbl.fold (fun order_id timestamp acc ->
+        if now -. timestamp > 30.0 then begin
+          Logging.debug_f ~section "Removing stale pending cancellation %s for %s (age: %.1fs)" order_id asset.symbol (now -. timestamp);
+          acc
+        end else
+          (order_id, timestamp) :: acc
+      ) state.pending_cancellations [] in
+
+      (* Clear and repopulate the hashtable with only non-stale entries *)
+      Hashtbl.clear state.pending_cancellations;
+      List.iter (fun (order_id, timestamp) ->
+        Hashtbl.add state.pending_cancellations order_id timestamp
+      ) pending_cancellations;
 
       (* Update with real orders from exchange - open_orders is (order_id, price, qty, side, userref) list *)
       (* Filter out recently cancelled orders to avoid race condition *)
@@ -698,6 +756,11 @@ let handle_order_cancelled asset_symbol order_id =
   Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
     order_id asset_symbol removed_pending removed_sell
 
+(** Clean up pending cancellation tracking for a completed order *)
+let cleanup_pending_cancellation asset_symbol order_id =
+  let state = get_strategy_state asset_symbol in
+  Hashtbl.remove state.pending_cancellations order_id
+
 (** Get pending orders from ringbuffer for processing *)
 let get_pending_orders max_orders =
   Mutex.lock order_buffer_mutex;
@@ -730,5 +793,6 @@ module Strategy = struct
   let handle_order_acknowledged = handle_order_acknowledged
   let handle_order_rejected = handle_order_rejected
   let handle_order_cancelled = handle_order_cancelled
+  let cleanup_pending_cancellation = cleanup_pending_cancellation
   let init = init
 end
