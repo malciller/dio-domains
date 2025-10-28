@@ -14,6 +14,7 @@ let log_interval = 1000000
 (** Use common types from Strategy_common module *)
 open Strategy_common
 
+
 (** Utility function to take first n elements from a list *)
 let rec take n = function
   | [] -> []
@@ -246,6 +247,25 @@ let push_order order =
         operation_str (string_of_order_side order.side) order.symbol;
       Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
 
+(** Cancel any existing orders at the same price level (duplicate guard) *)
+let cancel_duplicate_orders asset_symbol target_price target_side open_orders strategy =
+  let duplicates = List.filter (fun (order_id, order_price, qty, side_str, _) ->
+    let is_cancelled = List.exists (fun (cancelled_id, _) ->
+      cancelled_id = order_id) (get_strategy_state asset_symbol).cancelled_orders in
+    not is_cancelled && qty > 0.0 &&
+    side_str = (if target_side = Buy then "buy" else "sell") &&
+    abs_float (order_price -. target_price) < 0.000001  (* Exact price match *)
+  ) open_orders in
+
+  List.iter (fun (order_id, _, _, _, _) ->
+    let cancel_order = create_cancel_order order_id asset_symbol strategy in
+    push_order cancel_order;
+    Logging.debug_f ~section "Cancelling duplicate order %s for %s at price %.8f"
+      order_id asset_symbol target_price
+  ) duplicates;
+
+  List.length duplicates
+
 (** Main strategy execution function *)
 let execute_strategy
     (asset : trading_config)
@@ -258,22 +278,17 @@ let execute_strategy
     (open_orders : (string * float * float * string * int option) list)  (* order_id, price, remaining_qty, side, userref *)
     (cycle : int) =
 
-  (* Only execute strategy periodically to avoid excessive order generation *)
-  if cycle mod 10 <> 0 then () else begin
-
   (* Only log every x iterations to reduce log volume *)
   let should_log = cycle mod log_interval = 0 in
 
   let state = get_strategy_state asset.symbol in
 
-  (* Throttle order placement - wait at least 2 seconds between orders *)
   let now = Unix.time () in
-  if now -. state.last_order_time < 2.0 then () else begin
 
   (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
   let original_count = List.length state.pending_orders in
-  state.pending_orders <- List.filter (fun (order_id, _, _) ->
-    let age = now -. state.last_order_time in
+  state.pending_orders <- List.filter (fun (order_id, _, timestamp) ->
+    let age = now -. timestamp in
     if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
       if should_log then Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
       false
@@ -293,10 +308,6 @@ let execute_strategy
   if cleaned_count > 0 && should_log then
     Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_count asset.symbol;
 
-  (* Update memory monitoring metrics *)
-  Telemetry.set_strategy_pending_orders_count (List.length state.pending_orders);
-  Telemetry.set_strategy_cancelled_orders_count (List.length state.cancelled_orders);
-
   (* Clean up old cancelled orders from blacklist (older than 15 seconds) and enforce hard limit *)
   let original_cancelled_count = List.length state.cancelled_orders in
   state.cancelled_orders <- List.filter (fun (_, timestamp) ->
@@ -315,12 +326,6 @@ let execute_strategy
   if cleaned_cancelled_count > 0 && should_log then
     Logging.debug_f ~section "Cleaned up %d cancelled orders for %s" cleaned_cancelled_count asset.symbol;
 
-  if state.pending_orders <> [] then begin
-    (* Wait for pending orders before placing new ones *)
-    if should_log then Logging.debug_f ~section "Waiting for %d pending orders before placing new orders for %s"
-      (List.length state.pending_orders) asset.symbol;
-    state.last_cycle <- cycle
-  end else begin
 
   match current_price, top_of_book with
   | Some price, Some (bid, _bid_size, ask, _ask_size) ->
@@ -340,8 +345,14 @@ let execute_strategy
           | None -> None
         in
 
-        (* Get fee for the asset from config *)
-        let fee = get_fee_for_asset asset in
+        (* Get fee for the asset - prefer cache, fallback to config *)
+        let fee = match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
+          | Some cached_fee -> cached_fee
+          | None -> get_fee_for_asset asset
+        in
+
+        (* Trigger async fee refresh if not recently done *)
+        Fee_cache.refresh_async asset.symbol;
 
         (* Calculate current spread and exposure *)
         let spread = ask -. bid in
@@ -535,25 +546,29 @@ let execute_strategy
 
                 let can_place_sell = meets_min_qty asset.symbol qty in
 
-                (* Try to place buy order if possible, regardless of sell order status *)
-                if can_place_buy then begin
-                  let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true "MM" in
-                  push_order buy_order;
+                (* Place SELL order first, then BUY order *)
+                if can_place_sell then begin
+                  let sell_price = round_price ask asset.symbol in
+                  (* Cancel any duplicates at the same price level first *)
+                  let _ = cancel_duplicate_orders asset.symbol sell_price Sell open_orders "MM" in
+                  let sell_order = create_place_order asset.symbol Sell qty (Some sell_price) true "MM" in
+                  push_order sell_order;
 
-                  (* Place sell order only if it meets all criteria *)
-                  if can_place_sell then begin
-                    let sell_price = round_price ask asset.symbol in
-                    let sell_order = create_place_order asset.symbol Sell qty (Some sell_price) true "MM" in
-                    push_order sell_order;
+                  (* Place buy order only if it meets all criteria *)
+                  if can_place_buy then begin
+                    (* Cancel any duplicates at the same price level first *)
+                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy open_orders "MM" in
+                    let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true "MM" in
+                    push_order buy_order;
 
                     if should_log then Logging.info_f ~section "Placed order pair for %s: buy %.8f @ %.2f, sell %.8f @ %.2f (fee=%.6f)"
                       asset.symbol qty buy_price qty sell_price fee;
                   end else begin
-                    if should_log then Logging.info_f ~section "Placed buy-only for %s: buy %.8f @ %.2f (sell qty below minimum)"
-                      asset.symbol qty buy_price;
+                    if should_log then Logging.info_f ~section "Placed sell-only for %s: sell %.8f @ %.2f (buy balance constraints failed)"
+                      asset.symbol qty sell_price;
                   end
                 end else begin
-                  if should_log then Logging.debug_f ~section "Did not place buy order for %s: balance constraints failed"
+                  if should_log then Logging.debug_f ~section "Did not place sell order for %s: qty below minimum"
                     asset.symbol;
                 end
               end else begin
@@ -571,11 +586,16 @@ let execute_strategy
             match state.last_buy_order_price, state.last_buy_order_id with
             | Some current_buy_price, Some buy_order_id ->
                 (* Re-calculate required buy price as in "0 open buys" *)
-                let required_buy_price_raw = if fee = 0.0 then bid else ask -. (fee *. 2.0 +. 0.0001) in
+                (* Use same fee logic as above *)
+                let amendment_fee = match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
+                  | Some cached_fee -> cached_fee
+                  | None -> fee  (* Use the fee already calculated above *)
+                in
+                let required_buy_price_raw = if amendment_fee = 0.0 then bid else ask -. (amendment_fee *. 2.0 +. 0.0001) in
                 let required_buy_price = round_price required_buy_price_raw asset.symbol in
 
                 if should_log then Logging.debug_f ~section "Checking buy order for %s: current=%.8f, required=%.8f, bid=%.8f, ask=%.8f, fee=%.6f"
-                  asset.symbol current_buy_price required_buy_price bid ask fee;
+                  asset.symbol current_buy_price required_buy_price bid ask amendment_fee;
 
                 (* Check if price matches required level *)
                 let price_diff = abs_float (required_buy_price -. current_buy_price) in
@@ -588,8 +608,8 @@ let execute_strategy
                   (* Mismatched: Amend buy to the required price *)
                   (* Profitability and Post-Only checks *)
                   (* For zero-fee assets, any spread is profitable, so skip profitability check *)
-                  let profitability_ok = if fee = 0.0 then true else begin
-                    let required_spread = fee *. 2.0 +. 0.0001 in
+                  let profitability_ok = if amendment_fee = 0.0 then true else begin
+                    let required_spread = amendment_fee *. 2.0 +. 0.0001 in
                     let calculated_spread = ask -. required_buy_price in
                     calculated_spread >= required_spread
                   end in
@@ -604,9 +624,11 @@ let execute_strategy
                   in
 
                   if should_log then Logging.debug_f ~section "Amendment checks for %s: profit_ok=%B, post_only_ok=%B, balance_ok=%B, price=%.8f, fee=%.6f"
-                    asset.symbol profitability_ok (required_buy_price <= bid) amendment_balance_ok required_buy_price fee;
+                    asset.symbol profitability_ok (required_buy_price <= bid) amendment_balance_ok required_buy_price amendment_fee;
 
                   if profitability_ok && required_buy_price <= bid && amendment_balance_ok then begin
+                    (* Cancel any duplicates at the new price level first *)
+                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy open_orders "MM" in
                     let amend_order = create_amend_order buy_order_id asset.symbol Buy qty (Some required_buy_price) true "MM" in
                     push_order amend_order;
                     state.last_buy_order_price <- Some required_buy_price;
@@ -634,9 +656,6 @@ let execute_strategy
         (* Update cycle counter *)
         state.last_cycle <- cycle
       end
-    end
-  end
-end
 
 (** Handle order placement success - update pending order status *)
 let handle_order_acknowledged asset_symbol order_id side price =
@@ -723,6 +742,7 @@ let get_pending_orders max_orders =
 (** Initialize strategy module *)
 let init () =
   Logging.info_f ~section "Market Maker strategy initialized with order buffer size 4096";
+  Fee_cache.init ();
   Random.self_init ()
 
 (** Strategy module interface *)

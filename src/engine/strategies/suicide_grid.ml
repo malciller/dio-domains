@@ -404,10 +404,6 @@ let execute_strategy
     if cleaned_pending > 0 && cycle mod 100000 = 0 then
       Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_pending asset.symbol;
 
-    (* Update memory monitoring metrics *)
-    Telemetry.set_strategy_pending_orders_count (List.length state.pending_orders);
-    Telemetry.set_strategy_cancelled_orders_count (List.length state.cancelled_orders);
-
     if state.pending_orders <> [] then begin
         (* Only log every 100,000 iterations to avoid spam *)
         if cycle mod 100000 = 0 then begin

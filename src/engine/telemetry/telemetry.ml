@@ -723,8 +723,6 @@ let update_system_metrics () =
   set_gauge uptime_metric uptime
 
 (** Memory monitoring gauge metrics - created on demand *)
-let strategy_pending_orders_gauge = ref None
-let strategy_cancelled_orders_gauge = ref None
 let logs_dropped_gauge = ref None
 let event_bus_subscribers_total_gauge = ref None
 let event_bus_subscribers_active_gauge = ref None
@@ -732,26 +730,6 @@ let telemetry_rate_buffers_gauge = ref None
 let telemetry_histogram_buffers_gauge = ref None
 
 (** Helper functions to update memory monitoring metrics *)
-let set_strategy_pending_orders_count count =
-  let metric = match !strategy_pending_orders_gauge with
-    | Some m -> m
-    | None ->
-        let m = gauge "strategy_pending_orders_total" () in
-        strategy_pending_orders_gauge := Some m;
-        m
-  in
-  set_gauge metric (float_of_int count)
-
-let set_strategy_cancelled_orders_count count =
-  let metric = match !strategy_cancelled_orders_gauge with
-    | Some m -> m
-    | None ->
-        let m = gauge "strategy_cancelled_orders_total" () in
-        strategy_cancelled_orders_gauge := Some m;
-        m
-  in
-  set_gauge metric (float_of_int count)
-
 let set_logs_dropped_count count =
   let metric = match !logs_dropped_gauge with
     | Some m -> m
