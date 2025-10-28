@@ -140,6 +140,12 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
     asset_with_fees.exchange asset_with_fees.symbol asset_with_fees.strategy;
 
+  (* Fetch maker fee once at startup if needed *)
+  if asset_with_fees.exchange = "kraken" then begin
+    Dio_strategies.Fee_cache.refresh_if_missing asset_with_fees.symbol;
+    Logging.debug_f ~section "Triggered maker fee fetch for %s at domain startup" asset_with_fees.symbol
+  end;
+
   let key = domain_key asset_with_fees in
   let state = Hashtbl.find domain_registry key in
 
