@@ -133,7 +133,7 @@ let format_balance_total total_current_value total_accumulated_value =
   let accumulated_value_attr = if total_accumulated_value >= 0.0 then Notty.A.(fg green ++ st bold) else Notty.A.(fg red ++ st bold) in
   let accumulated_value_part = string ~attr:accumulated_value_attr (Printf.sprintf "%12s" accumulated_value_str) in
 
-  hcat [asset_part; total_balance_part; current_value_part; accumulated_balance_part; accumulated_value_part]
+  hcat [asset_part; string ~attr:Notty.A.empty " "; total_balance_part; string ~attr:Notty.A.empty " "; current_value_part; string ~attr:Notty.A.empty " "; accumulated_balance_part; string ~attr:Notty.A.empty " "; accumulated_value_part]
 
 (** Format a balance entry for display with USD values and accumulated amounts *)
 let format_balance_entry entry pending_amounts =
@@ -179,7 +179,7 @@ let format_balance_entry entry pending_amounts =
   let accumulated_balance_part = string ~attr:accumulated_balance_attr (Printf.sprintf "%15s" accumulated_balance_str) in
   let accumulated_value_part = string ~attr:accumulated_value_attr (Printf.sprintf "%12s" accumulated_value_str) in
 
-  hcat [asset_part; total_balance_part; current_value_part; accumulated_balance_part; accumulated_value_part]
+  hcat [asset_part; string ~attr:Notty.A.empty " "; total_balance_part; string ~attr:Notty.A.empty " "; current_value_part; string ~attr:Notty.A.empty " "; accumulated_balance_part; string ~attr:Notty.A.empty " "; accumulated_value_part]
 
 (** Format an open order entry for display *)
 let format_open_order_entry entry =
@@ -256,7 +256,7 @@ let format_aggregated_orders_entry (symbol, buy_count, sell_count, buy_cost, sel
   let taker_fee_attr = Notty.A.(fg white) in
   let taker_fee_part = string ~attr:taker_fee_attr (Printf.sprintf "%7s" taker_fee_str) in
 
-  hcat [symbol_part; buy_count_part; buy_cost_part; sell_count_part; sell_value_part; total_count_part; total_gain_part; maker_fee_part; taker_fee_part]
+  hcat [symbol_part; string ~attr:Notty.A.empty " "; maker_fee_part; string ~attr:Notty.A.empty " "; taker_fee_part; string ~attr:Notty.A.empty " "; buy_count_part; string ~attr:Notty.A.empty " "; buy_cost_part; string ~attr:Notty.A.empty " "; sell_count_part; string ~attr:Notty.A.empty " "; sell_value_part; string ~attr:Notty.A.empty " "; total_count_part; string ~attr:Notty.A.empty " "; total_gain_part]
 
 (** Aggregate open orders by symbol with counts and financial values *)
 let aggregate_orders_by_symbol orders =
@@ -331,7 +331,7 @@ let balances_view balance_snapshot _state =
   let total_row = format_balance_total total_current_value total_accumulated_value in
 
   (* Add separator line before total *)
-  let separator = string ~attr:Notty.A.(fg (gray 2)) (String.make 70 '-') in  (* Dim gray for gridlines *)
+  let separator = string ~attr:Notty.A.(fg (gray 2)) (String.make 66 '-') in  (* Dim gray for gridlines *)
 
   let balances_list = if balance_entries = [] then
     empty
@@ -346,7 +346,7 @@ let balances_view balance_snapshot _state =
   (* Open orders section *)
   let orders_title = string ~attr:Notty.A.(st bold ++ fg white) "\n\nOpen Orders:" in
   let orders_header = string ~attr:Notty.A.(fg white)
-    (Printf.sprintf "\n%-12s %6s %10s %6s %10s %6s %11s %7s %7s" "Pair" "Buy" "Buy Cost" "Sell" "Sell Gain" "Total" "Total Gain" "Maker%" "Taker%") in
+    (Printf.sprintf "\n%-12s %7s %7s %6s %10s %6s %10s %6s %11s" "Pair" "Maker%" "Taker%" "Buy" "Buy Cost" "Sell" "Sell Gain" "Total" "Total Gain") in
 
   let aggregated_orders = aggregate_orders_by_symbol balance_snapshot.open_orders in
   let order_entries = List.map (fun (symbol, (buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt)) ->
@@ -389,13 +389,13 @@ let balances_view balance_snapshot _state =
     let maker_fee_part = string ~attr:Notty.A.(fg white ++ st bold) (Printf.sprintf "%7s" "-") in
     let taker_fee_part = string ~attr:Notty.A.(fg white ++ st bold) (Printf.sprintf "%7s" "-") in
 
-    hcat [symbol_part; buy_count_part; buy_cost_part; sell_count_part; sell_value_part; total_count_part; total_gain_part; maker_fee_part; taker_fee_part]
+    hcat [symbol_part; string ~attr:Notty.A.empty " "; maker_fee_part; string ~attr:Notty.A.empty " "; taker_fee_part; string ~attr:Notty.A.empty " "; buy_count_part; string ~attr:Notty.A.empty " "; buy_cost_part; string ~attr:Notty.A.empty " "; sell_count_part; string ~attr:Notty.A.empty " "; sell_value_part; string ~attr:Notty.A.empty " "; total_count_part; string ~attr:Notty.A.empty " "; total_gain_part]
   in
 
   let orders_total_row = format_orders_total total_buy_count total_sell_count total_buy_cost total_sell_value total_orders_gain in
 
   (* Add separator and total row to orders list *)
-  let orders_separator = string ~attr:Notty.A.(fg (gray 2)) (String.make 67 '-') in
+  let orders_separator = string ~attr:Notty.A.(fg (gray 2)) (String.make 73 '-') in
   let orders_list = if order_entries = [] then
     empty
   else
