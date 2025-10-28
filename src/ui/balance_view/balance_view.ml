@@ -213,7 +213,7 @@ let format_open_order_entry entry =
   hcat [side_part; symbol_part; qty_part; price_part; status_part]
 
 (** Format aggregated open orders entry for display *)
-let format_aggregated_orders_entry (symbol, buy_count, sell_count, buy_cost, sell_value, total_gain) =
+let format_aggregated_orders_entry (symbol, buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt) =
   let symbol_attr = Notty.A.(fg white ++ st bold) in  (* Primary text for symbols *)
   let symbol_part = string ~attr:symbol_attr (Printf.sprintf "%-12s" symbol) in
 
@@ -242,7 +242,21 @@ let format_aggregated_orders_entry (symbol, buy_count, sell_count, buy_cost, sel
   let total_gain_attr = if total_gain >= 0.0 then Notty.A.(fg green ++ st bold) else Notty.A.(fg red ++ st bold) in
   let total_gain_part = string ~attr:total_gain_attr (Printf.sprintf "%11.2f" total_gain) in
 
-  hcat [symbol_part; buy_count_part; buy_cost_part; sell_count_part; sell_value_part; total_count_part; total_gain_part]
+  (* Maker Fee - display as percentage or "-" if not available *)
+  let maker_fee_str = match maker_fee_opt with
+    | Some fee -> Printf.sprintf "%.2f" (fee *. 100.0)
+    | None -> "-" in
+  let maker_fee_attr = Notty.A.(fg white) in
+  let maker_fee_part = string ~attr:maker_fee_attr (Printf.sprintf "%7s" maker_fee_str) in
+
+  (* Taker Fee - display as percentage or "-" if not available *)
+  let taker_fee_str = match taker_fee_opt with
+    | Some fee -> Printf.sprintf "%.2f" (fee *. 100.0)
+    | None -> "-" in
+  let taker_fee_attr = Notty.A.(fg white) in
+  let taker_fee_part = string ~attr:taker_fee_attr (Printf.sprintf "%7s" taker_fee_str) in
+
+  hcat [symbol_part; buy_count_part; buy_cost_part; sell_count_part; sell_value_part; total_count_part; total_gain_part; maker_fee_part; taker_fee_part]
 
 (** Aggregate open orders by symbol with counts and financial values *)
 let aggregate_orders_by_symbol orders =
@@ -250,8 +264,12 @@ let aggregate_orders_by_symbol orders =
     | [] -> acc
     | order :: rest ->
         let symbol = order.symbol in
-        let current = try List.assoc symbol acc with Not_found -> (0, 0, 0.0, 0.0, 0.0) in
-        let (buy_count, sell_count, buy_cost, sell_value, total_gain) = current in
+        let current = try List.assoc symbol acc with Not_found -> (0, 0, 0.0, 0.0, 0.0, None, None) in
+        let (buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt) = current in
+
+        (* Extract fees from the first order encountered for this symbol *)
+        let maker_fee_opt = match maker_fee_opt with Some _ -> maker_fee_opt | None -> order.maker_fee in
+        let taker_fee_opt = match taker_fee_opt with Some _ -> taker_fee_opt | None -> order.taker_fee in
 
         (* Get price for calculation - use limit price if available, otherwise market price *)
         let price = match order.limit_price with
@@ -264,9 +282,9 @@ let aggregate_orders_by_symbol orders =
 
         let value = order.remaining_qty *. price in
         let new_aggregates = match order.side with
-          | "buy" -> (buy_count + 1, sell_count, buy_cost +. value, sell_value, total_gain -. value)
-          | "sell" -> (buy_count, sell_count + 1, buy_cost, sell_value +. value, total_gain +. value)
-          | _ -> current
+          | "buy" -> (buy_count + 1, sell_count, buy_cost +. value, sell_value, total_gain -. value, maker_fee_opt, taker_fee_opt)
+          | "sell" -> (buy_count, sell_count + 1, buy_cost, sell_value +. value, total_gain +. value, maker_fee_opt, taker_fee_opt)
+          | _ -> (buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt)
         in
         let new_acc = (symbol, new_aggregates) :: List.remove_assoc symbol acc in
         aggregate_orders new_acc rest
@@ -328,19 +346,19 @@ let balances_view balance_snapshot _state =
   (* Open orders section *)
   let orders_title = string ~attr:Notty.A.(st bold ++ fg white) "\n\nOpen Orders:" in
   let orders_header = string ~attr:Notty.A.(fg white)
-    (Printf.sprintf "\n%-12s %6s %10s %6s %10s %6s %11s" "Pair" "Buy" "Buy Cost" "Sell" "Sell Gain" "Total" "Total Gain") in
+    (Printf.sprintf "\n%-12s %6s %10s %6s %10s %6s %11s %7s %7s" "Pair" "Buy" "Buy Cost" "Sell" "Sell Gain" "Total" "Total Gain" "Maker%" "Taker%") in
 
   let aggregated_orders = aggregate_orders_by_symbol balance_snapshot.open_orders in
-  let order_entries = List.map (fun (symbol, (buy_count, sell_count, buy_cost, sell_value, total_gain)) ->
-    format_aggregated_orders_entry (symbol, buy_count, sell_count, buy_cost, sell_value, total_gain)
+  let order_entries = List.map (fun (symbol, (buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt)) ->
+    format_aggregated_orders_entry (symbol, buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt)
   ) aggregated_orders in
 
   (* Calculate totals for open orders *)
-  let total_buy_count = List.fold_left (fun acc (_, (buy_count, _, _, _, _)) -> acc + buy_count) 0 aggregated_orders in
-  let total_sell_count = List.fold_left (fun acc (_, (_, sell_count, _, _, _)) -> acc + sell_count) 0 aggregated_orders in
-  let total_buy_cost = List.fold_left (fun acc (_, (_, _, buy_cost, _, _)) -> acc +. buy_cost) 0.0 aggregated_orders in
-  let total_sell_value = List.fold_left (fun acc (_, (_, _, _, sell_value, _)) -> acc +. sell_value) 0.0 aggregated_orders in
-  let total_orders_gain = List.fold_left (fun acc (_, (_, _, _, _, total_gain)) -> acc +. total_gain) 0.0 aggregated_orders in
+  let total_buy_count = List.fold_left (fun acc (_, (buy_count, _, _, _, _, _, _)) -> acc + buy_count) 0 aggregated_orders in
+  let total_sell_count = List.fold_left (fun acc (_, (_, sell_count, _, _, _, _, _)) -> acc + sell_count) 0 aggregated_orders in
+  let total_buy_cost = List.fold_left (fun acc (_, (_, _, buy_cost, _, _, _, _)) -> acc +. buy_cost) 0.0 aggregated_orders in
+  let total_sell_value = List.fold_left (fun acc (_, (_, _, _, sell_value, _, _, _)) -> acc +. sell_value) 0.0 aggregated_orders in
+  let total_orders_gain = List.fold_left (fun acc (_, (_, _, _, _, total_gain, _, _)) -> acc +. total_gain) 0.0 aggregated_orders in
 
   (* Format totals row for open orders *)
   let format_orders_total total_buy_count total_sell_count total_buy_cost total_sell_value total_orders_gain =
@@ -367,7 +385,11 @@ let balances_view balance_snapshot _state =
     let total_gain_attr = if total_orders_gain >= 0.0 then Notty.A.(fg green ++ st bold) else Notty.A.(fg red ++ st bold) in
     let total_gain_part = string ~attr:total_gain_attr (Printf.sprintf "%11.2f" total_orders_gain) in
 
-    hcat [symbol_part; buy_count_part; buy_cost_part; sell_count_part; sell_value_part; total_count_part; total_gain_part]
+    (* Fees don't aggregate - show "-" for totals *)
+    let maker_fee_part = string ~attr:Notty.A.(fg white ++ st bold) (Printf.sprintf "%7s" "-") in
+    let taker_fee_part = string ~attr:Notty.A.(fg white ++ st bold) (Printf.sprintf "%7s" "-") in
+
+    hcat [symbol_part; buy_count_part; buy_cost_part; sell_count_part; sell_value_part; total_count_part; total_gain_part; maker_fee_part; taker_fee_part]
   in
 
   let orders_total_row = format_orders_total total_buy_count total_sell_count total_buy_cost total_sell_value total_orders_gain in
