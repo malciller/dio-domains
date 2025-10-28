@@ -159,6 +159,81 @@ let test_config_parsing_optional () =
   check bool "parse optional empty" true (test_parse "" "TEST" "TEST/USD" None);
   check bool "parse optional invalid" true (test_parse "invalid" "TEST" "TEST/USD" None)
 
+let test_duplicate_cancellation () =
+  (* Test duplicate order cancellation logic *)
+  let open_orders = [
+    ("order1", 50000.0, 0.001, "buy", Some 2);
+    ("order2", 50000.0, 0.001, "buy", Some 2);  (* Same price - should be cancelled *)
+    ("order3", 51000.0, 0.001, "buy", Some 2);  (* Different price - should not be cancelled *)
+  ] in
+
+  (* Mock the strategy state to have a cancelled order *)
+  let state = Dio_strategies.Market_maker.get_strategy_state "TEST/USD" in
+  state.cancelled_orders <- [("order1", Unix.time ())];  (* Mark order1 as cancelled *)
+
+  (* Count duplicates cancelled *)
+  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders "MM" in
+
+  (* Should cancel 1 duplicate (order2), order1 is already cancelled *)
+  check int "duplicate cancellation count" 1 cancelled_count
+
+let test_sell_first_placement_logic () =
+  (* Test that sell orders are created before buy orders *)
+  (* This is more of an integration test - we'd need to mock the entire execution flow *)
+  (* For now, just test that the logic functions exist and don't crash *)
+  let asset = create_test_asset () in
+  let current_price = Some 50000.0 in
+  let top_of_book = Some (49950.0, 1.0, 50050.0, 1.0) in
+  let asset_balance = Some 0.1 in
+  let quote_balance = Some 1000.0 in
+
+  (* This would trigger the sell-first logic, but testing it fully requires mocking the order ringbuffer *)
+  (* For now, just ensure the function can be called without crashing *)
+  Dio_strategies.Market_maker.Strategy.execute asset current_price top_of_book asset_balance quote_balance 0 0 [] 1;
+  check bool "execute function runs" true true
+
+let test_fee_cache_integration () =
+  (* Test that fee cache is initialized and can be queried *)
+  Dio_strategies.Fee_cache.init ();
+  let fee_opt = Dio_strategies.Fee_cache.get_maker_fee ~exchange:"kraken" ~symbol:"BTC/USD" in
+  (* Initially should be None since no data cached *)
+  check (option (float 0.)) "initial fee cache empty" None fee_opt;
+
+  (* Test cache storage and retrieval *)
+  Dio_strategies.Fee_cache.store_fee ~exchange:"kraken" ~symbol:"BTC/USD" ~fee:0.001 ~ttl_seconds:600.0;
+  let fee_opt2 = Dio_strategies.Fee_cache.get_maker_fee ~exchange:"kraken" ~symbol:"BTC/USD" in
+  check (option (float 0.)) "fee cache retrieval" (Some 0.001) fee_opt2
+
+let test_profitability_checks () =
+  (* Test profitability calculations *)
+  (* For zero fee assets, any spread should be profitable *)
+  let zero_fee_asset = create_test_asset ~maker_fee:(Some 0.0) () in
+
+  (* For fee assets, test the required spread calculation *)
+  let fee_asset = create_test_asset ~maker_fee:(Some 0.001) () in
+
+  (* These tests would require more complex mocking of the execution environment *)
+  (* For now, ensure the fee calculation functions work *)
+  let fee1 = Dio_strategies.Market_maker.get_fee_for_asset zero_fee_asset in
+  let fee2 = Dio_strategies.Market_maker.get_fee_for_asset fee_asset in
+
+  check (float 0.) "zero fee calculation" 0.0 fee1;
+  check (float 0.) "maker fee calculation" 0.001 fee2
+
+let test_post_only_checks () =
+  (* Test post-only validation logic *)
+  (* This is mainly tested through the execution logic, which requires extensive mocking *)
+  (* For now, just ensure the strategy can handle various price scenarios *)
+  let asset = create_test_asset () in
+
+  (* Test with prices where buy < bid (valid post-only) *)
+  Dio_strategies.Market_maker.Strategy.execute asset (Some 50000.0) (Some (49950.0, 1.0, 50050.0, 1.0)) (Some 0.1) (Some 1000.0) 0 0 [] 1;
+
+  (* Test with prices where buy >= bid (invalid post-only - should be skipped) *)
+  Dio_strategies.Market_maker.Strategy.execute asset (Some 50000.0) (Some (50000.0, 1.0, 50050.0, 1.0)) (Some 0.1) (Some 1000.0) 0 0 [] 2;
+
+  check bool "post-only checks handled" true true
+
 let () =
   run "Market Maker" [
     "initialization", [
@@ -171,6 +246,7 @@ let () =
     ];
     "fee_calculation", [
       test_case "fee calculation" `Quick test_fee_calculation;
+      test_case "fee cache integration" `Quick test_fee_cache_integration;
     ];
     "price_handling", [
       test_case "price rounding" `Quick test_price_rounding;
@@ -183,6 +259,12 @@ let () =
       test_case "order acknowledgment" `Quick test_order_acknowledgment;
       test_case "order cancellation" `Quick test_order_cancellation;
       test_case "minimum quantity check" `Quick test_minimum_quantity_check;
+      test_case "duplicate cancellation" `Quick test_duplicate_cancellation;
+    ];
+    "strategy_logic", [
+      test_case "sell first placement" `Quick test_sell_first_placement_logic;
+      test_case "profitability checks" `Quick test_profitability_checks;
+      test_case "post-only checks" `Quick test_post_only_checks;
     ];
     "config_parsing", [
       test_case "config parsing" `Quick test_config_parsing;

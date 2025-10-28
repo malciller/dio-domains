@@ -305,6 +305,8 @@ type store = {
   mutable bids: (string * string * float * float) PriceMap.t;
   mutable asks: (string * string * float * float) PriceMap.t;
   ready: bool Atomic.t;
+  has_snapshot: bool Atomic.t;  (** Track if we have received a snapshot for this symbol *)
+  last_sequence: int64 option Atomic.t;  (** Track the last sequence number for this symbol *)
 }
 
 type decimals = int * int  (* pair_decimals, lot_decimals *)
@@ -446,6 +448,8 @@ let ensure_store symbol =
         bids = PriceMap.empty;
         asks = PriceMap.empty;
         ready = Atomic.make false;
+        has_snapshot = Atomic.make false;
+        last_sequence = Atomic.make None;
       } in
       Hashtbl.add stores symbol store;
       store
@@ -654,9 +658,54 @@ let process_orderbook_message ~reset json on_heartbeat =
       try
         let symbol = member "symbol" entry |> to_string in
         let store = ensure_store symbol in
+
+        (* Handle snapshot vs update logic *)
         if reset then begin
+          (* Snapshot: reset state and mark as having snapshot *)
           store.bids <- PriceMap.empty;
           store.asks <- PriceMap.empty;
+          Atomic.set store.has_snapshot true;
+
+          (* Extract sequence from snapshot entry *)
+          let sequence =
+            match int64_of_json (member "sequence" entry) with
+            | Some seq -> Some seq
+            | None -> None
+          in
+          Atomic.set store.last_sequence sequence;
+          Logging.debug_f ~section "Received snapshot for %s (sequence=%s), ready for updates"
+            symbol (match sequence with Some s -> Int64.to_string s | None -> "none");
+
+        end else begin
+          (* Update: only process if we have a snapshot *)
+          if not (Atomic.get store.has_snapshot) then begin
+            Logging.debug_f ~section "Ignoring update for %s: waiting for snapshot after reconnect"
+              symbol;
+            raise Exit  (* Skip processing this entry *)
+          end;
+
+          (* Validate sequence ordering for updates *)
+          let current_sequence =
+            match int64_of_json (member "sequence" entry) with
+            | Some seq -> Some seq
+            | None -> None
+          in
+          let last_seq_opt = Atomic.get store.last_sequence in
+          match current_sequence, last_seq_opt with
+          | Some curr_seq, Some last_seq when Int64.compare curr_seq last_seq <= 0 ->
+              Logging.warn_f ~section "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
+                symbol curr_seq last_seq;
+              Atomic.set store.has_snapshot false;
+              Atomic.set store.last_sequence None;
+              raise Exit  (* Skip processing this entry *)
+          | Some curr_seq, Some last_seq when Int64.compare curr_seq (Int64.add last_seq 1L) > 0 ->
+              let gap = Int64.sub curr_seq last_seq in
+              Logging.warn_f ~section "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking out-of-sync"
+                symbol curr_seq last_seq gap;
+              Atomic.set store.has_snapshot false;
+              Atomic.set store.last_sequence None;
+              raise Exit  (* Skip processing this entry *)
+          | _ -> ()  (* Sequence is valid or not present *)
         end;
         let bids_json = member "bids" entry in
         let asks_json = member "asks" entry in
@@ -683,22 +732,43 @@ let process_orderbook_message ~reset json on_heartbeat =
         Logging.debug_f ~section "Built orderbook for %s: bids=%d asks=%d checksum=%s"
           symbol (Array.length orderbook.bids) (Array.length orderbook.asks)
           (match orderbook.checksum with Some c -> Int32.to_string c | None -> "none");
-        RingBuffer.write store.buffer orderbook;
-        notify_ready store;
-        (* Verify checksum *)
-        (match orderbook.checksum with
-        | Some received_checksum ->
-            if Int32.compare calculated_checksum received_checksum <> 0 then
-              Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx)"
-                symbol received_checksum received_checksum calculated_checksum calculated_checksum
-            else
-              Logging.debug_f ~section "Checksum match for %s: %ld" symbol calculated_checksum
-        | None -> ());
-        Logging.debug_f ~section "Orderbook written to ringbuffer: %s bids=%d asks=%d"
-          symbol
-          (Array.length orderbook.bids)
-          (Array.length orderbook.asks);
-        Telemetry.inc_counter (Telemetry.counter "orderbook_updates" ()) ();
+
+        (* Verify checksum - only proceed if valid *)
+        let checksum_valid =
+          match orderbook.checksum with
+          | Some received_checksum ->
+              if Int32.compare calculated_checksum received_checksum <> 0 then begin
+                Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
+                  symbol received_checksum received_checksum calculated_checksum calculated_checksum;
+                (* Mark symbol out-of-sync on checksum mismatch *)
+                Atomic.set store.has_snapshot false;
+                Atomic.set store.last_sequence None;
+                false  (* Don't write to buffer *)
+              end else begin
+                Logging.debug_f ~section "Checksum match for %s: %ld" symbol calculated_checksum;
+                true   (* Write to buffer *)
+              end
+          | None -> true  (* No checksum to validate, proceed *)
+        in
+
+        if checksum_valid then begin
+          RingBuffer.write store.buffer orderbook;
+          notify_ready store;
+          Logging.debug_f ~section "Orderbook written to ringbuffer: %s bids=%d asks=%d"
+            symbol
+            (Array.length orderbook.bids)
+            (Array.length orderbook.asks);
+          Telemetry.inc_counter (Telemetry.counter "orderbook_updates" ()) ();
+
+          (* Update last sequence on successful write *)
+          let current_sequence =
+            match int64_of_json (member "sequence" entry) with
+            | Some seq -> Some seq
+            | None -> None
+          in
+          Atomic.set store.last_sequence current_sequence;
+        end;
+
         (* Update connection heartbeat *)
         on_heartbeat ()
       with exn ->
@@ -789,7 +859,9 @@ let clear_all_stores () =
     store.asks <- PriceMap.empty;
     (* Replace ring buffer with fresh empty one to clear any stale data *)
     store.buffer <- RingBuffer.create ring_buffer_size;
-    Atomic.set store.ready false
+    Atomic.set store.ready false;
+    Atomic.set store.has_snapshot false;
+    Atomic.set store.last_sequence None
   ) stores
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =

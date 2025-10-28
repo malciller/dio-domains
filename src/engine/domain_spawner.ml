@@ -93,6 +93,10 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   let current_price = ref None in
   let top_of_book = ref None in
 
+  (* Track when to execute strategies (event-driven) *)
+  let should_execute_strategy = ref true in  (* Start with true to execute on first cycle *)
+  let last_balance_check = ref 0.0 in
+
   (* Initialize strategy for this asset based on strategy type *)
   let (grid_strategy_asset, mm_strategy_asset) =
     if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
@@ -163,6 +167,8 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         (* Process ticker events - keep latest price *)
         List.iter (fun (ticker : Kraken.Kraken_ticker_feed.ticker) ->
           current_price := Some ((ticker.bid +. ticker.ask) /. 2.0);
+          (* Trigger strategy execution on price updates *)
+          should_execute_strategy := true;
           Logging.debug_f ~section "Asset [%s/%s]: Consumed ticker event - price=$%.2f"
             asset_with_fees.exchange asset_with_fees.symbol ((ticker.bid +. ticker.ask) /. 2.0)
         ) new_tickers
@@ -186,10 +192,12 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
               let bid_price, bid_size = float_of_string bid.price, float_of_string bid.size in
               let ask_price, ask_size = float_of_string ask.price, float_of_string ask.size in
               top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
+              (* Trigger strategy execution on orderbook updates *)
+              should_execute_strategy := true;
               Logging.debug_f ~section "Asset [%s/%s]: Consumed orderbook event - bid=$%.2f x %.4f, ask=$%.2f x %.4f"
                 asset_with_fees.exchange asset_with_fees.symbol
                 bid_price bid_size ask_price ask_size
-            with _ -> 
+            with _ ->
               Logging.warn_f ~section "Failed to parse orderbook level for %s" asset_with_fees.symbol)
           end
         ) new_orderbooks
@@ -221,6 +229,8 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
           List.iter (fun (event : Kraken.Kraken_executions_feed.execution_event) ->
             match event.order_status with
             | CanceledStatus ->
+                (* Trigger strategy execution on order cancellations *)
+                should_execute_strategy := true;
                 (* Notify strategies about external order cancellations *)
                 (match grid_strategy_asset with
                  | Some _ ->
@@ -237,6 +247,8 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
                        event.order_id asset_with_fees.symbol
                  | None -> ())
             | NewStatus | PartiallyFilledStatus ->
+                (* Trigger strategy execution on order fills/acknowledgments *)
+                should_execute_strategy := true;
                 (* Notify strategies about new or updated orders to clear pending state *)
                 (match event.limit_price with
                  | Some price ->
@@ -344,29 +356,43 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
     in
 
     (* Lock-free balance queries *)
-    let asset_balance = 
+    let asset_balance =
       if asset_with_fees.exchange = "kraken" then
         try Some (Kraken.Kraken_balances_feed.get_balance base_asset)
         with _ -> None
       else None
     in
-    let quote_balance = 
+    let quote_balance =
       if asset_with_fees.exchange = "kraken" then
         try Some (Kraken.Kraken_balances_feed.get_balance quote_currency)
         with _ -> None
       else None
     in
 
-    (* Execute strategy based on type - pass strategy-specific orders *)
-    (match grid_strategy_asset with
-     | Some asset ->
-         (* Pass ALL open orders to Grid strategy so it can see all sell orders for positioning *)
-         Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
-     | None -> ());
-    (match mm_strategy_asset with
-     | Some asset ->
-         Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
-     | None -> ());
+    (* Check for balance changes every 10 cycles (~2 seconds at 200k/sec) *)
+    let now = Unix.time () in
+    if now -. !last_balance_check > 2.0 then begin
+      last_balance_check := now;
+      (* Balance changes would trigger strategy execution, but we don't have old balances to compare *)
+      (* For now, we'll trigger periodically. Could be enhanced to track balance changes *)
+    end;
+
+    (* Execute strategy based on type - only when triggered by events (event-driven) *)
+    (* Add fallback: execute every 10000 cycles (~2 seconds at 200k/sec) to prevent getting stuck *)
+    let should_execute = !should_execute_strategy || (!cycle_count mod 10000 = 0) in
+    if should_execute then begin
+      should_execute_strategy := false;  (* Reset flag *)
+
+      (match grid_strategy_asset with
+       | Some asset ->
+           (* Pass ALL open orders to Grid strategy so it can see all sell orders for positioning *)
+           Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+       | None -> ());
+      (match mm_strategy_asset with
+       | Some asset ->
+           Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
+       | None -> ());
+    end;
     
     (* Calculate total order counts across all strategies for logging *)
     let total_open_buy_count = grid_open_buy_count + mm_open_buy_count in
