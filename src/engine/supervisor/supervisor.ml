@@ -628,23 +628,70 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
               asset.Dio_engine.Config.symbol
               (Option.value fee_info.Kraken.Kraken_get_fee.maker_fee ~default:0. *. 100.)
               (Option.value fee_info.Kraken.Kraken_get_fee.taker_fee ~default:0. *. 100.);
+            (* Store fees in Fee_cache so UI can access them *)
+            (match fee_info.Kraken.Kraken_get_fee.maker_fee, fee_info.Kraken.Kraken_get_fee.taker_fee with
+             | Some maker, Some taker ->
+                 Dio_strategies.Fee_cache.store_fees 
+                   ~exchange:asset.Dio_engine.Config.exchange 
+                   ~symbol:asset.Dio_engine.Config.symbol 
+                   ~maker_fee:maker 
+                   ~taker_fee:taker 
+                   ~ttl_seconds:600.0
+             | Some maker, None ->
+                 (* Use maker for both if taker not available *)
+                 Dio_strategies.Fee_cache.store_fees 
+                   ~exchange:asset.Dio_engine.Config.exchange 
+                   ~symbol:asset.Dio_engine.Config.symbol 
+                   ~maker_fee:maker 
+                   ~taker_fee:maker 
+                   ~ttl_seconds:600.0
+             | _ -> ());
             Lwt.return { asset with
               Dio_engine.Config.maker_fee = fee_info.Kraken.Kraken_get_fee.maker_fee;
               Dio_engine.Config.taker_fee = fee_info.Kraken.Kraken_get_fee.taker_fee }
         | None ->
             Logging.warn_f ~section "Failed to fetch fees for %s, using defaults" asset.Dio_engine.Config.symbol;
-            Lwt.return asset in
+            (* Store default fees in cache *)
+            Dio_strategies.Fee_cache.store_fees 
+              ~exchange:asset.Dio_engine.Config.exchange 
+              ~symbol:asset.Dio_engine.Config.symbol 
+              ~maker_fee:0.0016 
+              ~taker_fee:0.0026 
+              ~ttl_seconds:600.0;
+            Lwt.return { asset with
+              Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
+              Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *) in
         (* Add small delay between requests to ensure unique nonces *)
         let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
         Lwt.return result
       end else begin
-        Logging.warn_f ~section "Fee fetching not implemented for exchange: %s" asset.Dio_engine.Config.exchange;
-        Lwt.return asset
+        Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
+        (* Store default fees in cache for unsupported exchanges *)
+        Dio_strategies.Fee_cache.store_fees 
+          ~exchange:asset.Dio_engine.Config.exchange 
+          ~symbol:asset.Dio_engine.Config.symbol 
+          ~maker_fee:0.0016 
+          ~taker_fee:0.0026 
+          ~ttl_seconds:600.0;
+        (* Provide default fee values for unsupported exchanges *)
+        Lwt.return { asset with
+          Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
+          Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *)
       end
     with exn ->
       Logging.warn_f ~section "Exception during fee fetching for %s: %s, using defaults"
         asset.Dio_engine.Config.symbol (Printexc.to_string exn);
-      Lwt.return asset
+      (* Store default fees in cache when fetching fails *)
+      Dio_strategies.Fee_cache.store_fees 
+        ~exchange:asset.Dio_engine.Config.exchange 
+        ~symbol:asset.Dio_engine.Config.symbol 
+        ~maker_fee:0.0016 
+        ~taker_fee:0.0026 
+        ~ttl_seconds:600.0;
+      (* Provide default fee values when fetching fails to ensure strategies have fee data *)
+      Lwt.return { asset with
+        Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
+        Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *)
   ) configs in
 
   Lwt.return (configs_with_fees, auth_token)

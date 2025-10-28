@@ -7,6 +7,7 @@
 open Lwt.Infix
 open Kraken
 open Concurrency
+open Dio_strategies.Fee_cache
 
 (** Individual wallet balance *)
 type wallet_balance = {
@@ -34,6 +35,8 @@ type open_order_entry = {
   limit_price: float option;
   avg_price: float;
   order_status: string;
+  maker_fee: float option;
+  taker_fee: float option;
   last_updated: float;
 }
 
@@ -106,6 +109,8 @@ let balance_data_to_entry asset (balance_data : Kraken_balances_feed.balance_dat
 
 (** Convert open order data to UI entry *)
 let open_order_to_entry (order : Kraken_executions_feed.open_order) =
+  let maker_fee = get_maker_fee ~exchange:"kraken" ~symbol:order.symbol in
+  let taker_fee = get_taker_fee ~exchange:"kraken" ~symbol:order.symbol in
   {
     order_id = order.order_id;
     symbol = order.symbol;
@@ -115,6 +120,8 @@ let open_order_to_entry (order : Kraken_executions_feed.open_order) =
     limit_price = order.limit_price;
     avg_price = order.avg_price;
     order_status = Kraken_executions_feed.string_of_order_status order.order_status;
+    maker_fee;
+    taker_fee;
     last_updated = order.last_updated;
   }
 
