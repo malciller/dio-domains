@@ -26,14 +26,21 @@ let initial_state = {
   auto_scroll = true;
 }
 
-(** Format a log entry for display *)
-let format_log_entry entry =
-  let timestamp_part = string ~attr:Notty.A.(fg (gray 2)) (entry.timestamp ^ " ") in  (* Dim gray for timestamps *)
-  let level_part = string ~attr:entry.color (Printf.sprintf "[%s] " entry.level) in
-  let section_part = string ~attr:Notty.A.(fg cyan) (Printf.sprintf "[%s] " entry.section) in  (* Cyan for section names *)
-  let message_part = string ~attr:Notty.A.(fg white) entry.message in  (* Primary text for messages *)
+(** Format a log entry for display with width constraints *)
+let format_log_entry entry available_width =
+  let safe_width = max 20 available_width in (* Minimum width to show something useful *)
 
-  hcat [timestamp_part; level_part; section_part; message_part]
+  (* Create individual parts with their colors *)
+  let timestamp_part = string ~attr:Notty.A.(fg (gray 2)) (entry.timestamp ^ " ") in
+  let level_part = string ~attr:entry.color (Printf.sprintf "[%s] " entry.level) in
+  let section_part = string ~attr:Notty.A.(fg cyan) (Printf.sprintf "[%s] " entry.section) in
+  let message_part = string ~attr:Notty.A.(fg white) entry.message in
+
+  (* Combine all parts *)
+  let full_entry = hcat [timestamp_part; level_part; section_part; message_part] in
+
+  (* Use Nottui's resize to constrain width - this should be safe now *)
+  resize ~w:safe_width full_entry
 
 (** Create logs view widget with size constraints *)
 let logs_view log_entries_map state ~available_width ~available_height =
@@ -111,7 +118,7 @@ let logs_view log_entries_map state ~available_width ~available_height =
         |> List.of_seq
         |> List.rev
       in
-      let log_widgets = List.map format_log_entry visible_entries in
+      let log_widgets = List.map (fun entry -> format_log_entry entry available_width) visible_entries in
 
       let padding_count = max 0 (view_height - List.length log_widgets) in
       let padding = List.init padding_count (fun _ -> string "") in
