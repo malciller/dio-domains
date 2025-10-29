@@ -4,8 +4,8 @@
   "trading": [
     {
       "symbol": "BTC/USD",
-      "qty": "0.0002",
-      "grid_interval": "0.35",
+      "qty": "0.00025",
+      "grid_interval": "0.38",
       "sell_mult": "0.9995",
       "strategy": "Grid"
     },
@@ -19,7 +19,7 @@
     {
       "symbol": "ETH/USD",
       "qty": "0.003", 
-      "grid_interval": "0.75",
+      "grid_interval": "1.5",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
@@ -39,7 +39,7 @@
     },    
     {
       "symbol": "TRX/USD",
-      "qty": "35.0",
+      "qty": "40.0",
       "grid_interval": "1.5",
       "sell_mult": "0.999",
       "strategy": "Grid"

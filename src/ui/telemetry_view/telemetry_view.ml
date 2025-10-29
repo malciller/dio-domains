@@ -189,7 +189,7 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state =
            (* Check if we're taking too long *)
            let current_time = Unix.time () in
            if current_time -. start_time > 0.5 then begin
-             Logging.warn_f ~section:"telemetry_view" "Rendering timeout after %.3f seconds, category %s (%d metrics)"
+             Logging.debug_f ~section:"telemetry_view" "Rendering timeout after %.3f seconds, category %s (%d metrics)"
                (current_time -. start_time) category_name (List.length metrics);
              let error_attr = Notty.A.(fg yellow ++ st bold) in
              string ~attr:error_attr (Printf.sprintf "TIMEOUT: %s (%d metrics)" category_name (List.length metrics))
