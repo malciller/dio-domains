@@ -52,26 +52,61 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
   (* Determine screen size for adaptive display *)
   let screen_size = classify_screen_size available_width available_height in
 
-  (* Adaptive CPU info - truncate on small screens *)
-  let cpu_info = match stats.cpu_cores, stats.cpu_vendor, stats.cpu_model with
-    | Some cores, vendor, model ->
-        let full_info = Printf.sprintf "CPU: %s %s (%d cores)" (format_cpu_vendor vendor) (format_cpu_model model) cores in
-        begin match screen_size with
-        | Mobile -> truncate_string 20 full_info
-        | Small -> truncate_string 30 full_info
-        | Medium | Large -> full_info
-        end
-    | None, vendor, model ->
-        let full_info = Printf.sprintf "CPU: %s %s" (format_cpu_vendor vendor) (format_cpu_model model) in
-        begin match screen_size with
-        | Mobile -> truncate_string 15 full_info
-        | Small -> truncate_string 25 full_info
-        | Medium | Large -> full_info
-        end
-  in
-  let cpu_info_display = string ~attr:Notty.A.(fg white) cpu_info in
+  match screen_size with
+  | Mobile ->
+      (* Ultra-compact mobile layout: 2-3 lines maximum *)
+      let cpu_info = match stats.cpu_cores with
+        | Some cores -> Printf.sprintf "%s (%dc)" (truncate_tiny (format_cpu_model (Some "CPU"))) cores
+        | None -> truncate_tiny (format_cpu_model (Some "CPU"))
+      in
 
-  let header = cpu_info_display in
+      (* Single-line summary: CPU% | Mem% | Load | Procs *)
+      let cpu_pct = Ui_types.format_mobile_percentage stats.cpu_usage in
+      let mem_pct = Ui_types.format_mobile_percentage ((float_of_int stats.memory_used /. float_of_int stats.memory_total) *. 100.0) in
+      let load_val = Ui_types.format_mobile_number stats.load_avg_1 in
+      let proc_count = Ui_types.format_mobile_number (float_of_int stats.processes) in
+
+      let summary_line = Printf.sprintf "%s: %s | Mem: %s | Load: %s | Procs: %s"
+        cpu_info cpu_pct mem_pct load_val proc_count in
+      let summary_display = string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) summary_line) in
+
+      (* Second line: uptime (if space allows) *)
+      let uptime_hours = int_of_float (Unix.time () -. !Telemetry.start_time) / 3600 in
+      let uptime_line = if available_height >= 3 then
+        Printf.sprintf "Uptime: %dh" uptime_hours
+      else "" in
+      let uptime_display = if uptime_line <> "" then
+        string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) uptime_line)
+      else empty in
+
+      let content = if uptime_display = empty then
+        summary_display
+      else
+        vcat [summary_display; uptime_display]
+      in
+      content
+
+  | Small | Medium | Large ->
+      (* Existing full layout for larger screens *)
+      let cpu_info = match stats.cpu_cores, stats.cpu_vendor, stats.cpu_model with
+        | Some cores, vendor, model ->
+            let full_info = Printf.sprintf "CPU: %s %s (%d cores)" (format_cpu_vendor vendor) (format_cpu_model model) cores in
+            begin match screen_size with
+            | Small -> truncate_string 30 full_info
+            | Medium | Large -> full_info
+            | Mobile -> "" (* Won't reach here *)
+            end
+        | None, vendor, model ->
+            let full_info = Printf.sprintf "CPU: %s %s" (format_cpu_vendor vendor) (format_cpu_model model) in
+            begin match screen_size with
+            | Small -> truncate_string 25 full_info
+            | Medium | Large -> full_info
+            | Mobile -> "" (* Won't reach here *)
+            end
+      in
+      let cpu_info_display = string ~attr:Notty.A.(fg white) cpu_info in
+
+      let header = cpu_info_display in
 
   (* CPU Section - adaptive per-core usage display *)
   let cpu_title = string ~attr:Notty.A.(st bold ++ fg cyan) "CPU" in
@@ -291,11 +326,14 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
   vcat (sections @ [string ~attr:Notty.A.empty ""])
 
 (** Create reactive system view with shared stats and snapshot variables *)
-let make_system_view stats_var snapshot_var ~available_width ~available_height =
+let make_system_view stats_var snapshot_var viewport_var =
   (* Reactive UI *)
-  let ui = Lwd.map2 (Lwd.get snapshot_var) (Lwd.get stats_var) ~f:(fun snapshot stats ->
-    system_view stats snapshot ~available_width ~available_height
-  ) in
+  let ui = Lwd.map2
+    (Lwd.map2 (Lwd.get snapshot_var) (Lwd.get stats_var) ~f:(fun snapshot stats -> (snapshot, stats)))
+    (Lwd.get viewport_var)
+    ~f:(fun (snapshot, stats) (available_width, available_height) ->
+      system_view stats snapshot ~available_width ~available_height
+    ) in
 
   (* Event handling - only handle quit key *)
   let handle_event ev =

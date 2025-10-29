@@ -4,14 +4,14 @@ open Telemetry
 
 (** Screen size classification based on terminal dimensions *)
 type screen_size =
-  | Mobile    (* < 60 cols or < 20 rows - minimal content *)
+  | Mobile    (* < 60 cols or < 20 rows - ultra-compact content *)
   | Small     (* 60-80 cols or 20-30 rows - reduced content *)
   | Medium    (* 80-120 cols or 30-40 rows - moderate content *)
   | Large     (* 120+ cols or 40+ rows - full content *)
 
 (** Classify screen size based on width and height *)
 let classify_screen_size width height =
-  if width < 60 || height < 20 then Mobile
+  if width < 50 || height < 15 then Mobile  (* Stricter mobile detection for 45x15 *)
   else if width < 80 || height < 30 then Small
   else if width < 120 || height < 40 then Medium
   else Large
@@ -119,6 +119,74 @@ let should_show_cpu_cores screen_size =
   | Small -> false   (* No per-core display on small screens *)
   | Medium -> true   (* Show cores on tablets *)
   | Large -> true    (* Show cores on large screens *)
+
+(** Minimum dimensions per module *)
+let min_module_width = 40  (* chars *)
+let min_module_height = 15 (* lines *)
+
+(** Reserve space for UI chrome *)
+let chrome_height = 4  (* status bar + bottom bar + separators *)
+let hamburger_height = 1  (* if any modules collapsed *)
+
+(** Calculate available space for modules after chrome *)
+let calculate_available_space terminal_width terminal_height collapsed_count =
+  let chrome_h = chrome_height + (if collapsed_count > 0 then hamburger_height else 0) in
+  let available_w = terminal_width in
+  let available_h = max 1 (terminal_height - chrome_h) in
+  (available_w, available_h)
+
+(** Determine if viewport can support multiple modules simultaneously *)
+let can_support_multiple_modules available_width available_height =
+  available_width >= (min_module_width * 2) && available_height >= (min_module_height * 2)
+
+(** Get maximum number of modules that can fit in available space *)
+let max_modules_in_viewport available_width available_height =
+  let modules_wide = available_width / min_module_width in
+  let modules_tall = available_height / min_module_height in
+  modules_wide * modules_tall
+
+(** Mobile-specific sizing constants (45x15 viewport) *)
+let mobile_min_width = 45  (* Minimum width for mobile view *)
+let mobile_min_height = 15 (* Minimum height for mobile view *)
+let mobile_max_lines_per_view = 6  (* Maximum lines per view on mobile *)
+let mobile_max_entries_per_view = 5  (* Maximum entries/items per view on mobile *)
+
+(** Truncate string to fit mobile display (aggressive truncation) *)
+let truncate_mobile str =
+  if String.length str <= 15 then str
+  else String.sub str 0 12 ^ "..."
+
+(** Truncate string to fit small mobile display (ultra-aggressive) *)
+let truncate_tiny str =
+  if String.length str <= 8 then str
+  else String.sub str 0 5 ^ "..."
+
+(** Truncate string to exact width (no ellipsis) *)
+let truncate_exact width str =
+  if String.length str <= width then str
+  else String.sub str 0 width
+
+(** Format percentage with mobile-appropriate precision *)
+let format_mobile_percentage value =
+  Printf.sprintf "%.0f%%" value
+
+(** Format currency value for mobile (compact) *)
+let format_mobile_currency value =
+  if abs_float value >= 1000.0 then
+    Printf.sprintf "$%.0f" value
+  else if abs_float value >= 100.0 then
+    Printf.sprintf "$%.1f" value
+  else
+    Printf.sprintf "$%.2f" value
+
+(** Format number for mobile (compact) *)
+let format_mobile_number value =
+  if abs_float value >= 1000.0 then
+    Printf.sprintf "%.0f" value
+  else if abs_float value >= 100.0 then
+    Printf.sprintf "%.1f" value
+  else
+    Printf.sprintf "%.2f" value
 
 (** Cached telemetry snapshot for UI consumption *)
 type telemetry_snapshot = {

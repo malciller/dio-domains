@@ -21,6 +21,12 @@ let initial_state = {
   expanded_metrics = Hashtbl.create 32;
 }
 
+(** Helper function to take first n elements from a list *)
+let rec take_first n = function
+  | [] -> []
+  | _ when n <= 0 -> []
+  | x :: xs -> x :: take_first (n - 1) xs
+
 (** Format metric value with colors - using cached snapshot data *)
 let format_metric_value_ui metric =
   try
@@ -137,26 +143,29 @@ let category_header category_name metric_count selected =
   let header_attr = if selected then Notty.A.(base_attr ++ st reverse ++ bg black) else base_attr in
   string ~attr:header_attr title
 
-(** Create telemetry view widget *)
-let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state =
+(** Create telemetry view widget with size constraints *)
+let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_width ~available_height =
   let start_time = Unix.time () in
   try
     Logging.debug_f ~section:"telemetry_view" "Rendering telemetry view with %d categories at %.3f"
       (List.length snapshot.categories) start_time;
 
-    (* Header *)
-    let updated_attr = Notty.A.(fg (gray 2)) in  (* Dim gray for secondary info *)
-    let tm = Unix.localtime (Unix.time ()) in
-    let updated = string ~attr:updated_attr (Printf.sprintf "Updated: %02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec) in
+    (* Determine screen size for adaptive display *)
+    let screen_size = Ui_types.classify_screen_size available_width available_height in
 
-    (* Add memory pressure indicator *)
-    let memory_pressure_info =
-      try
-        let mem_low_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_low") snapshot.metrics in
-        let mem_med_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_medium") snapshot.metrics in
-        let mem_high_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_high") snapshot.metrics in
+    match screen_size with
+    | Mobile ->
+        (* Ultra-compact mobile layout: maximum 5 lines *)
+        let header_str = Printf.sprintf "Upd:%02d:%02d"
+          (Unix.localtime (Unix.time ())).Unix.tm_hour
+          (Unix.localtime (Unix.time ())).Unix.tm_min in
+        let header = string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) header_str) in
 
-        let (pressure_text, pressure_color) =
+        (* Get memory pressure for mobile header *)
+        let mem_pressure = try
+          let mem_med_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_medium") snapshot.metrics in
+          let mem_high_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_high") snapshot.metrics in
+
           let get_gauge_value metric_opt =
             match metric_opt with
             | Some m -> (match m.Telemetry.metric_type with
@@ -166,25 +175,98 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state =
           in
           let high_val = get_gauge_value mem_high_metric in
           let med_val = get_gauge_value mem_med_metric in
-          let low_val = get_gauge_value mem_low_metric in
 
-          if high_val > 0.5 then ("HIGH", Notty.A.(fg red ++ st bold))
-          else if med_val > 0.5 then ("MED", Notty.A.(fg yellow ++ st bold))
-          else if low_val > 0.5 then ("LOW", Notty.A.(fg green ++ st bold))
-          else ("UNK", Notty.A.(fg (gray 2)))
+          if high_val > 0.5 then "HIGH"
+          else if med_val > 0.5 then "MED"
+          else "LOW"
+        with _ -> "UNK" in
+
+        let mem_line = Printf.sprintf "Mem:%s" mem_pressure in
+        let mem_display = string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) mem_line) in
+
+        (* Show only top 1-2 categories with 1-2 most critical metrics each *)
+        let top_categories = match available_height with
+          | h when h <= 3 -> []  (* No space for categories *)
+          | h when h <= 4 -> take_first 1 snapshot.categories  (* 1 category max *)
+          | _ -> take_first 2 snapshot.categories  (* 2 categories max *)
         in
-        let mem_attr = Notty.A.(fg white ++ st bold) in
-        let mem_label = string ~attr:mem_attr "Mem:" in
-        let pressure_widget = string ~attr:pressure_color pressure_text in
-        hcat [mem_label; string ~attr:Notty.A.empty " "; pressure_widget]
-      with _ -> string ~attr:Notty.A.(fg (gray 2)) "Mem:UNK"
-    in
 
-    let header = hcat [updated; string ~attr:Notty.A.empty " | "; memory_pressure_info] in
+        (* Format categories and their top metrics in single lines *)
+        let category_lines = List.flatten (List.map (fun (cat_name, metrics) ->
+          let cat_short = Ui_types.truncate_tiny cat_name in
+
+          (* Get top 1-2 most critical metrics *)
+          let top_metrics = take_first (if available_height >= 5 then 2 else 1) metrics in
+
+          List.map (fun metric ->
+            let (value_str, _) = format_metric_value_ui metric in
+            let metric_name = Ui_types.truncate_tiny metric.Telemetry.name in
+            let line = Printf.sprintf "[%s] %s:%s" cat_short metric_name value_str in
+            string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) line)
+          ) top_metrics
+        ) top_categories) in
+
+        (* Combine all lines *)
+        let all_lines = header :: mem_display :: category_lines in
+        vcat all_lines
+
+    | Small | Medium | Large ->
+        (* Existing layout for larger screens *)
+        (* Header *)
+        let updated_attr = Notty.A.(fg (gray 2)) in  (* Dim gray for secondary info *)
+        let tm = Unix.localtime (Unix.time ()) in
+        let updated = string ~attr:updated_attr (Printf.sprintf "Updated: %02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec) in
+
+        (* Add memory pressure indicator *)
+        let memory_pressure_info =
+          try
+            let mem_low_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_low") snapshot.metrics in
+            let mem_med_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_medium") snapshot.metrics in
+            let mem_high_metric = List.find_opt (fun m -> m.Telemetry.name = "telemetry_memory_pressure_high") snapshot.metrics in
+
+            let (pressure_text, pressure_color) =
+              let get_gauge_value metric_opt =
+                match metric_opt with
+                | Some m -> (match m.Telemetry.metric_type with
+                             | Telemetry.Gauge r -> !r
+                             | _ -> 0.0)
+                | None -> 0.0
+              in
+              let high_val = get_gauge_value mem_high_metric in
+              let med_val = get_gauge_value mem_med_metric in
+              let low_val = get_gauge_value mem_low_metric in
+
+              if high_val > 0.5 then ("HIGH", Notty.A.(fg red ++ st bold))
+              else if med_val > 0.5 then ("MED", Notty.A.(fg yellow ++ st bold))
+              else if low_val > 0.5 then ("LOW", Notty.A.(fg green ++ st bold))
+              else ("UNK", Notty.A.(fg (gray 2)))
+            in
+            let mem_attr = Notty.A.(fg white ++ st bold) in
+            let mem_label = string ~attr:mem_attr "Mem:" in
+            let pressure_widget = string ~attr:pressure_color pressure_text in
+            hcat [mem_label; string ~attr:Notty.A.empty " "; pressure_widget]
+          with _ -> string ~attr:Notty.A.(fg (gray 2)) "Mem:UNK"
+        in
+
+        let header = hcat [updated; string ~attr:Notty.A.empty " | "; memory_pressure_info] in
+
+    (* Calculate adaptive limits based on available space *)
+    let screen_size = Ui_types.classify_screen_size available_width available_height in
+    let max_categories = Ui_types.max_visible_categories screen_size available_height 4 in (* Reserve space for header/footer *)
+    let max_metrics_per_category = Ui_types.max_metrics_per_category screen_size in
+
+    (* Limit categories to fit available space *)
+    let display_categories = if List.length snapshot.categories > max_categories then
+      let rec take_first n acc = function
+        | [] -> List.rev acc
+        | _ when n <= 0 -> List.rev acc
+        | h::t -> take_first (n-1) (h::acc) t
+      in take_first max_categories [] snapshot.categories
+    else snapshot.categories in
 
     (* Categories list - limit processing to prevent hangs *)
     let categories_widgets =
-      snapshot.categories
+      display_categories
       |> List.mapi (fun i (category_name, metrics) ->
            (* Check if we're taking too long *)
            let current_time = Unix.time () in
@@ -200,13 +282,13 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state =
                let expanded = Hashtbl.find_opt state.expanded_metrics category_name |> Option.value ~default:false in
 
                if expanded && metrics <> [] then
-                 (* Limit the number of metrics displayed to prevent UI hangs *)
-                 let display_metrics = if List.length metrics > 50 then
+                 (* Limit the number of metrics displayed based on screen size and available space *)
+                 let display_metrics = if List.length metrics > max_metrics_per_category then
                    let rec take_first n acc = function
                      | [] -> List.rev acc
                      | _ when n <= 0 -> List.rev acc
                      | h::t -> take_first (n-1) (h::acc) t
-                   in take_first 50 [] metrics
+                   in take_first max_metrics_per_category [] metrics
                  else metrics in
                  let metric_rows = List.map (fun metric -> metric_row metric false snapshot) display_metrics in
                  let indented_rows = List.map (fun row -> hcat [string ~attr:Notty.A.empty "  "; row]) metric_rows in
@@ -263,13 +345,16 @@ let handle_key state (snapshot : Ui_types.telemetry_snapshot) = function
   | _ -> `Continue state
 
 (** Create reactive telemetry view with shared snapshot variable *)
-let make_telemetry_view snapshot_var =
+let make_telemetry_view snapshot_var viewport_var =
   let state_var = Lwd.var initial_state in
 
-  (* Reactive UI that depends on both snapshot and state changes *)
-  let ui = Lwd.map2 (Lwd.get snapshot_var) (Lwd.get state_var) ~f:(fun snapshot state ->
-    telemetry_view snapshot state
-  ) in
+  (* Reactive UI that depends on snapshot, state, and viewport changes *)
+  let ui = Lwd.map2
+    (Lwd.map2 (Lwd.get snapshot_var) (Lwd.get state_var) ~f:(fun snapshot state -> (snapshot, state)))
+    (Lwd.get viewport_var)
+    ~f:(fun (snapshot, state) (available_width, available_height) ->
+      telemetry_view snapshot state ~available_width ~available_height
+    ) in
 
   (* Event handling *)
   let handle_event ev =
@@ -292,7 +377,7 @@ let make_telemetry_view snapshot_var =
 let run () =
   Telemetry_cache.init ();
 
-  (* Create our own snapshot variable for standalone execution *)
+  (* Create our own snapshot and viewport variables for standalone execution *)
   let empty_snapshot = {
     uptime = 0.0;
     metrics = [];
@@ -300,8 +385,9 @@ let run () =
     timestamp = 0.0;
   } in
   let snapshot_var = Lwd.var empty_snapshot in
+  let viewport_var = Lwd.var (80, 24) in
 
-  let (ui, handle_event) = make_telemetry_view snapshot_var in
+  let (ui, handle_event) = make_telemetry_view snapshot_var viewport_var in
 
   (* Create quit promise *)
   let quit_promise, quit_resolver = Lwt.wait () in

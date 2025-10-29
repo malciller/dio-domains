@@ -15,6 +15,12 @@ let excluded_assets = [
   (* Add more assets here as needed *)
 ]
 
+(** Helper function to take first n elements from a list *)
+let rec take_first n = function
+  | [] -> []
+  | _ when n <= 0 -> []
+  | x :: xs -> x :: take_first (n - 1) xs
+
 (** Simple price cache to avoid repeated lookups during UI render *)
 let price_cache = Hashtbl.create 32
 let price_cache_timestamp = ref 0.0
@@ -293,20 +299,81 @@ let aggregate_orders_by_symbol orders =
   (* Sort by symbol for consistent display *)
   List.sort (fun (s1, _) (s2, _) -> String.compare s1 s2) symbol_aggregates
 
-(** Create balances view widget *)
-let balances_view balance_snapshot _state =
-  (* Header *)
-  let timestamp_str = Printf.sprintf "Updated: %s"
-    (if balance_snapshot.timestamp > 0.0 then
-       let tm = Unix.localtime balance_snapshot.timestamp in
-       Printf.sprintf "%02d:%02d:%02d"
-         tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
-     else "Never")
-  in
-  let timestamp_attr = Notty.A.(fg white) in  (* Primary text for timestamps *)
-  let timestamp = string ~attr:timestamp_attr timestamp_str in
+(** Create balances view widget with size constraints *)
+let balances_view balance_snapshot _state ~available_width ~available_height =
+  (* Determine screen size for adaptive display *)
+  let screen_size = Ui_types.classify_screen_size available_width available_height in
 
-  let header = timestamp in
+  match screen_size with
+  | Mobile ->
+      (* Ultra-compact mobile layout: maximum 6 lines *)
+      let header_str = if balance_snapshot.timestamp > 0.0 then
+        let tm = Unix.localtime balance_snapshot.timestamp in
+        Printf.sprintf "Upd: %02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min
+      else "Never" in
+      let header = string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) header_str) in
+
+      (* Calculate pending amounts and filter/sort balances *)
+      let pending_amounts = calculate_pending_amounts balance_snapshot.open_orders in
+      let filtered_balances = List.filter (fun entry ->
+        entry.total_balance <> 0.0 && not (List.mem entry.asset excluded_assets)
+      ) balance_snapshot.balances in
+
+      (* Sort by current value (highest first) for mobile *)
+      let sorted_balances = List.sort (fun a b ->
+        let val_a = match get_usd_price a.asset with Some p -> a.total_balance *. p | None -> 0.0 in
+        let val_b = match get_usd_price b.asset with Some p -> b.total_balance *. p | None -> 0.0 in
+        compare val_b val_a  (* Descending order *)
+      ) filtered_balances in
+
+      (* Take top 4-5 assets only *)
+      let top_assets = match available_height with
+        | h when h <= 3 -> []  (* No space for assets *)
+        | h when h <= 4 -> take_first 2 sorted_balances  (* 2 assets max *)
+        | h when h <= 5 -> take_first 3 sorted_balances  (* 3 assets max *)
+        | _ -> take_first 4 sorted_balances  (* 4 assets max *)
+      in
+
+      (* Format each asset in ultra-compact single-line format *)
+      let asset_lines = List.map (fun entry ->
+        let pending_amount = try Hashtbl.find pending_amounts entry.asset with Not_found -> 0.0 in
+        let available_balance = entry.total_balance -. pending_amount in
+        let value = match get_usd_price entry.asset with
+          | Some price -> available_balance *. price
+          | None -> 0.0
+        in
+        let asset_name = Ui_types.truncate_tiny entry.asset in
+        let balance_str = Ui_types.format_mobile_number entry.total_balance in
+        let value_str = Ui_types.format_mobile_currency value in
+        let line = Printf.sprintf "%s: %s (%s)" asset_name balance_str value_str in
+        string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) line)
+      ) top_assets in
+
+      (* Combine header and asset lines *)
+      let all_lines = header :: asset_lines in
+      vcat all_lines
+
+  | Small | Medium | Large ->
+      (* Existing layout for larger screens *)
+      let show_orders = match screen_size with
+        | Ui_types.Small -> false   (* No orders on small screens *)
+        | Ui_types.Medium -> true   (* Show orders on tablets *)
+        | Ui_types.Large -> true    (* Show orders on large screens *)
+        | Mobile -> false (* Won't reach here *)
+      in
+
+      (* Header *)
+      let timestamp_str = Printf.sprintf "Updated: %s"
+        (if balance_snapshot.timestamp > 0.0 then
+           let tm = Unix.localtime balance_snapshot.timestamp in
+           Printf.sprintf "%02d:%02d:%02d"
+             tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
+         else "Never")
+      in
+      let timestamp_attr = Notty.A.(fg white) in  (* Primary text for timestamps *)
+      let timestamp = string ~attr:timestamp_attr timestamp_str in
+
+      let header = timestamp in
 
   (* Balances section *)
   let balances_title = string ~attr:Notty.A.(st bold ++ fg white) "\nBalances:" in
@@ -406,20 +473,25 @@ let balances_view balance_snapshot _state =
   else
     vcat [orders_title; orders_header; orders_list] in
 
-  (* Combine all sections *)
-  let content = vcat [header; balances_section; orders_section] in
+  (* Combine all sections - conditionally include orders based on screen size *)
+  let sections = [header; balances_section] in
+  let sections = if show_orders then sections @ [orders_section] else sections in
+  let content = vcat sections in
 
   (* Add some padding at the bottom *)
   vcat [content; string ~attr:Notty.A.empty "\n"]
 
 (** Create reactive balances view *)
-let make_balances_view balance_snapshot_var =
+let make_balances_view balance_snapshot_var viewport_var =
   let state_var = Lwd.var initial_state in
 
-  (* Reactive UI that updates when data changes *)
-  let ui = Lwd.map2 (Lwd.get balance_snapshot_var) (Lwd.get state_var) ~f:(fun (snapshot, _) state ->
-    balances_view snapshot state
-  ) in
+  (* Reactive UI that updates when data and viewport changes *)
+  let ui = Lwd.map2
+    (Lwd.map2 (Lwd.get balance_snapshot_var) (Lwd.get state_var) ~f:(fun (snapshot, _) state -> (snapshot, state)))
+    (Lwd.get viewport_var)
+    ~f:(fun (snapshot, state) (available_width, available_height) ->
+      balances_view snapshot state ~available_width ~available_height
+    ) in
 
   (* Event handler - for now just handle basic navigation *)
   let handle_event ev =
