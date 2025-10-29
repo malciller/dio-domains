@@ -10,6 +10,7 @@
   lwd
   dio_engine
   dio.ui_types
+  dio.ui.shared
   dio.ui.telemetry
   dio.ui.system
   dio.ui.logs

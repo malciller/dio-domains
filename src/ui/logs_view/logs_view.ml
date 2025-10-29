@@ -3,9 +3,11 @@
     Displays real-time log entries in a rich terminal UI using Nottui and LWD.
 *)
 
-open Nottui.Ui
 open Nottui_widgets
+open Nottui.Ui
 open Logs_cache
+
+module Ui_components = Dio_ui_shared.Ui_components
 
 (** Helper function to get a sublist *)
 let rec sublist start len = function
@@ -30,11 +32,11 @@ let initial_state = {
 let format_log_entry entry available_width =
   let safe_width = max 20 available_width in (* Minimum width to show something useful *)
 
-  (* Create individual parts with their colors *)
-  let timestamp_part = string ~attr:Notty.A.(fg (gray 2)) (entry.timestamp ^ " ") in
-  let level_part = string ~attr:entry.color (Printf.sprintf "[%s] " entry.level) in
-  let section_part = string ~attr:Notty.A.(fg cyan) (Printf.sprintf "[%s] " entry.section) in
-  let message_part = string ~attr:Notty.A.(fg white) entry.message in
+  (* Create individual parts with their colors using UI components *)
+  let timestamp_part = Ui_components.create_dimmed_text (entry.timestamp ^ " ") in
+  let level_part = Ui_components.create_status_element (Printf.sprintf "[%s] " entry.level) entry.color in
+  let section_part = Ui_components.create_highlighted_status (Printf.sprintf "[%s] " entry.section) in
+  let message_part = Ui_components.create_text entry.message in
 
   (* Combine all parts *)
   let full_entry = hcat [timestamp_part; level_part; section_part; message_part] in
@@ -52,11 +54,11 @@ let logs_view log_entries_map state ~available_width ~available_height =
       (* Ultra-compact mobile layout: maximum 6 lines *)
       let entry_count = LogMap.cardinal log_entries_map in
       let count_str = Printf.sprintf "%d logs" entry_count in
-      let header = string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) count_str) in
+      let header = Ui_components.create_text (Ui_types.truncate_exact (available_width - 4) count_str) in
 
       (* Auto-scroll indicator - simplified *)
       let scroll_str = if state.auto_scroll then "Auto:ON" else "Auto:OFF" in
-      let controls = string ~attr:Notty.A.(fg cyan) (Ui_types.truncate_exact (available_width - 4) scroll_str) in
+      let controls = Ui_components.create_highlighted_status (Ui_types.truncate_exact (available_width - 4) scroll_str) in
 
       (* Show only last 3-5 entries with simplified format *)
       let max_entries = match available_height with
@@ -81,7 +83,7 @@ let logs_view log_entries_map state ~available_width ~available_height =
         let section_short = Ui_types.truncate_tiny entry.section in
         let message_trunc = Ui_types.truncate_exact (available_width - 15) entry.message in  (* Reserve space for prefix *)
         let line = Printf.sprintf "%s [%s] [%s] %s" timestamp_str level_short section_short message_trunc in
-        string ~attr:entry.color (Ui_types.truncate_exact (available_width - 4) line)
+Ui_components.create_status_element (Ui_types.truncate_exact (available_width - 4) line) entry.color
       ) visible_entries in
 
       (* Combine everything - no footer on mobile to save space *)
@@ -93,14 +95,13 @@ let logs_view log_entries_map state ~available_width ~available_height =
       (* Header *)
       let entry_count = LogMap.cardinal log_entries_map in
       let count_str = Printf.sprintf "%d entries" entry_count in
-      let count_attr = Notty.A.(fg white) in  (* Primary text for count *)
-      let count = string ~attr:count_attr count_str in
+      let count = Ui_components.create_text count_str in
 
       let header = count in
 
       (* Auto-scroll control *)
       let auto_scroll_str = if state.auto_scroll then "Auto-scroll: ON" else "Auto-scroll: OFF" in
-      let controls = string ~attr:Notty.A.(fg cyan) auto_scroll_str in  (* Cyan for controls *)
+      let controls = Ui_components.create_highlighted_status auto_scroll_str in
 
       (* Log entries - adapt to available space *)
       let header_footer_space = 4 in (* Reserve space for header, controls, and footer *)
@@ -125,14 +126,14 @@ let logs_view log_entries_map state ~available_width ~available_height =
 
       let logs_content =
         if List.is_empty log_widgets then
-          string ~attr:Notty.A.(fg white) "No log entries"
+Ui_components.create_text "No log entries"
         else
           vcat (padding @ log_widgets)
       in
 
       (* Footer with controls *)
-      let footer = string ~attr:Notty.A.(fg (gray 2))
-        "↑↓: Scroll | a: Auto-scroll | c: Clear logs | q: Quit" in  (* Dim gray for secondary info *)
+      let footer = Ui_components.create_dimmed_text
+        "↑↓: Scroll | a: Auto-scroll | c: Clear logs | q: Quit" in
 
       (* Combine everything *)
       vcat [

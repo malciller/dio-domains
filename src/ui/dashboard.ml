@@ -4,9 +4,11 @@
     between telemetry, trading, and other system information displays.
 *)
 
-open Nottui_widgets
 open Ui_types
+open Nottui_widgets
+open Nottui.Ui
 open Dio_ui_balance.Balance_cache
+
 
 
 type panel_focus =
@@ -27,77 +29,10 @@ type dashboard_state = {
 
 (** Create bordered panel with title that dynamically scales and respects size constraints *)
 let create_panel ~title ~content ~focused ?max_width ?max_height () =
-  let open Nottui.Ui in
-  let border_char = "|" in
-
-  (* Adaptive border characters based on available space *)
-  let (top_left, top_right, bottom_left, bottom_right) = match max_width with
-    | Some w when w < 20 -> ("+", "+", "+", "+")  (* Simple borders for narrow panels *)
-    | _ -> ("/", "\\", "\\", "/")  (* Fancy borders for wider panels *)
-  in
-
-  let title_attr = if focused then Notty.A.(st bold ++ st reverse ++ bg cyan ++ fg black)
-                   else Notty.A.(st bold ++ fg white) in  (* Use cyan for focus, dim gray for inactive *)
-  let border_attr = if focused then Notty.A.(fg cyan) else Notty.A.(fg (gray 2)) in
-
-  (* Adaptive title - truncate if too long for available space *)
-  let title_base = " " ^ title ^ " " in
-  let title_display = match max_width with
-    | Some max_w when String.length title_base > max_w - 4 ->
-        (* Leave space for borders, truncate title *)
-        let available_title_space = max 3 (max_w - 4) in
-        let truncated_title = Ui_types.truncate_string (available_title_space - 2) title in
-        string ~attr:title_attr (" " ^ truncated_title ^ " ")
-    | _ -> string ~attr:title_attr title_base
-  in
-
-  (* Create border lines *)
-  let top_border = hcat [
-    string ~attr:border_attr top_left;
-    title_display;
-    string ~attr:border_attr top_right;
-  ] in
-
-  let bottom_border = hcat [
-    string ~attr:border_attr bottom_left;
-    string ~attr:border_attr bottom_right;
-  ] in
-
-  (* Apply size constraints to content if specified *)
-  let constrained_content = match max_width, max_height with
-    | Some w, Some h ->
-        (* Constrain both dimensions *)
-        resize ~w ~h content
-    | Some w, None ->
-        (* Constrain width only *)
-        resize ~w content
-    | None, Some h ->
-        (* Constrain height only - let width expand *)
-        resize ~h content
-    | None, None ->
-        (* No constraints *)
-        content
-  in
-
-  (* Content with side borders *)
-  let content_with_borders = hcat [
-    string ~attr:border_attr border_char;
-    string ~attr:Notty.A.empty " ";
-    constrained_content;
-    string ~attr:Notty.A.empty " ";
-    string ~attr:border_attr border_char;
-  ] in
-
-  (* Stack vertically: top border, content, bottom border *)
-  vcat [top_border; content_with_borders; bottom_border]
+Dio_ui_shared.Ui_components.create_bordered_panel ~title ~focused ?max_width ?max_height content
 
 (** Create top status bar with system info - adaptive to screen size *)
 let create_status_bar system_stats is_loading screen_size =
-  let open Nottui.Ui in
-  let primary_attr = Notty.A.(fg white ++ st bold) in  (* Primary text for status bar *)
-  let separator_attr = Notty.A.(fg (gray 2)) in     (* Dim gray for separators *)
-  let loading_attr = Notty.A.(fg yellow ++ st bold) in (* Yellow for loading indicator *)
-
   (* Adaptive title based on screen size *)
   let title_text = match screen_size with
     | Ui_types.Mobile -> if is_loading then "DIO (LOAD)" else "DIO"
@@ -105,11 +40,12 @@ let create_status_bar system_stats is_loading screen_size =
     | Ui_types.Medium -> if is_loading then "DIO TRADING (LOAD)" else "DIO TRADING"
     | Ui_types.Large -> if is_loading then " DIO TRADING TERMINAL (LOADING...) " else " DIO TRADING TERMINAL "
   in
-  let title = string ~attr:(if is_loading then loading_attr else primary_attr) title_text in
+  let title = if is_loading then Dio_ui_shared.Ui_components.create_warning_status title_text
+              else Dio_ui_shared.Ui_components.create_primary_status title_text in
 
   (* Adaptive uptime display *)
   let uptime_str = match screen_size with
-    | Ui_types.Mobile -> 
+    | Ui_types.Mobile ->
         let uptime = Unix.time () -. !Telemetry.start_time in
         let hours = int_of_float (uptime /. 3600.0) in
         Printf.sprintf "%dh" hours
@@ -126,16 +62,17 @@ let create_status_bar system_stats is_loading screen_size =
         if days > 0 then Printf.sprintf "%dd %02d:%02d" days hours mins
         else Printf.sprintf "%02d:%02d" hours mins
   in
-  let uptime = hcat [string ~attr:separator_attr " │ "; string ~attr:primary_attr ("UP:" ^ uptime_str)] in
+  let uptime = Dio_ui_shared.Ui_components.create_primary_status ("UP:" ^ uptime_str) in
 
   (* Adaptive CPU display *)
   let cpu_str = Printf.sprintf "%.0f%%" system_stats.cpu_usage in
-  let cpu_color = if system_stats.cpu_usage > 90.0 then Notty.A.(fg red) else if system_stats.cpu_usage > 70.0 then Notty.A.(fg yellow) else Notty.A.(fg green) in
-  let cpu = hcat [string ~attr:separator_attr " │ "; string ~attr:cpu_color ("CPU:" ^ cpu_str)] in
+  let cpu_element = if system_stats.cpu_usage > 90.0 then Dio_ui_shared.Ui_components.create_error_status ("CPU:" ^ cpu_str)
+                    else if system_stats.cpu_usage > 70.0 then Dio_ui_shared.Ui_components.create_warning_status ("CPU:" ^ cpu_str)
+                    else Dio_ui_shared.Ui_components.create_success_status ("CPU:" ^ cpu_str) in
 
   (* Adaptive memory display - hide on very small screens *)
-  let mem_part = match screen_size with
-    | Ui_types.Mobile -> empty  (* No memory info on mobile *)
+  let mem_element = match screen_size with
+    | Ui_types.Mobile -> Dio_ui_shared.Ui_components.create_secondary_status ""  (* No memory info on mobile *)
     | Ui_types.Small | Ui_types.Medium | Ui_types.Large ->
         let mem_usage_pct = (float_of_int system_stats.memory_used /. float_of_int system_stats.memory_total) *. 100.0 in
         let mem_str = match screen_size with
@@ -144,75 +81,71 @@ let create_status_bar system_stats is_loading screen_size =
           | Ui_types.Large -> Printf.sprintf "%d/%d MB" (system_stats.memory_used / 1024) (system_stats.memory_total / 1024)
           | _ -> ""
         in
-        let mem_color = if mem_usage_pct > 90.0 then Notty.A.(fg red) else if mem_usage_pct > 70.0 then Notty.A.(fg yellow) else Notty.A.(fg green) in
-        hcat [string ~attr:separator_attr " │ "; string ~attr:mem_color ("MEM:" ^ mem_str)]
+        let mem_text = "MEM:" ^ mem_str in
+        if mem_usage_pct > 90.0 then Dio_ui_shared.Ui_components.create_error_status mem_text
+        else if mem_usage_pct > 70.0 then Dio_ui_shared.Ui_components.create_warning_status mem_text
+        else Dio_ui_shared.Ui_components.create_success_status mem_text
   in
 
   (* Adaptive timestamp - simplified on small screens *)
   let timestamp_str = match screen_size with
-    | Ui_types.Mobile -> 
+    | Ui_types.Mobile ->
         let tm = Unix.localtime (Unix.time ()) in
         Printf.sprintf "%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min
     | Ui_types.Small | Ui_types.Medium | Ui_types.Large ->
         let tm = Unix.localtime (Unix.time ()) in
         Printf.sprintf "%02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
   in
-  let timestamp = hcat [string ~attr:separator_attr " │ "; string ~attr:primary_attr timestamp_str] in
+  let timestamp = Dio_ui_shared.Ui_components.create_primary_status timestamp_str in
 
-  (* Combine elements based on screen size *)
-  match screen_size with
-  | Ui_types.Mobile -> hcat [title; uptime; cpu]
-  | Ui_types.Small -> hcat [title; uptime; cpu; mem_part]
-  | Ui_types.Medium -> hcat [title; uptime; cpu; mem_part; timestamp]
-  | Ui_types.Large -> hcat [title; uptime; cpu; mem_part; timestamp]
+  (* Combine elements based on screen size using the new status bar component *)
+  let elements = match screen_size with
+    | Ui_types.Mobile -> [title; uptime; cpu_element]
+    | Ui_types.Small -> [title; uptime; cpu_element; mem_element]
+    | Ui_types.Medium -> [title; uptime; cpu_element; mem_element; timestamp]
+    | Ui_types.Large -> [title; uptime; cpu_element; mem_element; timestamp]
+  in
+Dio_ui_shared.Ui_components.create_status_bar elements
 
 (** Create bottom status bar with navigation hints - adaptive to screen size *)
 let create_bottom_bar focused_panel screen_size =
-  let open Nottui.Ui in
-  let inactive_attr = Notty.A.(fg (gray 2)) in      (* Dim gray for inactive panels *)
-  let active_attr = Notty.A.(fg cyan ++ st bold) in (* Cyan for active/focused panel *)
-  let primary_attr = Notty.A.(fg white) in          (* Primary text for general hints *)
-  let separator_attr = Notty.A.(fg (gray 2)) in     (* Dim gray for separators *)
-
   (* Adaptive panel hints based on screen size *)
-  let (s_hint, b_hint, t_hint, l_hint, spacer, refresh_hint, quit_hint) = match screen_size with
+
+  let (s_hint, b_hint, t_hint, l_hint, refresh_hint, quit_hint) = match screen_size with
     | Ui_types.Mobile ->
         (* Minimal hints for mobile - just single letters *)
-        let s = string ~attr:(if focused_panel = SystemPanel then active_attr else inactive_attr) "S" in
-        let b = string ~attr:(if focused_panel = BalancesPanel then active_attr else inactive_attr) "B" in
-        let t = string ~attr:(if focused_panel = TelemetryPanel then active_attr else inactive_attr) "T" in
-        let l = string ~attr:(if focused_panel = LogsPanel then active_attr else inactive_attr) "L" in
-        let r = if focused_panel = BalancesPanel then string ~attr:primary_attr "R" else empty in
-        let q = string ~attr:primary_attr "Q" in
-        (s, b, t, l, string ~attr:separator_attr "|", r, q)
+        let s = Dio_ui_shared.Ui_components.create_panel_hint SystemPanel "S" (focused_panel = SystemPanel) in
+        let b = Dio_ui_shared.Ui_components.create_panel_hint BalancesPanel "B" (focused_panel = BalancesPanel) in
+        let t = Dio_ui_shared.Ui_components.create_panel_hint TelemetryPanel "T" (focused_panel = TelemetryPanel) in
+        let l = Dio_ui_shared.Ui_components.create_panel_hint LogsPanel "L" (focused_panel = LogsPanel) in
+        let r = if focused_panel = BalancesPanel then Dio_ui_shared.Ui_components.create_primary_status "R" else Dio_ui_shared.Ui_components.create_secondary_status "" in
+        let q = Dio_ui_shared.Ui_components.create_primary_status "Q" in
+        (s, b, t, l, r, q)
     | Ui_types.Small ->
         (* Short hints for small screens *)
-        let s = string ~attr:(if focused_panel = SystemPanel then active_attr else inactive_attr) "S:Sys" in
-        let b = string ~attr:(if focused_panel = BalancesPanel then active_attr else inactive_attr) "B:Bal" in
-        let t = string ~attr:(if focused_panel = TelemetryPanel then active_attr else inactive_attr) "T:Tel" in
-        let l = string ~attr:(if focused_panel = LogsPanel then active_attr else inactive_attr) "L:Log" in
-        let r = if focused_panel = BalancesPanel then string ~attr:primary_attr "R:Ref" else empty in
-        let q = string ~attr:primary_attr "Q:Quit" in
-        (s, b, t, l, string ~attr:separator_attr " | ", r, q)
+        let s = Dio_ui_shared.Ui_components.create_panel_hint SystemPanel "S:Sys" (focused_panel = SystemPanel) in
+        let b = Dio_ui_shared.Ui_components.create_panel_hint BalancesPanel "B:Bal" (focused_panel = BalancesPanel) in
+        let t = Dio_ui_shared.Ui_components.create_panel_hint TelemetryPanel "T:Tel" (focused_panel = TelemetryPanel) in
+        let l = Dio_ui_shared.Ui_components.create_panel_hint LogsPanel "L:Log" (focused_panel = LogsPanel) in
+        let r = if focused_panel = BalancesPanel then Dio_ui_shared.Ui_components.create_primary_status "R:Ref" else Dio_ui_shared.Ui_components.create_secondary_status "" in
+        let q = Dio_ui_shared.Ui_components.create_primary_status "Q:Quit" in
+        (s, b, t, l, r, q)
     | Ui_types.Medium | Ui_types.Large ->
         (* Full hints for larger screens *)
-        let s = string ~attr:(if focused_panel = SystemPanel then active_attr else inactive_attr) " S:SYSTEM " in
-        let b = string ~attr:(if focused_panel = BalancesPanel then active_attr else inactive_attr) " B:BALANCES " in
-        let t = string ~attr:(if focused_panel = TelemetryPanel then active_attr else inactive_attr) " T:TELEMETRY " in
-        let l = string ~attr:(if focused_panel = LogsPanel then active_attr else inactive_attr) " L:LOGS " in
-        let r = if focused_panel = BalancesPanel then
-          hcat [string ~attr:primary_attr " R:REFRESH "; string ~attr:separator_attr "│ "]
-        else empty in
-        let q = string ~attr:primary_attr " Q:QUIT " in
-        (s, b, t, l, string ~attr:separator_attr " │ ", r, q)
+        let s = Dio_ui_shared.Ui_components.create_panel_hint SystemPanel " S:SYSTEM " (focused_panel = SystemPanel) in
+        let b = Dio_ui_shared.Ui_components.create_panel_hint BalancesPanel " B:BALANCES " (focused_panel = BalancesPanel) in
+        let t = Dio_ui_shared.Ui_components.create_panel_hint TelemetryPanel " T:TELEMETRY " (focused_panel = TelemetryPanel) in
+        let l = Dio_ui_shared.Ui_components.create_panel_hint LogsPanel " L:LOGS " (focused_panel = LogsPanel) in
+        let r = if focused_panel = BalancesPanel then Dio_ui_shared.Ui_components.create_primary_status " R:REFRESH " else Dio_ui_shared.Ui_components.create_secondary_status "" in
+        let q = Dio_ui_shared.Ui_components.create_primary_status " Q:QUIT " in
+        (s, b, t, l, r, q)
   in
 
-  (* Combine elements - adapt spacing based on screen size *)
-  match screen_size with
-  | Ui_types.Mobile -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
-  | Ui_types.Small -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
-  | Ui_types.Medium -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
-  | Ui_types.Large -> hcat [s_hint; spacer; b_hint; spacer; t_hint; spacer; l_hint; spacer; refresh_hint; quit_hint]
+  (* Combine elements using the status bar component *)
+  let elements = [s_hint; b_hint; t_hint; l_hint] in
+  let elements = if refresh_hint <> Dio_ui_shared.Ui_components.create_secondary_status "" then elements @ [refresh_hint] else elements in
+  let elements = elements @ [quit_hint] in
+Dio_ui_shared.Ui_components.create_status_bar elements
 
 
 (** Handle module open/close toggle behavior *)
@@ -252,7 +185,6 @@ let update_module_state state target_panel =
 
 (** Create hamburger menu showing collapsed modules *)
 let create_hamburger_menu collapsed_modules screen_size =
-  let open Nottui.Ui in
   if collapsed_modules = [] then
     empty  (* No hamburger menu if no modules are collapsed *)
   else
@@ -289,8 +221,6 @@ let create_hamburger_menu collapsed_modules screen_size =
 
 
 let make_dashboard () =
-  let open Nottui.Ui in
-
   (* Terminal size tracking *)
   let terminal_size_var = Lwd.var (80, 24) in  (* Default size *)
 

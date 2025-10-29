@@ -120,13 +120,26 @@ let should_show_cpu_cores screen_size =
   | Medium -> true   (* Show cores on tablets *)
   | Large -> true    (* Show cores on large screens *)
 
-(** Minimum dimensions per module *)
-let min_module_width = 40  (* chars *)
-let min_module_height = 15 (* lines *)
+(** Standardized panel dimensions - consistent across all modules *)
+let standard_panel_width = 50   (* Standard panel width for medium screens *)
+let standard_panel_height = 20  (* Standard panel height for medium screens *)
+let min_panel_width = 35         (* Minimum viable panel width *)
+let min_panel_height = 10        (* Minimum viable panel height *)
+
+(** Panel size recommendations by screen size *)
+let recommended_panel_sizes screen_size =
+  match screen_size with
+  | Mobile -> (min_panel_width, min_panel_height)     (* Ultra-compact *)
+  | Small -> (40, 12)                                  (* Compact *)
+  | Medium -> (standard_panel_width, standard_panel_height)  (* Standard *)
+  | Large -> (60, 25)                                  (* Expanded *)
 
 (** Reserve space for UI chrome *)
-let chrome_height = 4  (* status bar + bottom bar + separators *)
-let hamburger_height = 1  (* if any modules collapsed *)
+let status_bar_height = 1         (* Top status bar *)
+let bottom_bar_height = 1         (* Bottom navigation bar *)
+let separator_height = 1          (* Space between sections *)
+let chrome_height = status_bar_height + bottom_bar_height + separator_height  (* Total chrome: 3 lines *)
+let hamburger_height = 1          (* Hamburger menu when modules collapsed *)
 
 (** Calculate available space for modules after chrome *)
 let calculate_available_space terminal_width terminal_height collapsed_count =
@@ -137,13 +150,31 @@ let calculate_available_space terminal_width terminal_height collapsed_count =
 
 (** Determine if viewport can support multiple modules simultaneously *)
 let can_support_multiple_modules available_width available_height =
-  available_width >= (min_module_width * 2) && available_height >= (min_module_height * 2)
+  available_width >= (min_panel_width * 2) && available_height >= (min_panel_height * 2)
 
 (** Get maximum number of modules that can fit in available space *)
 let max_modules_in_viewport available_width available_height =
-  let modules_wide = available_width / min_module_width in
-  let modules_tall = available_height / min_module_height in
+  let modules_wide = available_width / min_panel_width in
+  let modules_tall = available_height / min_panel_height in
   modules_wide * modules_tall
+
+(** Calculate optimal panel dimensions for given screen size and available space *)
+let calculate_panel_dimensions screen_size available_width available_height panel_count =
+  let (recommended_w, _) = recommended_panel_sizes screen_size in
+
+  (* Calculate how many panels can fit horizontally and vertically *)
+  let panels_per_row = min panel_count (max 1 (available_width / recommended_w)) in
+  let rows_needed = (panel_count + panels_per_row - 1) / panels_per_row in
+
+  (* Distribute available space among panels *)
+  let panel_width = available_width / panels_per_row in
+  let panel_height = available_height / rows_needed in
+
+  (* Ensure minimum sizes *)
+  let final_width = max min_panel_width panel_width in
+  let final_height = max min_panel_height panel_height in
+
+  (final_width, final_height)
 
 (** Mobile-specific sizing constants (45x15 viewport) *)
 let mobile_min_width = 45  (* Minimum width for mobile view *)

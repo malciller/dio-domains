@@ -4,9 +4,11 @@
     and process statistics in a terminal UI using Nottui and LWD.
 *)
 
-open Nottui.Ui
 open Nottui_widgets
+open Nottui.Ui
 open Ui_types
+
+module Ui_components = Dio_ui_shared.Ui_components
 
 
 (** Format bytes to human readable *)
@@ -23,19 +25,16 @@ let format_bytes bytes =
   in
   format (float_of_int bytes) units
 
-(** Create progress bar *)
+(** Create progress bar using UI components *)
 let progress_bar width percentage =
-  let filled = min width (max 0 (int_of_float (percentage *. float_of_int width /. 100.0))) in
-  let bar = Printf.sprintf "%s%s" (String.make filled '#') (String.make (width - filled) '.') in
-  string ~attr:Notty.A.(fg white) bar
+Ui_components.create_progress_bar width percentage
 
-(** Create colored percentage display *)
+(** Create colored percentage display using UI components *)
 let colored_percentage percentage =
-  let color = if percentage > 90.0 then Notty.A.(fg red)
-             else if percentage > 70.0 then Notty.A.(fg yellow)
-             else Notty.A.(fg green) in
   let text = Printf.sprintf "%.1f%%" percentage in
-  string ~attr:color text
+  if percentage > 90.0 then Ui_components.create_error_status text
+  else if percentage > 70.0 then Ui_components.create_warning_status text
+  else Ui_components.create_success_status text
 
 (** Format CPU vendor *)
 let format_cpu_vendor = function
@@ -68,7 +67,7 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
 
       let summary_line = Printf.sprintf "%s: %s | Mem: %s | Load: %s | Procs: %s"
         cpu_info cpu_pct mem_pct load_val proc_count in
-      let summary_display = string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) summary_line) in
+      let summary_display = Ui_components.create_text (Ui_types.truncate_exact (available_width - 4) summary_line) in
 
       (* Second line: uptime (if space allows) *)
       let uptime_hours = int_of_float (Unix.time () -. !Telemetry.start_time) / 3600 in
@@ -76,7 +75,7 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
         Printf.sprintf "Uptime: %dh" uptime_hours
       else "" in
       let uptime_display = if uptime_line <> "" then
-        string ~attr:Notty.A.(fg white) (Ui_types.truncate_exact (available_width - 4) uptime_line)
+Ui_components.create_text (Ui_types.truncate_exact (available_width - 4) uptime_line)
       else empty in
 
       let content = if uptime_display = empty then
@@ -104,20 +103,19 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
             | Mobile -> "" (* Won't reach here *)
             end
       in
-      let cpu_info_display = string ~attr:Notty.A.(fg white) cpu_info in
+      let cpu_info_display = Ui_components.create_text cpu_info in
 
       let header = cpu_info_display in
 
   (* CPU Section - adaptive per-core usage display *)
-  let cpu_title = string ~attr:Notty.A.(st bold ++ fg cyan) "CPU" in
-  let total_cpu_color = if stats.cpu_usage > 90.0 then Notty.A.(fg red) else if stats.cpu_usage > 70.0 then Notty.A.(fg yellow) else Notty.A.(fg green) in
-  let total_cpu_text = string ~attr:total_cpu_color (Printf.sprintf "Total: %.1f%%" stats.cpu_usage) in
+  let cpu_title = Ui_components.create_label "CPU" in
+  let total_cpu_text = colored_percentage stats.cpu_usage in
 
   (* Adaptive load average display *)
   let load_text = match screen_size with
-    | Mobile -> string ~attr:Notty.A.(fg white) (Printf.sprintf "Load: %.1f" stats.load_avg_1)
-    | Small -> string ~attr:Notty.A.(fg white) (Printf.sprintf "Load: %.1f %.1f" stats.load_avg_1 stats.load_avg_5)
-    | Medium | Large -> string ~attr:Notty.A.(fg white) (Printf.sprintf "Load: %.2f %.2f %.2f" stats.load_avg_1 stats.load_avg_5 stats.load_avg_15)
+    | Mobile -> Ui_components.create_text (Printf.sprintf "Load: %.1f" stats.load_avg_1)
+    | Small -> Ui_components.create_text (Printf.sprintf "Load: %.1f %.1f" stats.load_avg_1 stats.load_avg_5)
+    | Medium | Large -> Ui_components.create_text (Printf.sprintf "Load: %.2f %.2f %.2f" stats.load_avg_1 stats.load_avg_5 stats.load_avg_15)
   in
 
   (* Adaptive core display based on screen size and available space *)
@@ -162,9 +160,9 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
             | Mobile -> 4 (* Won't be used *)
           in
           hcat [
-            string ~attr:Notty.A.(fg white) (Printf.sprintf "%-*s" name_width core_name);
+Ui_components.create_text (Printf.sprintf "%-*s" name_width core_name);
             bar;
-            string ~attr:Notty.A.empty " ";
+Ui_components.create_text " ";
             percent
           ]
         ) displayed_cores displayed_names in
@@ -172,8 +170,8 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
         (* Show core count info if we have cpuid data *)
         let cores_info = match stats.cpu_cores with
           | Some total_cores when screen_size = Large ->
-              string ~attr:Notty.A.(fg white) (Printf.sprintf " (%d cores)" total_cores)
-          | _ -> string ~attr:Notty.A.empty ""
+Ui_components.create_text (Printf.sprintf " (%d cores)" total_cores)
+          | _ -> empty
         in
 
         (core_bars, cores_info)
@@ -187,7 +185,7 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
   ] @ core_bars) in
 
   (* Memory Section - adaptive display *)
-  let mem_title = string ~attr:Notty.A.(st bold ++ fg cyan) "Memory" in
+  let mem_title = Ui_components.create_label "Memory" in
   let mem_total_mb = stats.memory_total / 1024 in
   let mem_used_mb = stats.memory_used / 1024 in
   let mem_usage = if mem_total_mb > 0 then float_of_int mem_used_mb /. float_of_int mem_total_mb *. 100.0 else 0.0 in
@@ -197,13 +195,13 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
 
   (* Adaptive memory text based on screen size *)
   let mem_text = match screen_size with
-    | Mobile -> string ~attr:Notty.A.(fg white) (Printf.sprintf "%.0f%%" mem_usage)
-    | Small -> string ~attr:Notty.A.(fg white) (Printf.sprintf "%dM/%dM" mem_used_mb mem_total_mb)
-    | Medium | Large -> string ~attr:Notty.A.(fg white) (Printf.sprintf "%d/%d MB" mem_used_mb mem_total_mb)
+    | Mobile -> Ui_components.create_text (Printf.sprintf "%.0f%%" mem_usage)
+    | Small -> Ui_components.create_text (Printf.sprintf "%dM/%dM" mem_used_mb mem_total_mb)
+    | Medium | Large -> Ui_components.create_text (Printf.sprintf "%d/%d MB" mem_used_mb mem_total_mb)
   in
   let mem_section = vcat [
     mem_title;
-    hcat [mem_bar; string ~attr:Notty.A.empty " "; mem_percent];
+    hcat [mem_bar; Ui_components.create_text " "; mem_percent];
     mem_text;
   ] in
 
@@ -211,28 +209,28 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
   let swap_section = match screen_size with
     | Mobile -> empty  (* No swap info on mobile *)
     | Small | Medium | Large ->
-        let swap_title = string ~attr:Notty.A.(st bold ++ fg cyan) "Swap" in
+        let swap_title = Ui_components.create_label "Swap" in
         let swap_usage = if stats.swap_total > 0 then float_of_int stats.swap_used /. float_of_int stats.swap_total *. 100.0 else 0.0 in
         let swap_bar = progress_bar (adaptive_progress_bar_width screen_size) swap_usage in
         let swap_percent = colored_percentage swap_usage in
 
         (* Adaptive swap text *)
         let swap_text = match screen_size with
-          | Small -> string ~attr:Notty.A.(fg white) (Printf.sprintf "%.0f%%" swap_usage)
-          | Medium -> string ~attr:Notty.A.(fg white) (Printf.sprintf "%s/%s" (format_bytes (stats.swap_used * 1024)) (format_bytes (stats.swap_total * 1024)))
-          | Large -> string ~attr:Notty.A.(fg white) (Printf.sprintf "%s/%s" (format_bytes stats.swap_used) (format_bytes stats.swap_total))
+          | Small -> Ui_components.create_text (Printf.sprintf "%.0f%%" swap_usage)
+          | Medium -> Ui_components.create_text (Printf.sprintf "%s/%s" (format_bytes (stats.swap_used * 1024)) (format_bytes (stats.swap_total * 1024)))
+          | Large -> Ui_components.create_text (Printf.sprintf "%s/%s" (format_bytes stats.swap_used) (format_bytes stats.swap_total))
           | Mobile -> empty  (* Won't be used *)
         in
         vcat [
           swap_title;
-          hcat [swap_bar; string ~attr:Notty.A.empty " "; swap_percent];
+          hcat [swap_bar; Ui_components.create_text " "; swap_percent];
           swap_text;
         ]
   in
 
   (* Process Section *)
-  let proc_title = string ~attr:Notty.A.(st bold ++ fg cyan) "Processes" in
-  let proc_text = string ~attr:Notty.A.(fg white) (Printf.sprintf "%d running" stats.processes) in
+  let proc_title = Ui_components.create_label "Processes" in
+  let proc_text = Ui_components.create_text (Printf.sprintf "%d running" stats.processes) in
   let proc_section = vcat [
     proc_title;
     proc_text;
@@ -246,18 +244,15 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
       match stats.cpu_temp, stats.gpu_temp with
       | None, None -> empty  (* No temperature data available *)
       | _, _ ->
-          let temp_title = string ~attr:Notty.A.(st bold ++ fg cyan) "Temperature" in
+          let temp_title = Ui_components.create_label "Temperature" in
           let temp_lines = [] in
 
           (* Add CPU temperature *)
           let temp_lines = match stats.cpu_temp with
             | Some temp ->
-                let temp_color =
-                  if temp > 90.0 then Notty.A.(fg red)
-                  else if temp > 75.0 then Notty.A.(fg yellow)
-                  else Notty.A.(fg green)
-                in
-                let cpu_temp_text = string ~attr:temp_color (Printf.sprintf "CPU: %.1f°C" temp) in
+                let cpu_temp_text = if temp > 90.0 then Ui_components.create_error_status (Printf.sprintf "CPU: %.1f°C" temp)
+                                   else if temp > 75.0 then Ui_components.create_warning_status (Printf.sprintf "CPU: %.1f°C" temp)
+                                   else Ui_components.create_success_status (Printf.sprintf "CPU: %.1f°C" temp) in
                 temp_lines @ [cpu_temp_text]
             | None -> temp_lines
           in
@@ -265,12 +260,9 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
           (* Add GPU temperature *)
           let temp_lines = match stats.gpu_temp with
             | Some temp ->
-                let temp_color =
-                  if temp > 85.0 then Notty.A.(fg red)
-                  else if temp > 70.0 then Notty.A.(fg yellow)
-                  else Notty.A.(fg green)
-                in
-                let gpu_temp_text = string ~attr:temp_color (Printf.sprintf "GPU: %.1f°C" temp) in
+                let gpu_temp_text = if temp > 85.0 then Ui_components.create_error_status (Printf.sprintf "GPU: %.1f°C" temp)
+                                   else if temp > 70.0 then Ui_components.create_warning_status (Printf.sprintf "GPU: %.1f°C" temp)
+                                   else Ui_components.create_success_status (Printf.sprintf "GPU: %.1f°C" temp) in
                 temp_lines @ [gpu_temp_text]
             | None -> temp_lines
           in
@@ -285,12 +277,10 @@ let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_
                 | Medium | Large -> 3
               in
               let sensor_lines = List.filteri (fun i _ -> i < max_sensors) stats.temps |> List.map (fun (name, temp) ->
-                let temp_color =
-                  if temp > 80.0 then Notty.A.(fg red)
-                  else if temp > 65.0 then Notty.A.(fg yellow)
-                  else Notty.A.(fg green)
-                in
-                string ~attr:temp_color (Printf.sprintf "%s: %.1f°C" name temp)
+                let sensor_text = if temp > 80.0 then Ui_components.create_error_status (Printf.sprintf "%s: %.1f°C" name temp)
+                                 else if temp > 65.0 then Ui_components.create_warning_status (Printf.sprintf "%s: %.1f°C" name temp)
+                                 else Ui_components.create_success_status (Printf.sprintf "%s: %.1f°C" name temp) in
+                sensor_text
               ) in
               temp_lines @ sensor_lines
             else
