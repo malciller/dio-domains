@@ -4,9 +4,11 @@
 *)
 
 
-open Nottui.Ui
 open Nottui_widgets
+open Nottui.Ui
 open Ui_types
+
+module Ui_components = Dio_ui_shared.Ui_components
 
 (** UI state for telemetry view *)
 type state = {
@@ -33,45 +35,51 @@ let format_metric_value_ui metric =
     match metric.Telemetry.metric_type with
     | Telemetry.Counter r ->
         let value = !r in  (* Safe since we're accessing from cache snapshot *)
-        let color = if value > 1000 then Notty.A.(fg red ++ st bold) else if value > 100 then Notty.A.(fg yellow ++ st bold) else Notty.A.(fg green ++ st bold) in
-        (Printf.sprintf "%d" value, color)
+        let text = Printf.sprintf "%d" value in
+        let widget = if value > 1000 then Ui_components.create_error_status text
+                     else if value > 100 then Ui_components.create_warning_status text
+                     else Ui_components.create_success_status text in
+        (text, widget)
     | Telemetry.SlidingCounter sliding ->
         let value = !(sliding.Telemetry.total_count) in  (* Safe since we're accessing from cache snapshot *)
         (* Validate the value to prevent display issues *)
         let value = if value < 0 || value > 1_000_000_000 then 0 else value in
-        let color = if value > 1000000 then Notty.A.(fg red ++ st bold) else if value > 100000 then Notty.A.(fg yellow ++ st bold) else Notty.A.(fg green ++ st bold) in
-        (Printf.sprintf "%d" value, color)
+        let text = Printf.sprintf "%d" value in
+        let widget = if value > 1000000 then Ui_components.create_error_status text
+                     else if value > 100000 then Ui_components.create_warning_status text
+                     else Ui_components.create_success_status text in
+        (text, widget)
     | Telemetry.Gauge r ->
         let value = !r in  (* Safe since we're accessing from cache snapshot *)
-        let color = if value > 100.0 then Notty.A.(fg red ++ st bold) else if value > 10.0 then Notty.A.(fg yellow ++ st bold) else Notty.A.(fg green ++ st bold) in
-        (Printf.sprintf "%.1f" value, color)
+        let text = Printf.sprintf "%.1f" value in
+        let widget = if value > 100.0 then Ui_components.create_error_status text
+                     else if value > 10.0 then Ui_components.create_warning_status text
+                     else Ui_components.create_success_status text in
+        (text, widget)
     | Telemetry.Histogram _ ->
         let (mean, p50, p95, p99, count) = Telemetry.histogram_stats metric in  (* Safe since we're accessing from cache snapshot *)
-        let color =
-          (* Special coloring for domain_cycle_duration_seconds *)
-          if metric.Telemetry.name = "domain_cycle_duration_seconds" then
-            if mean >= 0.0001 then Notty.A.(fg red ++ st bold)  (* >= 100µs *)
-            else if mean >= 0.00002 then Notty.A.(fg yellow ++ st bold)  (* >= 20µs *)
-            else Notty.A.(fg green ++ st bold)  (* < 20µs *)
-          else
-            (* Color based on average runtime for all other histogram metrics *)
-            if mean >= 0.0001 then Notty.A.(fg red ++ st bold)  (* >= 100µs *)
-            else if mean >= 0.00001 then Notty.A.(fg yellow ++ st bold)  (* >= 10µs *)
-            else Notty.A.(fg green ++ st bold)  (* < 10µs *)
-        in
-        if count > 0 then
-          (Printf.sprintf "%d samples | avg=%.1fµs p50=%.1fµs p95=%.1fµs p99=%.1fµs"
+        let text = if count > 0 then
+          Printf.sprintf "%d samples | avg=%.1fµs p50=%.1fµs p95=%.1fµs p99=%.1fµs"
              count
              (mean *. 1_000_000.0)
              (p50 *. 1_000_000.0)
              (p95 *. 1_000_000.0)
-             (p99 *. 1_000_000.0),
-           color)
-        else
-          ("no samples", Notty.A.(fg (gray 2)))  (* Dim gray for no data *)
+             (p99 *. 1_000_000.0)
+        else "no samples" in
+        let widget = (* Special coloring for domain_cycle_duration_seconds *)
+                     if metric.Telemetry.name = "domain_cycle_duration_seconds" then
+                       if mean >= 0.0001 then Ui_components.create_error_status text  (* >= 100µs *)
+                       else if mean >= 0.00002 then Ui_components.create_warning_status text  (* >= 20µs *)
+                       else Ui_components.create_success_status text  (* < 20µs *)
+                     else
+                       (* Color based on average runtime for all other histogram metrics *)
+                       if mean >= 0.0001 then Ui_components.create_error_status text  (* >= 100µs *)
+                       else if mean >= 0.00001 then Ui_components.create_warning_status text  (* >= 10µs *)
+                       else Ui_components.create_success_status text  (* < 10µs *) in
+        (text, widget)
   with exn ->
     Logging.error_f ~section:"telemetry_view" "Exception formatting metric %s: %s" metric.Telemetry.name (Printexc.to_string exn);
-    ("ERROR", Notty.A.(fg red ++ st bold))
+    ("ERROR", Ui_components.create_error_status "ERROR")
 
 (** Create a metric display row *)
 let metric_row metric _is_expanded _snapshot =
@@ -81,67 +89,48 @@ let metric_row metric _is_expanded _snapshot =
     (* Skip the generic domain_cycles counter when it's 0 and has no labels *)
     match metric.Telemetry.metric_type, metric.Telemetry.name, metric.Telemetry.labels with
     | Telemetry.Counter r, "domain_cycles", [] when !r = 0 ->
-empty  (* Don't display the generic domain_cycles when it's 0 *)
+        empty  (* Don't display the generic domain_cycles when it's 0 *)
     | _ ->
-        (* Special handling for domain_cycles: only show rate, not total count *)
-        let (value_str, color, skip_value) = 
-          if metric.Telemetry.name = "domain_cycles" then
-            (* For domain_cycles, we'll only show the rate, so mark to skip the value *)
-            ("", Notty.A.(fg green), true)
-          else
-            let (v, c) = format_metric_value_ui metric in
-            (v, c, false)
-        in
-
         let label_str =
           if metric.Telemetry.labels = [] then ""
           else " (" ^ (metric.Telemetry.labels |> List.map (fun (k, v) -> k ^ "=" ^ v) |> String.concat ", ") ^ ")"
         in
 
-        let name_attr = Notty.A.(fg white) in  (* Primary text for metric names *)
-        let name_widget = string ~attr:name_attr (name ^ ":") in
-        let label_widget = string ~attr:Notty.A.(fg (gray 2)) label_str in  (* Dim gray for labels *)
+        let name_widget = Ui_components.create_text (name ^ ":") in
+        let label_widget = Ui_components.create_dimmed_text label_str in
 
         (* Add special handling for domain_cycles rate *)
         match metric.Telemetry.metric_type, metric.Telemetry.name with
         | Telemetry.Counter _, "domain_cycles" ->
             let rate = Telemetry.get_counter_rate metric in
             let rate = if rate < 0.0 || rate > 1_000_000.0 then 0.0 else rate in  (* Validate rate *)
-            let rate_color =
-              if rate >= 100000.0 then Notty.A.(fg green ++ st bold)
-              else if rate >= 50000.0 then Notty.A.(fg yellow ++ st bold)
-              else Notty.A.(fg red ++ st bold)
-            in
-            let rate_widget = string ~attr:rate_color (Printf.sprintf "%.0f cycles/sec" rate) in
-            hcat [name_widget; string ~attr:Notty.A.empty " "; rate_widget; label_widget]
+            let rate_text = Printf.sprintf "%.0f cycles/sec" rate in
+            let rate_widget = if rate >= 100000.0 then Ui_components.create_success_status rate_text
+                             else if rate >= 50000.0 then Ui_components.create_warning_status rate_text
+                             else Ui_components.create_error_status rate_text in
+            hcat [name_widget; Ui_components.create_text " "; rate_widget; label_widget]
         | Telemetry.SlidingCounter _, "domain_cycles" ->
             (* Use rate tracker samples for more stable rate calculation *)
             let rate = Telemetry.get_counter_rate metric in
             let rate = if rate < 0.0 || rate > 1_000_000.0 then 0.0 else rate in  (* Validate rate *)
-            let rate_color =
-              if rate >= 100000.0 then Notty.A.(fg green ++ st bold)
-              else if rate >= 50000.0 then Notty.A.(fg yellow ++ st bold)
-              else Notty.A.(fg red ++ st bold)
-            in
-            let rate_widget = string ~attr:rate_color (Printf.sprintf "%.0f cycles/sec" rate) in
-            hcat [name_widget; string ~attr:Notty.A.empty " "; rate_widget; label_widget]
-        | _ -> 
-            if skip_value then
-              hcat [name_widget; label_widget]
-            else
-              let value_widget = string ~attr:color value_str in
-              hcat [name_widget; string ~attr:Notty.A.empty " "; value_widget; label_widget]
+            let rate_text = Printf.sprintf "%.0f cycles/sec" rate in
+            let rate_widget = if rate >= 100000.0 then Ui_components.create_success_status rate_text
+                             else if rate >= 50000.0 then Ui_components.create_warning_status rate_text
+                             else Ui_components.create_error_status rate_text in
+            hcat [name_widget; Ui_components.create_text " "; rate_widget; label_widget]
+        | _ ->
+            (* For other metrics, use the formatted value component *)
+            let (_, value_widget) = format_metric_value_ui metric in
+            hcat [name_widget; Ui_components.create_text " "; value_widget; label_widget]
   with exn ->
     Logging.error_f ~section:"telemetry_view" "Exception creating metric row for %s: %s" metric.Telemetry.name (Printexc.to_string exn);
-    let error_attr = Notty.A.(fg red ++ st bold) in
-    string ~attr:error_attr (Printf.sprintf "ERROR: %s" metric.Telemetry.name)
+Ui_components.create_error_status (Printf.sprintf "ERROR: %s" metric.Telemetry.name)
 
 (** Create category header *)
 let category_header category_name metric_count selected =
   let title = Printf.sprintf "[%s] (%d metrics)" category_name metric_count in
-  let base_attr = Notty.A.(fg cyan ++ st bold) in  (* Cyan for headers *)
-  let header_attr = if selected then Notty.A.(base_attr ++ st reverse ++ bg black) else base_attr in
-  string ~attr:header_attr title
+  if selected then Ui_components.create_highlighted_status title
+  else Ui_components.create_label title
 
 (** Create telemetry view widget with size constraints *)
 let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_width ~available_height =

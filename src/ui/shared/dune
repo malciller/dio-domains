@@ -1,0 +1,12 @@
+(library
+ (name dio_ui_shared)
+ (public_name dio.ui.shared)
+ (libraries
+  notty
+  nottui
+  nottui-lwt
+  lwd
+  dio.ui_types)
+ (modules design_tokens ui_components layout formatters)
+ (preprocess
+  (pps lwt_ppx)))

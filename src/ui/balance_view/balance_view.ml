@@ -3,9 +3,11 @@
     Displays real-time balance and open orders data in a rich terminal UI using Nottui and LWD.
 *)
 
-open Nottui.Ui
 open Nottui_widgets
+open Nottui.Ui
 open Balance_cache
+
+module Ui_components = Dio_ui_shared.Ui_components
 
 (** Assets to exclude from balance visualization and calculation *)
 let excluded_assets = [
@@ -120,149 +122,132 @@ let calculate_balance_totals balances pending_amounts =
 
 (** Format a total row for display *)
 let format_balance_total total_current_value total_accumulated_value =
-  let asset_attr = Notty.A.(st bold ++ fg white) in
-  let asset_part = string ~attr:asset_attr (Printf.sprintf "%-8s" "TOTAL") in
+  let asset_part = Ui_components.create_label (Printf.sprintf "%-8s" "TOTAL") in
 
   (* Total Balance - empty for totals *)
-  let total_balance_part = string ~attr:Notty.A.(fg white) (Printf.sprintf "%15s" "-") in
+  let total_balance_part = Ui_components.create_text (Printf.sprintf "%15s" "-") in
 
   (* Current Value total - use green for positive PnL, red for negative *)
   let current_value_str = Printf.sprintf "%.2f" total_current_value in
-  let current_value_attr = if total_current_value >= 0.0 then Notty.A.(fg green ++ st bold) else Notty.A.(fg red ++ st bold) in
-  let current_value_part = string ~attr:current_value_attr (Printf.sprintf "%12s" current_value_str) in
+  let current_value_part = if total_current_value >= 0.0 then Ui_components.create_success_status current_value_str
+                          else Ui_components.create_error_status current_value_str in
 
   (* Accumulated Balance - empty for totals *)
-  let accumulated_balance_part = string ~attr:Notty.A.(fg white) (Printf.sprintf "%15s" "-") in
+  let accumulated_balance_part = Ui_components.create_text (Printf.sprintf "%15s" "-") in
 
   (* Accumulated Value total - use green for positive PnL, red for negative *)
   let accumulated_value_str = Printf.sprintf "%.2f" total_accumulated_value in
-  let accumulated_value_attr = if total_accumulated_value >= 0.0 then Notty.A.(fg green ++ st bold) else Notty.A.(fg red ++ st bold) in
-  let accumulated_value_part = string ~attr:accumulated_value_attr (Printf.sprintf "%12s" accumulated_value_str) in
+  let accumulated_value_part = if total_accumulated_value >= 0.0 then Ui_components.create_success_status accumulated_value_str
+                              else Ui_components.create_error_status accumulated_value_str in
 
-  hcat [asset_part; string ~attr:Notty.A.empty " "; total_balance_part; string ~attr:Notty.A.empty " "; current_value_part; string ~attr:Notty.A.empty " "; accumulated_balance_part; string ~attr:Notty.A.empty " "; accumulated_value_part]
+  hcat [asset_part; Ui_components.create_text " "; total_balance_part; Ui_components.create_text " "; current_value_part; Ui_components.create_text " "; accumulated_balance_part; Ui_components.create_text " "; accumulated_value_part]
 
 (** Format a balance entry for display with USD values and accumulated amounts *)
 let format_balance_entry entry pending_amounts =
-  let asset_attr = Notty.A.(st bold ++ fg white) in
-  let asset_part = string ~attr:asset_attr (Printf.sprintf "%-8s" entry.asset) in
+  let asset_part = Ui_components.create_label (Printf.sprintf "%-8s" entry.asset) in
 
   (* Total Balance *)
   let total_balance_str = Printf.sprintf "%.8f" entry.total_balance in
-  let balance_attr = Notty.A.(fg white) in  (* Primary text for balance amounts *)
-  let total_balance_part = string ~attr:balance_attr (Printf.sprintf "%15s" total_balance_str) in
+  let total_balance_part = Ui_components.create_text (Printf.sprintf "%15s" total_balance_str) in
 
-  (* Current Value (USD equivalent of total balance) - use green/red for PnL *)
+  (* Current Value (USD equivalent of total balance) *)
   let current_value = match get_usd_price entry.asset with
     | Some price -> entry.total_balance *. price
     | None -> 0.0
   in
   let current_value_str = Printf.sprintf "%.2f" current_value in
-  let current_value_attr = Notty.A.(fg white) in
-  let current_value_part = string ~attr:current_value_attr (Printf.sprintf "%12s" current_value_str) in
+  let current_value_part = Ui_components.create_text (Printf.sprintf "%12s" current_value_str) in
 
   (* Accumulated Balance (total balance minus pending amounts) *)
   (* Exclude USD from accumulated calculations as an edge case *)
-  let (accumulated_balance_str, accumulated_balance_attr, accumulated_value_str, accumulated_value_attr) =
+  let (accumulated_balance_part, accumulated_value_part) =
     if entry.asset = "USD" then
       (* For USD, show "-" for accumulated fields since they don't apply *)
-      ("-", Notty.A.(fg white), "-", Notty.A.(fg white))
+      (Ui_components.create_text (Printf.sprintf "%15s" "-"), Ui_components.create_text (Printf.sprintf "%12s" "-"))
     else
       let pending_amount = try Hashtbl.find pending_amounts entry.asset with Not_found -> 0.0 in
       let accumulated_balance = entry.total_balance -. pending_amount in
       let accumulated_balance_str = Printf.sprintf "%.8f" accumulated_balance in
-      let accumulated_balance_attr = Notty.A.(fg white) in  (* Primary text for balance amounts *)
+      let accumulated_balance_part = Ui_components.create_text (Printf.sprintf "%15s" accumulated_balance_str) in
 
-      (* Accumulated Value (USD equivalent of accumulated balance) - use green/red for PnL *)
+      (* Accumulated Value (USD equivalent of accumulated balance) *)
       let accumulated_value = match get_usd_price entry.asset with
         | Some price -> accumulated_balance *. price
         | None -> 0.0
       in
       let accumulated_value_str = Printf.sprintf "%.2f" accumulated_value in
-      let accumulated_value_attr = Notty.A.(fg white) in
+      let accumulated_value_part = Ui_components.create_text (Printf.sprintf "%12s" accumulated_value_str) in
 
-      (accumulated_balance_str, accumulated_balance_attr, accumulated_value_str, accumulated_value_attr)
+      (accumulated_balance_part, accumulated_value_part)
   in
-  let accumulated_balance_part = string ~attr:accumulated_balance_attr (Printf.sprintf "%15s" accumulated_balance_str) in
-  let accumulated_value_part = string ~attr:accumulated_value_attr (Printf.sprintf "%12s" accumulated_value_str) in
 
-  hcat [asset_part; string ~attr:Notty.A.empty " "; total_balance_part; string ~attr:Notty.A.empty " "; current_value_part; string ~attr:Notty.A.empty " "; accumulated_balance_part; string ~attr:Notty.A.empty " "; accumulated_value_part]
+  hcat [asset_part; Ui_components.create_text " "; total_balance_part; Ui_components.create_text " "; current_value_part; Ui_components.create_text " "; accumulated_balance_part; Ui_components.create_text " "; accumulated_value_part]
 
 (** Format an open order entry for display *)
 let format_open_order_entry entry =
-  let side_attr = match entry.side with
-    | "buy" -> Notty.A.(fg green ++ st bold)  (* Success/green for buy *)
-    | "sell" -> Notty.A.(fg red ++ st bold)   (* Error/red for sell *)
-    | _ -> Notty.A.(fg white)
+  let side_part = match entry.side with
+    | "buy" -> Ui_components.create_success_status (Printf.sprintf "%-4s" entry.side)
+    | "sell" -> Ui_components.create_error_status (Printf.sprintf "%-4s" entry.side)
+    | _ -> Ui_components.create_text (Printf.sprintf "%-4s" entry.side)
   in
-  let side_part = string ~attr:side_attr (Printf.sprintf "%-4s" entry.side) in
 
-  let symbol_attr = Notty.A.(fg white) in  (* Primary text for symbols *)
-  let symbol_part = string ~attr:symbol_attr (Printf.sprintf "%-10s" entry.symbol) in
+  let symbol_part = Ui_components.create_text (Printf.sprintf "%-10s" entry.symbol) in
 
-  let qty_part = string ~attr:Notty.A.(fg white) (Printf.sprintf "%10.4f/%-10.4f" entry.remaining_qty entry.order_qty) in
+  let qty_part = Ui_components.create_text (Printf.sprintf "%10.4f/%-10.4f" entry.remaining_qty entry.order_qty) in
 
   let price_str = match entry.limit_price with
     | Some p -> Printf.sprintf "@ %.2f" p
     | None -> "@ market"
   in
-  let price_part = string ~attr:Notty.A.(fg white) (Printf.sprintf "%-12s" price_str) in
+  let price_part = Ui_components.create_text (Printf.sprintf "%-12s" price_str) in
 
-  let status_attr = match entry.order_status with
-    | "new" -> Notty.A.(fg green)           (* Success for new orders *)
-    | "partially_filled" -> Notty.A.(fg yellow) (* Warning for partial fills *)
-    | "filled" -> Notty.A.(fg green ++ st bold) (* Success for filled *)
-    | "canceled" -> Notty.A.(fg red)        (* Error for canceled *)
-    | _ -> Notty.A.(fg white)
+  let status_part = match entry.order_status with
+    | "new" -> Ui_components.create_success_status (Printf.sprintf "[%s]" entry.order_status)
+    | "partially_filled" -> Ui_components.create_warning_status (Printf.sprintf "[%s]" entry.order_status)
+    | "filled" -> Ui_components.create_success_status (Printf.sprintf "[%s]" entry.order_status)
+    | "canceled" -> Ui_components.create_error_status (Printf.sprintf "[%s]" entry.order_status)
+    | _ -> Ui_components.create_text (Printf.sprintf "[%s]" entry.order_status)
   in
-  let status_part = string ~attr:status_attr (Printf.sprintf "[%s]" entry.order_status) in
 
   hcat [side_part; symbol_part; qty_part; price_part; status_part]
 
 (** Format aggregated open orders entry for display *)
 let format_aggregated_orders_entry (symbol, buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt) =
-  let symbol_attr = Notty.A.(fg white ++ st bold) in  (* Primary text for symbols *)
-  let symbol_part = string ~attr:symbol_attr (Printf.sprintf "%-12s" symbol) in
+  let symbol_part = Ui_components.create_label (Printf.sprintf "%-12s" symbol) in
 
   (* Buy count *)
-  let buy_count_attr = Notty.A.(fg green) in
-  let buy_count_part = string ~attr:buy_count_attr (Printf.sprintf "%6d" buy_count) in
+  let buy_count_part = Ui_components.create_success_status (Printf.sprintf "%6d" buy_count) in
 
   (* Buy Cost - show as green for costs *)
-  let buy_cost_attr = Notty.A.(fg green) in
-  let buy_cost_part = string ~attr:buy_cost_attr (Printf.sprintf "%10.2f" buy_cost) in
+  let buy_cost_part = Ui_components.create_success_status (Printf.sprintf "%10.2f" buy_cost) in
 
   (* Sell count *)
-  let sell_count_attr = Notty.A.(fg red) in
-  let sell_count_part = string ~attr:sell_count_attr (Printf.sprintf "%6d" sell_count) in
+  let sell_count_part = Ui_components.create_error_status (Printf.sprintf "%6d" sell_count) in
 
   (* Sell Gain - show as red for gains from selling *)
-  let sell_value_attr = Notty.A.(fg red) in
-  let sell_value_part = string ~attr:sell_value_attr (Printf.sprintf "%10.2f" sell_value) in
+  let sell_value_part = Ui_components.create_error_status (Printf.sprintf "%10.2f" sell_value) in
 
   (* Total count *)
   let total_count = buy_count + sell_count in
-  let total_count_attr = Notty.A.(fg white) in
-  let total_count_part = string ~attr:total_count_attr (Printf.sprintf "%6d" total_count) in
+  let total_count_part = Ui_components.create_text (Printf.sprintf "%6d" total_count) in
 
   (* Total Gain - use green for positive, red for negative *)
-  let total_gain_attr = if total_gain >= 0.0 then Notty.A.(fg green ++ st bold) else Notty.A.(fg red ++ st bold) in
-  let total_gain_part = string ~attr:total_gain_attr (Printf.sprintf "%11.2f" total_gain) in
+  let total_gain_part = if total_gain >= 0.0 then Ui_components.create_success_status (Printf.sprintf "%11.2f" total_gain)
+                       else Ui_components.create_error_status (Printf.sprintf "%11.2f" total_gain) in
 
   (* Maker Fee - display as percentage or "-" if not available *)
   let maker_fee_str = match maker_fee_opt with
     | Some fee -> Printf.sprintf "%.2f" (fee *. 100.0)
     | None -> "-" in
-  let maker_fee_attr = Notty.A.(fg white) in
-  let maker_fee_part = string ~attr:maker_fee_attr (Printf.sprintf "%7s" maker_fee_str) in
+  let maker_fee_part = Ui_components.create_text (Printf.sprintf "%7s" maker_fee_str) in
 
   (* Taker Fee - display as percentage or "-" if not available *)
   let taker_fee_str = match taker_fee_opt with
     | Some fee -> Printf.sprintf "%.2f" (fee *. 100.0)
     | None -> "-" in
-  let taker_fee_attr = Notty.A.(fg white) in
-  let taker_fee_part = string ~attr:taker_fee_attr (Printf.sprintf "%7s" taker_fee_str) in
+  let taker_fee_part = Ui_components.create_text (Printf.sprintf "%7s" taker_fee_str) in
 
-  hcat [symbol_part; string ~attr:Notty.A.empty " "; maker_fee_part; string ~attr:Notty.A.empty " "; taker_fee_part; string ~attr:Notty.A.empty " "; buy_count_part; string ~attr:Notty.A.empty " "; buy_cost_part; string ~attr:Notty.A.empty " "; sell_count_part; string ~attr:Notty.A.empty " "; sell_value_part; string ~attr:Notty.A.empty " "; total_count_part; string ~attr:Notty.A.empty " "; total_gain_part]
+  hcat [symbol_part; Ui_components.create_text " "; maker_fee_part; Ui_components.create_text " "; taker_fee_part; Ui_components.create_text " "; buy_count_part; Ui_components.create_text " "; buy_cost_part; Ui_components.create_text " "; sell_count_part; Ui_components.create_text " "; sell_value_part; Ui_components.create_text " "; total_count_part; Ui_components.create_text " "; total_gain_part]
 
 (** Aggregate open orders by symbol with counts and financial values *)
 let aggregate_orders_by_symbol orders =
