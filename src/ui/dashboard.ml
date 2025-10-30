@@ -665,6 +665,21 @@ let run () : unit Lwt.t =
       (* Create terminal with error handling *)
       let term = Notty_lwt.Term.create () in
 
+      (* Get terminal size immediately after creation *)
+      let initial_size = Notty_lwt.Term.size term in
+      Lwd.set terminal_size_var initial_size;
+
+      (* Update initial state with real size *)
+      let current_state = Lwd.peek state_var in
+      let (available_w, available_h) = Ui_types.calculate_available_space
+        (fst initial_size) (snd initial_size) (List.length current_state.collapsed_modules) in
+      let new_single_module_mode = not (Ui_types.can_support_multiple_modules available_w available_h) in
+      Lwd.set viewport_var (available_w, available_h);
+      Lwd.set state_var { current_state with
+        viewport_constraints = (available_w, available_h);
+        single_module_mode = new_single_module_mode;
+      };
+
       let event_stream = Notty_lwt.Term.events term in
 
       let custom_event_stream =
@@ -679,14 +694,17 @@ let run () : unit Lwt.t =
         ) event_stream
       in
 
-      (* Run the UI using render directly - start with default size to avoid blocking *)
-      let size = Lwd.peek terminal_size_var in
-      let image_stream = Nottui_lwt.render ~quit:quit_promise ~size custom_event_stream ui in
+      (* Run the UI using render directly - now using real terminal size *)
+      let image_stream = Nottui_lwt.render ~quit:quit_promise ~size:initial_size custom_event_stream ui in
 
       (* Start size monitoring thread *)
       let _ = Lwt.async (fun () ->
-        let rec monitor_size () =
-          let%lwt () = Lwt_unix.sleep 0.5 in  (* Check size every 500ms *)
+        let rec monitor_size first_iter =
+          let%lwt () = if not first_iter then
+            Lwt_unix.sleep 0.5  (* Check size every 500ms, but not on first iteration *)
+          else
+            Lwt.return_unit
+          in
           let current_size = Notty_lwt.Term.size term in
           Lwd.set terminal_size_var current_size;
 
@@ -708,39 +726,9 @@ let run () : unit Lwt.t =
             };
           );
 
-          monitor_size ()
+          monitor_size false
         in
-        monitor_size ()
-      ) in
-
-      (* Immediate size update after terminal creation to get real size without blocking *)
-      let _ = Lwt.async (fun () ->
-        let%lwt () = Lwt_unix.sleep 0.1 in  (* Small delay to allow terminal to initialize *)
-        try
-          let current_size = Notty_lwt.Term.size term in
-          Lwd.set terminal_size_var current_size;
-
-          (* Update viewport constraints and single-module mode *)
-          let current_state = Lwd.peek state_var in
-          let (available_w, available_h) = Ui_types.calculate_available_space
-            (fst current_size) (snd current_size) (List.length current_state.collapsed_modules) in
-          let new_single_module_mode = not (Ui_types.can_support_multiple_modules available_w available_h) in
-
-          (* Update reactive viewport variable for views *)
-          Lwd.set viewport_var (available_w, available_h);
-
-          (* Update state if viewport constraints changed *)
-          if current_state.viewport_constraints <> (available_w, available_h) ||
-             current_state.single_module_mode <> new_single_module_mode then (
-            Lwd.set state_var { current_state with
-              viewport_constraints = (available_w, available_h);
-              single_module_mode = new_single_module_mode;
-            };
-          );
-          Lwt.return_unit
-        with exn ->
-          Logging.debug_f ~section:"dashboard" "Failed to get initial terminal size: %s" (Printexc.to_string exn);
-          Lwt.return_unit
+        monitor_size true  (* Start with immediate check *)
       ) in
 
       Lwt.finalize

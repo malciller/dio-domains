@@ -194,6 +194,7 @@ let truncate_tiny str =
 
 (** Truncate string to exact width (no ellipsis) *)
 let truncate_exact width str =
+  let width = max 0 width in
   if String.length str <= width then str
   else String.sub str 0 width
 

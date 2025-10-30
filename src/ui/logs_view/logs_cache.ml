@@ -56,12 +56,11 @@ let log_entries_var = Lwd.var (LogMap.empty, 0)
 let update_counter = ref 0
 
 (** Get reactive log entries variable *)
-let get_log_entries_var () = log_entries_var
-
-(** Safely update the reactive log entries variable *)
-let update_log_entries_var entries =
+let get_log_entries_var () =
+  (* Update the reactive variable with current state if needed *)
   incr update_counter;
-  Lwd.set log_entries_var (entries, !update_counter)
+  Lwd.set log_entries_var (cache.log_entries, !update_counter);
+  log_entries_var
 
 (** Convert log level to color *)
 let level_to_color level =
@@ -133,7 +132,8 @@ let set_max_entries max_entries =
 let clear_logs () =
   cache.log_entries <- LogMap.empty;
   Queue.clear cache.entry_keys;
-  update_log_entries_var LogMap.empty
+  incr update_counter;
+  Lwd.set log_entries_var (LogMap.empty, !update_counter)
 
 (** Filter log entries by level *)
 let filter_by_level level =
@@ -178,7 +178,6 @@ let get_dropped_logs_count () =
 
 (** Start background logs updater *)
 let start_logs_updater () =
-  let needs_ui_update = ref false in
 
   (* High-performance, yielding ingestion loop *)
   Lwt.async (fun () ->
@@ -204,7 +203,6 @@ let start_logs_updater () =
           cache.log_entries <- LogMap.add entry.id entry cache.log_entries;
           Queue.push entry.id cache.entry_keys
         ) entries_to_process;
-        needs_ui_update := true;
         trim_cache ();
       );
       
@@ -214,18 +212,7 @@ let start_logs_updater () =
     ingestion_loop ()
   );
 
-  (* Throttled UI update loop *)
-  Lwt.async (fun () ->
-    let rec ui_update_loop () =
-      let%lwt () = Lwt_unix.sleep 0.4 in (* ~2.5 FPS update rate - reduced for performance *)
-      if !needs_ui_update then (
-        needs_ui_update := false;
-        update_log_entries_var cache.log_entries
-      );
-      ui_update_loop ()
-    in
-    ui_update_loop ()
-  );
+  (* No longer need the async UI update loop - reactive variable is updated on access *)
 
   (* Periodic memory monitoring update *)
   Lwt.async (fun () ->
@@ -245,7 +232,8 @@ let init () =
     ()
   ) else (
     initialized := true;
-    update_log_entries_var LogMap.empty;
+    incr update_counter;
+    Lwd.set log_entries_var (LogMap.empty, !update_counter);
     start_logs_updater ();
     Logging.info ~section:"logs_cache" "Logs cache initialized"
   )
