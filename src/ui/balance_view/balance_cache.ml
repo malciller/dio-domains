@@ -310,6 +310,22 @@ let start_balance_updater () =
   (* Balance cache updates itself periodically - no external triggers needed *)
   ()
 
+  (* Add periodic event bus cleanup - every 5 minutes *)
+  let _cleanup_loop = Lwt.async (fun () ->
+    Logging.debug ~section:"balance_cache" "Starting event bus cleanup loop";
+    let rec cleanup_loop () =
+      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
+      let removed_opt = BalanceSnapshotEventBus.cleanup_stale_subscribers cache.balance_snapshot_event_bus () in
+      (match removed_opt with
+       | Some removed_count ->
+           if removed_count > 0 then
+             Logging.info_f ~section:"balance_cache" "Cleaned up %d stale balance subscribers" removed_count
+       | None -> ());
+      cleanup_loop ()
+    in
+    cleanup_loop ()
+  )
+
 (** Initialize the balance cache system with double-checked locking *)
 let init () =
   (* First check without locking (fast path) *)

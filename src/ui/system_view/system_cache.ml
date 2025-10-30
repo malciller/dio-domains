@@ -345,9 +345,9 @@ let perform_memory_maintenance () =
   let now = Unix.time () in
   let time_since_gc = now -. !last_gc_time in
 
-  (* Force GC every 30 minutes to prevent gradual memory creep *)
-  if time_since_gc > 1800.0 then (
-    Logging.debug ~section:"system_cache" "Performing scheduled GC";
+  (* Force GC every 15 minutes for dashboard mode to prevent gradual memory creep *)
+  if time_since_gc > 900.0 then (
+    Logging.debug ~section:"system_cache" "Performing scheduled GC (15-minute interval for dashboard mode)";
     Gc.full_major ();
     last_gc_time := now
   );
@@ -758,6 +758,22 @@ let start_system_updater () =
     system_loop ()
   ) in
   ()
+
+  (* Add periodic event bus cleanup - every 5 minutes *)
+  let _cleanup_loop = Lwt.async (fun () ->
+    Logging.debug ~section:"system_cache" "Starting event bus cleanup loop";
+    let rec cleanup_loop () =
+      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
+      let removed_opt = SystemStatsEventBus.cleanup_stale_subscribers cache.system_stats_event_bus () in
+      (match removed_opt with
+       | Some removed_count ->
+           if removed_count > 0 then
+             Logging.info_f ~section:"system_cache" "Cleaned up %d stale system stats subscribers" removed_count
+       | None -> ());
+      cleanup_loop ()
+    in
+    cleanup_loop ()
+  )
 
 (** Initialize the system cache with double-checked locking *)
 let init () =

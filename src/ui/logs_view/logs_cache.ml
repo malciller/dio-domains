@@ -217,7 +217,7 @@ let start_logs_updater () =
   (* Throttled UI update loop *)
   Lwt.async (fun () ->
     let rec ui_update_loop () =
-      let%lwt () = Lwt_unix.sleep 0.1 in (* ~10 FPS update rate *)
+      let%lwt () = Lwt_unix.sleep 0.4 in (* ~2.5 FPS update rate - reduced for performance *)
       if !needs_ui_update then (
         needs_ui_update := false;
         update_log_entries_var cache.log_entries
