@@ -7,6 +7,43 @@ let section = "kraken_orderbook"
 let orderbook_depth = 25
 let ring_buffer_size = 256
 
+(** Shared CRC32 implementation for checksum calculations *)
+let crc32_table =
+  Array.init 256 (fun n ->
+    let c = ref (Int32.of_int n) in
+    for _ = 0 to 7 do
+      if Int32.logand !c 1l <> 0l then
+        c := Int32.logxor (Int32.shift_right_logical !c 1) 0xEDB88320l
+      else
+        c := Int32.shift_right_logical !c 1
+    done;
+    !c)
+
+let crc32_zlib s =
+  let crc = ref 0xFFFFFFFFl in
+  for i = 0 to String.length s - 1 do
+    let byte = Char.code s.[i] in
+    let idx = Int32.to_int (Int32.logand (Int32.logxor !crc (Int32.of_int byte)) 0xFFl) in
+    crc := Int32.logxor crc32_table.(idx) (Int32.shift_right_logical !crc 8)
+  done;
+  Int32.logxor !crc 0xFFFFFFFFl
+
+(** Shared helpers for checksum calculations *)
+let remove_decimal s =
+  let b = Buffer.create (String.length s) in
+  String.iter (fun c -> if c <> '.' then Buffer.add_char b c) s;
+  Buffer.contents b
+
+let remove_leading_zeros s =
+  let len = String.length s in
+  let rec aux i =
+    if i >= len then ""
+    else if s.[i] = '0' then aux (i + 1)
+    else String.sub s i (len - i)
+  in
+  let trimmed = aux 0 in
+  if trimmed = "" then "0" else trimmed
+
 (** Individual price level with both float and string representations *)
 type level = {
   price: string;
@@ -181,31 +218,10 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
 
   Logging.debug_f ~section "Checksum input: symbol=%s bids=%d asks=%d" symbol (List.length bids_levels) (List.length asks_levels);
   Logging.debug_f ~section "Checksum levels used: bids=%d asks=%d" (List.length top_bids) (List.length top_asks);
-  Logging.debug_f ~section "Checksum levels (asks asc): %s"
-    (String.concat "; " (List.map (fun (p, q) -> p ^ "@" ^ q) top_asks));
-  Logging.debug_f ~section "Checksum levels (bids desc): %s"
-    (String.concat "; " (List.map (fun (p, q) -> p ^ "@" ^ q) top_bids));
-
-  let remove_decimal s =
-    let b = Buffer.create (String.length s) in
-    String.iter (fun c -> if c <> '.' then Buffer.add_char b c) s;
-    Buffer.contents b
-  in
 
   let format_price_level (price_str, qty_str) : string =
     let price_norm = remove_decimal price_str in
     let qty_norm = remove_decimal qty_str in
-
-    let remove_leading_zeros s =
-      let len = String.length s in
-      let rec aux i =
-        if i >= len then ""
-        else if s.[i] = '0' then aux (i + 1)
-        else String.sub s i (len - i)
-      in
-      let trimmed = aux 0 in
-      if trimmed = "" then "0" else trimmed
-    in
 
     let price_clean = remove_leading_zeros price_norm in
     let qty_clean = remove_leading_zeros qty_norm in
@@ -221,28 +237,6 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
 
   (* Concatenate asks + bids *)
   let combined_string = asks_string ^ bids_string in
-
-  (* Standard CRC32 implementation (zlib compatible) *)
-  let crc32_zlib s =
-    let crc_table = Array.init 256 (fun n ->
-      let c = ref (Int32.of_int n) in
-      for _ = 0 to 7 do
-        if Int32.logand !c 1l <> 0l then
-          c := Int32.logxor (Int32.shift_right_logical !c 1) 0xEDB88320l
-        else
-          c := Int32.shift_right_logical !c 1
-      done;
-      !c
-    ) in
-
-    let crc = ref 0xFFFFFFFFl in
-    for i = 0 to String.length s - 1 do
-      let byte = Char.code s.[i] in
-      let idx = Int32.to_int (Int32.logand (Int32.logxor !crc (Int32.of_int byte)) 0xFFl) in
-      crc := Int32.logxor crc_table.(idx) (Int32.shift_right_logical !crc 8)
-    done;
-    Int32.logxor !crc 0xFFFFFFFFl
-  in
 
   let result = crc32_zlib combined_string in
 
@@ -367,33 +361,12 @@ let calculate_checksum symbol bids asks : int32 =
 
   Logging.debug_f ~section "Checksum input: symbol=%s bids=%d asks=%d" symbol (Array.length bids) (Array.length asks);
   Logging.debug_f ~section "Checksum levels used: bids=%d asks=%d" (List.length top_bids) (List.length top_asks);
-  Logging.debug_f ~section "Checksum levels (asks asc): %s"
-    (String.concat "; " (List.map (fun l -> l.price ^ "@" ^ l.size) top_asks));
-  Logging.debug_f ~section "Checksum levels (bids desc): %s"
-    (String.concat "; " (List.map (fun l -> l.price ^ "@" ^ l.size) top_bids));
-
-  let remove_decimal s =
-    let b = Buffer.create (String.length s) in
-    String.iter (fun c -> if c <> '.' then Buffer.add_char b c) s;
-    Buffer.contents b
-  in
 
   let format_price_level (level: level) : string =
     let full_price_str = Printf.sprintf "%.*f" pd level.price_float in
     let full_qty_str = Printf.sprintf "%.*f" ld level.size_float in
     let price_norm = remove_decimal full_price_str in
     let qty_norm = remove_decimal full_qty_str in
-
-    let remove_leading_zeros s =
-      let len = String.length s in
-      let rec aux i =
-        if i >= len then ""
-        else if s.[i] = '0' then aux (i + 1)
-        else String.sub s i (len - i)
-      in
-      let trimmed = aux 0 in
-      if trimmed = "" then "0" else trimmed
-    in
 
     let price_clean = remove_leading_zeros price_norm in
     let qty_clean = remove_leading_zeros qty_norm in
@@ -409,28 +382,6 @@ let calculate_checksum symbol bids asks : int32 =
 
   (* Concatenate asks + bids *)
   let combined_string = asks_string ^ bids_string in
-
-  (* Standard CRC32 implementation (zlib compatible) *)
-  let crc32_zlib s =
-    let crc_table = Array.init 256 (fun n ->
-      let c = ref (Int32.of_int n) in
-      for _ = 0 to 7 do
-        if Int32.logand !c 1l <> 0l then
-          c := Int32.logxor (Int32.shift_right_logical !c 1) 0xEDB88320l
-        else
-          c := Int32.shift_right_logical !c 1
-      done;
-      !c
-    ) in
-
-    let crc = ref 0xFFFFFFFFl in
-    for i = 0 to String.length s - 1 do
-      let byte = Char.code s.[i] in
-      let idx = Int32.to_int (Int32.logand (Int32.logxor !crc (Int32.of_int byte)) 0xFFl) in
-      crc := Int32.logxor crc_table.(idx) (Int32.shift_right_logical !crc 8)
-    done;
-    Int32.logxor !crc 0xFFFFFFFFl
-  in
 
   let result = crc32_zlib combined_string in
 
@@ -695,6 +646,9 @@ let process_orderbook_message ~reset json on_heartbeat =
           | Some curr_seq, Some last_seq when Int64.compare curr_seq last_seq <= 0 ->
               Logging.warn_f ~section "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
                 symbol curr_seq last_seq;
+              store.bids <- PriceMap.empty;
+              store.asks <- PriceMap.empty;
+              store.buffer <- RingBuffer.create ring_buffer_size;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
               raise Exit  (* Skip processing this entry *)
@@ -702,6 +656,9 @@ let process_orderbook_message ~reset json on_heartbeat =
               let gap = Int64.sub curr_seq last_seq in
               Logging.warn_f ~section "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking out-of-sync"
                 symbol curr_seq last_seq gap;
+              store.bids <- PriceMap.empty;
+              store.asks <- PriceMap.empty;
+              store.buffer <- RingBuffer.create ring_buffer_size;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
               raise Exit  (* Skip processing this entry *)
@@ -709,8 +666,6 @@ let process_orderbook_message ~reset json on_heartbeat =
         end;
         let bids_json = member "bids" entry in
         let asks_json = member "asks" entry in
-        Logging.debug_f ~section "Raw orderbook data for %s: bids_json=%s asks_json=%s"
-          symbol (Yojson.Safe.to_string bids_json) (Yojson.Safe.to_string asks_json);
         let bids = parse_levels symbol bids_json in
         let asks = parse_levels symbol asks_json in
         Logging.debug_f ~section "Parsed levels for %s: bids=%d asks=%d"
@@ -741,6 +696,9 @@ let process_orderbook_message ~reset json on_heartbeat =
                 Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
                   symbol received_checksum received_checksum calculated_checksum calculated_checksum;
                 (* Mark symbol out-of-sync on checksum mismatch *)
+                store.bids <- PriceMap.empty;
+                store.asks <- PriceMap.empty;
+                store.buffer <- RingBuffer.create ring_buffer_size;
                 Atomic.set store.has_snapshot false;
                 Atomic.set store.last_sequence None;
                 false  (* Don't write to buffer *)
