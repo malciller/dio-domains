@@ -171,6 +171,22 @@ let start_telemetry_updater () =
       )
     in
     polling_loop () (* No initial delay once system is ready *)
+  );
+
+  (* Add periodic event bus cleanup - every 5 minutes *)
+  Lwt.async (fun () ->
+    Logging.debug ~section:"telemetry_cache" "Starting event bus cleanup loop";
+    let rec cleanup_loop () =
+      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
+      let removed_opt = TelemetrySnapshotEventBus.cleanup_stale_subscribers cache.telemetry_snapshot_event_bus () in
+      (match removed_opt with
+       | Some removed_count ->
+           if removed_count > 0 then
+             Logging.info_f ~section:"telemetry_cache" "Cleaned up %d stale telemetry subscribers" removed_count
+       | None -> ());
+      cleanup_loop ()
+    in
+    cleanup_loop ()
   )
 
 (** Initialize the telemetry cache system with double-checked locking *)

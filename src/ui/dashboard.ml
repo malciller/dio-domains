@@ -221,6 +221,7 @@ let create_hamburger_menu collapsed_modules screen_size =
 
 
 let make_dashboard () =
+
   (* Terminal size tracking *)
   let terminal_size_var = Lwd.var (80, 24) in  (* Default size *)
 
@@ -261,10 +262,10 @@ let make_dashboard () =
     timestamp = 0.0;
   }, 0) in
 
-  (* Start periodic time updates for uptime display *)
+  (* Start periodic time updates for uptime display - reduced frequency for performance *)
   Lwt.async (fun () ->
     let rec update_time () =
-      let%lwt () = Lwt_unix.sleep 1.0 in
+      let%lwt () = Lwt_unix.sleep 2.5 in
       Lwd.set time_var (Unix.time ());
       update_time ()
     in
@@ -347,73 +348,71 @@ let make_dashboard () =
     create_hamburger_menu state.collapsed_modules (Ui_types.classify_screen_size w h)
   ) in
 
+  (* Combine all panel UIs into a single reactive value to reduce nesting *)
+  let combined_panels_ui = Lwd.map2
+    (Lwd.map2 system_panel_ui balances_panel_ui ~f:(fun sp bp -> (sp, bp)))
+    (Lwd.map2 telemetry_panel_ui logs_panel_ui ~f:(fun tp lp -> (tp, lp)))
+    ~f:(fun (system_panel, balances_panel) (telemetry_panel, logs_panel) ->
+      (system_panel, balances_panel, telemetry_panel, logs_panel)) in
+
   (* Create adaptive main panel layout based on dashboard state *)
-  let main_panels_ui = Lwd.map2
-    (Lwd.map2
-      (Lwd.map2 (Lwd.get state_var)
-                (Lwd.map2 (Lwd.map2 system_panel_ui balances_panel_ui ~f:(fun sp bp -> (sp, bp)))
-                          telemetry_panel_ui ~f:(fun (sp, bp) tp -> (sp, bp, tp)))
-                ~f:(fun state (system_panel, balances_panel, telemetry_panel) ->
-                  (state, system_panel, balances_panel, telemetry_panel)))
-      logs_panel_ui
-      ~f:(fun (state, system_panel, balances_panel, telemetry_panel) logs_panel ->
-        (* Filter panels to only show those in open_modules *)
-        let get_panel panel_type =
-          match panel_type with
-          | SystemPanel -> system_panel
-          | BalancesPanel -> balances_panel
-          | TelemetryPanel -> telemetry_panel
-          | LogsPanel -> logs_panel
-          | NoFocus -> empty
-        in
+  let main_panels_ui = Lwd.map2 (Lwd.get state_var) combined_panels_ui
+    ~f:(fun state (system_panel, balances_panel, telemetry_panel, logs_panel) ->
+      (* Filter panels to only show those in open_modules *)
+      let get_panel panel_type =
+        match panel_type with
+        | SystemPanel -> system_panel
+        | BalancesPanel -> balances_panel
+        | TelemetryPanel -> telemetry_panel
+        | LogsPanel -> logs_panel
+        | NoFocus -> empty
+      in
 
-        let open_panels = List.map get_panel state.open_modules in
+      let open_panels = List.map get_panel state.open_modules in
 
-        if state.single_module_mode then
-          (* Single module mode: show only the focused panel or first open panel *)
-          match state.focused_panel with
-          | NoFocus when open_panels <> [] -> List.hd open_panels
-          | NoFocus -> empty
-          | focused -> get_panel focused
-        else
-          (* Multi-module mode: use screen size based layouts *)
-          let screen_size = Ui_types.classify_screen_size (fst state.viewport_constraints) (snd state.viewport_constraints) in
-          match screen_size with
-          | Ui_types.Mobile ->
-              (* Stack open panels vertically on mobile *)
-              vcat open_panels
-          | Ui_types.Small ->
-              (* Two columns layout for small screens *)
-              let left_panels = List.filteri (fun i _ -> i mod 2 = 0) open_panels in
-              let right_panels = List.filteri (fun i _ -> i mod 2 = 1) open_panels in
-              let left_column = vcat left_panels in
-              let right_column = vcat right_panels in
-              hcat [left_column; right_column]
-          | Ui_types.Medium ->
-              (* Two columns layout for medium screens *)
-              let left_panels = List.filteri (fun i _ -> i mod 2 = 0) open_panels in
-              let right_panels = List.filteri (fun i _ -> i mod 2 = 1) open_panels in
-              let left_column = vcat left_panels in
-              let right_column = vcat right_panels in
-              hcat [left_column; right_column]
-          | Ui_types.Large ->
-              (* Three panels on top, logs full-width below (if logs is open) *)
-              let non_logs_panels = List.filter (fun p -> p <> LogsPanel) state.open_modules in
-              let non_logs_ui = List.map get_panel non_logs_panels in
-              let logs_ui = if List.mem LogsPanel state.open_modules then [logs_panel] else [] in
-              let top_row = if non_logs_ui <> [] then hcat non_logs_ui else empty in
-              let bottom_row = if logs_ui <> [] then List.hd logs_ui else empty in
-              if top_row <> empty && bottom_row <> empty then
-                vcat [top_row; bottom_row]
-              else if top_row <> empty then
-                top_row
-              else if bottom_row <> empty then
-                bottom_row
-              else
-                empty
-      ))
-    (Lwd.get state_var)
-    ~f:(fun layout _ -> layout) in
+      if state.single_module_mode then
+        (* Single module mode: show only the focused panel or first open panel *)
+        match state.focused_panel with
+        | NoFocus when open_panels <> [] -> List.hd open_panels
+        | NoFocus -> empty
+        | focused -> get_panel focused
+      else
+        (* Multi-module mode: use screen size based layouts *)
+        let screen_size = Ui_types.classify_screen_size (fst state.viewport_constraints) (snd state.viewport_constraints) in
+        match screen_size with
+        | Ui_types.Mobile ->
+            (* Stack open panels vertically on mobile *)
+            vcat open_panels
+        | Ui_types.Small ->
+            (* Two columns layout for small screens *)
+            let left_panels = List.filteri (fun i _ -> i mod 2 = 0) open_panels in
+            let right_panels = List.filteri (fun i _ -> i mod 2 = 1) open_panels in
+            let left_column = vcat left_panels in
+            let right_column = vcat right_panels in
+            hcat [left_column; right_column]
+        | Ui_types.Medium ->
+            (* Two columns layout for medium screens *)
+            let left_panels = List.filteri (fun i _ -> i mod 2 = 0) open_panels in
+            let right_panels = List.filteri (fun i _ -> i mod 2 = 1) open_panels in
+            let left_column = vcat left_panels in
+            let right_column = vcat right_panels in
+            hcat [left_column; right_column]
+        | Ui_types.Large ->
+            (* Three panels on top, logs full-width below (if logs is open) *)
+            let non_logs_panels = List.filter (fun p -> p <> LogsPanel) state.open_modules in
+            let non_logs_ui = List.map get_panel non_logs_panels in
+            let logs_ui = if List.mem LogsPanel state.open_modules then [logs_panel] else [] in
+            let top_row = if non_logs_ui <> [] then hcat non_logs_ui else empty in
+            let bottom_row = if logs_ui <> [] then List.hd logs_ui else empty in
+            if top_row <> empty && bottom_row <> empty then
+              vcat [top_row; bottom_row]
+            else if top_row <> empty then
+              top_row
+            else if bottom_row <> empty then
+              bottom_row
+            else
+              empty
+    ) in
 
   (* Combine all UI elements *)
   let ui = Lwd.map2 status_bar_ui
@@ -512,6 +511,13 @@ let run () : unit Lwt.t =
   (* Create dashboard and reactive variables first *)
   let (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var, viewport_var) = make_dashboard () in
 
+  (* Performance monitoring counters and memory tracking (scoped to run) *)
+  let telemetry_update_count = ref 0 in
+  let system_update_count = ref 0 in
+  let balance_update_count = ref 0 in
+  let last_memory_check = ref (Unix.time ()) in
+  let last_memory_usage = ref 0.0 in
+
   (* Create quit promise *)
   let quit_promise, quit_resolver = Lwt.wait () in
 
@@ -557,7 +563,25 @@ let run () : unit Lwt.t =
           telemetry_loaded := true;
           check_all_loaded ()
         );
-        Lwd.set telemetry_snapshot_var snapshot
+        (* Performance monitoring - track update count *)
+        incr telemetry_update_count;
+        Lwd.set telemetry_snapshot_var snapshot;
+
+        (* Memory monitoring - check every 100 telemetry updates *)
+        if !telemetry_update_count mod 100 = 0 then (
+          let now = Unix.time () in
+          let time_since_check = now -. !last_memory_check in
+          if time_since_check > 300.0 then (  (* Check every 5 minutes *)
+            let current_memory = (Gc.stat ()).heap_words * (Sys.word_size / 8) / (1024 * 1024) in
+            let memory_diff = float_of_int current_memory -. !last_memory_usage in
+            if memory_diff > 50.0 then (
+              Logging.warn_f ~section:"dashboard" "Memory usage increased by %.1f MB in last %.0f minutes (%.1f MB total)"
+                memory_diff time_since_check !last_memory_usage
+            );
+            last_memory_check := now;
+            last_memory_usage := float_of_int current_memory
+          )
+        )
       ) stream
     with exn ->
       Logging.error_f ~section:"dashboard" "Failed to subscribe to telemetry updates: %s" (Printexc.to_string exn);
@@ -572,6 +596,8 @@ let run () : unit Lwt.t =
           system_loaded := true;
           check_all_loaded ()
         );
+        (* Performance monitoring - track update count *)
+        incr system_update_count;
         Lwd.set system_stats_var stats
       ) stream
     with exn ->
@@ -590,6 +616,8 @@ let run () : unit Lwt.t =
           check_all_loaded ()
         );
         incr update_counter;
+        (* Performance monitoring - track global update count *)
+        incr balance_update_count;
         Lwd.set balance_snapshot_var (snapshot, !update_counter)
       ) stream
     with exn ->
@@ -616,6 +644,20 @@ let run () : unit Lwt.t =
 
   (* The loading state will be cleared when data actually arrives via the streams *)
   Logging.info ~section:"dashboard" "Dashboard waiting for data sources to initialize...";
+
+  (* Periodic performance monitoring - log update statistics every 10 minutes *)
+  Lwt.async (fun () ->
+    Logging.info ~section:"dashboard" "Starting performance monitoring loop";
+    let rec monitor_performance () =
+      let%lwt () = Lwt_unix.sleep 600.0 in (* Log every 10 minutes *)
+      let total_updates = !telemetry_update_count + !system_update_count + !balance_update_count in
+      let current_memory = (Gc.stat ()).heap_words * (Sys.word_size / 8) / (1024 * 1024) in
+      Logging.info_f ~section:"dashboard" "Performance stats - Updates: telemetry=%d, system=%d, balance=%d (total=%d), Memory: %d MB"
+        !telemetry_update_count !system_update_count !balance_update_count total_updates current_memory;
+      monitor_performance ()
+    in
+    monitor_performance ()
+  );
 
   (* Dashboard main loop with TTY reconnection handling *)
   let rec run_dashboard_loop () =
@@ -720,6 +762,6 @@ let run () : unit Lwt.t =
       (* Wait a bit before retrying *)
       let%lwt () = Lwt_unix.sleep 1.0 in
       run_dashboard_loop ()
-  in
+    in
 
-  run_dashboard_loop ()
+    run_dashboard_loop ()
