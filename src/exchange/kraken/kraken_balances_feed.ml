@@ -110,7 +110,7 @@ let get_balance_store asset =
       (* This should not happen if initialized correctly, but as a fallback: *)
       let store = BalanceStore.create () in
       Hashtbl.add balance_stores asset store;
-      Logging.warn_f ~section "Created balance store on-the-fly for %s (should be pre-initialized)" asset;
+      Logging.debug_f ~section "Created balance store on-the-fly for %s (should be pre-initialized)" asset;
       store
   in
   Mutex.unlock balance_stores_mutex;
