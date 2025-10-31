@@ -600,20 +600,50 @@ let make_dashboard () =
 
   (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var, viewport_var, update_panel_viewports)
 
-(** Verify that all required caches are initialized *)
-let verify_cache_initialization () =
-  let telemetry_initialized = try Dio_ui_telemetry.Telemetry_cache.init (); true with _ -> false in
-  let system_initialized = try Dio_ui_system.System_cache.init (); true with _ -> false in
-  let balance_initialized = try Dio_ui_balance.Balance_cache.init (); true with _ -> false in
+(** Initialize caches and wait for them to be ready for subscriptions *)
+let initialize_caches_and_wait_ready () =
+  Logging.info ~section:"dashboard" "Initializing caches and waiting for readiness...";
 
-  if not telemetry_initialized then
-    Logging.warn ~section:"dashboard" "Telemetry cache initialization failed";
-  if not system_initialized then
-    Logging.warn ~section:"dashboard" "System cache initialization failed";
-  if not balance_initialized then
-    Logging.warn ~section:"dashboard" "Balance cache initialization failed";
+  (* Start cache initialization - these may start background threads *)
+  let telemetry_started = try Dio_ui_telemetry.Telemetry_cache.init (); true with exn ->
+    Logging.error_f ~section:"dashboard" "Failed to start telemetry cache: %s" (Printexc.to_string exn); false
+  in
 
-  telemetry_initialized && system_initialized && balance_initialized
+  let system_started = try Dio_ui_system.System_cache.init (); true with exn ->
+    Logging.error_f ~section:"dashboard" "Failed to start system cache: %s" (Printexc.to_string exn); false
+  in
+
+  let balance_started = try Dio_ui_balance.Balance_cache.init (); true with exn ->
+    Logging.error_f ~section:"dashboard" "Failed to start balance cache: %s" (Printexc.to_string exn); false
+  in
+
+  (* Wait for caches to be ready - give them time to start background threads *)
+  let%lwt () = Lwt_unix.sleep 2.0 in
+
+  (* Try to verify caches are actually ready by attempting to get current data *)
+  let telemetry_ready = telemetry_started && (try
+    let _ = Dio_ui_telemetry.Telemetry_cache.current_telemetry_snapshot () in true
+    with _ -> Logging.warn ~section:"dashboard" "Telemetry cache not ready yet"; false
+  ) in
+
+  let system_ready = system_started && (try
+    let _ = Dio_ui_system.System_cache.current_system_stats () in true
+    with _ -> Logging.warn ~section:"dashboard" "System cache not ready yet"; false
+  ) in
+
+  let balance_ready = balance_started && (try
+    let _ = Dio_ui_balance.Balance_cache.current_balance_snapshot () in true
+    with _ -> Logging.warn ~section:"dashboard" "Balance cache not ready yet"; false
+  ) in
+
+  let all_ready = telemetry_ready && system_ready && balance_ready in
+
+  if all_ready then
+    Logging.info ~section:"dashboard" "All caches initialized and ready for subscriptions"
+  else
+    Logging.warn_f ~section:"dashboard" "Caches initialization status - telemetry:%b system:%b balance:%b" telemetry_ready system_ready balance_ready;
+
+  Lwt.return all_ready
 
 (** Initialize and run the dashboard *)
 let run () : unit Lwt.t =
@@ -627,8 +657,8 @@ let run () : unit Lwt.t =
     Logging.error_f ~section:"dashboard" "Async exception caught: %s" (Printexc.to_string exn)
   );
 
-  (* Verify that all caches are initialized before proceeding *)
-  let caches_ready = verify_cache_initialization () in
+  (* Initialize caches and wait for them to be ready before proceeding *)
+  let%lwt caches_ready = initialize_caches_and_wait_ready () in
   if not caches_ready then
     Logging.warn ~section:"dashboard" "Some caches failed to initialize, dashboard may not function correctly";
 
@@ -685,11 +715,14 @@ let run () : unit Lwt.t =
 
   (* Subscribe to event streams for real-time updates with defensive checks *)
   let _telemetry_sub = Lwt.async (fun () ->
+    Logging.debug ~section:"dashboard" "Attempting to subscribe to telemetry updates";
     try
       let stream = Dio_ui_telemetry.Telemetry_cache.subscribe_telemetry_snapshot () in
+      Logging.info ~section:"dashboard" "Successfully subscribed to telemetry updates";
       Lwt_stream.iter (fun snapshot ->
         Logging.debug_f ~section:"dashboard" "Received telemetry snapshot update at %.3f" (Unix.time ());
         if not !telemetry_loaded then (
+          Logging.info ~section:"dashboard" "Telemetry data first received - marking as loaded";
           telemetry_loaded := true;
           check_all_loaded ()
         );
@@ -717,14 +750,18 @@ let run () : unit Lwt.t =
       ) stream
     with exn ->
       Logging.error_f ~section:"dashboard" "Failed to subscribe to telemetry updates: %s" (Printexc.to_string exn);
+      Logging.error ~section:"dashboard" "CRITICAL: Telemetry subscription failed - dashboard will not receive telemetry updates";
       Lwt.return_unit
   ) in
 
   let _system_stats_sub = Lwt.async (fun () ->
+    Logging.debug ~section:"dashboard" "Attempting to subscribe to system stats updates";
     try
       let stream = Dio_ui_system.System_cache.subscribe_system_stats () in
+      Logging.info ~section:"dashboard" "Successfully subscribed to system stats updates";
       Lwt_stream.iter (fun stats ->
         if not !system_loaded then (
+          Logging.info ~section:"dashboard" "System stats data first received - marking as loaded";
           system_loaded := true;
           check_all_loaded ()
         );
@@ -734,16 +771,20 @@ let run () : unit Lwt.t =
       ) stream
     with exn ->
       Logging.error_f ~section:"dashboard" "Failed to subscribe to system stats updates: %s" (Printexc.to_string exn);
+      Logging.error ~section:"dashboard" "CRITICAL: System stats subscription failed - dashboard will not receive system updates";
       Lwt.return_unit
   ) in
 
   let _balance_sub = Lwt.async (fun () ->
+    Logging.debug ~section:"dashboard" "Attempting to subscribe to balance updates";
     try
       let stream = Dio_ui_balance.Balance_cache.subscribe_balance_snapshot () in
+      Logging.info ~section:"dashboard" "Successfully subscribed to balance updates";
       let update_counter = ref 0 in
       Lwt_stream.iter (fun snapshot ->
         (* Only consider balances loaded when we have actual balance data, not just empty snapshots *)
         if not !balance_loaded && snapshot.balances <> [] then (
+          Logging.info ~section:"dashboard" "Balance data first received - marking as loaded";
           balance_loaded := true;
           check_all_loaded ()
         );
@@ -754,25 +795,70 @@ let run () : unit Lwt.t =
       ) stream
     with exn ->
       Logging.error_f ~section:"dashboard" "Failed to subscribe to balance updates: %s" (Printexc.to_string exn);
+      Logging.error ~section:"dashboard" "CRITICAL: Balance subscription failed - dashboard will not receive balance updates";
       Lwt.return_unit
   ) in
 
-  (* Initialize subsystems in the background to not block the UI *)
-  Lwt.async (fun () ->
-    try
-      Dio_ui_telemetry.Telemetry_cache.init ();
-      Dio_ui_system.System_cache.init ();
-      Dio_ui_balance.Balance_cache.init ();
-      Lwt.return_unit
-    with exn ->
-      Logging.error_f ~section:"dashboard" "Failed to initialize subsystems: %s" (Printexc.to_string exn);
-      Lwt.return_unit
-  );
+  (* Caches are already initialized above, no need for background initialization *)
 
-  (* Wait asynchronously for cache initialization to complete *)
-  (* Don't use blocking sleep - let the async threads run *)
-  let cache_init_wait = Lwt_unix.sleep 0.1 in  (* Small delay to let cache init threads start *)
-  let%lwt () = cache_init_wait in
+  (* Add timeout mechanism to clear loading state if data never arrives *)
+  Lwt.async (fun () ->
+    Logging.debug ~section:"dashboard" "Starting loading timeout mechanism";
+    let%lwt () = Lwt_unix.sleep 30.0 in  (* 30 second timeout *)
+    let current_state = Lwd.peek state_var in
+    if current_state.is_loading then (
+      Logging.warn ~section:"dashboard" "Loading timeout reached - clearing loading state to allow dashboard to function with available data";
+
+      (* Force clear loading state and open panels based on available data *)
+      let telemetry_has_data = !telemetry_loaded in
+      let system_has_data = !system_loaded in
+      let balance_has_data = !balance_loaded in
+
+      Logging.info_f ~section:"dashboard" "Loading timeout - data status: telemetry=%b system=%b balance=%b"
+        telemetry_has_data system_has_data balance_has_data;
+
+      (* Open panels that have data, start with system if available *)
+      let available_panels = [] in
+      let available_panels = if telemetry_has_data then TelemetryPanel :: available_panels else available_panels in
+      let available_panels = if system_has_data then SystemPanel :: available_panels else available_panels in
+      let available_panels = if balance_has_data then BalancesPanel :: available_panels else available_panels in
+
+      let open_modules, focused_panel =
+        if available_panels = [] then
+          (* No data at all - open system anyway and show error *)
+          ([SystemPanel], SystemPanel)
+        else
+          (* Open first available panel *)
+          ([List.hd available_panels], List.hd available_panels)
+      in
+
+      let collapsed_modules = List.filter (fun p -> not (List.mem p open_modules))
+        [SystemPanel; BalancesPanel; TelemetryPanel; LogsPanel] in
+
+      Lwd.set state_var { current_state with
+        is_loading = false;
+        open_modules = open_modules;
+        collapsed_modules = collapsed_modules;
+        focused_panel = focused_panel;
+      };
+      update_panel_viewports { current_state with
+        is_loading = false;
+        open_modules = open_modules;
+        collapsed_modules = collapsed_modules;
+        focused_panel = focused_panel;
+      };
+
+      if available_panels = [] then
+        Logging.error ~section:"dashboard" "No data sources available after timeout - dashboard may not be functional"
+      else
+        Logging.info ~section:"dashboard" "Dashboard loaded with partial data due to timeout";
+
+      Lwt.return_unit
+    ) else (
+      Logging.debug ~section:"dashboard" "Loading completed before timeout - no action needed";
+      Lwt.return_unit
+    )
+  );
 
   (* The loading state will be cleared when data actually arrives via the streams *)
   Logging.info ~section:"dashboard" "Dashboard waiting for data sources to initialize...";
@@ -843,8 +929,14 @@ let run () : unit Lwt.t =
       (* Create terminal with error handling *)
       let term = Notty_lwt.Term.create () in
 
-      (* Get terminal size immediately after creation *)
-      let initial_size = Notty_lwt.Term.size term in
+      (* Get terminal size immediately after creation with error handling *)
+      let initial_size =
+        try
+          Notty_lwt.Term.size term
+        with exn ->
+          Logging.warn_f ~section:"dashboard" "Failed to get initial terminal size: %s, using default" (Printexc.to_string exn);
+          (80, 24)  (* Fallback to standard terminal size *)
+      in
       Lwd.set terminal_size_var initial_size;
 
       (* Update initial state with real size *)
@@ -879,15 +971,25 @@ let run () : unit Lwt.t =
       (* Run the UI using render directly - now using real terminal size *)
       let image_stream = Nottui_lwt.render ~quit:quit_promise ~size:initial_size custom_event_stream ui in
 
-      (* Start size monitoring thread *)
+      (* Start size monitoring thread with error handling *)
       let _ = Lwt.async (fun () ->
-        let rec monitor_size first_iter =
+        let rec monitor_size first_iter last_known_size =
           let%lwt () = if not first_iter then
-            Lwt_unix.sleep 0.5  (* Check size every 500ms, but not on first iteration *)
+            Lwt_unix.sleep 1.0  (* Check size every 1 second, but not on first iteration *)
           else
-            Lwt.return_unit
+            Lwt_unix.sleep 0.1  (* Small delay before first check to allow terminal initialization *)
           in
-          let current_size = Notty_lwt.Term.size term in
+
+          (* Get terminal size with error handling *)
+          let current_size =
+            try
+              Notty_lwt.Term.size term
+            with exn ->
+              Logging.warn_f ~section:"dashboard" "Failed to get terminal size: %s, using cached size" (Printexc.to_string exn);
+              last_known_size  (* Use last known size on error *)
+          in
+
+          (* Update size variable only if we got a valid size *)
           Lwd.set terminal_size_var current_size;
 
           (* Update viewport constraints and single-module mode *)
@@ -910,9 +1012,11 @@ let run () : unit Lwt.t =
             update_panel_viewports new_state;
           );
 
-          monitor_size false
+          monitor_size false current_size
         in
-        monitor_size true  (* Start with immediate check *)
+        (* Start with default size and small delay *)
+        let initial_size = Lwd.peek terminal_size_var in
+        monitor_size true initial_size
       ) in
 
       Lwt.finalize
