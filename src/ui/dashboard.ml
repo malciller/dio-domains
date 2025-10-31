@@ -27,6 +27,9 @@ type dashboard_state = {
   single_module_mode: bool;             (* True when only one module can be open *)
 }
 
+(** Maximum height for logs panel when in bottom row (to prevent truncating other views) *)
+let max_logs_panel_height = 25
+
 (** Calculate panel dimensions based on available space and layout *)
 let calculate_panel_dimensions state panel_count =
   (* Handle empty panel count to prevent division by zero *)
@@ -68,12 +71,15 @@ let calculate_panel_dimensions state panel_count =
           (* Logs in bottom row - need to handle differently for logs vs non-logs *)
           let non_logs_count = List.length (List.filter (fun p -> p <> LogsPanel) state.open_modules) in
           if non_logs_count > 0 then
-            (* Top row height for non-logs panels *)
-            let top_row_height = max Ui_types.min_panel_height ((available_h / 2) - border_overhead) in
-            let top_row_width = max Ui_types.min_panel_width (available_w / non_logs_count) in
-            (* Bottom row height for logs panel *)
-            let bottom_row_height = max Ui_types.min_panel_height ((available_h / 2) - border_overhead) in
+            (* Cap logs panel height to prevent truncating other views *)
+            let max_bottom_height = max_logs_panel_height in
+            (* Bottom row height for logs panel - capped at max_logs_panel_height *)
+            let bottom_row_height = min max_bottom_height (max Ui_types.min_panel_height ((available_h / 2) - border_overhead)) in
             let bottom_row_width = max Ui_types.min_panel_width available_w in
+            (* Top row gets remaining height after logs panel is allocated *)
+            let remaining_height = available_h - bottom_row_height - border_overhead in
+            let top_row_height = max Ui_types.min_panel_height (remaining_height / non_logs_count) in
+            let top_row_width = max Ui_types.min_panel_width (available_w / non_logs_count) in
             (top_row_width, top_row_height, bottom_row_width, bottom_row_height)
           else
             (* Only logs panel - use full width *)

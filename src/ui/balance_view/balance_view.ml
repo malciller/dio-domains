@@ -390,7 +390,7 @@ let balances_view balance_snapshot _state ~available_width ~available_height =
   (* Balances section *)
   let balances_title = string ~attr:Notty.A.(st bold ++ fg white) "\nBalances:" in
   let balances_header = string ~attr:Notty.A.(fg white)
-    (Printf.sprintf "\n%-8s %15s %12s %15s %12s" "Asset" "Total Bal" "Cur Value" "Acc Bal" "Acc Value") in
+    (Printf.sprintf "%-8s %15s %12s %15s %12s" "Asset" "Total Bal" "Cur Value" "Acc Bal" "Acc Value") in
 
   (* Calculate pending amounts from open orders *)
   let pending_amounts = calculate_pending_amounts balance_snapshot.open_orders in
@@ -415,7 +415,7 @@ let balances_view balance_snapshot _state ~available_width ~available_height =
   let balances_list = if balance_entries = [] then
     empty
   else
-    vcat (balance_entries @ [string ~attr:Notty.A.empty ""; separator; total_row]) in
+    vcat (balance_entries @ [separator; total_row]) in
 
   let balances_section = if filtered_balances = [] then
     vcat [balances_title; balances_header; string ~attr:Notty.A.(fg red) "\n  No balance data available"]
@@ -423,9 +423,9 @@ let balances_view balance_snapshot _state ~available_width ~available_height =
     vcat [balances_title; balances_header; balances_list] in
 
   (* Open orders section *)
-  let orders_title = string ~attr:Notty.A.(st bold ++ fg white) "\n\nOpen Orders:" in
+  let orders_title = string ~attr:Notty.A.(st bold ++ fg white) "\nOpen Orders:" in
   let orders_header = string ~attr:Notty.A.(fg white)
-    (Printf.sprintf "\n%-12s %7s %7s %6s %10s %6s %10s %6s %11s" "Pair" "Maker%" "Taker%" "Buy" "Buy Cost" "Sell" "Sell Gain" "Total" "Total Gain") in
+    (Printf.sprintf "%-12s %7s %7s %6s %10s %6s %10s %6s %11s" "Pair" "Maker%" "Taker%" "Buy" "Buy Cost" "Sell" "Sell Gain" "Total" "Total Gain") in
 
   let aggregated_orders = aggregate_orders_by_symbol balance_snapshot.open_orders in
   let order_entries = List.map (fun (symbol, (buy_count, sell_count, buy_cost, sell_value, total_gain, maker_fee_opt, taker_fee_opt)) ->
@@ -478,7 +478,7 @@ let balances_view balance_snapshot _state ~available_width ~available_height =
   let orders_list = if order_entries = [] then
     empty
   else
-    vcat (order_entries @ [string ~attr:Notty.A.empty ""; orders_separator; orders_total_row]) in
+    vcat (order_entries @ [orders_separator; orders_total_row]) in
 
   let orders_section = if balance_snapshot.open_orders = [] then
     vcat [orders_title; orders_header; string ~attr:Notty.A.(fg white) "\n  No open orders"]
