@@ -14,13 +14,13 @@ module Ui_components = Dio_ui_shared.Ui_components
 type state = {
   selected_category: int;
   scroll_offset: int;
-  expanded_metrics: (string, bool) Hashtbl.t;
+  expanded_category: string option;
 }
 
 let initial_state = {
   selected_category = 0;
   scroll_offset = 0;
-  expanded_metrics = Hashtbl.create 32;
+  expanded_category = None;
 }
 
 (** Helper function to take first n elements from a list *)
@@ -280,7 +280,6 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_wid
     let screen_size = Ui_types.classify_screen_size available_width available_height in
     let reserved_lines = if is_constrained_layout then 2 else 4 in (* Reserve less space in compact mode *)
     let max_categories = Ui_types.max_visible_categories screen_size available_height reserved_lines in (* Reserve space for header/footer *)
-    let max_metrics_per_category = Ui_types.max_metrics_per_category screen_size in
 
     (* Limit categories to fit available space *)
     let display_categories = if List.length snapshot.categories > max_categories then
@@ -306,17 +305,11 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_wid
              try
                let selected = i = state.selected_category in
                let header = category_header category_name (List.length metrics) selected in
-               let expanded = Hashtbl.find_opt state.expanded_metrics category_name |> Option.value ~default:false in
+               let expanded = state.expanded_category = Some category_name in
 
                if expanded && metrics <> [] then
-                 (* Limit the number of metrics displayed based on screen size and available space *)
-                 let display_metrics = if List.length metrics > max_metrics_per_category then
-                   let rec take_first n acc = function
-                     | [] -> List.rev acc
-                     | _ when n <= 0 -> List.rev acc
-                     | h::t -> take_first (n-1) (h::acc) t
-                   in take_first max_metrics_per_category [] metrics
-                 else metrics in
+                 (* Show all metrics in expanded categories - no limiting *)
+                 let display_metrics = metrics in
                  let metric_rows = List.map (fun metric -> metric_row metric false snapshot) display_metrics in
                  let indented_rows = List.map (fun row -> hcat [string ~attr:Notty.A.empty "  "; row]) metric_rows in
                  vcat (header :: indented_rows)
@@ -360,9 +353,9 @@ let handle_key state (snapshot : Ui_types.telemetry_snapshot) = function
   | `ASCII 'q', [] -> `Quit
   | `ASCII ' ', [] ->
       let (category_name, _) = List.nth snapshot.categories state.selected_category in
-      let currently_expanded = Hashtbl.find_opt state.expanded_metrics category_name |> Option.value ~default:false in
-      Hashtbl.replace state.expanded_metrics category_name (not currently_expanded);
-      `Continue state
+      let currently_expanded = state.expanded_category = Some category_name in
+      let new_expanded_category = if currently_expanded then None else Some category_name in
+      `Continue { state with expanded_category = new_expanded_category }
   | `Arrow `Up, [] ->
       let new_selected = max 0 (state.selected_category - 1) in
       `Continue { state with selected_category = new_selected }
