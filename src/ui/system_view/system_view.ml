@@ -90,9 +90,12 @@ let calculate_system_view_min_width stats =
   List.fold_left max 20 widths  (* Minimum 20 chars to be reasonable *)
 
 (** Create responsive system monitoring UI *)
-let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_snapshot) ~available_width ~available_height =
+let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_snapshot) ~available_width ~available_height ~is_constrained_layout =
   (* Determine screen size for adaptive display *)
   let screen_size = classify_screen_size available_width available_height in
+  (* Detect compact mode when layout is constrained (when logs view is open with other panels) *)
+  let compact_mode = is_constrained_layout in
+
 
   match screen_size with
   | Mobile ->
@@ -187,8 +190,13 @@ Ui_components.create_text (Ui_types.truncate_exact (available_width - 4) uptime_
             (cores, List.init (List.length cores) (fun i -> Printf.sprintf "Core %d" i))
         in
 
-        (* Limit cores shown based on available height *)
-        let max_cores_display = max 1 (available_height - 8) in (* Reserve space for other sections *)
+        (* Limit cores shown based on available height - prioritize processes/temp over cores *)
+        let reserved_lines = if compact_mode then 12 else 8 in (* Reserve more space in compact mode *)
+        let max_cores_display =
+          if available_height < 15 then
+            0  (* Don't show cores when height is very constrained - prioritize processes/temp *)
+          else
+            max 1 (available_height - reserved_lines) in
         let cores_to_display = min (List.length cores_to_show) max_cores_display in
         let displayed_cores = List.filteri (fun i _ -> i < cores_to_display) cores_to_show in
         let displayed_names = List.filteri (fun i _ -> i < cores_to_display) core_names in
@@ -271,18 +279,31 @@ Ui_components.create_text (Printf.sprintf " (%d cores)" total_cores)
         ]
   in
 
-  (* Process Section *)
-  let proc_title = Ui_components.create_label "Processes" in
-  let proc_text = Ui_components.create_text (Printf.sprintf "%d running" stats.processes) in
-  let proc_section = vcat [
-    proc_title;
-    proc_text;
-  ] in
+  (* Process Section - compact in compact mode *)
+  let proc_section = if compact_mode then
+    (* In compact mode, combine processes with temperature if available *)
+    match stats.cpu_temp with
+    | Some cpu_temp ->
+        let proc_text = Printf.sprintf "Processes: %d" stats.processes in
+        let temp_text = Printf.sprintf "CPU: %.1f°C" cpu_temp in
+        let combined = Printf.sprintf "%s | %s" proc_text temp_text in
+        let color = if cpu_temp > 90.0 then Ui_components.create_error_status combined
+                   else if cpu_temp > 75.0 then Ui_components.create_warning_status combined
+                   else Ui_components.create_success_status combined in
+        color
+    | None ->
+        Ui_components.create_text (Printf.sprintf "Processes: %d" stats.processes)
+  else
+    (* Normal mode: separate title and text *)
+    let proc_title = Ui_components.create_label "Processes" in
+    let proc_text = Ui_components.create_text (Printf.sprintf "%d running" stats.processes) in
+    vcat [proc_title; proc_text]
+  in
 
-  (* Temperature Section - hide on small screens *)
+  (* Temperature Section - hide on small screens or in compact mode (already combined with processes) *)
   let temp_section =
-    if not (should_show_temperature screen_size) then
-      empty  (* Hide temperature on small screens *)
+    if compact_mode || not (should_show_temperature screen_size) then
+      empty  (* Hide temperature on small screens or in compact mode *)
     else
       match stats.cpu_temp, stats.gpu_temp with
       | None, None -> empty  (* No temperature data available *)
@@ -336,20 +357,21 @@ Ui_components.create_text (Printf.sprintf " (%d cores)" total_cores)
             vcat (temp_title :: temp_lines)
   in
 
-  (* Combine all sections with selective spacing *)
+  (* Combine all sections with conditional spacing based on compact mode *)
+  let section_spacing = if compact_mode then [] else [string ~attr:Notty.A.empty ""] in
   let sections = [
     header;
-    string ~attr:Notty.A.empty "";
+  ] @ section_spacing @ [
     cpu_section;
     mem_section;
     swap_section;
-    string ~attr:Notty.A.empty "";
+  ] @ section_spacing @ [
     proc_section;
   ] in
 
-  (* Only add temperature section if it's not empty, with minimal spacing *)
+  (* Only add temperature section if it's not empty, with conditional spacing *)
   let sections = if temp_section <> empty then
-    sections @ [temp_section]
+    sections @ (if compact_mode then [] else [string ~attr:Notty.A.empty ""]) @ [temp_section]
   else
     sections
   in
@@ -358,13 +380,16 @@ Ui_components.create_text (Printf.sprintf " (%d cores)" total_cores)
   vcat sections
 
 (** Create reactive system view with shared stats and snapshot variables *)
-let make_system_view stats_var snapshot_var viewport_var =
+let make_system_view stats_var snapshot_var viewport_var ~is_constrained_layout =
   (* Reactive UI *)
   let ui = Lwd.map2
-    (Lwd.map2 (Lwd.get snapshot_var) (Lwd.get stats_var) ~f:(fun snapshot stats -> (snapshot, stats)))
-    (Lwd.get viewport_var)
-    ~f:(fun (snapshot, stats) (available_width, available_height) ->
-      system_view stats snapshot ~available_width ~available_height
+    (Lwd.map2
+      (Lwd.map2 (Lwd.get snapshot_var) (Lwd.get stats_var) ~f:(fun snapshot stats -> (snapshot, stats)))
+      (Lwd.get viewport_var)
+      ~f:(fun (snapshot, stats) (available_width, available_height) -> (snapshot, stats, available_width, available_height)))
+    is_constrained_layout
+    ~f:(fun (snapshot, stats, available_width, available_height) constrained ->
+      system_view stats snapshot ~available_width ~available_height ~is_constrained_layout:constrained
     ) in
 
   (* Event handling - only handle quit key *)
