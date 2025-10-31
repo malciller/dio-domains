@@ -402,15 +402,14 @@ let make_dashboard () =
   (* Initialize panel viewports with current state *)
   update_panel_viewports (Lwd.peek state_var);
 
-  (* Create reactive views that adapt to viewport changes *)
-  let telemetry_ui, telemetry_handler = Dio_ui_telemetry.Telemetry_view.make_telemetry_view telemetry_snapshot_var telemetry_viewport_var in
-
-  (* Determine if system layout is constrained (logs open with other panels) *)
+  (* Determine if layout is constrained (logs open with other panels) *)
   let is_constrained_layout = Lwd.map (Lwd.get state_var) ~f:(fun state ->
     List.mem LogsPanel state.open_modules && List.length state.open_modules > 1
   ) in
 
+  (* Create reactive views that adapt to viewport changes *)
   let system_ui, system_handler = Dio_ui_system.System_view.make_system_view system_stats_var telemetry_snapshot_var system_viewport_var ~is_constrained_layout in
+  let telemetry_ui, telemetry_handler = Dio_ui_telemetry.Telemetry_view.make_telemetry_view telemetry_snapshot_var telemetry_viewport_var ~is_constrained_layout in
   let balances_ui, balances_handler = Dio_ui_balance.Balance_view.make_balances_view balance_snapshot_var balances_viewport_var in
   let log_entries_var = Dio_ui_logs.Logs_cache.get_log_entries_var () in
   let logs_ui, logs_handler = Dio_ui_logs.Logs_view.make_logs_view log_entries_var logs_viewport_var in

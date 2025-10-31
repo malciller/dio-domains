@@ -170,7 +170,7 @@ let calculate_telemetry_view_min_width snapshot =
   max 40 (calculate_category_widths snapshot.categories 0 + 4)
 
 (** Create telemetry view widget with size constraints *)
-let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_width ~available_height =
+let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_width ~available_height ~is_constrained_layout =
   let start_time = Unix.time () in
   try
     Logging.debug_f ~section:"telemetry_view" "Rendering telemetry view with %d categories at %.3f"
@@ -278,7 +278,8 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_wid
 
     (* Calculate adaptive limits based on available space *)
     let screen_size = Ui_types.classify_screen_size available_width available_height in
-    let max_categories = Ui_types.max_visible_categories screen_size available_height 4 in (* Reserve space for header/footer *)
+    let reserved_lines = if is_constrained_layout then 2 else 4 in (* Reserve less space in compact mode *)
+    let max_categories = Ui_types.max_visible_categories screen_size available_height reserved_lines in (* Reserve space for header/footer *)
     let max_metrics_per_category = Ui_types.max_metrics_per_category screen_size in
 
     (* Limit categories to fit available space *)
@@ -333,16 +334,17 @@ let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_wid
     (* Footer with controls *)
     let footer = string ~attr:Notty.A.empty "↑↓: Navigate categories | Space: Expand/collapse | q: Quit" in
 
-    (* Combine everything *)
+    (* Combine everything with conditional spacing *)
     let render_time = Unix.time () -. start_time in
     Logging.debug_f ~section:"telemetry_view" "Telemetry view rendered successfully in %.3f seconds" render_time;
-    vcat [
+    let spacing = if is_constrained_layout then [] else [string ~attr:Notty.A.empty ""] in
+    vcat ([
       header;
-      string ~attr:Notty.A.empty "";
+    ] @ spacing @ [
       categories_list;
-      string ~attr:Notty.A.empty "";
+    ] @ spacing @ [
       footer;
-    ]
+    ])
   with exn ->
     let render_time = Unix.time () -. start_time in
     Logging.error_f ~section:"telemetry_view" "Exception in telemetry_view after %.3f seconds: %s" render_time (Printexc.to_string exn);
@@ -371,15 +373,18 @@ let handle_key state (snapshot : Ui_types.telemetry_snapshot) = function
   | _ -> `Continue state
 
 (** Create reactive telemetry view with shared snapshot variable *)
-let make_telemetry_view snapshot_var viewport_var =
+let make_telemetry_view snapshot_var viewport_var ~is_constrained_layout =
   let state_var = Lwd.var initial_state in
 
   (* Reactive UI that depends on snapshot, state, and viewport changes *)
   let ui = Lwd.map2
-    (Lwd.map2 (Lwd.get snapshot_var) (Lwd.get state_var) ~f:(fun snapshot state -> (snapshot, state)))
-    (Lwd.get viewport_var)
-    ~f:(fun (snapshot, state) (available_width, available_height) ->
-      telemetry_view snapshot state ~available_width ~available_height
+    (Lwd.map2
+      (Lwd.map2 (Lwd.get snapshot_var) (Lwd.get state_var) ~f:(fun snapshot state -> (snapshot, state)))
+      (Lwd.get viewport_var)
+      ~f:(fun (snapshot, state) (available_width, available_height) -> (snapshot, state, available_width, available_height)))
+    is_constrained_layout
+    ~f:(fun (snapshot, state, available_width, available_height) constrained ->
+      telemetry_view snapshot state ~available_width ~available_height ~is_constrained_layout:constrained
     ) in
 
   (* Event handling *)
@@ -412,8 +417,9 @@ let run () =
   } in
   let snapshot_var = Lwd.var empty_snapshot in
   let viewport_var = Lwd.var (80, 24) in
+  let constrained_var = Lwd.var false in
 
-  let (ui, handle_event) = make_telemetry_view snapshot_var viewport_var in
+  let (ui, handle_event) = make_telemetry_view snapshot_var viewport_var ~is_constrained_layout:(Lwd.get constrained_var) in
 
   (* Create quit promise *)
   let quit_promise, quit_resolver = Lwt.wait () in
