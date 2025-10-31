@@ -59,7 +59,8 @@ let format_metric_value_ui metric =
     | Telemetry.Histogram _ ->
         let (mean, p50, p95, p99, count) = Telemetry.histogram_stats metric in  (* Safe since we're accessing from cache snapshot *)
         let text = if count > 0 then
-          Printf.sprintf "%d samples | avg=%.1fµs p50=%.1fµs p95=%.1fµs p99=%.1fµs"
+          (* More compact histogram format to prevent truncation *)
+          Printf.sprintf "%d | avg=%.1fµs p50=%.1f p95=%.1f p99=%.1f"
              count
              (mean *. 1_000_000.0)
              (p50 *. 1_000_000.0)
@@ -131,6 +132,42 @@ let category_header category_name metric_count selected =
   let title = Printf.sprintf "[%s] (%d metrics)" category_name metric_count in
   if selected then Ui_components.create_highlighted_status title
   else Ui_components.create_label title
+
+(** Calculate minimum width required for telemetry view content *)
+let calculate_telemetry_view_min_width snapshot =
+  let rec calculate_metric_widths metrics max_name_len max_value_len =
+    match metrics with
+    | [] -> (max_name_len, max_value_len)
+    | metric :: rest ->
+        let name_len = String.length metric.Telemetry.name in
+        let (value_str, _) = format_metric_value_ui metric in
+        let value_len = String.length value_str in
+
+        (* Account for labels - add some padding for " (" and ") " *)
+        let label_len = match metric.Telemetry.labels with
+          | [] -> 0
+          | labels -> 2 + String.length (String.concat ", " (List.map (fun (k, v) -> k ^ "=" ^ v) labels)) + 2
+        in
+
+        let new_max_name = max max_name_len (name_len + label_len + 1) in  (* +1 for ":" *)
+        let new_max_value = max max_value_len value_len in
+
+        calculate_metric_widths rest new_max_name new_max_value
+  in
+
+  let rec calculate_category_widths categories max_width =
+    match categories with
+    | [] -> max_width
+    | (cat_name, metrics) :: rest ->
+        let cat_header_len = String.length (Printf.sprintf "[%s] (%d metrics)" cat_name (List.length metrics)) in
+        let (name_width, value_width) = calculate_metric_widths metrics 0 0 in
+        let indented_metric_width = name_width + value_width + 4 in  (* +2 for indentation "  ", +2 for spacing *)
+        let category_max_width = max cat_header_len indented_metric_width in
+        calculate_category_widths rest (max max_width category_max_width)
+  in
+
+  (* Add some padding for borders and readability *)
+  max 40 (calculate_category_widths snapshot.categories 0 + 4)
 
 (** Create telemetry view widget with size constraints *)
 let telemetry_view (snapshot : Ui_types.telemetry_snapshot) state ~available_width ~available_height =

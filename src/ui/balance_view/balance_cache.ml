@@ -321,6 +321,11 @@ let start_balance_updater () =
            if removed_count > 0 then
              Logging.info_f ~section:"balance_cache" "Cleaned up %d stale balance subscribers" removed_count
        | None -> ());
+
+      (* Report subscriber statistics to telemetry *)
+      let (total, active, _) = BalanceSnapshotEventBus.get_subscriber_stats cache.balance_snapshot_event_bus in
+      Telemetry.set_event_bus_subscribers_total total;
+      Telemetry.set_event_bus_subscribers_active active;
       cleanup_loop ()
     in
     cleanup_loop ()

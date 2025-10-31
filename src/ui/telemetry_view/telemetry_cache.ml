@@ -24,6 +24,7 @@ type t = {
   update_interval: float;  (* Minimum time between updates *)
   mutable consecutive_failures: int;  (* Track consecutive failures for backoff *)
   mutable backoff_until: float;  (* When to resume updates after backoff *)
+  mutable last_metrics_hash: string;  (* Track hash of metrics for deduplication *)
 }
 
 (** Global telemetry cache instance *)
@@ -32,9 +33,10 @@ let cache = {
   telemetry_snapshot_event_bus = TelemetrySnapshotEventBus.create "telemetry_snapshot";
   update_condition = Lwt_condition.create ();
   last_update = 0.0;
-  update_interval = 1.0;  (* Update every 1 second for telemetry *)
+  update_interval = 3.0;  (* Update every 3 seconds for dashboard mode - reduced frequency *)
   consecutive_failures = 0;
   backoff_until = 0.0;
+  last_metrics_hash = "";
 }
 
 (** Initialization guard with mutex protection *)
@@ -52,52 +54,72 @@ let signal_system_ready () =
     Lwt_condition.broadcast system_ready_condition ()
   )
 
-(** Create a fresh telemetry snapshot *)
-let create_telemetry_snapshot () : telemetry_snapshot =
+(** Create a fresh telemetry snapshot with deduplication *)
+let create_telemetry_snapshot () : telemetry_snapshot option =
   let now = Unix.time () in
   let uptime = now -. !Telemetry.start_time in
-
-  Logging.debug_f ~section:"telemetry_cache" "Creating snapshot at %.3f (uptime: %.1f)" now uptime;
 
   (* Update cached rates and sliding counter snapshots before copying metrics *)
   Telemetry.update_cached_rates ();
 
-  (* Safely copy metrics from telemetry system *)
-  let metrics_list = ref [] in
-  Telemetry.(
+  (* Compute hash of current metrics for deduplication *)
+  let current_hash = Telemetry.(
     Mutex.lock metrics_mutex;
-    let metric_count = Hashtbl.length metrics in
-    Logging.debug_f ~section:"telemetry_cache" "Copying %d metrics from telemetry system" metric_count;
-    Hashtbl.iter (fun _ metric -> metrics_list := metric :: !metrics_list) metrics;
-    Mutex.unlock metrics_mutex
-  );
+    let hash = Hashtbl.fold (fun key metric acc ->
+      let metric_str = Printf.sprintf "%s:%s:%s:%.3f:%.3f"
+        key metric.name (String.concat "," (List.map (fun (k,v) -> k^"="^v) metric.labels))
+        metric.last_updated metric.cached_rate in
+      Digest.string (acc ^ metric_str) |> Digest.to_hex
+    ) metrics "" in
+    Mutex.unlock metrics_mutex;
+    hash
+  ) in
 
-  let final_metrics = !metrics_list in
-  Logging.debug_f ~section:"telemetry_cache" "Snapshot contains %d metrics" (List.length final_metrics);
+  (* Check if metrics have changed since last snapshot *)
+  if current_hash = cache.last_metrics_hash then (
+    Logging.debug ~section:"telemetry_cache" "Metrics unchanged, skipping snapshot creation";
+    None  (* No change, don't create new snapshot *)
+  ) else (
+    Logging.debug_f ~section:"telemetry_cache" "Creating snapshot at %.3f (uptime: %.1f)" now uptime;
+    cache.last_metrics_hash <- current_hash;
 
-  (* Group by categories *)
-  let categories = Hashtbl.create 16 in
-  List.iter (fun metric ->
-    let category = Telemetry.categorize_metric metric in
-    let existing = Hashtbl.find_opt categories category |> Option.value ~default:[] in
-    Hashtbl.replace categories category (metric :: existing)
-  ) !metrics_list;
+    (* Safely copy metrics from telemetry system - minimize allocations *)
+    let metrics_list = Telemetry.(
+      Mutex.lock metrics_mutex;
+      let metric_count = Hashtbl.length metrics in
+      Logging.debug_f ~section:"telemetry_cache" "Copying %d metrics from telemetry system" metric_count;
+      (* Use direct list creation instead of ref accumulation *)
+      Hashtbl.fold (fun _ metric acc -> metric :: acc) metrics []
+    ) in
+    Mutex.unlock metrics_mutex;
 
-  let category_list =
-    [("Connections", []); ("Trading", []); ("Positions", []); ("Domains", []); ("Market Data", []); ("Other", [])]
-    |> List.map (fun (cat, _) ->
-         match Hashtbl.find_opt categories cat with
-         | Some metrics -> (cat, List.sort (fun m1 m2 -> String.compare m1.name m2.name) metrics)
-         | None -> (cat, [])
-       )
-  in
+    let final_metrics = metrics_list in
+    Logging.debug_f ~section:"telemetry_cache" "Snapshot contains %d metrics" (List.length final_metrics);
 
-  {
-    uptime;
-    metrics = !metrics_list;
-    categories = category_list;
-    timestamp = now;
-  }
+    (* Compute categories efficiently - use single pass *)
+    let categories_hashtable = Hashtbl.create 16 in
+    List.iter (fun metric ->
+      let category = Telemetry.categorize_metric metric in
+      let existing = Hashtbl.find_opt categories_hashtable category |> Option.value ~default:[] in
+      Hashtbl.replace categories_hashtable category (metric :: existing)
+    ) final_metrics;
+
+    let category_list =
+      [("Connections", []); ("Trading", []); ("Positions", []); ("Domains", []); ("Market Data", []); ("System", []); ("Other", [])]
+      |> List.map (fun (cat, _) ->
+           match Hashtbl.find_opt categories_hashtable cat with
+           | Some metrics -> (cat, List.sort (fun m1 m2 -> String.compare m1.name m2.name) metrics)
+           | None -> (cat, [])
+         )
+    in
+
+    Some {
+      uptime;
+      metrics = final_metrics;
+      categories = category_list;
+      timestamp = now;
+    }
+  )
 
 (** Wait for next telemetry update *)
 let wait_for_update () = Lwt_condition.wait cache.update_condition
@@ -122,11 +144,25 @@ let current_telemetry_snapshot () =
 let start_telemetry_updater () =
   Logging.debug ~section:"telemetry_cache" "Starting background telemetry updater";
   (* Ensure we have an initial update *)
-  let initial_snapshot = create_telemetry_snapshot () in
-  cache.current_snapshot <- Some initial_snapshot;
-  cache.last_update <- Unix.time ();
-  TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus initial_snapshot;
-  Lwt_condition.broadcast cache.update_condition ();
+  (match create_telemetry_snapshot () with
+   | Some initial_snapshot ->
+       cache.current_snapshot <- Some initial_snapshot;
+       cache.last_update <- Unix.time ();
+       TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus initial_snapshot;
+       Lwt_condition.broadcast cache.update_condition ()
+   | None ->
+       (* No metrics yet, create empty snapshot *)
+       let empty_snapshot = {
+         uptime = 0.0;
+         metrics = [];
+         categories = [];
+         timestamp = Unix.time ();
+       } in
+       cache.current_snapshot <- Some empty_snapshot;
+       cache.last_update <- Unix.time ();
+       TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus empty_snapshot;
+       Lwt_condition.broadcast cache.update_condition ()
+  );
 
   (* Start periodic polling updater *)
   Lwt.async (fun () ->
@@ -151,14 +187,19 @@ let start_telemetry_updater () =
       ) else (
         if time_since_last >= cache.update_interval then (
           (try
-            let snapshot = create_telemetry_snapshot () in
-            cache.current_snapshot <- Some snapshot;
-            cache.last_update <- now;
-            cache.consecutive_failures <- 0;
-            cache.backoff_until <- 0.0;
-            TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
-            Lwt_condition.broadcast cache.update_condition ();
-            Logging.debug_f ~section:"telemetry_cache" "Telemetry snapshot updated at %.2f" snapshot.timestamp
+            match create_telemetry_snapshot () with
+            | Some snapshot ->
+                cache.current_snapshot <- Some snapshot;
+                cache.last_update <- now;
+                cache.consecutive_failures <- 0;
+                cache.backoff_until <- 0.0;
+                TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
+                Lwt_condition.broadcast cache.update_condition ();
+                Logging.debug_f ~section:"telemetry_cache" "Telemetry snapshot updated at %.2f" snapshot.timestamp
+            | None ->
+                (* Metrics unchanged, just update timestamp *)
+                cache.last_update <- now;
+                Logging.debug_f ~section:"telemetry_cache" "Metrics unchanged, skipping snapshot update at %.2f" now
           with exn ->
             cache.consecutive_failures <- cache.consecutive_failures + 1;
             let backoff_seconds = min 60.0 (2.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 5))) in
@@ -184,6 +225,11 @@ let start_telemetry_updater () =
            if removed_count > 0 then
              Logging.info_f ~section:"telemetry_cache" "Cleaned up %d stale telemetry subscribers" removed_count
        | None -> ());
+
+      (* Report subscriber statistics to telemetry *)
+      let (total, active, _) = TelemetrySnapshotEventBus.get_subscriber_stats cache.telemetry_snapshot_event_bus in
+      Telemetry.set_event_bus_subscribers_total total;
+      Telemetry.set_event_bus_subscribers_active active;
       cleanup_loop ()
     in
     cleanup_loop ()

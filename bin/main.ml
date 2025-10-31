@@ -56,6 +56,11 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
+  (* Read and apply logging configuration *)
+  let config = Dio_engine.Config.read_config () in
+  Logging.set_level config.logging.level;
+  Logging.set_enabled_sections config.logging.sections;
+
   if !dashboard_mode then begin
     (* Initialize logs cache for dashboard mode *)
     Dio_ui_logs.Logs_cache.init ();

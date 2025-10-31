@@ -102,13 +102,15 @@ let create_bordered_panel ~title ?(focused = false) ?max_width ?max_height conte
   let bottom_border = create_border_line bottom_left bottom_right in
 
   (* Apply size constraints to content if specified *)
+  (* Account for border and padding overhead: 2 borders + 2 spaces = 4 chars *)
+  let border_padding_overhead = 4 in
   let constrained_content = match max_width, max_height with
     | Some w, Some h ->
-        (* Constrain both dimensions *)
-        resize ~w ~h content
+        (* Constrain both dimensions - subtract border overhead from width *)
+        resize ~w:(w - border_padding_overhead) ~h content
     | Some w, None ->
-        (* Constrain width only *)
-        resize ~w content
+        (* Constrain width only - subtract border overhead *)
+        resize ~w:(w - border_padding_overhead) content
     | None, Some h ->
         (* Constrain height only - let width expand *)
         resize ~h content

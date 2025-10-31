@@ -60,6 +60,10 @@ let memory_config = {
 (** Mutex to protect memory_config access from race conditions *)
 let memory_config_mutex = Mutex.create ()
 
+(** Metric lifecycle management *)
+let metric_stale_ttl_seconds = 3600.0  (* Remove metrics not updated in 1 hour *)
+let max_metrics_count = 5000  (* Cap total metrics to prevent unbounded growth *)
+
 (** Get current memory pressure level based on OCaml heap usage *)
 let get_memory_pressure () : memory_pressure =
   let stat = Gc.stat () in
@@ -347,6 +351,49 @@ let adjust_buffer_capacities () =
   set_gauge rate_capacity_metric (float_of_int current_rate_capacity);
   set_gauge histogram_capacity_metric (float_of_int current_histogram_capacity)
 
+(** Prune stale metrics and cap total count to prevent unbounded growth *)
+let prune_stale_metrics () =
+  Mutex.lock metrics_mutex;
+  let now = Unix.gettimeofday () in
+  let stale_cutoff = now -. metric_stale_ttl_seconds in
+
+  (* Collect keys to remove *)
+  let keys_to_remove = ref [] in
+  let total_count = Hashtbl.length metrics in
+
+  Hashtbl.iter (fun key metric ->
+    if metric.last_updated < stale_cutoff then
+      keys_to_remove := key :: !keys_to_remove
+  ) metrics;
+
+  (* Remove stale metrics *)
+  let stale_removed = List.length !keys_to_remove in
+  List.iter (Hashtbl.remove metrics) !keys_to_remove;
+
+  (* If still over limit, remove oldest metrics *)
+  let current_count = Hashtbl.length metrics in
+  let to_remove_more = max 0 (current_count - max_metrics_count) in
+  if to_remove_more > 0 then begin
+    (* Collect all metrics with creation times *)
+    let metrics_with_times = ref [] in
+    Hashtbl.iter (fun key metric ->
+      metrics_with_times := (key, metric.created_at) :: !metrics_with_times
+    ) metrics;
+
+    (* Sort by creation time (oldest first) and remove oldest *)
+    let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t1 t2) !metrics_with_times in
+    let oldest_to_remove = List.map fst (List.filteri (fun i _ -> i < to_remove_more) sorted) in
+    List.iter (Hashtbl.remove metrics) oldest_to_remove;
+  end;
+
+  let final_count = Hashtbl.length metrics in
+  Mutex.unlock metrics_mutex;
+
+  (* Log summary if we removed anything *)
+  if stale_removed > 0 || to_remove_more > 0 then
+    Logging.info_f ~section "Pruned stale metrics: removed %d stale + %d oldest, total metrics: %d/%d"
+      stale_removed to_remove_more final_count total_count
+
 (** Start event-driven capacity adjustment loop *)
 let start_capacity_adjuster () =
   Lwt.async (fun () ->
@@ -362,7 +409,9 @@ let start_capacity_adjuster () =
 
       if time_since_last >= 60.0 then begin
         (* Perform adjustment *)
-        adjust_buffer_capacities ()
+        adjust_buffer_capacities ();
+        (* Also prune stale metrics *)
+        prune_stale_metrics ()
       end;
 
       (* Continue listening *)
@@ -676,6 +725,10 @@ let categorize_metric metric =
           String.starts_with ~prefix:"balance" name ||
           String.starts_with ~prefix:"execution" name then "Market Data"
   else if String.starts_with ~prefix:"open_" name then "Positions"
+  else if String.starts_with ~prefix:"heap_memory" name ||
+          String.starts_with ~prefix:"rss_memory" name ||
+          String.starts_with ~prefix:"telemetry_" name ||
+          String.starts_with ~prefix:"event_bus_" name then "System"
   else "Other"
 
 (** Format metric value for display *)
@@ -716,11 +769,24 @@ let asset_sliding_counter name asset ?(window_size=10000) ?(track_rate=false) ?(
 let asset_gauge name asset = gauge name ~labels:["asset", asset] ()
 let asset_histogram name asset () = histogram name ~labels:["asset", asset] ()
 
-(** Update system metrics *)
-let update_system_metrics () =
-  let uptime_metric = gauge "uptime_seconds" () in
-  let uptime = Unix.time () -. !start_time in
-  set_gauge uptime_metric uptime
+(** Get current OCaml heap usage in MB *)
+let get_ocaml_heap_usage () =
+  let stat = Gc.stat () in
+  let heap_words = stat.heap_words in
+  let word_size = Sys.word_size / 8 in  (* bytes per word *)
+  float_of_int (heap_words * word_size) /. (1024.0 *. 1024.0)
+
+(** Get current RSS (Resident Set Size) in MB *)
+let get_rss_usage () =
+  try
+    let pid = Unix.getpid () in
+    let cmd = Printf.sprintf "ps -o rss= -p %d" pid in
+    let ic = Unix.open_process_in cmd in
+    let line = input_line ic in
+    let _ = Unix.close_process_in ic in
+    let rss_kb = int_of_string (String.trim line) in
+    float_of_int rss_kb /. 1024.0  (* Convert KB to MB *)
+  with _ -> 0.0  (* Fallback if ps command fails *)
 
 (** Memory monitoring gauge metrics - created on demand *)
 let logs_dropped_gauge = ref None
@@ -728,6 +794,42 @@ let event_bus_subscribers_total_gauge = ref None
 let event_bus_subscribers_active_gauge = ref None
 let telemetry_rate_buffers_gauge = ref None
 let telemetry_histogram_buffers_gauge = ref None
+let heap_memory_gauge = ref None
+let rss_memory_gauge = ref None
+
+let set_heap_memory_usage usage =
+  let metric = match !heap_memory_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "heap_memory_mb" () in
+        heap_memory_gauge := Some m;
+        m
+  in
+  set_gauge metric usage
+
+let set_rss_memory_usage usage =
+  let metric = match !rss_memory_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "rss_memory_mb" () in
+        rss_memory_gauge := Some m;
+        m
+  in
+  set_gauge metric usage
+
+(** Update system metrics *)
+let update_system_metrics () =
+  let uptime_metric = gauge "uptime_seconds" () in
+  let uptime = Unix.time () -. !start_time in
+  set_gauge uptime_metric uptime;
+
+  (* Update memory usage gauges *)
+  let heap_mb = get_ocaml_heap_usage () in
+  let rss_mb = get_rss_usage () in
+  set_heap_memory_usage heap_mb;
+  set_rss_memory_usage rss_mb
+
+(** Update memory monitoring metrics *)
 
 (** Helper functions to update memory monitoring metrics *)
 let set_logs_dropped_count count =
@@ -779,6 +881,26 @@ let set_telemetry_histogram_buffers_size size =
         m
   in
   set_gauge metric (float_of_int size)
+
+let set_heap_memory_usage usage =
+  let metric = match !heap_memory_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "heap_memory_mb" () in
+        heap_memory_gauge := Some m;
+        m
+  in
+  set_gauge metric usage
+
+let set_rss_memory_usage usage =
+  let metric = match !rss_memory_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "rss_memory_mb" () in
+        rss_memory_gauge := Some m;
+        m
+  in
+  set_gauge metric usage
 
 (** Update memory monitoring metrics *)
 let update_memory_monitoring_metrics () =

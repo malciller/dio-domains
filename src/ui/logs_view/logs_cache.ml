@@ -112,6 +112,27 @@ let add_log_entry level section message =
 let current_log_entries () =
   LogMap.bindings cache.log_entries |> List.map snd
 
+(** Hard-cap entry_keys queue to max_entries to prevent unbounded growth *)
+let cap_entry_keys_queue () =
+  while Queue.length cache.entry_keys > cache.max_entries do
+    try
+      ignore (Queue.take cache.entry_keys)
+    with Queue.Empty ->
+      (* Queue was unexpectedly empty, just continue *)
+      ()
+  done
+
+(** Integrity check: remove keys from entry_keys that don't exist in log_entries *)
+let check_entry_keys_integrity () =
+  let valid_keys = ref [] in
+  Queue.iter (fun key ->
+    if Option.is_some (LogMap.find_opt key cache.log_entries) then
+      valid_keys := key :: !valid_keys
+  ) cache.entry_keys;
+  (* Clear and repopulate queue with only valid keys *)
+  Queue.clear cache.entry_keys;
+  List.iter (fun key -> Queue.push key cache.entry_keys) (List.rev !valid_keys)
+
 (** Efficiently trim the cache to max_entries *)
 let trim_cache () =
   while LogMap.cardinal cache.log_entries > cache.max_entries do
@@ -121,7 +142,9 @@ let trim_cache () =
     with Queue.Empty ->
       (* This should not happen if cardinal is > 0, but as a safeguard *)
       ()
-  done
+  done;
+  (* Ensure entry_keys queue doesn't exceed max_entries *)
+  cap_entry_keys_queue ()
 
 (** Set maximum number of log entries to keep *)
 let set_max_entries max_entries =
@@ -214,12 +237,15 @@ let start_logs_updater () =
 
   (* No longer need the async UI update loop - reactive variable is updated on access *)
 
-  (* Periodic memory monitoring update *)
+  (* Periodic memory monitoring and integrity check *)
   Lwt.async (fun () ->
     let rec monitoring_loop () =
-      let%lwt () = Lwt_unix.sleep 10.0 in (* Update every 10 seconds *)
-      let _dropped_count = get_dropped_logs_count () in
-      (* set_logs_dropped_count removed, replaced with no-op *)
+      let%lwt () = Lwt_unix.sleep 30.0 in (* Update every 30 seconds *)
+      let dropped_count = get_dropped_logs_count () in
+      (* Update telemetry with current dropped logs count *)
+      Telemetry.set_logs_dropped_count dropped_count;
+      (* Perform periodic integrity check on entry_keys queue *)
+      check_entry_keys_integrity ();
       monitoring_loop ()
     in
     monitoring_loop ()
