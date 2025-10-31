@@ -301,6 +301,7 @@ type store = {
   ready: bool Atomic.t;
   has_snapshot: bool Atomic.t;  (** Track if we have received a snapshot for this symbol *)
   last_sequence: int64 option Atomic.t;  (** Track the last sequence number for this symbol *)
+  mutable last_update: float;  (** Track when this store was last updated *)
 }
 
 type decimals = int * int  (* pair_decimals, lot_decimals *)
@@ -401,6 +402,7 @@ let ensure_store symbol =
         ready = Atomic.make false;
         has_snapshot = Atomic.make false;
         last_sequence = Atomic.make None;
+        last_update = Unix.time ();
       } in
       Hashtbl.add stores symbol store;
       store
@@ -673,6 +675,7 @@ let process_orderbook_message ~reset json on_heartbeat =
 
         store.bids <- apply_levels store.bids bids;
         store.asks <- apply_levels store.asks asks;
+        store.last_update <- Unix.time ();  (* Update timestamp on data change *)
 
         (* Truncate maps to top 25 levels to prevent bloat *)
         store.bids <- rebuild_map_from_top_levels store.bids true 25;
@@ -819,8 +822,65 @@ let clear_all_stores () =
     store.buffer <- RingBuffer.create ring_buffer_size;
     Atomic.set store.ready false;
     Atomic.set store.has_snapshot false;
-    Atomic.set store.last_sequence None
+    Atomic.set store.last_sequence None;
+    store.last_update <- Unix.time ()
   ) stores
+
+(** Prune inactive stores and stale price levels to prevent memory growth *)
+let prune_stale_data () =
+  let now = Unix.gettimeofday () in
+  let stale_threshold = 30.0 *. 60.0 in  (* 30 minutes *)
+  let max_price_levels = 100 in  (* Max levels to keep per side *)
+
+  let stores_to_remove = ref [] in
+  let trimmed_stores = ref [] in
+  let total_stores_before = Hashtbl.length stores in
+
+  Hashtbl.iter (fun symbol store ->
+    let age = now -. store.last_update in
+
+    (* Check if store is stale *)
+    if age > stale_threshold then begin
+      stores_to_remove := symbol :: !stores_to_remove
+    end else begin
+      (* For active stores, check if price maps are too large *)
+      let bids_count = PriceMap.cardinal store.bids in
+      let asks_count = PriceMap.cardinal store.asks in
+      let trimmed = ref false in
+
+      if bids_count > max_price_levels then begin
+        store.bids <- rebuild_map_from_top_levels store.bids true max_price_levels;
+        trimmed := true
+      end;
+
+      if asks_count > max_price_levels then begin
+        store.asks <- rebuild_map_from_top_levels store.asks false max_price_levels;
+        trimmed := true
+      end;
+
+      if !trimmed then
+        trimmed_stores := symbol :: !trimmed_stores
+    end
+  ) stores;
+
+  (* Remove stale stores *)
+  List.iter (fun symbol ->
+    Hashtbl.remove stores symbol;
+    Logging.debug_f ~section "Removed stale orderbook store for %s (age > 30min)" symbol
+  ) !stores_to_remove;
+
+  (* Log trimming actions *)
+  if !trimmed_stores <> [] then
+    Logging.debug_f ~section "Trimmed price levels for %d active stores: %s"
+      (List.length !trimmed_stores) (String.concat ", " !trimmed_stores);
+
+  let stores_removed = List.length !stores_to_remove in
+  let stores_trimmed = List.length !trimmed_stores in
+  let total_stores_after = Hashtbl.length stores in
+
+  if stores_removed > 0 || stores_trimmed > 0 then
+    Logging.info_f ~section "Orderbook cleanup: removed %d stale stores, trimmed %d active stores (%d -> %d total stores)"
+      stores_removed stores_trimmed total_stores_before total_stores_after
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
@@ -909,4 +969,15 @@ let initialize symbols =
     Logging.debug_f ~section "Created orderbook store for %s" symbol
   ) symbols;
   Logging.debug_f ~section "Orderbook feed stores initialized";
+
+  (* Start periodic cleanup of stale data *)
+  Lwt.async (fun () ->
+    let rec cleanup_loop () =
+      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
+      prune_stale_data ();
+      cleanup_loop ()
+    in
+    cleanup_loop ()
+  );
+
   Lwt.return_unit

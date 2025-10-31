@@ -27,6 +27,88 @@ type dashboard_state = {
   single_module_mode: bool;             (* True when only one module can be open *)
 }
 
+(** Calculate panel dimensions based on available space and layout *)
+let calculate_panel_dimensions state panel_count =
+  (* Handle empty panel count to prevent division by zero *)
+  if panel_count = 0 then (
+    let available_w, _ = state.viewport_constraints in
+    let default_width = max Ui_types.min_panel_width available_w in
+    let default_height = max Ui_types.min_panel_height Ui_types.standard_panel_height in
+    (default_width, default_height, default_width, default_height)
+  ) else (
+    let available_w, available_h = state.viewport_constraints in
+    let screen_size = Ui_types.classify_screen_size available_w available_h in
+
+    (* Account for panel borders (3 lines total) *)
+    let border_overhead = 3 in
+
+    if state.single_module_mode then
+    (* Single module mode: use full available space minus borders *)
+    let panel_height = max Ui_types.min_panel_height (available_h - border_overhead) in
+    let panel_width = max Ui_types.min_panel_width available_w in
+    (panel_width, panel_height, panel_width, panel_height)  (* Return 4-tuple for consistency *)
+  else
+    (* Multi-module mode: calculate based on screen size and layout *)
+    match screen_size with
+    | Ui_types.Mobile ->
+        (* Stack panels vertically - divide height equally *)
+        let panels_per_column = panel_count in
+        let panel_height = max Ui_types.min_panel_height ((available_h / panels_per_column) - border_overhead) in
+        let panel_width = max Ui_types.min_panel_width available_w in
+        (panel_width, panel_height, panel_width, panel_height)
+    | Ui_types.Small | Ui_types.Medium ->
+        (* Two column layout *)
+        let panels_per_column = (panel_count + 1) / 2 in  (* Ceiling division *)
+        let panel_height = max Ui_types.min_panel_height ((available_h / panels_per_column) - border_overhead) in
+        let panel_width = max Ui_types.min_panel_width (available_w / 2) in
+        (panel_width, panel_height, panel_width, panel_height)
+    | Ui_types.Large ->
+        (* Special handling for Large mode with logs in bottom row *)
+        if List.mem LogsPanel state.open_modules && List.length state.open_modules > 1 then
+          (* Logs in bottom row - need to handle differently for logs vs non-logs *)
+          let non_logs_count = List.length (List.filter (fun p -> p <> LogsPanel) state.open_modules) in
+          if non_logs_count > 0 then
+            (* Top row height for non-logs panels *)
+            let top_row_height = max Ui_types.min_panel_height ((available_h / 2) - border_overhead) in
+            let top_row_width = max Ui_types.min_panel_width (available_w / non_logs_count) in
+            (* Bottom row height for logs panel *)
+            let bottom_row_height = max Ui_types.min_panel_height ((available_h / 2) - border_overhead) in
+            let bottom_row_width = max Ui_types.min_panel_width available_w in
+            (top_row_width, top_row_height, bottom_row_width, bottom_row_height)
+          else
+            (* Only logs panel - use full width *)
+            let panel_height = max Ui_types.min_panel_height (available_h - border_overhead) in
+            let panel_width = max Ui_types.min_panel_width available_w in
+            (panel_width, panel_height, panel_width, panel_height)
+        else
+          (* No logs or logs is the only panel - standard layout *)
+          let panels_per_row = min panel_count 3 in  (* Max 3 panels per row *)
+          let rows = (panel_count + panels_per_row - 1) / panels_per_row in
+          let panel_height = max Ui_types.min_panel_height ((available_h / rows) - border_overhead) in
+          let panel_width = max Ui_types.min_panel_width (available_w / panels_per_row) in
+          (panel_width, panel_height, panel_width, panel_height)
+    )
+
+(** Calculate viewport dimensions for panel content (accounting for borders) *)
+let calculate_panel_viewport panel_type state panel_count =
+  let (top_w, top_h, bottom_w, bottom_h) = calculate_panel_dimensions state panel_count in
+
+  (* Panel border overhead: 2 lines (top + bottom borders) and 4 chars (borders + padding) *)
+  let border_height_overhead = 2 in
+  let border_width_overhead = 4 in
+
+  (* Get panel-specific dimensions *)
+  let (panel_width, panel_height) = match panel_type with
+    | LogsPanel -> (bottom_w, bottom_h)
+    | _ -> (top_w, top_h)
+  in
+
+  (* Calculate content viewport dimensions *)
+  let content_width = max 1 (panel_width - border_width_overhead) in
+  let content_height = max 1 (panel_height - border_height_overhead) in
+
+  (content_width, content_height)
+
 (** Create bordered panel with title that dynamically scales and respects size constraints *)
 let create_panel ~title ~content ~focused ?max_width ?max_height () =
 Dio_ui_shared.Ui_components.create_bordered_panel ~title ~focused ?max_width ?max_height content
@@ -225,6 +307,21 @@ let make_dashboard () =
   (* Terminal size tracking *)
   let terminal_size_var = Lwd.var (80, 24) in  (* Default size *)
 
+  (* Forward declaration of viewport variables and update function *)
+  let system_viewport_var = Lwd.var (80, 24) in
+  let balances_viewport_var = Lwd.var (80, 24) in
+  let telemetry_viewport_var = Lwd.var (80, 24) in
+  let logs_viewport_var = Lwd.var (80, 24) in
+
+  (* Function to update panel-specific viewport variables based on current state *)
+  let update_panel_viewports state =
+    let panel_count = List.length state.open_modules in
+    Lwd.set system_viewport_var (calculate_panel_viewport SystemPanel state panel_count);
+    Lwd.set balances_viewport_var (calculate_panel_viewport BalancesPanel state panel_count);
+    Lwd.set telemetry_viewport_var (calculate_panel_viewport TelemetryPanel state panel_count);
+    Lwd.set logs_viewport_var (calculate_panel_viewport LogsPanel state panel_count);
+  in
+
   (* Shared system stats and telemetry snapshot variables - start with empty defaults *)
   let empty_system_stats = {
     cpu_usage = 0.0;
@@ -280,13 +377,6 @@ let make_dashboard () =
   (* Create reactive viewport variables *)
   let viewport_var = Lwd.var initial_available_space in
 
-  (* Create reactive views that adapt to viewport changes *)
-  let telemetry_ui, telemetry_handler = Dio_ui_telemetry.Telemetry_view.make_telemetry_view telemetry_snapshot_var viewport_var in
-  let system_ui, system_handler = Dio_ui_system.System_view.make_system_view system_stats_var telemetry_snapshot_var viewport_var in
-  let balances_ui, balances_handler = Dio_ui_balance.Balance_view.make_balances_view balance_snapshot_var viewport_var in
-  let log_entries_var = Dio_ui_logs.Logs_cache.get_log_entries_var () in
-  let logs_ui, logs_handler = Dio_ui_logs.Logs_view.make_logs_view log_entries_var viewport_var in
-
   (* Dashboard state - starts with no focus and loading *)
   let state_var = Lwd.var {
     focused_panel = NoFocus;
@@ -308,6 +398,16 @@ let make_dashboard () =
     single_module_mode = initial_single_module_mode;
   };
 
+  (* Initialize panel viewports with current state *)
+  update_panel_viewports (Lwd.peek state_var);
+
+  (* Create reactive views that adapt to viewport changes *)
+  let telemetry_ui, telemetry_handler = Dio_ui_telemetry.Telemetry_view.make_telemetry_view telemetry_snapshot_var telemetry_viewport_var in
+  let system_ui, system_handler = Dio_ui_system.System_view.make_system_view system_stats_var telemetry_snapshot_var system_viewport_var in
+  let balances_ui, balances_handler = Dio_ui_balance.Balance_view.make_balances_view balance_snapshot_var balances_viewport_var in
+  let log_entries_var = Dio_ui_logs.Logs_cache.get_log_entries_var () in
+  let logs_ui, logs_handler = Dio_ui_logs.Logs_view.make_logs_view log_entries_var logs_viewport_var in
+
   (* Create reactive status bar *)
   let status_bar_ui = Lwd.map2
     (Lwd.map2 (Lwd.get system_stats_var) (Lwd.get time_var) ~f:(fun ss t -> (ss, t)))
@@ -317,25 +417,48 @@ let make_dashboard () =
       create_status_bar system_stats state.is_loading screen_size
     ) in
 
-  (* Create reactive panels with focus indication *)
-  let system_panel_ui = Lwd.map2 (Lwd.get state_var) system_ui
-    ~f:(fun state system_content ->
-      create_panel ~title:"SYSTEM" ~content:system_content ~focused:(state.focused_panel = SystemPanel) ()
+  (* Create reactive panels with content-based width allocation *)
+  let system_panel_ui = Lwd.map2 (Lwd.get state_var) (Lwd.map2 system_ui (Lwd.get system_stats_var) ~f:(fun content stats -> (content, stats)))
+    ~f:(fun state (system_content, system_stats) ->
+      let panel_count = List.length state.open_modules in
+      let (uniform_w, top_h, _, _) = calculate_panel_dimensions state panel_count in
+      (* Calculate content-based width for system panel *)
+      let content_width = Dio_ui_system.System_view.calculate_system_view_min_width system_stats in
+      (* Use the larger of uniform allocation and content needs, but cap at uniform to prevent overflow *)
+      let panel_width = min uniform_w (max content_width Ui_types.min_panel_width) in
+      create_panel ~title:"SYSTEM" ~content:system_content ~focused:(state.focused_panel = SystemPanel) ~max_width:panel_width ~max_height:top_h ()
     ) in
 
-  let balances_panel_ui = Lwd.map2 (Lwd.get state_var) balances_ui
-    ~f:(fun state balances_content ->
-      create_panel ~title:"BALANCES" ~content:balances_content ~focused:(state.focused_panel = BalancesPanel) ()
+  let balances_panel_ui = Lwd.map2 (Lwd.get state_var) (Lwd.map2 balances_ui (Lwd.map (Lwd.get balance_snapshot_var) ~f:(fun (snapshot, _) -> snapshot)) ~f:(fun content snapshot -> (content, snapshot)))
+    ~f:(fun state (balances_content, balance_snapshot) ->
+      let panel_count = List.length state.open_modules in
+      let (uniform_w, top_h, _, _) = calculate_panel_dimensions state panel_count in
+      (* Calculate content-based width for balances panel *)
+      let content_width = Dio_ui_balance.Balance_view.calculate_balance_view_min_width balance_snapshot in
+      (* Use the larger of uniform allocation and content needs, but cap at uniform to prevent overflow *)
+      let panel_width = min uniform_w (max content_width Ui_types.min_panel_width) in
+      create_panel ~title:"BALANCES" ~content:balances_content ~focused:(state.focused_panel = BalancesPanel) ~max_width:panel_width ~max_height:top_h ()
     ) in
 
-  let telemetry_panel_ui = Lwd.map2 (Lwd.get state_var) telemetry_ui
-    ~f:(fun state telemetry_content ->
-      create_panel ~title:"TELEMETRY" ~content:telemetry_content ~focused:(state.focused_panel = TelemetryPanel) ()
+  let telemetry_panel_ui = Lwd.map2 (Lwd.get state_var) (Lwd.map2 telemetry_ui (Lwd.get telemetry_snapshot_var) ~f:(fun content snapshot -> (content, snapshot)))
+    ~f:(fun state (telemetry_content, telemetry_snapshot) ->
+      let panel_count = List.length state.open_modules in
+      let (uniform_w, top_h, _, _) = calculate_panel_dimensions state panel_count in
+      (* Calculate content-based width for telemetry panel *)
+      let content_width = Dio_ui_telemetry.Telemetry_view.calculate_telemetry_view_min_width telemetry_snapshot in
+      (* Allow telemetry panel to expand significantly when content requires it *)
+      (* User reports display space is available when all views are open *)
+      let available_w, _ = state.viewport_constraints in
+      let max_telemetry_width = if panel_count >= 3 then min content_width (available_w / 2) else min content_width (uniform_w * 3) in
+      let panel_width = max uniform_w max_telemetry_width in
+      create_panel ~title:"TELEMETRY" ~content:telemetry_content ~focused:(state.focused_panel = TelemetryPanel) ~max_width:panel_width ~max_height:top_h ()
     ) in
 
   let logs_panel_ui = Lwd.map2 (Lwd.get state_var) logs_ui
     ~f:(fun state logs_content ->
-      create_panel ~title:"LOGS" ~content:logs_content ~focused:(state.focused_panel = LogsPanel) ()
+      let panel_count = List.length state.open_modules in
+      let (_, _, bottom_w, bottom_h) = calculate_panel_dimensions state panel_count in
+      create_panel ~title:"LOGS" ~content:logs_content ~focused:(state.focused_panel = LogsPanel) ~max_width:bottom_w ~max_height:bottom_h ()
     ) in
 
   (* Create reactive bottom bar *)
@@ -453,6 +576,7 @@ let make_dashboard () =
                 if target_panel <> NoFocus then (
                   let new_state = update_module_state state target_panel in
                   Lwd.set state_var new_state;
+                  update_panel_viewports new_state;
                 );
                 `Continue
             | _ -> `Continue
@@ -474,7 +598,7 @@ let make_dashboard () =
       | _ -> `Continue
   in
 
-  (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var, viewport_var)
+  (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var, viewport_var, update_panel_viewports)
 
 (** Verify that all required caches are initialized *)
 let verify_cache_initialization () =
@@ -509,7 +633,7 @@ let run () : unit Lwt.t =
     Logging.warn ~section:"dashboard" "Some caches failed to initialize, dashboard may not function correctly";
 
   (* Create dashboard and reactive variables first *)
-  let (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var, viewport_var) = make_dashboard () in
+  let (ui, handle_event, telemetry_snapshot_var, system_stats_var, balance_snapshot_var, state_var, terminal_size_var, viewport_var, update_panel_viewports) = make_dashboard () in
 
   (* Performance monitoring counters and memory tracking (scoped to run) *)
   let telemetry_update_count = ref 0 in
@@ -549,6 +673,12 @@ let run () : unit Lwt.t =
           collapsed_modules = initial_collapsed;
           focused_panel = initial_focused;
         };
+        update_panel_viewports { current_state with
+          is_loading = false;
+          open_modules = initial_open_modules;
+          collapsed_modules = initial_collapsed;
+          focused_panel = initial_focused;
+        };
         Logging.info ~section:"dashboard" "All data sources loaded, dashboard is live."
       )
   in
@@ -566,6 +696,8 @@ let run () : unit Lwt.t =
         (* Performance monitoring - track update count *)
         incr telemetry_update_count;
         Lwd.set telemetry_snapshot_var snapshot;
+        (* Trigger minor GC after large snapshot updates to encourage cleanup of old reactive graph nodes *)
+        if !telemetry_update_count mod 50 = 0 then Gc.minor ();
 
         (* Memory monitoring - check every 100 telemetry updates *)
         if !telemetry_update_count mod 100 = 0 then (
@@ -659,6 +791,52 @@ let run () : unit Lwt.t =
     monitor_performance ()
   );
 
+  (* Aggressive GC triggers for dashboard mode to prevent memory accumulation *)
+  Lwt.async (fun () ->
+    Logging.info ~section:"dashboard" "Starting aggressive GC triggers for dashboard mode";
+    let last_gc_compact = ref (Unix.time ()) in
+    let last_memory_check = ref (Unix.time ()) in
+    let last_memory_mb = ref 0.0 in
+
+    let rec gc_loop () =
+      let now = Unix.time () in
+
+      (* Trigger minor GC every 2 minutes to encourage prompt cleanup of old snapshots *)
+      let%lwt () = Lwt_unix.sleep 120.0 in  (* Every 2 minutes *)
+      Gc.minor ();
+      Logging.debug ~section:"dashboard" "Triggered minor GC for dashboard memory management";
+
+      (* Check memory growth every 2 minutes *)
+      let current_memory_mb = float_of_int ((Gc.stat ()).heap_words * (Sys.word_size / 8) / (1024 * 1024)) in
+      let time_since_check = now -. !last_memory_check in
+      if time_since_check >= 120.0 then (  (* Every 2 minutes *)
+        let memory_growth = current_memory_mb -. !last_memory_mb in
+        let growth_rate_per_hour = memory_growth *. (3600.0 /. time_since_check) in
+        if growth_rate_per_hour > 20.0 then (
+          Logging.warn_f ~section:"dashboard" "High memory growth detected: %.1f MB/hour (%.1f MB -> %.1f MB in %.0f seconds)"
+            growth_rate_per_hour !last_memory_mb current_memory_mb time_since_check;
+          (* Trigger major GC to try to reclaim memory *)
+          Gc.major ();
+          Logging.debug ~section:"dashboard" "Triggered major GC due to high memory growth"
+        );
+        last_memory_check := now;
+        last_memory_mb := current_memory_mb
+      );
+
+      (* Trigger full compaction every 30 minutes to defragment heap *)
+      let time_since_compact = now -. !last_gc_compact in
+      if time_since_compact >= 1800.0 then (  (* Every 30 minutes *)
+        Logging.info ~section:"dashboard" "Triggering full GC compaction for dashboard mode";
+        Gc.compact ();
+        last_gc_compact := now;
+        Logging.info_f ~section:"dashboard" "GC compaction completed, memory: %.1f MB" current_memory_mb
+      );
+
+      gc_loop ()
+    in
+    gc_loop ()
+  );
+
   (* Dashboard main loop with TTY reconnection handling *)
   let rec run_dashboard_loop () =
     try
@@ -676,6 +854,10 @@ let run () : unit Lwt.t =
       let new_single_module_mode = not (Ui_types.can_support_multiple_modules available_w available_h) in
       Lwd.set viewport_var (available_w, available_h);
       Lwd.set state_var { current_state with
+        viewport_constraints = (available_w, available_h);
+        single_module_mode = new_single_module_mode;
+      };
+      update_panel_viewports { current_state with
         viewport_constraints = (available_w, available_h);
         single_module_mode = new_single_module_mode;
       };
@@ -720,10 +902,12 @@ let run () : unit Lwt.t =
           (* Update state if viewport constraints changed *)
           if current_state.viewport_constraints <> (available_w, available_h) ||
              current_state.single_module_mode <> new_single_module_mode then (
-            Lwd.set state_var { current_state with
+            let new_state = { current_state with
               viewport_constraints = (available_w, available_h);
               single_module_mode = new_single_module_mode;
-            };
+            } in
+            Lwd.set state_var new_state;
+            update_panel_viewports new_state;
           );
 
           monitor_size false

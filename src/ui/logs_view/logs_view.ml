@@ -72,7 +72,6 @@ let logs_view log_entries_map state ~available_width ~available_height =
         |> Seq.map snd
         |> Seq.take max_entries
         |> List.of_seq
-        |> List.rev
       in
 
       (* Format entries in ultra-compact mobile style *)
@@ -104,8 +103,10 @@ Ui_components.create_status_element (Ui_types.truncate_exact (available_width - 
       let controls = Ui_components.create_highlighted_status auto_scroll_str in
 
       (* Log entries - adapt to available space *)
-      let header_footer_space = 4 in (* Reserve space for header, controls, and footer *)
-      let view_height = Ui_types.adaptive_log_view_height screen_size available_height header_footer_space in
+      (* Fixed UI elements: header + empty + controls + empty + logs_content + empty + footer = 7 lines total *)
+      (* So logs_content height = available_height - 6 (other UI elements) *)
+      let fixed_ui_lines = 6 in (* header, controls, footer, and 3 separators *)
+      let view_height = max 1 (available_height - fixed_ui_lines) in
 
       let effective_offset = if state.auto_scroll then 0 else state.scroll_offset in
       let max_offset = max 0 (entry_count - view_height) in
@@ -117,7 +118,7 @@ Ui_components.create_status_element (Ui_types.truncate_exact (available_width - 
         |> Seq.drop offset
         |> Seq.take view_height
         |> List.of_seq
-        |> List.rev
+        |> (fun entries -> if state.auto_scroll then entries else List.rev entries)
       in
       let log_widgets = List.map (fun entry -> format_log_entry entry available_width) visible_entries in
 
@@ -136,7 +137,7 @@ Ui_components.create_text "No log entries"
         "↑↓: Scroll | a: Auto-scroll | c: Clear logs | q: Quit" in
 
       (* Combine everything *)
-      vcat [
+      let full_widget = vcat [
         header;
         string ~attr:Notty.A.empty "";
         controls;
@@ -144,7 +145,10 @@ Ui_components.create_text "No log entries"
         logs_content;
         string ~attr:Notty.A.empty "";
         footer;
-      ]
+      ] in
+
+      (* Constrain height to available space to prevent overflow *)
+      resize ~h:available_height full_widget
 
 (** Handle keyboard input *)
 let handle_key state _log_entries = function

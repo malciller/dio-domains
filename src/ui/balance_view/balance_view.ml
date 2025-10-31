@@ -92,6 +92,28 @@ let initial_state = {
   auto_scroll = true;
 }
 
+(** Calculate minimum width required for balance view content *)
+let calculate_balance_view_min_width balance_snapshot =
+  (* Balances table width calculation - based on actual column content *)
+  let asset_max_len = List.fold_left (fun max_len entry ->
+    max max_len (String.length entry.asset)
+  ) 0 balance_snapshot.balances in
+
+  let balances_table_width = asset_max_len + 8 + 15 + 12 + 15 + 12 + 20 in (* Asset + Total Bal + Cur Value + Acc Bal + Acc Value + spacing *)
+
+  (* Orders table width calculation - based on actual order data *)
+  let symbol_max_len = List.fold_left (fun max_len order ->
+    max max_len (String.length order.symbol)
+  ) 0 balance_snapshot.open_orders in
+
+  let orders_table_width = max symbol_max_len 12 + 7 + 7 + 6 + 10 + 6 + 10 + 6 + 11 + 20 in (* Symbol + columns + spacing *)
+
+  (* Calculate based on the wider of the two tables, plus some padding *)
+  let table_width = max balances_table_width orders_table_width in
+
+  (* Add padding for readability and borders *)
+  max 60 (table_width + 8)
+
 (** Calculate totals for all balances *)
 let calculate_balance_totals balances pending_amounts =
   let total_current_value = ref 0.0 in
@@ -461,10 +483,7 @@ let balances_view balance_snapshot _state ~available_width ~available_height =
   (* Combine all sections - conditionally include orders based on screen size *)
   let sections = [header; balances_section] in
   let sections = if show_orders then sections @ [orders_section] else sections in
-  let content = vcat sections in
-
-  (* Add some padding at the bottom *)
-  vcat [content; string ~attr:Notty.A.empty "\n"]
+  vcat sections
 
 (** Create reactive balances view *)
 let make_balances_view balance_snapshot_var viewport_var =

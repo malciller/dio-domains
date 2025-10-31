@@ -770,6 +770,11 @@ let start_system_updater () =
            if removed_count > 0 then
              Logging.info_f ~section:"system_cache" "Cleaned up %d stale system stats subscribers" removed_count
        | None -> ());
+
+      (* Report subscriber statistics to telemetry *)
+      let (total, active, _) = SystemStatsEventBus.get_subscriber_stats cache.system_stats_event_bus in
+      Telemetry.set_event_bus_subscribers_total total;
+      Telemetry.set_event_bus_subscribers_active active;
       cleanup_loop ()
     in
     cleanup_loop ()

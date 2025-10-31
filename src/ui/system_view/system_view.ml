@@ -46,6 +46,49 @@ let format_cpu_model = function
   | Some model -> model
   | None -> "Unknown"
 
+(** Calculate minimum width required for system view content *)
+let calculate_system_view_min_width stats =
+  let cpu_info_width = match stats.cpu_cores, stats.cpu_vendor, stats.cpu_model with
+    | Some cores, vendor, model ->
+        let full_info = Printf.sprintf "CPU: %s %s (%d cores)" (format_cpu_vendor vendor) (format_cpu_model model) cores in
+        String.length full_info
+    | None, vendor, model ->
+        let full_info = Printf.sprintf "CPU: %s %s" (format_cpu_vendor vendor) (format_cpu_model model) in
+        String.length full_info
+  in
+
+  (* Memory text width - format_bytes gives us string length *)
+  let mem_text_width = String.length (Printf.sprintf "%s/%s" (format_bytes (stats.memory_used * 1024)) (format_bytes (stats.memory_total * 1024))) in
+
+  (* Swap text width (if swap exists) *)
+  let swap_text_width = if stats.swap_total > 0 then
+    String.length (Printf.sprintf "%s/%s" (format_bytes (stats.swap_used * 1024)) (format_bytes (stats.swap_total * 1024)))
+  else 0 in
+
+  (* Process count text *)
+  let proc_text_width = String.length (Printf.sprintf "%d running" stats.processes) in
+
+  (* Temperature text widths (if available) *)
+  let temp_widths = match stats.cpu_temp, stats.gpu_temp with
+    | Some cpu_temp, Some gpu_temp ->
+        [String.length (Printf.sprintf "CPU: %.1f°C" cpu_temp);
+         String.length (Printf.sprintf "GPU: %.1f°C" gpu_temp)]
+    | Some cpu_temp, None ->
+        [String.length (Printf.sprintf "CPU: %.1f°C" cpu_temp)]
+    | None, Some gpu_temp ->
+        [String.length (Printf.sprintf "GPU: %.1f°C" gpu_temp)]
+    | None, None -> []
+  in
+  let temp_widths = temp_widths @ List.map (fun (name, temp) -> String.length (Printf.sprintf "%s: %.1f°C" name temp)) stats.temps in
+  let max_temp_width = if temp_widths = [] then 0 else List.fold_left max 0 temp_widths in
+
+  (* Progress bar width - use adaptive width function *)
+  let progress_bar_width = Ui_types.adaptive_progress_bar_width (Ui_types.classify_screen_size 80 24) in
+
+  (* Find the maximum width needed across all elements *)
+  let widths = [cpu_info_width; mem_text_width; swap_text_width; proc_text_width; max_temp_width; progress_bar_width + 10] in
+  List.fold_left max 20 widths  (* Minimum 20 chars to be reasonable *)
+
 (** Create responsive system monitoring UI *)
 let system_view (stats : Ui_types.system_stats) (_snapshot : Ui_types.telemetry_snapshot) ~available_width ~available_height =
   (* Determine screen size for adaptive display *)
@@ -293,27 +336,26 @@ Ui_components.create_text (Printf.sprintf " (%d cores)" total_cores)
             vcat (temp_title :: temp_lines)
   in
 
-  (* Combine all sections *)
+  (* Combine all sections with selective spacing *)
   let sections = [
     header;
     string ~attr:Notty.A.empty "";
     cpu_section;
-    string ~attr:Notty.A.empty "";
     mem_section;
-    string ~attr:Notty.A.empty "";
     swap_section;
     string ~attr:Notty.A.empty "";
     proc_section;
   ] in
-  
-  (* Only add temperature section if it's not empty *)
+
+  (* Only add temperature section if it's not empty, with minimal spacing *)
   let sections = if temp_section <> empty then
-    sections @ [string ~attr:Notty.A.empty ""; temp_section]
+    sections @ [temp_section]
   else
     sections
   in
-  
-  vcat (sections @ [string ~attr:Notty.A.empty ""])
+
+  (* Minimal bottom padding only *)
+  vcat sections
 
 (** Create reactive system view with shared stats and snapshot variables *)
 let make_system_view stats_var snapshot_var viewport_var =

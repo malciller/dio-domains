@@ -80,6 +80,11 @@ let ready_condition = Lwt_condition.create ()
 let last_balance_update : (string, float) Hashtbl.t = Hashtbl.create 32
 let balance_update_mutex = Mutex.create ()
 
+(** Track configured assets (from trading config) vs dynamic assets *)
+let configured_assets : (string, unit) Hashtbl.t = Hashtbl.create 16
+let dynamic_assets_cap = 50  (* Maximum number of non-configured assets to track *)
+let configured_assets_mutex = Mutex.create ()
+
 (** Check if balance data is stale (older than threshold) *)
 let is_balance_stale asset threshold_seconds =
   try
@@ -361,6 +366,11 @@ let initialize assets =
   (* Also create stores for common quote currencies *)
   let all_assets = List.sort_uniq String.compare (assets @ ["USD"; "EUR"; "USDT"; "USDC"]) in
 
+  (* Mark configured assets (from trading config) *)
+  Mutex.lock configured_assets_mutex;
+  List.iter (fun asset -> Hashtbl.replace configured_assets asset ()) assets;
+  Mutex.unlock configured_assets_mutex;
+
   (* Pre-create all balance stores during initialization - thread-safe *)
   Mutex.lock balance_stores_mutex;
   List.iter (fun asset ->
@@ -392,6 +402,63 @@ let check_stale_balances assets =
   if !stale_count > 0 then
     Logging.warn_f ~section "%d assets have stale balance data" !stale_count
 
+(** Cleanup dynamic (non-configured) assets to prevent unbounded growth.
+    Configured assets are retained indefinitely regardless of staleness. *)
+let cleanup_dynamic_assets () =
+  Mutex.lock balance_stores_mutex;
+  Mutex.lock configured_assets_mutex;
+
+  (* Collect all assets and classify them *)
+  let all_assets = ref [] in
+  Hashtbl.iter (fun asset _ -> all_assets := asset :: !all_assets) balance_stores;
+
+  let configured = ref [] in
+  let dynamic = ref [] in
+
+  List.iter (fun asset ->
+    if Hashtbl.mem configured_assets asset then
+      configured := asset :: !configured
+    else
+      dynamic := asset :: !dynamic
+  ) !all_assets;
+
+  (* Sort dynamic assets by last update time (most recent first) *)
+  let dynamic_with_times = List.map (fun asset ->
+    let last_update = try
+      Mutex.lock balance_update_mutex;
+      let time = Hashtbl.find last_balance_update asset in
+      Mutex.unlock balance_update_mutex;
+      time
+    with Not_found ->
+      Mutex.unlock balance_update_mutex;
+      0.0  (* Never updated *)
+    in
+    last_update
+  ) !dynamic in
+
+  let dynamic_sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t2 t1)
+    (List.combine !dynamic dynamic_with_times) in
+
+  (* Keep only the most recently updated dynamic assets up to the cap *)
+  let dynamic_to_keep = List.map fst (List.filteri (fun i _ -> i < dynamic_assets_cap) dynamic_sorted) in
+  let dynamic_to_remove = List.filter (fun asset -> not (List.mem asset dynamic_to_keep)) !dynamic in
+
+  (* Remove excess dynamic assets *)
+  let removed_count = List.length dynamic_to_remove in
+  List.iter (fun asset ->
+    Hashtbl.remove balance_stores asset;
+    Mutex.lock balance_update_mutex;
+    Hashtbl.remove last_balance_update asset;
+    Mutex.unlock balance_update_mutex;
+  ) dynamic_to_remove;
+
+  Mutex.unlock configured_assets_mutex;
+  Mutex.unlock balance_stores_mutex;
+
+  if removed_count > 0 then
+    Logging.info_f ~section "Cleaned up %d dynamic balance assets, keeping %d configured + %d recent dynamic"
+      removed_count (List.length !configured) (List.length dynamic_to_keep)
+
 (** Restart the balance feed connection - useful when feed becomes stale.
     Note: The supervisor handles actual reconnection via heartbeat monitoring.
     This function is kept for backward compatibility but does minimal work. *)
@@ -407,4 +474,15 @@ let force_balance_refresh _token =
   (* For now, we'll just log the refresh attempt *)
   Logging.info ~section "Balance refresh requested - implement actual refresh logic";
   Lwt.return_unit
+
+(* Start periodic cleanup of dynamic assets *)
+let () =
+  Lwt.async (fun () ->
+    let rec cleanup_loop () =
+      let%lwt () = Lwt_unix.sleep 600.0 in (* Clean up every 10 minutes *)
+      cleanup_dynamic_assets ();
+      cleanup_loop ()
+    in
+    cleanup_loop ()
+  )
 
