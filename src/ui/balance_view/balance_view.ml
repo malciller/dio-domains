@@ -362,8 +362,13 @@ let balances_view balance_snapshot _state ~available_width ~available_height =
 
   | Small | Medium | Large ->
       (* Existing layout for larger screens *)
+      (* Calculate minimum height needed for both balances and orders sections *)
+      let minimum_height_for_orders = 18 in  (* ~6 for balances + ~6 for orders + headers + spacing *)
+
       let show_orders = match screen_size with
-        | Ui_types.Small -> false   (* No orders on small screens *)
+        | Ui_types.Small ->
+            (* For small screens, show orders only if there's enough vertical space *)
+            available_height >= minimum_height_for_orders
         | Ui_types.Medium -> true   (* Show orders on tablets *)
         | Ui_types.Large -> true    (* Show orders on large screens *)
         | Mobile -> false (* Won't reach here *)
