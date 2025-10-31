@@ -27,8 +27,6 @@ type dashboard_state = {
   single_module_mode: bool;             (* True when only one module can be open *)
 }
 
-(** Maximum height for logs panel when in bottom row (to prevent truncating other views) *)
-let max_logs_panel_height = 25
 
 (** Calculate panel dimensions based on available space and layout *)
 let calculate_panel_dimensions state panel_count =
@@ -71,15 +69,12 @@ let calculate_panel_dimensions state panel_count =
           (* Logs in bottom row - need to handle differently for logs vs non-logs *)
           let non_logs_count = List.length (List.filter (fun p -> p <> LogsPanel) state.open_modules) in
           if non_logs_count > 0 then
-            (* Cap logs panel height to prevent truncating other views *)
-            let max_bottom_height = max_logs_panel_height in
-            (* Bottom row height for logs panel - capped at max_logs_panel_height *)
-            let bottom_row_height = min max_bottom_height (max Ui_types.min_panel_height ((available_h / 2) - border_overhead)) in
-            let bottom_row_width = max Ui_types.min_panel_width available_w in
-            (* Top row gets remaining height after logs panel is allocated *)
-            let remaining_height = available_h - bottom_row_height - border_overhead in
-            let top_row_height = max Ui_types.min_panel_height (remaining_height / non_logs_count) in
+            (* Top row height for non-logs panels *)
+            let top_row_height = max Ui_types.min_panel_height ((available_h / 2) - border_overhead) in
             let top_row_width = max Ui_types.min_panel_width (available_w / non_logs_count) in
+            (* Bottom row height for logs panel *)
+            let bottom_row_height = max Ui_types.min_panel_height ((available_h / 2) - border_overhead) in
+            let bottom_row_width = max Ui_types.min_panel_width available_w in
             (top_row_width, top_row_height, bottom_row_width, bottom_row_height)
           else
             (* Only logs panel - use full width *)
@@ -409,7 +404,13 @@ let make_dashboard () =
 
   (* Create reactive views that adapt to viewport changes *)
   let telemetry_ui, telemetry_handler = Dio_ui_telemetry.Telemetry_view.make_telemetry_view telemetry_snapshot_var telemetry_viewport_var in
-  let system_ui, system_handler = Dio_ui_system.System_view.make_system_view system_stats_var telemetry_snapshot_var system_viewport_var in
+
+  (* Determine if system layout is constrained (logs open with other panels) *)
+  let is_constrained_layout = Lwd.map (Lwd.get state_var) ~f:(fun state ->
+    List.mem LogsPanel state.open_modules && List.length state.open_modules > 1
+  ) in
+
+  let system_ui, system_handler = Dio_ui_system.System_view.make_system_view system_stats_var telemetry_snapshot_var system_viewport_var ~is_constrained_layout in
   let balances_ui, balances_handler = Dio_ui_balance.Balance_view.make_balances_view balance_snapshot_var balances_viewport_var in
   let log_entries_var = Dio_ui_logs.Logs_cache.get_log_entries_var () in
   let logs_ui, logs_handler = Dio_ui_logs.Logs_view.make_logs_view log_entries_var logs_viewport_var in
