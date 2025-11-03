@@ -10,6 +10,9 @@ open Nottui.Ui
 open Dio_ui_balance.Balance_cache
 open Lwt.Infix
 
+(** Mutex to serialize reactive variable updates and prevent race conditions *)
+let reactive_update_mutex = Mutex.create ()
+
 
 type panel_focus =
   | SystemPanel
@@ -750,8 +753,18 @@ let run () : unit Lwt.t =
             );
             (* Performance monitoring - track update count *)
             incr telemetry_update_count;
-            (* Set new snapshot directly - unique version ensures LWD detects the change *)
-            Lwd.set telemetry_snapshot_var snapshot;
+
+            (* Serialize reactive updates to prevent race conditions *)
+            Mutex.lock reactive_update_mutex;
+            (try
+              (* Set new snapshot directly - unique version ensures LWD detects the change *)
+              Lwd.set telemetry_snapshot_var snapshot;
+              Mutex.unlock reactive_update_mutex
+            with exn ->
+              Mutex.unlock reactive_update_mutex;
+              raise exn
+            );
+
             (* Trigger minor GC after large snapshot updates to encourage cleanup of old reactive graph nodes *)
             if !telemetry_update_count mod 50 = 0 then Gc.minor ();
 
@@ -810,27 +823,37 @@ let run () : unit Lwt.t =
             );
             (* Performance monitoring - track update count *)
             incr system_update_count;
-            (* Clear old system stats before setting new one to help GC *)
-            Lwd.set system_stats_var {
-              cpu_usage = 0.0;
-              core_usages = [];
-              cpu_cores = None;
-              cpu_vendor = None;
-              cpu_model = None;
-              memory_total = 0;
-              memory_used = 0;
-              memory_free = 0;
-              swap_total = 0;
-              swap_used = 0;
-              load_avg_1 = 0.0;
-              load_avg_5 = 0.0;
-              load_avg_15 = 0.0;
-              processes = 0;
-              cpu_temp = None;
-              gpu_temp = None;
-              temps = [];
-            };
-            Lwd.set system_stats_var stats;
+
+            (* Serialize reactive updates to prevent race conditions *)
+            Mutex.lock reactive_update_mutex;
+            (try
+              (* Clear old system stats before setting new one to help GC *)
+              Lwd.set system_stats_var {
+                cpu_usage = 0.0;
+                core_usages = [];
+                cpu_cores = None;
+                cpu_vendor = None;
+                cpu_model = None;
+                memory_total = 0;
+                memory_used = 0;
+                memory_free = 0;
+                swap_total = 0;
+                swap_used = 0;
+                load_avg_1 = 0.0;
+                load_avg_5 = 0.0;
+                load_avg_15 = 0.0;
+                processes = 0;
+                cpu_temp = None;
+                gpu_temp = None;
+                temps = [];
+              };
+              Lwd.set system_stats_var stats;
+              Mutex.unlock reactive_update_mutex
+            with exn ->
+              Mutex.unlock reactive_update_mutex;
+              raise exn
+            );
+
             Lwt.return_unit
           ) (fun exn ->
             incr exception_count;
@@ -874,13 +897,23 @@ let run () : unit Lwt.t =
             incr update_counter;
             (* Performance monitoring - track global update count *)
             incr balance_update_count;
-            (* Clear old balance snapshot before setting new one to help GC *)
-            Lwd.set balance_snapshot_var ({
-              Dio_ui_balance.Balance_cache.balances = [];
-              open_orders = [];
-              timestamp = 0.0;
-            }, 0);
-            Lwd.set balance_snapshot_var (snapshot, !update_counter);
+
+            (* Serialize reactive updates to prevent race conditions *)
+            Mutex.lock reactive_update_mutex;
+            (try
+              (* Clear old balance snapshot before setting new one to help GC *)
+              Lwd.set balance_snapshot_var ({
+                Dio_ui_balance.Balance_cache.balances = [];
+                open_orders = [];
+                timestamp = 0.0;
+              }, 0);
+              Lwd.set balance_snapshot_var (snapshot, !update_counter);
+              Mutex.unlock reactive_update_mutex
+            with exn ->
+              Mutex.unlock reactive_update_mutex;
+              raise exn
+            );
+
             Lwt.return_unit
           ) (fun exn ->
             incr exception_count;
