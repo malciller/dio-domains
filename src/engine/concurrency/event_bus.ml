@@ -90,7 +90,7 @@ module Make (Payload : PAYLOAD) = struct
     ]
 
   (** Clean up stale subscribers (older than max_age_seconds or unused for too long) *)
-  let cleanup_stale_subscribers bus ?(max_age_seconds=3600.0) ?(max_unused_seconds=300.0) () =
+  let cleanup_stale_subscribers bus ?(max_age_seconds=300.0) ?(max_unused_seconds=300.0) () =
     let now = Unix.time () in
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in
@@ -98,6 +98,23 @@ module Make (Payload : PAYLOAD) = struct
         not sub.closed &&
         (now -. sub.created_at) <= max_age_seconds &&
         (now -. sub.last_used) <= max_unused_seconds
+      ) current in
+      let removed_count = List.length current - List.length filtered in
+      if removed_count > 0 then begin
+        if Atomic.compare_and_set bus.subscribers current filtered then
+          Some removed_count
+        else try_cleanup ()
+      end else None
+    in
+    try_cleanup ()
+
+  (** Force cleanup all stale subscribers regardless of age (for dashboard memory management) *)
+  let force_cleanup_stale_subscribers bus () =
+    let now = Unix.time () in
+    let rec try_cleanup () =
+      let current = Atomic.get bus.subscribers in
+      let filtered = List.filter (fun sub ->
+        not sub.closed && (now -. sub.last_used) <= 60.0  (* Keep only recently used subscribers *)
       ) current in
       let removed_count = List.length current - List.length filtered in
       if removed_count > 0 then begin

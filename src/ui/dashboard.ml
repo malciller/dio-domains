@@ -655,6 +655,15 @@ let initialize_caches_and_wait_ready () =
 let run () : unit Lwt.t =
   Logging.info ~section:"dashboard" "Starting Dio Dashboard...";
 
+  (* Configure aggressive GC settings for dashboard mode to prevent memory leaks *)
+  let gc_control = Gc.get () in
+  Gc.set { gc_control with
+    minor_heap_size = 64 * 1024 * 1024;  (* 64MB minor heap - more aggressive collection *)
+    major_heap_increment = 32 * 1024 * 1024;  (* Smaller major heap increment *)
+    space_overhead = 80;  (* Lower space overhead for more frequent collections *)
+  };
+  Logging.info ~section:"dashboard" "Configured aggressive GC settings for dashboard mode";
+
   (* Set up exception hook to ensure errors bubble up to stderr *)
   Lwt.async_exception_hook := (fun exn ->
     prerr_endline ("Dashboard async exception: " ^ Printexc.to_string exn);
@@ -734,6 +743,13 @@ let run () : unit Lwt.t =
         );
         (* Performance monitoring - track update count *)
         incr telemetry_update_count;
+        (* Clear old snapshot before setting new one to help GC *)
+        Lwd.set telemetry_snapshot_var {
+          uptime = 0.0;
+          metrics = [];
+          categories = [];
+          timestamp = 0.0;
+        };
         Lwd.set telemetry_snapshot_var snapshot;
         (* Trigger minor GC after large snapshot updates to encourage cleanup of old reactive graph nodes *)
         if !telemetry_update_count mod 50 = 0 then Gc.minor ();
@@ -773,6 +789,26 @@ let run () : unit Lwt.t =
         );
         (* Performance monitoring - track update count *)
         incr system_update_count;
+        (* Clear old system stats before setting new one to help GC *)
+        Lwd.set system_stats_var {
+          cpu_usage = 0.0;
+          core_usages = [];
+          cpu_cores = None;
+          cpu_vendor = None;
+          cpu_model = None;
+          memory_total = 0;
+          memory_used = 0;
+          memory_free = 0;
+          swap_total = 0;
+          swap_used = 0;
+          load_avg_1 = 0.0;
+          load_avg_5 = 0.0;
+          load_avg_15 = 0.0;
+          processes = 0;
+          cpu_temp = None;
+          gpu_temp = None;
+          temps = [];
+        };
         Lwd.set system_stats_var stats
       ) stream
     with exn ->
@@ -797,6 +833,12 @@ let run () : unit Lwt.t =
         incr update_counter;
         (* Performance monitoring - track global update count *)
         incr balance_update_count;
+        (* Clear old balance snapshot before setting new one to help GC *)
+        Lwd.set balance_snapshot_var ({
+          Dio_ui_balance.Balance_cache.balances = [];
+          open_orders = [];
+          timestamp = 0.0;
+        }, 0);
         Lwd.set balance_snapshot_var (snapshot, !update_counter)
       ) stream
     with exn ->
@@ -909,7 +951,9 @@ let run () : unit Lwt.t =
             growth_rate_per_hour !last_memory_mb current_memory_mb time_since_check;
           (* Trigger major GC to try to reclaim memory *)
           Gc.major ();
-          Logging.debug ~section:"dashboard" "Triggered major GC due to high memory growth"
+          (* Follow with compaction to defragment heap *)
+          Gc.compact ();
+          Logging.debug ~section:"dashboard" "Triggered major GC and compaction due to high memory growth"
         );
         last_memory_check := now;
         last_memory_mb := current_memory_mb
@@ -922,6 +966,30 @@ let run () : unit Lwt.t =
         Gc.compact ();
         last_gc_compact := now;
         Logging.info_f ~section:"dashboard" "GC compaction completed, memory: %.1f MB" current_memory_mb
+      );
+
+      (* Force cleanup of stale event bus subscribers every 10 minutes *)
+      let time_since_cleanup = now -. !last_gc_compact in  (* Reuse the compact timer variable *)
+      if time_since_cleanup >= 600.0 then (  (* Every 10 minutes *)
+        Logging.debug ~section:"dashboard" "Forcing cleanup of stale event bus subscribers";
+        let telemetry_cleaned = match Dio_ui_telemetry.Telemetry_cache.force_cleanup_stale_subscribers () with
+          | Some count -> count
+          | None -> 0
+        in
+        let system_cleaned = match Dio_ui_system.System_cache.force_cleanup_stale_subscribers () with
+          | Some count -> count
+          | None -> 0
+        in
+        let balance_cleaned = match Dio_ui_balance.Balance_cache.force_cleanup_stale_subscribers () with
+          | Some count -> count
+          | None -> 0
+        in
+        let total_cleaned = telemetry_cleaned + system_cleaned + balance_cleaned in
+        if total_cleaned > 0 then
+          Logging.info_f ~section:"dashboard" "Force cleaned %d stale event bus subscribers (%d telemetry, %d system, %d balance)"
+            total_cleaned telemetry_cleaned system_cleaned balance_cleaned;
+        (* Reset the cleanup timer *)
+        last_gc_compact := now
       );
 
       gc_loop ()

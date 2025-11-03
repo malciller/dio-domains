@@ -283,13 +283,15 @@ let start_balance_updater () =
           Logging.debug ~section:"balance_cache" "Updating balance snapshot";
           (try
             let snapshot = create_snapshot () in
-            cache.current_snapshot <- Some snapshot;
+            (* Publish snapshot to event bus first *)
+            BalanceSnapshotEventBus.publish cache.balance_snapshot_event_bus snapshot;
+            Lwt_condition.broadcast cache.update_condition ();
+            (* Clear cache.current_snapshot immediately after publishing to prevent memory accumulation *)
+            cache.current_snapshot <- None;
             cache.last_update <- now;
             cache.consecutive_failures <- 0;  (* Reset failure count on success *)
             cache.backoff_until <- 0.0;  (* Clear backoff *)
-            BalanceSnapshotEventBus.publish cache.balance_snapshot_event_bus snapshot;
-            Lwt_condition.broadcast cache.update_condition ();
-            Logging.debug_f ~section:"balance_cache" "Balance snapshot updated with %d balances, %d orders, timestamp: %.2f"
+            Logging.debug_f ~section:"balance_cache" "Balance snapshot published and cache cleared with %d balances, %d orders, timestamp: %.2f"
               (List.length snapshot.balances) (List.length snapshot.open_orders) snapshot.timestamp
           with exn ->
             (* Handle failure with exponential backoff *)
@@ -330,6 +332,10 @@ let start_balance_updater () =
     in
     cleanup_loop ()
   )
+
+(** Force cleanup stale subscribers for dashboard memory management *)
+let force_cleanup_stale_subscribers () =
+  BalanceSnapshotEventBus.force_cleanup_stale_subscribers cache.balance_snapshot_event_bus ()
 
 (** Initialize the balance cache system with double-checked locking *)
 let init () =

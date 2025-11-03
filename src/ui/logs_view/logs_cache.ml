@@ -55,11 +55,8 @@ let log_entries_var = Lwd.var (LogMap.empty, 0)
 (** Update counter to force reactivity *)
 let update_counter = ref 0
 
-(** Get reactive log entries variable *)
+(** Get reactive log entries variable (reactive variable is updated periodically by ingestion loop) *)
 let get_log_entries_var () =
-  (* Update the reactive variable with current state if needed *)
-  incr update_counter;
-  Lwd.set log_entries_var (cache.log_entries, !update_counter);
   log_entries_var
 
 (** Convert log level to color *)
@@ -204,10 +201,11 @@ let start_logs_updater () =
 
   (* High-performance, yielding ingestion loop *)
   Lwt.async (fun () ->
+    let batch_counter = ref 0 in
     let rec ingestion_loop () =
       (* Wait for a notification that a log has been added *)
       let%lwt _ = Lwt_unix.read notification_r notification_buffer 0 1 in
-      
+
       (* Process one batch of logs from the queue *)
       Mutex.lock pending_logs_mutex;
       let batch_size = 200 in
@@ -227,8 +225,15 @@ let start_logs_updater () =
           Queue.push entry.id cache.entry_keys
         ) entries_to_process;
         trim_cache ();
+
+        (* Update reactive variable every 5 batches (every 1000 logs) to reduce frequency *)
+        incr batch_counter;
+        if !batch_counter mod 5 = 0 then (
+          incr update_counter;
+          Lwd.set log_entries_var (cache.log_entries, !update_counter);
+        );
       );
-      
+
       (* Loop to wait for the next notification *)
       ingestion_loop ()
     in
