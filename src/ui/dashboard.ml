@@ -90,6 +90,44 @@ let calculate_panel_dimensions state panel_count =
           (panel_width, panel_height, panel_width, panel_height)
     )
 
+(** Calculate fair panel widths based on content needs and available space *)
+let calculate_fair_panel_widths state system_snapshot telemetry_snapshot balance_snapshot =
+  let panel_count = List.length state.open_modules in
+  let available_w, _ = state.viewport_constraints in
+
+  (* Get content widths for each panel type *)
+  let system_content_width = Dio_ui_system.System_view.calculate_system_view_min_width system_snapshot in
+  let telemetry_content_width = Dio_ui_telemetry.Telemetry_view.calculate_telemetry_view_min_width telemetry_snapshot in
+  let balance_content_width = Dio_ui_balance.Balance_view.calculate_balance_view_min_width balance_snapshot in
+
+  (* Determine which non-logs panels are open *)
+  let non_logs_panels = List.filter (fun p -> p <> LogsPanel) state.open_modules in
+
+  (* Calculate total content width needed for non-logs panels *)
+  let total_content_width =
+    List.fold_left (fun acc panel_type ->
+      match panel_type with
+      | SystemPanel -> acc + system_content_width
+      | BalancesPanel -> acc + balance_content_width
+      | TelemetryPanel -> acc + telemetry_content_width
+      | _ -> acc
+    ) 0 non_logs_panels in
+
+  (* If total content width fits, allow panels to use their content widths *)
+  if total_content_width <= available_w && panel_count >= 3 then
+    (* Space is available - use content-based widths *)
+    let system_width = if List.mem SystemPanel non_logs_panels then system_content_width else 0 in
+    let balance_width = if List.mem BalancesPanel non_logs_panels then balance_content_width else 0 in
+    let telemetry_width = if List.mem TelemetryPanel non_logs_panels then telemetry_content_width else 0 in
+    (system_width, balance_width, telemetry_width)
+  else
+    (* Space is constrained - use uniform allocation with minimum guarantees *)
+    let (uniform_w, _, _, _) = calculate_panel_dimensions state panel_count in
+    let system_width = if List.mem SystemPanel non_logs_panels then max uniform_w system_content_width else 0 in
+    let balance_width = if List.mem BalancesPanel non_logs_panels then max uniform_w balance_content_width else 0 in
+    let telemetry_width = if List.mem TelemetryPanel non_logs_panels then max uniform_w telemetry_content_width else 0 in
+    (system_width, balance_width, telemetry_width)
+
 (** Calculate viewport dimensions for panel content (accounting for borders) *)
 let calculate_panel_viewport panel_type state panel_count =
   let (top_w, top_h, bottom_w, bottom_h) = calculate_panel_dimensions state panel_count in
@@ -349,6 +387,7 @@ let make_dashboard () =
     metrics = [];
     categories = [];
     timestamp = 0.0;
+    version = 0;
   } in
 
   let system_stats_var = Lwd.var empty_system_stats in
@@ -423,40 +462,34 @@ let make_dashboard () =
       create_status_bar system_stats state.is_loading screen_size
     ) in
 
-  (* Create reactive panels with content-based width allocation *)
+  (* Create reactive panels with fair width allocation *)
   let system_panel_ui = Lwd.map2 (Lwd.get state_var) (Lwd.map2 system_ui (Lwd.get system_stats_var) ~f:(fun content stats -> (content, stats)))
     ~f:(fun state (system_content, system_stats) ->
       let panel_count = List.length state.open_modules in
-      let (uniform_w, top_h, _, _) = calculate_panel_dimensions state panel_count in
-      (* Calculate content-based width for system panel *)
-      let content_width = Dio_ui_system.System_view.calculate_system_view_min_width system_stats in
-      (* Use the larger of uniform allocation and content needs, but cap at uniform to prevent overflow *)
-      let panel_width = min uniform_w (max content_width Ui_types.min_panel_width) in
+      let (_, top_h, _, _) = calculate_panel_dimensions state panel_count in
+      (* Use fair width calculation *)
+      let (system_width, _, _) = calculate_fair_panel_widths state system_stats (Lwd.peek telemetry_snapshot_var) (fst (Lwd.peek balance_snapshot_var)) in
+      let panel_width = max Ui_types.min_panel_width system_width in
       create_panel ~title:"SYSTEM" ~content:system_content ~focused:(state.focused_panel = SystemPanel) ~max_width:panel_width ~max_height:top_h ()
     ) in
 
   let balances_panel_ui = Lwd.map2 (Lwd.get state_var) (Lwd.map2 balances_ui (Lwd.map (Lwd.get balance_snapshot_var) ~f:(fun (snapshot, _) -> snapshot)) ~f:(fun content snapshot -> (content, snapshot)))
     ~f:(fun state (balances_content, balance_snapshot) ->
       let panel_count = List.length state.open_modules in
-      let (uniform_w, top_h, _, _) = calculate_panel_dimensions state panel_count in
-      (* Calculate content-based width for balances panel *)
-      let content_width = Dio_ui_balance.Balance_view.calculate_balance_view_min_width balance_snapshot in
-      (* Use the larger of uniform allocation and content needs, but cap at uniform to prevent overflow *)
-      let panel_width = min uniform_w (max content_width Ui_types.min_panel_width) in
+      let (_, top_h, _, _) = calculate_panel_dimensions state panel_count in
+      (* Use fair width calculation *)
+      let (_, balance_width, _) = calculate_fair_panel_widths state (Lwd.peek system_stats_var) (Lwd.peek telemetry_snapshot_var) balance_snapshot in
+      let panel_width = max Ui_types.min_panel_width balance_width in
       create_panel ~title:"BALANCES" ~content:balances_content ~focused:(state.focused_panel = BalancesPanel) ~max_width:panel_width ~max_height:top_h ()
     ) in
 
   let telemetry_panel_ui = Lwd.map2 (Lwd.get state_var) (Lwd.map2 telemetry_ui (Lwd.get telemetry_snapshot_var) ~f:(fun content snapshot -> (content, snapshot)))
     ~f:(fun state (telemetry_content, telemetry_snapshot) ->
       let panel_count = List.length state.open_modules in
-      let (uniform_w, top_h, _, _) = calculate_panel_dimensions state panel_count in
-      (* Calculate content-based width for telemetry panel *)
-      let content_width = Dio_ui_telemetry.Telemetry_view.calculate_telemetry_view_min_width telemetry_snapshot in
-      (* Allow telemetry panel to expand significantly when content requires it *)
-      (* User reports display space is available when all views are open *)
-      let available_w, _ = state.viewport_constraints in
-      let max_telemetry_width = if panel_count >= 3 then min content_width (available_w / 2) else min content_width (uniform_w * 3) in
-      let panel_width = max uniform_w max_telemetry_width in
+      let (_, top_h, _, _) = calculate_panel_dimensions state panel_count in
+      (* Use fair width calculation *)
+      let (_, _, telemetry_width) = calculate_fair_panel_widths state (Lwd.peek system_stats_var) telemetry_snapshot (fst (Lwd.peek balance_snapshot_var)) in
+      let panel_width = max Ui_types.min_panel_width telemetry_width in
       create_panel ~title:"TELEMETRY" ~content:telemetry_content ~focused:(state.focused_panel = TelemetryPanel) ~max_width:panel_width ~max_height:top_h ()
     ) in
 
@@ -743,12 +776,13 @@ let run () : unit Lwt.t =
         );
         (* Performance monitoring - track update count *)
         incr telemetry_update_count;
-        (* Clear old snapshot before setting new one to help GC *)
+        (* Clear old snapshot aggressively to help GC release reactive graph nodes *)
         Lwd.set telemetry_snapshot_var {
           uptime = 0.0;
           metrics = [];
           categories = [];
           timestamp = 0.0;
+          version = -1;  (* Use invalid version to ensure structural difference *)
         };
         Lwd.set telemetry_snapshot_var snapshot;
         (* Trigger minor GC after large snapshot updates to encourage cleanup of old reactive graph nodes *)
@@ -968,9 +1002,9 @@ let run () : unit Lwt.t =
         Logging.info_f ~section:"dashboard" "GC compaction completed, memory: %.1f MB" current_memory_mb
       );
 
-      (* Force cleanup of stale event bus subscribers every 10 minutes *)
+      (* Force cleanup of stale event bus subscribers every 5 minutes (more frequent) *)
       let time_since_cleanup = now -. !last_gc_compact in  (* Reuse the compact timer variable *)
-      if time_since_cleanup >= 600.0 then (  (* Every 10 minutes *)
+      if time_since_cleanup >= 300.0 then (  (* Every 5 minutes *)
         Logging.debug ~section:"dashboard" "Forcing cleanup of stale event bus subscribers";
         let telemetry_cleaned = match Dio_ui_telemetry.Telemetry_cache.force_cleanup_stale_subscribers () with
           | Some count -> count

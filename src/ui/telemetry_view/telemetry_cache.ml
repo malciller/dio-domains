@@ -106,13 +106,50 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
               total_count = ref !(sliding.Telemetry.total_count);  (* Copy the current total *)
               last_cleanup = ref !(sliding.Telemetry.last_cleanup);
             } in
-            { metric with
+            (* Create completely new metric record to avoid retaining mutable references *)
+            {
+              Telemetry.name = metric.Telemetry.name;
               metric_type = SlidingCounter lightweight_sliding;
+              labels = metric.Telemetry.labels;  (* Labels are immutable, safe to share *)
+              created_at = metric.Telemetry.created_at;
+              last_updated = metric.Telemetry.last_updated;
               rate_tracker = None;  (* Don't copy rate tracker to save memory *)
+              cached_rate = metric.Telemetry.cached_rate;
             }
-        | Counter _ | Gauge _ | Histogram _ ->
-            (* For other metric types, copy as-is but without rate_tracker to save memory *)
-            { metric with rate_tracker = None }
+        | Counter r ->
+            (* Create completely new metric record to avoid retaining mutable references *)
+            {
+              Telemetry.name = metric.Telemetry.name;
+              metric_type = Counter (ref !r);  (* Copy the counter value *)
+              labels = metric.Telemetry.labels;
+              created_at = metric.Telemetry.created_at;
+              last_updated = metric.Telemetry.last_updated;
+              rate_tracker = None;
+              cached_rate = metric.Telemetry.cached_rate;
+            }
+        | Gauge r ->
+            (* Create completely new metric record to avoid retaining mutable references *)
+            {
+              Telemetry.name = metric.Telemetry.name;
+              metric_type = Gauge (ref !r);  (* Copy the gauge value *)
+              labels = metric.Telemetry.labels;
+              created_at = metric.Telemetry.created_at;
+              last_updated = metric.Telemetry.last_updated;
+              rate_tracker = None;
+              cached_rate = metric.Telemetry.cached_rate;
+            }
+        | Histogram hist ->
+            (* Create completely new metric record to avoid retaining mutable references *)
+            (* Note: histogram_stats function handles histogram data safely *)
+            {
+              Telemetry.name = metric.Telemetry.name;
+              metric_type = Histogram hist;  (* Histograms are immutable once created *)
+              labels = metric.Telemetry.labels;
+              created_at = metric.Telemetry.created_at;
+              last_updated = metric.Telemetry.last_updated;
+              rate_tracker = None;
+              cached_rate = metric.Telemetry.cached_rate;
+            }
         in
         lightweight_metric :: acc
       ) metrics [] in
@@ -146,6 +183,7 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
       metrics = final_metrics;
       categories = category_list;
       timestamp = now;
+      version = truncate (now *. 1000000.0);  (* Microsecond precision version counter *)
     } in
 
     (* Record snapshot creation time for performance monitoring *)
@@ -173,6 +211,7 @@ let current_telemetry_snapshot () =
         metrics = [];
         categories = [];
         timestamp = Unix.time ();
+        version = 0;
       }
 
 (** Start background telemetry updater (polling-based) *)
@@ -192,6 +231,7 @@ let start_telemetry_updater () =
          metrics = [];
          categories = [];
          timestamp = Unix.time ();
+         version = 0;
        } in
        cache.current_snapshot <- Some empty_snapshot;
        cache.last_update <- Unix.time ();

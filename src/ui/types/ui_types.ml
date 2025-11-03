@@ -226,6 +226,7 @@ type telemetry_snapshot = {
   metrics: metric list;
   categories: (string * metric list) list;
   timestamp: float;
+  version: int;  (* Force structural differences for LWD invalidation *)
 }
 
 (** System statistics snapshot *)
