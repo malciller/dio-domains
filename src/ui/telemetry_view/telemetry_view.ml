@@ -407,6 +407,7 @@ let run () =
     metrics = [];
     categories = [];
     timestamp = 0.0;
+    version = 0;
   } in
   let snapshot_var = Lwd.var empty_snapshot in
   let viewport_var = Lwd.var (80, 24) in

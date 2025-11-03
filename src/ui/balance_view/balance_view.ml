@@ -94,19 +94,15 @@ let initial_state = {
 
 (** Calculate minimum width required for balance view content *)
 let calculate_balance_view_min_width balance_snapshot =
-  (* Balances table width calculation - based on actual column content *)
-  let asset_max_len = List.fold_left (fun max_len entry ->
-    max max_len (String.length entry.asset)
-  ) 0 balance_snapshot.balances in
-
-  let balances_table_width = asset_max_len + 8 + 15 + 12 + 15 + 12 + 20 in (* Asset + Total Bal + Cur Value + Acc Bal + Acc Value + spacing *)
+  (* Balances table width calculation - fixed column widths *)
+  let balances_table_width = 8 + 15 + 12 + 15 + 12 + 4 in (* Asset (8) + Total Bal (15) + Cur Value (12) + Acc Bal (15) + Acc Value (12) + 4 spaces *)
 
   (* Orders table width calculation - based on actual order data *)
   let symbol_max_len = List.fold_left (fun max_len order ->
     max max_len (String.length order.symbol)
   ) 0 balance_snapshot.open_orders in
 
-  let orders_table_width = max symbol_max_len 12 + 7 + 7 + 6 + 10 + 6 + 10 + 6 + 11 + 20 in (* Symbol + columns + spacing *)
+  let orders_table_width = max symbol_max_len 12 + 7 + 7 + 6 + 10 + 6 + 10 + 6 + 11 + 8 in (* Symbol + columns + spacing: 9 columns + 8 spaces *)
 
   (* Calculate based on the wider of the two tables, plus some padding *)
   let table_width = max balances_table_width orders_table_width in
