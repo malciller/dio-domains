@@ -33,7 +33,7 @@
     {
       "symbol": "ADA/USD",
       "qty": "19.0",
-      "grid_interval": "2.5",
+      "grid_interval": "5.0",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },    

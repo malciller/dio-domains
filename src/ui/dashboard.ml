@@ -8,7 +8,7 @@ open Ui_types
 open Nottui_widgets
 open Nottui.Ui
 open Dio_ui_balance.Balance_cache
-
+open Lwt.Infix
 
 
 type panel_focus =
@@ -720,6 +720,13 @@ let run () : unit Lwt.t =
   let last_memory_check = ref (Unix.time ()) in
   let last_memory_usage = ref 0.0 in
 
+  (* Stream health monitoring *)
+  let last_telemetry_update = ref (Unix.time ()) in
+  let last_system_update = ref (Unix.time ()) in
+  let last_balance_update = ref (Unix.time ()) in
+  let stream_health_check_interval = 30.0 in  (* Check every 30 seconds *)
+  let stream_stale_threshold = 15.0 in  (* Consider stream stale if no update for 15 seconds *)
+
   (* Create quit promise *)
   let quit_promise, quit_resolver = Lwt.wait () in
 
@@ -763,122 +770,182 @@ let run () : unit Lwt.t =
 
   (* Subscribe to event streams for real-time updates with defensive checks *)
   let _telemetry_sub = Lwt.async (fun () ->
-    Logging.debug ~section:"dashboard" "Attempting to subscribe to telemetry updates";
-    try
-      let stream = Dio_ui_telemetry.Telemetry_cache.subscribe_telemetry_snapshot () in
-      Logging.info ~section:"dashboard" "Successfully subscribed to telemetry updates";
-      Lwt_stream.iter (fun snapshot ->
-        Logging.debug_f ~section:"dashboard" "Received telemetry snapshot update at %.3f" (Unix.time ());
-        if not !telemetry_loaded then (
-          Logging.info ~section:"dashboard" "Telemetry data first received - marking as loaded";
-          telemetry_loaded := true;
-          check_all_loaded ()
-        );
-        (* Performance monitoring - track update count *)
-        incr telemetry_update_count;
-        (* Clear old snapshot aggressively to help GC release reactive graph nodes *)
-        Lwd.set telemetry_snapshot_var {
-          uptime = 0.0;
-          metrics = [];
-          categories = [];
-          timestamp = 0.0;
-          version = -1;  (* Use invalid version to ensure structural difference *)
-        };
-        Lwd.set telemetry_snapshot_var snapshot;
-        (* Trigger minor GC after large snapshot updates to encourage cleanup of old reactive graph nodes *)
-        if !telemetry_update_count mod 50 = 0 then Gc.minor ();
-
-        (* Memory monitoring - check every 100 telemetry updates *)
-        if !telemetry_update_count mod 100 = 0 then (
-          let now = Unix.time () in
-          let time_since_check = now -. !last_memory_check in
-          if time_since_check > 300.0 then (  (* Check every 5 minutes *)
-            let current_memory = (Gc.stat ()).heap_words * (Sys.word_size / 8) / (1024 * 1024) in
-            let memory_diff = float_of_int current_memory -. !last_memory_usage in
-            if memory_diff > 50.0 then (
-              Logging.warn_f ~section:"dashboard" "Memory usage increased by %.1f MB in last %.0f minutes (%.1f MB total)"
-                memory_diff time_since_check !last_memory_usage
+    let restart_count = ref 0 in
+    let rec subscribe_loop () =
+      Logging.debug ~section:"dashboard" "Attempting to subscribe to telemetry updates";
+      try
+        let stream = Dio_ui_telemetry.Telemetry_cache.subscribe_telemetry_snapshot () in
+        Logging.info ~section:"dashboard" "Successfully subscribed to telemetry updates";
+        let exception_count = ref 0 in
+        Lwt_stream.iter_s (fun snapshot ->
+          Lwt.catch (fun () ->
+            Logging.debug_f ~section:"dashboard" "Received telemetry snapshot update at %.3f" (Unix.time ());
+            last_telemetry_update := Unix.time ();  (* Record update time for health monitoring *)
+            if not !telemetry_loaded then (
+              Logging.info ~section:"dashboard" "Telemetry data first received - marking as loaded";
+              telemetry_loaded := true;
+              check_all_loaded ()
             );
-            last_memory_check := now;
-            last_memory_usage := float_of_int current_memory
+            (* Performance monitoring - track update count *)
+            incr telemetry_update_count;
+            (* Clear old snapshot aggressively to help GC release reactive graph nodes *)
+            Lwd.set telemetry_snapshot_var {
+              uptime = 0.0;
+              metrics = [];
+              categories = [];
+              timestamp = 0.0;
+              version = -1;  (* Use invalid version to ensure structural difference *)
+            };
+            Lwd.set telemetry_snapshot_var snapshot;
+            (* Trigger minor GC after large snapshot updates to encourage cleanup of old reactive graph nodes *)
+            if !telemetry_update_count mod 50 = 0 then Gc.minor ();
+
+            (* Memory monitoring - check every 100 telemetry updates *)
+            if !telemetry_update_count mod 100 = 0 then (
+              let now = Unix.time () in
+              let time_since_check = now -. !last_memory_check in
+              if time_since_check > 300.0 then (  (* Check every 5 minutes *)
+                let current_memory = (Gc.stat ()).heap_words * (Sys.word_size / 8) / (1024 * 1024) in
+                let memory_diff = float_of_int current_memory -. !last_memory_usage in
+                if memory_diff > 50.0 then (
+                  Logging.warn_f ~section:"dashboard" "Memory usage increased by %.1f MB in last %.0f minutes (%.1f MB total)"
+                    memory_diff time_since_check !last_memory_usage
+                );
+                last_memory_check := now;
+                last_memory_usage := float_of_int current_memory
+              )
+            );
+            Lwt.return_unit
+          ) (fun exn ->
+            incr exception_count;
+            Logging.error_f ~section:"dashboard" "Exception in telemetry stream callback (%d total): %s" !exception_count (Printexc.to_string exn);
+            (* Continue processing despite exceptions *)
+            Lwt.return_unit
           )
-        )
-      ) stream
-    with exn ->
-      Logging.error_f ~section:"dashboard" "Failed to subscribe to telemetry updates: %s" (Printexc.to_string exn);
-      Logging.error ~section:"dashboard" "CRITICAL: Telemetry subscription failed - dashboard will not receive telemetry updates";
-      Lwt.return_unit
+        ) stream >>= fun () ->
+        (* Stream ended - restart with exponential backoff *)
+        incr restart_count;
+        let backoff_seconds = min 30.0 (2.0 ** float_of_int (min !restart_count 5)) in
+        Logging.warn_f ~section:"dashboard" "Telemetry stream ended (restart %d), waiting %.1f seconds before reconnecting" !restart_count backoff_seconds;
+        Lwt_unix.sleep backoff_seconds >>= subscribe_loop
+      with exn ->
+        incr restart_count;
+        let backoff_seconds = min 30.0 (2.0 ** float_of_int (min !restart_count 5)) in
+        Logging.error_f ~section:"dashboard" "Failed to subscribe to telemetry updates (attempt %d): %s, retrying in %.1f seconds" !restart_count (Printexc.to_string exn) backoff_seconds;
+        Lwt_unix.sleep backoff_seconds >>= subscribe_loop
+    in
+    subscribe_loop ()
   ) in
 
   let _system_stats_sub = Lwt.async (fun () ->
-    Logging.debug ~section:"dashboard" "Attempting to subscribe to system stats updates";
-    try
-      let stream = Dio_ui_system.System_cache.subscribe_system_stats () in
-      Logging.info ~section:"dashboard" "Successfully subscribed to system stats updates";
-      Lwt_stream.iter (fun stats ->
-        if not !system_loaded then (
-          Logging.info ~section:"dashboard" "System stats data first received - marking as loaded";
-          system_loaded := true;
-          check_all_loaded ()
-        );
-        (* Performance monitoring - track update count *)
-        incr system_update_count;
-        (* Clear old system stats before setting new one to help GC *)
-        Lwd.set system_stats_var {
-          cpu_usage = 0.0;
-          core_usages = [];
-          cpu_cores = None;
-          cpu_vendor = None;
-          cpu_model = None;
-          memory_total = 0;
-          memory_used = 0;
-          memory_free = 0;
-          swap_total = 0;
-          swap_used = 0;
-          load_avg_1 = 0.0;
-          load_avg_5 = 0.0;
-          load_avg_15 = 0.0;
-          processes = 0;
-          cpu_temp = None;
-          gpu_temp = None;
-          temps = [];
-        };
-        Lwd.set system_stats_var stats
-      ) stream
-    with exn ->
-      Logging.error_f ~section:"dashboard" "Failed to subscribe to system stats updates: %s" (Printexc.to_string exn);
-      Logging.error ~section:"dashboard" "CRITICAL: System stats subscription failed - dashboard will not receive system updates";
-      Lwt.return_unit
+    let restart_count = ref 0 in
+    let rec subscribe_loop () =
+      Logging.debug ~section:"dashboard" "Attempting to subscribe to system stats updates";
+      try
+        let stream = Dio_ui_system.System_cache.subscribe_system_stats () in
+        Logging.info ~section:"dashboard" "Successfully subscribed to system stats updates";
+        let exception_count = ref 0 in
+        Lwt_stream.iter_s (fun stats ->
+          Lwt.catch (fun () ->
+            last_system_update := Unix.time ();  (* Record update time for health monitoring *)
+            if not !system_loaded then (
+              Logging.info ~section:"dashboard" "System stats data first received - marking as loaded";
+              system_loaded := true;
+              check_all_loaded ()
+            );
+            (* Performance monitoring - track update count *)
+            incr system_update_count;
+            (* Clear old system stats before setting new one to help GC *)
+            Lwd.set system_stats_var {
+              cpu_usage = 0.0;
+              core_usages = [];
+              cpu_cores = None;
+              cpu_vendor = None;
+              cpu_model = None;
+              memory_total = 0;
+              memory_used = 0;
+              memory_free = 0;
+              swap_total = 0;
+              swap_used = 0;
+              load_avg_1 = 0.0;
+              load_avg_5 = 0.0;
+              load_avg_15 = 0.0;
+              processes = 0;
+              cpu_temp = None;
+              gpu_temp = None;
+              temps = [];
+            };
+            Lwd.set system_stats_var stats;
+            Lwt.return_unit
+          ) (fun exn ->
+            incr exception_count;
+            Logging.error_f ~section:"dashboard" "Exception in system stats stream callback (%d total): %s" !exception_count (Printexc.to_string exn);
+            (* Continue processing despite exceptions *)
+            Lwt.return_unit
+          )
+        ) stream >>= fun () ->
+        (* Stream ended - restart with exponential backoff *)
+        incr restart_count;
+        let backoff_seconds = min 30.0 (2.0 ** float_of_int (min !restart_count 5)) in
+        Logging.warn_f ~section:"dashboard" "System stats stream ended (restart %d), waiting %.1f seconds before reconnecting" !restart_count backoff_seconds;
+        Lwt_unix.sleep backoff_seconds >>= subscribe_loop
+      with exn ->
+        incr restart_count;
+        let backoff_seconds = min 30.0 (2.0 ** float_of_int (min !restart_count 5)) in
+        Logging.error_f ~section:"dashboard" "Failed to subscribe to system stats updates (attempt %d): %s, retrying in %.1f seconds" !restart_count (Printexc.to_string exn) backoff_seconds;
+        Lwt_unix.sleep backoff_seconds >>= subscribe_loop
+    in
+    subscribe_loop ()
   ) in
 
   let _balance_sub = Lwt.async (fun () ->
-    Logging.debug ~section:"dashboard" "Attempting to subscribe to balance updates";
-    try
-      let stream = Dio_ui_balance.Balance_cache.subscribe_balance_snapshot () in
-      Logging.info ~section:"dashboard" "Successfully subscribed to balance updates";
-      let update_counter = ref 0 in
-      Lwt_stream.iter (fun snapshot ->
-        (* Only consider balances loaded when we have actual balance data, not just empty snapshots *)
-        if not !balance_loaded && snapshot.balances <> [] then (
-          Logging.info ~section:"dashboard" "Balance data first received - marking as loaded";
-          balance_loaded := true;
-          check_all_loaded ()
-        );
-        incr update_counter;
-        (* Performance monitoring - track global update count *)
-        incr balance_update_count;
-        (* Clear old balance snapshot before setting new one to help GC *)
-        Lwd.set balance_snapshot_var ({
-          Dio_ui_balance.Balance_cache.balances = [];
-          open_orders = [];
-          timestamp = 0.0;
-        }, 0);
-        Lwd.set balance_snapshot_var (snapshot, !update_counter)
-      ) stream
-    with exn ->
-      Logging.error_f ~section:"dashboard" "Failed to subscribe to balance updates: %s" (Printexc.to_string exn);
-      Logging.error ~section:"dashboard" "CRITICAL: Balance subscription failed - dashboard will not receive balance updates";
-      Lwt.return_unit
+    let restart_count = ref 0 in
+    let rec subscribe_loop () =
+      Logging.debug ~section:"dashboard" "Attempting to subscribe to balance updates";
+      try
+        let stream = Dio_ui_balance.Balance_cache.subscribe_balance_snapshot () in
+        Logging.info ~section:"dashboard" "Successfully subscribed to balance updates";
+        let exception_count = ref 0 in
+        let update_counter = ref 0 in
+        Lwt_stream.iter_s (fun snapshot ->
+          Lwt.catch (fun () ->
+            last_balance_update := Unix.time ();  (* Record update time for health monitoring *)
+            (* Only consider balances loaded when we have actual balance data, not just empty snapshots *)
+            if not !balance_loaded && snapshot.balances <> [] then (
+              Logging.info ~section:"dashboard" "Balance data first received - marking as loaded";
+              balance_loaded := true;
+              check_all_loaded ()
+            );
+            incr update_counter;
+            (* Performance monitoring - track global update count *)
+            incr balance_update_count;
+            (* Clear old balance snapshot before setting new one to help GC *)
+            Lwd.set balance_snapshot_var ({
+              Dio_ui_balance.Balance_cache.balances = [];
+              open_orders = [];
+              timestamp = 0.0;
+            }, 0);
+            Lwd.set balance_snapshot_var (snapshot, !update_counter);
+            Lwt.return_unit
+          ) (fun exn ->
+            incr exception_count;
+            Logging.error_f ~section:"dashboard" "Exception in balance stream callback (%d total): %s" !exception_count (Printexc.to_string exn);
+            (* Continue processing despite exceptions *)
+            Lwt.return_unit
+          )
+        ) stream >>= fun () ->
+        (* Stream ended - restart with exponential backoff *)
+        incr restart_count;
+        let backoff_seconds = min 30.0 (2.0 ** float_of_int (min !restart_count 5)) in
+        Logging.warn_f ~section:"dashboard" "Balance stream ended (restart %d), waiting %.1f seconds before reconnecting" !restart_count backoff_seconds;
+        Lwt_unix.sleep backoff_seconds >>= subscribe_loop
+      with exn ->
+        incr restart_count;
+        let backoff_seconds = min 30.0 (2.0 ** float_of_int (min !restart_count 5)) in
+        Logging.error_f ~section:"dashboard" "Failed to subscribe to balance updates (attempt %d): %s, retrying in %.1f seconds" !restart_count (Printexc.to_string exn) backoff_seconds;
+        Lwt_unix.sleep backoff_seconds >>= subscribe_loop
+    in
+    subscribe_loop ()
   ) in
 
   (* Caches are already initialized above, no need for background initialization *)
@@ -957,6 +1024,32 @@ let run () : unit Lwt.t =
       monitor_performance ()
     in
     monitor_performance ()
+  );
+
+  (* Stream health monitoring - check for stale streams every 30 seconds *)
+  Lwt.async (fun () ->
+    Logging.info ~section:"dashboard" "Starting stream health monitoring loop";
+    let rec monitor_streams () =
+      let%lwt () = Lwt_unix.sleep stream_health_check_interval in
+      let now = Unix.time () in
+
+      (* Check each stream for staleness *)
+      let check_stream name last_update_ref =
+        let time_since_update = now -. !last_update_ref in
+        if time_since_update > stream_stale_threshold then (
+          Logging.warn_f ~section:"dashboard" "%s stream appears stale (%.1f seconds since last update)" name time_since_update;
+          (* Reset the timestamp to avoid repeated warnings until next update *)
+          last_update_ref := now -. (stream_stale_threshold /. 2.0)
+        )
+      in
+
+      check_stream "Telemetry" last_telemetry_update;
+      check_stream "System" last_system_update;
+      check_stream "Balance" last_balance_update;
+
+      monitor_streams ()
+    in
+    monitor_streams ()
   );
 
   (* Aggressive GC triggers for dashboard mode to prevent memory accumulation *)
