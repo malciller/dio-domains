@@ -56,11 +56,15 @@ let signal_system_ready () =
 
 (** Create a fresh telemetry snapshot with deduplication *)
 let create_telemetry_snapshot () : telemetry_snapshot option =
+  let start_time = Unix.gettimeofday () in
   let now = Unix.time () in
   let uptime = now -. !Telemetry.start_time in
 
   (* Update cached rates and sliding counter snapshots before copying metrics *)
   Telemetry.update_cached_rates ();
+
+  (* Update sliding window statistics for monitoring *)
+  Telemetry.update_sliding_window_stats ();
 
   (* Compute hash of current metrics for deduplication *)
   let current_hash = Telemetry.(
@@ -84,12 +88,36 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
     cache.last_metrics_hash <- current_hash;
 
     (* Safely copy metrics from telemetry system - minimize allocations *)
+    (* Strip heavy data structures like sliding window lists to prevent memory bloat *)
     let metrics_list = Telemetry.(
       Mutex.lock metrics_mutex;
       let metric_count = Hashtbl.length metrics in
       Logging.debug_f ~section:"telemetry_cache" "Copying %d metrics from telemetry system" metric_count;
-      (* Use direct list creation instead of ref accumulation *)
-      Hashtbl.fold (fun _ metric acc -> metric :: acc) metrics []
+
+      (* Create lightweight copies of metrics for dashboard, stripping heavy data *)
+      let lightweight_metrics = Hashtbl.fold (fun _ metric acc ->
+        let lightweight_metric = match metric.metric_type with
+        | SlidingCounter sliding ->
+            (* For sliding counters, create a lightweight version without the current_window list *)
+            (* Create a lightweight sliding_counter with empty current_window *)
+            let lightweight_sliding = {
+              Telemetry.window_size = sliding.Telemetry.window_size;
+              current_window = ref [];  (* Empty list to save memory *)
+              total_count = ref !(sliding.Telemetry.total_count);  (* Copy the current total *)
+              last_cleanup = ref !(sliding.Telemetry.last_cleanup);
+            } in
+            { metric with
+              metric_type = SlidingCounter lightweight_sliding;
+              rate_tracker = None;  (* Don't copy rate tracker to save memory *)
+            }
+        | Counter _ | Gauge _ | Histogram _ ->
+            (* For other metric types, copy as-is but without rate_tracker to save memory *)
+            { metric with rate_tracker = None }
+        in
+        lightweight_metric :: acc
+      ) metrics [] in
+
+      lightweight_metrics
     ) in
     Mutex.unlock metrics_mutex;
 
@@ -113,12 +141,19 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
          )
     in
 
-    Some {
+    let result = Some {
       uptime;
       metrics = final_metrics;
       categories = category_list;
       timestamp = now;
-    }
+    } in
+
+    (* Record snapshot creation time for performance monitoring *)
+    let end_time = Unix.gettimeofday () in
+    let duration = end_time -. start_time in
+    Telemetry.record_snapshot_creation_time duration;
+
+    result
   )
 
 (** Wait for next telemetry update *)

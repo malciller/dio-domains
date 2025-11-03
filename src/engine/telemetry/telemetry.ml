@@ -189,28 +189,13 @@ let metric_key name labels =
 let update_cached_rates () =
   Mutex.lock metrics_mutex;
   Hashtbl.iter (fun _ metric ->
-    (* Cache current sliding counter values and rates for UI snapshots *)
-    (match metric.metric_type with
-     | SlidingCounter sliding ->
-         (* Calculate rate from sliding window data for display *)
-         let window = !(sliding.current_window) in
-         let rate = if window = [] then 0.0
-                   else
-                     let total_increments = List.fold_left (fun acc (_, inc) -> acc + inc) 0 window in
-                     let earliest_time = List.fold_left (fun acc (t, _) -> min acc t) (fst (List.hd window)) window in
-                     let latest_time = List.fold_left (fun acc (t, _) -> max acc t) earliest_time window in
-                     let time_span = max 1.0 (latest_time -. earliest_time) in  (* Avoid division by zero *)
-                     float_of_int total_increments /. time_span in
-         metric.cached_rate <- rate
-     | _ -> ());
-
-    (* Update rate calculations *)
+    (* Only calculate expensive rates for metrics that actually have rate tracking enabled *)
     match metric.metric_type, metric.rate_tracker with
     | Counter _, Some tracker ->
+        (* For counters with rate tracking, calculate from rate samples *)
         let samples = get_rate_samples tracker.samples in
-        if samples = [] then ()
-        else if List.length samples = 1 then ()  (* Need at least 2 samples for rate *)
-        else
+        let sample_count = List.length samples in
+        if sample_count >= 2 then
           (* Find min and max timestamps efficiently without full sort *)
           let min_sample = ref (List.hd samples) in
           let max_sample = ref (List.hd samples) in
@@ -222,10 +207,15 @@ let update_cached_rates () =
           let value_diff = (!max_sample).value - (!min_sample).value in
           if time_diff > 0.0 && time_diff <= tracker.window_seconds then
             metric.cached_rate <- float_of_int value_diff /. time_diff
+          else
+            metric.cached_rate <- 0.0
+        else
+          metric.cached_rate <- 0.0
     | SlidingCounter _, Some tracker ->
-        (* For sliding counters with rate tracking, calculate rate from samples *)
+        (* For sliding counters with rate tracking, calculate rate from rate samples *)
         let samples = get_rate_samples tracker.samples in
-        if samples <> [] && List.length samples >= 2 then
+        let sample_count = List.length samples in
+        if sample_count >= 2 then
           let sorted_samples = List.sort (fun s1 s2 -> Float.compare s1.timestamp s2.timestamp) samples in
           let earliest = List.hd sorted_samples in
           let latest = List.hd (List.rev sorted_samples) in
@@ -233,7 +223,20 @@ let update_cached_rates () =
           let value_diff = latest.value - earliest.value in
           if time_diff > 0.0 && time_diff <= tracker.window_seconds then
             metric.cached_rate <- float_of_int value_diff /. time_diff
-    | _ -> ()
+          else
+            metric.cached_rate <- 0.0
+        else
+          metric.cached_rate <- 0.0
+    | SlidingCounter sliding, None ->
+        (* For sliding counters without rate tracking, skip expensive window iteration *)
+        (* Use a simple heuristic: rate = total_count / 30 seconds (our cleanup window) *)
+        let rate = if !(sliding.total_count) > 0 then
+          float_of_int !(sliding.total_count) /. 30.0
+        else 0.0 in
+        metric.cached_rate <- rate
+    | _ ->
+        (* For other metric types without rate tracking, set rate to 0 *)
+        metric.cached_rate <- 0.0
   ) metrics;
   Mutex.unlock metrics_mutex
 
@@ -548,7 +551,43 @@ let inc_sliding_counter metric ?(value=1) () =
       Mutex.lock metrics_mutex;
       let now = Unix.gettimeofday () in
 
-      (* Add new increment to window *)
+      (* Check window size BEFORE adding new entry to prevent unbounded growth *)
+      let current_len = List.length !(sliding.current_window) in
+      if current_len >= sliding.window_size then begin
+        (* Window is at or beyond limit - perform immediate truncation *)
+        let cutoff = now -. 30.0 in  (* Keep last 30 seconds for rate calculation *)
+        let new_window = ref [] in
+        let new_total = ref 0 in
+
+        List.iter (fun (timestamp, count) ->
+          if timestamp >= cutoff then begin
+            new_window := (timestamp, count) :: !new_window;
+            new_total := !new_total + count;
+          end
+        ) !(sliding.current_window);
+
+        (* If still too many entries after time-based filtering, keep only most recent *)
+        let filtered_window = !new_window in
+        if List.length filtered_window > sliding.window_size then begin
+          let sorted = List.sort (fun (t1, _) (t2, _) -> Float.compare t2 t1) filtered_window in
+          let recent = ref [] in
+          let count = ref 0 in
+          List.iter (fun (timestamp, inc) ->
+            if !count < sliding.window_size then begin
+              recent := (timestamp, inc) :: !recent;
+              count := !count + inc;
+            end
+          ) sorted;
+          sliding.current_window := !recent;
+          sliding.total_count := !count;
+        end else begin
+          sliding.current_window := filtered_window;
+          sliding.total_count := !new_total;
+        end;
+        sliding.last_cleanup := now;
+      end;
+
+      (* Now add new increment to window *)
       sliding.current_window := (now, value) :: !(sliding.current_window);
       sliding.total_count := !(sliding.total_count) + value;
       metric.last_updated <- now;
@@ -573,24 +612,18 @@ let inc_sliding_counter metric ?(value=1) () =
            end
        | None -> ());
 
-      (* Check if cleanup is needed - do this quickly *)
-      let window_len = List.length !(sliding.current_window) in
-      let should_cleanup = now -. !(sliding.last_cleanup) > 10.0 ||
-                          window_len > sliding.window_size ||
-                          window_len > sliding.window_size * 2 in
+      (* Periodic cleanup: trigger every 30 seconds regardless of size *)
+      let should_cleanup = now -. !(sliding.last_cleanup) > 30.0 in
 
       Mutex.unlock metrics_mutex;
 
-      (* Do expensive cleanup outside of the main mutex if needed *)
+      (* Do periodic cleanup outside of the main mutex *)
       if should_cleanup then
         begin
           Mutex.lock metrics_mutex;
           (* Re-check condition in case another thread already cleaned up *)
           let now_check = Unix.time () in
-          let window_len_check = List.length !(sliding.current_window) in
-          if now_check -. !(sliding.last_cleanup) > 10.0 ||
-             window_len_check > sliding.window_size ||
-             window_len_check > sliding.window_size * 2 then
+          if now_check -. !(sliding.last_cleanup) > 30.0 then
             begin
               sliding.last_cleanup := now_check;
               let cutoff = now_check -. 30.0 in  (* Keep last 30 seconds for rate calculation *)
@@ -607,8 +640,9 @@ let inc_sliding_counter metric ?(value=1) () =
               sliding.current_window := !new_window;
               sliding.total_count := !new_total;
 
-              (* If still too many entries, keep only the most recent ones *)
-              if List.length !new_window > sliding.window_size then begin
+              (* Ensure we don't exceed window size *)
+              let window_len = List.length !new_window in
+              if window_len > sliding.window_size then begin
                 let sorted = List.sort (fun (t1, _) (t2, _) -> Float.compare t2 t1) !new_window in
                 let recent = ref [] in
                 let count = ref 0 in
@@ -816,6 +850,58 @@ let set_rss_memory_usage usage =
         m
   in
   set_gauge metric usage
+
+(** Performance monitoring metrics for telemetry system health *)
+let snapshot_creation_time_histogram = ref None
+let max_sliding_window_size_gauge = ref None
+let total_sliding_entries_gauge = ref None
+
+(** Track snapshot creation performance *)
+let record_snapshot_creation_time duration_seconds =
+  let metric = match !snapshot_creation_time_histogram with
+    | Some m -> m
+    | None ->
+        let m = histogram "telemetry_snapshot_creation_seconds" () in
+        snapshot_creation_time_histogram := Some m;
+        m
+  in
+  observe_histogram metric duration_seconds
+
+(** Track sliding window statistics for memory monitoring *)
+let update_sliding_window_stats () =
+  Mutex.lock metrics_mutex;
+  let max_window_size = ref 0 in
+  let total_entries = ref 0 in
+
+  Hashtbl.iter (fun _ metric ->
+    match metric.metric_type with
+    | SlidingCounter sliding ->
+        let window_size = List.length !(sliding.current_window) in
+        max_window_size := max !max_window_size window_size;
+        total_entries := !total_entries + window_size
+    | _ -> ()
+  ) metrics;
+
+  Mutex.unlock metrics_mutex;
+
+  (* Update gauges *)
+  let max_gauge = match !max_sliding_window_size_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "telemetry_max_sliding_window_size" () in
+        max_sliding_window_size_gauge := Some m;
+        m
+  in
+  set_gauge max_gauge (float_of_int !max_window_size);
+
+  let total_gauge = match !total_sliding_entries_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "telemetry_total_sliding_entries" () in
+        total_sliding_entries_gauge := Some m;
+        m
+  in
+  set_gauge total_gauge (float_of_int !total_entries)
 
 (** Update system metrics *)
 let update_system_metrics () =
