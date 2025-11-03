@@ -224,13 +224,15 @@ let start_telemetry_updater () =
           (try
             match create_telemetry_snapshot () with
             | Some snapshot ->
-                cache.current_snapshot <- Some snapshot;
+                (* Publish snapshot to event bus first *)
+                TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
+                Lwt_condition.broadcast cache.update_condition ();
+                (* Clear cache.current_snapshot immediately after publishing to prevent memory accumulation *)
+                cache.current_snapshot <- None;
                 cache.last_update <- now;
                 cache.consecutive_failures <- 0;
                 cache.backoff_until <- 0.0;
-                TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
-                Lwt_condition.broadcast cache.update_condition ();
-                Logging.debug_f ~section:"telemetry_cache" "Telemetry snapshot updated at %.2f" snapshot.timestamp
+                Logging.debug_f ~section:"telemetry_cache" "Telemetry snapshot published and cache cleared at %.2f" snapshot.timestamp
             | None ->
                 (* Metrics unchanged, just update timestamp *)
                 cache.last_update <- now;
@@ -269,6 +271,10 @@ let start_telemetry_updater () =
     in
     cleanup_loop ()
   )
+
+(** Force cleanup stale subscribers for dashboard memory management *)
+let force_cleanup_stale_subscribers () =
+  TelemetrySnapshotEventBus.force_cleanup_stale_subscribers cache.telemetry_snapshot_event_bus ()
 
 (** Initialize the telemetry cache system with double-checked locking *)
 let init () =

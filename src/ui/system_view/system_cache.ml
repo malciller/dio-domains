@@ -296,7 +296,7 @@ let cache = {
   current_system_stats = None;
   system_stats_event_bus = SystemStatsEventBus.create "system_stats";
   last_update = 0.0;
-  update_interval = 0.5;  (* Update system stats at most every 0.5 seconds *)
+  update_interval = 1.0;  (* Update system stats at most every 1.0 seconds for dashboard mode *)
 }
 
 (** Memory usage tracking for leak detection *)
@@ -753,7 +753,7 @@ let start_system_updater () =
       let%lwt () = update_system_stats_cache_lwt () in
       (* Perform periodic memory maintenance *)
       perform_memory_maintenance ();
-      Lwt_unix.sleep 0.5 >>= system_loop
+      Lwt_unix.sleep 1.0 >>= system_loop
     in
     system_loop ()
   ) in
@@ -779,6 +779,10 @@ let start_system_updater () =
     in
     cleanup_loop ()
   )
+
+(** Force cleanup stale subscribers for dashboard memory management *)
+let force_cleanup_stale_subscribers () =
+  SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus ()
 
 (** Initialize the system cache with double-checked locking *)
 let init () =
