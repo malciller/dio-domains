@@ -750,14 +750,7 @@ let run () : unit Lwt.t =
             );
             (* Performance monitoring - track update count *)
             incr telemetry_update_count;
-            (* Clear old snapshot aggressively to help GC release reactive graph nodes *)
-            Lwd.set telemetry_snapshot_var {
-              uptime = 0.0;
-              metrics = [];
-              categories = [];
-              timestamp = 0.0;
-              version = -1;  (* Use invalid version to ensure structural difference *)
-            };
+            (* Set new snapshot directly - unique version ensures LWD detects the change *)
             Lwd.set telemetry_snapshot_var snapshot;
             (* Trigger minor GC after large snapshot updates to encourage cleanup of old reactive graph nodes *)
             if !telemetry_update_count mod 50 = 0 then Gc.minor ();

@@ -43,6 +43,9 @@ let cache = {
 let initialized = ref false
 let init_mutex = Mutex.create ()
 
+(** Atomic counter for unique snapshot versions *)
+let snapshot_version_counter = Atomic.make 1
+
 (** System initialization ready barrier *)
 let system_ready = ref false
 let system_ready_condition = Lwt_condition.create ()
@@ -178,12 +181,13 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
          )
     in
 
+    let version = Atomic.incr snapshot_version_counter; Atomic.get snapshot_version_counter in
     let result = Some {
       uptime;
       metrics = final_metrics;
       categories = category_list;
       timestamp = now;
-      version = truncate (now *. 1000000.0);  (* Microsecond precision version counter *)
+      version;
     } in
 
     (* Record snapshot creation time for performance monitoring *)
