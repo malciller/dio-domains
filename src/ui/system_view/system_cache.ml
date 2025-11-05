@@ -23,16 +23,22 @@ module Cpu_info = struct
         (* Fallback: try sysctl on macOS/Linux *)
         try
           let cmd = Unix.open_process_in "sysctl -n hw.ncpu 2>/dev/null" in
-          let result = String.trim (input_line cmd) in
-          ignore (Unix.close_process_in cmd);
-          Some (int_of_string result)
+          Fun.protect
+            ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+            (fun () ->
+              let result = String.trim (input_line cmd) in
+              Some (int_of_string result)
+            )
         with _ ->
           (* Last fallback: try nproc command *)
           try
             let cmd = Unix.open_process_in "nproc 2>/dev/null" in
-            let result = String.trim (input_line cmd) in
-            ignore (Unix.close_process_in cmd);
-            Some (int_of_string result)
+            Fun.protect
+              ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+              (fun () ->
+                let result = String.trim (input_line cmd) in
+                Some (int_of_string result)
+              )
           with _ -> None
 
   let get_cpu_vendor () =
@@ -44,19 +50,25 @@ module Cpu_info = struct
         (* On ARM/macOS, we can't get vendor via cpuid *)
         try
           let cmd = Unix.open_process_in "sysctl -n machdep.cpu.vendor 2>/dev/null" in
-          let vendor_str = String.trim (input_line cmd) in
-          ignore (Unix.close_process_in cmd);
-          Some vendor_str
+          Fun.protect
+            ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+            (fun () ->
+              let vendor_str = String.trim (input_line cmd) in
+              Some vendor_str
+            )
         with _ ->
           (* Try uname -m for architecture *)
           try
             let cmd = Unix.open_process_in "uname -m 2>/dev/null" in
-            let arch = String.trim (input_line cmd) in
-            ignore (Unix.close_process_in cmd);
-            match arch with
-            | "arm64" | "aarch64" -> Some "Apple Silicon"
-            | "x86_64" -> Some "Intel/AMD"
-            | _ -> Some arch
+            Fun.protect
+              ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+              (fun () ->
+                let arch = String.trim (input_line cmd) in
+                match arch with
+                | "arm64" | "aarch64" -> Some "Apple Silicon"
+                | "x86_64" -> Some "Intel/AMD"
+                | _ -> Some arch
+              )
           with _ -> None
 
   let get_cpu_model () =
@@ -66,16 +78,22 @@ module Cpu_info = struct
         (* Try to get CPU model on macOS/ARM *)
         try
           let cmd = Unix.open_process_in "sysctl -n machdep.cpu.brand_string 2>/dev/null" in
-          let model_str = String.trim (input_line cmd) in
-          ignore (Unix.close_process_in cmd);
-          Some model_str
+          Fun.protect
+            ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+            (fun () ->
+              let model_str = String.trim (input_line cmd) in
+              Some model_str
+            )
         with _ ->
           (* Fallback to uname -p for processor type *)
           try
             let cmd = Unix.open_process_in "uname -p 2>/dev/null" in
-            let proc = String.trim (input_line cmd) in
-            ignore (Unix.close_process_in cmd);
-            Some proc
+            Fun.protect
+              ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+              (fun () ->
+                let proc = String.trim (input_line cmd) in
+                Some proc
+              )
           with _ -> None
 end
 
@@ -86,55 +104,64 @@ module Temperature = struct
     try
       (* Try osx-cpu-temp if installed *)
       let cmd = Unix.open_process_in "osx-cpu-temp 2>/dev/null" in
-      let output = String.trim (input_line cmd) in
-      ignore (Unix.close_process_in cmd);
-      
-      (* Parse output like "61.2°C" - extract digits before the degree symbol *)
-      let temp_str = 
-        let parts = Str.split (Str.regexp "[°C]") output in
-        match parts with
-        | temp :: _ -> String.trim temp
-        | [] -> output
-      in
-      let temp = float_of_string temp_str in
-      Some (Some temp, None, [])
+      Fun.protect
+        ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+        (fun () ->
+          let output = String.trim (input_line cmd) in
+
+          (* Parse output like "61.2°C" - extract digits before the degree symbol *)
+          let temp_str =
+            let parts = Str.split (Str.regexp "[°C]") output in
+            match parts with
+            | temp :: _ -> String.trim temp
+            | [] -> output
+          in
+          let temp = float_of_string temp_str in
+          Some (Some temp, None, [])
+        )
     with _ ->
       (* Try powermetrics (requires sudo, so may fail) *)
       try
         let cmd = Unix.open_process_in "powermetrics --samplers smc -i1 -n1 2>/dev/null | grep -i 'CPU die temperature'" in
-        let line = input_line cmd in
-        ignore (Unix.close_process_in cmd);
-        
-        (* Parse line like "CPU die temperature: 45.67 C" *)
-        let parts = String.split_on_char ':' line in
-        if List.length parts >= 2 then
-          let temp_part = List.nth parts 1 |> String.trim in
-          let temp_str = String.split_on_char ' ' temp_part |> List.hd |> String.trim in
-          let temp = float_of_string temp_str in
-          Some (Some temp, None, [])
-        else
-          None
+        Fun.protect
+          ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+          (fun () ->
+            let line = input_line cmd in
+
+            (* Parse line like "CPU die temperature: 45.67 C" *)
+            let parts = String.split_on_char ':' line in
+            if List.length parts >= 2 then
+              let temp_part = List.nth parts 1 |> String.trim in
+              let temp_str = String.split_on_char ' ' temp_part |> List.hd |> String.trim in
+              let temp = float_of_string temp_str in
+              Some (Some temp, None, [])
+            else
+              None
+          )
       with _ ->
         (* Try istats if installed *)
         try
           let cmd = Unix.open_process_in "istats cpu temp 2>/dev/null" in
-          let line = input_line cmd in
-          ignore (Unix.close_process_in cmd);
-          
-          (* Parse output like "CPU temp: 45.5°C" *)
-          let parts = String.split_on_char ':' line in
-          if List.length parts >= 2 then
-            let temp_part = List.nth parts 1 |> String.trim in
-            let temp_str = 
-              let parts = Str.split (Str.regexp "[°C]") temp_part in
-              match parts with
-              | temp :: _ -> String.trim temp
-              | [] -> temp_part
-            in
-            let temp = float_of_string temp_str in
-            Some (Some temp, None, [])
-          else
-            None
+          Fun.protect
+            ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+            (fun () ->
+              let line = input_line cmd in
+
+              (* Parse output like "CPU temp: 45.5°C" *)
+              let parts = String.split_on_char ':' line in
+              if List.length parts >= 2 then
+                let temp_part = List.nth parts 1 |> String.trim in
+                let temp_str =
+                  let parts = Str.split (Str.regexp "[°C]") temp_part in
+                  match parts with
+                  | temp :: _ -> String.trim temp
+                  | [] -> temp_part
+                in
+                let temp = float_of_string temp_str in
+                Some (Some temp, None, [])
+              else
+                None
+            )
         with _ -> None
 
   (** Try to get temperature from Linux thermal zones *)
@@ -182,51 +209,54 @@ module Temperature = struct
       (* Fallback: try lm-sensors command *)
       try
         let cmd = Unix.open_process_in "sensors 2>/dev/null" in
-        let rec read_sensors cpu_temp gpu_temp all_temps =
-          try
-            let line = input_line cmd in
-            
-            (* Look for temperature lines like "Core 0:        +45.0°C" or "temp1:        +50.0°C" *)
-            if String.contains line ':' && String.contains line '+' then
-              let parts = String.split_on_char ':' line in
-              match parts with
-              | name :: value_part :: _ ->
-                  let name = String.trim name in
-                  let value_str = String.trim value_part in
-                  
-                  (* Extract temperature value - look for pattern like "+45.0" *)
-                  let temp_opt = try
-                    let temp_start = String.index value_str '+' in
-                    (* Find the end of the number - could be space, degree symbol, or end of string *)
-                    let rec find_number_end str pos =
-                      if pos >= String.length str then pos
-                      else match str.[pos] with
-                      | '0'..'9' | '.' -> find_number_end str (pos + 1)
-                      | _ -> pos
-                    in
-                    let temp_end = find_number_end value_str (temp_start + 1) in
-                    let temp_str = String.sub value_str (temp_start + 1) (temp_end - temp_start - 1) in
-                    Some (float_of_string temp_str)
-                  with _ -> None
-                  in
-                  
-                  (match temp_opt with
-                   | Some temp ->
-                       let lower = String.lowercase_ascii name in
-                       let new_cpu = if cpu_temp = None && (String.contains lower 'c' || String.contains lower 'p') then Some temp else cpu_temp in
-                       let new_gpu = if gpu_temp = None && String.contains lower 'g' then Some temp else gpu_temp in
-                       let new_all = (name, temp) :: all_temps in
-                       read_sensors new_cpu new_gpu new_all
-                   | None -> read_sensors cpu_temp gpu_temp all_temps)
-              | _ -> read_sensors cpu_temp gpu_temp all_temps
-            else
-              read_sensors cpu_temp gpu_temp all_temps
-          with End_of_file ->
-            ignore (Unix.close_process_in cmd);
-            (cpu_temp, gpu_temp, List.rev all_temps)
-        in
-        let cpu, gpu, all = read_sensors None None [] in
-        Some (cpu, gpu, all)
+        Fun.protect
+          ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+          (fun () ->
+            let rec read_sensors cpu_temp gpu_temp all_temps =
+              try
+                let line = input_line cmd in
+
+                (* Look for temperature lines like "Core 0:        +45.0°C" or "temp1:        +50.0°C" *)
+                if String.contains line ':' && String.contains line '+' then
+                  let parts = String.split_on_char ':' line in
+                  match parts with
+                  | name :: value_part :: _ ->
+                      let name = String.trim name in
+                      let value_str = String.trim value_part in
+
+                      (* Extract temperature value - look for pattern like "+45.0" *)
+                      let temp_opt = try
+                        let temp_start = String.index value_str '+' in
+                        (* Find the end of the number - could be space, degree symbol, or end of string *)
+                        let rec find_number_end str pos =
+                          if pos >= String.length str then pos
+                          else match str.[pos] with
+                          | '0'..'9' | '.' -> find_number_end str (pos + 1)
+                          | _ -> pos
+                        in
+                        let temp_end = find_number_end value_str (temp_start + 1) in
+                        let temp_str = String.sub value_str (temp_start + 1) (temp_end - temp_start - 1) in
+                        Some (float_of_string temp_str)
+                      with _ -> None
+                      in
+
+                      (match temp_opt with
+                       | Some temp ->
+                           let lower = String.lowercase_ascii name in
+                           let new_cpu = if cpu_temp = None && (String.contains lower 'c' || String.contains lower 'p') then Some temp else cpu_temp in
+                           let new_gpu = if gpu_temp = None && String.contains lower 'g' then Some temp else gpu_temp in
+                           let new_all = (name, temp) :: all_temps in
+                           read_sensors new_cpu new_gpu new_all
+                       | None -> read_sensors cpu_temp gpu_temp all_temps)
+                  | _ -> read_sensors cpu_temp gpu_temp all_temps
+                else
+                  read_sensors cpu_temp gpu_temp all_temps
+              with End_of_file ->
+                (cpu_temp, gpu_temp, List.rev all_temps)
+            in
+            let cpu, gpu, all = read_sensors None None [] in
+            Some (cpu, gpu, all)
+          )
       with _ -> None
 
   (** Try to get temperature from Windows (via WMI) *)
@@ -234,29 +264,32 @@ module Temperature = struct
     try
       (* Try using wmic to query temperature sensors *)
       let cmd = Unix.open_process_in "wmic /namespace:\\\\\\\\root\\\\wmi PATH MSAcpi_ThermalZoneTemperature get CurrentTemperature 2>nul" in
-      let rec read_temps temps =
-        try
-          let line = input_line cmd in
-          let trimmed = String.trim line in
-          (* WMI returns temperature in tenths of Kelvin, convert to Celsius *)
-          if trimmed <> "" && trimmed <> "CurrentTemperature" then
+      Fun.protect
+        ~finally:(fun () -> ignore (Unix.close_process_in cmd))
+        (fun () ->
+          let rec read_temps temps =
             try
-              let temp_tenths_k = float_of_string trimmed in
-              let temp_c = (temp_tenths_k /. 10.0) -. 273.15 in
-              read_temps (temp_c :: temps)
-            with _ -> read_temps temps
-          else
-            read_temps temps
-        with End_of_file ->
-          ignore (Unix.close_process_in cmd);
-          List.rev temps
-      in
-      let temps = read_temps [] in
-      match temps with
-      | [] -> None
-      | cpu_temp :: _ ->
-          (* First temp is usually CPU, but we don't have GPU info from this method *)
-          Some (Some cpu_temp, None, List.mapi (fun i t -> (Printf.sprintf "Sensor%d" i, t)) temps)
+              let line = input_line cmd in
+              let trimmed = String.trim line in
+              (* WMI returns temperature in tenths of Kelvin, convert to Celsius *)
+              if trimmed <> "" && trimmed <> "CurrentTemperature" then
+                try
+                  let temp_tenths_k = float_of_string trimmed in
+                  let temp_c = (temp_tenths_k /. 10.0) -. 273.15 in
+                  read_temps (temp_c :: temps)
+                with _ -> read_temps temps
+              else
+                read_temps temps
+            with End_of_file ->
+              List.rev temps
+          in
+          let temps = read_temps [] in
+          match temps with
+          | [] -> None
+          | cpu_temp :: _ ->
+              (* First temp is usually CPU, but we don't have GPU info from this method *)
+              Some (Some cpu_temp, None, List.mapi (fun i t -> (Printf.sprintf "Sensor%d" i, t)) temps)
+        )
     with _ -> None
 
   (** Get system temperatures for current platform *)
@@ -266,13 +299,16 @@ module Temperature = struct
         (* Try to detect which Unix variant *)
         (try
           let uname_cmd = Unix.open_process_in "uname 2>/dev/null" in
-          let uname = String.trim (input_line uname_cmd) in
-          ignore (Unix.close_process_in uname_cmd);
-          
-          match uname with
-          | "Darwin" -> get_macos_temps ()
-          | "Linux" -> get_linux_temps ()
-          | _ -> get_linux_temps ()  (* Default to Linux method *)
+          Fun.protect
+            ~finally:(fun () -> ignore (Unix.close_process_in uname_cmd))
+            (fun () ->
+              let uname = String.trim (input_line uname_cmd) in
+
+              match uname with
+              | "Darwin" -> get_macos_temps ()
+              | "Linux" -> get_linux_temps ()
+              | _ -> get_linux_temps ()  (* Default to Linux method *)
+            )
         with _ -> get_linux_temps ())  (* Default to Linux method *)
     | "Win32" -> get_windows_temps ()
     | _ -> None
@@ -392,42 +428,50 @@ let get_memory_stats () =
     (* macOS implementation *)
     try
       let mem_total_cmd = Unix.open_process_in "sysctl -n hw.memsize" in
-      let mem_total_bytes = int_of_string (String.trim (input_line mem_total_cmd)) in
-      ignore (Unix.close_process_in mem_total_cmd);
-      let mem_total = mem_total_bytes / 1024 in  (* Convert to KB *)
+      let mem_total = Fun.protect
+        ~finally:(fun () -> ignore (Unix.close_process_in mem_total_cmd))
+        (fun () ->
+          let mem_total_bytes = int_of_string (String.trim (input_line mem_total_cmd)) in
+          mem_total_bytes / 1024  (* Convert to KB *)
+        )
+      in
 
       let vm_stats_cmd = Unix.open_process_in "vm_stat" in
-      let rec read_vm_stats pages_free pages_active pages_inactive pages_wired =
-        try
-          let line = input_line vm_stats_cmd in
-          if String.contains line ':' then
-            let parts = String.split_on_char ':' line in
-            match List.map String.trim parts with
-            | ["Pages free"; value] ->
-                let free = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
-                read_vm_stats free pages_active pages_inactive pages_wired
-            | ["Pages active"; value] ->
-                let active = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
-                read_vm_stats pages_free active pages_inactive pages_wired
-            | ["Pages inactive"; value] ->
-                let inactive = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
-                read_vm_stats pages_free pages_active inactive pages_wired
-            | ["Pages wired down"; value] ->
-                let wired = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
-                read_vm_stats pages_free pages_active pages_inactive wired
-            | _ -> read_vm_stats pages_free pages_active pages_inactive pages_wired
-          else
-            read_vm_stats pages_free pages_active pages_inactive pages_wired
-        with End_of_file ->
-          ignore (Unix.close_process_in vm_stats_cmd);
-          let page_size_kb = 16384 / 1024 in (* Apple Silicon uses 16KB pages *)
-          let mem_used_pages = pages_active + pages_wired in
-          let mem_free_pages = pages_free + pages_inactive in
-          let mem_used = mem_used_pages * page_size_kb in
-          let mem_free = mem_free_pages * page_size_kb in
-          (mem_total, mem_used, mem_free, 0, 0)  (* macOS swap is handled differently *)
+      let mem_total, mem_used, mem_free, swap_total, swap_used = Fun.protect
+        ~finally:(fun () -> ignore (Unix.close_process_in vm_stats_cmd))
+        (fun () ->
+          let rec read_vm_stats pages_free pages_active pages_inactive pages_wired =
+            try
+              let line = input_line vm_stats_cmd in
+              if String.contains line ':' then
+                let parts = String.split_on_char ':' line in
+                match List.map String.trim parts with
+                | ["Pages free"; value] ->
+                    let free = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
+                    read_vm_stats free pages_active pages_inactive pages_wired
+                | ["Pages active"; value] ->
+                    let active = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
+                    read_vm_stats pages_free active pages_inactive pages_wired
+                | ["Pages inactive"; value] ->
+                    let inactive = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
+                    read_vm_stats pages_free pages_active inactive pages_wired
+                | ["Pages wired down"; value] ->
+                    let wired = int_of_string (String.trim (String.sub value 0 (String.length value - 1))) in
+                    read_vm_stats pages_free pages_active pages_inactive wired
+                | _ -> read_vm_stats pages_free pages_active pages_inactive pages_wired
+              else
+                read_vm_stats pages_free pages_active pages_inactive pages_wired
+            with End_of_file ->
+              let page_size_kb = 16384 / 1024 in (* Apple Silicon uses 16KB pages *)
+              let mem_used_pages = pages_active + pages_wired in
+              let mem_free_pages = pages_free + pages_inactive in
+              let mem_used = mem_used_pages * page_size_kb in
+              let mem_free = mem_free_pages * page_size_kb in
+              (mem_total, mem_used, mem_free, 0, 0)  (* macOS swap is handled differently *)
+          in
+          read_vm_stats 0 0 0 0
+        )
       in
-      let mem_total, mem_used, mem_free, swap_total, swap_used = read_vm_stats 0 0 0 0 in
       Some (mem_total, mem_used, mem_free, swap_total, swap_used)
     with _ ->
       (* Unable to collect memory stats *)
@@ -530,8 +574,12 @@ let get_cpu_usage () =
     in 
     try
       let top_cmd = Unix.open_process_in "top -l 1 -n 0 | grep -i 'cpu usage'" in
-      let line = input_line top_cmd in
-      ignore (Unix.close_process_in top_cmd);
+      let line = Fun.protect
+        ~finally:(fun () -> ignore (Unix.close_process_in top_cmd))
+        (fun () ->
+          input_line top_cmd
+        )
+      in
 
       (* Parse line like: "CPU usage: 15.23% user, 12.45% sys, 72.32% idle" *)
       let clean_line = String.trim line in
@@ -612,8 +660,12 @@ let get_load_avg () =
     (* macOS implementation *)
     try
       let loadavg_cmd = Unix.open_process_in "sysctl -n vm.loadavg" in
-      let loadavg_str = String.trim (input_line loadavg_cmd) in
-      ignore (Unix.close_process_in loadavg_cmd);
+      let loadavg_str = Fun.protect
+        ~finally:(fun () -> ignore (Unix.close_process_in loadavg_cmd))
+        (fun () ->
+          String.trim (input_line loadavg_cmd)
+        )
+      in
       (* Parse output like "{ 3.59 5.28 6.46 }" *)
       let clean_str = String.sub loadavg_str 1 (String.length loadavg_str - 2) in  (* Remove { } *)
       let parts = String.split_on_char ' ' clean_str |> List.filter (fun s -> s <> "") in
@@ -629,8 +681,12 @@ let get_load_avg () =
 let get_process_count () =
   try
     let ic = Unix.open_process_in "ps aux 2>/dev/null | wc -l 2>/dev/null" in
-    let count_str = String.trim (input_line ic) in
-    ignore (Unix.close_process_in ic);
+    let count_str = Fun.protect
+      ~finally:(fun () -> ignore (Unix.close_process_in ic))
+      (fun () ->
+        String.trim (input_line ic)
+      )
+    in
     let count = int_of_string count_str in
     Some (max 1 (count - 1))  (* Subtract header line, ensure at least 1 *)
   with _ ->

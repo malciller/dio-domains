@@ -5,8 +5,8 @@
     {
       "symbol": "BTC/USD",
       "qty": "0.00025",
-      "grid_interval": "0.45",
-      "sell_mult": "0.9995",
+      "grid_interval": "0.5",
+      "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
@@ -25,15 +25,15 @@
     },
     {
       "symbol": "SOL/USD",
-      "qty": "0.06",
+      "qty": "0.08",
       "grid_interval": "2.5",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "ADA/USD",
-      "qty": "19.0",
-      "grid_interval": "5.0",
+      "qty": "22.0",
+      "grid_interval": "2.5",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },    
