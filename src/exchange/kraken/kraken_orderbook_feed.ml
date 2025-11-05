@@ -732,7 +732,9 @@ let process_orderbook_message ~reset json on_heartbeat =
 
         (* Update connection heartbeat *)
         on_heartbeat ()
-      with exn ->
+      with
+      | Exit -> ()  (* Exit is used for control flow to skip entries - don't log *)
+      | exn ->
         Logging.warn_f ~section "Failed to process orderbook entry: %s"
           (Printexc.to_string exn)
     ) data;
