@@ -85,8 +85,8 @@ let notify_ready store =
     Atomic.set store.ready true;
     (try
       Lwt_condition.broadcast ready_condition ()
-    with Invalid_argument _ ->
-      (* Ignore - some waiters may have timed out or been cancelled *)
+    with _ ->
+      (* Ignore all exceptions during broadcast - waiters may have been cancelled *)
       ())
   end
 
@@ -122,23 +122,34 @@ let has_price_data symbol =
 
 (** Wait until price data is available for all symbols using event signalling *)
 let wait_for_price_data_lwt symbols timeout_seconds =
-  let deadline = Unix.gettimeofday () +. timeout_seconds in
-  let rec loop () =
+  let start_time = Unix.gettimeofday () in
+  let timeout_ref = ref false in
+  let rec wait_loop () =
     if List.for_all has_price_data symbols then
       Lwt.return_true
     else
-      let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0.0 then
+      let elapsed = Unix.gettimeofday () -. start_time in
+      if elapsed >= timeout_seconds then
+        Lwt.return_false
+      else if !timeout_ref then
         Lwt.return_false
       else
-        Lwt.pick [
-          (Lwt_condition.wait ready_condition >|= fun () -> `Again);
-          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-        ] >>= function
-        | `Again -> loop ()
-        | `Timeout -> Lwt.return (List.for_all has_price_data symbols)
+        (* Wait for condition signal, but handle potential cancellation issues *)
+        Lwt.catch (fun () ->
+          Lwt_condition.wait ready_condition >>= fun () -> wait_loop ()
+        ) (fun _ ->
+          (* If condition wait fails (e.g., due to cancellation), treat as timeout *)
+          timeout_ref := true;
+          Lwt.return_false
+        )
   in
-  loop ()
+  (* Start a background timeout that sets the flag *)
+  Lwt.async (fun () ->
+    Lwt_unix.sleep timeout_seconds >>= fun () ->
+    timeout_ref := true;
+    Lwt.return_unit
+  );
+  wait_loop ()
 
 let wait_for_price_data = wait_for_price_data_lwt
 
@@ -152,6 +163,8 @@ let parse_ticker json on_heartbeat =
       None
   | [] -> Some ()
   | data ->
+      (* Track symbols that successfully wrote to buffer in this message *)
+      let notified_symbols = Hashtbl.create 16 in
       List.iter (fun ticker_data ->
         try
           let symbol = ticker_data |> member "symbol" |> to_string in
@@ -165,7 +178,8 @@ let parse_ticker json on_heartbeat =
           } in
           let store = ensure_store symbol in
           RingBuffer.write store.buffer ticker;
-          notify_ready store;
+          (* Record that this symbol should be notified (only once per message) *)
+          Hashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f last=%.2f"
             symbol ticker.bid ticker.ask ticker.last;
           Telemetry.inc_counter (Telemetry.counter "ticker_updates" ()) ();
@@ -175,6 +189,10 @@ let parse_ticker json on_heartbeat =
           Logging.warn_f ~section "Failed to parse ticker data: %s"
             (Printexc.to_string exn)
       ) data;
+
+      (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
+      Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+
       Some ()
 
 (** WebSocket message handler *)
@@ -256,8 +274,8 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "WebSocket established, subscribing to ticker feed";
-    Lwt.async (fun () -> start_message_handler conn symbols on_failure on_heartbeat);
-    Logging.info ~section "Ticker WebSocket connection established";
+    start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
+    Logging.info ~section "Ticker WebSocket connection closed";
     Lwt.return_unit
 
 (** Initialize ticker feed data stores *)

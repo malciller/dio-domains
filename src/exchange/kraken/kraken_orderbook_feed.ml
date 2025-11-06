@@ -414,8 +414,8 @@ let notify_ready store =
     Atomic.set store.ready true;
     (try
       Lwt_condition.broadcast ready_condition ()
-    with Invalid_argument _ ->
-      (* Ignore - some waiters may have timed out or been cancelled *)
+    with _ ->
+      (* Ignore all exceptions during broadcast - waiters may have been cancelled *)
       ())
   end
 
@@ -607,6 +607,8 @@ let process_orderbook_message ~reset json on_heartbeat =
     let data = member "data" json |> to_list in
     Logging.debug_f ~section "Processing orderbook message with %d entries (reset=%b)"
       (List.length data) reset;
+    (* Track symbols that successfully wrote to buffer in this message *)
+    let notified_symbols = Hashtbl.create 16 in
     List.iter (fun entry ->
       try
         let symbol = member "symbol" entry |> to_string in
@@ -714,7 +716,8 @@ let process_orderbook_message ~reset json on_heartbeat =
 
         if checksum_valid then begin
           RingBuffer.write store.buffer orderbook;
-          notify_ready store;
+          (* Record that this symbol should be notified (only once per message) *)
+          Hashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Orderbook written to ringbuffer: %s bids=%d asks=%d"
             symbol
             (Array.length orderbook.bids)
@@ -738,6 +741,10 @@ let process_orderbook_message ~reset json on_heartbeat =
         Logging.warn_f ~section "Failed to process orderbook entry: %s"
           (Printexc.to_string exn)
     ) data;
+
+    (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
+    Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+
     Some ()
   with exn ->
     Logging.warn_f ~section "Failed to parse orderbook message: %s"
@@ -885,23 +892,34 @@ let prune_stale_data () =
       stores_removed stores_trimmed total_stores_before total_stores_after
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
-  let deadline = Unix.gettimeofday () +. timeout_seconds in
-  let rec loop () =
+  let start_time = Unix.gettimeofday () in
+  let timeout_ref = ref false in
+  let rec wait_loop () =
     if List.for_all has_orderbook_data symbols then
       Lwt.return_true
     else
-      let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0.0 then
+      let elapsed = Unix.gettimeofday () -. start_time in
+      if elapsed >= timeout_seconds then
+        Lwt.return_false
+      else if !timeout_ref then
         Lwt.return_false
       else
-        Lwt.pick [
-          (Lwt_condition.wait ready_condition >|= fun () -> `Again);
-          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-        ] >>= function
-        | `Again -> loop ()
-        | `Timeout -> Lwt.return (List.for_all has_orderbook_data symbols)
+        (* Wait for condition signal, but handle potential cancellation issues *)
+        Lwt.catch (fun () ->
+          Lwt_condition.wait ready_condition >>= fun () -> wait_loop ()
+        ) (fun _ ->
+          (* If condition wait fails (e.g., due to cancellation), treat as timeout *)
+          timeout_ref := true;
+          Lwt.return_false
+        )
   in
-  loop ()
+  (* Start a background timeout that sets the flag *)
+  Lwt.async (fun () ->
+    Lwt_unix.sleep timeout_seconds >>= fun () ->
+    timeout_ref := true;
+    Lwt.return_unit
+  );
+  wait_loop ()
 
 let wait_for_orderbook_data = wait_for_orderbook_data_lwt
 
@@ -959,8 +977,8 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
-    Lwt.async (fun () -> start_message_handler conn symbols on_failure on_heartbeat);
-    Logging.debug_f ~section "Orderbook WebSocket connection established";
+    start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
+    Logging.debug_f ~section "Orderbook WebSocket connection closed";
     Lwt.return_unit
 
 let initialize symbols =

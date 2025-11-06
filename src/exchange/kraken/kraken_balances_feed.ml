@@ -355,8 +355,8 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "Authenticated WebSocket established, subscribing to balances";
-    Lwt.async (fun () -> start_message_handler conn token on_failure on_heartbeat);
-    Logging.info ~section "Balances WebSocket connection established";
+    start_message_handler conn token on_failure on_heartbeat >>= fun () ->
+    Logging.info ~section "Balances WebSocket connection closed";
     Lwt.return_unit
 
 (** Initialize balances feed data stores *)

@@ -296,7 +296,8 @@ let ensure_connection ?on_failure token =
             state.reader <- Some reader;
             Lwt.return_unit) >>= fun () ->
           notify_connection `Connected;
-          Lwt.return_unit
+          (* Wait for the reader task to complete (only happens on error/disconnect) *)
+          reader
 
 let send_message ~message_str ~req_id ~timeout_ms =
   Lwt_mutex.with_lock state.mutex (fun () ->
