@@ -3,7 +3,7 @@
 [![OCaml](https://img.shields.io/badge/Language-OCaml-blue.svg)](https://ocaml.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-High-performance OCaml 5.2 trading engine for Kraken featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, circuit breaker connection management, and real-time telemetry. Built for high-frequency trading with WebSocket data feeds, asynchronous order execution, and a reactive terminal dashboard.
+High-performance OCaml 5.2 trading engine for Kraken featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, circuit breaker connection management, and real-time telemetry. Built for high-frequency trading with WebSocket data feeds, asynchronous order execution.
 
 ## Requirements
 
@@ -15,8 +15,8 @@ High-performance OCaml 5.2 trading engine for Kraken featuring domain-based para
 
 ### Install
 ```bash
-git clone https://github.com/malciller/dio.git
-cd dio
+git clone https://github.com/malciller/dio-domains.git
+cd dio-domains
 opam install . --deps-only
 dune build
 ```
@@ -26,13 +26,20 @@ Create `.env`:
 ```bash
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_API_SECRET=your_kraken_api_secret
+ALLOWED_CLIENT_TOKEN=your_client_token
+ALLOWED_CLIENT_IP=machine_name_or_ip_to_whitelist
 ```
 
 Edit `config.json` (example):
 ```json
 {
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
-  "logging_sections": "",             // Filter logs by section (optional, comma-separated)
+  "logging_sections": "",    // Filter logs by section (optional, comma-separated)
+    "metrics_broadcast": {
+    "port": 8080, // port to broadcast tcp stream
+    "enable_token_auth": true, // enable token authorization, leave false for no toke validation
+    "enable_ip_whitelist": true // enable specific ip access, leave false for all connection sources
+  },         
   "trading": [
     {
       "symbol": "BTC/USD",            // Pair to trade
@@ -54,8 +61,7 @@ Edit `config.json` (example):
 
 ### Run
 ```bash
-./_build/default/bin/main.exe --dashboard   # with UI
-./_build/default/bin/main.exe               # headless
+./_build/default/bin/main.exe            
 ```
 
 ## Strategies
@@ -89,13 +95,7 @@ Edit `config.json` (example):
   - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
   - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
   - **Authentication**: Secure token generation and management.
-- **Dashboard**: Reactive terminal UI with real-time metrics, connection status, and trading activity monitoring.
-
-## Dashboard
-- Interactive Terminal Dashboard - Hotkeys to navigate.
-
-####  Compact Asset View
-![Dio Dashboard](.github/readme/dashboard.png) 
+- **UI**: Raw TCP stream of vairous metrics and values from the bot. 
 
 
 ## Development
