@@ -472,151 +472,156 @@ let parse_execution_event json =
     let order_id = member "order_id" json |> to_string in
     let exec_type_str = member "exec_type" json |> to_string in
     let order_status_str = member "order_status" json |> to_string in
-    
+
     (* Symbol may be missing in minimal status updates (e.g., cancellations) *)
     let symbol_opt = member "symbol" json |> to_string_option in
 
     (* For minimal events, look up symbol from our mapping *)
     let symbol = match symbol_opt with
-      | Some s -> s
+      | Some s -> Some s
       | None ->
           Mutex.lock global_orders_mutex;
           let s = Hashtbl.find_opt order_to_symbol order_id in
           Mutex.unlock global_orders_mutex;
           (match s with
-           | Some sym -> sym
+           | Some sym -> Some sym
            | None ->
-               (* If we don't have the symbol, we can't process this event *)
-               Logging.warn_f ~section "Cannot process minimal event for order %s: symbol not found in mapping" order_id;
-               raise (Failure "missing_symbol"))
+               (* If we don't have the symbol, skip this event silently.
+                  This is expected for orders that existed before app startup. *)
+               Logging.debug_f ~section "Skipping event for unknown order %s (likely pre-startup order)" order_id;
+               None)
     in
-    
-    (* Get existing order to fill in missing fields for minimal events *)
-    let store = get_symbol_store symbol in
-    Mutex.lock global_orders_mutex;
-    let existing_order = Hashtbl.find_opt store.open_orders order_id in
-    Mutex.unlock global_orders_mutex;
-    
-    (* Extract fields from JSON, using existing order as fallback *)
-    let side_str = 
-      match member "side" json |> to_string_option with
-      | Some s -> s
-      | None ->
-          (match existing_order with
-           | Some order -> string_of_side order.side
-           | None -> "buy")  (* Default if we have no existing data *)
-    in
-    
-    let order_qty = 
-      match parse_float_opt json "order_qty" with
-      | Some q -> q
-      | None ->
-          (match existing_order with
-           | Some order -> order.order_qty
-           | None -> 0.0)
-    in
-    
-    let cum_qty = 
-      match parse_float_opt json "cum_qty" with
-      | Some q -> q
-      | None ->
-          (match existing_order with
+
+    (* If we couldn't determine the symbol, return None *)
+    match symbol with
+    | None -> None
+    | Some sym ->
+        (* Get existing order to fill in missing fields for minimal events *)
+        let store = get_symbol_store sym in
+        Mutex.lock global_orders_mutex;
+        let existing_order = Hashtbl.find_opt store.open_orders order_id in
+        Mutex.unlock global_orders_mutex;
+
+        (* Extract fields from JSON, using existing order as fallback *)
+        let side_str =
+          match member "side" json |> to_string_option with
+          | Some s -> s
+          | None ->
+              (match existing_order with
+               | Some order -> string_of_side order.side
+               | None -> "buy")  (* Default if we have no existing data *)
+        in
+
+        let order_qty =
+          match parse_float_opt json "order_qty" with
+          | Some q -> q
+          | None ->
+              (match existing_order with
+               | Some order -> order.order_qty
+               | None -> 0.0)
+        in
+
+        let cum_qty =
+          match parse_float_opt json "cum_qty" with
+          | Some q -> q
+          | None ->
+              (match existing_order with
            | Some order -> order.cum_qty
            | None -> 0.0)
-    in
-    
-    let cum_cost = 
-      match parse_float_opt json "cum_cost" with
-      | Some c -> c
-      | None ->
-          (match existing_order with
-           | Some order -> order.cum_cost
-           | None -> 0.0)
-    in
-    
-    let avg_price = 
-      match parse_float_opt json "avg_price" with
-      | Some p -> p
-      | None ->
-          (match existing_order with
-           | Some order -> order.avg_price
-           | None -> 0.0)
-    in
-    
-    let limit_price = 
-      match parse_float_opt json "limit_price" with
-      | Some _ as p -> p
-      | None ->
-          (match existing_order with
-           | Some order -> order.limit_price
-           | None -> None)
-    in
-    
-    let last_qty = parse_float_opt json "last_qty" in
-    let last_price = parse_float_opt json "last_price" in
-    
-    (* Parse fees - handle both single fee and fees array *)
-    let fee = 
-      match parse_float_opt json "fee_usd_equiv" with
-      | Some f -> Some f
-      | None ->
-          try
-            let fees = member "fees" json |> to_list in
-            match fees with
-            | fee_obj :: _ ->
-                parse_float_opt fee_obj "qty"
-            | [] -> None
-          with _ -> None
-    in
-    
-    let trade_id = parse_int64_opt json "trade_id" in
-    
-    let order_userref = 
-      match parse_int_opt json "order_userref" with
-      | Some _ as u -> u
-      | None ->
-          (match existing_order with
-           | Some order -> order.order_userref
-           | None -> None)
-    in
-    
-    let cl_ord_id = 
-      match member "cl_ord_id" json |> to_string_option with
-      | Some _ as c -> c
-      | None ->
-          (match existing_order with
-           | Some order -> order.cl_ord_id
-           | None -> None)
-    in
-    
-    let _timestamp_str = member "timestamp" json |> to_string in
-    (* Use current time for event timestamp - proper RFC3339 parsing can be added later if needed *)
-    let timestamp = Unix.gettimeofday () in
-    
-    (* Log when we're processing a minimal event *)
-    if symbol_opt = None then
-      Logging.debug_f ~section "Processing minimal event for order %s [%s]: status=%s exec_type=%s"
-        order_id symbol order_status_str exec_type_str;
-    
-    Some {
-      order_id;
-      symbol;
-      exec_type = exec_type_of_string exec_type_str;
-      order_status = order_status_of_string order_status_str;
-      side = side_of_string side_str;
-      order_qty;
-      cum_qty;
-      cum_cost;
-      avg_price;
-      limit_price;
-      last_qty;
-      last_price;
-      fee;
-      trade_id;
-      order_userref;
-      cl_ord_id;
-      timestamp;
-    }
+        in
+
+        let cum_cost =
+          match parse_float_opt json "cum_cost" with
+          | Some c -> c
+          | None ->
+              (match existing_order with
+               | Some order -> order.cum_cost
+               | None -> 0.0)
+        in
+
+        let avg_price =
+          match parse_float_opt json "avg_price" with
+          | Some p -> p
+          | None ->
+              (match existing_order with
+               | Some order -> order.avg_price
+               | None -> 0.0)
+        in
+
+        let limit_price =
+          match parse_float_opt json "limit_price" with
+          | Some _ as p -> p
+          | None ->
+              (match existing_order with
+               | Some order -> order.limit_price
+               | None -> None)
+        in
+
+        let last_qty = parse_float_opt json "last_qty" in
+        let last_price = parse_float_opt json "last_price" in
+
+        (* Parse fees - handle both single fee and fees array *)
+        let fee =
+          match parse_float_opt json "fee_usd_equiv" with
+          | Some f -> Some f
+          | None ->
+              try
+                let fees = member "fees" json |> to_list in
+                match fees with
+                | fee_obj :: _ ->
+                    parse_float_opt fee_obj "qty"
+                | [] -> None
+              with _ -> None
+        in
+
+        let trade_id = parse_int64_opt json "trade_id" in
+
+        let order_userref =
+          match parse_int_opt json "order_userref" with
+          | Some _ as u -> u
+          | None ->
+              (match existing_order with
+               | Some order -> order.order_userref
+               | None -> None)
+        in
+
+        let cl_ord_id =
+          match member "cl_ord_id" json |> to_string_option with
+          | Some _ as c -> c
+          | None ->
+              (match existing_order with
+               | Some order -> order.cl_ord_id
+               | None -> None)
+        in
+
+        let _timestamp_str = member "timestamp" json |> to_string in
+        (* Use current time for event timestamp - proper RFC3339 parsing can be added later if needed *)
+        let timestamp = Unix.gettimeofday () in
+
+        (* Log when we're processing a minimal event *)
+        if symbol_opt = None then
+          Logging.debug_f ~section "Processing minimal event for order %s [%s]: status=%s exec_type=%s"
+            order_id sym order_status_str exec_type_str;
+
+        Some {
+          order_id;
+          symbol = sym;
+          exec_type = exec_type_of_string exec_type_str;
+          order_status = order_status_of_string order_status_str;
+          side = side_of_string side_str;
+          order_qty;
+          cum_qty;
+          cum_cost;
+          avg_price;
+          limit_price;
+          last_qty;
+          last_price;
+          fee;
+          trade_id;
+          order_userref;
+          cl_ord_id;
+          timestamp;
+        }
   with exn ->
     Logging.warn_f ~section "Failed to parse execution event: %s | JSON: %s" 
       (Printexc.to_string exn)
@@ -779,8 +784,8 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "Authenticated WebSocket established, subscribing to executions";
-    Lwt.async (fun () -> start_message_handler conn token on_failure on_heartbeat);
-    Logging.info ~section "Executions WebSocket connection established";
+    start_message_handler conn token on_failure on_heartbeat >>= fun () ->
+    Logging.info ~section "Executions WebSocket connection closed";
     Lwt.return_unit
 
 (** Initialize executions feed data stores *)
