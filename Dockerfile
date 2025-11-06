@@ -54,5 +54,8 @@ RUN eval $(opam env --switch=5.2.0) \
 # 9.  Runtime PATH (opam binaries + app)
 ENV PATH="/usr/local/bin:/root/.opam/5.2.0/bin:${PATH}"
 
-# 10. Default command
+# 10. Expose metrics broadcast port
+EXPOSE 8080
+
+# 11. Default command
 CMD ["dio"]

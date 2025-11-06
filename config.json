@@ -1,6 +1,11 @@
 {
   "logging_level": "info",
   "logging_sections": "",
+  "metrics_broadcast": {
+    "port": 8080,
+    "enable_token_auth": true,
+    "enable_ip_whitelist": true
+  },
   "trading": [
     {
       "symbol": "BTC/USD",

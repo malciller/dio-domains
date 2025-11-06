@@ -558,10 +558,21 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.catch (fun () ->
       let on_failure reason = set_state trading_conn (Failed reason) in
       Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure >>= fun () ->
-      (* Connection established successfully *)
-      set_state trading_conn Connected;
-      (* Connection will run indefinitely until closed *)
-      Lwt.return_unit
+      (* Check if connection is actually still connected before marking as Connected *)
+      if Kraken.Kraken_trading_client.is_connected () then begin
+        (* Connection established successfully *)
+        set_state trading_conn Connected;
+        (* Connection will run indefinitely until closed *)
+        Lwt.return_unit
+      end else begin
+        (* Connection was lost, on_failure should have already been called *)
+        (* But if not, mark as Failed *)
+        let current_state = get_state trading_conn in
+        (match current_state with
+         | Failed _ -> ()  (* Already failed, don't override *)
+         | _ -> set_state trading_conn (Failed "Connection lost after establishment"));
+        Lwt.return_unit
+      end
     ) (fun exn ->
       let error_msg = Printexc.to_string exn in
       Logging.error_f ~section "[%s] Connection failed during establishment: %s" trading_conn.name error_msg;
