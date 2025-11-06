@@ -827,6 +827,9 @@ let start_system_updater () =
              Logging.info_f ~section:"system_cache" "Cleaned up %d stale system stats subscribers" removed_count
        | None -> ());
 
+      (* Clear event bus latest reference periodically to prevent memory retention *)
+      SystemStatsEventBus.clear_latest cache.system_stats_event_bus;
+
       (* Report subscriber statistics to telemetry *)
       let (total, active, _) = SystemStatsEventBus.get_subscriber_stats cache.system_stats_event_bus in
       Telemetry.set_event_bus_subscribers_total total;

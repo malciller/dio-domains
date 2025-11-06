@@ -10,6 +10,11 @@ open Concurrency
 
 open Ui_types
 
+(** Helper function to take first n elements from a list *)
+let rec take n = function
+  | [] -> []
+  | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
+
 (** Event bus for telemetry snapshots *)
 module TelemetrySnapshotEventBus = Event_bus.Make(struct
   type t = telemetry_snapshot
@@ -161,7 +166,17 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
     ) in
     Mutex.unlock metrics_mutex;
 
-    let final_metrics = metrics_list in
+    (* Limit snapshot size to prevent memory issues - keep most recent metrics *)
+    let max_metrics_per_snapshot = 1000 in
+    let final_metrics =
+      if List.length metrics_list > max_metrics_per_snapshot then (
+        Logging.warn_f ~section:"telemetry_cache" "Limiting snapshot size from %d to %d metrics to prevent memory issues"
+          (List.length metrics_list) max_metrics_per_snapshot;
+        (* Take the first N metrics (most recent by insertion order) *)
+        take max_metrics_per_snapshot metrics_list
+      ) else
+        metrics_list
+    in
     Logging.debug_f ~section:"telemetry_cache" "Snapshot contains %d metrics" (List.length final_metrics);
 
     (* Compute categories efficiently - use single pass *)
@@ -306,6 +321,9 @@ let start_telemetry_updater () =
            if removed_count > 0 then
              Logging.info_f ~section:"telemetry_cache" "Cleaned up %d stale telemetry subscribers" removed_count
        | None -> ());
+
+      (* Clear event bus latest reference periodically to prevent memory retention *)
+      TelemetrySnapshotEventBus.clear_latest cache.telemetry_snapshot_event_bus;
 
       (* Report subscriber statistics to telemetry *)
       let (total, active, _) = TelemetrySnapshotEventBus.get_subscriber_stats cache.telemetry_snapshot_event_bus in

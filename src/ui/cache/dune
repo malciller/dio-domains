@@ -1,0 +1,15 @@
+(library
+ (name dio_ui_cache)
+ (public_name dio.ui.cache)
+(libraries
+ lwt
+ lwt.unix
+ dio_engine
+ dio.ui_types
+ concurrency
+ cpuid
+ unix
+ str)
+ (modules telemetry_cache system_cache balance_cache logs_cache)
+ (preprocess
+  (pps lwt_ppx)))

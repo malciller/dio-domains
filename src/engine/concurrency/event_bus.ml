@@ -40,16 +40,38 @@ module Make (Payload : PAYLOAD) = struct
 
   let latest bus = Atomic.get bus.latest
 
+  (** Clear the latest snapshot to prevent memory retention *)
+  let clear_latest bus = Atomic.set bus.latest None
+
   let publish bus payload =
     Atomic.set bus.latest (Some payload);
     let now = Unix.time () in
     let subs = Atomic.get bus.subscribers in
+    (* Filter out closed subscribers and validate each one before pushing *)
+    let active_subs = List.filter (fun sub -> not sub.closed) subs in
     List.iter (fun sub ->
+      (* Double-check subscriber is still active before pushing *)
       if not sub.closed then begin
         sub.last_used <- now;
-        sub.push payload
+        (* Make pushes non-blocking to prevent backpressure *)
+        Lwt.async (fun () ->
+          Lwt.catch
+            (fun () ->
+              (* Add timeout to prevent slow subscribers from blocking indefinitely *)
+              Lwt.pick [
+                (Lwt.return (sub.push payload) >|= fun () -> ());
+                (Lwt_unix.sleep 0.1 >|= fun () -> ())  (* 100ms timeout *)
+              ]
+            )
+            (fun exn ->
+              (* Mark subscriber as closed on push failure *)
+              Logging.debug_f ~section:"event_bus" "Subscriber push failed, marking closed: %s" (Printexc.to_string exn);
+              sub.closed <- true;
+              Lwt.return_unit
+            )
+        )
       end
-    ) subs
+    ) active_subs
 
   let subscribe bus =
     let stream, push = Lwt_stream.create () in

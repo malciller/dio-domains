@@ -324,6 +324,9 @@ let start_balance_updater () =
              Logging.info_f ~section:"balance_cache" "Cleaned up %d stale balance subscribers" removed_count
        | None -> ());
 
+      (* Clear event bus latest reference periodically to prevent memory retention *)
+      BalanceSnapshotEventBus.clear_latest cache.balance_snapshot_event_bus;
+
       (* Report subscriber statistics to telemetry *)
       let (total, active, _) = BalanceSnapshotEventBus.get_subscriber_stats cache.balance_snapshot_event_bus in
       Telemetry.set_event_bus_subscribers_total total;
