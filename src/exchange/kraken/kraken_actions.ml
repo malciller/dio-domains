@@ -84,7 +84,14 @@ let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : strin
 (** Generate unique request ID *)
 let next_req_id =
   let counter = ref 0 in
-  fun () -> incr counter; !counter
+  let ping_start_id = 1000000 in  (* Ping IDs start at this value *)
+  fun () ->
+    incr counter;
+    let id = !counter in
+    (* Warn if approaching ping ID range to detect potential collisions *)
+    if id >= ping_start_id - 1000 then
+      Logging.warn_f ~section "Trading request ID %d approaching ping ID range (ping IDs start at %d) - potential collision risk" id ping_start_id;
+    id
 
 (** Retry configuration *)
 type retry_config = {

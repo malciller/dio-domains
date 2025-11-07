@@ -46,7 +46,7 @@ type state = {
   mutable conn: Websocket_lwt_unix.conn option;
   mutable reader: unit Lwt.t option;
   mutable connecting: bool;
-  responses: Kraken_common_types.ws_response Lwt.u Response_table.t;
+  responses: (Kraken_common_types.ws_response Lwt.u * string) Response_table.t;  (* wakener * expected_method *)
   mutable on_failure: (string -> unit) option;
   connected: bool Atomic.t;
 }
@@ -135,27 +135,38 @@ let parse_ws_response json : Kraken_common_types.ws_response =
     { method_; success; req_id; time_in; time_out; result; error; warnings }
   end
 
-let resolve_response req_id response =
+let resolve_response req_id (response : Kraken_common_types.ws_response) =
   let start_time = Telemetry.start_timer () in
   (* Minimize mutex hold time - only hold during critical section *)
   Lwt_mutex.with_lock state.mutex (fun () ->
     try
-      let wak = Response_table.find state.responses req_id in
+      let wakener, expected_method = Response_table.find state.responses req_id in
       Response_table.remove state.responses req_id;
-      Lwt.return (Some wak)
+      Lwt.return (Some (wakener, expected_method))
     with Not_found -> Lwt.return None
   ) >>= function
-  | Some wak ->
-      (* Perform wakeup outside mutex to reduce contention *)
-      (try
-        Lwt.wakeup_later wak response;
-        let duration = Telemetry.record_duration Telemetry.Common.api_duration start_time in
-        Logging.debug_f ~section "Successfully matched response for req_id=%d in %.3fms (method=%s, success=%b)"
-          req_id (duration *. 1000.0) response.method_ response.success
-      with Invalid_argument _ ->
-        (* Promise was already resolved (likely by timeout) - this is expected *)
-        Logging.debug_f ~section "Promise for req_id=%d was already resolved (likely timeout), response discarded" req_id);
-      Lwt.return_unit
+  | Some (wakener, expected_method) ->
+      (* Validate response method matches expected method, with special handling for ping/pong *)
+      let is_valid_response =
+        expected_method = response.method_ ||
+        (expected_method = "ping" && response.method_ = "pong")
+      in
+      if not is_valid_response then begin
+        Logging.error_f ~section "Response method mismatch for req_id=%d: expected '%s', got '%s' (response discarded)"
+          req_id expected_method response.method_;
+        Lwt.return_unit
+      end else begin
+        (* Perform wakeup outside mutex to reduce contention *)
+        (try
+          Lwt.wakeup_later wakener response;
+          let duration = Telemetry.record_duration Telemetry.Common.api_duration start_time in
+          Logging.debug_f ~section "Successfully matched response for req_id=%d in %.3fms (method=%s, success=%b)"
+            req_id (duration *. 1000.0) response.method_ response.success
+        with Invalid_argument _ ->
+          (* Promise was already resolved (likely by timeout) - this is expected *)
+          Logging.debug_f ~section "Promise for req_id=%d was already resolved (likely timeout), response discarded" req_id);
+        Lwt.return_unit
+      end
   | None ->
       Logging.warn_f ~section "No waiter found for req_id=%d (response arrived after timeout, method=%s, success=%b)"
         req_id response.method_ response.success;
@@ -164,7 +175,7 @@ let resolve_response req_id response =
 let fail_all_pending reason =
   let pending =
     Lwt_mutex.with_lock state.mutex (fun () ->
-      let wakers = Response_table.fold (fun _ wak acc -> wak :: acc) state.responses [] in
+      let wakers = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
       Response_table.clear state.responses;
       Lwt.return wakers
     )
@@ -181,7 +192,7 @@ let reset_state conn ~notify_failure reason =
     let (pending, should_reset, failure_cb) =
       match state.conn with
       | Some current when current == conn ->
-          let wakers = Response_table.fold (fun _ wak acc -> wak :: acc) state.responses [] in
+          let wakers = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
           Response_table.clear state.responses;
           state.conn <- None;
           state.reader <- None;
@@ -324,7 +335,7 @@ let ensure_connection ?on_failure ?on_connected token =
           (* Wait for the reader task to complete (only happens on error/disconnect) *)
           reader
 
-let send_message ~message_str ~req_id ~timeout_ms =
+let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
   (* Check for shutdown before sending new requests *)
   if Atomic.get shutdown_requested then
     Lwt.fail_with (Printf.sprintf "Request req_id %d cancelled due to shutdown" req_id)
@@ -333,15 +344,20 @@ let send_message ~message_str ~req_id ~timeout_ms =
       match state.conn with
       | None -> Lwt.return (Error (Failure "Trading WebSocket not connected"))
       | Some conn ->
-          let waiter, wakener = Lwt.wait () in
-          Response_table.replace state.responses req_id wakener;
-          Lwt.catch
-            (fun () ->
-               Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:message_str ()) >|= fun () ->
-               Ok waiter)
-            (fun exn ->
-               Response_table.remove state.responses req_id;
-               Lwt.return (Error exn))
+          (* Check for req_id collision before registering wakener *)
+          if Response_table.mem state.responses req_id then
+            Lwt.return (Error (Failure (Printf.sprintf "Request ID collision detected: req_id %d already in use" req_id)))
+          else begin
+            let waiter, wakener = Lwt.wait () in
+            Response_table.add state.responses req_id (wakener, expected_method);
+            Lwt.catch
+              (fun () ->
+                 Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:message_str ()) >|= fun () ->
+                 Ok waiter)
+              (fun exn ->
+                 Response_table.remove state.responses req_id;
+                 Lwt.return (Error exn))
+          end
     ) >>= function
     | Error exn -> Lwt.fail exn
     | Ok waiter ->
@@ -381,7 +397,7 @@ let send_ping ~req_id ~timeout_ms : Kraken_common_types.ws_response Lwt.t =
   get_connection () >>= fun _ ->
   let message = `Assoc [ ("method", `String "ping"); ("req_id", `Int req_id) ] in
   let message_str = json_to_string_precise None message in
-  send_message ~message_str ~req_id ~timeout_ms
+  send_message ~message_str ~req_id ~expected_method:"ping" ~timeout_ms
 
 let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_types.ws_response Lwt.t =
   let start_time = Telemetry.start_timer () in
@@ -392,7 +408,7 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
     ] in
   let message_str = json_to_string_precise symbol message in
   Logging.debug ~section (Printf.sprintf "Sending WebSocket message: %s" message_str);
-  send_message ~message_str ~req_id ~timeout_ms >>= fun response ->
+  send_message ~message_str ~req_id ~expected_method:method_ ~timeout_ms >>= fun response ->
   let _ = Telemetry.record_duration Telemetry.Common.api_duration start_time in
   Telemetry.inc_counter Telemetry.Common.api_requests ();
   Lwt.return response
@@ -412,7 +428,7 @@ let close () : unit Lwt.t =
         state.reader <- None;
         state.connecting <- false;
         Atomic.set state.connected false;
-        let pending = Response_table.fold (fun _ wak acc -> wak :: acc) state.responses [] in
+        let pending = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
         Response_table.clear state.responses;
         Lwt.return (Some (conn, pending))
   ) >>= function
