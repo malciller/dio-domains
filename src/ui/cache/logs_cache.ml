@@ -66,6 +66,14 @@ let initialized = ref false
 (** Subscribe to log entry updates *)
 let subscribe_log_entries () = LogEntryEventBus.subscribe cache.log_entry_event_bus
 
+(** Get logs event bus subscriber statistics *)
+let get_logs_subscriber_stats () =
+  LogEntryEventBus.get_subscriber_stats cache.log_entry_event_bus
+
+(** Force cleanup stale subscribers for dashboard memory management *)
+let force_cleanup_stale_subscribers () =
+  LogEntryEventBus.force_cleanup_stale_subscribers cache.log_entry_event_bus ()
+
 (** Format timestamp for display *)
 let format_display_timestamp () =
   let time = Unix.gettimeofday () in

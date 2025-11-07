@@ -30,6 +30,7 @@ type server_state = {
   enable_ip_whitelist: bool;
   token: string option;
   ip_whitelist: string list option;
+  shutdown_requested: bool Atomic.t;  (* Graceful shutdown flag *)
 }
 
 (** Safely close channels with error handling *)
@@ -51,6 +52,7 @@ let create_server_state config = {
   enable_ip_whitelist = config.Dio_engine.Config.enable_ip_whitelist;
   token = config.Dio_engine.Config.token;
   ip_whitelist = config.Dio_engine.Config.ip_whitelist;
+  shutdown_requested = Atomic.make false;
 }
 
 (** Close channels for inactive clients *)
@@ -224,26 +226,46 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
       Lwt.return_unit
     )
 
-(** Non-blocking stream consumer - process items immediately without backpressure *)
+(** Stream consumer that processes items synchronously without backpressure *)
 let consume_stream_non_blocking stream_type stream process_fn state =
-  let consecutive_timeouts = ref 0 in
   let last_success_time = ref (Unix.time ()) in
+  let last_health_log_time = ref (Unix.time ()) in
 
-  let rec consumer_loop () =
-    (* Check for stream inactivity timeout (defense in depth) *)
+  (* Background health monitor task *)
+  Lwt.async (fun () ->
+    let rec monitor_loop () =
+      Lwt_unix.sleep 30.0 >>= fun () ->  (* Check every 30 seconds *)
     let now = Unix.time () in
     let time_since_last_item = now -. !last_success_time in
-    if time_since_last_item > 180.0 then (  (* 3 minutes timeout *)
-      Logging.warn_f ~section:"broadcast" "%s stream inactive for %.1f seconds (>3 minutes), restarting subscription" stream_type time_since_last_item;
-      Lwt.fail (Failure (Printf.sprintf "%s stream inactive for too long" stream_type))
-    ) else
-      (* Process items immediately - no timeout to prevent backpressure *)
-      Lwt_stream.get stream >>= function
-      | Some item ->
-          consecutive_timeouts := 0;
-          last_success_time := Unix.time ();
 
-          (* Process item immediately - drop only if no active clients remain *)
+      (* Check for stream inactivity (5 minutes timeout) *)
+      if time_since_last_item > 300.0 then (
+      Logging.warn_f ~section:"broadcast" "%s stream inactive for %.1f seconds (>5 minutes), restarting subscription" stream_type time_since_last_item;
+      Lwt.fail (Failure (Printf.sprintf "%s stream inactive for too long" stream_type))
+      ) else (
+          (* Log successful item processing every minute for health monitoring *)
+          let time_since_health_log = now -. !last_health_log_time in
+          if time_since_health_log >= 60.0 then (
+            Logging.debug_f ~section:"broadcast" "%s stream health: received item %.1f seconds ago, active" stream_type time_since_last_item;
+            last_health_log_time := now
+          );
+        monitor_loop ()
+      )
+    in
+    monitor_loop ()
+  );
+
+  let rec consumer_loop () =
+    (* Use Lwt.pick with short timeout to allow periodic shutdown checks *)
+    let get_with_shutdown_check = Lwt.pick [
+      Lwt_stream.get stream;
+      (Lwt_unix.sleep 0.1 >|= fun () -> None)  (* 0.1s timeout for shutdown checks *)
+    ] in
+
+    get_with_shutdown_check >>= function
+    | Some item ->
+        (* Got an item - process it asynchronously *)
+        last_success_time := Unix.time ();
           Lwt.async (fun () ->
             Lwt.catch
               (fun () -> process_fn item state)
@@ -252,11 +274,17 @@ let consume_stream_non_blocking stream_type stream process_fn state =
                 Lwt.return_unit
               )
           );
+        (* Continue reading immediately - don't wait for processing *)
+        consumer_loop ()
+    | None ->
+        (* Either timeout or stream closed - check if shutdown requested *)
+        if Atomic.get state.shutdown_requested then (
+          Logging.info_f ~section:"broadcast" "%s stream consumer shutting down due to shutdown request" stream_type;
+          Lwt.return_unit
+        ) else (
+          (* Just a timeout - continue waiting *)
           consumer_loop ()
-      | None ->
-          (* Stream ended - this shouldn't happen for event streams, but if it does, trigger retry *)
-          Logging.warn_f ~section:"broadcast" "%s stream ended unexpectedly, will retry subscription" stream_type;
-          Lwt.fail (Failure (Printf.sprintf "%s stream ended unexpectedly" stream_type))
+        )
   in
   consumer_loop ()
 
@@ -279,8 +307,13 @@ let setup_broadcast_subscriptions state =
           consume_stream_non_blocking "telemetry" stream process_telemetry state
         )
         (fun exn ->
+          (match exn with
+           | Lwt.Canceled ->
+               Logging.debug ~section:"broadcast" "Telemetry subscription cancelled";
+               Lwt.return_unit
+           | _ ->
           Logging.warn_f ~section:"broadcast" "Telemetry subscription failed: %s, retrying..." (Printexc.to_string exn);
-          Lwt_unix.sleep 1.0 >>= subscribe_telemetry  (* Retry after short delay *)
+               Lwt_unix.sleep 1.0 >>= subscribe_telemetry)
         )
     in
     subscribe_telemetry ()
@@ -301,8 +334,13 @@ let setup_broadcast_subscriptions state =
           consume_stream_non_blocking "system" stream process_system_stats state
         )
         (fun exn ->
+          (match exn with
+           | Lwt.Canceled ->
+               Logging.debug ~section:"broadcast" "System stats subscription cancelled";
+               Lwt.return_unit
+           | _ ->
           Logging.warn_f ~section:"broadcast" "System stats subscription failed: %s, retrying..." (Printexc.to_string exn);
-          Lwt_unix.sleep 1.0 >>= subscribe_system  (* Retry after short delay *)
+               Lwt_unix.sleep 1.0 >>= subscribe_system)
         )
     in
     subscribe_system ()
@@ -323,8 +361,13 @@ let setup_broadcast_subscriptions state =
           consume_stream_non_blocking "balance" stream process_balance state
         )
         (fun exn ->
+          (match exn with
+           | Lwt.Canceled ->
+               Logging.debug ~section:"broadcast" "Balance subscription cancelled";
+               Lwt.return_unit
+           | _ ->
           Logging.warn_f ~section:"broadcast" "Balance subscription failed: %s, retrying..." (Printexc.to_string exn);
-          Lwt_unix.sleep 1.0 >>= subscribe_balance  (* Retry after short delay *)
+               Lwt_unix.sleep 1.0 >>= subscribe_balance)
         )
     in
     subscribe_balance ()
@@ -345,8 +388,13 @@ let setup_broadcast_subscriptions state =
           consume_stream_non_blocking "log" stream process_log_entry state
         )
         (fun exn ->
+          (match exn with
+           | Lwt.Canceled ->
+               Logging.debug ~section:"broadcast" "Logs subscription cancelled";
+               Lwt.return_unit
+           | _ ->
           Logging.warn_f ~section:"broadcast" "Logs subscription failed: %s, retrying..." (Printexc.to_string exn);
-          Lwt_unix.sleep 1.0 >>= subscribe_logs  (* Retry after short delay *)
+               Lwt_unix.sleep 1.0 >>= subscribe_logs)
         )
     in
     subscribe_logs ()
@@ -440,7 +488,7 @@ let client_allowed sockaddr whitelist =
     Lwt.fail_with (Printf.sprintf "Client IP %s (hostname: %s) not in whitelist" client_ip client_hostname)
 
 (** Start the metrics broadcast server *)
-let start_server (config : Dio_engine.Config.metrics_broadcast_config) : unit Lwt.t =
+let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown_condition : unit Lwt_condition.t) : unit Lwt.t =
   Logging.info_f ~section:"broadcast" "Starting TCP metrics broadcast server on port %d" config.port;
 
   (* Log authentication configuration *)
@@ -504,6 +552,14 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) : unit Lw
 
   (* Accept connections in a loop *)
   let rec accept_loop () =
+    (* Check if shutdown has been requested *)
+    if Atomic.get state.shutdown_requested then (
+      Logging.info ~section:"broadcast" "Shutdown requested, stopping connection acceptance";
+      (* Close the server socket to stop accepting new connections *)
+      Lwt.catch
+        (fun () -> Lwt_unix.close server_socket)
+        (fun exn -> Logging.debug_f ~section:"broadcast" "Error closing server socket: %s" (Printexc.to_string exn); Lwt.return_unit)
+    ) else (
     Lwt_unix.accept server_socket >>= fun (client_socket, sockaddr) ->
     Lwt.async (fun () ->
       Lwt.catch
@@ -606,6 +662,19 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) : unit Lw
         )
     );
     accept_loop ()
+    )
   in
 
-  accept_loop ()
+  (* Start accept loop in background *)
+  Lwt.async accept_loop;
+
+  (* Wait for shutdown signal *)
+  Logging.info ~section:"broadcast" "Server started, waiting for shutdown signal";
+  Lwt_condition.wait shutdown_condition >>= fun () ->
+  Atomic.set state.shutdown_requested true;
+  Logging.info ~section:"broadcast" "Shutdown signal received, cleaning up...";
+
+  (* Give a moment for cleanup *)
+  Lwt_unix.sleep 0.5 >>= fun () ->
+  Logging.info ~section:"broadcast" "Server shutdown complete";
+  Lwt.return_unit

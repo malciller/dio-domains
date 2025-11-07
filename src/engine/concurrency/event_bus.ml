@@ -21,6 +21,7 @@ module Make (Payload : PAYLOAD) = struct
     mutable closed: bool;
     created_at: float;  (* Track when subscriber was created *)
     mutable last_used: float;  (* Track when subscriber was last used *)
+    persistent: bool;  (* Mark persistent subscribers that should not be force cleaned *)
   }
 
   type t = {
@@ -73,7 +74,7 @@ module Make (Payload : PAYLOAD) = struct
       end
     ) active_subs
 
-  let subscribe bus =
+  let subscribe ?(persistent=false) bus =
     let stream, push = Lwt_stream.create () in
     let now = Unix.time () in
     let subscriber = {
@@ -81,6 +82,7 @@ module Make (Payload : PAYLOAD) = struct
       closed = false;
       created_at = now;
       last_used = now;
+      persistent;
     } in
     let rec try_add () =
       let current = Atomic.get bus.subscribers in
@@ -136,7 +138,9 @@ module Make (Payload : PAYLOAD) = struct
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in
       let filtered = List.filter (fun sub ->
-        not sub.closed && (now -. sub.last_used) <= 30.0  (* Keep only very recently used subscribers *)
+        (* Never force cleanup persistent subscribers *)
+        sub.persistent ||
+        (not sub.closed && (now -. sub.last_used) <= 30.0)  (* Keep only very recently used subscribers *)
       ) current in
       let removed_count = List.length current - List.length filtered in
       if removed_count > 0 then begin
