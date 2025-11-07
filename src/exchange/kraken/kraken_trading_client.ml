@@ -9,6 +9,18 @@ open Concurrency
 
 let section = "kraken_trading_client"
 
+(** Safely force Conduit context with error handling *)
+let get_conduit_ctx () =
+  try
+    Lazy.force Conduit_lwt_unix.default_ctx
+  with
+  | CamlinternalLazy.Undefined ->
+      Logging.error ~section "Conduit context was accessed before initialization - this should not happen";
+      raise (Failure "Conduit context not initialized - ensure main.ml initializes it before domain spawning")
+  | exn ->
+      Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
+      raise exn
+
 (** Global shutdown flag for trading client *)
 let shutdown_requested = Atomic.make false
 
@@ -41,11 +53,17 @@ module Connection_bus = Event_bus.Make (struct
   type t = [ `Connected | `Disconnected of string ]
 end)
 
+type connection_with_generation = {
+  conn: Websocket_lwt_unix.conn;
+  generation: int;
+}
+
 type state = {
   mutex: Lwt_mutex.t;
-  mutable conn: Websocket_lwt_unix.conn option;
+  mutable conn: connection_with_generation option;
   mutable reader: unit Lwt.t option;
   mutable connecting: bool;
+  mutable connection_generation: int;
   responses: (Kraken_common_types.ws_response Lwt.u * string) Response_table.t;  (* wakener * expected_method *)
   mutable on_failure: (string -> unit) option;
   connected: bool Atomic.t;
@@ -56,6 +74,7 @@ let state = {
   conn = None;
   reader = None;
   connecting = false;
+  connection_generation = 0;
   responses = Response_table.create 32;
   on_failure = None;
   connected = Atomic.make false;
@@ -188,44 +207,56 @@ let fail_all_pending reason =
   )
 
 let reset_state conn ~notify_failure reason =
+  (* Capture reader task and other state before clearing *)
   Lwt_mutex.with_lock state.mutex (fun () ->
-    let (pending, should_reset, failure_cb) =
-      match state.conn with
-      | Some current when current == conn ->
-          let wakers = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
-          Response_table.clear state.responses;
-          state.conn <- None;
-          state.reader <- None;
-          state.connecting <- false;
-          Atomic.set state.connected false;
-          let failure_cb = if notify_failure then state.on_failure else None in
-          (wakers, true, failure_cb)
-      | _ ->
-          state.connecting <- false;
-          ([], false, None)
-    in
-    Lwt.return (pending, should_reset, failure_cb)
-  ) >>= fun (pending, should_reset, failure_cb) ->
+    match state.conn with
+    | Some current when current.conn == conn ->
+        let wakers = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
+        let reader = state.reader in
+        Response_table.clear state.responses;
+        state.conn <- None;
+        state.reader <- None;
+        state.connecting <- false;
+        state.connection_generation <- state.connection_generation + 1;  (* Increment generation on reset *)
+        Atomic.set state.connected false;
+        let failure_cb = if notify_failure then state.on_failure else None in
+        Lwt.return (wakers, reader, true, failure_cb)
+    | _ ->
+        state.connecting <- false;
+        Lwt.return ([], None, false, None)
+  ) >>= fun (wakers, reader_task, should_reset, failure_cb) ->
   if not should_reset then Lwt.return_unit
-  else
+  else begin
+    (* Cancel reader loop first to prevent it from processing more frames *)
+    (match reader_task with
+     | Some reader ->
+         Lwt.cancel reader;
+         Logging.debug ~section "Cancelled reader loop during reset_state"
+     | None -> ());
+    
+    (* Close transport connection *)
     Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
+    
+    (* Wake up all pending waiters *)
     List.iter (fun wak ->
       try
         Lwt.wakeup_later_exn wak (Failure reason)
       with Invalid_argument _ ->
         Logging.debug ~section "Attempted to wake already-resolved promise during reset_state"
-    ) pending;
+    ) wakers;
+    
     notify_connection (`Disconnected reason);
     (match failure_cb with Some f -> f reason | None -> ());
     Lwt.return_unit
+  end
 
 
-let handle_frame frame =
+let handle_frame frame ~expected_generation =
   notify_heartbeat ();
   (* Track frame processing *)
   Telemetry.inc_counter (Telemetry.counter "websocket_frames_received" ()) ();
 
-  (* Synchronously resolve responses to prevent race with timeout cleanup *)
+  (* Parse frame first to extract req_id, then check generation and response table atomically *)
   (try
      let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
      let open Yojson.Safe.Util in
@@ -233,14 +264,31 @@ let handle_frame frame =
      match method_opt with
      | Some method_name ->
          let response = parse_ws_response json in
-         Logging.debug_f ~section "Received response for req_id=%s, method=%s"
-           (match response.req_id with Some id -> string_of_int id | None -> "none") method_name;
          (match response.req_id with
           | Some req_id ->
-              (* Synchronously resolve response to prevent timeout race *)
-              resolve_response req_id response >>= fun () ->
-              (* Continue with any additional async processing if needed *)
-              Lwt.return_unit
+              (* Check generation and response table atomically - only ignore if generation doesn't match AND req_id not in table *)
+              Lwt_mutex.with_lock state.mutex (fun () ->
+                let current_gen = state.connection_generation in
+                let req_id_exists = Response_table.mem state.responses req_id in
+                (* Process frame if: generation matches OR req_id is still in response table (delayed response) *)
+                let should_process = expected_generation = current_gen || req_id_exists in
+                Lwt.return (should_process, req_id_exists, current_gen)
+              ) >>= fun (should_process, req_id_exists, current_gen) ->
+              if not should_process then begin
+                Logging.debug_f ~section "Ignoring frame from old connection (generation %d, current %d, req_id=%d not in table)"
+                  expected_generation current_gen req_id;
+                Lwt.return_unit
+              end else begin
+                if expected_generation <> current_gen && req_id_exists then begin
+                  Logging.debug_f ~section "Processing delayed response from old connection (generation %d, current %d, req_id=%d still pending)"
+                    expected_generation current_gen req_id;
+                end;
+                Logging.debug_f ~section "Received response for req_id=%d, method=%s"
+                  req_id method_name;
+                (* Synchronously resolve response to prevent timeout race *)
+                resolve_response req_id response >>= fun () ->
+                Lwt.return_unit
+              end
           | None ->
              Logging.debug ~section
                (Printf.sprintf "Unhandled trading response without req_id (method=%s)" method_name);
@@ -261,18 +309,18 @@ let handle_frame frame =
   (* Any additional processing can happen here asynchronously *)
   Lwt.return_unit
 
-let rec reader_loop conn =
+let rec reader_loop conn generation =
   Websocket_lwt_unix.read conn >>= function
   | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
       Logging.warn ~section "Trading WebSocket closed by server";
       reset_state conn ~notify_failure:true "Connection closed by server"
   | frame ->
-      handle_frame frame >>= fun () -> reader_loop conn
+      handle_frame frame ~expected_generation:generation >>= fun () -> reader_loop conn generation
 
-let start_reader conn =
+let start_reader conn generation =
   let task =
     Lwt.catch
-      (fun () -> reader_loop conn)
+      (fun () -> reader_loop conn generation)
       (fun exn ->
          let reason = Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn) in
          Logging.error ~section reason;
@@ -291,7 +339,7 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
     | _ -> failwith "Failed to resolve ws-auth.kraken.com"
   in
   let client = `TLS (`Hostname "ws-auth.kraken.com", `IP ip, `Port 443) in
-  let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+  let ctx = get_conduit_ctx () in
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
   Logging.info ~section "Trading WebSocket connection established";
   Lwt.return conn
@@ -299,23 +347,46 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
 let ensure_connection ?on_failure ?on_connected token =
   Lwt_mutex.with_lock state.mutex (fun () ->
     (match on_failure with Some f -> state.on_failure <- Some f | None -> ());
-    if state.conn <> None || state.connecting then Lwt.return `Already
+    if state.conn <> None then begin
+      (* Connection already exists, call on_connected if provided *)
+      (match on_connected with Some f -> f () | None -> ());
+      Lwt.return `Already
+    end else if state.connecting then
+      Lwt.return `Wait
     else begin
       state.connecting <- true;
       Lwt.return `Connect
     end
   ) >>= function
   | `Already -> Lwt.return_unit
+  | `Wait ->
+      (* Wait for connection to complete, then call on_connected *)
+      let rec wait_for_connection () =
+        Lwt_unix.sleep 0.1 >>= fun () ->
+        Lwt_mutex.with_lock state.mutex (fun () ->
+          if state.conn <> None then begin
+            (match on_connected with Some f -> f () | None -> ());
+            Lwt.return true
+          end else if state.connecting then
+            Lwt.return false
+          else
+            (* Connection failed, give up *)
+            Lwt.return true
+        ) >>= fun done_ ->
+        if done_ then Lwt.return_unit else wait_for_connection ()
+      in
+      wait_for_connection ()
   | `Connect ->
       Lwt.catch
         (fun () ->
            connect token >>= fun conn ->
            Lwt_mutex.with_lock state.mutex (fun () ->
+             let generation = state.connection_generation in
              state.connecting <- false;
-             state.conn <- Some conn;
+             state.conn <- Some { conn; generation };
              state.reader <- None;
              Atomic.set state.connected true;
-             Lwt.return (Some conn))
+             Lwt.return (Some (conn, generation)))
         )
         (fun exn ->
            Lwt_mutex.with_lock state.mutex (fun () ->
@@ -324,8 +395,8 @@ let ensure_connection ?on_failure ?on_connected token =
            Lwt.fail exn
         ) >>= function
       | None -> Lwt.return_unit
-      | Some conn ->
-          let reader = start_reader conn in
+      | Some (conn, generation) ->
+          let reader = start_reader conn generation in
           Lwt_mutex.with_lock state.mutex (fun () ->
             state.reader <- Some reader;
             Lwt.return_unit) >>= fun () ->
@@ -343,7 +414,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
     Lwt_mutex.with_lock state.mutex (fun () ->
       match state.conn with
       | None -> Lwt.return (Error (Failure "Trading WebSocket not connected"))
-      | Some conn ->
+      | Some conn_with_gen ->
           (* Check for req_id collision before registering wakener *)
           if Response_table.mem state.responses req_id then
             Lwt.return (Error (Failure (Printf.sprintf "Request ID collision detected: req_id %d already in use" req_id)))
@@ -352,7 +423,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             Response_table.add state.responses req_id (wakener, expected_method);
             Lwt.catch
               (fun () ->
-                 Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:message_str ()) >|= fun () ->
+                 Websocket_lwt_unix.write conn_with_gen.conn (Websocket.Frame.create ~content:message_str ()) >|= fun () ->
                  Ok waiter)
               (fun exn ->
                  Response_table.remove state.responses req_id;
@@ -387,7 +458,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
 let get_connection () : Websocket_lwt_unix.conn Lwt.t =
   Lwt_mutex.with_lock state.mutex (fun () ->
     match state.conn with
-    | Some conn -> Lwt.return (Ok conn)
+    | Some conn_with_gen -> Lwt.return (Ok conn_with_gen.conn)
     | None -> Lwt.return (Error "Trading WebSocket not connected. Call init() first."))
   >>= function
   | Ok conn -> Lwt.return conn
@@ -423,14 +494,14 @@ let close () : unit Lwt.t =
   Lwt_mutex.with_lock state.mutex (fun () ->
     match state.conn with
     | None -> Lwt.return None
-    | Some conn ->
+    | Some conn_with_gen ->
         state.conn <- None;
         state.reader <- None;
         state.connecting <- false;
         Atomic.set state.connected false;
         let pending = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
         Response_table.clear state.responses;
-        Lwt.return (Some (conn, pending))
+        Lwt.return (Some (conn_with_gen.conn, pending))
   ) >>= function
   | None -> Lwt.return_unit
   | Some (conn, pending) ->
