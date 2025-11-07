@@ -102,6 +102,12 @@ let () =
 
   Logging.info ~section:"main" "Starting Dio Trading Engine with Metrics Broadcast...";
 
+  (* Signal that caches are ready before any initialization if metrics broadcast is active *)
+  if config.metrics_broadcast.active then (
+    Dio_ui_cache.Balance_cache.signal_feeds_ready ();
+    Dio_ui_cache.Telemetry_cache.signal_system_ready ();
+  );
+
   try
     (* Initialize trading engine synchronously *)
     Logging.info ~section:"main" "Initializing trading engine...";
@@ -109,12 +115,6 @@ let () =
 
     (* Initialize order executor asynchronously - this can run in background *)
     let _order_executor_promise = init_order_executor_async () in
-
-      (* Signal that feeds are ready for cache initialization if metrics broadcast is active *)
-      if config.metrics_broadcast.active then (
-        Dio_ui_cache.Balance_cache.signal_feeds_ready ();
-        Dio_ui_cache.Telemetry_cache.signal_system_ready ();
-      );
 
     (* Start metrics broadcast server if enabled - runs until shutdown signal *)
     if config.metrics_broadcast.active then (

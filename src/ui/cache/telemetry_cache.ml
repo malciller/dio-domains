@@ -7,6 +7,7 @@
 open Lwt.Infix
 open Telemetry
 open Concurrency
+open Ring_buffer
 
 open Ui_types
 
@@ -15,21 +16,32 @@ let rec take n = function
   | [] -> []
   | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
 
+(** Telemetry update event for ring buffer storage *)
+type telemetry_update_event = {
+  timestamp: float;
+  event_type: string;  (* "metric_updated", "metric_added", "metric_removed" *)
+  metric_key: string;  (* Telemetry metric key *)
+}
+
 (** Event bus for telemetry snapshots *)
 module TelemetrySnapshotEventBus = Event_bus.Make(struct
   type t = telemetry_snapshot
 end)
 
-(** Telemetry cache state *)
+(** Telemetry cache state - Two Layer Architecture *)
 type t = {
+  (* Layer 1: Bounded ring buffer for individual metric updates *)
+  layer1_ring_buffer: telemetry_update_event RingBuffer.t;
+
+  (* Layer 2: Current and previous snapshots for retry/recovery *)
   mutable current_snapshot: telemetry_snapshot option;
+  mutable previous_snapshot: telemetry_snapshot option;
+
   telemetry_snapshot_event_bus: TelemetrySnapshotEventBus.t;
   update_condition: unit Lwt_condition.t;
-  mutable last_update: float;
-  update_interval: float;  (* Minimum time between updates *)
-  mutable consecutive_failures: int;  (* Track consecutive failures for backoff *)
-  mutable backoff_until: float;  (* When to resume updates after backoff *)
   mutable last_metrics_hash: string;  (* Track hash of metrics for deduplication *)
+  mutable last_update: float;  (* Track when we last published a snapshot *)
+  update_interval: float;  (* Minimum time between periodic updates *)
 }
 
 (** Global shutdown flag for background tasks *)
@@ -39,17 +51,30 @@ let shutdown_requested = Atomic.make false
 let signal_shutdown () =
   Atomic.set shutdown_requested true
 
-(** Global telemetry cache instance *)
+(** Global telemetry cache instance - Two Layer Architecture *)
 let cache = {
+  layer1_ring_buffer = RingBuffer.create 1000;  (* Bounded ring buffer for metric updates *)
   current_snapshot = None;
+  previous_snapshot = None;
   telemetry_snapshot_event_bus = TelemetrySnapshotEventBus.create "telemetry_snapshot";
   update_condition = Lwt_condition.create ();
-  last_update = 0.0;
-  update_interval = 3.0;  (* Update every 3 seconds for dashboard mode - reduced frequency *)
-  consecutive_failures = 0;
-  backoff_until = 0.0;
   last_metrics_hash = "";
+  last_update = 0.0;
+  update_interval = 1.0;  (* Update telemetry snapshots at most every 1.0 seconds for dashboard mode *)
 }
+
+(** Safe broadcast helper for cache update condition *)
+let safe_broadcast_update_condition cache =
+  try
+    Lwt_condition.broadcast cache.update_condition ()
+  with
+  | Invalid_argument _ ->
+      (* Promise already resolved - this can happen with concurrent broadcasts *)
+      (* Not fatal, just means a waiter was already woken up *)
+      ()
+  | exn ->
+      (* Other errors should still be logged *)
+      Logging.warn_f ~section:"telemetry_cache" "Error broadcasting update_condition: %s" (Printexc.to_string exn)
 
 (** Initialization guard with mutex protection *)
 let initialized = ref false
@@ -69,11 +94,13 @@ let signal_system_ready () =
     Lwt_condition.broadcast system_ready_condition ()
   )
 
-(** Create a fresh telemetry snapshot with deduplication *)
-let create_telemetry_snapshot () : telemetry_snapshot option =
+(** Rebuild telemetry snapshot from Layer 1 events (triggered by metric updates) *)
+let rebuild_snapshot_from_layer1 () : telemetry_snapshot =
   let start_time = Unix.gettimeofday () in
   let now = Unix.time () in
   let uptime = now -. !Telemetry.start_time in
+
+  Logging.debug_f ~section:"telemetry_cache" "Rebuilding snapshot from Layer 1 at %.3f (uptime: %.1f)" now uptime;
 
   (* Update cached rates and sliding counter snapshots before copying metrics *)
   Telemetry.update_cached_rates ();
@@ -81,7 +108,7 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
   (* Update sliding window statistics for monitoring *)
   Telemetry.update_sliding_window_stats ();
 
-  (* Compute hash of current metrics for deduplication *)
+  (* Get current metrics hash for tracking changes *)
   let current_hash = Telemetry.(
     Mutex.lock metrics_mutex;
     let hash = Hashtbl.fold (fun key metric acc ->
@@ -94,13 +121,8 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
     hash
   ) in
 
-  (* Check if metrics have changed since last snapshot *)
-  if current_hash = cache.last_metrics_hash then (
-    Logging.debug ~section:"telemetry_cache" "Metrics unchanged, skipping snapshot creation";
-    None  (* No change, don't create new snapshot *)
-  ) else (
-    Logging.debug_f ~section:"telemetry_cache" "Creating snapshot at %.3f (uptime: %.1f)" now uptime;
-    cache.last_metrics_hash <- current_hash;
+  (* Update last hash for future comparisons *)
+  cache.last_metrics_hash <- current_hash;
 
     (* Safely copy metrics from telemetry system - minimize allocations *)
     (* Strip heavy data structures like sliding window lists to prevent memory bloat *)
@@ -204,7 +226,7 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
     in
 
     let version = Atomic.incr snapshot_version_counter; Atomic.get snapshot_version_counter in
-    let result = Some {
+    let snapshot = {
       uptime;
       metrics = final_metrics;
       categories = category_list;
@@ -217,7 +239,71 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
     let duration = end_time -. start_time in
     Telemetry.record_snapshot_creation_time duration;
 
-    result
+    snapshot
+
+(** Update Layer 2 snapshots - move current to previous, set new current *)
+let update_layer2_snapshots new_snapshot =
+  (* Move current to previous (destroying old previous) *)
+  cache.previous_snapshot <- cache.current_snapshot;
+  (* Set new current *)
+  cache.current_snapshot <- Some new_snapshot;
+
+  Logging.debug_f ~section:"telemetry_cache" "Layer 2 snapshots updated - current version: %d, previous exists: %b"
+    new_snapshot.version (Option.is_some cache.previous_snapshot)
+
+(** Add a metric update event to Layer 1 ring buffer and immediately trigger Layer 2 snapshot *)
+let add_metric_update_event metric_key event_type =
+  let event = {
+    timestamp = Unix.gettimeofday ();
+    event_type;
+    metric_key;
+  } in
+  RingBuffer.write cache.layer1_ring_buffer event;
+  Logging.debug_f ~section:"telemetry_cache" "Added %s event for metric %s to Layer 1 ring buffer"
+    event_type metric_key;
+
+  (* Immediately rebuild Layer 2 snapshot and publish when any event is added to Layer 1 *)
+  try
+    let snapshot = rebuild_snapshot_from_layer1 () in
+    update_layer2_snapshots snapshot;
+
+    (* Update last_update timestamp *)
+    cache.last_update <- Unix.time ();
+
+    (* Publish snapshot to event bus for streaming *)
+    TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
+    safe_broadcast_update_condition cache;
+
+    Logging.debug_f ~section:"telemetry_cache" "Snapshot published immediately after Layer 1 update (version: %d) at %.2f"
+      snapshot.version snapshot.timestamp
+  with exn ->
+    Logging.warn_f ~section:"telemetry_cache" "Failed to rebuild snapshot after Layer 1 update: %s"
+      (Printexc.to_string exn)
+
+(** Periodic update function that publishes snapshots even when metrics haven't changed *)
+let update_telemetry_cache_periodic () =
+  let now = Unix.time () in
+  let time_since_last = now -. cache.last_update in
+
+  (* Always try to update if enough time has passed, OR if it's been too long since last publish (keepalive) *)
+  let should_update = time_since_last >= cache.update_interval in
+  let needs_keepalive = time_since_last >= 30.0 in  (* Keepalive every 30 seconds max *)
+
+  if should_update || needs_keepalive then (
+    try
+      let snapshot = rebuild_snapshot_from_layer1 () in
+      update_layer2_snapshots snapshot;
+      cache.last_update <- now;
+
+      (* Publish snapshot to event bus for streaming *)
+      TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
+      safe_broadcast_update_condition cache;
+
+      Logging.debug_f ~section:"telemetry_cache" "Periodic snapshot published (version: %d) at %.2f"
+        snapshot.version snapshot.timestamp
+    with exn ->
+      Logging.warn_f ~section:"telemetry_cache" "Failed to rebuild snapshot during periodic update: %s"
+        (Printexc.to_string exn)
   )
 
 (** Wait for next telemetry update *)
@@ -249,139 +335,82 @@ let current_telemetry_snapshot () =
 (** Publish initial telemetry snapshot synchronously *)
 let publish_initial_snapshot () =
   Logging.debug ~section:"telemetry_cache" "Publishing initial telemetry snapshot";
-  (* Ensure we have an initial update *)
-  (match create_telemetry_snapshot () with
-   | Some initial_snapshot ->
-       cache.current_snapshot <- Some initial_snapshot;
-       cache.last_update <- Unix.time ();
-       TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus initial_snapshot;
-       Lwt_condition.broadcast cache.update_condition ();
-       Logging.debug ~section:"telemetry_cache" "Initial telemetry snapshot published"
-   | None ->
-       (* No metrics yet, create empty snapshot *)
-       let empty_snapshot = {
-         uptime = 0.0;
-         metrics = [];
-         categories = [];
-         timestamp = Unix.time ();
-         version = 0;
-       } in
-       cache.current_snapshot <- Some empty_snapshot;
-       cache.last_update <- Unix.time ();
-       TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus empty_snapshot;
-       Lwt_condition.broadcast cache.update_condition ();
-       Logging.debug ~section:"telemetry_cache" "Initial empty telemetry snapshot published"
-  )
+  let initial_snapshot = rebuild_snapshot_from_layer1 () in
+  update_layer2_snapshots initial_snapshot;
+  cache.last_update <- Unix.time ();
+  TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus initial_snapshot;
+  safe_broadcast_update_condition cache;
+  Logging.debug_f ~section:"telemetry_cache" "Initial telemetry snapshot published (version: %d)" initial_snapshot.version
 
-(** Start background telemetry updater (polling-based) *)
+(** Start event-driven telemetry updater (subscribes to telemetry changes) *)
 let start_telemetry_updater () =
-  Logging.debug ~section:"telemetry_cache" "Starting background telemetry updater";
+  Logging.debug ~section:"telemetry_cache" "Starting event-driven telemetry updater";
 
-  (* Start periodic polling updater *)
+  (* Start event-driven updater that reacts to telemetry changes *)
   Lwt.async (fun () ->
-    Logging.debug_f ~section:"telemetry_cache" "Starting telemetry polling updater";
+    Logging.debug ~section:"telemetry_cache" "Starting telemetry event-driven updater";
 
-    (* Wait for system to be ready before starting polling *)
+    (* Wait for system to be ready before starting subscription *)
     (if !system_ready then
       Lwt.return_unit
     else
       Lwt_condition.wait system_ready_condition) >>= fun () ->
-    Logging.debug_f ~section:"telemetry_cache" "Telemetry polling updater starting after system ready";
+    Logging.debug ~section:"telemetry_cache" "Telemetry event-driven updater starting after system ready";
 
-    let rec polling_loop () =
+    (* Subscribe to metric changes using stream-based approach *)
+    Logging.debug ~section:"telemetry_cache" "Subscribing to metric changes";
+    let (metric_stream, _metric_close) = Telemetry.subscribe_metric_changes () in
+
+    let rec process_metric_updates () =
       (* Check for shutdown request *)
       if Atomic.get shutdown_requested then (
         Logging.debug ~section:"telemetry_cache" "Telemetry cache updater shutting down due to shutdown request";
         Lwt.return_unit
       ) else (
-      let now = Unix.time () in
-      let time_since_last = now -. cache.last_update in
-
-      (* Check if we're in backoff period *)
-      let in_backoff = now < cache.backoff_until in
-
-      if in_backoff then (
-        Lwt_unix.sleep 1.0 >>= polling_loop
-      ) else (
-        (* Always try to update if enough time has passed, OR if it's been too long since last publish (keepalive) *)
-        let should_update = time_since_last >= cache.update_interval in
-        let needs_keepalive = time_since_last >= 30.0 in  (* Keepalive every 30 seconds max *)
-
-        if should_update || needs_keepalive then (
-          (try
-            match create_telemetry_snapshot () with
-            | Some snapshot ->
-                (* Publish snapshot to event bus first *)
-                TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
-                Lwt_condition.broadcast cache.update_condition ();
-                (* Clear cache.current_snapshot immediately after publishing to prevent memory accumulation *)
-                cache.current_snapshot <- None;
-                cache.last_update <- now;
-                cache.consecutive_failures <- 0;
-                cache.backoff_until <- 0.0;
-                Logging.debug_f ~section:"telemetry_cache" "Telemetry snapshot published and cache cleared at %.2f" snapshot.timestamp
-            | None when needs_keepalive ->
-                (* No new data but we need keepalive - republish last known snapshot if available *)
-                (match cache.current_snapshot with
-                 | Some last_snapshot ->
-                     (* Update timestamp and republish *)
-                     let keepalive_snapshot = { last_snapshot with timestamp = now } in
-                     TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus keepalive_snapshot;
-                     Lwt_condition.broadcast cache.update_condition ();
-                     cache.last_update <- now;
-                     Logging.debug_f ~section:"telemetry_cache" "Telemetry keepalive published at %.2f" now
-                 | None ->
-                     (* No snapshot available, just update timestamp *)
-                     cache.last_update <- now;
-                     Logging.debug_f ~section:"telemetry_cache" "No telemetry snapshot available for keepalive at %.2f" now
-                )
+        Lwt.catch
+          (fun () -> Lwt_stream.get metric_stream >>= function
+            | Some () ->
+                (* Metrics changed - add event to Layer 1 (this will immediately trigger Layer 2 snapshot rebuild) *)
+                Logging.debug ~section:"telemetry_cache" "Telemetry metrics changed, adding event to Layer 1";
+                (* Add generic metric update event to Layer 1 - this will immediately trigger snapshot rebuild *)
+                add_metric_update_event "all" "metrics_changed";
+                (* Continue listening for next change *)
+                process_metric_updates ()
             | None ->
-                (* Metrics unchanged, just update timestamp *)
-                cache.last_update <- now;
-                Logging.debug_f ~section:"telemetry_cache" "Metrics unchanged, skipping snapshot update at %.2f" now
-          with exn ->
-            cache.consecutive_failures <- cache.consecutive_failures + 1;
-            let backoff_seconds = min 60.0 (2.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 5))) in
-            cache.backoff_until <- now +. backoff_seconds;
-            Logging.warn_f ~section:"telemetry_cache" "Failed to update telemetry snapshot (attempt %d): %s, backing off for %.1f seconds"
-              cache.consecutive_failures (Printexc.to_string exn) backoff_seconds
-          );
-        );
-        Lwt_unix.sleep 1.0 >>= polling_loop (* Poll every second *)
-        )
+                (* Stream ended - wait a bit and try to resubscribe *)
+                Logging.debug ~section:"telemetry_cache" "Metric changes subscription stream ended, will resubscribe";
+                Lwt_unix.sleep 1.0 >>= process_metric_updates)
+          (fun exn ->
+            Logging.warn_f ~section:"telemetry_cache" "Metric changes subscription error: %s, will retry" (Printexc.to_string exn);
+            Lwt_unix.sleep 1.0 >>= process_metric_updates)
       )
     in
-    polling_loop () (* No initial delay once system is ready *)
+    process_metric_updates ()
   );
 
-  (* Add periodic event bus cleanup - every 5 minutes *)
+  (* Start periodic updater that publishes snapshots even when metrics haven't changed *)
   Lwt.async (fun () ->
-    Logging.debug ~section:"telemetry_cache" "Starting event bus cleanup loop";
-    let rec cleanup_loop () =
+    Logging.debug ~section:"telemetry_cache" "Starting periodic telemetry updater";
+    
+    (* Wait for system to be ready *)
+    (if !system_ready then
+      Lwt.return_unit
+    else
+      Lwt_condition.wait system_ready_condition) >>= fun () ->
+    
+    let rec periodic_loop () =
       (* Check for shutdown request *)
       if Atomic.get shutdown_requested then (
-        Logging.debug ~section:"telemetry_cache" "Telemetry cache cleanup loop shutting down due to shutdown request";
+        Logging.debug ~section:"telemetry_cache" "Periodic telemetry updater shutting down due to shutdown request";
         Lwt.return_unit
       ) else (
-      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
-      let removed_opt = TelemetrySnapshotEventBus.cleanup_stale_subscribers cache.telemetry_snapshot_event_bus () in
-      (match removed_opt with
-       | Some removed_count ->
-           if removed_count > 0 then
-             Logging.info_f ~section:"telemetry_cache" "Cleaned up %d stale telemetry subscribers" removed_count
-       | None -> ());
-
-      (* Clear event bus latest reference periodically to prevent memory retention *)
-      TelemetrySnapshotEventBus.clear_latest cache.telemetry_snapshot_event_bus;
-
-      (* Report subscriber statistics to telemetry *)
-      let (total, active, _) = TelemetrySnapshotEventBus.get_subscriber_stats cache.telemetry_snapshot_event_bus in
-      Telemetry.set_event_bus_subscribers_total total;
-      Telemetry.set_event_bus_subscribers_active active;
-      cleanup_loop ()
+        (* Update cache periodically (this will check if enough time has passed) *)
+        update_telemetry_cache_periodic ();
+        (* Sleep 1 second and continue *)
+        Lwt_unix.sleep 1.0 >>= periodic_loop
       )
     in
-    cleanup_loop ()
+    periodic_loop ()
   )
 
 (** Force cleanup stale subscribers for dashboard memory management *)

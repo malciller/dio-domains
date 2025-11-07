@@ -1,6 +1,7 @@
 (** Lightweight Telemetry System for Performance Tracking *)
 
 open Lwt.Infix
+open Concurrency
 
 let section = "telemetry"
 
@@ -171,6 +172,30 @@ let metrics : (string, metric) Hashtbl.t = Hashtbl.create 128
 let metrics_mutex = Mutex.create ()
 let metrics_changed_condition = Lwt_condition.create ()
 
+(** Event bus for metric changes (stream-based subscription) *)
+module MetricChangeEventBus = Event_bus.Make(struct
+  type t = unit  (* Metric changes don't need data, just notification *)
+end)
+
+(** Global metric change event bus instance *)
+let metric_change_event_bus = MetricChangeEventBus.create "metric_change"
+
+(** Safe broadcast helper that handles Invalid_argument exceptions from concurrent access *)
+let safe_broadcast_metrics_changed () =
+  try
+    Lwt_condition.broadcast metrics_changed_condition ()
+  with
+  | Invalid_argument _ ->
+      (* Promise already resolved - this can happen with concurrent broadcasts *)
+      (* Not fatal, just means a waiter was already woken up *)
+      ()
+  | exn ->
+      (* Other errors should still be logged *)
+      Logging.warn_f ~section:"telemetry" "Error broadcasting metrics_changed: %s" (Printexc.to_string exn);
+
+  (* Also publish to event bus for stream-based subscribers *)
+  MetricChangeEventBus.publish metric_change_event_bus ()
+
 
 (** Helper to generate metric key *)
 let metric_key name labels =
@@ -274,7 +299,17 @@ let set_gauge metric value =
       r := value;
       metric.last_updated <- Unix.gettimeofday ();
       Mutex.unlock metrics_mutex;
-      Lwt_condition.broadcast metrics_changed_condition ()
+      safe_broadcast_metrics_changed ()
+  | _ -> ()
+
+(** Silent gauge update - updates metric without broadcasting changes *)
+let set_gauge_silent metric value =
+  match metric.metric_type with
+  | Gauge r ->
+      Mutex.lock metrics_mutex;
+      r := value;
+      metric.last_updated <- Unix.gettimeofday ();
+      Mutex.unlock metrics_mutex
   | _ -> ()
 
 let inc_gauge metric value =
@@ -284,7 +319,7 @@ let inc_gauge metric value =
       r := !r +. value;
       metric.last_updated <- Unix.gettimeofday ();
       Mutex.unlock metrics_mutex;
-      Lwt_condition.broadcast metrics_changed_condition ()
+      safe_broadcast_metrics_changed ()
   | _ -> ()
 
 let get_gauge metric =
@@ -453,7 +488,7 @@ let observe_histogram metric value =
       add_histogram_sample buffer value;
       metric.last_updated <- Unix.gettimeofday ();
       Mutex.unlock metrics_mutex;
-      Lwt_condition.broadcast metrics_changed_condition ()
+      safe_broadcast_metrics_changed ()
   | _ -> ()
 
 let histogram_stats metric =
@@ -659,7 +694,7 @@ let inc_sliding_counter metric ?(value=1) () =
           Mutex.unlock metrics_mutex;
         end;
 
-      Lwt_condition.broadcast metrics_changed_condition ()
+      safe_broadcast_metrics_changed ()
   | _ -> ()
 
 (** Get current value of sliding window counter *)
@@ -727,7 +762,7 @@ let inc_counter metric ?(value=1) () =
        | None -> ());
 
       Mutex.unlock metrics_mutex;
-      Lwt_condition.broadcast metrics_changed_condition ()
+      safe_broadcast_metrics_changed ()
   | _ -> ()
 
 let get_counter metric =
@@ -839,7 +874,10 @@ let telemetry_histogram_buffers_gauge = ref None
 let heap_memory_gauge = ref None
 let rss_memory_gauge = ref None
 
-let set_heap_memory_usage usage =
+
+
+(** Silent memory usage updates - update metrics without broadcasting changes *)
+let set_heap_memory_usage_silent usage =
   let metric = match !heap_memory_gauge with
     | Some m -> m
     | None ->
@@ -847,9 +885,9 @@ let set_heap_memory_usage usage =
         heap_memory_gauge := Some m;
         m
   in
-  set_gauge metric usage
+  set_gauge_silent metric usage
 
-let set_rss_memory_usage usage =
+let set_rss_memory_usage_silent usage =
   let metric = match !rss_memory_gauge with
     | Some m -> m
     | None ->
@@ -857,7 +895,7 @@ let set_rss_memory_usage usage =
         rss_memory_gauge := Some m;
         m
   in
-  set_gauge metric usage
+  set_gauge_silent metric usage
 
 (** Performance monitoring metrics for telemetry system health *)
 let snapshot_creation_time_histogram = ref None
@@ -913,21 +951,25 @@ let update_sliding_window_stats () =
 
 (** Update system metrics *)
 let update_system_metrics () =
+  (* Update all metrics silently to batch changes *)
   let uptime_metric = gauge "uptime_seconds" () in
   let uptime = Unix.time () -. !start_time in
-  set_gauge uptime_metric uptime;
+  set_gauge_silent uptime_metric uptime;
 
-  (* Update memory usage gauges *)
+  (* Update memory usage gauges silently *)
   let heap_mb = get_ocaml_heap_usage () in
   let rss_mb = get_rss_usage () in
   let alloc_rate = get_allocation_rate () in
 
-  set_heap_memory_usage heap_mb;
-  set_rss_memory_usage rss_mb;
+  set_heap_memory_usage_silent heap_mb;
+  set_rss_memory_usage_silent rss_mb;
 
-  (* Add allocation rate metric *)
+  (* Add allocation rate metric silently *)
   let alloc_rate_metric = gauge "allocation_rate_mwords_per_sample" () in
-  set_gauge alloc_rate_metric alloc_rate
+  set_gauge_silent alloc_rate_metric alloc_rate;
+
+  (* Broadcast once at the end to trigger telemetry_cache update *)
+  safe_broadcast_metrics_changed ()
 
 (** Update memory monitoring metrics *)
 
@@ -982,25 +1024,7 @@ let set_telemetry_histogram_buffers_size size =
   in
   set_gauge metric (float_of_int size)
 
-let set_heap_memory_usage usage =
-  let metric = match !heap_memory_gauge with
-    | Some m -> m
-    | None ->
-        let m = gauge "heap_memory_mb" () in
-        heap_memory_gauge := Some m;
-        m
-  in
-  set_gauge metric usage
 
-let set_rss_memory_usage usage =
-  let metric = match !rss_memory_gauge with
-    | Some m -> m
-    | None ->
-        let m = gauge "rss_memory_mb" () in
-        rss_memory_gauge := Some m;
-        m
-  in
-  set_gauge metric usage
 
 (** Update memory monitoring metrics *)
 let update_memory_monitoring_metrics () =
@@ -1084,4 +1108,9 @@ let report_metrics () =
 
 (** Wait for metric changes (event-driven) *)
 let wait_for_metric_changes () = Lwt_condition.wait metrics_changed_condition
+
+(** Subscribe to metric changes (stream-based) *)
+let subscribe_metric_changes () =
+  let subscription = MetricChangeEventBus.subscribe metric_change_event_bus in
+  (subscription.stream, subscription.close)
 

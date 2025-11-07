@@ -2,6 +2,6 @@
  (name concurrency)
  (public_name dio.concurrency)
  (libraries lwt lwt.unix dio.logging)
- (modules Event_bus Event_registry)
+ (modules Event_bus Event_registry Ring_buffer)
 )
 

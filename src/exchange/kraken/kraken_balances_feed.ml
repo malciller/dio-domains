@@ -1,6 +1,7 @@
 (** Kraken Balances Feed - WebSocket v2 authenticated balances subscription with lock-free atomics *)
 
 open Lwt.Infix
+open Concurrency
 
 let section = "kraken_balances"
 
@@ -69,6 +70,14 @@ module BalanceStore = struct
       last_updated = Atomic.get store.last_updated;
     }
 end
+
+(** Event bus for balance updates - publishes individual balance changes *)
+module BalanceUpdateEventBus = Event_bus.Make(struct
+  type t = balance_data
+end)
+
+(** Global balance update event bus instance *)
+let balance_update_event_bus = BalanceUpdateEventBus.create "balance_update"
 
 (** Global balance stores per asset - protected by mutex *)
 let balance_stores : (string, BalanceStore.t) Hashtbl.t = Hashtbl.create 32
@@ -245,6 +254,17 @@ let parse_update json on_heartbeat =
         BalanceStore.update_wallet store balance wallet_type wallet_id;
         update_balance_timestamp asset;
         notify_ready ();
+
+        (* Publish balance update event to event bus *)
+        let balance_data = BalanceStore.get_all store in
+        let event_data = {
+          asset;
+          balance = balance_data.balance;
+          wallet_type = balance_data.wallet_type;
+          wallet_id = balance_data.wallet_id;
+          last_updated = balance_data.last_updated;
+        } in
+        BalanceUpdateEventBus.publish balance_update_event_bus event_data;
 
         Logging.info_f ~section "Balance update: %s %+.8f (new: %.8f) [%s]"
           asset amount balance tx_type;
@@ -468,6 +488,11 @@ let restart_connection () =
   (* The supervisor's heartbeat monitor will detect connection issues and reconnect automatically *)
   (* We don't need to spam logs or check every asset here *)
   Lwt.return_unit
+
+(** Subscribe to balance update events *)
+let subscribe_balance_updates () =
+  let subscription = BalanceUpdateEventBus.subscribe balance_update_event_bus in
+  (subscription.stream, subscription.close)
 
 (** Force refresh balance data by requesting a new snapshot *)
 let force_balance_refresh _token =
