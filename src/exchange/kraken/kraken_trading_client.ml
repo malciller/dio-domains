@@ -285,7 +285,7 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
   Logging.info ~section "Trading WebSocket connection established";
   Lwt.return conn
 
-let ensure_connection ?on_failure token =
+let ensure_connection ?on_failure ?on_connected token =
   Lwt_mutex.with_lock state.mutex (fun () ->
     (match on_failure with Some f -> state.on_failure <- Some f | None -> ());
     if state.conn <> None || state.connecting then Lwt.return `Already
@@ -319,6 +319,8 @@ let ensure_connection ?on_failure token =
             state.reader <- Some reader;
             Lwt.return_unit) >>= fun () ->
           notify_connection `Connected;
+          (* Call on_connected callback if provided *)
+          (match on_connected with Some f -> f () | None -> ());
           (* Wait for the reader task to complete (only happens on error/disconnect) *)
           reader
 
@@ -397,7 +399,7 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
 
 let init token : unit Lwt.t = ensure_connection token
 
-let connect_and_monitor token ~on_failure = ensure_connection ~on_failure token
+let connect_and_monitor token ~on_failure ~on_connected = ensure_connection ~on_failure ~on_connected token
 
 let is_connected () = Atomic.get state.connected
 

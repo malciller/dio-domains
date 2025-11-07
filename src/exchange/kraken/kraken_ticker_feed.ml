@@ -247,7 +247,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   msg_loop ()
 
 (** WebSocket connection to Kraken - establishes connection and starts message handler *)
-let connect_and_subscribe symbols ~on_failure ~on_heartbeat =
+let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
 
   Logging.info_f ~section "Connecting to Kraken WebSocket...";
@@ -263,6 +263,8 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "WebSocket established, subscribing to ticker feed";
+    (* Call on_connected callback after successful connection and before starting message handler *)
+    on_connected ();
     start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
     Logging.info ~section "Ticker WebSocket connection closed";
     Lwt.return_unit
