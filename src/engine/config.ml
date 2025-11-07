@@ -18,6 +18,7 @@ type logging_config = {
 }
 
 type metrics_broadcast_config = {
+  active: bool;
   port: int;
   enable_token_auth: bool;
   enable_ip_whitelist: bool;
@@ -64,6 +65,7 @@ let parse_logging_config json : logging_config =
 (** Parse metrics broadcast configuration *)
 let parse_metrics_broadcast_config json : metrics_broadcast_config =
   let open Yojson.Basic.Util in
+  let active = json |> member "active" |> to_bool_option |> Option.value ~default:true in
   let port = json |> member "port" |> to_int_option |> Option.value ~default:8080 in
   let enable_token_auth = json |> member "enable_token_auth" |> to_bool_option |> Option.value ~default:false in
   let enable_ip_whitelist = json |> member "enable_ip_whitelist" |> to_bool_option |> Option.value ~default:false in
@@ -109,7 +111,7 @@ let parse_metrics_broadcast_config json : metrics_broadcast_config =
       None
   in
 
-  { port; enable_token_auth; enable_ip_whitelist; token; ip_whitelist }
+  { active; port; enable_token_auth; enable_ip_whitelist; token; ip_whitelist }
 
 (** Read and parse engine configuration from config.json *)
 let read_config () : config =
@@ -121,4 +123,4 @@ let read_config () : config =
     let metrics_broadcast = json |> member "metrics_broadcast" |> parse_metrics_broadcast_config in
     { logging; trading; metrics_broadcast }
   with
-  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = [] }; trading = []; metrics_broadcast = { port = 8080; enable_token_auth = false; enable_ip_whitelist = false; token = None; ip_whitelist = None } }
+  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = [] }; trading = []; metrics_broadcast = { active = true; port = 8080; enable_token_auth = false; enable_ip_whitelist = false; token = None; ip_whitelist = None } }
