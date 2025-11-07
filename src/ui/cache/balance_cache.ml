@@ -63,6 +63,13 @@ type t = {
   mutable backoff_until: float;  (* When to resume updates after backoff *)
 }
 
+(** Global shutdown flag for background tasks *)
+let shutdown_requested = Atomic.make false
+
+(** Signal shutdown to background tasks *)
+let signal_shutdown () =
+  Atomic.set shutdown_requested true
+
 (** Global balance cache instance *)
 let cache = {
   current_snapshot = None;
@@ -90,7 +97,13 @@ let signal_feeds_ready () =
   )
 
 (** Subscribe to balance snapshot updates *)
-let subscribe_balance_snapshot () = BalanceSnapshotEventBus.subscribe cache.balance_snapshot_event_bus
+let subscribe_balance_snapshot () =
+  let subscription = BalanceSnapshotEventBus.subscribe ~persistent:true cache.balance_snapshot_event_bus in
+  (subscription.stream, subscription.close)
+
+(** Get balance event bus subscriber statistics *)
+let get_balance_subscriber_stats () =
+  BalanceSnapshotEventBus.get_subscriber_stats cache.balance_snapshot_event_bus
 
 (** Convert balance data to UI entry - now aggregates wallets *)
 let balance_data_to_entry asset (balance_data : Kraken_balances_feed.balance_data) =
@@ -234,9 +247,9 @@ let clear_cache () =
   Lwt_condition.broadcast cache.update_condition ()
 
 
-(** Start background balance updater (mirrors telemetry cache pattern) *)
-let start_balance_updater () =
-  Logging.debug_f ~section:"balance_cache" "Starting balance updater...";
+(** Publish initial balance snapshot synchronously *)
+let publish_initial_snapshot () =
+  Logging.debug ~section:"balance_cache" "Publishing initial balance snapshot";
   (* Start with empty snapshot - don't try to access Kraken feeds during init *)
   let initial_timestamp = Unix.time () in
   let initial_snapshot = {
@@ -248,7 +261,11 @@ let start_balance_updater () =
   cache.last_update <- initial_timestamp;
   BalanceSnapshotEventBus.publish cache.balance_snapshot_event_bus initial_snapshot;
   Lwt_condition.broadcast cache.update_condition ();
-  Logging.debug_f ~section:"balance_cache" "Started with empty snapshot, timestamp %.2f" initial_timestamp;
+  Logging.debug_f ~section:"balance_cache" "Initial balance snapshot published with timestamp %.2f" initial_timestamp
+
+(** Start background balance updater (mirrors telemetry cache pattern) *)
+let start_balance_updater () =
+  Logging.debug_f ~section:"balance_cache" "Starting balance updater...";
 
   (* Start periodic balance updater - mirrors telemetry polling pattern *)
   let _polling_updater = Lwt.async (fun () ->
@@ -262,6 +279,11 @@ let start_balance_updater () =
     Logging.debug_f ~section:"balance_cache" "Balance polling updater starting after feeds ready";
 
     let rec polling_loop () =
+      (* Check for shutdown request *)
+      if Atomic.get shutdown_requested then (
+        Logging.debug ~section:"balance_cache" "Balance cache updater shutting down due to shutdown request";
+        Lwt.return_unit
+      ) else (
       Logging.debug_f ~section:"balance_cache" "Balance polling loop iteration";
       let now = Unix.time () in
       let time_since_last = now -. cache.last_update in
@@ -273,15 +295,16 @@ let start_balance_updater () =
       if in_backoff then
         Logging.debug_f ~section:"balance_cache" "In backoff period, skipping update until %.2f" cache.backoff_until
       else (
-        (* Always try to update - either if enough time has passed, or if data is getting stale *)
+        (* Always try to update - either if enough time has passed, or if data is getting stale, or if keepalive needed *)
         let should_update = time_since_last >= cache.update_interval ||
                            (match cache.current_snapshot with
                             | Some current -> (now -. current.timestamp) > 30.0  (* Force update if data > 30 seconds old *)
                             | None -> true) in
+        let needs_keepalive = time_since_last >= 30.0 in  (* Keepalive every 30 seconds max *)
 
-        if should_update then (
+        if should_update || needs_keepalive then (
           Logging.debug ~section:"balance_cache" "Updating balance snapshot";
-          (try
+          try
             let snapshot = create_snapshot () in
             (* Publish snapshot to event bus first *)
             BalanceSnapshotEventBus.publish cache.balance_snapshot_event_bus snapshot;
@@ -294,17 +317,43 @@ let start_balance_updater () =
             Logging.debug_f ~section:"balance_cache" "Balance snapshot published and cache cleared with %d balances, %d orders, timestamp: %.2f"
               (List.length snapshot.balances) (List.length snapshot.open_orders) snapshot.timestamp
           with exn ->
-            (* Handle failure with exponential backoff *)
-            cache.consecutive_failures <- cache.consecutive_failures + 1;
-            let backoff_seconds = min 300.0 (5.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 6))) in
-            cache.backoff_until <- now +. backoff_seconds;
-            Logging.warn_f ~section:"balance_cache" "Failed to update balance snapshot (attempt %d): %s, backing off for %.1f seconds"
-              cache.consecutive_failures (Printexc.to_string exn) backoff_seconds
-          )
+            (* Failed to create new snapshot *)
+            if needs_keepalive then (
+              (* We need keepalive - republish last known snapshot if available *)
+              match cache.current_snapshot with
+              | Some last_snapshot ->
+                  (* Update timestamp and republish *)
+                  let keepalive_snapshot = { last_snapshot with timestamp = now } in
+                  BalanceSnapshotEventBus.publish cache.balance_snapshot_event_bus keepalive_snapshot;
+                  Lwt_condition.broadcast cache.update_condition ();
+                  cache.last_update <- now;
+                  Logging.debug_f ~section:"balance_cache" "Balance keepalive published at %.2f" now
+              | None ->
+                  (* No snapshot available, try to create a minimal one *)
+                  try
+                    let snapshot = create_snapshot () in
+                    BalanceSnapshotEventBus.publish cache.balance_snapshot_event_bus snapshot;
+                    Lwt_condition.broadcast cache.update_condition ();
+                    cache.current_snapshot <- None;
+                    cache.last_update <- now;
+                    Logging.debug_f ~section:"balance_cache" "Balance snapshot created for keepalive at %.2f" now
+                  with _ ->
+                    (* Couldn't create snapshot, just update timestamp *)
+                    cache.last_update <- now;
+                    Logging.debug_f ~section:"balance_cache" "Balance keepalive failed, no snapshot available at %.2f" now
+            ) else (
+              (* Handle failure with exponential backoff *)
+              cache.consecutive_failures <- cache.consecutive_failures + 1;
+              let backoff_seconds = min 300.0 (5.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 6))) in
+              cache.backoff_until <- now +. backoff_seconds;
+              Logging.warn_f ~section:"balance_cache" "Failed to update balance snapshot (attempt %d): %s, backing off for %.1f seconds"
+                cache.consecutive_failures (Printexc.to_string exn) backoff_seconds
+            )
         )
       );
 
       Lwt_unix.sleep 2.0 >>= polling_loop  (* Check every 2 seconds to reduce resource usage *)
+        )
     in
     polling_loop ()
   ) in
@@ -316,6 +365,11 @@ let start_balance_updater () =
   let _cleanup_loop = Lwt.async (fun () ->
     Logging.debug ~section:"balance_cache" "Starting event bus cleanup loop";
     let rec cleanup_loop () =
+      (* Check for shutdown request *)
+      if Atomic.get shutdown_requested then (
+        Logging.debug ~section:"balance_cache" "Balance cache cleanup loop shutting down due to shutdown request";
+        Lwt.return_unit
+      ) else (
       let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
       let removed_opt = BalanceSnapshotEventBus.cleanup_stale_subscribers cache.balance_snapshot_event_bus () in
       (match removed_opt with
@@ -324,11 +378,15 @@ let start_balance_updater () =
              Logging.info_f ~section:"balance_cache" "Cleaned up %d stale balance subscribers" removed_count
        | None -> ());
 
+      (* Clear event bus latest reference periodically to prevent memory retention *)
+      BalanceSnapshotEventBus.clear_latest cache.balance_snapshot_event_bus;
+
       (* Report subscriber statistics to telemetry *)
       let (total, active, _) = BalanceSnapshotEventBus.get_subscriber_stats cache.balance_snapshot_event_bus in
       Telemetry.set_event_bus_subscribers_total total;
       Telemetry.set_event_bus_subscribers_active active;
       cleanup_loop ()
+      )
     in
     cleanup_loop ()
   )
@@ -356,6 +414,8 @@ let init () =
           Logging.debug_f ~section:"balance_cache" "Initializing balance cache";
           initialized := true;
           try
+            (* Publish initial snapshot synchronously before starting background updater *)
+            publish_initial_snapshot ();
             start_balance_updater ();
             Logging.debug_f ~section:"balance_cache" "Balance cache initialized successfully"
           with exn ->

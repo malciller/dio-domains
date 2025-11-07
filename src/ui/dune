@@ -4,19 +4,14 @@
  (libraries
   lwt
   lwt.unix
-  notty
-  nottui
-  nottui-lwt
-  lwd
+  websocket-lwt-unix
+  cohttp-lwt-unix
+  yojson
   dio_engine
   dio.ui_types
-  dio.ui.shared
-  dio.ui.telemetry
-  dio.ui.system
-  dio.ui.logs
-  dio.ui.balance
+  dio.ui.cache
   unix
   str)
- (modules dashboard)
+ (modules metrics_broadcast metrics_json)
  (preprocess
   (pps lwt_ppx)))

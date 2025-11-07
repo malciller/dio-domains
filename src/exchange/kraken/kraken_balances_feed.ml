@@ -339,7 +339,7 @@ let start_message_handler conn token on_failure on_heartbeat =
   msg_loop ()
 
 (** WebSocket connection to Kraken authenticated endpoint - establishes connection and starts message handler *)
-let connect_and_subscribe token ~on_failure ~on_heartbeat =
+let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
 
   Logging.info_f ~section "Connecting to Kraken authenticated WebSocket...";
@@ -355,6 +355,8 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "Authenticated WebSocket established, subscribing to balances";
+    (* Call on_connected callback after successful connection and before starting message handler *)
+    on_connected ();
     start_message_handler conn token on_failure on_heartbeat >>= fun () ->
     Logging.info ~section "Balances WebSocket connection closed";
     Lwt.return_unit

@@ -1,8 +1,11 @@
-(** Logs cache for the logs view
+(** Logs cache for metrics broadcast
 
-    Provides reactive access to log data for the logs dashboard UI,
+    Provides access to log data for the metrics broadcast system,
     respecting the concurrency model.
 *)
+
+
+open Concurrency
 
 module LogMap = Map.Make(Int)
 
@@ -11,15 +14,19 @@ let rec take n = function
   | [] -> []
   | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
 
-(** Log entry type for UI display *)
+(** Log entry type for JSON serialization *)
 type log_entry = {
   id: int;
   timestamp: string;
   level: string;
   section: string;
   message: string;
-  color: Notty.A.t;
 }
+
+(** Event bus for log entries *)
+module LogEntryEventBus = Event_bus.Make(struct
+  type t = log_entry
+end)
 
 (** Logs cache state *)
 type t = {
@@ -28,6 +35,8 @@ type t = {
   mutable max_entries: int;
   mutable next_id: int;
   mutable dropped_logs: int;
+  log_entry_event_bus: LogEntryEventBus.t;
+  entries_mutex: Mutex.t;  (* Protect log_entries access *)
 }
 
 (** Global logs cache instance *)
@@ -37,6 +46,8 @@ let cache = {
   max_entries = 500;
   next_id = 0;
   dropped_logs = 0;
+  log_entry_event_bus = LogEntryEventBus.create "log_entry";
+  entries_mutex = Mutex.create ();
 }
 
 (** Thread-safe queue for pending log entries *)
@@ -46,28 +57,24 @@ let max_pending_logs = 1000 (* Limit the queue size *)
 let (notification_r, notification_w) = Lwt_unix.pipe ()
 let notification_buffer = Bytes.create 1
 
+(* Set notification pipe write end to non-blocking to prevent blocking on full buffer *)
+let () = Lwt_unix.set_blocking notification_w false
+
 (** Initialization guard *)
 let initialized = ref false
 
-(** Reactive variable for log entries *)
-let log_entries_var = Lwd.var (LogMap.empty, 0)
+(** Subscribe to log entry updates *)
+let subscribe_log_entries () =
+  let subscription = LogEntryEventBus.subscribe cache.log_entry_event_bus in
+  (subscription.stream, subscription.close)
 
-(** Update counter to force reactivity *)
-let update_counter = ref 0
+(** Get logs event bus subscriber statistics *)
+let get_logs_subscriber_stats () =
+  LogEntryEventBus.get_subscriber_stats cache.log_entry_event_bus
 
-(** Get reactive log entries variable (reactive variable is updated periodically by ingestion loop) *)
-let get_log_entries_var () =
-  log_entries_var
-
-(** Convert log level to color *)
-let level_to_color level =
-  match level with
-  | "DEBUG" -> Notty.A.(fg cyan)
-  | "INFO" -> Notty.A.(fg green)
-  | "WARN" -> Notty.A.(fg yellow)
-  | "ERROR" -> Notty.A.(fg red)
-  | "CRITICAL" -> Notty.A.(fg red ++ st bold ++ bg red)
-  | _ -> Notty.A.(fg white)
+(** Force cleanup stale subscribers for dashboard memory management *)
+let force_cleanup_stale_subscribers () =
+  LogEntryEventBus.force_cleanup_stale_subscribers cache.log_entry_event_bus ()
 
 (** Format timestamp for display *)
 let format_display_timestamp () =
@@ -81,12 +88,11 @@ let format_display_timestamp () =
 (** Add a new log entry to the cache from any thread *)
 let add_log_entry level section message =
   let timestamp = format_display_timestamp () in
-  let color = level_to_color level in
-  
+
   Mutex.lock pending_logs_mutex;
   let id = cache.next_id in
   cache.next_id <- id + 1;
-  let entry = { id; timestamp; level; section; message; color } in
+  let entry = { id; timestamp; level; section; message } in
   if Queue.length pending_logs_queue >= max_pending_logs then (
     try
       ignore (Queue.take pending_logs_queue);
@@ -98,16 +104,31 @@ let add_log_entry level section message =
   Queue.push entry pending_logs_queue;
   Mutex.unlock pending_logs_mutex;
 
+  (* Publish log entry to event bus for real-time broadcasting *)
+  LogEntryEventBus.publish cache.log_entry_event_bus entry;
+
   (* Asynchronously notify the ingestion loop, returning a promise *)
+  (* Pipe is non-blocking, so write will not block even if buffer is full *)
   try%lwt
     let%lwt _ = Lwt_unix.write notification_w (Bytes.of_string "n") 0 1 in
     Lwt.return_unit
-  with Unix.Unix_error (EPIPE, _, _) ->
-    Lwt.return_unit
+  with
+  | Unix.Unix_error (Unix.EPIPE, _, _) ->
+      (* Pipe closed, ingestion loop probably stopped *)
+      Lwt.return_unit
+  | Unix.Unix_error (Unix.EAGAIN, _, _) | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) ->
+      (* Pipe buffer full, ingestion loop will catch up eventually *)
+      Lwt.return_unit
+  | _ ->
+      (* Other write errors, continue anyway *)
+      Lwt.return_unit
 
 (** Get current log entries *)
 let current_log_entries () =
-  LogMap.bindings cache.log_entries |> List.map snd
+  Mutex.lock cache.entries_mutex;
+  let result = LogMap.bindings cache.log_entries |> List.map snd in
+  Mutex.unlock cache.entries_mutex;
+  result
 
 (** Hard-cap entry_keys queue to max_entries to prevent unbounded growth *)
 let cap_entry_keys_queue () =
@@ -121,6 +142,7 @@ let cap_entry_keys_queue () =
 
 (** Integrity check: remove keys from entry_keys that don't exist in log_entries *)
 let check_entry_keys_integrity () =
+  Mutex.lock cache.entries_mutex;
   let valid_keys = ref [] in
   Queue.iter (fun key ->
     if Option.is_some (LogMap.find_opt key cache.log_entries) then
@@ -128,10 +150,12 @@ let check_entry_keys_integrity () =
   ) cache.entry_keys;
   (* Clear and repopulate queue with only valid keys *)
   Queue.clear cache.entry_keys;
-  List.iter (fun key -> Queue.push key cache.entry_keys) (List.rev !valid_keys)
+  List.iter (fun key -> Queue.push key cache.entry_keys) (List.rev !valid_keys);
+  Mutex.unlock cache.entries_mutex
 
 (** Efficiently trim the cache to max_entries *)
 let trim_cache () =
+  Mutex.lock cache.entries_mutex;
   while LogMap.cardinal cache.log_entries > cache.max_entries do
     try
       let oldest_key = Queue.take cache.entry_keys in
@@ -140,6 +164,7 @@ let trim_cache () =
       (* This should not happen if cardinal is > 0, but as a safeguard *)
       ()
   done;
+  Mutex.unlock cache.entries_mutex;
   (* Ensure entry_keys queue doesn't exceed max_entries *)
   cap_entry_keys_queue ()
 
@@ -150,10 +175,10 @@ let set_max_entries max_entries =
 
 (** Clear all log entries *)
 let clear_logs () =
+  Mutex.lock cache.entries_mutex;
   cache.log_entries <- LogMap.empty;
-  Queue.clear cache.entry_keys;
-  incr update_counter;
-  Lwd.set log_entries_var (LogMap.empty, !update_counter)
+  Mutex.unlock cache.entries_mutex;
+  Queue.clear cache.entry_keys
 
 (** Filter log entries by level *)
 let filter_by_level level =
@@ -161,8 +186,11 @@ let filter_by_level level =
     if level = "ALL" then fun _ -> true
     else fun entry -> entry.level = level
   in
-  LogMap.filter (fun _ entry -> filter_func entry) cache.log_entries
-  |> LogMap.bindings |> List.map snd
+  Mutex.lock cache.entries_mutex;
+  let result = LogMap.filter (fun _ entry -> filter_func entry) cache.log_entries
+              |> LogMap.bindings |> List.map snd in
+  Mutex.unlock cache.entries_mutex;
+  result
 
 (** Filter log entries by section *)
 let filter_by_section section =
@@ -170,16 +198,22 @@ let filter_by_section section =
     if section = "ALL" then fun _ -> true
     else fun entry -> entry.section = section
   in
-  LogMap.filter (fun _ entry -> filter_func entry) cache.log_entries
-  |> LogMap.bindings |> List.map snd
+  Mutex.lock cache.entries_mutex;
+  let result = LogMap.filter (fun _ entry -> filter_func entry) cache.log_entries
+              |> LogMap.bindings |> List.map snd in
+  Mutex.unlock cache.entries_mutex;
+  result
 
 (** Get unique sections from log entries *)
 let get_sections () =
+  Mutex.lock cache.entries_mutex;
   let sections = Hashtbl.create 16 in
   LogMap.iter (fun _ entry ->
     Hashtbl.replace sections entry.section true
   ) cache.log_entries;
-  "ALL" :: (Hashtbl.fold (fun section _ acc -> section :: acc) sections [])
+  let result = "ALL" :: (Hashtbl.fold (fun section _ acc -> section :: acc) sections []) in
+  Mutex.unlock cache.entries_mutex;
+  result
 
 (** Get and reset dropped logs counter (for monitoring) *)
 let get_and_reset_dropped_logs () =
@@ -201,7 +235,6 @@ let start_logs_updater () =
 
   (* High-performance, yielding ingestion loop *)
   Lwt.async (fun () ->
-    let batch_counter = ref 0 in
     let rec ingestion_loop () =
       (* Wait for a notification that a log has been added *)
       let%lwt _ = Lwt_unix.read notification_r notification_buffer 0 1 in
@@ -220,18 +253,15 @@ let start_logs_updater () =
       Mutex.unlock pending_logs_mutex;
 
       if entries_to_process <> [] then (
+        Mutex.lock cache.entries_mutex;
         List.iter (fun entry ->
           cache.log_entries <- LogMap.add entry.id entry cache.log_entries;
           Queue.push entry.id cache.entry_keys
         ) entries_to_process;
+        Mutex.unlock cache.entries_mutex;
         trim_cache ();
 
-        (* Update reactive variable every 5 batches (every 1000 logs) to reduce frequency *)
-        incr batch_counter;
-        if !batch_counter mod 5 = 0 then (
-          incr update_counter;
-          Lwd.set log_entries_var (cache.log_entries, !update_counter);
-        );
+        (* No reactive updates needed - logs are published individually when added *)
       );
 
       (* Loop to wait for the next notification *)
@@ -263,8 +293,6 @@ let init () =
     ()
   ) else (
     initialized := true;
-    incr update_counter;
-    Lwd.set log_entries_var (LogMap.empty, !update_counter);
     start_logs_updater ();
     Logging.info ~section:"logs_cache" "Logs cache initialized"
   )

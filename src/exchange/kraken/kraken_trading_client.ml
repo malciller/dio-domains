@@ -9,6 +9,13 @@ open Concurrency
 
 let section = "kraken_trading_client"
 
+(** Global shutdown flag for trading client *)
+let shutdown_requested = Atomic.make false
+
+(** Signal shutdown to trading client *)
+let signal_shutdown () =
+  Atomic.set shutdown_requested true
+
 let string_contains str substr =
   let str_len = String.length str and substr_len = String.length substr in
   if substr_len > str_len then false
@@ -129,24 +136,29 @@ let parse_ws_response json : Kraken_common_types.ws_response =
   end
 
 let resolve_response req_id response =
+  let start_time = Telemetry.start_timer () in
+  (* Minimize mutex hold time - only hold during critical section *)
   Lwt_mutex.with_lock state.mutex (fun () ->
-    let wakener_opt =
-      try
-        let wak = Response_table.find state.responses req_id in
-        Response_table.remove state.responses req_id;
-        Some wak
-      with Not_found -> None
-    in
-    Lwt.return wakener_opt
+    try
+      let wak = Response_table.find state.responses req_id in
+      Response_table.remove state.responses req_id;
+      Lwt.return (Some wak)
+    with Not_found -> Lwt.return None
   ) >>= function
   | Some wak ->
+      (* Perform wakeup outside mutex to reduce contention *)
       (try
-        Lwt.wakeup_later wak response
+        Lwt.wakeup_later wak response;
+        let duration = Telemetry.record_duration Telemetry.Common.api_duration start_time in
+        Logging.debug_f ~section "Successfully matched response for req_id=%d in %.3fms (method=%s, success=%b)"
+          req_id (duration *. 1000.0) response.method_ response.success
       with Invalid_argument _ ->
-        Logging.warn_f ~section "Attempted to wake already-resolved promise for req_id=%d" req_id);
+        (* Promise was already resolved (likely by timeout) - this is expected *)
+        Logging.debug_f ~section "Promise for req_id=%d was already resolved (likely timeout), response discarded" req_id);
       Lwt.return_unit
   | None ->
-      Logging.debug ~section (Printf.sprintf "No waiter found for req_id=%d" req_id);
+      Logging.warn_f ~section "No waiter found for req_id=%d (response arrived after timeout, method=%s, success=%b)"
+        req_id response.method_ response.success;
       Lwt.return_unit
 
 let fail_all_pending reason =
@@ -196,36 +208,47 @@ let reset_state conn ~notify_failure reason =
     (match failure_cb with Some f -> f reason | None -> ());
     Lwt.return_unit
 
-let handle_json json =
-  let open Yojson.Safe.Util in
-  let method_opt = member "method" json |> to_string_option in
-  match method_opt with
-  | Some method_name ->
-      let response = parse_ws_response json in
-      (match response.req_id with
-       | Some req_id -> resolve_response req_id response
-       | None ->
-          Logging.debug ~section
-            (Printf.sprintf "Unhandled trading response without req_id (method=%s)" method_name);
-          Lwt.return_unit)
-  | None ->
-      (match member "channel" json |> to_string_option with
-       | Some "heartbeat" -> Lwt.return_unit
-       | _ ->
-          Logging.debug ~section
-            (Printf.sprintf "Unhandled trading message: %s" (Yojson.Safe.to_string json));
-          Lwt.return_unit)
 
 let handle_frame frame =
   notify_heartbeat ();
-  Lwt.catch
-    (fun () ->
-       let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
-       handle_json json)
-    (fun exn ->
-       Logging.error ~section
-         (Printf.sprintf "Failed to handle trading frame: %s" (Printexc.to_string exn));
-       Lwt.return_unit)
+  (* Track frame processing *)
+  Telemetry.inc_counter (Telemetry.counter "websocket_frames_received" ()) ();
+
+  (* Synchronously resolve responses to prevent race with timeout cleanup *)
+  (try
+     let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
+     let open Yojson.Safe.Util in
+     let method_opt = member "method" json |> to_string_option in
+     match method_opt with
+     | Some method_name ->
+         let response = parse_ws_response json in
+         Logging.debug_f ~section "Received response for req_id=%s, method=%s"
+           (match response.req_id with Some id -> string_of_int id | None -> "none") method_name;
+         (match response.req_id with
+          | Some req_id ->
+              (* Synchronously resolve response to prevent timeout race *)
+              resolve_response req_id response >>= fun () ->
+              (* Continue with any additional async processing if needed *)
+              Lwt.return_unit
+          | None ->
+             Logging.debug ~section
+               (Printf.sprintf "Unhandled trading response without req_id (method=%s)" method_name);
+             Lwt.return_unit)
+     | None ->
+         (match member "channel" json |> to_string_option with
+          | Some "heartbeat" -> Lwt.return_unit
+          | _ ->
+             Logging.debug ~section
+               (Printf.sprintf "Unhandled trading message: %s" (Yojson.Safe.to_string json));
+             Lwt.return_unit)
+   with exn ->
+     Telemetry.inc_counter (Telemetry.counter "websocket_frame_errors" ()) ();
+     Logging.error ~section
+       (Printf.sprintf "Failed to handle trading frame synchronously: %s" (Printexc.to_string exn));
+     Lwt.return_unit) >>= fun () ->
+
+  (* Any additional processing can happen here asynchronously *)
+  Lwt.return_unit
 
 let rec reader_loop conn =
   Websocket_lwt_unix.read conn >>= function
@@ -262,7 +285,7 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
   Logging.info ~section "Trading WebSocket connection established";
   Lwt.return conn
 
-let ensure_connection ?on_failure token =
+let ensure_connection ?on_failure ?on_connected token =
   Lwt_mutex.with_lock state.mutex (fun () ->
     (match on_failure with Some f -> state.on_failure <- Some f | None -> ());
     if state.conn <> None || state.connecting then Lwt.return `Already
@@ -296,37 +319,54 @@ let ensure_connection ?on_failure token =
             state.reader <- Some reader;
             Lwt.return_unit) >>= fun () ->
           notify_connection `Connected;
+          (* Call on_connected callback if provided *)
+          (match on_connected with Some f -> f () | None -> ());
           (* Wait for the reader task to complete (only happens on error/disconnect) *)
           reader
 
 let send_message ~message_str ~req_id ~timeout_ms =
-  Lwt_mutex.with_lock state.mutex (fun () ->
-    match state.conn with
-    | None -> Lwt.return (Error (Failure "Trading WebSocket not connected"))
-    | Some conn ->
-        let waiter, wakener = Lwt.wait () in
-        Response_table.replace state.responses req_id wakener;
-        Lwt.catch
-          (fun () ->
-             Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:message_str ()) >|= fun () ->
-             Ok waiter)
-          (fun exn ->
-             Response_table.remove state.responses req_id;
-             Lwt.return (Error exn))
-  ) >>= function
-  | Error exn -> Lwt.fail exn
-  | Ok waiter ->
-      let timeout = float_of_int timeout_ms /. 1000.0 in
-      Lwt.pick [
-        (waiter >|= fun response -> `Response response);
-        (Lwt_unix.sleep timeout >|= fun () -> `Timeout)
-      ] >>= function
-      | `Response response -> Lwt.return response
-      | `Timeout ->
-          Lwt_mutex.with_lock state.mutex (fun () ->
-            Response_table.remove state.responses req_id;
-            Lwt.return_unit) >>= fun () ->
-          Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
+  (* Check for shutdown before sending new requests *)
+  if Atomic.get shutdown_requested then
+    Lwt.fail_with (Printf.sprintf "Request req_id %d cancelled due to shutdown" req_id)
+  else
+    Lwt_mutex.with_lock state.mutex (fun () ->
+      match state.conn with
+      | None -> Lwt.return (Error (Failure "Trading WebSocket not connected"))
+      | Some conn ->
+          let waiter, wakener = Lwt.wait () in
+          Response_table.replace state.responses req_id wakener;
+          Lwt.catch
+            (fun () ->
+               Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:message_str ()) >|= fun () ->
+               Ok waiter)
+            (fun exn ->
+               Response_table.remove state.responses req_id;
+               Lwt.return (Error exn))
+    ) >>= function
+    | Error exn -> Lwt.fail exn
+    | Ok waiter ->
+        let timeout = float_of_int timeout_ms /. 1000.0 in
+        Lwt.pick [
+          (waiter >|= fun response -> `Response response);
+          (Lwt_unix.sleep timeout >|= fun () -> `Timeout)
+        ] >>= function
+        | `Response response ->
+            (* Track successful response *)
+            Telemetry.inc_counter Telemetry.Common.api_requests ();
+            Lwt.return response
+        | `Timeout ->
+            (* Track timeout for monitoring *)
+            Telemetry.inc_counter (Telemetry.counter "websocket_timeouts" ()) ();
+            Logging.warn_f ~section "Request timeout: req_id=%d, timeout_ms=%d, sent %.3fs ago" req_id timeout_ms timeout;
+
+            (* Remove wakener from table first to prevent race with resolve_response *)
+            Lwt_mutex.with_lock state.mutex (fun () ->
+              Response_table.remove state.responses req_id;
+              Lwt.return_unit) >>= fun () ->
+
+            (* Cancel the waiter promise to prevent double-wakeup race condition *)
+            Lwt.cancel waiter;
+            Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
 
 let get_connection () : Websocket_lwt_unix.conn Lwt.t =
   Lwt_mutex.with_lock state.mutex (fun () ->
@@ -359,7 +399,7 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
 
 let init token : unit Lwt.t = ensure_connection token
 
-let connect_and_monitor token ~on_failure = ensure_connection ~on_failure token
+let connect_and_monitor token ~on_failure ~on_connected = ensure_connection ~on_failure ~on_connected token
 
 let is_connected () = Atomic.get state.connected
 

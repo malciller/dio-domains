@@ -16,11 +16,18 @@ end
 module Make (Payload : PAYLOAD) = struct
   type snapshot = Payload.t
 
+  type subscription = {
+    stream: snapshot Lwt_stream.t;
+    close: unit -> unit;  (* Function to close this subscription's stream *)
+  }
+
   type subscriber = {
     push: snapshot -> unit;
+    close: unit -> unit;  (* Function to close this subscriber's stream *)
     mutable closed: bool;
     created_at: float;  (* Track when subscriber was created *)
     mutable last_used: float;  (* Track when subscriber was last used *)
+    persistent: bool;  (* Mark persistent subscribers that should not be force cleaned *)
   }
 
   type t = {
@@ -40,25 +47,49 @@ module Make (Payload : PAYLOAD) = struct
 
   let latest bus = Atomic.get bus.latest
 
+  (** Clear the latest snapshot to prevent memory retention *)
+  let clear_latest bus = Atomic.set bus.latest None
+
   let publish bus payload =
     Atomic.set bus.latest (Some payload);
     let now = Unix.time () in
     let subs = Atomic.get bus.subscribers in
+    (* Filter out closed subscribers and validate each one before pushing *)
+    let active_subs = List.filter (fun sub -> not sub.closed) subs in
     List.iter (fun sub ->
+      (* Double-check subscriber is still active before pushing *)
       if not sub.closed then begin
         sub.last_used <- now;
-        sub.push payload
+        (* Make pushes non-blocking to prevent backpressure *)
+        Lwt.async (fun () ->
+          Lwt.catch
+            (fun () ->
+              (* Use very short timeout to detect blocking immediately *)
+              Lwt.pick [
+                (Lwt.return (sub.push payload) >|= fun () -> ());
+                (Lwt_unix.sleep 0.001 >|= fun () -> ())  (* 1ms timeout - fail fast on blocking *)
+              ]
+            )
+            (fun exn ->
+              (* Mark subscriber as closed on push failure (including timeout) *)
+              Logging.debug_f ~section:"event_bus" "Subscriber push failed/timed out, marking closed: %s" (Printexc.to_string exn);
+              sub.closed <- true;
+              Lwt.return_unit
+            )
+        )
       end
-    ) subs
+    ) active_subs
 
-  let subscribe bus =
+  let subscribe ?(persistent=false) bus =
     let stream, push = Lwt_stream.create () in
     let now = Unix.time () in
     let subscriber = {
       push = (fun payload -> push (Some payload));
+      close = (fun () -> push None);  (* Close the stream by sending None *)
       closed = false;
       created_at = now;
       last_used = now;
+      persistent;
     } in
     let rec try_add () =
       let current = Atomic.get bus.subscribers in
@@ -80,12 +111,12 @@ module Make (Payload : PAYLOAD) = struct
     (match Atomic.get bus.latest with
     | Some payload -> push (Some payload)
     | None -> ());
-    stream
+    { stream; close = subscriber.close }
 
   let await_next bus timeout =
-    let stream = subscribe bus in
+    let subscription = subscribe bus in
     Lwt.pick [
-      (Lwt_stream.get stream >|= fun evt -> evt);
+      (Lwt_stream.get subscription.stream >|= fun evt -> evt);
       (Lwt_unix.sleep timeout >|= fun () -> None)
     ]
 
@@ -114,7 +145,9 @@ module Make (Payload : PAYLOAD) = struct
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in
       let filtered = List.filter (fun sub ->
-        not sub.closed && (now -. sub.last_used) <= 30.0  (* Keep only very recently used subscribers *)
+        (* Never force cleanup persistent subscribers *)
+        sub.persistent ||
+        (not sub.closed && (now -. sub.last_used) <= 30.0)  (* Keep only very recently used subscribers *)
       ) current in
       let removed_count = List.length current - List.length filtered in
       if removed_count > 0 then begin

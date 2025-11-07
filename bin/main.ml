@@ -2,6 +2,7 @@
 
 (** Graceful shutdown flag *)
 let shutdown_requested = Atomic.make false
+let shutdown_condition = Lwt_condition.create ()
 
 (** Signal handler for graceful shutdown *)
 let setup_signal_handlers () =
@@ -10,27 +11,32 @@ let setup_signal_handlers () =
       Atomic.set shutdown_requested true;
       Logging.warn ~section:"main" "Shutdown signal received, cleaning up...";
 
+      (* Signal shutdown to all components *)
+      Dio_ui_cache.System_cache.signal_shutdown ();
+      Dio_ui_cache.Telemetry_cache.signal_shutdown ();
+      Dio_ui_cache.Balance_cache.signal_shutdown ();
+      Dio_engine.Order_executor.signal_shutdown ();
+      Kraken.Kraken_trading_client.signal_shutdown ();
+
       (* Stop all supervised domains *)
       Dio_engine.Domain_spawner.stop_all_domains ();
 
       (* Stop all websocket connections *)
       Supervisor.stop_all ();
 
-      exit 0
+      (* Signal shutdown condition to allow graceful server shutdown *)
+      Lwt_condition.broadcast shutdown_condition ();
+
+      Logging.info ~section:"main" "Shutdown cleanup initiated, waiting up to 5 seconds for graceful exit..."
     )
   in
   Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
   Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_signal)
 
-(** Command line argument parsing *)
-let dashboard_mode = ref false
+(** Command line argument parsing - no options needed for metrics broadcast mode *)
+let speclist = []
 
-let speclist = [
-  ("--dashboard", Arg.Set dashboard_mode, "Run in dashboard mode");
-  ("-d", Arg.Set dashboard_mode, "Run in dashboard mode");
-]
-
-let usage_msg = "Dio Trading Engine\n\nUsage: " ^ Sys.argv.(0) ^ " [options]\n\nOptions:"
+let usage_msg = "Dio Trading Engine with Metrics Broadcast\n\nUsage: " ^ Sys.argv.(0) ^ "\n\nStarts the trading engine and metrics broadcast server on the configured port."
 
 (** Initialize the trading engine synchronously (for websocket setup) *)
 let init_trading_engine_sync () =
@@ -56,22 +62,37 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
+  (* Initialize memory tracing if requested *)
+  (* Note: Enhanced memory monitoring is built-in via Gc.stat() calls *)
+  (* Memory monitoring is handled by system_cache.ml and telemetry.ml *)();
+
   (* Read and apply logging configuration *)
   let config = Dio_engine.Config.read_config () in
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
 
-  if !dashboard_mode then begin
-    (* Initialize logs cache for dashboard mode *)
-    Dio_ui_logs.Logs_cache.init ();
+  (* Initialize caches for metrics broadcast if enabled *)
+  if config.metrics_broadcast.active then (
+    Logging.info ~section:"main" "Metrics broadcast enabled, initializing caches...";
+    Dio_ui_cache.Logs_cache.init ();
+    Dio_ui_cache.Telemetry_cache.init ();
+    Dio_ui_cache.System_cache.init ();
+    Dio_ui_cache.Balance_cache.init ();
+  ) else (
+    Logging.info ~section:"main" "Metrics broadcast disabled, skipping cache initialization";
+  );
 
-    (* Set up log streaming to dashboard cache - silence stdout logging, redirect to dashboard *)
-    Logging.set_quiet_mode true;
+  (* Set up log streaming to logs cache if metrics broadcast is active *)
+  if config.metrics_broadcast.active then (
     Logging.set_log_callback (fun level section message ->
-      let level_str = Logging.level_to_string level in
-      Dio_ui_logs.Logs_cache.add_log_entry level_str section message
-    )
-  end;
+      (* Skip broadcast section logs to prevent infinite recursion *)
+      if section <> "broadcast" then (
+        let level_str = Logging.level_to_string level in
+        Dio_ui_cache.Logs_cache.add_log_entry level_str section message
+      ) else
+        Lwt.return_unit
+    );
+  );
 
   (* Initialize random number generator for crypto operations *)
   Mirage_crypto_rng_unix.use_default ();
@@ -79,41 +100,41 @@ let () =
   (* Setup signal handlers for graceful shutdown *)
   setup_signal_handlers ();
 
-  if !dashboard_mode then (
-    Logging.info ~section:"main" "Starting in dashboard mode...";
+  Logging.info ~section:"main" "Starting Dio Trading Engine with Metrics Broadcast...";
 
-    try
-      (* Initialize trading engine synchronously before starting dashboard *)
-      Logging.info ~section:"main" "Initializing trading engine...";
-      let _configs = init_trading_engine_sync () in
-
-      (* Initialize order executor asynchronously - this can run in background *)
-      let _order_executor_promise = init_order_executor_async () in
-
-      (* Signal that feeds are ready for cache initialization *)
-      Dio_ui_balance.Balance_cache.signal_feeds_ready ();
-      Dio_ui_telemetry.Telemetry_cache.signal_system_ready ();
-
-      (* Now run dashboard with trading engine fully initialized *)
-      Logging.info ~section:"main" "Trading engine ready, starting dashboard...";
-      Lwt_main.run (Dio_ui.Dashboard.run ());
-
-      Logging.info ~section:"main" "Dashboard closed, shutting down..."
-    with e ->
-      Logging.error_f ~section:"main" "Exception in dashboard mode: %s" (Printexc.to_string e);
-      raise e
-  ) else (
-    Logging.info ~section:"main" "Starting trading engine...";
-
+  try
     (* Initialize trading engine synchronously *)
+    Logging.info ~section:"main" "Initializing trading engine...";
     let _configs = init_trading_engine_sync () in
 
-    (* Initialize order executor asynchronously *)
+    (* Initialize order executor asynchronously - this can run in background *)
     let _order_executor_promise = init_order_executor_async () in
 
-    (* Keep the main Lwt scheduler running to handle websockets *)
-    let forever, _ = Lwt.wait () in
-    Lwt_main.run forever;
+      (* Signal that feeds are ready for cache initialization if metrics broadcast is active *)
+      if config.metrics_broadcast.active then (
+        Dio_ui_cache.Balance_cache.signal_feeds_ready ();
+        Dio_ui_cache.Telemetry_cache.signal_system_ready ();
+      );
 
-    Logging.info ~section:"main" "Shutting down gracefully..."
-  )
+    (* Start metrics broadcast server if enabled - runs until shutdown signal *)
+    if config.metrics_broadcast.active then (
+      Logging.info_f ~section:"main" "Trading engine ready, starting metrics broadcast server on port %d..." config.metrics_broadcast.port;
+
+      (* Run server until shutdown signal is received *)
+      Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast shutdown_condition);
+
+      Logging.info ~section:"main" "Metrics broadcast server closed gracefully, shutting down...";
+    ) else (
+      Logging.info ~section:"main" "Trading engine ready, waiting for shutdown signal...";
+
+      (* Wait for shutdown signal without starting server *)
+      Lwt_main.run (Lwt_condition.wait shutdown_condition);
+
+      Logging.info ~section:"main" "Shutdown signal received, shutting down...";
+    );
+
+    (* Force exit to ensure process terminates even if background tasks are still running *)
+    exit 0
+  with e ->
+    Logging.error_f ~section:"main" "Exception during startup: %s" (Printexc.to_string e);
+    raise e

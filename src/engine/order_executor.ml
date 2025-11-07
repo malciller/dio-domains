@@ -9,6 +9,13 @@ open Lwt.Infix
 
 let section = "order_executor"
 
+(** Global shutdown flag for order executor *)
+let shutdown_requested = Atomic.make false
+
+(** Signal shutdown to order executor *)
+let signal_shutdown () =
+  Atomic.set shutdown_requested true
+
 (** In-flight order cache to prevent duplicate orders *)
 module InFlightOrders = struct
   module Registry = Concurrency.Event_registry.Make(struct
@@ -171,7 +178,11 @@ let place_order
     ?retry_config
     (request : order_request) : (Kraken.Kraken_common_types.add_order_result, string) result Lwt.t =
 
-  with_error_handling ~operation_name:"place_order" (fun () ->
+  (* Check for shutdown before accepting new orders *)
+  if Atomic.get shutdown_requested then
+    Lwt.return (Error "Order placement cancelled due to shutdown")
+  else
+    with_error_handling ~operation_name:"place_order" (fun () ->
     match validate_order_request request with
     | Error err ->
         Logging.error_f ~section "Order validation failed: %s" err;
@@ -231,7 +242,11 @@ let amend_order
     ?retry_config
     (request : amend_request) : (Kraken.Kraken_common_types.amend_order_result, string) result Lwt.t =
 
-  with_error_handling ~operation_name:"amend_order" (fun () ->
+  (* Check for shutdown before accepting new amendments *)
+  if Atomic.get shutdown_requested then
+    Lwt.return (Error "Order amendment cancelled due to shutdown")
+  else
+    with_error_handling ~operation_name:"amend_order" (fun () ->
     match validate_amend_request request with
     | Error err ->
         Logging.error_f ~section "Amend validation failed: %s" err;
