@@ -614,7 +614,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Logging.info ~section "Waiting for executions feed to be ready...";
   let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
   if not executions_ready then
-    Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
+    Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
   else
     Logging.info ~section "✓ Executions feed ready";
 
@@ -638,7 +638,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   (* Wait for executions data again *)
   let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
   if not executions_ready then
-    Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
+    Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
   else
     Logging.info ~section "✓ Executions feed ready";
 

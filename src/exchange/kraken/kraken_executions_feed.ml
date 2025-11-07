@@ -8,6 +8,18 @@ open Concurrency
 let section = "kraken_executions"
 let ring_buffer_size = 512
 
+(** Safely force Conduit context with error handling *)
+let get_conduit_ctx () =
+  try
+    Lazy.force Conduit_lwt_unix.default_ctx
+  with
+  | CamlinternalLazy.Undefined ->
+      Logging.error ~section "Conduit context was accessed before initialization - this should not happen";
+      raise (Failure "Conduit context not initialized - ensure main.ml initializes it before domain spawning")
+  | exn ->
+      Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
+      raise exn
+
 (** Execution event types from Kraken WebSocket *)
 type exec_type =
   | PendingNew
@@ -793,7 +805,7 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
     | _ -> failwith "Failed to resolve ws-auth.kraken.com"
   in
   let client = `TLS (`Hostname "ws-auth.kraken.com", `IP ip, `Port 443) in
-  let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+  let ctx = get_conduit_ctx () in
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "Authenticated WebSocket established, subscribing to executions";
