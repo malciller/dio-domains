@@ -36,7 +36,7 @@ Edit `config.json` (example):
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
   "logging_sections": "",    // Filter logs by section (optional, comma-separated)
     "metrics_broadcast": {
-      "active": true, // boolean, should metrics be broadcast?
+      "active": true, // bool, whether to broadcast metrics via tcp or not
       "port": 8080, // int, port to broadcast tcp stream
       "enable_token_auth": true, // bool, enable token authorization, leave false for no toke validation
       "enable_ip_whitelist": true // bool, enable specific ip access, leave false for all connection sources
@@ -126,6 +126,51 @@ Dio provides comprehensive memory monitoring using OCaml's built-in `Gc.stat()` 
 dune build
 ./_build/default/bin/main.exe
 
+# Memory monitoring features:
+# - Automatic leak detection (alerts when heap grows >100MB over 5+ minutes)
+# - Per-domain heap tracking in multicore environments
+# - Allocation rate monitoring
+# - Detailed GC statistics logging every 5 minutes
+# - Automatic GC triggering every 15 minutes to prevent memory creep
+```
+
+**Memory Monitoring Output:**
+```
+Memory leak detected: 150.2 MB growth in 420 seconds, triggering GC
+GC Stats: heap=234.5MB live=189.3MB free=45.2MB fragments=12 compactions=3
+Domain 1: heap=156.7MB (last update 12.3s ago)
+```
+
+### Memory Monitoring
+
+The system automatically monitors memory usage and stream depths:
+
+- **Periodic GC**: Automatic garbage collection every 15 minutes
+- **Memory leak detection**: Alerts when heap grows by >100MB over recent readings
+- **Per-domain tracking**: Monitors heap usage across multiple domains in multicore environments
+- **Allocation rate tracking**: Monitors allocation patterns to identify hotspots
+- **Stream depth monitoring**: Warns when event bus streams exceed 100 items
+- **Detailed reporting**: Memory statistics logged every 5 minutes
+
+### Common Issues and Solutions
+
+**Backpressure Warnings**: If you see "consecutive timeouts" messages, the system is dropping items to prevent memory accumulation.
+
+**Memory Growth**: Check logs for GC activity and memory statistics. The built-in monitoring identifies allocation hotspots and provides detailed heap analysis.
+
+**Stream Depth Warnings**: High stream depths indicate consumers are slower than producers. The system automatically drops old items.
+
+### External Memory Profiling Tools
+
+For additional analysis, consider these external tools (note: these don't work with OCaml 5.1.1 multicore out-of-the-box):
+
+```bash
+# Valgrind (memory leak detection via system call tracing)
+valgrind --tool=memcheck ./_build/default/bin/main.exe
+
+# Heaptrack (memory allocation profiling)
+heaptrack ./_build/default/bin/main.exe
+```
 
 **Future Note**: OCaml 5.3 will include statistical memory profiling (statmemprof) with full multicore support, providing more detailed allocation analysis than the current `Gc.stat()` approach.
 
