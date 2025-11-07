@@ -38,6 +38,19 @@ type t = {
   mutable backoff_until: float;
 }
 
+(** Safe broadcast helper for cache update condition *)
+let safe_broadcast_update_condition cache =
+  try
+    Lwt_condition.broadcast cache.update_condition ()
+  with
+  | Invalid_argument _ ->
+      (* Promise already resolved - this can happen with concurrent broadcasts *)
+      (* Not fatal, just means a waiter was already woken up *)
+      ()
+  | exn ->
+      (* Other errors should still be logged *)
+      Logging.warn_f ~section:"supervisor_cache" "Error broadcasting update_condition: %s" (Printexc.to_string exn)
+
 (** Global cache instance *)
 let cache = {
   current_snapshots = [];
@@ -127,7 +140,7 @@ let start_cache_updater () =
 
           (* Publish to event bus *)
           ConnectionSnapshotEventBus.publish cache.snapshot_event_bus snapshots;
-          Lwt_condition.broadcast cache.update_condition ();
+          safe_broadcast_update_condition cache;
         with exn ->
           cache.consecutive_failures <- cache.consecutive_failures + 1;
           let backoff_seconds = min 60.0 (2.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 5))) in

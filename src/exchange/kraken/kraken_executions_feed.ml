@@ -1,8 +1,9 @@
-(** Kraken Executions Feed - WebSocket v2 authenticated executions subscription with lock-free ring buffers 
+(** Kraken Executions Feed - WebSocket v2 authenticated executions subscription with lock-free ring buffers
  *  Tracks open orders and order completions per asset using event-driven, lock-free architecture
  *)
 
 open Lwt.Infix
+open Concurrency
 
 let section = "kraken_executions"
 let ring_buffer_size = 512
@@ -110,6 +111,14 @@ type execution_event = {
   cl_ord_id: string option;
   timestamp: float;
 }
+
+(** Event bus for order updates - publishes individual order changes *)
+module OrderUpdateEventBus = Event_bus.Make(struct
+  type t = execution_event
+end)
+
+(** Global order update event bus instance *)
+let order_update_event_bus = OrderUpdateEventBus.create "order_update"
 
 (** Open order information *)
 type open_order = {
@@ -669,6 +678,10 @@ let handle_update json on_heartbeat =
           update_open_orders store event;
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
+
+          (* Publish order update event to event bus *)
+          OrderUpdateEventBus.publish order_update_event_bus event;
+
           Telemetry.inc_counter (Telemetry.counter "execution_updates" ()) ();
           (* Update connection heartbeat *)
           on_heartbeat ()
@@ -790,15 +803,20 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
     Logging.info ~section "Executions WebSocket connection closed";
     Lwt.return_unit
 
+(** Subscribe to order update events *)
+let subscribe_order_updates () =
+  let subscription = OrderUpdateEventBus.subscribe order_update_event_bus in
+  (subscription.stream, subscription.close)
+
 (** Initialize executions feed data stores *)
 let initialize symbols =
   Logging.info_f ~section "Initializing executions feed for %d symbols" (List.length symbols);
-  
+
   (* Pre-create all symbol stores during initialization *)
   List.iter (fun symbol ->
     let _store = get_symbol_store symbol in
     Logging.debug_f ~section "Created lock-free execution store for %s" symbol
   ) symbols;
-  
+
   Logging.info ~section "Execution stores initialized - now operating lock-free"
 

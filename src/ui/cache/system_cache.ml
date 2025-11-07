@@ -1255,61 +1255,34 @@ let publish_initial_snapshot () =
   SystemStatsEventBus.publish cache.system_stats_event_bus placeholder_stats;
   Logging.debug ~section:"system_cache" "Initial placeholder system stats snapshot published"
 
-(** Start background system stats updater *)
+(** Start event-driven system metrics computation *)
 let start_system_updater () =
-  Logging.debug ~section:"system_cache" "Starting background system stats updater";
+  Logging.debug ~section:"system_cache" "Starting event-driven system metrics computation";
 
-  (* Start periodic system metrics updater *)
-  let _system_updater = Lwt.async (fun () ->
+  (* Start event-driven metric computation (computes metrics and injects as events) *)
+  let _metric_computer = Lwt.async (fun () ->
     (* Update immediately on startup to replace placeholder with real data *)
     let%lwt () = update_system_stats_cache_lwt () in
-    let rec system_loop () =
+    let rec compute_loop () =
       (* Check for shutdown request *)
       if Atomic.get shutdown_requested then (
-        Logging.debug ~section:"system_cache" "System cache updater shutting down due to shutdown request";
+        Logging.debug ~section:"system_cache" "System metrics computation shutting down due to shutdown request";
         Lwt.return_unit
       ) else (
-      Telemetry.update_system_metrics ();
-      (* Always update system stats cache for real-time dashboard *)
-      let%lwt () = update_system_stats_cache_lwt () in
-      (* Perform periodic memory maintenance *)
-      perform_memory_maintenance ();
-      Lwt_unix.sleep 1.0 >>= system_loop
+        (* Compute and inject system metrics as events *)
+        Telemetry.update_system_metrics ();
+        (* Update system stats cache with computed metrics *)
+        let%lwt () = update_system_stats_cache_lwt () in
+        (* Perform periodic memory maintenance *)
+        perform_memory_maintenance ();
+        (* Continue computing metrics periodically *)
+        Lwt_unix.sleep 1.0 >>= compute_loop
       )
     in
-    system_loop ()
+    compute_loop ()
   ) in
   ()
 
-  (* Add periodic event bus cleanup - every 5 minutes *)
-  let _cleanup_loop = Lwt.async (fun () ->
-    Logging.debug ~section:"system_cache" "Starting event bus cleanup loop";
-    let rec cleanup_loop () =
-      (* Check for shutdown request *)
-      if Atomic.get shutdown_requested then (
-        Logging.debug ~section:"system_cache" "System cache cleanup loop shutting down due to shutdown request";
-        Lwt.return_unit
-      ) else (
-      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
-      let removed_opt = SystemStatsEventBus.cleanup_stale_subscribers cache.system_stats_event_bus () in
-      (match removed_opt with
-       | Some removed_count ->
-           if removed_count > 0 then
-             Logging.info_f ~section:"system_cache" "Cleaned up %d stale system stats subscribers" removed_count
-       | None -> ());
-
-      (* Clear event bus latest reference periodically to prevent memory retention *)
-      SystemStatsEventBus.clear_latest cache.system_stats_event_bus;
-
-      (* Report subscriber statistics to telemetry *)
-      let (total, active, _) = SystemStatsEventBus.get_subscriber_stats cache.system_stats_event_bus in
-      Telemetry.set_event_bus_subscribers_total total;
-      Telemetry.set_event_bus_subscribers_active active;
-      cleanup_loop ()
-      )
-    in
-    cleanup_loop ()
-  )
 
 (** Force cleanup stale subscribers for dashboard memory management *)
 let force_cleanup_stale_subscribers () =
