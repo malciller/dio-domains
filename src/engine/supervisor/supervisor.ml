@@ -279,7 +279,7 @@ let monitor_loop () =
   let cycle_count = ref 0 in
   while true do
     try
-      Thread.delay 10.0;  (* Check every 10 seconds *)
+      Thread.delay 2.0;  (* Check every 2 seconds for faster reconnection detection *)
       incr cycle_count;
 
       Mutex.lock registry_mutex;
@@ -299,7 +299,7 @@ let monitor_loop () =
       match state, has_connect_fn with
       | Failed reason, true ->
           (* Check if automatic restart is already scheduled (connection should be in Connecting state) *)
-          if state <> Connecting then begin
+          if get_state conn <> Connecting then begin
             (* Calculate backoff delay: 2s, 4s, 6s, ... max 30s *)
             let delay = min 30.0 (2.0 *. Float.of_int attempts) in
 
@@ -556,7 +556,14 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let trading_connect_fn () =
     (* Wrap the connection in try-catch for proper error handling *)
     Lwt.catch (fun () ->
-      let on_failure reason = set_state trading_conn (Failed reason) in
+      let on_failure reason =
+        set_state trading_conn (Failed reason);
+        (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
+        Lwt.async (fun () ->
+          Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
+          start_async trading_conn;
+          Lwt.return_unit)
+      in
       Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure >>= fun () ->
       (* Check if connection is actually still connected before marking as Connected *)
       if Kraken.Kraken_trading_client.is_connected () then begin
@@ -720,7 +727,15 @@ let order_processing_loop () =
 
     (* Check if trading WebSocket is connected *)
     if not (Kraken.Kraken_trading_client.is_connected ()) then begin
-      Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
+      (* Check if reconnection is in progress to avoid false alerts *)
+      let is_reconnecting =
+        try
+          let trading_conn = Hashtbl.find connections "kraken_trading_ws" in
+          get_state trading_conn = Connecting
+        with Not_found -> false
+      in
+      if not is_reconnecting then
+        Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
       (* Clear any pending orders to avoid stale amendments *)
       ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);
       ignore (Dio_strategies.Market_maker.Strategy.get_pending_orders 1000)
