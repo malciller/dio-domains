@@ -249,9 +249,9 @@ let consume_stream_non_blocking stream_type stream process_fn state =
             );
             consumer_loop ()
         | None ->
-            (* Stream ended - this shouldn't happen for event streams *)
-            Logging.warn_f ~section:"broadcast" "%s stream ended unexpectedly" stream_type;
-            Lwt.return_unit
+            (* Stream ended - this shouldn't happen for event streams, but if it does, trigger retry *)
+            Logging.warn_f ~section:"broadcast" "%s stream ended unexpectedly, will retry subscription" stream_type;
+            Lwt.fail (Failure (Printf.sprintf "%s stream ended unexpectedly" stream_type))
       )
       (fun exn ->
         Logging.warn_f ~section:"broadcast" "%s stream consumer failed: %s, restarting..." stream_type (Printexc.to_string exn);
@@ -265,40 +265,70 @@ let consume_stream_non_blocking stream_type stream process_fn state =
 let setup_broadcast_subscriptions state =
   (* Telemetry subscription *)
   Lwt.async (fun () ->
-    Logging.info ~section:"broadcast" "Setting up telemetry broadcast subscription";
-    let stream = subscribe_telemetry_snapshot () in
-    Logging.info ~section:"broadcast" "Telemetry stream subscribed, waiting for data...";
-    let process_telemetry snapshot state =
-      Logging.info_f ~section:"broadcast" "Received telemetry snapshot with %d metrics, broadcasting..." (List.length snapshot.metrics);
-      let json_str = Metrics_json.(telemetry_snapshot_to_json snapshot |> json_to_string) in
-      broadcast_to_stream state "telemetry" json_str;
-      Lwt.return_unit
+    let rec subscribe_telemetry () =
+      Lwt.catch
+        (fun () ->
+          Logging.info ~section:"broadcast" "Setting up telemetry broadcast subscription";
+          let stream = subscribe_telemetry_snapshot () in
+          Logging.info ~section:"broadcast" "Telemetry stream subscribed, waiting for data...";
+          let process_telemetry snapshot state =
+            Logging.info_f ~section:"broadcast" "Received telemetry snapshot with %d metrics, broadcasting..." (List.length snapshot.metrics);
+            let json_str = Metrics_json.(telemetry_snapshot_to_json snapshot |> json_to_string) in
+            broadcast_to_stream state "telemetry" json_str;
+            Lwt.return_unit
+          in
+          consume_stream_non_blocking "telemetry" stream process_telemetry state
+        )
+        (fun exn ->
+          Logging.warn_f ~section:"broadcast" "Telemetry subscription failed: %s, retrying..." (Printexc.to_string exn);
+          Lwt_unix.sleep 1.0 >>= subscribe_telemetry  (* Retry after short delay *)
+        )
     in
-    consume_stream_non_blocking "telemetry" stream process_telemetry state
+    subscribe_telemetry ()
   );
 
   (* System stats subscription *)
   Lwt.async (fun () ->
-    Logging.info ~section:"broadcast" "Setting up system stats broadcast subscription";
-    let stream = subscribe_system_stats () in
-    let process_system_stats stats state =
-      let json_str = Metrics_json.(system_stats_to_json stats |> json_to_string) in
-      broadcast_to_stream state "system" json_str;
-      Lwt.return_unit
+    let rec subscribe_system () =
+      Lwt.catch
+        (fun () ->
+          Logging.info ~section:"broadcast" "Setting up system stats broadcast subscription";
+          let stream = subscribe_system_stats () in
+          let process_system_stats stats state =
+            let json_str = Metrics_json.(system_stats_to_json stats |> json_to_string) in
+            broadcast_to_stream state "system" json_str;
+            Lwt.return_unit
+          in
+          consume_stream_non_blocking "system" stream process_system_stats state
+        )
+        (fun exn ->
+          Logging.warn_f ~section:"broadcast" "System stats subscription failed: %s, retrying..." (Printexc.to_string exn);
+          Lwt_unix.sleep 1.0 >>= subscribe_system  (* Retry after short delay *)
+        )
     in
-    consume_stream_non_blocking "system" stream process_system_stats state
+    subscribe_system ()
   );
 
   (* Balance subscription *)
   Lwt.async (fun () ->
-    Logging.info ~section:"broadcast" "Setting up balance broadcast subscription";
-    let stream = subscribe_balance_snapshot () in
-    let process_balance snapshot state =
-      let json_str = Metrics_json.(balance_snapshot_to_json snapshot |> json_to_string) in
-      broadcast_to_stream state "balance" json_str;
-      Lwt.return_unit
+    let rec subscribe_balance () =
+      Lwt.catch
+        (fun () ->
+          Logging.info ~section:"broadcast" "Setting up balance broadcast subscription";
+          let stream = subscribe_balance_snapshot () in
+          let process_balance snapshot state =
+            let json_str = Metrics_json.(balance_snapshot_to_json snapshot |> json_to_string) in
+            broadcast_to_stream state "balance" json_str;
+            Lwt.return_unit
+          in
+          consume_stream_non_blocking "balance" stream process_balance state
+        )
+        (fun exn ->
+          Logging.warn_f ~section:"broadcast" "Balance subscription failed: %s, retrying..." (Printexc.to_string exn);
+          Lwt_unix.sleep 1.0 >>= subscribe_balance  (* Retry after short delay *)
+        )
     in
-    consume_stream_non_blocking "balance" stream process_balance state
+    subscribe_balance ()
   );
 
   (* Logs subscription *)
