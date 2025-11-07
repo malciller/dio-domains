@@ -177,7 +177,7 @@ let broadcast_to_stream state stream_type json_str =
   ) state.clients;
   Mutex.unlock state.client_mutex;
   if !count > 0 then
-    Logging.info_f ~section:"broadcast" "Broadcast %s update to %d clients" stream_type !count
+    Logging.debug_f ~section:"broadcast" "Broadcast %s update to %d clients" stream_type !count
   else
     Logging.debug_f ~section:"broadcast" "Broadcast %s update but no active clients" stream_type
 
@@ -212,7 +212,7 @@ let send_current_snapshot client stream_type =
                failwith "Partial write - client too slow");
             (Lwt_unix.sleep 0.01 >|= fun () -> failwith "Write timeout - client too slow")
           ] >>= fun _ ->
-          Logging.info_f ~section:"broadcast" "Sent current %s snapshot to client %d" stream_type client.id;
+          Logging.debug_f ~section:"broadcast" "Sent current %s snapshot to client %d" stream_type client.id;
           Lwt.return_unit
         ) else (
           Logging.warn_f ~section:"broadcast" "No current snapshot available for stream type %s" stream_type;
@@ -241,7 +241,7 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
   Hashtbl.add state.clients client_id client;
   Mutex.unlock state.client_mutex;
 
-  Logging.info_f ~section:"broadcast" "Client %d connected to %s stream" client_id stream_type;
+  Logging.debug_f ~section:"broadcast" "Client %d connected to %s stream" client_id stream_type;
 
   (* Send current snapshot immediately *)
   send_current_snapshot client stream_type;
@@ -259,7 +259,7 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
             | None ->
                 (* Client disconnected normally *)
                 client.active <- false;
-                Logging.info_f ~section:"broadcast" "Client %d disconnected from %s stream" client_id stream_type;
+                Logging.debug_f ~section:"broadcast" "Client %d disconnected from %s stream" client_id stream_type;
                 Lwt.return_unit
           )
           (fun exn ->
@@ -288,32 +288,22 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
 let consume_stream_non_blocking stream_type stream process_fn state close_stream =
   let last_success_time = ref (Unix.time ()) in
   let last_health_log_time = ref (Unix.time ()) in
-  let cancellation_requested = Atomic.make false in
-  let cancellation_condition = Lwt_condition.create () in
 
   (* Background health monitor task *)
   Lwt.async (fun () ->
     Lwt.catch (fun () ->
       let rec monitor_loop () =
         Lwt_unix.sleep 30.0 >>= fun () ->  (* Check every 30 seconds *)
-      let now = Unix.time () in
-      let time_since_last_item = now -. !last_success_time in
+        let now = Unix.time () in
+        let time_since_last_item = now -. !last_success_time in
 
-        (* Check for stream inactivity (5 minutes timeout) *)
-        if time_since_last_item > 300.0 then (
-        Logging.warn_f ~section:"broadcast" "%s stream inactive for %.1f seconds (>5 minutes), restarting subscription" stream_type time_since_last_item;
-        Atomic.set cancellation_requested true;
-        Lwt_condition.broadcast cancellation_condition ();
-        Lwt.return_unit  (* Exit monitor loop gracefully *)
-        ) else (
-            (* Log successful item processing every minute for health monitoring *)
-            let time_since_health_log = now -. !last_health_log_time in
-            if time_since_health_log >= 60.0 then (
-              Logging.debug_f ~section:"broadcast" "%s stream health: received item %.1f seconds ago, active" stream_type time_since_last_item;
-              last_health_log_time := now
-            );
-          monitor_loop ()
-        )
+        (* Log successful item processing every minute for health monitoring *)
+        let time_since_health_log = now -. !last_health_log_time in
+        if time_since_health_log >= 60.0 then (
+          Logging.debug_f ~section:"broadcast" "%s stream health: received item %.1f seconds ago, active" stream_type time_since_last_item;
+          last_health_log_time := now
+        );
+        monitor_loop ()
       in
       monitor_loop ()
     ) (fun exn ->
@@ -323,46 +313,37 @@ let consume_stream_non_blocking stream_type stream process_fn state close_stream
   );
 
   let rec consumer_loop () =
-    (* Check for cancellation before processing next item *)
-    if Atomic.get cancellation_requested then (
-      Logging.warn_f ~section:"broadcast" "%s stream consumer exiting due to inactivity timeout" stream_type;
-      (* CRITICAL: Close stream before failing to ensure event bus cleanup *)
-      close_stream () >>= fun () ->
-      Lwt.fail (Failure (Printf.sprintf "%s stream inactive for too long" stream_type))
-    ) else (
-      (* Use Lwt.pick with short timeout to allow periodic shutdown checks *)
-      let get_with_shutdown_check = Lwt.pick [
-        Lwt_stream.get stream;
-        (Lwt_unix.sleep 0.1 >|= fun () -> None);  (* 0.1s timeout for shutdown checks *)
-        (Lwt_condition.wait cancellation_condition >|= fun () -> None)  (* Check for cancellation signal *)
-      ] in
+    (* Use Lwt.pick with short timeout to allow periodic shutdown checks *)
+    let get_with_shutdown_check = Lwt.pick [
+      Lwt_stream.get stream;
+      (Lwt_unix.sleep 0.1 >|= fun () -> None);  (* 0.1s timeout for shutdown checks *)
+    ] in
 
-      get_with_shutdown_check >>= function
-      | Some item ->
-          (* Got an item - process it asynchronously *)
-          last_success_time := Unix.time ();
-            Lwt.async (fun () ->
-              Lwt.catch
-                (fun () -> process_fn item state)
-                (fun exn ->
-                  Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
-                  Lwt.return_unit
-                )
-            );
-          (* Continue reading immediately - don't wait for processing *)
+    get_with_shutdown_check >>= function
+    | Some item ->
+        (* Got an item - process it asynchronously *)
+        last_success_time := Unix.time ();
+          Lwt.async (fun () ->
+            Lwt.catch
+              (fun () -> process_fn item state)
+              (fun exn ->
+                Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
+                Lwt.return_unit
+              )
+          );
+        (* Continue reading immediately - don't wait for processing *)
+        consumer_loop ()
+    | None ->
+        (* Either timeout or stream closed - check if shutdown requested *)
+        if Atomic.get state.shutdown_requested then (
+          Logging.info_f ~section:"broadcast" "%s stream consumer shutting down due to shutdown request" stream_type;
+          (* Close stream on shutdown to ensure cleanup *)
+          close_stream () >>= fun () ->
+          Lwt.return_unit
+        ) else (
+          (* Just a timeout - continue waiting *)
           consumer_loop ()
-      | None ->
-          (* Either timeout or stream closed - check if shutdown requested *)
-          if Atomic.get state.shutdown_requested then (
-            Logging.info_f ~section:"broadcast" "%s stream consumer shutting down due to shutdown request" stream_type;
-            (* Close stream on shutdown to ensure cleanup *)
-            close_stream () >>= fun () ->
-            Lwt.return_unit
-          ) else (
-            (* Just a timeout - continue waiting *)
-            consumer_loop ()
-          )
-    )
+        )
   in
   consumer_loop ()
 
@@ -377,9 +358,8 @@ let setup_broadcast_subscriptions state =
           ignore (close_active_subscription "telemetry");
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
-          Logging.info ~section:"broadcast" "Setting up telemetry broadcast subscription";
+          Logging.info ~section:"broadcast" "Telemetry stream subscription active";
           let (stream, close_fn) = subscribe_telemetry_snapshot () in
-          Logging.info ~section:"broadcast" "Telemetry stream subscribed, waiting for data...";
 
           (* Create close function for this stream - wrap to return Lwt.t *)
           let close_stream () = close_fn (); Lwt.return_unit in
@@ -388,7 +368,7 @@ let setup_broadcast_subscriptions state =
           register_active_subscription "telemetry" close_stream;
 
           let process_telemetry snapshot state =
-            Logging.info_f ~section:"broadcast" "Received telemetry snapshot with %d metrics, broadcasting..." (List.length snapshot.metrics);
+            Logging.debug_f ~section:"broadcast" "Received telemetry snapshot with %d metrics, broadcasting..." (List.length snapshot.metrics);
             let json_str = Metrics_json.(telemetry_snapshot_to_json snapshot |> json_to_string) in
             broadcast_to_stream state "telemetry" json_str;
             Lwt.return_unit
@@ -417,7 +397,7 @@ let setup_broadcast_subscriptions state =
           ignore (close_active_subscription "system");
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
-          Logging.info ~section:"broadcast" "Setting up system stats broadcast subscription";
+          Logging.info ~section:"broadcast" "System stream subscription active";
           let (stream, close_fn) = subscribe_system_stats () in
 
           (* Create close function for this stream - wrap to return Lwt.t *)
@@ -455,7 +435,7 @@ let setup_broadcast_subscriptions state =
           ignore (close_active_subscription "balance");
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
-          Logging.info ~section:"broadcast" "Setting up balance broadcast subscription";
+          Logging.info ~section:"broadcast" "Balance stream subscription active";
           let (stream, close_fn) = subscribe_balance_snapshot () in
 
           (* Create close function for this stream - wrap to return Lwt.t *)
@@ -493,7 +473,7 @@ let setup_broadcast_subscriptions state =
           ignore (close_active_subscription "log");
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
-          Logging.info ~section:"broadcast" "Setting up logs broadcast subscription";
+          Logging.info ~section:"broadcast" "Logs stream subscription active";
           let (stream, close_fn) = Dio_ui_cache.Logs_cache.subscribe_log_entries () in
 
           (* Create close function for this stream - wrap to return Lwt.t *)
@@ -652,7 +632,7 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown
 
       (* Report metrics for monitoring *)
       if cleaned_count > 0 then
-        Logging.info_f ~section:"broadcast" "Cleaned up %d inactive clients, %d total clients remaining" cleaned_count after_cleanup;
+        Logging.debug_f ~section:"broadcast" "Cleaned up %d inactive clients, %d total clients remaining" cleaned_count after_cleanup;
 
       (* Report active client counts *)
       let active_clients = ref 0 in
