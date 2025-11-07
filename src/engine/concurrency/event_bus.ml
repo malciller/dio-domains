@@ -16,8 +16,14 @@ end
 module Make (Payload : PAYLOAD) = struct
   type snapshot = Payload.t
 
+  type subscription = {
+    stream: snapshot Lwt_stream.t;
+    close: unit -> unit;  (* Function to close this subscription's stream *)
+  }
+
   type subscriber = {
     push: snapshot -> unit;
+    close: unit -> unit;  (* Function to close this subscriber's stream *)
     mutable closed: bool;
     created_at: float;  (* Track when subscriber was created *)
     mutable last_used: float;  (* Track when subscriber was last used *)
@@ -58,15 +64,15 @@ module Make (Payload : PAYLOAD) = struct
         Lwt.async (fun () ->
           Lwt.catch
             (fun () ->
-              (* Add timeout to prevent slow subscribers from blocking indefinitely *)
+              (* Use very short timeout to detect blocking immediately *)
               Lwt.pick [
                 (Lwt.return (sub.push payload) >|= fun () -> ());
-                (Lwt_unix.sleep 0.1 >|= fun () -> ())  (* 100ms timeout *)
+                (Lwt_unix.sleep 0.001 >|= fun () -> ())  (* 1ms timeout - fail fast on blocking *)
               ]
             )
             (fun exn ->
-              (* Mark subscriber as closed on push failure *)
-              Logging.debug_f ~section:"event_bus" "Subscriber push failed, marking closed: %s" (Printexc.to_string exn);
+              (* Mark subscriber as closed on push failure (including timeout) *)
+              Logging.debug_f ~section:"event_bus" "Subscriber push failed/timed out, marking closed: %s" (Printexc.to_string exn);
               sub.closed <- true;
               Lwt.return_unit
             )
@@ -79,6 +85,7 @@ module Make (Payload : PAYLOAD) = struct
     let now = Unix.time () in
     let subscriber = {
       push = (fun payload -> push (Some payload));
+      close = (fun () -> push None);  (* Close the stream by sending None *)
       closed = false;
       created_at = now;
       last_used = now;
@@ -104,12 +111,12 @@ module Make (Payload : PAYLOAD) = struct
     (match Atomic.get bus.latest with
     | Some payload -> push (Some payload)
     | None -> ());
-    stream
+    { stream; close = subscriber.close }
 
   let await_next bus timeout =
-    let stream = subscribe bus in
+    let subscription = subscribe bus in
     Lwt.pick [
-      (Lwt_stream.get stream >|= fun evt -> evt);
+      (Lwt_stream.get subscription.stream >|= fun evt -> evt);
       (Lwt_unix.sleep timeout >|= fun () -> None)
     ]
 

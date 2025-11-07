@@ -97,7 +97,9 @@ let signal_feeds_ready () =
   )
 
 (** Subscribe to balance snapshot updates *)
-let subscribe_balance_snapshot () = BalanceSnapshotEventBus.subscribe ~persistent:true cache.balance_snapshot_event_bus
+let subscribe_balance_snapshot () =
+  let subscription = BalanceSnapshotEventBus.subscribe ~persistent:true cache.balance_snapshot_event_bus in
+  (subscription.stream, subscription.close)
 
 (** Get balance event bus subscriber statistics *)
 let get_balance_subscriber_stats () =

@@ -12,14 +12,14 @@ let test_event_publish_subscribe () =
     let bus = EventBus.create "test_bus" in
     let received = ref [] in
     let finished = Lwt_condition.create () in
-    let stream = EventBus.subscribe bus in
+    let subscription = EventBus.subscribe bus in
 
     (* Subscribe to events *)
     Lwt.async (fun () ->
       let rec loop () =
         Lwt.pick [
           (* Try to get an event from the stream *)
-          (Lwt_stream.get stream >>= function
+          (Lwt_stream.get subscription.stream >>= function
            | Some event ->
                received := event :: !received;
                Lwt.return `Continue

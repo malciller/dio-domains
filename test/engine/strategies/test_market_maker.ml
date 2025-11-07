@@ -100,7 +100,7 @@ let test_order_acknowledgment () =
   let initial_state = Dio_strategies.Market_maker.get_strategy_state "TEST/USD" in
 
   (* Add a pending order manually for testing *)
-  initial_state.pending_orders <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0) :: initial_state.pending_orders;
+  initial_state.pending_orders <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ()) :: initial_state.pending_orders;
 
   (* Handle acknowledgment *)
   Dio_strategies.Market_maker.Strategy.handle_order_acknowledged "TEST/USD" "order456" Dio_strategies.Strategy_common.Buy 50000.0;
