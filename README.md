@@ -98,6 +98,9 @@ Edit `config.json` (example):
   - **Authentication**: Secure token generation and management.
 - **UI**: Raw TCP stream of vairous metrics and values from the bot. 
 
+### TCP Stream Integration
+
+For an example integration demonstrating how to read and use the TCP stream that dio produces, see: [https://github.com/malciller/c_stuf/tree/main/tcp](https://github.com/malciller/c_stuf/tree/main/tcp)
 
 ## Development
 
