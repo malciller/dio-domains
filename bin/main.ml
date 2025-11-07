@@ -71,20 +71,27 @@ let () =
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
 
-  (* Initialize caches for metrics broadcast *)
-  Dio_ui_cache.Logs_cache.init ();
-  Dio_ui_cache.Telemetry_cache.init ();
-  Dio_ui_cache.System_cache.init ();
-  Dio_ui_cache.Balance_cache.init ();
+  (* Initialize caches for metrics broadcast if enabled *)
+  if config.metrics_broadcast.active then (
+    Logging.info ~section:"main" "Metrics broadcast enabled, initializing caches...";
+    Dio_ui_cache.Logs_cache.init ();
+    Dio_ui_cache.Telemetry_cache.init ();
+    Dio_ui_cache.System_cache.init ();
+    Dio_ui_cache.Balance_cache.init ();
+  ) else (
+    Logging.info ~section:"main" "Metrics broadcast disabled, skipping cache initialization";
+  );
 
-  (* Set up log streaming to logs cache *)
-  Logging.set_log_callback (fun level section message ->
-    (* Skip broadcast section logs to prevent infinite recursion *)
-    if section <> "broadcast" then (
-      let level_str = Logging.level_to_string level in
-      Dio_ui_cache.Logs_cache.add_log_entry level_str section message
-    ) else
-      Lwt.return_unit
+  (* Set up log streaming to logs cache if metrics broadcast is active *)
+  if config.metrics_broadcast.active then (
+    Logging.set_log_callback (fun level section message ->
+      (* Skip broadcast section logs to prevent infinite recursion *)
+      if section <> "broadcast" then (
+        let level_str = Logging.level_to_string level in
+        Dio_ui_cache.Logs_cache.add_log_entry level_str section message
+      ) else
+        Lwt.return_unit
+    );
   );
 
   (* Initialize random number generator for crypto operations *)
@@ -103,17 +110,28 @@ let () =
     (* Initialize order executor asynchronously - this can run in background *)
     let _order_executor_promise = init_order_executor_async () in
 
-      (* Signal that feeds are ready for cache initialization *)
-      Dio_ui_cache.Balance_cache.signal_feeds_ready ();
-      Dio_ui_cache.Telemetry_cache.signal_system_ready ();
+      (* Signal that feeds are ready for cache initialization if metrics broadcast is active *)
+      if config.metrics_broadcast.active then (
+        Dio_ui_cache.Balance_cache.signal_feeds_ready ();
+        Dio_ui_cache.Telemetry_cache.signal_system_ready ();
+      );
 
-    (* Start metrics broadcast server - runs until shutdown signal *)
-    Logging.info_f ~section:"main" "Trading engine ready, starting metrics broadcast server on port %d..." config.metrics_broadcast.port;
+    (* Start metrics broadcast server if enabled - runs until shutdown signal *)
+    if config.metrics_broadcast.active then (
+      Logging.info_f ~section:"main" "Trading engine ready, starting metrics broadcast server on port %d..." config.metrics_broadcast.port;
 
-    (* Run server until shutdown signal is received *)
-    Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast shutdown_condition);
+      (* Run server until shutdown signal is received *)
+      Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast shutdown_condition);
 
-    Logging.info ~section:"main" "Metrics broadcast server closed gracefully, shutting down...";
+      Logging.info ~section:"main" "Metrics broadcast server closed gracefully, shutting down...";
+    ) else (
+      Logging.info ~section:"main" "Trading engine ready, waiting for shutdown signal...";
+
+      (* Wait for shutdown signal without starting server *)
+      Lwt_main.run (Lwt_condition.wait shutdown_condition);
+
+      Logging.info ~section:"main" "Shutdown signal received, shutting down...";
+    );
 
     (* Force exit to ensure process terminates even if background tasks are still running *)
     exit 0
