@@ -230,61 +230,77 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
 let consume_stream_non_blocking stream_type stream process_fn state =
   let last_success_time = ref (Unix.time ()) in
   let last_health_log_time = ref (Unix.time ()) in
+  let cancellation_requested = Atomic.make false in
+  let cancellation_condition = Lwt_condition.create () in
 
   (* Background health monitor task *)
   Lwt.async (fun () ->
-    let rec monitor_loop () =
-      Lwt_unix.sleep 30.0 >>= fun () ->  (* Check every 30 seconds *)
-    let now = Unix.time () in
-    let time_since_last_item = now -. !last_success_time in
+    Lwt.catch (fun () ->
+      let rec monitor_loop () =
+        Lwt_unix.sleep 30.0 >>= fun () ->  (* Check every 30 seconds *)
+      let now = Unix.time () in
+      let time_since_last_item = now -. !last_success_time in
 
-      (* Check for stream inactivity (5 minutes timeout) *)
-      if time_since_last_item > 300.0 then (
-      Logging.warn_f ~section:"broadcast" "%s stream inactive for %.1f seconds (>5 minutes), restarting subscription" stream_type time_since_last_item;
-      Lwt.fail (Failure (Printf.sprintf "%s stream inactive for too long" stream_type))
-      ) else (
-          (* Log successful item processing every minute for health monitoring *)
-          let time_since_health_log = now -. !last_health_log_time in
-          if time_since_health_log >= 60.0 then (
-            Logging.debug_f ~section:"broadcast" "%s stream health: received item %.1f seconds ago, active" stream_type time_since_last_item;
-            last_health_log_time := now
-          );
-        monitor_loop ()
-      )
-    in
-    monitor_loop ()
+        (* Check for stream inactivity (5 minutes timeout) *)
+        if time_since_last_item > 300.0 then (
+        Logging.warn_f ~section:"broadcast" "%s stream inactive for %.1f seconds (>5 minutes), restarting subscription" stream_type time_since_last_item;
+        Atomic.set cancellation_requested true;
+        Lwt_condition.broadcast cancellation_condition ();
+        Lwt.return_unit  (* Exit monitor loop gracefully *)
+        ) else (
+            (* Log successful item processing every minute for health monitoring *)
+            let time_since_health_log = now -. !last_health_log_time in
+            if time_since_health_log >= 60.0 then (
+              Logging.debug_f ~section:"broadcast" "%s stream health: received item %.1f seconds ago, active" stream_type time_since_last_item;
+              last_health_log_time := now
+            );
+          monitor_loop ()
+        )
+      in
+      monitor_loop ()
+    ) (fun exn ->
+      Logging.error_f ~section:"broadcast" "Monitor loop for %s stream crashed: %s" stream_type (Printexc.to_string exn);
+      Lwt.return_unit
+    )
   );
 
   let rec consumer_loop () =
-    (* Use Lwt.pick with short timeout to allow periodic shutdown checks *)
-    let get_with_shutdown_check = Lwt.pick [
-      Lwt_stream.get stream;
-      (Lwt_unix.sleep 0.1 >|= fun () -> None)  (* 0.1s timeout for shutdown checks *)
-    ] in
+    (* Check for cancellation before processing next item *)
+    if Atomic.get cancellation_requested then (
+      Logging.warn_f ~section:"broadcast" "%s stream consumer exiting due to inactivity timeout" stream_type;
+      Lwt.fail (Failure (Printf.sprintf "%s stream inactive for too long" stream_type))
+    ) else (
+      (* Use Lwt.pick with short timeout to allow periodic shutdown checks *)
+      let get_with_shutdown_check = Lwt.pick [
+        Lwt_stream.get stream;
+        (Lwt_unix.sleep 0.1 >|= fun () -> None);  (* 0.1s timeout for shutdown checks *)
+        (Lwt_condition.wait cancellation_condition >|= fun () -> None)  (* Check for cancellation signal *)
+      ] in
 
-    get_with_shutdown_check >>= function
-    | Some item ->
-        (* Got an item - process it asynchronously *)
-        last_success_time := Unix.time ();
-          Lwt.async (fun () ->
-            Lwt.catch
-              (fun () -> process_fn item state)
-              (fun exn ->
-                Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
-                Lwt.return_unit
-              )
-          );
-        (* Continue reading immediately - don't wait for processing *)
-        consumer_loop ()
-    | None ->
-        (* Either timeout or stream closed - check if shutdown requested *)
-        if Atomic.get state.shutdown_requested then (
-          Logging.info_f ~section:"broadcast" "%s stream consumer shutting down due to shutdown request" stream_type;
-          Lwt.return_unit
-        ) else (
-          (* Just a timeout - continue waiting *)
+      get_with_shutdown_check >>= function
+      | Some item ->
+          (* Got an item - process it asynchronously *)
+          last_success_time := Unix.time ();
+            Lwt.async (fun () ->
+              Lwt.catch
+                (fun () -> process_fn item state)
+                (fun exn ->
+                  Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
+                  Lwt.return_unit
+                )
+            );
+          (* Continue reading immediately - don't wait for processing *)
           consumer_loop ()
-        )
+      | None ->
+          (* Either timeout or stream closed - check if shutdown requested *)
+          if Atomic.get state.shutdown_requested then (
+            Logging.info_f ~section:"broadcast" "%s stream consumer shutting down due to shutdown request" stream_type;
+            Lwt.return_unit
+          ) else (
+            (* Just a timeout - continue waiting *)
+            consumer_loop ()
+          )
+    )
   in
   consumer_loop ()
 
