@@ -160,18 +160,6 @@ The system automatically monitors memory usage and stream depths:
 
 **Stream Depth Warnings**: High stream depths indicate consumers are slower than producers. The system automatically drops old items.
 
-### External Memory Profiling Tools
-
-For additional analysis, consider these external tools (note: these don't work with OCaml 5.1.1 multicore out-of-the-box):
-
-```bash
-# Valgrind (memory leak detection via system call tracing)
-valgrind --tool=memcheck ./_build/default/bin/main.exe
-
-# Heaptrack (memory allocation profiling)
-heaptrack ./_build/default/bin/main.exe
-```
-
 **Future Note**: OCaml 5.3 will include statistical memory profiling (statmemprof) with full multicore support, providing more detailed allocation analysis than the current `Gc.stat()` approach.
 
 ## Logging
