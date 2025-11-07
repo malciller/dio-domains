@@ -16,6 +16,7 @@ type client = {
   stream_type: string;
   input_channel: Lwt_io.input_channel;
   output_channel: Lwt_io.output_channel;
+  socket_fd: Lwt_unix.file_descr;  (* Direct access to socket for non-blocking writes *)
   mutable active: bool;
 }
 
@@ -82,32 +83,34 @@ let cleanup_clients state =
 (** Broadcast message to all clients of a specific stream type *)
 let broadcast_to_stream state stream_type json_str =
   let count = ref 0 in
+  let json_bytes = Bytes.of_string (json_str ^ "\n") in
+  let json_len = Bytes.length json_bytes in
   Mutex.lock state.client_mutex;
   Hashtbl.iter (fun _ client ->
     if client.stream_type = stream_type && client.active then (
       incr count;
+      (* Non-blocking write with timeout - drop client immediately if slow *)
+      (* Set non-blocking mode *)
+      Lwt_unix.set_blocking client.socket_fd false;
       Lwt.async (fun () ->
         Lwt.catch
           (fun () ->
-            let%lwt () = Lwt_io.write_line client.output_channel json_str in
+            (* Attempt write with 10ms timeout *)
+            Lwt.pick [
+              (Lwt_unix.write client.socket_fd json_bytes 0 json_len >|= fun written ->
+               if written < json_len then
+                 (* Partial write - client too slow, drop immediately *)
+                 failwith "Partial write - client too slow");
+              (Lwt_unix.sleep 0.01 >|= fun () -> failwith "Write timeout - client too slow")
+            ] >>= fun _ ->
             Logging.debug_f ~section:"broadcast" "Sent %s update to client %d" stream_type client.id;
             Lwt.return_unit
           )
           (fun exn ->
-            (* Handle EPIPE and other connection errors gracefully *)
-            match exn with
-            | Unix.Unix_error (Unix.EPIPE, _, _) ->
-                Logging.debug_f ~section:"broadcast" "Client %d disconnected (broken pipe)" client.id;
-                client.active <- false;
-                Lwt.return_unit
-            | Unix.Unix_error (err, _, _) ->
-                Logging.warn_f ~section:"broadcast" "Unix error sending to client %d: %s" client.id (Unix.error_message err);
-                client.active <- false;
-                Lwt.return_unit
-            | _ ->
-                Logging.warn_f ~section:"broadcast" "Failed to send to client %d: %s" client.id (Printexc.to_string exn);
-                client.active <- false;
-                Lwt.return_unit
+            (* Any write failure means client is too slow - drop immediately *)
+            Logging.debug_f ~section:"broadcast" "Client %d too slow, dropping: %s" client.id (Printexc.to_string exn);
+            client.active <- false;
+            Lwt.return_unit
           )
       )
     )
@@ -139,7 +142,16 @@ let send_current_snapshot client stream_type =
           | _ -> ""
         in
         if json_str <> "" then (
-          let%lwt () = Lwt_io.write_line client.output_channel json_str in
+          (* Non-blocking write with timeout - drop client immediately if slow *)
+          let json_bytes = Bytes.of_string (json_str ^ "\n") in
+          let json_len = Bytes.length json_bytes in
+          Lwt_unix.set_blocking client.socket_fd false;
+          Lwt.pick [
+            (Lwt_unix.write client.socket_fd json_bytes 0 json_len >|= fun written ->
+             if written < json_len then
+               failwith "Partial write - client too slow");
+            (Lwt_unix.sleep 0.01 >|= fun () -> failwith "Write timeout - client too slow")
+          ] >>= fun _ ->
           Logging.info_f ~section:"broadcast" "Sent current %s snapshot to client %d" stream_type client.id;
           Lwt.return_unit
         ) else (
@@ -148,30 +160,21 @@ let send_current_snapshot client stream_type =
         )
       )
       (fun exn ->
-        (* Handle EPIPE and other connection errors gracefully *)
-        match exn with
-        | Unix.Unix_error (Unix.EPIPE, _, _) ->
-            Logging.debug_f ~section:"broadcast" "Client %d disconnected before snapshot sent (broken pipe)" client.id;
-            client.active <- false;
-            Lwt.return_unit
-        | Unix.Unix_error (err, _, _) ->
-            Logging.warn_f ~section:"broadcast" "Unix error sending snapshot to client %d: %s" client.id (Unix.error_message err);
-            client.active <- false;
-            Lwt.return_unit
-        | _ ->
-            Logging.warn_f ~section:"broadcast" "Failed to send current snapshot to client %d: %s" client.id (Printexc.to_string exn);
-            client.active <- false;
-            Lwt.return_unit
+        (* Any write failure means client is too slow - drop immediately *)
+        Logging.debug_f ~section:"broadcast" "Client %d too slow during snapshot send, dropping: %s" client.id (Printexc.to_string exn);
+        client.active <- false;
+        Lwt.return_unit
       )
   )
 
 (** Handle TCP connection for a specific stream type *)
-let handle_tcp_connection state stream_type client_id input_channel output_channel =
+let handle_tcp_connection state stream_type client_id input_channel output_channel socket_fd =
   let client = {
     id = client_id;
     stream_type;
     input_channel;
     output_channel;
+    socket_fd;
     active = true;
   } in
   Mutex.lock state.client_mutex;
@@ -221,23 +224,21 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
       Lwt.return_unit
     )
 
-(** Non-blocking stream consumer with backpressure detection and monitoring *)
+(** Non-blocking stream consumer - process items immediately without backpressure *)
 let consume_stream_non_blocking stream_type stream process_fn state =
   let consecutive_timeouts = ref 0 in
   let last_success_time = ref (Unix.time ()) in
+
   let rec consumer_loop () =
     Lwt.catch
       (fun () ->
-        (* Use get with timeout to prevent blocking *)
-        Lwt.pick [
-          (Lwt_stream.get stream >|= fun opt -> opt);
-          (Lwt_unix.sleep 0.05 >|= fun () -> None)  (* 50ms timeout *)
-        ] >>= fun opt ->
-        match opt with
+        (* Process items immediately - no timeout to prevent backpressure *)
+        Lwt_stream.get stream >>= function
         | Some item ->
             consecutive_timeouts := 0;
             last_success_time := Unix.time ();
-            (* Process the item asynchronously to avoid blocking the consumer *)
+
+            (* Process item immediately - drop only if no active clients remain *)
             Lwt.async (fun () ->
               Lwt.catch
                 (fun () -> process_fn item state)
@@ -248,19 +249,9 @@ let consume_stream_non_blocking stream_type stream process_fn state =
             );
             consumer_loop ()
         | None ->
-            (* No item available within timeout - track for backpressure detection *)
-            let new_timeouts = !consecutive_timeouts + 1 in
-            consecutive_timeouts := new_timeouts;
-            let time_since_success = Unix.time () -. !last_success_time in
-
-            (* Log backpressure warnings *)
-            if new_timeouts = 10 then
-              Logging.debug_f ~section:"broadcast" "%s stream: 10 consecutive timeouts, possible backpressure" stream_type
-            else if new_timeouts mod 100 = 0 && new_timeouts > 0 then
-              Logging.warn_f ~section:"broadcast" "%s stream: %d consecutive timeouts (%.1fs since last success), severe backpressure detected"
-                stream_type new_timeouts time_since_success;
-
-            consumer_loop ()
+            (* Stream ended - this shouldn't happen for event streams *)
+            Logging.warn_f ~section:"broadcast" "%s stream ended unexpectedly" stream_type;
+            Lwt.return_unit
       )
       (fun exn ->
         Logging.warn_f ~section:"broadcast" "%s stream consumer failed: %s, restarting..." stream_type (Printexc.to_string exn);
@@ -528,7 +519,7 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) : unit Lw
                               | "telemetry" | "system" | "balance" | "log" ->
                                   let client_id = Atomic.get state.next_client_id in
                                   Atomic.incr state.next_client_id;
-                                  handle_tcp_connection state stream_type client_id input_channel output_channel
+                                  handle_tcp_connection state stream_type client_id input_channel output_channel client_socket
                               | _ ->
                                   Logging.warn_f ~section:"broadcast" "Unknown stream type requested: %s" stream_type;
                                   let error_msg = Printf.sprintf "Unknown stream type: %s\nValid types: telemetry, system, balance, log\n" stream_type in
@@ -555,7 +546,7 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) : unit Lw
                    | "telemetry" | "system" | "balance" | "log" ->
                        let client_id = Atomic.get state.next_client_id in
                        Atomic.incr state.next_client_id;
-                       handle_tcp_connection state stream_type client_id input_channel output_channel
+                       handle_tcp_connection state stream_type client_id input_channel output_channel client_socket
                    | _ ->
                        Logging.warn_f ~section:"broadcast" "Unknown stream type requested: %s" stream_type;
                        let error_msg = Printf.sprintf "Unknown stream type: %s\nValid types: telemetry, system, balance, log\n" stream_type in
