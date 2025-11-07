@@ -230,34 +230,33 @@ let consume_stream_non_blocking stream_type stream process_fn state =
   let last_success_time = ref (Unix.time ()) in
 
   let rec consumer_loop () =
-    Lwt.catch
-      (fun () ->
-        (* Process items immediately - no timeout to prevent backpressure *)
-        Lwt_stream.get stream >>= function
-        | Some item ->
-            consecutive_timeouts := 0;
-            last_success_time := Unix.time ();
+    (* Check for stream inactivity timeout (defense in depth) *)
+    let now = Unix.time () in
+    let time_since_last_item = now -. !last_success_time in
+    if time_since_last_item > 180.0 then (  (* 3 minutes timeout *)
+      Logging.warn_f ~section:"broadcast" "%s stream inactive for %.1f seconds (>3 minutes), restarting subscription" stream_type time_since_last_item;
+      Lwt.fail (Failure (Printf.sprintf "%s stream inactive for too long" stream_type))
+    ) else
+      (* Process items immediately - no timeout to prevent backpressure *)
+      Lwt_stream.get stream >>= function
+      | Some item ->
+          consecutive_timeouts := 0;
+          last_success_time := Unix.time ();
 
-            (* Process item immediately - drop only if no active clients remain *)
-            Lwt.async (fun () ->
-              Lwt.catch
-                (fun () -> process_fn item state)
-                (fun exn ->
-                  Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
-                  Lwt.return_unit
-                )
-            );
-            consumer_loop ()
-        | None ->
-            (* Stream ended - this shouldn't happen for event streams, but if it does, trigger retry *)
-            Logging.warn_f ~section:"broadcast" "%s stream ended unexpectedly, will retry subscription" stream_type;
-            Lwt.fail (Failure (Printf.sprintf "%s stream ended unexpectedly" stream_type))
-      )
-      (fun exn ->
-        Logging.warn_f ~section:"broadcast" "%s stream consumer failed: %s, restarting..." stream_type (Printexc.to_string exn);
-        consecutive_timeouts := 0;  (* Reset on failure *)
-        Lwt_unix.sleep 1.0 >>= consumer_loop  (* Restart after delay *)
-      )
+          (* Process item immediately - drop only if no active clients remain *)
+          Lwt.async (fun () ->
+            Lwt.catch
+              (fun () -> process_fn item state)
+              (fun exn ->
+                Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
+                Lwt.return_unit
+              )
+          );
+          consumer_loop ()
+      | None ->
+          (* Stream ended - this shouldn't happen for event streams, but if it does, trigger retry *)
+          Logging.warn_f ~section:"broadcast" "%s stream ended unexpectedly, will retry subscription" stream_type;
+          Lwt.fail (Failure (Printf.sprintf "%s stream ended unexpectedly" stream_type))
   in
   consumer_loop ()
 
