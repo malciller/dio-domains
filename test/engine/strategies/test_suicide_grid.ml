@@ -115,7 +115,7 @@ let test_order_acknowledgment () =
   let state = Dio_strategies.Suicide_grid.get_strategy_state "TEST/USD" in
 
   (* Add a pending order manually for testing *)
-  state.pending_orders <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0) :: state.pending_orders;
+  state.pending_orders <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ()) :: state.pending_orders;
 
   (* Handle acknowledgment *)
   Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged "TEST/USD" "order456" Dio_strategies.Strategy_common.Buy 50000.0;
@@ -144,7 +144,7 @@ let test_order_rejection () =
   let state = Dio_strategies.Suicide_grid.get_strategy_state "TEST3/USD" in
 
   (* Add a pending order manually for testing *)
-  state.pending_orders <- [("test123", Dio_strategies.Strategy_common.Sell, 51000.0)];
+  state.pending_orders <- [("test123", Dio_strategies.Strategy_common.Sell, 51000.0, Unix.time ())];
 
   (* Handle rejection *)
   Dio_strategies.Suicide_grid.Strategy.handle_order_rejected "TEST3/USD" Dio_strategies.Strategy_common.Sell 51000.0;

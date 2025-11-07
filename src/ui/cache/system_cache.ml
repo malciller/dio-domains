@@ -327,6 +327,13 @@ type t = {
   update_interval: float;  (* Minimum time between system updates *)
 }
 
+(** Global shutdown flag for background tasks *)
+let shutdown_requested = Atomic.make false
+
+(** Signal shutdown to background tasks *)
+let signal_shutdown () =
+  Atomic.set shutdown_requested true
+
 (** Global system cache instance *)
 let cache = {
   current_system_stats = None;
@@ -340,6 +347,193 @@ let memory_usage_history = ref []
 let max_memory_history = 100  (* Keep last 100 memory readings *)
 let memory_leak_threshold_mb = 100.0  (* Alert if memory grows by 100MB in last readings *)
 let last_gc_time = ref 0.0
+let last_memory_log_time = ref 0.0  (* Track when we last logged memory stats *)
+
+(** Per-domain heap tracking for multicore environments *)
+let domain_heap_history : (int, (float * float) list) Hashtbl.t = Hashtbl.create 16  (* Domain ID -> [(time, heap_mb)] list *)
+let domain_allocation_rates : (int, (float * float) list) Hashtbl.t = Hashtbl.create 16  (* Domain ID -> [(time, allocs_per_sec)] list *)
+let max_domain_history = 50  (* Keep last 50 readings per domain *)
+
+(** Per-feed memory tracking for leak detection *)
+type feed_memory_stats = {
+  timestamp: float;
+  event_bus_subscribers_total: int;
+  event_bus_subscribers_active: int;
+  event_bus_subscribers_stale: int;
+  cache_entries: int;
+  estimated_memory_mb: float;
+  last_growth_rate: float;  (* MB per second *)
+}
+
+let feed_memory_history : (string, feed_memory_stats list) Hashtbl.t = Hashtbl.create 16
+let max_feed_history = 20  (* Keep last 20 readings per feed *)
+
+(** Memory breakdown record type *)
+type memory_breakdown_info = {
+  total_heap_mb: float;
+  feed_breakdown: (string * float) list;
+  other_memory_mb: float;
+  timestamp: float;
+}
+
+(** Get memory statistics for telemetry feed *)
+let get_telemetry_feed_stats () =
+  let now = Unix.time () in
+  let (total, active, stale) = 
+    try Telemetry_cache.get_telemetry_subscriber_stats ()
+    with _ -> (0, 0, 0)
+  in
+  (* Safely get cache size - snapshot may be None if cache was cleared *)
+  let cache_size = 
+    try
+      let snapshot = Telemetry_cache.current_telemetry_snapshot () in
+      (* Snapshot is immutable, safe to access fields *)
+      List.length snapshot.metrics
+    with 
+    | Invalid_argument _ -> 0  (* Handle invalid access *)
+    | _ -> 0  (* Handle any other exception *)
+  in
+  let estimated_mb = float_of_int (total + cache_size) *. 0.001 in  (* Rough estimate *)
+  {
+    timestamp = now;
+    event_bus_subscribers_total = total;
+    event_bus_subscribers_active = active;
+    event_bus_subscribers_stale = stale;
+    cache_entries = cache_size;
+    estimated_memory_mb = estimated_mb;
+    last_growth_rate = 0.0;  (* Will be calculated from history *)
+  }
+
+(** Get memory statistics for system stats feed *)
+let get_system_feed_stats () =
+  let now = Unix.time () in
+  let (total, active, stale) = 
+    try SystemStatsEventBus.get_subscriber_stats cache.system_stats_event_bus
+    with _ -> (0, 0, 0)
+  in
+  let cache_size = 
+    try
+      match cache.current_system_stats with
+      | Some _ -> 1
+      | None -> 0
+    with _ -> 0
+  in
+  let estimated_mb = float_of_int (total + cache_size) *. 0.001 in
+  {
+    timestamp = now;
+    event_bus_subscribers_total = total;
+    event_bus_subscribers_active = active;
+    event_bus_subscribers_stale = stale;
+    cache_entries = cache_size;
+    estimated_memory_mb = estimated_mb;
+    last_growth_rate = 0.0;
+  }
+
+(** Get memory statistics for balance feed *)
+let get_balance_feed_stats () =
+  let now = Unix.time () in
+  let (total, active, stale) = 
+    try Balance_cache.get_balance_subscriber_stats ()
+    with _ -> (0, 0, 0)
+  in
+  (* Safely get cache size - snapshot may be None if cache was cleared *)
+  let cache_size = 
+    try
+      let snapshot = Balance_cache.current_balance_snapshot () in
+      (* Snapshot is immutable, safe to access fields *)
+      List.length snapshot.balances + List.length snapshot.open_orders
+    with 
+    | Invalid_argument _ -> 0  (* Handle invalid access *)
+    | _ -> 0  (* Handle any other exception *)
+  in
+  let estimated_mb = float_of_int (total + cache_size) *. 0.001 in
+  {
+    timestamp = now;
+    event_bus_subscribers_total = total;
+    event_bus_subscribers_active = active;
+    event_bus_subscribers_stale = stale;
+    cache_entries = cache_size;
+    estimated_memory_mb = estimated_mb;
+    last_growth_rate = 0.0;
+  }
+
+(** Get memory statistics for logs feed *)
+let get_logs_feed_stats () =
+  let now = Unix.time () in
+  let (total, active, stale) = 
+    try Logs_cache.get_logs_subscriber_stats ()
+    with _ -> (0, 0, 0)
+  in
+  let cache_size = 
+    try Logs_cache.current_log_entries () |> List.length
+    with _ -> 0
+  in
+  let estimated_mb = float_of_int (total + cache_size) *. 0.01 in  (* Logs take more memory *)
+  {
+    timestamp = now;
+    event_bus_subscribers_total = total;
+    event_bus_subscribers_active = active;
+    event_bus_subscribers_stale = stale;
+    cache_entries = cache_size;
+    estimated_memory_mb = estimated_mb;
+    last_growth_rate = 0.0;
+  }
+
+(** Mutex to protect feed memory tracking updates *)
+let feed_tracking_mutex = Mutex.create ()
+
+(** Update per-feed memory tracking *)
+let update_feed_memory_tracking () =
+  (* Protect against concurrent access *)
+  if Mutex.try_lock feed_tracking_mutex then (
+    try
+      (* Safely get current stats for all feeds with error handling *)
+      let feeds = 
+        try [
+          ("telemetry", get_telemetry_feed_stats ());
+          ("system", get_system_feed_stats ());
+          ("balance", get_balance_feed_stats ());
+          ("logs", get_logs_feed_stats ());
+        ] with exn ->
+          Logging.debug_f ~section:"memory_monitoring" "Error collecting feed stats: %s" (Printexc.to_string exn);
+          []
+      in
+
+      try
+        List.iter (fun (feed_name, (feed_stats : feed_memory_stats)) ->
+          (* Get existing history *)
+          let existing_history = try Hashtbl.find feed_memory_history feed_name with Not_found -> [] in
+
+          (* Calculate growth rate if we have previous data *)
+          let stats_with_growth : feed_memory_stats = match existing_history with
+            | (prev_stats : feed_memory_stats) :: _ ->
+                let time_diff = feed_stats.timestamp -. prev_stats.timestamp in
+                if time_diff > 0.0 then
+                  let growth_rate = (feed_stats.estimated_memory_mb -. prev_stats.estimated_memory_mb) /. time_diff in
+                  { feed_stats with last_growth_rate = growth_rate }
+                else
+                  feed_stats
+            | [] -> feed_stats
+          in
+
+          (* Add to history and trim *)
+          let new_history = stats_with_growth :: existing_history in
+          let trimmed_history = if List.length new_history > max_feed_history
+                               then take max_feed_history new_history
+                               else new_history in
+          Hashtbl.replace feed_memory_history feed_name trimmed_history
+        ) feeds
+      with exn ->
+        Logging.debug_f ~section:"memory_monitoring" "Error updating feed memory tracking: %s" (Printexc.to_string exn);
+      
+      Mutex.unlock feed_tracking_mutex
+    with exn ->
+      Mutex.unlock feed_tracking_mutex;
+      Logging.debug_f ~section:"memory_monitoring" "Error in feed tracking (unlocked mutex): %s" (Printexc.to_string exn)
+  ) else (
+    (* Mutex is locked, skip this update to avoid blocking *)
+    ()
+  )
 
 (** Get current OCaml memory usage in MB *)
 let get_ocaml_memory_usage () =
@@ -347,6 +541,29 @@ let get_ocaml_memory_usage () =
   let heap_words = stat.heap_words in
   let word_size = Sys.word_size / 8 in  (* bytes per word *)
   float_of_int (heap_words * word_size) /. (1024.0 *. 1024.0)
+
+(** Get detailed GC statistics *)
+let get_gc_stats () =
+  Gc.stat ()
+
+(** Get current domain ID (for multicore tracking) *)
+let get_current_domain_id () =
+  try Obj.magic (Domain.self ()) 
+  with _ -> 0  (* Fallback for single-core or if Domain.self fails *)
+
+(** Track memory usage per domain *)
+let track_domain_memory_usage () =
+  let domain_id = get_current_domain_id () in
+  let now = Unix.time () in
+  let heap_mb = get_ocaml_memory_usage () in
+
+  (* Update domain heap history *)
+  let current_history = try Hashtbl.find domain_heap_history domain_id with Not_found -> [] in
+  let new_history = (now, heap_mb) :: current_history in
+  let trimmed_history = if List.length new_history > max_domain_history
+                        then take max_domain_history new_history
+                        else new_history in
+  Hashtbl.replace domain_heap_history domain_id trimmed_history
 
 (** Check for memory leaks and trigger cleanup if needed *)
 let check_memory_leak () =
@@ -360,6 +577,9 @@ let check_memory_leak () =
   if List.length !memory_usage_history > max_memory_history then
     memory_usage_history := take max_memory_history !memory_usage_history;
 
+  (* Update domain-specific tracking *)
+  track_domain_memory_usage ();
+
   (* Check for memory growth trend *)
   match !memory_usage_history with
   | (oldest_time, oldest_mem) :: _ when List.length !memory_usage_history >= 10 ->
@@ -368,13 +588,198 @@ let check_memory_leak () =
 
       (* If memory has grown significantly over the last readings, trigger GC *)
       if mem_diff > memory_leak_threshold_mb && time_diff > 300.0 then (  (* 5 minutes *)
-        Logging.warn_f ~section:"system_cache" "Memory leak detected: %.1f MB growth in %.0f seconds, triggering GC"
+        Logging.warn_f ~section:"memory_monitoring" "Memory leak detected: %.1f MB growth in %.0f seconds, triggering GC"
           mem_diff time_diff;
         Gc.full_major ();
         last_gc_time := now;
-        Logging.info_f ~section:"system_cache" "GC completed, memory now: %.1f MB" (get_ocaml_memory_usage ())
+        Logging.info_f ~section:"memory_monitoring" "GC completed, memory now: %.1f MB" (get_ocaml_memory_usage ())
       )
   | _ -> ()
+
+(** Log detailed memory statistics periodically *)
+let log_detailed_memory_stats () =
+  let now = Unix.time () in
+  let gc_stats = get_gc_stats () in
+  let heap_mb = get_ocaml_memory_usage () in
+
+  Logging.info_f ~section:"memory_monitoring" "GC Stats: heap=%.1fMB live=%.1fMB free=%.1fMB fragments=%d compactions=%d"
+    heap_mb
+    (float_of_int gc_stats.live_words *. float_of_int (Sys.word_size / 8) /. (1024.0 *. 1024.0))
+    (float_of_int gc_stats.free_words *. float_of_int (Sys.word_size / 8) /. (1024.0 *. 1024.0))
+    gc_stats.fragments
+    gc_stats.compactions;
+
+  (* Log per-feed statistics *)
+  let feeds = ["telemetry"; "system"; "balance"; "logs"] in
+  List.iter (fun feed_name ->
+    match try Some (Hashtbl.find feed_memory_history feed_name) with Not_found -> None with
+    | Some (latest :: _) ->
+        Logging.info_f ~section:"memory_monitoring" "Feed %s: subs=%d/%d/%d cache=%d mem=%.3fMB growth=%.6fMB/s"
+          feed_name
+          latest.event_bus_subscribers_total
+          latest.event_bus_subscribers_active
+          latest.event_bus_subscribers_stale
+          latest.cache_entries
+          latest.estimated_memory_mb
+          latest.last_growth_rate
+    | _ ->
+        Logging.debug_f ~section:"memory_monitoring" "Feed %s: no data available" feed_name
+  ) feeds;
+
+  (* Log per-domain statistics if available *)
+  Hashtbl.iter (fun domain_id history ->
+    match history with
+    | (latest_time, latest_heap) :: _ when now -. latest_time < 60.0 ->
+        Logging.debug_f ~section:"memory_monitoring" "Domain %d: heap=%.1fMB (last update %.1fs ago)"
+          domain_id latest_heap (now -. latest_time)
+    | _ -> ()
+  ) domain_heap_history
+
+(** Check for per-feed memory leaks and issue alerts *)
+let check_per_feed_leaks () =
+  let feeds = ["telemetry"; "system"; "balance"; "logs"] in
+
+  List.iter (fun feed_name ->
+    match try Some (Hashtbl.find feed_memory_history feed_name) with Not_found -> None with
+    | Some history when List.length history >= 3 ->
+        (* Check last 3 readings for trends *)
+        let recent = take 3 history in
+        begin match recent with
+        | latest :: _ :: oldest :: _ ->
+            let time_span = latest.timestamp -. oldest.timestamp in
+            let (subscriber_growth, cache_growth, memory_growth) =
+              if time_span > 60.0 then (  (* Only check if we have at least 1 minute of data *)
+                let sub_growth = float_of_int (latest.event_bus_subscribers_total - oldest.event_bus_subscribers_total) /. time_span in
+                let cache_growth_rate = float_of_int (latest.cache_entries - oldest.cache_entries) /. time_span in
+                let mem_growth_rate = (latest.estimated_memory_mb -. oldest.estimated_memory_mb) /. time_span in
+                (sub_growth, cache_growth_rate, mem_growth_rate)
+              ) else (0.0, 0.0, 0.0)
+            in
+
+            (* Alert thresholds *)
+            let sub_threshold = 1.0 /. 60.0 in  (* More than 1 new subscriber per minute *)
+            let cache_threshold = 100.0 /. 60.0 in  (* More than 100 new cache entries per minute *)
+            let mem_threshold = 1.0 /. 60.0 in  (* More than 1MB growth per minute *)
+
+            (* Issue alerts for concerning growth patterns *)
+            if subscriber_growth > sub_threshold then
+              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High subscriber growth %.2f subs/min (total: %d)"
+                feed_name subscriber_growth latest.event_bus_subscribers_total;
+
+            if cache_growth > cache_threshold then
+              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High cache growth %.1f entries/min (total: %d)"
+                feed_name cache_growth latest.cache_entries;
+
+            if memory_growth > mem_threshold then
+              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High memory growth %.3f MB/min (total: %.3f MB)"
+                feed_name memory_growth latest.estimated_memory_mb;
+
+            (* Check for stale subscriber accumulation *)
+            if latest.event_bus_subscribers_stale > latest.event_bus_subscribers_total / 2 then
+              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High stale subscriber ratio %d/%d (%d%%)"
+                feed_name latest.event_bus_subscribers_stale latest.event_bus_subscribers_total
+                (latest.event_bus_subscribers_stale * 100 / max 1 latest.event_bus_subscribers_total);
+        | _ -> ()
+        end
+
+    | _ -> ()  (* Not enough data yet *)
+  ) feeds
+
+(** Get detailed memory breakdown by component *)
+let get_memory_breakdown () : memory_breakdown_info =
+  let total_heap = get_ocaml_memory_usage () in
+  let feed_breakdown =
+    Hashtbl.fold (fun feed_name history acc ->
+      match history with
+      | latest :: _ ->
+          (feed_name, latest.estimated_memory_mb) :: acc
+      | [] -> acc
+    ) feed_memory_history []
+  in
+
+  let total_feed_memory = List.fold_left (fun acc (_, mem) -> acc +. mem) 0.0 feed_breakdown in
+  let other_memory = max 0.0 (total_heap -. total_feed_memory) in
+
+  {
+    total_heap_mb = total_heap;
+    feed_breakdown = feed_breakdown;
+    other_memory_mb = other_memory;
+    timestamp = Unix.time ();
+  }
+
+(** Get memory consumption ranking (feeds with highest memory usage) *)
+let get_memory_consumption_ranking () =
+  let feed_breakdown =
+    Hashtbl.fold (fun feed_name history acc ->
+      match history with
+      | latest :: _ -> (feed_name, latest) :: acc
+      | [] -> acc
+    ) feed_memory_history []
+  in
+
+  (* Sort by estimated memory usage, descending *)
+  let sorted = List.sort (fun (_, a) (_, b) ->
+    compare b.estimated_memory_mb a.estimated_memory_mb
+  ) feed_breakdown in
+
+  List.map (fun (name, stats) ->
+    (name, stats.estimated_memory_mb, stats.last_growth_rate)
+  ) sorted
+
+(** Force cleanup of stale subscribers across all feeds *)
+let force_cleanup_all_stale_subscribers () =
+  let telemetry_cleaned = Telemetry_cache.force_cleanup_stale_subscribers () in
+  let system_cleaned = SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus () in
+  let balance_cleaned = Balance_cache.force_cleanup_stale_subscribers () in
+  let logs_cleaned = Logs_cache.force_cleanup_stale_subscribers () in
+
+  let total_cleaned = Option.value telemetry_cleaned ~default:0 +
+                     Option.value system_cleaned ~default:0 +
+                     Option.value balance_cleaned ~default:0 +
+                     Option.value logs_cleaned ~default:0 in
+
+  if total_cleaned > 0 then
+    Logging.info_f ~section:"memory_monitoring" "Force cleaned %d stale subscribers across all feeds" total_cleaned;
+
+  total_cleaned
+
+(** Generate comprehensive memory diagnostic report *)
+let generate_memory_diagnostic_report () =
+  let mem_breakdown = get_memory_breakdown () in
+  let ranking = get_memory_consumption_ranking () in
+  let gc_stats = get_gc_stats () in
+
+  Logging.info ~section:"memory_monitoring" "=== MEMORY DIAGNOSTIC REPORT ===";
+  Logging.info_f ~section:"memory_monitoring" "Total heap: %.2f MB" mem_breakdown.total_heap_mb;
+  Logging.info_f ~section:"memory_monitoring" "GC stats: live=%.2fMB free=%.2fMB fragments=%d"
+    (float_of_int gc_stats.live_words *. float_of_int (Sys.word_size / 8) /. (1024.0 *. 1024.0))
+    (float_of_int gc_stats.free_words *. float_of_int (Sys.word_size / 8) /. (1024.0 *. 1024.0))
+    gc_stats.fragments;
+
+  Logging.info ~section:"memory_monitoring" "Feed memory ranking (by estimated usage):";
+  List.iteri (fun i (name, mem_mb, growth_rate) ->
+    Logging.info_f ~section:"memory_monitoring" "  %d. %s: %.3f MB (growth: %.6f MB/s)"
+      (i + 1) name mem_mb growth_rate
+  ) ranking;
+
+  Logging.info_f ~section:"memory_monitoring" "Other memory: %.2f MB" mem_breakdown.other_memory_mb;
+
+  (* Show detailed feed stats *)
+  Logging.info ~section:"memory_monitoring" "Detailed feed statistics:";
+  Hashtbl.iter (fun feed_name history ->
+    match history with
+    | latest :: _ ->
+        Logging.info_f ~section:"memory_monitoring" "  %s: subs=%d/%d/%d cache=%d mem=%.3fMB"
+          feed_name
+          latest.event_bus_subscribers_total
+          latest.event_bus_subscribers_active
+          latest.event_bus_subscribers_stale
+          latest.cache_entries
+          latest.estimated_memory_mb
+    | _ -> ()
+  ) feed_memory_history;
+
+  Logging.info ~section:"memory_monitoring" "=== END MEMORY DIAGNOSTIC REPORT ==="
 
 (** Periodic memory maintenance *)
 let perform_memory_maintenance () =
@@ -383,13 +788,26 @@ let perform_memory_maintenance () =
 
   (* Force GC every 15 minutes for dashboard mode to prevent gradual memory creep *)
   if time_since_gc > 900.0 then (
-    Logging.debug ~section:"system_cache" "Performing scheduled GC (15-minute interval for dashboard mode)";
+    Logging.debug ~section:"memory_monitoring" "Performing scheduled GC (15-minute interval for dashboard mode)";
     Gc.full_major ();
     last_gc_time := now
   );
 
+  (* Update per-feed memory tracking *)
+  update_feed_memory_tracking ();
+
+  (* Check for per-component memory leaks *)
+  check_per_feed_leaks ();
+
   (* Check for memory leaks *)
-  check_memory_leak ()
+  check_memory_leak ();
+
+  (* Log detailed memory stats every 10 seconds *)
+  let time_since_last_log = now -. !last_memory_log_time in
+  if time_since_last_log >= 10.0 then (
+    log_detailed_memory_stats ();
+    last_memory_log_time := now
+  )
 
 (** Initialization guard with mutex protection *)
 let initialized = ref false
@@ -735,13 +1153,32 @@ let create_system_stats_lwt () : system_stats option Lwt.t =
 (** Update system stats cache with throttling (Lwt-friendly) *)
 let update_system_stats_cache_lwt () =
   let now = Unix.time () in
-  if now -. cache.last_update >= cache.update_interval then (
+  let time_since_last = now -. cache.last_update in
+
+  (* Always try to update if enough time has passed, OR if it's been too long since last publish (keepalive) *)
+  let should_update = time_since_last >= cache.update_interval in
+  let needs_keepalive = time_since_last >= 30.0 in  (* Keepalive every 30 seconds max *)
+
+  if should_update || needs_keepalive then (
     let%lwt stats_opt = create_system_stats_lwt () in
     (match stats_opt with
      | Some stats ->
          cache.current_system_stats <- Some stats;
          cache.last_update <- now;
          SystemStatsEventBus.publish cache.system_stats_event_bus stats
+     | None when needs_keepalive ->
+         (* No new data but we need keepalive - republish last known stats if available *)
+         (match cache.current_system_stats with
+          | Some last_stats ->
+              (* Update timestamp and republish (system stats don't have explicit timestamps, but we can republish) *)
+              SystemStatsEventBus.publish cache.system_stats_event_bus last_stats;
+              cache.last_update <- now;
+              Logging.debug_f ~section:"system_cache" "System stats keepalive published at %.2f" now
+          | None ->
+              (* No stats available, just update timestamp *)
+              cache.last_update <- now;
+              Logging.debug_f ~section:"system_cache" "No system stats available for keepalive at %.2f" now
+         )
      | None ->
          (* Keep previous stats if collection fails - don't create dummy data *)
          (* The UI will show the last known good values or handle the None case *)
@@ -751,7 +1188,9 @@ let update_system_stats_cache_lwt () =
     Lwt.return_unit
 
 (** Subscribe to system stats updates *)
-let subscribe_system_stats () = SystemStatsEventBus.subscribe cache.system_stats_event_bus
+let subscribe_system_stats () =
+  let subscription = SystemStatsEventBus.subscribe ~persistent:true cache.system_stats_event_bus in
+  (subscription.stream, subscription.close)
 
 (** Get current system stats (can block on first call if not ready) *)
 let current_system_stats () =
@@ -787,29 +1226,56 @@ let current_system_stats () =
             }
       )
 
+(** Publish initial system stats snapshot synchronously *)
+let publish_initial_snapshot () =
+  Logging.debug ~section:"system_cache" "Publishing initial system stats snapshot";
+  (* Publish a placeholder snapshot immediately so subscriptions have data *)
+  (* The background updater will replace it with real data very soon (within 1 second) *)
+  let placeholder_stats = {
+    cpu_usage = 0.0;
+    core_usages = [];
+    cpu_cores = None;
+    cpu_vendor = None;
+    cpu_model = None;
+    memory_total = 0;
+    memory_used = 0;
+    memory_free = 0;
+    swap_total = 0;
+    swap_used = 0;
+    load_avg_1 = 0.0;
+    load_avg_5 = 0.0;
+    load_avg_15 = 0.0;
+    processes = 0;
+    cpu_temp = None;
+    gpu_temp = None;
+    temps = [];
+  } in
+  cache.current_system_stats <- Some placeholder_stats;
+  cache.last_update <- 0.0;  (* Set to 0 so updater runs immediately *)
+  SystemStatsEventBus.publish cache.system_stats_event_bus placeholder_stats;
+  Logging.debug ~section:"system_cache" "Initial placeholder system stats snapshot published"
+
 (** Start background system stats updater *)
 let start_system_updater () =
-  (* Ensure we have initial system stats, but do it asynchronously *)
-  Lwt.async (fun () ->
-    let%lwt initial_stats_opt = create_system_stats_lwt () in
-    (match initial_stats_opt with
-     | Some initial_stats ->
-         cache.current_system_stats <- Some initial_stats;
-         cache.last_update <- Unix.time ();
-         SystemStatsEventBus.publish cache.system_stats_event_bus initial_stats
-     | None -> ());
-    Lwt.return_unit
-  );
+  Logging.debug ~section:"system_cache" "Starting background system stats updater";
 
   (* Start periodic system metrics updater *)
   let _system_updater = Lwt.async (fun () ->
+    (* Update immediately on startup to replace placeholder with real data *)
+    let%lwt () = update_system_stats_cache_lwt () in
     let rec system_loop () =
+      (* Check for shutdown request *)
+      if Atomic.get shutdown_requested then (
+        Logging.debug ~section:"system_cache" "System cache updater shutting down due to shutdown request";
+        Lwt.return_unit
+      ) else (
       Telemetry.update_system_metrics ();
       (* Always update system stats cache for real-time dashboard *)
       let%lwt () = update_system_stats_cache_lwt () in
       (* Perform periodic memory maintenance *)
       perform_memory_maintenance ();
       Lwt_unix.sleep 1.0 >>= system_loop
+      )
     in
     system_loop ()
   ) in
@@ -819,6 +1285,11 @@ let start_system_updater () =
   let _cleanup_loop = Lwt.async (fun () ->
     Logging.debug ~section:"system_cache" "Starting event bus cleanup loop";
     let rec cleanup_loop () =
+      (* Check for shutdown request *)
+      if Atomic.get shutdown_requested then (
+        Logging.debug ~section:"system_cache" "System cache cleanup loop shutting down due to shutdown request";
+        Lwt.return_unit
+      ) else (
       let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
       let removed_opt = SystemStatsEventBus.cleanup_stale_subscribers cache.system_stats_event_bus () in
       (match removed_opt with
@@ -827,11 +1298,15 @@ let start_system_updater () =
              Logging.info_f ~section:"system_cache" "Cleaned up %d stale system stats subscribers" removed_count
        | None -> ());
 
+      (* Clear event bus latest reference periodically to prevent memory retention *)
+      SystemStatsEventBus.clear_latest cache.system_stats_event_bus;
+
       (* Report subscriber statistics to telemetry *)
       let (total, active, _) = SystemStatsEventBus.get_subscriber_stats cache.system_stats_event_bus in
       Telemetry.set_event_bus_subscribers_total total;
       Telemetry.set_event_bus_subscribers_active active;
       cleanup_loop ()
+      )
     in
     cleanup_loop ()
   )
@@ -858,6 +1333,8 @@ let init () =
         ) else (
           initialized := true;
           try
+            (* Publish initial snapshot synchronously before starting background updater *)
+            publish_initial_snapshot ();
             start_system_updater ();
             Logging.info ~section:"system_cache" "System cache initialized"
           with exn ->

@@ -45,7 +45,7 @@ type strategy_state = {
   mutable last_buy_order_id: string option;
   mutable last_sell_order_price: float option;
   mutable last_sell_order_id: string option;
-  mutable pending_orders: (string * order_side * float) list;  (* order_id * side * price - orders sent but not yet acknowledged *)
+  mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
@@ -263,7 +263,8 @@ let push_order order =
                   (string_of_order_side order.side)
                   (Option.value order.price ~default:0.0) in
                 let order_price = Option.value order.price ~default:0.0 in
-                state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
+                let timestamp = Unix.time () in
+                state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
                 Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
                   (string_of_order_side order.side) temp_order_id order_price order.symbol;
 
@@ -279,7 +280,8 @@ let push_order order =
                 let temp_order_id = Printf.sprintf "pending_amend_%s"
                   (Option.value order.order_id ~default:"unknown") in
                 let order_price = Option.value order.price ~default:0.0 in
-                state.pending_orders <- (temp_order_id, order.side, order_price) :: state.pending_orders;
+                let timestamp = Unix.time () in
+                state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
                 Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
                   (string_of_order_side order.side) temp_order_id order_price order.symbol
                   (Option.value order.order_id ~default:"unknown")
@@ -330,7 +332,7 @@ let execute_strategy
 
   (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
   let original_count = List.length state.pending_orders in
-  state.pending_orders <- List.filter (fun (order_id, _, timestamp) ->
+  state.pending_orders <- List.filter (fun (order_id, _, _, timestamp) ->
     let age = now -. timestamp in
     if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
       if should_log then Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
@@ -715,9 +717,13 @@ let execute_strategy
 (** Handle order placement success - update pending order status *)
 let handle_order_acknowledged asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
-  (* Remove from pending orders - match by side and approximate price since we might not have exact order_id yet *)
-  state.pending_orders <- List.filter (fun (_, s, p) ->
-    not (s = side && abs_float (p -. price) < 0.01)  (* Allow small price difference *)
+  (* Remove from pending orders - match by side and approximate price, or by amend order_id *)
+  state.pending_orders <- List.filter (fun (pending_id, s, p, _) ->
+    (* Match regular orders by side and price, or amend orders by order_id *)
+    let matches_side_price = s = side && abs_float (p -. price) < 0.01 in
+    let matches_amend = String.starts_with ~prefix:"pending_amend_" pending_id &&
+                       String.sub pending_id 14 (String.length pending_id - 14) = order_id in
+    not (matches_side_price || matches_amend)
   ) state.pending_orders;
 
   (* Update buy/sell order tracking if this is a buy/sell order acknowledgment *)
@@ -736,7 +742,7 @@ let handle_order_acknowledged asset_symbol order_id side price =
 let handle_order_rejected asset_symbol side price =
   let state = get_strategy_state asset_symbol in
   (* Remove from pending orders *)
-  state.pending_orders <- List.filter (fun (_, s, p) ->
+  state.pending_orders <- List.filter (fun (_, s, p, _) ->
     not (s = side && abs_float (p -. price) < 0.01)  (* Allow small price difference *)
   ) state.pending_orders;
   Logging.debug_f ~section "Order rejected and removed from pending: %s @ %.2f for %s"
@@ -752,7 +758,7 @@ let handle_order_cancelled asset_symbol order_id =
 
   (* Remove from pending orders if it's there *)
   let original_pending_count = List.length state.pending_orders in
-  state.pending_orders <- List.filter (fun (pending_id, _, _) ->
+  state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
     pending_id <> order_id
   ) state.pending_orders;
   let removed_pending = original_pending_count - List.length state.pending_orders in

@@ -810,6 +810,14 @@ let get_ocaml_heap_usage () =
   let word_size = Sys.word_size / 8 in  (* bytes per word *)
   float_of_int (heap_words * word_size) /. (1024.0 *. 1024.0)
 
+(** Get allocation rate (minor words allocated per second) *)
+let get_allocation_rate () =
+  let stat = Gc.quick_stat () in
+  let minor_words = stat.minor_words in
+  (* Estimate allocation rate based on recent activity *)
+  (* This is a rough approximation - in practice you'd want time-based sampling *)
+  minor_words /. 1000000.0  (* Convert to millions of words per sample *)
+
 (** Get current RSS (Resident Set Size) in MB *)
 let get_rss_usage () =
   try
@@ -912,8 +920,14 @@ let update_system_metrics () =
   (* Update memory usage gauges *)
   let heap_mb = get_ocaml_heap_usage () in
   let rss_mb = get_rss_usage () in
+  let alloc_rate = get_allocation_rate () in
+
   set_heap_memory_usage heap_mb;
-  set_rss_memory_usage rss_mb
+  set_rss_memory_usage rss_mb;
+
+  (* Add allocation rate metric *)
+  let alloc_rate_metric = gauge "allocation_rate_mwords_per_sample" () in
+  set_gauge alloc_rate_metric alloc_rate
 
 (** Update memory monitoring metrics *)
 

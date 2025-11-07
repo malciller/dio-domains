@@ -122,34 +122,23 @@ let has_price_data symbol =
 
 (** Wait until price data is available for all symbols using event signalling *)
 let wait_for_price_data_lwt symbols timeout_seconds =
-  let start_time = Unix.gettimeofday () in
-  let timeout_ref = ref false in
-  let rec wait_loop () =
+  let deadline = Unix.gettimeofday () +. timeout_seconds in
+  let rec loop () =
     if List.for_all has_price_data symbols then
       Lwt.return_true
     else
-      let elapsed = Unix.gettimeofday () -. start_time in
-      if elapsed >= timeout_seconds then
-        Lwt.return_false
-      else if !timeout_ref then
+      let remaining = deadline -. Unix.gettimeofday () in
+      if remaining <= 0.0 then
         Lwt.return_false
       else
-        (* Wait for condition signal, but handle potential cancellation issues *)
-        Lwt.catch (fun () ->
-          Lwt_condition.wait ready_condition >>= fun () -> wait_loop ()
-        ) (fun _ ->
-          (* If condition wait fails (e.g., due to cancellation), treat as timeout *)
-          timeout_ref := true;
-          Lwt.return_false
-        )
+        Lwt.pick [
+          (Lwt_condition.wait ready_condition >|= fun () -> `Again);
+          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
+        ] >>= function
+        | `Again -> loop ()
+        | `Timeout -> Lwt.return (List.for_all has_price_data symbols)
   in
-  (* Start a background timeout that sets the flag *)
-  Lwt.async (fun () ->
-    Lwt_unix.sleep timeout_seconds >>= fun () ->
-    timeout_ref := true;
-    Lwt.return_unit
-  );
-  wait_loop ()
+  loop ()
 
 let wait_for_price_data = wait_for_price_data_lwt
 
@@ -258,7 +247,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   msg_loop ()
 
 (** WebSocket connection to Kraken - establishes connection and starts message handler *)
-let connect_and_subscribe symbols ~on_failure ~on_heartbeat =
+let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
 
   Logging.info_f ~section "Connecting to Kraken WebSocket...";
@@ -274,6 +263,8 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "WebSocket established, subscribing to ticker feed";
+    (* Call on_connected callback after successful connection and before starting message handler *)
+    on_connected ();
     start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
     Logging.info ~section "Ticker WebSocket connection closed";
     Lwt.return_unit

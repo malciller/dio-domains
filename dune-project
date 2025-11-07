@@ -38,10 +38,6 @@
    conduit-lwt-unix
    ipaddr
    alcotest
-   lwd
-   notty
-   nottui
-   nottui-lwt
    cpuid
    mtime)
  (tags

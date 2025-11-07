@@ -27,6 +27,7 @@ type supervised_connection = {
   mutable state: connection_state;
   mutable last_connected: float option;
   mutable last_disconnected: float option;
+  mutable last_connecting: float option;  (* Timestamp when entered Connecting state *)
   mutable last_data_received: float option;  (* For heartbeat monitoring *)
   mutable last_ping_sent: float option;  (* For ping/pong monitoring *)
   ping_failures: int Atomic.t;  (* Consecutive ping failures *)
@@ -65,6 +66,7 @@ let register ~name ~connect_fn =
     state = Disconnected;
     last_connected = None;
     last_disconnected = Some (Unix.time ());  (* Set to now to prevent immediate auto-restart *)
+    last_connecting = None;
     last_data_received = None;
     last_ping_sent = None;
     ping_failures = Atomic.make 0;
@@ -89,6 +91,7 @@ let register_for_monitoring ~name =
     state = Connected;  (* Assume it's connected since we're just monitoring *)
     last_connected = Some (Unix.time ());
     last_disconnected = None;
+    last_connecting = None;
     last_data_received = Some (Unix.time ());  (* Assume data was recently received *)
     last_ping_sent = None;
     ping_failures = Atomic.make 0;
@@ -114,6 +117,7 @@ let set_state conn new_state =
   (match new_state with
   | Connected ->
       conn.last_connected <- Some (Unix.time ());
+      conn.last_connecting <- None;  (* Clear connecting timestamp *)
       conn.last_data_received <- Some (Unix.time ());  (* Reset data heartbeat on connect *)
       conn.last_ping_sent <- None;  (* Reset ping tracking on connect *)
       Atomic.set conn.ping_failures 0;  (* Reset ping failures on connect *)
@@ -124,17 +128,20 @@ let set_state conn new_state =
         conn.name conn.total_connections
   | Disconnected ->
       conn.last_disconnected <- Some (Unix.time ());
+      conn.last_connecting <- None;  (* Clear connecting timestamp *)
       Telemetry.set_gauge (Telemetry.gauge "connection_state" ~labels:[("name", conn.name)] ()) (0.0);
       Logging.warn_f ~section "[%s] Connection lost" conn.name
   | Connecting ->
-      Logging.info_f ~section "[%s] Attempting connection (attempt #%d)" 
+      conn.last_connecting <- Some (Unix.time ());  (* Record when we started connecting *)
+      Logging.info_f ~section "[%s] Attempting connection (attempt #%d)"
         conn.name (conn.reconnect_attempts + 1)
   | Failed reason ->
       conn.last_disconnected <- Some (Unix.time ());
+      conn.last_connecting <- None;  (* Clear connecting timestamp *)
       conn.reconnect_attempts <- conn.reconnect_attempts + 1;
       Telemetry.set_gauge (Telemetry.gauge "connection_state" ~labels:[("name", conn.name)] ()) (-1.0);
       Telemetry.inc_counter (Telemetry.counter "connection_failures" ~labels:[("name", conn.name)] ()) ();
-      Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)" 
+      Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)"
         conn.name reason conn.reconnect_attempts);
   
   Mutex.unlock conn.mutex;
@@ -232,36 +239,47 @@ let start_async conn =
   | None ->
       Logging.warn_f ~section "[%s] Cannot start connection - no connect function provided (monitoring only)" conn.name
   | Some connect_fn ->
-      (* Check circuit breaker before attempting connection *)
-      if not (circuit_breaker_allows_connection conn) then begin
-        Logging.warn_f ~section "[%s] Circuit breaker blocks connection attempt" conn.name;
-        set_state conn (Failed "Circuit breaker open");
-      end else begin
-        (* Set to Connecting immediately to prevent duplicate restarts *)
-        set_state conn Connecting;
+      (* Check if connection is already attempting to connect *)
       Mutex.lock conn.mutex;
-      conn.reconnect_attempts <- conn.reconnect_attempts + 1;
-      let attempt_num = conn.reconnect_attempts in
+      let current_state = conn.state in
       Mutex.unlock conn.mutex;
-      
-      Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)"
-        conn.name attempt_num;
-      
-      let open Lwt.Infix in
-      Lwt.async (fun () ->
-        (* The connection function now handles its own state management *)
-        (* Just start the connection and let it manage success/failure *)
-        Lwt.catch (fun () ->
-          connect_fn () >>= fun () ->
-          (* Connection function completed - this shouldn't happen for WebSocket connections *)
-          Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
-          Lwt.return_unit
-        ) (fun exn ->
-          let error_msg = Printexc.to_string exn in
-          Logging.error_f ~section "[%s] Unexpected error in connection function: %s" conn.name error_msg;
-          Lwt.return_unit
-        )
-      )
+
+      if current_state = Connecting then begin
+        Logging.debug_f ~section "[%s] Connection already connecting, skipping duplicate start" conn.name;
+      end else begin
+        (* Check circuit breaker before attempting connection *)
+        if not (circuit_breaker_allows_connection conn) then begin
+          Logging.warn_f ~section "[%s] Circuit breaker blocks connection attempt" conn.name;
+          set_state conn (Failed "Circuit breaker open");
+        end else begin
+          (* Set to Connecting immediately to prevent duplicate restarts *)
+          set_state conn Connecting;
+          Mutex.lock conn.mutex;
+          conn.reconnect_attempts <- conn.reconnect_attempts + 1;
+          let attempt_num = conn.reconnect_attempts in
+          Mutex.unlock conn.mutex;
+
+          Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)"
+            conn.name attempt_num;
+
+          let open Lwt.Infix in
+          Lwt.async (fun () ->
+            (* The connection function now handles its own state management *)
+            (* Just start the connection and let it manage success/failure *)
+            Lwt.catch (fun () ->
+              connect_fn () >>= fun () ->
+              (* Connection function completed - this shouldn't happen for WebSocket connections *)
+              Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
+              Lwt.return_unit
+            ) (fun exn ->
+              let error_msg = Printexc.to_string exn in
+              Logging.error_f ~section "[%s] Unexpected error in connection function: %s" conn.name error_msg;
+              (* Ensure state is set to Failed on any exception during connection setup *)
+              set_state conn (Failed error_msg);
+              Lwt.return_unit
+            )
+          )
+        end
       end
 
 (** Restart a connection *)
@@ -279,7 +297,7 @@ let monitor_loop () =
   let cycle_count = ref 0 in
   while true do
     try
-      Thread.delay 10.0;  (* Check every 10 seconds *)
+      Thread.delay 2.0;  (* Check every 2 seconds for faster reconnection detection *)
       incr cycle_count;
 
       Mutex.lock registry_mutex;
@@ -288,18 +306,24 @@ let monitor_loop () =
     
     (* Check each connection and trigger auto-restart if needed *)
     List.iter (fun conn ->
+      (* Get all state information atomically *)
       Mutex.lock conn.mutex;
       let state = conn.state in
       let attempts = conn.reconnect_attempts in
       let last_disconnected = conn.last_disconnected in
+      let last_connecting = conn.last_connecting in
       let has_connect_fn = Option.is_some conn.connect_fn in
       Mutex.unlock conn.mutex;
-      
+
       (* Health monitoring and backup restart logic *)
       match state, has_connect_fn with
       | Failed reason, true ->
-          (* Check if automatic restart is already scheduled (connection should be in Connecting state) *)
-          if state <> Connecting then begin
+          (* Check current state atomically to avoid race conditions *)
+          Mutex.lock conn.mutex;
+          let current_state = conn.state in
+          Mutex.unlock conn.mutex;
+
+          if current_state <> Connecting then begin
             (* Calculate backoff delay: 2s, 4s, 6s, ... max 30s *)
             let delay = min 30.0 (2.0 *. Float.of_int attempts) in
 
@@ -330,14 +354,21 @@ let monitor_loop () =
           end
       | Connecting, _ ->
           (* Already connecting, check for stuck connections *)
-          let uptime = match conn.last_connected with
+          let stuck_time = match last_connecting with
             | Some t -> Unix.time () -. t
-            | None -> 0.0
+            | None -> 0.0  (* Shouldn't happen if state logic is correct, but defensive *)
           in
-          if uptime > 120.0 then begin  (* Stuck for more than 2 minutes *)
-            Logging.error_f ~section "[%s] Connection stuck in 'Connecting' state for %.0fs, restarting..." conn.name uptime;
-            set_state conn Disconnected;
-            start_async conn
+          if stuck_time > 120.0 then begin  (* Stuck for more than 2 minutes *)
+            Logging.error_f ~section "[%s] Connection stuck in 'Connecting' state for %.0fs, restarting..." conn.name stuck_time;
+            (* Atomically set state and restart to avoid race conditions *)
+            Mutex.lock conn.mutex;
+            let current_state = conn.state in
+            Mutex.unlock conn.mutex;
+
+            if current_state = Connecting then begin
+              set_state conn Disconnected;
+              start_async conn
+            end
           end
       | Connected, _ ->
           (* Connected and healthy - implement heartbeat monitoring for all connections *)
@@ -468,10 +499,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.catch (fun () ->
       let on_failure reason = set_state ticker_conn (Failed reason) in
       let on_heartbeat () = update_data_heartbeat ticker_conn in
-      Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat >>= fun () ->
-      (* Connection established successfully *)
-      set_state ticker_conn Connected;
-      (* Connection will run indefinitely until closed *)
+      let on_connected () = set_state ticker_conn Connected in
+      Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
       Lwt.return_unit
     ) (fun exn ->
       let error_msg = Printexc.to_string exn in
@@ -492,10 +522,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.catch (fun () ->
       let on_failure reason = set_state orderbook_conn (Failed reason) in
       let on_heartbeat () = update_data_heartbeat orderbook_conn in
-      Kraken.Kraken_orderbook_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat >>= fun () ->
-      (* Connection established successfully *)
-      set_state orderbook_conn Connected;
-      (* Connection will run indefinitely until closed *)
+      let on_connected () = set_state orderbook_conn Connected in
+      Kraken.Kraken_orderbook_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
       Lwt.return_unit
     ) (fun exn ->
       let error_msg = Printexc.to_string exn in
@@ -514,10 +543,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.catch (fun () ->
       let on_failure reason = set_state balances_conn (Failed reason) in
       let on_heartbeat () = update_data_heartbeat balances_conn in
-      Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat >>= fun () ->
-      (* Connection established successfully *)
-      set_state balances_conn Connected;
-      (* Connection will run indefinitely until closed *)
+      let on_connected () = set_state balances_conn Connected in
+      Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
       Lwt.return_unit
     ) (fun exn ->
       let error_msg = Printexc.to_string exn in
@@ -536,10 +564,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.catch (fun () ->
       let on_failure reason = set_state executions_conn (Failed reason) in
       let on_heartbeat () = update_data_heartbeat executions_conn in
-      Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat >>= fun () ->
-      (* Connection established successfully *)
-      set_state executions_conn Connected;
-      (* Connection will run indefinitely until closed *)
+      let on_connected () = set_state executions_conn Connected in
+      Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
       Lwt.return_unit
     ) (fun exn ->
       let error_msg = Printexc.to_string exn in
@@ -556,11 +583,17 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let trading_connect_fn () =
     (* Wrap the connection in try-catch for proper error handling *)
     Lwt.catch (fun () ->
-      let on_failure reason = set_state trading_conn (Failed reason) in
-      Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure >>= fun () ->
-      (* Connection established successfully *)
-      set_state trading_conn Connected;
-      (* Connection will run indefinitely until closed *)
+      let on_failure reason =
+        set_state trading_conn (Failed reason);
+        (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
+        Lwt.async (fun () ->
+          Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
+          start_async trading_conn;
+          Lwt.return_unit)
+      in
+      let on_connected () = set_state trading_conn Connected in
+      Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
       Lwt.return_unit
     ) (fun exn ->
       let error_msg = Printexc.to_string exn in
@@ -709,7 +742,15 @@ let order_processing_loop () =
 
     (* Check if trading WebSocket is connected *)
     if not (Kraken.Kraken_trading_client.is_connected ()) then begin
-      Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
+      (* Check if reconnection is in progress to avoid false alerts *)
+      let is_reconnecting =
+        try
+          let trading_conn = Hashtbl.find connections "kraken_trading_ws" in
+          get_state trading_conn = Connecting
+        with Not_found -> false
+      in
+      if not is_reconnecting then
+        Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
       (* Clear any pending orders to avoid stale amendments *)
       ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);
       ignore (Dio_strategies.Market_maker.Strategy.get_pending_orders 1000)
