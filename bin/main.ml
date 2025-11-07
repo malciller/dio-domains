@@ -51,6 +51,11 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
+  (* Initialize memory tracing if requested *)
+  (* Note: Spacetime requires a spacetime-enabled OCaml compiler variant *)
+  (* If OCAML_SPACETIME_INTERVAL is set, spacetime profiling will be enabled automatically *)
+  (* by the OCaml runtime if the compiler supports it *)();
+
   (* Read and apply logging configuration *)
   let config = Dio_engine.Config.read_config () in
   Logging.set_level config.logging.level;

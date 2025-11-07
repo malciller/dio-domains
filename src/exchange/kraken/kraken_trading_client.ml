@@ -129,24 +129,26 @@ let parse_ws_response json : Kraken_common_types.ws_response =
   end
 
 let resolve_response req_id response =
+  let start_time = Telemetry.start_timer () in
+  (* Minimize mutex hold time - only hold during critical section *)
   Lwt_mutex.with_lock state.mutex (fun () ->
-    let wakener_opt =
-      try
-        let wak = Response_table.find state.responses req_id in
-        Response_table.remove state.responses req_id;
-        Some wak
-      with Not_found -> None
-    in
-    Lwt.return wakener_opt
+    try
+      let wak = Response_table.find state.responses req_id in
+      Response_table.remove state.responses req_id;
+      Lwt.return (Some wak)
+    with Not_found -> Lwt.return None
   ) >>= function
   | Some wak ->
+      (* Perform wakeup outside mutex to reduce contention *)
       (try
         Lwt.wakeup_later wak response
       with Invalid_argument _ ->
         Logging.warn_f ~section "Attempted to wake already-resolved promise for req_id=%d" req_id);
+      let duration = Telemetry.record_duration Telemetry.Common.api_duration start_time in
+      Logging.debug_f ~section "Resolved response for req_id=%d in %.3fms" req_id (duration *. 1000.0);
       Lwt.return_unit
   | None ->
-      Logging.debug ~section (Printf.sprintf "No waiter found for req_id=%d" req_id);
+      Logging.debug ~section (Printf.sprintf "No waiter found for req_id=%d (may have timed out)" req_id);
       Lwt.return_unit
 
 let fail_all_pending reason =
@@ -217,15 +219,25 @@ let handle_json json =
           Lwt.return_unit)
 
 let handle_frame frame =
+  let frame_start_time = Telemetry.start_timer () in
   notify_heartbeat ();
-  Lwt.catch
-    (fun () ->
-       let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
-       handle_json json)
-    (fun exn ->
-       Logging.error ~section
-         (Printf.sprintf "Failed to handle trading frame: %s" (Printexc.to_string exn));
-       Lwt.return_unit)
+  (* Track frame processing *)
+  Telemetry.inc_counter (Telemetry.counter "websocket_frames_received" ()) ();
+  (* Process frame asynchronously to prevent blocking the reader loop *)
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () ->
+         let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
+         handle_json json >>= fun () ->
+         let frame_duration = Telemetry.record_duration (Telemetry.counter "websocket_frame_processing_time" ()) frame_start_time in
+         Logging.debug_f ~section "Processed WebSocket frame in %.3fms" (frame_duration *. 1000.0);
+         Lwt.return_unit)
+      (fun exn ->
+         Telemetry.inc_counter (Telemetry.counter "websocket_frame_errors" ()) ();
+         Logging.error ~section
+           (Printf.sprintf "Failed to handle trading frame: %s" (Printexc.to_string exn));
+         Lwt.return_unit));
+  Lwt.return_unit
 
 let rec reader_loop conn =
   Websocket_lwt_unix.read conn >>= function
@@ -321,10 +333,22 @@ let send_message ~message_str ~req_id ~timeout_ms =
         (waiter >|= fun response -> `Response response);
         (Lwt_unix.sleep timeout >|= fun () -> `Timeout)
       ] >>= function
-      | `Response response -> Lwt.return response
+      | `Response response ->
+          (* Track successful response *)
+          Telemetry.inc_counter Telemetry.Common.api_requests ();
+          Lwt.return response
       | `Timeout ->
+          (* Track timeout for monitoring *)
+          Telemetry.inc_counter (Telemetry.counter "websocket_timeouts" ()) ();
+          Logging.warn_f ~section "Request timeout: req_id=%d, timeout_ms=%d" req_id timeout_ms;
           Lwt_mutex.with_lock state.mutex (fun () ->
-            Response_table.remove state.responses req_id;
+            (* Check if response arrived between timeout and cleanup *)
+            (try
+               let _ = Response_table.find state.responses req_id in
+               Response_table.remove state.responses req_id;
+               Logging.debug_f ~section "Cleaned up timed-out request req_id=%d" req_id
+             with Not_found ->
+               Logging.debug_f ~section "Request req_id=%d already cleaned up or resolved" req_id);
             Lwt.return_unit) >>= fun () ->
           Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
 
