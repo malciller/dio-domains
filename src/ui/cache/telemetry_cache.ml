@@ -224,7 +224,9 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
 let wait_for_update () = Lwt_condition.wait cache.update_condition
 
 (** Subscribe to telemetry snapshot updates *)
-let subscribe_telemetry_snapshot () = TelemetrySnapshotEventBus.subscribe ~persistent:true cache.telemetry_snapshot_event_bus
+let subscribe_telemetry_snapshot () =
+  let subscription = TelemetrySnapshotEventBus.subscribe ~persistent:true cache.telemetry_snapshot_event_bus in
+  (subscription.stream, subscription.close)
 
 (** Get telemetry event bus subscriber statistics *)
 let get_telemetry_subscriber_stats () =

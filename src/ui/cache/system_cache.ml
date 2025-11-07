@@ -1188,7 +1188,9 @@ let update_system_stats_cache_lwt () =
     Lwt.return_unit
 
 (** Subscribe to system stats updates *)
-let subscribe_system_stats () = SystemStatsEventBus.subscribe ~persistent:true cache.system_stats_event_bus
+let subscribe_system_stats () =
+  let subscription = SystemStatsEventBus.subscribe ~persistent:true cache.system_stats_event_bus in
+  (subscription.stream, subscription.close)
 
 (** Get current system stats (can block on first call if not ready) *)
 let current_system_stats () =

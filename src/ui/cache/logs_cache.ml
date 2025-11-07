@@ -64,7 +64,9 @@ let () = Lwt_unix.set_blocking notification_w false
 let initialized = ref false
 
 (** Subscribe to log entry updates *)
-let subscribe_log_entries () = LogEntryEventBus.subscribe cache.log_entry_event_bus
+let subscribe_log_entries () =
+  let subscription = LogEntryEventBus.subscribe cache.log_entry_event_bus in
+  (subscription.stream, subscription.close)
 
 (** Get logs event bus subscriber statistics *)
 let get_logs_subscriber_stats () =
