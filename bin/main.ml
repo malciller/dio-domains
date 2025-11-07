@@ -2,6 +2,7 @@
 
 (** Graceful shutdown flag *)
 let shutdown_requested = Atomic.make false
+let shutdown_condition = Lwt_condition.create ()
 
 (** Signal handler for graceful shutdown *)
 let setup_signal_handlers () =
@@ -10,13 +11,23 @@ let setup_signal_handlers () =
       Atomic.set shutdown_requested true;
       Logging.warn ~section:"main" "Shutdown signal received, cleaning up...";
 
+      (* Signal shutdown to all components *)
+      Dio_ui_cache.System_cache.signal_shutdown ();
+      Dio_ui_cache.Telemetry_cache.signal_shutdown ();
+      Dio_ui_cache.Balance_cache.signal_shutdown ();
+      Dio_engine.Order_executor.signal_shutdown ();
+      Kraken.Kraken_trading_client.signal_shutdown ();
+
       (* Stop all supervised domains *)
       Dio_engine.Domain_spawner.stop_all_domains ();
 
       (* Stop all websocket connections *)
       Supervisor.stop_all ();
 
-      exit 0
+      (* Signal shutdown condition to allow graceful server shutdown *)
+      Lwt_condition.broadcast shutdown_condition ();
+
+      Logging.info ~section:"main" "Shutdown cleanup initiated, waiting up to 5 seconds for graceful exit..."
     )
   in
   Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
@@ -52,9 +63,8 @@ let () =
   Logging.init ();
 
   (* Initialize memory tracing if requested *)
-  (* Note: Spacetime requires a spacetime-enabled OCaml compiler variant *)
-  (* If OCAML_SPACETIME_INTERVAL is set, spacetime profiling will be enabled automatically *)
-  (* by the OCaml runtime if the compiler supports it *)();
+  (* Note: Enhanced memory monitoring is built-in via Gc.stat() calls *)
+  (* Memory monitoring is handled by system_cache.ml and telemetry.ml *)();
 
   (* Read and apply logging configuration *)
   let config = Dio_engine.Config.read_config () in
@@ -97,11 +107,16 @@ let () =
       Dio_ui_cache.Balance_cache.signal_feeds_ready ();
       Dio_ui_cache.Telemetry_cache.signal_system_ready ();
 
-    (* Start metrics broadcast server *)
+    (* Start metrics broadcast server - runs until shutdown signal *)
     Logging.info_f ~section:"main" "Trading engine ready, starting metrics broadcast server on port %d..." config.metrics_broadcast.port;
-    Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast);
 
-    Logging.info ~section:"main" "Metrics broadcast server closed, shutting down..."
+    (* Run server until shutdown signal is received *)
+    Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast shutdown_condition);
+
+    Logging.info ~section:"main" "Metrics broadcast server closed gracefully, shutting down...";
+
+    (* Force exit to ensure process terminates even if background tasks are still running *)
+    exit 0
   with e ->
     Logging.error_f ~section:"main" "Exception during startup: %s" (Printexc.to_string e);
     raise e

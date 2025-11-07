@@ -19,6 +19,9 @@ type domain_state = {
 let domain_registry : (string, domain_state) Hashtbl.t = Hashtbl.create 32
 let registry_mutex = Mutex.create ()
 
+(** Global shutdown flag for domain supervisor *)
+let shutdown_requested = Atomic.make false
+
 
 (** The worker function executed by each domain for a trading asset *)
 let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset : trading_config) =
@@ -533,7 +536,8 @@ let stop_domain state =
 (** Check if domain needs restart *)
 let domain_needs_restart state =
   Mutex.lock state.mutex;
-  let needs_restart = not (Atomic.get state.is_running) in
+  (* Don't restart if shutdown has been requested, even if domain is not running *)
+  let needs_restart = not (Atomic.get state.is_running) && not (Atomic.get shutdown_requested) in
   Mutex.unlock state.mutex;
   needs_restart
 
@@ -542,15 +546,21 @@ let supervisor_loop fee_fetcher =
   let section = "domain_supervisor" in
   Logging.info ~section "Domain supervisor started";
 
-  while true do
+  while not (Atomic.get shutdown_requested) do
     try
       Thread.delay 5.0;  (* Check every 5 seconds *)
+
+      (* Check for shutdown again after the delay *)
+      if Atomic.get shutdown_requested then raise Exit;
 
       Mutex.lock registry_mutex;
       let domains = Hashtbl.to_seq_values domain_registry |> List.of_seq in
       Mutex.unlock registry_mutex;
 
       List.iter (fun state ->
+        (* Check for shutdown during iteration to exit immediately *)
+        if Atomic.get shutdown_requested then raise Exit;
+
         if domain_needs_restart state then (
           let key = domain_key state.asset in
           let last_restart = Atomic.get state.last_restart in
@@ -569,7 +579,9 @@ let supervisor_loop fee_fetcher =
       ) domains
 
     with exn ->
-      Logging.error_f ~section "Exception in domain supervisor: %s" (Printexc.to_string exn)
+      match exn with
+      | Exit -> ()  (* Exit cleanly on shutdown *)
+      | _ -> Logging.error_f ~section "Exception in domain supervisor: %s" (Printexc.to_string exn)
   done
 
 (** Spawn supervised domains for assets *)
@@ -620,6 +632,8 @@ let clear_domain_registry () =
 (** Stop all domains gracefully *)
 let stop_all_domains () =
   Logging.info ~section "Stopping all supervised domains...";
+  (* Signal supervisor to stop restarting domains *)
+  Atomic.set shutdown_requested true;
   Mutex.lock registry_mutex;
   let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
   Mutex.unlock registry_mutex;

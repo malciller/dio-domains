@@ -32,6 +32,13 @@ type t = {
   mutable last_metrics_hash: string;  (* Track hash of metrics for deduplication *)
 }
 
+(** Global shutdown flag for background tasks *)
+let shutdown_requested = Atomic.make false
+
+(** Signal shutdown to background tasks *)
+let signal_shutdown () =
+  Atomic.set shutdown_requested true
+
 (** Global telemetry cache instance *)
 let cache = {
   current_snapshot = None;
@@ -217,7 +224,11 @@ let create_telemetry_snapshot () : telemetry_snapshot option =
 let wait_for_update () = Lwt_condition.wait cache.update_condition
 
 (** Subscribe to telemetry snapshot updates *)
-let subscribe_telemetry_snapshot () = TelemetrySnapshotEventBus.subscribe cache.telemetry_snapshot_event_bus
+let subscribe_telemetry_snapshot () = TelemetrySnapshotEventBus.subscribe ~persistent:true cache.telemetry_snapshot_event_bus
+
+(** Get telemetry event bus subscriber statistics *)
+let get_telemetry_subscriber_stats () =
+  TelemetrySnapshotEventBus.get_subscriber_stats cache.telemetry_snapshot_event_bus
 
 (** Get current telemetry snapshot (returns cached data, never blocks) *)
 let current_telemetry_snapshot () =
@@ -233,16 +244,17 @@ let current_telemetry_snapshot () =
         version = 0;
       }
 
-(** Start background telemetry updater (polling-based) *)
-let start_telemetry_updater () =
-  Logging.debug ~section:"telemetry_cache" "Starting background telemetry updater";
+(** Publish initial telemetry snapshot synchronously *)
+let publish_initial_snapshot () =
+  Logging.debug ~section:"telemetry_cache" "Publishing initial telemetry snapshot";
   (* Ensure we have an initial update *)
   (match create_telemetry_snapshot () with
    | Some initial_snapshot ->
        cache.current_snapshot <- Some initial_snapshot;
        cache.last_update <- Unix.time ();
        TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus initial_snapshot;
-       Lwt_condition.broadcast cache.update_condition ()
+       Lwt_condition.broadcast cache.update_condition ();
+       Logging.debug ~section:"telemetry_cache" "Initial telemetry snapshot published"
    | None ->
        (* No metrics yet, create empty snapshot *)
        let empty_snapshot = {
@@ -255,8 +267,13 @@ let start_telemetry_updater () =
        cache.current_snapshot <- Some empty_snapshot;
        cache.last_update <- Unix.time ();
        TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus empty_snapshot;
-       Lwt_condition.broadcast cache.update_condition ()
-  );
+       Lwt_condition.broadcast cache.update_condition ();
+       Logging.debug ~section:"telemetry_cache" "Initial empty telemetry snapshot published"
+  )
+
+(** Start background telemetry updater (polling-based) *)
+let start_telemetry_updater () =
+  Logging.debug ~section:"telemetry_cache" "Starting background telemetry updater";
 
   (* Start periodic polling updater *)
   Lwt.async (fun () ->
@@ -270,6 +287,11 @@ let start_telemetry_updater () =
     Logging.debug_f ~section:"telemetry_cache" "Telemetry polling updater starting after system ready";
 
     let rec polling_loop () =
+      (* Check for shutdown request *)
+      if Atomic.get shutdown_requested then (
+        Logging.debug ~section:"telemetry_cache" "Telemetry cache updater shutting down due to shutdown request";
+        Lwt.return_unit
+      ) else (
       let now = Unix.time () in
       let time_since_last = now -. cache.last_update in
 
@@ -279,7 +301,11 @@ let start_telemetry_updater () =
       if in_backoff then (
         Lwt_unix.sleep 1.0 >>= polling_loop
       ) else (
-        if time_since_last >= cache.update_interval then (
+        (* Always try to update if enough time has passed, OR if it's been too long since last publish (keepalive) *)
+        let should_update = time_since_last >= cache.update_interval in
+        let needs_keepalive = time_since_last >= 30.0 in  (* Keepalive every 30 seconds max *)
+
+        if should_update || needs_keepalive then (
           (try
             match create_telemetry_snapshot () with
             | Some snapshot ->
@@ -292,6 +318,21 @@ let start_telemetry_updater () =
                 cache.consecutive_failures <- 0;
                 cache.backoff_until <- 0.0;
                 Logging.debug_f ~section:"telemetry_cache" "Telemetry snapshot published and cache cleared at %.2f" snapshot.timestamp
+            | None when needs_keepalive ->
+                (* No new data but we need keepalive - republish last known snapshot if available *)
+                (match cache.current_snapshot with
+                 | Some last_snapshot ->
+                     (* Update timestamp and republish *)
+                     let keepalive_snapshot = { last_snapshot with timestamp = now } in
+                     TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus keepalive_snapshot;
+                     Lwt_condition.broadcast cache.update_condition ();
+                     cache.last_update <- now;
+                     Logging.debug_f ~section:"telemetry_cache" "Telemetry keepalive published at %.2f" now
+                 | None ->
+                     (* No snapshot available, just update timestamp *)
+                     cache.last_update <- now;
+                     Logging.debug_f ~section:"telemetry_cache" "No telemetry snapshot available for keepalive at %.2f" now
+                )
             | None ->
                 (* Metrics unchanged, just update timestamp *)
                 cache.last_update <- now;
@@ -305,6 +346,7 @@ let start_telemetry_updater () =
           );
         );
         Lwt_unix.sleep 1.0 >>= polling_loop (* Poll every second *)
+        )
       )
     in
     polling_loop () (* No initial delay once system is ready *)
@@ -314,6 +356,11 @@ let start_telemetry_updater () =
   Lwt.async (fun () ->
     Logging.debug ~section:"telemetry_cache" "Starting event bus cleanup loop";
     let rec cleanup_loop () =
+      (* Check for shutdown request *)
+      if Atomic.get shutdown_requested then (
+        Logging.debug ~section:"telemetry_cache" "Telemetry cache cleanup loop shutting down due to shutdown request";
+        Lwt.return_unit
+      ) else (
       let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
       let removed_opt = TelemetrySnapshotEventBus.cleanup_stale_subscribers cache.telemetry_snapshot_event_bus () in
       (match removed_opt with
@@ -330,6 +377,7 @@ let start_telemetry_updater () =
       Telemetry.set_event_bus_subscribers_total total;
       Telemetry.set_event_bus_subscribers_active active;
       cleanup_loop ()
+      )
     in
     cleanup_loop ()
   )
@@ -356,6 +404,8 @@ let init () =
         ) else (
           initialized := true;
           try
+            (* Publish initial snapshot synchronously before starting background updater *)
+            publish_initial_snapshot ();
             start_telemetry_updater ();
             Logging.info ~section:"telemetry_cache" "Telemetry cache initialized"
           with exn ->

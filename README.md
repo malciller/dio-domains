@@ -116,31 +116,28 @@ dune build @doc
 
 Dio includes built-in memory profiling tools to help identify memory leaks and performance issues:
 
-### Spacetime Profiling
+### Enhanced Memory Monitoring
 
-Spacetime generates memory allocation traces over time for detailed analysis. Requires a spacetime-enabled OCaml compiler variant:
+Dio provides comprehensive memory monitoring using OCaml's built-in `Gc.stat()` API, designed to work out-of-the-box with OCaml 5.1.1 multicore:
 
 ```bash
-# Install spacetime-enabled OCaml compiler variant
-opam switch create 5.1.1+spacetime ocaml-variants.5.1.1+spacetime
-
-# Switch to the spacetime-enabled compiler
-opam switch 5.1.1+spacetime
-
-# Reinstall project dependencies
-opam install . --deps-only
-
-# Rebuild the project
+# Build and run the project
 dune build
+./_build/default/bin/main.exe
 
-# Run with spacetime profiling enabled (interval in milliseconds)
-# Profiling is enabled automatically by the OCaml runtime when this env var is set
-OCAML_SPACETIME_INTERVAL=100 ./_build/default/bin/main.exe
+# Memory monitoring features:
+# - Automatic leak detection (alerts when heap grows >100MB over 5+ minutes)
+# - Per-domain heap tracking in multicore environments
+# - Allocation rate monitoring
+# - Detailed GC statistics logging every 5 minutes
+# - Automatic GC triggering every 15 minutes to prevent memory creep
+```
 
-# The trace file will be generated as 'spacetime.heap'
-# Analyze the trace (requires spacetime-tools)
-spacetime print spacetime.heap  # Print heap snapshots
-spacetime dot spacetime.heap    # Generate DOT files for visualization
+**Memory Monitoring Output:**
+```
+Memory leak detected: 150.2 MB growth in 420 seconds, triggering GC
+GC Stats: heap=234.5MB live=189.3MB free=45.2MB fragments=12 compactions=3
+Domain 1: heap=156.7MB (last update 12.3s ago)
 ```
 
 ### Memory Monitoring
@@ -149,6 +146,8 @@ The system automatically monitors memory usage and stream depths:
 
 - **Periodic GC**: Automatic garbage collection every 15 minutes
 - **Memory leak detection**: Alerts when heap grows by >100MB over recent readings
+- **Per-domain tracking**: Monitors heap usage across multiple domains in multicore environments
+- **Allocation rate tracking**: Monitors allocation patterns to identify hotspots
 - **Stream depth monitoring**: Warns when event bus streams exceed 100 items
 - **Detailed reporting**: Memory statistics logged every 5 minutes
 
@@ -156,9 +155,23 @@ The system automatically monitors memory usage and stream depths:
 
 **Backpressure Warnings**: If you see "consecutive timeouts" messages, the system is dropping items to prevent memory accumulation.
 
-**Memory Growth**: Check logs for GC activity and memory statistics. Use Memtrace to identify allocation hotspots.
+**Memory Growth**: Check logs for GC activity and memory statistics. The built-in monitoring identifies allocation hotspots and provides detailed heap analysis.
 
 **Stream Depth Warnings**: High stream depths indicate consumers are slower than producers. The system automatically drops old items.
+
+### External Memory Profiling Tools
+
+For additional analysis, consider these external tools (note: these don't work with OCaml 5.1.1 multicore out-of-the-box):
+
+```bash
+# Valgrind (memory leak detection via system call tracing)
+valgrind --tool=memcheck ./_build/default/bin/main.exe
+
+# Heaptrack (memory allocation profiling)
+heaptrack ./_build/default/bin/main.exe
+```
+
+**Future Note**: OCaml 5.3 will include statistical memory profiling (statmemprof) with full multicore support, providing more detailed allocation analysis than the current `Gc.stat()` approach.
 
 ## Logging
 
