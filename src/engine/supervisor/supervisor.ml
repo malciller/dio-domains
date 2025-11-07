@@ -57,6 +57,11 @@ module Token_store = struct
   let get () = Atomic.get token
 end
 
+(** Generate unique ping request ID - start high to avoid conflicts with trading req_ids *)
+let next_ping_req_id =
+  let counter = ref 1000000 in
+  fun () -> incr counter; !counter
+
 
 (** Register a new supervised connection with auto-restart capability *)
 let register ~name ~connect_fn =
@@ -386,7 +391,7 @@ let monitor_loop () =
               (* Send ping asynchronously *)
               conn.last_ping_sent <- Some current_time;
               Lwt.async (fun () ->
-                let req_id = Random.int 1000000 in  (* Simple random req_id for ping *)
+                let req_id = next_ping_req_id () in
                 Lwt.catch
                   (fun () ->
                     Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->

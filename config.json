@@ -2,16 +2,44 @@
   "logging_level": "info",
   "logging_sections": "",
   "metrics_broadcast": {
-    "active": true,
-    "port": 8080,
-    "enable_token_auth": true,
-    "enable_ip_whitelist": true
-  },
+    "active": true, 
+    "port": 8080, 
+    "enable_token_auth": true, 
+    "enable_ip_whitelist": true 
+},   
   "trading": [
     {
       "symbol": "BTC/USD",
       "qty": "0.00025",
       "grid_interval": "0.5",
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "PAXG/USD",
+      "qty": "0.0029",
+      "grid_interval": "1.0",
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "ETH/USD",
+      "qty": "0.003", 
+      "grid_interval": "2.5",
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "SOL/USD",
+      "qty": "0.08",
+      "grid_interval": "2.5",
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "TRX/USD",
+      "qty": "40.0",
+      "grid_interval": "2.5",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
