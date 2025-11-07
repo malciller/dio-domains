@@ -1,5 +1,14 @@
 
 
+(** Enable backtraces for better error reporting *)
+let () = Printexc.record_backtrace true
+
+(** Set up atexit handler for final logging *)
+let () =
+  at_exit (fun () ->
+    Logging.info ~section:"main" "Process exiting - final cleanup complete"
+  )
+
 (** Graceful shutdown flag *)
 let shutdown_requested = Atomic.make false
 let shutdown_condition = Lwt_condition.create ()
@@ -32,6 +41,52 @@ let setup_signal_handlers () =
   in
   Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
   Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_signal)
+
+(** Fatal signal handler for crashes *)
+let setup_fatal_signal_handlers () =
+  let handle_fatal_signal signum =
+    let signal_name = match signum with
+      | 11 -> "SIGSEGV (segmentation fault)"
+      | 6 -> "SIGABRT (abort)"
+      | 7 -> "SIGBUS (bus error)"
+      | 10 -> "SIGBUS (bus error)"  (* Some systems use 10 *)
+      | 8 -> "SIGFPE (floating point exception)"
+      | _ -> Printf.sprintf "signal %d" signum
+    in
+    Logging.critical_f ~section:"main" "Fatal signal received: %s - attempting emergency shutdown" signal_name;
+
+    (* Attempt emergency shutdown *)
+    if not (Atomic.get shutdown_requested) then (
+      Atomic.set shutdown_requested true;
+
+      (* Quick emergency cleanup *)
+      Dio_engine.Domain_spawner.stop_all_domains ();
+      Supervisor.stop_all ();
+      Lwt_condition.broadcast shutdown_condition ();
+
+      Logging.critical ~section:"main" "Emergency shutdown initiated";
+    );
+
+    (* Give a moment for cleanup before exit *)
+    Thread.delay 0.1;
+    Logging.critical_f ~section:"main" "Process terminating due to fatal signal: %s" signal_name;
+    exit 1
+  in
+
+  (* Register handlers for fatal signals - using integer values as OCaml doesn't define them in Sys *)
+  List.iter (fun signal ->
+    Sys.set_signal signal (Sys.Signal_handle handle_fatal_signal)
+  ) [11; 6; 7; 8]  (* SIGSEGV=11, SIGABRT=6, SIGBUS=7, SIGFPE=8 *)
+
+(** Set up Lwt unhandled exception handler *)
+let setup_lwt_exception_handler () =
+  Lwt.async_exception_hook := (fun exn ->
+    let backtrace = Printexc.get_backtrace () in
+    Logging.critical_f ~section:"main" "Unhandled exception in Lwt.async: %s\nBacktrace:\n%s"
+      (Printexc.to_string exn) backtrace;
+    (* Don't re-raise - this would cause the process to exit *)
+    ()
+  )
 
 (** Command line argument parsing - no options needed for metrics broadcast mode *)
 let speclist = []
@@ -110,6 +165,12 @@ let () =
   (* Setup signal handlers for graceful shutdown *)
   setup_signal_handlers ();
 
+  (* Setup fatal signal handlers for crashes *)
+  setup_fatal_signal_handlers ();
+
+  (* Setup Lwt unhandled exception handler *)
+  setup_lwt_exception_handler ();
+
   Logging.info ~section:"main" "Starting Dio Trading Engine with Metrics Broadcast...";
 
   (* Signal that caches are ready before any initialization if metrics broadcast is active *)
@@ -131,20 +192,37 @@ let () =
       Logging.info_f ~section:"main" "Trading engine ready, starting metrics broadcast server on port %d..." config.metrics_broadcast.port;
 
       (* Run server until shutdown signal is received *)
-      Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast shutdown_condition);
+      (try
+        Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast shutdown_condition)
+      with e ->
+        let backtrace = Printexc.get_backtrace () in
+        Logging.critical_f ~section:"main" "Fatal exception in Lwt event loop (metrics broadcast): %s\nBacktrace:\n%s"
+          (Printexc.to_string e) backtrace;
+        exit 1
+      );
 
       Logging.info ~section:"main" "Metrics broadcast server closed gracefully, shutting down...";
     ) else (
       Logging.info ~section:"main" "Trading engine ready, waiting for shutdown signal...";
 
       (* Wait for shutdown signal without starting server *)
-      Lwt_main.run (Lwt_condition.wait shutdown_condition);
+      (try
+        Lwt_main.run (Lwt_condition.wait shutdown_condition)
+      with e ->
+        let backtrace = Printexc.get_backtrace () in
+        Logging.critical_f ~section:"main" "Fatal exception in Lwt event loop (no server): %s\nBacktrace:\n%s"
+          (Printexc.to_string e) backtrace;
+        exit 1
+      );
 
       Logging.info ~section:"main" "Shutdown signal received, shutting down...";
     );
 
     (* Force exit to ensure process terminates even if background tasks are still running *)
+    Logging.info ~section:"main" "Process terminating normally";
     exit 0
   with e ->
-    Logging.error_f ~section:"main" "Exception during startup: %s" (Printexc.to_string e);
-    raise e
+    let backtrace = Printexc.get_backtrace () in
+    Logging.critical_f ~section:"main" "Fatal exception during startup: %s\nBacktrace:\n%s"
+      (Printexc.to_string e) backtrace;
+    exit 1

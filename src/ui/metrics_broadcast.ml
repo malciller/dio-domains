@@ -61,35 +61,32 @@ let close_active_subscription stream_type =
   | Some subscription ->
       begin match subscription.close_stream with
       | Some close_fn ->
-          (* Close the stream asynchronously *)
-          Lwt.async (fun () ->
-            Lwt.catch
-              (fun () ->
-                Logging.debug_f ~section:"broadcast" "Closing %s stream subscription" stream_type;
-                close_fn () >>= fun () ->
-                Logging.debug_f ~section:"broadcast" "Closed %s stream subscription" stream_type;
-                Lwt.return_unit
-              )
-              (fun exn ->
-                Logging.warn_f ~section:"broadcast" "Error closing %s stream subscription: %s" stream_type (Printexc.to_string exn);
-                Lwt.return_unit
-              )
-          );
           (* Remove from tracking immediately *)
           Hashtbl.remove active_subscriptions stream_type;
           Mutex.unlock subscriptions_mutex;
-          true
+          (* Close the stream and return the promise *)
+          Lwt.catch
+            (fun () ->
+              Logging.debug_f ~section:"broadcast" "Closing %s stream subscription" stream_type;
+              close_fn () >>= fun () ->
+              Logging.debug_f ~section:"broadcast" "Closed %s stream subscription" stream_type;
+              Lwt.return_unit
+            )
+            (fun exn ->
+              Logging.warn_f ~section:"broadcast" "Error closing %s stream subscription: %s" stream_type (Printexc.to_string exn);
+              Lwt.return_unit
+            )
       | None ->
           (* No close function, just remove from tracking *)
           Hashtbl.remove active_subscriptions stream_type;
           Mutex.unlock subscriptions_mutex;
           Logging.debug_f ~section:"broadcast" "Removed %s stream subscription from tracking (no close function)" stream_type;
-          false
+          Lwt.return_unit
       end
   | None ->
       Mutex.unlock subscriptions_mutex;
       Logging.debug_f ~section:"broadcast" "No active subscription found for %s stream" stream_type;
-      false
+      Lwt.return_unit
 
 (** Safely close channels with error handling *)
 let safe_close_channels input_channel output_channel =
@@ -355,7 +352,7 @@ let setup_broadcast_subscriptions state =
       Lwt.catch
         (fun () ->
           (* CRITICAL: Close any existing telemetry subscription before creating new one *)
-          ignore (close_active_subscription "telemetry");
+          close_active_subscription "telemetry" >>= fun () ->
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
           Logging.info ~section:"broadcast" "Telemetry stream subscription active";
@@ -394,7 +391,7 @@ let setup_broadcast_subscriptions state =
       Lwt.catch
         (fun () ->
           (* CRITICAL: Close any existing system subscription before creating new one *)
-          ignore (close_active_subscription "system");
+          close_active_subscription "system" >>= fun () ->
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
           Logging.info ~section:"broadcast" "System stream subscription active";
@@ -432,7 +429,7 @@ let setup_broadcast_subscriptions state =
       Lwt.catch
         (fun () ->
           (* CRITICAL: Close any existing balance subscription before creating new one *)
-          ignore (close_active_subscription "balance");
+          close_active_subscription "balance" >>= fun () ->
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
           Logging.info ~section:"broadcast" "Balance stream subscription active";
@@ -470,7 +467,7 @@ let setup_broadcast_subscriptions state =
       Lwt.catch
         (fun () ->
           (* CRITICAL: Close any existing logs subscription before creating new one *)
-          ignore (close_active_subscription "log");
+          close_active_subscription "log" >>= fun () ->
           Lwt_unix.sleep 0.01 >>= fun () ->  (* Brief pause to allow cleanup *)
 
           Logging.info ~section:"broadcast" "Logs stream subscription active";
@@ -595,10 +592,11 @@ let close_all_active_subscriptions () =
   Mutex.lock subscriptions_mutex;
   let stream_types = Hashtbl.fold (fun stream_type _ acc -> stream_type :: acc) active_subscriptions [] in
   Mutex.unlock subscriptions_mutex;
-  List.iter (fun stream_type ->
-    ignore (close_active_subscription stream_type)
-  ) stream_types;
-  Logging.info ~section:"broadcast" "All stream subscriptions closed"
+  (* Collect all close promises and await them *)
+  let close_promises = List.map (fun stream_type -> close_active_subscription stream_type) stream_types in
+  Lwt.join close_promises >>= fun () ->
+  Logging.info ~section:"broadcast" "All stream subscriptions closed";
+  Lwt.return_unit
 
 (** Start the metrics broadcast server *)
 let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown_condition : unit Lwt_condition.t) : unit Lwt.t =
@@ -622,30 +620,42 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown
 
   (* Start periodic cleanup of inactive clients and monitoring *)
   Lwt.async (fun () ->
-    Logging.info ~section:"broadcast" "Starting periodic client cleanup task";
-    let rec cleanup_loop () =
-      let%lwt () = Lwt_unix.sleep 5.0 in (* Clean up every 5 seconds *)
-      let before_cleanup = Hashtbl.length state.clients in
-      cleanup_clients state;
-      let after_cleanup = Hashtbl.length state.clients in
-      let cleaned_count = before_cleanup - after_cleanup in
+    Lwt.catch (fun () ->
+      Logging.info ~section:"broadcast" "Starting periodic client cleanup task";
+      let rec cleanup_loop () =
+        Lwt.catch (fun () ->
+          let%lwt () = Lwt_unix.sleep 5.0 in (* Clean up every 5 seconds *)
+          let before_cleanup = Hashtbl.length state.clients in
+          cleanup_clients state;
+          let after_cleanup = Hashtbl.length state.clients in
+          let cleaned_count = before_cleanup - after_cleanup in
 
-      (* Report metrics for monitoring *)
-      if cleaned_count > 0 then
-        Logging.debug_f ~section:"broadcast" "Cleaned up %d inactive clients, %d total clients remaining" cleaned_count after_cleanup;
+          (* Report metrics for monitoring *)
+          if cleaned_count > 0 then
+            Logging.debug_f ~section:"broadcast" "Cleaned up %d inactive clients, %d total clients remaining" cleaned_count after_cleanup;
 
-      (* Report active client counts *)
-      let active_clients = ref 0 in
-      Hashtbl.iter (fun _ client ->
-        if client.active then incr active_clients
-      ) state.clients;
+          (* Report active client counts *)
+          let active_clients = ref 0 in
+          Hashtbl.iter (fun _ client ->
+            if client.active then incr active_clients
+          ) state.clients;
 
-      Logging.debug_f ~section:"broadcast" "Broadcast status: %d active clients, %d total clients"
-        !active_clients (Hashtbl.length state.clients);
+          Logging.debug_f ~section:"broadcast" "Broadcast status: %d active clients, %d total clients"
+            !active_clients (Hashtbl.length state.clients);
 
+          cleanup_loop ()
+        ) (fun exn ->
+          Logging.error_f ~section:"broadcast" "Exception in cleanup loop: %s, continuing..." (Printexc.to_string exn);
+          (* Brief delay before retrying *)
+          let%lwt () = Lwt_unix.sleep 1.0 in
+          cleanup_loop ()
+        )
+      in
       cleanup_loop ()
-    in
-    cleanup_loop ()
+    ) (fun exn ->
+      Logging.critical_f ~section:"broadcast" "Fatal exception in client cleanup task: %s" (Printexc.to_string exn);
+      Lwt.return_unit
+    )
   );
 
   (* Create TCP server *)
@@ -788,7 +798,7 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown
   Logging.info ~section:"broadcast" "Shutdown signal received, cleaning up...";
 
   (* Close all active stream subscriptions to prevent leaks *)
-  close_all_active_subscriptions ();
+  close_all_active_subscriptions () >>= fun () ->
 
   (* Give a moment for cleanup *)
   Lwt_unix.sleep 0.5 >>= fun () ->

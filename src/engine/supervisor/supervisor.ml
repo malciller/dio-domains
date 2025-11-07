@@ -592,9 +592,15 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         set_state trading_conn (Failed reason);
         (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
         Lwt.async (fun () ->
-          Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
-          start_async trading_conn;
-          Lwt.return_unit)
+          Lwt.catch (fun () ->
+            Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
+            start_async trading_conn;
+            Lwt.return_unit
+          ) (fun exn ->
+            Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" trading_conn.name (Printexc.to_string exn);
+            Lwt.return_unit
+          )
+        )
       in
       let on_connected () = set_state trading_conn Connected in
       Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
