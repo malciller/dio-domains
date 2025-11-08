@@ -115,10 +115,13 @@ module Make (Payload : PAYLOAD) = struct
 
   let await_next bus timeout =
     let subscription = subscribe bus in
-    Lwt.pick [
-      (Lwt_stream.get subscription.stream >|= fun evt -> evt);
-      (Lwt_unix.sleep timeout >|= fun () -> None)
-    ]
+    Lwt.finalize
+      (fun () ->
+        Lwt.pick [
+          (Lwt_stream.get subscription.stream >|= fun evt -> evt);
+          (Lwt_unix.sleep timeout >|= fun () -> None)
+        ])
+      (fun () -> subscription.close (); Lwt.return_unit)
 
   (** Clean up stale subscribers (older than max_age_seconds or unused for too long) *)
   let cleanup_stale_subscribers bus ?(max_age_seconds=300.0) ?(max_unused_seconds=120.0) () =

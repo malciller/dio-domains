@@ -64,7 +64,7 @@ type state = {
   mutable reader: unit Lwt.t option;
   mutable connecting: bool;
   mutable connection_generation: int;
-  responses: (Kraken_common_types.ws_response Lwt.u * string) Response_table.t;  (* wakener * expected_method *)
+  responses: (Kraken_common_types.ws_response Lwt.u * string * float) Response_table.t;  (* wakener * expected_method * timestamp *)
   mutable on_failure: (string -> unit) option;
   connected: bool Atomic.t;
 }
@@ -162,7 +162,7 @@ let resolve_response req_id (response : Kraken_common_types.ws_response) =
   Lwt_mutex.with_lock state.mutex (fun () ->
     let pending_count = Response_table.length state.responses in
     try
-      let wakener, expected_method = Response_table.find state.responses req_id in
+      let wakener, expected_method, _timestamp = Response_table.find state.responses req_id in
       Response_table.remove state.responses req_id;
       Logging.debug_f ~section "Found waiter for req_id=%d (expected_method=%s, remaining pending: %d)"
         req_id expected_method (pending_count - 1);
@@ -203,7 +203,7 @@ let resolve_response req_id (response : Kraken_common_types.ws_response) =
 let fail_all_pending reason =
   let pending =
     Lwt_mutex.with_lock state.mutex (fun () ->
-      let wakers = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
+      let wakers = Response_table.fold (fun _ (wak, _, _) acc -> wak :: acc) state.responses [] in
       Response_table.clear state.responses;
       Lwt.return wakers
     )
@@ -224,7 +224,7 @@ let reset_state conn ~notify_failure reason =
         let new_generation = old_generation + 1 in
         Logging.debug_f ~section "Resetting state: incrementing generation from %d to %d (reason: %s)"
           old_generation new_generation reason;
-        let wakers = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
+        let wakers = Response_table.fold (fun _ (wak, _, _) acc -> wak :: acc) state.responses [] in
         let reader = state.reader in
         let pending_count = Response_table.length state.responses in
         if pending_count > 0 then
@@ -484,9 +484,13 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             Lwt.return (Error (Failure (Printf.sprintf "Request ID collision detected: req_id %d already in use" req_id)))
           end else begin
             let waiter, wakener = Lwt.wait () in
-            Response_table.add state.responses req_id (wakener, expected_method);
+            Response_table.add state.responses req_id (wakener, expected_method, Unix.time ());
+            let pending_count = Response_table.length state.responses in
             Logging.debug_f ~section "Request req_id=%d registered in response table (pending requests: %d)"
-              req_id (Response_table.length state.responses);
+              req_id pending_count;
+            (* Log warning if response table is growing large *)
+            if pending_count > 10 then
+              Logging.warn_f ~section "Response table size is high: %d pending requests" pending_count;
             Lwt.catch
               (fun () ->
                  Logging.debug_f ~section "Request req_id=%d: writing to WebSocket" req_id;
@@ -516,7 +520,6 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
         | `Timeout ->
             (* Track timeout for monitoring *)
             Telemetry.inc_counter (Telemetry.counter "websocket_timeouts" ()) ();
-            Logging.warn_f ~section "Request timeout: req_id=%d, timeout_ms=%d, sent %.3fs ago" req_id timeout_ms timeout;
 
             (* Check if request is still in table before removing *)
             Lwt_mutex.with_lock state.mutex (fun () ->
@@ -524,15 +527,39 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
               if still_pending then begin
                 Response_table.remove state.responses req_id;
                 Logging.debug_f ~section "Request req_id=%d: removed from response table due to timeout" req_id;
+                Lwt.return `Was_pending
               end else begin
-                Logging.debug_f ~section "Request req_id=%d: already removed from response table" req_id;
-              end;
-              Lwt.return_unit) >>= fun () ->
+                Logging.debug_f ~section "Request req_id=%d: already removed from response table - response may have arrived" req_id;
+                Lwt.return `Already_removed
+              end) >>= fun removal_status ->
 
-            (* Cancel the waiter promise to prevent double-wakeup race condition *)
-            Logging.debug_f ~section "Request req_id=%d: cancelling waiter promise" req_id;
-            Lwt.cancel waiter;
-            Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
+            match removal_status with
+            | `Was_pending ->
+                (* Actual timeout - request was still pending *)
+                Logging.warn_f ~section "Request timeout: req_id=%d, timeout_ms=%d, sent %.3fs ago" req_id timeout_ms timeout;
+                Logging.debug_f ~section "Request req_id=%d: cancelling waiter promise due to actual timeout" req_id;
+                Lwt.cancel waiter;
+                Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
+            | `Already_removed ->
+                (* Response may have arrived just before timeout - wait briefly for waiter to resolve *)
+                Logging.debug_f ~section "Request req_id=%d: possible race condition - waiting briefly for response" req_id;
+                Lwt.pick [
+                  waiter >|= (fun response -> `Response response);
+                  Lwt_unix.sleep 0.01 >|= (fun () -> `Still_timeout)
+                ] >>= function
+                | `Response response ->
+                    (* Response arrived after timeout but before we gave up - success! *)
+                    Logging.info_f ~section "Request req_id=%d: recovered from race condition - response arrived after timeout" req_id;
+                    (* Track successful response *)
+                    Telemetry.inc_counter Telemetry.Common.api_requests ();
+                    Logging.debug_f ~section "Request req_id=%d: response received successfully (recovered from timeout)" req_id;
+                    Lwt.return response
+                | `Still_timeout ->
+                    (* Waiter still not resolved - this is an actual timeout despite req_id removal *)
+                    Logging.warn_f ~section "Request timeout (race condition): req_id=%d, timeout_ms=%d, sent %.3fs ago" req_id timeout_ms timeout;
+                    Logging.debug_f ~section "Request req_id=%d: waiter not resolved after race condition wait" req_id;
+                    (* Don't cancel waiter - it might still resolve, but fail this call *)
+                    Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
   end
 
 let get_connection () : Websocket_lwt_unix.conn Lwt.t =
@@ -570,6 +597,58 @@ let connect_and_monitor token ~on_failure ~on_connected = ensure_connection ~on_
 
 let is_connected () = Atomic.get state.connected
 
+(** Clean up stale response table entries (older than 30 seconds) - runs asynchronously *)
+let cleanup_stale_response_entries () =
+  (* Skip cleanup if shutdown is requested or client is not connected *)
+  if Atomic.get shutdown_requested || not (Atomic.get state.connected) then
+    ()
+  else
+    Lwt.async (fun () ->
+      (* Double-check shutdown state before proceeding *)
+      if Atomic.get shutdown_requested then
+        Lwt.return_unit
+      else
+        Lwt.catch
+          (fun () ->
+            let now = Unix.time () in
+            let stale_entries = ref [] in
+            (* Use timeout to prevent hanging if mutex is held for too long *)
+            Lwt.pick [
+              (Lwt_mutex.with_lock state.mutex (fun () ->
+                (* Check shutdown again after acquiring mutex *)
+                if Atomic.get shutdown_requested then
+                  Lwt.return_unit
+                else begin
+                  Response_table.iter (fun req_id (wakener, expected_method, timestamp) ->
+                    if now -. timestamp > 30.0 then
+                      stale_entries := (req_id, wakener, expected_method, timestamp) :: !stale_entries
+                  ) state.responses;
+                  List.iter (fun (req_id, wakener, expected_method, timestamp) ->
+                    Response_table.remove state.responses req_id;
+                    Logging.debug_f ~section "Cleaned up stale response entry for req_id=%d (age: %.1fs, method: %s)" req_id (now -. timestamp) expected_method;
+                    (* Wake up the stale promise to prevent memory leaks *)
+                    try
+                      Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
+                    with Invalid_argument _ ->
+                      Logging.debug_f ~section "Promise for stale req_id=%d was already resolved" req_id
+                  ) !stale_entries;
+                  if !stale_entries <> [] then
+                    Logging.debug_f ~section "Cleaned up %d stale response table entries" (List.length !stale_entries);
+                  Lwt.return_unit
+                end
+              ));
+              (Lwt_unix.sleep 0.1 >|= fun () -> ())  (* 100ms timeout to prevent hanging *)
+            ] >>= fun () ->
+            Lwt.return_unit
+          )
+          (fun exn ->
+            (* Ignore errors during shutdown - they're expected *)
+            if not (Atomic.get shutdown_requested) then
+              Logging.debug_f ~section "Error during response table cleanup: %s" (Printexc.to_string exn);
+            Lwt.return_unit
+          )
+    )
+
 let close () : unit Lwt.t =
   Lwt_mutex.with_lock state.mutex (fun () ->
     match state.conn with
@@ -579,7 +658,7 @@ let close () : unit Lwt.t =
         state.reader <- None;
         state.connecting <- false;
         Atomic.set state.connected false;
-        let pending = Response_table.fold (fun _ (wak, _) acc -> wak :: acc) state.responses [] in
+        let pending = Response_table.fold (fun _ (wak, _, _) acc -> wak :: acc) state.responses [] in
         Response_table.clear state.responses;
         Lwt.return (Some (conn_with_gen.conn, pending))
   ) >>= function
