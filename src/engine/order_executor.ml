@@ -51,14 +51,15 @@ module InFlightAmendments = struct
     let equal = String.equal
     let hash = Hashtbl.hash
   end)(struct
-    type t = unit (* We only need to track presence *)
+    type t = float (* timestamp when amendment was added *)
   end)
 
   let registry = Registry.create ()
 
   (** Check if an amendment is already in-flight and add it if not *)
   let add_in_flight_amendment order_id =
-    match Registry.replace registry order_id () with
+    let now = Unix.gettimeofday () in
+    match Registry.replace registry order_id now with
     | Some (_, true) -> false (* Already existed *)
     | Some (_, false) -> true (* Added successfully *)
     | None -> false (* Should not happen *)
@@ -70,6 +71,26 @@ module InFlightAmendments = struct
   (** Get the current size of the in-flight amendments registry *)
   let get_registry_size () =
     Registry.size registry
+
+  (** Clean up stale in-flight amendments (older than timeout_seconds) *)
+  let cleanup_stale_amendments ?(timeout_seconds=30.0) () =
+    let now = Unix.gettimeofday () in
+    let cutoff = now -. timeout_seconds in
+    let cleaned = ref 0 in
+
+    (* Get all current amendments *)
+    let snapshot = Registry.snapshot registry in
+    Registry.Tbl.iter (fun order_id timestamp ->
+      if timestamp < cutoff then (
+        (* Remove stale amendment *)
+        if Registry.remove registry order_id |> Option.is_some then (
+          incr cleaned;
+          Logging.debug_f ~section:"in_flight_amendments" "Cleaned up stale in-flight amendment for order %s (age: %.1fs)" order_id (now -. timestamp)
+        )
+      )
+    ) snapshot;
+
+    !cleaned
 end
 
 (** Order type definitions *)

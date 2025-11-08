@@ -338,6 +338,14 @@ let publish_initial_snapshot () =
   safe_broadcast_update_condition cache;
   Logging.debug_f ~section:"balance_cache" "Initial balance snapshot published with timestamp %.2f" initial_timestamp
 
+(** Force cleanup stale subscribers for dashboard memory management *)
+let force_cleanup_stale_subscribers () =
+  BalanceSnapshotEventBus.force_cleanup_stale_subscribers cache.balance_snapshot_event_bus ()
+
+(** Get current subscriber count for memory monitoring *)
+let get_subscriber_count () =
+  BalanceSnapshotEventBus.get_subscriber_count cache.balance_snapshot_event_bus
+
 (** Start event-driven balance updater (subscribes to balance and order events) *)
 let start_balance_updater () =
   Logging.debug_f ~section:"balance_cache" "Starting event-driven balance updater";
@@ -425,16 +433,17 @@ let start_balance_updater () =
     Lwt.return_unit
   );
 
-  (* Start periodic updater that publishes snapshots even when balances/orders haven't changed *)
-  Lwt.async (fun () ->
+(* Start periodic updater that publishes snapshots even when balances/orders haven't changed *)
+Lwt.async (fun () ->
     Logging.debug ~section:"balance_cache" "Starting periodic balance updater";
-    
+    let cleanup_counter = ref 0 in
+
     (* Wait for Kraken feeds to be ready *)
     (if !kraken_feeds_ready then
       Lwt.return_unit
     else
       Lwt_condition.wait kraken_feeds_condition) >>= fun () ->
-    
+
     let rec periodic_loop () =
       (* Check for shutdown request *)
       if Atomic.get shutdown_requested then (
@@ -443,16 +452,18 @@ let start_balance_updater () =
       ) else (
         (* Update cache periodically (this will check if enough time has passed) *)
         update_balance_cache_periodic ();
+        (* Force cleanup stale subscribers every 30 seconds (every 30 iterations) *)
+        cleanup_counter := !cleanup_counter + 1;
+        if !cleanup_counter >= 30 then begin
+          let _ = force_cleanup_stale_subscribers () in
+          cleanup_counter := 0;
+        end;
         (* Sleep 1 second and continue *)
         Lwt_unix.sleep 1.0 >>= periodic_loop
       )
     in
     periodic_loop ()
   )
-
-(** Force cleanup stale subscribers for dashboard memory management *)
-let force_cleanup_stale_subscribers () =
-  BalanceSnapshotEventBus.force_cleanup_stale_subscribers cache.balance_snapshot_event_bus ()
 
 (** Initialize the balance cache system with double-checked locking *)
 let init () =

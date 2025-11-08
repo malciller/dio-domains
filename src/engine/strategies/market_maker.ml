@@ -56,6 +56,61 @@ type strategy_state = {
 let strategy_states : (string, strategy_state) Hashtbl.t = Hashtbl.create 16
 let strategy_states_mutex = Mutex.create ()
 
+(** Periodic deep cleanup for memory management - called from system cache *)
+let perform_deep_cleanup () =
+  let cleaned_total = ref 0 in
+  let now = Unix.time () in
+
+  Mutex.lock strategy_states_mutex;
+  Hashtbl.iter (fun asset_symbol state ->
+    (* Clean up very old cancelled orders (older than 60 seconds) *)
+    let original_cancelled_count = List.length state.cancelled_orders in
+    state.cancelled_orders <- List.filter (fun (_, timestamp) ->
+      now -. timestamp < 60.0
+    ) state.cancelled_orders;
+    let cancelled_cleaned = original_cancelled_count - List.length state.cancelled_orders in
+
+    (* Clean up very old pending cancellations (older than 60 seconds) *)
+    let pending_cancellations = Hashtbl.fold (fun order_id timestamp acc ->
+      if now -. timestamp > 60.0 then
+        acc
+      else
+        (order_id, timestamp) :: acc
+    ) state.pending_cancellations [] in
+
+    (* Enforce strict limits during deep cleanup *)
+    let max_cancelled = 10 in
+    let max_pending = 25 in
+
+    if List.length state.cancelled_orders > max_cancelled then begin
+      state.cancelled_orders <- take max_cancelled state.cancelled_orders;
+    end;
+
+    let pending_cancellations =
+      if List.length pending_cancellations > max_pending then begin
+        let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t2 t1) pending_cancellations in
+        take max_pending sorted
+      end else
+        pending_cancellations
+    in
+
+    (* Clear and repopulate hashtable *)
+    Hashtbl.clear state.pending_cancellations;
+    List.iter (fun (order_id, timestamp) ->
+      Hashtbl.add state.pending_cancellations order_id timestamp
+    ) pending_cancellations;
+
+    let pending_cleaned = Hashtbl.length state.pending_cancellations - List.length pending_cancellations in
+
+    if cancelled_cleaned > 0 || pending_cleaned > 0 then begin
+      Logging.debug_f ~section "Deep cleanup for %s: removed %d cancelled, %d pending" asset_symbol cancelled_cleaned pending_cleaned;
+      cleaned_total := !cleaned_total + cancelled_cleaned + pending_cleaned;
+    end;
+  ) strategy_states;
+  Mutex.unlock strategy_states_mutex;
+
+  !cleaned_total
+
 (** Get or create strategy state for an asset *)
 let get_strategy_state asset_symbol =
   Mutex.lock strategy_states_mutex;
@@ -366,7 +421,7 @@ let execute_strategy
     if should_log then Logging.warn_f ~section "Truncated %d excess cancelled orders for %s (kept 20)" excess asset.symbol;
   end;
 
-  (* Clean up old pending cancellations (older than 30 seconds) *)
+  (* Clean up old pending cancellations (older than 30 seconds) and enforce hard size limit *)
   let pending_cancellations = Hashtbl.fold (fun order_id timestamp acc ->
     if now -. timestamp > 30.0 then begin
       if should_log then Logging.debug_f ~section "Removing stale pending cancellation %s for %s (age: %.1fs)" order_id asset.symbol (now -. timestamp);
@@ -374,6 +429,19 @@ let execute_strategy
     end else
       (order_id, timestamp) :: acc
   ) state.pending_cancellations [] in
+
+  (* Enforce hard limit of 50 pending cancellations to prevent unbounded growth *)
+  let max_pending_cancellations = 50 in
+  let pending_cancellations =
+    if List.length pending_cancellations > max_pending_cancellations then begin
+      let excess = List.length pending_cancellations - max_pending_cancellations in
+      let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t2 t1) pending_cancellations in (* Most recent first *)
+      let kept = take max_pending_cancellations sorted in
+      if should_log then Logging.warn_f ~section "Truncated %d excess pending cancellations for %s (kept %d)" excess asset.symbol max_pending_cancellations;
+      kept
+    end else
+      pending_cancellations
+  in
 
   (* Clear and repopulate the hashtable with only non-stale entries *)
   Hashtbl.clear state.pending_cancellations;

@@ -162,6 +162,10 @@ module Make (Payload : PAYLOAD) = struct
     try_cleanup ()
 
   (** Get subscriber statistics for monitoring *)
+  let get_subscriber_count bus =
+    let subs = Atomic.get bus.subscribers in
+    List.length subs
+
   let get_subscriber_stats bus =
     let subs = Atomic.get bus.subscribers in
     let now = Unix.time () in

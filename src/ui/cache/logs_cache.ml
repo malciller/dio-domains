@@ -76,6 +76,10 @@ let get_logs_subscriber_stats () =
 let force_cleanup_stale_subscribers () =
   LogEntryEventBus.force_cleanup_stale_subscribers cache.log_entry_event_bus ()
 
+(** Get current subscriber count for memory monitoring *)
+let get_subscriber_count () =
+  LogEntryEventBus.get_subscriber_count cache.log_entry_event_bus
+
 (** Format timestamp for display *)
 let format_display_timestamp () =
   let time = Unix.gettimeofday () in
@@ -281,6 +285,8 @@ let start_logs_updater () =
       Telemetry.set_logs_dropped_count dropped_count;
       (* Perform periodic integrity check on entry_keys queue *)
       check_entry_keys_integrity ();
+      (* Force cleanup stale subscribers every 30 seconds *)
+      let _ = force_cleanup_stale_subscribers () in
       monitoring_loop ()
     in
     monitoring_loop ()

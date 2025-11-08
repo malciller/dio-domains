@@ -807,6 +807,10 @@ let generate_memory_diagnostic_report () =
 
   Logging.info ~section:"memory_monitoring" "=== END MEMORY DIAGNOSTIC REPORT ==="
 
+(** Get current subscriber count for memory monitoring *)
+let get_system_stats_subscriber_count () =
+  SystemStatsEventBus.get_subscriber_count cache.system_stats_event_bus
+
 (** Periodic memory maintenance *)
 let perform_memory_maintenance () =
   (* Skip cleanup operations during shutdown to avoid deadlocks *)
@@ -861,8 +865,69 @@ let perform_memory_maintenance () =
     (* Clean up stale response table entries in trading client *)
     Kraken.Kraken_trading_client.cleanup_stale_response_entries ();
 
+    (* Clean up Kraken execution feed data structures *)
+    let kraken_cleaned = Kraken.Kraken_executions_feed.cleanup_stale_entries () in
+
+    (* Clean up in-flight amendments *)
+    let amendments_cleaned = Dio_engine.Order_executor.Test.InFlightAmendments.cleanup_stale_amendments () in
+
+    (* Clean up strategy state hashtables *)
+    let market_maker_cleaned = Dio_strategies.Market_maker.perform_deep_cleanup () in
+    let suicide_grid_cleaned = Dio_strategies.Suicide_grid.perform_deep_cleanup () in
+
+    (* Clean up sliding counters *)
+    let sliding_cleaned = Telemetry.perform_sliding_counter_cleanup () in
+
+    (* Update memory leak detection metrics - collect values first, then set gauges to avoid nested mutex locks *)
+    (try
+       (* Collect all values first *)
+       let kraken_open_orders, kraken_order_to_symbol = Kraken.Kraken_executions_feed.get_memory_stats () in
+       let market_maker_states = Hashtbl.length Dio_strategies.Market_maker.strategy_states in
+       let suicide_grid_states = Hashtbl.length Dio_strategies.Suicide_grid.strategy_states in
+       let telemetry_subscribers = Telemetry_cache.get_subscriber_count () in
+       let balance_subscribers = Balance_cache.get_subscriber_count () in
+       let logs_subscribers = Logs_cache.get_subscriber_count () in
+       let system_stats_subscribers = get_system_stats_subscriber_count () in
+
+       (* Now set all gauges - these acquire metrics_mutex individually *)
+       Telemetry.set_kraken_total_open_orders kraken_open_orders;
+       Telemetry.set_kraken_order_to_symbol_size kraken_order_to_symbol;
+       Telemetry.set_market_maker_strategy_states market_maker_states;
+       Telemetry.set_suicide_grid_strategy_states suicide_grid_states;
+       Telemetry.set_telemetry_event_bus_subscribers telemetry_subscribers;
+       Telemetry.set_balance_event_bus_subscribers balance_subscribers;
+       Telemetry.set_logs_event_bus_subscribers logs_subscribers;
+       Telemetry.set_system_stats_event_bus_subscribers system_stats_subscribers;
+
+       (* Log memory leak detection metrics *)
+       Logging.debug_f ~section:"memory_leak_detection"
+         "Data structure sizes: Kraken(open_orders=%d, order_to_symbol=%d), Strategies(market_maker=%d, suicide_grid=%d), EventBus(telemetry=%d, balance=%d, logs=%d, system=%d)"
+         kraken_open_orders kraken_order_to_symbol market_maker_states suicide_grid_states
+         telemetry_subscribers balance_subscribers logs_subscribers system_stats_subscribers;
+
+       (* Check for concerning sizes *)
+       let warning_threshold = 1000 in
+       let critical_threshold = 5000 in
+
+       if kraken_order_to_symbol > critical_threshold then
+         Logging.warn_f ~section:"memory_leak_detection" "CRITICAL: Kraken order_to_symbol size is %d (exceeds %d limit)" kraken_order_to_symbol critical_threshold
+       else if kraken_order_to_symbol > warning_threshold then
+         Logging.warn_f ~section:"memory_leak_detection" "WARNING: Kraken order_to_symbol size is %d (approaching %d limit)" kraken_order_to_symbol critical_threshold;
+
+       if kraken_open_orders > critical_threshold then
+         Logging.warn_f ~section:"memory_leak_detection" "CRITICAL: Kraken total open orders is %d (exceeds %d limit)" kraken_open_orders critical_threshold
+       else if kraken_open_orders > warning_threshold then
+         Logging.warn_f ~section:"memory_leak_detection" "WARNING: Kraken total open orders is %d (approaching %d limit)" kraken_open_orders critical_threshold;
+
+    with exn ->
+       Logging.debug_f ~section:"memory_leak_detection" "Failed to collect memory leak detection metrics: %s" (Printexc.to_string exn));
+
     (* Check for memory leaks *)
     check_memory_leak ();
+
+    (* Log cleanup summary *)
+    Logging.info_f ~section:"memory_maintenance" "Comprehensive cleanup completed: %d Kraken entries, %d amendments, %d market maker, %d suicide grid, %d sliding counters"
+      kraken_cleaned amendments_cleaned market_maker_cleaned suicide_grid_cleaned sliding_cleaned;
 
     (* Log detailed memory stats every 10 seconds *)
     let time_since_last_log = now -. !last_memory_log_time in
@@ -1336,14 +1401,28 @@ let start_system_updater () =
         Telemetry.update_system_metrics ();
         (* Update system stats cache with computed metrics *)
         let%lwt () = update_system_stats_cache_lwt () in
-        (* Perform periodic memory maintenance *)
-        perform_memory_maintenance ();
         (* Continue computing metrics periodically *)
         Lwt_unix.sleep 1.0 >>= compute_loop
       )
     in
     compute_loop ()
   ) in
+
+  (* Start periodic memory maintenance (every 45 seconds) *)
+  let _memory_maintenance = Lwt.async (fun () ->
+    let rec maintenance_loop () =
+      if Atomic.get shutdown_requested then
+        Lwt.return_unit
+      else begin
+        (* Perform comprehensive memory maintenance *)
+        perform_memory_maintenance ();
+        Lwt_unix.sleep 45.0 >>= maintenance_loop
+      end
+    in
+    (* Wait 10 seconds before starting maintenance loop *)
+    Lwt_unix.sleep 10.0 >>= maintenance_loop
+  ) in
+
   ()
 
 

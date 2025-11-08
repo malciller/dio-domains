@@ -32,7 +32,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   
   (* Create telemetry metrics for this asset *)
   let asset_label = asset_with_fees.exchange ^ "/" ^ asset_with_fees.symbol in
-  let cycles_counter = Telemetry.asset_counter "domain_cycles" asset_label ~track_rate:true ~rate_window:30.0 () in
+  let cycles_counter = Telemetry.asset_sliding_counter "domain_cycles" asset_label ~window_size:2000 ~track_rate:true ~rate_window:30.0 () in
   let cycle_duration_hist = Telemetry.asset_histogram "domain_cycle_duration_seconds" asset_label () in
   let open_buy_orders_gauge = Telemetry.asset_gauge "open_buy_orders" asset_label in
   let open_sell_orders_gauge = Telemetry.asset_gauge "open_sell_orders" asset_label in
@@ -450,7 +450,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         else
           (0, 0)
       in
-      Telemetry.inc_counter cycles_counter ~value:1000 ();
+      Telemetry.inc_sliding_counter cycles_counter ~value:1000 ();
       Telemetry.set_gauge open_buy_orders_gauge (float_of_int open_buy_count);
       Telemetry.set_gauge open_sell_orders_gauge (float_of_int open_sell_count);
       telemetry_batch := 0

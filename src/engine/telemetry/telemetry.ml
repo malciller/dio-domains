@@ -32,6 +32,7 @@ type rate_tracker = {
   samples: rate_buffer;
   window_seconds: float;
   mutable samples_since_cleanup: int;  (* Track samples added since last cleanup *)
+  mutable previous_value: int;  (* Store previous counter value for delta calculation *)
 }
 
 (** Bounded circular buffer for histogram samples *)
@@ -50,12 +51,14 @@ type memory_config = {
   mutable rate_buffer_capacity: int;
   mutable histogram_capacity: int;
   mutable last_adjustment: float;
+  mutable last_global_reset_time: float;
 }
 
 let memory_config = {
   rate_buffer_capacity = 200;
   histogram_capacity = 15000;
   last_adjustment = 0.0;
+  last_global_reset_time = 0.0;
 }
 
 (** Mutex to protect memory_config access from race conditions *)
@@ -171,6 +174,30 @@ type metric = {
 let metrics : (string, metric) Hashtbl.t = Hashtbl.create 128
 let metrics_mutex = Mutex.create ()
 let metrics_changed_condition = Lwt_condition.create ()
+
+(** Helper function to acquire mutex with timeout to detect deadlocks *)
+let lock_mutex_with_timeout mutex timeout_seconds name =
+  let start_time = Unix.gettimeofday () in
+  let rec try_lock attempts =
+    if attempts > 10 then (* Give up after 10 attempts *)
+      failwith (Printf.sprintf "Failed to acquire %s mutex after %.1fs (possible deadlock)" name timeout_seconds)
+    else
+      try
+        Mutex.lock mutex;
+        let elapsed = Unix.gettimeofday () -. start_time in
+        if elapsed > 0.1 then (* Log if it took more than 100ms *)
+          Logging.debug_f ~section:"mutex_lock" "Slow mutex acquisition for %s: %.3fs" name elapsed
+      with Sys_error _ -> (* Mutex is locked *)
+        let elapsed = Unix.gettimeofday () -. start_time in
+        if elapsed > timeout_seconds then
+          failwith (Printf.sprintf "Timeout acquiring %s mutex after %.1fs (possible deadlock)" name elapsed)
+        else begin
+          (* Brief sleep and retry *)
+          Thread.delay 0.01;
+          try_lock (attempts + 1)
+        end
+  in
+  try_lock 0
 
 (** Event bus for metric changes (stream-based subscription) *)
 module MetricChangeEventBus = Event_bus.Make(struct
@@ -292,6 +319,14 @@ let gauge name ?(labels=[]) () =
   Mutex.unlock metrics_mutex;
   metric
 
+(** Internal gauge update - assumes metrics_mutex is already held *)
+let set_gauge_unsafe metric value =
+  match metric.metric_type with
+  | Gauge r ->
+      r := value;
+      metric.last_updated <- Unix.gettimeofday ()
+  | _ -> ()
+
 let set_gauge metric value =
   match metric.metric_type with
   | Gauge r ->
@@ -389,8 +424,177 @@ let adjust_buffer_capacities () =
   set_gauge rate_capacity_metric (float_of_int current_rate_capacity);
   set_gauge histogram_capacity_metric (float_of_int current_histogram_capacity)
 
+(** Reset counter to zero and clear rate tracker samples *)
+let reset_counter metric =
+  match metric.metric_type with
+  | Counter r ->
+      Mutex.lock metrics_mutex;
+      r := 0;
+      metric.last_updated <- Unix.gettimeofday ();
+      (* Clear rate tracker samples if present *)
+      (match metric.rate_tracker with
+       | Some tracker ->
+           tracker.samples.size <- 0;
+           tracker.samples.write_pos <- 0;
+           tracker.samples_since_cleanup <- 0;
+           tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
+           (* Clear the samples array *)
+           for i = 0 to Array.length tracker.samples.data - 1 do
+             tracker.samples.data.(i) <- None
+           done
+       | None -> ());
+      Mutex.unlock metrics_mutex;
+      safe_broadcast_metrics_changed ()
+  | SlidingCounter sliding ->
+      Mutex.lock metrics_mutex;
+      sliding.current_window := [];
+      sliding.total_count := 0;
+      sliding.last_cleanup := Unix.gettimeofday ();
+      metric.last_updated <- Unix.gettimeofday ();
+      (* Clear rate tracker samples if present *)
+      (match metric.rate_tracker with
+       | Some tracker ->
+           tracker.samples.size <- 0;
+           tracker.samples.write_pos <- 0;
+           tracker.samples_since_cleanup <- 0;
+           tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
+           (* Clear the samples array *)
+           for i = 0 to Array.length tracker.samples.data - 1 do
+             tracker.samples.data.(i) <- None
+           done
+       | None -> ());
+      Mutex.unlock metrics_mutex;
+      safe_broadcast_metrics_changed ()
+  | _ -> ()
+
+let get_counter metric =
+  Mutex.lock metrics_mutex;
+  let result = match metric.metric_type with
+  | Counter r -> !r
+  | SlidingCounter sliding -> !(sliding.total_count)
+  | _ -> 0
+  in
+  Mutex.unlock metrics_mutex;
+  result
+
+(** Reset counters that exceed thresholds or should be periodically reset *)
+let reset_large_counters () =
+  (* Track memory usage before cleanup *)
+  let mem_before = Gc.stat () in
+  let heap_before = mem_before.heap_words * (Sys.word_size / 8) in
+
+  let now = Unix.gettimeofday () in
+  let reset_value_threshold = 50_000_000 in  (* 50 million *)
+  let high_frequency_names = ["strategy_orders_generated"; "strategy_orders_dropped"] in
+
+  (* Check if it's time for a global reset (every 1 minute) *)
+  lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config";
+  let global_reset_due = now -. memory_config.last_global_reset_time > 60.0 in
+  if global_reset_due then
+    memory_config.last_global_reset_time <- now;
+  Mutex.unlock memory_config_mutex;
+
+  (* CRITICAL: Minimize mutex hold time to prevent deadlocks
+     First pass: collect metrics that need resetting while holding mutex briefly *)
+  let metrics_to_reset = ref [] in
+  lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
+  Hashtbl.iter (fun key metric ->
+    let should_reset = match metric.metric_type with
+      | Counter r ->
+          (* Global reset every 5 minutes OR *)
+          global_reset_due ||
+          (* Reset counters exceeding threshold *)
+          !r > reset_value_threshold ||
+          (* Reset high-frequency counters every minute *)
+          (List.mem metric.name high_frequency_names &&
+           now -. metric.last_updated > 60.0)
+      | SlidingCounter sliding ->
+          (* Global reset every 5 minutes OR *)
+          global_reset_due ||
+          (* Reset sliding counters exceeding threshold *)
+          !(sliding.total_count) > reset_value_threshold ||
+          (* Reset high-frequency counters every minute *)
+          (List.mem metric.name high_frequency_names &&
+           now -. metric.last_updated > 60.0)
+      | _ -> false
+    in
+    if should_reset then
+      metrics_to_reset := (key, metric) :: !metrics_to_reset
+  ) metrics;
+  Mutex.unlock metrics_mutex;
+
+  (* Second pass: reset each metric individually with minimal lock time *)
+  let reset_count = ref 0 in
+  List.iter (fun (_, metric) ->
+    let old_value = get_counter metric in
+
+    (* Reset metric with minimal mutex hold time *)
+    Mutex.lock metrics_mutex;
+    (match metric.metric_type with
+     | Counter r ->
+         r := 0;
+         (* Clear rate tracker samples if present - all operations inside mutex for thread safety *)
+         (match metric.rate_tracker with
+          | Some tracker ->
+              tracker.samples.size <- 0;
+              tracker.samples.write_pos <- 0;
+              tracker.samples_since_cleanup <- 0;
+              tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
+              (* Clear the samples array - keep inside mutex to prevent races with concurrent writes *)
+              for i = 0 to Array.length tracker.samples.data - 1 do
+                tracker.samples.data.(i) <- None
+              done
+          | None -> ())
+     | SlidingCounter sliding ->
+         sliding.current_window := [];
+         sliding.total_count := 0;
+         sliding.last_cleanup := now;
+         (* Clear rate tracker samples if present *)
+         (match metric.rate_tracker with
+          | Some tracker ->
+              tracker.samples.size <- 0;
+              tracker.samples.write_pos <- 0;
+              tracker.samples_since_cleanup <- 0;
+              tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
+              (* Clear the samples array - keep inside mutex to prevent races with concurrent writes *)
+              for i = 0 to Array.length tracker.samples.data - 1 do
+                tracker.samples.data.(i) <- None
+              done
+          | None -> ())
+     | _ -> ());
+    metric.last_updated <- now;
+    Mutex.unlock metrics_mutex;
+
+    incr reset_count;
+    Logging.info_f ~section "Reset counter %s (was %d)" metric.name old_value
+  ) !metrics_to_reset;
+
+  let total_counters = Hashtbl.length metrics in
+
+  (* Track memory usage after cleanup *)
+  let mem_after = Gc.stat () in
+  let heap_after = mem_after.heap_words * (Sys.word_size / 8) in
+  let memory_freed_bytes = heap_before - heap_after in
+  let memory_freed_mb = float_of_int memory_freed_bytes /. (1024.0 *. 1024.0) in
+
+  (* Always log that the function ran *)
+  let reset_reason = if global_reset_due then "global reset" else "thresholds" in
+  Logging.info_f ~section "Reset counters check: %d/%d counters reset (%s), memory freed: %.2fMB"
+    !reset_count total_counters reset_reason memory_freed_mb;
+
+  (* Broadcast metrics changed if any counters were reset *)
+  if !reset_count > 0 then begin
+    safe_broadcast_metrics_changed ();
+    (* Trigger GC to free memory from reset counter rate trackers *)
+    Gc.full_major ()
+  end
+
 (** Prune stale metrics and cap total count to prevent unbounded growth *)
 let prune_stale_metrics () =
+  (* Track memory usage before cleanup *)
+  let mem_before = Gc.stat () in
+  let heap_before = mem_before.heap_words * (Sys.word_size / 8) in
+
   Mutex.lock metrics_mutex;
   let now = Unix.gettimeofday () in
   let stale_cutoff = now -. metric_stale_ttl_seconds in
@@ -427,35 +631,58 @@ let prune_stale_metrics () =
   let final_count = Hashtbl.length metrics in
   Mutex.unlock metrics_mutex;
 
-  (* Log summary if we removed anything *)
-  if stale_removed > 0 || to_remove_more > 0 then
-    Logging.info_f ~section "Pruned stale metrics: removed %d stale + %d oldest, total metrics: %d/%d"
-      stale_removed to_remove_more final_count total_count
+  (* Track memory usage after cleanup *)
+  let mem_after = Gc.stat () in
+  let heap_after = mem_after.heap_words * (Sys.word_size / 8) in
+  let memory_freed_bytes = heap_before - heap_after in
+  let memory_freed_mb = float_of_int memory_freed_bytes /. (1024.0 *. 1024.0) in
 
-(** Start event-driven capacity adjustment loop *)
+  (* Always log the prune operation, even if nothing was removed *)
+  Logging.info_f ~section "Pruned stale metrics: removed %d stale + %d oldest, total metrics: %d/%d, memory freed: %.2fMB"
+    stale_removed to_remove_more final_count total_count memory_freed_mb;
+
+  (* Trigger GC to free memory from removed metrics *)
+  if stale_removed > 0 || to_remove_more > 0 then
+    Gc.full_major ()
+
+(** Start periodic capacity adjustment loop *)
 let start_capacity_adjuster () =
   Lwt.async (fun () ->
-    let rec adjustment_loop () =
-      (* Wait for any metric change *)
-      Lwt_condition.wait metrics_changed_condition >>= fun () ->
+    (* Add startup delay to ensure initialization completes before capacity adjuster runs *)
+    let%lwt () = Lwt_unix.sleep 10.0 in
 
-      (* Check if 60 seconds have passed since last adjustment *)
+    let rec adjustment_loop last_run_time =
       let now = Unix.gettimeofday () in
-      Mutex.lock memory_config_mutex;
-      let time_since_last = now -. memory_config.last_adjustment in
-      Mutex.unlock memory_config_mutex;
+      let time_since_last = now -. last_run_time in
 
+      (* Always run if 60 seconds have passed, regardless of metric changes *)
       if time_since_last >= 60.0 then begin
         (* Perform adjustment *)
         adjust_buffer_capacities ();
         (* Also prune stale metrics *)
-        prune_stale_metrics ()
-      end;
+        prune_stale_metrics ();
+        (* Reset large counters to prevent unbounded growth *)
+        reset_large_counters ();
 
-      (* Continue listening *)
-      adjustment_loop ()
+        (* Update last run time *)
+        lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config";
+        memory_config.last_adjustment <- now;
+        Mutex.unlock memory_config_mutex;
+
+        (* Continue with updated time *)
+        adjustment_loop now
+      end else begin
+        (* Wait for either metric change or timeout to reach 60 seconds *)
+        let wait_for_condition = Lwt_condition.wait metrics_changed_condition in
+        let remaining_time = 60.0 -. time_since_last in
+        let timeout = Lwt_unix.sleep remaining_time in
+
+        Lwt.pick [wait_for_condition; timeout] >>= fun () ->
+        adjustment_loop last_run_time
+      end
     in
-    adjustment_loop ()
+    (* Start with current time as last run time *)
+    adjustment_loop (Unix.gettimeofday ())
   )
 
 (** Histogram - track distribution of values *)
@@ -543,7 +770,7 @@ let record_duration_v2 metric timer =
 let start_time = ref (Unix.time ())
 
 (** Sliding window counter for high-frequency metrics *)
-let sliding_counter name ?(labels=[]) ?(window_size=1000) ?(track_rate=false) ?(rate_window=10.0) () =
+let sliding_counter name ?(labels=[]) ?(window_size=500) ?(track_rate=false) ?(rate_window=10.0) () =
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
   let metric =
@@ -555,6 +782,7 @@ let sliding_counter name ?(labels=[]) ?(window_size=1000) ?(track_rate=false) ?(
             samples = create_rate_buffer ();  (* Capacity managed by memory_config *)
             window_seconds = rate_window;
             samples_since_cleanup = 0;
+            previous_value = 0;  (* Start with 0 as previous value *)
           }
         else None in
         let sliding = {
@@ -630,7 +858,10 @@ let inc_sliding_counter metric ?(value=1) () =
       (* Update rate tracker if enabled *)
       (match metric.rate_tracker with
        | Some tracker ->
-           let sample = { timestamp = now; value = !(sliding.total_count) } in
+           let current_value = !(sliding.total_count) in
+           let delta = current_value - tracker.previous_value in
+           tracker.previous_value <- current_value;
+           let sample = { timestamp = now; value = delta } in
            add_rate_sample tracker.samples sample;
            tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
            (* Filter old samples periodically *)
@@ -692,6 +923,8 @@ let inc_sliding_counter metric ?(value=1) () =
               end
             end;
           Mutex.unlock metrics_mutex;
+          (* Trigger GC after sliding counter cleanup to free memory *)
+          Gc.full_major ();
         end;
 
       safe_broadcast_metrics_changed ()
@@ -716,6 +949,7 @@ let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
             samples = create_rate_buffer ();  (* Capacity managed by memory_config *)
             window_seconds = rate_window;
             samples_since_cleanup = 0;
+            previous_value = 0;  (* Start with 0 as previous value *)
           }
         else None in
         let m = {
@@ -744,7 +978,9 @@ let inc_counter metric ?(value=1) () =
       (* Update rate tracker if enabled *)
       (match metric.rate_tracker with
        | Some tracker ->
-           let sample = { timestamp = now; value = !r } in
+           let delta = !r - tracker.previous_value in
+           tracker.previous_value <- !r;
+           let sample = { timestamp = now; value = delta } in
            add_rate_sample tracker.samples sample;
            tracker.samples_since_cleanup <- tracker.samples_since_cleanup + 1;
            (* Filter old samples periodically *)
@@ -765,13 +1001,6 @@ let inc_counter metric ?(value=1) () =
       safe_broadcast_metrics_changed ()
   | _ -> ()
 
-let get_counter metric =
-  match metric.metric_type with
-  | Counter r -> !r
-  | SlidingCounter sliding -> !(sliding.total_count)
-  | _ -> 0
-
-(** Initialize basic system metrics *)
 let () =
   (* Create some initial metrics to ensure the dashboard has data *)
   ignore (gauge "uptime_seconds" ())
@@ -833,10 +1062,86 @@ end
 
 (** Per-asset metrics helper *)
 let asset_counter name asset ?(track_rate=false) ?(rate_window=10.0) () = counter name ~labels:["asset", asset] ~track_rate ~rate_window ()
-let asset_sliding_counter name asset ?(window_size=10000) ?(track_rate=false) ?(rate_window=10.0) () =
+let asset_sliding_counter name asset ?(window_size=1000) ?(track_rate=false) ?(rate_window=10.0) () =
   sliding_counter name ~labels:["asset", asset] ~window_size ~track_rate ~rate_window ()
 let asset_gauge name asset = gauge name ~labels:["asset", asset] ()
 let asset_histogram name asset () = histogram name ~labels:["asset", asset] ()
+
+(** Periodic deep cleanup of sliding counters - called from memory maintenance *)
+let perform_sliding_counter_cleanup () =
+  let cleaned_total = ref 0 in
+  let now = Unix.gettimeofday () in
+
+  (* Collect sliding counters that need cleanup - minimize mutex hold time *)
+  let counters_to_clean = ref [] in
+  lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
+  Hashtbl.iter (fun key metric ->
+    match metric.metric_type with
+    | SlidingCounter sliding ->
+        (* Check if this counter needs cleanup (old entries or excessive size) *)
+        let current_len = List.length !(sliding.current_window) in
+        let time_since_cleanup = now -. !(sliding.last_cleanup) in
+        if current_len > 100 || time_since_cleanup > 120.0 then (* Force cleanup every 2 minutes or if >100 entries *)
+          counters_to_clean := (key, metric) :: !counters_to_clean
+    | _ -> ()
+  ) metrics;
+  Mutex.unlock metrics_mutex;
+
+  (* Clean up each counter individually with minimal lock time *)
+  List.iter (fun (key, metric) ->
+    match metric.metric_type with
+    | SlidingCounter sliding ->
+        (* Perform cleanup with minimal mutex hold *)
+        lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
+        let current_len = List.length !(sliding.current_window) in
+        Mutex.unlock metrics_mutex;
+
+        if current_len > 0 then begin
+          (* Do expensive cleanup outside mutex *)
+          let cutoff = now -. 60.0 in (* Keep last 60 seconds for rate calculation *)
+          let old_window = !(sliding.current_window) in
+          let new_window = List.filter (fun (timestamp, _) -> timestamp >= cutoff) old_window in
+          let new_total = List.fold_left (fun acc (_, count) -> acc + count) 0 new_window in
+
+          (* Enforce hard limit of 200 entries regardless of time *)
+          let final_window, final_total =
+            if List.length new_window > 200 then begin
+              let sorted = List.sort (fun (t1, _) (t2, _) -> Float.compare t2 t1) new_window in
+              let recent = ref [] in
+              let count = ref 0 in
+              List.iter (fun (timestamp, inc) ->
+                if !count < 200 then begin
+                  recent := (timestamp, inc) :: !recent;
+                  count := !count + inc;
+                end
+              ) sorted;
+              (!recent, !count)
+            end else begin
+              (new_window, new_total)
+            end
+          in
+
+          (* Update with minimal mutex hold *)
+          lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
+          sliding.current_window := final_window;
+          sliding.total_count := final_total;
+          sliding.last_cleanup := now;
+          Mutex.unlock metrics_mutex;
+
+          let cleaned_entries = current_len - List.length final_window in
+          if cleaned_entries > 0 then begin
+            Logging.debug_f ~section "Sliding counter cleanup for %s: removed %d entries (%d -> %d)"
+              key cleaned_entries current_len (List.length final_window);
+            cleaned_total := !cleaned_total + cleaned_entries;
+          end;
+        end
+    | _ -> ()
+  ) !counters_to_clean;
+
+  (* Trigger GC after cleanup to free memory *)
+  Gc.full_major ();
+
+  !cleaned_total
 
 (** Get current OCaml heap usage in MB *)
 let get_ocaml_heap_usage () =
@@ -875,6 +1180,14 @@ let heap_memory_gauge = ref None
 let rss_memory_gauge = ref None
 let registry_size_gauge = ref None
 let amendments_registry_size_gauge = ref None
+let kraken_order_to_symbol_size_gauge = ref None
+let kraken_total_open_orders_gauge = ref None
+let market_maker_strategy_states_gauge = ref None
+let suicide_grid_strategy_states_gauge = ref None
+let telemetry_event_bus_subscribers_gauge = ref None
+let balance_event_bus_subscribers_gauge = ref None
+let logs_event_bus_subscribers_gauge = ref None
+let system_stats_event_bus_subscribers_gauge = ref None
 
 
 
@@ -1046,6 +1359,94 @@ let set_amendments_registry_size size =
   in
   set_gauge metric (float_of_int size)
 
+(** Set Kraken order_to_symbol hashtable size for memory leak detection *)
+let set_kraken_order_to_symbol_size size =
+  let metric = match !kraken_order_to_symbol_size_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "kraken_order_to_symbol_size" () in
+        kraken_order_to_symbol_size_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+(** Set Kraken total open orders size for memory leak detection *)
+let set_kraken_total_open_orders size =
+  let metric = match !kraken_total_open_orders_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "kraken_total_open_orders" () in
+        kraken_total_open_orders_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+(** Set market maker strategy state size for memory leak detection *)
+let set_market_maker_strategy_states size =
+  let metric = match !market_maker_strategy_states_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "market_maker_strategy_states" () in
+        market_maker_strategy_states_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+(** Set suicide grid strategy state size for memory leak detection *)
+let set_suicide_grid_strategy_states size =
+  let metric = match !suicide_grid_strategy_states_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "suicide_grid_strategy_states" () in
+        suicide_grid_strategy_states_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+(** Set telemetry event bus subscriber count for memory leak detection *)
+let set_telemetry_event_bus_subscribers size =
+  let metric = match !telemetry_event_bus_subscribers_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "telemetry_event_bus_subscribers" () in
+        telemetry_event_bus_subscribers_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+(** Set balance event bus subscriber count for memory leak detection *)
+let set_balance_event_bus_subscribers size =
+  let metric = match !balance_event_bus_subscribers_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "balance_event_bus_subscribers" () in
+        balance_event_bus_subscribers_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+(** Set logs event bus subscriber count for memory leak detection *)
+let set_logs_event_bus_subscribers size =
+  let metric = match !logs_event_bus_subscribers_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "logs_event_bus_subscribers" () in
+        logs_event_bus_subscribers_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+(** Set system stats event bus subscriber count for memory leak detection *)
+let set_system_stats_event_bus_subscribers size =
+  let metric = match !system_stats_event_bus_subscribers_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "system_stats_event_bus_subscribers" () in
+        system_stats_event_bus_subscribers_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
 
 
 (** Update memory monitoring metrics *)
@@ -1066,8 +1467,46 @@ let update_memory_monitoring_metrics () =
     | _ -> acc
   ) metrics 0 in
 
-  set_telemetry_rate_buffers_size rate_buffer_total;
-  set_telemetry_histogram_buffers_size histogram_buffer_total;
+  (* Update gauge values directly since mutex is already held *)
+  let rate_metric = match !telemetry_rate_buffers_gauge with
+    | Some m -> m
+    | None ->
+        (* Create metric manually to avoid deadlock *)
+        let key = metric_key "telemetry_rate_buffers_total_size" [] in
+        let m = {
+          name = "telemetry_rate_buffers_total_size";
+          metric_type = Gauge (ref 0.0);
+          labels = [];
+          created_at = Unix.time ();
+          last_updated = Unix.gettimeofday ();
+          rate_tracker = None;
+          cached_rate = 0.0;
+        } in
+        Hashtbl.add metrics key m;
+        telemetry_rate_buffers_gauge := Some m;
+        m
+  in
+  set_gauge_unsafe rate_metric (float_of_int rate_buffer_total);
+
+  let histogram_metric = match !telemetry_histogram_buffers_gauge with
+    | Some m -> m
+    | None ->
+        (* Create metric manually to avoid deadlock *)
+        let key = metric_key "telemetry_histogram_buffers_total_size" [] in
+        let m = {
+          name = "telemetry_histogram_buffers_total_size";
+          metric_type = Gauge (ref 0.0);
+          labels = [];
+          created_at = Unix.time ();
+          last_updated = Unix.gettimeofday ();
+          rate_tracker = None;
+          cached_rate = 0.0;
+        } in
+        Hashtbl.add metrics key m;
+        telemetry_histogram_buffers_gauge := Some m;
+        m
+  in
+  set_gauge_unsafe histogram_metric (float_of_int histogram_buffer_total);
   ()
 
 (** Report all metrics organized by category *)

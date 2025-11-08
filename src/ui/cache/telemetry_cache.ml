@@ -342,6 +342,14 @@ let publish_initial_snapshot () =
   safe_broadcast_update_condition cache;
   Logging.debug_f ~section:"telemetry_cache" "Initial telemetry snapshot published (version: %d)" initial_snapshot.version
 
+(** Force cleanup stale subscribers for dashboard memory management *)
+let force_cleanup_stale_subscribers () =
+  TelemetrySnapshotEventBus.force_cleanup_stale_subscribers cache.telemetry_snapshot_event_bus ()
+
+(** Get current subscriber count for memory monitoring *)
+let get_subscriber_count () =
+  TelemetrySnapshotEventBus.get_subscriber_count cache.telemetry_snapshot_event_bus
+
 (** Start event-driven telemetry updater (subscribes to telemetry changes) *)
 let start_telemetry_updater () =
   Logging.debug ~section:"telemetry_cache" "Starting event-driven telemetry updater";
@@ -388,16 +396,17 @@ let start_telemetry_updater () =
     process_metric_updates ()
   );
 
-  (* Start periodic updater that publishes snapshots even when metrics haven't changed *)
-  Lwt.async (fun () ->
+(* Start periodic updater that publishes snapshots even when metrics haven't changed *)
+Lwt.async (fun () ->
     Logging.debug ~section:"telemetry_cache" "Starting periodic telemetry updater";
-    
+    let cleanup_counter = ref 0 in
+
     (* Wait for system to be ready *)
     (if !system_ready then
       Lwt.return_unit
     else
       Lwt_condition.wait system_ready_condition) >>= fun () ->
-    
+
     let rec periodic_loop () =
       (* Check for shutdown request *)
       if Atomic.get shutdown_requested then (
@@ -406,16 +415,18 @@ let start_telemetry_updater () =
       ) else (
         (* Update cache periodically (this will check if enough time has passed) *)
         update_telemetry_cache_periodic ();
+        (* Force cleanup stale subscribers every 30 seconds (every 30 iterations) *)
+        cleanup_counter := !cleanup_counter + 1;
+        if !cleanup_counter >= 30 then begin
+          let _ = force_cleanup_stale_subscribers () in
+          cleanup_counter := 0;
+        end;
         (* Sleep 1 second and continue *)
         Lwt_unix.sleep 1.0 >>= periodic_loop
       )
     in
     periodic_loop ()
   )
-
-(** Force cleanup stale subscribers for dashboard memory management *)
-let force_cleanup_stale_subscribers () =
-  TelemetrySnapshotEventBus.force_cleanup_stale_subscribers cache.telemetry_snapshot_event_bus ()
 
 (** Initialize the telemetry cache system with double-checked locking *)
 let init () =

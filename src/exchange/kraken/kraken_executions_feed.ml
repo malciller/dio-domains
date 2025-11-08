@@ -8,6 +8,11 @@ open Concurrency
 let section = "kraken_executions"
 let ring_buffer_size = 512
 
+(** Helper function to take first n elements from a list *)
+let rec take n = function
+  | [] -> []
+  | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
+
 (** Safely force Conduit context with error handling *)
 let get_conduit_ctx () =
   try
@@ -819,6 +824,79 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
 let subscribe_order_updates () =
   let subscription = OrderUpdateEventBus.subscribe order_update_event_bus in
   (subscription.stream, subscription.close)
+
+(** Periodic cleanup to prevent unbounded memory growth *)
+let cleanup_stale_entries () =
+  let cleaned_count = ref 0 in
+
+  (* Clean up order_to_symbol: remove entries for orders that are no longer in open_orders *)
+  Mutex.lock global_orders_mutex;
+  let order_to_symbol_keys = ref [] in
+  Hashtbl.iter (fun order_id _ -> order_to_symbol_keys := order_id :: !order_to_symbol_keys) order_to_symbol;
+
+  List.iter (fun order_id ->
+    let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
+    match symbol_opt with
+    | Some symbol ->
+        let store = get_symbol_store symbol in
+        if not (Hashtbl.mem store.open_orders order_id) then begin
+          Hashtbl.remove order_to_symbol order_id;
+          incr cleaned_count;
+          Logging.debug_f ~section "Cleaned up orphaned order_to_symbol entry for %s" order_id
+        end
+    | None -> () (* Should not happen *)
+  ) !order_to_symbol_keys;
+
+  (* Enforce size limits on open_orders hashtables per symbol *)
+  Hashtbl.iter (fun symbol store ->
+    let current_size = Hashtbl.length store.open_orders in
+    let max_size = 1000 in (* Allow up to 1000 open orders per symbol *)
+    if current_size > max_size then begin
+      Logging.warn_f ~section "Open orders hashtable for %s exceeded limit (%d > %d), trimming oldest entries"
+        symbol current_size max_size;
+
+      (* Collect orders with timestamps *)
+      let orders_with_times = ref [] in
+      Hashtbl.iter (fun order_id order ->
+        orders_with_times := (order_id, order.last_updated) :: !orders_with_times
+      ) store.open_orders;
+
+      (* Sort by last_updated (oldest first) and keep only the most recent *)
+      let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t1 t2) !orders_with_times in
+      let to_keep = take max_size sorted in
+      let to_remove = List.filter (fun (order_id, _) ->
+        not (List.mem_assoc order_id to_keep)
+      ) !orders_with_times in
+
+      (* Remove excess orders *)
+      List.iter (fun (order_id, _) ->
+        Hashtbl.remove store.open_orders order_id;
+        Hashtbl.remove order_to_symbol order_id;
+        incr cleaned_count;
+      ) to_remove;
+
+      Logging.warn_f ~section "Removed %d excess open orders for %s"
+        (List.length to_remove) symbol
+    end
+  ) symbol_stores;
+
+  Mutex.unlock global_orders_mutex;
+
+  if !cleaned_count > 0 then
+    Logging.info_f ~section "Cleaned up %d stale entries from execution feed data structures" !cleaned_count;
+
+  !cleaned_count
+
+(** Get statistics for memory monitoring *)
+let get_memory_stats () =
+  Mutex.lock global_orders_mutex;
+  let total_open_orders = ref 0 in
+  let order_to_symbol_size = Hashtbl.length order_to_symbol in
+  Hashtbl.iter (fun _ store ->
+    total_open_orders := !total_open_orders + Hashtbl.length store.open_orders
+  ) symbol_stores;
+  Mutex.unlock global_orders_mutex;
+  (!total_open_orders, order_to_symbol_size)
 
 (** Initialize executions feed data stores *)
 let initialize symbols =
