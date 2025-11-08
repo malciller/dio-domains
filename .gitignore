@@ -11,7 +11,7 @@
 *.sh
 *.csv
 *.html
-
+.vscode/
 
 
 # Files containing detailed information about the compilation (generated
@@ -23,6 +23,7 @@
 
 # ocamlbuild and Dune default working directory
 _build/
+
 
 # ocamlbuild targets
 *.byte

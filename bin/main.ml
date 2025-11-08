@@ -13,6 +13,9 @@ let () =
 let shutdown_requested = Atomic.make false
 let shutdown_condition = Lwt_condition.create ()
 
+(** Fatal signal tracking - None if no fatal signal received, Some signal_number if fatal signal occurred *)
+let fatal_signal_received = Atomic.make None
+
 (** Signal handler for graceful shutdown *)
 let setup_signal_handlers () =
   let handle_signal _signum =
@@ -49,11 +52,29 @@ let setup_fatal_signal_handlers () =
       | 11 -> "SIGSEGV (segmentation fault)"
       | 6 -> "SIGABRT (abort)"
       | 7 -> "SIGBUS (bus error)"
-      | 10 -> "SIGBUS (bus error)"  (* Some systems use 10 *)
+      | 10 -> "SIGBUS/SIGUSR1 (bus error or user signal)"  (* Signal 10 can be SIGBUS or SIGUSR1 depending on system *)
       | 8 -> "SIGFPE (floating point exception)"
       | _ -> Printf.sprintf "signal %d" signum
     in
+
+    (* Diagnostic logging for crash investigation *)
+    let backtrace = Printexc.get_backtrace () in
+    let gc_stats = Gc.stat () in
+    Logging.critical_f ~section:"main" "=== FATAL SIGNAL DIAGNOSTICS ===";
+    Logging.critical_f ~section:"main" "Signal: %s (signal number: %d)" signal_name signum;
+    Logging.critical_f ~section:"main" "Memory: heap=%dMB live=%dMB free=%dMB fragments=%d compactions=%d"
+      (gc_stats.heap_words * (Sys.word_size / 8) / 1048576)
+      (gc_stats.live_words * (Sys.word_size / 8) / 1048576)
+      ((gc_stats.heap_words - gc_stats.live_words) * (Sys.word_size / 8) / 1048576)
+      gc_stats.fragments
+      gc_stats.compactions;
+    Logging.critical_f ~section:"main" "Backtrace:\n%s" backtrace;
+    Logging.critical_f ~section:"main" "=== END DIAGNOSTICS ===";
+
     Logging.critical_f ~section:"main" "Fatal signal received: %s - attempting emergency shutdown" signal_name;
+
+    (* Track that a fatal signal was received *)
+    Atomic.set fatal_signal_received (Some signum);
 
     (* Attempt emergency shutdown *)
     if not (Atomic.get shutdown_requested) then (
@@ -70,13 +91,14 @@ let setup_fatal_signal_handlers () =
     (* Give a moment for cleanup before exit *)
     Thread.delay 0.1;
     Logging.critical_f ~section:"main" "Process terminating due to fatal signal: %s" signal_name;
-    exit 1
+    (* Don't exit immediately - let main loop handle graceful shutdown *)
+    ()
   in
 
   (* Register handlers for fatal signals - using integer values as OCaml doesn't define them in Sys *)
   List.iter (fun signal ->
     Sys.set_signal signal (Sys.Signal_handle handle_fatal_signal)
-  ) [11; 6; 7; 8]  (* SIGSEGV=11, SIGABRT=6, SIGBUS=7, SIGFPE=8 *)
+  ) [11; 6; 7; 8; 10]  (* SIGSEGV=11, SIGABRT=6, SIGBUS=7, SIGFPE=8, SIGBUS/SIGUSR1=10 *)
 
 (** Set up Lwt unhandled exception handler *)
 let setup_lwt_exception_handler () =
@@ -218,9 +240,15 @@ let () =
       Logging.info ~section:"main" "Shutdown signal received, shutting down...";
     );
 
-    (* Force exit to ensure process terminates even if background tasks are still running *)
-    Logging.info ~section:"main" "Process terminating normally";
-    exit 0
+    (* Check if a fatal signal was received during execution *)
+    match Atomic.get fatal_signal_received with
+    | Some signal_num ->
+        Logging.critical_f ~section:"main" "Process terminating due to fatal signal %d received during execution" signal_num;
+        exit 1
+    | None ->
+        (* Force exit to ensure process terminates even if background tasks are still running *)
+        Logging.info ~section:"main" "Process terminating normally";
+        exit 0
   with e ->
     let backtrace = Printexc.get_backtrace () in
     Logging.critical_f ~section:"main" "Fatal exception during startup: %s\nBacktrace:\n%s"

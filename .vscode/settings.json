@@ -1,6 +1,0 @@
-{
-    "ocaml.sandbox": {
-        "kind": "opam",
-        "switch": "dio-5.1"
-    }
-}
