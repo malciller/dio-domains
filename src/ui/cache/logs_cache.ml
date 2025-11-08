@@ -39,21 +39,22 @@ type t = {
   entries_mutex: Mutex.t;  (* Protect log_entries access *)
 }
 
-(** Global logs cache instance *)
+(** Global logs cache instance with tighter memory bounds *)
 let cache = {
   log_entries = LogMap.empty;
   entry_keys = Queue.create ();
-  max_entries = 500;
+  max_entries = 200;  (* Reduced from 500 for more aggressive memory management *)
   next_id = 0;
   dropped_logs = 0;
   log_entry_event_bus = LogEntryEventBus.create "log_entry";
   entries_mutex = Mutex.create ();
 }
 
-(** Thread-safe queue for pending log entries *)
+(** Thread-safe queue for pending log entries with proactive limits *)
 let pending_logs_queue = Queue.create ()
 let pending_logs_mutex = Mutex.create ()
-let max_pending_logs = 1000 (* Limit the queue size *)
+let max_pending_logs = 500  (* Reduced from 1000 for more aggressive memory management *)
+let proactive_pending_threshold = 400  (* Start dropping when we reach 400 pending logs *)
 let (notification_r, notification_w) = Lwt_unix.pipe ()
 let notification_buffer = Bytes.create 1
 
@@ -97,35 +98,45 @@ let add_log_entry level section message =
   let id = cache.next_id in
   cache.next_id <- id + 1;
   let entry = { id; timestamp; level; section; message } in
-  if Queue.length pending_logs_queue >= max_pending_logs then (
+
+  (* Proactive dropping: drop oldest entries when approaching limit *)
+  while Queue.length pending_logs_queue >= proactive_pending_threshold do
     try
       ignore (Queue.take pending_logs_queue);
       cache.dropped_logs <- cache.dropped_logs + 1;
     with Queue.Empty ->
       (* Queue was unexpectedly empty, just continue *)
       ()
-  );
-  Queue.push entry pending_logs_queue;
-  Mutex.unlock pending_logs_mutex;
+  done;
 
-  (* Publish log entry to event bus for real-time broadcasting *)
-  LogEntryEventBus.publish cache.log_entry_event_bus entry;
+  (* Hard limit: if still at max, drop this new entry *)
+  if Queue.length pending_logs_queue >= max_pending_logs then (
+    cache.dropped_logs <- cache.dropped_logs + 1;
+    Mutex.unlock pending_logs_mutex;
+    Lwt.return_unit  (* Don't add this entry *)
+  ) else (
+    Queue.push entry pending_logs_queue;
+    Mutex.unlock pending_logs_mutex;
 
-  (* Asynchronously notify the ingestion loop, returning a promise *)
-  (* Pipe is non-blocking, so write will not block even if buffer is full *)
-  try%lwt
-    let%lwt _ = Lwt_unix.write notification_w (Bytes.of_string "n") 0 1 in
-    Lwt.return_unit
-  with
-  | Unix.Unix_error (Unix.EPIPE, _, _) ->
-      (* Pipe closed, ingestion loop probably stopped *)
+    (* Publish log entry to event bus for real-time broadcasting *)
+    LogEntryEventBus.publish cache.log_entry_event_bus entry;
+
+    (* Asynchronously notify the ingestion loop, returning a promise *)
+    (* Pipe is non-blocking, so write will not block even if buffer is full *)
+    try%lwt
+      let%lwt _ = Lwt_unix.write notification_w (Bytes.of_string "n") 0 1 in
       Lwt.return_unit
-  | Unix.Unix_error (Unix.EAGAIN, _, _) | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) ->
-      (* Pipe buffer full, ingestion loop will catch up eventually *)
-      Lwt.return_unit
-  | _ ->
-      (* Other write errors, continue anyway *)
-      Lwt.return_unit
+    with
+    | Unix.Unix_error (Unix.EPIPE, _, _) ->
+        (* Pipe closed, ingestion loop probably stopped *)
+        Lwt.return_unit
+    | Unix.Unix_error (Unix.EAGAIN, _, _) | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) ->
+        (* Pipe buffer full, ingestion loop will catch up eventually *)
+        Lwt.return_unit
+    | _ ->
+        (* Other write errors, continue anyway *)
+        Lwt.return_unit
+  )
 
 (** Get current log entries *)
 let current_log_entries () =

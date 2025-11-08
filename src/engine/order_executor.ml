@@ -16,82 +16,81 @@ let shutdown_requested = Atomic.make false
 let signal_shutdown () =
   Atomic.set shutdown_requested true
 
-(** In-flight order cache to prevent duplicate orders *)
-module InFlightOrders = struct
+(** Unified request key type for in-flight tracking *)
+type request_key =
+  | NewOrder of string  (* duplicate_key for new orders *)
+  | AmendOrder of string (* order_id for amendments *)
+
+(** Unified in-flight request cache to prevent duplicate orders and amendments *)
+module InFlightRequests = struct
   module Registry = Concurrency.Event_registry.Make(struct
-    type t = string (* duplicate_key *)
-    let equal = String.equal
-    let hash = Hashtbl.hash
+    type t = request_key
+    let equal a b = match a, b with
+      | NewOrder k1, NewOrder k2 -> String.equal k1 k2
+      | AmendOrder k1, AmendOrder k2 -> String.equal k1 k2
+      | _ -> false
+    let hash = function
+      | NewOrder k -> Hashtbl.hash ("new", k)
+      | AmendOrder k -> Hashtbl.hash ("amend", k)
   end)(struct
-    type t = unit (* We only need to track presence *)
+    type t = float (* timestamp when request was added *)
   end)
 
   let registry = Registry.create ()
 
-  (** Check if an order is already in-flight and add it if not *)
-  let add_in_flight_order duplicate_key =
-    match Registry.replace registry duplicate_key () with
-    | Some (_, true) -> false (* Already existed *)
-    | Some (_, false) -> true (* Added successfully *)
-    | None -> false (* Should not happen *)
-
-  (** Remove an order from the in-flight cache *)
-  let remove_in_flight_order duplicate_key =
-    Registry.remove registry duplicate_key |> Option.is_some
-
-  (** Get the current size of the in-flight orders registry *)
-  let get_registry_size () =
-    Registry.size registry
-end
-
-(** In-flight amendment cache to prevent duplicate amendments *)
-module InFlightAmendments = struct
-  module Registry = Concurrency.Event_registry.Make(struct
-    type t = string (* order_id *)
-    let equal = String.equal
-    let hash = Hashtbl.hash
-  end)(struct
-    type t = float (* timestamp when amendment was added *)
-  end)
-
-  let registry = Registry.create ()
-
-  (** Check if an amendment is already in-flight and add it if not *)
-  let add_in_flight_amendment order_id =
+  (** Check if a request is already in-flight and add it if not *)
+  let add_in_flight_request request_key =
     let now = Unix.gettimeofday () in
-    match Registry.replace registry order_id now with
+    match Registry.replace registry request_key now with
     | Some (_, true) -> false (* Already existed *)
     | Some (_, false) -> true (* Added successfully *)
     | None -> false (* Should not happen *)
 
-  (** Remove an amendment from the in-flight cache *)
-  let remove_in_flight_amendment order_id =
-    Registry.remove registry order_id |> Option.is_some
+  (** Remove a request from the in-flight cache *)
+  let remove_in_flight_request request_key =
+    Registry.remove registry request_key |> Option.is_some
 
-  (** Get the current size of the in-flight amendments registry *)
+  (** Get the current size of the in-flight requests registry *)
   let get_registry_size () =
     Registry.size registry
 
-  (** Clean up stale in-flight amendments (older than timeout_seconds) *)
-  let cleanup_stale_amendments ?(timeout_seconds=30.0) () =
+  (** Clean up stale in-flight requests (older than timeout_seconds) *)
+  let cleanup_stale_requests ?(timeout_seconds=30.0) () =
     let now = Unix.gettimeofday () in
     let cutoff = now -. timeout_seconds in
     let cleaned = ref 0 in
 
-    (* Get all current amendments *)
+    (* Get all current requests *)
     let snapshot = Registry.snapshot registry in
-    Registry.Tbl.iter (fun order_id timestamp ->
+    Registry.Tbl.iter (fun request_key timestamp ->
       if timestamp < cutoff then (
-        (* Remove stale amendment *)
-        if Registry.remove registry order_id |> Option.is_some then (
+        (* Remove stale request *)
+        if Registry.remove registry request_key |> Option.is_some then (
           incr cleaned;
-          Logging.debug_f ~section:"in_flight_amendments" "Cleaned up stale in-flight amendment for order %s (age: %.1fs)" order_id (now -. timestamp)
+          let request_type = match request_key with
+            | NewOrder key -> Printf.sprintf "new order (%s)" key
+            | AmendOrder order_id -> Printf.sprintf "amendment for order %s" order_id
+          in
+          Logging.debug_f ~section:"in_flight_requests" "Cleaned up stale in-flight %s (age: %.1fs)" request_type (now -. timestamp)
         )
       )
     ) snapshot;
 
     !cleaned
 end
+
+(** Backwards compatibility functions *)
+let add_in_flight_order duplicate_key =
+  InFlightRequests.add_in_flight_request (NewOrder duplicate_key)
+
+let remove_in_flight_order duplicate_key =
+  InFlightRequests.remove_in_flight_request (NewOrder duplicate_key)
+
+let add_in_flight_amendment order_id =
+  InFlightRequests.add_in_flight_request (AmendOrder order_id)
+
+let remove_in_flight_amendment order_id =
+  InFlightRequests.remove_in_flight_request (AmendOrder order_id)
 
 (** Order type definitions *)
 type order_type = string (* "market" | "limit" | "stop-loss" | "take-profit" | "trailing-stop" | etc. *)
@@ -220,45 +219,36 @@ let with_error_handling ~operation_name ?(max_retries=3) ?(retry_delay=1.0) f =
   in
   attempt 0
 
-(** Periodic cleanup task for in-flight orders and amendments registries *)
+(** Periodic cleanup task for in-flight requests registry *)
 let start_inflight_cleanup () =
-  Logging.debug ~section "Starting periodic in-flight orders and amendments cleanup task";
+  Logging.debug ~section "Starting periodic in-flight requests cleanup task";
   let rec cleanup_loop () =
     (* Check for shutdown request *)
     if Atomic.get shutdown_requested then (
-      Logging.debug ~section "In-flight orders and amendments cleanup task shutting down due to shutdown request";
+      Logging.debug ~section "In-flight requests cleanup task shutting down due to shutdown request";
       Lwt.return_unit
     ) else (
-      (* Perform cleanup for orders registry *)
-      let orders_cleanup_stats = InFlightOrders.Registry.cleanup InFlightOrders.registry () in
-      (match orders_cleanup_stats with
+      (* Perform cleanup for unified requests registry - use shorter timeout for amendments *)
+      let requests_cleaned = InFlightRequests.cleanup_stale_requests ~timeout_seconds:15.0 () in
+      if requests_cleaned > 0 then
+        Logging.info_f ~section "Cleaned up %d stale in-flight requests (older than 15s)" requests_cleaned;
+
+      (* Also perform registry maintenance for requests *)
+      let requests_cleanup_stats = InFlightRequests.Registry.cleanup InFlightRequests.registry () in
+      (match requests_cleanup_stats with
        | Some (size_drift, size_trimmed) ->
            (match size_drift with
             | Some drift when drift <> 0 ->
-                Logging.info_f ~section "InFlightOrders registry size drift corrected: %d entries" drift
+                Logging.info_f ~section "InFlightRequests registry size drift corrected: %d entries" drift
             | _ -> ());
            (match size_trimmed with
             | Some trimmed when trimmed > 0 ->
-                Logging.info_f ~section "InFlightOrders registry size limit enforced: removed %d stale entries" trimmed
+                Logging.info_f ~section "InFlightRequests registry size limit enforced: removed %d stale entries" trimmed
             | _ -> ())
        | None -> ());
 
-      (* Perform cleanup for amendments registry *)
-      let amendments_cleanup_stats = InFlightAmendments.Registry.cleanup InFlightAmendments.registry () in
-      (match amendments_cleanup_stats with
-       | Some (size_drift, size_trimmed) ->
-           (match size_drift with
-            | Some drift when drift <> 0 ->
-                Logging.info_f ~section "InFlightAmendments registry size drift corrected: %d entries" drift
-            | _ -> ());
-           (match size_trimmed with
-            | Some trimmed when trimmed > 0 ->
-                Logging.info_f ~section "InFlightAmendments registry size limit enforced: removed %d stale entries" trimmed
-            | _ -> ())
-       | None -> ());
-
-      (* Sleep for 5 minutes before next cleanup *)
-      Lwt_unix.sleep 300.0 >>= cleanup_loop
+      (* Sleep for 2 minutes before next cleanup - more frequent for better memory management *)
+      Lwt_unix.sleep 120.0 >>= cleanup_loop
     )
   in
   Lwt.async cleanup_loop
@@ -286,7 +276,7 @@ let place_order
         Lwt.return (Error err)
     | Ok () ->
         (* Check for duplicate orders *)
-        if not (InFlightOrders.add_in_flight_order request.duplicate_key) then begin
+        if not (add_in_flight_order request.duplicate_key) then begin
           let err = Printf.sprintf "Duplicate order detected: %s %s %f @ %s"
             request.side request.symbol request.quantity
             (match request.limit_price with Some p -> Printf.sprintf "%.2f" p | None -> "market") in
@@ -323,12 +313,12 @@ let place_order
             )
             (fun exn ->
               (* Remove from in-flight cache on error *)
-              let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
+              let _ = remove_in_flight_order request.duplicate_key in
               Lwt.fail exn
             )
           >>= fun result ->
           (* Remove from in-flight cache on success *)
-          let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
+          let _ = remove_in_flight_order request.duplicate_key in
           Lwt.return result
         end
   )
@@ -375,7 +365,7 @@ let amend_order
           })
         end else begin
           (* Check for duplicate amendments *)
-          if not (InFlightAmendments.add_in_flight_amendment request.order_id) then begin
+          if not (add_in_flight_amendment request.order_id) then begin
             let err = Printf.sprintf "Duplicate amendment detected for order %s" request.order_id in
             Logging.warn_f ~section "%s" err;
             Lwt.return (Error err)
@@ -406,12 +396,12 @@ let amend_order
               )
               (fun exn ->
                 (* Remove from in-flight cache on error *)
-                let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
+                let _ = remove_in_flight_amendment request.order_id in
                 Lwt.fail exn
               )
             >>= fun result ->
             (* Remove from in-flight cache on success *)
-            let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
+            let _ = remove_in_flight_amendment request.order_id in
             Lwt.return result
           end
         end
@@ -534,6 +524,5 @@ let close () : unit Lwt.t =
 (** Test interface - exposed for unit testing *)
 module Test = struct
   let generate_duplicate_key = generate_duplicate_key
-  module InFlightOrders = InFlightOrders
-  module InFlightAmendments = InFlightAmendments
+  module InFlightRequests = InFlightRequests
 end

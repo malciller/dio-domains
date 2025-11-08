@@ -620,7 +620,7 @@ let cleanup_stale_response_entries () =
                   Lwt.return_unit
                 else begin
                   Response_table.iter (fun req_id (wakener, expected_method, timestamp) ->
-                    if now -. timestamp > 30.0 then
+                    if now -. timestamp > 15.0 then
                       stale_entries := (req_id, wakener, expected_method, timestamp) :: !stale_entries
                   ) state.responses;
                   List.iter (fun (req_id, wakener, expected_method, timestamp) ->

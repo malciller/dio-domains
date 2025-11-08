@@ -344,15 +344,20 @@ let cache = {
 
 (** Memory usage tracking for leak detection *)
 let memory_usage_history = ref []
-let max_memory_history = 100  (* Keep last 100 memory readings *)
-let memory_leak_threshold_mb = 100.0  (* Alert if memory grows by 100MB in last readings *)
+let max_memory_history = 50  (* Keep last 50 memory readings - more aggressive *)
+let memory_leak_threshold_mb = 50.0  (* Alert if memory grows by 50MB in last readings *)
 let last_gc_time = ref 0.0
 let last_memory_log_time = ref 0.0  (* Track when we last logged memory stats *)
+
+(** Proactive trimming thresholds - trim before reaching max limits *)
+let proactive_memory_threshold = 40  (* Start trimming when we have 40 readings *)
+let proactive_domain_threshold = 20  (* Start trimming when we have 20 readings per domain *)
+let proactive_feed_threshold = 8  (* Start trimming when we have 8 readings per feed *)
 
 (** Per-domain heap tracking for multicore environments *)
 let domain_heap_history : (int, (float * float) list) Hashtbl.t = Hashtbl.create 16  (* Domain ID -> [(time, heap_mb)] list *)
 let domain_allocation_rates : (int, (float * float) list) Hashtbl.t = Hashtbl.create 16  (* Domain ID -> [(time, allocs_per_sec)] list *)
-let max_domain_history = 50  (* Keep last 50 readings per domain *)
+let max_domain_history = 25  (* Keep last 25 readings per domain - more aggressive *)
 
 (** Per-feed memory tracking for leak detection *)
 type feed_memory_stats = {
@@ -366,7 +371,7 @@ type feed_memory_stats = {
 }
 
 let feed_memory_history : (string, feed_memory_stats list) Hashtbl.t = Hashtbl.create 16
-let max_feed_history = 20  (* Keep last 20 readings per feed *)
+let max_feed_history = 10  (* Keep last 10 readings per feed - more aggressive *)
 
 (** Memory breakdown record type *)
 type memory_breakdown_info = {
@@ -379,9 +384,9 @@ type memory_breakdown_info = {
 (** Get memory statistics for telemetry feed *)
 let get_telemetry_feed_stats () =
   let now = Unix.time () in
-  let (total, active, stale) = 
+  let (total, active, stale, _, _, _) = 
     try Telemetry_cache.get_telemetry_subscriber_stats ()
-    with _ -> (0, 0, 0)
+    with _ -> (0, 0, 0, 0, 0, 0)
   in
   (* Safely get cache size - snapshot may be None if cache was cleared *)
   let cache_size = 
@@ -407,9 +412,9 @@ let get_telemetry_feed_stats () =
 (** Get memory statistics for system stats feed *)
 let get_system_feed_stats () =
   let now = Unix.time () in
-  let (total, active, stale) = 
+  let (total, active, stale, _, _, _) = 
     try SystemStatsEventBus.get_subscriber_stats cache.system_stats_event_bus
-    with _ -> (0, 0, 0)
+    with _ -> (0, 0, 0, 0, 0, 0)
   in
   let cache_size = 
     try
@@ -432,9 +437,9 @@ let get_system_feed_stats () =
 (** Get memory statistics for balance feed *)
 let get_balance_feed_stats () =
   let now = Unix.time () in
-  let (total, active, stale) = 
+  let (total, active, stale, _, _, _) =
     try Balance_cache.get_balance_subscriber_stats ()
-    with _ -> (0, 0, 0)
+    with _ -> (0, 0, 0, 0, 0, 0)
   in
   (* Safely get cache size - snapshot may be None if cache was cleared *)
   let cache_size = 
@@ -460,9 +465,9 @@ let get_balance_feed_stats () =
 (** Get memory statistics for logs feed *)
 let get_logs_feed_stats () =
   let now = Unix.time () in
-  let (total, active, stale) =
+  let (total, active, stale, _, _, _) =
     try Logs_cache.get_logs_subscriber_stats ()
-    with _ -> (0, 0, 0)
+    with _ -> (0, 0, 0, 0, 0, 0)
   in
   let cache_size =
     try Logs_cache.current_log_entries () |> List.length
@@ -482,17 +487,12 @@ let get_logs_feed_stats () =
 (** Get memory statistics for event registries *)
 let get_registry_stats () =
   let now = Unix.time () in
-  (* Get InFlightOrders registry size *)
-  let inflight_orders_size =
-    try Dio_engine.Order_executor.Test.InFlightOrders.get_registry_size ()
+  (* Get InFlightRequests registry size *)
+  let inflight_requests_size =
+    try Dio_engine.Order_executor.Test.InFlightRequests.get_registry_size ()
     with _ -> 0
   in
-  (* Get InFlightAmendments registry size *)
-  let inflight_amendments_size =
-    try Dio_engine.Order_executor.Test.InFlightAmendments.get_registry_size ()
-    with _ -> 0
-  in
-  let total_registry_size = inflight_orders_size + inflight_amendments_size in
+  let total_registry_size = inflight_requests_size in
   let estimated_mb = float_of_int total_registry_size *. 0.0001 in  (* Very rough estimate per entry *)
   {
     timestamp = now;
@@ -544,7 +544,7 @@ let update_feed_memory_tracking () =
 
           (* Add to history and trim *)
           let new_history = stats_with_growth :: existing_history in
-          let trimmed_history = if List.length new_history > max_feed_history
+          let trimmed_history = if List.length new_history > proactive_feed_threshold
                                then take max_feed_history new_history
                                else new_history in
           Hashtbl.replace feed_memory_history feed_name trimmed_history
@@ -586,10 +586,119 @@ let track_domain_memory_usage () =
   (* Update domain heap history *)
   let current_history = try Hashtbl.find domain_heap_history domain_id with Not_found -> [] in
   let new_history = (now, heap_mb) :: current_history in
-  let trimmed_history = if List.length new_history > max_domain_history
+  let trimmed_history = if List.length new_history > proactive_domain_threshold
                         then take max_domain_history new_history
                         else new_history in
   Hashtbl.replace domain_heap_history domain_id trimmed_history
+
+(** Memory pressure levels for adaptive behavior *)
+type memory_pressure_level =
+  | Normal
+  | Moderate
+  | High
+  | Critical
+
+(** Detect current memory pressure level *)
+let detect_memory_pressure () : memory_pressure_level =
+  let stat = Gc.stat () in
+  let heap_words = stat.heap_words in
+  let live_words = stat.live_words in
+  let free_ratio = 1.0 -. (float_of_int live_words /. float_of_int heap_words) in
+
+  (* Calculate memory pressure based on multiple factors *)
+  let heap_mb = float_of_int heap_words *. float_of_int (Sys.word_size / 8) /. (1024.0 *. 1024.0) in
+
+  if heap_mb > 2048.0 || free_ratio < 0.1 then Critical  (* Over 2GB heap or <10% free *)
+  else if heap_mb > 1024.0 || free_ratio < 0.2 then High  (* Over 1GB heap or <20% free *)
+  else if heap_mb > 512.0 || free_ratio < 0.3 then Moderate  (* Over 512MB heap or <30% free *)
+  else Normal
+
+(** Get comprehensive memory statistics for monitoring *)
+let get_comprehensive_memory_stats () =
+  let stat = Gc.stat () in
+  let heap_words = stat.heap_words in
+  let live_words = stat.live_words in
+  let free_words = stat.free_words in
+  let stack_size = stat.stack_size in
+
+  let word_size_bytes = Sys.word_size / 8 in
+  let heap_mb = float_of_int (heap_words * word_size_bytes) /. (1024.0 *. 1024.0) in
+  let live_mb = float_of_int (live_words * word_size_bytes) /. (1024.0 *. 1024.0) in
+  let free_mb = float_of_int (free_words * word_size_bytes) /. (1024.0 *. 1024.0) in
+  let stack_mb = float_of_int (stack_size * word_size_bytes) /. (1024.0 *. 1024.0) in
+
+  let free_ratio = if heap_words > 0 then 1.0 -. (float_of_int live_words /. float_of_int heap_words) else 0.0 in
+  let fragmentation_ratio = if live_words > 0 then float_of_int free_words /. float_of_int live_words else 0.0 in
+
+  let pressure_level = detect_memory_pressure () in
+
+  (heap_mb, live_mb, free_mb, stack_mb, free_ratio, fragmentation_ratio, pressure_level)
+
+(** Log comprehensive memory statistics *)
+let log_memory_stats () =
+  let (heap_mb, live_mb, free_mb, stack_mb, free_ratio, fragmentation_ratio, pressure_level) = get_comprehensive_memory_stats () in
+
+  let pressure_str = match pressure_level with
+    | Normal -> "NORMAL"
+    | Moderate -> "MODERATE"
+    | High -> "HIGH"
+    | Critical -> "CRITICAL"
+  in
+
+  Logging.info_f ~section:"memory_monitoring"
+    "Memory stats: heap=%.1fMB, live=%.1fMB, free=%.1fMB, stack=%.1fMB, free_ratio=%.1f%%, fragmentation=%.2f, pressure=%s"
+    heap_mb live_mb free_mb stack_mb (free_ratio *. 100.0) fragmentation_ratio pressure_str;
+
+  (* Trigger alerts for high memory pressure *)
+  match pressure_level with
+  | Critical ->
+      Logging.warn_f ~section:"memory_monitoring" "CRITICAL MEMORY PRESSURE: Immediate action required (heap: %.1fMB, free_ratio: %.1f%%)" heap_mb (free_ratio *. 100.0)
+  | High ->
+      Logging.warn_f ~section:"memory_monitoring" "HIGH MEMORY PRESSURE: Consider triggering cleanup (heap: %.1fMB, free_ratio: %.1f%%)" heap_mb (free_ratio *. 100.0)
+  | Moderate ->
+      Logging.debug_f ~section:"memory_monitoring" "Moderate memory pressure detected (heap: %.1fMB)" heap_mb
+  | Normal ->
+      Logging.debug_f ~section:"memory_monitoring" "Memory pressure normal (heap: %.1fMB)" heap_mb
+
+(** Perform deep cleanup during memory pressure - more aggressive than regular maintenance *)
+let perform_deep_cleanup () =
+  let pressure_level = detect_memory_pressure () in
+  Logging.info_f ~section:"memory_maintenance" "Performing deep cleanup (memory pressure: %s)"
+    (match pressure_level with Normal -> "normal" | Moderate -> "moderate" | High -> "high" | Critical -> "critical");
+
+  (* Force cleanup of stale event bus subscribers - very aggressive *)
+  let telemetry_cleaned = Telemetry_cache.force_cleanup_stale_subscribers () in
+  let system_cleaned = SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus () in
+  let balance_cleaned = Balance_cache.force_cleanup_stale_subscribers () in
+  let logs_cleaned = Logs_cache.force_cleanup_stale_subscribers () in
+  let subscriber_total_cleaned = Option.value telemetry_cleaned ~default:0 +
+                                  Option.value system_cleaned ~default:0 +
+                                  Option.value balance_cleaned ~default:0 +
+                                  Option.value logs_cleaned ~default:0 in
+  if subscriber_total_cleaned > 0 then
+    Logging.info_f ~section:"memory_monitoring" "Force cleaned %d stale subscribers across all feeds during deep cleanup" subscriber_total_cleaned;
+
+  (* Clean up stale response table entries in trading client - more aggressive *)
+  Kraken.Kraken_trading_client.cleanup_stale_response_entries ();
+
+  (* Clean up Kraken execution feed data structures *)
+  let kraken_cleaned = Kraken.Kraken_executions_feed.cleanup_stale_entries () in
+
+  (* Clean up in-flight requests *)
+  let requests_cleaned = Dio_engine.Order_executor.Test.InFlightRequests.cleanup_stale_requests () in
+
+  (* Clean up strategy state hashtables - aggressive cleanup *)
+  let market_maker_cleaned = Dio_strategies.Market_maker.perform_deep_cleanup () in
+  let suicide_grid_cleaned = Dio_strategies.Suicide_grid.perform_deep_cleanup () in
+
+  (* Clean up sliding counters - aggressive cleanup *)
+  let sliding_cleaned = Telemetry.perform_sliding_counter_cleanup () in
+
+  (* Force cleanup telemetry buffers more aggressively *)
+  Telemetry.adjust_buffer_capacities ();
+
+  Logging.info_f ~section:"memory_maintenance" "Deep cleanup completed: %d Kraken entries, %d amendments, %d market maker, %d suicide grid, %d sliding counters"
+    kraken_cleaned requests_cleaned market_maker_cleaned suicide_grid_cleaned sliding_cleaned
 
 (** Check for memory leaks and trigger cleanup if needed *)
 let check_memory_leak () =
@@ -599,8 +708,8 @@ let check_memory_leak () =
   (* Add current reading to history *)
   memory_usage_history := (now, current_mem) :: !memory_usage_history;
 
-  (* Trim history to max size *)
-  if List.length !memory_usage_history > max_memory_history then
+  (* Trim history to max size proactively *)
+  if List.length !memory_usage_history > proactive_memory_threshold then
     memory_usage_history := take max_memory_history !memory_usage_history;
 
   (* Update domain-specific tracking *)
@@ -612,19 +721,19 @@ let check_memory_leak () =
       let time_diff = now -. oldest_time in
       let mem_diff = current_mem -. oldest_mem in
 
-      (* If memory has grown significantly over the last readings, trigger GC *)
-      if mem_diff > memory_leak_threshold_mb && time_diff > 300.0 then (  (* 5 minutes *)
-        Logging.warn_f ~section:"memory_monitoring" "Memory leak detected: %.1f MB growth in %.0f seconds, triggering GC"
+      (* If memory has grown significantly over the last readings, trigger deep cleanup and GC *)
+      if mem_diff > memory_leak_threshold_mb && time_diff > 60.0 then (  (* 1 minute *)
+        Logging.warn_f ~section:"memory_monitoring" "Memory leak detected: %.1f MB growth in %.0f seconds, triggering deep cleanup and GC"
           mem_diff time_diff;
+        perform_deep_cleanup ();
         Gc.full_major ();
         last_gc_time := now;
-        Logging.info_f ~section:"memory_monitoring" "GC completed, memory now: %.1f MB" (get_ocaml_memory_usage ())
+        Logging.info_f ~section:"memory_monitoring" "Deep cleanup and GC completed, memory now: %.1f MB" (get_ocaml_memory_usage ())
       )
   | _ -> ()
 
 (** Log detailed memory statistics periodically *)
 let log_detailed_memory_stats () =
-  let now = Unix.time () in
   let gc_stats = get_gc_stats () in
   let heap_mb = get_ocaml_memory_usage () in
 
@@ -650,16 +759,42 @@ let log_detailed_memory_stats () =
           latest.last_growth_rate
     | _ ->
         Logging.debug_f ~section:"memory_monitoring" "Feed %s: no data available" feed_name
-  ) feeds;
+  ) feeds
 
-  (* Log per-domain statistics if available *)
-  Hashtbl.iter (fun domain_id history ->
-    match history with
-    | (latest_time, latest_heap) :: _ when now -. latest_time < 60.0 ->
-        Logging.debug_f ~section:"memory_monitoring" "Domain %d: heap=%.1fMB (last update %.1fs ago)"
-          domain_id latest_heap (now -. latest_time)
-    | _ -> ()
-  ) domain_heap_history
+(** Periodic memory monitoring and automatic cleanup trigger *)
+let perform_memory_monitoring () =
+  (* Skip monitoring during shutdown *)
+  if Atomic.get shutdown_requested then
+    ()
+  else begin
+    let now = Unix.time () in
+    (* Log memory stats periodically *)
+    if now -. !last_memory_log_time > 60.0 then begin
+      log_memory_stats ();
+      last_memory_log_time := now;
+      (* Log per-domain statistics if available *)
+      Hashtbl.iter (fun domain_id history ->
+        match history with
+        | (latest_time, latest_heap) :: _ when now -. latest_time < 60.0 ->
+            Logging.debug_f ~section:"memory_monitoring" "Domain %d: heap=%.1fMB (last update %.1fs ago)"
+              domain_id latest_heap (now -. latest_time)
+        | _ -> ()
+      ) domain_heap_history
+    end;
+    (* Check memory pressure and trigger cleanup if needed *)
+    let pressure_level = detect_memory_pressure () in
+    match pressure_level with
+    | Critical ->
+        Logging.warn ~section:"memory_monitoring" "CRITICAL memory pressure detected - triggering emergency cleanup";
+        perform_deep_cleanup ()
+    | High ->
+        Logging.info ~section:"memory_monitoring" "High memory pressure detected - triggering cleanup";
+        perform_deep_cleanup ()
+    | Moderate ->
+        Logging.debug ~section:"memory_monitoring" "Moderate memory pressure detected - minor cleanup may be beneficial"
+    | Normal ->
+        ()
+  end
 
 (** Check for per-feed memory leaks and issue alerts *)
 let check_per_feed_leaks () =
@@ -667,48 +802,49 @@ let check_per_feed_leaks () =
 
   List.iter (fun feed_name ->
     match try Some (Hashtbl.find feed_memory_history feed_name) with Not_found -> None with
-    | Some history when List.length history >= 3 ->
-        (* Check last 3 readings for trends *)
-        let recent = take 3 history in
-        begin match recent with
-        | latest :: _ :: oldest :: _ ->
-            let time_span = latest.timestamp -. oldest.timestamp in
-            let (subscriber_growth, cache_growth, memory_growth) =
-              if time_span > 60.0 then (  (* Only check if we have at least 1 minute of data *)
-                let sub_growth = float_of_int (latest.event_bus_subscribers_total - oldest.event_bus_subscribers_total) /. time_span in
-                let cache_growth_rate = float_of_int (latest.cache_entries - oldest.cache_entries) /. time_span in
-                let mem_growth_rate = (latest.estimated_memory_mb -. oldest.estimated_memory_mb) /. time_span in
-                (sub_growth, cache_growth_rate, mem_growth_rate)
-              ) else (0.0, 0.0, 0.0)
-            in
+    | Some history ->
+        if List.length history >= 3 then begin
+          (* Check last 3 readings for trends *)
+          let recent = take 3 history in
+          begin match recent with
+          | latest :: _ :: oldest :: [] ->
+              let time_span = latest.timestamp -. oldest.timestamp in
+              let (subscriber_growth, cache_growth, memory_growth) =
+                if time_span > 60.0 then (  (* Only check if we have at least 1 minute of data *)
+                  let sub_growth = float_of_int (latest.event_bus_subscribers_total - oldest.event_bus_subscribers_total) /. time_span in
+                  let cache_growth_rate = float_of_int (latest.cache_entries - oldest.cache_entries) /. time_span in
+                  let mem_growth_rate = (latest.estimated_memory_mb -. oldest.estimated_memory_mb) /. time_span in
+                  (sub_growth, cache_growth_rate, mem_growth_rate)
+                ) else (0.0, 0.0, 0.0)
+              in
 
-            (* Alert thresholds *)
-            let sub_threshold = 1.0 /. 60.0 in  (* More than 1 new subscriber per minute *)
-            let cache_threshold = 100.0 /. 60.0 in  (* More than 100 new cache entries per minute *)
-            let mem_threshold = 1.0 /. 60.0 in  (* More than 1MB growth per minute *)
+              (* Alert thresholds *)
+              let sub_threshold = 1.0 /. 60.0 in  (* More than 1 new subscriber per minute *)
+              let cache_threshold = 100.0 /. 60.0 in  (* More than 100 new cache entries per minute *)
+              let mem_threshold = 1.0 /. 60.0 in  (* More than 1MB growth per minute *)
 
-            (* Issue alerts for concerning growth patterns *)
-            if subscriber_growth > sub_threshold then
-              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High subscriber growth %.2f subs/min (total: %d)"
-                feed_name subscriber_growth latest.event_bus_subscribers_total;
+              (* Issue alerts for concerning growth patterns *)
+              if subscriber_growth > sub_threshold then
+                Logging.warn_f ~section:"memory_monitoring" "Feed %s: High subscriber growth %.2f subs/min (total: %d)"
+                  feed_name subscriber_growth latest.event_bus_subscribers_total;
 
-            if cache_growth > cache_threshold then
-              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High cache growth %.1f entries/min (total: %d)"
-                feed_name cache_growth latest.cache_entries;
+              if cache_growth > cache_threshold then
+                Logging.warn_f ~section:"memory_monitoring" "Feed %s: High cache growth %.1f entries/min (total: %d)"
+                  feed_name cache_growth latest.cache_entries;
 
-            if memory_growth > mem_threshold then
-              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High memory growth %.3f MB/min (total: %.3f MB)"
-                feed_name memory_growth latest.estimated_memory_mb;
+              if memory_growth > mem_threshold then
+                Logging.warn_f ~section:"memory_monitoring" "Feed %s: High memory growth %.3f MB/min (total: %.3f MB)"
+                  feed_name memory_growth latest.estimated_memory_mb;
 
-            (* Check for stale subscriber accumulation *)
-            if latest.event_bus_subscribers_stale > latest.event_bus_subscribers_total / 2 then
-              Logging.warn_f ~section:"memory_monitoring" "Feed %s: High stale subscriber ratio %d/%d (%d%%)"
-                feed_name latest.event_bus_subscribers_stale latest.event_bus_subscribers_total
-                (latest.event_bus_subscribers_stale * 100 / max 1 latest.event_bus_subscribers_total);
-        | _ -> ()
+              (* Check for stale subscriber accumulation *)
+              if latest.event_bus_subscribers_stale > latest.event_bus_subscribers_total / 2 then
+                Logging.warn_f ~section:"memory_monitoring" "Feed %s: High stale subscriber ratio %d/%d (%d%%)"
+                  feed_name latest.event_bus_subscribers_stale latest.event_bus_subscribers_total
+                  (latest.event_bus_subscribers_stale * 100 / max 1 latest.event_bus_subscribers_total);
+          | _ -> ()  (* Not exactly 3 elements, skip *)
+          end
         end
-
-    | _ -> ()  (* Not enough data yet *)
+    | None -> ()  (* No data for this feed yet *)
   ) feeds
 
 (** Get detailed memory breakdown by component *)
@@ -832,27 +968,20 @@ let perform_memory_maintenance () =
 
     (* Update registry size telemetry and check for warnings *)
     (try
-       let orders_registry_size = Dio_engine.Order_executor.Test.InFlightOrders.get_registry_size () in
-       let amendments_registry_size = Dio_engine.Order_executor.Test.InFlightAmendments.get_registry_size () in
+       let requests_registry_size = Dio_engine.Order_executor.Test.InFlightRequests.get_registry_size () in
 
-       Telemetry.set_registry_size orders_registry_size;
-       Telemetry.set_amendments_registry_size amendments_registry_size;
+       Telemetry.set_registry_size requests_registry_size;
+       Telemetry.set_amendments_registry_size requests_registry_size;
 
        (* Log warnings for large registry sizes *)
        let warning_threshold = 500 in
        let critical_threshold = 1000 in
 
-       (* Check orders registry *)
-       if orders_registry_size > critical_threshold then
-         Logging.warn_f ~section:"memory_monitoring" "CRITICAL: InFlightOrders registry size is %d (exceeds %d limit)" orders_registry_size critical_threshold
-       else if orders_registry_size > warning_threshold then
-         Logging.warn_f ~section:"memory_monitoring" "WARNING: InFlightOrders registry size is %d (approaching %d limit)" orders_registry_size critical_threshold;
-
-       (* Check amendments registry *)
-       if amendments_registry_size > critical_threshold then
-         Logging.warn_f ~section:"memory_monitoring" "CRITICAL: InFlightAmendments registry size is %d (exceeds %d limit)" amendments_registry_size critical_threshold
-       else if amendments_registry_size > warning_threshold then
-         Logging.warn_f ~section:"memory_monitoring" "WARNING: InFlightAmendments registry size is %d (approaching %d limit)" amendments_registry_size critical_threshold
+       (* Check unified requests registry *)
+       if requests_registry_size > critical_threshold then
+         Logging.warn_f ~section:"memory_monitoring" "CRITICAL: InFlightRequests registry size is %d (exceeds %d limit)" requests_registry_size critical_threshold
+       else if requests_registry_size > warning_threshold then
+         Logging.warn_f ~section:"memory_monitoring" "WARNING: InFlightRequests registry size is %d (approaching %d limit)" requests_registry_size warning_threshold
      with exn ->
        Logging.debug_f ~section:"memory_monitoring" "Failed to get registry sizes: %s" (Printexc.to_string exn));
 
@@ -868,8 +997,8 @@ let perform_memory_maintenance () =
     (* Clean up Kraken execution feed data structures *)
     let kraken_cleaned = Kraken.Kraken_executions_feed.cleanup_stale_entries () in
 
-    (* Clean up in-flight amendments *)
-    let amendments_cleaned = Dio_engine.Order_executor.Test.InFlightAmendments.cleanup_stale_amendments () in
+    (* Clean up in-flight requests *)
+    let requests_cleaned = Dio_engine.Order_executor.Test.InFlightRequests.cleanup_stale_requests () in
 
     (* Clean up strategy state hashtables *)
     let market_maker_cleaned = Dio_strategies.Market_maker.perform_deep_cleanup () in
@@ -927,7 +1056,7 @@ let perform_memory_maintenance () =
 
     (* Log cleanup summary *)
     Logging.info_f ~section:"memory_maintenance" "Comprehensive cleanup completed: %d Kraken entries, %d amendments, %d market maker, %d suicide grid, %d sliding counters"
-      kraken_cleaned amendments_cleaned market_maker_cleaned suicide_grid_cleaned sliding_cleaned;
+      kraken_cleaned requests_cleaned market_maker_cleaned suicide_grid_cleaned sliding_cleaned;
 
     (* Log detailed memory stats every 10 seconds *)
     let time_since_last_log = now -. !last_memory_log_time in
@@ -1421,6 +1550,21 @@ let start_system_updater () =
     in
     (* Wait 10 seconds before starting maintenance loop *)
     Lwt_unix.sleep 10.0 >>= maintenance_loop
+  ) in
+
+  (* Start periodic deep cleanup (every 10 minutes) *)
+  let _deep_cleanup = Lwt.async (fun () ->
+    let rec deep_cleanup_loop () =
+      if Atomic.get shutdown_requested then
+        Lwt.return_unit
+      else begin
+        (* Perform deep cleanup periodically *)
+        perform_deep_cleanup ();
+        Lwt_unix.sleep 600.0 >>= deep_cleanup_loop  (* 10 minutes *)
+      end
+    in
+    (* Wait 5 minutes before starting deep cleanup loop *)
+    Lwt_unix.sleep 300.0 >>= deep_cleanup_loop
   ) in
 
   ()

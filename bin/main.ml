@@ -33,13 +33,18 @@ let setup_signal_handlers () =
       (* Stop all supervised domains *)
       Dio_engine.Domain_spawner.stop_all_domains ();
 
-      (* Stop all websocket connections *)
-      Supervisor.stop_all ();
+      (* Force-kill all websocket connections immediately *)
+      Supervisor.stop_all_immediate ();
 
       (* Signal shutdown condition to allow graceful server shutdown *)
       Lwt_condition.broadcast shutdown_condition ();
 
-      Logging.info ~section:"main" "Shutdown cleanup initiated, waiting up to 5 seconds for graceful exit..."
+      Logging.critical ~section:"main" "IMMEDIATE SHUTDOWN: All connections terminated, exiting now...";
+
+      (* Force exit immediately after brief cleanup delay *)
+      Thread.delay 0.05;  (* Give 50ms for critical cleanup *)
+      Logging.critical ~section:"main" "Process terminating immediately";
+      exit 0
     )
   in
   Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
@@ -82,16 +87,18 @@ let setup_fatal_signal_handlers () =
 
       (* Quick emergency cleanup *)
       Dio_engine.Domain_spawner.stop_all_domains ();
-      Supervisor.stop_all ();
+      Supervisor.stop_all_immediate ();
       Lwt_condition.broadcast shutdown_condition ();
 
       Logging.critical ~section:"main" "Emergency shutdown initiated";
+
+      (* Force exit immediately after brief cleanup delay *)
+      Thread.delay 0.02;  (* Give 20ms for critical cleanup *)
+      Logging.critical_f ~section:"main" "Process terminating immediately due to fatal signal: %s" signal_name;
+      exit 1
     );
 
-    (* Give a moment for cleanup before exit *)
-    Thread.delay 0.1;
-    Logging.critical_f ~section:"main" "Process terminating due to fatal signal: %s" signal_name;
-    (* Don't exit immediately - let main loop handle graceful shutdown *)
+    (* Don't reach here - fatal signal should have exited *)
     ()
   in
 

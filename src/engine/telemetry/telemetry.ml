@@ -64,9 +64,9 @@ let memory_config = {
 (** Mutex to protect memory_config access from race conditions *)
 let memory_config_mutex = Mutex.create ()
 
-(** Metric lifecycle management *)
-let metric_stale_ttl_seconds = 3600.0  (* Remove metrics not updated in 1 hour *)
-let max_metrics_count = 5000  (* Cap total metrics to prevent unbounded growth *)
+(** Metric lifecycle management - more aggressive to prevent memory leaks *)
+let metric_stale_ttl_seconds = 1800.0  (* Remove metrics not updated in 30 minutes (was 1 hour) *)
+let max_metrics_count = 2500  (* Cap total metrics to prevent unbounded growth (was 5000) *)
 
 (** Get current memory pressure level based on OCaml heap usage *)
 let get_memory_pressure () : memory_pressure =
@@ -385,10 +385,10 @@ let adjust_buffer_capacities () =
          (* Keep current capacities *)
          ()
      | High ->
-         (* Decrease capacities with minimum limits - ensure enough samples for smooth metrics *)
+         (* Decrease capacities aggressively with minimum limits - ensure enough samples for smooth metrics *)
          (* At 2k samples/sec (1/100 sampling), 10000 samples = ~5s, 15000 samples = ~7.5s *)
-         memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity * 7 / 10);
-         memory_config.histogram_capacity <- max 10000 (memory_config.histogram_capacity * 7 / 10);
+         memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity / 2);
+         memory_config.histogram_capacity <- max 10000 (memory_config.histogram_capacity / 2);
 
          Logging.debug_f ~section:"telemetry" "Reduced buffer capacities due to high memory pressure: rate %d->%d, histogram %d->%d"
            old_rate_capacity memory_config.rate_buffer_capacity
@@ -644,6 +644,34 @@ let prune_stale_metrics () =
   (* Trigger GC to free memory from removed metrics *)
   if stale_removed > 0 || to_remove_more > 0 then
     Gc.full_major ()
+
+(** Get telemetry memory statistics for monitoring *)
+let get_telemetry_memory_stats () =
+  Mutex.lock metrics_mutex;
+  let total_metrics = Hashtbl.length metrics in
+  let sliding_counters = ref 0 in
+  let histograms = ref 0 in
+  let counters = ref 0 in
+  let gauges = ref 0 in
+
+  let total_sliding_entries = ref 0 in
+  let total_histogram_samples = ref 0 in
+
+  Hashtbl.iter (fun _ metric ->
+    match metric.metric_type with
+    | SlidingCounter sliding ->
+        incr sliding_counters;
+        total_sliding_entries := !total_sliding_entries + List.length !(sliding.current_window)
+    | Histogram buffer ->
+        incr histograms;
+        total_histogram_samples := !total_histogram_samples + buffer.hist_size
+    | Counter _ -> incr counters
+    | Gauge _ -> incr gauges
+  ) metrics;
+
+  Mutex.unlock metrics_mutex;
+
+  (total_metrics, !sliding_counters, !histograms, !counters, !gauges, !total_sliding_entries, !total_histogram_samples)
 
 (** Start periodic capacity adjustment loop *)
 let start_capacity_adjuster () =
@@ -1078,10 +1106,11 @@ let perform_sliding_counter_cleanup () =
   Hashtbl.iter (fun key metric ->
     match metric.metric_type with
     | SlidingCounter sliding ->
-        (* Check if this counter needs cleanup (old entries or excessive size) *)
+        (* More aggressive cleanup: check size and age more frequently *)
         let current_len = List.length !(sliding.current_window) in
         let time_since_cleanup = now -. !(sliding.last_cleanup) in
-        if current_len > 100 || time_since_cleanup > 120.0 then (* Force cleanup every 2 minutes or if >100 entries *)
+        (* Force cleanup if >50 entries OR every 60 seconds OR if very old (>300 seconds) *)
+        if current_len > 50 || time_since_cleanup > 60.0 || time_since_cleanup > 300.0 then
           counters_to_clean := (key, metric) :: !counters_to_clean
     | _ -> ()
   ) metrics;
@@ -1098,19 +1127,19 @@ let perform_sliding_counter_cleanup () =
 
         if current_len > 0 then begin
           (* Do expensive cleanup outside mutex *)
-          let cutoff = now -. 60.0 in (* Keep last 60 seconds for rate calculation *)
+          let cutoff = now -. 30.0 in (* More aggressive: Keep only last 30 seconds for rate calculation *)
           let old_window = !(sliding.current_window) in
           let new_window = List.filter (fun (timestamp, _) -> timestamp >= cutoff) old_window in
           let new_total = List.fold_left (fun acc (_, count) -> acc + count) 0 new_window in
 
-          (* Enforce hard limit of 200 entries regardless of time *)
+          (* More aggressive hard limit: 100 entries regardless of time (down from 200) *)
           let final_window, final_total =
-            if List.length new_window > 200 then begin
+            if List.length new_window > 100 then begin
               let sorted = List.sort (fun (t1, _) (t2, _) -> Float.compare t2 t1) new_window in
               let recent = ref [] in
               let count = ref 0 in
               List.iter (fun (timestamp, inc) ->
-                if !count < 200 then begin
+                if !count < 100 then begin
                   recent := (timestamp, inc) :: !recent;
                   count := !count + inc;
                 end

@@ -15,15 +15,15 @@ let test_in_flight_orders () =
   let key1 = "test_key_1" in
   let key2 = "test_key_2" in
 
-  Alcotest.(check bool) "can add new order to cache" true (Test.InFlightOrders.add_in_flight_order key1);
-  Alcotest.(check bool) "duplicate order rejected" false (Test.InFlightOrders.add_in_flight_order key1);
-  Alcotest.(check bool) "different order key accepted" true (Test.InFlightOrders.add_in_flight_order key2);
-  Alcotest.(check bool) "order successfully removed" true (Test.InFlightOrders.remove_in_flight_order key1);
-  Alcotest.(check bool) "order can be added again after removal" true (Test.InFlightOrders.add_in_flight_order key1);
+  Alcotest.(check bool) "can add new order to cache" true (Test.InFlightRequests.add_in_flight_request (Dio_engine.Order_executor.NewOrder key1));
+  Alcotest.(check bool) "duplicate order rejected" false (Test.InFlightRequests.add_in_flight_request (Dio_engine.Order_executor.NewOrder key1));
+  Alcotest.(check bool) "different order key accepted" true (Test.InFlightRequests.add_in_flight_request (Dio_engine.Order_executor.NewOrder key2));
+  Alcotest.(check bool) "order successfully removed" true (Test.InFlightRequests.remove_in_flight_request (Dio_engine.Order_executor.NewOrder key1));
+  Alcotest.(check bool) "order can be added again after removal" true (Test.InFlightRequests.add_in_flight_request (Dio_engine.Order_executor.NewOrder key1));
 
   (* Clean up *)
-  ignore (Test.InFlightOrders.remove_in_flight_order key1);
-  ignore (Test.InFlightOrders.remove_in_flight_order key2)
+  ignore (Test.InFlightRequests.remove_in_flight_request (Dio_engine.Order_executor.NewOrder key1));
+  ignore (Test.InFlightRequests.remove_in_flight_request (Dio_engine.Order_executor.NewOrder key2))
 
 let test_validate_order_request () =
   (* Test valid order *)

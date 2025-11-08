@@ -19,23 +19,23 @@ let test_in_flight_orders () =
   let key2 = "test_key_2" in
 
   (* Initially empty - can add new order *)
-  Alcotest.(check bool) "can add new order to cache" true (Test.InFlightOrders.add_in_flight_order key1);
+  Alcotest.(check bool) "can add new order to cache" true (Test.InFlightRequests.add_in_flight_request (OrderExecutor.NewOrder key1));
 
   (* Duplicate order should be rejected *)
-  Alcotest.(check bool) "duplicate order rejected" false (Test.InFlightOrders.add_in_flight_order key1);
+  Alcotest.(check bool) "duplicate order rejected" false (Test.InFlightRequests.add_in_flight_request (OrderExecutor.NewOrder key1));
 
   (* Different key should work *)
-  Alcotest.(check bool) "different order key accepted" true (Test.InFlightOrders.add_in_flight_order key2);
+  Alcotest.(check bool) "different order key accepted" true (Test.InFlightRequests.add_in_flight_request (OrderExecutor.NewOrder key2));
 
   (* Remove first order *)
-  Alcotest.(check bool) "order successfully removed" true (Test.InFlightOrders.remove_in_flight_order key1);
+  Alcotest.(check bool) "order successfully removed" true (Test.InFlightRequests.remove_in_flight_request (OrderExecutor.NewOrder key1));
 
   (* Should be able to add again after removal *)
-  Alcotest.(check bool) "order can be added again after removal" true (Test.InFlightOrders.add_in_flight_order key1);
+  Alcotest.(check bool) "order can be added again after removal" true (Test.InFlightRequests.add_in_flight_request (OrderExecutor.NewOrder key1));
 
   (* Clean up *)
-  ignore (Test.InFlightOrders.remove_in_flight_order key1);
-  ignore (Test.InFlightOrders.remove_in_flight_order key2)
+  ignore (Test.InFlightRequests.remove_in_flight_request (OrderExecutor.NewOrder key1));
+  ignore (Test.InFlightRequests.remove_in_flight_request (OrderExecutor.NewOrder key2))
 
 let () =
   Alcotest.run "Order Cache" [

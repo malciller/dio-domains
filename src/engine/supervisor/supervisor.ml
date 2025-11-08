@@ -47,6 +47,9 @@ let registry_mutex = Mutex.create ()
 (** Shutdown flag for graceful termination *)
 let shutdown_requested = Atomic.make false
 
+(** Immediate shutdown flag - bypasses all reconnection logic *)
+let immediate_shutdown = Atomic.make false
+
 (** Global authentication token for reuse across modules *)
 module Token_store = struct
   (* Single writer (supervisor init) with atomic snapshots to avoid races *)
@@ -300,7 +303,7 @@ let restart conn =
 (** Monitor all connections and report status *)
 let monitor_loop () =
   let cycle_count = ref 0 in
-  while true do
+  while not (Atomic.get immediate_shutdown) do
     try
       Thread.delay 2.0;  (* Check every 2 seconds for faster reconnection detection *)
       incr cycle_count;
@@ -1448,4 +1451,21 @@ let stop_all () =
     set_state conn Disconnected
   ) connections;
   Mutex.unlock registry_mutex
+
+(** Immediately stop all connections and monitoring - for forceful shutdown *)
+let stop_all_immediate () =
+  Logging.critical ~section "IMMEDIATE SHUTDOWN: Force-closing all connections";
+  Atomic.set immediate_shutdown true;
+  stop_order_processing ();
+
+  (* Force-close all connections without waiting *)
+  Mutex.lock registry_mutex;
+  Hashtbl.iter (fun _name conn ->
+    Logging.critical_f ~section "Force-closing connection: %s" conn.name;
+    set_state conn (Failed "immediate shutdown")
+  ) connections;
+  Mutex.unlock registry_mutex;
+
+  (* Give monitor loop time to exit *)
+  Thread.delay 0.1
 

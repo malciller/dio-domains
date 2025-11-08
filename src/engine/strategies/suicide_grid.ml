@@ -52,9 +52,64 @@ type strategy_state = {
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
 }
 
-(** Global strategy state store *)
-let strategy_states : (string, strategy_state) Hashtbl.t = Hashtbl.create 16
+(** Global strategy state store with memory management *)
+let strategy_states : (string, strategy_state * float) Hashtbl.t = Hashtbl.create 16  (* asset -> (state, last_access_time) *)
 let strategy_states_mutex = Mutex.create ()
+
+(** Memory management limits *)
+let max_assets = 100  (* Maximum number of assets to track *)
+let asset_expiry_seconds = 3600.0  (* Remove assets not accessed in 1 hour *)
+let lru_cleanup_threshold = 80  (* Start LRU cleanup when we have this many assets *)
+
+(** Perform LRU cleanup of strategy states to prevent unbounded growth *)
+let perform_lru_cleanup () =
+  let now = Unix.time () in
+  let current_size = Hashtbl.length strategy_states in
+
+  if current_size >= lru_cleanup_threshold then begin
+    (* Collect all assets with their access times *)
+    let assets_with_times = Hashtbl.fold (fun asset (_, last_access) acc ->
+      (asset, last_access) :: acc
+    ) strategy_states [] in
+
+    (* Sort by last access time (oldest first) *)
+    let sorted_assets = List.sort (fun (_, t1) (_, t2) -> Float.compare t1 t2) assets_with_times in
+
+    (* Remove expired assets first *)
+    let expired_assets = List.filter (fun (_, last_access) ->
+      now -. last_access > asset_expiry_seconds
+    ) sorted_assets in
+
+    (* Calculate how many more to remove to get under the threshold *)
+    let remaining_to_remove = max 0 (current_size - max_assets + List.length expired_assets) in
+
+    (* Remove expired assets *)
+    List.iter (fun (asset, _) ->
+      Hashtbl.remove strategy_states asset;
+      Logging.debug_f ~section "LRU cleanup: removed expired asset %s" asset
+    ) expired_assets;
+
+    (* Remove oldest accessed assets if still over limit *)
+    if remaining_to_remove > 0 then begin
+      let oldest_assets = ref [] in
+      let count = ref 0 in
+      List.iter (fun (asset, last_access) ->
+        if !count < remaining_to_remove && now -. last_access <= asset_expiry_seconds then begin
+          oldest_assets := (asset, last_access) :: !oldest_assets;
+          incr count;
+        end
+      ) sorted_assets;
+
+      List.iter (fun (asset, _) ->
+        Hashtbl.remove strategy_states asset;
+        Logging.debug_f ~section "LRU cleanup: removed LRU asset %s" asset
+      ) !oldest_assets;
+    end;
+
+    let final_size = Hashtbl.length strategy_states in
+    if current_size <> final_size then
+      Logging.info_f ~section "Strategy state LRU cleanup: %d -> %d assets" current_size final_size
+  end
 
 (** Periodic deep cleanup for memory management - called from system cache *)
 let perform_deep_cleanup () =
@@ -62,7 +117,10 @@ let perform_deep_cleanup () =
   let now = Unix.time () in
 
   Mutex.lock strategy_states_mutex;
-  Hashtbl.iter (fun asset_symbol state ->
+
+  (* First perform LRU cleanup to manage hashtable size *)
+  perform_lru_cleanup ();
+  Hashtbl.iter (fun asset_symbol (state, _) ->
     (* Clean up very old cancelled orders (older than 60 seconds) *)
     let original_cancelled_count = List.length state.cancelled_orders in
     state.cancelled_orders <- List.filter (fun (_, timestamp) ->
@@ -113,11 +171,23 @@ let perform_deep_cleanup () =
 
 (** Get or create strategy state for an asset *)
 let get_strategy_state asset_symbol =
+  let now = Unix.time () in
   Mutex.lock strategy_states_mutex;
-  let state =
+
+  (* Check if we need to perform LRU cleanup before adding new asset *)
+  let current_size = Hashtbl.length strategy_states in
+  if current_size >= max_assets then begin
+    perform_lru_cleanup ();
+  end;
+
+  let (state, _) =
     match Hashtbl.find_opt strategy_states asset_symbol with
-    | Some state -> state
+    | Some (existing_state, _) ->
+        (* Update access time *)
+        Hashtbl.replace strategy_states asset_symbol (existing_state, now);
+        (existing_state, now)
     | None ->
+        (* Create new state *)
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
@@ -128,8 +198,14 @@ let get_strategy_state asset_symbol =
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
         } in
-        Hashtbl.add strategy_states asset_symbol new_state;
-        new_state
+        Hashtbl.add strategy_states asset_symbol (new_state, now);
+
+        (* Log if we're approaching limits *)
+        let new_size = Hashtbl.length strategy_states in
+        if new_size >= lru_cleanup_threshold then
+          Logging.warn_f ~section "Strategy state count approaching limit: %d/%d assets" new_size max_assets;
+
+        (new_state, now)
   in
   Mutex.unlock strategy_states_mutex;
   state
