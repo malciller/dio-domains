@@ -783,31 +783,42 @@ let generate_memory_diagnostic_report () =
 
 (** Periodic memory maintenance *)
 let perform_memory_maintenance () =
-  let now = Unix.time () in
-  let time_since_gc = now -. !last_gc_time in
+  (* Skip cleanup operations during shutdown to avoid deadlocks *)
+  if Atomic.get shutdown_requested then
+    ()
+  else begin
+    let now = Unix.time () in
+    let time_since_gc = now -. !last_gc_time in
 
-  (* Force GC every 15 minutes for dashboard mode to prevent gradual memory creep *)
-  if time_since_gc > 900.0 then (
-    Logging.debug ~section:"memory_monitoring" "Performing scheduled GC (15-minute interval for dashboard mode)";
-    Gc.full_major ();
-    last_gc_time := now
-  );
+    (* Force GC every 15 minutes for dashboard mode to prevent gradual memory creep *)
+    if time_since_gc > 900.0 then (
+      Logging.debug ~section:"memory_monitoring" "Performing scheduled GC (15-minute interval for dashboard mode)";
+      Gc.full_major ();
+      last_gc_time := now
+    );
 
-  (* Update per-feed memory tracking *)
-  update_feed_memory_tracking ();
+    (* Update per-feed memory tracking *)
+    update_feed_memory_tracking ();
 
-  (* Check for per-component memory leaks *)
-  check_per_feed_leaks ();
+    (* Check for per-component memory leaks *)
+    check_per_feed_leaks ();
 
-  (* Check for memory leaks *)
-  check_memory_leak ();
+    (* Force cleanup of stale event bus subscribers *)
+    let _ = force_cleanup_all_stale_subscribers () in
 
-  (* Log detailed memory stats every 10 seconds *)
-  let time_since_last_log = now -. !last_memory_log_time in
-  if time_since_last_log >= 10.0 then (
-    log_detailed_memory_stats ();
-    last_memory_log_time := now
-  )
+    (* Clean up stale response table entries in trading client *)
+    Kraken.Kraken_trading_client.cleanup_stale_response_entries ();
+
+    (* Check for memory leaks *)
+    check_memory_leak ();
+
+    (* Log detailed memory stats every 10 seconds *)
+    let time_since_last_log = now -. !last_memory_log_time in
+    if time_since_last_log >= 10.0 then (
+      log_detailed_memory_stats ();
+      last_memory_log_time := now
+    )
+  end
 
 (** Initialization guard with mutex protection *)
 let initialized = ref false

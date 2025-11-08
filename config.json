@@ -11,7 +11,7 @@
     {
       "symbol": "BTC/USD",
       "qty": "0.00025",
-      "grid_interval": "0.5",
+      "grid_interval": "0.75",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
@@ -36,6 +36,13 @@
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
+    {
+      "symbol": "ADA/USD",
+      "qty": "19.0",
+      "grid_interval": "5.0",
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },    
     {
       "symbol": "TRX/USD",
       "qty": "40.0",
