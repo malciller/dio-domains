@@ -873,6 +873,8 @@ let telemetry_rate_buffers_gauge = ref None
 let telemetry_histogram_buffers_gauge = ref None
 let heap_memory_gauge = ref None
 let rss_memory_gauge = ref None
+let registry_size_gauge = ref None
+let amendments_registry_size_gauge = ref None
 
 
 
@@ -1020,6 +1022,26 @@ let set_telemetry_histogram_buffers_size size =
     | None ->
         let m = gauge "telemetry_histogram_buffers_total_size" () in
         telemetry_histogram_buffers_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+let set_registry_size size =
+  let metric = match !registry_size_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "registry_size_total" () in
+        registry_size_gauge := Some m;
+        m
+  in
+  set_gauge metric (float_of_int size)
+
+let set_amendments_registry_size size =
+  let metric = match !amendments_registry_size_gauge with
+    | Some m -> m
+    | None ->
+        let m = gauge "amendments_registry_size_total" () in
+        amendments_registry_size_gauge := Some m;
         m
   in
   set_gauge metric (float_of_int size)

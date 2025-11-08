@@ -460,11 +460,11 @@ let get_balance_feed_stats () =
 (** Get memory statistics for logs feed *)
 let get_logs_feed_stats () =
   let now = Unix.time () in
-  let (total, active, stale) = 
+  let (total, active, stale) =
     try Logs_cache.get_logs_subscriber_stats ()
     with _ -> (0, 0, 0)
   in
-  let cache_size = 
+  let cache_size =
     try Logs_cache.current_log_entries () |> List.length
     with _ -> 0
   in
@@ -479,6 +479,31 @@ let get_logs_feed_stats () =
     last_growth_rate = 0.0;
   }
 
+(** Get memory statistics for event registries *)
+let get_registry_stats () =
+  let now = Unix.time () in
+  (* Get InFlightOrders registry size *)
+  let inflight_orders_size =
+    try Dio_engine.Order_executor.Test.InFlightOrders.get_registry_size ()
+    with _ -> 0
+  in
+  (* Get InFlightAmendments registry size *)
+  let inflight_amendments_size =
+    try Dio_engine.Order_executor.Test.InFlightAmendments.get_registry_size ()
+    with _ -> 0
+  in
+  let total_registry_size = inflight_orders_size + inflight_amendments_size in
+  let estimated_mb = float_of_int total_registry_size *. 0.0001 in  (* Very rough estimate per entry *)
+  {
+    timestamp = now;
+    event_bus_subscribers_total = 0;  (* Not applicable for registries *)
+    event_bus_subscribers_active = 0;
+    event_bus_subscribers_stale = 0;
+    cache_entries = total_registry_size;
+    estimated_memory_mb = estimated_mb;
+    last_growth_rate = 0.0;
+  }
+
 (** Mutex to protect feed memory tracking updates *)
 let feed_tracking_mutex = Mutex.create ()
 
@@ -488,12 +513,13 @@ let update_feed_memory_tracking () =
   if Mutex.try_lock feed_tracking_mutex then (
     try
       (* Safely get current stats for all feeds with error handling *)
-      let feeds = 
+      let feeds =
         try [
           ("telemetry", get_telemetry_feed_stats ());
           ("system", get_system_feed_stats ());
           ("balance", get_balance_feed_stats ());
           ("logs", get_logs_feed_stats ());
+          ("registry", get_registry_stats ());
         ] with exn ->
           Logging.debug_f ~section:"memory_monitoring" "Error collecting feed stats: %s" (Printexc.to_string exn);
           []
@@ -799,6 +825,32 @@ let perform_memory_maintenance () =
 
     (* Update per-feed memory tracking *)
     update_feed_memory_tracking ();
+
+    (* Update registry size telemetry and check for warnings *)
+    (try
+       let orders_registry_size = Dio_engine.Order_executor.Test.InFlightOrders.get_registry_size () in
+       let amendments_registry_size = Dio_engine.Order_executor.Test.InFlightAmendments.get_registry_size () in
+
+       Telemetry.set_registry_size orders_registry_size;
+       Telemetry.set_amendments_registry_size amendments_registry_size;
+
+       (* Log warnings for large registry sizes *)
+       let warning_threshold = 500 in
+       let critical_threshold = 1000 in
+
+       (* Check orders registry *)
+       if orders_registry_size > critical_threshold then
+         Logging.warn_f ~section:"memory_monitoring" "CRITICAL: InFlightOrders registry size is %d (exceeds %d limit)" orders_registry_size critical_threshold
+       else if orders_registry_size > warning_threshold then
+         Logging.warn_f ~section:"memory_monitoring" "WARNING: InFlightOrders registry size is %d (approaching %d limit)" orders_registry_size critical_threshold;
+
+       (* Check amendments registry *)
+       if amendments_registry_size > critical_threshold then
+         Logging.warn_f ~section:"memory_monitoring" "CRITICAL: InFlightAmendments registry size is %d (exceeds %d limit)" amendments_registry_size critical_threshold
+       else if amendments_registry_size > warning_threshold then
+         Logging.warn_f ~section:"memory_monitoring" "WARNING: InFlightAmendments registry size is %d (approaching %d limit)" amendments_registry_size critical_threshold
+     with exn ->
+       Logging.debug_f ~section:"memory_monitoring" "Failed to get registry sizes: %s" (Printexc.to_string exn));
 
     (* Check for per-component memory leaks *)
     check_per_feed_leaks ();

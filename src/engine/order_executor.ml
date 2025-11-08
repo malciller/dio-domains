@@ -38,6 +38,38 @@ module InFlightOrders = struct
   (** Remove an order from the in-flight cache *)
   let remove_in_flight_order duplicate_key =
     Registry.remove registry duplicate_key |> Option.is_some
+
+  (** Get the current size of the in-flight orders registry *)
+  let get_registry_size () =
+    Registry.size registry
+end
+
+(** In-flight amendment cache to prevent duplicate amendments *)
+module InFlightAmendments = struct
+  module Registry = Concurrency.Event_registry.Make(struct
+    type t = string (* order_id *)
+    let equal = String.equal
+    let hash = Hashtbl.hash
+  end)(struct
+    type t = unit (* We only need to track presence *)
+  end)
+
+  let registry = Registry.create ()
+
+  (** Check if an amendment is already in-flight and add it if not *)
+  let add_in_flight_amendment order_id =
+    match Registry.replace registry order_id () with
+    | Some (_, true) -> false (* Already existed *)
+    | Some (_, false) -> true (* Added successfully *)
+    | None -> false (* Should not happen *)
+
+  (** Remove an amendment from the in-flight cache *)
+  let remove_in_flight_amendment order_id =
+    Registry.remove registry order_id |> Option.is_some
+
+  (** Get the current size of the in-flight amendments registry *)
+  let get_registry_size () =
+    Registry.size registry
 end
 
 (** Order type definitions *)
@@ -167,9 +199,53 @@ let with_error_handling ~operation_name ?(max_retries=3) ?(retry_delay=1.0) f =
   in
   attempt 0
 
+(** Periodic cleanup task for in-flight orders and amendments registries *)
+let start_inflight_cleanup () =
+  Logging.debug ~section "Starting periodic in-flight orders and amendments cleanup task";
+  let rec cleanup_loop () =
+    (* Check for shutdown request *)
+    if Atomic.get shutdown_requested then (
+      Logging.debug ~section "In-flight orders and amendments cleanup task shutting down due to shutdown request";
+      Lwt.return_unit
+    ) else (
+      (* Perform cleanup for orders registry *)
+      let orders_cleanup_stats = InFlightOrders.Registry.cleanup InFlightOrders.registry () in
+      (match orders_cleanup_stats with
+       | Some (size_drift, size_trimmed) ->
+           (match size_drift with
+            | Some drift when drift <> 0 ->
+                Logging.info_f ~section "InFlightOrders registry size drift corrected: %d entries" drift
+            | _ -> ());
+           (match size_trimmed with
+            | Some trimmed when trimmed > 0 ->
+                Logging.info_f ~section "InFlightOrders registry size limit enforced: removed %d stale entries" trimmed
+            | _ -> ())
+       | None -> ());
+
+      (* Perform cleanup for amendments registry *)
+      let amendments_cleanup_stats = InFlightAmendments.Registry.cleanup InFlightAmendments.registry () in
+      (match amendments_cleanup_stats with
+       | Some (size_drift, size_trimmed) ->
+           (match size_drift with
+            | Some drift when drift <> 0 ->
+                Logging.info_f ~section "InFlightAmendments registry size drift corrected: %d entries" drift
+            | _ -> ());
+           (match size_trimmed with
+            | Some trimmed when trimmed > 0 ->
+                Logging.info_f ~section "InFlightAmendments registry size limit enforced: removed %d stale entries" trimmed
+            | _ -> ())
+       | None -> ());
+
+      (* Sleep for 5 minutes before next cleanup *)
+      Lwt_unix.sleep 300.0 >>= cleanup_loop
+    )
+  in
+  Lwt.async cleanup_loop
+
 (** Initialize the order executor with authentication token *)
 let init : unit Lwt.t =
   (* Trading client is now managed by the supervisor *)
+  start_inflight_cleanup ();
   Lwt.return_unit
 
 (** Place a new order *)
@@ -277,27 +353,46 @@ let amend_order
             cl_ord_id = request.cl_ord_id;
           })
         end else begin
-          Logging.info_f ~section "Amending order %s: %s" request.order_id
-            (match request.new_limit_price with Some p -> Printf.sprintf "price=%.2f" p | None -> "");
+          (* Check for duplicate amendments *)
+          if not (InFlightAmendments.add_in_flight_amendment request.order_id) then begin
+            let err = Printf.sprintf "Duplicate amendment detected for order %s" request.order_id in
+            Logging.warn_f ~section "%s" err;
+            Lwt.return (Error err)
+          end else begin
+            Logging.info_f ~section "Amending order %s: %s" request.order_id
+              (match request.new_limit_price with Some p -> Printf.sprintf "price=%.2f" p | None -> "");
 
-          let default_retry_config = Kraken.Kraken_actions.default_retry_config in
-          let actual_retry_config = Option.value retry_config ~default:default_retry_config in
+            let default_retry_config = Kraken.Kraken_actions.default_retry_config in
+            let actual_retry_config = Option.value retry_config ~default:default_retry_config in
 
-          Kraken.Kraken_actions.amend_order
-            ~token
-            ~order_id:request.order_id
-            ?cl_ord_id:request.cl_ord_id
-            ?order_qty:request.new_quantity
-            ?limit_price:request.new_limit_price
-            ?limit_price_type:request.limit_price_type
-            ?post_only:request.post_only
-            ?trigger_price:request.new_trigger_price
-            ?trigger_price_type:request.trigger_price_type
-            ?display_qty:request.new_display_qty
-            ?deadline:request.deadline
-            ?symbol:request.symbol
-            ~retry_config:actual_retry_config
-            ()
+            Lwt.catch
+              (fun () ->
+                Kraken.Kraken_actions.amend_order
+                  ~token
+                  ~order_id:request.order_id
+                  ?cl_ord_id:request.cl_ord_id
+                  ?order_qty:request.new_quantity
+                  ?limit_price:request.new_limit_price
+                  ?limit_price_type:request.limit_price_type
+                  ?post_only:request.post_only
+                  ?trigger_price:request.new_trigger_price
+                  ?trigger_price_type:request.trigger_price_type
+                  ?display_qty:request.new_display_qty
+                  ?deadline:request.deadline
+                  ?symbol:request.symbol
+                  ~retry_config:actual_retry_config
+                  ()
+              )
+              (fun exn ->
+                (* Remove from in-flight cache on error *)
+                let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
+                Lwt.fail exn
+              )
+            >>= fun result ->
+            (* Remove from in-flight cache on success *)
+            let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
+            Lwt.return result
+          end
         end
   )
 
@@ -419,4 +514,5 @@ let close () : unit Lwt.t =
 module Test = struct
   let generate_duplicate_key = generate_duplicate_key
   module InFlightOrders = InFlightOrders
+  module InFlightAmendments = InFlightAmendments
 end
