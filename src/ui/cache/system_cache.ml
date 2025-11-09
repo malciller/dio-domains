@@ -667,16 +667,19 @@ let perform_deep_cleanup () =
     (match pressure_level with Normal -> "normal" | Moderate -> "moderate" | High -> "high" | Critical -> "critical");
 
   (* Force cleanup of stale event bus subscribers - very aggressive *)
-  let telemetry_cleaned = Telemetry_cache.force_cleanup_stale_subscribers () in
-  let system_cleaned = SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus () in
-  let balance_cleaned = Balance_cache.force_cleanup_stale_subscribers () in
-  let logs_cleaned = Logs_cache.force_cleanup_stale_subscribers () in
-  let subscriber_total_cleaned = Option.value telemetry_cleaned ~default:0 +
+  (* Skip broadcast event buses to prevent TCP streams from being interrupted *)
+  (* let telemetry_cleaned = Telemetry_cache.force_cleanup_stale_subscribers () in *)
+  (* let system_cleaned = SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus () in *)
+  (* let balance_cleaned = Balance_cache.force_cleanup_stale_subscribers () in *)
+  (* let logs_cleaned = Logs_cache.force_cleanup_stale_subscribers () in *)
+  (* let subscriber_total_cleaned = Option.value telemetry_cleaned ~default:0 +
                                   Option.value system_cleaned ~default:0 +
                                   Option.value balance_cleaned ~default:0 +
                                   Option.value logs_cleaned ~default:0 in
   if subscriber_total_cleaned > 0 then
-    Logging.info_f ~section:"memory_monitoring" "Force cleaned %d stale subscribers across all feeds during deep cleanup" subscriber_total_cleaned;
+    Logging.info_f ~section:"memory_monitoring" "Force cleaned %d stale subscribers across all feeds during deep cleanup" subscriber_total_cleaned; *)
+
+  Logging.debug ~section:"memory_monitoring" "Skipping broadcast event bus cleanup during deep cleanup to preserve TCP streams";
 
   (* Clean up stale response table entries in trading client - more aggressive *)
   Kraken.Kraken_trading_client.cleanup_stale_response_entries ();
@@ -890,20 +893,24 @@ let get_memory_consumption_ranking () =
 
 (** Force cleanup of stale subscribers across all feeds *)
 let force_cleanup_all_stale_subscribers () =
-  let telemetry_cleaned = Telemetry_cache.force_cleanup_stale_subscribers () in
-  let system_cleaned = SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus () in
-  let balance_cleaned = Balance_cache.force_cleanup_stale_subscribers () in
-  let logs_cleaned = Logs_cache.force_cleanup_stale_subscribers () in
+  (* Skip broadcast event buses to prevent TCP streams from being interrupted *)
+  (* Broadcast streams are persistent and should not be cleaned up during memory maintenance *)
+  (* let telemetry_cleaned = Telemetry_cache.force_cleanup_stale_subscribers () in *)
+  (* let system_cleaned = SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus () in *)
+  (* let balance_cleaned = Balance_cache.force_cleanup_stale_subscribers () in *)
+  (* let logs_cleaned = Logs_cache.force_cleanup_stale_subscribers () in *)
 
-  let total_cleaned = Option.value telemetry_cleaned ~default:0 +
+  (* let total_cleaned = Option.value telemetry_cleaned ~default:0 +
                      Option.value system_cleaned ~default:0 +
                      Option.value balance_cleaned ~default:0 +
                      Option.value logs_cleaned ~default:0 in
 
   if total_cleaned > 0 then
-    Logging.info_f ~section:"memory_monitoring" "Force cleaned %d stale subscribers across all feeds" total_cleaned;
+    Logging.info_f ~section:"memory_monitoring" "Force cleaned %d stale subscribers across all feeds" total_cleaned; *)
 
-  total_cleaned
+  Logging.debug ~section:"memory_monitoring" "Skipping broadcast event bus cleanup during periodic maintenance to preserve TCP streams";
+
+  0  (* Return 0 cleaned subscribers since we're not cleaning broadcast buses *)
 
 (** Generate comprehensive memory diagnostic report *)
 let generate_memory_diagnostic_report () =

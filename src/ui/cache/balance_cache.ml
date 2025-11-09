@@ -436,7 +436,6 @@ let start_balance_updater () =
 (* Start periodic updater that publishes snapshots even when balances/orders haven't changed *)
 Lwt.async (fun () ->
     Logging.debug ~section:"balance_cache" "Starting periodic balance updater";
-    let cleanup_counter = ref 0 in
 
     (* Wait for Kraken feeds to be ready *)
     (if !kraken_feeds_ready then
@@ -452,12 +451,12 @@ Lwt.async (fun () ->
       ) else (
         (* Update cache periodically (this will check if enough time has passed) *)
         update_balance_cache_periodic ();
-        (* Force cleanup stale subscribers every 30 seconds (every 30 iterations) *)
-        cleanup_counter := !cleanup_counter + 1;
+        (* Skip periodic cleanup of broadcast event bus to prevent TCP streams from being interrupted *)
+        (* cleanup_counter := !cleanup_counter + 1;
         if !cleanup_counter >= 30 then begin
           let _ = force_cleanup_stale_subscribers () in
           cleanup_counter := 0;
-        end;
+        end; *)
         (* Sleep 1 second and continue *)
         Lwt_unix.sleep 1.0 >>= periodic_loop
       )

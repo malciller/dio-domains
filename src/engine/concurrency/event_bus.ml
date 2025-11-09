@@ -62,11 +62,14 @@ module Make (Payload : PAYLOAD) = struct
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in
       let filtered = List.filter (fun sub ->
-        not sub.closed &&
-        (now -. sub.created_at) <= max_age_seconds &&
-        (now -. sub.last_used) <= max_unused_seconds &&
-        (* Additional aggressive cleanup: remove subscribers that have been unused for extended periods *)
-        (now -. sub.last_used) <= 300.0  (* Hard limit: 5 minutes max unused time *)
+        (* Never clean up persistent subscribers (like broadcast streams) *)
+        sub.persistent ||
+        (not sub.closed &&
+         (now -. sub.created_at) <= max_age_seconds &&
+         (now -. sub.last_used) <= max_unused_seconds &&
+         (* Additional aggressive cleanup: remove subscribers that have been unused for extended periods *)
+         (now -. sub.last_used) <= 300.0  (* Hard limit: 5 minutes max unused time *)
+        )
       ) current in
       let removed_count = List.length current - List.length filtered in
       if removed_count > 0 then begin

@@ -66,7 +66,7 @@ let initialized = ref false
 
 (** Subscribe to log entry updates *)
 let subscribe_log_entries () =
-  let subscription = LogEntryEventBus.subscribe cache.log_entry_event_bus in
+  let subscription = LogEntryEventBus.subscribe ~persistent:true cache.log_entry_event_bus in
   (subscription.stream, subscription.close)
 
 (** Get logs event bus subscriber statistics *)
@@ -296,8 +296,8 @@ let start_logs_updater () =
       Telemetry.set_logs_dropped_count dropped_count;
       (* Perform periodic integrity check on entry_keys queue *)
       check_entry_keys_integrity ();
-      (* Force cleanup stale subscribers every 30 seconds *)
-      let _ = force_cleanup_stale_subscribers () in
+      (* Skip periodic cleanup of broadcast event bus to prevent TCP streams from being interrupted *)
+      (* let _ = force_cleanup_stale_subscribers () in *)
       monitoring_loop ()
     in
     monitoring_loop ()

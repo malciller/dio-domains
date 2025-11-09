@@ -300,7 +300,16 @@ let consume_stream_non_blocking stream_type stream process_fn state close_stream
           Logging.debug_f ~section:"broadcast" "%s stream health: received item %.1f seconds ago, active" stream_type time_since_last_item;
           last_health_log_time := now
         );
-        monitor_loop ()
+
+        (* Check for extended inactivity - trigger reconnection if no events for 2 minutes *)
+        (* This indicates the stream subscription was likely cleaned up or broken *)
+        if time_since_last_item > 120.0 then (
+          Logging.warn_f ~section:"broadcast" "%s stream appears dead - no events received for %.1f seconds, triggering reconnection" stream_type time_since_last_item;
+          (* Close the current subscription and let the outer retry logic handle reconnection *)
+          close_stream () >>= fun () ->
+          Lwt.fail_with (Printf.sprintf "%s stream dead - no events for %.1f seconds" stream_type time_since_last_item)
+        ) else
+          monitor_loop ()
       in
       monitor_loop ()
     ) (fun exn ->
@@ -310,14 +319,14 @@ let consume_stream_non_blocking stream_type stream process_fn state close_stream
   );
 
   let rec consumer_loop () =
-    (* Use Lwt.pick with short timeout to allow periodic shutdown checks *)
-    let get_with_shutdown_check = Lwt.pick [
-      Lwt_stream.get stream;
-      (Lwt_unix.sleep 0.1 >|= fun () -> None);  (* 0.1s timeout for shutdown checks *)
+    (* First check if stream is closed by trying to get without timeout *)
+    let check_stream_closure = Lwt.pick [
+      (Lwt_stream.get stream >|= fun result -> `StreamResult result);
+      (Lwt_unix.sleep 0.001 >|= fun () -> `Timeout);  (* Very short timeout to detect immediate None *)
     ] in
 
-    get_with_shutdown_check >>= function
-    | Some item ->
+    check_stream_closure >>= function
+    | `StreamResult (Some item) ->
         (* Got an item - process it asynchronously *)
         last_success_time := Unix.time ();
           Lwt.async (fun () ->
@@ -330,8 +339,14 @@ let consume_stream_non_blocking stream_type stream process_fn state close_stream
           );
         (* Continue reading immediately - don't wait for processing *)
         consumer_loop ()
-    | None ->
-        (* Either timeout or stream closed - check if shutdown requested *)
+    | `StreamResult None ->
+        (* Stream is permanently closed - this indicates the subscription was removed *)
+        Logging.warn_f ~section:"broadcast" "%s stream was closed unexpectedly (likely due to cleanup) - triggering reconnection" stream_type;
+        (* Close the current subscription and let the outer retry logic handle reconnection *)
+        close_stream () >>= fun () ->
+        Lwt.fail_with (Printf.sprintf "%s stream closed unexpectedly" stream_type)
+    | `Timeout ->
+        (* Stream is still active but no data available - check for shutdown *)
         if Atomic.get state.shutdown_requested then (
           Logging.info_f ~section:"broadcast" "%s stream consumer shutting down due to shutdown request" stream_type;
           (* Close stream on shutdown to ensure cleanup *)
