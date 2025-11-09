@@ -155,6 +155,19 @@ let () =
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
 
+  (* Initialize random number generator for crypto operations *)
+  Mirage_crypto_rng_unix.use_default ();
+
+  (* Initialize Conduit context early to prevent CamlinternalLazy.Undefined race conditions *)
+  (* This must be done before any domains spawn or websockets connect *)
+  (try
+    let _ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+    Logging.debug ~section:"main" "Conduit context initialized successfully"
+  with exn ->
+    Logging.error_f ~section:"main" "Failed to initialize Conduit context: %s" (Printexc.to_string exn);
+    raise exn
+  );
+
   (* Initialize caches for metrics broadcast if enabled *)
   if config.metrics_broadcast.active then (
     Logging.info ~section:"main" "Metrics broadcast enabled, initializing caches...";
@@ -176,19 +189,6 @@ let () =
       ) else
         Lwt.return_unit
     );
-  );
-
-  (* Initialize random number generator for crypto operations *)
-  Mirage_crypto_rng_unix.use_default ();
-
-  (* Initialize Conduit context early to prevent CamlinternalLazy.Undefined race conditions *)
-  (* This must be done before any domains spawn or websockets connect *)
-  (try
-    let _ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-    Logging.debug ~section:"main" "Conduit context initialized successfully"
-  with exn ->
-    Logging.error_f ~section:"main" "Failed to initialize Conduit context: %s" (Printexc.to_string exn);
-    raise exn
   );
 
   (* Setup signal handlers for graceful shutdown *)
