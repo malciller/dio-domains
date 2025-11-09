@@ -319,7 +319,9 @@ type store = {
 type decimals = int * int  (* pair_decimals, lot_decimals *)
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
+let stores_mutex = Mutex.create ()
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
+let decimals_tbl_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
 
 (** Get precision info from instruments feed cache *)
@@ -338,8 +340,13 @@ let calculate_checksum symbol bids asks : int32 =
         (price_prec, qty_prec)
     | None ->
         (* Fall back to decimals_tbl from AssetPairs API *)
-        try Hashtbl.find decimals_tbl symbol
+        Mutex.lock decimals_tbl_mutex;
+        try
+          let result = Hashtbl.find decimals_tbl symbol in
+          Mutex.unlock decimals_tbl_mutex;
+          result
         with Not_found ->
+          Mutex.unlock decimals_tbl_mutex;
           Logging.debug_f ~section "No precision found for %s, using defaults" symbol;
           (8, 8)  (* Fallback defaults *)
   in
@@ -404,10 +411,11 @@ let calculate_checksum symbol bids asks : int32 =
   result
 
 let ensure_store symbol =
-  match Hashtbl.find_opt stores symbol with
-  | Some store -> store
+  Mutex.lock stores_mutex;
+  let store = match Hashtbl.find_opt stores symbol with
+  | Some s -> s
   | None ->
-      let store = {
+      let s = {
         buffer = RingBuffer.create ring_buffer_size;
         bids = PriceMap.empty;
         asks = PriceMap.empty;
@@ -416,10 +424,17 @@ let ensure_store symbol =
         last_sequence = Atomic.make None;
         last_update = Unix.time ();
       } in
-      Hashtbl.add stores symbol store;
-      store
+      Hashtbl.add stores symbol s;
+      s
+  in
+  Mutex.unlock stores_mutex;
+  store
 
-let store_opt symbol = Hashtbl.find_opt stores symbol
+let store_opt symbol =
+  Mutex.lock stores_mutex;
+  let result = Hashtbl.find_opt stores symbol in
+  Mutex.unlock stores_mutex;
+  result
 
 let notify_ready store =
   if not (Atomic.get store.ready) then begin
@@ -465,11 +480,14 @@ let parse_level symbol price_json size_json =
         (price_prec, qty_prec)
     | None ->
         (* Fall back to decimals_tbl from AssetPairs API *)
+        Mutex.lock decimals_tbl_mutex;
         try
           let decimals = Hashtbl.find decimals_tbl symbol in
+          Mutex.unlock decimals_tbl_mutex;
           Logging.debug_f ~section "Found decimals_tbl for %s: %d, %d" symbol (fst decimals) (snd decimals);
           decimals
         with Not_found ->
+          Mutex.unlock decimals_tbl_mutex;
           Logging.debug_f ~section "No decimals found for %s, using defaults" symbol;
           (8, 8)  (* Fallback defaults *)
   in
@@ -602,8 +620,11 @@ let fetch_decimals symbols =
             let pd = to_int (member "pair_decimals" pair_json) in
             let ld = to_int (member "lot_decimals" pair_json) in
             List.iter (fun sym ->
-              if altname = Some sym || wsname = Some sym then
-                Hashtbl.add decimals_tbl sym (pd, ld)
+              if altname = Some sym || wsname = Some sym then begin
+                Mutex.lock decimals_tbl_mutex;
+                Hashtbl.add decimals_tbl sym (pd, ld);
+                Mutex.unlock decimals_tbl_mutex
+              end
             ) symbols
           ) pairs;
           Lwt.return ()
@@ -855,6 +876,7 @@ let prune_stale_data () =
 
   let stores_to_remove = ref [] in
   let trimmed_stores = ref [] in
+  Mutex.lock stores_mutex;
   let total_stores_before = Hashtbl.length stores in
 
   Hashtbl.iter (fun symbol store ->
@@ -901,7 +923,9 @@ let prune_stale_data () =
 
   if stores_removed > 0 || stores_trimmed > 0 then
     Logging.info_f ~section "Orderbook cleanup: removed %d stale stores, trimmed %d active stores (%d -> %d total stores)"
-      stores_removed stores_trimmed total_stores_before total_stores_after
+      stores_removed stores_trimmed total_stores_before total_stores_after;
+
+  Mutex.unlock stores_mutex
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
   let start_time = Unix.gettimeofday () in

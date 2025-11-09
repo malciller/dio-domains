@@ -24,7 +24,7 @@ let shutdown_requested = Atomic.make false
 
 
 (** The worker function executed by each domain for a trading asset *)
-let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset : trading_config) =
+let asset_domain_worker state (fee_fetcher : trading_config -> trading_config) (asset : trading_config) =
   Random.self_init ();  (* Initialize random state for this domain *)
   
   (* Fetch fees at domain startup using the provided fetcher *)
@@ -143,10 +143,6 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   
   Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
     asset_with_fees.exchange asset_with_fees.symbol asset_with_fees.strategy;
-
-
-  let key = domain_key asset_with_fees in
-  let state = Hashtbl.find domain_registry key in
 
   let cycle_count = ref 0 in
   let telemetry_batch = ref 0 in
@@ -499,7 +495,7 @@ let start_domain state fee_fetcher =
 
       (* Exception handling for robustness *)
       try
-        asset_domain_worker fee_fetcher asset;
+        asset_domain_worker state fee_fetcher asset;
         Logging.info_f ~section "Domain for %s/%s completed normally" asset.exchange asset.symbol
       with exn ->
         Logging.critical_f ~section "Domain for %s/%s crashed: %s"

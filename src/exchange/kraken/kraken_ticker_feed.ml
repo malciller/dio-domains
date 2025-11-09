@@ -77,20 +77,29 @@ type store = {
 }
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
+let stores_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
 
 let ensure_store symbol =
-  match Hashtbl.find_opt stores symbol with
-  | Some store -> store
+  Mutex.lock stores_mutex;
+  let store = match Hashtbl.find_opt stores symbol with
+  | Some s -> s
   | None ->
-      let store = {
+      let s = {
         buffer = RingBuffer.create 100;
         ready = Atomic.make false;
       } in
-      Hashtbl.add stores symbol store;
-      store
+      Hashtbl.add stores symbol s;
+      s
+  in
+  Mutex.unlock stores_mutex;
+  store
 
-let store_opt symbol = Hashtbl.find_opt stores symbol
+let store_opt symbol =
+  Mutex.lock stores_mutex;
+  let result = Hashtbl.find_opt stores symbol in
+  Mutex.unlock stores_mutex;
+  result
 
 let notify_ready store =
   if not (Atomic.get store.ready) then begin

@@ -99,6 +99,7 @@ let ready_condition = Lwt_condition.create ()
 
 (** Track last balance update time per asset for staleness detection *)
 let last_balance_update : (string, float) Hashtbl.t = Hashtbl.create 32
+let last_balance_update_mutex = Mutex.create ()
 let balance_update_mutex = Mutex.create ()
 
 (** Track configured assets (from trading config) vs dynamic assets *)

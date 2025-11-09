@@ -225,9 +225,10 @@ let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
 (** Global order_id to symbol mapping for handling minimal events *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 128
+let order_to_symbol_mutex = Mutex.create ()
 let global_orders_mutex = Mutex.create ()
 
-let initialization_mutex = Mutex.create ()
+let symbol_stores_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
 
 (** Get or create store for a symbol - wait-free after init *)
@@ -235,7 +236,7 @@ let get_symbol_store symbol =
   match Hashtbl.find_opt symbol_stores symbol with
   | Some store -> store
   | None ->
-      Mutex.lock initialization_mutex;
+      Mutex.lock symbol_stores_mutex;
       let store = 
         match Hashtbl.find_opt symbol_stores symbol with
         | Some s -> s
@@ -250,7 +251,7 @@ let get_symbol_store symbol =
             Logging.debug_f ~section "Created execution store for %s" symbol;
             s
       in
-      Mutex.unlock initialization_mutex;
+      Mutex.unlock symbol_stores_mutex;
       store
 
 (** Notify that execution data is ready *)
@@ -384,7 +385,9 @@ let update_open_orders store (event : execution_event) =
       Hashtbl.remove store.open_orders event.order_id;
       
       (* Remove from global order mapping *)
+      Mutex.lock order_to_symbol_mutex;
       Hashtbl.remove order_to_symbol event.order_id;
+      Mutex.unlock order_to_symbol_mutex;
       
       if is_terminal_status then
         Logging.info_f ~section "Removed order: %s [%s] status=%s exec_type=%s"
@@ -428,7 +431,9 @@ let update_open_orders store (event : execution_event) =
     Hashtbl.replace store.open_orders event.order_id order;
     
     (* Add to global order mapping *)
+    Mutex.lock order_to_symbol_mutex;
     Hashtbl.replace order_to_symbol event.order_id event.symbol;
+    Mutex.unlock order_to_symbol_mutex;
     
     if was_present then begin
       Logging.info_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"

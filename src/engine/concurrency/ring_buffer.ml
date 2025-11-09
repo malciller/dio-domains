@@ -10,7 +10,7 @@ module RingBuffer = struct
     data: 'a option Atomic.t array;
     write_pos: int Atomic.t;
     size: int;
-    mutable count: int;  (* Track number of valid entries *)
+    count: int Atomic.t;  (* Track number of valid entries *)
   }
 
   (** Create a new ring buffer with the specified capacity *)
@@ -21,7 +21,7 @@ module RingBuffer = struct
       data = Array.init size (fun _ -> Atomic.make None);
       write_pos = Atomic.make 0;
       size;
-      count = 0;
+      count = Atomic.make 0;
     }
 
   (** Lock-free write - overwrites oldest entry when full (FIFO eviction) *)
@@ -30,12 +30,13 @@ module RingBuffer = struct
     Atomic.set buffer.data.(pos) (Some value);
     let new_pos = (pos + 1) mod buffer.size in
     Atomic.set buffer.write_pos new_pos;
-    if buffer.count < buffer.size then
-      buffer.count <- buffer.count + 1
+    let current_count = Atomic.get buffer.count in
+    if current_count < buffer.size then
+      ignore (Atomic.compare_and_set buffer.count current_count (current_count + 1))
     (* When full, we overwrite oldest but count stays at size *)
 
   (** Get current number of valid entries *)
-  let length buffer = buffer.count
+  let length buffer = Atomic.get buffer.count
 
   (** Get capacity of the buffer *)
   let capacity buffer = buffer.size
@@ -43,7 +44,8 @@ module RingBuffer = struct
   (** Read all current entries in the buffer (for snapshot rebuilding) *)
   let read_all buffer =
     let write_pos = Atomic.get buffer.write_pos in
-    if buffer.count = 0 then
+    let count = Atomic.get buffer.count in
+    if count = 0 then
       []
     else
       let rec collect acc remaining pos =
@@ -55,12 +57,12 @@ module RingBuffer = struct
           | None -> collect acc (remaining - 1) ((pos + 1) mod buffer.size)
       in
       (* Start reading from the oldest entry *)
-      let start_pos = if buffer.count < buffer.size then 0 else write_pos in
-      collect [] buffer.count start_pos
+      let start_pos = if count < buffer.size then 0 else write_pos in
+      collect [] count start_pos
 
   (** Read latest entry (most recent) *)
   let read_latest buffer =
-    if buffer.count = 0 then
+    if Atomic.get buffer.count = 0 then
       None
     else
       let write_pos = Atomic.get buffer.write_pos in
@@ -70,7 +72,7 @@ module RingBuffer = struct
   (** Read entries from a specific position onwards (for incremental updates) *)
   let read_since buffer last_pos =
     let current_pos = Atomic.get buffer.write_pos in
-    if last_pos = current_pos || buffer.count = 0 then
+    if last_pos = current_pos || Atomic.get buffer.count = 0 then
       []
     else
       let rec collect acc pos =
@@ -87,11 +89,11 @@ module RingBuffer = struct
   let clear buffer =
     Array.iter (fun atomic -> Atomic.set atomic None) buffer.data;
     Atomic.set buffer.write_pos 0;
-    buffer.count <- 0
+    Atomic.set buffer.count 0
 
   (** Check if buffer is empty *)
-  let is_empty buffer = buffer.count = 0
+  let is_empty buffer = Atomic.get buffer.count = 0
 
   (** Check if buffer is at full capacity *)
-  let is_full buffer = buffer.count >= buffer.size
+  let is_full buffer = Atomic.get buffer.count >= buffer.size
 end
