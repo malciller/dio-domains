@@ -92,6 +92,12 @@ let add_in_flight_amendment order_id =
 let remove_in_flight_amendment order_id =
   InFlightRequests.remove_in_flight_request (AmendOrder order_id)
 
+(** Check if an amendment is already in-flight without modifying the registry *)
+let is_amendment_in_flight order_id =
+  match InFlightRequests.Registry.find InFlightRequests.registry (AmendOrder order_id) with
+  | Some _ -> true
+  | None -> false
+
 (** Order type definitions *)
 type order_type = string (* "market" | "limit" | "stop-loss" | "take-profit" | "trailing-stop" | etc. *)
 type order_side = string (* "buy" | "sell" *)
@@ -524,5 +530,6 @@ let close () : unit Lwt.t =
 (** Test interface - exposed for unit testing *)
 module Test = struct
   let generate_duplicate_key = generate_duplicate_key
+  let is_amendment_in_flight = is_amendment_in_flight
   module InFlightRequests = InFlightRequests
 end

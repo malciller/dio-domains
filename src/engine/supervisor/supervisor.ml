@@ -60,6 +60,19 @@ module Token_store = struct
   let get () = Atomic.get token
 end
 
+(** Check if requested price differs significantly from current order price *)
+let price_differs_significantly ?(threshold_percent=0.1) symbol order_id requested_price =
+  match Kraken.Kraken_executions_feed.get_open_order symbol order_id with
+  | Some current_order ->
+      (match current_order.limit_price with
+       | Some current_price ->
+           let diff_percent = abs_float ((requested_price -. current_price) /. current_price) *. 100.0 in
+           diff_percent > threshold_percent
+       | None -> false)
+  | None ->
+      Logging.warn_f ~section "Order %s not found in open orders cache when checking price difference" order_id;
+      false
+
 (** Generate unique ping request ID - start high to avoid conflicts with trading req_ids *)
 let next_ping_req_id =
   let counter = ref 1000000 in
@@ -913,102 +926,124 @@ let order_processing_loop () =
                (* Handle amend operation *)
                (match order.order_id with
                 | Some target_order_id ->
-                    let amend_request = {
-                      Dio_engine.Order_executor.order_id = target_order_id;
-                      cl_ord_id = None;
-                      new_quantity = Some order.qty;
-                      new_limit_price = order.price;
-                      limit_price_type = None;
-                      post_only = Some order.post_only;
-                      new_trigger_price = None;
-                      trigger_price_type = None;
-                      new_display_qty = None;
-                      deadline = None;
-                      symbol = Some order.symbol;
-                    } in
+                    (* Check for duplicate amendments before proceeding *)
+                    let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
+                    let should_proceed = if amendment_in_flight then
+                      (* Check if there's a significant price difference indicating a deeper issue *)
+                      match order.price with
+                      | Some requested_price ->
+                          if price_differs_significantly order.symbol target_order_id requested_price then begin
+                            Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
+                            true
+                          end else begin
+                            Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
+                            false
+                          end
+                      | None ->
+                          Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
+                          false
+                    else
+                      true
+                    in
 
-                    Lwt.async (fun () ->
-                      Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
-                        | Ok result ->
-                            incr orders_placed;
-                            Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)"
-                              (match order.side with
-                          | Buy -> "buy"
-                          | Sell -> "sell") order.symbol order.qty
-                              (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
-                              result.amend_id;
-                            Telemetry.inc_counter (Telemetry.counter "orders_amended" ()) ();
+                    if should_proceed then begin
+                      let amend_request = {
+                        Dio_engine.Order_executor.order_id = target_order_id;
+                        cl_ord_id = None;
+                        new_quantity = Some order.qty;
+                        new_limit_price = order.price;
+                        limit_price_type = None;
+                        post_only = Some order.post_only;
+                        new_trigger_price = None;
+                        trigger_price_type = None;
+                        new_display_qty = None;
+                        deadline = None;
+                        symbol = Some order.symbol;
+                      } in
 
-                            (* Notify strategy that amendment was acknowledged *)
-                            (match order.price with
-                             | Some price ->
-                                 (match order.strategy with
-                                  | "Grid" ->
-                                      Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
-                                        order.symbol result.order_id order.side price
-                                  | "MM" ->
-                                      Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
-                                        order.symbol result.order_id order.side price
-                                  | _ ->
-                                      Logging.warn_f ~section "Unknown strategy '%s' for amendment acknowledgment: %s" order.strategy result.order_id
-                                 )
-                             | None ->
-                                 Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.order_id
-                            );
-                            Lwt.return_unit
-                        | Error err ->
-                            Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s"
-                              (match order.side with
-                          | Buy -> "buy"
-                          | Sell -> "sell") order.symbol order.qty
-                              (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
-                              err;
-                            Telemetry.inc_counter Telemetry.Common.orders_failed ();
+                      Lwt.async (fun () ->
+                        Lwt.catch (fun () ->
+                          Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
+                          | Ok result ->
+                              incr orders_placed;
+                              Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)"
+                                (match order.side with
+                            | Buy -> "buy"
+                            | Sell -> "sell") order.symbol order.qty
+                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                                result.amend_id;
+                              Telemetry.inc_counter (Telemetry.counter "orders_amended" ()) ();
 
-                            (* Notify strategy that amendment was rejected *)
-                            (match order.price with
-                             | Some price ->
-                                 (match order.strategy with
-                                  | "Grid" ->
-                                      Dio_strategies.Suicide_grid.Strategy.handle_order_rejected
-                                        order.symbol order.side price
-                                  | "MM" ->
-                                      Dio_strategies.Market_maker.Strategy.handle_order_rejected
-                                        order.symbol order.side price
-                                  | _ ->
-                                      Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
-                                 )
-                             | None ->
-                                 Logging.warn_f ~section "Amendment rejected but no price available for strategy update: %s" err
-                            );
-                            Lwt.return_unit
-                      ) (fun exn ->
-                        Logging.error_f ~section "✗ Exception amending order %s %s: %s"
-                          (match order.side with
-                          | Buy -> "buy"
-                          | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                        Telemetry.inc_counter Telemetry.Common.orders_failed ();
+                              (* Notify strategy that amendment was acknowledged *)
+                              (match order.price with
+                               | Some price ->
+                                   (match order.strategy with
+                                    | "Grid" ->
+                                        Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
+                                          order.symbol result.order_id order.side price
+                                    | "MM" ->
+                                        Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
+                                          order.symbol result.order_id order.side price
+                                    | _ ->
+                                        Logging.warn_f ~section "Unknown strategy '%s' for amendment acknowledgment: %s" order.strategy result.order_id
+                                   )
+                               | None ->
+                                   Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.order_id
+                              );
+                              Lwt.return_unit
+                          | Error err ->
+                              Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s"
+                                (match order.side with
+                            | Buy -> "buy"
+                            | Sell -> "sell") order.symbol order.qty
+                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                                err;
+                              Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
-                        (* For exceptions, also notify strategy that amendment failed *)
-                        (match order.price with
-                         | Some price ->
-                             (match order.strategy with
-                              | "Grid" ->
-                                  Dio_strategies.Suicide_grid.Strategy.handle_order_rejected
-                                    order.symbol order.side price
-                              | "MM" ->
-                                  Dio_strategies.Market_maker.Strategy.handle_order_rejected
-                                    order.symbol order.side price
-                              | _ ->
-                                  Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
-                             )
-                         | None ->
-                             Logging.warn_f ~section "Amendment exception but no price available for strategy update: %s" (Printexc.to_string exn)
-                        );
-                        Lwt.return_unit
+                              (* Notify strategy that amendment was rejected *)
+                              (match order.price with
+                               | Some price ->
+                                   (match order.strategy with
+                                    | "Grid" ->
+                                        Dio_strategies.Suicide_grid.Strategy.handle_order_rejected
+                                          order.symbol order.side price
+                                    | "MM" ->
+                                        Dio_strategies.Market_maker.Strategy.handle_order_rejected
+                                          order.symbol order.side price
+                                    | _ ->
+                                        Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
+                                   )
+                               | None ->
+                                   Logging.warn_f ~section "Amendment rejected but no price available for strategy update: %s" err
+                              );
+                              Lwt.return_unit
+                        ) (fun exn ->
+                          Logging.error_f ~section "✗ Exception amending order %s %s: %s"
+                            (match order.side with
+                            | Buy -> "buy"
+                            | Sell -> "sell") order.symbol (Printexc.to_string exn);
+                          Telemetry.inc_counter Telemetry.Common.orders_failed ();
+
+                          (* For exceptions, also notify strategy that amendment failed *)
+                          (match order.price with
+                           | Some price ->
+                               (match order.strategy with
+                                | "Grid" ->
+                                    Dio_strategies.Suicide_grid.Strategy.handle_order_rejected
+                                      order.symbol order.side price
+                                | "MM" ->
+                                    Dio_strategies.Market_maker.Strategy.handle_order_rejected
+                                      order.symbol order.side price
+                                | _ ->
+                                    Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
+                               )
+                           | None ->
+                               Logging.warn_f ~section "Amendment exception but no price available for strategy update: %s" (Printexc.to_string exn)
+                          );
+                          Lwt.return_unit
+                        )
                       )
-                    )
+                    end
                 | None ->
                     Logging.error_f ~section "Amendment request missing target order ID for %s %s"
                       (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol;
@@ -1213,7 +1248,28 @@ let order_processing_loop () =
                (* Handle amend operation *)
                (match order.order_id with
                 | Some target_order_id ->
-                    let amend_request = {
+                    (* Check for duplicate amendments before proceeding *)
+                    let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
+                    let should_proceed = if amendment_in_flight then
+                      (* Check if there's a significant price difference indicating a deeper issue *)
+                      match order.price with
+                      | Some requested_price ->
+                          if price_differs_significantly order.symbol target_order_id requested_price then begin
+                            Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
+                            true
+                          end else begin
+                            Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
+                            false
+                          end
+                      | None ->
+                          Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
+                          false
+                    else
+                      true
+                    in
+
+                    if should_proceed then begin
+                      let amend_request = {
                       Dio_engine.Order_executor.order_id = target_order_id;
                       cl_ord_id = None;
                       new_quantity = Some order.qty;
@@ -1309,6 +1365,7 @@ let order_processing_loop () =
                         Lwt.return_unit
                       )
                     )
+                    end
                 | None ->
                     Logging.error_f ~section "Amendment request missing target order ID for %s %s"
                       (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol;
