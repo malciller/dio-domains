@@ -24,7 +24,7 @@
     },
     {
       "symbol": "ETH/USD",
-      "qty": "0.003", 
+      "qty": "0.004", 
       "grid_interval": "2.5",
       "sell_mult": "0.999",
       "strategy": "Grid"

@@ -966,7 +966,7 @@ let perform_memory_maintenance () =
     (* Force GC every 15 minutes for dashboard mode to prevent gradual memory creep *)
     if time_since_gc > 900.0 then (
       Logging.debug ~section:"memory_monitoring" "Performing scheduled GC (15-minute interval for dashboard mode)";
-      Gc.full_major ();
+      Telemetry.safe_gc ();
       last_gc_time := now
     );
 

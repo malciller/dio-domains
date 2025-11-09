@@ -320,10 +320,20 @@ let consume_stream_non_blocking stream_type stream process_fn state close_stream
 
   let rec consumer_loop () =
     (* First check if stream is closed by trying to get without timeout *)
-    let check_stream_closure = Lwt.pick [
-      (Lwt_stream.get stream >|= fun result -> `StreamResult result);
-      (Lwt_unix.sleep 0.001 >|= fun () -> `Timeout);  (* Very short timeout to detect immediate None *)
-    ] in
+    let check_stream_closure = Lwt.catch
+      (fun () -> Lwt.pick [
+        (Lwt_stream.get stream >|= fun result -> `StreamResult result);
+        (Lwt_unix.sleep 0.001 >|= fun () -> `Timeout);  (* Very short timeout to detect immediate None *)
+      ])
+      (function
+       | Queue.Empty ->
+           (* Queue.Empty indicates a race condition in Lwt's internal resolution loop *)
+           (* Treat it as a timeout and continue *)
+           Lwt.return `Timeout
+       | exn ->
+           (* Re-raise other exceptions *)
+           Lwt.fail exn
+      ) in
 
     check_stream_closure >>= function
     | `StreamResult (Some item) ->

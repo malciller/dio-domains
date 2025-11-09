@@ -920,7 +920,10 @@ let order_processing_loop () =
                    );
                    Lwt.return_unit
                  )
-               )
+               );
+
+               (* Unlock mutex immediately after starting async operation *)
+               (try Mutex.unlock order_mutex with Sys_error _ -> ())
 
            | Amend ->
                (* Handle amend operation *)
@@ -929,19 +932,30 @@ let order_processing_loop () =
                     (* Check for duplicate amendments before proceeding *)
                     let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
                     let should_proceed = if amendment_in_flight then
-                      (* Check if there's a significant price difference indicating a deeper issue *)
-                      match order.price with
-                      | Some requested_price ->
-                          if price_differs_significantly order.symbol target_order_id requested_price then begin
-                            Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
-                            true
-                          end else begin
-                            Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
+                      (* Check if the order still exists in the open orders cache *)
+                      let order_exists = match Kraken.Kraken_executions_feed.get_open_order order.symbol target_order_id with
+                        | Some _ -> true
+                        | None -> false
+                      in
+                      if order_exists then
+                        (* Order still exists - check for significant price differences *)
+                        match order.price with
+                        | Some requested_price ->
+                            if price_differs_significantly order.symbol target_order_id requested_price then begin
+                              Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
+                              true
+                            end else begin
+                              Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
+                              false
+                            end
+                        | None ->
+                            Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
                             false
-                          end
-                      | None ->
-                          Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
-                          false
+                      else begin
+                        (* Order was cleaned up as stale - allow amendment to proceed even if in-flight *)
+                        Logging.debug_f ~section "Order %s not found in cache but amendment in-flight, proceeding with amendment (likely stale order cleanup)" target_order_id;
+                        true
+                      end
                     else
                       true
                     in
@@ -1042,7 +1056,10 @@ let order_processing_loop () =
                           );
                           Lwt.return_unit
                         )
-                      )
+                      );
+
+                      (* Unlock mutex immediately after starting async operation *)
+                      (try Mutex.unlock order_mutex with Sys_error _ -> ())
                     end
                 | None ->
                     Logging.error_f ~section "Amendment request missing target order ID for %s %s"
@@ -1100,15 +1117,18 @@ let order_processing_loop () =
 
                         Lwt.return_unit
                       )
-                    )
+                    );
+
+                    (* Unlock mutex immediately after starting async operation *)
+                    (try Mutex.unlock order_mutex with Sys_error _ -> ())
                 | None ->
                     Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                     Telemetry.inc_counter Telemetry.Common.orders_failed ()
                )
           );
-          Mutex.unlock order_mutex
+          (try Mutex.unlock order_mutex with Sys_error _ -> ())
         with exn ->
-          Mutex.unlock order_mutex;
+          (try Mutex.unlock order_mutex with Sys_error _ -> ());
           Logging.error_f ~section "Error processing order %s %s: %s"
             (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
       ) pending_grid_orders;
@@ -1242,7 +1262,10 @@ let order_processing_loop () =
                    );
                    Lwt.return_unit
                  )
-               )
+               );
+
+               (* Unlock mutex immediately after starting async operation *)
+               (try Mutex.unlock order_mutex with Sys_error _ -> ())
 
            | Amend ->
                (* Handle amend operation *)
@@ -1251,19 +1274,30 @@ let order_processing_loop () =
                     (* Check for duplicate amendments before proceeding *)
                     let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
                     let should_proceed = if amendment_in_flight then
-                      (* Check if there's a significant price difference indicating a deeper issue *)
-                      match order.price with
-                      | Some requested_price ->
-                          if price_differs_significantly order.symbol target_order_id requested_price then begin
-                            Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
-                            true
-                          end else begin
-                            Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
+                      (* Check if the order still exists in the open orders cache *)
+                      let order_exists = match Kraken.Kraken_executions_feed.get_open_order order.symbol target_order_id with
+                        | Some _ -> true
+                        | None -> false
+                      in
+                      if order_exists then
+                        (* Order still exists - check for significant price differences *)
+                        match order.price with
+                        | Some requested_price ->
+                            if price_differs_significantly order.symbol target_order_id requested_price then begin
+                              Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
+                              true
+                            end else begin
+                              Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
+                              false
+                            end
+                        | None ->
+                            Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
                             false
-                          end
-                      | None ->
-                          Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
-                          false
+                      else begin
+                        (* Order was cleaned up as stale - allow amendment to proceed even if in-flight *)
+                        Logging.debug_f ~section "Order %s not found in cache but amendment in-flight, proceeding with amendment (likely stale order cleanup)" target_order_id;
+                        true
+                      end
                     else
                       true
                     in
@@ -1422,15 +1456,18 @@ let order_processing_loop () =
 
                         Lwt.return_unit
                       )
-                    )
+                    );
+
+                    (* Unlock mutex immediately after starting async operation *)
+                    (try Mutex.unlock order_mutex with Sys_error _ -> ())
                 | None ->
                     Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                     Telemetry.inc_counter Telemetry.Common.orders_failed ()
                )
           );
-          Mutex.unlock order_mutex
+          (try Mutex.unlock order_mutex with Sys_error _ -> ())
         with exn ->
-          Mutex.unlock order_mutex;
+          (try Mutex.unlock order_mutex with Sys_error _ -> ());
           Logging.error_f ~section "Error processing order %s %s: %s"
             (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
       ) pending_mm_orders;

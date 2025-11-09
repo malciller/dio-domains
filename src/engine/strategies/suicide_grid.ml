@@ -584,12 +584,14 @@ let execute_strategy
         (match state.last_buy_order_price with Some p -> Printf.sprintf "%.2f" p | None -> "none")
         (List.length state.open_sell_orders)
     end;
-    (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
+    (* Clean up stale pending orders (older than 5 seconds for regular orders, 15 seconds for amendments) and enforce hard limit of 50 *)
     let now = Unix.time () in
     let original_pending_count = List.length state.pending_orders in
     state.pending_orders <- List.filter (fun (order_id, _, _, timestamp) ->
       let age = now -. timestamp in
-      if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
+      let is_amend_order = String.starts_with ~prefix:"pending_amend_" order_id in
+      let timeout = if is_amend_order then 15.0 else 5.0 in  (* Give amendments more time since they can take longer *)
+      if age > timeout then begin
         Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
         false
       end else

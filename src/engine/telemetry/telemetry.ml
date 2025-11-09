@@ -175,29 +175,34 @@ let metrics : (string, metric) Hashtbl.t = Hashtbl.create 128
 let metrics_mutex = Mutex.create ()
 let metrics_changed_condition = Lwt_condition.create ()
 
+(** Mutex to serialize garbage collection calls to prevent race conditions *)
+let gc_mutex = Mutex.create ()
+
 (** Helper function to acquire mutex with timeout to detect deadlocks *)
 let lock_mutex_with_timeout mutex timeout_seconds name =
   let start_time = Unix.gettimeofday () in
-  let rec try_lock attempts =
-    if attempts > 10 then (* Give up after 10 attempts *)
-      failwith (Printf.sprintf "Failed to acquire %s mutex after %.1fs (possible deadlock)" name timeout_seconds)
-    else
-      try
-        Mutex.lock mutex;
+  let rec try_lock_loop () =
+    if Mutex.try_lock mutex then
+      begin
+        (* Lock was acquired successfully *)
         let elapsed = Unix.gettimeofday () -. start_time in
         if elapsed > 0.1 then (* Log if it took more than 100ms *)
-          Logging.debug_f ~section:"mutex_lock" "Slow mutex acquisition for %s: %.3fs" name elapsed
-      with Sys_error _ -> (* Mutex is locked *)
-        let elapsed = Unix.gettimeofday () -. start_time in
-        if elapsed > timeout_seconds then
-          failwith (Printf.sprintf "Timeout acquiring %s mutex after %.1fs (possible deadlock)" name elapsed)
-        else begin
-          (* Brief sleep and retry *)
-          Thread.delay 0.01;
-          try_lock (attempts + 1)
-        end
+          Logging.debug_f ~section:"mutex_lock" "Slow mutex acquisition for %s: %.3fs" name elapsed;
+        true
+      end
+    else if (Unix.gettimeofday () -. start_time) > timeout_seconds then
+      begin
+        (* Timeout - give up *)
+        Logging.warn_f ~section:"mutex_lock" "Timeout acquiring %s mutex after %.1fs (possible deadlock)" name timeout_seconds;
+        false
+      end
+    else begin
+      (* Brief sleep and try again *)
+      Thread.delay 0.01;
+      try_lock_loop ()
+    end
   in
-  try_lock 0
+  try_lock_loop ()
 
 (** Event bus for metric changes (stream-based subscription) *)
 module MetricChangeEventBus = Event_bus.Make(struct
@@ -223,6 +228,11 @@ let safe_broadcast_metrics_changed () =
   (* Also publish to event bus for stream-based subscribers *)
   MetricChangeEventBus.publish metric_change_event_bus ()
 
+(** Safe garbage collection helper to prevent race conditions *)
+let safe_gc () =
+  Mutex.lock gc_mutex;
+  Gc.full_major ();
+  Mutex.unlock gc_mutex
 
 (** Helper to generate metric key *)
 let metric_key name labels =
@@ -364,65 +374,79 @@ let get_gauge metric =
 
 (** Adjust buffer capacities based on memory pressure *)
 let adjust_buffer_capacities () =
-  let now = Unix.gettimeofday () in
-  let pressure = get_memory_pressure () in
+  try
+    let now = Unix.gettimeofday () in
+    let pressure = get_memory_pressure () in
 
-  (* Only adjust capacities every 60 seconds to avoid excessive churn *)
-  Mutex.lock memory_config_mutex;
-  let time_since_last = now -. memory_config.last_adjustment in
-  if time_since_last >= 60.0 then begin
-    Logging.warn_f ~section:"telemetry" "Adjusting buffer capacities (pressure: %s)"
-      (match pressure with Low -> "Low" | Medium -> "Medium" | High -> "High");
-    let old_rate_capacity = memory_config.rate_buffer_capacity in
-    let old_histogram_capacity = memory_config.histogram_capacity in
+    (* Initialize capacity variables - will be updated if we can acquire the mutex *)
+    let current_rate_capacity = ref memory_config.rate_buffer_capacity in
+    let current_histogram_capacity = ref memory_config.histogram_capacity in
+
+    (* Only adjust capacities every 60 seconds to avoid excessive churn *)
+    if lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config" then begin
+      let time_since_last = now -. memory_config.last_adjustment in
+      if time_since_last >= 60.0 then begin
+        let old_rate_capacity = memory_config.rate_buffer_capacity in
+        let old_histogram_capacity = memory_config.histogram_capacity in
+
+        (match pressure with
+         | Low ->
+             (* Increase capacities up to max limits *)
+             memory_config.rate_buffer_capacity <- min 500 (memory_config.rate_buffer_capacity * 6 / 5);
+             memory_config.histogram_capacity <- min 30000 (memory_config.histogram_capacity * 6 / 5);
+             (* Low pressure is normal - log at debug level *)
+             Logging.debug_f ~section:"telemetry" "Adjusting buffer capacities (pressure: Low): rate %d->%d, histogram %d->%d"
+               old_rate_capacity memory_config.rate_buffer_capacity
+               old_histogram_capacity memory_config.histogram_capacity
+         | Medium ->
+             (* Keep current capacities *)
+             (* Medium pressure - log as info *)
+             Logging.info_f ~section:"telemetry" "Memory pressure: Medium (maintaining buffer capacities)"
+         | High ->
+             (* Decrease capacities aggressively with minimum limits - ensure enough samples for smooth metrics *)
+             (* At 2k samples/sec (1/100 sampling), 10000 samples = ~5s, 15000 samples = ~7.5s *)
+             memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity / 2);
+             memory_config.histogram_capacity <- max 10000 (memory_config.histogram_capacity / 2);
+             (* High pressure is concerning - log as warning *)
+             Logging.warn_f ~section:"telemetry" "Adjusting buffer capacities (pressure: High): rate %d->%d, histogram %d->%d"
+               old_rate_capacity memory_config.rate_buffer_capacity
+               old_histogram_capacity memory_config.histogram_capacity
+        );
+
+        memory_config.last_adjustment <- now;
+      end;
+
+      (* Get current capacities for metrics (within mutex) *)
+      current_rate_capacity := memory_config.rate_buffer_capacity;
+      current_histogram_capacity := memory_config.histogram_capacity;
+      Mutex.unlock memory_config_mutex;
+    end else begin
+      (* Could not acquire memory_config mutex, skip capacity adjustment *)
+      Logging.warn ~section "Skipping buffer capacity adjustment due to mutex timeout"
+    end;
+
+    (* Always update metrics (outside throttle) *)
+    let rate_capacity_metric = gauge "telemetry_rate_buffer_capacity" () in
+    let histogram_capacity_metric = gauge "telemetry_histogram_buffer_capacity" () in
+
+    (* Reset ALL pressure gauges to 0, then set current to 1 *)
+    let mem_low = gauge "telemetry_memory_pressure_low" () in
+    let mem_med = gauge "telemetry_memory_pressure_medium" () in
+    let mem_high = gauge "telemetry_memory_pressure_high" () in
+
+    set_gauge mem_low 0.0;
+    set_gauge mem_med 0.0;
+    set_gauge mem_high 0.0;
 
     (match pressure with
-     | Low ->
-         (* Increase capacities up to max limits *)
-         memory_config.rate_buffer_capacity <- min 500 (memory_config.rate_buffer_capacity * 6 / 5);
-         memory_config.histogram_capacity <- min 30000 (memory_config.histogram_capacity * 6 / 5)
-     | Medium ->
-         (* Keep current capacities *)
-         ()
-     | High ->
-         (* Decrease capacities aggressively with minimum limits - ensure enough samples for smooth metrics *)
-         (* At 2k samples/sec (1/100 sampling), 10000 samples = ~5s, 15000 samples = ~7.5s *)
-         memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity / 2);
-         memory_config.histogram_capacity <- max 10000 (memory_config.histogram_capacity / 2);
+     | Low -> set_gauge mem_low 1.0
+     | Medium -> set_gauge mem_med 1.0
+     | High -> set_gauge mem_high 1.0);
 
-         Logging.debug_f ~section:"telemetry" "Reduced buffer capacities due to high memory pressure: rate %d->%d, histogram %d->%d"
-           old_rate_capacity memory_config.rate_buffer_capacity
-           old_histogram_capacity memory_config.histogram_capacity
-    );
-
-    memory_config.last_adjustment <- now;
-  end;
-
-  (* Get current capacities for metrics (within mutex) *)
-  let current_rate_capacity = memory_config.rate_buffer_capacity in
-  let current_histogram_capacity = memory_config.histogram_capacity in
-  Mutex.unlock memory_config_mutex;
-
-  (* Always update metrics (outside throttle) *)
-  let rate_capacity_metric = gauge "telemetry_rate_buffer_capacity" () in
-  let histogram_capacity_metric = gauge "telemetry_histogram_buffer_capacity" () in
-
-  (* Reset ALL pressure gauges to 0, then set current to 1 *)
-  let mem_low = gauge "telemetry_memory_pressure_low" () in
-  let mem_med = gauge "telemetry_memory_pressure_medium" () in
-  let mem_high = gauge "telemetry_memory_pressure_high" () in
-
-  set_gauge mem_low 0.0;
-  set_gauge mem_med 0.0;
-  set_gauge mem_high 0.0;
-
-  (match pressure with
-   | Low -> set_gauge mem_low 1.0
-   | Medium -> set_gauge mem_med 1.0
-   | High -> set_gauge mem_high 1.0);
-
-  set_gauge rate_capacity_metric (float_of_int current_rate_capacity);
-  set_gauge histogram_capacity_metric (float_of_int current_histogram_capacity)
+    set_gauge rate_capacity_metric (float_of_int !current_rate_capacity);
+    set_gauge histogram_capacity_metric (float_of_int !current_histogram_capacity)
+  with exn ->
+    Logging.error_f ~section "Exception in adjust_buffer_capacities: %s" (Printexc.to_string exn)
 
 (** Reset counter to zero and clear rate tracker samples *)
 let reset_counter metric =
@@ -488,40 +512,50 @@ let reset_large_counters () =
   let high_frequency_names = ["strategy_orders_generated"; "strategy_orders_dropped"] in
 
   (* Check if it's time for a global reset (every 1 minute) *)
-  lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config";
-  let global_reset_due = now -. memory_config.last_global_reset_time > 60.0 in
-  if global_reset_due then
-    memory_config.last_global_reset_time <- now;
-  Mutex.unlock memory_config_mutex;
+  let global_reset_due =
+    if lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config" then begin
+      let result = now -. memory_config.last_global_reset_time > 60.0 in
+      if result then
+        memory_config.last_global_reset_time <- now;
+      Mutex.unlock memory_config_mutex;
+      result
+    end else begin
+      (* Could not acquire lock, skip global reset check *)
+      false
+    end in
 
   (* CRITICAL: Minimize mutex hold time to prevent deadlocks
      First pass: collect metrics that need resetting while holding mutex briefly *)
   let metrics_to_reset = ref [] in
-  lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
-  Hashtbl.iter (fun key metric ->
-    let should_reset = match metric.metric_type with
-      | Counter r ->
-          (* Global reset every 5 minutes OR *)
-          global_reset_due ||
-          (* Reset counters exceeding threshold *)
-          !r > reset_value_threshold ||
-          (* Reset high-frequency counters every minute *)
-          (List.mem metric.name high_frequency_names &&
-           now -. metric.last_updated > 60.0)
-      | SlidingCounter sliding ->
-          (* Global reset every 5 minutes OR *)
-          global_reset_due ||
-          (* Reset sliding counters exceeding threshold *)
-          !(sliding.total_count) > reset_value_threshold ||
-          (* Reset high-frequency counters every minute *)
-          (List.mem metric.name high_frequency_names &&
-           now -. metric.last_updated > 60.0)
-      | _ -> false
-    in
-    if should_reset then
-      metrics_to_reset := (key, metric) :: !metrics_to_reset
-  ) metrics;
-  Mutex.unlock metrics_mutex;
+  if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+    Hashtbl.iter (fun key metric ->
+      let should_reset = match metric.metric_type with
+        | Counter r ->
+            (* Global reset every 5 minutes OR *)
+            global_reset_due ||
+            (* Reset counters exceeding threshold *)
+            !r > reset_value_threshold ||
+            (* Reset high-frequency counters every minute *)
+            (List.mem metric.name high_frequency_names &&
+             now -. metric.last_updated > 60.0)
+        | SlidingCounter sliding ->
+            (* Global reset every 5 minutes OR *)
+            global_reset_due ||
+            (* Reset sliding counters exceeding threshold *)
+            !(sliding.total_count) > reset_value_threshold ||
+            (* Reset high-frequency counters every minute *)
+            (List.mem metric.name high_frequency_names &&
+             now -. metric.last_updated > 60.0)
+        | _ -> false
+      in
+      if should_reset then
+        metrics_to_reset := (key, metric) :: !metrics_to_reset
+    ) metrics;
+    Mutex.unlock metrics_mutex
+  end else begin
+    (* Could not acquire metrics mutex, skip counter reset *)
+    Logging.warn ~section "Skipping counter reset due to mutex timeout"
+  end;
 
   (* Second pass: reset each metric individually with minimal lock time *)
   let reset_count = ref 0 in
@@ -586,7 +620,7 @@ let reset_large_counters () =
   if !reset_count > 0 then begin
     safe_broadcast_metrics_changed ();
     (* Trigger GC to free memory from reset counter rate trackers *)
-    Gc.full_major ()
+    safe_gc ()
   end
 
 (** Prune stale metrics and cap total count to prevent unbounded growth *)
@@ -643,7 +677,7 @@ let prune_stale_metrics () =
 
   (* Trigger GC to free memory from removed metrics *)
   if stale_removed > 0 || to_remove_more > 0 then
-    Gc.full_major ()
+    safe_gc ()
 
 (** Get telemetry memory statistics for monitoring *)
 let get_telemetry_memory_stats () =
@@ -693,9 +727,13 @@ let start_capacity_adjuster () =
         reset_large_counters ();
 
         (* Update last run time *)
-        lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config";
-        memory_config.last_adjustment <- now;
-        Mutex.unlock memory_config_mutex;
+        if lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config" then begin
+          memory_config.last_adjustment <- now;
+          Mutex.unlock memory_config_mutex
+        end else begin
+          (* Could not acquire memory_config mutex, skip adjustment timestamp update *)
+          Logging.warn ~section "Skipping memory config adjustment timestamp update due to mutex timeout"
+        end;
 
         (* Continue with updated time *)
         adjustment_loop now
@@ -952,7 +990,7 @@ let inc_sliding_counter metric ?(value=1) () =
             end;
           Mutex.unlock metrics_mutex;
           (* Trigger GC after sliding counter cleanup to free memory *)
-          Gc.full_major ();
+          safe_gc ();
         end;
 
       safe_broadcast_metrics_changed ()
@@ -1102,28 +1140,39 @@ let perform_sliding_counter_cleanup () =
 
   (* Collect sliding counters that need cleanup - minimize mutex hold time *)
   let counters_to_clean = ref [] in
-  lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
-  Hashtbl.iter (fun key metric ->
-    match metric.metric_type with
-    | SlidingCounter sliding ->
-        (* More aggressive cleanup: check size and age more frequently *)
-        let current_len = List.length !(sliding.current_window) in
-        let time_since_cleanup = now -. !(sliding.last_cleanup) in
-        (* Force cleanup if >50 entries OR every 60 seconds OR if very old (>300 seconds) *)
-        if current_len > 50 || time_since_cleanup > 60.0 || time_since_cleanup > 300.0 then
-          counters_to_clean := (key, metric) :: !counters_to_clean
-    | _ -> ()
-  ) metrics;
-  Mutex.unlock metrics_mutex;
+  if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+    Hashtbl.iter (fun key metric ->
+      match metric.metric_type with
+      | SlidingCounter sliding ->
+          (* More aggressive cleanup: check size and age more frequently *)
+          let current_len = List.length !(sliding.current_window) in
+          let time_since_cleanup = now -. !(sliding.last_cleanup) in
+          (* Force cleanup if >50 entries OR every 60 seconds OR if very old (>300 seconds) *)
+          if current_len > 50 || time_since_cleanup > 60.0 || time_since_cleanup > 300.0 then
+            counters_to_clean := (key, metric) :: !counters_to_clean
+      | _ -> ()
+    ) metrics;
+    Mutex.unlock metrics_mutex
+  end else begin
+    (* Could not acquire metrics mutex, skip sliding counter cleanup *)
+    Logging.warn ~section "Skipping sliding counter cleanup due to mutex timeout"
+  end;
 
   (* Clean up each counter individually with minimal lock time *)
   List.iter (fun (key, metric) ->
     match metric.metric_type with
-    | SlidingCounter sliding ->
+      | SlidingCounter sliding ->
         (* Perform cleanup with minimal mutex hold *)
-        lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
-        let current_len = List.length !(sliding.current_window) in
-        Mutex.unlock metrics_mutex;
+        let current_len =
+          if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+            let len = List.length !(sliding.current_window) in
+            Mutex.unlock metrics_mutex;
+            len
+          end else begin
+            (* Could not acquire mutex, skip this counter *)
+            Logging.warn_f ~section "Skipping sliding counter %s cleanup due to mutex timeout" key;
+            0
+          end in
 
         if current_len > 0 then begin
           (* Do expensive cleanup outside mutex *)
@@ -1151,11 +1200,15 @@ let perform_sliding_counter_cleanup () =
           in
 
           (* Update with minimal mutex hold *)
-          lock_mutex_with_timeout metrics_mutex 1.0 "metrics";
-          sliding.current_window := final_window;
-          sliding.total_count := final_total;
-          sliding.last_cleanup := now;
-          Mutex.unlock metrics_mutex;
+          if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+            sliding.current_window := final_window;
+            sliding.total_count := final_total;
+            sliding.last_cleanup := now;
+            Mutex.unlock metrics_mutex
+          end else begin
+            (* Could not acquire mutex, skip update for this counter *)
+            Logging.warn_f ~section "Skipping sliding counter %s update due to mutex timeout" key
+          end;
 
           let cleaned_entries = current_len - List.length final_window in
           if cleaned_entries > 0 then begin
@@ -1168,7 +1221,7 @@ let perform_sliding_counter_cleanup () =
   ) !counters_to_clean;
 
   (* Trigger GC after cleanup to free memory *)
-  Gc.full_major ();
+  safe_gc ();
 
   !cleaned_total
 
