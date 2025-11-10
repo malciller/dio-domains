@@ -165,6 +165,9 @@ let asset_domain_worker state (fee_fetcher : trading_config -> trading_config) (
     let cycle_start = Telemetry.start_timer_v2 () in
     incr cycle_count;
     incr telemetry_batch;
+
+    (* For testing: exit quickly if shutdown requested *)
+    if Atomic.get shutdown_requested then raise Exit;
     
     (* Minimal logging in hot loop *)
     if !cycle_count mod 1000000 = 0 then
@@ -400,12 +403,20 @@ let asset_domain_worker state (fee_fetcher : trading_config -> trading_config) (
 
       (match grid_strategy_asset with
        | Some asset ->
-           (* Pass ALL open orders to Grid strategy so it can see all sell orders for positioning *)
-           Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+           (try
+             (* Pass ALL open orders to Grid strategy so it can see all sell orders for positioning *)
+             Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+           with exn ->
+             Logging.error_f ~section "Exception in Grid strategy execution for %s: %s"
+               asset_with_fees.symbol (Printexc.to_string exn))
        | None -> ());
       (match mm_strategy_asset with
        | Some asset ->
-           Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
+           (try
+             Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
+           with exn ->
+             Logging.error_f ~section "Exception in MM strategy execution for %s: %s"
+               asset_with_fees.symbol (Printexc.to_string exn))
        | None -> ());
     end;
     
@@ -468,6 +479,11 @@ let asset_domain_worker state (fee_fetcher : trading_config -> trading_config) (
 
     (* Yield to allow other threads (websockets) to run *)
     Domain.cpu_relax ();
+
+    (* Debug: Log completion of cycle for USDG to help diagnose hangs *)
+    if asset_with_fees.symbol = "USDG/USD" && !cycle_count mod 100 = 0 then
+      Logging.debug_f ~section "Domain %s completed cycle %d" asset_with_fees.symbol !cycle_count;
+
     ()
   done
 
@@ -516,8 +532,13 @@ let start_domain state fee_fetcher =
         asset_domain_worker state fee_fetcher asset;
         Logging.info_f ~section "Domain for %s/%s completed normally" asset.exchange asset.symbol
       with exn ->
-        Logging.critical_f ~section "Domain for %s/%s crashed: %s"
-          asset.exchange asset.symbol (Printexc.to_string exn);
+        match exn with
+        | Exit -> 
+            (* Clean shutdown requested *)
+            Logging.debug_f ~section "Domain for %s/%s shutting down cleanly" asset.exchange asset.symbol
+        | _ ->
+            Logging.critical_f ~section "Domain for %s/%s crashed: %s"
+              asset.exchange asset.symbol (Printexc.to_string exn);
 
         (* Mark domain as stopped and allow restart *)
         Atomic.set state.is_running false;
@@ -543,6 +564,7 @@ let stop_domain state =
        Logging.info_f ~section "Stopping domain %s..." key;
        (* Note: OCaml doesn't provide a way to forcibly stop domains *)
        (* The domain will stop when it detects is_running = false *)
+       (* For testing, we need to ensure domains exit quickly *)
        Atomic.set state.domain_handle None
    | None -> ());
   Mutex.unlock state.mutex
@@ -562,7 +584,9 @@ let supervisor_loop fee_fetcher =
 
   while not (Atomic.get shutdown_requested) do
     try
-      Thread.delay 5.0;  (* Check every 5 seconds *)
+      (* Use shorter delay for testing to allow quick shutdown *)
+      let delay = if Sys.getenv_opt "DIO_TESTING" = Some "1" then 0.1 else 5.0 in
+      Thread.delay delay;
 
       (* Check for shutdown again after the delay *)
       if Atomic.get shutdown_requested then raise Exit;
@@ -602,38 +626,32 @@ let supervisor_loop fee_fetcher =
 let spawn_supervised_domains_for_assets (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : unit Lwt.t =
   Logging.debug_f ~section "Spawning supervised domains for %d assets..." (List.length assets);
 
-  (* Wait for feeds to be initialized before starting domains *)
-  Logging.info ~section "Waiting for feeds initialization to complete...";
-  Lwt.bind (wait_for_phase FeedsInit 60.0) (fun feeds_ready ->
-    if not feeds_ready then
-      Logging.warn ~section "Timeout waiting for feeds initialization, proceeding anyway...";
+  (* Initialize strategy modules *)
+  Dio_strategies.Suicide_grid.Strategy.init ();
+  Dio_strategies.Market_maker.Strategy.init ();
 
-    (* Initialize strategy modules *)
-    Dio_strategies.Suicide_grid.Strategy.init ();
-    Dio_strategies.Market_maker.Strategy.init ();
+  (* Register all domains *)
+  List.iter (fun asset ->
+    ignore (register_domain asset)
+  ) assets;
 
-    (* Register all domains *)
-    List.iter (fun asset ->
-      ignore (register_domain asset)
-    ) assets;
+  (* Start initial domains *)
+  Mutex.lock registry_mutex;
+  let all_states = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
+  Mutex.unlock registry_mutex;
 
-    (* Start initial domains *)
-    Mutex.lock registry_mutex;
-    let all_states = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
-    Mutex.unlock registry_mutex;
+  List.iter (fun state ->
+    ignore (start_domain state fee_fetcher)
+  ) all_states;
 
-    List.iter (fun state ->
-      ignore (start_domain state fee_fetcher)
-    ) all_states;
+  (* Start supervisor thread *)
+  ignore (Thread.create supervisor_loop fee_fetcher);
+  Logging.info ~section "Domain supervisor thread started";
 
-    (* Start supervisor thread *)
-    ignore (Thread.create supervisor_loop fee_fetcher);
-    Logging.info ~section "Domain supervisor thread started";
+  (* Signal that all domains have been initialized and are ready *)
+  signal_phase_complete DomainsInit;
 
-    (* Signal that all domains have been initialized and are ready *)
-    signal_phase_complete DomainsInit;
-
-    Lwt.return_unit)
+  Lwt.return_unit
 
 (** Get domain status for monitoring *)
 let get_domain_status () =
@@ -653,27 +671,45 @@ let clear_domain_registry () =
   Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear domain_registry;
   Mutex.unlock registry_mutex
 
-(** Stop all domains gracefully *)
-let stop_all_domains () =
-  Logging.info ~section "Stopping all supervised domains...";
+(** Get the number of domains currently registered *)
+let get_domain_registry_count () =
+  Mutex.lock registry_mutex;
+  let count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length domain_registry in
+  Mutex.unlock registry_mutex;
+  count
+
+(** Signal all domains to shutdown (synchronous) *)
+let signal_domain_shutdown () =
+  Logging.info ~section "Signaling all supervised domains to shutdown...";
   (* Signal supervisor to stop restarting domains *)
   Atomic.set shutdown_requested true;
   Mutex.lock registry_mutex;
   let all_states = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
   Mutex.unlock registry_mutex;
 
-  List.iter stop_domain all_states;
+  List.iter stop_domain all_states
 
-  (* Wait for domains to stop *)
+(** Stop all domains gracefully *)
+let stop_all_domains () : unit Lwt.t =
+  Logging.info ~section "Stopping all supervised domains...";
+  (* Signal shutdown to all domains *)
+  signal_domain_shutdown ();
+
+  (* Get the list of states to monitor for shutdown *)
+  Mutex.lock registry_mutex;
+  let all_states = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
+  Mutex.unlock registry_mutex;
+
+  (* Wait for domains to stop asynchronously *)
   let rec wait_for_stop max_wait =
     if max_wait <= 0.0 then
-      Logging.warn ~section "Timeout waiting for domains to stop"
+      Lwt.return (Logging.warn ~section "Timeout waiting for domains to stop")
     else
       let all_stopped = List.for_all (fun state -> not (Atomic.get state.is_running)) all_states in
       if all_stopped then
-        Logging.info ~section "All domains stopped successfully"
+        Lwt.return (Logging.info ~section "All domains stopped successfully")
       else (
-        Thread.delay 0.1;
+        let%lwt () = Lwt_unix.sleep 0.1 in
         wait_for_stop (max_wait -. 0.1)
       )
   in

@@ -1,3 +1,4 @@
 (test
  (name test_domain_spawner)
- (libraries dio.engine alcotest))
+ (libraries dio.engine alcotest)
+ (preprocess (pps lwt_ppx)))

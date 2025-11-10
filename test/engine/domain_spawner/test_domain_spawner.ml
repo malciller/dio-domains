@@ -30,20 +30,44 @@ let test_spawn_domains_basic () =
       taker_fee = None }
   ] in
 
-  (* Spawn domains for the assets *)
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets mock_fee_fetcher assets in
+  (* Set testing environment for faster shutdown *)
+  Unix.putenv "DIO_TESTING" "1";
 
-  (* Verify correct number of domains created *)
-  Alcotest.(check int) "correct number of domains" (List.length assets) (List.length domains)
+  (* Spawn supervised domains for the assets *)
+  Lwt_main.run (
+    let%lwt () = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets mock_fee_fetcher assets in
+
+    (* Give domains a moment to start *)
+    let%lwt () = Lwt_unix.sleep 0.1 in
+
+    (* Check that domains were registered in the registry *)
+    let registry_count = Dio_engine.Domain_spawner.get_domain_registry_count () in
+    Alcotest.(check int) "correct number of domains registered" (List.length assets) registry_count;
+
+    (* Clean up: stop all domains to prevent hanging *)
+    let%lwt () = Dio_engine.Domain_spawner.stop_all_domains () in
+
+    (* Give cleanup a moment to complete *)
+    let%lwt () = Lwt_unix.sleep 0.2 in
+
+    Lwt.return_unit
+  )
 
 let test_spawn_domains_empty () =
   (* Test spawning domains with empty asset list *)
   (* Clear any existing domain registry state from previous tests *)
   Dio_engine.Domain_spawner.clear_domain_registry ();
 
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets mock_fee_fetcher [] in
+  (* Spawn supervised domains for empty asset list - this returns unit *)
+  Lwt_main.run (
+    let%lwt () = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets mock_fee_fetcher [] in
 
-  Alcotest.(check int) "empty domains list length" 0 (List.length domains)
+    (* Check that no domains were registered *)
+    let registry_count = Dio_engine.Domain_spawner.get_domain_registry_count () in
+    Alcotest.(check int) "empty domains registry count" 0 registry_count;
+
+    Lwt.return_unit
+  )
 
 let test_fee_fetcher_integration () =
   (* Test that fee fetcher is called and integrated properly *)
@@ -75,6 +99,9 @@ let test_domain_error_handling () =
   (* Clear any existing domain registry state from previous tests *)
   Dio_engine.Domain_spawner.clear_domain_registry ();
 
+  (* Set testing environment for faster shutdown *)
+  Unix.putenv "DIO_TESTING" "1";
+
   (* Test that domain errors are handled properly - create a failing asset config *)
   let failing_asset = {
     Dio_engine.Config.exchange = "invalid_exchange";
@@ -89,12 +116,25 @@ let test_domain_error_handling () =
     taker_fee = None
   } in
 
-  (* This should not crash the test runner, domains should handle errors internally *)
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets mock_fee_fetcher [failing_asset] in
-  (* Give domains a moment to potentially fail *)
-  Unix.sleepf 0.1;
-  (* If we get here, domains were created successfully (even if they fail internally) *)
-  Alcotest.(check int) "domain created for failing asset" 1 (List.length domains)
+  (* Spawn supervised domains - this should not crash even with invalid config *)
+  Lwt_main.run (
+    let%lwt () = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets mock_fee_fetcher [failing_asset] in
+
+    (* Give domains a moment to potentially fail *)
+    let%lwt () = Lwt_unix.sleep 0.1 in
+
+    (* Check that domain was registered (even if it fails internally) *)
+    let registry_count = Dio_engine.Domain_spawner.get_domain_registry_count () in
+    Alcotest.(check int) "domain registered for failing asset" 1 registry_count;
+
+    (* Clean up: stop all domains to prevent hanging *)
+    let%lwt () = Dio_engine.Domain_spawner.stop_all_domains () in
+
+    (* Give cleanup a moment to complete *)
+    let%lwt () = Lwt_unix.sleep 0.2 in
+
+    Lwt.return_unit
+  )
 
 let () =
   Alcotest.run "Domain Spawner" [

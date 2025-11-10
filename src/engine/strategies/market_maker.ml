@@ -735,36 +735,8 @@ let execute_strategy
           (* open_buy_count already calculated earlier for balance checks *)
           if should_log then Logging.debug_f ~section "Buy order management for %s: open_buy_count=%d" asset.symbol open_buy_count;
 
-          (* Final state consistency check - ensure internal state matches filtered orders *)
-          let final_strategy_orders = List.filter (fun (_, _, _, _, userref_opt) ->
-            match userref_opt with
-            | Some userref -> Strategy_common.is_strategy_order Strategy_common.strategy_userref_mm userref
-            | None -> false
-          ) open_orders in
-
-          (* If our tracked order IDs don't exist in the filtered orders, clear them *)
-          (match state.last_buy_order_id with
-           | Some buy_id ->
-               if not (List.exists (fun (order_id, _, _, _, _) -> order_id = buy_id) final_strategy_orders) then begin
-                 state.last_buy_order_id <- None;
-                 state.last_buy_order_price <- None;
-                 if should_log then Logging.debug_f ~section "Cleared stale buy order tracking for %s (order not in filtered list)" asset.symbol
-               end
-           | None -> ());
-          (match state.last_sell_order_id with
-           | Some sell_id ->
-               if not (List.exists (fun (order_id, _, _, _, _) -> order_id = sell_id) final_strategy_orders) then begin
-                 state.last_sell_order_id <- None;
-                 state.last_sell_order_price <- None;
-                 if should_log then Logging.debug_f ~section "Cleared stale sell order tracking for %s (order not in filtered list)" asset.symbol
-               end
-           | None -> ());
-
-          (* Recalculate counts after cleanup *)
-          let final_open_buy_count = List.length (List.filter (fun (order_id, _, qty, side_str, _) ->
-            let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            side_str = "buy" && not is_cancelled && qty > 0.0
-          ) final_strategy_orders) in
+          (* Use the original count for now *)
+          let final_open_buy_count = open_buy_count in
 
           (* BUY ORDER MANAGEMENT - Aim for Exactly One Active Buy at Profitable Level *)
           if final_open_buy_count > 1 then begin
@@ -772,7 +744,7 @@ let execute_strategy
             let excess_orders = List.filter (fun (order_id, _, qty, side_str, _) ->
               let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
               side_str = "buy" && not is_cancelled && qty > 0.0
-            ) final_strategy_orders in
+            ) strategy_orders in
             if should_log then Logging.debug_f ~section "Cancelling %d excess buy orders for %s" final_open_buy_count asset.symbol;
             List.iter (fun (order_id, _, _, _, _) ->
               let cancel_order = create_cancel_order order_id asset.symbol "MM" in

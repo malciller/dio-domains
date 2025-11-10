@@ -47,8 +47,8 @@ let setup_signal_handlers () =
       Dio_engine.Order_executor.signal_shutdown ();
       Kraken.Kraken_trading_client.signal_shutdown ();
 
-      (* Stop all supervised domains *)
-      Dio_engine.Domain_spawner.stop_all_domains ();
+      (* Signal all supervised domains to shutdown *)
+      Dio_engine.Domain_spawner.signal_domain_shutdown ();
 
       (* Force-kill all websocket connections immediately *)
       Supervisor.stop_all_immediate ();
@@ -103,7 +103,7 @@ let setup_fatal_signal_handlers () =
       Atomic.set shutdown_requested true;
 
       (* Quick emergency cleanup *)
-      Dio_engine.Domain_spawner.stop_all_domains ();
+      Dio_engine.Domain_spawner.signal_domain_shutdown ();
       Supervisor.stop_all_immediate ();
       Lwt_condition.broadcast shutdown_condition ();
 

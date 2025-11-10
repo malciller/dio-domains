@@ -2,4 +2,5 @@
  (name dio_engine)
  (public_name dio.engine)
  (libraries yojson logging telemetry dio.kraken dio.strategies threads dio.concurrency dio_memory_tracing dio.memory_cleanup)
- (modules Config Domain_spawner Order_executor))
+ (modules Config Domain_spawner Order_executor)
+ (preprocess (pps lwt_ppx)))
