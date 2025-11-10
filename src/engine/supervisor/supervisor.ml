@@ -975,7 +975,7 @@ let order_processing_loop () : unit Lwt.t =
   (* Bounded concurrency control - limit concurrent order operations *)
   let max_concurrent_orders = 10 in
   let semaphore = Lwt_mutex.create () in
-  let active_orders = ref 0 in
+  let active_orders = Atomic.make 0 in
 
   (* Recursive function to process orders periodically *)
   let rec process_cycle () =
@@ -1022,14 +1022,14 @@ let order_processing_loop () : unit Lwt.t =
               let process_orders = List.map (fun order ->
                 Lwt_mutex.with_lock semaphore (fun () ->
                   (* Check if we're still within concurrent limit *)
-                  if !active_orders >= max_concurrent_orders then begin
+                  if Atomic.get active_orders >= max_concurrent_orders then begin
                     Logging.debug_f ~section "Max concurrent orders (%d) reached, waiting..." max_concurrent_orders;
                     Lwt.return_unit
                   end else begin
-                    incr active_orders;
+                    Atomic.incr active_orders;
                     Lwt.finalize
                       (fun () -> process_order_concurrently auth_token order orders_placed)
-                      (fun () -> decr active_orders; Lwt.return_unit)
+                      (fun () -> Atomic.decr active_orders; Lwt.return_unit)
                   end
                 )
               ) all_orders in

@@ -1006,23 +1006,21 @@ let cleanup_pending_cancellation asset_symbol order_id =
 
 (** Get pending orders from ringbuffer for processing *)
 let get_pending_orders max_orders =
-  Mutex.lock order_buffer_mutex;
-  let orders =
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock order_buffer_mutex)
-      (fun () ->
-         let orders = ref [] in
-         let count = ref 0 in
-         while !count < max_orders do
-           match OrderRingBuffer.read order_buffer with
-           | Some order ->
-               orders := order :: !orders;
-               incr count
-           | None -> count := max_orders  (* Exit loop *)
-         done;
-         List.rev !orders)
-  in
-  orders
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock order_buffer_mutex)
+    (fun () ->
+       Mutex.lock order_buffer_mutex;
+       let orders = ref [] in
+       let count = ref 0 in
+       while !count < max_orders do
+         match OrderRingBuffer.read order_buffer with
+         | Some order ->
+             orders := order :: !orders;
+             incr count
+         | None -> count := max_orders  (* Exit loop *)
+       done;
+       List.rev !orders
+    )
 
 (** Initialize strategy module *)
 let init () =

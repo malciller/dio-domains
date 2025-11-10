@@ -607,13 +607,9 @@ let execute_strategy
         if should_log then Logging.debug_f ~section "DEBUG Asset [%s/%s]: spread=%.8f, spread_pct=%.8f, fee=%.8f, exposure=%.2f"
           asset.exchange asset.symbol spread spread_pct fee exposure_value;
 
-        (* Count open buy orders for this asset - needed for balance check *)
-        let open_buy_orders = List.filter (fun (order_id, _, qty, side_str, _) ->
-          let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-          side_str = "buy" && not is_cancelled && qty > 0.0
-        ) open_orders in
-
-        let open_buy_count = List.length open_buy_orders in
+        (* Use the passed open_buy_count parameter for consistency *)
+        (* This comes from filtered orders (mm_open_orders) in domain_spawner.ml *)
+        let open_buy_count = _open_buy_count in
 
         (* Check balance limits - PAUSE/RESUME LOGIC (only apply constraints if parameters are provided) *)
         (* Consider if we can actually place orders without violating constraints *)
@@ -661,11 +657,18 @@ let execute_strategy
           if should_log then Logging.debug_f ~section "Balance/exposure limits exceeded for %s (exposure_ok=%B, usd_ok=%B), pausing strategy"
             asset.symbol exposure_ok usd_balance_ok;
 
-          (* Sync strategy state with actual open orders first *)
+          (* Sync strategy state with strategy-tagged orders only *)
           state.last_buy_order_price <- None;
           state.last_buy_order_id <- None;
           state.last_sell_order_price <- None;
           state.last_sell_order_id <- None;
+
+          (* Filter open_orders to only include strategy-tagged orders *)
+          let strategy_orders = List.filter (fun (_, _, _, _, userref_opt) ->
+            match userref_opt with
+            | Some userref -> Strategy_common.is_strategy_order Strategy_common.strategy_userref_mm userref
+            | None -> false
+          ) open_orders in
 
           List.iter (fun (order_id, order_price, qty, side_str, _) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
@@ -676,7 +679,7 @@ let execute_strategy
               else
                 (state.last_sell_order_price <- Some order_price;
                  state.last_sell_order_id <- Some order_id)
-          ) open_orders;
+          ) strategy_orders;
 
           (* Cancel all open buy orders *)
           (match state.last_buy_order_id with
@@ -704,11 +707,19 @@ let execute_strategy
         end else begin
           (* Both checks pass: Proceed to Step 3 - BUY ORDER MANAGEMENT *)
 
-          (* Sync strategy state with actual open orders *)
+          (* Sync strategy state with strategy-tagged orders only *)
+          (* Use the same filtered source as the counts for consistency *)
           state.last_buy_order_price <- None;
           state.last_buy_order_id <- None;
           state.last_sell_order_price <- None;
           state.last_sell_order_id <- None;
+
+          (* Filter open_orders to only include strategy-tagged orders *)
+          let strategy_orders = List.filter (fun (_, _, _, _, userref_opt) ->
+            match userref_opt with
+            | Some userref -> Strategy_common.is_strategy_order Strategy_common.strategy_userref_mm userref
+            | None -> false
+          ) open_orders in
 
           List.iter (fun (order_id, order_price, qty, side_str, _) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
@@ -719,22 +730,57 @@ let execute_strategy
               else
                 (state.last_sell_order_price <- Some order_price;
                  state.last_sell_order_id <- Some order_id)
-          ) open_orders;
+          ) strategy_orders;
 
           (* open_buy_count already calculated earlier for balance checks *)
           if should_log then Logging.debug_f ~section "Buy order management for %s: open_buy_count=%d" asset.symbol open_buy_count;
 
+          (* Final state consistency check - ensure internal state matches filtered orders *)
+          let final_strategy_orders = List.filter (fun (_, _, _, _, userref_opt) ->
+            match userref_opt with
+            | Some userref -> Strategy_common.is_strategy_order Strategy_common.strategy_userref_mm userref
+            | None -> false
+          ) open_orders in
+
+          (* If our tracked order IDs don't exist in the filtered orders, clear them *)
+          (match state.last_buy_order_id with
+           | Some buy_id ->
+               if not (List.exists (fun (order_id, _, _, _, _) -> order_id = buy_id) final_strategy_orders) then begin
+                 state.last_buy_order_id <- None;
+                 state.last_buy_order_price <- None;
+                 if should_log then Logging.debug_f ~section "Cleared stale buy order tracking for %s (order not in filtered list)" asset.symbol
+               end
+           | None -> ());
+          (match state.last_sell_order_id with
+           | Some sell_id ->
+               if not (List.exists (fun (order_id, _, _, _, _) -> order_id = sell_id) final_strategy_orders) then begin
+                 state.last_sell_order_id <- None;
+                 state.last_sell_order_price <- None;
+                 if should_log then Logging.debug_f ~section "Cleared stale sell order tracking for %s (order not in filtered list)" asset.symbol
+               end
+           | None -> ());
+
+          (* Recalculate counts after cleanup *)
+          let final_open_buy_count = List.length (List.filter (fun (order_id, _, qty, side_str, _) ->
+            let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
+            side_str = "buy" && not is_cancelled && qty > 0.0
+          ) final_strategy_orders) in
+
           (* BUY ORDER MANAGEMENT - Aim for Exactly One Active Buy at Profitable Level *)
-          if open_buy_count > 1 then begin
+          if final_open_buy_count > 1 then begin
             (* If >1 open buy: Cancel all open buys. Stop—next trigger will replace. *)
-            if should_log then Logging.debug_f ~section "Cancelling %d excess buy orders for %s" open_buy_count asset.symbol;
+            let excess_orders = List.filter (fun (order_id, _, qty, side_str, _) ->
+              let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
+              side_str = "buy" && not is_cancelled && qty > 0.0
+            ) final_strategy_orders in
+            if should_log then Logging.debug_f ~section "Cancelling %d excess buy orders for %s" final_open_buy_count asset.symbol;
             List.iter (fun (order_id, _, _, _, _) ->
               let cancel_order = create_cancel_order order_id asset.symbol "MM" in
               push_order cancel_order
-            ) open_buy_orders;
+            ) excess_orders;
             (* Next trigger will place new orders *)
 
-          end else if open_buy_count = 0 then begin
+          end else if final_open_buy_count = 0 then begin
             (* If 0 open buys: Determine buy price based on fee and place new pair *)
             if should_log then Logging.debug_f ~section "No buy orders for %s, placing new pair" asset.symbol;
 
@@ -948,23 +994,21 @@ let cleanup_pending_cancellation asset_symbol order_id =
 
 (** Get pending orders from ringbuffer for processing *)
 let get_pending_orders max_orders =
-  Mutex.lock order_buffer_mutex;
-  let orders =
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock order_buffer_mutex)
-      (fun () ->
-         let orders = ref [] in
-         let count = ref 0 in
-         while !count < max_orders do
-           match OrderRingBuffer.read order_buffer with
-           | Some order ->
-               orders := order :: !orders;
-               incr count
-           | None -> count := max_orders  (* Exit loop *)
-         done;
-         List.rev !orders)
-  in
-  orders
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock order_buffer_mutex)
+    (fun () ->
+       Mutex.lock order_buffer_mutex;
+       let orders = ref [] in
+       let count = ref 0 in
+       while !count < max_orders do
+         match OrderRingBuffer.read order_buffer with
+         | Some order ->
+             orders := order :: !orders;
+             incr count
+         | None -> count := max_orders  (* Exit loop *)
+       done;
+       List.rev !orders
+    )
 
 (** Initialize strategy module *)
 let init () =
