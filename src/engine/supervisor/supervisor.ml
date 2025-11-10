@@ -843,9 +843,10 @@ let process_order_concurrently auth_token order orders_placed_ref =
            | Some target_order_id ->
                (* Check for duplicate amendments before proceeding *)
                let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
-               let should_proceed = if amendment_in_flight then
+               let check_should_proceed = if amendment_in_flight then
                  (* Check if the order still exists in the open orders cache *)
-                 let order_exists = match Kraken.Kraken_executions_feed.get_open_order order.symbol target_order_id with
+                 Lwt.return (Kraken.Kraken_executions_feed.get_open_order order.symbol target_order_id) >>= fun order_opt ->
+                 let order_exists = match order_opt with
                    | Some _ -> true
                    | None -> false
                  in
@@ -855,23 +856,24 @@ let process_order_concurrently auth_token order orders_placed_ref =
                    | Some requested_price ->
                        if price_differs_significantly order.symbol target_order_id requested_price then begin
                          Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
-                         true
+                         Lwt.return true
                        end else begin
                          Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
-                         false
+                         Lwt.return false
                        end
                    | None ->
                        Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
-                       false
+                       Lwt.return false
                  else begin
                    (* Order was cleaned up as stale - allow amendment to proceed even if in-flight *)
                    Logging.debug_f ~section "Order %s not found in cache but amendment in-flight, proceeding with amendment (likely stale order cleanup)" target_order_id;
-                   true
+                   Lwt.return true
                  end
                else
-                 true
+                 Lwt.return true
                in
 
+               check_should_proceed >>= fun should_proceed ->
                if should_proceed then begin
                  let amend_request = {
                    Dio_engine.Order_executor.order_id = target_order_id;
@@ -1020,18 +1022,27 @@ let order_processing_loop () : unit Lwt.t =
           | Some auth_token ->
               (* Process orders concurrently with bounded concurrency *)
               let process_orders = List.map (fun order ->
-                Lwt_mutex.with_lock semaphore (fun () ->
-                  (* Check if we're still within concurrent limit *)
-                  if Atomic.get active_orders >= max_concurrent_orders then begin
-                    Logging.debug_f ~section "Max concurrent orders (%d) reached, waiting..." max_concurrent_orders;
-                    Lwt.return_unit
-                  end else begin
-                    Atomic.incr active_orders;
-                    Lwt.finalize
-                      (fun () -> process_order_concurrently auth_token order orders_placed)
-                      (fun () -> Atomic.decr active_orders; Lwt.return_unit)
-                  end
-                )
+                (* Check concurrent limit before acquiring any lock *)
+                if Atomic.get active_orders >= max_concurrent_orders then begin
+                  Logging.debug_f ~section "Max concurrent orders (%d) reached, waiting..." max_concurrent_orders;
+                  Lwt.return_unit
+                end else begin
+                  (* Briefly acquire semaphore only for counter synchronization *)
+                  Lwt_mutex.with_lock semaphore (fun () ->
+                    (* Double-check limit after acquiring lock to avoid race conditions *)
+                    if Atomic.get active_orders >= max_concurrent_orders then begin
+                      Logging.debug_f ~section "Max concurrent orders (%d) reached (double-check), waiting..." max_concurrent_orders;
+                      Lwt.return_unit
+                    end else begin
+                      Atomic.incr active_orders;
+                      Lwt.return_unit
+                    end
+                  ) >>= fun () ->
+                  (* Start async processing outside the semaphore lock *)
+                  Lwt.finalize
+                    (fun () -> process_order_concurrently auth_token order orders_placed)
+                    (fun () -> Atomic.decr active_orders; Lwt.return_unit)
+                end
               ) all_orders in
 
               (* Start all order processing asynchronously - don't block on completion *)

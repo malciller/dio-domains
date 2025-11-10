@@ -241,6 +241,7 @@ let order_to_symbol : (string, string) Dio_memory_tracing.Memory_tracing.Tracked
 let order_to_symbol_mutex = Mutex.create ()
 let global_orders_mutex = Mutex.create ()
 
+
 (** Track key hashtables for memory leak detection *)
 let symbol_stores_tracking_record =
   if memory_tracing_available then
@@ -369,8 +370,9 @@ let[@inline always] count_open_orders_by_side symbol =
     | Buy -> incr buys
     | Sell -> incr sells
   ) store.open_orders;
+  let result = (!buys, !sells) in
   Mutex.unlock global_orders_mutex;
-  (!buys, !sells)
+  result
 
 (** Read latest execution events for a symbol since last position *)
 let[@inline always] read_execution_events symbol last_pos =
@@ -385,13 +387,12 @@ let[@inline always] get_current_position symbol =
 (** Update open orders based on execution event *)
 let update_open_orders store (event : execution_event) =
   Mutex.lock global_orders_mutex;
-  
   (* Determine if order should be in open orders based on order_status (most reliable) *)
   let is_terminal_status = match event.order_status with
     | FilledStatus | CanceledStatus | ExpiredStatus | RejectedStatus -> true
     | PendingNewStatus | NewStatus | PartiallyFilledStatus | UnknownStatus _ -> false
   in
-  
+
   let raw_remaining_qty = event.order_qty -. event.cum_qty in
   let remaining_qty =
     if raw_remaining_qty <= 0.0 then 0.0 else raw_remaining_qty
@@ -401,7 +402,7 @@ let update_open_orders store (event : execution_event) =
     if abs_order_qty = 0.0 then 1e-12 else abs_order_qty *. 1e-6
   in
   let is_effectively_filled = remaining_qty <= epsilon in
-  
+
   if is_terminal_status || is_effectively_filled then begin
     (* Terminal state - remove from open orders if present *)
     if Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem store.open_orders event.order_id then begin
@@ -411,10 +412,10 @@ let update_open_orders store (event : execution_event) =
       Mutex.lock order_to_symbol_mutex;
       Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove order_to_symbol event.order_id;
       Mutex.unlock order_to_symbol_mutex;
-      
+
       if is_terminal_status then
         Logging.info_f ~section "Removed order: %s [%s] status=%s exec_type=%s"
-          event.order_id event.symbol 
+          event.order_id event.symbol
           (string_of_order_status event.order_status)
           (string_of_exec_type event.exec_type)
       else
@@ -449,7 +450,7 @@ let update_open_orders store (event : execution_event) =
       cl_ord_id = event.cl_ord_id;
       last_updated = event.timestamp;
     } in
-    
+
     let was_present = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem store.open_orders event.order_id in
     Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace store.open_orders event.order_id order;
 
@@ -457,22 +458,22 @@ let update_open_orders store (event : execution_event) =
     Mutex.lock order_to_symbol_mutex;
     Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace order_to_symbol event.order_id event.symbol;
     Mutex.unlock order_to_symbol_mutex;
-    
+
     if was_present then begin
       Logging.info_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
-        event.order_id event.symbol remaining_qty 
-        (Option.value event.limit_price ~default:0.0) 
+        event.order_id event.symbol remaining_qty
+        (Option.value event.limit_price ~default:0.0)
         event.cum_qty event.order_qty
         (string_of_order_status event.order_status)
     end else begin
       Logging.debug_f ~section "Added new open order: %s [%s] %s side %.8f@%.2f status=%s"
-        event.order_id event.symbol 
+        event.order_id event.symbol
         (string_of_side event.side)
         event.order_qty
         (Option.value event.limit_price ~default:0.0)
         (string_of_order_status event.order_status)
     end;
-    
+
     (* Log trade fills separately for visibility *)
     if event.exec_type = Trade then begin
       Logging.info_f ~section "Trade fill: %s [%s] qty=%.8f price=%.2f (total filled: %.8f/%.8f)"
@@ -482,7 +483,6 @@ let update_open_orders store (event : execution_event) =
         event.cum_qty event.order_qty
     end
   end;
-  
   Mutex.unlock global_orders_mutex
 
 (** Parse float from JSON *)
@@ -532,29 +532,30 @@ let parse_execution_event json =
 
     (* For minimal events, look up symbol from our mapping *)
     let symbol = match symbol_opt with
-      | Some s -> Some s
+      | Some s -> s
       | None ->
           Mutex.lock global_orders_mutex;
           let s = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt order_to_symbol order_id in
           Mutex.unlock global_orders_mutex;
           (match s with
-           | Some sym -> Some sym
+           | Some sym -> sym
            | None ->
                (* If we don't have the symbol, skip this event silently.
                   This is expected for orders that existed before app startup. *)
                Logging.debug_f ~section "Skipping event for unknown order %s (likely pre-startup order)" order_id;
-               None)
+               "")
     in
 
     (* If we couldn't determine the symbol, return None *)
-    match symbol with
-    | None -> None
-    | Some sym ->
-        (* Get existing order to fill in missing fields for minimal events *)
-        let store = get_symbol_store sym in
-        Mutex.lock global_orders_mutex;
-        let existing_order = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt store.open_orders order_id in
-        Mutex.unlock global_orders_mutex;
+    if symbol = "" then
+      Lwt.return None
+    else begin
+      (* Get existing order to fill in missing fields for minimal events *)
+      let store = get_symbol_store symbol in
+      Mutex.lock global_orders_mutex;
+      let existing_order = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt store.open_orders order_id in
+      Mutex.unlock global_orders_mutex;
+      let%lwt () = Lwt.return_unit in
 
         (* Extract fields from JSON, using existing order as fallback *)
         let side_str =
@@ -655,11 +656,11 @@ let parse_execution_event json =
         (* Log when we're processing a minimal event *)
         if symbol_opt = None then
           Logging.debug_f ~section "Processing minimal event for order %s [%s]: status=%s exec_type=%s"
-            order_id sym order_status_str exec_type_str;
+            order_id symbol order_status_str exec_type_str;
 
-        Some {
+        Lwt.return (Some {
           order_id;
-          symbol = sym;
+          symbol;
           exec_type = exec_type_of_string exec_type_str;
           order_status = order_status_of_string order_status_str;
           side = side_of_string side_str;
@@ -675,12 +676,13 @@ let parse_execution_event json =
           order_userref;
           cl_ord_id;
           timestamp;
-        }
+        })
+      end
   with exn ->
-    Logging.warn_f ~section "Failed to parse execution event: %s | JSON: %s" 
+    Logging.warn_f ~section "Failed to parse execution event: %s | JSON: %s"
       (Printexc.to_string exn)
       (Yojson.Safe.to_string json);
-    None
+    Lwt.return None
 
 (** Handle execution snapshot *)
 let handle_snapshot json on_heartbeat =
@@ -690,24 +692,29 @@ let handle_snapshot json on_heartbeat =
     
     Logging.debug_f ~section "Processing execution snapshot with %d items" (List.length data);
     
-    List.iter (fun item ->
-      match parse_execution_event item with
+    let process_items = List.map (fun item ->
+      parse_execution_event item >>= function
       | Some event ->
           let store = get_symbol_store event.symbol in
           RingBuffer.write store.events_buffer event;
           update_open_orders store event;
+          let%lwt () = Lwt.return_unit in
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
           Telemetry.inc_counter (Telemetry.counter "execution_snapshot_items" ()) ();
           (* Update connection heartbeat *)
-          on_heartbeat ()
-      | None -> ()
-    ) data;
-    
-    Logging.debug_f ~section "Execution snapshot processed"
+          on_heartbeat ();
+          Lwt.return_unit
+      | None -> Lwt.return_unit
+    ) data in
+
+    Lwt.join process_items >>= fun () ->
+    Logging.debug_f ~section "Execution snapshot processed";
+    Lwt.return_unit
   with exn ->
     Logging.error_f ~section "Failed to process execution snapshot: %s"
-      (Printexc.to_string exn)
+      (Printexc.to_string exn);
+    Lwt.return_unit
 
 (** Handle execution update *)
 let handle_update json on_heartbeat =
@@ -715,12 +722,13 @@ let handle_update json on_heartbeat =
     let open Yojson.Safe.Util in
     let data = member "data" json |> to_list in
     
-    List.iter (fun item ->
-      match parse_execution_event item with
+    let process_items = List.map (fun item ->
+      parse_execution_event item >>= function
       | Some event ->
           let store = get_symbol_store event.symbol in
           RingBuffer.write store.events_buffer event;
           update_open_orders store event;
+          let%lwt () = Lwt.return_unit in
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
 
@@ -729,12 +737,17 @@ let handle_update json on_heartbeat =
 
           Telemetry.inc_counter (Telemetry.counter "execution_updates" ()) ();
           (* Update connection heartbeat *)
-          on_heartbeat ()
-      | None -> ()
-    ) data
+          on_heartbeat ();
+          Lwt.return_unit
+      | None -> Lwt.return_unit
+    ) data in
+
+    Lwt.join process_items >>= fun () ->
+    Lwt.return_unit
   with exn ->
     Logging.error_f ~section "Failed to process execution update: %s"
-      (Printexc.to_string exn)
+      (Printexc.to_string exn);
+    Lwt.return_unit
 
 (** WebSocket message handler *)
 let handle_message message on_heartbeat =
@@ -755,9 +768,9 @@ let handle_message message on_heartbeat =
     
     match channel, msg_type, method_type with
     | Some "executions", Some "snapshot", _ ->
-        handle_snapshot json on_heartbeat
+        Lwt.ignore_result (handle_snapshot json on_heartbeat)
     | Some "executions", Some "update", _ ->
-        handle_update json on_heartbeat
+        Lwt.ignore_result (handle_update json on_heartbeat)
     | Some "heartbeat", _, _ ->
         on_heartbeat () (* Update connection heartbeat *)
     | _, _, Some "subscribe" ->
@@ -857,8 +870,8 @@ let subscribe_order_updates () =
 let cleanup_stale_entries () =
   let cleaned_count = ref 0 in
 
-  (* Clean up order_to_symbol: remove entries for orders that are no longer in open_orders *)
   Mutex.lock global_orders_mutex;
+  (* Clean up order_to_symbol: remove entries for orders that are no longer in open_orders *)
   let order_to_symbol_keys = ref [] in
   Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun order_id _ -> order_to_symbol_keys := order_id :: !order_to_symbol_keys) order_to_symbol;
 
@@ -907,7 +920,6 @@ let cleanup_stale_entries () =
         (List.length to_remove) symbol
     end
   ) symbol_stores;
-
   Mutex.unlock global_orders_mutex;
 
   if !cleaned_count > 0 then
@@ -923,8 +935,10 @@ let get_memory_stats () =
   Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ store ->
     total_open_orders := !total_open_orders + Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length store.open_orders
   ) symbol_stores;
+  let result = (!total_open_orders, order_to_symbol_size) in
   Mutex.unlock global_orders_mutex;
-  (!total_open_orders, order_to_symbol_size)
+  result
+
 
 (** Initialize executions feed data stores *)
 let initialize symbols =

@@ -453,9 +453,10 @@ let amend_order
         Lwt.return (Error err)
     | Ok () ->
         (* Check if new price is the same as current price to avoid unnecessary amendments *)
-        let should_skip_amendment = match request.symbol, request.new_limit_price with
+        let check_should_skip_amendment = match request.symbol, request.new_limit_price with
           | Some symbol, Some new_price ->
-              (match Kraken.Kraken_executions_feed.get_open_order symbol request.order_id with
+              Lwt.return (Kraken.Kraken_executions_feed.get_open_order symbol request.order_id) >>= fun current_order_opt ->
+              let should_skip = match current_order_opt with
                | Some current_order ->
                    (match current_order.limit_price with
                     | Some current_price ->
@@ -464,10 +465,13 @@ let amend_order
                     | None -> false)
                | None ->
                    Logging.warn_f ~section "Order %s not found in open orders cache, proceeding with amendment" request.order_id;
-                   false)
-          | _ -> false
+                   false
+              in
+              Lwt.return should_skip
+          | _ -> Lwt.return false
         in
 
+        check_should_skip_amendment >>= fun should_skip_amendment ->
         if should_skip_amendment then begin
           Logging.debug_f ~section "Skipping amendment for order %s: new price equals current price" request.order_id;
           (* Return a fake successful result to avoid disrupting the flow *)
@@ -531,7 +535,8 @@ let amend_order
                     end else begin
                       Lwt_unix.sleep 1.0 >>= fun () -> (* Check every 1 second *)
                       (* Check current order state from execution feed *)
-                      let confirmed = match Kraken.Kraken_executions_feed.get_open_order symbol_str request.order_id with
+                      Lwt.return (Kraken.Kraken_executions_feed.get_open_order symbol_str request.order_id) >>= fun current_order_opt ->
+                      let confirmed = match current_order_opt with
                        | Some current_order ->
                            let current_price = current_order.limit_price in
                            let current_qty = current_order.order_qty in

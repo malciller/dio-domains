@@ -990,7 +990,7 @@ let get_system_stats_subscriber_count () =
 let perform_memory_maintenance () =
   (* Skip cleanup operations during shutdown to avoid deadlocks *)
   if Atomic.get shutdown_requested then
-    ()
+    Lwt.return_unit
   else begin
     let now = Unix.time () in
     let time_since_gc = now -. !last_gc_time in
@@ -1111,7 +1111,9 @@ let perform_memory_maintenance () =
     if time_since_last_log >= 10.0 then (
       log_detailed_memory_stats ();
       last_memory_log_time := now
-    )
+    );
+
+    Lwt.return_unit
   end
 
 (** Initialization guard with mutex protection *)
@@ -1561,7 +1563,7 @@ let publish_initial_snapshot () =
 (** Enhanced memory maintenance with cleanup event publishing *)
 let perform_memory_maintenance_with_events () =
   let start_time = Unix.gettimeofday () in
-  perform_memory_maintenance ();
+  let%lwt () = perform_memory_maintenance () in
   let duration = Unix.gettimeofday () -. start_time in
 
   (* Publish cleanup completion event *)
@@ -1570,7 +1572,9 @@ let perform_memory_maintenance_with_events () =
       "system_cache" "memory_maintenance" (int_of_float (duration *. 1000000.0)) 0.5
   with _ -> ());
 
-  Logging.debug_f ~section:"memory_monitoring" "Memory maintenance completed in %.3f seconds" duration
+  Logging.debug_f ~section:"memory_monitoring" "Memory maintenance completed in %.3f seconds" duration;
+
+  Lwt.return_unit
 
 (** Start event-driven system metrics computation *)
 let start_system_updater () =
@@ -1604,7 +1608,7 @@ let start_system_updater () =
         Lwt.return_unit
       else begin
         (* Perform comprehensive memory maintenance with event publishing *)
-        perform_memory_maintenance_with_events ();
+        perform_memory_maintenance_with_events () >>= fun () ->
         Lwt_unix.sleep 45.0 >>= maintenance_loop
       end
     in
@@ -1652,7 +1656,7 @@ let _memory_cleanup_subscription =
                     if time_since_last_cleanup >= 60.0 then begin
                       Logging.debug_f ~section:"system_cache" "Received allocation threshold event for %s at %s (%d/min) - scheduling cleanup asynchronously (%.1fs since last)" structure_type allocation_site frequency_per_minute time_since_last_cleanup;
                       last_event_cleanup_time := now;
-                      Lwt.async (fun () -> Lwt.return (perform_memory_maintenance ()))
+                      Lwt.async (fun () -> perform_memory_maintenance ())
                     end else begin
                       (* Throttle logging - only log every 1000th skip to reduce spam *)
                       skip_cleanup_log_counter := !skip_cleanup_log_counter + 1;

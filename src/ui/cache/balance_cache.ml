@@ -197,22 +197,16 @@ let collect_balances () =
 
 (** Safely collect all open orders *)
 let collect_open_orders () =
-  try
-    (* Get open orders from all symbols *)
-    let symbols = Kraken_executions_feed.get_all_symbols () in
-    Logging.debug_f ~section:"balance_cache" "Found %d initialized symbols" (List.length symbols);
-    let all_orders = List.fold_left (fun acc symbol ->
-      try
-        let open_orders = Kraken_executions_feed.get_open_orders symbol in
-        (List.map open_order_to_entry open_orders) @ acc
-      with _ -> acc
-    ) [] symbols in
-    Logging.debug_f ~section:"balance_cache" "Collected %d total open orders" (List.length all_orders);
-    all_orders
-  with exn ->
-    (* Return empty list if we can't collect orders *)
-    Logging.warn_f ~section:"balance_cache" "Error collecting open orders: %s" (Printexc.to_string exn);
-    []
+  let symbols = Kraken_executions_feed.get_all_symbols () in
+  Logging.debug_f ~section:"balance_cache" "Found %d initialized symbols" (List.length symbols);
+  let all_orders = List.fold_left (fun acc symbol ->
+    try
+      let open_orders = Kraken_executions_feed.get_open_orders symbol in
+      (List.map open_order_to_entry open_orders) @ acc
+    with _ -> acc
+  ) [] symbols in
+  Logging.debug_f ~section:"balance_cache" "Collected %d total open orders" (List.length all_orders);
+  all_orders
 
 (** Rebuild balance snapshot from Layer 1 events (triggered by balance/order updates) *)
 let rebuild_snapshot_from_layer1 () =
