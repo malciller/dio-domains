@@ -41,49 +41,10 @@ let detector_mutex = Mutex.create ()
 let function_counts_cache : (int * (string * int) list) list ref = ref []
 let function_counts_cache_timestamp : float ref = ref 0.0
 let function_counts_cache_ttl_seconds = 30.0  (* Cache for 30 seconds in HFT scenarios *)
-let max_cache_memory_mb = 50.0  (* Maximum cache size: 50MB *)
-let max_cache_entries = 10000  (* Maximum number of cached function entries across all domains *)
 
 (** Growth tracker limits to prevent unbounded growth *)
 let max_growth_trackers = 500  (* Maximum number of growth trackers to maintain *)
 let tracker_stale_seconds = 3600.0  (* Remove trackers not updated in 1 hour *)
-
-(** Estimate memory usage of cache in bytes *)
-let estimate_cache_memory_usage cache =
-  (* Rough estimate: each domain entry ~ 100 bytes overhead + function entries *)
-  let domain_overhead = 100 in
-  let function_entry_overhead = 50 in  (* string + int + list overhead *)
-  List.fold_left (fun acc (_, functions) ->
-    acc + domain_overhead + (List.length functions * function_entry_overhead)
-  ) 0 cache
-
-(** Check if cache exceeds size limits *)
-let cache_exceeds_limits cache =
-  let total_entries = List.fold_left (fun acc (_, functions) -> acc + List.length functions) 0 cache in
-  let memory_mb = float_of_int (estimate_cache_memory_usage cache) /. (1024.0 *. 1024.0) in
-  total_entries > max_cache_entries || memory_mb > max_cache_memory_mb
-
-(** Check if system is under memory pressure *)
-let is_under_memory_pressure () =
-  let stat = Gc.stat () in
-  let heap_words = stat.Gc.heap_words in
-  let live_words = stat.Gc.live_words in
-  let free_words = heap_words - live_words in
-  (* Consider memory pressure if free heap is less than 20% of total heap *)
-  free_words < (heap_words / 5)
-
-(** Clear cache if it exceeds limits or under memory pressure *)
-let clear_cache_if_needed () =
-  let cache = !function_counts_cache in
-  if cache_exceeds_limits cache then begin
-    Logging.info_f ~section:"leak_detector" "Clearing function counts cache (size limit exceeded)";
-    function_counts_cache := [];
-    function_counts_cache_timestamp := 0.0;
-  end else if is_under_memory_pressure () && cache <> [] then begin
-    Logging.info_f ~section:"leak_detector" "Clearing function counts cache (memory pressure detected)";
-    function_counts_cache := [];
-    function_counts_cache_timestamp := 0.0;
-  end
 
 (** Sync active_allocations with allocation tracker's source of truth *)
 let sync_active_allocations () =
@@ -361,48 +322,35 @@ let get_allocation_counts_by_function_per_domain () =
   sync_active_allocations ();
   let now = Unix.gettimeofday () in
 
-  (* Check cache limits and clear if needed *)
-  clear_cache_if_needed ();
-
   (* Check if cache is still valid *)
   if !function_counts_cache_timestamp +. function_counts_cache_ttl_seconds > now && !function_counts_cache <> [] then begin
-    (* Return defensive copy of cached result *)
-    List.map (fun (domain_id, functions) -> (domain_id, List.map (fun (name, count) -> (name, count)) functions)) !function_counts_cache
+    !function_counts_cache  (* Return cached result *)
   end else begin
     (* Cache expired or empty, recalculate *)
     Mutex.lock detector_mutex;
-    let counts : (int * string, int) Allocation_tracker.TrackedHashtbl.t = Allocation_tracker.TrackedHashtbl.create 256 in
+    let counts : (string, (string, int) Allocation_tracker.TrackedHashtbl.t) Allocation_tracker.TrackedHashtbl.t = Allocation_tracker.TrackedHashtbl.create 16 in
 
     Allocation_tracker.TrackedHashtbl.iter (fun _ record ->
-      let key = (record.Allocation_tracker.domain_id, record.site.Allocation_tracker.function_name) in
-      let current = Allocation_tracker.TrackedHashtbl.find_opt counts key |> Option.value ~default:0 in
-      Allocation_tracker.TrackedHashtbl.replace counts key (current + 1)
+      let domain_key = string_of_int record.Allocation_tracker.domain_id in
+      let function_counts = Allocation_tracker.TrackedHashtbl.find_opt counts domain_key |> Option.value ~default:(Allocation_tracker.TrackedHashtbl.create 64) in
+      let current = Allocation_tracker.TrackedHashtbl.find_opt function_counts record.site.Allocation_tracker.function_name |> Option.value ~default:0 in
+      Allocation_tracker.TrackedHashtbl.replace function_counts record.site.function_name (current + 1);
+      Allocation_tracker.TrackedHashtbl.replace counts domain_key function_counts
     ) active_allocations;
 
-    (* Group by domain *)
-    let domain_map : (int, (string * int) list) Allocation_tracker.TrackedHashtbl.t = Allocation_tracker.TrackedHashtbl.create 16 in
-    Allocation_tracker.TrackedHashtbl.iter (fun (domain_id, func_name) count ->
-      let current_list = Allocation_tracker.TrackedHashtbl.find_opt domain_map domain_id |> Option.value ~default:[] in
-      Allocation_tracker.TrackedHashtbl.replace domain_map domain_id ((func_name, count) :: current_list)
-    ) counts;
-
-    let result = Allocation_tracker.TrackedHashtbl.fold (fun domain_id function_list acc ->
+    let result = Allocation_tracker.TrackedHashtbl.fold (fun domain_str function_counts acc ->
+      let domain_id = int_of_string domain_str in
+      let function_list = Allocation_tracker.TrackedHashtbl.fold (fun func_name count func_acc -> (func_name, count) :: func_acc) function_counts [] in
+      Allocation_tracker.TrackedHashtbl.destroy function_counts;
       (domain_id, function_list) :: acc
-    ) domain_map [] in
+    ) counts [] in
 
     Allocation_tracker.TrackedHashtbl.destroy counts;
-    Allocation_tracker.TrackedHashtbl.destroy domain_map;
     Mutex.unlock detector_mutex;
 
-    (* Check if result would exceed cache limits before caching *)
-    if not (cache_exceeds_limits result) then begin
-      (* Update cache *)
-      function_counts_cache := result;
-      function_counts_cache_timestamp := now;
-    end else begin
-      Logging.warn_f ~section:"leak_detector" "Skipping cache update for function counts (result too large: %d domains, %d total functions)"
-        (List.length result) (List.fold_left (fun acc (_, funcs) -> acc + List.length funcs) 0 result);
-    end;
+    (* Update cache *)
+    function_counts_cache := result;
+    function_counts_cache_timestamp := now;
 
     result
   end
@@ -501,25 +449,6 @@ let get_growth_trackers_count () =
   let count = Allocation_tracker.TrackedHashtbl.length growth_trackers in
   Mutex.unlock detector_mutex;
   count
-
-(** Force clear function counts cache (for manual cleanup) *)
-let clear_function_counts_cache () =
-  Mutex.lock detector_mutex;
-  function_counts_cache := [];
-  function_counts_cache_timestamp := 0.0;
-  Mutex.unlock detector_mutex;
-  Logging.info ~section:"leak_detector" "Function counts cache manually cleared"
-
-(** Periodic maintenance function - call this regularly to maintain cache health *)
-let perform_periodic_maintenance () =
-  (* Clear cache if needed (size limits or memory pressure) *)
-  clear_cache_if_needed ();
-
-  (* Force GC to help with memory pressure *)
-  if is_under_memory_pressure () then begin
-    Logging.info ~section:"leak_detector" "Triggering garbage collection due to memory pressure";
-    Gc.compact ();
-  end
 
 (** Initialize leak detector - register callbacks *)
 let init () =

@@ -39,7 +39,11 @@ let string_contains str substr =
     in
     loop 0
 
-module Response_table = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl
+module Response_table = Hashtbl.Make (struct
+  type t = int
+  let equal = Int.equal
+  let hash = Hashtbl.hash
+end)
 
 module Heartbeat_bus = Event_bus.Make (struct
   type t = unit
@@ -60,7 +64,7 @@ type state = {
   mutable reader: unit Lwt.t option;
   mutable connecting: bool;
   mutable connection_generation: int;
-  responses: (int, Kraken_common_types.ws_response Lwt.u * string * float * bool) Response_table.t;  (* req_id -> (wakener * expected_method * timestamp * timed_out) *)
+  responses: (Kraken_common_types.ws_response Lwt.u * string * float * bool) Response_table.t;  (* wakener * expected_method * timestamp * timed_out *)
   mutable on_failure: (string -> unit) option;
   connected: bool Atomic.t;
 }
@@ -340,8 +344,7 @@ let rec reader_loop conn generation =
       | frame ->
           Logging.debug_f ~section "Received WebSocket frame (generation %d, content length: %d)"
             generation (String.length frame.Websocket.Frame.content);
-          (* Process frame asynchronously to avoid head-of-line blocking *)
-          Lwt.async (fun () -> handle_frame frame ~expected_generation:generation);
+          handle_frame frame ~expected_generation:generation >>= fun () ->
           reader_loop conn generation
     )
     (function

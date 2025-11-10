@@ -54,33 +54,13 @@ module InFlightRequests = struct
   let add_in_flight_request request_key =
     let now = Unix.gettimeofday () in
     match Registry.replace registry request_key now with
-    | Some (_, true) ->
-        let request_type = match request_key with
-          | NewOrder key -> Printf.sprintf "new order (%s)" key
-          | AmendOrder order_id -> Printf.sprintf "amendment for order %s" order_id
-        in
-        Logging.debug_f ~section:"in_flight_requests" "Request already in-flight, rejecting duplicate: %s" request_type;
-        false (* Already existed *)
-    | Some (_, false) ->
-        let request_type = match request_key with
-          | NewOrder key -> Printf.sprintf "new order (%s)" key
-          | AmendOrder order_id -> Printf.sprintf "amendment for order %s" order_id
-        in
-        Logging.debug_f ~section:"in_flight_requests" "Added to in-flight tracking: %s" request_type;
-        true (* Added successfully *)
+    | Some (_, true) -> false (* Already existed *)
+    | Some (_, false) -> true (* Added successfully *)
     | None -> false (* Should not happen *)
 
   (** Remove a request from the in-flight cache *)
   let remove_in_flight_request request_key =
-    let removed = Registry.remove registry request_key |> Option.is_some in
-    if removed then begin
-      let request_type = match request_key with
-        | NewOrder key -> Printf.sprintf "new order (%s)" key
-        | AmendOrder order_id -> Printf.sprintf "amendment for order %s" order_id
-      in
-      Logging.debug_f ~section:"in_flight_requests" "Removed from in-flight tracking: %s" request_type;
-    end;
-    removed
+    Registry.remove registry request_key |> Option.is_some
 
   (** Get the current size of the in-flight requests registry *)
   let get_registry_size () =
@@ -163,9 +143,9 @@ module TimedOutAmendments = struct
       grace_period;
     } in
     Registry.replace registry order_id amendment |> ignore;
-    Logging.info_f ~section "Added timed-out amendment tracking for order %s (grace period: %.1fs)" order_id grace_period
+    Logging.debug_f ~section "Added timed-out amendment tracking for order %s (grace period: %.1fs)" order_id grace_period
 
-  (** Check if order update matches timed-out amendment (and remove if confirmed) *)
+  (** Check if order update matches timed-out amendment *)
   let check_order_update order_id current_price current_qty =
     match Registry.find registry order_id with
     | Some amendment ->
@@ -196,34 +176,9 @@ module TimedOutAmendments = struct
         )
     | None -> false
 
-  (** Check if order state matches timed-out amendment (without removing) *)
-  let check_order_matches_timed_out order_id current_price current_qty =
-    match Registry.find registry order_id with
-    | Some amendment ->
-        let now = Unix.gettimeofday () in
-        if now -. amendment.timeout_time > amendment.grace_period then (
-          (* Grace period expired, but don't remove here - let cleanup handle it *)
-          false
-        ) else (
-          (* Check if order matches requested values *)
-          let price_match = match amendment.requested_price with
-            | Some req_price -> current_price <> None && abs_float (Option.value current_price ~default:0.0 -. req_price) < 0.000001
-            | None -> true
-          in
-          let qty_match = match amendment.requested_qty with
-            | Some req_qty -> abs_float (current_qty -. req_qty) < 0.000001
-            | None -> true
-          in
-          price_match && qty_match
-        )
-    | None -> false
-
   (** Remove timed-out amendment (e.g., when confirmed or failed) *)
   let remove_timed_out_amendment order_id =
-    let removed = Registry.remove registry order_id |> Option.is_some in
-    if removed then
-      Logging.info_f ~section "Removed timed-out amendment tracking for order %s" order_id;
-    removed
+    Registry.remove registry order_id |> Option.is_some
 
   (** Clean up expired grace periods *)
   let cleanup_expired () =
@@ -824,20 +779,9 @@ let close () : unit Lwt.t =
   Logging.info ~section "Closing order executor";
   Kraken.Kraken_trading_client.close ()
 
-(** Force clear stuck order tracking states for recovery *)
-let force_clear_order_tracking order_id =
-  Logging.warn_f ~section "Forcing recovery of order tracking state for %s" order_id;
-  let cleared_inflight = remove_in_flight_amendment order_id in
-  let cleared_timed_out = TimedOutAmendments.remove_timed_out_amendment order_id in
-  Logging.info_f ~section "Order tracking recovery for %s: cleared in-flight=%b, cleared timed-out=%b"
-    order_id cleared_inflight cleared_timed_out;
-  cleared_inflight || cleared_timed_out
-
 (** Test interface - exposed for unit testing *)
 module Test = struct
   let generate_duplicate_key = generate_duplicate_key
   let is_amendment_in_flight = is_amendment_in_flight
   module InFlightRequests = InFlightRequests
-  module TimedOutAmendments = TimedOutAmendments
-  let force_clear_order_tracking = force_clear_order_tracking
 end

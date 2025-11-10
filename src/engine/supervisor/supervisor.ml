@@ -859,27 +859,11 @@ let process_order_concurrently auth_token order orders_placed_ref =
                        Logging.debug_f ~section "Skipping amendment for order %s: already matches execution feed state" target_order_id;
                        Lwt.return false
                      end else begin
-                       (* Enhanced amendment tracking check - account for timed-out amendments that were confirmed *)
+                       (* Check for in-flight amendments *)
                        let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
-                       let timed_out_amendment = match Dio_engine.Order_executor.Test.TimedOutAmendments.Registry.find Dio_engine.Order_executor.Test.TimedOutAmendments.registry target_order_id with
-                         | Some _timed_out -> true
-                         | None -> false
-                       in
-
                        if amendment_in_flight then begin
                          Logging.warn_f ~section "Amendment for order %s already in-flight, skipping to prevent conflicts" target_order_id;
                          Lwt.return false
-                       end else if timed_out_amendment then begin
-                         (* There's a timed-out amendment - check if it has been confirmed via execution feed *)
-                         (* If the current order state matches what we want, it means the amendment was confirmed *)
-                         let confirmed_via_feed = Dio_engine.Order_executor.Test.TimedOutAmendments.check_order_matches_timed_out target_order_id current_order.limit_price current_order.order_qty in
-                         if confirmed_via_feed then begin
-                           Logging.info_f ~section "Timed-out amendment for order %s confirmed via execution feed state check, allowing new amendment" target_order_id;
-                           Lwt.return true
-                         end else begin
-                           Logging.debug_f ~section "Timed-out amendment for order %s still pending confirmation, skipping to prevent conflicts" target_order_id;
-                           Lwt.return false
-                         end
                        end else begin
                          Lwt.return true
                        end
