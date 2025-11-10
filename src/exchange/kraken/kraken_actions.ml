@@ -267,7 +267,7 @@ let place_order
       ~method_:"add_order"
       ~params
       ~req_id
-      ~timeout_ms:10000 >>= fun response ->
+      ~timeout_ms:15000 >>= fun response ->
 
     if response.success then begin
       match response.result with
@@ -404,7 +404,7 @@ let amend_order
       ~method_:"amend_order"
       ~params
       ~req_id
-      ~timeout_ms:10000 >>= fun response ->
+      ~timeout_ms:15000 >>= fun response ->
 
     if response.success then begin
       match response.result with
@@ -481,7 +481,7 @@ let cancel_orders
       ~method_:"cancel_order"
       ~params
       ~req_id
-      ~timeout_ms:10000 >>= fun response ->
+      ~timeout_ms:15000 >>= fun response ->
 
     (* For cancel operations, Kraken returns individual responses for each cancelled order *)
     (* The current response contains one result, but we need to handle the fact that
