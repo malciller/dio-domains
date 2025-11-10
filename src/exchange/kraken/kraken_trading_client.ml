@@ -344,7 +344,8 @@ let rec reader_loop conn generation =
       | frame ->
           Logging.debug_f ~section "Received WebSocket frame (generation %d, content length: %d)"
             generation (String.length frame.Websocket.Frame.content);
-          handle_frame frame ~expected_generation:generation >>= fun () ->
+          (* Process frame asynchronously to avoid head-of-line blocking *)
+          Lwt.async (fun () -> handle_frame frame ~expected_generation:generation);
           reader_loop conn generation
     )
     (function
