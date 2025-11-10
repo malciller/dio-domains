@@ -121,16 +121,27 @@ module Make (Payload : PAYLOAD) = struct
         Lwt.async (fun () ->
           Lwt.catch
             (fun () ->
-              (* Use very short timeout to detect blocking immediately *)
-              Lwt.pick [
-                (Lwt.return (sub.push payload) >|= fun () -> ());
-                (Lwt_unix.sleep 0.001 >|= fun () -> ())  (* 1ms timeout - fail fast on blocking *)
-              ]
+              (* Handle persistent subscribers differently - no timeout, never mark as closed on timeout *)
+              if sub.persistent then begin
+                (* Persistent subscribers: push without timeout *)
+                Lwt.return (sub.push payload)
+              end else begin
+                (* Non-persistent subscribers: use timeout to detect blocking *)
+                Lwt.pick [
+                  (Lwt.return (sub.push payload) >|= fun () -> ());
+                  (Lwt_unix.sleep 0.001 >|= fun () -> ())  (* 1ms timeout - fail fast on blocking *)
+                ]
+              end
             )
             (fun exn ->
-              (* Mark subscriber as closed on push failure (including timeout) *)
-              Logging.debug_f ~section:"event_bus" "Subscriber push failed/timed out, marking closed: %s" (Printexc.to_string exn);
-              sub.closed <- true;
+              (* Only mark non-persistent subscribers as closed on push failure *)
+              if not sub.persistent then begin
+                Logging.debug_f ~section:"event_bus" "Non-persistent subscriber push failed/timed out, marking closed: %s" (Printexc.to_string exn);
+                sub.closed <- true;
+              end else begin
+                (* Log persistent subscriber issues but don't mark as closed *)
+                Logging.debug_f ~section:"event_bus" "Persistent subscriber push failed but keeping active: %s" (Printexc.to_string exn);
+              end;
               Lwt.return_unit
             )
         )

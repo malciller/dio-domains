@@ -9,6 +9,18 @@ open Lwt.Infix
 
 let section = "order_executor"
 
+(** Helper function to check if string contains substring *)
+let string_contains str substr =
+  let str_len = String.length str and substr_len = String.length substr in
+  if substr_len > str_len then false
+  else
+    let rec loop i =
+      if i + substr_len > str_len then false
+      else if String.sub str i substr_len = substr then true
+      else loop (i + 1)
+    in
+    loop 0
+
 (** Global shutdown flag for order executor *)
 let shutdown_requested = Atomic.make false
 
@@ -97,6 +109,96 @@ let is_amendment_in_flight order_id =
   match InFlightRequests.Registry.find InFlightRequests.registry (AmendOrder order_id) with
   | Some _ -> true
   | None -> false
+
+(** Timed-out amendments pending execution feed confirmation *)
+module TimedOutAmendments = struct
+  type timed_out_amendment = {
+    order_id: string;
+    symbol: string;
+    requested_price: float option;
+    requested_qty: float option;
+    timeout_time: float;
+    grace_period: float; (* seconds *)
+  }
+
+  module Registry = Concurrency.Event_registry.Make(struct
+    type t = string (* order_id *)
+    let equal = String.equal
+    let hash = Hashtbl.hash
+  end)(struct
+    type t = timed_out_amendment
+  end)
+
+  let registry = Registry.create ()
+
+  (** Add a timed-out amendment for confirmation tracking *)
+  let add_timed_out_amendment order_id symbol requested_price requested_qty grace_period =
+    let now = Unix.gettimeofday () in
+    let amendment = {
+      order_id;
+      symbol;
+      requested_price;
+      requested_qty;
+      timeout_time = now;
+      grace_period;
+    } in
+    Registry.replace registry order_id amendment |> ignore;
+    Logging.debug_f ~section "Added timed-out amendment tracking for order %s (grace period: %.1fs)" order_id grace_period
+
+  (** Check if order update matches timed-out amendment *)
+  let check_order_update order_id current_price current_qty =
+    match Registry.find registry order_id with
+    | Some amendment ->
+        let now = Unix.gettimeofday () in
+        if now -. amendment.timeout_time > amendment.grace_period then (
+          (* Grace period expired, remove stale entry *)
+          Registry.remove registry order_id |> ignore;
+          Logging.debug_f ~section "Grace period expired for timed-out amendment %s, removing tracking" order_id;
+          false
+        ) else (
+          (* Check if order matches requested values *)
+          let price_match = match amendment.requested_price with
+            | Some req_price -> current_price <> None && abs_float (Option.value current_price ~default:0.0 -. req_price) < 0.000001
+            | None -> true
+          in
+          let qty_match = match amendment.requested_qty with
+            | Some req_qty -> abs_float (current_qty -. req_qty) < 0.000001
+            | None -> true
+          in
+          if price_match && qty_match then (
+            Registry.remove registry order_id |> ignore;
+            Logging.info_f ~section "Timed-out amendment confirmed via execution feed: order %s matches requested values" order_id;
+            true
+          ) else (
+            Logging.debug_f ~section "Order update for %s doesn't match timed-out amendment (price_match=%b, qty_match=%b)" order_id price_match qty_match;
+            false
+          )
+        )
+    | None -> false
+
+  (** Remove timed-out amendment (e.g., when confirmed or failed) *)
+  let remove_timed_out_amendment order_id =
+    Registry.remove registry order_id |> Option.is_some
+
+  (** Clean up expired grace periods *)
+  let cleanup_expired () =
+    let now = Unix.gettimeofday () in
+    let cleaned = ref 0 in
+    let snapshot = Registry.snapshot registry in
+    Registry.Tbl.iter (fun order_id amendment ->
+      if now -. amendment.timeout_time > amendment.grace_period then (
+        if Registry.remove registry order_id |> Option.is_some then (
+          incr cleaned;
+          Logging.debug_f ~section "Cleaned up expired timed-out amendment for order %s" order_id
+        )
+      )
+    ) snapshot;
+    !cleaned
+
+  (** Get current size for monitoring *)
+  let get_size () = Registry.size registry
+end
+
 
 (** Order type definitions *)
 type order_type = string (* "market" | "limit" | "stop-loss" | "take-profit" | "trailing-stop" | etc. *)
@@ -253,6 +355,11 @@ let start_inflight_cleanup () =
             | _ -> ())
        | None -> ());
 
+      (* Clean up expired timed-out amendments *)
+      let timed_out_cleaned = TimedOutAmendments.cleanup_expired () in
+      if timed_out_cleaned > 0 then
+        Logging.info_f ~section "Cleaned up %d expired timed-out amendments" timed_out_cleaned;
+
       (* Sleep for 2 minutes before next cleanup - more frequent for better memory management *)
       Lwt_unix.sleep 120.0 >>= cleanup_loop
     )
@@ -401,9 +508,57 @@ let amend_order
                   ()
               )
               (fun exn ->
-                (* Remove from in-flight cache on error *)
-                let _ = remove_in_flight_amendment request.order_id in
-                Lwt.fail exn
+                let exn_str = Printexc.to_string exn in
+                (* Check if this is a timeout error that might succeed via execution feed *)
+                if string_contains exn_str "Timeout waiting for response" then begin
+                  (* WebSocket timeout - add to timed-out amendments tracking for grace period *)
+                  let symbol_str = Option.value request.symbol ~default:"" in
+                  let grace_period = 5.0 in (* 5 second grace period *)
+                  TimedOutAmendments.add_timed_out_amendment
+                    request.order_id symbol_str request.new_limit_price request.new_quantity grace_period;
+
+                  Logging.warn_f ~section "Amendment timeout for order %s, starting grace period check (%.1fs) for execution feed confirmation"
+                    request.order_id grace_period;
+
+                  (* Check immediately and then periodically during grace period *)
+                  let rec check_grace_period remaining_checks =
+                    if remaining_checks <= 0 then begin
+                      (* Grace period expired - remove tracking and fail *)
+                      TimedOutAmendments.remove_timed_out_amendment request.order_id |> ignore;
+                      let _ = remove_in_flight_amendment request.order_id in
+                      Logging.error_f ~section "Grace period expired for timed-out amendment %s, failing request" request.order_id;
+                      Lwt.fail exn
+                    end else begin
+                      Lwt_unix.sleep 1.0 >>= fun () -> (* Check every 1 second *)
+                      (* Check current order state from execution feed *)
+                      let confirmed = match Kraken.Kraken_executions_feed.get_open_order symbol_str request.order_id with
+                       | Some current_order ->
+                           let current_price = current_order.limit_price in
+                           let current_qty = current_order.order_qty in
+                           TimedOutAmendments.check_order_update request.order_id current_price current_qty
+                       | None -> false
+                      in
+                      if confirmed then begin
+                        (* Confirmed via execution feed - treat as success *)
+                        let _ = remove_in_flight_amendment request.order_id in
+                        Logging.info_f ~section "Timed-out amendment confirmed via execution feed: %s" request.order_id;
+                        (* Return a synthetic success result since we can't get the real amend_id *)
+                        Lwt.return (Ok {
+                          Kraken.Kraken_common_types.amend_id = "confirmed_via_execution_feed";
+                          order_id = request.order_id;
+                          cl_ord_id = request.cl_ord_id;
+                        })
+                      end else begin
+                        check_grace_period (remaining_checks - 1)
+                      end
+                    end
+                  in
+                  check_grace_period (int_of_float grace_period)
+                end else begin
+                  (* Non-timeout error - remove from in-flight cache and fail immediately *)
+                  let _ = remove_in_flight_amendment request.order_id in
+                  Lwt.fail exn
+                end
               )
             >>= fun result ->
             (* Remove from in-flight cache on success *)

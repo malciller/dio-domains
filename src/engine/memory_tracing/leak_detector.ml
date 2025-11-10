@@ -37,10 +37,41 @@ let growth_trackers : (string, growth_tracker) Allocation_tracker.TrackedHashtbl
 let leak_results : leak_result list ref = ref []
 let detector_mutex = Mutex.create ()
 
+(** Cache for function-per-domain allocation counts to avoid excessive computation in HFT scenarios *)
+let function_counts_cache : (int * (string * int) list) list ref = ref []
+let function_counts_cache_timestamp : float ref = ref 0.0
+let function_counts_cache_ttl_seconds = 30.0  (* Cache for 30 seconds in HFT scenarios *)
 
 (** Growth tracker limits to prevent unbounded growth *)
 let max_growth_trackers = 500  (* Maximum number of growth trackers to maintain *)
 let tracker_stale_seconds = 3600.0  (* Remove trackers not updated in 1 hour *)
+
+(** Sync active_allocations with allocation tracker's source of truth *)
+let sync_active_allocations () =
+  Mutex.lock detector_mutex;
+  let tracker_allocations = Allocation_tracker.get_all_active_allocations () in
+
+  (* Create a set of current allocation IDs from tracker *)
+  let current_ids = Allocation_tracker.TrackedHashtbl.create 256 in
+  List.iter (fun record -> Allocation_tracker.TrackedHashtbl.add current_ids record.Allocation_tracker.id record) tracker_allocations;
+
+  (* Add any missing allocations to leak detector's table *)
+  Allocation_tracker.TrackedHashtbl.iter (fun id record ->
+    if not (Allocation_tracker.TrackedHashtbl.mem active_allocations id) then
+      Allocation_tracker.TrackedHashtbl.add active_allocations id record
+  ) current_ids;
+
+  (* Remove any allocations no longer active *)
+  let to_remove = ref [] in
+  Allocation_tracker.TrackedHashtbl.iter (fun id _ ->
+    if not (Allocation_tracker.TrackedHashtbl.mem current_ids id) then
+      to_remove := id :: !to_remove
+  ) active_allocations;
+  List.iter (Allocation_tracker.TrackedHashtbl.remove active_allocations) !to_remove;
+
+  (* Clean up temporary table *)
+  Allocation_tracker.TrackedHashtbl.destroy current_ids;
+  Mutex.unlock detector_mutex
 
 (** Generate tracker key *)
 let tracker_key structure_type (site : Allocation_tracker.allocation_site) domain_id =
@@ -50,12 +81,16 @@ let tracker_key structure_type (site : Allocation_tracker.allocation_site) domai
 let register_allocation record =
   Mutex.lock detector_mutex;
   Allocation_tracker.TrackedHashtbl.add active_allocations record.Allocation_tracker.id record;
+  (* Invalidate function counts cache since allocation state changed *)
+  function_counts_cache_timestamp := 0.0;
   Mutex.unlock detector_mutex
 
 (** Register deallocation for leak detection *)
 let register_deallocation id =
   Mutex.lock detector_mutex;
   Allocation_tracker.TrackedHashtbl.remove active_allocations id;
+  (* Invalidate function counts cache since allocation state changed *)
+  function_counts_cache_timestamp := 0.0;
   Mutex.unlock detector_mutex
 
 (** Update growth tracker with new sample *)
@@ -252,6 +287,7 @@ let analyze_for_leaks () =
 
 (** Get active allocation count by type *)
 let get_allocation_counts_by_type () =
+  sync_active_allocations ();
   Mutex.lock detector_mutex;
   let counts : (string, int) Allocation_tracker.TrackedHashtbl.t = Allocation_tracker.TrackedHashtbl.create 16 in
 
@@ -267,6 +303,7 @@ let get_allocation_counts_by_type () =
 
 (** Get allocation counts by domain *)
 let get_allocation_counts_by_domain () =
+  sync_active_allocations ();
   Mutex.lock detector_mutex;
   let counts : (int, int) Allocation_tracker.TrackedHashtbl.t = Allocation_tracker.TrackedHashtbl.create 16 in
 
@@ -280,29 +317,43 @@ let get_allocation_counts_by_domain () =
   Mutex.unlock detector_mutex;
   result
 
-(** Get allocation counts by function per domain *)
+(** Get allocation counts by function per domain (with caching for HFT performance) *)
 let get_allocation_counts_by_function_per_domain () =
-  Mutex.lock detector_mutex;
-  let counts : (string, (string, int) Allocation_tracker.TrackedHashtbl.t) Allocation_tracker.TrackedHashtbl.t = Allocation_tracker.TrackedHashtbl.create 16 in
+  sync_active_allocations ();
+  let now = Unix.gettimeofday () in
 
-  Allocation_tracker.TrackedHashtbl.iter (fun _ record ->
-    let domain_key = string_of_int record.Allocation_tracker.domain_id in
-    let function_counts = Allocation_tracker.TrackedHashtbl.find_opt counts domain_key |> Option.value ~default:(Allocation_tracker.TrackedHashtbl.create 64) in
-    let current = Allocation_tracker.TrackedHashtbl.find_opt function_counts record.site.Allocation_tracker.function_name |> Option.value ~default:0 in
-    Allocation_tracker.TrackedHashtbl.replace function_counts record.site.function_name (current + 1);
-    Allocation_tracker.TrackedHashtbl.replace counts domain_key function_counts
-  ) active_allocations;
+  (* Check if cache is still valid *)
+  if !function_counts_cache_timestamp +. function_counts_cache_ttl_seconds > now && !function_counts_cache <> [] then begin
+    !function_counts_cache  (* Return cached result *)
+  end else begin
+    (* Cache expired or empty, recalculate *)
+    Mutex.lock detector_mutex;
+    let counts : (string, (string, int) Allocation_tracker.TrackedHashtbl.t) Allocation_tracker.TrackedHashtbl.t = Allocation_tracker.TrackedHashtbl.create 16 in
 
-  let result = Allocation_tracker.TrackedHashtbl.fold (fun domain_str function_counts acc ->
-    let domain_id = int_of_string domain_str in
-    let function_list = Allocation_tracker.TrackedHashtbl.fold (fun func_name count func_acc -> (func_name, count) :: func_acc) function_counts [] in
-    Allocation_tracker.TrackedHashtbl.destroy function_counts;
-    (domain_id, function_list) :: acc
-  ) counts [] in
+    Allocation_tracker.TrackedHashtbl.iter (fun _ record ->
+      let domain_key = string_of_int record.Allocation_tracker.domain_id in
+      let function_counts = Allocation_tracker.TrackedHashtbl.find_opt counts domain_key |> Option.value ~default:(Allocation_tracker.TrackedHashtbl.create 64) in
+      let current = Allocation_tracker.TrackedHashtbl.find_opt function_counts record.site.Allocation_tracker.function_name |> Option.value ~default:0 in
+      Allocation_tracker.TrackedHashtbl.replace function_counts record.site.function_name (current + 1);
+      Allocation_tracker.TrackedHashtbl.replace counts domain_key function_counts
+    ) active_allocations;
 
-  Allocation_tracker.TrackedHashtbl.destroy counts;
-  Mutex.unlock detector_mutex;
-  result
+    let result = Allocation_tracker.TrackedHashtbl.fold (fun domain_str function_counts acc ->
+      let domain_id = int_of_string domain_str in
+      let function_list = Allocation_tracker.TrackedHashtbl.fold (fun func_name count func_acc -> (func_name, count) :: func_acc) function_counts [] in
+      Allocation_tracker.TrackedHashtbl.destroy function_counts;
+      (domain_id, function_list) :: acc
+    ) counts [] in
+
+    Allocation_tracker.TrackedHashtbl.destroy counts;
+    Mutex.unlock detector_mutex;
+
+    (* Update cache *)
+    function_counts_cache := result;
+    function_counts_cache_timestamp := now;
+
+    result
+  end
 
 (** Detect domain-specific memory issues *)
 let detect_domain_memory_issues () =
@@ -357,6 +408,7 @@ type status_summary = {
 
 (** Get current leak status summary *)
 let get_leak_status_summary () =
+  sync_active_allocations ();
   let leaks = analyze_for_leaks () in
   let domain_issues = detect_domain_memory_issues () in
   let type_counts = get_allocation_counts_by_type () in
@@ -364,7 +416,7 @@ let get_leak_status_summary () =
   {
     recent_leaks = List.length leaks;
     domain_issues = List.length domain_issues;
-    total_active_allocations = Allocation_tracker.TrackedHashtbl.length active_allocations;
+    total_active_allocations = (Allocation_tracker.get_allocation_stats ()).active_allocations;
     allocation_types = type_counts;
     critical_leaks = List.length (List.filter (fun l -> l.severity = `Critical) leaks);
     high_leaks = List.length (List.filter (fun l -> l.severity = `High) leaks);

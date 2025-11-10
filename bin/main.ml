@@ -295,19 +295,19 @@ let () =
     Dio_ui_cache.Telemetry_cache.signal_system_ready ();
   );
 
+  (* Force Conduit context initialization synchronously before entering Lwt event loop *)
+  (* This ensures the lazy context is properly initialized before any Lwt operations or domain spawning *)
+  begin
+    try
+      let _ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+      Logging.debug ~section:"main" "Conduit context initialized successfully"
+    with exn ->
+      Logging.error_f ~section:"main" "Failed to initialize Conduit context: %s" (Printexc.to_string exn);
+      exit 1
+  end;
+
   Lwt_main.run (
     try%lwt
-      (* Force Conduit context initialization inside Lwt event loop to prevent nested Lwt_main.run *)
-      (* This ensures the lazy context is properly initialized before any HTTP operations *)
-      let%lwt () = Lwt.wrap (fun () ->
-        try
-          (* Actually force the lazy Conduit context within the Lwt context *)
-          let _ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-          Logging.debug ~section:"main" "Conduit context initialized successfully"
-        with exn ->
-          Logging.error_f ~section:"main" "Failed to initialize Conduit context: %s" (Printexc.to_string exn);
-          raise exn
-      ) in
 
       (* Initialize trading engine and domains asynchronously *)
       Logging.info ~section:"main" "Initializing trading engine...";

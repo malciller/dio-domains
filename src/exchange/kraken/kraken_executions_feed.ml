@@ -476,7 +476,7 @@ let update_open_orders store (event : execution_event) =
     (* Log trade fills separately for visibility *)
     if event.exec_type = Trade then begin
       Logging.info_f ~section "Trade fill: %s [%s] qty=%.8f price=%.2f (total filled: %.8f/%.8f)"
-        event.order_id event.symbol 
+        event.order_id event.symbol
         (Option.value event.last_qty ~default:0.0)
         (Option.value event.last_price ~default:0.0)
         event.cum_qty event.order_qty

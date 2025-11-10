@@ -40,6 +40,9 @@ type memory_report = {
 let generate_report () : memory_report Lwt.t =
   let start_time = Unix.gettimeofday () in
 
+  (* Sync leak detector with all allocations *)
+  Leak_detector.sync_active_allocations ();
+
   (* Gather all data *)
   let alloc_stats = Allocation_tracker.get_allocation_stats () in
   let allocations : Allocation_tracker.allocation_record list = Allocation_tracker.get_all_active_allocations () in
@@ -96,6 +99,9 @@ let generate_report () : memory_report Lwt.t =
       recommendations := Printf.sprintf "HIGH FREQUENCY: %d allocations from %s in last minute - possible improper data structure recreation" count site :: !recommendations
   ) site_counts;
 
+  (* Clean up the temporary tracked hashtable to prevent memory leaks *)
+  Allocation_tracker.TrackedHashtbl.destroy site_counts;
+
   let end_time = Unix.gettimeofday () in
 
   (* Add reuse ratio analysis to recommendations *)
@@ -122,7 +128,7 @@ let generate_report () : memory_report Lwt.t =
     allocation_counts = type_counts;
     domain_counts;
     function_per_domain_counts;
-    allocations = allocations;
+    allocations;
     recommendations = !recommendations;
   }
 
@@ -474,10 +480,12 @@ let start_periodic_reporting interval_seconds =
 (** Generate on-demand report *)
 let generate_report_now format =
   generate_report () >>= fun report ->
-  match format with
-  | `Text -> Lwt.return (generate_text_report report)
-  | `Json -> Lwt.return (Yojson.Basic.to_string (generate_json_report report))
-  | `Summary -> Lwt.return (generate_summary_report report)
+  let result = match format with
+    | `Text -> generate_text_report report
+    | `Json -> Yojson.Basic.to_string (generate_json_report report)
+    | `Summary -> generate_summary_report report
+  in
+  Lwt.return result
 
 (** Initialize reporter *)
 let init () =
