@@ -257,20 +257,27 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
 
   result
 
-(** Lock-free ring buffer for orderbook data using atomics *)
+(** Lock-free ring buffer for orderbook data using atomics with memory tracing *)
 module RingBuffer = struct
   type 'a t = {
     data: 'a option Atomic.t array;
     write_pos: int Atomic.t;
     size: int;
+    mutable tracking_record: Obj.t option;  (** Memory tracing record *)
   }
 
   let create size =
-    {
+    let buffer = {
       data = Array.init size (fun _ -> Atomic.make None);
       write_pos = Atomic.make 0;
       size;
-    }
+      tracking_record = None;
+    } in
+    (* Add memory tracking for the ring buffer structure *)
+    let buffer_size = size * (Sys.word_size / 8) in  (* Estimate size based on array elements *)
+    buffer.tracking_record <- Some (Obj.repr (Dio_memory_tracing.Memory_tracing.track_custom_structure
+      "RingBuffer" buffer_size));
+    buffer
 
   let write buffer value =
     let pos = Atomic.get buffer.write_pos in
@@ -298,9 +305,15 @@ module RingBuffer = struct
           | None -> collect acc ((pos + 1) mod buffer.size)
       in
       collect [] last_pos
+
+  (** Clean up memory tracking when buffer is no longer needed *)
+  let destroy buffer =
+    match buffer.tracking_record with
+    | Some record -> Dio_memory_tracing.Memory_tracing.untrack_custom_structure (Obj.obj record)
+    | None -> ()
 end
 
-module PriceMap = Map.Make (struct
+module PriceMap = Dio_memory_tracing.Memory_tracing.Tracked.Map.Make (struct
   type t = string
   let compare = String.compare
 end)
@@ -310,18 +323,23 @@ type store = {
   mutable buffer: orderbook RingBuffer.t;
   mutable bids: (string * string * float * float) PriceMap.t;
   mutable asks: (string * string * float * float) PriceMap.t;
+  mutable bids_size: int;  (** Track current size of bids map for efficient size checks *)
+  mutable asks_size: int;  (** Track current size of asks map for efficient size checks *)
   ready: bool Atomic.t;
   has_snapshot: bool Atomic.t;  (** Track if we have received a snapshot for this symbol *)
   last_sequence: int64 option Atomic.t;  (** Track the last sequence number for this symbol *)
   mutable last_update: float;  (** Track when this store was last updated *)
+  mutable cached_bids_array: level array option;  (** Cache sorted bids array to avoid recomputation *)
+  mutable cached_asks_array: level array option;  (** Cache sorted asks array to avoid recomputation *)
+  mutable cached_top10_bids: level array option;  (** Cache top 10 bids for checksum calculations *)
+  mutable cached_top10_asks: level array option;  (** Cache top 10 asks for checksum calculations *)
+  mutable cache_valid: bool;  (** Track if cached arrays are still valid *)
 }
 
 type decimals = int * int  (* pair_decimals, lot_decimals *)
 
-let stores : (string, store) Hashtbl.t = Hashtbl.create 32
-let stores_mutex = Mutex.create ()
-let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
-let decimals_tbl_mutex = Mutex.create ()
+let stores : (string, store) Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.create 32
+let decimals_tbl : (string, decimals) Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.create 16
 let ready_condition = Lwt_condition.create ()
 
 (** Get precision info from instruments feed cache *)
@@ -340,15 +358,11 @@ let calculate_checksum symbol bids asks : int32 =
         (price_prec, qty_prec)
     | None ->
         (* Fall back to decimals_tbl from AssetPairs API *)
-        Mutex.lock decimals_tbl_mutex;
-        try
-          let result = Hashtbl.find decimals_tbl symbol in
-          Mutex.unlock decimals_tbl_mutex;
-          result
-        with Not_found ->
-          Mutex.unlock decimals_tbl_mutex;
-          Logging.debug_f ~section "No precision found for %s, using defaults" symbol;
-          (8, 8)  (* Fallback defaults *)
+        match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt decimals_tbl symbol with
+        | Some result -> result
+        | None ->
+            Logging.debug_f ~section "No precision found for %s, using defaults" symbol;
+            (8, 8)  (* Fallback defaults *)
   in
 
   (* Helper: check if size is effectively zero using string comparison *)
@@ -411,30 +425,30 @@ let calculate_checksum symbol bids asks : int32 =
   result
 
 let ensure_store symbol =
-  Mutex.lock stores_mutex;
-  let store = match Hashtbl.find_opt stores symbol with
+  match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt stores symbol with
   | Some s -> s
   | None ->
       let s = {
         buffer = RingBuffer.create ring_buffer_size;
-        bids = PriceMap.empty;
-        asks = PriceMap.empty;
+        bids = PriceMap.empty ();
+        asks = PriceMap.empty ();
+        bids_size = 0;
+        asks_size = 0;
         ready = Atomic.make false;
         has_snapshot = Atomic.make false;
         last_sequence = Atomic.make None;
         last_update = Unix.time ();
+        cached_bids_array = None;
+        cached_asks_array = None;
+        cached_top10_bids = None;
+        cached_top10_asks = None;
+        cache_valid = false;
       } in
-      Hashtbl.add stores symbol s;
+      Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.add stores symbol s;
       s
-  in
-  Mutex.unlock stores_mutex;
-  store
 
 let store_opt symbol =
-  Mutex.lock stores_mutex;
-  let result = Hashtbl.find_opt stores symbol in
-  Mutex.unlock stores_mutex;
-  result
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt stores symbol
 
 let notify_ready store =
   if not (Atomic.get store.ready) then begin
@@ -480,16 +494,13 @@ let parse_level symbol price_json size_json =
         (price_prec, qty_prec)
     | None ->
         (* Fall back to decimals_tbl from AssetPairs API *)
-        Mutex.lock decimals_tbl_mutex;
-        try
-          let decimals = Hashtbl.find decimals_tbl symbol in
-          Mutex.unlock decimals_tbl_mutex;
-          Logging.debug_f ~section "Found decimals_tbl for %s: %d, %d" symbol (fst decimals) (snd decimals);
-          decimals
-        with Not_found ->
-          Mutex.unlock decimals_tbl_mutex;
-          Logging.debug_f ~section "No decimals found for %s, using defaults" symbol;
-          (8, 8)  (* Fallback defaults *)
+        match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt decimals_tbl symbol with
+        | Some decimals ->
+            Logging.debug_f ~section "Found decimals_tbl for %s: %d, %d" symbol (fst decimals) (snd decimals);
+            decimals
+        | None ->
+            Logging.debug_f ~section "No decimals found for %s, using defaults" symbol;
+            (8, 8)  (* Fallback defaults *)
   in
 
   let price_str = to_decimal_str ~dec:pd price_json in
@@ -515,12 +526,34 @@ let parse_levels symbol json =
   | _ -> []
 
 let apply_levels map levels =
-  List.fold_left (fun acc (price_str, size_str, price_float, size_float) ->
+  (* Build list of bindings to add/update and keys to remove *)
+  let bindings_to_add = ref [] in
+  let keys_to_remove = ref [] in
+
+  List.iter (fun (price_str, size_str, price_float, size_float) ->
     if is_effectively_zero size_str then
-      PriceMap.remove price_str acc
+      keys_to_remove := price_str :: !keys_to_remove
     else
-      PriceMap.add price_str (price_str, size_str, price_float, size_float) acc
-  ) map levels
+      bindings_to_add := (price_str, (price_str, size_str, price_float, size_float)) :: !bindings_to_add
+  ) levels;
+
+  (* Get current bindings, filter out removals, add new ones *)
+  let current_bindings = PriceMap.bindings map in
+  let filtered_bindings = List.filter (fun (k, _) -> not (List.mem k !keys_to_remove)) current_bindings in
+  let new_bindings = List.rev_append filtered_bindings !bindings_to_add in
+
+  (* Create new map with all updates in one operation - no intermediate allocations *)
+  PriceMap.of_list new_bindings
+
+(** Apply levels and update size counter *)
+let apply_levels_with_size_tracking store map levels is_bids =
+  let new_map = apply_levels map levels in
+  let size_change = (PriceMap.cardinal new_map) - (if is_bids then store.bids_size else store.asks_size) in
+  if is_bids then
+    store.bids_size <- store.bids_size + size_change
+  else
+    store.asks_size <- store.asks_size + size_change;
+  new_map
 
 let levels_to_array ?(sort_desc = false) map depth =
   let levels_list = PriceMap.fold (fun _ (price_str, size_str, price_float, size_float) acc ->
@@ -539,13 +572,108 @@ let levels_to_array ?(sort_desc = false) map depth =
     | level :: rest -> take (n - 1) rest (level :: acc)
   in
 
-  Array.of_list (take depth sorted_levels [])
+  Dio_memory_tracing.Memory_tracing.Tracked.Array.of_list (take depth sorted_levels [])
 
-let rebuild_map_from_top_levels map sort_desc max_levels =
-  let levels_array = levels_to_array ~sort_desc map max_levels in
-  Array.fold_left (fun acc level ->
-    PriceMap.add level.price (level.price, level.size, level.price_float, level.size_float) acc
-  ) PriceMap.empty levels_array
+(** Get cached sorted arrays for bids and asks, computing them if needed *)
+let get_cached_arrays store depth =
+  (* Only recompute if cache is invalid *)
+  if not store.cache_valid then begin
+    (* Helper to compute sorted array for a price map *)
+    let compute_sorted_array price_map sort_desc target_depth =
+      let levels_list = PriceMap.fold (fun _ (price_str, size_str, price_float, size_float) acc ->
+        { price = price_str; size = size_str; price_float; size_float } :: acc
+      ) price_map [] in
+
+      let sorted_levels = List.sort (fun l1 l2 ->
+        if sort_desc then decimal_compare l2.price l1.price else decimal_compare l1.price l2.price
+      ) levels_list in
+
+      let rec take n lst acc =
+        if n = 0 then List.rev acc
+        else match lst with
+        | [] -> List.rev acc
+        | level :: rest -> take (n - 1) rest (level :: acc)
+      in
+
+      (* Create regular array directly without tracked array intermediate *)
+      let levels = take target_depth sorted_levels [] in
+      Array.of_list levels
+    in
+
+    (* Compute arrays for requested depth *)
+    let bids_array = compute_sorted_array store.bids true depth in
+    let asks_array = compute_sorted_array store.asks false depth in
+    store.cached_bids_array <- Some bids_array;
+    store.cached_asks_array <- Some asks_array;
+
+    (* Always compute top10 arrays for checksums *)
+    let top10_bids = compute_sorted_array store.bids true 10 in
+    let top10_asks = compute_sorted_array store.asks false 10 in
+    store.cached_top10_bids <- Some top10_bids;
+    store.cached_top10_asks <- Some top10_asks;
+
+    store.cache_valid <- true;
+  end;
+
+  (* Return appropriate cached arrays *)
+  if depth = 10 then begin
+    (Option.get store.cached_top10_bids, Option.get store.cached_top10_asks)
+  end else begin
+    let bids_array = Option.get store.cached_bids_array in
+    let asks_array = Option.get store.cached_asks_array in
+    (* Trim if necessary, but avoid creating new arrays when possible *)
+    if Array.length bids_array <= depth && Array.length asks_array <= depth then
+      (bids_array, asks_array)
+    else
+      let bids_trimmed = if Array.length bids_array <= depth then bids_array
+                         else Array.sub bids_array 0 depth in
+      let asks_trimmed = if Array.length asks_array <= depth then asks_array
+                         else Array.sub asks_array 0 depth in
+      (bids_trimmed, asks_trimmed)
+  end
+
+(** Invalidate cache when maps are modified *)
+let invalidate_cache store =
+  store.cache_valid <- false;
+  store.cached_bids_array <- None;
+  store.cached_asks_array <- None;
+  store.cached_top10_bids <- None;
+  store.cached_top10_asks <- None
+
+(** Rebuild map from top levels and return new size *)
+let rebuild_map_from_top_levels map sort_desc max_levels current_size =
+  (* Check if we need to rebuild at all - use provided size for efficiency *)
+  if current_size <= max_levels then
+    (* No need to rebuild - already within limits *)
+    (map, current_size)
+  else begin
+    (* Avoid expensive Map -> List -> Array -> Map conversion chain *)
+    (* Directly work with the map to keep only top max_levels entries *)
+    let levels_list = PriceMap.fold (fun _ (price_str, size_str, price_float, size_float) acc ->
+      { price = price_str; size = size_str; price_float; size_float } :: acc
+    ) map [] in
+
+    let sorted_levels = List.sort (fun l1 l2 ->
+      let cmp = if sort_desc then decimal_compare l2.price l1.price else decimal_compare l1.price l2.price in
+      cmp
+    ) levels_list in
+
+    (* Take only the top max_levels *)
+    let top_levels = fst (List.fold_left (fun (acc, count) level ->
+      if count >= max_levels then (acc, count)
+      else (level :: acc, count + 1)
+    ) ([], 0) sorted_levels) in
+
+    (* Build bindings list first, then create new map in one operation *)
+    let new_bindings = List.map (fun level ->
+      (level.price, (level.price, level.size, level.price_float, level.size_float))
+    ) top_levels in
+
+    (* Create new map with all updates in one operation - no intermediate allocations *)
+    let new_map = PriceMap.of_list new_bindings in
+
+    (new_map, List.length top_levels)
+  end
 
 let build_orderbook store symbol entry =
   let open Yojson.Safe.Util in
@@ -580,10 +708,12 @@ let build_orderbook store symbol entry =
         Logging.error_f ~section "Unexpected checksum JSON type: %s" (Yojson.Safe.to_string json);
         None
   in
+  (* Use cached arrays to avoid recomputation *)
+  let bids_regular, asks_regular = get_cached_arrays store orderbook_depth in
   {
     symbol;
-    bids = levels_to_array ~sort_desc:true store.bids orderbook_depth;
-    asks = levels_to_array ~sort_desc:false store.asks orderbook_depth;
+    bids = bids_regular;
+    asks = asks_regular;
     sequence;
     checksum;
     timestamp = Unix.time ();
@@ -621,9 +751,7 @@ let fetch_decimals symbols =
             let ld = to_int (member "lot_decimals" pair_json) in
             List.iter (fun sym ->
               if altname = Some sym || wsname = Some sym then begin
-                Mutex.lock decimals_tbl_mutex;
-                Hashtbl.add decimals_tbl sym (pd, ld);
-                Mutex.unlock decimals_tbl_mutex
+                Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.add decimals_tbl sym (pd, ld)
               end
             ) symbols
           ) pairs;
@@ -636,12 +764,12 @@ let fetch_decimals symbols =
 
 let process_orderbook_message ~reset json on_heartbeat =
   let open Yojson.Safe.Util in
+  (* Track symbols that successfully wrote to buffer in this message *)
+  let notified_symbols = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.create 8 in
   try
     let data = member "data" json |> to_list in
     Logging.debug_f ~section "Processing orderbook message with %d entries (reset=%b)"
       (List.length data) reset;
-    (* Track symbols that successfully wrote to buffer in this message *)
-    let notified_symbols = Hashtbl.create 16 in
     List.iter (fun entry ->
       try
         let symbol = member "symbol" entry |> to_string in
@@ -650,8 +778,12 @@ let process_orderbook_message ~reset json on_heartbeat =
         (* Handle snapshot vs update logic *)
         if reset then begin
           (* Snapshot: reset state and mark as having snapshot *)
-          store.bids <- PriceMap.empty;
-          store.asks <- PriceMap.empty;
+          (* Track replacements of old maps *)
+          store.bids <- PriceMap.empty ~replace_old:(Some store.bids) ();
+          store.asks <- PriceMap.empty ~replace_old:(Some store.asks) ();
+          store.bids_size <- 0;
+          store.asks_size <- 0;
+          invalidate_cache store;
           Atomic.set store.has_snapshot true;
 
           (* Extract sequence from snapshot entry *)
@@ -683,8 +815,13 @@ let process_orderbook_message ~reset json on_heartbeat =
           | Some curr_seq, Some last_seq when Int64.compare curr_seq last_seq <= 0 ->
               Logging.warn_f ~section "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
                 symbol curr_seq last_seq;
-              store.bids <- PriceMap.empty;
-              store.asks <- PriceMap.empty;
+              (* Track replacements of old maps *)
+              store.bids <- PriceMap.empty ~replace_old:(Some store.bids) ();
+              store.asks <- PriceMap.empty ~replace_old:(Some store.asks) ();
+              store.bids_size <- 0;
+              store.asks_size <- 0;
+              invalidate_cache store;
+              RingBuffer.destroy store.buffer;
               store.buffer <- RingBuffer.create ring_buffer_size;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
@@ -693,8 +830,13 @@ let process_orderbook_message ~reset json on_heartbeat =
               let gap = Int64.sub curr_seq last_seq in
               Logging.warn_f ~section "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking out-of-sync"
                 symbol curr_seq last_seq gap;
-              store.bids <- PriceMap.empty;
-              store.asks <- PriceMap.empty;
+              (* Track replacements of old maps *)
+              store.bids <- PriceMap.empty ~replace_old:(Some store.bids) ();
+              store.asks <- PriceMap.empty ~replace_old:(Some store.asks) ();
+              store.bids_size <- 0;
+              store.asks_size <- 0;
+              invalidate_cache store;
+              RingBuffer.destroy store.buffer;
               store.buffer <- RingBuffer.create ring_buffer_size;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
@@ -708,18 +850,38 @@ let process_orderbook_message ~reset json on_heartbeat =
         Logging.debug_f ~section "Parsed levels for %s: bids=%d asks=%d"
           symbol (List.length bids) (List.length asks);
 
-        store.bids <- apply_levels store.bids bids;
-        store.asks <- apply_levels store.asks asks;
+        (* Apply levels and track map replacements *)
+        let new_bids = apply_levels_with_size_tracking store store.bids bids true in
+        let new_asks = apply_levels_with_size_tracking store store.asks asks false in
+        Dio_memory_tracing.Memory_tracing.Internal.Allocation_tracker.record_replacement
+          store.bids.record.id
+          new_bids.record.id;
+        Dio_memory_tracing.Memory_tracing.Internal.Allocation_tracker.record_replacement
+          store.asks.record.id
+          new_asks.record.id;
+        store.bids <- new_bids;
+        store.asks <- new_asks;
         store.last_update <- Unix.time ();  (* Update timestamp on data change *)
 
-        (* Truncate maps to top 25 levels to prevent bloat *)
-        store.bids <- rebuild_map_from_top_levels store.bids true 25;
-        store.asks <- rebuild_map_from_top_levels store.asks false 25;
+        (* Truncate maps to top 25 levels to prevent bloat - only if actually oversized *)
+        let bids_map, bids_size = rebuild_map_from_top_levels store.bids true 25 store.bids_size in
+        let asks_map, asks_size = rebuild_map_from_top_levels store.asks false 25 store.asks_size in
+        (* Track map replacements *)
+        Dio_memory_tracing.Memory_tracing.Internal.Allocation_tracker.record_replacement
+          store.bids.record.id
+          bids_map.record.id;
+        Dio_memory_tracing.Memory_tracing.Internal.Allocation_tracker.record_replacement
+          store.asks.record.id
+          asks_map.record.id;
+        store.bids <- bids_map;
+        store.asks <- asks_map;
+        store.bids_size <- bids_size;
+        store.asks_size <- asks_size;
+        invalidate_cache store;
 
         (* Calculate checksum from current orderbook state (top 10 levels) *)
-        let calculated_checksum = calculate_checksum symbol
-          (levels_to_array ~sort_desc:true store.bids 10)
-          (levels_to_array ~sort_desc:false store.asks 10) in
+        let bids_top10, asks_top10 = get_cached_arrays store 10 in
+        let calculated_checksum = calculate_checksum symbol bids_top10 asks_top10 in
 
         let orderbook = build_orderbook store symbol entry in
         Logging.debug_f ~section "Built orderbook for %s: bids=%d asks=%d checksum=%s"
@@ -734,8 +896,12 @@ let process_orderbook_message ~reset json on_heartbeat =
                 Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
                   symbol received_checksum received_checksum calculated_checksum calculated_checksum;
                 (* Mark symbol out-of-sync on checksum mismatch *)
-                store.bids <- PriceMap.empty;
-                store.asks <- PriceMap.empty;
+                (* Track replacements of old maps *)
+                store.bids <- PriceMap.empty ~replace_old:(Some store.bids) ();
+                store.asks <- PriceMap.empty ~replace_old:(Some store.asks) ();
+                store.bids_size <- 0;
+                store.asks_size <- 0;
+                invalidate_cache store;
                 store.buffer <- RingBuffer.create ring_buffer_size;
                 Atomic.set store.has_snapshot false;
                 Atomic.set store.last_sequence None;
@@ -750,7 +916,7 @@ let process_orderbook_message ~reset json on_heartbeat =
         if checksum_valid then begin
           RingBuffer.write store.buffer orderbook;
           (* Record that this symbol should be notified (only once per message) *)
-          Hashtbl.replace notified_symbols symbol store;
+          Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Orderbook written to ringbuffer: %s bids=%d asks=%d"
             symbol
             (Array.length orderbook.bids)
@@ -776,10 +942,13 @@ let process_orderbook_message ~reset json on_heartbeat =
     ) data;
 
     (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
-    Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.destroy notified_symbols;
 
     Some ()
   with exn ->
+    (* Clean up hashtable in case of exception *)
+    (try Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.destroy notified_symbols with _ -> ());
     Logging.warn_f ~section "Failed to parse orderbook message: %s"
       (Printexc.to_string exn);
     None
@@ -854,50 +1023,85 @@ let has_orderbook_data symbol =
   | Some store when Atomic.get store.ready -> Option.is_some (RingBuffer.read_latest store.buffer)
   | _ -> false
 
-(** Clear all orderbook stores - used when reconnecting to ensure clean state *)
-let clear_all_stores () =
-  Hashtbl.iter (fun symbol store ->
-    Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
-    store.bids <- PriceMap.empty;
-    store.asks <- PriceMap.empty;
-    (* Replace ring buffer with fresh empty one to clear any stale data *)
-    store.buffer <- RingBuffer.create ring_buffer_size;
-    Atomic.set store.ready false;
-    Atomic.set store.has_snapshot false;
-    Atomic.set store.last_sequence None;
-    store.last_update <- Unix.time ()
-  ) stores
+(** Destroy all orderbook stores - used when reconnecting to ensure clean state *)
+let destroy_all_stores () =
+  (* Collect all symbols first - can't iterate and remove simultaneously *)
+  let symbols_to_destroy =
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.fold
+      (fun symbol _ acc -> symbol :: acc) stores [] in
+
+  List.iter (fun symbol ->
+    match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt stores symbol with
+    | Some store ->
+        Logging.debug_f ~section "Destroying orderbook store for %s" symbol;
+        (* Destroy ring buffer *)
+        RingBuffer.destroy store.buffer;
+        (* Destroy maps - note: PriceMap.empty with replace_old handles destruction *)
+        ignore (PriceMap.empty ~replace_old:(Some store.bids) ());
+        ignore (PriceMap.empty ~replace_old:(Some store.asks) ());
+        (* Remove from hashtable - this completely destroys the store *)
+        Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.remove stores symbol
+    | None -> ()
+  ) symbols_to_destroy
 
 (** Prune inactive stores and stale price levels to prevent memory growth *)
 let prune_stale_data () =
   let now = Unix.gettimeofday () in
   let stale_threshold = 30.0 *. 60.0 in  (* 30 minutes *)
   let max_price_levels = 100 in  (* Max levels to keep per side *)
+  let max_stores = 50 in  (* Maximum number of active stores to prevent unbounded growth *)
 
   let stores_to_remove = ref [] in
   let trimmed_stores = ref [] in
-  Mutex.lock stores_mutex;
-  let total_stores_before = Hashtbl.length stores in
+  let total_stores_before = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.length stores in
 
-  Hashtbl.iter (fun symbol store ->
+  (* Collect all stores with their last update times for LRU-style cleanup *)
+  let store_activity = ref [] in
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.iter (fun symbol store ->
+    store_activity := (symbol, store.last_update) :: !store_activity
+  ) stores;
+
+  (* Sort by last update time (oldest first) *)
+  let sorted_stores = List.sort (fun (_, t1) (_, t2) -> compare t1 t2) !store_activity in
+
+  (* Remove stores beyond our limit (keeping most recently active) *)
+  if List.length sorted_stores > max_stores then begin
+    let excess_count = List.length sorted_stores - max_stores in
+    let rec take n lst acc =
+      if n = 0 then List.rev acc
+      else match lst with
+      | [] -> List.rev acc
+      | (symbol, _) :: rest -> take (n - 1) rest (symbol :: acc)
+    in
+    let stores_to_remove_lru = take excess_count sorted_stores [] in
+    stores_to_remove := stores_to_remove_lru @ !stores_to_remove;
+    Logging.debug_f ~section "Removing %d stores due to connection limit (%d max): %s"
+      excess_count max_stores (String.concat ", " stores_to_remove_lru)
+  end;
+
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.iter (fun symbol store ->
     let age = now -. store.last_update in
 
     (* Check if store is stale *)
     if age > stale_threshold then begin
       stores_to_remove := symbol :: !stores_to_remove
     end else begin
-      (* For active stores, check if price maps are too large *)
-      let bids_count = PriceMap.cardinal store.bids in
-      let asks_count = PriceMap.cardinal store.asks in
+      (* For active stores, check if price maps are too large - use cached sizes for efficiency *)
       let trimmed = ref false in
 
-      if bids_count > max_price_levels then begin
-        store.bids <- rebuild_map_from_top_levels store.bids true max_price_levels;
+      if store.bids_size > max_price_levels then begin
+        let bids_map, bids_size = rebuild_map_from_top_levels store.bids true max_price_levels store.bids_size in
+        store.bids <- bids_map;
+        store.bids_size <- bids_size;
+        invalidate_cache store;
         trimmed := true
       end;
 
-      if asks_count > max_price_levels then begin
-        store.asks <- rebuild_map_from_top_levels store.asks false max_price_levels;
+      if store.asks_size > max_price_levels then begin
+        let asks_map, asks_size = rebuild_map_from_top_levels store.asks false max_price_levels store.asks_size in
+        store.asks <- asks_map;
+        store.asks_size <- asks_size;
+        invalidate_cache store;
         trimmed := true
       end;
 
@@ -906,10 +1110,13 @@ let prune_stale_data () =
     end
   ) stores;
 
-  (* Remove stale stores *)
+  (* Remove stale and excess stores *)
   List.iter (fun symbol ->
-    Hashtbl.remove stores symbol;
-    Logging.debug_f ~section "Removed stale orderbook store for %s (age > 30min)" symbol
+    (match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt stores symbol with
+     | Some store -> RingBuffer.destroy store.buffer
+     | None -> ());
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.remove stores symbol;
+    Logging.debug_f ~section "Removed orderbook store for %s (stale or excess)" symbol
   ) !stores_to_remove;
 
   (* Log trimming actions *)
@@ -919,13 +1126,11 @@ let prune_stale_data () =
 
   let stores_removed = List.length !stores_to_remove in
   let stores_trimmed = List.length !trimmed_stores in
-  let total_stores_after = Hashtbl.length stores in
+  let total_stores_after = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.length stores in
 
   if stores_removed > 0 || stores_trimmed > 0 then
-    Logging.info_f ~section "Orderbook cleanup: removed %d stale stores, trimmed %d active stores (%d -> %d total stores)"
-      stores_removed stores_trimmed total_stores_before total_stores_after;
-
-  Mutex.unlock stores_mutex
+    Logging.info_f ~section "Orderbook cleanup: removed %d stores, trimmed %d active stores (%d -> %d total stores)"
+      stores_removed stores_trimmed total_stores_before total_stores_after
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
   let start_time = Unix.gettimeofday () in
@@ -1001,7 +1206,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
 
-  Logging.debug_f ~section "Connecting to Kraken orderbook WebSocket...";
+  Logging.info_f ~section "Connecting to Kraken orderbook WebSocket...";
   Lwt_unix.getaddrinfo "ws.kraken.com" "443" [Unix.AI_FAMILY Unix.PF_INET] >>= fun addresses ->
   let ip = match addresses with
     | {Unix.ai_addr = Unix.ADDR_INET (addr, _); _} :: _ ->
@@ -1011,13 +1216,12 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let client = `TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
-
-    Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
-    (* Call on_connected callback after successful connection and before starting message handler *)
-    on_connected ();
-    start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
-    Logging.debug_f ~section "Orderbook WebSocket connection closed";
-    Lwt.return_unit
+  Logging.info_f ~section "Orderbook WebSocket established, subscribing...";
+  (* Call on_connected callback after successful connection and before starting message handler *)
+  on_connected ();
+  start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
+  Logging.debug_f ~section "Orderbook WebSocket connection closed";
+  Lwt.return_unit
 
 let initialize symbols =
   Logging.debug_f ~section "Initializing orderbook feed for %d symbols" (List.length symbols);
@@ -1031,7 +1235,7 @@ let initialize symbols =
   (* Start periodic cleanup of stale data *)
   Lwt.async (fun () ->
     let rec cleanup_loop () =
-      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
+      let%lwt () = Lwt_unix.sleep 120.0 in (* Clean up every 2 minutes *)
       prune_stale_data ();
       cleanup_loop ()
     in

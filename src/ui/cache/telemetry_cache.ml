@@ -7,7 +7,10 @@
 open Lwt.Infix
 open Telemetry
 open Concurrency
-open Ring_buffer
+
+
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
 
 open Ui_types
 
@@ -31,7 +34,7 @@ end)
 (** Telemetry cache state - Two Layer Architecture *)
 type t = {
   (* Layer 1: Bounded ring buffer for individual metric updates *)
-  layer1_ring_buffer: telemetry_update_event RingBuffer.t;
+  layer1_ring_buffer: telemetry_update_event Ringbuffer.t;
 
   (* Layer 2: Current and previous snapshots for retry/recovery *)
   mutable current_snapshot: telemetry_snapshot option;
@@ -53,7 +56,7 @@ let signal_shutdown () =
 
 (** Global telemetry cache instance - Two Layer Architecture *)
 let cache = {
-  layer1_ring_buffer = RingBuffer.create 1000;  (* Bounded ring buffer for metric updates *)
+  layer1_ring_buffer = Ringbuffer.create 1000;  (* Bounded ring buffer for metric updates *)
   current_snapshot = None;
   previous_snapshot = None;
   telemetry_snapshot_event_bus = TelemetrySnapshotEventBus.create "telemetry_snapshot";
@@ -111,7 +114,7 @@ let rebuild_snapshot_from_layer1 () : telemetry_snapshot =
   (* Get current metrics hash for tracking changes *)
   let current_hash = Telemetry.(
     Mutex.lock metrics_mutex;
-    let hash = Hashtbl.fold (fun key metric acc ->
+    let hash = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun key metric acc ->
       let metric_str = Printf.sprintf "%s:%s:%s:%.3f:%.3f"
         key metric.name (String.concat "," (List.map (fun (k,v) -> k^"="^v) metric.labels))
         metric.last_updated metric.cached_rate in
@@ -128,11 +131,11 @@ let rebuild_snapshot_from_layer1 () : telemetry_snapshot =
     (* Strip heavy data structures like sliding window lists to prevent memory bloat *)
     let metrics_list = Telemetry.(
       Mutex.lock metrics_mutex;
-      let metric_count = Hashtbl.length metrics in
+      let metric_count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length metrics in
       Logging.debug_f ~section:"telemetry_cache" "Copying %d metrics from telemetry system" metric_count;
 
       (* Create lightweight copies of metrics for dashboard, stripping heavy data *)
-      let lightweight_metrics = Hashtbl.fold (fun _ metric acc ->
+      let lightweight_metrics = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun _ metric acc ->
         let lightweight_metric = match metric.metric_type with
         | SlidingCounter sliding ->
             (* For sliding counters, create a lightweight version without the current_window list *)
@@ -209,21 +212,22 @@ let rebuild_snapshot_from_layer1 () : telemetry_snapshot =
     Logging.debug_f ~section:"telemetry_cache" "Snapshot contains %d metrics" (List.length final_metrics);
 
     (* Compute categories efficiently - use single pass *)
-    let categories_hashtable = Hashtbl.create 16 in
+    let categories_hashtable = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16 in
     List.iter (fun metric ->
       let category = Telemetry.categorize_metric metric in
-      let existing = Hashtbl.find_opt categories_hashtable category |> Option.value ~default:[] in
-      Hashtbl.replace categories_hashtable category (metric :: existing)
+      let existing = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt categories_hashtable category |> Option.value ~default:[] in
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace categories_hashtable category (metric :: existing)
     ) final_metrics;
 
     let category_list =
       [("Connections", []); ("Trading", []); ("Positions", []); ("Domains", []); ("Market Data", []); ("System", []); ("Other", [])]
       |> List.map (fun (cat, _) ->
-           match Hashtbl.find_opt categories_hashtable cat with
+           match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt categories_hashtable cat with
            | Some metrics -> (cat, List.sort (fun m1 m2 -> String.compare m1.name m2.name) metrics)
            | None -> (cat, [])
          )
     in
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.destroy categories_hashtable;
 
     let version = Atomic.incr snapshot_version_counter; Atomic.get snapshot_version_counter in
     let snapshot = {
@@ -258,7 +262,7 @@ let add_metric_update_event metric_key event_type =
     event_type;
     metric_key;
   } in
-  RingBuffer.write cache.layer1_ring_buffer event;
+  Ringbuffer.write cache.layer1_ring_buffer event;
   Logging.debug_f ~section:"telemetry_cache" "Added %s event for metric %s to Layer 1 ring buffer"
     event_type metric_key;
 
@@ -299,8 +303,13 @@ let update_telemetry_cache_periodic () =
       TelemetrySnapshotEventBus.publish cache.telemetry_snapshot_event_bus snapshot;
       safe_broadcast_update_condition cache;
 
-      Logging.debug_f ~section:"telemetry_cache" "Periodic snapshot published (version: %d) at %.2f"
-        snapshot.version snapshot.timestamp
+      (* Log keepalive vs regular update for monitoring *)
+      if needs_keepalive && not should_update then
+        Logging.info_f ~section:"telemetry_cache" "Keepalive snapshot published (%.1fs since last update, version: %d)"
+          time_since_last snapshot.version
+      else
+        Logging.debug_f ~section:"telemetry_cache" "Periodic snapshot published (version: %d) at %.2f"
+          snapshot.version snapshot.timestamp
     with exn ->
       Logging.warn_f ~section:"telemetry_cache" "Failed to rebuild snapshot during periodic update: %s"
         (Printexc.to_string exn)

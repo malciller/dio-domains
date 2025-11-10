@@ -1,9 +1,12 @@
 (**
   Common types shared between strategies (suicide_grid, market_maker, etc.)
-  
+
   This module provides unified types for strategy orders to enable consistent
   order processing in the supervisor regardless of which strategy generates them.
 *)
+
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
 
 (** Strategy userref values - simple integers to tag orders by strategy
     These are non-unique identifiers that group all orders from a strategy together *)
@@ -56,7 +59,7 @@ type strategy_order = {
 (** Lock-free ring buffer for strategy orders *)
 module OrderRingBuffer = struct
   type 'a t = {
-    data: 'a option Atomic.t array;
+    data: 'a option Atomic.t Dio_memory_tracing.Memory_tracing.Tracked.Array.t;
     write_pos: int Atomic.t;
     read_pos: int Atomic.t;
     size: int;
@@ -64,7 +67,7 @@ module OrderRingBuffer = struct
 
   let create size =
     {
-      data = Array.init size (fun _ -> Atomic.make None);
+      data = Dio_memory_tracing.Memory_tracing.Tracked.Array.init size (fun _ -> Atomic.make None);
       write_pos = Atomic.make 0;
       read_pos = Atomic.make 0;
       size;
@@ -80,7 +83,7 @@ module OrderRingBuffer = struct
     if next_pos = read_pos then
       None  (* Buffer full, drop the order *)
     else begin
-      Atomic.set buffer.data.(pos) (Some value);
+      Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.data pos (Atomic.make (Some value));
       Atomic.set buffer.write_pos next_pos;
       Some ()
     end
@@ -93,9 +96,9 @@ module OrderRingBuffer = struct
     if read_pos = write_pos then
       None  (* Buffer empty *)
     else
-      match Atomic.get buffer.data.(read_pos) with
+      match Atomic.get (Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.data read_pos) with
       | Some value ->
-          Atomic.set buffer.data.(read_pos) None;
+          Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.data read_pos (Atomic.make None);
           let next_read_pos = (read_pos + 1) mod buffer.size in
           Atomic.set buffer.read_pos next_read_pos;
           Some value

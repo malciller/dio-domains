@@ -3,7 +3,7 @@
  (public_name dio)
  (name main)
  (modes exe)
- (libraries dio.kraken dio.ui lwt supervisor mirage-crypto-rng.unix)
+ (libraries dio.kraken dio.ui lwt supervisor mirage-crypto-rng.unix dio_memory_tracing)
  (preprocess (pps lwt_ppx))
  (instrumentation
   (backend spacetime))

@@ -2,7 +2,7 @@
  (name supervisor)
  (public_name dio.supervisor)
  (modules supervisor)
- (libraries logging telemetry threads lwt.unix dio.engine dio.kraken)
+ (libraries logging telemetry threads lwt.unix dio.engine dio.kraken dio_memory_tracing)
  (preprocess (pps lwt_ppx))
 )
 

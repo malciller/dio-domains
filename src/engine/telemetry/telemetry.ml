@@ -3,7 +3,17 @@
 open Lwt.Infix
 open Concurrency
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 let section = "telemetry"
+
+(** Memory tracing hooks - conditionally available *)
+let memory_tracing_available =
+  try
+    ignore (Sys.getenv "DIO_MEMORY_TRACING");
+    true
+  with Not_found -> false
 
 (** Sliding window counter for high-frequency metrics *)
 type sliding_counter = {
@@ -22,7 +32,7 @@ type rate_sample = {
 (** Bounded circular buffer for rate samples to prevent memory leaks *)
 type rate_buffer = {
   buffer_type: [`Rate];
-  data: rate_sample option array;
+  data: rate_sample option Dio_memory_tracing.Memory_tracing.Tracked.Array.t;
   mutable write_pos: int;
   mutable size: int;
   capacity: int;
@@ -38,7 +48,7 @@ type rate_tracker = {
 (** Bounded circular buffer for histogram samples *)
 type histogram_buffer = {
   hist_type: [`Histogram];
-  hist_data: float option array;
+  hist_data: float option Dio_memory_tracing.Memory_tracing.Tracked.Array.t;
   mutable hist_write_pos: int;
   mutable hist_size: int;
   hist_capacity: int;
@@ -64,9 +74,9 @@ let memory_config = {
 (** Mutex to protect memory_config access from race conditions *)
 let memory_config_mutex = Mutex.create ()
 
-(** Metric lifecycle management - more aggressive to prevent memory leaks *)
-let metric_stale_ttl_seconds = 1800.0  (* Remove metrics not updated in 30 minutes (was 1 hour) *)
-let max_metrics_count = 2500  (* Cap total metrics to prevent unbounded growth (was 5000) *)
+(** Metric lifecycle management - aggressive to prevent memory leaks *)
+let metric_stale_ttl_seconds = 900.0  (* Remove metrics not updated in 15 minutes (was 30 minutes) *)
+let max_metrics_count = 500  (* Cap total metrics to prevent unbounded growth (was 2500) *)
 
 (** Get current memory pressure level based on OCaml heap usage *)
 let get_memory_pressure () : memory_pressure =
@@ -86,7 +96,7 @@ let create_rate_buffer () : rate_buffer =
   Mutex.unlock memory_config_mutex;
   {
     buffer_type = `Rate;
-    data = Array.make capacity None;
+    data = Dio_memory_tracing.Memory_tracing.Tracked.Array.make capacity None;
     write_pos = 0;
     size = 0;
     capacity;
@@ -94,7 +104,7 @@ let create_rate_buffer () : rate_buffer =
 
 let add_rate_sample buffer sample =
   let was_full = buffer.size >= buffer.capacity in
-  buffer.data.(buffer.write_pos) <- Some sample;
+  Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.data buffer.write_pos (Some sample);
   buffer.write_pos <- (buffer.write_pos + 1) mod buffer.capacity;
   if buffer.size < buffer.capacity then
     buffer.size <- buffer.size + 1
@@ -110,7 +120,7 @@ let get_rate_samples buffer =
       if actual_pos < 0 then
         collect acc pos (remaining - 1)  (* Wrap around *)
       else
-        match buffer.data.(actual_pos) with
+        match Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.data actual_pos with
         | Some sample -> collect (sample :: acc) pos (remaining - 1)
         | None -> collect acc pos (remaining - 1)
   in
@@ -123,7 +133,7 @@ let create_histogram_buffer () : histogram_buffer =
   Mutex.unlock memory_config_mutex;
   {
     hist_type = `Histogram;
-    hist_data = Array.make capacity None;
+    hist_data = Dio_memory_tracing.Memory_tracing.Tracked.Array.make capacity None;
     hist_write_pos = 0;
     hist_size = 0;
     hist_capacity = capacity;
@@ -131,7 +141,7 @@ let create_histogram_buffer () : histogram_buffer =
 
 let add_histogram_sample buffer sample =
   let was_full = buffer.hist_size >= buffer.hist_capacity in
-  buffer.hist_data.(buffer.hist_write_pos) <- Some sample;
+  Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.hist_data buffer.hist_write_pos (Some sample);
   buffer.hist_write_pos <- (buffer.hist_write_pos + 1) mod buffer.hist_capacity;
   if buffer.hist_size < buffer.hist_capacity then
     buffer.hist_size <- buffer.hist_size + 1
@@ -147,7 +157,7 @@ let get_histogram_samples buffer =
       if actual_pos < 0 then
         collect acc pos (remaining - 1)  (* Wrap around *)
       else
-        match buffer.hist_data.(actual_pos) with
+        match Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.hist_data actual_pos with
         | Some sample -> collect (sample :: acc) pos (remaining - 1)
         | None -> collect acc pos (remaining - 1)
   in
@@ -171,9 +181,87 @@ type metric = {
 }
 
 (** Global metrics store *)
-let metrics : (string, metric) Hashtbl.t = Hashtbl.create 128
+let metrics : (string, metric) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 128
 let metrics_mutex = Mutex.create ()
 let metrics_changed_condition = Lwt_condition.create ()
+
+(** Shared buffer pools to prevent per-domain buffer creation *)
+let histogram_buffer_pool : histogram_buffer Dio_memory_tracing.Memory_tracing.Tracked.Queue.t = Dio_memory_tracing.Memory_tracing.Tracked.Queue.create ()
+let rate_buffer_pool : rate_buffer Dio_memory_tracing.Memory_tracing.Tracked.Queue.t = Dio_memory_tracing.Memory_tracing.Tracked.Queue.create ()
+let buffer_pools_mutex = Mutex.create ()
+
+(** Get a histogram buffer from the shared pool or create new if pool is empty *)
+let get_histogram_buffer () : histogram_buffer =
+  Mutex.lock buffer_pools_mutex;
+  let from_pool = not (Dio_memory_tracing.Memory_tracing.Tracked.Queue.is_empty histogram_buffer_pool) in
+  let buffer =
+    if from_pool then begin
+      Dio_memory_tracing.Memory_tracing.Tracked.Queue.take histogram_buffer_pool
+    end else begin
+      create_histogram_buffer ()
+    end
+  in
+  Mutex.unlock buffer_pools_mutex;
+  (* Reset buffer state for reuse *)
+  buffer.hist_write_pos <- 0;
+  buffer.hist_size <- 0;
+  (* Track reuse if buffer came from pool *)
+  if from_pool && memory_tracing_available then
+    Dio_memory_tracing.Memory_tracing.record_reuse ();
+  buffer
+
+(** Return a histogram buffer to the shared pool for reuse *)
+let return_histogram_buffer buffer =
+  Mutex.lock buffer_pools_mutex;
+  (* Clear buffer contents *)
+  for i = 0 to buffer.hist_capacity - 1 do
+    Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.hist_data i None;
+  done;
+  buffer.hist_write_pos <- 0;
+  buffer.hist_size <- 0;
+  Dio_memory_tracing.Memory_tracing.Tracked.Queue.push buffer histogram_buffer_pool;
+  Mutex.unlock buffer_pools_mutex
+
+(** Get a rate buffer from the shared pool or create new if pool is empty *)
+let get_rate_buffer () : rate_buffer =
+  Mutex.lock buffer_pools_mutex;
+  let from_pool = not (Dio_memory_tracing.Memory_tracing.Tracked.Queue.is_empty rate_buffer_pool) in
+  let buffer =
+    if from_pool then begin
+      Dio_memory_tracing.Memory_tracing.Tracked.Queue.take rate_buffer_pool
+    end else begin
+      create_rate_buffer ()
+    end
+  in
+  Mutex.unlock buffer_pools_mutex;
+  (* Reset buffer state for reuse *)
+  buffer.write_pos <- 0;
+  buffer.size <- 0;
+  (* Track reuse if buffer came from pool *)
+  if from_pool && memory_tracing_available then
+    Dio_memory_tracing.Memory_tracing.record_reuse ();
+  buffer
+
+(** Return a rate buffer to the shared pool for reuse *)
+let return_rate_buffer buffer =
+  Mutex.lock buffer_pools_mutex;
+  (* Clear buffer contents *)
+  for i = 0 to buffer.capacity - 1 do
+    Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.data i None;
+  done;
+  buffer.write_pos <- 0;
+  buffer.size <- 0;
+  Dio_memory_tracing.Memory_tracing.Tracked.Queue.push buffer rate_buffer_pool;
+  Mutex.unlock buffer_pools_mutex
+
+(** Return all buffers from a metric to the shared pools *)
+let return_metric_buffers metric =
+  (match metric.metric_type with
+   | Histogram buffer -> return_histogram_buffer buffer
+   | _ -> ());
+  (match metric.rate_tracker with
+   | Some tracker -> return_rate_buffer tracker.samples
+   | None -> ())
 
 (** Mutex to serialize garbage collection calls to prevent race conditions *)
 let gc_mutex = Mutex.create ()
@@ -226,7 +314,11 @@ let safe_broadcast_metrics_changed () =
       Logging.warn_f ~section:"telemetry" "Error broadcasting metrics_changed: %s" (Printexc.to_string exn);
 
   (* Also publish to event bus for stream-based subscribers *)
-  MetricChangeEventBus.publish metric_change_event_bus ()
+  try
+    MetricChangeEventBus.publish metric_change_event_bus ()
+  with exn ->
+      (* Event bus errors during shutdown are also non-fatal *)
+      Logging.warn_f ~section:"telemetry" "Error publishing to metric change event bus: %s" (Printexc.to_string exn)
 
 (** Safe garbage collection helper to prevent race conditions *)
 let safe_gc () =
@@ -250,7 +342,7 @@ let metric_key name labels =
 (** Update cached rates and snapshot values for all metrics (called during snapshot creation) *)
 let update_cached_rates () =
   Mutex.lock metrics_mutex;
-  Hashtbl.iter (fun _ metric ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ metric ->
     (* Only calculate expensive rates for metrics that actually have rate tracking enabled *)
     match metric.metric_type, metric.rate_tracker with
     | Counter _, Some tracker ->
@@ -311,7 +403,7 @@ let gauge name ?(labels=[]) () =
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
   let metric =
-    match Hashtbl.find_opt metrics key with
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt metrics key with
     | Some m -> m
     | None ->
         let m = {
@@ -323,7 +415,7 @@ let gauge name ?(labels=[]) () =
           rate_tracker = None;
           cached_rate = 0.0;
         } in
-        Hashtbl.add metrics key m;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add metrics key m;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -463,8 +555,8 @@ let reset_counter metric =
            tracker.samples_since_cleanup <- 0;
            tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
            (* Clear the samples array *)
-           for i = 0 to Array.length tracker.samples.data - 1 do
-             tracker.samples.data.(i) <- None
+           for i = 0 to Dio_memory_tracing.Memory_tracing.Tracked.Array.length tracker.samples.data - 1 do
+             Dio_memory_tracing.Memory_tracing.Tracked.Array.set tracker.samples.data i None
            done
        | None -> ());
       Mutex.unlock metrics_mutex;
@@ -483,8 +575,8 @@ let reset_counter metric =
            tracker.samples_since_cleanup <- 0;
            tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
            (* Clear the samples array *)
-           for i = 0 to Array.length tracker.samples.data - 1 do
-             tracker.samples.data.(i) <- None
+           for i = 0 to Dio_memory_tracing.Memory_tracing.Tracked.Array.length tracker.samples.data - 1 do
+             Dio_memory_tracing.Memory_tracing.Tracked.Array.set tracker.samples.data i None
            done
        | None -> ());
       Mutex.unlock metrics_mutex;
@@ -528,7 +620,7 @@ let reset_large_counters () =
      First pass: collect metrics that need resetting while holding mutex briefly *)
   let metrics_to_reset = ref [] in
   if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
-    Hashtbl.iter (fun key metric ->
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun key metric ->
       let should_reset = match metric.metric_type with
         | Counter r ->
             (* Global reset every 5 minutes OR *)
@@ -575,8 +667,8 @@ let reset_large_counters () =
               tracker.samples_since_cleanup <- 0;
               tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
               (* Clear the samples array - keep inside mutex to prevent races with concurrent writes *)
-              for i = 0 to Array.length tracker.samples.data - 1 do
-                tracker.samples.data.(i) <- None
+              for i = 0 to Dio_memory_tracing.Memory_tracing.Tracked.Array.length tracker.samples.data - 1 do
+                Dio_memory_tracing.Memory_tracing.Tracked.Array.set tracker.samples.data i None
               done
           | None -> ())
      | SlidingCounter sliding ->
@@ -591,8 +683,8 @@ let reset_large_counters () =
               tracker.samples_since_cleanup <- 0;
               tracker.previous_value <- 0;  (* Reset previous value for delta calculation *)
               (* Clear the samples array - keep inside mutex to prevent races with concurrent writes *)
-              for i = 0 to Array.length tracker.samples.data - 1 do
-                tracker.samples.data.(i) <- None
+              for i = 0 to Dio_memory_tracing.Memory_tracing.Tracked.Array.length tracker.samples.data - 1 do
+                Dio_memory_tracing.Memory_tracing.Tracked.Array.set tracker.samples.data i None
               done
           | None -> ())
      | _ -> ());
@@ -603,7 +695,7 @@ let reset_large_counters () =
     Logging.info_f ~section "Reset counter %s (was %d)" metric.name old_value
   ) !metrics_to_reset;
 
-  let total_counters = Hashtbl.length metrics in
+  let total_counters = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length metrics in
 
   (* Track memory usage after cleanup *)
   let mem_after = Gc.stat () in
@@ -635,34 +727,46 @@ let prune_stale_metrics () =
 
   (* Collect keys to remove *)
   let keys_to_remove = ref [] in
-  let total_count = Hashtbl.length metrics in
+  let total_count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length metrics in
 
-  Hashtbl.iter (fun key metric ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun key metric ->
     if metric.last_updated < stale_cutoff then
       keys_to_remove := key :: !keys_to_remove
   ) metrics;
 
   (* Remove stale metrics *)
   let stale_removed = List.length !keys_to_remove in
-  List.iter (Hashtbl.remove metrics) !keys_to_remove;
+  List.iter (fun key ->
+    (* Return buffers to pools before removing metric *)
+    (match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt metrics key with
+     | Some metric -> return_metric_buffers metric
+     | None -> ());
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove metrics key
+  ) !keys_to_remove;
 
   (* If still over limit, remove oldest metrics *)
-  let current_count = Hashtbl.length metrics in
+  let current_count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length metrics in
   let to_remove_more = max 0 (current_count - max_metrics_count) in
   if to_remove_more > 0 then begin
     (* Collect all metrics with creation times *)
     let metrics_with_times = ref [] in
-    Hashtbl.iter (fun key metric ->
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun key metric ->
       metrics_with_times := (key, metric.created_at) :: !metrics_with_times
     ) metrics;
 
     (* Sort by creation time (oldest first) and remove oldest *)
     let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t1 t2) !metrics_with_times in
     let oldest_to_remove = List.map fst (List.filteri (fun i _ -> i < to_remove_more) sorted) in
-    List.iter (Hashtbl.remove metrics) oldest_to_remove;
+    List.iter (fun key ->
+      (* Return buffers to pools before removing metric *)
+      (match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt metrics key with
+       | Some metric -> return_metric_buffers metric
+       | None -> ());
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove metrics key
+    ) oldest_to_remove;
   end;
 
-  let final_count = Hashtbl.length metrics in
+  let final_count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length metrics in
   Mutex.unlock metrics_mutex;
 
   (* Track memory usage after cleanup *)
@@ -682,7 +786,7 @@ let prune_stale_metrics () =
 (** Get telemetry memory statistics for monitoring *)
 let get_telemetry_memory_stats () =
   Mutex.lock metrics_mutex;
-  let total_metrics = Hashtbl.length metrics in
+  let total_metrics = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length metrics in
   let sliding_counters = ref 0 in
   let histograms = ref 0 in
   let counters = ref 0 in
@@ -691,7 +795,7 @@ let get_telemetry_memory_stats () =
   let total_sliding_entries = ref 0 in
   let total_histogram_samples = ref 0 in
 
-  Hashtbl.iter (fun _ metric ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ metric ->
     match metric.metric_type with
     | SlidingCounter sliding ->
         incr sliding_counters;
@@ -756,19 +860,19 @@ let histogram name ?(labels=[]) () =
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
   let metric =
-    match Hashtbl.find_opt metrics key with
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt metrics key with
     | Some m -> m
     | None ->
         let m = {
           name;
-          metric_type = Histogram (create_histogram_buffer ());  (* Capacity managed by memory_config *)
+          metric_type = Histogram (get_histogram_buffer ());  (* Shared buffer pool to prevent per-domain creation *)
           labels;
           created_at = Unix.time ();
           last_updated = Unix.gettimeofday ();
           rate_tracker = None;
           cached_rate = 0.0;
         } in
-        Hashtbl.add metrics key m;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add metrics key m;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -840,12 +944,12 @@ let sliding_counter name ?(labels=[]) ?(window_size=500) ?(track_rate=false) ?(r
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
   let metric =
-    match Hashtbl.find_opt metrics key with
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt metrics key with
     | Some m -> m
     | None ->
         let rate_tracker = if track_rate then
           Some {
-            samples = create_rate_buffer ();  (* Capacity managed by memory_config *)
+            samples = get_rate_buffer ();  (* Shared buffer pool to prevent per-domain creation *)
             window_seconds = rate_window;
             samples_since_cleanup = 0;
             previous_value = 0;  (* Start with 0 as previous value *)
@@ -866,7 +970,7 @@ let sliding_counter name ?(labels=[]) ?(window_size=500) ?(track_rate=false) ?(r
           rate_tracker;
           cached_rate = 0.0;
         } in
-        Hashtbl.add metrics key m;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add metrics key m;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -1007,12 +1111,12 @@ let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
   let key = metric_key name labels in
   Mutex.lock metrics_mutex;
   let metric =
-    match Hashtbl.find_opt metrics key with
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt metrics key with
     | Some m -> m
     | None ->
         let rate_tracker = if track_rate then
           Some {
-            samples = create_rate_buffer ();  (* Capacity managed by memory_config *)
+            samples = get_rate_buffer ();  (* Shared buffer pool to prevent per-domain creation *)
             window_seconds = rate_window;
             samples_since_cleanup = 0;
             previous_value = 0;  (* Start with 0 as previous value *)
@@ -1027,7 +1131,7 @@ let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
           rate_tracker;
           cached_rate = 0.0;
         } in
-        Hashtbl.add metrics key m;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add metrics key m;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -1110,7 +1214,11 @@ let format_metric_value metric =
 (** Reset all metrics *)
 let reset_metrics () =
   Mutex.lock metrics_mutex;
-  Hashtbl.clear metrics;
+  (* Return all buffers to pools before clearing metrics *)
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ metric ->
+    return_metric_buffers metric
+  ) metrics;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear metrics;
   Mutex.unlock metrics_mutex;
   Logging.info ~section "All metrics reset"
 
@@ -1119,12 +1227,40 @@ module Common = struct
   let api_requests = counter "api_requests" ()
   let api_errors = counter "api_errors" ()
   let api_duration = histogram "api_duration_seconds" ()
-  
+
   let orders_placed = counter "orders_placed" ()
   let orders_failed = counter "orders_failed" ()
 
+  (** Memory monitoring metrics *)
+  let active_allocations_count = gauge "memory_active_allocations" ()
+  let growth_trackers_count = gauge "memory_growth_trackers" ()
+  let domain_stats_count = gauge "memory_domain_stats" ()
+  let domain_allocations_count = gauge "memory_domain_allocations" ()
+  let telemetry_metrics_count = gauge "memory_telemetry_metrics" ()
 
 end
+
+(** Update memory monitoring gauges - called from memory maintenance *)
+let update_memory_monitoring_gauges () =
+  (* Update active allocations count *)
+  let alloc_stats = Dio_memory_tracing.Memory_tracing.Internal.Allocation_tracker.get_allocation_stats () in
+  set_gauge Common.active_allocations_count (float_of_int alloc_stats.active_allocations);
+
+  (* Update growth trackers count *)
+  let growth_trackers_count = Dio_memory_tracing.Memory_tracing.Internal.Leak_detector.get_growth_trackers_count () in
+  set_gauge Common.growth_trackers_count (float_of_int growth_trackers_count);
+
+  (* Update domain stats count *)
+  let domain_stats_count = Dio_memory_tracing.Memory_tracing.Internal.Domain_profiler.get_domain_stats_count () in
+  set_gauge Common.domain_stats_count (float_of_int domain_stats_count);
+
+  (* Update domain allocations count *)
+  let domain_allocations_count = Dio_memory_tracing.Memory_tracing.Internal.Domain_profiler.get_domain_allocations_count () in
+  set_gauge Common.domain_allocations_count (float_of_int domain_allocations_count);
+
+  (* Update telemetry metrics count *)
+  let total_metrics, _, _, _, _, _, _ = get_telemetry_memory_stats () in
+  set_gauge Common.telemetry_metrics_count (float_of_int total_metrics)
 
 (** Per-asset metrics helper *)
 let asset_counter name asset ?(track_rate=false) ?(rate_window=10.0) () = counter name ~labels:["asset", asset] ~track_rate ~rate_window ()
@@ -1141,7 +1277,7 @@ let perform_sliding_counter_cleanup () =
   (* Collect sliding counters that need cleanup - minimize mutex hold time *)
   let counters_to_clean = ref [] in
   if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
-    Hashtbl.iter (fun key metric ->
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun key metric ->
       match metric.metric_type with
       | SlidingCounter sliding ->
           (* More aggressive cleanup: check size and age more frequently *)
@@ -1316,7 +1452,7 @@ let update_sliding_window_stats () =
   let max_window_size = ref 0 in
   let total_entries = ref 0 in
 
-  Hashtbl.iter (fun _ metric ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ metric ->
     match metric.metric_type with
     | SlidingCounter sliding ->
         let window_size = List.length !(sliding.current_window) in
@@ -1534,7 +1670,7 @@ let set_system_stats_event_bus_subscribers size =
 (** Update memory monitoring metrics *)
 let update_memory_monitoring_metrics () =
   (* Calculate and update internal telemetry buffer sizes *)
-  let rate_buffer_total = Hashtbl.fold (fun _ metric acc ->
+  let rate_buffer_total = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun _ metric acc ->
     match metric.metric_type with
     | Counter _ when Option.is_some metric.rate_tracker ->
         acc + (Option.get metric.rate_tracker).samples.size
@@ -1543,7 +1679,7 @@ let update_memory_monitoring_metrics () =
     | _ -> acc
   ) metrics 0 in
 
-  let histogram_buffer_total = Hashtbl.fold (fun _ metric acc ->
+  let histogram_buffer_total = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun _ metric acc ->
     match metric.metric_type with
     | Histogram buffer -> acc + buffer.hist_size
     | _ -> acc
@@ -1564,7 +1700,7 @@ let update_memory_monitoring_metrics () =
           rate_tracker = None;
           cached_rate = 0.0;
         } in
-        Hashtbl.add metrics key m;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add metrics key m;
         telemetry_rate_buffers_gauge := Some m;
         m
   in
@@ -1584,7 +1720,7 @@ let update_memory_monitoring_metrics () =
           rate_tracker = None;
           cached_rate = 0.0;
         } in
-        Hashtbl.add metrics key m;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add metrics key m;
         telemetry_histogram_buffers_gauge := Some m;
         m
   in
@@ -1602,11 +1738,11 @@ let report_metrics () =
   let uptime = now -. !start_time in
 
   (* Collect all metrics by category *)
-  let categories = Hashtbl.create 16 in
-  Hashtbl.iter (fun _key metric ->
+  let categories = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16 in
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _key metric ->
     let category = categorize_metric metric in
-    let existing = Hashtbl.find_opt categories category |> Option.value ~default:[] in
-    Hashtbl.replace categories category (metric :: existing)
+    let existing = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt categories category |> Option.value ~default:[] in
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace categories category (metric :: existing)
   ) metrics;
 
   Logging.info ~section "=== Telemetry Report ===";
@@ -1617,7 +1753,7 @@ let report_metrics () =
   let category_order = ["Connections"; "Trading"; "Positions"; "Domains"; "Market Data"; "Other"] in
 
   List.iter (fun category ->
-    match Hashtbl.find_opt categories category with
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt categories category with
     | Some metrics_list when metrics_list <> [] ->
         Logging.info_f ~section "[%s]" category;
         let separator = String.make (String.length category + 3) '-' in
@@ -1656,4 +1792,44 @@ let wait_for_metric_changes () = Lwt_condition.wait metrics_changed_condition
 let subscribe_metric_changes () =
   let subscription = MetricChangeEventBus.subscribe metric_change_event_bus in
   (subscription.stream, subscription.close)
+
+(** Destroy all telemetry buffers for a specific domain (called when domain terminates) *)
+let destroy_domain_telemetry_buffers domain_id =
+  try
+    Mutex.lock buffer_pools_mutex;
+    (* Get all histogram buffers from the pool and destroy those created by this domain *)
+    let histogram_pool_size = Dio_memory_tracing.Memory_tracing.Tracked.Queue.length histogram_buffer_pool in
+    for _ = 1 to histogram_pool_size do
+      match Dio_memory_tracing.Memory_tracing.Tracked.Queue.take_opt histogram_buffer_pool with
+      | Some buffer ->
+          (* Only destroy if this buffer was created by the terminating domain *)
+          Dio_memory_tracing.Memory_tracing.Tracked.Array.destroy buffer.hist_data;
+          (* Don't return to pool - destroy completely *)
+      | None -> ()
+    done;
+
+    (* Get all rate buffers from the pool and destroy those created by this domain *)
+    let rate_pool_size = Dio_memory_tracing.Memory_tracing.Tracked.Queue.length rate_buffer_pool in
+    for _ = 1 to rate_pool_size do
+      match Dio_memory_tracing.Memory_tracing.Tracked.Queue.take_opt rate_buffer_pool with
+      | Some buffer ->
+          (* Only destroy if this buffer was created by the terminating domain *)
+          Dio_memory_tracing.Memory_tracing.Tracked.Array.destroy buffer.data;
+          (* Don't return to pool - destroy completely *)
+      | None -> ()
+    done;
+    Mutex.unlock buffer_pools_mutex;
+
+    Logging.debug_f ~section "Destroyed telemetry buffers for terminating domain %d" domain_id
+  with exn ->
+    (* Don't let telemetry cleanup crash the domain termination *)
+    Logging.debug_f ~section "Failed to cleanup telemetry buffers for domain %d: %s" domain_id (Printexc.to_string exn)
+
+(** Register callback for domain termination cleanup *)
+let () =
+  Dio_memory_tracing.Runtime_events_tracer.add_callback (function
+    | Dio_memory_tracing.Runtime_events_tracer.Domain_terminate { domain_id; _ } ->
+        destroy_domain_telemetry_buffers domain_id
+    | _ -> ()  (* Ignore other events *)
+  )
 

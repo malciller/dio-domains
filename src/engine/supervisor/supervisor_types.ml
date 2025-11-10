@@ -31,13 +31,16 @@ type supervised_connection = {
   mutex: Mutex.t;
 }
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 (** Global registry of supervised connections *)
-let connections : (string, supervised_connection) Hashtbl.t = Hashtbl.create 16
+let connections : (string, supervised_connection) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16
 let registry_mutex = Mutex.create ()
 
 (** Safely get connection list for cache *)
 let with_connections_list f =
   Mutex.lock registry_mutex;
-  let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
+  let conn_list = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values connections |> List.of_seq in
   Mutex.unlock registry_mutex;
   f conn_list

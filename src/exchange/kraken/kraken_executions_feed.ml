@@ -5,8 +5,18 @@
 open Lwt.Infix
 open Concurrency
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 let section = "kraken_executions"
 let ring_buffer_size = 512
+
+(** Memory tracing hooks - conditionally available *)
+let memory_tracing_available =
+  try
+    ignore (Sys.getenv "DIO_MEMORY_TRACING");
+    true
+  with Not_found -> false
 
 (** Helper function to take first n elements from a list *)
 let rec take n = function
@@ -157,14 +167,14 @@ type open_order = {
 (** Lock-free ring buffer for execution events using atomics *)
 module RingBuffer = struct
   type 'a t = {
-    data: 'a option Atomic.t array;
+    data: 'a option Atomic.t Dio_memory_tracing.Memory_tracing.Tracked.Array.t;
     write_pos: int Atomic.t;
     size: int;
   }
 
   let create size =
     {
-      data = Array.init size (fun _ -> Atomic.make None);
+      data = Dio_memory_tracing.Memory_tracing.Tracked.Array.init size (fun _ -> Atomic.make None);
       write_pos = Atomic.make 0;
       size;
     }
@@ -172,7 +182,7 @@ module RingBuffer = struct
   (** Lock-free write - producer side *)
   let write buffer value =
     let pos = Atomic.get buffer.write_pos in
-    Atomic.set buffer.data.(pos) (Some value);
+    Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.data pos (Atomic.make (Some value));
     let new_pos = (pos + 1) mod buffer.size in
     Atomic.set buffer.write_pos new_pos;
     Telemetry.inc_counter (Telemetry.counter "execution_events_produced" ()) ()
@@ -181,7 +191,7 @@ module RingBuffer = struct
   let read_latest buffer =
     let pos = Atomic.get buffer.write_pos in
     let read_pos = if pos = 0 then buffer.size - 1 else pos - 1 in
-    Atomic.get buffer.data.(read_pos)
+    Atomic.get (Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.data read_pos)
 
   (** Read events from last known position - for domain consumers *)
   let read_since buffer last_pos =
@@ -193,7 +203,7 @@ module RingBuffer = struct
         if pos = current_pos then
           List.rev acc
         else
-          match Atomic.get buffer.data.(pos) with
+          match Atomic.get (Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.data pos) with
           | Some event -> collect (event :: acc) ((pos + 1) mod buffer.size)
           | None -> collect acc ((pos + 1) mod buffer.size)
       in
@@ -205,54 +215,67 @@ module RingBuffer = struct
       if i >= buffer.size then
         List.rev acc
       else
-        match Atomic.get buffer.data.(i) with
+        match Atomic.get (Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.data i) with
         | Some event -> collect_all (event :: acc) (i + 1)
         | None -> collect_all acc (i + 1)
     in
     collect_all [] 0
+
+  let destroy buffer =
+    Dio_memory_tracing.Memory_tracing.Tracked.Array.destroy buffer.data
 end
 
 (** Per-symbol execution store *)
 type symbol_store = {
   events_buffer: execution_event RingBuffer.t;
-  open_orders: (string, open_order) Hashtbl.t;
+  open_orders: (string, open_order) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t;
   ready: bool Atomic.t;
   last_event_time: float Atomic.t;
 }
 
 (** Global stores per symbol *)
-let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
+let symbol_stores : (string, symbol_store) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 64
 
 (** Global order_id to symbol mapping for handling minimal events *)
-let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 128
+let order_to_symbol : (string, string) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 128
 let order_to_symbol_mutex = Mutex.create ()
 let global_orders_mutex = Mutex.create ()
+
+(** Track key hashtables for memory leak detection *)
+let symbol_stores_tracking_record =
+  if memory_tracing_available then
+    try Some (Dio_memory_tracing.Memory_tracing.track_custom_structure "KrakenSymbolStores" 64)
+    with _ -> None
+  else None
+
+let order_to_symbol_tracking_record =
+  if memory_tracing_available then
+    try Some (Dio_memory_tracing.Memory_tracing.track_custom_structure "KrakenOrderToSymbol" 128)
+    with _ -> None
+  else None
 
 let symbol_stores_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
 
-(** Get or create store for a symbol - wait-free after init *)
+(** Get or create store for a symbol - thread-safe *)
 let get_symbol_store symbol =
-  match Hashtbl.find_opt symbol_stores symbol with
-  | Some store -> store
-  | None ->
-      Mutex.lock symbol_stores_mutex;
-      let store = 
-        match Hashtbl.find_opt symbol_stores symbol with
-        | Some s -> s
-        | None ->
-            let s = {
-              events_buffer = RingBuffer.create ring_buffer_size;
-              open_orders = Hashtbl.create 32;
-              ready = Atomic.make false;
-              last_event_time = Atomic.make 0.0;
-            } in
-            Hashtbl.add symbol_stores symbol s;
-            Logging.debug_f ~section "Created execution store for %s" symbol;
-            s
-      in
-      Mutex.unlock symbol_stores_mutex;
-      store
+  Mutex.lock symbol_stores_mutex;
+  let store =
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt symbol_stores symbol with
+    | Some s -> s
+    | None ->
+        let s = {
+          events_buffer = RingBuffer.create ring_buffer_size;
+          open_orders = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32;
+          ready = Atomic.make false;
+          last_event_time = Atomic.make 0.0;
+        } in
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add symbol_stores symbol s;
+        Logging.debug_f ~section "Created execution store for %s" symbol;
+        s
+  in
+  Mutex.unlock symbol_stores_mutex;
+  store
 
 (** Notify that execution data is ready *)
 let notify_ready store =
@@ -298,7 +321,7 @@ let wait_for_execution_data = wait_for_execution_data_lwt
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
-  let orders = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+  let orders = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Mutex.unlock global_orders_mutex;
   orders
 
@@ -306,7 +329,7 @@ let[@inline always] get_open_orders symbol =
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
-  let order_opt = Hashtbl.find_opt store.open_orders order_id in
+  let order_opt = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt store.open_orders order_id in
   Mutex.unlock global_orders_mutex;
   order_opt
 
@@ -314,7 +337,7 @@ let[@inline always] get_open_order symbol order_id =
 let[@inline always] has_open_order symbol order_id =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
-  let exists = Hashtbl.mem store.open_orders order_id in
+  let exists = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem store.open_orders order_id in
   Mutex.unlock global_orders_mutex;
   exists
 
@@ -322,7 +345,7 @@ let[@inline always] has_open_order symbol order_id =
 let get_all_symbols () =
   Mutex.lock global_orders_mutex;
   let symbols = ref [] in
-  Hashtbl.iter (fun symbol _store -> symbols := symbol :: !symbols) symbol_stores;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun symbol _store -> symbols := symbol :: !symbols) symbol_stores;
   let result = !symbols in
   Mutex.unlock global_orders_mutex;
   result
@@ -331,7 +354,7 @@ let get_all_symbols () =
 let[@inline always] count_open_orders symbol =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
-  let count = Hashtbl.length store.open_orders in
+  let count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length store.open_orders in
   Mutex.unlock global_orders_mutex;
   count
 
@@ -341,7 +364,7 @@ let[@inline always] count_open_orders_by_side symbol =
   Mutex.lock global_orders_mutex;
   let buys = ref 0 in
   let sells = ref 0 in
-  Hashtbl.iter (fun _id order ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _id order ->
     match order.side with
     | Buy -> incr buys
     | Sell -> incr sells
@@ -381,12 +404,12 @@ let update_open_orders store (event : execution_event) =
   
   if is_terminal_status || is_effectively_filled then begin
     (* Terminal state - remove from open orders if present *)
-    if Hashtbl.mem store.open_orders event.order_id then begin
-      Hashtbl.remove store.open_orders event.order_id;
-      
+    if Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem store.open_orders event.order_id then begin
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove store.open_orders event.order_id;
+
       (* Remove from global order mapping *)
       Mutex.lock order_to_symbol_mutex;
-      Hashtbl.remove order_to_symbol event.order_id;
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove order_to_symbol event.order_id;
       Mutex.unlock order_to_symbol_mutex;
       
       if is_terminal_status then
@@ -427,12 +450,12 @@ let update_open_orders store (event : execution_event) =
       last_updated = event.timestamp;
     } in
     
-    let was_present = Hashtbl.mem store.open_orders event.order_id in
-    Hashtbl.replace store.open_orders event.order_id order;
-    
+    let was_present = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem store.open_orders event.order_id in
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace store.open_orders event.order_id order;
+
     (* Add to global order mapping *)
     Mutex.lock order_to_symbol_mutex;
-    Hashtbl.replace order_to_symbol event.order_id event.symbol;
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace order_to_symbol event.order_id event.symbol;
     Mutex.unlock order_to_symbol_mutex;
     
     if was_present then begin
@@ -512,7 +535,7 @@ let parse_execution_event json =
       | Some s -> Some s
       | None ->
           Mutex.lock global_orders_mutex;
-          let s = Hashtbl.find_opt order_to_symbol order_id in
+          let s = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt order_to_symbol order_id in
           Mutex.unlock global_orders_mutex;
           (match s with
            | Some sym -> Some sym
@@ -530,7 +553,7 @@ let parse_execution_event json =
         (* Get existing order to fill in missing fields for minimal events *)
         let store = get_symbol_store sym in
         Mutex.lock global_orders_mutex;
-        let existing_order = Hashtbl.find_opt store.open_orders order_id in
+        let existing_order = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt store.open_orders order_id in
         Mutex.unlock global_orders_mutex;
 
         (* Extract fields from JSON, using existing order as fallback *)
@@ -837,15 +860,15 @@ let cleanup_stale_entries () =
   (* Clean up order_to_symbol: remove entries for orders that are no longer in open_orders *)
   Mutex.lock global_orders_mutex;
   let order_to_symbol_keys = ref [] in
-  Hashtbl.iter (fun order_id _ -> order_to_symbol_keys := order_id :: !order_to_symbol_keys) order_to_symbol;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun order_id _ -> order_to_symbol_keys := order_id :: !order_to_symbol_keys) order_to_symbol;
 
   List.iter (fun order_id ->
-    let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
+    let symbol_opt = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt order_to_symbol order_id in
     match symbol_opt with
     | Some symbol ->
         let store = get_symbol_store symbol in
-        if not (Hashtbl.mem store.open_orders order_id) then begin
-          Hashtbl.remove order_to_symbol order_id;
+        if not (Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem store.open_orders order_id) then begin
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove order_to_symbol order_id;
           incr cleaned_count;
           Logging.debug_f ~section "Cleaned up orphaned order_to_symbol entry for %s" order_id
         end
@@ -853,8 +876,8 @@ let cleanup_stale_entries () =
   ) !order_to_symbol_keys;
 
   (* Enforce size limits on open_orders hashtables per symbol *)
-  Hashtbl.iter (fun symbol store ->
-    let current_size = Hashtbl.length store.open_orders in
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun symbol store ->
+    let current_size = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length store.open_orders in
     let max_size = 1000 in (* Allow up to 1000 open orders per symbol *)
     if current_size > max_size then begin
       Logging.warn_f ~section "Open orders hashtable for %s exceeded limit (%d > %d), trimming oldest entries"
@@ -862,7 +885,7 @@ let cleanup_stale_entries () =
 
       (* Collect orders with timestamps *)
       let orders_with_times = ref [] in
-      Hashtbl.iter (fun order_id order ->
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun order_id order ->
         orders_with_times := (order_id, order.last_updated) :: !orders_with_times
       ) store.open_orders;
 
@@ -875,8 +898,8 @@ let cleanup_stale_entries () =
 
       (* Remove excess orders *)
       List.iter (fun (order_id, _) ->
-        Hashtbl.remove store.open_orders order_id;
-        Hashtbl.remove order_to_symbol order_id;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove store.open_orders order_id;
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove order_to_symbol order_id;
         incr cleaned_count;
       ) to_remove;
 
@@ -896,9 +919,9 @@ let cleanup_stale_entries () =
 let get_memory_stats () =
   Mutex.lock global_orders_mutex;
   let total_open_orders = ref 0 in
-  let order_to_symbol_size = Hashtbl.length order_to_symbol in
-  Hashtbl.iter (fun _ store ->
-    total_open_orders := !total_open_orders + Hashtbl.length store.open_orders
+  let order_to_symbol_size = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length order_to_symbol in
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ store ->
+    total_open_orders := !total_open_orders + Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length store.open_orders
   ) symbol_stores;
   Mutex.unlock global_orders_mutex;
   (!total_open_orders, order_to_symbol_size)

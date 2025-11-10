@@ -2,6 +2,9 @@
 
 open Lwt.Infix
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 let section = "kraken_instrument"
 
 type pair_status = 
@@ -45,8 +48,8 @@ type pair_info = {
 }
 
 (* In-memory cache of pair information *)
-let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 32
-let cache_mutex = Lwt_mutex.create ()
+let pair_cache : (string, pair_info) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32
+let cache_mutex = Mutex.create ()
 
 (** Parse pair info from JSON *)
 let parse_pair_info json : pair_info option =
@@ -70,21 +73,34 @@ let parse_pair_info json : pair_info option =
 
 (** Update cache with pair info *)
 let update_pair_info info =
-  Lwt_mutex.with_lock cache_mutex (fun () ->
-    let prev_status = Hashtbl.find_opt pair_cache info.symbol |> Option.map (fun p -> p.status) in
-    Hashtbl.replace pair_cache info.symbol info;
-    (match prev_status with
-    | Some prev when prev <> info.status ->
-        Logging.warn_f ~section "Pair %s status changed: %s -> %s" info.symbol (status_to_string prev) (status_to_string info.status)
-    | None ->
-        Logging.debug_f ~section "Pair %s initialized: status=%s, qty_min=%.8f, price_inc=%.8f"
-          info.symbol (status_to_string info.status) info.qty_min info.price_increment
-    | _ -> ());
-    Lwt.return_unit)
+  Lwt.wrap (fun () ->
+    Mutex.lock cache_mutex;
+    try
+      let prev_status = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt pair_cache info.symbol |> Option.map (fun p -> p.status) in
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace pair_cache info.symbol info;
+      (match prev_status with
+      | Some prev when prev <> info.status ->
+          Logging.warn_f ~section "Pair %s status changed: %s -> %s" info.symbol (status_to_string prev) (status_to_string info.status)
+      | None ->
+          Logging.debug_f ~section "Pair %s initialized: status=%s, qty_min=%.8f, price_inc=%.8f"
+            info.symbol (status_to_string info.status) info.qty_min info.price_increment
+      | _ -> ());
+      Mutex.unlock cache_mutex
+    with exn ->
+      Mutex.unlock cache_mutex;
+      raise exn)
 
 (** Get pair info from cache *)
 let get_pair_info symbol : pair_info option Lwt.t =
-  Lwt_mutex.with_lock cache_mutex (fun () -> Lwt.return (Hashtbl.find_opt pair_cache symbol))
+  Lwt.wrap (fun () ->
+    Mutex.lock cache_mutex;
+    try
+      let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt pair_cache symbol in
+      Mutex.unlock cache_mutex;
+      result
+    with exn ->
+      Mutex.unlock cache_mutex;
+      raise exn)
 
 (** Check if a pair is currently tradeable *)
 let is_pair_tradeable symbol : bool Lwt.t =
@@ -210,19 +226,37 @@ let initialize_symbols symbols : unit Lwt.t =
   fetch_from_rest symbols
 
 let get_pair_info symbol : (pair_info option) Lwt.t =
-  Lwt_mutex.with_lock cache_mutex (fun () -> Lwt.return (Hashtbl.find_opt pair_cache symbol))
+  Lwt.wrap (fun () ->
+    Mutex.lock cache_mutex;
+    try
+      let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt pair_cache symbol in
+      Mutex.unlock cache_mutex;
+      result
+    with exn ->
+      Mutex.unlock cache_mutex;
+      raise exn)
 
 (** Get precision info for a symbol - synchronous version for internal use *)
 let get_precision_info symbol : (int * int) option =
   try
-    Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> (info.price_precision, info.qty_precision))
-  with _ -> None
+    Mutex.lock cache_mutex;
+    let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> (info.price_precision, info.qty_precision)) in
+    Mutex.unlock cache_mutex;
+    result
+  with exn ->
+    Mutex.unlock cache_mutex;
+    raise exn
 
 (** Get price increment for a symbol - synchronous version for internal use *)
 let get_price_increment symbol : float option =
   try
-    Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.price_increment)
-  with _ -> None
+    Mutex.lock cache_mutex;
+    let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.price_increment) in
+    Mutex.unlock cache_mutex;
+    result
+  with exn ->
+    Mutex.unlock cache_mutex;
+    raise exn
 
 let get_price_precision_exn symbol : int =
   match get_precision_info symbol with
@@ -232,6 +266,25 @@ let get_price_precision_exn symbol : int =
 (** Get minimum quantity for a symbol - synchronous version for internal use *)
 let get_qty_min symbol : float option =
   try
-    Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_min)
-  with _ -> None
+    Mutex.lock cache_mutex;
+    let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_min) in
+    Mutex.unlock cache_mutex;
+    result
+  with exn ->
+    Mutex.unlock cache_mutex;
+    raise exn
+
+(** Verify that all symbols have instrument data loaded *)
+let verify_all_symbols_loaded symbols : bool Lwt.t =
+  Lwt.wrap (fun () ->
+    Mutex.lock cache_mutex;
+    try
+      let all_loaded = List.for_all (fun symbol ->
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem pair_cache symbol
+      ) symbols in
+      Mutex.unlock cache_mutex;
+      all_loaded
+    with exn ->
+      Mutex.unlock cache_mutex;
+      raise exn)
 

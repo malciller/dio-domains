@@ -11,7 +11,8 @@
   dio.ui_types
   dio.ui.cache
   unix
-  str)
+  str
+  dio_memory_tracing)
  (modules metrics_broadcast metrics_json)
  (preprocess
   (pps lwt_ppx)))

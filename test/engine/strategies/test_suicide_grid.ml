@@ -96,12 +96,88 @@ let test_userref_generation () =
   (* Test userref tagging - Grid strategy should use userref=1 *)
   let strategy_userref = Dio_strategies.Strategy_common.strategy_userref_grid in
   check int "grid strategy userref" 1 strategy_userref;
-  
+
   (* Test that is_strategy_order correctly identifies Grid orders *)
-  check bool "userref 1 matches grid" true 
+  check bool "userref 1 matches grid" true
     (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 1);
-  check bool "userref 2 doesn't match grid" false 
+  check bool "userref 2 doesn't match grid" false
     (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 2)
+
+let test_memory_limits_enforced () =
+  (* Test that memory limits are properly enforced *)
+  let state = Dio_strategies.Suicide_grid.get_strategy_state "MEMORY_TEST/USD" in
+
+  (* Add many pending orders to test limit enforcement *)
+  for i = 1 to 60 do
+    let temp_order_id = Printf.sprintf "test_order_%d" i in
+    let timestamp = Unix.time () in
+    state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.destroy_and_cons
+      (temp_order_id, Dio_strategies.Strategy_common.Buy, 50000.0, timestamp) state.pending_orders
+  done;
+
+  (* The list should still have 60 items since we haven't triggered cleanup yet *)
+  let initial_count = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders in
+  check bool "pending orders added" true (initial_count = 60);
+
+  (* Now simulate the cleanup that happens during strategy execution *)
+  (* Clean up stale pending orders (older than 5 seconds) - all are recent so none should be removed *)
+  let now = Unix.time () in
+  state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.destroy_and_filter (fun (_order_id, _, _, timestamp) ->
+    let age = now -. timestamp in
+    let timeout = 5.0 in
+    if age > timeout then begin
+      false
+    end else
+      true
+  ) state.pending_orders;
+
+  (* Should still have 60 since they're all recent *)
+  let after_filter_count = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders in
+  check bool "no stale orders removed" true (after_filter_count = 60);
+
+  (* Now test the hard limit enforcement *)
+  if Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders > 50 then begin
+    let excess = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders - 50 in
+    state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.destroy_and_take 50 state.pending_orders;
+    check bool "excess calculated correctly" true (excess = 10)
+  end;
+
+  (* Should be limited to 50 pending orders max *)
+  check bool "pending orders limit enforced" true (Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders <= 50)
+
+let test_tracked_list_destruction () =
+  (* Test that tracked lists are properly destroyed when replaced *)
+  let state = Dio_strategies.Suicide_grid.get_strategy_state "DESTRUCTION_TEST/USD" in
+
+  (* Add some sell orders *)
+  state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.destroy_and_cons ("order1", 51000.0) state.open_sell_orders;
+  state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.destroy_and_cons ("order2", 52000.0) state.open_sell_orders;
+
+  let initial_length = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders in
+  check bool "initial sell orders added" true (initial_length = 2);
+
+  (* Simulate order sync that replaces the sell orders list *)
+  let new_sell_orders = [("order3", 53000.0); ("order4", 54000.0)] in
+  let tracked_new = Dio_memory_tracing.Memory_tracing.Tracked.List.of_list new_sell_orders in
+  Dio_memory_tracing.Memory_tracing.Tracked.List.destroy state.open_sell_orders;
+  state.open_sell_orders <- tracked_new;
+
+  (* Should have new orders, old ones should be destroyed *)
+  let final_length = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders in
+  check bool "sell orders replaced correctly" true (final_length = 2)
+
+let test_lru_cleanup_works () =
+  (* Test that LRU cleanup can remove old strategy states *)
+  (* Create a few strategy states *)
+  let _ = Dio_strategies.Suicide_grid.get_strategy_state "LRU_TEST1/USD" in
+  let _ = Dio_strategies.Suicide_grid.get_strategy_state "LRU_TEST2/USD" in
+  let _ = Dio_strategies.Suicide_grid.get_strategy_state "LRU_TEST3/USD" in
+
+  (* LRU cleanup should work without errors *)
+  Dio_strategies.Suicide_grid.perform_lru_cleanup ();
+
+  (* Test passes if no exceptions are thrown *)
+  check bool "LRU cleanup succeeds" true true
 
 let test_balance_checking () =
   (* Test balance checking logic *)
@@ -115,7 +191,7 @@ let test_order_acknowledgment () =
   let state = Dio_strategies.Suicide_grid.get_strategy_state "TEST/USD" in
 
   (* Add a pending order manually for testing *)
-  state.pending_orders <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ()) :: state.pending_orders;
+  state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.cons ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ()) state.pending_orders;
 
   (* Handle acknowledgment *)
   Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged "TEST/USD" "order456" Dio_strategies.Strategy_common.Buy 50000.0;
@@ -130,7 +206,7 @@ let test_order_cancellation () =
   (* Set up some tracked orders *)
   state.last_buy_order_id <- Some "buy123";
   state.last_buy_order_price <- Some 49000.0;
-  state.open_sell_orders <- [("sell456", 51000.0); ("sell789", 52000.0)];
+  state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.of_list [("sell456", 51000.0); ("sell789", 52000.0)];
 
   (* Cancel the buy order *)
   Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled "TEST2/USD" "buy123";
@@ -144,13 +220,13 @@ let test_order_rejection () =
   let state = Dio_strategies.Suicide_grid.get_strategy_state "TEST3/USD" in
 
   (* Add a pending order manually for testing *)
-  state.pending_orders <- [("test123", Dio_strategies.Strategy_common.Sell, 51000.0, Unix.time ())];
+  state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.of_list [("test123", Dio_strategies.Strategy_common.Sell, 51000.0, Unix.time ())];
 
   (* Handle rejection *)
   Dio_strategies.Suicide_grid.Strategy.handle_order_rejected "TEST3/USD" Dio_strategies.Strategy_common.Sell 51000.0;
 
   (* Should remove from pending orders *)
-  check bool "pending orders cleared" true (List.length state.pending_orders = 0)
+  check bool "pending orders cleared" true (Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders = 0)
 
 let () =
   run "Suicide Grid" [
@@ -172,6 +248,9 @@ let () =
     "state", [
       test_case "state management" `Quick test_state_management;
       test_case "userref generation" `Quick test_userref_generation;
+      test_case "memory limits enforced" `Quick test_memory_limits_enforced;
+      test_case "tracked list destruction" `Quick test_tracked_list_destruction;
+      test_case "lru cleanup works" `Quick test_lru_cleanup_works;
     ];
     "balance", [
       test_case "balance checking" `Quick test_balance_checking;

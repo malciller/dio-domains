@@ -1,9 +1,22 @@
 open Config
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 let section = "domain_spawner"
+
+(** Memory tracing hooks - conditionally available *)
+let memory_tracing_available =
+  try
+    ignore (Sys.getenv "DIO_MEMORY_TRACING");
+    true
+  with Not_found -> false
 
 (** Get domain key for registry *)
 let domain_key asset = Printf.sprintf "%s/%s" asset.exchange asset.symbol
+
+(** Import startup coordinator for phase coordination *)
+open Concurrency.Startup_coordinator
 
 (** Domain supervisor state *)
 type domain_state = {
@@ -16,7 +29,8 @@ type domain_state = {
 }
 
 (** Global domain registry *)
-let domain_registry : (string, domain_state) Hashtbl.t = Hashtbl.create 32
+let domain_registry : (string, domain_state) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t =
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32
 let registry_mutex = Mutex.create ()
 
 (** Global shutdown flag for domain supervisor *)
@@ -68,7 +82,7 @@ let asset_domain_worker state (fee_fetcher : trading_config -> trading_config) (
               | None -> "Buy:none"
             in
             let sell_info =
-              if state.open_sell_orders = [] then
+              if Dio_memory_tracing.Memory_tracing.Tracked.List.is_empty state.open_sell_orders then
                 "Sell:none"
               else
                 let closest_sell = List.fold_left (fun acc (_, sell_price) ->
@@ -78,11 +92,11 @@ let asset_domain_worker state (fee_fetcher : trading_config -> trading_config) (
                       if abs_float (sell_price -. price) < abs_float (current_closest -. price)
                       then Some sell_price
                       else Some current_closest
-                ) None state.open_sell_orders in
+                ) None (Dio_memory_tracing.Memory_tracing.Tracked.List.to_list state.open_sell_orders) in
                 match closest_sell with
                 | Some sell_price ->
                     let sell_distance_pct = ((sell_price -. price) /. price) *. 100.0 in
-                    Printf.sprintf "Sell@%.2f(%.2f%c,%d)" sell_price sell_distance_pct '%' (List.length state.open_sell_orders)
+                    Printf.sprintf "Sell@%.2f(%.2f%c,%d)" sell_price sell_distance_pct '%' (Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders)
                 | None -> "Sell:none"
             in
             Printf.sprintf " | Strategy: %s %s" buy_info sell_info
@@ -468,9 +482,13 @@ let register_domain asset =
     is_running = Atomic.make false;
     mutex = Mutex.create ();
   } in
+  (* Lock registry for entire operation to prevent race conditions *)
   Mutex.lock registry_mutex;
-  Hashtbl.replace domain_registry key state;
+  let already_exists = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem domain_registry key in
+  if not already_exists then
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace domain_registry key state;
   Mutex.unlock registry_mutex;
+
   Logging.debug_f ~section "Registered domain for supervision: %s" key;
   state
 
@@ -550,7 +568,7 @@ let supervisor_loop fee_fetcher =
       if Atomic.get shutdown_requested then raise Exit;
 
       Mutex.lock registry_mutex;
-      let domains = Hashtbl.to_seq_values domain_registry |> List.of_seq in
+      let domains = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
       Mutex.unlock registry_mutex;
 
       List.iter (fun state ->
@@ -581,36 +599,46 @@ let supervisor_loop fee_fetcher =
   done
 
 (** Spawn supervised domains for assets *)
-let spawn_supervised_domains_for_assets (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : Thread.t =
+let spawn_supervised_domains_for_assets (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : unit Lwt.t =
   Logging.debug_f ~section "Spawning supervised domains for %d assets..." (List.length assets);
 
-  (* Initialize strategy modules *)
-  Dio_strategies.Suicide_grid.Strategy.init ();
-  Dio_strategies.Market_maker.Strategy.init ();
+  (* Wait for feeds to be initialized before starting domains *)
+  Logging.info ~section "Waiting for feeds initialization to complete...";
+  Lwt.bind (wait_for_phase FeedsInit 60.0) (fun feeds_ready ->
+    if not feeds_ready then
+      Logging.warn ~section "Timeout waiting for feeds initialization, proceeding anyway...";
 
-  (* Register all domains *)
-  List.iter (fun asset ->
-    ignore (register_domain asset)
-  ) assets;
+    (* Initialize strategy modules *)
+    Dio_strategies.Suicide_grid.Strategy.init ();
+    Dio_strategies.Market_maker.Strategy.init ();
 
-  (* Start initial domains *)
-  Mutex.lock registry_mutex;
-  let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
-  Mutex.unlock registry_mutex;
+    (* Register all domains *)
+    List.iter (fun asset ->
+      ignore (register_domain asset)
+    ) assets;
 
-  List.iter (fun state ->
-    ignore (start_domain state fee_fetcher)
-  ) all_states;
+    (* Start initial domains *)
+    Mutex.lock registry_mutex;
+    let all_states = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
+    Mutex.unlock registry_mutex;
 
-  (* Start supervisor thread *)
-  let supervisor_thread = Thread.create supervisor_loop fee_fetcher in
-  Logging.info ~section "Domain supervisor thread started";
-  supervisor_thread
+    List.iter (fun state ->
+      ignore (start_domain state fee_fetcher)
+    ) all_states;
+
+    (* Start supervisor thread *)
+    ignore (Thread.create supervisor_loop fee_fetcher);
+    Logging.info ~section "Domain supervisor thread started";
+
+    (* Signal that all domains have been initialized and are ready *)
+    signal_phase_complete DomainsInit;
+
+    Lwt.return_unit)
 
 (** Get domain status for monitoring *)
 let get_domain_status () =
   Mutex.lock registry_mutex;
-  let status = Hashtbl.fold (fun key state acc ->
+  let status = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun key state acc ->
     let running = Atomic.get state.is_running in
     let restart_count = Atomic.get state.restart_count in
     let last_restart = Atomic.get state.last_restart in
@@ -622,7 +650,7 @@ let get_domain_status () =
 (** Clear domain registry (for testing) *)
 let clear_domain_registry () =
   Mutex.lock registry_mutex;
-  Hashtbl.clear domain_registry;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear domain_registry;
   Mutex.unlock registry_mutex
 
 (** Stop all domains gracefully *)
@@ -631,7 +659,7 @@ let stop_all_domains () =
   (* Signal supervisor to stop restarting domains *)
   Atomic.set shutdown_requested true;
   Mutex.lock registry_mutex;
-  let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
+  let all_states = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
   Mutex.unlock registry_mutex;
 
   List.iter stop_domain all_states;
@@ -658,7 +686,7 @@ let spawn_domains_for_assets (fee_fetcher : trading_config -> trading_config) (a
 
   (* Return the list of domain handles for compatibility *)
   Mutex.lock registry_mutex;
-  let domains = Hashtbl.to_seq_values domain_registry |> List.of_seq
+  let domains = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq
                 |> List.filter_map (fun state -> Atomic.get state.domain_handle) in
   Mutex.unlock registry_mutex;
   domains

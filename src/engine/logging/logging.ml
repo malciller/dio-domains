@@ -23,6 +23,7 @@ type section = { name: string; mutable min_level: level }
 
 (* Global configuration *)
 let global_min_level = ref INFO
+(* This hashtable remains untracked to avoid circular dependency with memory tracing *)
 let sections = Hashtbl.create 32
 let use_colors = ref true
 let output_channel = ref stderr
@@ -86,17 +87,17 @@ let log level section_name message =
   end
 
 (* Public API *)
-let debug_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log DEBUG section msg)) fmt
-let info_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log INFO section msg)) fmt
-let warn_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log WARN section msg)) fmt
-let error_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log ERROR section msg)) fmt
-let critical_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log CRITICAL section msg)) fmt
+let debug_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> Lwt.catch (fun () -> log DEBUG section msg) (fun _exn -> Lwt.return_unit))) fmt
+let info_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> Lwt.catch (fun () -> log INFO section msg) (fun _exn -> Lwt.return_unit))) fmt
+let warn_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> Lwt.catch (fun () -> log WARN section msg) (fun _exn -> Lwt.return_unit))) fmt
+let error_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> Lwt.catch (fun () -> log ERROR section msg) (fun _exn -> Lwt.return_unit))) fmt
+let critical_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> Lwt.catch (fun () -> log CRITICAL section msg) (fun _exn -> Lwt.return_unit))) fmt
 
-let debug ~section msg = Lwt.async (fun () -> log DEBUG section msg)
-let info ~section msg = Lwt.async (fun () -> log INFO section msg)
-let warn ~section msg = Lwt.async (fun () -> log WARN section msg)
-let error ~section msg = Lwt.async (fun () -> log ERROR section msg)
-let critical ~section msg = Lwt.async (fun () -> log CRITICAL section msg)
+let debug ~section msg = Lwt.async (fun () -> Lwt.catch (fun () -> log DEBUG section msg) (fun _exn -> Lwt.return_unit))
+let info ~section msg = Lwt.async (fun () -> Lwt.catch (fun () -> log INFO section msg) (fun _exn -> Lwt.return_unit))
+let warn ~section msg = Lwt.async (fun () -> Lwt.catch (fun () -> log WARN section msg) (fun _exn -> Lwt.return_unit))
+let error ~section msg = Lwt.async (fun () -> Lwt.catch (fun () -> log ERROR section msg) (fun _exn -> Lwt.return_unit))
+let critical ~section msg = Lwt.async (fun () -> Lwt.catch (fun () -> log CRITICAL section msg) (fun _exn -> Lwt.return_unit))
 
 (* Configuration *)
 let init () = ()

@@ -3,6 +3,9 @@
 open Lwt.Infix
 open Concurrency
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 let section = "kraken_balances"
 
 (** Safely force Conduit context with error handling *)
@@ -37,14 +40,14 @@ module BalanceStore = struct
 
   type t = {
     (* Store balances for all wallets of this asset *)
-    wallets: (string, wallet_balance) Hashtbl.t;
+    wallets: (string, wallet_balance) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t;
     mutex: Mutex.t;
     total_balance: float Atomic.t;  (* Cached total across all wallets *)
     last_updated: float Atomic.t;
   }
 
   let create () = {
-    wallets = Hashtbl.create 4;  (* Most assets won't have many wallets *)
+    wallets = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 4;  (* Most assets won't have many wallets *)
     mutex = Mutex.create ();
     total_balance = Atomic.make 0.0;
     last_updated = Atomic.make 0.0;
@@ -62,10 +65,10 @@ module BalanceStore = struct
     } in
 
     Mutex.lock store.mutex;
-    Hashtbl.replace store.wallets wallet_key wallet_data;
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace store.wallets wallet_key wallet_data;
 
     (* Recalculate total balance across all wallets *)
-    let total = Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0 in
+    let total = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0 in
     Atomic.set store.total_balance total;
     Atomic.set store.last_updated now;
     Mutex.unlock store.mutex
@@ -92,18 +95,18 @@ end)
 let balance_update_event_bus = BalanceUpdateEventBus.create "balance_update"
 
 (** Global balance stores per asset - protected by mutex *)
-let balance_stores : (string, BalanceStore.t) Hashtbl.t = Hashtbl.create 32
+let balance_stores : (string, BalanceStore.t) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32
 let balance_stores_mutex = Mutex.create ()
 let initialized = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
 (** Track last balance update time per asset for staleness detection *)
-let last_balance_update : (string, float) Hashtbl.t = Hashtbl.create 32
+let last_balance_update : (string, float) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32
 let last_balance_update_mutex = Mutex.create ()
 let balance_update_mutex = Mutex.create ()
 
 (** Track configured assets (from trading config) vs dynamic assets *)
-let configured_assets : (string, unit) Hashtbl.t = Hashtbl.create 16
+let configured_assets : (string, unit) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16
 let dynamic_assets_cap = 50  (* Maximum number of non-configured assets to track *)
 let configured_assets_mutex = Mutex.create ()
 
@@ -111,7 +114,7 @@ let configured_assets_mutex = Mutex.create ()
 let is_balance_stale asset threshold_seconds =
   try
     Mutex.lock balance_update_mutex;
-    match Hashtbl.find_opt last_balance_update asset with
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt last_balance_update asset with
     | Some last_update ->
         let age = Unix.time () -. last_update in
         Mutex.unlock balance_update_mutex;
@@ -125,18 +128,18 @@ let is_balance_stale asset threshold_seconds =
 (** Update last balance update timestamp *)
 let update_balance_timestamp asset =
   Mutex.lock balance_update_mutex;
-  Hashtbl.replace last_balance_update asset (Unix.time ());
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace last_balance_update asset (Unix.time ());
   Mutex.unlock balance_update_mutex
 
 (** Get or create balance store for an asset - thread-safe *)
 let get_balance_store asset =
   Mutex.lock balance_stores_mutex;
-  let store = match Hashtbl.find_opt balance_stores asset with
+  let store = match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt balance_stores asset with
   | Some store -> store
   | None ->
       (* This should not happen if initialized correctly, but as a fallback: *)
       let store = BalanceStore.create () in
-      Hashtbl.add balance_stores asset store;
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add balance_stores asset store;
       Logging.debug_f ~section "Created balance store on-the-fly for %s (should be pre-initialized)" asset;
       store
   in
@@ -166,7 +169,7 @@ let has_balance_data asset =
 let get_all_assets () =
   Mutex.lock balance_stores_mutex;
   let assets = ref [] in
-  Hashtbl.iter (fun asset _store -> assets := asset :: !assets) balance_stores;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun asset _store -> assets := asset :: !assets) balance_stores;
   Mutex.unlock balance_stores_mutex;
   !assets
 
@@ -403,15 +406,15 @@ let initialize assets =
 
   (* Mark configured assets (from trading config) *)
   Mutex.lock configured_assets_mutex;
-  List.iter (fun asset -> Hashtbl.replace configured_assets asset ()) assets;
+  List.iter (fun asset -> Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace configured_assets asset ()) assets;
   Mutex.unlock configured_assets_mutex;
 
   (* Pre-create all balance stores during initialization - thread-safe *)
   Mutex.lock balance_stores_mutex;
   List.iter (fun asset ->
-    if not (Hashtbl.mem balance_stores asset) then begin
+    if not (Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem balance_stores asset) then begin
       let store = BalanceStore.create () in
-      Hashtbl.add balance_stores asset store;
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add balance_stores asset store;
       Logging.debug_f ~section "Created thread-safe balance store for %s" asset
     end
   ) all_assets;
@@ -445,13 +448,13 @@ let cleanup_dynamic_assets () =
 
   (* Collect all assets and classify them *)
   let all_assets = ref [] in
-  Hashtbl.iter (fun asset _ -> all_assets := asset :: !all_assets) balance_stores;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun asset _ -> all_assets := asset :: !all_assets) balance_stores;
 
   let configured = ref [] in
   let dynamic = ref [] in
 
   List.iter (fun asset ->
-    if Hashtbl.mem configured_assets asset then
+    if Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem configured_assets asset then
       configured := asset :: !configured
     else
       dynamic := asset :: !dynamic
@@ -461,7 +464,7 @@ let cleanup_dynamic_assets () =
   let dynamic_with_times = List.map (fun asset ->
     let last_update = try
       Mutex.lock balance_update_mutex;
-      let time = Hashtbl.find last_balance_update asset in
+      let time = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find last_balance_update asset in
       Mutex.unlock balance_update_mutex;
       time
     with Not_found ->
@@ -481,9 +484,9 @@ let cleanup_dynamic_assets () =
   (* Remove excess dynamic assets *)
   let removed_count = List.length dynamic_to_remove in
   List.iter (fun asset ->
-    Hashtbl.remove balance_stores asset;
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove balance_stores asset;
     Mutex.lock balance_update_mutex;
-    Hashtbl.remove last_balance_update asset;
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove last_balance_update asset;
     Mutex.unlock balance_update_mutex;
   ) dynamic_to_remove;
 

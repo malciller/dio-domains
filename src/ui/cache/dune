@@ -6,10 +6,12 @@
  lwt.unix
  dio_engine
  dio.ui_types
+ dio.memory_cleanup
  concurrency
  cpuid
  unix
- str)
+ str
+ dio_memory_tracing)
  (modules telemetry_cache system_cache balance_cache logs_cache)
  (preprocess
   (pps lwt_ppx)))

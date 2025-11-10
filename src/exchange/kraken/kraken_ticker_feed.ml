@@ -1,6 +1,9 @@
 (** Kraken Ticker Feed - WebSocket v2 ticker subscription with ring buffer *)
 open Lwt.Infix
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 let section = "kraken_ticker"
 
 (** Safely force Conduit context with error handling *)
@@ -28,14 +31,14 @@ type ticker = {
 (** Lock-free ring buffer for ticker data using atomics *)
 module RingBuffer = struct
   type 'a t = {
-    data: 'a option Atomic.t array;
+    data: 'a option Atomic.t Dio_memory_tracing.Memory_tracing.Tracked.Array.t;
     write_pos: int Atomic.t;
     size: int;
   }
 
   let create size =
     {
-      data = Array.init size (fun _ -> Atomic.make None);
+      data = Dio_memory_tracing.Memory_tracing.Tracked.Array.init size (fun _ -> Atomic.make None);
       write_pos = Atomic.make 0;
       size;
     }
@@ -43,7 +46,7 @@ module RingBuffer = struct
   (* Lock-free write - single writer *)
   let write buffer value =
     let pos = Atomic.get buffer.write_pos in
-    Atomic.set buffer.data.(pos) (Some value);
+    Dio_memory_tracing.Memory_tracing.Tracked.Array.set buffer.data pos (Atomic.make (Some value));
     let new_pos = (pos + 1) mod buffer.size in
     Atomic.set buffer.write_pos new_pos
 
@@ -51,7 +54,7 @@ module RingBuffer = struct
   let read_latest buffer =
     let pos = Atomic.get buffer.write_pos in
     let read_pos = if pos = 0 then buffer.size - 1 else pos - 1 in
-    Atomic.get buffer.data.(read_pos)
+    Atomic.get (Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.data read_pos)
 
   (** Read events from last known position - for domain consumers *)
   let read_since buffer last_pos =
@@ -63,7 +66,7 @@ module RingBuffer = struct
         if pos = current_pos then
           List.rev acc
         else
-          match Atomic.get buffer.data.(pos) with
+          match Atomic.get (Dio_memory_tracing.Memory_tracing.Tracked.Array.get buffer.data pos) with
           | Some event -> collect (event :: acc) ((pos + 1) mod buffer.size)
           | None -> collect acc ((pos + 1) mod buffer.size)
       in
@@ -76,30 +79,26 @@ type store = {
   ready: bool Atomic.t;
 }
 
-let stores : (string, store) Hashtbl.t = Hashtbl.create 32
-let stores_mutex = Mutex.create ()
+let stores : (string, store) Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 
 let ensure_store symbol =
-  Mutex.lock stores_mutex;
-  let store = match Hashtbl.find_opt stores symbol with
-  | Some s -> s
-  | None ->
-      let s = {
-        buffer = RingBuffer.create 100;
-        ready = Atomic.make false;
-      } in
-      Hashtbl.add stores symbol s;
-      s
-  in
-  Mutex.unlock stores_mutex;
-  store
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock stores (fun stores ->
+    match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt stores symbol with
+    | Some s -> s
+    | None ->
+        let s = {
+          buffer = RingBuffer.create 100;
+          ready = Atomic.make false;
+        } in
+        Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.add stores symbol s;
+        s
+  )
 
 let store_opt symbol =
-  Mutex.lock stores_mutex;
-  let result = Hashtbl.find_opt stores symbol in
-  Mutex.unlock stores_mutex;
-  result
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock stores (fun stores ->
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt stores symbol
+  )
 
 let notify_ready store =
   if not (Atomic.get store.ready) then begin
@@ -174,7 +173,7 @@ let parse_ticker json on_heartbeat =
   | [] -> Some ()
   | data ->
       (* Track symbols that successfully wrote to buffer in this message *)
-      let notified_symbols = Hashtbl.create 16 in
+      let notified_symbols = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16 in
       List.iter (fun ticker_data ->
         try
           let symbol = ticker_data |> member "symbol" |> to_string in
@@ -189,7 +188,7 @@ let parse_ticker json on_heartbeat =
           let store = ensure_store symbol in
           RingBuffer.write store.buffer ticker;
           (* Record that this symbol should be notified (only once per message) *)
-          Hashtbl.replace notified_symbols symbol store;
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f last=%.2f"
             symbol ticker.bid ticker.ask ticker.last;
           Telemetry.inc_counter (Telemetry.counter "ticker_updates" ()) ();
@@ -201,7 +200,10 @@ let parse_ticker json on_heartbeat =
       ) data;
 
       (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
-      Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+
+      (* Clean up the temporary hashtable *)
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.destroy notified_symbols;
 
       Some ()
 

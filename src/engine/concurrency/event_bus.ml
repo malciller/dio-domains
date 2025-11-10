@@ -11,6 +11,13 @@
 
 open Lwt.Infix
 
+(** Memory tracing hooks - conditionally available *)
+let memory_tracing_available =
+  try
+    ignore (Sys.getenv "DIO_MEMORY_TRACING");
+    true
+  with Not_found -> false
+
 module type PAYLOAD = sig
   type t
 end

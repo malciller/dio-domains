@@ -8,6 +8,9 @@ open Lwt.Infix
 open Ui_types
 open Dio_ui_cache.Telemetry_cache
 open Dio_ui_cache.System_cache
+
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
 open Dio_ui_cache.Balance_cache
 
 (** Connected client state *)
@@ -23,7 +26,7 @@ type client = {
 (** Server state *)
 type server_state = {
   next_client_id: int Atomic.t;
-  mutable clients: (int, client) Hashtbl.t;
+  mutable clients: (int, client) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t;
   client_mutex: Mutex.t;  (* Protect hashtable operations *)
   port: int;
   enable_token_auth: bool;
@@ -40,7 +43,7 @@ type active_subscription = {
 }
 
 (** Global stream subscription registry - tracks active subscriptions per stream type *)
-let active_subscriptions : (string, active_subscription) Hashtbl.t = Hashtbl.create 16
+let active_subscriptions : (string, active_subscription) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16
 let subscriptions_mutex = Mutex.create ()
 
 (** Register an active subscription for tracking *)
@@ -50,19 +53,19 @@ let register_active_subscription stream_type close_stream =
     stream_type;
     close_stream = Some close_stream;
   } in
-  Hashtbl.replace active_subscriptions stream_type subscription;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace active_subscriptions stream_type subscription;
   Mutex.unlock subscriptions_mutex;
   Logging.debug_f ~section:"broadcast" "Registered active subscription for %s stream" stream_type
 
 (** Close an active subscription and remove it from tracking *)
 let close_active_subscription stream_type =
   Mutex.lock subscriptions_mutex;
-  match Hashtbl.find_opt active_subscriptions stream_type with
+  match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt active_subscriptions stream_type with
   | Some subscription ->
       begin match subscription.close_stream with
       | Some close_fn ->
           (* Remove from tracking immediately *)
-          Hashtbl.remove active_subscriptions stream_type;
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove active_subscriptions stream_type;
           Mutex.unlock subscriptions_mutex;
           (* Close the stream and return the promise *)
           Lwt.catch
@@ -78,7 +81,7 @@ let close_active_subscription stream_type =
             )
       | None ->
           (* No close function, just remove from tracking *)
-          Hashtbl.remove active_subscriptions stream_type;
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove active_subscriptions stream_type;
           Mutex.unlock subscriptions_mutex;
           Logging.debug_f ~section:"broadcast" "Removed %s stream subscription from tracking (no close function)" stream_type;
           Lwt.return_unit
@@ -98,22 +101,33 @@ let safe_close_channels input_channel output_channel =
     (fun _ -> Lwt.return_unit)  (* Ignore errors when closing *)
 
 (** Create server state *)
-let create_server_state config = {
-  next_client_id = Atomic.make 0;
-  clients = Hashtbl.create 16;
-  client_mutex = Mutex.create ();
-  port = config.Dio_engine.Config.port;
-  enable_token_auth = config.Dio_engine.Config.enable_token_auth;
-  enable_ip_whitelist = config.Dio_engine.Config.enable_ip_whitelist;
-  token = config.Dio_engine.Config.token;
-  ip_whitelist = config.Dio_engine.Config.ip_whitelist;
-  shutdown_requested = Atomic.make false;
-}
+let create_server_state config =
+  (* Defer allocation tracking during server state creation to avoid deadlocks *)
+  Dio_memory_tracing.Memory_tracing.defer_allocation_tracking ();
+  try
+    let state = {
+      next_client_id = Atomic.make 0;
+      clients = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16;
+      client_mutex = Mutex.create ();
+      port = config.Dio_engine.Config.port;
+      enable_token_auth = config.Dio_engine.Config.enable_token_auth;
+      enable_ip_whitelist = config.Dio_engine.Config.enable_ip_whitelist;
+      token = config.Dio_engine.Config.token;
+      ip_whitelist = config.Dio_engine.Config.ip_whitelist;
+      shutdown_requested = Atomic.make false;
+    } in
+    (* Resume tracking after state creation *)
+    Dio_memory_tracing.Memory_tracing.resume_allocation_tracking ();
+    state
+  with exn ->
+    (* Make sure to resume tracking even on error *)
+    Dio_memory_tracing.Memory_tracing.resume_allocation_tracking ();
+    raise exn
 
 (** Close channels for inactive clients *)
 let close_inactive_client_channels state =
   Mutex.lock state.client_mutex;
-  Hashtbl.iter (fun _ client ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ client ->
     if not client.active then (
       (* Close channels asynchronously to avoid blocking *)
       Lwt.async (fun () ->
@@ -129,11 +143,11 @@ let cleanup_clients state =
   close_inactive_client_channels state;
   Mutex.lock state.client_mutex;
   let to_remove = ref [] in
-  Hashtbl.iter (fun id client ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun id client ->
     if not client.active then
       to_remove := id :: !to_remove
   ) state.clients;
-  List.iter (Hashtbl.remove state.clients) !to_remove;
+  List.iter (Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove state.clients) !to_remove;
   Mutex.unlock state.client_mutex;
   Logging.debug_f ~section:"broadcast" "Cleaned up %d inactive clients" (List.length !to_remove)
 
@@ -143,7 +157,7 @@ let broadcast_to_stream state stream_type json_str =
   let json_bytes = Bytes.of_string (json_str ^ "\n") in
   let json_len = Bytes.length json_bytes in
   Mutex.lock state.client_mutex;
-  Hashtbl.iter (fun _ (client : client) ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ (client : client) ->
     if client.stream_type = stream_type && client.active then (
       incr count;
       (* Non-blocking write with timeout - drop client immediately if slow *)
@@ -183,20 +197,20 @@ let send_current_snapshot client stream_type =
   Lwt.async (fun () ->
     Lwt.catch
       (fun () ->
-        let json_str = match stream_type with
+        let%lwt json_str = match stream_type with
           | "telemetry" ->
               let snapshot = Dio_ui_cache.Telemetry_cache.current_telemetry_snapshot () in
-              Metrics_json.(telemetry_snapshot_to_json snapshot |> json_to_string)
+              Lwt.return Metrics_json.(telemetry_snapshot_to_json snapshot |> json_to_string)
           | "system" ->
-              let stats = Dio_ui_cache.System_cache.current_system_stats () in
-              Metrics_json.(system_stats_to_json stats |> json_to_string)
+              let%lwt stats = Dio_ui_cache.System_cache.current_system_stats () in
+              Lwt.return Metrics_json.(system_stats_to_json stats |> json_to_string)
           | "balance" ->
               let snapshot = Dio_ui_cache.Balance_cache.current_balance_snapshot () in
-              Metrics_json.(balance_snapshot_to_json snapshot |> json_to_string)
+              Lwt.return Metrics_json.(balance_snapshot_to_json snapshot |> json_to_string)
           | "log" ->
               (* Logs are streamed individually, not as snapshots *)
-              "{\"type\":\"log\",\"message\":\"Log stream active\"}"
-          | _ -> ""
+              Lwt.return "{\"type\":\"log\",\"message\":\"Log stream active\"}"
+          | _ -> Lwt.return ""
         in
         if json_str <> "" then (
           (* Non-blocking write with timeout - drop client immediately if slow *)
@@ -235,7 +249,7 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
     active = true;
   } in
   Mutex.lock state.client_mutex;
-  Hashtbl.add state.clients client_id client;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add state.clients client_id client;
   Mutex.unlock state.client_mutex;
 
   Logging.debug_f ~section:"broadcast" "Client %d connected to %s stream" client_id stream_type;
@@ -285,6 +299,26 @@ let handle_tcp_connection state stream_type client_id input_channel output_chann
 let consume_stream_non_blocking stream_type stream process_fn state close_stream =
   let last_success_time = ref (Unix.time ()) in
   let last_health_log_time = ref (Unix.time ()) in
+  let shutdown_requested = Atomic.make false in  (* Shared shutdown flag for coordination *)
+  let stream_closed = Atomic.make false in  (* Track if stream has been closed to prevent double-close *)
+
+  (* Idempotent close function that prevents double-closing *)
+  let close_stream_idempotent () =
+    if Atomic.compare_and_set stream_closed false true then (
+      (* First time closing - actually close the stream *)
+      Lwt.catch
+        (fun () -> close_stream ())
+        (function
+         | Lwt.Canceled -> Lwt.return_unit  (* Already closed *)
+         | exn ->
+             Logging.warn_f ~section:"broadcast" "Error closing %s stream: %s" stream_type (Printexc.to_string exn);
+             Lwt.return_unit
+        )
+    ) else (
+      (* Already closed - return immediately *)
+      Logging.debug_f ~section:"broadcast" "%s stream already closed, skipping close operation" stream_type;
+      Lwt.return_unit
+    ) in
 
   (* Background health monitor task *)
   Lwt.async (fun () ->
@@ -301,12 +335,16 @@ let consume_stream_non_blocking stream_type stream process_fn state close_stream
           last_health_log_time := now
         );
 
-        (* Check for extended inactivity - trigger reconnection if no events for 2 minutes *)
+        (* Check for extended inactivity - trigger reconnection if no events for 2.5 minutes *)
         (* This indicates the stream subscription was likely cleaned up or broken *)
-        if time_since_last_item > 120.0 then (
+        if time_since_last_item > 150.0 then (
           Logging.warn_f ~section:"broadcast" "%s stream appears dead - no events received for %.1f seconds, triggering reconnection" stream_type time_since_last_item;
+          (* Set shutdown flag first to coordinate with consumer loop *)
+          Atomic.set shutdown_requested true;
+          (* Brief pause to allow consumer loop to see shutdown flag *)
+          Lwt_unix.sleep 0.1 >>= fun () ->
           (* Close the current subscription and let the outer retry logic handle reconnection *)
-          close_stream () >>= fun () ->
+          close_stream_idempotent () >>= fun () ->
           Lwt.fail_with (Printf.sprintf "%s stream dead - no events for %.1f seconds" stream_type time_since_last_item)
         ) else
           monitor_loop ()
@@ -319,53 +357,60 @@ let consume_stream_non_blocking stream_type stream process_fn state close_stream
   );
 
   let rec consumer_loop () =
-    (* First check if stream is closed by trying to get without timeout *)
-    let check_stream_closure = Lwt.catch
-      (fun () -> Lwt.pick [
-        (Lwt_stream.get stream >|= fun result -> `StreamResult result);
-        (Lwt_unix.sleep 0.001 >|= fun () -> `Timeout);  (* Very short timeout to detect immediate None *)
-      ])
-      (function
-       | Queue.Empty ->
-           (* Queue.Empty indicates a race condition in Lwt's internal resolution loop *)
-           (* Treat it as a timeout and continue *)
-           Lwt.return `Timeout
-       | exn ->
-           (* Re-raise other exceptions *)
-           Lwt.fail exn
-      ) in
+    (* First check shutdown flag - exit gracefully if shutdown requested *)
+    if Atomic.get shutdown_requested then (
+      Logging.debug_f ~section:"broadcast" "%s stream consumer shutting down due to coordination flag" stream_type;
+      Lwt.return_unit
+    ) else (
+      (* Check if stream is closed by trying to get without timeout *)
+      let check_stream_closure = Lwt.catch
+        (fun () -> Lwt.pick [
+          (Lwt_stream.get stream >|= fun result -> `StreamResult result);
+          (Lwt_unix.sleep 0.001 >|= fun () -> `Timeout);  (* Very short timeout to detect immediate None *)
+        ])
+        (function
+         | Queue.Empty ->
+             (* Queue.Empty indicates a race condition in Lwt's internal resolution loop *)
+             (* Treat it as a timeout and continue *)
+             Lwt.return `Timeout
+         | Lwt.Canceled ->
+             (* Stream was closed - set shutdown flag and exit *)
+             Atomic.set shutdown_requested true;
+             Lwt.return `StreamClosed
+         | exn ->
+             (* Re-raise other exceptions *)
+             Lwt.fail exn
+        ) in
 
-    check_stream_closure >>= function
-    | `StreamResult (Some item) ->
-        (* Got an item - process it asynchronously *)
-        last_success_time := Unix.time ();
-          Lwt.async (fun () ->
-            Lwt.catch
-              (fun () -> process_fn item state)
-              (fun exn ->
-                Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
-                Lwt.return_unit
-              )
-          );
-        (* Continue reading immediately - don't wait for processing *)
-        consumer_loop ()
-    | `StreamResult None ->
-        (* Stream is permanently closed - this indicates the subscription was removed *)
-        Logging.warn_f ~section:"broadcast" "%s stream was closed unexpectedly (likely due to cleanup) - triggering reconnection" stream_type;
-        (* Close the current subscription and let the outer retry logic handle reconnection *)
-        close_stream () >>= fun () ->
-        Lwt.fail_with (Printf.sprintf "%s stream closed unexpectedly" stream_type)
-    | `Timeout ->
-        (* Stream is still active but no data available - check for shutdown *)
-        if Atomic.get state.shutdown_requested then (
-          Logging.info_f ~section:"broadcast" "%s stream consumer shutting down due to shutdown request" stream_type;
-          (* Close stream on shutdown to ensure cleanup *)
-          close_stream () >>= fun () ->
-          Lwt.return_unit
-        ) else (
-          (* Just a timeout - continue waiting *)
+      check_stream_closure >>= function
+      | `StreamResult (Some item) ->
+          (* Got an item - process it asynchronously *)
+          last_success_time := Unix.time ();
+            Lwt.async (fun () ->
+              Lwt.catch
+                (fun () -> process_fn item state)
+                (fun exn ->
+                  Logging.warn_f ~section:"broadcast" "Error processing %s item: %s" stream_type (Printexc.to_string exn);
+                  Lwt.return_unit
+                )
+            );
+          (* Continue reading immediately - don't wait for processing *)
           consumer_loop ()
-        )
+      | `StreamResult None ->
+          (* Stream is permanently closed - set shutdown flag and trigger reconnection *)
+          Logging.warn_f ~section:"broadcast" "%s stream was closed unexpectedly (likely due to cleanup) - triggering reconnection" stream_type;
+          Atomic.set shutdown_requested true;
+          (* Close the current subscription and let the outer retry logic handle reconnection *)
+          close_stream_idempotent () >>= fun () ->
+          Lwt.fail_with (Printf.sprintf "%s stream closed unexpectedly" stream_type)
+      | `StreamClosed ->
+          (* Stream was closed via cancellation - exit gracefully *)
+          Logging.debug_f ~section:"broadcast" "%s stream closed via cancellation" stream_type;
+          Lwt.return_unit
+      | `Timeout ->
+          (* Stream is still active but no data available - continue waiting *)
+          consumer_loop ()
+    )
   in
   consumer_loop ()
 
@@ -615,7 +660,7 @@ let client_allowed sockaddr whitelist =
 let close_all_active_subscriptions () =
   Logging.info ~section:"broadcast" "Closing all active stream subscriptions";
   Mutex.lock subscriptions_mutex;
-  let stream_types = Hashtbl.fold (fun stream_type _ acc -> stream_type :: acc) active_subscriptions [] in
+  let stream_types = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun stream_type _ acc -> stream_type :: acc) active_subscriptions [] in
   Mutex.unlock subscriptions_mutex;
   (* Collect all close promises and await them *)
   let close_promises = List.map (fun stream_type -> close_active_subscription stream_type) stream_types in
@@ -638,6 +683,9 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown
   else
     Logging.info ~section:"broadcast" "IP whitelist disabled";
 
+  (* Initialize random number generator for retry jitter *)
+  Random.self_init ();
+
   let state = create_server_state config in
 
   (* Set up subscriptions to cache event buses *)
@@ -650,9 +698,9 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown
       let rec cleanup_loop () =
         Lwt.catch (fun () ->
           let%lwt () = Lwt_unix.sleep 5.0 in (* Clean up every 5 seconds *)
-          let before_cleanup = Hashtbl.length state.clients in
+          let before_cleanup = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length state.clients in
           cleanup_clients state;
-          let after_cleanup = Hashtbl.length state.clients in
+          let after_cleanup = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length state.clients in
           let cleaned_count = before_cleanup - after_cleanup in
 
           (* Report metrics for monitoring *)
@@ -661,12 +709,12 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown
 
           (* Report active client counts *)
           let active_clients = ref 0 in
-          Hashtbl.iter (fun _ client ->
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ client ->
             if client.active then incr active_clients
           ) state.clients;
 
           Logging.debug_f ~section:"broadcast" "Broadcast status: %d active clients, %d total clients"
-            !active_clients (Hashtbl.length state.clients);
+            !active_clients (Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length state.clients);
 
           cleanup_loop ()
         ) (fun exn ->
@@ -683,15 +731,46 @@ let start_server (config : Dio_engine.Config.metrics_broadcast_config) (shutdown
     )
   );
 
-  (* Create TCP server *)
-  let server_socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.setsockopt server_socket Unix.SO_REUSEADDR true;
+  (* Create TCP server with port binding retry logic *)
+  let rec try_bind_socket attempt current_port max_attempts =
+    if attempt > max_attempts then
+      Lwt.fail (Failure (Printf.sprintf "Failed to bind to any port after %d attempts" max_attempts))
+    else begin
+      let server_socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+      Lwt_unix.setsockopt server_socket Unix.SO_REUSEADDR true;
 
-  let sockaddr = Unix.ADDR_INET (Unix.inet_addr_any, config.port) in
-  Lwt_unix.bind server_socket sockaddr >>= fun () ->
-  Lwt_unix.listen server_socket 10;
+      let sockaddr = Unix.ADDR_INET (Unix.inet_addr_any, current_port) in
+      Lwt.catch
+        (fun () ->
+          Lwt_unix.bind server_socket sockaddr >>= fun () ->
+          Lwt_unix.listen server_socket 10;
+          Lwt.return (server_socket, current_port)
+        )
+        (function
+          | Unix.Unix_error (Unix.EADDRINUSE, "bind", _) ->
+              Logging.warn_f ~section:"broadcast" "Port %d is already in use (attempt %d/%d), trying next port..." current_port attempt max_attempts;
+              (* Close the socket and try next port *)
+              Lwt.catch
+                (fun () -> Lwt_unix.close server_socket)
+                (fun _ -> Lwt.return_unit) >>= fun () ->
+              (* Exponential backoff with jitter *)
+              let delay = 0.1 *. (2.0 ** float_of_int (attempt - 1)) +. Random.float 0.1 in
+              Lwt_unix.sleep delay >>= fun () ->
+              try_bind_socket (attempt + 1) (current_port + 1) max_attempts
+          | exn ->
+              (* Re-raise other exceptions *)
+              Lwt.fail exn
+        )
+    end
+  in
 
-  Logging.info_f ~section:"broadcast" "TCP metrics broadcast server listening on port %d" config.port;
+  try_bind_socket 1 config.port 10 >>= fun (server_socket, actual_port) ->
+
+  (* Log port change if it occurred *)
+  if actual_port <> config.port then
+    Logging.info_f ~section:"broadcast" "Using alternative port %d instead of requested port %d" actual_port config.port;
+
+  Logging.info_f ~section:"broadcast" "TCP metrics broadcast server listening on port %d" actual_port;
   Logging.info ~section:"broadcast" "Available streams (connect and send stream name):";
   Logging.info ~section:"broadcast" "  telemetry - Telemetry metrics";
   Logging.info ~section:"broadcast" "  system - System statistics";

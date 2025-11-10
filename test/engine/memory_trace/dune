@@ -1,0 +1,5 @@
+(executable
+ (name test_memory_report)
+ (libraries dio.memory_tracing logging lwt lwt.unix yojson))
+
+

@@ -1,0 +1,5 @@
+(library
+ (name dio_memory_cleanup)
+ (public_name dio.memory_cleanup)
+ (libraries lwt logging telemetry concurrency dio_memory_tracing)
+ (modules Memory_cleanup_events Memory_cleanup_service))

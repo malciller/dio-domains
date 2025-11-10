@@ -20,12 +20,15 @@ type cache_entry = {
   ttl_seconds: float;
 }
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 (** In-memory cache: (exchange, symbol) -> cache_entry *)
-let fee_cache : (string * string, cache_entry) Hashtbl.t = Hashtbl.create 32
+let fee_cache : (string * string, cache_entry) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32
 let cache_mutex = Mutex.create ()
 
 (** In-flight fetches: (exchange, symbol) -> unit promise *)
-let in_flight : (string * string, unit Lwt.t) Hashtbl.t = Hashtbl.create 32
+let in_flight : (string * string, unit Lwt.t) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32
 let in_flight_mutex = Mutex.create ()
 
 (** Default TTL for cache entries (10 minutes) *)
@@ -39,11 +42,11 @@ let is_valid entry =
 (** Get cached maker fee for exchange/symbol pair *)
 let get_maker_fee ~exchange ~symbol =
   Mutex.lock cache_mutex;
-  let result = match Hashtbl.find_opt fee_cache (exchange, symbol) with
+  let result = match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt fee_cache (exchange, symbol) with
     | Some entry when is_valid entry -> Some entry.maker_fee
     | Some _ ->
         (* Entry exists but expired - remove it *)
-        Hashtbl.remove fee_cache (exchange, symbol);
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove fee_cache (exchange, symbol);
         None
     | None -> None
   in
@@ -53,11 +56,11 @@ let get_maker_fee ~exchange ~symbol =
 (** Get cached taker fee for exchange/symbol pair *)
 let get_taker_fee ~exchange ~symbol =
   Mutex.lock cache_mutex;
-  let result = match Hashtbl.find_opt fee_cache (exchange, symbol) with
+  let result = match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt fee_cache (exchange, symbol) with
     | Some entry when is_valid entry -> Some entry.taker_fee
     | Some _ ->
         (* Entry exists but expired - remove it *)
-        Hashtbl.remove fee_cache (exchange, symbol);
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove fee_cache (exchange, symbol);
         None
     | None -> None
   in
@@ -73,7 +76,7 @@ let store_fees ~exchange ~symbol ~maker_fee ~taker_fee ~ttl_seconds =
     ttl_seconds;
   } in
   Mutex.lock cache_mutex;
-  Hashtbl.replace fee_cache (exchange, symbol) entry;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace fee_cache (exchange, symbol) entry;
   Mutex.unlock cache_mutex;
   Logging.debug_f ~section "Cached fees for %s/%s: maker=%.6f, taker=%.6f (TTL: %.0fs)" exchange symbol maker_fee taker_fee ttl_seconds
 
@@ -82,7 +85,7 @@ let refresh_async symbol =
   (* Check if we have a valid cached entry first *)
   Mutex.lock cache_mutex;
   let has_valid_entry =
-    match Hashtbl.find_opt fee_cache ("kraken", symbol) with
+    match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt fee_cache ("kraken", symbol) with
     | Some entry when is_valid entry -> true
     | _ -> false
   in
@@ -94,7 +97,7 @@ let refresh_async symbol =
   end else begin
     (* Check if fetch is already in-flight *)
     Mutex.lock in_flight_mutex;
-    let existing_promise = Hashtbl.find_opt in_flight ("kraken", symbol) in
+    let existing_promise = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt in_flight ("kraken", symbol) in
     let promise = match existing_promise with
       | Some p ->
           Logging.debug_f ~section "Fee fetch for %s already in-flight, reusing promise" symbol;
@@ -138,7 +141,7 @@ let refresh_async symbol =
             )
           in
           let p = fetch_with_retry 1 in
-          Hashtbl.replace in_flight ("kraken", symbol) p;
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace in_flight ("kraken", symbol) p;
           p
     in
     Mutex.unlock in_flight_mutex;
@@ -147,11 +150,11 @@ let refresh_async symbol =
     Lwt.on_any promise
       (fun () ->
          Mutex.lock in_flight_mutex;
-         Hashtbl.remove in_flight ("kraken", symbol);
+         Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove in_flight ("kraken", symbol);
          Mutex.unlock in_flight_mutex)
       (fun _ ->
          Mutex.lock in_flight_mutex;
-         Hashtbl.remove in_flight ("kraken", symbol);
+         Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove in_flight ("kraken", symbol);
          Mutex.unlock in_flight_mutex);
 
     promise
@@ -165,15 +168,15 @@ let init () =
 (** Clear cache - for testing *)
 let clear () =
   Mutex.lock cache_mutex;
-  Hashtbl.clear fee_cache;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear fee_cache;
   Mutex.unlock cache_mutex
 
 
 (** Get cache statistics for monitoring *)
 let stats () =
   Mutex.lock cache_mutex;
-  let count = Hashtbl.length fee_cache in
-  let valid_count = Hashtbl.fold (fun _ entry acc ->
+  let count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length fee_cache in
+  let valid_count = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun _ entry acc ->
     if is_valid entry then acc + 1 else acc
   ) fee_cache 0 in
   Mutex.unlock cache_mutex;

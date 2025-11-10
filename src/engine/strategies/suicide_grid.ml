@@ -10,6 +10,8 @@
   The strategy generates orders and pushes them to a ringbuffer for execution elsewhere.
 *)
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
 
 let section = "suicide_grid"
 
@@ -40,21 +42,80 @@ let order_buffer_mutex = Mutex.create ()
 (** Exposed for external access *)
 let get_order_buffer () = order_buffer
 
+(** Shared hashtable pool to prevent per-strategy hashtable creation *)
+let hashtable_pool : (string, unit) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t Dio_memory_tracing.Memory_tracing.Tracked.Queue.t = Dio_memory_tracing.Memory_tracing.Tracked.Queue.create ()
+let hashtable_pool_mutex = Mutex.create ()
+
+(** Shared hashtable pool for (string, float) hashtables used by pending_cancellations *)
+let float_hashtable_pool : (string, float) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t Dio_memory_tracing.Memory_tracing.Tracked.Queue.t = Dio_memory_tracing.Memory_tracing.Tracked.Queue.create ()
+let float_hashtable_pool_mutex = Mutex.create ()
+
+(** Get a hashtable from the shared pool or create new if pool is empty *)
+let get_shared_hashtable () : (string, unit) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t =
+  Mutex.lock hashtable_pool_mutex;
+  let from_pool = not (Dio_memory_tracing.Memory_tracing.Tracked.Queue.is_empty hashtable_pool) in
+  let hashtbl =
+    if from_pool then
+      Dio_memory_tracing.Memory_tracing.Tracked.Queue.take hashtable_pool
+    else
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16
+  in
+  Mutex.unlock hashtable_pool_mutex;
+  (* Clear hashtable for reuse *)
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear hashtbl;
+  (* Track reuse if hashtable came from pool *)
+  if from_pool then
+    Dio_memory_tracing.Memory_tracing.record_reuse ();
+  hashtbl
+
+(** Get a (string, float) hashtable from the shared pool or create new if pool is empty *)
+let get_shared_float_hashtable () : (string, float) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t =
+  Mutex.lock float_hashtable_pool_mutex;
+  let from_pool = not (Dio_memory_tracing.Memory_tracing.Tracked.Queue.is_empty float_hashtable_pool) in
+  let hashtbl =
+    if from_pool then
+      Dio_memory_tracing.Memory_tracing.Tracked.Queue.take float_hashtable_pool
+    else
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16
+  in
+  Mutex.unlock float_hashtable_pool_mutex;
+  (* Clear hashtable for reuse *)
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear hashtbl;
+  (* Track reuse if hashtable came from pool *)
+  if from_pool then
+    Dio_memory_tracing.Memory_tracing.record_reuse ();
+  hashtbl
+
+(** Return a hashtable to the shared pool for reuse *)
+let return_shared_hashtable hashtbl =
+  Mutex.lock hashtable_pool_mutex;
+  (* Clear contents before returning to pool *)
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear hashtbl;
+  Dio_memory_tracing.Memory_tracing.Tracked.Queue.push hashtbl hashtable_pool;
+  Mutex.unlock hashtable_pool_mutex
+
+(** Return a (string, float) hashtable to the shared pool for reuse *)
+let return_shared_float_hashtable hashtbl =
+  Mutex.lock float_hashtable_pool_mutex;
+  (* Clear contents before returning to pool *)
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear hashtbl;
+  Dio_memory_tracing.Memory_tracing.Tracked.Queue.push hashtbl float_hashtable_pool;
+  Mutex.unlock float_hashtable_pool_mutex
+
 (** Strategy state per asset *)
 type strategy_state = {
   mutable last_buy_order_price: float option;
   mutable last_buy_order_id: string option;
-  mutable open_sell_orders: (string * float) list;  (* order_id * price *)
-  mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
+  mutable open_sell_orders: (string * float) Dio_memory_tracing.Memory_tracing.Tracked.List.t;  (* order_id * price *)
+  mutable pending_orders: (string * order_side * float * float) Dio_memory_tracing.Memory_tracing.Tracked.List.t;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
-  mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
-  mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
+  mutable cancelled_orders: (string * float) Dio_memory_tracing.Memory_tracing.Tracked.List.t;  (* order_id * timestamp - blacklist of recently cancelled orders *)
+  mutable pending_cancellations: (string, float) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
 }
 
 (** Global strategy state store with memory management *)
-let strategy_states : (string, strategy_state * float) Hashtbl.t = Hashtbl.create 16  (* asset -> (state, last_access_time) *)
-let strategy_states_mutex = Mutex.create ()
+let strategy_states : (string, strategy_state * float) Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.create 16  (* asset -> (state, last_access_time) *)
 
 (** Memory management limits *)
 let max_assets = 100  (* Maximum number of assets to track *)
@@ -62,13 +123,24 @@ let asset_expiry_seconds = 3600.0  (* Remove assets not accessed in 1 hour *)
 let lru_cleanup_threshold = 80  (* Start LRU cleanup when we have this many assets *)
 
 (** Perform LRU cleanup of strategy states to prevent unbounded growth *)
-let perform_lru_cleanup () =
+let rec perform_lru_cleanup ?(already_locked=false) () =
+  if not already_locked then
+    (* When called externally, use with_lock *)
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock strategy_states (fun strategy_states ->
+      perform_lru_cleanup_work strategy_states
+    )
+  else
+    (* When called from within a locked context, work directly on the hashtable *)
+    perform_lru_cleanup_work strategy_states
+
+(** Internal LRU cleanup work - assumes hashtable is already accessible *)
+and perform_lru_cleanup_work strategy_states =
   let now = Unix.time () in
-  let current_size = Hashtbl.length strategy_states in
+  let current_size = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.length strategy_states in
 
   if current_size >= lru_cleanup_threshold then begin
     (* Collect all assets with their access times *)
-    let assets_with_times = Hashtbl.fold (fun asset (_, last_access) acc ->
+    let assets_with_times = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.fold (fun asset (_, last_access) acc ->
       (asset, last_access) :: acc
     ) strategy_states [] in
 
@@ -85,7 +157,11 @@ let perform_lru_cleanup () =
 
     (* Remove expired assets *)
     List.iter (fun (asset, _) ->
-      Hashtbl.remove strategy_states asset;
+      (* Return hashtable to pool before removing state *)
+      (match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt strategy_states asset with
+       | Some (state, _) -> return_shared_float_hashtable state.pending_cancellations
+       | None -> ());
+      Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.remove strategy_states asset;
       Logging.debug_f ~section "LRU cleanup: removed expired asset %s" asset
     ) expired_assets;
 
@@ -101,114 +177,123 @@ let perform_lru_cleanup () =
       ) sorted_assets;
 
       List.iter (fun (asset, _) ->
-        Hashtbl.remove strategy_states asset;
+        (* Return hashtable to pool before removing state *)
+        (match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt strategy_states asset with
+         | Some (state, _) -> return_shared_float_hashtable state.pending_cancellations
+         | None -> ());
+        Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.remove strategy_states asset;
         Logging.debug_f ~section "LRU cleanup: removed LRU asset %s" asset
       ) !oldest_assets;
     end;
 
-    let final_size = Hashtbl.length strategy_states in
+    let final_size = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.length strategy_states in
     if current_size <> final_size then
       Logging.info_f ~section "Strategy state LRU cleanup: %d -> %d assets" current_size final_size
   end
 
+(** Get the current number of strategy states - thread-safe *)
+let get_strategy_states_count () =
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock strategy_states (fun strategy_states ->
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.length strategy_states
+  )
+
 (** Periodic deep cleanup for memory management - called from system cache *)
 let perform_deep_cleanup () =
-  let cleaned_total = ref 0 in
-  let now = Unix.time () in
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock strategy_states (fun strategy_states ->
+    let cleaned_total = ref 0 in
+    let now = Unix.time () in
 
-  Mutex.lock strategy_states_mutex;
+    (* First perform LRU cleanup to manage hashtable size *)
+    perform_lru_cleanup ~already_locked:true ();
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.iter (fun asset_symbol (state, _) ->
+      (* Clean up very old cancelled orders (older than 60 seconds) *)
+      let original_cancelled_count = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.cancelled_orders in
+      let cutoff_time = now -. 60.0 in
+      state.cancelled_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.cancelled_orders (List.filter (fun (_, timestamp) ->
+        timestamp > cutoff_time
+      ) state.cancelled_orders.list);
+      let cancelled_cleaned = original_cancelled_count - Dio_memory_tracing.Memory_tracing.Tracked.List.length state.cancelled_orders in
 
-  (* First perform LRU cleanup to manage hashtable size *)
-  perform_lru_cleanup ();
-  Hashtbl.iter (fun asset_symbol (state, _) ->
-    (* Clean up very old cancelled orders (older than 60 seconds) *)
-    let original_cancelled_count = List.length state.cancelled_orders in
-    state.cancelled_orders <- List.filter (fun (_, timestamp) ->
-      now -. timestamp < 60.0
-    ) state.cancelled_orders;
-    let cancelled_cleaned = original_cancelled_count - List.length state.cancelled_orders in
+      (* Clean up very old pending cancellations (older than 60 seconds) *)
+      let pending_cancellations = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun order_id timestamp acc ->
+        if now -. timestamp > 60.0 then
+          acc
+        else
+          (order_id, timestamp) :: acc
+      ) state.pending_cancellations [] in
 
-    (* Clean up very old pending cancellations (older than 60 seconds) *)
-    let pending_cancellations = Hashtbl.fold (fun order_id timestamp acc ->
-      if now -. timestamp > 60.0 then
-        acc
-      else
-        (order_id, timestamp) :: acc
-    ) state.pending_cancellations [] in
+      (* Enforce strict limits during deep cleanup *)
+      let max_cancelled = 20 in  (* Consistent with other limits *)
+      let max_pending = 50 in    (* Consistent with other limits *)
 
-    (* Enforce strict limits during deep cleanup *)
-    let max_cancelled = 10 in
-    let max_pending = 25 in
+      if Dio_memory_tracing.Memory_tracing.Tracked.List.length state.cancelled_orders > max_cancelled then begin
+        state.cancelled_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.cancelled_orders (List.filteri (fun i _ -> i < max_cancelled) state.cancelled_orders.list);
+      end;
 
-    if List.length state.cancelled_orders > max_cancelled then begin
-      state.cancelled_orders <- take max_cancelled state.cancelled_orders;
-    end;
+      let pending_cancellations =
+        if List.length pending_cancellations > max_pending then begin
+          let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t2 t1) pending_cancellations in
+          take max_pending sorted
+        end else
+          pending_cancellations
+      in
 
-    let pending_cancellations =
-      if List.length pending_cancellations > max_pending then begin
-        let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t2 t1) pending_cancellations in
-        take max_pending sorted
-      end else
-        pending_cancellations
-    in
+      (* Clear and repopulate hashtable *)
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear state.pending_cancellations;
+      List.iter (fun (order_id, timestamp) ->
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add state.pending_cancellations order_id timestamp
+      ) pending_cancellations;
 
-    (* Clear and repopulate hashtable *)
-    Hashtbl.clear state.pending_cancellations;
-    List.iter (fun (order_id, timestamp) ->
-      Hashtbl.add state.pending_cancellations order_id timestamp
-    ) pending_cancellations;
+      let pending_cleaned = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length state.pending_cancellations - List.length pending_cancellations in
 
-    let pending_cleaned = Hashtbl.length state.pending_cancellations - List.length pending_cancellations in
+      if cancelled_cleaned > 0 || pending_cleaned > 0 then begin
+        Logging.debug_f ~section "Deep cleanup for %s: removed %d cancelled, %d pending" asset_symbol cancelled_cleaned pending_cleaned;
+        cleaned_total := !cleaned_total + cancelled_cleaned + pending_cleaned;
+      end;
+    ) strategy_states;
 
-    if cancelled_cleaned > 0 || pending_cleaned > 0 then begin
-      Logging.debug_f ~section "Deep cleanup for %s: removed %d cancelled, %d pending" asset_symbol cancelled_cleaned pending_cleaned;
-      cleaned_total := !cleaned_total + cancelled_cleaned + pending_cleaned;
-    end;
-  ) strategy_states;
-  Mutex.unlock strategy_states_mutex;
-
-  !cleaned_total
+    !cleaned_total
+  )
 
 (** Get or create strategy state for an asset *)
 let get_strategy_state asset_symbol =
   let now = Unix.time () in
-  Mutex.lock strategy_states_mutex;
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock strategy_states (fun strategy_states ->
+    (* Check if we need to perform LRU cleanup before adding new asset *)
+    let current_size = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.length strategy_states in
+    if current_size >= max_assets then begin
+      perform_lru_cleanup ~already_locked:true ();
+    end;
 
-  (* Check if we need to perform LRU cleanup before adding new asset *)
-  let current_size = Hashtbl.length strategy_states in
-  if current_size >= max_assets then begin
-    perform_lru_cleanup ();
-  end;
-
-  let (state, _) =
-    match Hashtbl.find_opt strategy_states asset_symbol with
+    let (state, _) =
+      match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt strategy_states asset_symbol with
     | Some (existing_state, _) ->
         (* Update access time *)
-        Hashtbl.replace strategy_states asset_symbol (existing_state, now);
+        Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.replace strategy_states asset_symbol (existing_state, now);
         (existing_state, now)
     | None ->
         (* Create new state *)
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
-          open_sell_orders = [];
-          pending_orders = [];
+          open_sell_orders = Dio_memory_tracing.Memory_tracing.Tracked.List.empty ();
+          pending_orders = Dio_memory_tracing.Memory_tracing.Tracked.List.empty ();
           last_cycle = 0;
           last_order_time = 0.0;
-          cancelled_orders = [];
-          pending_cancellations = Hashtbl.create 16;
+          cancelled_orders = Dio_memory_tracing.Memory_tracing.Tracked.List.empty ();
+          pending_cancellations = get_shared_float_hashtable ();  (* Shared pool to prevent per-domain creation *)
         } in
-        Hashtbl.add strategy_states asset_symbol (new_state, now);
+        Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.add strategy_states asset_symbol (new_state, now);
 
         (* Log if we're approaching limits *)
-        let new_size = Hashtbl.length strategy_states in
+        let new_size = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.length strategy_states in
         if new_size >= lru_cleanup_threshold then
           Logging.warn_f ~section "Strategy state count approaching limit: %d/%d assets" new_size max_assets;
 
         (new_state, now)
   in
-  Mutex.unlock strategy_states_mutex;
   state
+  )
 
 (** Parse configuration values to floats *)
 let parse_config_float config value_name default exchange symbol =
@@ -326,7 +411,7 @@ let push_order order =
        let state = get_strategy_state order.symbol in
        (match order.order_id with
         | Some target_order_id ->
-            if Hashtbl.mem state.pending_cancellations target_order_id then begin
+            if Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.mem state.pending_cancellations target_order_id then begin
               Logging.debug_f ~section "Skipping duplicate cancellation for order %s (already pending)" target_order_id;
               (* Return early without pushing - duplicate cancellation *)
               ()
@@ -349,7 +434,7 @@ let push_order order =
                   (* Update strategy state *)
                   state.last_order_time <- Unix.time ();
                   (* Add to pending cancellations tracking *)
-                  Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
+                  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
                   Logging.debug_f ~section "Cancelling order for %s (target: %s)"
                     order.symbol target_order_id
               | None ->
@@ -390,7 +475,7 @@ let push_order order =
                   (Option.value order.price ~default:0.0) in
                 let order_price = Option.value order.price ~default:0.0 in
                 let timestamp = Unix.time () in
-                state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
+                state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.pending_orders ((temp_order_id, order.side, order_price, timestamp) :: state.pending_orders.list);
                 Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
                   (string_of_order_side order.side) temp_order_id order_price order.symbol;
 
@@ -399,7 +484,7 @@ let push_order order =
                  | Sell, Some price ->
                      (* Add sell order to tracking list - use temporary ID for now *)
                      let order_id = temp_order_id in
-                     state.open_sell_orders <- (order_id, price) :: state.open_sell_orders;
+                     state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.open_sell_orders ((order_id, price) :: state.open_sell_orders.list);
                      Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" order_id price order.symbol
                  | _ -> ())
             | Amend ->
@@ -408,7 +493,7 @@ let push_order order =
                   (Option.value order.order_id ~default:"unknown") in
                 let order_price = Option.value order.price ~default:0.0 in
                 let timestamp = Unix.time () in
-                state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
+                state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.pending_orders ((temp_order_id, order.side, order_price, timestamp) :: state.pending_orders.list);
                 Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
                   (string_of_order_side order.side) temp_order_id order_price order.symbol
                   (Option.value order.order_id ~default:"unknown")
@@ -445,27 +530,28 @@ let execute_strategy
   | Some price, _ ->
 
       (* Sync strategy state with actual open orders from exchange *)
-      (* Clear existing tracked orders *)
-      state.open_sell_orders <- [];
+      (* Clear existing tracked orders - use replace_contents for immediate clearing *)
+      state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.open_sell_orders [];
       state.last_buy_order_price <- None;
       state.last_buy_order_id <- None;
       (* Note: We don't clear pending_orders here - they should be managed by order placement responses *)
 
       (* Clean up old cancelled orders from blacklist (older than 15 seconds) and enforce hard limit *)
       let now = Unix.time () in
-      state.cancelled_orders <- List.filter (fun (_, timestamp) ->
-        now -. timestamp < 15.0  (* Reduced from 30 to 15 seconds *)
-      ) state.cancelled_orders;
+      let cutoff_time = now -. 15.0 in
+      state.cancelled_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.cancelled_orders (List.filter (fun (_, timestamp) ->
+        timestamp > cutoff_time
+      ) state.cancelled_orders.list);
 
       (* Enforce hard limit of 20 cancelled orders to prevent memory growth *)
-      if List.length state.cancelled_orders > 20 then begin
-        let excess = List.length state.cancelled_orders - 20 in
-        state.cancelled_orders <- take 20 state.cancelled_orders;  (* Keep most recent 20 *)
+      if Dio_memory_tracing.Memory_tracing.Tracked.List.length state.cancelled_orders > 20 then begin
+        let excess = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.cancelled_orders - 20 in
+        state.cancelled_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.cancelled_orders (List.filteri (fun i _ -> i < 20) state.cancelled_orders.list);
         Logging.warn_f ~section "Truncated %d excess cancelled orders for %s (kept 20)" excess asset.symbol;
       end;
 
       (* Clean up old pending cancellations (older than 30 seconds) and enforce hard size limit *)
-      let pending_cancellations = Hashtbl.fold (fun order_id timestamp acc ->
+      let pending_cancellations = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun order_id timestamp acc ->
         if now -. timestamp > 30.0 then begin
           Logging.debug_f ~section "Removing stale pending cancellation %s for %s (age: %.1fs)" order_id asset.symbol (now -. timestamp);
           acc
@@ -487,9 +573,9 @@ let execute_strategy
       in
 
       (* Clear and repopulate the hashtable with only non-stale entries *)
-      Hashtbl.clear state.pending_cancellations;
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear state.pending_cancellations;
       List.iter (fun (order_id, timestamp) ->
-        Hashtbl.add state.pending_cancellations order_id timestamp
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.add state.pending_cancellations order_id timestamp
       ) pending_cancellations;
 
       (* Update with real orders from exchange - open_orders is (order_id, price, qty, side, userref) list *)
@@ -499,7 +585,7 @@ let execute_strategy
 
       List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         (* Skip if this order was recently cancelled *)
-        let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
+        let is_cancelled = Dio_memory_tracing.Memory_tracing.Tracked.List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
         if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
@@ -523,8 +609,15 @@ let execute_strategy
            state.last_buy_order_price <- Some best_price;
            state.last_buy_order_id <- Some best_order_id);
 
-      (* Set sell orders *)
-      state.open_sell_orders <- !sell_orders;
+      (* Set sell orders - reuse existing list instead of destroy/create *)
+      state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.open_sell_orders !sell_orders;
+
+      (* Enforce hard limit of 100 open sell orders to prevent memory growth *)
+      if Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders > 100 then begin
+        let excess = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders - 100 in
+        state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.open_sell_orders (List.filteri (fun i _ -> i < 100) state.open_sell_orders.list);  (* Keep most recent 100 *)
+        Logging.warn_f ~section "Truncated %d excess open sell orders for %s (kept 100)" excess asset.symbol;
+      end;
 
       Logging.debug_f ~section "Synced %d open orders for %s: %d buys, %d sells"
         (List.length open_orders) asset.symbol
@@ -580,44 +673,41 @@ let execute_strategy
     (* Log current state for debugging race conditions *)
     if state.last_cycle <> cycle && cycle mod 100000 = 0 then begin
       Logging.debug_f ~section "Strategy state for %s: open_buy_count=%d, pending_orders=%d, buy_price=%s, sell_count=%d"
-        asset.symbol open_buy_count (List.length state.pending_orders)
+        asset.symbol open_buy_count (Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders)
         (match state.last_buy_order_price with Some p -> Printf.sprintf "%.2f" p | None -> "none")
-        (List.length state.open_sell_orders)
+        (Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders)
     end;
     (* Clean up stale pending orders (older than 5 seconds for regular orders, 15 seconds for amendments) and enforce hard limit of 50 *)
     let now = Unix.time () in
-    let original_pending_count = List.length state.pending_orders in
-    state.pending_orders <- List.filter (fun (order_id, _, _, timestamp) ->
-      let age = now -. timestamp in
+    let regular_timeout = now -. 5.0 in
+    let amend_timeout = now -. 15.0 in
+    let original_pending_count = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders in
+    state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.pending_orders (List.filter (fun (order_id, _, _, timestamp) ->
       let is_amend_order = String.starts_with ~prefix:"pending_amend_" order_id in
-      let timeout = if is_amend_order then 15.0 else 5.0 in  (* Give amendments more time since they can take longer *)
-      if age > timeout then begin
-        Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
-        false
-      end else
-        true
-    ) state.pending_orders;
+      let cutoff = if is_amend_order then amend_timeout else regular_timeout in
+      timestamp > cutoff
+    ) state.pending_orders.list);
 
     (* Enforce hard limit of 50 pending orders to prevent memory growth *)
-    if List.length state.pending_orders > 50 then begin
-      let excess = List.length state.pending_orders - 50 in
-      state.pending_orders <- take 50 state.pending_orders;  (* Keep most recent 50 *)
+    if Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders > 50 then begin
+      let excess = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders - 50 in
+      state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.pending_orders (List.filteri (fun i _ -> i < 50) state.pending_orders.list);
       Logging.warn_f ~section "Truncated %d excess pending orders for %s (kept 50)" excess asset.symbol;
     end;
 
     (* Log cleanup summary occasionally *)
-    let cleaned_pending = original_pending_count - List.length state.pending_orders in
+    let cleaned_pending = original_pending_count - Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders in
     if cleaned_pending > 0 && cycle mod 100000 = 0 then
       Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_pending asset.symbol;
 
-    if state.pending_orders <> [] then begin
+    if not (Dio_memory_tracing.Memory_tracing.Tracked.List.is_empty state.pending_orders) then begin
         (* Only log every 100,000 iterations to avoid spam *)
         if cycle mod 100000 = 0 then begin
           Logging.debug_f ~section "Waiting for %d pending orders before placing new orders for %s: [%s]"
-            (List.length state.pending_orders) asset.symbol
+            (Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders) asset.symbol
             (String.concat "; " (List.map (fun (order_id, side, price, _) ->
               Printf.sprintf "%s %s@%.2f" (string_of_order_side side) order_id price
-            ) state.pending_orders))
+            ) (Dio_memory_tracing.Memory_tracing.Tracked.List.to_list state.pending_orders)))
         end;
         (* Update cycle counter *)
         state.last_cycle <- cycle
@@ -661,7 +751,7 @@ let execute_strategy
              
              (* Enforce exactly 2x grid_interval spacing *)
              (* Find closest sell above buy (including the one we just placed) *)
-             let all_sells = (("new_sell", sell_price) :: state.open_sell_orders) in
+             let all_sells = (("new_sell", sell_price) :: Dio_memory_tracing.Memory_tracing.Tracked.List.to_list state.open_sell_orders) in
              let closest_sell = List.fold_left (fun acc (_, sp) ->
                if sp > buy_price then
                  match acc with
@@ -690,14 +780,14 @@ let execute_strategy
         state.last_cycle <- cycle
       end else if open_buy_count > 0 then begin
         (* Case 2: We have an open buy order - check for sell orders *)
-        if state.open_sell_orders <> [] then begin
+        if not (Dio_memory_tracing.Memory_tracing.Tracked.List.is_empty state.open_sell_orders) then begin
           (* Find the closest sell order *)
           let closest_sell_order = List.fold_left (fun acc (order_id, sell_price) ->
             match acc with
             | None -> Some (order_id, sell_price)
             | Some (_, best_price) ->
-                if sell_price < best_price then Some (order_id, sell_price) else acc
-          ) None state.open_sell_orders in
+              if sell_price < best_price then Some (order_id, sell_price) else acc
+          ) None (Dio_memory_tracing.Memory_tracing.Tracked.List.to_list state.open_sell_orders) in
 
           match closest_sell_order, state.last_buy_order_price, state.last_buy_order_id with
           | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
@@ -843,13 +933,14 @@ end
 let handle_order_acknowledged asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
   (* Remove from pending orders - match by side and approximate price, or by amend order_id *)
-  state.pending_orders <- List.filter (fun (pending_id, s, p, _) ->
+  state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.pending_orders (List.filter (fun (pending_id, s, p, _) ->
     (* Match regular orders by side and price, or amend orders by order_id *)
     let matches_side_price = s = side && abs_float (p -. price) < 0.01 in
     let matches_amend = String.starts_with ~prefix:"pending_amend_" pending_id &&
-                       String.sub pending_id 14 (String.length pending_id - 14) = order_id in
+                       let id_len = String.length pending_id in
+                       if id_len > 14 then String.sub pending_id 14 (id_len - 14) = order_id else false in
     not (matches_side_price || matches_amend)
-  ) state.pending_orders;
+  ) state.pending_orders.list);
 
   (* Update buy order tracking if this is a buy order acknowledgment *)
   (match side with
@@ -865,9 +956,9 @@ let handle_order_acknowledged asset_symbol order_id side price =
 let handle_order_rejected asset_symbol side price =
   let state = get_strategy_state asset_symbol in
   (* Remove from pending orders *)
-  state.pending_orders <- List.filter (fun (_, s, p, _) ->
+  state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.pending_orders (List.filter (fun (_, s, p, _) ->
     not (s = side && abs_float (p -. price) < 0.01)  (* Allow small price difference *)
-  ) state.pending_orders;
+  ) state.pending_orders.list);
   Logging.debug_f ~section "Order rejected and removed from pending: %s @ %.2f for %s"
     (string_of_order_side side) price asset_symbol;
   ()
@@ -881,15 +972,15 @@ let handle_order_cancelled asset_symbol order_id =
   
   (* Add to cancelled orders blacklist to prevent re-adding during sync *)
   let now = Unix.time () in
-  state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
+  state.cancelled_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.cancelled_orders ((order_id, now) :: state.cancelled_orders.list);
   
   (* Remove from pending orders if it's there *)
-  let original_pending_count = List.length state.pending_orders in
-  state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
+  let original_pending_count = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders in
+  state.pending_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.pending_orders (List.filter (fun (pending_id, _, _, _) ->
     pending_id <> order_id
-  ) state.pending_orders;
-  let removed_pending = original_pending_count - List.length state.pending_orders in
-  
+  ) state.pending_orders.list);
+  let removed_pending = original_pending_count - Dio_memory_tracing.Memory_tracing.Tracked.List.length state.pending_orders in
+
   (* If this was a tracked buy order, clear it *)
   (match state.last_buy_order_id with
    | Some buy_id when buy_id = order_id ->
@@ -897,13 +988,13 @@ let handle_order_cancelled asset_symbol order_id =
        state.last_buy_order_price <- None;
        Logging.debug_f ~section "Cancelled buy order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
    | _ -> ());
-  
+
   (* Remove from sell orders list *)
-  let original_sell_count = List.length state.open_sell_orders in
-  state.open_sell_orders <- List.filter (fun (sell_id, _) ->
+  let original_sell_count = Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders in
+  state.open_sell_orders <- Dio_memory_tracing.Memory_tracing.Tracked.List.replace_contents state.open_sell_orders (List.filter (fun (sell_id, _) ->
     sell_id <> order_id
-  ) state.open_sell_orders;
-  let removed_sell = original_sell_count - List.length state.open_sell_orders in
+  ) state.open_sell_orders.list);
+  let removed_sell = original_sell_count - Dio_memory_tracing.Memory_tracing.Tracked.List.length state.open_sell_orders in
   
   Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
     order_id asset_symbol removed_pending removed_sell
@@ -911,7 +1002,7 @@ let handle_order_cancelled asset_symbol order_id =
 (** Clean up pending cancellation tracking for a completed order *)
 let cleanup_pending_cancellation asset_symbol order_id =
   let state = get_strategy_state asset_symbol in
-  Hashtbl.remove state.pending_cancellations order_id
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove state.pending_cancellations order_id
 
 (** Get pending orders from ringbuffer for processing *)
 let get_pending_orders max_orders =
@@ -937,6 +1028,36 @@ let get_pending_orders max_orders =
 let init () =
   Logging.debug_f ~section "Suicide Grid strategy initialized with order buffer size 4096";
   Random.self_init ()
+
+(** Subscribe to memory cleanup events for coordinated batch processing *)
+let _memory_cleanup_subscription =
+  try
+    let (stream, close) = Dio_memory_cleanup.Memory_cleanup_events.subscribe_cleanup_events () in
+    Lwt.async (fun () ->
+      let rec process_events () =
+        Lwt.catch
+          (fun () -> Lwt.bind (Lwt_stream.get stream) (function
+            | Some event ->
+                (match event with
+                | Dio_memory_cleanup.Memory_cleanup_events.AllocationThresholdExceeded { structure_type = "List"; allocation_site; _ } ->
+                    (* High-frequency list allocations detected - could trigger batch cleanup if needed *)
+                    Logging.debug_f ~section "Received allocation threshold event for %s" allocation_site
+                | Dio_memory_cleanup.Memory_cleanup_events.BatchListUpdate { module_name = "suicide_grid"; _ } ->
+                    (* Batch list update event - could trigger immediate cleanup *)
+                    Logging.debug ~section "Received batch list update event for suicide_grid"
+                 | _ -> ());
+                process_events ()
+            | None -> Lwt.return_unit))
+          (fun exn ->
+            Logging.debug_f ~section "Memory cleanup event subscription error: %s" (Printexc.to_string exn);
+            Lwt.return_unit)
+      in
+      process_events ()
+    );
+    Some close
+  with exn ->
+    Logging.debug_f ~section "Failed to subscribe to memory cleanup events: %s" (Printexc.to_string exn);
+    None
 
 (** Strategy module interface *)
 module Strategy = struct

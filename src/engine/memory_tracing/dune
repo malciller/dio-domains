@@ -1,0 +1,22 @@
+(library
+ (name dio_memory_tracing)
+ (public_name dio.memory_tracing)
+ (libraries
+   lwt
+   lwt.unix
+   threads
+   unix
+   str
+   runtime_events
+   logging
+   yojson)
+ (modules
+   config
+   runtime_events_tracer
+   allocation_tracker
+   domain_profiler
+   leak_detector
+   reporter
+   memory_tracing)
+ (preprocess
+   (pps lwt_ppx)))

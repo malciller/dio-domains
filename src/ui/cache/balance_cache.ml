@@ -7,7 +7,6 @@
 open Lwt.Infix
 open Kraken
 open Concurrency
-open Ring_buffer
 open Dio_strategies.Fee_cache
 
 (** Individual wallet balance *)
@@ -61,7 +60,7 @@ end)
 (** Balance cache state - Two Layer Architecture *)
 type t = {
   (* Layer 1: Bounded ring buffer for individual balance/order updates *)
-  layer1_ring_buffer: balance_update_event RingBuffer.t;
+  layer1_ring_buffer: balance_update_event Ringbuffer.t;
 
   (* Layer 2: Current and previous snapshots for retry/recovery *)
   mutable current_snapshot: balance_snapshot option;
@@ -95,7 +94,7 @@ let signal_shutdown () =
 
 (** Global balance cache instance - Two Layer Architecture *)
 let cache = {
-  layer1_ring_buffer = RingBuffer.create 2000;  (* Bounded ring buffer for balance/order updates *)
+  layer1_ring_buffer = Ringbuffer.create 2000;  (* Bounded ring buffer for balance/order updates *)
   current_snapshot = None;
   previous_snapshot = None;
   balance_snapshot_event_bus = BalanceSnapshotEventBus.create "balance_snapshot";
@@ -263,7 +262,7 @@ let current_balance_snapshot () =
 
 (** Add a balance/order update event to Layer 1 ring buffer and immediately trigger Layer 2 snapshot *)
 let add_balance_update_event event =
-  RingBuffer.write cache.layer1_ring_buffer event;
+  Ringbuffer.write cache.layer1_ring_buffer event;
   Logging.debug ~section:"balance_cache" "Added balance/order update event to Layer 1 ring buffer";
 
   (* Immediately rebuild Layer 2 snapshot and publish when any event is added to Layer 1 *)

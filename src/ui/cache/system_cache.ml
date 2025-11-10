@@ -8,6 +8,9 @@ open Lwt.Infix
 open Concurrency
 open Ui_types
 
+(** Import memory tracing for tracked data structures *)
+let () = try ignore (Sys.getenv "DIO_MEMORY_TRACING") with Not_found -> ()
+
 (** Helper function to take first n elements from a list *)
 let rec take n = function
   | [] -> []
@@ -348,6 +351,9 @@ let max_memory_history = 50  (* Keep last 50 memory readings - more aggressive *
 let memory_leak_threshold_mb = 50.0  (* Alert if memory grows by 50MB in last readings *)
 let last_gc_time = ref 0.0
 let last_memory_log_time = ref 0.0  (* Track when we last logged memory stats *)
+let last_event_cleanup_time = ref 0.0  (* Track last event-driven cleanup to prevent too frequent triggers *)
+let skip_cleanup_log_counter = ref 0  (* Throttle "skipping cleanup" debug logs *)
+let skip_memory_pressure_log_counter = ref 0  (* Throttle "skipping memory pressure cleanup" warn logs *)
 
 (** Proactive trimming thresholds - trim before reaching max limits *)
 let proactive_memory_threshold = 40  (* Start trimming when we have 40 readings *)
@@ -355,8 +361,8 @@ let proactive_domain_threshold = 20  (* Start trimming when we have 20 readings 
 let proactive_feed_threshold = 8  (* Start trimming when we have 8 readings per feed *)
 
 (** Per-domain heap tracking for multicore environments *)
-let domain_heap_history : (int, (float * float) list) Hashtbl.t = Hashtbl.create 16  (* Domain ID -> [(time, heap_mb)] list *)
-let domain_allocation_rates : (int, (float * float) list) Hashtbl.t = Hashtbl.create 16  (* Domain ID -> [(time, allocs_per_sec)] list *)
+let domain_heap_history : (int, (float * float) list) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16  (* Domain ID -> [(time, heap_mb)] list *)
+let domain_allocation_rates : (int, (float * float) list) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16  (* Domain ID -> [(time, allocs_per_sec)] list *)
 let max_domain_history = 25  (* Keep last 25 readings per domain - more aggressive *)
 
 (** Per-feed memory tracking for leak detection *)
@@ -370,7 +376,7 @@ type feed_memory_stats = {
   last_growth_rate: float;  (* MB per second *)
 }
 
-let feed_memory_history : (string, feed_memory_stats list) Hashtbl.t = Hashtbl.create 16
+let feed_memory_history : (string, feed_memory_stats list) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16
 let max_feed_history = 10  (* Keep last 10 readings per feed - more aggressive *)
 
 (** Memory breakdown record type *)
@@ -507,6 +513,9 @@ let get_registry_stats () =
 (** Mutex to protect feed memory tracking updates *)
 let feed_tracking_mutex = Mutex.create ()
 
+(** Mutex to protect domain heap tracking updates *)
+let domain_tracking_mutex = Mutex.create ()
+
 (** Update per-feed memory tracking *)
 let update_feed_memory_tracking () =
   (* Protect against concurrent access *)
@@ -528,7 +537,7 @@ let update_feed_memory_tracking () =
       try
         List.iter (fun (feed_name, (feed_stats : feed_memory_stats)) ->
           (* Get existing history *)
-          let existing_history = try Hashtbl.find feed_memory_history feed_name with Not_found -> [] in
+          let existing_history = try Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find feed_memory_history feed_name with Not_found -> [] in
 
           (* Calculate growth rate if we have previous data *)
           let stats_with_growth : feed_memory_stats = match existing_history with
@@ -547,7 +556,7 @@ let update_feed_memory_tracking () =
           let trimmed_history = if List.length new_history > proactive_feed_threshold
                                then take max_feed_history new_history
                                else new_history in
-          Hashtbl.replace feed_memory_history feed_name trimmed_history
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace feed_memory_history feed_name trimmed_history
         ) feeds
       with exn ->
         Logging.debug_f ~section:"memory_monitoring" "Error updating feed memory tracking: %s" (Printexc.to_string exn);
@@ -583,13 +592,15 @@ let track_domain_memory_usage () =
   let now = Unix.time () in
   let heap_mb = get_ocaml_memory_usage () in
 
-  (* Update domain heap history *)
-  let current_history = try Hashtbl.find domain_heap_history domain_id with Not_found -> [] in
+  (* Update domain heap history - protect with mutex *)
+  Mutex.lock domain_tracking_mutex;
+  let current_history = try Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find domain_heap_history domain_id with Not_found -> [] in
   let new_history = (now, heap_mb) :: current_history in
   let trimmed_history = if List.length new_history > proactive_domain_threshold
-                        then take max_domain_history new_history
-                        else new_history in
-  Hashtbl.replace domain_heap_history domain_id trimmed_history
+                       then take max_domain_history new_history
+                       else new_history in
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace domain_heap_history domain_id trimmed_history;
+  Mutex.unlock domain_tracking_mutex
 
 (** Memory pressure levels for adaptive behavior *)
 type memory_pressure_level =
@@ -728,6 +739,13 @@ let check_memory_leak () =
       if mem_diff > memory_leak_threshold_mb && time_diff > 60.0 then (  (* 1 minute *)
         Logging.warn_f ~section:"memory_monitoring" "Memory leak detected: %.1f MB growth in %.0f seconds, triggering deep cleanup and GC"
           mem_diff time_diff;
+
+        (* Publish memory pressure event *)
+        (try
+          Dio_memory_cleanup.Memory_cleanup_events.publish_memory_pressure
+            "high" 0 1000 ["deep_cleanup"; "gc"; "memory_maintenance"]
+        with _ -> ());
+
         perform_deep_cleanup ();
         Gc.full_major ();
         last_gc_time := now;
@@ -747,10 +765,11 @@ let log_detailed_memory_stats () =
     gc_stats.fragments
     gc_stats.compactions;
 
-  (* Log per-feed statistics *)
-  let feeds = ["telemetry"; "system"; "balance"; "logs"] in
-  List.iter (fun feed_name ->
-    match try Some (Hashtbl.find feed_memory_history feed_name) with Not_found -> None with
+  (* Log per-feed statistics - protect with try_lock to avoid blocking logging *)
+  if Mutex.try_lock feed_tracking_mutex then begin
+    let feeds = ["telemetry"; "system"; "balance"; "logs"] in
+    List.iter (fun feed_name ->
+      match try Some (Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find feed_memory_history feed_name) with Not_found -> None with
     | Some (latest :: _) ->
         Logging.info_f ~section:"memory_monitoring" "Feed %s: subs=%d/%d/%d cache=%d mem=%.3fMB growth=%.6fMB/s"
           feed_name
@@ -762,7 +781,9 @@ let log_detailed_memory_stats () =
           latest.last_growth_rate
     | _ ->
         Logging.debug_f ~section:"memory_monitoring" "Feed %s: no data available" feed_name
-  ) feeds
+    ) feeds;
+    Mutex.unlock feed_tracking_mutex
+  end
 
 (** Periodic memory monitoring and automatic cleanup trigger *)
 let perform_memory_monitoring () =
@@ -775,14 +796,17 @@ let perform_memory_monitoring () =
     if now -. !last_memory_log_time > 60.0 then begin
       log_memory_stats ();
       last_memory_log_time := now;
-      (* Log per-domain statistics if available *)
-      Hashtbl.iter (fun domain_id history ->
-        match history with
-        | (latest_time, latest_heap) :: _ when now -. latest_time < 60.0 ->
-            Logging.debug_f ~section:"memory_monitoring" "Domain %d: heap=%.1fMB (last update %.1fs ago)"
-              domain_id latest_heap (now -. latest_time)
-        | _ -> ()
-      ) domain_heap_history
+      (* Log per-domain statistics if available - protect with try_lock *)
+      if Mutex.try_lock domain_tracking_mutex then begin
+        Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun domain_id history ->
+          match history with
+          | (latest_time, latest_heap) :: _ when now -. latest_time < 60.0 ->
+              Logging.debug_f ~section:"memory_monitoring" "Domain %d: heap=%.1fMB (last update %.1fs ago)"
+                domain_id latest_heap (now -. latest_time)
+          | _ -> ()
+        ) domain_heap_history;
+        Mutex.unlock domain_tracking_mutex
+      end
     end;
     (* Check memory pressure and trigger cleanup if needed *)
     let pressure_level = detect_memory_pressure () in
@@ -804,7 +828,7 @@ let check_per_feed_leaks () =
   let feeds = ["telemetry"; "system"; "balance"; "logs"] in
 
   List.iter (fun feed_name ->
-    match try Some (Hashtbl.find feed_memory_history feed_name) with Not_found -> None with
+    match try Some (Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find feed_memory_history feed_name) with Not_found -> None with
     | Some history ->
         if List.length history >= 3 then begin
           (* Check last 3 readings for trends *)
@@ -854,12 +878,16 @@ let check_per_feed_leaks () =
 let get_memory_breakdown () : memory_breakdown_info =
   let total_heap = get_ocaml_memory_usage () in
   let feed_breakdown =
-    Hashtbl.fold (fun feed_name history acc ->
-      match history with
-      | latest :: _ ->
-          (feed_name, latest.estimated_memory_mb) :: acc
-      | [] -> acc
-    ) feed_memory_history []
+    if Mutex.try_lock feed_tracking_mutex then begin
+      let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun feed_name history acc ->
+        match history with
+        | latest :: _ ->
+            (feed_name, latest.estimated_memory_mb) :: acc
+        | [] -> acc
+      ) feed_memory_history [] in
+      Mutex.unlock feed_tracking_mutex;
+      result
+    end else []
   in
 
   let total_feed_memory = List.fold_left (fun acc (_, mem) -> acc +. mem) 0.0 feed_breakdown in
@@ -875,11 +903,15 @@ let get_memory_breakdown () : memory_breakdown_info =
 (** Get memory consumption ranking (feeds with highest memory usage) *)
 let get_memory_consumption_ranking () =
   let feed_breakdown =
-    Hashtbl.fold (fun feed_name history acc ->
-      match history with
-      | latest :: _ -> (feed_name, latest) :: acc
-      | [] -> acc
-    ) feed_memory_history []
+    if Mutex.try_lock feed_tracking_mutex then begin
+      let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.fold (fun feed_name history acc ->
+        match history with
+        | latest :: _ -> (feed_name, latest) :: acc
+        | [] -> acc
+      ) feed_memory_history [] in
+      Mutex.unlock feed_tracking_mutex;
+      result
+    end else []
   in
 
   (* Sort by estimated memory usage, descending *)
@@ -935,7 +967,7 @@ let generate_memory_diagnostic_report () =
 
   (* Show detailed feed stats *)
   Logging.info ~section:"memory_monitoring" "Detailed feed statistics:";
-  Hashtbl.iter (fun feed_name history ->
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun feed_name history ->
     match history with
     | latest :: _ ->
         Logging.info_f ~section:"memory_monitoring" "  %s: subs=%d/%d/%d cache=%d mem=%.3fMB"
@@ -1014,12 +1046,21 @@ let perform_memory_maintenance () =
     (* Clean up sliding counters *)
     let sliding_cleaned = Telemetry.perform_sliding_counter_cleanup () in
 
+    (* Clean up stale telemetry metrics *)
+    Telemetry.prune_stale_metrics ();
+
+    (* Clean up stale active allocations *)
+    Dio_memory_tracing.Memory_tracing.Internal.Allocation_tracker.cleanup_stale_allocations ();
+
+    (* Update memory monitoring gauges *)
+    Telemetry.update_memory_monitoring_gauges ();
+
     (* Update memory leak detection metrics - collect values first, then set gauges to avoid nested mutex locks *)
     (try
        (* Collect all values first *)
        let kraken_open_orders, kraken_order_to_symbol = Kraken.Kraken_executions_feed.get_memory_stats () in
-       let market_maker_states = Hashtbl.length Dio_strategies.Market_maker.strategy_states in
-       let suicide_grid_states = Hashtbl.length Dio_strategies.Suicide_grid.strategy_states in
+       let market_maker_states = Dio_strategies.Market_maker.get_strategy_states_count () in
+       let suicide_grid_states = Dio_strategies.Suicide_grid.get_strategy_states_count () in
        let telemetry_subscribers = Telemetry_cache.get_subscriber_count () in
        let balance_subscribers = Balance_cache.get_subscriber_count () in
        let logs_subscribers = Logs_cache.get_subscriber_count () in
@@ -1456,39 +1497,37 @@ let subscribe_system_stats () =
   let subscription = SystemStatsEventBus.subscribe ~persistent:true cache.system_stats_event_bus in
   (subscription.stream, subscription.close)
 
-(** Get current system stats (can block on first call if not ready) *)
-let current_system_stats () =
+(** Get current system stats (async version) *)
+let current_system_stats () : system_stats Lwt.t =
   match cache.current_system_stats with
-  | Some stats -> stats
+  | Some stats -> Lwt.return stats
   | None ->
-      (* This is a fallback for direct calls, might block briefly *)
-      Lwt_main.run (
-        let%lwt stats_opt = create_system_stats_lwt () in
-        match stats_opt with
-        | Some stats ->
-            cache.current_system_stats <- Some stats;
-            Lwt.return stats
-        | None ->
-            Lwt.return {
-              cpu_usage = 0.0;
-              core_usages = [];
-              cpu_cores = None;
-              cpu_vendor = None;
-              cpu_model = None;
-              memory_total = 0;
-              memory_used = 0;
-              memory_free = 0;
-              swap_total = 0;
-              swap_used = 0;
-              load_avg_1 = 0.0;
-              load_avg_5 = 0.0;
-              load_avg_15 = 0.0;
-              processes = 0;
-              cpu_temp = None;
-              gpu_temp = None;
-              temps = [];
-            }
-      )
+      (* This is a fallback for direct calls - collect stats async *)
+      let%lwt stats_opt = create_system_stats_lwt () in
+      match stats_opt with
+      | Some stats ->
+          cache.current_system_stats <- Some stats;
+          Lwt.return stats
+      | None ->
+          Lwt.return {
+            cpu_usage = 0.0;
+            core_usages = [];
+            cpu_cores = None;
+            cpu_vendor = None;
+            cpu_model = None;
+            memory_total = 0;
+            memory_used = 0;
+            memory_free = 0;
+            swap_total = 0;
+            swap_used = 0;
+            load_avg_1 = 0.0;
+            load_avg_5 = 0.0;
+            load_avg_15 = 0.0;
+            processes = 0;
+            cpu_temp = None;
+            gpu_temp = None;
+            temps = [];
+          }
 
 (** Publish initial system stats snapshot synchronously *)
 let publish_initial_snapshot () =
@@ -1519,6 +1558,20 @@ let publish_initial_snapshot () =
   SystemStatsEventBus.publish cache.system_stats_event_bus placeholder_stats;
   Logging.debug ~section:"system_cache" "Initial placeholder system stats snapshot published"
 
+(** Enhanced memory maintenance with cleanup event publishing *)
+let perform_memory_maintenance_with_events () =
+  let start_time = Unix.gettimeofday () in
+  perform_memory_maintenance ();
+  let duration = Unix.gettimeofday () -. start_time in
+
+  (* Publish cleanup completion event *)
+  (try
+    Dio_memory_cleanup.Memory_cleanup_events.publish_deferred_cleanup
+      "system_cache" "memory_maintenance" (int_of_float (duration *. 1000000.0)) 0.5
+  with _ -> ());
+
+  Logging.debug_f ~section:"memory_monitoring" "Memory maintenance completed in %.3f seconds" duration
+
 (** Start event-driven system metrics computation *)
 let start_system_updater () =
   Logging.debug ~section:"system_cache" "Starting event-driven system metrics computation";
@@ -1544,14 +1597,14 @@ let start_system_updater () =
     compute_loop ()
   ) in
 
-  (* Start periodic memory maintenance (every 45 seconds) *)
+(** Start periodic memory maintenance (every 45 seconds) *)
   let _memory_maintenance = Lwt.async (fun () ->
     let rec maintenance_loop () =
       if Atomic.get shutdown_requested then
         Lwt.return_unit
       else begin
-        (* Perform comprehensive memory maintenance *)
-        perform_memory_maintenance ();
+        (* Perform comprehensive memory maintenance with event publishing *)
+        perform_memory_maintenance_with_events ();
         Lwt_unix.sleep 45.0 >>= maintenance_loop
       end
     in
@@ -1582,6 +1635,64 @@ let force_cleanup_stale_subscribers () =
   SystemStatsEventBus.force_cleanup_stale_subscribers cache.system_stats_event_bus ()
 
 (** Initialize the system cache with double-checked locking *)
+(** Subscribe to memory cleanup events for coordinated batch processing *)
+let _memory_cleanup_subscription =
+  try
+    let (stream, close) = Dio_memory_cleanup.Memory_cleanup_events.subscribe_cleanup_events () in
+    Lwt.async (fun () ->
+      let rec process_events () =
+        Lwt.catch
+          (fun () -> Lwt.bind (Lwt_stream.get stream) (function
+            | Some event ->
+                (match event with
+                | Dio_memory_cleanup.Memory_cleanup_events.AllocationThresholdExceeded { structure_type; allocation_site; frequency_per_minute; _ } ->
+                    (* High-frequency allocations detected - trigger asynchronous memory maintenance with throttling *)
+                    let now = Unix.time () in
+                    let time_since_last_cleanup = now -. !last_event_cleanup_time in
+                    if time_since_last_cleanup >= 60.0 then begin
+                      Logging.debug_f ~section:"system_cache" "Received allocation threshold event for %s at %s (%d/min) - scheduling cleanup asynchronously (%.1fs since last)" structure_type allocation_site frequency_per_minute time_since_last_cleanup;
+                      last_event_cleanup_time := now;
+                      Lwt.async (fun () -> Lwt.return (perform_memory_maintenance ()))
+                    end else begin
+                      (* Throttle logging - only log every 1000th skip to reduce spam *)
+                      skip_cleanup_log_counter := !skip_cleanup_log_counter + 1;
+                      if !skip_cleanup_log_counter mod 1000 = 0 then
+                        Logging.debug_f ~section:"system_cache" "Skipping allocation threshold cleanup for %s at %s - too soon since last cleanup (%.1fs < 60s) [logged 1/%d events]" structure_type allocation_site time_since_last_cleanup 1000
+                    end
+                | Dio_memory_cleanup.Memory_cleanup_events.MemoryPressureEvent { pressure_level; active_allocations; _ } ->
+                    (* Memory pressure detected - perform deep cleanup asynchronously with throttling *)
+                    let now = Unix.time () in
+                    let time_since_last_cleanup = now -. !last_event_cleanup_time in
+                    if time_since_last_cleanup >= 60.0 then begin
+                      Logging.warn_f ~section:"system_cache" "Memory pressure event received: %s (%d active allocations) - scheduling deep cleanup asynchronously (%.1fs since last)" pressure_level active_allocations time_since_last_cleanup;
+                      last_event_cleanup_time := now;
+                      Lwt.async (fun () -> Lwt.return (perform_deep_cleanup ()))
+                    end else begin
+                      (* Throttle logging - only log every 100th skip to reduce spam *)
+                      skip_memory_pressure_log_counter := !skip_memory_pressure_log_counter + 1;
+                      if !skip_memory_pressure_log_counter mod 100 = 0 then
+                        Logging.warn_f ~section:"system_cache" "Skipping memory pressure cleanup - too soon since last cleanup (%.1fs < 60s) [logged 1/%d events]" time_since_last_cleanup 100
+                    end
+                | Dio_memory_cleanup.Memory_cleanup_events.BatchMapUpdate { module_name; operation_count; _ } ->
+                    (* Batch operations completed - could trigger memory maintenance *)
+                    Logging.debug_f ~section:"system_cache" "Batch Map update completed for %s (%d operations)" module_name operation_count
+                | Dio_memory_cleanup.Memory_cleanup_events.BatchListUpdate { module_name; operation_count; _ } ->
+                    (* Batch operations completed - could trigger memory maintenance *)
+                    Logging.debug_f ~section:"system_cache" "Batch List update completed for %s (%d operations)" module_name operation_count
+                 | _ -> ());
+                process_events ()
+            | None -> Lwt.return_unit))
+          (fun exn ->
+            Logging.debug_f ~section:"system_cache" "Memory cleanup event subscription error: %s" (Printexc.to_string exn);
+            Lwt.return_unit)
+      in
+      process_events ()
+    );
+    Some close
+  with exn ->
+    Logging.debug_f ~section:"system_cache" "Failed to subscribe to memory cleanup events: %s" (Printexc.to_string exn);
+    None
+
 let init () =
   (* First check without locking (fast path) *)
   if !initialized then (
