@@ -42,13 +42,18 @@ let init () =
 
 (** Shutdown memory tracing system *)
 let shutdown () =
-  if Config.is_memory_tracing_enabled () then begin
-    Logging.info ~section:"memory_tracing" "Shutting down memory tracing system...";
+  Logging.info ~section:"memory_tracing" "Shutting down memory tracing system...";
 
+  (* Request shutdown of background threads *)
+  Allocation_tracker.request_shutdown ();
+
+  if Config.is_memory_tracing_enabled () then begin
     (* Stop runtime events tracer *)
     Runtime_events_tracer.stop ();
 
     Logging.info ~section:"memory_tracing" "Memory tracing system shut down";
+  end else begin
+    Logging.info ~section:"memory_tracing" "Memory tracing background threads requested to shutdown";
   end
 
 (** Generate immediate memory report *)
@@ -86,8 +91,23 @@ let is_enabled () = Config.is_memory_tracing_enabled ()
 
 (** Reconfigure tracing (for runtime adjustments) *)
 let reconfigure () =
-  if Config.is_memory_tracing_enabled () then begin
-    Config.load_from_environment ();
+  let was_enabled = Config.is_memory_tracing_enabled () in
+  Config.load_from_environment ();
+  let now_enabled = Config.is_memory_tracing_enabled () in
+
+  if now_enabled && not was_enabled then begin
+    (* Memory tracing was just enabled - start background threads *)
+    Logging.info ~section:"memory_tracing" "Memory tracing enabled at runtime - starting background threads";
+
+    (* Start periodic size sampling for dynamic size tracking *)
+    let _size_sampling_thread = Allocation_tracker.start_periodic_size_sampling () in
+
+    (* Start periodic reporting *)
+    let interval = Config.get_reporting_interval () in
+    Reporter.start_periodic_reporting interval;
+
+    Logging.info_f ~section:"memory_tracing" "Memory tracing system initialized (reporting every %d seconds)" interval;
+  end else if was_enabled then begin
     Logging.info ~section:"memory_tracing" "Memory tracing reconfigured";
   end
 
@@ -120,12 +140,18 @@ module Tracked = struct
   module Map = Allocation_tracker.TrackedMap
   module Queue = Allocation_tracker.TrackedQueue
   module RingBuffer = Allocation_tracker.TrackedRingBuffer
+  module LwtPromise = Allocation_tracker.TrackedLwtPromise
 end
 
 (** Manual allocation tracking functions *)
 let track_custom_structure = Allocation_tracker.track_custom_structure
 let untrack_custom_structure = Allocation_tracker.untrack_custom_structure
 let record_reuse = Allocation_tracker.record_reuse
+
+(** Lwt promise tracking functions *)
+let register_tracked_promise = Allocation_tracker.register_tracked_promise
+let cleanup_completed_promises = Allocation_tracker.cleanup_completed_promises
+let get_tracked_promises_count = Allocation_tracker.get_tracked_promises_count
 
 (** Tracking deferral control - for avoiding deadlocks during critical phases *)
 let defer_allocation_tracking = Allocation_tracker.defer_tracking

@@ -5,6 +5,8 @@
     using backtraces for precise leak identification.
 *)
 
+open Lwt.Infix
+
 (** Allocation site information *)
 type allocation_site = {
   file: string;
@@ -54,6 +56,9 @@ let recreation_counter = Atomic.make 0
 (** Tracking deferral flag - when set, allocation tracking is deferred to avoid deadlocks *)
 let tracking_deferred = Atomic.make false
 
+(** Shutdown flag for background threads *)
+let shutdown_requested = Atomic.make false
+
 (** Global event callbacks *)
 let event_callbacks = ref []
 let callbacks_mutex = Mutex.create ()
@@ -61,6 +66,16 @@ let callbacks_mutex = Mutex.create ()
 (** Allocation event processor callback - registered externally to avoid circular dependencies *)
 let allocation_event_processor = ref (fun _ _ _ _ _ _ _ -> ())
 let allocation_event_processor_mutex = Mutex.create ()
+
+(** Active allocation registry mutex - defined early to avoid forward reference issues *)
+let active_allocations_mutex = Mutex.create ()
+
+(** Active allocation registry for tracking live allocations *)
+(* Cannot use TrackedHashtbl due to bootstrap/circular dependency - this is the core infrastructure *)
+let active_allocations = Hashtbl.create 1024
+
+(** Replaced allocations queue mutex - defined early to avoid forward reference issues *)
+let replaced_allocations_mutex = Mutex.create ()
 
 (** Track reuse events *)
 let record_reuse () = Atomic.incr reuse_counter
@@ -71,19 +86,9 @@ let record_recreation () = Atomic.incr recreation_counter
 (** Get reuse metrics *)
 let get_reuse_metrics () = (Atomic.get reuse_counter, Atomic.get recreation_counter)
 
-(** Active allocation registry for tracking live allocations *)
-(* This hashtable remains untracked - it's the core tracking infrastructure itself *)
-let active_allocations = Hashtbl.create 1024
-let active_allocations_mutex = Mutex.create ()
-
 (** Active allocations limits to prevent unbounded growth *)
 let max_active_allocations = 10000  (* Maximum number of active allocations to track *)
 let stale_allocation_seconds = 86400.0  (* Remove allocations older than 24 hours *)
-
-(** Queue of allocation IDs that have been replaced and are safe to destroy *)
-let replaced_allocations_queue : int Queue.t = Queue.create ()
-let replaced_allocations_mutex = Mutex.create ()
-let replacement_counter = Atomic.make 0
 
 (** Defer allocation tracking during critical phases *)
 let defer_tracking () = Atomic.set tracking_deferred true
@@ -93,6 +98,12 @@ let resume_tracking () = Atomic.set tracking_deferred false
 
 (** Check if tracking is currently deferred *)
 let is_tracking_deferred () = Atomic.get tracking_deferred
+
+(** Request shutdown of background threads *)
+let request_shutdown () = Atomic.set shutdown_requested true
+
+(** Check if shutdown has been requested *)
+let is_shutdown_requested () = Atomic.get shutdown_requested
 
 (** Register an event callback *)
 let add_callback callback =
@@ -431,6 +442,141 @@ let update_allocation_size record new_size =
     end;
   end
 
+(** Tracked Queue wrapper - provides memory tracking for mutable queues *)
+module TrackedQueue = struct
+  type 'a t = {
+    queue: 'a Queue.t;
+    record: allocation_record;
+    mutable length: int;
+  }
+
+  (** Estimate memory usage of a queue (rough approximation) *)
+  let estimate_memory_usage length =
+    (* Base overhead + entry overhead * length *)
+    (* Queue has overhead for array storage and indices *)
+    let base_overhead = 48 in  (* queue structure itself *)
+    let entry_overhead = 16 in  (* per element overhead *)
+    base_overhead + (entry_overhead * length)
+
+  (** Update the allocation record with current memory usage *)
+  let update_size t =
+    let current_size = estimate_memory_usage t.length in
+    update_allocation_size t.record current_size
+
+  (** Create a new empty tracked queue *)
+  let create () =
+    let queue = Queue.create () in
+    let record = record_allocation "Queue" (estimate_memory_usage 0) in
+    { queue; record; length = 0 }
+
+  (** Add an element to the queue *)
+  let push value t =
+    Queue.push value t.queue;
+    t.length <- t.length + 1;
+    update_size t
+
+  (** Take and remove the first element *)
+  let pop t =
+    let result = Queue.pop t.queue in
+    t.length <- t.length - 1;
+    update_size t;
+    result
+
+  (** Take and remove the first element (non-raising) *)
+  let take t =
+    let result = Queue.take t.queue in
+    t.length <- t.length - 1;
+    update_size t;
+    result
+
+  (** Peek at the first element without removing it *)
+  let peek t = Queue.peek t.queue
+
+  (** Peek at the first element without removing it (non-raising) *)
+  let peek_opt t = Queue.peek_opt t.queue
+
+  (** Take and remove the first element (non-raising) *)
+  let take_opt t =
+    match Queue.take_opt t.queue with
+    | Some value ->
+        t.length <- t.length - 1;
+        update_size t;
+        Some value
+    | None -> None
+
+  (** Remove all elements from the queue *)
+  let clear t =
+    Queue.clear t.queue;
+    t.length <- 0;
+    update_size t
+
+  (** Get the number of elements in the queue *)
+  let length t = t.length
+
+  (** Check if the queue is empty *)
+  let is_empty t = t.length = 0
+
+  (** Iterate over elements *)
+  let iter f t = Queue.iter f t.queue
+
+  (** Fold over elements *)
+  let fold f t init = Queue.fold f t.queue init
+
+  (** Convert to list *)
+  let to_list t =
+    let result = ref [] in
+    Queue.iter (fun x -> result := x :: !result) t.queue;
+    List.rev !result
+
+  (** Add all elements from a list *)
+  let add_seq t seq =
+    Queue.add_seq t.queue seq;
+    (* Count elements in sequence *)
+    let count = Seq.fold_left (fun acc _ -> acc + 1) 0 seq in
+    t.length <- t.length + count;
+    update_size t
+
+  (** Convert to sequence *)
+  let to_seq t = Queue.to_seq t.queue
+
+  (** Create from sequence *)
+  let of_seq seq =
+    let queue = Queue.of_seq seq in
+    let length = Seq.fold_left (fun acc _ -> acc + 1) 0 seq in
+    let record = record_allocation "Queue" (estimate_memory_usage length) in
+    { queue; record; length }
+
+  (** Create from list *)
+  let of_list lst =
+    let queue = Queue.create () in
+    List.iter (fun x -> Queue.push x queue) lst;
+    let length = List.length lst in
+    let record = record_allocation "Queue" (estimate_memory_usage length) in
+    { queue; record; length }
+
+  (** Copy the queue *)
+  let copy t =
+    let new_queue = Queue.copy t.queue in
+    let record = record_allocation "Queue" (estimate_memory_usage t.length) in
+    { queue = new_queue; record; length = t.length }
+
+  (** Transfer elements from one queue to another *)
+  let transfer src dst =
+    let count = Queue.length src.queue in
+    Queue.transfer src.queue dst.queue;
+    src.length <- 0;
+    dst.length <- dst.length + count;
+    update_size src;
+    update_size dst
+
+  (** Destroy the tracked queue *)
+  let destroy t = record_deallocation t.record
+end
+
+(** Queue of allocation IDs that have been replaced and are safe to destroy *)
+let replaced_allocations_queue : int TrackedQueue.t = TrackedQueue.create ()
+let replacement_counter = Atomic.make 0
+
 (** Record that an allocation has been replaced by a new one *)
 let record_replacement old_id new_id =
   if Config.is_memory_tracing_enabled () && not (Atomic.get tracking_deferred) then begin
@@ -443,7 +589,7 @@ let record_replacement old_id new_id =
            (* Add to replacement queue for deferred destruction *)
            Mutex.unlock active_allocations_mutex;
            if Mutex.try_lock replaced_allocations_mutex then begin
-             Queue.push old_id replaced_allocations_queue;
+             TrackedQueue.push old_id replaced_allocations_queue;
              Atomic.incr replacement_counter;
              Mutex.unlock replaced_allocations_mutex;
              Logging.debug_f ~section:"allocation_tracker"
@@ -485,11 +631,11 @@ let destroy_replaced_allocations ?(batch_size = 50) () =
     if try_lock_with_timeout replaced_allocations_mutex timeout_ms then begin
       (* Collect batch of IDs to destroy *)
       let ids_to_destroy = ref [] in
-      let queue_length = Queue.length replaced_allocations_queue in
+      let queue_length = TrackedQueue.length replaced_allocations_queue in
       let batch_count = min batch_size queue_length in
       for _ = 1 to batch_count do
-        if not (Queue.is_empty replaced_allocations_queue) then
-          ids_to_destroy := Queue.pop replaced_allocations_queue :: !ids_to_destroy
+        if not (TrackedQueue.is_empty replaced_allocations_queue) then
+          ids_to_destroy := TrackedQueue.take replaced_allocations_queue :: !ids_to_destroy
       done;
       Mutex.unlock replaced_allocations_mutex;
       
@@ -520,7 +666,7 @@ let destroy_replaced_allocations ?(batch_size = 50) () =
       end else begin
         (* Couldn't acquire active_allocations_mutex - put IDs back in queue *)
         Mutex.lock replaced_allocations_mutex;
-        List.iter (fun id -> Queue.push id replaced_allocations_queue) !ids_to_destroy;
+        List.iter (fun id -> TrackedQueue.push id replaced_allocations_queue) !ids_to_destroy;
         Mutex.unlock replaced_allocations_mutex;
         Logging.debug_f ~section:"allocation_tracker"
           "Deferred destruction of %d allocations (mutex contended)" (List.length !ids_to_destroy)
@@ -538,7 +684,7 @@ let destroy_replaced_allocations ?(batch_size = 50) () =
 (** Get count of allocations waiting to be destroyed *)
 let get_replaced_allocations_count () =
   if Mutex.try_lock replaced_allocations_mutex then begin
-    let count = Queue.length replaced_allocations_queue in
+    let count = TrackedQueue.length replaced_allocations_queue in
     Mutex.unlock replaced_allocations_mutex;
     count
   end else
@@ -563,11 +709,11 @@ let destroy_replaced_allocations_aggressive ?(batch_size = 1000) ?(timeout_ms = 
     if try_lock_with_timeout replaced_allocations_mutex timeout_ms then begin
       (* Collect larger batch of IDs to destroy *)
       let ids_to_destroy = ref [] in
-      let queue_length = Queue.length replaced_allocations_queue in
+      let queue_length = TrackedQueue.length replaced_allocations_queue in
       let batch_count = min batch_size queue_length in
       for _ = 1 to batch_count do
-        if not (Queue.is_empty replaced_allocations_queue) then
-          ids_to_destroy := Queue.pop replaced_allocations_queue :: !ids_to_destroy
+        if not (TrackedQueue.is_empty replaced_allocations_queue) then
+          ids_to_destroy := TrackedQueue.take replaced_allocations_queue :: !ids_to_destroy
       done;
       Mutex.unlock replaced_allocations_mutex;
 
@@ -598,7 +744,7 @@ let destroy_replaced_allocations_aggressive ?(batch_size = 1000) ?(timeout_ms = 
       end else begin
         (* Couldn't acquire active_allocations_mutex - put IDs back in queue *)
         Mutex.lock replaced_allocations_mutex;
-        List.iter (fun id -> Queue.push id replaced_allocations_queue) !ids_to_destroy;
+        List.iter (fun id -> TrackedQueue.push id replaced_allocations_queue) !ids_to_destroy;
         Mutex.unlock replaced_allocations_mutex;
         Logging.debug_f ~section:"allocation_tracker"
           "Aggressive cleanup deferred: couldn't acquire active_allocations_mutex"
@@ -1148,136 +1294,6 @@ module TrackedMap = struct
   end
 end
 
-(** Tracked Queue wrapper - provides memory tracking for mutable queues *)
-module TrackedQueue = struct
-  type 'a t = {
-    queue: 'a Queue.t;
-    record: allocation_record;
-    mutable length: int;
-  }
-
-  (** Estimate memory usage of a queue (rough approximation) *)
-  let estimate_memory_usage length =
-    (* Base overhead + entry overhead * length *)
-    (* Queue has overhead for array storage and indices *)
-    let base_overhead = 48 in  (* queue structure itself *)
-    let entry_overhead = 16 in  (* per element overhead *)
-    base_overhead + (entry_overhead * length)
-
-  (** Update the allocation record with current memory usage *)
-  let update_size t =
-    let current_size = estimate_memory_usage t.length in
-    update_allocation_size t.record current_size
-
-  (** Create a new empty tracked queue *)
-  let create () =
-    let queue = Queue.create () in
-    let record = record_allocation "Queue" (estimate_memory_usage 0) in
-    { queue; record; length = 0 }
-
-  (** Add an element to the queue *)
-  let push value t =
-    Queue.push value t.queue;
-    t.length <- t.length + 1;
-    update_size t
-
-  (** Take and remove the first element *)
-  let pop t =
-    let result = Queue.pop t.queue in
-    t.length <- t.length - 1;
-    update_size t;
-    result
-
-  (** Take and remove the first element (non-raising) *)
-  let take t =
-    let result = Queue.take t.queue in
-    t.length <- t.length - 1;
-    update_size t;
-    result
-
-  (** Peek at the first element without removing it *)
-  let peek t = Queue.peek t.queue
-
-  (** Peek at the first element without removing it (non-raising) *)
-  let peek_opt t = Queue.peek_opt t.queue
-
-  (** Take and remove the first element (non-raising) *)
-  let take_opt t =
-    match Queue.take_opt t.queue with
-    | Some value ->
-        t.length <- t.length - 1;
-        update_size t;
-        Some value
-    | None -> None
-
-  (** Remove all elements from the queue *)
-  let clear t =
-    Queue.clear t.queue;
-    t.length <- 0;
-    update_size t
-
-  (** Get the number of elements in the queue *)
-  let length t = t.length
-
-  (** Check if the queue is empty *)
-  let is_empty t = t.length = 0
-
-  (** Iterate over elements *)
-  let iter f t = Queue.iter f t.queue
-
-  (** Fold over elements *)
-  let fold f t init = Queue.fold f t.queue init
-
-  (** Convert to list *)
-  let to_list t =
-    let result = ref [] in
-    Queue.iter (fun x -> result := x :: !result) t.queue;
-    List.rev !result
-
-  (** Add all elements from a list *)
-  let add_seq t seq =
-    Queue.add_seq t.queue seq;
-    (* Count elements in sequence *)
-    let count = Seq.fold_left (fun acc _ -> acc + 1) 0 seq in
-    t.length <- t.length + count;
-    update_size t
-
-  (** Convert to sequence *)
-  let to_seq t = Queue.to_seq t.queue
-
-  (** Create from sequence *)
-  let of_seq seq =
-    let queue = Queue.of_seq seq in
-    let length = Seq.fold_left (fun acc _ -> acc + 1) 0 seq in
-    let record = record_allocation "Queue" (estimate_memory_usage length) in
-    { queue; record; length }
-
-  (** Create from list *)
-  let of_list lst =
-    let queue = Queue.create () in
-    List.iter (fun x -> Queue.push x queue) lst;
-    let length = List.length lst in
-    let record = record_allocation "Queue" (estimate_memory_usage length) in
-    { queue; record; length }
-
-  (** Copy the queue *)
-  let copy t =
-    let new_queue = Queue.copy t.queue in
-    let record = record_allocation "Queue" (estimate_memory_usage t.length) in
-    { queue = new_queue; record; length = t.length }
-
-  (** Transfer elements from one queue to another *)
-  let transfer src dst =
-    let count = Queue.length src.queue in
-    Queue.transfer src.queue dst.queue;
-    src.length <- 0;
-    dst.length <- dst.length + count;
-    update_size src;
-    update_size dst
-
-  (** Destroy the tracked queue *)
-  let destroy t = record_deallocation t.record
-end
 
 (** Safe Tracked Hashtbl wrapper with type-level mutex enforcement *)
 module SafeTrackedHashtbl = struct
@@ -1360,6 +1376,9 @@ module SafeTrackedHashtbl = struct
   let destroy (safe_hashtbl : ('k, 'v) t) =
     TrackedHashtbl.destroy safe_hashtbl.hashtbl
 end
+
+(** Queue of allocation IDs that have been replaced and are safe to destroy *)
+let replacement_counter = Atomic.make 0
 
 (** Custom structure tracking - for domain registries, event buses, etc. *)
 let track_custom_structure name size =
@@ -1454,33 +1473,178 @@ let set_size_sampling_interval interval =
 (** Get current size sampling interval *)
 let get_size_sampling_interval () = !size_sampling_interval_seconds
 
+(** Tracked Lwt Promise wrapper - for tracking async tasks and preventing memory leaks *)
+module TrackedLwtPromise = struct
+  type 'a t = {
+    mutable promise: 'a Lwt.t;
+    record: allocation_record;
+    mutable completed: bool;
+    created_at: float;
+    mutable completed_at: float option;
+  }
+
+  (** Estimate memory usage of a Lwt promise (rough approximation) *)
+  let estimate_memory_usage () =
+    (* Base overhead for Lwt promise structure + callback chains *)
+    let base_overhead = 96 in  (* Lwt promise + internal structures *)
+    base_overhead
+
+  (** Create a tracked Lwt async task *)
+  let async task =
+    let record = record_allocation "LwtPromise" (estimate_memory_usage ()) in
+    let now = Unix.gettimeofday () in
+    let tracked_promise = {
+      promise = Lwt.return_unit;
+      record;
+      completed = false;
+      created_at = now;
+      completed_at = None;
+    } in
+
+    (* Create the actual promise with completion tracking *)
+    let promise = Lwt.catch
+      (fun () -> task ())
+      (fun exn ->
+        tracked_promise.completed <- true;
+        tracked_promise.completed_at <- Some (Unix.gettimeofday ());
+        Lwt.fail exn
+      )
+    >|= fun result ->
+      tracked_promise.completed <- true;
+      tracked_promise.completed_at <- Some (Unix.gettimeofday ());
+      result
+    in
+
+    tracked_promise.promise <- promise;
+    tracked_promise
+
+  (** Mark promise as completed and record deallocation *)
+  let mark_completed t =
+    if not t.completed then begin
+      t.completed <- true;
+      t.completed_at <- Some (Unix.gettimeofday ());
+      record_deallocation t.record
+    end
+
+  (** Check if promise is completed *)
+  let is_completed t = t.completed
+
+  (** Get promise lifetime *)
+  let lifetime t =
+    match t.completed_at with
+    | Some completed_at -> completed_at -. t.created_at
+    | None -> Unix.gettimeofday () -. t.created_at
+
+  (** Destroy tracked promise if not already completed *)
+  let destroy t =
+    if not t.completed then begin
+      record_deallocation t.record
+    end
+end
+
+(** Existential wrapper for tracked promises of different types *)
+type any_tracked_promise = AnyPromise : 'a TrackedLwtPromise.t -> any_tracked_promise
+
+(** Global registry of tracked Lwt promises for cleanup *)
+let tracked_promises = ref []
+let tracked_promises_mutex = Mutex.create ()
+
+(** Register a tracked promise for cleanup monitoring *)
+let register_tracked_promise promise =
+  if Config.is_memory_tracing_enabled () then begin
+    Mutex.lock tracked_promises_mutex;
+    tracked_promises := (AnyPromise promise) :: !tracked_promises;
+    Mutex.unlock tracked_promises_mutex;
+  end
+
+(** Cleanup completed Lwt promises to prevent memory leaks *)
+let cleanup_completed_promises ?(max_age_seconds=300.0) () =
+  if Config.is_memory_tracing_enabled () then begin
+    Mutex.lock tracked_promises_mutex;
+    let now = Unix.gettimeofday () in
+    let original_count = List.length !tracked_promises in
+
+    (* Filter out completed promises and old uncompleted ones *)
+    let filtered = List.filter (fun (AnyPromise promise) ->
+      if TrackedLwtPromise.is_completed promise then begin
+        (* Promise completed, destroy it *)
+        TrackedLwtPromise.destroy promise;
+        false  (* Remove from registry *)
+      end else if (now -. promise.created_at) > max_age_seconds then begin
+        (* Promise is too old and still not completed, force cleanup *)
+        Logging.debug_f ~section:"allocation_tracker" "Force cleaning up old Lwt promise (age=%.1fs)" (now -. promise.created_at);
+        TrackedLwtPromise.destroy promise;
+        false  (* Remove from registry *)
+      end else begin
+        true   (* Keep in registry *)
+      end
+    ) !tracked_promises in
+
+    tracked_promises := filtered;
+    let cleaned_count = original_count - List.length filtered in
+    Mutex.unlock tracked_promises_mutex;
+
+    if cleaned_count > 0 then (
+      Logging.debug_f ~section:"allocation_tracker" "Cleaned up %d completed Lwt promises" cleaned_count;
+      cleaned_count
+    ) else 0;
+  end else 0
+
+(** Get count of currently tracked promises *)
+let get_tracked_promises_count () =
+  Mutex.lock tracked_promises_mutex;
+  let count = List.length !tracked_promises in
+  Mutex.unlock tracked_promises_mutex;
+  count
+
 (** Periodic size sampling thread *)
 let start_periodic_size_sampling () =
+  (* Reset shutdown flag when starting *)
+  Atomic.set shutdown_requested false;
+
   let rec sampling_loop () =
-    Thread.delay !size_sampling_interval_seconds;
-    if Config.is_memory_tracing_enabled () then begin
-      try
-        (* Defer allocation tracking during size sampling to avoid deadlocks *)
-        defer_tracking ();
+    (* Check if shutdown was requested *)
+    if is_shutdown_requested () then begin
+      Logging.debug ~section:"allocation_tracker" "Size sampling thread shutting down";
+      ()
+    end else begin
+      Thread.delay !size_sampling_interval_seconds;
+      if is_shutdown_requested () then begin
+        Logging.debug ~section:"allocation_tracker" "Size sampling thread shutting down";
+        ()
+      end else if Config.is_memory_tracing_enabled () then begin
+        try
+          (* Defer allocation tracking during size sampling to avoid deadlocks *)
+          defer_tracking ();
 
-        (* Resample sizes of all active allocations *)
-        (* Note: This is a simplified implementation. In practice, we'd need
-           type-specific size calculation functions for each data structure type.
-           For now, we'll just log that sampling occurred. *)
+          (* Cleanup completed Lwt promises to prevent memory leaks *)
+          let cleaned_promises = cleanup_completed_promises () in
+          if cleaned_promises > 0 then
+            Logging.debug_f ~section:"allocation_tracker" "Periodic cleanup: removed %d completed Lwt promises" cleaned_promises;
 
-        Logging.debug ~section:"allocation_tracker" "Periodic size sampling completed";
+          (* Resample sizes of all active allocations *)
+          (* Note: This is a simplified implementation. In practice, we'd need
+             type-specific size calculation functions for each data structure type.
+             For now, we'll just log that sampling occurred. *)
 
-        (* Resume allocation tracking *)
-        resume_tracking ();
+          Logging.debug ~section:"allocation_tracker" "Periodic size sampling completed";
 
-        (* Continue sampling *)
+          (* Resume allocation tracking *)
+          resume_tracking ();
+
+          (* Continue sampling *)
+          sampling_loop ()
+        with exn ->
+          (* Resume tracking even if sampling failed *)
+          resume_tracking ();
+          Logging.warn_f ~section:"allocation_tracker" "Size sampling failed: %s" (Printexc.to_string exn);
+          (* Continue despite errors *)
+          sampling_loop ()
+      end else begin
+        (* Memory tracing is disabled - sleep and check again later to avoid busy loop *)
+        Thread.delay 10.0;  (* Check every 10 seconds if tracing was re-enabled *)
         sampling_loop ()
-      with exn ->
-        (* Resume tracking even if sampling failed *)
-        resume_tracking ();
-        Logging.warn_f ~section:"allocation_tracker" "Size sampling failed: %s" (Printexc.to_string exn);
-        (* Continue despite errors *)
-        sampling_loop ()
+      end
     end
   in
   let sampling_thread = Thread.create sampling_loop () in

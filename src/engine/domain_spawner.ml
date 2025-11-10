@@ -25,6 +25,7 @@ type domain_state = {
   last_restart: float Atomic.t;
   restart_count: int Atomic.t;
   is_running: bool Atomic.t;
+  is_initialized: bool Atomic.t;  (* Track if domain has completed initialization *)
   mutex: Mutex.t;
 }
 
@@ -157,6 +158,12 @@ let asset_domain_worker state (fee_fetcher : trading_config -> trading_config) (
   
   Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
     asset_with_fees.exchange asset_with_fees.symbol asset_with_fees.strategy;
+
+  (* Signal that this domain is ready for operation *)
+  (* This helps prevent race conditions during startup by ensuring domains are fully initialized before others start *)
+  Atomic.set state.is_initialized true;
+  (* Note: Using synchronous signaling since this is called from within the domain thread *)
+  ();
 
   let cycle_count = ref 0 in
   let telemetry_batch = ref 0 in
@@ -496,6 +503,7 @@ let register_domain asset =
     last_restart = Atomic.make (Unix.time ());
     restart_count = Atomic.make 0;
     is_running = Atomic.make false;
+    is_initialized = Atomic.make false;
     mutex = Mutex.create ();
   } in
   (* Lock registry for entire operation to prevent race conditions *)
@@ -635,14 +643,29 @@ let spawn_supervised_domains_for_assets (fee_fetcher : trading_config -> trading
     ignore (register_domain asset)
   ) assets;
 
-  (* Start initial domains *)
+  (* Start initial domains with coordination to prevent startup race conditions *)
   Mutex.lock registry_mutex;
   let all_states = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.to_seq_values domain_registry |> List.of_seq in
   Mutex.unlock registry_mutex;
 
-  List.iter (fun state ->
-    ignore (start_domain state fee_fetcher)
-  ) all_states;
+  (* Start domains sequentially and wait for each to initialize to prevent startup race conditions *)
+  let%lwt () = Lwt_list.iter_s (fun state ->
+    let started = start_domain state fee_fetcher in
+    if started then begin
+      (* Wait for domain to signal that it's fully initialized by polling the atomic flag *)
+      let rec wait_for_init () =
+        if Atomic.get state.is_initialized then
+          Lwt.return_unit
+        else begin
+          let%lwt () = Lwt_unix.sleep 0.001 in  (* Small delay to avoid busy waiting *)
+          wait_for_init ()
+        end
+      in
+      wait_for_init ()
+    end else begin
+      Lwt.return_unit
+    end
+  ) all_states in
 
   (* Start supervisor thread *)
   ignore (Thread.create supervisor_loop fee_fetcher);

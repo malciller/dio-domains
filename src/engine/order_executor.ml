@@ -199,6 +199,43 @@ module TimedOutAmendments = struct
   let get_size () = Registry.size registry
 end
 
+(** Enhanced check for whether an amendment should be considered a duplicate *)
+let should_skip_amendment_due_to_inflight order_id symbol new_price new_qty =
+  (* First check if it's actively in-flight *)
+  if is_amendment_in_flight order_id then
+    true
+  else begin
+    (* Check if it's in timed-out amendments tracking *)
+    match TimedOutAmendments.Registry.find TimedOutAmendments.registry order_id with
+    | Some _timed_out ->
+        (* If it's timed-out, check current execution feed state to see if amendment succeeded *)
+        (match Kraken.Kraken_executions_feed.get_open_order symbol order_id with
+         | Some current_order ->
+             (* Check if current state matches what we want to amend to *)
+             let price_matches = match new_price, current_order.limit_price with
+               | Some req_price, Some curr_price ->
+                   abs_float (req_price -. curr_price) < 0.000001
+               | None, None -> true
+               | _ -> false
+             in
+             let qty_matches = match new_qty with
+               | Some req_qty -> abs_float (req_qty -. current_order.order_qty) < 0.000001
+               | None -> true
+             in
+             if price_matches && qty_matches then begin
+               Logging.debug_f ~section "Amendment for order %s already matches execution feed state, skipping" order_id;
+               true
+             end else begin
+               Logging.debug_f ~section "Amendment for timed-out order %s still needed (price_match=%b, qty_match=%b)"
+                 order_id price_matches qty_matches;
+               false
+             end
+         | None ->
+             (* Order not found in execution feed, can't determine state *)
+             Logging.debug_f ~section "Order %s not found in execution feed during duplicate check" order_id;
+             false)
+    | None -> false
+  end
 
 (** Order type definitions *)
 type order_type = string (* "market" | "limit" | "stop-loss" | "take-profit" | "trailing-stop" | etc. *)
@@ -367,9 +404,45 @@ let start_inflight_cleanup () =
   Lwt.async cleanup_loop
 
 (** Initialize the order executor with authentication token *)
+(** Start background task to handle execution feed order updates *)
+let start_order_update_handler () =
+  Logging.debug ~section "Starting order update event handler";
+  let stream, close_fn = Kraken.Kraken_executions_feed.subscribe_order_updates () in
+  let rec handle_updates () =
+    (* Check for shutdown request *)
+    if Atomic.get shutdown_requested then (
+      Logging.debug ~section "Order update handler shutting down due to shutdown request";
+      close_fn ();
+      Lwt.return_unit
+    ) else (
+      Lwt_stream.get stream >>= function
+      | Some event ->
+          (* Handle execution event - check if it resolves any timed-out amendments *)
+          (match TimedOutAmendments.Registry.find TimedOutAmendments.registry event.order_id with
+           | Some _timed_out_amendment ->
+               (* Check if this execution event confirms the timed-out amendment *)
+               let confirmed = TimedOutAmendments.check_order_update
+                 event.order_id event.limit_price event.order_qty in
+               if confirmed then begin
+                 Logging.info_f ~section "Execution feed confirmed timed-out amendment for order %s" event.order_id;
+                 (* Remove from in-flight tracking if it was still there *)
+                 let _ = remove_in_flight_amendment event.order_id in
+                 ()
+               end
+           | None -> ());
+          handle_updates ()
+      | None ->
+          (* Stream ended *)
+          Logging.warn ~section "Order update stream ended unexpectedly";
+          Lwt.return_unit
+    )
+  in
+  Lwt.async handle_updates
+
 let init : unit Lwt.t =
   (* Trading client is now managed by the supervisor *)
   start_inflight_cleanup ();
+  start_order_update_handler ();
   Lwt.return_unit
 
 (** Place a new order *)
@@ -452,28 +525,39 @@ let amend_order
         Logging.error_f ~section "Amend validation failed: %s" err;
         Lwt.return (Error err)
     | Ok () ->
-        (* Check if new price is the same as current price to avoid unnecessary amendments *)
-        let check_should_skip_amendment = match request.symbol, request.new_limit_price with
-          | Some symbol, Some new_price ->
+        (* Comprehensive pre-amendment validation against current execution feed state *)
+        let check_should_skip_amendment = match request.symbol with
+          | Some symbol ->
               Lwt.return (Kraken.Kraken_executions_feed.get_open_order symbol request.order_id) >>= fun current_order_opt ->
               let should_skip = match current_order_opt with
                | Some current_order ->
-                   (match current_order.limit_price with
-                    | Some current_price ->
-                        (* Use small epsilon for floating point comparison *)
-                        abs_float (new_price -. current_price) < 0.000001
-                    | None -> false)
+                   (* Check if all requested changes already match current state *)
+                   let price_matches = match request.new_limit_price, current_order.limit_price with
+                     | Some new_price, Some curr_price ->
+                         abs_float (new_price -. curr_price) < 0.000001
+                     | None, None -> true
+                     | _ -> false
+                   in
+                   let qty_matches = match request.new_quantity with
+                     | Some new_qty -> abs_float (new_qty -. current_order.order_qty) < 0.000001
+                     | None -> true
+                   in
+                   (* For now, we only check price and quantity as those are the main amendment targets *)
+                   let all_match = price_matches && qty_matches in
+                   if all_match then
+                     Logging.debug_f ~section "Skipping amendment for order %s: all requested changes already match current state" request.order_id;
+                   all_match
                | None ->
                    Logging.warn_f ~section "Order %s not found in open orders cache, proceeding with amendment" request.order_id;
                    false
               in
               Lwt.return should_skip
-          | _ -> Lwt.return false
+          | None -> Lwt.return false
         in
 
         check_should_skip_amendment >>= fun should_skip_amendment ->
         if should_skip_amendment then begin
-          Logging.debug_f ~section "Skipping amendment for order %s: new price equals current price" request.order_id;
+          Logging.debug_f ~section "Skipping amendment for order %s: all requested changes already match current state" request.order_id;
           (* Return a fake successful result to avoid disrupting the flow *)
           Lwt.return (Ok {
             Kraken.Kraken_common_types.amend_id = "skipped_no_change";
@@ -481,8 +565,14 @@ let amend_order
             cl_ord_id = request.cl_ord_id;
           })
         end else begin
-          (* Check for duplicate amendments *)
-          if not (add_in_flight_amendment request.order_id) then begin
+          (* Check for duplicate amendments using enhanced logic *)
+          let symbol_str = Option.value request.symbol ~default:"" in
+          if should_skip_amendment_due_to_inflight request.order_id symbol_str request.new_limit_price request.new_quantity then begin
+            let err = Printf.sprintf "Duplicate amendment detected for order %s" request.order_id in
+            Logging.warn_f ~section "%s" err;
+            Lwt.return (Error err)
+          end else if not (add_in_flight_amendment request.order_id) then begin
+            (* Fallback to old logic if enhanced check passes but we still can't add to in-flight *)
             let err = Printf.sprintf "Duplicate amendment detected for order %s" request.order_id in
             Logging.warn_f ~section "%s" err;
             Lwt.return (Error err)
@@ -520,6 +610,8 @@ let amend_order
                   let grace_period = 5.0 in (* 5 second grace period *)
                   TimedOutAmendments.add_timed_out_amendment
                     request.order_id symbol_str request.new_limit_price request.new_quantity grace_period;
+                  (* Remove from in-flight registry to prevent false duplicate detection during grace period *)
+                  let _ = remove_in_flight_amendment request.order_id in
 
                   Logging.warn_f ~section "Amendment timeout for order %s, starting grace period check (%.1fs) for execution feed confirmation"
                     request.order_id grace_period;

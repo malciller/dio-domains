@@ -842,35 +842,36 @@ let process_order_concurrently auth_token order orders_placed_ref =
           (match order.order_id with
            | Some target_order_id ->
                (* Check for duplicate amendments before proceeding *)
-               let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
-               let check_should_proceed = if amendment_in_flight then
-                 (* Check if the order still exists in the open orders cache *)
+               (* Check for amendments in-flight using enhanced logic *)
+               let check_should_proceed =
                  Lwt.return (Kraken.Kraken_executions_feed.get_open_order order.symbol target_order_id) >>= fun order_opt ->
-                 let order_exists = match order_opt with
-                   | Some _ -> true
-                   | None -> false
-                 in
-                 if order_exists then
-                   (* Order still exists - check for significant price differences *)
-                   match order.price with
-                   | Some requested_price ->
-                       if price_differs_significantly order.symbol target_order_id requested_price then begin
-                         Logging.warn_f ~section "Amendment for order %s already in-flight but price differs significantly (%.8f vs current), proceeding with amendment" target_order_id requested_price;
-                         Lwt.return true
-                       end else begin
-                         Logging.debug_f ~section "Skipping duplicate amendment for order %s (price unchanged)" target_order_id;
-                         Lwt.return false
-                       end
-                   | None ->
-                       Logging.debug_f ~section "Skipping duplicate amendment for order %s (no price change)" target_order_id;
+                 match order_opt with
+                 | Some current_order ->
+                     (* Check if requested changes already match current state *)
+                     let price_matches = match order.price, current_order.limit_price with
+                       | Some req_price, Some curr_price ->
+                           abs_float (req_price -. curr_price) < 0.000001
+                       | None, None -> true
+                       | _ -> false
+                     in
+                     let qty_matches = abs_float (order.qty -. current_order.order_qty) < 0.000001 in
+                     if price_matches && qty_matches then begin
+                       Logging.debug_f ~section "Skipping amendment for order %s: already matches execution feed state" target_order_id;
                        Lwt.return false
-                 else begin
-                   (* Order was cleaned up as stale - allow amendment to proceed even if in-flight *)
-                   Logging.debug_f ~section "Order %s not found in cache but amendment in-flight, proceeding with amendment (likely stale order cleanup)" target_order_id;
-                   Lwt.return true
-                 end
-               else
-                 Lwt.return true
+                     end else begin
+                       (* Check for in-flight amendments *)
+                       let amendment_in_flight = Dio_engine.Order_executor.Test.is_amendment_in_flight target_order_id in
+                       if amendment_in_flight then begin
+                         Logging.warn_f ~section "Amendment for order %s already in-flight, skipping to prevent conflicts" target_order_id;
+                         Lwt.return false
+                       end else begin
+                         Lwt.return true
+                       end
+                     end
+                 | None ->
+                     (* Order not found - allow amendment to proceed *)
+                     Logging.debug_f ~section "Order %s not found in execution feed, proceeding with amendment" target_order_id;
+                     Lwt.return true
                in
 
                check_should_proceed >>= fun should_proceed ->
