@@ -166,13 +166,13 @@ let broadcast_to_stream state stream_type json_str =
       Lwt.async (fun () ->
         Lwt.catch
           (fun () ->
-            (* Attempt write with 10ms timeout *)
+            (* Attempt write with 100ms timeout *)
             Lwt.pick [
               (Lwt_unix.write client.socket_fd json_bytes 0 json_len >|= fun written ->
                if written < json_len then
                  (* Partial write - client too slow, drop immediately *)
                  failwith "Partial write - client too slow");
-              (Lwt_unix.sleep 0.01 >|= fun () -> failwith "Write timeout - client too slow")
+              (Lwt_unix.sleep 0.1 >|= fun () -> failwith "Write timeout - client too slow")
             ] >>= fun _ ->
             Logging.debug_f ~section:"broadcast" "Sent %s update to client %d" stream_type client.id;
             Lwt.return_unit
@@ -221,7 +221,7 @@ let send_current_snapshot client stream_type =
             (Lwt_unix.write client.socket_fd json_bytes 0 json_len >|= fun written ->
              if written < json_len then
                failwith "Partial write - client too slow");
-            (Lwt_unix.sleep 0.01 >|= fun () -> failwith "Write timeout - client too slow")
+            (Lwt_unix.sleep 0.1 >|= fun () -> failwith "Write timeout - client too slow")
           ] >>= fun _ ->
           Logging.debug_f ~section:"broadcast" "Sent current %s snapshot to client %d" stream_type client.id;
           Lwt.return_unit
