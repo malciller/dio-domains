@@ -539,7 +539,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let orderbook_conn = register ~name:"kraken_orderbook_ws" ~connect_fn:None in
   let orderbook_connect_fn () =
     (* Destroy orderbook stores before reconnecting to ensure clean state *)
-    Kraken.Kraken_orderbook_feed.destroy_all_stores ();
+    Kraken.Kraken_orderbook_feed.clear_all_stores ();
     (* Wrap the connection in try-catch for proper error handling *)
     Lwt.catch (fun () ->
       let on_failure reason = set_state orderbook_conn (Failed reason) in
