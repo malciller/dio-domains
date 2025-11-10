@@ -39,11 +39,7 @@ let string_contains str substr =
     in
     loop 0
 
-module Response_table = Hashtbl.Make (struct
-  type t = int
-  let equal = Int.equal
-  let hash = Hashtbl.hash
-end)
+module Response_table = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl
 
 module Heartbeat_bus = Event_bus.Make (struct
   type t = unit
@@ -64,7 +60,7 @@ type state = {
   mutable reader: unit Lwt.t option;
   mutable connecting: bool;
   mutable connection_generation: int;
-  responses: (Kraken_common_types.ws_response Lwt.u * string * float * bool) Response_table.t;  (* wakener * expected_method * timestamp * timed_out *)
+  responses: (int, Kraken_common_types.ws_response Lwt.u * string * float * bool) Response_table.t;  (* req_id -> (wakener * expected_method * timestamp * timed_out) *)
   mutable on_failure: (string -> unit) option;
   connected: bool Atomic.t;
 }

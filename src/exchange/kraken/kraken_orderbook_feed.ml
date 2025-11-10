@@ -318,10 +318,9 @@ type store = {
 
 type decimals = int * int  (* pair_decimals, lot_decimals *)
 
-let stores : (string, store) Hashtbl.t = Hashtbl.create 32
+let stores : (string, store) Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 32
 let stores_mutex = Mutex.create ()
-let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
-let decimals_tbl_mutex = Mutex.create ()
+let decimals_tbl : (string, decimals) Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.t = Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.create 16
 let ready_condition = Lwt_condition.create ()
 
 (** Get precision info from instruments feed cache *)
@@ -340,15 +339,13 @@ let calculate_checksum symbol bids asks : int32 =
         (price_prec, qty_prec)
     | None ->
         (* Fall back to decimals_tbl from AssetPairs API *)
-        Mutex.lock decimals_tbl_mutex;
-        try
-          let result = Hashtbl.find decimals_tbl symbol in
-          Mutex.unlock decimals_tbl_mutex;
-          result
-        with Not_found ->
-          Mutex.unlock decimals_tbl_mutex;
-          Logging.debug_f ~section "No precision found for %s, using defaults" symbol;
-          (8, 8)  (* Fallback defaults *)
+        Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock decimals_tbl (fun safe_decimals ->
+          match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt safe_decimals symbol with
+          | Some result -> result
+          | None ->
+              Logging.debug_f ~section "No precision found for %s, using defaults" symbol;
+              (8, 8)  (* Fallback defaults *)
+        )
   in
 
   (* Helper: check if size is effectively zero using string comparison *)
@@ -412,7 +409,7 @@ let calculate_checksum symbol bids asks : int32 =
 
 let ensure_store symbol =
   Mutex.lock stores_mutex;
-  let store = match Hashtbl.find_opt stores symbol with
+  let store = match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt stores symbol with
   | Some s -> s
   | None ->
       let s = {
@@ -424,7 +421,7 @@ let ensure_store symbol =
         last_sequence = Atomic.make None;
         last_update = Unix.time ();
       } in
-      Hashtbl.add stores symbol s;
+      Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace stores symbol s;
       s
   in
   Mutex.unlock stores_mutex;
@@ -432,7 +429,7 @@ let ensure_store symbol =
 
 let store_opt symbol =
   Mutex.lock stores_mutex;
-  let result = Hashtbl.find_opt stores symbol in
+  let result = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt stores symbol in
   Mutex.unlock stores_mutex;
   result
 
@@ -480,16 +477,15 @@ let parse_level symbol price_json size_json =
         (price_prec, qty_prec)
     | None ->
         (* Fall back to decimals_tbl from AssetPairs API *)
-        Mutex.lock decimals_tbl_mutex;
-        try
-          let decimals = Hashtbl.find decimals_tbl symbol in
-          Mutex.unlock decimals_tbl_mutex;
-          Logging.debug_f ~section "Found decimals_tbl for %s: %d, %d" symbol (fst decimals) (snd decimals);
-          decimals
-        with Not_found ->
-          Mutex.unlock decimals_tbl_mutex;
-          Logging.debug_f ~section "No decimals found for %s, using defaults" symbol;
-          (8, 8)  (* Fallback defaults *)
+        Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock decimals_tbl (fun safe_decimals ->
+          match Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.find_opt safe_decimals symbol with
+          | Some decimals ->
+              Logging.debug_f ~section "Found decimals_tbl for %s: %d, %d" symbol (fst decimals) (snd decimals);
+              decimals
+          | None ->
+              Logging.debug_f ~section "No decimals found for %s, using defaults" symbol;
+              (8, 8)  (* Fallback defaults *)
+        )
   in
 
   let price_str = to_decimal_str ~dec:pd price_json in
@@ -621,9 +617,9 @@ let fetch_decimals symbols =
             let ld = to_int (member "lot_decimals" pair_json) in
             List.iter (fun sym ->
               if altname = Some sym || wsname = Some sym then begin
-                Mutex.lock decimals_tbl_mutex;
-                Hashtbl.add decimals_tbl sym (pd, ld);
-                Mutex.unlock decimals_tbl_mutex
+                Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock decimals_tbl (fun safe_decimals ->
+                  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.replace safe_decimals sym (pd, ld)
+                )
               end
             ) symbols
           ) pairs;
@@ -641,7 +637,7 @@ let process_orderbook_message ~reset json on_heartbeat =
     Logging.debug_f ~section "Processing orderbook message with %d entries (reset=%b)"
       (List.length data) reset;
     (* Track symbols that successfully wrote to buffer in this message *)
-    let notified_symbols = Hashtbl.create 16 in
+    let notified_symbols = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.create 16 in
     List.iter (fun entry ->
       try
         let symbol = member "symbol" entry |> to_string in
@@ -750,7 +746,7 @@ let process_orderbook_message ~reset json on_heartbeat =
         if checksum_valid then begin
           RingBuffer.write store.buffer orderbook;
           (* Record that this symbol should be notified (only once per message) *)
-          Hashtbl.replace notified_symbols symbol store;
+          Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Orderbook written to ringbuffer: %s bids=%d asks=%d"
             symbol
             (Array.length orderbook.bids)
@@ -776,7 +772,7 @@ let process_orderbook_message ~reset json on_heartbeat =
     ) data;
 
     (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
-    Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
 
     Some ()
   with exn ->
@@ -856,17 +852,23 @@ let has_orderbook_data symbol =
 
 (** Clear all orderbook stores - used when reconnecting to ensure clean state *)
 let clear_all_stores () =
-  Hashtbl.iter (fun symbol store ->
+  Mutex.lock stores_mutex;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun symbol store ->
     Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
     store.bids <- PriceMap.empty;
     store.asks <- PriceMap.empty;
-    (* Replace ring buffer with fresh empty one to clear any stale data *)
+    (* Clear ring buffer by setting all positions to None before replacing *)
+    for i = 0 to Array.length store.buffer.data - 1 do
+      Atomic.set store.buffer.data.(i) None
+    done;
+    (* Replace ring buffer with fresh empty one to ensure clean state *)
     store.buffer <- RingBuffer.create ring_buffer_size;
     Atomic.set store.ready false;
     Atomic.set store.has_snapshot false;
     Atomic.set store.last_sequence None;
     store.last_update <- Unix.time ()
-  ) stores
+  ) stores;
+  Mutex.unlock stores_mutex
 
 (** Prune inactive stores and stale price levels to prevent memory growth *)
 let prune_stale_data () =
@@ -874,12 +876,13 @@ let prune_stale_data () =
   let stale_threshold = 30.0 *. 60.0 in  (* 30 minutes *)
   let max_price_levels = 100 in  (* Max levels to keep per side *)
 
+  Mutex.lock stores_mutex;
+  let total_stores_before = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length stores in
   let stores_to_remove = ref [] in
   let trimmed_stores = ref [] in
-  Mutex.lock stores_mutex;
-  let total_stores_before = Hashtbl.length stores in
 
-  Hashtbl.iter (fun symbol store ->
+  (* First pass: identify stale stores and stores needing trimming *)
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun symbol store ->
     let age = now -. store.last_update in
 
     (* Check if store is stale *)
@@ -906,9 +909,19 @@ let prune_stale_data () =
     end
   ) stores;
 
-  (* Remove stale stores *)
+  (* Remove stale stores - first clear their contents to ensure proper cleanup *)
   List.iter (fun symbol ->
-    Hashtbl.remove stores symbol;
+    (match Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.find_opt stores symbol with
+     | Some store ->
+         (* Clear ring buffer contents before removal *)
+         for i = 0 to Array.length store.buffer.data - 1 do
+           Atomic.set store.buffer.data.(i) None
+         done;
+         (* Clear maps *)
+         store.bids <- PriceMap.empty;
+         store.asks <- PriceMap.empty
+     | None -> ());
+    Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.remove stores symbol;
     Logging.debug_f ~section "Removed stale orderbook store for %s (age > 30min)" symbol
   ) !stores_to_remove;
 
@@ -919,7 +932,7 @@ let prune_stale_data () =
 
   let stores_removed = List.length !stores_to_remove in
   let stores_trimmed = List.length !trimmed_stores in
-  let total_stores_after = Hashtbl.length stores in
+  let total_stores_after = Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.length stores in
 
   if stores_removed > 0 || stores_trimmed > 0 then
     Logging.info_f ~section "Orderbook cleanup: removed %d stale stores, trimmed %d active stores (%d -> %d total stores)"
@@ -959,6 +972,30 @@ let wait_for_orderbook_data_lwt symbols timeout_seconds =
 
 let wait_for_orderbook_data = wait_for_orderbook_data_lwt
 
+(** Shutdown function - ensures proper cleanup of all tracked data structures *)
+let shutdown () =
+  Logging.info ~section "Shutting down orderbook feed and cleaning up memory";
+
+  (* Clear all stores with proper cleanup *)
+  Mutex.lock stores_mutex;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun _symbol store ->
+    (* Clear ring buffer contents *)
+    for i = 0 to Array.length store.buffer.data - 1 do
+      Atomic.set store.buffer.data.(i) None
+    done;
+    (* Clear maps *)
+    store.bids <- PriceMap.empty;
+    store.asks <- PriceMap.empty
+  ) stores;
+  Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.clear stores;
+  Mutex.unlock stores_mutex;
+
+  (* Clear decimals table *)
+  Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.with_lock decimals_tbl (fun safe_decimals ->
+    Dio_memory_tracing.Memory_tracing.Tracked.SafeHashtbl.clear safe_decimals
+  );
+
+  Logging.info ~section "Orderbook feed shutdown complete"
 
 (** Message handling loop - runs in background *)
 let start_message_handler conn symbols on_failure on_heartbeat =
