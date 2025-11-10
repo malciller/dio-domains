@@ -619,7 +619,8 @@ let reset_large_counters () =
   (* CRITICAL: Minimize mutex hold time to prevent deadlocks
      First pass: collect metrics that need resetting while holding mutex briefly *)
   let metrics_to_reset = ref [] in
-  if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+  try
+    Mutex.lock metrics_mutex;
     Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun key metric ->
       let should_reset = match metric.metric_type with
         | Counter r ->
@@ -644,10 +645,9 @@ let reset_large_counters () =
         metrics_to_reset := (key, metric) :: !metrics_to_reset
     ) metrics;
     Mutex.unlock metrics_mutex
-  end else begin
+  with _ ->
     (* Could not acquire metrics mutex, skip counter reset *)
-    Logging.warn ~section "Skipping counter reset due to mutex timeout"
-  end;
+    ();
 
   (* Second pass: reset each metric individually with minimal lock time *)
   let reset_count = ref 0 in
@@ -823,23 +823,26 @@ let start_capacity_adjuster () =
 
       (* Always run if 60 seconds have passed, regardless of metric changes *)
       if time_since_last >= 60.0 then begin
-        (* Perform adjustment *)
-        adjust_buffer_capacities ();
-        (* Also prune stale metrics *)
-        prune_stale_metrics ();
-        (* Reset large counters to prevent unbounded growth *)
-        reset_large_counters ();
+        (* Perform adjustment - run synchronously but avoid blocking timeouts *)
+        let run_adjustments () =
+          try
+            adjust_buffer_capacities ();
+            prune_stale_metrics ();
+            reset_large_counters ();
 
-        (* Update last run time *)
-        if lock_mutex_with_timeout memory_config_mutex 1.0 "memory_config" then begin
-          memory_config.last_adjustment <- now;
-          Mutex.unlock memory_config_mutex
-        end else begin
-          (* Could not acquire memory_config mutex, skip adjustment timestamp update *)
-          Logging.warn ~section "Skipping memory config adjustment timestamp update due to mutex timeout"
-        end;
+            (* Update last run time - use regular mutex lock to avoid blocking *)
+            Mutex.lock memory_config_mutex;
+            memory_config.last_adjustment <- now;
+            Mutex.unlock memory_config_mutex;
 
-        (* Continue with updated time *)
+            true
+          with exn ->
+            Logging.warn_f ~section "Exception in capacity adjustment: %s" (Printexc.to_string exn);
+            false
+        in
+
+        (* Run adjustments and continue *)
+        let _success = run_adjustments () in
         adjustment_loop now
       end else begin
         (* Wait for either metric change or timeout to reach 60 seconds *)
@@ -1276,7 +1279,8 @@ let perform_sliding_counter_cleanup () =
 
   (* Collect sliding counters that need cleanup - minimize mutex hold time *)
   let counters_to_clean = ref [] in
-  if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+  let _ = try
+    Mutex.lock metrics_mutex;
     Dio_memory_tracing.Memory_tracing.Tracked.Hashtbl.iter (fun key metric ->
       match metric.metric_type with
       | SlidingCounter sliding ->
@@ -1289,10 +1293,10 @@ let perform_sliding_counter_cleanup () =
       | _ -> ()
     ) metrics;
     Mutex.unlock metrics_mutex
-  end else begin
+  with _ ->
     (* Could not acquire metrics mutex, skip sliding counter cleanup *)
-    Logging.warn ~section "Skipping sliding counter cleanup due to mutex timeout"
-  end;
+    ()
+  in
 
   (* Clean up each counter individually with minimal lock time *)
   List.iter (fun (key, metric) ->
@@ -1300,15 +1304,15 @@ let perform_sliding_counter_cleanup () =
       | SlidingCounter sliding ->
         (* Perform cleanup with minimal mutex hold *)
         let current_len =
-          if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+          try
+            Mutex.lock metrics_mutex;
             let len = List.length !(sliding.current_window) in
             Mutex.unlock metrics_mutex;
             len
-          end else begin
+          with _ ->
             (* Could not acquire mutex, skip this counter *)
-            Logging.warn_f ~section "Skipping sliding counter %s cleanup due to mutex timeout" key;
             0
-          end in
+          in
 
         if current_len > 0 then begin
           (* Do expensive cleanup outside mutex *)
@@ -1336,19 +1340,20 @@ let perform_sliding_counter_cleanup () =
           in
 
           (* Update with minimal mutex hold *)
-          if lock_mutex_with_timeout metrics_mutex 1.0 "metrics" then begin
+          let _ = try
+            Mutex.lock metrics_mutex;
             sliding.current_window := final_window;
             sliding.total_count := final_total;
             sliding.last_cleanup := now;
             Mutex.unlock metrics_mutex
-          end else begin
+          with _ ->
             (* Could not acquire mutex, skip update for this counter *)
-            Logging.warn_f ~section "Skipping sliding counter %s update due to mutex timeout" key
-          end;
+            ()
+          in
 
           let cleaned_entries = current_len - List.length final_window in
           if cleaned_entries > 0 then begin
-            Logging.debug_f ~section "Sliding counter cleanup for %s: removed %d entries (%d -> %d)"
+            Logging.debug_f ~section:"telemetry" "Sliding counter cleanup for %s: removed %d entries (%d -> %d)"
               key cleaned_entries current_len (List.length final_window);
             cleaned_total := !cleaned_total + cleaned_entries;
           end;
