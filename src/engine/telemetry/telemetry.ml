@@ -53,8 +53,8 @@ type memory_config = {
 }
 
 let memory_config = {
-  rate_buffer_capacity = 200;
-  histogram_capacity = 15000;
+  rate_buffer_capacity = 50;
+  histogram_capacity = 2000;
   last_adjustment = 0.0;
 }
 
@@ -388,6 +388,14 @@ let adjust_buffer_capacities () =
 
   set_gauge rate_capacity_metric (float_of_int current_rate_capacity);
   set_gauge histogram_capacity_metric (float_of_int current_histogram_capacity)
+
+(** Remove a metric explicitly *)
+let remove_metric name ?(labels=[]) () =
+  let key = metric_key name labels in
+  Mutex.lock metrics_mutex;
+  Hashtbl.remove metrics key;
+  Mutex.unlock metrics_mutex;
+  Logging.debug_f ~section:"telemetry" "Explicitly removed metric: %s" key
 
 (** Prune stale metrics and cap total count to prevent unbounded growth *)
 let prune_stale_metrics () =

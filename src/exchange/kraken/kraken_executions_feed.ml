@@ -8,7 +8,7 @@ open Concurrency
 
 let section = "kraken_executions"
 (* TODO: Magic number - ring_buffer_size should be configurable *)
-let ring_buffer_size = 512
+let ring_buffer_size = 128
 
 (** Safely force Conduit context with error handling *)
 let get_conduit_ctx () =
