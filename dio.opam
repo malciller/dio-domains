@@ -13,7 +13,7 @@ bug-reports: "https://github.com/malciller/dio/issues"
 depends: [
   "ocaml"
   "dune" {>= "3.17"}
-  "yojson" {>= "2.1.0"}
+  "yojson" {= "2.2.2"}
   "lwt"
   "lwt_ppx"
   "lwt_ssl"
