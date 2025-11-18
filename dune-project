@@ -24,7 +24,7 @@
   ocaml
   dune
   (yojson
-   (>= 2.1.0))
+   (= 2.2.2))
   lwt
   lwt_ppx
   lwt_ssl

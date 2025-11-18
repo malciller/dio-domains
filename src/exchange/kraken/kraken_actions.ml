@@ -80,7 +80,8 @@ let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : strin
         "\"" ^ k ^ "\":" ^ json_to_string_precise ~field_name:k symbol v
       ) pairs)) ^ "}"
   | `Intlit s -> s
-  | _ -> failwith "json_to_string_precise: Tuple and Variant not supported"
+  | `Tuple _ -> failwith "json_to_string_precise: Tuple not supported"
+  | `Variant _ -> failwith "json_to_string_precise: Variant not supported"
 
 (** Generate unique request ID *)
 let next_req_id =
