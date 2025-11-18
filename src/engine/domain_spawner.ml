@@ -131,9 +131,14 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   
   (* Set exec position to current to skip any snapshot events that occurred before this domain started *)
   if asset_with_fees.exchange = "kraken" then begin
-    exec_read_pos := Kraken.Kraken_executions_feed.get_current_position asset_with_fees.symbol;
-    Logging.debug_f ~section "Domain for %s/%s starting consumption from exec position %d"
-      asset_with_fees.exchange asset_with_fees.symbol !exec_read_pos
+    try
+      exec_read_pos := Kraken.Kraken_executions_feed.get_current_position asset_with_fees.symbol;
+      Logging.debug_f ~section "Domain for %s/%s starting consumption from exec position %d"
+        asset_with_fees.exchange asset_with_fees.symbol !exec_read_pos
+    with exn ->
+      Logging.error_f ~section "Failed to get execution position for %s/%s: %s (starting from 0)"
+        asset_with_fees.exchange asset_with_fees.symbol (Printexc.to_string exn);
+      exec_read_pos := 0
   end;
   
   (* Initialize ticker and orderbook positions to 0 to catch all data from start *)
