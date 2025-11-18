@@ -1,10 +1,12 @@
 (** Kraken Balances Feed - WebSocket v2 authenticated balances subscription with lock-free atomics *)
+(* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
 open Concurrency
 
 let section = "kraken_balances"
 
+(* TODO: Duplicate function - also exists in kraken_trading_client.ml, should be moved to common utilities *)
 (** Safely force Conduit context with error handling *)
 let get_conduit_ctx () =
   try
@@ -103,6 +105,7 @@ let balance_update_mutex = Mutex.create ()
 
 (** Track configured assets (from trading config) vs dynamic assets *)
 let configured_assets : (string, unit) Hashtbl.t = Hashtbl.create 16
+(* TODO: Magic number - dynamic_assets_cap should be configurable *)
 let dynamic_assets_cap = 50  (* Maximum number of non-configured assets to track *)
 let configured_assets_mutex = Mutex.create ()
 
@@ -397,6 +400,7 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
 let initialize assets =
   Logging.info_f ~section "Initializing balances feed for %d assets" (List.length assets);
 
+  (* TODO: Hardcoded common currencies - should be configurable or derived from trading pairs *)
   (* Also create stores for common quote currencies *)
   let all_assets = List.sort_uniq String.compare (assets @ ["USD"; "EUR"; "USDT"; "USDC"]) in
 
@@ -424,6 +428,7 @@ let initialize assets =
 let check_stale_balances assets =
   let stale_count = ref 0 in
   List.iter (fun asset ->
+    (* TODO: Magic number - 300.0 seconds staleness threshold should be configurable *)
     if is_balance_stale asset 300.0 then begin (* 5 minutes threshold *)
       Logging.warn_f ~section "Balance data for %s is stale (>5 minutes old)" asset;
       incr stale_count;
@@ -506,18 +511,13 @@ let subscribe_balance_updates () =
   let subscription = BalanceUpdateEventBus.subscribe balance_update_event_bus in
   (subscription.stream, subscription.close)
 
-(** Force refresh balance data by requesting a new snapshot *)
-let force_balance_refresh _token =
-  Logging.info ~section "Forcing balance data refresh...";
-  (* This would send a request for fresh balance data *)
-  (* For now, we'll just log the refresh attempt *)
-  Logging.info ~section "Balance refresh requested - implement actual refresh logic";
-  Lwt.return_unit
+
 
 (* Start periodic cleanup of dynamic assets *)
 let () =
   Lwt.async (fun () ->
     let rec cleanup_loop () =
+      (* TODO: Magic number - 600.0 seconds cleanup interval should be configurable *)
       let%lwt () = Lwt_unix.sleep 600.0 in (* Clean up every 10 minutes *)
       cleanup_dynamic_assets ();
       cleanup_loop ()

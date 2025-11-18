@@ -1,9 +1,11 @@
 (** Kraken Orderbook Feed - WebSocket v2 depth subscription with ring buffer *)
+(* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
 
 let section = "kraken_orderbook"
 
+(* TODO: Duplicate function - also exists in kraken_trading_client.ml, should be moved to common utilities *)
 (** Safely force Conduit context with error handling *)
 let get_conduit_ctx () =
   try
@@ -16,6 +18,7 @@ let get_conduit_ctx () =
       Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
       raise exn
 
+(* TODO: Magic numbers - orderbook_depth and ring_buffer_size should be configurable *)
 let orderbook_depth = 25
 let ring_buffer_size = 256
 

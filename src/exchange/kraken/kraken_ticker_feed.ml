@@ -1,8 +1,10 @@
 (** Kraken Ticker Feed - WebSocket v2 ticker subscription with ring buffer *)
+(* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 open Lwt.Infix
 
 let section = "kraken_ticker"
 
+(* TODO: Duplicate function - also exists in kraken_trading_client.ml, should be moved to common utilities *)
 (** Safely force Conduit context with error handling *)
 let get_conduit_ctx () =
   try

@@ -2,6 +2,7 @@ open Lwt.Infix
 open Cohttp_lwt_unix
 
 let section = "kraken_get_fee"
+(* TODO: Hardcoded endpoint should be configurable *)
 let endpoint = "https://api.kraken.com"
 
 type fee_info = {
@@ -20,6 +21,7 @@ let get_api_credentials_from_env () : (string * string) Lwt.t =
     | Some v -> Lwt.return v | None -> Lwt.fail_with (Printf.sprintf "Missing environment variable: %s" var) in
   Lwt.both (get_env "KRAKEN_API_KEY") (get_env "KRAKEN_API_SECRET")
 
+(* TODO: Function is too long and complex - consider breaking into smaller functions *)
 (** Get actual account fee schedule from TradeVolume endpoint *)
 let get_fee_info symbol : fee_info option Lwt.t =
   Lwt.catch (fun () ->

@@ -233,23 +233,28 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
           (* Process events to detect new orders and cancellations, notify strategies *)
           List.iter (fun (event : Kraken.Kraken_executions_feed.execution_event) ->
             match event.order_status with
-            | CanceledStatus ->
-                (* Trigger strategy execution on order cancellations *)
+            | CanceledStatus | FilledStatus ->
+                (* Trigger strategy execution on order cancellations or fills *)
                 should_execute_strategy := true;
-                (* Notify strategies about external order cancellations *)
+                (* Notify strategies about external order cancellations/fills - both remove orders from active tracking *)
+                let status_desc = match event.order_status with
+                  | CanceledStatus -> "cancelled"
+                  | FilledStatus -> "filled"
+                  | _ -> "terminated"
+                in
                 (match grid_strategy_asset with
                  | Some _ ->
                      Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled
                        asset_with_fees.symbol event.order_id;
-                     Logging.debug_f ~section "Notified Grid strategy about cancelled order %s for %s"
-                       event.order_id asset_with_fees.symbol
+                     Logging.debug_f ~section "Notified Grid strategy about %s order %s for %s"
+                       status_desc event.order_id asset_with_fees.symbol
                  | None -> ());
                 (match mm_strategy_asset with
                  | Some _ ->
                      Dio_strategies.Market_maker.Strategy.handle_order_cancelled
                        asset_with_fees.symbol event.order_id;
-                     Logging.debug_f ~section "Notified MM strategy about cancelled order %s for %s"
-                       event.order_id asset_with_fees.symbol
+                     Logging.debug_f ~section "Notified MM strategy about %s order %s for %s"
+                       status_desc event.order_id asset_with_fees.symbol
                  | None -> ())
             | NewStatus | PartiallyFilledStatus ->
                 (* Trigger strategy execution on order fills/acknowledgments *)

@@ -131,6 +131,7 @@ let rec json_to_string_precise ?field_name symbol json =
       "{" ^ String.concat "," (List.map (fun (k, v) ->
         "\"" ^ k ^ "\":" ^ json_to_string_precise ~field_name:k symbol v) pairs) ^ "}"
   | `Intlit s -> s
+  | `Tuple _ | `Variant _ -> failwith "json_to_string_precise: Tuple and Variant not supported"
 
 let parse_ws_response json : Kraken_common_types.ws_response =
   let method_ = Yojson.Safe.Util.(member "method" json |> to_string) in
@@ -331,6 +332,10 @@ let handle_frame frame ~expected_generation =
 
 let rec reader_loop conn generation =
   Logging.debug_f ~section "Reader loop iteration (generation %d)" generation;
+  if Atomic.get shutdown_requested then begin
+    Logging.info_f ~section "Reader loop shutting down (generation %d)" generation;
+    Lwt.return_unit
+  end else
   Lwt.catch
     (fun () ->
       Websocket_lwt_unix.read conn >>= function
@@ -506,6 +511,19 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
     ) >>= function
     | Error exn -> Lwt.fail exn
     | Ok waiter ->
+        (* Add cancellation handler to remove from table if request is cancelled *)
+        Lwt.on_cancel waiter (fun () ->
+          Lwt.async (fun () ->
+            Lwt_mutex.with_lock state.mutex (fun () ->
+              if Response_table.mem state.responses req_id then begin
+                Response_table.remove state.responses req_id;
+                Logging.debug_f ~section "Request req_id=%d cancelled, removed from response table" req_id;
+                Lwt.return_unit
+              end else Lwt.return_unit
+            )
+          )
+        );
+
         let timeout = float_of_int timeout_ms /. 1000.0 in
         Logging.debug_f ~section "Request req_id=%d: waiting for response (timeout: %.3fs)" req_id timeout;
         Lwt.pick [
@@ -591,25 +609,22 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
   Telemetry.inc_counter Telemetry.Common.api_requests ();
   Lwt.return response
 
-let init token : unit Lwt.t = ensure_connection token
-
-let connect_and_monitor token ~on_failure ~on_connected = ensure_connection ~on_failure ~on_connected token
-
-let is_connected () = Atomic.get state.connected
-
-(** Clean up stale response table entries (older than 30 seconds) - runs asynchronously *)
-let cleanup_stale_response_entries () =
-  (* Skip cleanup if shutdown is requested or client is not connected *)
-  if Atomic.get shutdown_requested || not (Atomic.get state.connected) then
+(** Clean up stale response table entries (older than 30 seconds) - runs as a continuous loop *)
+let rec cleanup_stale_response_entries () =
+  (* Skip cleanup if shutdown is requested *)
+  if Atomic.get shutdown_requested then
     ()
   else
     Lwt.async (fun () ->
-      (* Double-check shutdown state before proceeding *)
-      if Atomic.get shutdown_requested then
-        Lwt.return_unit
-      else
-        Lwt.catch
-          (fun () ->
+      Lwt.catch
+        (fun () ->
+          (* Wait 30 seconds between cleanup cycles *)
+          Lwt_unix.sleep 30.0 >>= fun () ->
+          
+          (* Double-check shutdown state before proceeding *)
+          if Atomic.get shutdown_requested then
+            Lwt.return_unit
+          else begin
             let now = Unix.time () in
             let stale_entries = ref [] in
             (* Use timeout to prevent hanging if mutex is held for too long *)
@@ -639,15 +654,31 @@ let cleanup_stale_response_entries () =
               ));
               (Lwt_unix.sleep 0.1 >|= fun () -> ())  (* 100ms timeout to prevent hanging *)
             ] >>= fun () ->
+            (* Continue the loop *)
+            cleanup_stale_response_entries ();
             Lwt.return_unit
-          )
-          (fun exn ->
-            (* Ignore errors during shutdown - they're expected *)
-            if not (Atomic.get shutdown_requested) then
-              Logging.debug_f ~section "Error during response table cleanup: %s" (Printexc.to_string exn);
-            Lwt.return_unit
-          )
+          end
+        )
+        (fun exn ->
+          (* Ignore errors during shutdown - they're expected *)
+          if not (Atomic.get shutdown_requested) then begin
+            Logging.error_f ~section "Error during response table cleanup: %s" (Printexc.to_string exn);
+            (* Retry loop after delay even on error *)
+            Lwt.async (fun () -> Lwt_unix.sleep 5.0 >>= fun () -> cleanup_stale_response_entries (); Lwt.return_unit)
+          end;
+          Lwt.return_unit
+        )
     )
+
+let is_connected () = Atomic.get state.connected
+
+let init token : unit Lwt.t = 
+  cleanup_stale_response_entries ();
+  ensure_connection token
+
+let connect_and_monitor token ~on_failure ~on_connected = 
+  cleanup_stale_response_entries ();
+  ensure_connection ~on_failure ~on_connected token
 
 let close () : unit Lwt.t =
   Lwt_mutex.with_lock state.mutex (fun () ->

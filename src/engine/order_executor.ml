@@ -18,58 +18,101 @@ let signal_shutdown () =
 
 (** In-flight order cache to prevent duplicate orders *)
 module InFlightOrders = struct
-  module Registry = Concurrency.Event_registry.Make(struct
-    type t = string (* duplicate_key *)
-    let equal = String.equal
-    let hash = Hashtbl.hash
-  end)(struct
-    type t = unit (* We only need to track presence *)
-  end)
-
-  let registry = Registry.create ()
+  (* Map duplicate_key -> timestamp *)
+  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
+  let mutex = Mutex.create ()
 
   (** Check if an order is already in-flight and add it if not *)
   let add_in_flight_order duplicate_key =
-    match Registry.replace registry duplicate_key () with
-    | Some (_, true) -> false (* Already existed *)
-    | Some (_, false) -> true (* Added successfully *)
-    | None -> false (* Should not happen *)
+    Mutex.lock mutex;
+    match Hashtbl.mem registry duplicate_key with
+    | true ->
+        Mutex.unlock mutex;
+        false (* Already existed *)
+    | false ->
+        Hashtbl.add registry duplicate_key (Unix.gettimeofday ());
+        Mutex.unlock mutex;
+        true (* Added successfully *)
 
   (** Remove an order from the in-flight cache *)
   let remove_in_flight_order duplicate_key =
-    Registry.remove registry duplicate_key |> Option.is_some
+    Mutex.lock mutex;
+    let existed = Hashtbl.mem registry duplicate_key in
+    if existed then Hashtbl.remove registry duplicate_key;
+    Mutex.unlock mutex;
+    existed
 
   (** Get the current size of the in-flight orders registry *)
   let get_registry_size () =
-    Registry.size registry
+    Mutex.lock mutex;
+    let size = Hashtbl.length registry in
+    Mutex.unlock mutex;
+    size
+
+  (** Cleanup stale entries *)
+  let cleanup ?(max_age=300.0) () =
+    Mutex.lock mutex;
+    let now = Unix.gettimeofday () in
+    let initial_size = Hashtbl.length registry in
+    (* Collect keys to remove first to avoid modification during iteration issues if any *)
+    let to_remove = Hashtbl.fold (fun key timestamp acc ->
+      if now -. timestamp > max_age then key :: acc else acc
+    ) registry [] in
+    
+    List.iter (Hashtbl.remove registry) to_remove;
+    
+    let final_size = Hashtbl.length registry in
+    Mutex.unlock mutex;
+    (0, initial_size - final_size) (* drift, trimmed *)
 end
 
 (** In-flight amendment cache to prevent duplicate amendments *)
 module InFlightAmendments = struct
-  module Registry = Concurrency.Event_registry.Make(struct
-    type t = string (* order_id *)
-    let equal = String.equal
-    let hash = Hashtbl.hash
-  end)(struct
-    type t = unit (* We only need to track presence *)
-  end)
-
-  let registry = Registry.create ()
+  (* Map order_id -> timestamp *)
+  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
+  let mutex = Mutex.create ()
 
   (** Check if an amendment is already in-flight and add it if not *)
   let add_in_flight_amendment order_id =
-    match Registry.replace registry order_id () with
-    | Some (_, true) -> false (* Already existed *)
-    | Some (_, false) -> true (* Added successfully *)
-    | None -> false (* Should not happen *)
+    Mutex.lock mutex;
+    match Hashtbl.mem registry order_id with
+    | true ->
+        Mutex.unlock mutex;
+        false (* Already existed *)
+    | false ->
+        Hashtbl.add registry order_id (Unix.gettimeofday ());
+        Mutex.unlock mutex;
+        true (* Added successfully *)
 
   (** Remove an amendment from the in-flight cache *)
   let remove_in_flight_amendment order_id =
-    Registry.remove registry order_id |> Option.is_some
+    Mutex.lock mutex;
+    let existed = Hashtbl.mem registry order_id in
+    if existed then Hashtbl.remove registry order_id;
+    Mutex.unlock mutex;
+    existed
 
   (** Get the current size of the in-flight amendments registry *)
   let get_registry_size () =
-    Registry.size registry
+    Mutex.lock mutex;
+    let size = Hashtbl.length registry in
+    Mutex.unlock mutex;
+    size
+
+  (** Cleanup stale entries *)
+  let cleanup ?(max_age=300.0) () =
+    Mutex.lock mutex;
+    let now = Unix.gettimeofday () in
+    let initial_size = Hashtbl.length registry in
+    let to_remove = Hashtbl.fold (fun key timestamp acc ->
+      if now -. timestamp > max_age then key :: acc else acc
+    ) registry [] in
+    
+    List.iter (Hashtbl.remove registry) to_remove;
+    
+    let final_size = Hashtbl.length registry in
+    Mutex.unlock mutex;
+    (0, initial_size - final_size) (* drift, trimmed *)
 end
 
 (** Order type definitions *)
@@ -209,32 +252,14 @@ let start_inflight_cleanup () =
       Lwt.return_unit
     ) else (
       (* Perform cleanup for orders registry *)
-      let orders_cleanup_stats = InFlightOrders.Registry.cleanup InFlightOrders.registry () in
-      (match orders_cleanup_stats with
-       | Some (size_drift, size_trimmed) ->
-           (match size_drift with
-            | Some drift when drift <> 0 ->
-                Logging.info_f ~section "InFlightOrders registry size drift corrected: %d entries" drift
-            | _ -> ());
-           (match size_trimmed with
-            | Some trimmed when trimmed > 0 ->
-                Logging.info_f ~section "InFlightOrders registry size limit enforced: removed %d stale entries" trimmed
-            | _ -> ())
-       | None -> ());
+      let (_drift, trimmed) = InFlightOrders.cleanup () in
+      if trimmed > 0 then
+        Logging.info_f ~section "InFlightOrders registry cleaned up: removed %d stale entries" trimmed;
 
       (* Perform cleanup for amendments registry *)
-      let amendments_cleanup_stats = InFlightAmendments.Registry.cleanup InFlightAmendments.registry () in
-      (match amendments_cleanup_stats with
-       | Some (size_drift, size_trimmed) ->
-           (match size_drift with
-            | Some drift when drift <> 0 ->
-                Logging.info_f ~section "InFlightAmendments registry size drift corrected: %d entries" drift
-            | _ -> ());
-           (match size_trimmed with
-            | Some trimmed when trimmed > 0 ->
-                Logging.info_f ~section "InFlightAmendments registry size limit enforced: removed %d stale entries" trimmed
-            | _ -> ())
-       | None -> ());
+      let (_drift, trimmed) = InFlightAmendments.cleanup () in
+      if trimmed > 0 then
+        Logging.info_f ~section "InFlightAmendments registry cleaned up: removed %d stale entries" trimmed;
 
       (* Sleep for 5 minutes before next cleanup *)
       Lwt_unix.sleep 300.0 >>= cleanup_loop

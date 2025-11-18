@@ -585,7 +585,13 @@ let execute_strategy
                   let price_diff = abs_float (target_buy_price -. current_buy_price) in
                   let min_move_threshold = get_price_increment asset.symbol in
                   
-                  if price_diff > min_move_threshold && target_buy_price <> current_buy_price then begin
+                  (* Check if this order is already being amended *)
+                  let is_being_amended = List.exists (fun (id, _, _, _) ->
+                    String.starts_with ~prefix:"pending_amend_" id &&
+                    String.sub id 14 (String.length id - 14) = buy_order_id
+                  ) state.pending_orders in
+                  
+                  if not is_being_amended && price_diff > min_move_threshold && target_buy_price <> current_buy_price then begin
                     (match quote_balance with
                      | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                          let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" in
@@ -610,7 +616,13 @@ let execute_strategy
                 let price_diff = abs_float (exact_target -. current_buy_price) in
                 let min_move_threshold = get_price_increment asset.symbol in
 
-                if price_diff > min_move_threshold && exact_target <> current_buy_price then begin
+                (* Check if this order is already being amended *)
+                let is_being_amended = List.exists (fun (id, _, _, _) ->
+                  String.starts_with ~prefix:"pending_amend_" id &&
+                  String.sub id 14 (String.length id - 14) = buy_order_id
+                ) state.pending_orders in
+
+                if not is_being_amended && price_diff > min_move_threshold && exact_target <> current_buy_price then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" in
@@ -662,7 +674,13 @@ let execute_strategy
                 let price_diff = target_buy_price -. current_buy_price in
                 let min_move_threshold = get_price_increment asset.symbol in
 
-                if price_diff > min_move_threshold then begin
+                (* Check if this order is already being amended *)
+                let is_being_amended = List.exists (fun (id, _, _, _) ->
+                  String.starts_with ~prefix:"pending_amend_" id &&
+                  String.sub id 14 (String.length id - 14) = buy_order_id
+                ) state.pending_orders in
+
+                if not is_being_amended && price_diff > min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" in

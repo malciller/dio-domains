@@ -661,7 +661,13 @@ let execute_strategy
                   | None -> 0.01
                 in
 
-                if price_diff > min_move_threshold then begin
+                (* Check if this order is already being amended *)
+                let is_being_amended = List.exists (fun (id, _, _, _) ->
+                  String.starts_with ~prefix:"pending_amend_" id &&
+                  String.sub id 14 (String.length id - 14) = buy_order_id
+                ) state.pending_orders in
+
+                if not is_being_amended && price_diff > min_move_threshold then begin
                   (* Mismatched: Amend buy to the required price *)
                   (* Profitability and Post-Only checks *)
                   (* For zero-fee assets, any spread is profitable, so skip profitability check *)

@@ -46,6 +46,29 @@ let registry_mutex = Mutex.create ()
 
 (** Shutdown flag for graceful termination *)
 let shutdown_requested = Atomic.make false
+let shutdown_mutex = Mutex.create ()
+let shutdown_cond = Condition.create ()
+
+(** Sleep for a specified duration, but wake up immediately if shutdown is requested *)
+let interruptible_sleep seconds =
+  if Atomic.get shutdown_requested then ()
+  else begin
+    Mutex.lock shutdown_mutex;
+    if Atomic.get shutdown_requested then
+      Mutex.unlock shutdown_mutex
+    else begin
+      Mutex.unlock shutdown_mutex;
+      let rec sleep_loop remaining =
+        if remaining <= 0.0 || Atomic.get shutdown_requested then ()
+        else begin
+          let sleep_time = min remaining 0.1 in
+          Thread.delay sleep_time;
+          sleep_loop (remaining -. sleep_time)
+        end
+      in
+      sleep_loop seconds
+    end
+  end
 
 (** Global authentication token for reuse across modules *)
 module Token_store = struct
@@ -300,9 +323,11 @@ let restart conn =
 (** Monitor all connections and report status *)
 let monitor_loop () =
   let cycle_count = ref 0 in
-  while true do
+  while not (Atomic.get shutdown_requested) do
     try
-      Thread.delay 2.0;  (* Check every 2 seconds for faster reconnection detection *)
+      interruptible_sleep 2.0;  (* Check every 2 seconds for faster reconnection detection *)
+      if Atomic.get shutdown_requested then raise Exit;
+
       incr cycle_count;
 
       Mutex.lock registry_mutex;
@@ -311,6 +336,7 @@ let monitor_loop () =
     
     (* Check each connection and trigger auto-restart if needed *)
     List.iter (fun conn ->
+      if Atomic.get shutdown_requested then () else
       (* Get all state information atomically *)
       Mutex.lock conn.mutex;
       let state = conn.state in
@@ -437,7 +463,9 @@ let monitor_loop () =
     ) conn_list;
     
     (* Telemetry updates are handled by supervisor_cache event-driven updates *)
-    with exn ->
+    with 
+    | Exit -> ()
+    | exn ->
       Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);
       Logging.error_f ~section "Monitor loop continuing after exception..."
   done
@@ -748,7 +776,8 @@ let order_processing_loop () =
   let order_mutex = Mutex.create () in
 
   while not (Atomic.get shutdown_requested) do
-    Thread.delay 1.0;  (* Process orders every second *)
+    interruptible_sleep 1.0;  (* Process orders every second *)
+    if Atomic.get shutdown_requested then () else begin
     incr cycle_count;
 
     (* Check if trading WebSocket is connected *)
@@ -777,6 +806,7 @@ let order_processing_loop () =
 
       (* Process suicide grid orders *)
       List.iter (fun order ->
+        if Atomic.get shutdown_requested then () else
         Mutex.lock order_mutex;
         try
           (* Get authentication token *)
@@ -1383,6 +1413,7 @@ let order_processing_loop () =
     with exn ->
       Logging.error_f ~section "Exception in order processing loop: %s" (Printexc.to_string exn);
     end;
+    end;
 
   done
 
@@ -1436,12 +1467,16 @@ let get_all_connections () =
 (** Stop order processing loop *)
 let stop_order_processing () =
   Atomic.set shutdown_requested true;
+  (* Wake up any sleeping threads *)
+  Mutex.lock shutdown_mutex;
+  Condition.broadcast shutdown_cond;
+  Mutex.unlock shutdown_mutex;
   Logging.info ~section "Order processing loop shutdown requested"
 
 (** Stop all connections *)
 let stop_all () =
   stop_order_processing ();
-  Thread.delay 0.5;  (* Give order processing thread time to finish current iteration *)
+  interruptible_sleep 0.5;  (* Give order processing thread time to finish current iteration *)
   Logging.warn ~section "Stopping all supervised connections";
   Mutex.lock registry_mutex;
   Hashtbl.iter (fun _name conn ->

@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+  - All new data structures must be wrapped in a trackable `src/engine/memory_tracing/` trackable data structure for future tracing. This applies to all data structures.
+
