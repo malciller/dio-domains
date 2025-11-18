@@ -489,6 +489,12 @@ let cleanup_dynamic_assets () =
     Mutex.lock balance_update_mutex;
     Hashtbl.remove last_balance_update asset;
     Mutex.unlock balance_update_mutex;
+    
+    (* Explicitly remove associated telemetry metrics to free memory immediately *)
+    Telemetry.remove_metric "balance_stale_assets" ~labels:[("asset", asset)] ();
+    (* Also try to remove any other asset-specific metrics if they exist *)
+    (* Note: We can't easily know all metric names without tracking them, 
+       but this handles the one we know is created with dynamic labels *)
   ) dynamic_to_remove;
 
   Mutex.unlock configured_assets_mutex;

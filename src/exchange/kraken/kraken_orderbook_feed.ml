@@ -20,7 +20,7 @@ let get_conduit_ctx () =
 
 (* TODO: Magic numbers - orderbook_depth and ring_buffer_size should be configurable *)
 let orderbook_depth = 25
-let ring_buffer_size = 256
+let ring_buffer_size = 64
 
 (** Shared CRC32 implementation for checksum calculations *)
 let crc32_table =
