@@ -1,11 +1,13 @@
 (** Kraken Executions Feed - WebSocket v2 authenticated executions subscription with lock-free ring buffers
  *  Tracks open orders and order completions per asset using event-driven, lock-free architecture
  *)
+(* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
 open Concurrency
 
 let section = "kraken_executions"
+(* TODO: Magic number - ring_buffer_size should be configurable *)
 let ring_buffer_size = 512
 
 (** Safely force Conduit context with error handling *)
@@ -67,6 +69,7 @@ let string_of_side = function
   | Buy -> "buy"
   | Sell -> "sell"
 
+(* TODO: Problematic default fallback - returns Buy for unknown side strings, should probably raise error or use Result type *)
 let side_of_string = function
   | "buy" -> Buy
   | "sell" -> Sell

@@ -588,7 +588,26 @@ let inc_sliding_counter metric ?(value=1) () =
 
       (* Check window size BEFORE adding new entry to prevent unbounded growth *)
       let current_len = List.length !(sliding.current_window) in
-      if current_len >= sliding.window_size then begin
+      
+      (* Emergency truncation if window is way over limit *)
+      if current_len >= sliding.window_size * 3 / 2 then begin  (* 1.5x target size *)
+        Logging.warn_f ~section:"telemetry" "EMERGENCY: Sliding window for metric exceeded 1.5x limit (%d/%d), forcing truncation" 
+          current_len sliding.window_size;
+        let cutoff = now -. 15.0 in  (* Keep last 15 seconds *)
+        let new_window = ref [] in
+        let new_total = ref 0 in
+
+        List.iter (fun (timestamp, count) ->
+          if timestamp >= cutoff then begin
+            new_window := (timestamp, count) :: !new_window;
+            new_total := !new_total + count;
+          end
+        ) !(sliding.current_window);
+
+        sliding.current_window := !new_window;
+        sliding.total_count := !new_total;
+        sliding.last_cleanup := now;
+      end else if current_len >= sliding.window_size then begin
         (* Window is at or beyond limit - perform immediate truncation *)
         let cutoff = now -. 30.0 in  (* Keep last 30 seconds for rate calculation *)
         let new_window = ref [] in
@@ -647,8 +666,8 @@ let inc_sliding_counter metric ?(value=1) () =
            end
        | None -> ());
 
-      (* Periodic cleanup: trigger every 30 seconds regardless of size *)
-      let should_cleanup = now -. !(sliding.last_cleanup) > 30.0 in
+      (* Periodic cleanup: trigger every 15 seconds (reduced from 30) *)
+      let should_cleanup = now -. !(sliding.last_cleanup) > 15.0 in
 
       Mutex.unlock metrics_mutex;
 
@@ -661,7 +680,7 @@ let inc_sliding_counter metric ?(value=1) () =
           if now_check -. !(sliding.last_cleanup) > 30.0 then
             begin
               sliding.last_cleanup := now_check;
-              let cutoff = now_check -. 30.0 in  (* Keep last 30 seconds for rate calculation *)
+              let cutoff = now_check -. 15.0 in  (* Keep last 15 seconds (reduced from 30) *)
               let new_window = ref [] in
               let new_total = ref 0 in
 

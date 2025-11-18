@@ -1,18 +1,12 @@
 {
   "logging_level": "info",
   "logging_sections": "",
-  "metrics_broadcast": {
-    "active": true, 
-    "port": 8080, 
-    "enable_token_auth": true, 
-    "enable_ip_whitelist": true 
-},   
   "trading": [
     {
       "symbol": "BTC/USD",
       "qty": "0.00025",
       "grid_interval": "0.75",
-      "sell_mult": "0.999",
+      "sell_mult": "0.9995",
       "strategy": "Grid"
     },
     {
@@ -24,29 +18,29 @@
     },
     {
       "symbol": "ETH/USD",
-      "qty": "0.003", 
-      "grid_interval": "2.5",
+      "qty": "0.0035",
+      "grid_interval": "5.0",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "SOL/USD",
       "qty": "0.08",
-      "grid_interval": "2.5",
+      "grid_interval": "5.0",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "ADA/USD",
-      "qty": "19.0",
+      "qty": "23.0",
       "grid_interval": "5.0",
       "sell_mult": "0.999",
       "strategy": "Grid"
-    },    
+    },
     {
       "symbol": "TRX/USD",
       "qty": "40.0",
-      "grid_interval": "2.5",
+      "grid_interval": "5.0",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },

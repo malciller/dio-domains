@@ -26,21 +26,13 @@ Create `.env`:
 ```bash
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_API_SECRET=your_kraken_api_secret
-ALLOWED_CLIENT_TOKEN=your_client_token
-ALLOWED_CLIENT_IP=machine_name_or_ip_to_whitelist
 ```
 
 Edit `config.json` (example):
 ```json
 {
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
-  "logging_sections": "",    // Filter logs by section (optional, comma-separated)
-    "metrics_broadcast": {
-      "active": true, // bool, whether to broadcast metrics via tcp or not
-      "port": 8080, // int, port to broadcast tcp stream
-      "enable_token_auth": true, // bool, enable token authorization, leave false for no toke validation
-      "enable_ip_whitelist": true // bool, enable specific ip access, leave false for all connection sources
-  },         
+  "logging_sections": "",    // Filter logs by section (optional, comma-separated)  
   "trading": [
     {
       "symbol": "BTC/USD",            // Pair to trade
@@ -78,7 +70,6 @@ Edit `config.json` (example):
 - **Real-Time Telemetry**: Comprehensive metrics collection for performance monitoring and debugging
 - **High-Frequency Trading**: Optimized for low-latency execution with microsecond-precision timing
 - **Fault Tolerance**: Supervised domains with automatic restart and exponential backoff
-- **Reactive Dashboard**: Real-time terminal UI with live metrics and connection status
 
 ## Architecture
 
@@ -96,11 +87,6 @@ Edit `config.json` (example):
   - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
   - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
   - **Authentication**: Secure token generation and management.
-- **UI**: Raw TCP stream of vairous metrics and values from the bot. 
-
-### TCP Stream Integration
-
-For an example integration demonstrating how to read and use the TCP stream that dio produces, see: [https://github.com/malciller/c_stuf/tree/main/tcp](https://github.com/malciller/c_stuf/tree/main/tcp)
 
 ## Development
 
@@ -116,54 +102,10 @@ dune fmt
 dune build @doc
 ```
 
-## Memory Profiling and Debugging
-
-Dio includes built-in memory profiling tools to help identify memory leaks and performance issues:
-
-### Enhanced Memory Monitoring
-
-Dio provides comprehensive memory monitoring using OCaml's built-in `Gc.stat()` API, designed to work out-of-the-box with OCaml 5.1.1 multicore:
-
 ```bash
 # Build and run the project
 dune build
 ./_build/default/bin/main.exe
-
-# Memory monitoring features:
-# - Automatic leak detection (alerts when heap grows >100MB over 5+ minutes)
-# - Per-domain heap tracking in multicore environments
-# - Allocation rate monitoring
-# - Detailed GC statistics logging every 5 minutes
-# - Automatic GC triggering every 15 minutes to prevent memory creep
-```
-
-**Memory Monitoring Output:**
-```
-Memory leak detected: 150.2 MB growth in 420 seconds, triggering GC
-GC Stats: heap=234.5MB live=189.3MB free=45.2MB fragments=12 compactions=3
-Domain 1: heap=156.7MB (last update 12.3s ago)
-```
-
-### Memory Monitoring
-
-The system automatically monitors memory usage and stream depths:
-
-- **Periodic GC**: Automatic garbage collection every 15 minutes
-- **Memory leak detection**: Alerts when heap grows by >100MB over recent readings
-- **Per-domain tracking**: Monitors heap usage across multiple domains in multicore environments
-- **Allocation rate tracking**: Monitors allocation patterns to identify hotspots
-- **Stream depth monitoring**: Warns when event bus streams exceed 100 items
-- **Detailed reporting**: Memory statistics logged every 5 minutes
-
-### Common Issues and Solutions
-
-**Backpressure Warnings**: If you see "consecutive timeouts" messages, the system is dropping items to prevent memory accumulation.
-
-**Memory Growth**: Check logs for GC activity and memory statistics. The built-in monitoring identifies allocation hotspots and provides detailed heap analysis.
-
-**Stream Depth Warnings**: High stream depths indicate consumers are slower than producers. The system automatically drops old items.
-
-**Future Note**: OCaml 5.3 will include statistical memory profiling (statmemprof) with full multicore support, providing more detailed allocation analysis than the current `Gc.stat()` approach.
 
 ## Logging
 

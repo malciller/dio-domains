@@ -13,20 +13,27 @@ let () =
 let shutdown_requested = Atomic.make false
 let shutdown_condition = Lwt_condition.create ()
 
+(** Force exit flag - for double SIGINT *)
+let force_exit_requested = Atomic.make false
+
 (** Fatal signal tracking - None if no fatal signal received, Some signal_number if fatal signal occurred *)
 let fatal_signal_received = Atomic.make None
 
 (** Signal handler for graceful shutdown *)
 let setup_signal_handlers () =
-  let handle_signal _signum =
+  let handle_force_exit _signum =
+    Logging.critical ~section:"main" "Force exit signal received - terminating immediately";
+    exit 1
+  in
+  let handle_graceful_shutdown _signum =
     if not (Atomic.get shutdown_requested) then (
       Atomic.set shutdown_requested true;
       Logging.warn ~section:"main" "Shutdown signal received, cleaning up...";
 
+      (* Install force exit handler for subsequent signals *)
+      Sys.set_signal Sys.sigint (Sys.Signal_handle handle_force_exit);
+
       (* Signal shutdown to all components *)
-      Dio_ui_cache.System_cache.signal_shutdown ();
-      Dio_ui_cache.Telemetry_cache.signal_shutdown ();
-      Dio_ui_cache.Balance_cache.signal_shutdown ();
       Dio_engine.Order_executor.signal_shutdown ();
       Kraken.Kraken_trading_client.signal_shutdown ();
 
@@ -36,14 +43,18 @@ let setup_signal_handlers () =
       (* Stop all websocket connections *)
       Supervisor.stop_all ();
 
-      (* Signal shutdown condition to allow graceful server shutdown *)
+      (* Signal shutdown condition to allow graceful shutdown *)
       Lwt_condition.broadcast shutdown_condition ();
 
-      Logging.info ~section:"main" "Shutdown cleanup initiated, waiting up to 5 seconds for graceful exit..."
+      Logging.info ~section:"main" "Shutdown cleanup initiated, force exit available with second Ctrl+C..."
+    ) else if not (Atomic.get force_exit_requested) then (
+      Atomic.set force_exit_requested true;
+      Logging.critical ~section:"main" "Second shutdown signal received - forcing immediate exit";
+      exit 1
     )
   in
-  Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
-  Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_signal)
+  Sys.set_signal Sys.sigint (Sys.Signal_handle handle_graceful_shutdown);
+  Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_graceful_shutdown)
 
 (** Fatal signal handler for crashes *)
 let setup_fatal_signal_handlers () =
@@ -81,6 +92,7 @@ let setup_fatal_signal_handlers () =
       Atomic.set shutdown_requested true;
 
       (* Quick emergency cleanup *)
+      Dio_engine.Order_executor.signal_shutdown ();
       Dio_engine.Domain_spawner.stop_all_domains ();
       Supervisor.stop_all ();
       Lwt_condition.broadcast shutdown_condition ();
@@ -110,10 +122,10 @@ let setup_lwt_exception_handler () =
     ()
   )
 
-(** Command line argument parsing - no options needed for metrics broadcast mode *)
+(** Command line argument parsing *)
 let speclist = []
 
-let usage_msg = "Dio Trading Engine with Metrics Broadcast\n\nUsage: " ^ Sys.argv.(0) ^ "\n\nStarts the trading engine and metrics broadcast server on the configured port."
+let usage_msg = "Dio Trading Engine\n\nUsage: " ^ Sys.argv.(0) ^ "\n\nStarts the trading engine."
 
 (** Initialize the trading engine synchronously (for websocket setup) *)
 let init_trading_engine_sync () =
@@ -139,37 +151,245 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
-  (* Initialize memory tracing if requested *)
-  (* Note: Enhanced memory monitoring is built-in via Gc.stat() calls *)
-  (* Memory monitoring is handled by system_cache.ml and telemetry.ml *)();
+  (* Initialize enhanced memory monitoring for leak detection *)
+  Logging.info ~section:"main" "Initializing enhanced memory monitoring...";
+
+  (* Track GC statistics over time for leak detection *)
+  let initial_gc_stats = Gc.stat () in
+  let gc_stats_history = ref [] in
+  let max_history_size = 50 in  (* Reduced to save memory *)
+
+  (* Lightweight allocation tracking - NO backtrace strings stored *)
+  let allocation_samples = Hashtbl.create 100 in  (* hash -> (count, total_words) *)
+  let max_allocation_samples = 100 in  (* Hard limit - reduced from 500 *)
+  let last_gc_live_words = ref (Gc.stat ()).live_words in
+  let sample_interval = 7.0 in
+  let last_sample_time = ref (Unix.gettimeofday ()) in
+  let sampling_in_progress = ref false in
+  let sample_counter = ref 0 in
+
+  (* Component-level memory tracking *)
+  let component_sizes = Hashtbl.create 20 in  (* component_name -> (size, timestamp) *)
+  let last_component_check = ref (Unix.gettimeofday ()) in
+
+  (* Immediate LRU eviction - no separate cleanup function needed *)
+  let evict_lru_sample_if_needed () =
+    if Hashtbl.length allocation_samples >= max_allocation_samples then (
+      (* Find and remove smallest allocation to make room *)
+      let smallest_hash = ref None in
+      let smallest_words = ref Int64.max_int in
+      Hashtbl.iter (fun hash (_, total_words) ->
+        if total_words < !smallest_words then (
+          smallest_words := total_words;
+          smallest_hash := Some hash
+        )
+      ) allocation_samples;
+      match !smallest_hash with
+      | Some hash -> Hashtbl.remove allocation_samples hash
+      | None -> ()
+    )
+  in
+
+  let sample_allocations () =
+    (* Early exit if shutdown is requested *)
+    if Atomic.get shutdown_requested then () else
+    let now = Unix.gettimeofday () in
+    (* Sample ~70% of the time when interval is reached *)
+    let should_sample = !sample_counter mod 10 < 7 in
+    incr sample_counter;
+    if now -. !last_sample_time >= sample_interval && not !sampling_in_progress && should_sample then (
+      last_sample_time := now;
+      sampling_in_progress := true;
+      (try
+        let current_gc_stats = Gc.stat () in
+        let allocated_words = Int64.of_int (max 0 (current_gc_stats.live_words - !last_gc_live_words)) in
+        last_gc_live_words := current_gc_stats.live_words;
+
+        if allocated_words > 50000L then (* >400KB allocation *)
+          (* Get backtrace but DON'T store the string - only use hash *)
+          let backtrace = Printexc.get_callstack 5 in  (* Reduced depth from 10 to 5 *)
+          let backtrace_hash = Hashtbl.hash (Printexc.raw_backtrace_to_string backtrace) in
+          
+          (* Evict LRU entry if at capacity BEFORE adding *)
+          evict_lru_sample_if_needed ();
+          
+          let count, total_words =
+            try Hashtbl.find allocation_samples backtrace_hash
+            with Not_found -> (0L, 0L)
+          in
+          (* Store only hash + counts, NO backtrace string *)
+          Hashtbl.replace allocation_samples backtrace_hash 
+            (Int64.add count 1L, Int64.add total_words allocated_words)
+      with _ -> ()  (* Ignore backtrace errors *)
+      );
+      sampling_in_progress := false
+    )
+  in
+
+  (* Track component memory usage via hashtable sizes *)
+  let track_component_memory () =
+    if Atomic.get shutdown_requested then () else
+    let now = Unix.gettimeofday () in
+    if now -. !last_component_check >= 30.0 then (
+      last_component_check := now;
+      (* Store component sizes for growth tracking *)
+      Hashtbl.replace component_sizes "allocation_samples" 
+        (Hashtbl.length allocation_samples, now)
+    )
+  in
+
+  (* Periodic memory statistics reporting *)
+  let start_time = Unix.gettimeofday () in
+  let last_report_time = ref start_time in
+  let report_interval = 30.0 in  (* Report every 5 minutes *)
+
+  let report_memory_stats () =
+    (* Early exit if shutdown is requested *)
+    if Atomic.get shutdown_requested then () else
+    let now = Unix.gettimeofday () in
+    if now -. !last_report_time >= report_interval then (
+      last_report_time := now;
+      let runtime = now -. start_time in
+      let current_gc_stats = Gc.stat () in
+
+      (* Early exit if shutdown requested after GC stat collection *)
+      if Atomic.get shutdown_requested then () else (
+
+      (* Store current stats in history for trend analysis *)
+      gc_stats_history := current_gc_stats :: !gc_stats_history;
+      if List.length !gc_stats_history > max_history_size then
+        gc_stats_history := List.rev (List.tl (List.rev !gc_stats_history));
+
+      (* Early exit if shutdown requested after history update *)
+      if Atomic.get shutdown_requested then () else (
+
+      (* Calculate memory growth trends *)
+      let heap_growth = current_gc_stats.heap_words - initial_gc_stats.heap_words in
+      let live_growth = current_gc_stats.live_words - initial_gc_stats.live_words in
+      let collections_growth = current_gc_stats.major_collections - initial_gc_stats.major_collections in
+
+      (* Early exit if shutdown requested before logging *)
+      if Atomic.get shutdown_requested then () else (
+
+      Logging.info_f ~section:"memory" "=== MEMORY STATISTICS (Runtime: %.1fs) ===" runtime;
+
+      (* Early exit if shutdown requested after header *)
+      if Atomic.get shutdown_requested then () else (
+
+      Logging.info_f ~section:"memory" "Current GC Stats: heap=%dMB live=%dMB free=%dMB"
+        (current_gc_stats.heap_words * (Sys.word_size / 8) / 1048576)
+        (current_gc_stats.live_words * (Sys.word_size / 8) / 1048576)
+        ((current_gc_stats.heap_words - current_gc_stats.live_words) * (Sys.word_size / 8) / 1048576);
+
+      (* Early exit if shutdown requested after GC stats *)
+      if Atomic.get shutdown_requested then () else (
+
+      Logging.info_f ~section:"memory" "GC Activity: minor_collections=%d major_collections=%d compactions=%d"
+        current_gc_stats.minor_collections
+        current_gc_stats.major_collections
+        current_gc_stats.compactions;
+
+      Logging.info_f ~section:"memory" "Memory Growth: heap %+dMB live %+dMB (+%d major GC cycles)"
+        (heap_growth * (Sys.word_size / 8) / 1048576)
+        (live_growth * (Sys.word_size / 8) / 1048576)
+        collections_growth;
+
+      (* Calculate allocation rate *)
+      let allocation_rate_kb_per_sec = float_of_int (live_growth * (Sys.word_size / 8) / 1024) /. runtime in
+      Logging.info_f ~section:"memory" "Allocation Rate: %.1f KB/s average since startup" allocation_rate_kb_per_sec;
+
+      (* Memory leak warning *)
+      if live_growth > 10000000 then (* 10MB growth *)
+        Logging.warn_f ~section:"memory" "POTENTIAL MEMORY LEAK: Live memory grew by %dMB since startup"
+          (live_growth * (Sys.word_size / 8) / 1048576);
+
+      (* Monitor monitoring system's own memory usage - much lighter now *)
+      let monitoring_memory_kb = (Hashtbl.length allocation_samples * 16) / 1024 in  (* Only 16 bytes per entry now *)
+      if monitoring_memory_kb > 100 then (* More than 100KB used by monitoring *)
+        Logging.warn_f ~section:"memory" "MONITORING SYSTEM MEMORY USAGE: %dKB (%d allocation samples)"
+          monitoring_memory_kb (Hashtbl.length allocation_samples);
+      if Hashtbl.length allocation_samples >= max_allocation_samples then
+        Logging.info_f ~section:"memory" "Allocation samples at limit (%d), LRU eviction active" max_allocation_samples;
+
+      (* Early exit if shutdown requested before fragmentation analysis *)
+      if Atomic.get shutdown_requested then () else (
+
+      (* Fragmentation analysis *)
+      let fragmentation_ratio = float_of_int current_gc_stats.fragments /. float_of_int current_gc_stats.heap_words in
+      Logging.info_f ~section:"memory" "Fragmentation: %d words (%.2f%% of heap)"
+        current_gc_stats.fragments (fragmentation_ratio *. 100.0);
+
+      (* Early exit if shutdown requested before allocation sites processing *)
+      if Atomic.get shutdown_requested then () else (
+
+      (* Report top allocation sites - lightweight version without backtrace strings *)
+      if not (Atomic.get shutdown_requested) && Hashtbl.length allocation_samples > 0 then (
+        Logging.info ~section:"memory" "Top memory allocation sites (by hash):";
+        let top_sites = Hashtbl.fold (fun hash (count, total_words) acc ->
+          if Atomic.get shutdown_requested then acc else
+          (hash, count, total_words) :: acc
+        ) allocation_samples []
+        |> (fun acc -> if Atomic.get shutdown_requested then [] else List.sort (fun (_, _, w1) (_, _, w2) -> compare w2 w1) acc)
+        |> (fun l -> if Atomic.get shutdown_requested then [] else let rec take n acc = function | [] -> List.rev acc | h::t when n > 0 -> take (n-1) (h::acc) t | _ -> List.rev acc in take 5 [] l)
+        in
+        if not (Atomic.get shutdown_requested) then (
+          List.iteri (fun i (hash, count, total_words) ->
+            if not (Atomic.get shutdown_requested) then (
+              let bytes = Int64.to_int total_words * (Sys.word_size / 8) in
+              Logging.info_f ~section:"memory" "  %d. %d bytes (%Ld words) in %Ld samples [hash:%d]"
+                (i + 1) bytes total_words count hash
+            )
+          ) top_sites;
+          if not (Atomic.get shutdown_requested) then
+            Logging.info_f ~section:"memory" "  (Lightweight tracking: %d unique sites, max %d, ~%dKB overhead)" 
+              (Hashtbl.length allocation_samples) max_allocation_samples ((Hashtbl.length allocation_samples * 16) / 1024)
+        )
+      );
+
+      Logging.info ~section:"memory" "=== END MEMORY STATISTICS ==="
+      )
+      )
+      )
+      )
+      )
+      )
+      )
+    )
+  in
+
+  (* Start periodic memory reporting thread *)
+  let memory_reporter_thread = Thread.create (fun () ->
+    let last_report = ref (Unix.gettimeofday ()) in
+    let last_sample = ref (Unix.gettimeofday ()) in
+    try
+      while not (Atomic.get shutdown_requested) do
+        let now = Unix.gettimeofday () in
+        (* Sample allocations at the proper intervals *)
+        if now -. !last_sample >= 1.0 then (
+          last_sample := now;
+          sample_allocations ();
+          track_component_memory ()  (* Also track component sizes *)
+        );
+        (* Report memory stats at regular intervals *)
+        if now -. !last_report >= report_interval then (
+          report_memory_stats ();
+          last_report := now
+        );
+        (* Very responsive shutdown check - even shorter delay when shutdown requested *)
+        let delay_time = if Atomic.get shutdown_requested then 0.001 else 0.01 in
+        Thread.delay delay_time
+      done;
+      (* Skip final memory report during shutdown to prevent race conditions *)
+      ()
+    with _ ->
+      (* If anything goes wrong during shutdown, just exit the thread *)
+      ()
+  ) () in
 
   (* Read and apply logging configuration *)
   let config = Dio_engine.Config.read_config () in
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
-
-  (* Initialize caches for metrics broadcast if enabled *)
-  if config.metrics_broadcast.active then (
-    Logging.info ~section:"main" "Metrics broadcast enabled, initializing caches...";
-    Dio_ui_cache.Logs_cache.init ();
-    Dio_ui_cache.Telemetry_cache.init ();
-    Dio_ui_cache.System_cache.init ();
-    Dio_ui_cache.Balance_cache.init ();
-  ) else (
-    Logging.info ~section:"main" "Metrics broadcast disabled, skipping cache initialization";
-  );
-
-  (* Set up log streaming to logs cache if metrics broadcast is active *)
-  if config.metrics_broadcast.active then (
-    Logging.set_log_callback (fun level section message ->
-      (* Skip broadcast section logs to prevent infinite recursion *)
-      if section <> "broadcast" then (
-        let level_str = Logging.level_to_string level in
-        Dio_ui_cache.Logs_cache.add_log_entry level_str section message
-      ) else
-        Lwt.return_unit
-    );
-  );
 
   (* Initialize random number generator for crypto operations *)
   Mirage_crypto_rng_unix.use_default ();
@@ -193,13 +413,7 @@ let () =
   (* Setup Lwt unhandled exception handler *)
   setup_lwt_exception_handler ();
 
-  Logging.info ~section:"main" "Starting Dio Trading Engine with Metrics Broadcast...";
-
-  (* Signal that caches are ready before any initialization if metrics broadcast is active *)
-  if config.metrics_broadcast.active then (
-    Dio_ui_cache.Balance_cache.signal_feeds_ready ();
-    Dio_ui_cache.Telemetry_cache.signal_system_ready ();
-  );
+  Logging.info ~section:"main" "Starting Dio Trading Engine...";
 
   try
     (* Initialize trading engine synchronously *)
@@ -209,35 +423,51 @@ let () =
     (* Initialize order executor asynchronously - this can run in background *)
     let _order_executor_promise = init_order_executor_async () in
 
-    (* Start metrics broadcast server if enabled - runs until shutdown signal *)
-    if config.metrics_broadcast.active then (
-      Logging.info_f ~section:"main" "Trading engine ready, starting metrics broadcast server on port %d..." config.metrics_broadcast.port;
+    Logging.info ~section:"main" "Trading engine ready, waiting for shutdown signal...";
 
-      (* Run server until shutdown signal is received *)
-      (try
-        Lwt_main.run (Dio_ui.Metrics_broadcast.start_server config.metrics_broadcast shutdown_condition)
-      with e ->
-        let backtrace = Printexc.get_backtrace () in
-        Logging.critical_f ~section:"main" "Fatal exception in Lwt event loop (metrics broadcast): %s\nBacktrace:\n%s"
-          (Printexc.to_string e) backtrace;
-        exit 1
-      );
+    (* Wait for shutdown signal *)
+    (try
+      Lwt_main.run (Lwt_condition.wait shutdown_condition)
+    with e ->
+      let backtrace = Printexc.get_backtrace () in
+      Logging.critical_f ~section:"main" "Fatal exception in Lwt event loop: %s\nBacktrace:\n%s"
+        (Printexc.to_string e) backtrace;
+      exit 1
+    );
 
-      Logging.info ~section:"main" "Metrics broadcast server closed gracefully, shutting down...";
-    ) else (
-      Logging.info ~section:"main" "Trading engine ready, waiting for shutdown signal...";
+    Logging.info ~section:"main" "Shutdown signal received, shutting down...";
 
-      (* Wait for shutdown signal without starting server *)
-      (try
-        Lwt_main.run (Lwt_condition.wait shutdown_condition)
-      with e ->
-        let backtrace = Printexc.get_backtrace () in
-        Logging.critical_f ~section:"main" "Fatal exception in Lwt event loop (no server): %s\nBacktrace:\n%s"
-          (Printexc.to_string e) backtrace;
-        exit 1
-      );
+    (* Start aggressive shutdown timer - force exit after 3 seconds total *)
+    let shutdown_start = Unix.gettimeofday () in
+    let force_exit_timeout = 3.0 in
 
-      Logging.info ~section:"main" "Shutdown signal received, shutting down...";
+    (* Wait briefly for memory reporter thread, but don't wait forever *)
+    let memory_thread_timeout = 1.0 in  (* Only wait 1 second for memory thread *)
+    let memory_join_start = Unix.gettimeofday () in
+    let memory_joined = ref false in
+    let _memory_join_thread = Thread.create (fun () ->
+      try
+        Thread.join memory_reporter_thread;
+        memory_joined := true
+      with _ -> ()  (* Thread.join can raise exceptions *)
+    ) () in
+
+    (* Wait for memory thread with short timeout *)
+    while not !memory_joined && Unix.gettimeofday () -. memory_join_start < memory_thread_timeout do
+      Thread.delay 0.05  (* Very short delay for responsiveness *)
+    done;
+
+    if !memory_joined then
+      Logging.info ~section:"main" "Memory monitoring thread completed gracefully"
+    else
+      Logging.warn ~section:"main" "Memory monitoring thread did not complete, forcing shutdown";
+
+    (* Force exit after total timeout to ensure process terminates *)
+    let elapsed = Unix.gettimeofday () -. shutdown_start in
+    if elapsed < force_exit_timeout then (
+      let remaining = force_exit_timeout -. elapsed in
+      Logging.info_f ~section:"main" "Waiting %.1fs before force exit..." remaining;
+      Thread.delay remaining
     );
 
     (* Check if a fatal signal was received during execution *)
@@ -246,8 +476,7 @@ let () =
         Logging.critical_f ~section:"main" "Process terminating due to fatal signal %d received during execution" signal_num;
         exit 1
     | None ->
-        (* Force exit to ensure process terminates even if background tasks are still running *)
-        Logging.info ~section:"main" "Process terminating normally";
+        Logging.info ~section:"main" "Force exiting process to ensure clean shutdown";
         exit 0
   with e ->
     let backtrace = Printexc.get_backtrace () in
