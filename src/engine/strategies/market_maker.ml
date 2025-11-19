@@ -100,21 +100,12 @@ let parse_config_float_opt config value_name exchange symbol =
 
 (** Round price to appropriate precision for the symbol *)
 let round_price price symbol =
-  (* Fetch price precision from Kraken instruments feed cache *)
-  match Kraken.Kraken_instruments_feed.get_precision_info symbol with
-  | Some (price_precision, qty_precision) ->
-      Logging.debug_f ~section "Rounding price %.8f for %s with precision %d (qty_precision: %d)" price symbol price_precision qty_precision;
-      (* Clamp to exact decimal precision by formatting as string and parsing back *)
-      (* This ensures we never exceed the allowed decimal places *)
-      let clamped_str = Printf.sprintf "%.*f" price_precision price in
-      let rounded_price = (try float_of_string clamped_str
-       with Failure _ ->
-         Logging.warn_f ~section "Failed to parse clamped price '%s' for %s, using original" clamped_str symbol;
-         price) in
-      Logging.debug_f ~section "Rounded price %.8f -> '%s' -> %.8f for %s" price clamped_str rounded_price symbol;
-      rounded_price
+  (* Use float-based rounding to avoid string allocation overhead *)
+  match Kraken.Kraken_instruments_feed.get_price_increment symbol with
+  | Some increment ->
+      Float.round (price /. increment) *. increment
   | None ->
-      Logging.warn_f ~section "No price precision info for %s, using default rounding" symbol;
+      Logging.warn_f ~section "No price increment info for %s, using default rounding" symbol;
       Float.round price  (* Default: 0 decimal places *)
 
 (** Get fee for the asset from the trading config *)
@@ -662,9 +653,9 @@ let execute_strategy
                 in
 
                 (* Check if this order is already being amended *)
+                let expected_amend_id = "pending_amend_" ^ buy_order_id in
                 let is_being_amended = List.exists (fun (id, _, _, _) ->
-                  String.starts_with ~prefix:"pending_amend_" id &&
-                  String.sub id 14 (String.length id - 14) = buy_order_id
+                  id = expected_amend_id
                 ) state.pending_orders in
 
                 if not is_being_amended && price_diff > min_move_threshold then begin
