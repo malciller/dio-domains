@@ -99,21 +99,20 @@ let test_common_metrics () =
 
   check int "orders_placed counter" 3 (Telemetry.get_counter Telemetry.Common.orders_placed);
   check int "orders_failed counter" 1 (Telemetry.get_counter Telemetry.Common.orders_failed)
-
 let test_asset_metrics () =
-  (* Test asset-specific metric helpers *)
+  (* Test asset-specific metric helpers - note: asset label is now ignored to prevent memory leaks *)
   let btc_counter = Telemetry.asset_counter "asset_trades" "BTC" () in
-  let eth_gauge = Telemetry.asset_gauge "asset_balance" "ETH" in
+  let eth_gauge = Telemetry.asset_gauge "asset_balance" "ETH" () in
   let ada_hist = Telemetry.asset_histogram "asset_latency" "ADA" () in
 
   (* Test counter *)
   Telemetry.inc_counter btc_counter ~value:5 ();
   check int "asset counter value" 5 (Telemetry.get_counter btc_counter);
-
+  
   (* Test gauge *)
   Telemetry.set_gauge eth_gauge 1234.56;
   check (float 0.001) "asset gauge value" 1234.56 (Telemetry.get_gauge eth_gauge);
-
+  
   (* Test histogram *)
   Telemetry.observe_histogram ada_hist 0.05;
   Telemetry.observe_histogram ada_hist 0.08;
