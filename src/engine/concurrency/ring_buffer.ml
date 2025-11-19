@@ -13,10 +13,22 @@ module RingBuffer = struct
     mutable count: int;  (* Track number of valid entries *)
   }
 
+  (* Helper to find the next power of 2, for efficient modulo operations *)
+  let next_pow2 n =
+    let rec loop k =
+      if k >= n then k
+      else loop (k * 2)
+    in
+    if n <= 0 then 1 (* Or raise an error, depending on desired behavior for non-positive input *)
+    else loop 1
+
   (** Create a new ring buffer with the specified capacity *)
-  let create size =
-    if size <= 0 then
-      invalid_arg "RingBuffer.create: size must be positive";
+  let create capacity =
+    if capacity <= 0 then
+      invalid_arg "RingBuffer.create: capacity must be positive";
+    (* Assuming a Logging module exists and is in scope *)
+    Logging.info_f ~section:"ring_buffer" "Creating new RingBuffer with capacity %d" capacity;
+    let size = next_pow2 capacity in
     {
       data = Array.init size (fun _ -> Atomic.make None);
       write_pos = Atomic.make 0;

@@ -267,32 +267,12 @@ let start_inflight_cleanup () =
   in
   Lwt.async cleanup_loop
 
-(** Listen for execution events to clear in-flight amendment locks *)
-let start_execution_listener () =
-  Logging.info ~section "Starting execution listener for in-flight amendment clearing";
-  let (stream, _close_fn) = Kraken.Kraken_executions_feed.subscribe_order_updates () in
-  
-  let rec listen_loop () =
-    Lwt_stream.get stream >>= function
-    | Some event ->
-        (* Check if this event corresponds to an in-flight amendment *)
-        (* We clear the lock when we see ANY update for the order, as that means the exchange state has changed *)
-        (* and the strategy will see the new state on its next cycle *)
-        if InFlightAmendments.remove_in_flight_amendment event.order_id then
-          Logging.debug_f ~section "Inflight amendment lock cleared by event for order %s (status: %s)" 
-            event.order_id (Kraken.Kraken_executions_feed.string_of_order_status event.order_status);
-        listen_loop ()
-    | None ->
-        Logging.warn ~section "Execution event stream closed unexpectedly";
-        Lwt.return_unit
-  in
-  Lwt.async listen_loop
+
 
 (** Initialize the order executor with authentication token *)
 let init : unit Lwt.t =
   (* Trading client is now managed by the supervisor *)
   start_inflight_cleanup ();
-  start_execution_listener ();
   Lwt.return_unit
 
 (** Place a new order *)
@@ -436,11 +416,8 @@ let amend_order
                 Lwt.fail exn
               )
             >>= fun result ->
-            (* CRITICAL CHANGE: Do NOT remove from in-flight cache immediately on success. *)
-            (* We wait for the execution event to arrive via WebSocket to confirm the state change. *)
-            (* This prevents the strategy from seeing the old state and re-submitting the amendment. *)
-            (* The cleanup task will handle cases where the event never arrives. *)
-            Logging.debug_f ~section "Amendment submitted for %s, keeping inflight lock until event confirmation" request.order_id;
+            (* Remove from in-flight cache on success immediately, just like place_order *)
+            let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
             Lwt.return result
           end
         end

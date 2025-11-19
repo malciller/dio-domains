@@ -287,6 +287,7 @@ let gauge name ?(labels=[]) () =
           cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
+        Logging.info_f ~section:"telemetry" "Created NEW gauge metric: %s" key;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -484,6 +485,7 @@ let histogram name ?(labels=[]) () =
           cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
+        Logging.info_f ~section:"telemetry" "Created NEW histogram metric: %s" key;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -755,6 +757,7 @@ let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
           cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
+        Logging.info_f ~section:"telemetry" "Created NEW counter metric: %s" key;
         m
   in
   Mutex.unlock metrics_mutex;
