@@ -62,8 +62,8 @@ let memory_config = {
 let memory_config_mutex = Mutex.create ()
 
 (** Metric lifecycle management *)
-let metric_stale_ttl_seconds = 3600.0  (* Remove metrics not updated in 1 hour *)
-let max_metrics_count = 5000  (* Cap total metrics to prevent unbounded growth *)
+let metric_stale_ttl_seconds = 300.0  (* Remove metrics not updated in 5 minutes - reduced from 1 hour to prevent unbounded growth *)
+let max_metrics_count = 1000  (* Cap total metrics to prevent unbounded growth - reduced from 5000 *)
 
 (** Get current memory pressure level based on OCaml heap usage *)
 let get_memory_pressure () : memory_pressure =
@@ -287,7 +287,7 @@ let gauge name ?(labels=[]) () =
           cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
-        Logging.info_f ~section:"telemetry" "Created NEW gauge metric: %s" key;
+        Logging.debug_f ~section:"telemetry" "Created gauge metric: %s" key;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -333,10 +333,10 @@ let adjust_buffer_capacities () =
   let now = Unix.gettimeofday () in
   let pressure = get_memory_pressure () in
 
-  (* Only adjust capacities every 60 seconds to avoid excessive churn *)
+  (* Only adjust capacities every 30 seconds to avoid excessive churn *)
   Mutex.lock memory_config_mutex;
   let time_since_last = now -. memory_config.last_adjustment in
-  if time_since_last >= 60.0 then begin
+  if time_since_last >= 30.0 then begin
     Logging.warn_f ~section:"telemetry" "Adjusting buffer capacities (pressure: %s)"
       (match pressure with Low -> "Low" | Medium -> "Medium" | High -> "High");
     let old_rate_capacity = memory_config.rate_buffer_capacity in
@@ -441,30 +441,39 @@ let prune_stale_metrics () =
     Logging.info_f ~section "Pruned stale metrics: removed %d stale + %d oldest, total metrics: %d/%d"
       stale_removed to_remove_more final_count total_count
 
-(** Start event-driven capacity adjustment loop *)
+(** Start event-driven capacity adjustment loop with explicit periodic pruning *)
 let start_capacity_adjuster () =
+  (* Start reactive adjustment loop triggered by metric changes *)
   Lwt.async (fun () ->
     let rec adjustment_loop () =
       (* Wait for any metric change *)
       Lwt_condition.wait metrics_changed_condition >>= fun () ->
 
-      (* Check if 60 seconds have passed since last adjustment *)
+      (* Check if 30 seconds have passed since last adjustment *)
       let now = Unix.gettimeofday () in
       Mutex.lock memory_config_mutex;
       let time_since_last = now -. memory_config.last_adjustment in
       Mutex.unlock memory_config_mutex;
 
-      if time_since_last >= 60.0 then begin
+      if time_since_last >= 30.0 then begin
         (* Perform adjustment *)
         adjust_buffer_capacities ();
-        (* Also prune stale metrics *)
-        prune_stale_metrics ()
       end;
 
       (* Continue listening *)
       adjustment_loop ()
     in
     adjustment_loop ()
+  );
+  
+  (* Start separate explicit pruning loop every 60 seconds to ensure stale metrics are removed *)
+  Lwt.async (fun () ->
+    let rec pruning_loop () =
+      Lwt_unix.sleep 60.0 >>= fun () ->
+      prune_stale_metrics ();
+      pruning_loop ()
+    in
+    pruning_loop ()
   )
 
 (** Histogram - track distribution of values *)
@@ -485,7 +494,7 @@ let histogram name ?(labels=[]) () =
           cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
-        Logging.info_f ~section:"telemetry" "Created NEW histogram metric: %s" key;
+        Logging.debug_f ~section:"telemetry" "Created histogram metric: %s" key;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -599,9 +608,9 @@ let inc_sliding_counter metric ?(value=1) () =
       (* Check window size BEFORE adding new entry to prevent unbounded growth *)
       let current_len = List.length !(sliding.current_window) in
       
-      (* Emergency truncation if window is way over limit *)
-      if current_len >= sliding.window_size * 3 / 2 then begin  (* 1.5x target size *)
-        Logging.warn_f ~section:"telemetry" "EMERGENCY: Sliding window for metric exceeded 1.5x limit (%d/%d), forcing truncation" 
+      (* Emergency truncation if window is over limit - more aggressive threshold *)
+      if current_len >= sliding.window_size * 6 / 5 then begin  (* 1.2x target size - reduced from 1.5x for faster cleanup *)
+        Logging.warn_f ~section:"telemetry" "EMERGENCY: Sliding window for metric exceeded 1.2x limit (%d/%d), forcing truncation" 
           current_len sliding.window_size;
         let cutoff = now -. 15.0 in  (* Keep last 15 seconds *)
         let new_window = ref [] in
@@ -676,8 +685,8 @@ let inc_sliding_counter metric ?(value=1) () =
            end
        | None -> ());
 
-      (* Periodic cleanup: trigger every 15 seconds (reduced from 30) *)
-      let should_cleanup = now -. !(sliding.last_cleanup) > 15.0 in
+      (* Periodic cleanup: trigger every 10 seconds (reduced from 15s for more aggressive cleanup) *)
+      let should_cleanup = now -. !(sliding.last_cleanup) > 10.0 in
 
       Mutex.unlock metrics_mutex;
 
@@ -757,7 +766,7 @@ let counter name ?(labels=[]) ?(track_rate=false) ?(rate_window=10.0) () =
           cached_rate = 0.0;
         } in
         Hashtbl.add metrics key m;
-        Logging.info_f ~section:"telemetry" "Created NEW counter metric: %s" key;
+        Logging.debug_f ~section:"telemetry" "Created counter metric: %s" key;
         m
   in
   Mutex.unlock metrics_mutex;
@@ -861,12 +870,25 @@ module Common = struct
 
 end
 
-(** Per-asset metrics helper *)
-let asset_counter name asset ?(track_rate=false) ?(rate_window=10.0) () = counter name ~labels:["asset", asset] ~track_rate ~rate_window ()
-let asset_sliding_counter name asset ?(window_size=10000) ?(track_rate=false) ?(rate_window=10.0) () =
-  sliding_counter name ~labels:["asset", asset] ~window_size ~track_rate ~rate_window ()
-let asset_gauge name asset = gauge name ~labels:["asset", asset] ()
-let asset_histogram name asset () = histogram name ~labels:["asset", asset] ()
+(* Per-asset metrics helper - WARNING: Creates aggregate metrics WITHOUT asset labels to prevent memory leaks *)
+(* These functions intentionally ignore the asset parameter and create unified aggregate metrics. *)
+(* This prevents unbounded metric creation due to high-cardinality labels. *)
+(* For per-asset tracking, use application-level data structures like hashtables in strategy state. *)
+let asset_counter name _asset ?(track_rate=false) ?(rate_window=10.0) () = 
+  (* Note: asset parameter is ignored to prevent creating one metric per asset *)
+  counter name ~track_rate ~rate_window ()
+
+let asset_sliding_counter name _asset ?(window_size=10000) ?(track_rate=false) ?(rate_window=10.0) () =
+  (* Note: asset parameter is ignored to prevent creating one metric per asset *)
+  sliding_counter name ~window_size ~track_rate ~rate_window ()
+
+let asset_gauge name _asset () = 
+  (* Note: asset parameter is ignored to prevent creating one metric per asset *)
+  gauge name ()
+
+let asset_histogram name _asset () = 
+  (* Note: asset parameter is ignored to prevent creating one metric per asset *)
+  histogram name ()
 
 (** Get current OCaml heap usage in MB *)
 let get_ocaml_heap_usage () =

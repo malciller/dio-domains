@@ -1,6 +1,6 @@
 {
   "logging_level": "info",
-  "logging_sections": "",
+  "logging_sections": "memory",
   "trading": [
     {
       "symbol": "BTC/USD",
