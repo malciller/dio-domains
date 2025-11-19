@@ -1,0 +1,384 @@
+2025-11-19 08:31:45.694 [32mINFO[0m [telemetry] Created NEW gauge metric: uptime_seconds
+2025-11-19 08:31:45.694 [32mINFO[0m [telemetry] Created NEW counter metric: api_requests
+2025-11-19 08:31:45.694 [32mINFO[0m [telemetry] Created NEW counter metric: api_errors
+2025-11-19 08:31:45.694 [32mINFO[0m [telemetry] Created NEW histogram metric: api_duration_seconds
+2025-11-19 08:31:45.694 [32mINFO[0m [telemetry] Created NEW counter metric: orders_placed
+2025-11-19 08:31:45.694 [32mINFO[0m [telemetry] Created NEW counter metric: orders_failed
+2025-11-19 08:31:45.706 [32mINFO[0m [main] Initializing enhanced memory monitoring...
+2025-11-19 08:31:45.708 [32mINFO[0m [main] Starting Dio Trading Engine...
+2025-11-19 08:31:45.708 [32mINFO[0m [main] Initializing trading engine...
+2025-11-19 08:31:45.708 [32mINFO[0m [supervisor] Starting connection supervisor
+2025-11-19 08:31:45.708 [32mINFO[0m [supervisor] Initializing websocket feeds...
+2025-11-19 08:31:45.708 [32mINFO[0m [supervisor] Loaded 7 trading configuration(s)
+2025-11-19 08:31:45.708 [32mINFO[0m [supervisor] Connecting to 7 Kraken websockets...
+2025-11-19 08:31:45.708 [32mINFO[0m [supervisor] Step 1: Initializing ticker feed stores...
+2025-11-19 08:31:45.708 [32mINFO[0m [kraken_ticker] Initializing ticker feed for 7 symbols
+2025-11-19 08:31:45.708 [32mINFO[0m [kraken_ticker] Ticker feed stores initialized
+2025-11-19 08:31:45.708 [32mINFO[0m [supervisor] Step 2: Initializing instruments feed stores...
+2025-11-19 08:31:45.901 [32mINFO[0m [kraken_instrument] Instrument data for BTC/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.00005000, price_precision=1, price_increment=0.10000000, cost_precision=5, cost_min=0.50, marginable=true
+2025-11-19 08:31:45.901 [32mINFO[0m [kraken_instrument] Instrument data for PAXG/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.00100000, price_precision=2, price_increment=0.01000000, cost_precision=6, cost_min=0.50, marginable=true
+2025-11-19 08:31:45.901 [32mINFO[0m [kraken_instrument] Instrument data for ETH/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.00100000, price_precision=2, price_increment=0.01000000, cost_precision=5, cost_min=0.50, marginable=true
+2025-11-19 08:31:45.901 [32mINFO[0m [kraken_instrument] Instrument data for SOL/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.02000000, price_precision=2, price_increment=0.01000000, cost_precision=5, cost_min=0.50, marginable=true
+2025-11-19 08:31:45.901 [32mINFO[0m [kraken_instrument] Instrument data for ADA/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=4.40000000, price_precision=6, price_increment=0.00000100, cost_precision=6, cost_min=0.50, marginable=true
+2025-11-19 08:31:45.901 [32mINFO[0m [kraken_instrument] Instrument data for TRX/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=15.00000000, price_precision=6, price_increment=0.00000100, cost_precision=7, cost_min=0.50, marginable=true
+2025-11-19 08:31:45.901 [32mINFO[0m [kraken_instrument] Instrument data for USDG/USD: status=online, qty_precision=5, qty_increment=0.00001000, qty_min=5.00000000, price_precision=4, price_increment=0.00010000, cost_precision=8, cost_min=0.50, marginable=true
+2025-11-19 08:31:45.901 [32mINFO[0m [supervisor] Step 3: Initializing orderbook feed stores...
+2025-11-19 08:31:45.901 [32mINFO[0m [supervisor] Step 4: Getting authentication token...
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Authentication token obtained
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Step 5: Initializing balances feed stores...
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_balances] Initializing balances feed for 8 assets
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_balances] Balance stores initialized - now thread-safe
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Balances feed stores initialized
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Step 6: Initializing executions feed stores...
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_executions] Initializing executions feed for 7 symbols
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_executions] Execution stores initialized - now operating lock-free
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Step 7: Starting supervised websocket connections...
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Registered supervised connection: kraken_ticker_ws
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Registered supervised connection: kraken_orderbook_ws
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Registered supervised connection: kraken_balances_ws
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Registered supervised connection: kraken_executions_ws
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Registered supervised connection: kraken_trading_ws
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_trading_client] Starting new connection
+2025-11-19 08:31:46.149 [32mINFO[0m [kraken_trading_client] Connecting to Kraken authenticated WebSocket for trading...
+2025-11-19 08:31:46.149 [32mINFO[0m [supervisor] Waiting for executions feed to be ready...
+2025-11-19 08:31:46.512 [32mINFO[0m [kraken_executions] Authenticated WebSocket established, subscribing to executions
+2025-11-19 08:31:46.512 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_executions_ws}
+2025-11-19 08:31:46.512 [32mINFO[0m [supervisor] [kraken_executions_ws] Connection established (total: 1)
+2025-11-19 08:31:46.514 [33mWARN[0m [telemetry] Adjusting buffer capacities (pressure: Low)
+2025-11-19 08:31:46.514 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_rate_buffer_capacity
+2025-11-19 08:31:46.514 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_histogram_buffer_capacity
+2025-11-19 08:31:46.514 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_memory_pressure_low
+2025-11-19 08:31:46.514 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_memory_pressure_medium
+2025-11-19 08:31:46.514 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_memory_pressure_high
+2025-11-19 08:31:46.521 [32mINFO[0m [kraken_trading_client] Trading WebSocket connection established
+2025-11-19 08:31:46.521 [32mINFO[0m [kraken_trading_client] Connection established successfully (generation 0)
+2025-11-19 08:31:46.521 [32mINFO[0m [kraken_trading_client] Starting WebSocket reader loop (generation 0)
+2025-11-19 08:31:46.521 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_trading_ws}
+2025-11-19 08:31:46.521 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 1)
+2025-11-19 08:31:46.521 [32mINFO[0m [kraken_trading_client] Waiting for reader task to complete (generation 0)
+2025-11-19 08:31:46.522 [32mINFO[0m [telemetry] Created NEW counter metric: websocket_frames_received
+2025-11-19 08:31:46.640 [32mINFO[0m [kraken_executions] Subscribed to executions feed
+2025-11-19 08:31:46.640 [32mINFO[0m [telemetry] Created NEW counter metric: executions_subscribed
+2025-11-19 08:31:46.956 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_produced
+2025-11-19 08:31:46.956 [32mINFO[0m [telemetry] Created NEW counter metric: execution_snapshot_items
+2025-11-19 08:31:47.339 [32mINFO[0m [kraken_ticker] WebSocket established, subscribing to ticker feed
+2025-11-19 08:31:47.339 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_ticker_ws}
+2025-11-19 08:31:47.339 [32mINFO[0m [supervisor] [kraken_ticker_ws] Connection established (total: 1)
+2025-11-19 08:31:47.339 [32mINFO[0m [kraken_ticker] Connected to Kraken WebSocket v2
+2025-11-19 08:31:47.380 [32mINFO[0m [kraken_balances] Authenticated WebSocket established, subscribing to balances
+2025-11-19 08:31:47.380 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_balances_ws}
+2025-11-19 08:31:47.380 [32mINFO[0m [supervisor] [kraken_balances_ws] Connection established (total: 1)
+2025-11-19 08:31:47.380 [32mINFO[0m [kraken_balances] Connected to Kraken authenticated WebSocket
+2025-11-19 08:31:47.484 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_orderbook_ws}
+2025-11-19 08:31:47.484 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Connection established (total: 1)
+2025-11-19 08:31:47.507 [32mINFO[0m [kraken_balances] Subscribed to balances feed
+2025-11-19 08:31:47.511 [32mINFO[0m [telemetry] Created NEW counter metric: balance_updates
+2025-11-19 08:31:47.566 [32mINFO[0m [kraken_ticker] Subscribed to BTC/USD ticker feed
+2025-11-19 08:31:47.566 [32mINFO[0m [kraken_ticker] Subscribed to PAXG/USD ticker feed
+2025-11-19 08:31:47.566 [32mINFO[0m [kraken_ticker] Subscribed to ETH/USD ticker feed
+2025-11-19 08:31:47.566 [32mINFO[0m [kraken_ticker] Subscribed to SOL/USD ticker feed
+2025-11-19 08:31:47.566 [32mINFO[0m [kraken_ticker] Subscribed to ADA/USD ticker feed
+2025-11-19 08:31:47.566 [32mINFO[0m [kraken_ticker] Subscribed to TRX/USD ticker feed
+2025-11-19 08:31:47.566 [32mINFO[0m [kraken_ticker] Subscribed to USDG/USD ticker feed
+2025-11-19 08:31:47.566 [32mINFO[0m [telemetry] Created NEW counter metric: ticker_updates
+2025-11-19 08:31:47.986 [32mINFO[0m [telemetry] Created NEW counter metric: orderbook_updates
+2025-11-19 08:31:52.336 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90483.60 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:31:52.337 [32mINFO[0m [telemetry] Created NEW counter metric: execution_updates
+2025-11-19 08:31:55.339 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.57 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:31:56.150 [32mINFO[0m [supervisor] Waiting for initial market data from all feeds...
+2025-11-19 08:31:56.150 [32mINFO[0m [supervisor] ✓ Ticker feed ready
+2025-11-19 08:31:56.150 [32mINFO[0m [supervisor] ✓ Orderbook feed ready
+2025-11-19 08:32:02.360 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90483.20 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:05.387 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.55 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:32:06.150 [32mINFO[0m [supervisor] ✓ Balances feed ready
+2025-11-19 08:32:06.150 [32mINFO[0m [supervisor] All feeds initialized with market data!
+2025-11-19 08:32:06.150 [32mINFO[0m [supervisor] Step 8: Fetching trading fees for all assets...
+2025-11-19 08:32:08.616 [32mINFO[0m [main] Initializing supervised asset domains...
+2025-11-19 08:32:08.616 [32mINFO[0m [market_maker] Market Maker strategy initialized with order buffer size 4096
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain for kraken/TRX/USD started (restart #1)
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain kraken/TRX/USD started successfully2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/TRX/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/TRX/USD}
+
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/TRX/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/TRX/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/TRX/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/TRX/USD (Strategy: Grid)
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain kraken/SOL/USD started successfully
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain for kraken/SOL/USD started (restart #1)
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/SOL/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/SOL/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/SOL/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/SOL/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/SOL/USD}
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain kraken/ETH/USD started successfully
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/SOL/USD (Strategy: Grid)
+2025-11-19 08:32:08.616 [32mINFO[0m [domain_spawner] Domain for kraken/ETH/USD started (restart #1)
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain kraken/PAXG/USD started successfully
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain for kraken/PAXG/USD started (restart #1)
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/ETH/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/ETH/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/ETH/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/ETH/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain kraken/USDG/USD started successfully
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/ETH/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain for kraken/USDG/USD started (restart #1)
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain kraken/BTC/USD started successfully
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/ETH/USD (Strategy: Grid)
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain for kraken/BTC/USD started (restart #1)
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain kraken/ADA/USD started successfully
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/PAXG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain for kraken/ADA/USD started (restart #1)
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain supervisor thread started
+2025-11-19 08:32:08.617 [32mINFO[0m [main] 7 supervised asset domains initialized!
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_supervisor] Domain supervisor started
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/PAXG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/PAXG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/PAXG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [main] Initializing order executor...
+2025-11-19 08:32:08.617 [32mINFO[0m [main] Trading engine ready, waiting for shutdown signal...
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/PAXG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/PAXG/USD (Strategy: Grid)
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/BTC/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/BTC/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/BTC/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/BTC/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/BTC/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/BTC/USD (Strategy: Grid)
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/ADA/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/ADA/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/ADA/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/USDG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/USDG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/USDG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/USDG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/USDG/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/USDG/USD (Strategy: MM)
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/ADA/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/ADA/USD}
+2025-11-19 08:32:08.617 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/ADA/USD (Strategy: Grid)
+2025-11-19 08:32:08.680 [32mINFO[0m [telemetry] Created NEW counter metric: strategy_orders_generated
+2025-11-19 08:32:09.461 [32mINFO[0m [order_executor] Amending order OYWAHP-N27XD-VIZR33: price=0.27
+2025-11-19 08:32:09.461 [32mINFO[0m [kraken_actions] Amending order OYWAHP-N27XD-VIZR33: qty=40.00000000, price=0.269809
+2025-11-19 08:32:09.462 [32mINFO[0m [order_executor] Amending order O2XWFU-WMSE6-4KCD6P: price=90483.00
+2025-11-19 08:32:09.462 [32mINFO[0m [kraken_actions] Amending order O2XWFU-WMSE6-4KCD6P: qty=0.00025000, price=90483.000000
+2025-11-19 08:32:09.569 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90483.00 (Amend ID: TAYR2Z-AHLFG-LXJYR4)
+2025-11-19 08:32:09.569 [32mINFO[0m [telemetry] Created NEW counter metric: orders_amended
+2025-11-19 08:32:09.569 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy TRX/USD 40.00000000 @ 0.27 (Amend ID: T45NN2-27XCB-CABLFA)
+2025-11-19 08:32:09.570 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90483.00 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:09.570 [32mINFO[0m [kraken_executions] Updated open order: OYWAHP-N27XD-VIZR33 [TRX/USD] 40.00000000@0.27 (filled: 0.00000000/40.00000000) status=new
+2025-11-19 08:32:10.368 [32mINFO[0m [kraken_executions] Updated open order: OYWAHP-N27XD-VIZR33 [TRX/USD] 40.00000000@0.27 (filled: 0.00000000/40.00000000) status=new
+2025-11-19 08:32:10.480 [32mINFO[0m [order_executor] Amending order OYWAHP-N27XD-VIZR33: price=0.27
+2025-11-19 08:32:10.480 [32mINFO[0m [kraken_actions] Amending order OYWAHP-N27XD-VIZR33: qty=40.00000000, price=0.269809
+2025-11-19 08:32:10.582 [32mINFO[0m [kraken_executions] Updated open order: OYWAHP-N27XD-VIZR33 [TRX/USD] 40.00000000@0.27 (filled: 0.00000000/40.00000000) status=new
+2025-11-19 08:32:10.582 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy TRX/USD 40.00000000 @ 0.27 (Amend ID: TOKEFI-IGGPC-NY4EZA)
+2025-11-19 08:32:13.541 [32mINFO[0m [order_executor] Amending order OYWAHP-N27XD-VIZR33: price=0.27
+2025-11-19 08:32:13.541 [32mINFO[0m [kraken_actions] Amending order OYWAHP-N27XD-VIZR33: qty=40.00000000, price=0.269807
+2025-11-19 08:32:13.641 [32mINFO[0m [kraken_executions] Updated open order: OYWAHP-N27XD-VIZR33 [TRX/USD] 40.00000000@0.27 (filled: 0.00000000/40.00000000) status=new
+2025-11-19 08:32:13.644 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy TRX/USD 40.00000000 @ 0.27 (Amend ID: TOJ6S7-V2WZC-AL6XD3)
+2025-11-19 08:32:14.118 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:14.118 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#1000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:14.165 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#1000000 - $4105.24 | bid=$4104.24000000 | ask=$4105.57000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:14.381 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#1000000 - $138.80 | bid=$138.79000000 | ask=$138.80000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.38%) Sell@153.88(10.87%,24)
+2025-11-19 08:32:14.497 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#1000000 - $3095.30 | bid=$3094.70000000 | ask=$3094.71000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2888.55(-6.68%) Sell@3198.08(3.32%,26)
+2025-11-19 08:32:14.519 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#1000000 - $0.29 | bid=$0.28792700 | ask=$0.28796700 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:14.526 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#1000000 - $0.47 | bid=$0.46846900 | ask=$0.46850900 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-4.09%) Sell@0.50(6.01%,22)
+2025-11-19 08:32:15.596 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#1000000 - $91799.95 | bid=$91799.90000000 | ask=$91800.00000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90483.00(-1.43%) Sell@91860.00(0.07%,60)
+2025-11-19 08:32:15.724 [32mINFO[0m [memory] === MEMORY STATISTICS (Runtime: 30.0s) ===
+2025-11-19 08:32:15.724 [32mINFO[0m [memory] Current GC Stats: heap=28MB live=4MB free=23MB
+2025-11-19 08:32:15.724 [32mINFO[0m [memory] GC Activity: minor_collections=5792 major_collections=40 compactions=0
+2025-11-19 08:32:15.724 [32mINFO[0m [memory] Memory Growth: heap +27MB live +4MB (+35 major GC cycles)
+2025-11-19 08:32:15.724 [32mINFO[0m [memory] Allocation Rate: 141.3 KB/s average since startup
+2025-11-19 08:32:15.724 [32mINFO[0m [memory] Fragmentation: 6480 words (0.17% of heap)
+2025-11-19 08:32:15.724 [32mINFO[0m [memory] Top memory allocation sites (by hash):
+2025-11-19 08:32:15.724 [32mINFO[0m [memory]   1. 2971072 bytes (371384 words) in 3 samples [hash:171922128]
+2025-11-19 08:32:15.724 [32mINFO[0m [memory]      Backtrace:
+Raised by primitive operation at Dune__exe__Main.sample_allocations in file "bin/main.ml", line 210, characters 26-51
+Called from Dune__exe__Main.(fun) in file "bin/main.ml", line 375, characters 10-31
+Called from Thread.create.(fun) in file "thread.ml", line 48, characters 8-14
+
+2025-11-19 08:32:15.725 [32mINFO[0m [memory]   (Lightweight tracking: 1 unique sites, max 100, ~0KB overhead)
+2025-11-19 08:32:15.725 [32mINFO[0m [memory] === END MEMORY STATISTICS ===
+2025-11-19 08:32:19.616 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:19.616 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#2000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:19.724 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#2000000 - $4105.24 | bid=$4103.82000000 | ask=$4105.01000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:20.212 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#2000000 - $138.75 | bid=$138.70000000 | ask=$138.72000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.35%) Sell@153.88(10.90%,24)
+2025-11-19 08:32:20.428 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#2000000 - $3095.30 | bid=$3094.70000000 | ask=$3094.71000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2888.55(-6.68%) Sell@3198.08(3.32%,26)
+2025-11-19 08:32:20.468 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#2000000 - $0.29 | bid=$0.28793200 | ask=$0.28795000 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:20.485 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#2000000 - $0.47 | bid=$0.46839800 | ask=$0.46850500 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-4.09%) Sell@0.50(6.01%,22)
+2025-11-19 08:32:22.585 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#2000000 - $91799.95 | bid=$91799.90000000 | ask=$91800.00000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90483.00(-1.43%) Sell@91860.00(0.07%,60)
+2025-11-19 08:32:24.386 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.71 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:32:24.746 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy ETH/USD 0.00350000 @ 2888.71 (Amend ID: skipped_no_change)
+2025-11-19 08:32:25.102 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:25.103 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#3000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:25.227 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#3000000 - $4105.24 | bid=$4103.63000000 | ask=$4104.83000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:25.898 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#3000000 - $138.75 | bid=$138.67000000 | ask=$138.68000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.35%) Sell@153.88(10.90%,24)
+2025-11-19 08:32:26.235 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#3000000 - $3093.70 | bid=$3091.58000000 | ask=$3091.59000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2888.71(-6.63%) Sell@3198.08(3.37%,26)
+2025-11-19 08:32:26.276 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#3000000 - $0.29 | bid=$0.28794000 | ask=$0.28794100 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:26.311 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#3000000 - $0.47 | bid=$0.46822800 | ask=$0.46835400 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-4.09%) Sell@0.50(6.01%,22)
+2025-11-19 08:32:27.792 [32mINFO[0m [order_executor] Amending order OWTCPY-JZ2OO-VBSK7V: price=2888.98
+2025-11-19 08:32:27.794 [32mINFO[0m [kraken_actions] Amending order OWTCPY-JZ2OO-VBSK7V: qty=0.00350000, price=2888.980000
+2025-11-19 08:32:27.896 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.98 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:32:27.896 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy ETH/USD 0.00350000 @ 2888.98 (Amend ID: TRRMSU-M46Y7-LFCFSB)
+2025-11-19 08:32:29.396 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#3000000 - $91799.95 | bid=$91799.90000000 | ask=$91800.00000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90483.00(-1.43%) Sell@91860.00(0.07%,60)
+2025-11-19 08:32:30.426 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:30.426 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#4000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:30.606 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#4000000 - $4105.24 | bid=$4103.37000000 | ask=$4104.58000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:31.535 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#4000000 - $138.75 | bid=$138.56000000 | ask=$138.57000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.35%) Sell@153.88(10.90%,24)
+2025-11-19 08:32:31.877 [32mINFO[0m [order_executor] Amending order OWTCPY-JZ2OO-VBSK7V: price=2889.11
+2025-11-19 08:32:31.877 [32mINFO[0m [kraken_actions] Amending order OWTCPY-JZ2OO-VBSK7V: qty=0.00350000, price=2889.110000
+2025-11-19 08:32:31.973 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#4000000 - $3089.66 | bid=$3089.04000000 | ask=$3089.64000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.11(-6.49%) Sell@3198.08(3.51%,26)
+2025-11-19 08:32:31.979 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2889.11 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:32:32.002 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy ETH/USD 0.00350000 @ 2889.11 (Amend ID: TV2WJ4-GRWX3-62FGMB)
+2025-11-19 08:32:32.026 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#4000000 - $0.29 | bid=$0.28788900 | ask=$0.28789000 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:32.063 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#4000000 - $0.47 | bid=$0.46713100 | ask=$0.46732500 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.94%) Sell@0.50(6.17%,22)
+2025-11-19 08:32:32.431 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90483.10 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:32.897 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90483.10 (Amend ID: skipped_no_change)
+2025-11-19 08:32:35.804 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:35.804 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#5000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:36.021 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#5000000 - $4105.24 | bid=$4102.17000000 | ask=$4104.29000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:36.201 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#4000000 - $91795.00 | bid=$91790.00000000 | ask=$91790.10000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90483.10(-1.43%) Sell@91860.00(0.07%,60)
+2025-11-19 08:32:36.970 [32mINFO[0m [order_executor] Amending order O2XWFU-WMSE6-4KCD6P: price=90483.40
+2025-11-19 08:32:36.970 [32mINFO[0m [kraken_actions] Amending order O2XWFU-WMSE6-4KCD6P: qty=0.00025000, price=90483.400000
+2025-11-19 08:32:37.125 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90483.40 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:37.125 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90483.40 (Amend ID: T26DYM-GGXBQ-ODKDAU)
+2025-11-19 08:32:37.162 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#5000000 - $138.75 | bid=$138.48000000 | ask=$138.49000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.35%) Sell@153.88(10.90%,24)
+2025-11-19 08:32:37.760 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#5000000 - $3089.66 | bid=$3086.91000000 | ask=$3087.96000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.11(-6.49%) Sell@3198.08(3.51%,26)
+2025-11-19 08:32:37.838 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#5000000 - $0.29 | bid=$0.28785400 | ask=$0.28786900 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:37.875 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#5000000 - $0.47 | bid=$0.46684100 | ask=$0.46701400 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.94%) Sell@0.50(6.17%,22)
+2025-11-19 08:32:37.994 [32mINFO[0m [order_executor] Amending order O2XWFU-WMSE6-4KCD6P: price=90483.80
+2025-11-19 08:32:37.994 [32mINFO[0m [kraken_actions] Amending order O2XWFU-WMSE6-4KCD6P: qty=0.00025000, price=90483.800000
+2025-11-19 08:32:38.139 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90483.80 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:38.139 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90483.80 (Amend ID: TDRHAO-CLBQJ-B2PD5V)
+2025-11-19 08:32:39.007 [32mINFO[0m [order_executor] Amending order O2XWFU-WMSE6-4KCD6P: price=90484.10
+2025-11-19 08:32:39.007 [32mINFO[0m [kraken_actions] Amending order O2XWFU-WMSE6-4KCD6P: qty=0.00025000, price=90484.100000
+2025-11-19 08:32:39.007 [32mINFO[0m [order_executor] Amending order OWTCPY-JZ2OO-VBSK7V: price=2889.48
+2025-11-19 08:32:39.007 [32mINFO[0m [kraken_actions] Amending order OWTCPY-JZ2OO-VBSK7V: qty=0.00350000, price=2889.480000
+2025-11-19 08:32:39.118 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90484.10 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:39.118 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2889.48 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:32:39.120 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90484.10 (Amend ID: TVXZCS-TFENX-ZGBCU2)
+2025-11-19 08:32:39.120 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy ETH/USD 0.00350000 @ 2889.48 (Amend ID: TQ3ME2-ZHZDT-6Q2M2C)
+2025-11-19 08:32:41.042 [32mINFO[0m [order_executor] Amending order O2XWFU-WMSE6-4KCD6P: price=90484.30
+2025-11-19 08:32:41.042 [32mINFO[0m [kraken_actions] Amending order O2XWFU-WMSE6-4KCD6P: qty=0.00025000, price=90484.300000
+2025-11-19 08:32:41.148 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90484.30 (Amend ID: TH7PZ6-3YSCB-GV7FXI)
+2025-11-19 08:32:41.262 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:41.262 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#6000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:41.359 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90484.30 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:41.517 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#6000000 - $4105.24 | bid=$4102.86000000 | ask=$4103.94000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:42.058 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90484.30 (Amend ID: skipped_no_change)
+2025-11-19 08:32:42.911 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#6000000 - $138.75 | bid=$138.43000000 | ask=$138.44000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.35%) Sell@153.88(10.90%,24)
+2025-11-19 08:32:43.123 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#5000000 - $91715.05 | bid=$91710.00000000 | ask=$91710.10000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90484.30(-1.34%) Sell@91860.00(0.16%,60)
+2025-11-19 08:32:43.572 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#6000000 - $3085.97 | bid=$3085.27000000 | ask=$3087.01000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.48(-6.37%) Sell@3198.08(3.63%,26)
+2025-11-19 08:32:43.665 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#6000000 - $0.29 | bid=$0.28777000 | ask=$0.28783100 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:43.717 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#6000000 - $0.47 | bid=$0.46673700 | ask=$0.46690200 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.94%) Sell@0.50(6.17%,22)
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] === MEMORY STATISTICS (Runtime: 60.0s) ===
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] Current GC Stats: heap=48MB live=8MB free=40MB
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] GC Activity: minor_collections=26770 major_collections=57 compactions=0
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] Memory Growth: heap +47MB live +7MB (+52 major GC cycles)
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] Allocation Rate: 131.5 KB/s average since startup
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] Fragmentation: 10144 words (0.16% of heap)
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] Top memory allocation sites (by hash):
+2025-11-19 08:32:45.735 [32mINFO[0m [memory]   1. 6773776 bytes (846722 words) in 6 samples [hash:171922128]
+2025-11-19 08:32:45.735 [32mINFO[0m [memory]      Backtrace:
+Raised by primitive operation at Dune__exe__Main.sample_allocations in file "bin/main.ml", line 210, characters 26-51
+Called from Dune__exe__Main.(fun) in file "bin/main.ml", line 375, characters 10-31
+Called from Thread.create.(fun) in file "thread.ml", line 48, characters 8-14
+
+2025-11-19 08:32:45.735 [32mINFO[0m [memory]   (Lightweight tracking: 1 unique sites, max 100, ~0KB overhead)
+2025-11-19 08:32:45.735 [32mINFO[0m [memory] === END MEMORY STATISTICS ===
+2025-11-19 08:32:46.695 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:46.695 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#7000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:46.974 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#7000000 - $4105.24 | bid=$4102.12000000 | ask=$4103.43000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:48.577 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#7000000 - $138.39 | bid=$138.42000000 | ask=$138.43000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.10%) Sell@153.88(11.19%,24)
+2025-11-19 08:32:49.341 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#7000000 - $3085.97 | bid=$3085.73000000 | ask=$3086.34000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.48(-6.37%) Sell@3198.08(3.63%,26)
+2025-11-19 08:32:49.455 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#7000000 - $0.29 | bid=$0.28777900 | ask=$0.28781600 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:49.513 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#7000000 - $0.47 | bid=$0.46673700 | ask=$0.46690100 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.70%) Sell@0.50(6.44%,22)
+2025-11-19 08:32:49.924 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#6000000 - $91715.05 | bid=$91710.00000000 | ask=$91710.10000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90484.30(-1.34%) Sell@91860.00(0.16%,60)
+2025-11-19 08:32:52.017 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:52.017 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#8000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:52.363 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#8000000 - $4105.24 | bid=$4101.89000000 | ask=$4103.08000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:53.277 [32mINFO[0m [order_executor] Amending order O2XWFU-WMSE6-4KCD6P: price=90484.50
+2025-11-19 08:32:53.277 [32mINFO[0m [kraken_actions] Amending order O2XWFU-WMSE6-4KCD6P: qty=0.00025000, price=90484.500000
+2025-11-19 08:32:53.380 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90484.50 (Amend ID: TX4KHD-6XLVS-4UOSZN)
+2025-11-19 08:32:53.382 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90484.50 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:54.221 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#8000000 - $138.39 | bid=$138.40000000 | ask=$138.41000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.10%) Sell@153.88(11.19%,24)
+2025-11-19 08:32:54.294 [32mINFO[0m [order_executor] Amending order O2XWFU-WMSE6-4KCD6P: price=90484.70
+2025-11-19 08:32:54.294 [32mINFO[0m [kraken_actions] Amending order O2XWFU-WMSE6-4KCD6P: qty=0.00025000, price=90484.700000
+2025-11-19 08:32:54.410 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90484.70 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:32:54.410 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90484.70 (Amend ID: TDETYG-FFGDL-MQRZYX)
+2025-11-19 08:32:55.107 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#8000000 - $3085.97 | bid=$3085.98000000 | ask=$3086.33000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.48(-6.37%) Sell@3198.08(3.63%,26)
+2025-11-19 08:32:55.236 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#8000000 - $0.29 | bid=$0.28778600 | ask=$0.28781000 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:32:55.293 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#8000000 - $0.47 | bid=$0.46675400 | ask=$0.46689700 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.70%) Sell@0.50(6.44%,22)
+2025-11-19 08:32:56.816 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#7000000 - $91683.95 | bid=$91683.90000000 | ask=$91684.00000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90484.70(-1.31%) Sell@91860.00(0.19%,60)
+2025-11-19 08:32:57.481 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:32:57.481 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#9000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:32:57.893 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#9000000 - $4105.24 | bid=$4101.30000000 | ask=$4102.68000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:32:59.981 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#9000000 - $138.41 | bid=$138.40000000 | ask=$138.42000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.11%) Sell@153.88(11.18%,24)
+2025-11-19 08:33:00.937 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#9000000 - $3085.97 | bid=$3086.61000000 | ask=$3086.71000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.48(-6.37%) Sell@3198.08(3.63%,26)
+2025-11-19 08:33:01.083 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#9000000 - $0.29 | bid=$0.28777600 | ask=$0.28780700 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:33:01.145 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#9000000 - $0.47 | bid=$0.46690200 | ask=$0.46690300 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.70%) Sell@0.50(6.44%,22)
+2025-11-19 08:33:02.870 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:33:02.870 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#10000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:33:03.286 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#10000000 - $4105.24 | bid=$4101.05000000 | ask=$4102.51000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:33:03.636 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#8000000 - $91683.95 | bid=$91683.90000000 | ask=$91684.00000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90484.70(-1.31%) Sell@91860.00(0.19%,60)
+2025-11-19 08:33:05.583 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#10000000 - $138.41 | bid=$138.42000000 | ask=$138.43000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.11%) Sell@153.88(11.18%,24)
+2025-11-19 08:33:06.491 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2889.46 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:33:06.510 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy ETH/USD 0.00350000 @ 2889.46 (Amend ID: skipped_no_change)
+2025-11-19 08:33:06.663 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#10000000 - $3086.18 | bid=$3085.95000000 | ask=$3086.54000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.46(-6.37%) Sell@3198.08(3.63%,26)
+2025-11-19 08:33:06.821 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#10000000 - $0.29 | bid=$0.28778600 | ask=$0.28781000 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:33:06.887 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#10000000 - $0.47 | bid=$0.46690400 | ask=$0.46704500 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.70%) Sell@0.50(6.44%,22)
+2025-11-19 08:33:07.498 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90484.80 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:33:07.532 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy BTC/USD 0.00025000 @ 90484.80 (Amend ID: skipped_no_change)
+2025-11-19 08:33:08.275 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:33:08.275 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#11000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:33:08.715 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#11000000 - $4105.24 | bid=$4100.03000000 | ask=$4102.01000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:33:10.465 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#9000000 - $91673.85 | bid=$91673.80000000 | ask=$91673.90000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90484.80(-1.30%) Sell@91860.00(0.20%,60)
+2025-11-19 08:33:11.284 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#11000000 - $138.41 | bid=$138.40000000 | ask=$138.41000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.11%) Sell@153.88(11.18%,24)
+2025-11-19 08:33:12.463 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#11000000 - $3086.18 | bid=$3084.72000000 | ask=$3084.74000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2889.46(-6.37%) Sell@3198.08(3.63%,26)
+2025-11-19 08:33:12.605 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#11000000 - $0.29 | bid=$0.28779500 | ask=$0.28780100 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.30%) Sell@0.30(3.70%,22)
+2025-11-19 08:33:12.697 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#11000000 - $0.47 | bid=$0.46690600 | ask=$0.46690700 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-3.70%) Sell@0.50(6.44%,22)
+2025-11-19 08:33:13.644 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:33:13.644 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#12000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:33:14.131 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#12000000 - $4105.24 | bid=$4100.05000000 | ask=$4100.87000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.86%) Sell@4236.04(3.19%,1)
+2025-11-19 08:33:15.443 [33mWARN[0m [main] Shutdown signal received, cleaning up...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping all supervised domains...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping domain kraken/TRX/USD...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping domain kraken/SOL/USD...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping domain kraken/ETH/USD...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping domain kraken/PAXG/USD...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping domain kraken/USDG/USD...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping domain kraken/BTC/USD...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Stopping domain kraken/ADA/USD...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] All domains stopped successfully
+2025-11-19 08:33:15.443 [32mINFO[0m [supervisor] Order processing loop shutdown requested
+2025-11-19 08:33:15.443 [33mWARN[0m [supervisor] Stopping all supervised connections
+2025-11-19 08:33:15.443 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection lost
+2025-11-19 08:33:15.443 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-19 08:33:15.443 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-19 08:33:15.443 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-19 08:33:15.443 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-19 08:33:15.443 [32mINFO[0m [main] Shutdown cleanup initiated, force exit available with second Ctrl+C...
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Domain for kraken/PAXG/USD completed normally
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Domain for kraken/ETH/USD completed normally
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Domain for kraken/USDG/USD completed normally
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Domain for kraken/BTC/USD completed normally
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Domain for kraken/TRX/USD completed normally
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Domain for kraken/SOL/USD completed normally
+2025-11-19 08:33:15.443 [32mINFO[0m [domain_spawner] Domain for kraken/ADA/USD completed normally
+2025-11-19 08:33:15.448 [32mINFO[0m [main] Shutdown signal received, shutting down...
+2025-11-19 08:33:15.500 [32mINFO[0m [main] Memory monitoring thread completed gracefully
+2025-11-19 08:33:15.500 [32mINFO[0m [main] Waiting 2.9s before force exit...
+2025-11-19 08:33:18.453 [32mINFO[0m [main] Force exiting process to ensure clean shutdown
+2025-11-19 08:33:18.453 [32mINFO[0m [main] Process exiting - final cleanup complete

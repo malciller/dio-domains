@@ -1,0 +1,256 @@
+2025-11-19 08:31:02.845 [32mINFO[0m [telemetry] Created NEW gauge metric: uptime_seconds
+2025-11-19 08:31:02.845 [32mINFO[0m [telemetry] Created NEW counter metric: api_requests
+2025-11-19 08:31:02.845 [32mINFO[0m [telemetry] Created NEW counter metric: api_errors
+2025-11-19 08:31:02.845 [32mINFO[0m [telemetry] Created NEW histogram metric: api_duration_seconds
+2025-11-19 08:31:02.845 [32mINFO[0m [telemetry] Created NEW counter metric: orders_placed
+2025-11-19 08:31:02.845 [32mINFO[0m [telemetry] Created NEW counter metric: orders_failed
+2025-11-19 08:31:02.858 [32mINFO[0m [main] Initializing enhanced memory monitoring...
+2025-11-19 08:31:02.859 [32mINFO[0m [main] Starting Dio Trading Engine...
+2025-11-19 08:31:02.859 [32mINFO[0m [main] Initializing trading engine...
+2025-11-19 08:31:02.859 [32mINFO[0m [supervisor] Starting connection supervisor
+2025-11-19 08:31:02.859 [32mINFO[0m [supervisor] Initializing websocket feeds...
+2025-11-19 08:31:02.859 [32mINFO[0m [supervisor] Loaded 7 trading configuration(s)
+2025-11-19 08:31:02.859 [32mINFO[0m [supervisor] Connecting to 7 Kraken websockets...
+2025-11-19 08:31:02.859 [32mINFO[0m [supervisor] Step 1: Initializing ticker feed stores...
+2025-11-19 08:31:02.859 [32mINFO[0m [kraken_ticker] Initializing ticker feed for 7 symbols
+2025-11-19 08:31:02.859 [32mINFO[0m [kraken_ticker] Ticker feed stores initialized
+2025-11-19 08:31:02.859 [32mINFO[0m [supervisor] Step 2: Initializing instruments feed stores...
+2025-11-19 08:31:03.077 [32mINFO[0m [kraken_instrument] Instrument data for BTC/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.00005000, price_precision=1, price_increment=0.10000000, cost_precision=5, cost_min=0.50, marginable=true
+2025-11-19 08:31:03.077 [32mINFO[0m [kraken_instrument] Instrument data for PAXG/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.00100000, price_precision=2, price_increment=0.01000000, cost_precision=6, cost_min=0.50, marginable=true
+2025-11-19 08:31:03.077 [32mINFO[0m [kraken_instrument] Instrument data for ETH/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.00100000, price_precision=2, price_increment=0.01000000, cost_precision=5, cost_min=0.50, marginable=true
+2025-11-19 08:31:03.077 [32mINFO[0m [kraken_instrument] Instrument data for SOL/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=0.02000000, price_precision=2, price_increment=0.01000000, cost_precision=5, cost_min=0.50, marginable=true
+2025-11-19 08:31:03.077 [32mINFO[0m [kraken_instrument] Instrument data for ADA/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=4.40000000, price_precision=6, price_increment=0.00000100, cost_precision=6, cost_min=0.50, marginable=true
+2025-11-19 08:31:03.077 [32mINFO[0m [kraken_instrument] Instrument data for TRX/USD: status=online, qty_precision=8, qty_increment=0.00000001, qty_min=15.00000000, price_precision=6, price_increment=0.00000100, cost_precision=7, cost_min=0.50, marginable=true
+2025-11-19 08:31:03.078 [32mINFO[0m [kraken_instrument] Instrument data for USDG/USD: status=online, qty_precision=5, qty_increment=0.00001000, qty_min=5.00000000, price_precision=4, price_increment=0.00010000, cost_precision=8, cost_min=0.50, marginable=true
+2025-11-19 08:31:03.078 [32mINFO[0m [supervisor] Step 3: Initializing orderbook feed stores...
+2025-11-19 08:31:03.078 [32mINFO[0m [supervisor] Step 4: Getting authentication token...
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Authentication token obtained
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Step 5: Initializing balances feed stores...
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_balances] Initializing balances feed for 8 assets
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_balances] Balance stores initialized - now thread-safe
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Balances feed stores initialized
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Step 6: Initializing executions feed stores...
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_executions] Initializing executions feed for 7 symbols
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_executions] Execution stores initialized - now operating lock-free
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Step 7: Starting supervised websocket connections...
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Registered supervised connection: kraken_ticker_ws
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Registered supervised connection: kraken_orderbook_ws
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Registered supervised connection: kraken_balances_ws
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Registered supervised connection: kraken_executions_ws
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Registered supervised connection: kraken_trading_ws
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #1)
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_trading_client] Starting new connection
+2025-11-19 08:31:03.406 [32mINFO[0m [kraken_trading_client] Connecting to Kraken authenticated WebSocket for trading...
+2025-11-19 08:31:03.406 [32mINFO[0m [supervisor] Waiting for executions feed to be ready...
+2025-11-19 08:31:03.839 [32mINFO[0m [kraken_ticker] WebSocket established, subscribing to ticker feed
+2025-11-19 08:31:03.839 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_ticker_ws}
+2025-11-19 08:31:03.839 [32mINFO[0m [supervisor] [kraken_ticker_ws] Connection established (total: 1)
+2025-11-19 08:31:03.842 [33mWARN[0m [telemetry] Adjusting buffer capacities (pressure: Low)
+2025-11-19 08:31:03.842 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_rate_buffer_capacity
+2025-11-19 08:31:03.842 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_histogram_buffer_capacity
+2025-11-19 08:31:03.842 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_memory_pressure_low
+2025-11-19 08:31:03.842 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_memory_pressure_medium
+2025-11-19 08:31:03.842 [32mINFO[0m [telemetry] Created NEW gauge metric: telemetry_memory_pressure_high
+2025-11-19 08:31:03.842 [32mINFO[0m [kraken_ticker] Connected to Kraken WebSocket v2
+2025-11-19 08:31:03.944 [32mINFO[0m [kraken_ticker] Subscribed to BTC/USD ticker feed
+2025-11-19 08:31:03.944 [32mINFO[0m [kraken_ticker] Subscribed to PAXG/USD ticker feed
+2025-11-19 08:31:03.944 [32mINFO[0m [kraken_ticker] Subscribed to ETH/USD ticker feed
+2025-11-19 08:31:03.944 [32mINFO[0m [kraken_ticker] Subscribed to SOL/USD ticker feed
+2025-11-19 08:31:03.944 [32mINFO[0m [kraken_ticker] Subscribed to ADA/USD ticker feed
+2025-11-19 08:31:03.944 [32mINFO[0m [kraken_ticker] Subscribed to TRX/USD ticker feed
+2025-11-19 08:31:03.944 [32mINFO[0m [kraken_ticker] Subscribed to USDG/USD ticker feed
+2025-11-19 08:31:03.944 [32mINFO[0m [telemetry] Created NEW counter metric: ticker_updates
+2025-11-19 08:31:04.631 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_orderbook_ws}
+2025-11-19 08:31:04.631 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Connection established (total: 1)
+2025-11-19 08:31:04.690 [32mINFO[0m [kraken_balances] Authenticated WebSocket established, subscribing to balances
+2025-11-19 08:31:04.690 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_balances_ws}
+2025-11-19 08:31:04.690 [32mINFO[0m [supervisor] [kraken_balances_ws] Connection established (total: 1)
+2025-11-19 08:31:04.690 [32mINFO[0m [kraken_balances] Connected to Kraken authenticated WebSocket
+2025-11-19 08:31:04.787 [32mINFO[0m [kraken_executions] Authenticated WebSocket established, subscribing to executions
+2025-11-19 08:31:04.787 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_executions_ws}
+2025-11-19 08:31:04.787 [32mINFO[0m [supervisor] [kraken_executions_ws] Connection established (total: 1)
+2025-11-19 08:31:04.796 [32mINFO[0m [kraken_balances] Subscribed to balances feed
+2025-11-19 08:31:04.799 [32mINFO[0m [telemetry] Created NEW counter metric: balance_updates
+2025-11-19 08:31:04.810 [32mINFO[0m [kraken_trading_client] Trading WebSocket connection established
+2025-11-19 08:31:04.810 [32mINFO[0m [kraken_trading_client] Connection established successfully (generation 0)
+2025-11-19 08:31:04.810 [32mINFO[0m [kraken_trading_client] Starting WebSocket reader loop (generation 0)
+2025-11-19 08:31:04.810 [32mINFO[0m [telemetry] Created NEW counter metric: websocket_frames_received
+2025-11-19 08:31:04.810 [32mINFO[0m [telemetry] Created NEW gauge metric: connection_state{name=kraken_trading_ws}
+2025-11-19 08:31:04.810 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 1)
+2025-11-19 08:31:04.810 [32mINFO[0m [kraken_trading_client] Waiting for reader task to complete (generation 0)
+2025-11-19 08:31:04.895 [32mINFO[0m [kraken_executions] Subscribed to executions feed
+2025-11-19 08:31:04.895 [32mINFO[0m [telemetry] Created NEW counter metric: executions_subscribed
+2025-11-19 08:31:05.028 [32mINFO[0m [telemetry] Created NEW counter metric: orderbook_updates
+2025-11-19 08:31:05.285 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_produced
+2025-11-19 08:31:05.285 [32mINFO[0m [telemetry] Created NEW counter metric: execution_snapshot_items
+2025-11-19 08:31:08.806 [32mINFO[0m [kraken_executions] Updated open order: O2XWFU-WMSE6-4KCD6P [BTC/USD] 0.00025000@90483.90 (filled: 0.00000000/0.00025000) status=new
+2025-11-19 08:31:08.806 [32mINFO[0m [telemetry] Created NEW counter metric: execution_updates
+2025-11-19 08:31:10.371 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.72 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:31:13.407 [32mINFO[0m [supervisor] Waiting for initial market data from all feeds...
+2025-11-19 08:31:13.407 [32mINFO[0m [supervisor] ✓ Ticker feed ready
+2025-11-19 08:31:13.407 [32mINFO[0m [supervisor] ✓ Orderbook feed ready
+2025-11-19 08:31:23.410 [32mINFO[0m [supervisor] ✓ Balances feed ready
+2025-11-19 08:31:23.410 [32mINFO[0m [supervisor] All feeds initialized with market data!
+2025-11-19 08:31:23.410 [32mINFO[0m [supervisor] Step 8: Fetching trading fees for all assets...
+2025-11-19 08:31:25.370 [32mINFO[0m [main] Initializing supervised asset domains...
+2025-11-19 08:31:25.370 [32mINFO[0m [market_maker] Market Maker strategy initialized with order buffer size 4096
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain kraken/TRX/USD started successfully
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain for kraken/TRX/USD started (restart #1)
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/TRX/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/TRX/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain for kraken/SOL/USD started (restart #1)
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain kraken/SOL/USD started successfully
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/TRX/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/SOL/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/SOL/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/SOL/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/SOL/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/SOL/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/SOL/USD (Strategy: Grid)
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain kraken/ETH/USD started successfully
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/TRX/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/TRX/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/TRX/USD (Strategy: Grid)
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain for kraken/ETH/USD started (restart #1)
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain kraken/PAXG/USD started successfully
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/ETH/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain for kraken/PAXG/USD started (restart #1)
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/ETH/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/ETH/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/ETH/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/ETH/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain kraken/USDG/USD started successfully
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/ETH/USD (Strategy: Grid)
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain for kraken/USDG/USD started (restart #1)
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/PAXG/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain kraken/BTC/USD started successfully
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain for kraken/BTC/USD started (restart #1)
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/PAXG/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/PAXG/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/PAXG/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/PAXG/USD}
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/PAXG/USD (Strategy: Grid)
+2025-11-19 08:31:25.371 [32mINFO[0m [domain_spawner] Domain kraken/ADA/USD started successfully
+2025-11-19 08:31:25.371 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/BTC/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [domain_spawner] Domain for kraken/ADA/USD started (restart #1)
+2025-11-19 08:31:25.372 [32mINFO[0m [domain_spawner] Domain supervisor thread started
+2025-11-19 08:31:25.372 [32mINFO[0m [main] 7 supervised asset domains initialized!
+2025-11-19 08:31:25.372 [32mINFO[0m [main] Initializing order executor...
+2025-11-19 08:31:25.372 [32mINFO[0m [domain_supervisor] Domain supervisor started
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/BTC/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [main] Trading engine ready, waiting for shutdown signal...
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/BTC/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/BTC/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/ADA/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/ADA/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/ADA/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/ADA/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/ADA/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/ADA/USD (Strategy: Grid)
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/BTC/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/BTC/USD (Strategy: Grid)
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW counter metric: domain_cycles{asset=kraken/USDG/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW histogram metric: domain_cycle_duration_seconds{asset=kraken/USDG/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW gauge metric: open_buy_orders{asset=kraken/USDG/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW gauge metric: open_sell_orders{asset=kraken/USDG/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [telemetry] Created NEW counter metric: execution_events_consumed{asset=kraken/USDG/USD}
+2025-11-19 08:31:25.372 [32mINFO[0m [domain_spawner] Domain initialized for asset: kraken/USDG/USD (Strategy: MM)
+2025-11-19 08:31:29.537 [32mINFO[0m [telemetry] Created NEW counter metric: strategy_orders_generated
+2025-11-19 08:31:29.747 [32mINFO[0m [order_executor] Amending order OYWAHP-N27XD-VIZR33: price=0.27
+2025-11-19 08:31:29.747 [32mINFO[0m [kraken_actions] Amending order OYWAHP-N27XD-VIZR33: qty=40.00000000, price=0.269834
+2025-11-19 08:31:29.856 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy TRX/USD 40.00000000 @ 0.27 (Amend ID: THDZEA-R4OXV-7UXSV7)
+2025-11-19 08:31:29.856 [32mINFO[0m [telemetry] Created NEW counter metric: orders_amended
+2025-11-19 08:31:29.856 [32mINFO[0m [kraken_executions] Updated open order: OYWAHP-N27XD-VIZR33 [TRX/USD] 40.00000000@0.27 (filled: 0.00000000/40.00000000) status=new
+2025-11-19 08:31:30.756 [32mINFO[0m [order_executor] Amending order OYWAHP-N27XD-VIZR33: price=0.27
+2025-11-19 08:31:30.756 [32mINFO[0m [kraken_actions] Amending order OYWAHP-N27XD-VIZR33: qty=40.00000000, price=0.269818
+2025-11-19 08:31:30.859 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy TRX/USD 40.00000000 @ 0.27 (Amend ID: TTJEFU-MHU27-F4PCSQ)
+2025-11-19 08:31:30.860 [32mINFO[0m [kraken_executions] Updated open order: OYWAHP-N27XD-VIZR33 [TRX/USD] 40.00000000@0.27 (filled: 0.00000000/40.00000000) status=new
+2025-11-19 08:31:31.505 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#1000000 - $4104.65 | bid=$4105.35000000 | ask=$4105.98000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.85%) Sell@4236.04(3.20%,1)
+2025-11-19 08:31:31.547 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:31:31.547 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#1000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:31:31.916 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#1000000 - $138.80 | bid=$138.79000000 | ask=$138.80000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.38%) Sell@153.88(10.87%,24)
+2025-11-19 08:31:31.936 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#1000000 - $0.47 | bid=$0.46888800 | ask=$0.46891800 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-4.06%) Sell@0.50(6.04%,22)
+2025-11-19 08:31:32.026 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#1000000 - $0.29 | bid=$0.28791800 | ask=$0.28792600 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.26%) Sell@0.30(3.74%,22)
+2025-11-19 08:31:32.056 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#1000000 - $3093.64 | bid=$3094.70000000 | ask=$3094.71000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2888.72(-6.62%) Sell@3198.08(3.38%,26)
+2025-11-19 08:31:32.871 [32mINFO[0m [memory] === MEMORY STATISTICS (Runtime: 30.0s) ===
+2025-11-19 08:31:32.871 [32mINFO[0m [memory] Current GC Stats: heap=25MB live=4MB free=20MB
+2025-11-19 08:31:32.871 [32mINFO[0m [memory] GC Activity: minor_collections=5407 major_collections=39 compactions=0
+2025-11-19 08:31:32.871 [32mINFO[0m [memory] Memory Growth: heap +23MB live +3MB (+34 major GC cycles)
+2025-11-19 08:31:32.871 [32mINFO[0m [memory] Allocation Rate: 131.0 KB/s average since startup
+2025-11-19 08:31:32.872 [32mINFO[0m [memory] Fragmentation: 6004 words (0.18% of heap)
+2025-11-19 08:31:32.872 [32mINFO[0m [memory] Top memory allocation sites (by hash):
+2025-11-19 08:31:32.872 [32mINFO[0m [memory]   1. 2728840 bytes (341105 words) in 3 samples [hash:171922128]
+2025-11-19 08:31:32.872 [32mINFO[0m [memory]      Backtrace:
+Raised by primitive operation at Dune__exe__Main.sample_allocations in file "bin/main.ml", line 210, characters 26-51
+Called from Dune__exe__Main.(fun) in file "bin/main.ml", line 375, characters 10-31
+Called from Thread.create.(fun) in file "thread.ml", line 48, characters 8-14
+
+2025-11-19 08:31:32.872 [32mINFO[0m [memory]   (Lightweight tracking: 1 unique sites, max 100, ~0KB overhead)
+2025-11-19 08:31:32.872 [32mINFO[0m [memory] === END MEMORY STATISTICS ===
+2025-11-19 08:31:33.062 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#1000000 - $91749.95 | bid=$91749.90000000 | ask=$91750.00000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90483.90(-1.38%) Sell@91860.00(0.12%,60)
+2025-11-19 08:31:37.612 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#2000000 - $4104.65 | bid=$4105.32000000 | ask=$4105.93000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.85%) Sell@4236.04(3.20%,1)
+2025-11-19 08:31:37.707 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:31:37.708 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#2000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:31:38.379 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#2000000 - $138.80 | bid=$138.79000000 | ask=$138.80000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.38%) Sell@153.88(10.87%,24)
+2025-11-19 08:31:38.446 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#2000000 - $0.47 | bid=$0.46849500 | ask=$0.46858700 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-4.06%) Sell@0.50(6.04%,22)
+2025-11-19 08:31:38.604 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#2000000 - $0.29 | bid=$0.28792500 | ask=$0.28792600 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.26%) Sell@0.30(3.74%,22)
+2025-11-19 08:31:38.669 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#2000000 - $3093.64 | bid=$3094.70000000 | ask=$3094.71000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2888.72(-6.62%) Sell@3198.08(3.38%,26)
+2025-11-19 08:31:40.716 [32mINFO[0m [domain_spawner] [kraken/BTC/USD] C#2000000 - $91749.95 | bid=$91749.90000000 | ask=$91750.00000000 | BTC: 0.03620835 | USD: 295.25 | 1 buy / 60 sell | Strategy: Buy@90483.90(-1.38%) Sell@91860.00(0.12%,60)
+2025-11-19 08:31:43.726 [32mINFO[0m [domain_spawner] [kraken/PAXG/USD] C#3000000 - $4104.65 | bid=$4104.58000000 | ask=$4106.57000000 | PAXG: 0.00330182 | USD: 295.25 | 1 buy / 1 sell | Strategy: Buy@4069.81(-0.85%) Sell@4236.04(3.20%,1)
+2025-11-19 08:31:43.866 [32mINFO[0m [market_maker] Strategy check for USDG/USD: open_buy_count=0, current_exposure=0.02, projected_sell_exposure=-99.98, max_exposure=unlimited, current_usd=295.2525, projected_buy_usd=195.26, min_usd=500.00, exposure_ok=true, usd_ok=false
+2025-11-19 08:31:43.866 [32mINFO[0m [domain_spawner] [kraken/USDG/USD] C#3000000 - $1.00 | bid=$0.99990000 | ask=$1.00000000 | USDG: 0.01506120 | USD: 295.25 | 0 buy / 0 sell | Strategy: Buy:none Sell:none
+2025-11-19 08:31:44.328 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.61 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:31:44.885 [32mINFO[0m [domain_spawner] [kraken/SOL/USD] C#3000000 - $138.80 | bid=$138.79000000 | ask=$138.80000000 | SOL: 2.55313654 | USD: 295.25 | 1 buy / 24 sell | Strategy: Buy@135.49(-2.38%) Sell@153.88(10.87%,24)
+2025-11-19 08:31:44.989 [32mINFO[0m [order_executor] Amending order OWTCPY-JZ2OO-VBSK7V: price=2888.72
+2025-11-19 08:31:44.989 [32mINFO[0m [kraken_actions] Amending order OWTCPY-JZ2OO-VBSK7V: qty=0.00350000, price=2888.720000
+2025-11-19 08:31:45.022 [32mINFO[0m [domain_spawner] [kraken/ADA/USD] C#3000000 - $0.47 | bid=$0.46861800 | ask=$0.46873600 | ADA: 897.81381794 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.45(-4.06%) Sell@0.50(6.04%,22)
+2025-11-19 08:31:45.096 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy ETH/USD 0.00350000 @ 2888.72 (Amend ID: TIIGL5-TNGQF-EN3A4B)
+2025-11-19 08:31:45.125 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.72 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:31:45.236 [32mINFO[0m [domain_spawner] [kraken/TRX/USD] C#3000000 - $0.29 | bid=$0.28792500 | ask=$0.28792600 | TRX: 1130.07438627 | USD: 295.25 | 1 buy / 22 sell | Strategy: Buy@0.27(-6.26%) Sell@0.30(3.74%,22)
+2025-11-19 08:31:45.345 [32mINFO[0m [domain_spawner] [kraken/ETH/USD] C#3000000 - $3093.64 | bid=$3094.70000000 | ask=$3094.71000000 | ETH: 0.11095219 | USD: 295.25 | 1 buy / 26 sell | Strategy: Buy@2888.72(-6.62%) Sell@3198.08(3.38%,26)
+2025-11-19 08:31:46.003 [32mINFO[0m [order_executor] Amending order OWTCPY-JZ2OO-VBSK7V: price=2888.61
+2025-11-19 08:31:46.003 [32mINFO[0m [kraken_actions] Amending order OWTCPY-JZ2OO-VBSK7V: qty=0.00350000, price=2888.610000
+2025-11-19 08:31:46.106 [32mINFO[0m [order_processor] ✓ Order amended successfully: buy ETH/USD 0.00350000 @ 2888.61 (Amend ID: TNTE2J-QO6TL-URKV5N)
+2025-11-19 08:31:46.117 [32mINFO[0m [kraken_executions] Updated open order: OWTCPY-JZ2OO-VBSK7V [ETH/USD] 0.00350000@2888.61 (filled: 0.00000000/0.00350000) status=new
+2025-11-19 08:31:47.176 [33mWARN[0m [main] Shutdown signal received, cleaning up...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping all supervised domains...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping domain kraken/TRX/USD...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping domain kraken/SOL/USD...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping domain kraken/ETH/USD...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping domain kraken/PAXG/USD...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping domain kraken/USDG/USD...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping domain kraken/BTC/USD...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Stopping domain kraken/ADA/USD...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] All domains stopped successfully
+2025-11-19 08:31:47.176 [32mINFO[0m [supervisor] Order processing loop shutdown requested
+2025-11-19 08:31:47.176 [33mWARN[0m [supervisor] Stopping all supervised connections
+2025-11-19 08:31:47.176 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection lost
+2025-11-19 08:31:47.176 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-19 08:31:47.176 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-19 08:31:47.176 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-19 08:31:47.176 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-19 08:31:47.176 [32mINFO[0m [main] Shutdown cleanup initiated, force exit available with second Ctrl+C...
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Domain for kraken/ETH/USD completed normally
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Domain for kraken/PAXG/USD completed normally
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Domain for kraken/ADA/USD completed normally
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Domain for kraken/BTC/USD completed normally
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Domain for kraken/USDG/USD completed normally
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Domain for kraken/TRX/USD completed normally
+2025-11-19 08:31:47.176 [32mINFO[0m [domain_spawner] Domain for kraken/SOL/USD completed normally
+2025-11-19 08:31:47.269 [32mINFO[0m [main] Shutdown signal received, shutting down...
+2025-11-19 08:31:47.324 [32mINFO[0m [main] Memory monitoring thread completed gracefully
+2025-11-19 08:31:47.324 [32mINFO[0m [main] Waiting 2.9s before force exit...
+2025-11-19 08:31:50.270 [32mINFO[0m [main] Force exiting process to ensure clean shutdown
+2025-11-19 08:31:50.270 [32mINFO[0m [main] Process exiting - final cleanup complete
