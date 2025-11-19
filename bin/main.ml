@@ -178,7 +178,7 @@ let () =
       (* Find and remove smallest allocation to make room *)
       let smallest_hash = ref None in
       let smallest_words = ref Int64.max_int in
-      Hashtbl.iter (fun hash (_, total_words) ->
+      Hashtbl.iter (fun hash (_, total_words, _) ->
         if total_words < !smallest_words then (
           smallest_words := total_words;
           smallest_hash := Some hash
@@ -207,19 +207,20 @@ let () =
 
         if allocated_words > 50000L then (* >400KB allocation *)
           (* Get backtrace but DON'T store the string - only use hash *)
-          let backtrace = Printexc.get_callstack 5 in  (* Reduced depth from 10 to 5 *)
-          let backtrace_hash = Hashtbl.hash (Printexc.raw_backtrace_to_string backtrace) in
+          let backtrace = Printexc.get_callstack 10 in  (* Increased depth *)
+          let backtrace_str = Printexc.raw_backtrace_to_string backtrace in
+          let backtrace_hash = Hashtbl.hash backtrace_str in
           
           (* Evict LRU entry if at capacity BEFORE adding *)
           evict_lru_sample_if_needed ();
           
-          let count, total_words =
+          let count, total_words, _ =
             try Hashtbl.find allocation_samples backtrace_hash
-            with Not_found -> (0L, 0L)
+            with Not_found -> (0L, 0L, "")
           in
-          (* Store only hash + counts, NO backtrace string *)
+          (* Store hash + counts + backtrace string *)
           Hashtbl.replace allocation_samples backtrace_hash 
-            (Int64.add count 1L, Int64.add total_words allocated_words)
+            (Int64.add count 1L, Int64.add total_words allocated_words, backtrace_str)
       with _ -> ()  (* Ignore backtrace errors *)
       );
       sampling_in_progress := false
@@ -325,19 +326,23 @@ let () =
       (* Report top allocation sites - lightweight version without backtrace strings *)
       if not (Atomic.get shutdown_requested) && Hashtbl.length allocation_samples > 0 then (
         Logging.info ~section:"memory" "Top memory allocation sites (by hash):";
-        let top_sites = Hashtbl.fold (fun hash (count, total_words) acc ->
+        let top_sites = Hashtbl.fold (fun hash (count, total_words, bt_str) acc ->
           if Atomic.get shutdown_requested then acc else
-          (hash, count, total_words) :: acc
+          (hash, count, total_words, bt_str) :: acc
         ) allocation_samples []
-        |> (fun acc -> if Atomic.get shutdown_requested then [] else List.sort (fun (_, _, w1) (_, _, w2) -> compare w2 w1) acc)
+        |> (fun acc -> if Atomic.get shutdown_requested then [] else List.sort (fun (_, _, w1, _) (_, _, w2, _) -> compare w2 w1) acc)
         |> (fun l -> if Atomic.get shutdown_requested then [] else let rec take n acc = function | [] -> List.rev acc | h::t when n > 0 -> take (n-1) (h::acc) t | _ -> List.rev acc in take 5 [] l)
         in
         if not (Atomic.get shutdown_requested) then (
-          List.iteri (fun i (hash, count, total_words) ->
+          List.iteri (fun i (hash, count, total_words, bt_str) ->
             if not (Atomic.get shutdown_requested) then (
               let bytes = Int64.to_int total_words * (Sys.word_size / 8) in
               Logging.info_f ~section:"memory" "  %d. %d bytes (%Ld words) in %Ld samples [hash:%d]"
-                (i + 1) bytes total_words count hash
+                (i + 1) bytes total_words count hash;
+              if i < 3 then (
+                 Logging.info_f ~section:"memory" "     Backtrace:\n%s" 
+                   (if bt_str = "" then "     (no backtrace available)" else bt_str)
+              )
             )
           ) top_sites;
           if not (Atomic.get shutdown_requested) then

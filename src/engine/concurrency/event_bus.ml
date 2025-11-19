@@ -22,7 +22,7 @@ module Make (Payload : PAYLOAD) = struct
   }
 
   type subscriber = {
-    push: snapshot -> unit;
+    push: snapshot -> unit Lwt.t;
     close: unit -> unit;  (* Function to close this subscriber's stream *)
     mutable closed: bool;
     created_at: float;  (* Track when subscriber was created *)
@@ -59,15 +59,19 @@ module Make (Payload : PAYLOAD) = struct
     List.iter (fun sub ->
       (* Double-check subscriber is still active before pushing *)
       if not sub.closed then begin
-        sub.last_used <- now;
         (* Make pushes non-blocking to prevent backpressure *)
         Lwt.async (fun () ->
           Lwt.catch
             (fun () ->
-              (* Use very short timeout to detect blocking immediately *)
+              (* Use timeout to detect blocking/slow consumers *)
               Lwt.pick [
-                (Lwt.return (sub.push payload) >|= fun () -> ());
-                (Lwt_unix.sleep 0.001 >|= fun () -> ())  (* 1ms timeout - fail fast on blocking *)
+                (sub.push payload >|= fun () -> 
+                   (* Only update last_used on successful push *)
+                   sub.last_used <- now);
+                (Lwt_unix.sleep 0.001 >|= fun () -> 
+                   (* Timeout - subscriber is too slow *)
+                   Logging.warn_f ~section:"event_bus" "Subscriber too slow (1ms timeout), dropping: %s" bus.topic;
+                   sub.closed <- true) 
               ]
             )
             (fun exn ->
@@ -81,11 +85,12 @@ module Make (Payload : PAYLOAD) = struct
     ) active_subs
 
   let subscribe ?(persistent=false) bus =
-    let stream, push = Lwt_stream.create () in
+    (* Use bounded stream to prevent unbounded memory growth *)
+    let stream, push_source = Lwt_stream.create_bounded 1000 in
     let now = Unix.time () in
     let subscriber = {
-      push = (fun payload -> push (Some payload));
-      close = (fun () -> push None);  (* Close the stream by sending None *)
+      push = (fun payload -> push_source#push payload);
+      close = (fun () -> push_source#close);
       closed = false;
       created_at = now;
       last_used = now;
@@ -109,7 +114,7 @@ module Make (Payload : PAYLOAD) = struct
       try_remove ()
     );
     (match Atomic.get bus.latest with
-    | Some payload -> push (Some payload)
+    | Some payload -> Lwt.async (fun () -> push_source#push payload)
     | None -> ());
     { stream; close = subscriber.close }
 
