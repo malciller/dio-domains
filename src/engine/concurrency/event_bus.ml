@@ -108,10 +108,15 @@ module Make (Payload : PAYLOAD) = struct
       if Atomic.compare_and_set bus.subscribers current filtered then () else try_remove ()
     in
     try_add ();
+    (* Use finalize pattern to guarantee cleanup when stream closes *)
     Lwt.async (fun () ->
-      Lwt_stream.closed stream >|= fun () ->
-      subscriber.closed <- true;
-      try_remove ()
+      Lwt.finalize
+        (fun () -> Lwt_stream.closed stream)
+        (fun () ->
+          subscriber.closed <- true;
+          try_remove ();
+          Lwt.return_unit
+        )
     );
     (match Atomic.get bus.latest with
     | Some payload -> Lwt.async (fun () -> push_source#push payload)
@@ -129,7 +134,7 @@ module Make (Payload : PAYLOAD) = struct
       (fun () -> subscription.close (); Lwt.return_unit)
 
   (** Clean up stale subscribers (older than max_age_seconds or unused for too long) *)
-  let cleanup_stale_subscribers bus ?(max_age_seconds=300.0) ?(max_unused_seconds=120.0) () =
+  let cleanup_stale_subscribers bus ?(max_age_seconds=60.0) ?(max_unused_seconds=30.0) () =
     let now = Unix.time () in
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in

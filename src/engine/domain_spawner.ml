@@ -503,6 +503,15 @@ let start_domain state fee_fetcher =
     Atomic.set state.restart_count (Atomic.get state.restart_count + 1);
     Atomic.set state.is_running true;
 
+    (* Join old domain synchronously before starting new one *)
+    (match Atomic.get state.domain_handle with
+     | Some old_handle ->
+         Logging.debug_f ~section "Joining old domain %s before restart" key;
+         (try Domain.join old_handle
+          with exn -> Logging.warn_f ~section "Exception joining old domain %s: %s" 
+                        key (Printexc.to_string exn))
+     | None -> ());
+
     let domain_handle = Domain.spawn (fun () ->
       Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
         asset.exchange asset.symbol (Atomic.get state.restart_count);
@@ -517,7 +526,8 @@ let start_domain state fee_fetcher =
 
         (* Mark domain as stopped and allow restart *)
         Atomic.set state.is_running false;
-        Atomic.set state.domain_handle None;
+        (* Do NOT clear domain_handle here - we need it to join the domain later *)
+        (* Atomic.set state.domain_handle None; *)
 
         (* Don't re-raise - domain should be restarted by supervisor *)
         ()
@@ -535,10 +545,12 @@ let stop_domain state =
   Mutex.lock state.mutex;
   Atomic.set state.is_running false;
   (match Atomic.get state.domain_handle with
-   | Some _handle ->
+   | Some handle ->
        Logging.info_f ~section "Stopping domain %s..." key;
-       (* Note: OCaml doesn't provide a way to forcibly stop domains *)
-       (* The domain will stop when it detects is_running = false *)
+       (* Join synchronously - domain will exit quickly when is_running=false *)
+       (try Domain.join handle
+        with exn -> Logging.warn_f ~section "Exception joining domain %s: %s" 
+                      key (Printexc.to_string exn));
        Atomic.set state.domain_handle None
    | None -> ());
   Mutex.unlock state.mutex
@@ -615,6 +627,8 @@ let spawn_supervised_domains_for_assets (fee_fetcher : trading_config -> trading
   List.iter (fun state ->
     ignore (start_domain state fee_fetcher)
   ) all_states;
+
+
 
   (* Start supervisor thread *)
   let supervisor_thread = Thread.create supervisor_loop fee_fetcher in
