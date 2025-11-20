@@ -1,11 +1,11 @@
 {
   "logging_level": "info",
-  "logging_sections": "memory",
+  "logging_sections": "",
   "trading": [
     {
       "symbol": "BTC/USD",
       "qty": "0.00025",
-      "grid_interval": "0.75",
+      "grid_interval": "0.5",
       "sell_mult": "0.9995",
       "strategy": "Grid"
     },
@@ -32,7 +32,7 @@
     },
     {
       "symbol": "ADA/USD",
-      "qty": "23.0",
+      "qty": "26.0",
       "grid_interval": "5.0",
       "sell_mult": "0.999",
       "strategy": "Grid"

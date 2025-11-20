@@ -644,6 +644,29 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   set_connect_fn trading_conn (Some trading_connect_fn);
   start_async trading_conn;
 
+  (* Wait for trading client connection to be fully established before proceeding *)
+  (* This prevents a race condition where domains start trading before the WebSocket is ready *)
+  Logging.info ~section "Waiting for trading client to be ready...";
+  let%lwt trading_client_ready = 
+    let timeout = 10.0 in
+    let start_time = Unix.gettimeofday () in
+    let rec wait_loop () =
+      let elapsed = Unix.gettimeofday () -. start_time in
+      if elapsed >= timeout then
+        Lwt.return false
+      else if Kraken.Kraken_trading_client.is_connected () then
+        Lwt.return true
+      else
+        Lwt_unix.sleep 0.1 >>= fun () ->
+        wait_loop ()
+    in
+    wait_loop ()
+  in
+  if not trading_client_ready then
+    Logging.warn ~section "Timeout waiting for trading client connection, continuing anyway..."
+  else
+    Logging.info ~section "✓ Trading client connected and ready";
+
   (* Wait for executions data FIRST to avoid race condition *)
   Logging.info ~section "Waiting for executions feed to be ready...";
   let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
