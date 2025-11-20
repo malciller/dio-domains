@@ -2421,3 +2421,1047 @@ Called from Thread.create.(fun) in file "thread.ml", line 48, characters 8-14
 2025-11-20 09:51:33.900 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
 2025-11-20 09:51:35.968 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000431 cancelled due to shutdown")
 2025-11-20 09:51:50.430 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000432 cancelled due to shutdown")
+2025-11-20 09:52:06.968 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000433 cancelled due to shutdown")
+2025-11-20 09:52:06.968 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:52:06.969 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:52:09.031 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:52:09.031 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:52:09.031 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:52:09.031 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 144)
+2025-11-20 09:52:09.031 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:52:10.718 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 09:52:11.094 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000434 cancelled due to shutdown")
+2025-11-20 09:52:27.607 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000435 cancelled due to shutdown")
+2025-11-20 09:52:42.086 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000436 cancelled due to shutdown")
+2025-11-20 09:52:42.086 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:52:42.086 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:52:44.158 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:52:44.158 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:52:44.158 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:52:44.158 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 145)
+2025-11-20 09:52:44.158 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:52:46.220 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000437 cancelled due to shutdown")
+2025-11-20 09:53:02.771 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000438 cancelled due to shutdown")
+2025-11-20 09:53:06.906 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:53:06.906 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #37)
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #37)
+2025-11-20 09:53:06.906 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:53:06.906 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #37)
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #37)
+2025-11-20 09:53:06.906 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 09:53:06.906 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:53:06.906 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #37)
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #37)
+2025-11-20 09:53:06.906 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 09:53:06.906 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:53:06.906 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #37)
+2025-11-20 09:53:06.906 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #37)
+2025-11-20 09:53:06.906 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 09:53:17.210 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000439 cancelled due to shutdown")
+2025-11-20 09:53:17.210 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:53:17.210 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:53:19.270 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:53:19.270 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:53:19.270 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:53:19.270 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 146)
+2025-11-20 09:53:19.270 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:53:21.329 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000440 cancelled due to shutdown")
+2025-11-20 09:53:37.878 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000441 cancelled due to shutdown")
+2025-11-20 09:53:52.331 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000442 cancelled due to shutdown")
+2025-11-20 09:53:52.331 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:53:52.331 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:53:54.119 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 09:53:54.396 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:53:54.396 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:53:54.396 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:53:54.396 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 147)
+2025-11-20 09:53:54.396 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:53:56.460 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000443 cancelled due to shutdown")
+2025-11-20 09:54:12.965 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000444 cancelled due to shutdown")
+2025-11-20 09:54:27.473 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000445 cancelled due to shutdown")
+2025-11-20 09:54:27.473 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:54:27.473 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:54:29.553 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:54:29.553 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:54:29.553 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:54:29.553 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 148)
+2025-11-20 09:54:29.553 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:54:31.626 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000446 cancelled due to shutdown")
+2025-11-20 09:54:46.115 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000447 cancelled due to shutdown")
+2025-11-20 09:55:02.632 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000448 cancelled due to shutdown")
+2025-11-20 09:55:02.632 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:55:02.632 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:55:04.704 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:55:04.704 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:55:04.704 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:55:04.704 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 149)
+2025-11-20 09:55:04.704 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:55:06.761 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000449 cancelled due to shutdown")
+2025-11-20 09:55:08.827 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:55:08.827 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #38)
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #38)
+2025-11-20 09:55:08.827 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:55:08.827 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #38)
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #38)
+2025-11-20 09:55:08.827 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 09:55:08.827 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:55:08.827 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #38)
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #38)
+2025-11-20 09:55:08.827 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 09:55:08.827 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:55:08.827 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #38)
+2025-11-20 09:55:08.827 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #38)
+2025-11-20 09:55:08.827 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 09:55:21.233 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000450 cancelled due to shutdown")
+2025-11-20 09:55:37.385 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 09:55:37.733 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000451 cancelled due to shutdown")
+2025-11-20 09:55:37.733 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:55:37.733 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:55:39.788 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:55:39.788 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:55:39.788 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:55:39.788 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 150)
+2025-11-20 09:55:39.788 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:55:41.853 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000452 cancelled due to shutdown")
+2025-11-20 09:55:56.306 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000453 cancelled due to shutdown")
+2025-11-20 09:56:12.849 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000454 cancelled due to shutdown")
+2025-11-20 09:56:12.849 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:56:12.849 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:56:14.910 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:56:14.910 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:56:14.910 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:56:14.910 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 151)
+2025-11-20 09:56:14.910 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:56:16.986 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000455 cancelled due to shutdown")
+2025-11-20 09:56:31.452 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000456 cancelled due to shutdown")
+2025-11-20 09:56:48.015 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000457 cancelled due to shutdown")
+2025-11-20 09:56:48.015 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:56:48.015 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:56:50.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:56:50.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:56:50.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:56:50.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 152)
+2025-11-20 09:56:50.071 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:56:52.136 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000458 cancelled due to shutdown")
+2025-11-20 09:57:08.659 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000459 cancelled due to shutdown")
+2025-11-20 09:57:10.728 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:57:10.728 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #39)
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #39)
+2025-11-20 09:57:10.728 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:57:10.728 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #39)
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #39)
+2025-11-20 09:57:10.728 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 09:57:10.728 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:57:10.728 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #39)
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #39)
+2025-11-20 09:57:10.728 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 09:57:10.728 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:57:10.728 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #39)
+2025-11-20 09:57:10.728 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #39)
+2025-11-20 09:57:10.728 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 09:57:20.786 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 09:57:23.137 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000460 cancelled due to shutdown")
+2025-11-20 09:57:23.137 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:57:23.137 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:57:25.189 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:57:25.189 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:57:25.189 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:57:25.189 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 153)
+2025-11-20 09:57:25.189 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:57:27.254 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000461 cancelled due to shutdown")
+2025-11-20 09:57:43.745 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000462 cancelled due to shutdown")
+2025-11-20 09:57:58.227 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000463 cancelled due to shutdown")
+2025-11-20 09:57:58.227 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:57:58.227 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:58:00.304 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:58:00.304 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:58:00.304 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:58:00.304 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 154)
+2025-11-20 09:58:00.304 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:58:02.383 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000464 cancelled due to shutdown")
+2025-11-20 09:58:18.902 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000465 cancelled due to shutdown")
+2025-11-20 09:58:33.308 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000466 cancelled due to shutdown")
+2025-11-20 09:58:33.308 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:58:33.308 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:58:35.367 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:58:35.367 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:58:35.367 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:58:35.367 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 155)
+2025-11-20 09:58:35.367 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:58:37.434 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000467 cancelled due to shutdown")
+2025-11-20 09:58:53.998 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000468 cancelled due to shutdown")
+2025-11-20 09:59:04.134 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 09:59:08.439 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000469 cancelled due to shutdown")
+2025-11-20 09:59:08.440 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:59:08.440 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:59:10.512 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:59:10.512 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:59:10.512 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:59:10.512 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 156)
+2025-11-20 09:59:10.512 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:59:12.587 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000470 cancelled due to shutdown")
+2025-11-20 09:59:12.587 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:59:12.587 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 09:59:12.587 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #40)
+2025-11-20 09:59:12.587 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #40)
+2025-11-20 09:59:12.587 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:59:12.587 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 09:59:12.587 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #40)
+2025-11-20 09:59:12.587 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #40)
+2025-11-20 09:59:12.587 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 09:59:12.588 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:59:12.588 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 09:59:12.588 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #40)
+2025-11-20 09:59:12.588 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #40)
+2025-11-20 09:59:12.588 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 09:59:12.588 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 09:59:12.588 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 09:59:12.588 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #40)
+2025-11-20 09:59:12.588 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #40)
+2025-11-20 09:59:12.588 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 09:59:27.067 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000471 cancelled due to shutdown")
+2025-11-20 09:59:43.566 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000472 cancelled due to shutdown")
+2025-11-20 09:59:43.566 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 09:59:43.566 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 09:59:45.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 09:59:45.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 09:59:45.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 09:59:45.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 157)
+2025-11-20 09:59:45.628 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 09:59:47.679 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000473 cancelled due to shutdown")
+2025-11-20 10:00:02.149 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000474 cancelled due to shutdown")
+2025-11-20 10:00:18.680 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000475 cancelled due to shutdown")
+2025-11-20 10:00:18.680 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:00:18.680 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:00:20.729 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:00:20.729 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:00:20.729 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:00:20.729 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 158)
+2025-11-20 10:00:20.729 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:00:22.797 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000476 cancelled due to shutdown")
+2025-11-20 10:00:37.249 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000477 cancelled due to shutdown")
+2025-11-20 10:00:47.515 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:00:53.813 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000478 cancelled due to shutdown")
+2025-11-20 10:00:53.813 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:00:53.813 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:00:55.876 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:00:55.876 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:00:55.876 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:00:55.876 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 159)
+2025-11-20 10:00:55.876 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:00:57.935 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000479 cancelled due to shutdown")
+2025-11-20 10:01:12.415 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000480 cancelled due to shutdown")
+2025-11-20 10:01:14.483 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:01:14.483 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #41)
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #41)
+2025-11-20 10:01:14.483 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:01:14.483 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #41)
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #41)
+2025-11-20 10:01:14.483 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:01:14.483 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:01:14.483 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #41)
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #41)
+2025-11-20 10:01:14.483 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:01:14.483 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:01:14.483 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #41)
+2025-11-20 10:01:14.483 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #41)
+2025-11-20 10:01:14.483 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:01:28.940 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000481 cancelled due to shutdown")
+2025-11-20 10:01:28.940 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:01:28.940 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:01:30.997 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:01:30.997 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:01:30.997 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:01:30.997 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 160)
+2025-11-20 10:01:30.997 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:01:33.049 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000482 cancelled due to shutdown")
+2025-11-20 10:01:49.560 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000483 cancelled due to shutdown")
+2025-11-20 10:02:04.011 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000484 cancelled due to shutdown")
+2025-11-20 10:02:04.011 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:02:04.011 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:02:06.067 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:02:06.067 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:02:06.067 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:02:06.067 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 161)
+2025-11-20 10:02:06.067 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:02:08.129 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000485 cancelled due to shutdown")
+2025-11-20 10:02:24.658 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000486 cancelled due to shutdown")
+2025-11-20 10:02:30.798 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:02:39.085 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000487 cancelled due to shutdown")
+2025-11-20 10:02:39.085 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:02:39.085 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:02:41.161 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:02:41.161 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:02:41.161 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:02:41.161 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 162)
+2025-11-20 10:02:41.161 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:02:43.222 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000488 cancelled due to shutdown")
+2025-11-20 10:02:59.730 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000489 cancelled due to shutdown")
+2025-11-20 10:03:14.201 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000490 cancelled due to shutdown")
+2025-11-20 10:03:14.201 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:03:14.201 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 163)
+2025-11-20 10:03:16.278 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:03:16.278 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:03:16.278 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #42)
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #42)
+2025-11-20 10:03:16.278 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:03:16.278 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #42)
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #42)
+2025-11-20 10:03:16.278 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:03:16.278 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:03:16.278 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #42)
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #42)
+2025-11-20 10:03:16.278 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:03:16.278 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:03:16.278 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #42)
+2025-11-20 10:03:16.278 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #42)
+2025-11-20 10:03:16.278 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:03:18.356 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000491 cancelled due to shutdown")
+2025-11-20 10:03:34.883 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000492 cancelled due to shutdown")
+2025-11-20 10:03:49.348 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000493 cancelled due to shutdown")
+2025-11-20 10:03:49.348 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:03:49.348 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:03:51.416 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:03:51.416 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:03:51.416 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:03:51.416 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 164)
+2025-11-20 10:03:51.416 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:03:53.480 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000494 cancelled due to shutdown")
+2025-11-20 10:04:09.998 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000495 cancelled due to shutdown")
+2025-11-20 10:04:14.040 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:04:24.509 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000496 cancelled due to shutdown")
+2025-11-20 10:04:24.509 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:04:24.509 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:04:26.572 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:04:26.572 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:04:26.572 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:04:26.572 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 165)
+2025-11-20 10:04:26.572 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:04:28.642 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000497 cancelled due to shutdown")
+2025-11-20 10:04:43.097 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000498 cancelled due to shutdown")
+2025-11-20 10:04:59.588 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000499 cancelled due to shutdown")
+2025-11-20 10:04:59.588 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:04:59.588 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:05:01.648 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:05:01.648 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:05:01.648 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:05:01.648 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 166)
+2025-11-20 10:05:01.648 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:05:03.714 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000500 cancelled due to shutdown")
+2025-11-20 10:05:18.172 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000501 cancelled due to shutdown")
+2025-11-20 10:05:18.173 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:05:18.173 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #43)
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #43)
+2025-11-20 10:05:18.173 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:05:18.173 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #43)
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #43)
+2025-11-20 10:05:18.173 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:05:18.173 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:05:18.173 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #43)
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #43)
+2025-11-20 10:05:18.173 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:05:18.173 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:05:18.173 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #43)
+2025-11-20 10:05:18.173 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #43)
+2025-11-20 10:05:18.173 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:05:34.674 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000502 cancelled due to shutdown")
+2025-11-20 10:05:34.674 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:05:34.674 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:05:36.734 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:05:36.734 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:05:36.734 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:05:36.734 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 167)
+2025-11-20 10:05:36.734 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:05:38.795 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000503 cancelled due to shutdown")
+2025-11-20 10:05:53.257 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000504 cancelled due to shutdown")
+2025-11-20 10:05:57.298 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:06:09.789 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000505 cancelled due to shutdown")
+2025-11-20 10:06:09.790 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:06:09.790 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:06:11.851 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:06:11.851 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:06:11.851 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:06:11.851 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 168)
+2025-11-20 10:06:11.851 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:06:13.922 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000506 cancelled due to shutdown")
+2025-11-20 10:06:28.374 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000507 cancelled due to shutdown")
+2025-11-20 10:06:44.841 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000508 cancelled due to shutdown")
+2025-11-20 10:06:44.841 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:06:44.841 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:06:46.907 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:06:46.907 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:06:46.907 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:06:46.907 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 169)
+2025-11-20 10:06:46.907 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:06:48.959 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000509 cancelled due to shutdown")
+2025-11-20 10:07:03.403 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000510 cancelled due to shutdown")
+2025-11-20 10:07:19.951 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000511 cancelled due to shutdown")
+2025-11-20 10:07:19.951 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:07:19.952 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:07:19.952 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:07:19.952 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #44)
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #44)
+2025-11-20 10:07:19.952 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:07:19.952 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #44)
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #44)
+2025-11-20 10:07:19.952 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:07:19.952 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:07:19.952 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #44)
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #44)
+2025-11-20 10:07:19.952 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:07:19.952 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:07:19.952 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #44)
+2025-11-20 10:07:19.952 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #44)
+2025-11-20 10:07:19.952 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:07:22.027 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:07:22.027 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:07:22.027 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:07:22.027 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 170)
+2025-11-20 10:07:22.027 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:07:24.099 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000512 cancelled due to shutdown")
+2025-11-20 10:07:40.478 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:07:40.631 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000513 cancelled due to shutdown")
+2025-11-20 10:07:55.102 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000514 cancelled due to shutdown")
+2025-11-20 10:07:55.102 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:07:55.102 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:07:57.169 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:07:57.169 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:07:57.169 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:07:57.169 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 171)
+2025-11-20 10:07:57.169 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:07:59.227 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000515 cancelled due to shutdown")
+2025-11-20 10:08:15.733 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000516 cancelled due to shutdown")
+2025-11-20 10:08:30.218 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000517 cancelled due to shutdown")
+2025-11-20 10:08:30.218 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:08:30.218 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:08:32.287 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:08:32.287 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:08:32.287 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:08:32.287 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 172)
+2025-11-20 10:08:32.287 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:08:34.353 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000518 cancelled due to shutdown")
+2025-11-20 10:08:50.860 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000519 cancelled due to shutdown")
+2025-11-20 10:09:05.330 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000520 cancelled due to shutdown")
+2025-11-20 10:09:05.330 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:09:05.330 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:09:07.391 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:09:07.391 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:09:07.391 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:09:07.391 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 173)
+2025-11-20 10:09:07.391 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:09:09.457 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000521 cancelled due to shutdown")
+2025-11-20 10:09:21.870 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:09:21.870 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #45)
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #45)
+2025-11-20 10:09:21.870 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:09:21.870 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #45)
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #45)
+2025-11-20 10:09:21.870 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:09:21.870 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:09:21.870 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #45)
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #45)
+2025-11-20 10:09:21.870 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:09:21.870 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:09:21.870 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #45)
+2025-11-20 10:09:21.870 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #45)
+2025-11-20 10:09:21.870 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:09:23.782 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:09:25.997 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000522 cancelled due to shutdown")
+2025-11-20 10:09:40.460 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000523 cancelled due to shutdown")
+2025-11-20 10:09:40.460 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:09:40.460 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:09:42.525 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:09:42.525 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:09:42.525 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:09:42.525 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 174)
+2025-11-20 10:09:42.525 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:09:44.588 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000524 cancelled due to shutdown")
+2025-11-20 10:09:59.017 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000525 cancelled due to shutdown")
+2025-11-20 10:10:15.573 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000526 cancelled due to shutdown")
+2025-11-20 10:10:15.573 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:10:15.573 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:10:17.642 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:10:17.642 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:10:17.642 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:10:17.642 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 175)
+2025-11-20 10:10:17.642 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:10:19.700 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000527 cancelled due to shutdown")
+2025-11-20 10:10:34.151 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000528 cancelled due to shutdown")
+2025-11-20 10:10:50.654 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000529 cancelled due to shutdown")
+2025-11-20 10:10:50.654 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:10:50.654 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:10:52.706 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:10:52.706 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:10:52.706 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:10:52.706 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 176)
+2025-11-20 10:10:52.706 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:10:54.773 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000530 cancelled due to shutdown")
+2025-11-20 10:11:06.985 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:11:09.256 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000531 cancelled due to shutdown")
+2025-11-20 10:11:23.690 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:11:23.690 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #46)
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #46)
+2025-11-20 10:11:23.690 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:11:23.690 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #46)
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #46)
+2025-11-20 10:11:23.690 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:11:23.690 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:11:23.690 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #46)
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #46)
+2025-11-20 10:11:23.690 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:11:23.690 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:11:23.690 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #46)
+2025-11-20 10:11:23.690 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #46)
+2025-11-20 10:11:23.690 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:11:25.756 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000532 cancelled due to shutdown")
+2025-11-20 10:11:25.756 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:11:25.756 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:11:27.824 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:11:27.824 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:11:27.824 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:11:27.824 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 177)
+2025-11-20 10:11:27.824 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:11:29.888 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000533 cancelled due to shutdown")
+2025-11-20 10:11:44.314 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000534 cancelled due to shutdown")
+2025-11-20 10:12:00.814 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000535 cancelled due to shutdown")
+2025-11-20 10:12:00.814 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:12:00.814 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:12:02.873 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:12:02.873 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:12:02.873 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:12:02.873 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 178)
+2025-11-20 10:12:02.873 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:12:04.948 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000536 cancelled due to shutdown")
+2025-11-20 10:12:19.395 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000537 cancelled due to shutdown")
+2025-11-20 10:12:35.888 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000538 cancelled due to shutdown")
+2025-11-20 10:12:35.888 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:12:35.888 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:12:37.950 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:12:37.950 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:12:37.950 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:12:37.950 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 179)
+2025-11-20 10:12:37.950 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:12:40.016 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000539 cancelled due to shutdown")
+2025-11-20 10:12:50.223 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:12:56.564 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000540 cancelled due to shutdown")
+2025-11-20 10:13:11.013 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000541 cancelled due to shutdown")
+2025-11-20 10:13:11.013 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:13:11.013 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:13:13.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:13:13.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:13:13.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:13:13.071 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 180)
+2025-11-20 10:13:13.071 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:13:15.134 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000542 cancelled due to shutdown")
+2025-11-20 10:13:25.468 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:13:25.468 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #47)
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #47)
+2025-11-20 10:13:25.468 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:13:25.468 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #47)
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #47)
+2025-11-20 10:13:25.468 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:13:25.468 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:13:25.468 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #47)
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #47)
+2025-11-20 10:13:25.468 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:13:25.468 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:13:25.468 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #47)
+2025-11-20 10:13:25.468 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #47)
+2025-11-20 10:13:25.468 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:13:31.667 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000543 cancelled due to shutdown")
+2025-11-20 10:13:46.156 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000544 cancelled due to shutdown")
+2025-11-20 10:13:46.156 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:13:46.156 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:13:48.230 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:13:48.230 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:13:48.230 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:13:48.230 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 181)
+2025-11-20 10:13:48.230 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:13:50.304 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000545 cancelled due to shutdown")
+2025-11-20 10:14:06.841 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000546 cancelled due to shutdown")
+2025-11-20 10:14:21.313 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000547 cancelled due to shutdown")
+2025-11-20 10:14:21.313 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:14:21.313 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:14:23.377 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:14:23.377 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:14:23.377 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:14:23.377 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 182)
+2025-11-20 10:14:23.377 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:14:25.443 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000548 cancelled due to shutdown")
+2025-11-20 10:14:33.447 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:14:41.966 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000549 cancelled due to shutdown")
+2025-11-20 10:14:56.428 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000550 cancelled due to shutdown")
+2025-11-20 10:14:56.428 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:14:56.428 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:14:58.507 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:14:58.507 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:14:58.507 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:14:58.507 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 183)
+2025-11-20 10:14:58.507 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:15:00.568 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000551 cancelled due to shutdown")
+2025-11-20 10:15:15.037 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000552 cancelled due to shutdown")
+2025-11-20 10:15:27.441 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:15:27.441 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #48)
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #48)
+2025-11-20 10:15:27.441 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:15:27.441 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #48)
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #48)
+2025-11-20 10:15:27.441 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:15:27.441 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:15:27.441 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #48)
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #48)
+2025-11-20 10:15:27.441 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:15:27.441 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:15:27.441 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #48)
+2025-11-20 10:15:27.441 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #48)
+2025-11-20 10:15:27.441 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:15:31.569 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000553 cancelled due to shutdown")
+2025-11-20 10:15:31.569 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:15:31.569 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:15:33.625 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:15:33.626 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:15:33.626 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:15:33.626 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 184)
+2025-11-20 10:15:33.626 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:15:35.705 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000554 cancelled due to shutdown")
+2025-11-20 10:15:50.161 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000555 cancelled due to shutdown")
+2025-11-20 10:16:06.674 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000556 cancelled due to shutdown")
+2025-11-20 10:16:06.674 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:16:06.674 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:16:08.749 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:16:08.749 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:16:08.749 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:16:08.749 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 185)
+2025-11-20 10:16:08.749 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:16:10.816 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000557 cancelled due to shutdown")
+2025-11-20 10:16:16.718 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:16:25.293 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000558 cancelled due to shutdown")
+2025-11-20 10:16:41.806 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000559 cancelled due to shutdown")
+2025-11-20 10:16:41.806 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:16:41.806 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:16:43.871 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:16:43.871 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:16:43.871 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:16:43.871 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 186)
+2025-11-20 10:16:43.871 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:16:45.942 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000560 cancelled due to shutdown")
+2025-11-20 10:17:00.401 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000561 cancelled due to shutdown")
+2025-11-20 10:17:16.938 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000562 cancelled due to shutdown")
+2025-11-20 10:17:16.938 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:17:16.938 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:17:19.022 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:17:19.022 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:17:19.022 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:17:19.022 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 187)
+2025-11-20 10:17:19.022 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:17:21.092 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000563 cancelled due to shutdown")
+2025-11-20 10:17:29.348 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:17:29.348 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #49)
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #49)
+2025-11-20 10:17:29.348 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:17:29.348 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #49)
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #49)
+2025-11-20 10:17:29.348 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:17:29.348 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:17:29.348 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #49)
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #49)
+2025-11-20 10:17:29.348 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:17:29.348 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:17:29.348 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #49)
+2025-11-20 10:17:29.348 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #49)
+2025-11-20 10:17:29.348 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:17:37.647 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000564 cancelled due to shutdown")
+2025-11-20 10:17:52.112 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000565 cancelled due to shutdown")
+2025-11-20 10:17:52.112 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:17:52.112 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:17:54.171 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:17:54.171 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:17:54.171 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:17:54.171 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 188)
+2025-11-20 10:17:54.171 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:17:56.245 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000566 cancelled due to shutdown")
+2025-11-20 10:18:00.033 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:18:12.737 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000567 cancelled due to shutdown")
+2025-11-20 10:18:27.161 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000568 cancelled due to shutdown")
+2025-11-20 10:18:27.161 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:18:27.161 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:18:29.215 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:18:29.215 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:18:29.215 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:18:29.215 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 189)
+2025-11-20 10:18:29.215 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:18:31.289 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000569 cancelled due to shutdown")
+2025-11-20 10:18:47.785 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000570 cancelled due to shutdown")
+2025-11-20 10:19:02.227 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000571 cancelled due to shutdown")
+2025-11-20 10:19:02.227 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:19:02.227 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:19:04.297 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:19:04.297 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:19:04.297 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:19:04.297 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 190)
+2025-11-20 10:19:04.297 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:19:06.359 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000572 cancelled due to shutdown")
+2025-11-20 10:19:22.871 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000573 cancelled due to shutdown")
+2025-11-20 10:19:31.112 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:19:31.112 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #50)
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #50)
+2025-11-20 10:19:31.112 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:19:31.112 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #50)
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #50)
+2025-11-20 10:19:31.112 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:19:31.112 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:19:31.112 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #50)
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #50)
+2025-11-20 10:19:31.112 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:19:31.112 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:19:31.112 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #50)
+2025-11-20 10:19:31.112 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #50)
+2025-11-20 10:19:31.112 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:19:37.301 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000574 cancelled due to shutdown")
+2025-11-20 10:19:37.301 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:19:37.301 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:19:39.380 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:19:39.380 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:19:39.380 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:19:39.380 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 191)
+2025-11-20 10:19:39.380 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:19:41.443 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000575 cancelled due to shutdown")
+2025-11-20 10:19:43.333 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:19:57.951 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000576 cancelled due to shutdown")
+2025-11-20 10:20:12.430 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000577 cancelled due to shutdown")
+2025-11-20 10:20:12.430 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:20:12.430 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:20:14.485 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:20:14.485 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:20:14.485 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:20:14.485 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 192)
+2025-11-20 10:20:14.485 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:20:16.549 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000578 cancelled due to shutdown")
+2025-11-20 10:20:33.042 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000579 cancelled due to shutdown")
+2025-11-20 10:20:49.561 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000580 cancelled due to shutdown")
+2025-11-20 10:20:49.561 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:20:49.561 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:20:51.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:20:51.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:20:51.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:20:51.628 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 193)
+2025-11-20 10:20:51.628 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:20:53.689 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000581 cancelled due to shutdown")
+2025-11-20 10:21:08.154 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000582 cancelled due to shutdown")
+2025-11-20 10:21:24.698 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000583 cancelled due to shutdown")
+2025-11-20 10:21:24.698 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:21:24.698 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:21:26.714 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:21:26.766 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:21:26.766 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:21:26.766 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:21:26.766 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 194)
+2025-11-20 10:21:26.766 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:21:28.852 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000584 cancelled due to shutdown")
+2025-11-20 10:21:32.991 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:21:32.991 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #51)
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #51)
+2025-11-20 10:21:32.991 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:21:32.991 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #51)
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #51)
+2025-11-20 10:21:32.991 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:21:32.991 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:21:32.991 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #51)
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #51)
+2025-11-20 10:21:32.991 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:21:32.991 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 121s, restarting...
+2025-11-20 10:21:32.991 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #51)
+2025-11-20 10:21:32.991 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #51)
+2025-11-20 10:21:32.991 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:21:43.338 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000585 cancelled due to shutdown")
+2025-11-20 10:21:59.883 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000586 cancelled due to shutdown")
+2025-11-20 10:21:59.883 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:21:59.883 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:22:01.941 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:22:01.941 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:22:01.941 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:22:01.941 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 195)
+2025-11-20 10:22:01.941 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:22:04.002 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000587 cancelled due to shutdown")
+2025-11-20 10:22:20.532 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000588 cancelled due to shutdown")
+2025-11-20 10:22:37.065 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000589 cancelled due to shutdown")
+2025-11-20 10:22:37.065 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:22:37.065 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:22:39.128 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:22:39.128 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:22:39.128 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:22:39.128 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 196)
+2025-11-20 10:22:39.128 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:22:41.192 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000590 cancelled due to shutdown")
+2025-11-20 10:22:57.756 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000591 cancelled due to shutdown")
+2025-11-20 10:23:09.992 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:23:12.213 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000592 cancelled due to shutdown")
+2025-11-20 10:23:12.213 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:23:12.213 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:23:14.282 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:23:14.282 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:23:14.282 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:23:14.282 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 197)
+2025-11-20 10:23:14.282 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:23:16.359 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000593 cancelled due to shutdown")
+2025-11-20 10:23:32.860 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000594 cancelled due to shutdown")
+2025-11-20 10:23:34.930 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:23:34.930 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #52)
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #52)
+2025-11-20 10:23:34.930 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:23:34.930 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #52)
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #52)
+2025-11-20 10:23:34.930 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:23:34.930 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:23:34.930 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #52)
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #52)
+2025-11-20 10:23:34.930 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:23:34.930 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:23:34.930 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #52)
+2025-11-20 10:23:34.930 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #52)
+2025-11-20 10:23:34.930 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:23:47.338 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000595 cancelled due to shutdown")
+2025-11-20 10:23:47.338 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:23:47.338 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:23:49.394 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:23:49.394 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:23:49.394 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:23:49.394 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 198)
+2025-11-20 10:23:49.394 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:23:51.451 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000596 cancelled due to shutdown")
+2025-11-20 10:24:07.985 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000597 cancelled due to shutdown")
+2025-11-20 10:24:22.443 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000598 cancelled due to shutdown")
+2025-11-20 10:24:22.443 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:24:22.443 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:24:24.496 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:24:24.496 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:24:24.496 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:24:24.496 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 199)
+2025-11-20 10:24:24.496 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:24:26.543 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000599 cancelled due to shutdown")
+2025-11-20 10:24:41.007 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000600 cancelled due to shutdown")
+2025-11-20 10:24:53.392 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:24:57.536 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000601 cancelled due to shutdown")
+2025-11-20 10:24:57.536 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:24:57.536 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:24:59.588 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:24:59.588 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:24:59.588 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:24:59.588 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 200)
+2025-11-20 10:24:59.588 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:25:01.657 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000602 cancelled due to shutdown")
+2025-11-20 10:25:16.118 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000603 cancelled due to shutdown")
+2025-11-20 10:25:32.688 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000604 cancelled due to shutdown")
+2025-11-20 10:25:32.688 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:25:32.688 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:25:34.753 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:25:34.753 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:25:34.753 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:25:34.753 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 201)
+2025-11-20 10:25:34.753 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:25:36.819 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000605 cancelled due to shutdown")
+2025-11-20 10:25:36.819 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:25:36.819 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #53)
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #53)
+2025-11-20 10:25:36.819 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:25:36.819 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #53)
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #53)
+2025-11-20 10:25:36.819 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:25:36.819 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:25:36.819 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #53)
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #53)
+2025-11-20 10:25:36.819 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:25:36.819 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:25:36.819 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #53)
+2025-11-20 10:25:36.819 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #53)
+2025-11-20 10:25:36.819 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:25:51.267 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000606 cancelled due to shutdown")
+2025-11-20 10:26:07.857 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000607 cancelled due to shutdown")
+2025-11-20 10:26:07.857 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:26:07.857 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:26:09.930 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:26:09.930 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:26:09.930 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:26:09.930 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 202)
+2025-11-20 10:26:09.930 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:26:11.996 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000608 cancelled due to shutdown")
+2025-11-20 10:26:26.473 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000609 cancelled due to shutdown")
+2025-11-20 10:26:36.764 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:26:43.018 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000610 cancelled due to shutdown")
+2025-11-20 10:26:43.018 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:26:43.018 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:26:45.076 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:26:45.076 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:26:45.076 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:26:45.076 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 203)
+2025-11-20 10:26:45.076 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:26:47.139 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000611 cancelled due to shutdown")
+2025-11-20 10:27:03.669 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000612 cancelled due to shutdown")
+2025-11-20 10:27:18.117 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000613 cancelled due to shutdown")
+2025-11-20 10:27:18.117 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:27:18.117 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:27:20.170 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:27:20.170 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:27:20.170 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:27:20.170 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 204)
+2025-11-20 10:27:20.170 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:27:22.230 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000614 cancelled due to shutdown")
+2025-11-20 10:27:38.770 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000615 cancelled due to shutdown")
+2025-11-20 10:27:38.770 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:27:38.770 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:27:38.770 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #54)
+2025-11-20 10:27:38.770 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #54)
+2025-11-20 10:27:38.770 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:27:38.770 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:27:38.770 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #54)
+2025-11-20 10:27:38.770 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #54)
+2025-11-20 10:27:38.771 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:27:38.771 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:27:38.771 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:27:38.771 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #54)
+2025-11-20 10:27:38.771 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #54)
+2025-11-20 10:27:38.771 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:27:38.771 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:27:38.771 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:27:38.771 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #54)
+2025-11-20 10:27:38.771 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #54)
+2025-11-20 10:27:38.771 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:27:53.231 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000616 cancelled due to shutdown")
+2025-11-20 10:27:53.231 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:27:53.231 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:27:55.303 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:27:55.303 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:27:55.303 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:27:55.303 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 205)
+2025-11-20 10:27:55.303 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:27:57.362 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000617 cancelled due to shutdown")
+2025-11-20 10:28:13.924 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000618 cancelled due to shutdown")
+2025-11-20 10:28:20.183 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:28:28.399 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000619 cancelled due to shutdown")
+2025-11-20 10:28:28.399 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:28:28.399 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:28:30.474 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:28:30.474 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:28:30.474 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:28:30.474 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 206)
+2025-11-20 10:28:30.474 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:28:32.535 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000620 cancelled due to shutdown")
+2025-11-20 10:28:47.018 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000621 cancelled due to shutdown")
+2025-11-20 10:29:03.538 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000622 cancelled due to shutdown")
+2025-11-20 10:29:03.538 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:29:03.538 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:29:05.607 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:29:05.607 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:29:05.607 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:29:05.607 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 207)
+2025-11-20 10:29:05.607 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:29:07.680 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000623 cancelled due to shutdown")
+2025-11-20 10:29:22.140 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000624 cancelled due to shutdown")
+2025-11-20 10:29:38.669 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000625 cancelled due to shutdown")
+2025-11-20 10:29:38.669 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:29:38.669 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 208)
+2025-11-20 10:29:40.738 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:29:40.738 [31mERROR[0m [supervisor] [kraken_orderbook_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:29:40.738 [33mWARN[0m [supervisor] [kraken_orderbook_ws] Connection lost
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Attempting connection (attempt #55)
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_orderbook_ws] Starting supervised connection (attempt #55)
+2025-11-20 10:29:40.738 [31mERROR[0m [supervisor] [kraken_executions_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:29:40.738 [33mWARN[0m [supervisor] [kraken_executions_ws] Connection lost
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_executions_ws] Attempting connection (attempt #55)
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_executions_ws] Starting supervised connection (attempt #55)
+2025-11-20 10:29:40.738 [32mINFO[0m [kraken_executions] Connecting to Kraken authenticated WebSocket for executions...
+2025-11-20 10:29:40.738 [31mERROR[0m [supervisor] [kraken_balances_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:29:40.738 [33mWARN[0m [supervisor] [kraken_balances_ws] Connection lost
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_balances_ws] Attempting connection (attempt #55)
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_balances_ws] Starting supervised connection (attempt #55)
+2025-11-20 10:29:40.738 [32mINFO[0m [kraken_balances] Connecting to Kraken authenticated WebSocket...
+2025-11-20 10:29:40.738 [31mERROR[0m [supervisor] [kraken_ticker_ws] Connection stuck in 'Connecting' state for 122s, restarting...
+2025-11-20 10:29:40.738 [33mWARN[0m [supervisor] [kraken_ticker_ws] Connection lost
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_ticker_ws] Attempting connection (attempt #55)
+2025-11-20 10:29:40.738 [32mINFO[0m [supervisor] [kraken_ticker_ws] Starting supervised connection (attempt #55)
+2025-11-20 10:29:40.738 [32mINFO[0m [kraken_ticker] Connecting to Kraken WebSocket...
+2025-11-20 10:29:42.810 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000626 cancelled due to shutdown")
+2025-11-20 10:29:57.643 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000627 cancelled due to shutdown")
+2025-11-20 10:30:04.015 [32mINFO[0m [order_processor] Order processing: 2 orders placed, 0 grid + 0 mm pending in current batch
+2025-11-20 10:30:12.333 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000628 cancelled due to shutdown")
+2025-11-20 10:30:12.333 [31mERROR[0m [supervisor] [kraken_trading_ws] Ping failed 3 times, marking connection as failed
+2025-11-20 10:30:12.333 [31mERROR[0m [supervisor] [kraken_trading_ws] Connection failed: ping timeout (attempt #1)
+2025-11-20 10:30:14.410 [32mINFO[0m [supervisor] [kraken_trading_ws] Backup auto-reconnecting after 2.0s backoff (reason: ping timeout)...
+2025-11-20 10:30:14.410 [32mINFO[0m [supervisor] [kraken_trading_ws] Attempting connection (attempt #2)
+2025-11-20 10:30:14.410 [32mINFO[0m [supervisor] [kraken_trading_ws] Starting supervised connection (attempt #2)
+2025-11-20 10:30:14.410 [32mINFO[0m [supervisor] [kraken_trading_ws] Connection established (total: 209)
+2025-11-20 10:30:14.410 [33mWARN[0m [supervisor] [kraken_trading_ws] Connection function completed unexpectedly
+2025-11-20 10:30:16.456 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000629 cancelled due to shutdown")
+2025-11-20 10:30:33.044 [33mWARN[0m [supervisor] [kraken_trading_ws] Ping exception: Failure("Request req_id 1000630 cancelled due to shutdown")
