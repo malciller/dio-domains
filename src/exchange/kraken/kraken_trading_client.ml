@@ -567,10 +567,10 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
                 ] >>= function
                 | `Response response ->
                     (* Response arrived after timeout but before we gave up - success! *)
-                    Logging.info_f ~section "Request req_id=%d: recovered from race condition - response arrived after timeout" req_id;
+                    Logging.info_f ~section "Request req_id=%d: response arrived just after timeout (within 10ms grace period)" req_id;
                     (* Track successful response *)
                     Telemetry.inc_counter Telemetry.Common.api_requests ();
-                    Logging.debug_f ~section "Request req_id=%d: response received successfully (recovered from timeout)" req_id;
+                    Logging.debug_f ~section "Request req_id=%d: response received successfully (timeout race resolved)" req_id;
                     Lwt.return response
                 | `Still_timeout ->
                     (* Waiter still not resolved - this is an actual timeout despite req_id removal *)
