@@ -537,6 +537,20 @@ let execute_strategy
         end else begin
           (* Both checks pass: Proceed to Step 3 - BUY ORDER MANAGEMENT *)
 
+          (* CRITICAL: Check for pending orders before placing new ones - prevents duplicate spam *)
+          if state.pending_orders <> [] then begin
+            (* Only log every 100,000 iterations to avoid spam *)
+            if should_log then begin
+              Logging.debug_f ~section "Waiting for %d pending orders before placing new orders for %s: [%s]"
+                (List.length state.pending_orders) asset.symbol
+                (String.concat "; " (List.map (fun (order_id, side, price, _) ->
+                  Printf.sprintf "%s %s@%.2f" (string_of_order_side side) order_id price
+                ) state.pending_orders))
+            end;
+            (* Update cycle counter and exit early *)
+            state.last_cycle <- cycle
+          end else begin
+
           (* Sync strategy state with actual open orders *)
           state.last_buy_order_price <- None;
           state.last_buy_order_id <- None;
@@ -709,8 +723,9 @@ let execute_strategy
                   if should_log then Logging.debug_f ~section "Buy order for %s already at correct price: %.8f" asset.symbol current_buy_price;
                 end
             | _ -> Logging.warn_f ~section "Buy order tracking inconsistent for %s" asset.symbol
-          end
-        end;
+          end;
+          end  (* Close pending_orders check *)
+        end;  (* Close balance checks *)
 
         (* Update cycle counter *)
         state.last_cycle <- cycle
