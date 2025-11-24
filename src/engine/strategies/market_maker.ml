@@ -50,6 +50,7 @@ type strategy_state = {
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
+  mutable last_cleanup_time: float; (* Last time cleanup was run *)
 }
 
 (** Global strategy state store *)
@@ -73,6 +74,7 @@ let get_strategy_state asset_symbol =
           last_order_time = 0.0;
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
+          last_cleanup_time = 0.0;
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
         new_state
@@ -321,6 +323,9 @@ let execute_strategy
 
   let now = Unix.time () in
 
+  (* Efficient cleanup logic - run every cycle but use scan-and-remove to avoid allocation *)
+  (* This prevents accumulation while maintaining HFT responsiveness *)
+  
   (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
   let original_count = List.length state.pending_orders in
   state.pending_orders <- List.filter (fun (order_id, _, _, timestamp) ->
@@ -358,19 +363,17 @@ let execute_strategy
   end;
 
   (* Clean up old pending cancellations (older than 30 seconds) *)
-  let pending_cancellations = Hashtbl.fold (fun order_id timestamp acc ->
-    if now -. timestamp > 30.0 then begin
-      if should_log then Logging.debug_f ~section "Removing stale pending cancellation %s for %s (age: %.1fs)" order_id asset.symbol (now -. timestamp);
-      acc
-    end else
-      (order_id, timestamp) :: acc
-  ) state.pending_cancellations [] in
+  (* Optimized scan and remove to avoid Hashtbl copy *)
+  let to_remove = ref [] in
+  Hashtbl.iter (fun order_id timestamp ->
+    if now -. timestamp > 30.0 then
+      to_remove := order_id :: !to_remove
+  ) state.pending_cancellations;
 
-  (* Clear and repopulate the hashtable with only non-stale entries *)
-  Hashtbl.clear state.pending_cancellations;
-  List.iter (fun (order_id, timestamp) ->
-    Hashtbl.add state.pending_cancellations order_id timestamp
-  ) pending_cancellations;
+  List.iter (fun order_id ->
+    if should_log then Logging.debug_f ~section "Removing stale pending cancellation %s for %s" order_id asset.symbol;
+    Hashtbl.remove state.pending_cancellations order_id
+  ) !to_remove;
 
   (* Log if we cleaned up many cancelled orders *)
   let cleaned_cancelled_count = original_cancelled_count - List.length state.cancelled_orders in
@@ -658,7 +661,7 @@ let execute_strategy
                   id = expected_amend_id
                 ) state.pending_orders in
 
-                if not is_being_amended && price_diff > min_move_threshold then begin
+                if not is_being_amended && price_diff >= min_move_threshold *. 0.9 then begin
                   (* Mismatched: Amend buy to the required price *)
                   (* Profitability and Post-Only checks *)
                   (* For zero-fee assets, any spread is profitable, so skip profitability check *)
@@ -671,8 +674,11 @@ let execute_strategy
                   (* Balance check for amendment *)
                   let amendment_balance_ok = match min_usd_balance_opt, available_quote_balance with
                     | Some min_bal, Some qb ->
+                        (* Add back funds locked in the current order being amended *)
+                        let current_locked = current_buy_price *. qty in
+                        let effective_qb = qb +. current_locked in
                         let required_quote = required_buy_price *. qty in
-                        qb >= required_quote && qb -. required_quote >= min_bal
+                        effective_qb >= required_quote && effective_qb -. required_quote >= min_bal
                     | Some _, None -> false  (* Can't check balance if no data *)
                     | None, _ -> true        (* No constraint *)
                   in
@@ -689,8 +695,14 @@ let execute_strategy
                     if should_log then Logging.info_f ~section "Amended buy order for %s: %.8f -> %.8f (spread=%.2f%%, reason=book shift)"
                       asset.symbol current_buy_price required_buy_price (spread_pct *. 100.0);
                   end else begin
-                    if should_log then Logging.warn_f ~section "Cannot amend buy order for %s: checks failed (profit=%B, post_only=%B, balance=%B)"
-                      asset.symbol profitability_ok (required_buy_price <= bid) amendment_balance_ok;
+                    if Hashtbl.mem state.pending_cancellations buy_order_id then begin
+                      if should_log then Logging.debug_f ~section "Buy order %s already pending cancellation, skipping retry" buy_order_id
+                    end else begin
+                      if should_log then Logging.warn_f ~section "Cannot amend buy order for %s: checks failed (profit=%B, post_only=%B, balance=%B) - CANCELLING"
+                        asset.symbol profitability_ok (required_buy_price <= bid) amendment_balance_ok;
+                      let cancel_order = create_cancel_order buy_order_id asset.symbol "MM" in
+                      push_order cancel_order
+                    end
                   end
                 end else begin
                   (* Matched: No action needed *)
@@ -810,11 +822,22 @@ let init () =
 
 (** Strategy module interface *)
 module Strategy = struct
+  (** Clean up strategy state for a symbol when domain stops *)
+  let cleanup_strategy_state symbol =
+    Mutex.lock strategy_states_mutex;
+    (match Hashtbl.find_opt strategy_states symbol with
+     | Some _ ->
+         Hashtbl.remove strategy_states symbol;
+         Logging.debug_f ~section "Removed strategy state for %s" symbol
+     | None -> ());
+    Mutex.unlock strategy_states_mutex
+
   let execute = execute_strategy
   let get_pending_orders = get_pending_orders
   let handle_order_acknowledged = handle_order_acknowledged
   let handle_order_rejected = handle_order_rejected
   let handle_order_cancelled = handle_order_cancelled
   let cleanup_pending_cancellation = cleanup_pending_cancellation
+  let cleanup_strategy_state = cleanup_strategy_state
   let init = init
 end
