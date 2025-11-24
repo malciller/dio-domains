@@ -13,6 +13,26 @@ module type PAYLOAD = sig
   type t
 end
 
+(** Global registry of all event buses for monitoring and cleanup *)
+type bus_ops = {
+  topic: string;
+  cleanup: unit -> int option;
+  stats: unit -> (int * int * int);
+}
+
+let registry : bus_ops list Atomic.t = Atomic.make []
+
+let register ops =
+  let rec loop () =
+    let old = Atomic.get registry in
+    if Atomic.compare_and_set registry old (ops :: old) then ()
+    else loop ()
+  in
+  loop ()
+
+let iter_buses f =
+  List.iter f (Atomic.get registry)
+
 module Make (Payload : PAYLOAD) = struct
   type snapshot = Payload.t
 
@@ -34,14 +54,75 @@ module Make (Payload : PAYLOAD) = struct
     topic: string;
     latest: snapshot option Atomic.t;
     subscribers: subscriber list Atomic.t;
+    mutable publish_count: int;  (* Counter for event-driven cleanup *)
   }
 
+  (** Clean up stale subscribers (older than max_age_seconds or unused for too long) *)
+  let cleanup_stale_subscribers bus ?(max_age_seconds=60.0) ?(max_unused_seconds=30.0) () =
+    let now = Unix.time () in
+    let rec try_cleanup () =
+      let current = Atomic.get bus.subscribers in
+      let filtered = List.filter (fun sub ->
+        not sub.closed &&
+        (now -. sub.created_at) <= max_age_seconds &&
+        (now -. sub.last_used) <= max_unused_seconds
+      ) current in
+      let removed_count = List.length current - List.length filtered in
+      if removed_count > 0 then begin
+        Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length filtered);
+        if Atomic.compare_and_set bus.subscribers current filtered then
+          Some removed_count
+        else try_cleanup ()
+      end else None
+    in
+    try_cleanup ()
+
+  (** Force cleanup all stale subscribers regardless of age (for dashboard memory management) *)
+  let force_cleanup_stale_subscribers bus () =
+    let now = Unix.time () in
+    let rec try_cleanup () =
+      let current = Atomic.get bus.subscribers in
+      let filtered = List.filter (fun sub ->
+        (* Keep persistent subscribers *)
+        sub.persistent ||
+        (* Keep non-closed subscribers that have been used within the last 10 seconds *)
+        (not sub.closed && (now -. sub.last_used) <= 10.0)
+      ) current in
+      let removed_count = List.length current - List.length filtered in
+      if removed_count > 0 then begin
+        Logging.debug_f ~section:"event_bus" "Force cleaned %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length filtered);
+        if Atomic.compare_and_set bus.subscribers current filtered then
+          Some removed_count
+        else try_cleanup ()
+      end else None
+    in
+    try_cleanup ()
+
+  (** Get subscriber statistics for monitoring *)
+  let get_subscriber_stats bus =
+    let subs = Atomic.get bus.subscribers in
+    let now = Unix.time () in
+    let total = List.length subs in
+    let active = List.length (List.filter (fun sub -> not sub.closed) subs) in
+    let stale = List.length (List.filter (fun sub ->
+      sub.closed || (now -. sub.last_used) > 300.0
+    ) subs) in
+    (total, active, stale)
+
   let create ?initial topic =
-    {
+    let bus = {
       topic;
       latest = Atomic.make initial;
       subscribers = Atomic.make [];
-    }
+      publish_count = 0;
+    } in
+    (* Register with global registry *)
+    register {
+      topic;
+      cleanup = (fun () -> cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 ());
+      stats = (fun () -> get_subscriber_stats bus);
+    };
+    bus
 
   let topic bus = bus.topic
 
@@ -65,13 +146,13 @@ module Make (Payload : PAYLOAD) = struct
             (fun () ->
               (* Use timeout to detect blocking/slow consumers *)
               Lwt.pick [
-                (sub.push payload >|= fun () -> 
+                (sub.push payload >|= fun () ->
                    (* Only update last_used on successful push *)
                    sub.last_used <- now);
-                (Lwt_unix.sleep 0.001 >|= fun () -> 
+                (Lwt_unix.sleep 0.001 >|= fun () ->
                    (* Timeout - subscriber is too slow *)
                    Logging.warn_f ~section:"event_bus" "Subscriber too slow (1ms timeout), dropping: %s" bus.topic;
-                   sub.closed <- true) 
+                   sub.closed <- true)
               ]
             )
             (fun exn ->
@@ -82,7 +163,15 @@ module Make (Payload : PAYLOAD) = struct
             )
         )
       end
-    ) active_subs
+    ) active_subs;
+
+    (* Event-driven cleanup: run cleanup every 100 publications to avoid overhead *)
+    bus.publish_count <- bus.publish_count + 1;
+    if bus.publish_count mod 100 = 0 then
+      match cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 () with
+      | Some removed_count ->
+          Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s" removed_count bus.topic
+      | None -> ()
 
   let subscribe ?(persistent=false) bus =
     (* Use bounded stream to prevent unbounded memory growth *)
@@ -132,55 +221,6 @@ module Make (Payload : PAYLOAD) = struct
           (Lwt_unix.sleep timeout >|= fun () -> None)
         ])
       (fun () -> subscription.close (); Lwt.return_unit)
-
-  (** Clean up stale subscribers (older than max_age_seconds or unused for too long) *)
-  let cleanup_stale_subscribers bus ?(max_age_seconds=60.0) ?(max_unused_seconds=30.0) () =
-    let now = Unix.time () in
-    let rec try_cleanup () =
-      let current = Atomic.get bus.subscribers in
-      let filtered = List.filter (fun sub ->
-        not sub.closed &&
-        (now -. sub.created_at) <= max_age_seconds &&
-        (now -. sub.last_used) <= max_unused_seconds
-      ) current in
-      let removed_count = List.length current - List.length filtered in
-      if removed_count > 0 then begin
-        if Atomic.compare_and_set bus.subscribers current filtered then
-          Some removed_count
-        else try_cleanup ()
-      end else None
-    in
-    try_cleanup ()
-
-  (** Force cleanup all stale subscribers regardless of age (for dashboard memory management) *)
-  let force_cleanup_stale_subscribers bus () =
-    let now = Unix.time () in
-    let rec try_cleanup () =
-      let current = Atomic.get bus.subscribers in
-      let filtered = List.filter (fun sub ->
-        (* Never force cleanup persistent subscribers *)
-        sub.persistent ||
-        (not sub.closed && (now -. sub.last_used) <= 30.0)  (* Keep only very recently used subscribers *)
-      ) current in
-      let removed_count = List.length current - List.length filtered in
-      if removed_count > 0 then begin
-        if Atomic.compare_and_set bus.subscribers current filtered then
-          Some removed_count
-        else try_cleanup ()
-      end else None
-    in
-    try_cleanup ()
-
-  (** Get subscriber statistics for monitoring *)
-  let get_subscriber_stats bus =
-    let subs = Atomic.get bus.subscribers in
-    let now = Unix.time () in
-    let total = List.length subs in
-    let active = List.length (List.filter (fun sub -> not sub.closed) subs) in
-    let stale = List.length (List.filter (fun sub ->
-      sub.closed || (now -. sub.last_used) > 300.0
-    ) subs) in
-    (total, active, stale)
 end
 
 

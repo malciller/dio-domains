@@ -25,6 +25,7 @@ module Make (Key : KEY) (Value : VALUE) = struct
     version: int Atomic.t;
     data: snapshot Atomic.t;
     mutable last_cleanup: float;  (* Track when we last cleaned up *)
+    mutable operation_count: int;  (* Counter for event-driven cleanup *)
   }
 
   let create () =
@@ -33,6 +34,7 @@ module Make (Key : KEY) (Value : VALUE) = struct
       version = Atomic.make 0;
       data = Atomic.make (Tbl.create 0);
       last_cleanup = Unix.gettimeofday ();
+      operation_count = 0;
     }
 
   let snapshot registry = Atomic.get registry.data
@@ -40,6 +42,9 @@ module Make (Key : KEY) (Value : VALUE) = struct
   let size registry = Atomic.get registry.size
 
   let bump_version registry = Atomic.fetch_and_add registry.version 1 + 1
+
+  (* Forward reference for cleanup function - will be set after cleanup is defined *)
+  let cleanup_fn_ref = ref (fun _registry -> ())
 
   let replace registry key value =
     let rec loop () =
@@ -52,11 +57,25 @@ module Make (Key : KEY) (Value : VALUE) = struct
         Some (bump_version registry, existed)
       ) else loop ()
     in
-    loop ()
+    let result = loop () in
+
+    (* Event-driven cleanup: increment counter and perform cleanup every 50 operations *)
+    registry.operation_count <- registry.operation_count + 1;
+    if registry.operation_count mod 50 = 0 then
+      !cleanup_fn_ref registry;
+
+    result
 
   let find registry key =
     let current = Atomic.get registry.data in
-    try Some (Tbl.find current key) with Not_found -> None
+    let result = try Some (Tbl.find current key) with Not_found -> None in
+
+    (* Event-driven cleanup: increment counter and perform cleanup every 50 operations *)
+    registry.operation_count <- registry.operation_count + 1;
+    if registry.operation_count mod 50 = 0 then
+      !cleanup_fn_ref registry;
+
+    result
 
   let remove registry key =
     let rec loop () =
@@ -138,6 +157,10 @@ module Make (Key : KEY) (Value : VALUE) = struct
       (* Return cleanup stats *)
       Some (size_drift, size_trimmed)
     end else None
+
+  (* Set the cleanup function reference after cleanup is defined *)
+  let () =
+    cleanup_fn_ref := (fun registry ->
+      ignore (cleanup registry ~max_age_seconds:300.0 ~max_entries:1000 ())
+    )
 end
-
-

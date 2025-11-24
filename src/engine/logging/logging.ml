@@ -38,6 +38,13 @@ let get_section name =
   | Some s -> s
   | None -> let s = { name; min_level = !global_min_level } in Hashtbl.add sections name s; s
 
+(** Check if a log level will be enabled for a section (avoids allocation) *)
+let will_log level section_name =
+  let section = get_section section_name in
+  (!enabled_sections = [] || List.mem section_name !enabled_sections) &&
+  level_to_int level >= level_to_int section.min_level &&
+  level_to_int level >= level_to_int !global_min_level
+
 (* Format timestamp - performance optimized *)
 let format_timestamp =
   let last_sec = ref 0.0 in
@@ -86,11 +93,45 @@ let log level section_name message =
   end
 
 (* Public API *)
-let debug_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log DEBUG section msg)) fmt
-let info_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log INFO section msg)) fmt
-let warn_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log WARN section msg)) fmt
-let error_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log ERROR section msg)) fmt
-let critical_f ~section fmt = Printf.ksprintf (fun msg -> Lwt.async (fun () -> log CRITICAL section msg)) fmt
+let debug_f ~section fmt =
+  Printf.ksprintf (fun msg ->
+    if will_log DEBUG section then
+      Lwt.async (fun () -> log DEBUG section msg)
+    else
+      ()
+  ) fmt
+
+let info_f ~section fmt =
+  Printf.ksprintf (fun msg ->
+    if will_log INFO section then
+      Lwt.async (fun () -> log INFO section msg)
+    else
+      ()
+  ) fmt
+
+let warn_f ~section fmt =
+  Printf.ksprintf (fun msg ->
+    if will_log WARN section then
+      Lwt.async (fun () -> log WARN section msg)
+    else
+      ()
+  ) fmt
+
+let error_f ~section fmt =
+  Printf.ksprintf (fun msg ->
+    if will_log ERROR section then
+      Lwt.async (fun () -> log ERROR section msg)
+    else
+      ()
+  ) fmt
+
+let critical_f ~section fmt =
+  Printf.ksprintf (fun msg ->
+    if will_log CRITICAL section then
+      Lwt.async (fun () -> log CRITICAL section msg)
+    else
+      ()
+  ) fmt
 
 let debug ~section msg = Lwt.async (fun () -> log DEBUG section msg)
 let info ~section msg = Lwt.async (fun () -> log INFO section msg)

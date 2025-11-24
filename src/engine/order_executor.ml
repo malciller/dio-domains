@@ -50,20 +50,22 @@ module InFlightOrders = struct
     size
 
   (** Cleanup stale entries *)
-  let cleanup ?(max_age=300.0) () =
+  let cleanup ?(max_age=60.0) () =
     Mutex.lock mutex;
     let now = Unix.gettimeofday () in
-    let initial_size = Hashtbl.length registry in
-    (* Collect keys to remove first to avoid modification during iteration issues if any *)
-    let to_remove = Hashtbl.fold (fun key timestamp acc ->
-      if now -. timestamp > max_age then key :: acc else acc
-    ) registry [] in
-    
-    List.iter (Hashtbl.remove registry) to_remove;
-    
-    let final_size = Hashtbl.length registry in
+    let removed = ref 0 in
+
+    (* Scan and remove stale entries directly - safe under mutex protection *)
+    Hashtbl.filter_map_inplace (fun _key timestamp ->
+      if now -. timestamp > max_age then begin
+        incr removed;
+        None  (* Remove this entry *)
+      end else
+        Some timestamp  (* Keep this entry *)
+    ) registry;
+
     Mutex.unlock mutex;
-    (0, initial_size - final_size) (* drift, trimmed *)
+    (0, !removed) (* drift, trimmed *)
 end
 
 (** In-flight amendment cache to prevent duplicate amendments *)
@@ -100,19 +102,22 @@ module InFlightAmendments = struct
     size
 
   (** Cleanup stale entries *)
-  let cleanup ?(max_age=300.0) () =
+  let cleanup ?(max_age=60.0) () =
     Mutex.lock mutex;
     let now = Unix.gettimeofday () in
-    let initial_size = Hashtbl.length registry in
-    let to_remove = Hashtbl.fold (fun key timestamp acc ->
-      if now -. timestamp > max_age then key :: acc else acc
-    ) registry [] in
-    
-    List.iter (Hashtbl.remove registry) to_remove;
-    
-    let final_size = Hashtbl.length registry in
+    let removed = ref 0 in
+
+    (* Scan and remove stale entries directly - safe under mutex protection *)
+    Hashtbl.filter_map_inplace (fun _key timestamp ->
+      if now -. timestamp > max_age then begin
+        incr removed;
+        None  (* Remove this entry *)
+      end else
+        Some timestamp  (* Keep this entry *)
+    ) registry;
+
     Mutex.unlock mutex;
-    (0, initial_size - final_size) (* drift, trimmed *)
+    (0, !removed) (* drift, trimmed *)
 end
 
 (** Order type definitions *)
@@ -242,37 +247,9 @@ let with_error_handling ~operation_name ?(max_retries=3) ?(retry_delay=1.0) f =
   in
   attempt 0
 
-(** Periodic cleanup task for in-flight orders and amendments registries *)
-let start_inflight_cleanup () =
-  Logging.debug ~section "Starting periodic in-flight orders and amendments cleanup task";
-  let rec cleanup_loop () =
-    (* Check for shutdown request *)
-    if Atomic.get shutdown_requested then (
-      Logging.debug ~section "In-flight orders and amendments cleanup task shutting down due to shutdown request";
-      Lwt.return_unit
-    ) else (
-      (* Perform cleanup for orders registry *)
-      let (_drift, trimmed) = InFlightOrders.cleanup () in
-      if trimmed > 0 then
-        Logging.info_f ~section "InFlightOrders registry cleaned up: removed %d stale entries" trimmed;
-
-      (* Perform cleanup for amendments registry *)
-      let (_drift, trimmed) = InFlightAmendments.cleanup () in
-      if trimmed > 0 then
-        Logging.info_f ~section "InFlightAmendments registry cleaned up: removed %d stale entries" trimmed;
-
-      (* Sleep for 5 minutes before next cleanup *)
-      Lwt_unix.sleep 300.0 >>= cleanup_loop
-    )
-  in
-  Lwt.async cleanup_loop
-
-
-
 (** Initialize the order executor with authentication token *)
 let init : unit Lwt.t =
   (* Trading client is now managed by the supervisor *)
-  start_inflight_cleanup ();
   Lwt.return_unit
 
 (** Place a new order *)
@@ -285,6 +262,10 @@ let place_order
   if Atomic.get shutdown_requested then
     Lwt.return (Error "Order placement cancelled due to shutdown")
   else
+    (* Event-driven cleanup: clean up stale entries when orders are placed *)
+    let (_drift, trimmed) = InFlightOrders.cleanup () in
+    if trimmed > 0 then
+      Logging.debug_f ~section "InFlightOrders registry cleaned up: removed %d stale entries" trimmed;
     with_error_handling ~operation_name:"place_order" (fun () ->
     match validate_order_request request with
     | Error err ->
@@ -349,6 +330,10 @@ let amend_order
   if Atomic.get shutdown_requested then
     Lwt.return (Error "Order amendment cancelled due to shutdown")
   else
+    (* Event-driven cleanup: clean up stale entries when orders are amended *)
+    let (_drift, trimmed) = InFlightAmendments.cleanup () in
+    if trimmed > 0 then
+      Logging.debug_f ~section "InFlightAmendments registry cleaned up: removed %d stale entries" trimmed;
     with_error_handling ~operation_name:"amend_order" (fun () ->
     match validate_amend_request request with
     | Error err ->
@@ -435,6 +420,11 @@ let cancel_orders
         Logging.error_f ~section "Cancel validation failed: %s" err;
         Lwt.return (Error err)
     | Ok () ->
+        (* Event-driven cleanup: clean up stale entries when orders are cancelled *)
+        let (_drift, trimmed) = InFlightOrders.cleanup () in
+        if trimmed > 0 then
+          Logging.debug_f ~section "InFlightOrders registry cleaned up: removed %d stale entries" trimmed;
+
         let order_count =
           List.length (Option.value request.order_ids ~default:[]) +
           List.length (Option.value request.cl_ord_ids ~default:[]) +

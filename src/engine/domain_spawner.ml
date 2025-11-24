@@ -544,12 +544,25 @@ let stop_domain state =
   let key = domain_key state.asset in
   Mutex.lock state.mutex;
   Atomic.set state.is_running false;
+
+  (* Clean up strategy state when domain stops *)
+  let symbol = state.asset.symbol in
+  (match state.asset.strategy with
+   | "Grid" ->
+       Dio_strategies.Suicide_grid.Strategy.cleanup_strategy_state symbol;
+       Logging.debug_f ~section "Cleaned up Grid strategy state for %s" symbol
+   | "MM" ->
+       Dio_strategies.Market_maker.Strategy.cleanup_strategy_state symbol;
+       Logging.debug_f ~section "Cleaned up MM strategy state for %s" symbol
+   | _ ->
+       Logging.debug_f ~section "No cleanup needed for strategy %s" state.asset.strategy);
+
   (match Atomic.get state.domain_handle with
    | Some handle ->
        Logging.info_f ~section "Stopping domain %s..." key;
        (* Join synchronously - domain will exit quickly when is_running=false *)
        (try Domain.join handle
-        with exn -> Logging.warn_f ~section "Exception joining domain %s: %s" 
+        with exn -> Logging.warn_f ~section "Exception joining domain %s: %s"
                       key (Printexc.to_string exn));
        Atomic.set state.domain_handle None
    | None -> ());
@@ -696,4 +709,5 @@ let spawn_config_domains (fee_fetcher : trading_config -> trading_config) () : u
   let configs = (read_config ()).trading in
   Logging.debug_f ~section "Preparing to spawn domains for %d assets..." (List.length configs);
   spawn_domains_for_assets fee_fetcher configs
+
 

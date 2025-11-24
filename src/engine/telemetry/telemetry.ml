@@ -406,42 +406,60 @@ let prune_stale_metrics () =
   let now = Unix.gettimeofday () in
   let stale_cutoff = now -. metric_stale_ttl_seconds in
 
-  (* Collect keys to remove *)
-  let keys_to_remove = ref [] in
+  (* Scan and remove stale metrics directly *)
   let total_count = Hashtbl.length metrics in
+  let stale_removed = ref 0 in
 
-  Hashtbl.iter (fun key metric ->
-    if metric.last_updated < stale_cutoff then
-      keys_to_remove := key :: !keys_to_remove
+  Hashtbl.filter_map_inplace (fun _key metric ->
+    if metric.last_updated < stale_cutoff then begin
+      incr stale_removed;
+      None  (* Remove this stale metric *)
+    end else
+      Some metric  (* Keep this metric *)
   ) metrics;
 
-  (* Remove stale metrics *)
-  let stale_removed = List.length !keys_to_remove in
-  List.iter (Hashtbl.remove metrics) !keys_to_remove;
-
-  (* If still over limit, remove oldest metrics *)
+  (* If still over limit, remove oldest metrics using efficient scan *)
   let current_count = Hashtbl.length metrics in
   let to_remove_more = max 0 (current_count - max_metrics_count) in
   if to_remove_more > 0 then begin
-    (* Collect all metrics with creation times *)
-    let metrics_with_times = ref [] in
+    (* Use array for better performance than repeated list operations *)
+    let entries = Array.make current_count ("", 0.0) in
+    let idx = ref 0 in
     Hashtbl.iter (fun key metric ->
-      metrics_with_times := (key, metric.created_at) :: !metrics_with_times
+      entries.(!idx) <- (key, metric.created_at);
+      incr idx
     ) metrics;
 
-    (* Sort by creation time (oldest first) and remove oldest *)
-    let sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t1 t2) !metrics_with_times in
-    let oldest_to_remove = List.map fst (List.filteri (fun i _ -> i < to_remove_more) sorted) in
-    List.iter (Hashtbl.remove metrics) oldest_to_remove;
+    (* Selection algorithm: repeatedly find and remove the oldest *)
+    for _ = 1 to to_remove_more do
+      let oldest_idx = ref 0 in
+      let oldest_time = ref (snd entries.(0)) in
+      for i = 1 to Array.length entries - 1 do
+        let (_, time) = entries.(i) in
+        if time < !oldest_time then begin
+          oldest_time := time;
+          oldest_idx := i
+        end
+      done;
+
+      (* Remove the oldest from hashtable and mark as removed in array *)
+      let (oldest_key, _) = entries.(!oldest_idx) in
+      Hashtbl.remove metrics oldest_key;
+      entries.(!oldest_idx) <- ("", max_float)  (* Mark as removed *)
+    done;
   end;
 
   let final_count = Hashtbl.length metrics in
   Mutex.unlock metrics_mutex;
 
   (* Log summary if we removed anything *)
-  if stale_removed > 0 || to_remove_more > 0 then
-    Logging.info_f ~section "Pruned stale metrics: removed %d stale + %d oldest, total metrics: %d/%d"
-      stale_removed to_remove_more final_count total_count
+  let total_removed = !stale_removed + to_remove_more in
+  if total_removed > 0 then
+    Logging.info_f ~section "Pruned stale metrics: removed %d stale + %d oldest = %d total, remaining metrics: %d/%d"
+      !stale_removed to_remove_more total_removed final_count total_count;
+
+  (* Return actual count of removed metrics *)
+  total_removed
 
 (** Start event-driven capacity adjustment loop with explicit periodic pruning *)
 let start_capacity_adjuster () =
@@ -472,7 +490,7 @@ let start_capacity_adjuster () =
   Lwt.async (fun () ->
     let rec pruning_loop () =
       Lwt_unix.sleep 60.0 >>= fun () ->
-      prune_stale_metrics ();
+      ignore (prune_stale_metrics ());
       pruning_loop ()
     in
     pruning_loop ()

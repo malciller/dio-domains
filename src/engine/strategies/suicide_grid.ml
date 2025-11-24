@@ -50,6 +50,7 @@ type strategy_state = {
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
+  mutable last_cleanup_time: float; (* Last time cleanup was run *)
 }
 
 (** Global strategy state store *)
@@ -72,6 +73,7 @@ let get_strategy_state asset_symbol =
           last_order_time = 0.0;
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
+          last_cleanup_time = 0.0;
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
         new_state
@@ -301,27 +303,46 @@ let execute_strategy
     (cycle : int) =
 
   (* Only execute strategy periodically to avoid excessive order generation *)
-  if cycle mod 100 <> 0 then () else begin
+  (* Removed 100 cycle throttle for HFT execution *)
+  if true then begin
 
   let state = get_strategy_state asset.symbol in
 
   (* Throttle order placement - wait at least 1 second between orders *)
+  (* Keep order placement throttle, but allow logic to run every cycle *)
   let now = Unix.time () in
-  if now -. state.last_order_time < 1.0 then () else begin
-
+  
   match current_price, top_of_book with
   | None, _ -> ()  (* No price data available yet *)
   | Some price, _ ->
 
-      (* Sync strategy state with actual open orders from exchange *)
-      (* Clear existing tracked orders *)
-      state.open_sell_orders <- [];
-      state.last_buy_order_price <- None;
-      state.last_buy_order_id <- None;
-      (* Note: We don't clear pending_orders here - they should be managed by order placement responses *)
+      (* Efficient cleanup logic - run every cycle but use scan-and-remove to avoid allocation *)
+      (* This prevents accumulation while maintaining HFT responsiveness *)
+      
+      (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
+      let original_pending_count = List.length state.pending_orders in
+      state.pending_orders <- List.filter (fun (order_id, _, _, timestamp) ->
+        let age = now -. timestamp in
+        if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
+          Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
+          false
+        end else
+          true
+      ) state.pending_orders;
+
+      (* Enforce hard limit of 50 pending orders to prevent memory growth *)
+      if List.length state.pending_orders > 50 then begin
+        let excess = List.length state.pending_orders - 50 in
+        state.pending_orders <- take 50 state.pending_orders;  (* Keep most recent 50 *)
+        Logging.warn_f ~section "Truncated %d excess pending orders for %s (kept 50)" excess asset.symbol;
+      end;
+
+      (* Log cleanup summary occasionally *)
+      let cleaned_pending = original_pending_count - List.length state.pending_orders in
+      if cleaned_pending > 0 && cycle mod 100000 = 0 then
+        Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_pending asset.symbol;
 
       (* Clean up old cancelled orders from blacklist (older than 15 seconds) and enforce hard limit *)
-      let now = Unix.time () in
       state.cancelled_orders <- List.filter (fun (_, timestamp) ->
         now -. timestamp < 15.0  (* Reduced from 30 to 15 seconds *)
       ) state.cancelled_orders;
@@ -334,19 +355,24 @@ let execute_strategy
       end;
 
       (* Clean up old pending cancellations (older than 30 seconds) *)
-      let pending_cancellations = Hashtbl.fold (fun order_id timestamp acc ->
-        if now -. timestamp > 30.0 then begin
-          Logging.debug_f ~section "Removing stale pending cancellation %s for %s (age: %.1fs)" order_id asset.symbol (now -. timestamp);
-          acc
-        end else
-          (order_id, timestamp) :: acc
-      ) state.pending_cancellations [] in
+      (* Optimized scan and remove to avoid Hashtbl copy *)
+      let to_remove = ref [] in
+      Hashtbl.iter (fun order_id timestamp ->
+        if now -. timestamp > 30.0 then
+          to_remove := order_id :: !to_remove
+      ) state.pending_cancellations;
 
-      (* Clear and repopulate the hashtable with only non-stale entries *)
-      Hashtbl.clear state.pending_cancellations;
-      List.iter (fun (order_id, timestamp) ->
-        Hashtbl.add state.pending_cancellations order_id timestamp
-      ) pending_cancellations;
+      List.iter (fun order_id ->
+        Logging.debug_f ~section "Removing stale pending cancellation %s for %s" order_id asset.symbol;
+        Hashtbl.remove state.pending_cancellations order_id
+      ) !to_remove;
+
+      (* Sync strategy state with actual open orders from exchange *)
+      (* Clear existing tracked orders *)
+      state.open_sell_orders <- [];
+      state.last_buy_order_price <- None;
+      state.last_buy_order_id <- None;
+      (* Note: We don't clear pending_orders here - they should be managed by order placement responses *)
 
       (* Update with real orders from exchange - open_orders is (order_id, price, qty, side, userref) list *)
       (* Filter out recently cancelled orders to avoid race condition *)
@@ -709,7 +735,7 @@ let execute_strategy
       end
   end
 end
-end
+
 
 (** Handle order placement success - update pending order status *)
 let handle_order_acknowledged asset_symbol order_id side price =
@@ -812,11 +838,22 @@ let init () =
 
 (** Strategy module interface *)
 module Strategy = struct
+  (** Clean up strategy state for a symbol when domain stops *)
+  let cleanup_strategy_state symbol =
+    Mutex.lock strategy_states_mutex;
+    (match Hashtbl.find_opt strategy_states symbol with
+     | Some _ ->
+         Hashtbl.remove strategy_states symbol;
+         Logging.debug_f ~section "Removed strategy state for %s" symbol
+     | None -> ());
+    Mutex.unlock strategy_states_mutex
+
   let execute = execute_strategy
   let get_pending_orders = get_pending_orders
   let handle_order_acknowledged = handle_order_acknowledged
   let handle_order_rejected = handle_order_rejected
   let handle_order_cancelled = handle_order_cancelled
   let cleanup_pending_cancellation = cleanup_pending_cancellation
+  let cleanup_strategy_state = cleanup_strategy_state
   let init = init
 end

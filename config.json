@@ -4,21 +4,21 @@
   "trading": [
     {
       "symbol": "BTC/USD",
-      "qty": "0.00025",
-      "grid_interval": "0.5",
+      "qty": "0.0003",
+      "grid_interval": "1.0",
       "sell_mult": "0.9995",
       "strategy": "Grid"
     },
     {
       "symbol": "PAXG/USD",
       "qty": "0.0029",
-      "grid_interval": "1.0",
+      "grid_interval": "2.5",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "ETH/USD",
-      "qty": "0.0035",
+      "qty": "0.005",
       "grid_interval": "5.0",
       "sell_mult": "0.999",
       "strategy": "Grid"

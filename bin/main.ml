@@ -151,51 +151,60 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
-  (* Basic GC statistics reporting - no profiling *)
-  let initial_gc_stats = Gc.stat () in
+  (* Start memory cleanup coordinator *)
+  Logging.info ~section:"main" "Starting memory cleanup coordinator...";
+  Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ();
+  Logging.info ~section:"main" "Memory cleanup coordinator started";
+
+  (* Basic GC statistics reporting *)
   let start_time = Unix.gettimeofday () in
   let last_report_time = ref start_time in
-  let report_interval = 30.0 in  (* Report every 30 seconds *)
+  let report_interval = 900.0 in  (* Report every 15 minutes *)
 
   let report_memory_stats () =
-    if Atomic.get shutdown_requested then () else
-    let now = Unix.gettimeofday () in
-    if now -. !last_report_time >= report_interval then (
-      last_report_time := now;
-      let runtime = now -. start_time in
-      let current_gc_stats = Gc.stat () in
+    if Atomic.get shutdown_requested then ()
+    else
+      let now = Unix.gettimeofday () in
+      if now -. !last_report_time >= report_interval then (
+        last_report_time := now;
+        let runtime = now -. start_time in
+        let current_gc_stats = Gc.stat () in
 
-      if Atomic.get shutdown_requested then () else (
-        let heap_growth = current_gc_stats.heap_words - initial_gc_stats.heap_words in
-        let live_growth = current_gc_stats.live_words - initial_gc_stats.live_words in
-        let collections_growth = current_gc_stats.major_collections - initial_gc_stats.major_collections in
+        if Atomic.get shutdown_requested then ()
+        else (
+          let heap_mb = current_gc_stats.heap_words * (Sys.word_size / 8) / 1048576 in
+          let live_mb = current_gc_stats.live_words * (Sys.word_size / 8) / 1048576 in
 
-        Logging.info_f ~section:"memory" "=== MEMORY STATISTICS (Runtime: %.1fs) ===" runtime;
-        Logging.info_f ~section:"memory" "Current GC Stats: heap=%dMB live=%dMB free=%dMB"
-          (current_gc_stats.heap_words * (Sys.word_size / 8) / 1048576)
-          (current_gc_stats.live_words * (Sys.word_size / 8) / 1048576)
-          ((current_gc_stats.heap_words - current_gc_stats.live_words) * (Sys.word_size / 8) / 1048576);
+          Logging.info_f ~section:"memory" "=== MEMORY STATISTICS (Runtime: %.1fs) ===" runtime;
+          Logging.info_f ~section:"memory" "Main Domain: heap=%dMB live=%dMB free=%dMB"
+            heap_mb live_mb (heap_mb - live_mb);
 
-        Logging.info_f ~section:"memory" "GC Activity: minor_collections=%d major_collections=%d compactions=%d"
-          current_gc_stats.minor_collections
-          current_gc_stats.major_collections
-          current_gc_stats.compactions;
+          Logging.info_f ~section:"memory" "GC Activity: minor=%d major=%d compactions=%d"
+            current_gc_stats.minor_collections
+            current_gc_stats.major_collections
+            current_gc_stats.compactions;
 
-        Logging.info_f ~section:"memory" "Memory Growth: heap %+dMB live %+dMB (+%d major GC cycles)"
-          (heap_growth * (Sys.word_size / 8) / 1048576)
-          (live_growth * (Sys.word_size / 8) / 1048576)
-          collections_growth;
+          (* Subsystem counts *)
+          Logging.info ~section:"memory" "";
+          Logging.info ~section:"memory" "--- SUBSYSTEM COUNTS ---";
 
-        let allocation_rate_kb_per_sec = float_of_int (live_growth * (Sys.word_size / 8) / 1024) /. runtime in
-        Logging.info_f ~section:"memory" "Allocation Rate: %.1f KB/s average since startup" allocation_rate_kb_per_sec;
+          let ticker_stores = Hashtbl.length Kraken.Kraken_ticker_feed.stores in
+          let orderbook_stores = Hashtbl.length Kraken.Kraken_orderbook_feed.stores in
+          let executions_stores = Hashtbl.length Kraken.Kraken_executions_feed.symbol_stores in
+          let balances_stores = Hashtbl.length Kraken.Kraken_balances_feed.balance_stores in
 
-        let fragmentation_ratio = float_of_int current_gc_stats.fragments /. float_of_int current_gc_stats.heap_words in
-        Logging.info_f ~section:"memory" "Fragmentation: %d words (%.2f%% of heap)"
-          current_gc_stats.fragments (fragmentation_ratio *. 100.0);
+          Logging.info_f ~section:"memory" "Stores: ticker=%d orderbook=%d executions=%d balances=%d"
+            ticker_stores orderbook_stores executions_stores balances_stores;
 
-        Logging.info ~section:"memory" "=== END MEMORY STATISTICS ==="
+          let telemetry_metrics = Hashtbl.length Telemetry.metrics in
+          let domain_count = Hashtbl.length Dio_engine.Domain_spawner.domain_registry in
+          
+          Logging.info_f ~section:"memory" "Telemetry: %d metrics" telemetry_metrics;
+          Logging.info_f ~section:"memory" "Domains: %d registered" domain_count;
+
+          Logging.info ~section:"memory" "=== END MEMORY STATISTICS ===";
+        )
       )
-    )
   in
 
   (* Start periodic memory reporting thread *)
