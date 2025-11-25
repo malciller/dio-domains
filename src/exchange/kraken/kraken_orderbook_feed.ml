@@ -22,6 +22,9 @@ let get_conduit_ctx () =
 let orderbook_depth = 25
 let ring_buffer_size = 64
 
+(** Global flag to track if cleanup loop is running *)
+let cleanup_loop_started = Atomic.make false
+
 (** Shared CRC32 implementation for checksum calculations *)
 let crc32_table =
   Array.init 256 (fun n ->
@@ -1007,14 +1010,17 @@ let initialize symbols =
   ) symbols;
   Logging.debug_f ~section "Orderbook feed stores initialized";
 
-  (* Start periodic cleanup of stale data *)
-  Lwt.async (fun () ->
-    let rec cleanup_loop () =
-      let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
-      prune_stale_data ();
+  (* Start periodic cleanup of stale data - singleton pattern *)
+  if Atomic.compare_and_set cleanup_loop_started false true then begin
+    Logging.info ~section "Starting singleton orderbook cleanup loop";
+    Lwt.async (fun () ->
+      let rec cleanup_loop () =
+        let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
+        prune_stale_data ();
+        cleanup_loop ()
+      in
       cleanup_loop ()
-    in
-    cleanup_loop ()
-  );
+    )
+  end;
 
   Lwt.return_unit

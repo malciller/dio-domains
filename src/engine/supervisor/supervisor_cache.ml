@@ -63,6 +63,7 @@ let cache = {
 }
 
 let initialized = ref false
+let polling_loop_started = Atomic.make false
 
 (** Create connection snapshots by safely reading from supervisor *)
 let create_connection_snapshots () : connection_snapshot list =
@@ -117,42 +118,45 @@ let update_telemetry_from_snapshots snapshots =
     Telemetry.set_gauge total_gauge (float_of_int snapshot.total_connections);
   ) snapshots
 
-(** Start background updater *)
+(** Start background updater - singleton pattern *)
 let start_cache_updater () =
-  Lwt.async (fun () ->
-    let rec polling_loop () =
-      let now = Unix.time () in
-      let time_since_last = now -. cache.last_update in
-      let in_backoff = now < cache.backoff_until in
+  if Atomic.compare_and_set polling_loop_started false true then begin
+    Logging.info ~section:"supervisor_cache" "Starting singleton supervisor cache polling loop";
+    Lwt.async (fun () ->
+      let rec polling_loop () =
+        let now = Unix.time () in
+        let time_since_last = now -. cache.last_update in
+        let in_backoff = now < cache.backoff_until in
 
-      if in_backoff then
-        Lwt_unix.sleep 1.0 >>= polling_loop
-      else if time_since_last >= cache.update_interval then (
-        (try
-          let snapshots = create_connection_snapshots () in
-          cache.current_snapshots <- snapshots;
-          cache.last_update <- now;
-          cache.consecutive_failures <- 0;
-          cache.backoff_until <- 0.0;
+        if in_backoff then
+          Lwt_unix.sleep 1.0 >>= polling_loop
+        else if time_since_last >= cache.update_interval then (
+          (try
+            let snapshots = create_connection_snapshots () in
+            cache.current_snapshots <- snapshots;
+            cache.last_update <- now;
+            cache.consecutive_failures <- 0;
+            cache.backoff_until <- 0.0;
 
-          (* Update telemetry from snapshots *)
-          update_telemetry_from_snapshots snapshots;
+            (* Update telemetry from snapshots *)
+            update_telemetry_from_snapshots snapshots;
 
-          (* Publish to event bus *)
-          ConnectionSnapshotEventBus.publish cache.snapshot_event_bus snapshots;
-          safe_broadcast_update_condition cache;
-        with exn ->
-          cache.consecutive_failures <- cache.consecutive_failures + 1;
-          let backoff_seconds = min 60.0 (2.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 5))) in
-          cache.backoff_until <- now +. backoff_seconds;
-          Logging.warn_f ~section:"supervisor_cache" "Failed to update connection snapshots: %s" (Printexc.to_string exn)
-        );
-        Lwt_unix.sleep 1.0 >>= polling_loop
-      ) else
-        Lwt_unix.sleep 1.0 >>= polling_loop
-    in
-    Lwt_unix.sleep 1.0 >>= polling_loop
-  )
+            (* Publish to event bus *)
+            ConnectionSnapshotEventBus.publish cache.snapshot_event_bus snapshots;
+            safe_broadcast_update_condition cache;
+          with exn ->
+            cache.consecutive_failures <- cache.consecutive_failures + 1;
+            let backoff_seconds = min 60.0 (2.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 5))) in
+            cache.backoff_until <- now +. backoff_seconds;
+            Logging.warn_f ~section:"supervisor_cache" "Failed to update connection snapshots: %s" (Printexc.to_string exn)
+          );
+          Lwt_unix.sleep 1.0 >>= polling_loop
+        ) else
+          Lwt_unix.sleep 1.0 >>= polling_loop
+      in
+      Lwt_unix.sleep 1.0 >>= polling_loop
+    )
+  end
 
 (** Initialize cache *)
 let init () =

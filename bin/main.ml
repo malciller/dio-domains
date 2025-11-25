@@ -159,7 +159,7 @@ let () =
   (* Basic GC statistics reporting *)
   let start_time = Unix.gettimeofday () in
   let last_report_time = ref start_time in
-  let report_interval = 900.0 in  (* Report every 15 minutes *)
+  let report_interval = 30.0 in  (* Report every 30 seconds *)
 
   let report_memory_stats () =
     if Atomic.get shutdown_requested then ()
