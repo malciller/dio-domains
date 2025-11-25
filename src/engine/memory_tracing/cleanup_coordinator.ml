@@ -162,28 +162,34 @@ let get_all_event_bus_stats () =
   );
   (!total_acc, !active_acc, !stale_acc, !per_bus_acc)
 
-(** Start the cleanup coordinator *)
+(** Global flag to track if cleanup coordinator is running *)
+let coordinator_started = Atomic.make false
+
+(** Start the cleanup coordinator - singleton pattern *)
 let start_cleanup_coordinator () =
-  Logging.info ~section:"cleanup_coordinator" "Starting memory cleanup coordinator";
+  if Atomic.compare_and_set coordinator_started false true then begin
+    Logging.info ~section:"cleanup_coordinator" "Starting singleton memory cleanup coordinator";
 
-  (* Subscribe to memory events *)
-  let subscription = Memory_events.subscribe_memory_events () in
+    (* Subscribe to memory events *)
+    let subscription = Memory_events.subscribe_memory_events () in
 
-  (* Start event processing loop *)
-  Lwt.async (fun () ->
-    let rec process_events () =
-      Lwt_stream.get subscription.stream >>= function
-      | Some event ->
-          handle_memory_pressure_event event;
-          process_events ()
-      | None ->
-          Logging.info ~section:"cleanup_coordinator" "Memory event stream closed";
-          Lwt.return_unit
-    in
-    process_events ()
-  );
+    (* Start event processing loop *)
+    Lwt.async (fun () ->
+      let rec process_events () =
+        Lwt_stream.get subscription.stream >>= function
+        | Some event ->
+            handle_memory_pressure_event event;
+            process_events ()
+        | None ->
+            Logging.info ~section:"cleanup_coordinator" "Memory event stream closed";
+            Lwt.return_unit
+      in
+      process_events ()
+    );
 
-  Logging.info ~section:"cleanup_coordinator" "Memory cleanup coordinator started"
+    Logging.info ~section:"cleanup_coordinator" "Memory cleanup coordinator started"
+  end else
+    Logging.debug ~section:"cleanup_coordinator" "Cleanup coordinator already running (singleton)"
 
 (** Get cleanup statistics *)
 let get_cleanup_stats () = {
