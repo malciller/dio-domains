@@ -110,6 +110,19 @@ let round_price price symbol =
       Logging.warn_f ~section "No price increment info for %s, using default rounding" symbol;
       Float.round price  (* Default: 0 decimal places *)
 
+(** Round quantity to appropriate precision for the symbol, ensuring we don't exceed max_qty *)
+let round_qty qty symbol ~max_qty =
+  (* Round DOWN to qty_increment to ensure we don't try to sell more than we have *)
+  match Kraken.Kraken_instruments_feed.get_qty_increment symbol with
+  | Some increment ->
+      let rounded = Float.floor (qty /. increment) *. increment in
+      (* Ensure we don't exceed the maximum available quantity *)
+      Float.min rounded max_qty
+  | None ->
+      Logging.warn_f ~section "No qty increment info for %s, using 8 decimal places" symbol;
+      let rounded = Float.floor (qty *. 100000000.0) /. 100000000.0 in
+      Float.min rounded max_qty
+
 (** Get fee for the asset from the trading config *)
 let get_fee_for_asset (asset : trading_config) =
   let maker_fee_str = match asset.maker_fee with Some f -> Printf.sprintf "%.6f" f | None -> "None" in
@@ -520,16 +533,34 @@ let execute_strategy
            | None -> ());
 
           (* Place/ensure sell orders for all available asset_balance at or above best_ask *)
-          (match available_asset_balance with
-           | Some ab when ab > 0.0 ->
-               if meets_min_qty asset.symbol ab then begin
-                 let sell_price = round_price ask asset.symbol in
-                 let sell_order = create_place_order asset.symbol Sell ab (Some sell_price) true "MM" in
-                 push_order sell_order;
-                 if should_log then Logging.debug_f ~section "Placed emergency sell order: %.8f @ %.2f for %s" ab sell_price asset.symbol
-               end
-               (* Exit quietly if below minimum - don't spam logs for dust accumulation *)
-           | _ -> ());
+          (* CRITICAL: Check for pending sell orders first to prevent duplicate spam *)
+          let has_pending_sell = List.exists (fun (_, side, _, _) -> 
+            side = Sell
+          ) state.pending_orders in
+          
+          (* Also check if there's already an open sell order for this symbol *)
+          let has_open_sell = match state.last_sell_order_id with
+            | Some _ -> true
+            | None -> false
+          in
+          
+          if has_pending_sell || has_open_sell then begin
+            if should_log then Logging.debug_f ~section "Skipping emergency sell for %s: already have pending=%B or open=%B sell order"
+              asset.symbol has_pending_sell has_open_sell
+          end else begin
+            (match available_asset_balance with
+             | Some ab when ab > 0.0 ->
+                 (* Round quantity to instrument precision, ensuring we don't exceed available balance *)
+                 let rounded_qty = round_qty ab asset.symbol ~max_qty:ab in
+                 if meets_min_qty asset.symbol rounded_qty then begin
+                   let sell_price = round_price ask asset.symbol in
+                   let sell_order = create_place_order asset.symbol Sell rounded_qty (Some sell_price) true "MM" in
+                   push_order sell_order;
+                   if should_log then Logging.debug_f ~section "Placed emergency sell order: %.8f @ %.2f for %s (raw: %.8f)" rounded_qty sell_price asset.symbol ab
+                 end
+                 (* Exit quietly if below minimum - don't spam logs for dust accumulation *)
+             | _ -> ())
+          end;
 
           (* Stop execution for this trigger - will re-check on next trigger *)
           state.last_cycle <- cycle
