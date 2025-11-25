@@ -461,40 +461,50 @@ let prune_stale_metrics () =
   (* Return actual count of removed metrics *)
   total_removed
 
+(** Global flags to track if cleanup loops are running *)
+let adjustment_loop_started = Atomic.make false
+let pruning_loop_started = Atomic.make false
+
 (** Start event-driven capacity adjustment loop with explicit periodic pruning *)
 let start_capacity_adjuster () =
-  (* Start reactive adjustment loop triggered by metric changes *)
-  Lwt.async (fun () ->
-    let rec adjustment_loop () =
-      (* Wait for any metric change *)
-      Lwt_condition.wait metrics_changed_condition >>= fun () ->
+  (* Start reactive adjustment loop triggered by metric changes - singleton *)
+  if Atomic.compare_and_set adjustment_loop_started false true then begin
+    Logging.info ~section:"telemetry" "Starting singleton capacity adjustment loop";
+    Lwt.async (fun () ->
+      let rec adjustment_loop () =
+        (* Wait for any metric change *)
+        Lwt_condition.wait metrics_changed_condition >>= fun () ->
 
-      (* Check if 30 seconds have passed since last adjustment *)
-      let now = Unix.gettimeofday () in
-      Mutex.lock memory_config_mutex;
-      let time_since_last = now -. memory_config.last_adjustment in
-      Mutex.unlock memory_config_mutex;
+        (* Check if 30 seconds have passed since last adjustment *)
+        let now = Unix.gettimeofday () in
+        Mutex.lock memory_config_mutex;
+        let time_since_last = now -. memory_config.last_adjustment in
+        Mutex.unlock memory_config_mutex;
 
-      if time_since_last >= 30.0 then begin
-        (* Perform adjustment *)
-        adjust_buffer_capacities ();
-      end;
+        if time_since_last >= 30.0 then begin
+          (* Perform adjustment *)
+          adjust_buffer_capacities ();
+        end;
 
-      (* Continue listening *)
+        (* Continue listening *)
+        adjustment_loop ()
+      in
       adjustment_loop ()
-    in
-    adjustment_loop ()
-  );
+    )
+  end;
   
-  (* Start separate explicit pruning loop every 60 seconds to ensure stale metrics are removed *)
-  Lwt.async (fun () ->
-    let rec pruning_loop () =
-      Lwt_unix.sleep 60.0 >>= fun () ->
-      ignore (prune_stale_metrics ());
+  (* Start separate explicit pruning loop every 60 seconds - singleton *)
+  if Atomic.compare_and_set pruning_loop_started false true then begin
+    Logging.info ~section:"telemetry" "Starting singleton metrics pruning loop";
+    Lwt.async (fun () ->
+      let rec pruning_loop () =
+        Lwt_unix.sleep 60.0 >>= fun () ->
+        ignore (prune_stale_metrics ());
+        pruning_loop ()
+      in
       pruning_loop ()
-    in
-    pruning_loop ()
-  )
+    )
+  end
 
 (** Histogram - track distribution of values *)
 let histogram name ?(labels=[]) () =

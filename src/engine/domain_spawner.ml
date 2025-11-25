@@ -527,8 +527,6 @@ let start_domain state fee_fetcher =
         (* Mark domain as stopped and allow restart *)
         Atomic.set state.is_running false;
         (* Do NOT clear domain_handle here - we need it to join the domain later *)
-        (* Atomic.set state.domain_handle None; *)
-
         (* Don't re-raise - domain should be restarted by supervisor *)
         ()
     ) in

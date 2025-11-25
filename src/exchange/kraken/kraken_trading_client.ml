@@ -24,6 +24,9 @@ let get_conduit_ctx () =
 (** Global shutdown flag for trading client *)
 let shutdown_requested = Atomic.make false
 
+(** Global flag to track if cleanup loop is running *)
+let cleanup_loop_started = Atomic.make false
+
 (** Signal shutdown to trading client *)
 let signal_shutdown () =
   Atomic.set shutdown_requested true
@@ -609,66 +612,71 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
   Telemetry.inc_counter Telemetry.Common.api_requests ();
   Lwt.return response
 
-(** Clean up stale response table entries (older than 30 seconds) - runs as a continuous loop *)
-let rec cleanup_stale_response_entries () =
+(** Clean up stale response table entries (older than 30 seconds) - runs as a continuous loop **)
+let cleanup_stale_response_entries () =
   (* Skip cleanup if shutdown is requested *)
   if Atomic.get shutdown_requested then
     ()
-  else
+  else if Atomic.compare_and_set cleanup_loop_started false true then begin
+    Logging.info ~section "Starting singleton stale response cleanup loop";
     Lwt.async (fun () ->
-      Lwt.catch
-        (fun () ->
-          (* Wait 30 seconds between cleanup cycles *)
-          Lwt_unix.sleep 30.0 >>= fun () ->
-          
-          (* Double-check shutdown state before proceeding *)
-          if Atomic.get shutdown_requested then
-            Lwt.return_unit
-          else begin
-            let now = Unix.time () in
-            let stale_entries = ref [] in
-            (* Use timeout to prevent hanging if mutex is held for too long *)
-            Lwt.pick [
-              (Lwt_mutex.with_lock state.mutex (fun () ->
-                (* Check shutdown again after acquiring mutex *)
-                if Atomic.get shutdown_requested then
-                  Lwt.return_unit
-                else begin
-                  Response_table.iter (fun req_id (wakener, expected_method, timestamp) ->
-                    if now -. timestamp > 30.0 then
-                      stale_entries := (req_id, wakener, expected_method, timestamp) :: !stale_entries
-                  ) state.responses;
-                  List.iter (fun (req_id, wakener, expected_method, timestamp) ->
-                    Response_table.remove state.responses req_id;
-                    Logging.debug_f ~section "Cleaned up stale response entry for req_id=%d (age: %.1fs, method: %s)" req_id (now -. timestamp) expected_method;
-                    (* Wake up the stale promise to prevent memory leaks *)
-                    try
-                      Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
-                    with Invalid_argument _ ->
-                      Logging.debug_f ~section "Promise for stale req_id=%d was already resolved" req_id
-                  ) !stale_entries;
-                  if !stale_entries <> [] then
-                    Logging.debug_f ~section "Cleaned up %d stale response table entries" (List.length !stale_entries);
-                  Lwt.return_unit
-                end
-              ));
-              (Lwt_unix.sleep 0.1 >|= fun () -> ())  (* 100ms timeout to prevent hanging *)
-            ] >>= fun () ->
-            (* Continue the loop *)
-            cleanup_stale_response_entries ();
-            Lwt.return_unit
-          end
-        )
-        (fun exn ->
-          (* Ignore errors during shutdown - they're expected *)
-          if not (Atomic.get shutdown_requested) then begin
-            Logging.error_f ~section "Error during response table cleanup: %s" (Printexc.to_string exn);
-            (* Retry loop after delay even on error *)
-            Lwt.async (fun () -> Lwt_unix.sleep 5.0 >>= fun () -> cleanup_stale_response_entries (); Lwt.return_unit)
-          end;
-          Lwt.return_unit
-        )
+      let rec loop () =
+        Lwt.catch
+          (fun () ->
+            (* Wait 30 seconds between cleanup cycles *)
+            Lwt_unix.sleep 30.0 >>= fun () ->
+            
+            (* Double-check shutdown state before proceeding *)
+            if Atomic.get shutdown_requested then
+              Lwt.return_unit
+            else begin
+              let now = Unix.time () in
+              let stale_entries = ref [] in
+              (* Use timeout to prevent hanging if mutex is held for too long *)
+              Lwt.pick [
+                (Lwt_mutex.with_lock state.mutex (fun () ->
+                  (* Check shutdown again after acquiring mutex *)
+                  if Atomic.get shutdown_requested then
+                    Lwt.return_unit
+                  else begin
+                    Response_table.iter (fun req_id (wakener, expected_method, timestamp) ->
+                      if now -. timestamp > 30.0 then
+                        stale_entries := (req_id, wakener, expected_method, timestamp) :: !stale_entries
+                    ) state.responses;
+                    List.iter (fun (req_id, wakener, expected_method, timestamp) ->
+                      Response_table.remove state.responses req_id;
+                      Logging.debug_f ~section "Cleaned up stale response entry for req_id=%d (age: %.1fs, method: %s)" req_id (now -. timestamp) expected_method;
+                      (* Wake up the stale promise to prevent memory leaks *)
+                      try
+                        Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
+                      with Invalid_argument _ ->
+                        Logging.debug_f ~section "Promise for stale req_id=%d was already resolved" req_id
+                    ) !stale_entries;
+                    if !stale_entries <> [] then
+                      Logging.debug_f ~section "Cleaned up %d stale response table entries" (List.length !stale_entries);
+                    Lwt.return_unit
+                  end
+                ));
+                (Lwt_unix.sleep 0.1 >|= fun () -> ())  (* 100ms timeout to prevent hanging *)
+              ] >>= fun () ->
+              (* Continue the loop *)
+              loop ()
+            end
+          )
+          (fun exn ->
+            (* Ignore errors during shutdown - they're expected *)
+            if not (Atomic.get shutdown_requested) then begin
+              Logging.error_f ~section "Error during response table cleanup: %s" (Printexc.to_string exn);
+              (* Retry loop after delay even on error *)
+              Lwt_unix.sleep 5.0 >>= fun () ->
+              loop ()
+            end else
+              Lwt.return_unit
+          )
+      in
+      loop ()
     )
+  end
 
 let is_connected () = Atomic.get state.connected
 
