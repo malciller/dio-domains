@@ -235,3 +235,9 @@ let get_qty_min symbol : float option =
     Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_min)
   with _ -> None
 
+(** Get quantity increment for a symbol - synchronous version for internal use *)
+let get_qty_increment symbol : float option =
+  try
+    Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_increment)
+  with _ -> None
+
