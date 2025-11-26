@@ -132,6 +132,13 @@ module InFlightAmendments = struct
         Mutex.unlock mutex;
         true (* Added successfully *)
 
+  (** Check if an amendment is currently in-flight *)
+  let is_in_flight order_id =
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry order_id in
+    Mutex.unlock mutex;
+    exists
+
   (** Remove an amendment from the in-flight cache *)
   let remove_in_flight_amendment order_id =
     Mutex.lock mutex;
