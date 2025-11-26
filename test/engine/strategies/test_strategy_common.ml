@@ -2,7 +2,12 @@
 let create_test_order ?(operation=Dio_strategies.Strategy_common.Place)
     ?(order_id=None) ?(symbol="BTC/USD") ?(side=Dio_strategies.Strategy_common.Buy)
     ?(order_type="limit") ?(qty=0.001) ?(price=Some 50000.0)
-    ?(time_in_force="GTC") ?(post_only=true) ?(userref=Some 2) ?(strategy="MM") () =
+    ?(time_in_force="GTC") ?(post_only=true) ?(userref=Some 2) ?(strategy="MM") 
+    ?duplicate_key () =
+  let duplicate_key = match duplicate_key with
+    | Some k -> k
+    | None -> Dio_strategies.Strategy_common.generate_duplicate_key symbol (Dio_strategies.Strategy_common.string_of_order_side side) qty price
+  in
   {
     Dio_strategies.Strategy_common.operation;
     order_id;
@@ -15,6 +20,7 @@ let create_test_order ?(operation=Dio_strategies.Strategy_common.Place)
     post_only;
     userref;
     strategy;
+    duplicate_key;
   }
 
 let test_order_side_conversion () =

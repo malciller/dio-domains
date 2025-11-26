@@ -17,108 +17,10 @@ let signal_shutdown () =
   Atomic.set shutdown_requested true
 
 (** In-flight order cache to prevent duplicate orders *)
-module InFlightOrders = struct
-  (* Map duplicate_key -> timestamp *)
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
-  let mutex = Mutex.create ()
-
-  (** Check if an order is already in-flight and add it if not *)
-  let add_in_flight_order duplicate_key =
-    Mutex.lock mutex;
-    match Hashtbl.mem registry duplicate_key with
-    | true ->
-        Mutex.unlock mutex;
-        false (* Already existed *)
-    | false ->
-        Hashtbl.add registry duplicate_key (Unix.gettimeofday ());
-        Mutex.unlock mutex;
-        true (* Added successfully *)
-
-  (** Remove an order from the in-flight cache *)
-  let remove_in_flight_order duplicate_key =
-    Mutex.lock mutex;
-    let existed = Hashtbl.mem registry duplicate_key in
-    if existed then Hashtbl.remove registry duplicate_key;
-    Mutex.unlock mutex;
-    existed
-
-  (** Get the current size of the in-flight orders registry *)
-  let get_registry_size () =
-    Mutex.lock mutex;
-    let size = Hashtbl.length registry in
-    Mutex.unlock mutex;
-    size
-
-  (** Cleanup stale entries *)
-  let cleanup ?(max_age=60.0) () =
-    Mutex.lock mutex;
-    let now = Unix.gettimeofday () in
-    let removed = ref 0 in
-
-    (* Scan and remove stale entries directly - safe under mutex protection *)
-    Hashtbl.filter_map_inplace (fun _key timestamp ->
-      if now -. timestamp > max_age then begin
-        incr removed;
-        None  (* Remove this entry *)
-      end else
-        Some timestamp  (* Keep this entry *)
-    ) registry;
-
-    Mutex.unlock mutex;
-    (0, !removed) (* drift, trimmed *)
-end
+module InFlightOrders = Dio_strategies.Strategy_common.InFlightOrders
 
 (** In-flight amendment cache to prevent duplicate amendments *)
-module InFlightAmendments = struct
-  (* Map order_id -> timestamp *)
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
-  let mutex = Mutex.create ()
-
-  (** Check if an amendment is already in-flight and add it if not *)
-  let add_in_flight_amendment order_id =
-    Mutex.lock mutex;
-    match Hashtbl.mem registry order_id with
-    | true ->
-        Mutex.unlock mutex;
-        false (* Already existed *)
-    | false ->
-        Hashtbl.add registry order_id (Unix.gettimeofday ());
-        Mutex.unlock mutex;
-        true (* Added successfully *)
-
-  (** Remove an amendment from the in-flight cache *)
-  let remove_in_flight_amendment order_id =
-    Mutex.lock mutex;
-    let existed = Hashtbl.mem registry order_id in
-    if existed then Hashtbl.remove registry order_id;
-    Mutex.unlock mutex;
-    existed
-
-  (** Get the current size of the in-flight amendments registry *)
-  let get_registry_size () =
-    Mutex.lock mutex;
-    let size = Hashtbl.length registry in
-    Mutex.unlock mutex;
-    size
-
-  (** Cleanup stale entries *)
-  let cleanup ?(max_age=60.0) () =
-    Mutex.lock mutex;
-    let now = Unix.gettimeofday () in
-    let removed = ref 0 in
-
-    (* Scan and remove stale entries directly - safe under mutex protection *)
-    Hashtbl.filter_map_inplace (fun _key timestamp ->
-      if now -. timestamp > max_age then begin
-        incr removed;
-        None  (* Remove this entry *)
-      end else
-        Some timestamp  (* Keep this entry *)
-    ) registry;
-
-    Mutex.unlock mutex;
-    (0, !removed) (* drift, trimmed *)
-end
+module InFlightAmendments = Dio_strategies.Strategy_common.InFlightAmendments
 
 (** Order type definitions *)
 type order_type = string (* "market" | "limit" | "stop-loss" | "take-profit" | "trailing-stop" | etc. *)
@@ -167,12 +69,7 @@ type cancel_request = {
 }
 
 (** Generate a hash key for duplicate order detection *)
-let generate_duplicate_key symbol side quantity limit_price =
-  let limit_price_str = match limit_price with
-    | Some p -> Printf.sprintf "%.8f" p
-    | None -> "market"
-  in
-  Printf.sprintf "%s|%s|%.8f|%s" symbol side quantity limit_price_str
+let generate_duplicate_key = Dio_strategies.Strategy_common.generate_duplicate_key
 
 (** Validation functions *)
 let validate_order_request (request : order_request) : (unit, string) result =
@@ -256,6 +153,7 @@ let init : unit Lwt.t =
 let place_order
     ~token
     ?retry_config
+    ?(check_duplicate=true)
     (request : order_request) : (Kraken.Kraken_common_types.add_order_result, string) result Lwt.t =
 
   (* Check for shutdown before accepting new orders *)
@@ -273,7 +171,9 @@ let place_order
         Lwt.return (Error err)
     | Ok () ->
         (* Check for duplicate orders *)
-        if not (InFlightOrders.add_in_flight_order request.duplicate_key) then begin
+        let is_duplicate = if check_duplicate then not (InFlightOrders.add_in_flight_order request.duplicate_key) else false in
+        
+        if is_duplicate then begin
           let err = Printf.sprintf "Duplicate order detected: %s %s %f @ %s"
             request.side request.symbol request.quantity
             (match request.limit_price with Some p -> Printf.sprintf "%.2f" p | None -> "market") in
@@ -324,6 +224,7 @@ let place_order
 let amend_order
     ~token
     ?retry_config
+    ?(check_duplicate=true)
     (request : amend_request) : (Kraken.Kraken_common_types.amend_order_result, string) result Lwt.t =
 
   (* Check for shutdown before accepting new amendments *)
@@ -366,7 +267,9 @@ let amend_order
           })
         end else begin
           (* Check for duplicate amendments *)
-          if not (InFlightAmendments.add_in_flight_amendment request.order_id) then begin
+          let is_duplicate = if check_duplicate then not (InFlightAmendments.add_in_flight_amendment request.order_id) else false in
+          
+          if is_duplicate then begin
             let err = Printf.sprintf "Duplicate amendment detected for order %s" request.order_id in
             Logging.warn_f ~section "%s" err;
             Lwt.return (Error err)
