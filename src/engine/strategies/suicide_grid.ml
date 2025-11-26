@@ -638,7 +638,9 @@ let execute_strategy
                     String.sub id 14 (String.length id - 14) = buy_order_id
                   ) state.pending_orders in
                   
-                  if not is_being_amended && price_diff > min_move_threshold && target_buy_price <> current_buy_price then begin
+                  let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+                  
+                  if not is_being_amended && not is_in_flight && price_diff > min_move_threshold && target_buy_price <> current_buy_price then begin
                     (match quote_balance with
                      | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                          let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" in
@@ -669,7 +671,9 @@ let execute_strategy
                   String.sub id 14 (String.length id - 14) = buy_order_id
                 ) state.pending_orders in
 
-                if not is_being_amended && price_diff > min_move_threshold && exact_target <> current_buy_price then begin
+                let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+
+                if not is_being_amended && not is_in_flight && price_diff > min_move_threshold && exact_target <> current_buy_price then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" in
@@ -727,7 +731,9 @@ let execute_strategy
                   String.sub id 14 (String.length id - 14) = buy_order_id
                 ) state.pending_orders in
 
-                if not is_being_amended && price_diff > min_move_threshold then begin
+                let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+
+                if not is_being_amended && not is_in_flight && price_diff > min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" in

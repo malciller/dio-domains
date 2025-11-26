@@ -727,7 +727,9 @@ let execute_strategy
                   id = expected_amend_id
                 ) state.pending_orders in
 
-                if not is_being_amended && price_diff >= min_move_threshold *. 0.9 then begin
+                let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+
+                if not is_being_amended && not is_in_flight && price_diff >= min_move_threshold *. 0.9 then begin
                   (* Mismatched: Amend buy to the required price *)
                   (* Profitability and Post-Only checks *)
                   (* For zero-fee assets, any spread is profitable, so skip profitability check *)
