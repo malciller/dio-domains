@@ -862,14 +862,14 @@ let order_processing_loop () =
                  trigger_price_type = None;
                  display_qty = None;
                  fee_preference = None;
-                 duplicate_key = Dio_engine.Order_executor.Test.generate_duplicate_key order.symbol (match order.side with Buy -> "buy" | Sell -> "sell") order.qty order.price;
+                 duplicate_key = order.duplicate_key;
                } in
 
                (* Place the order using Lwt async but within mutex protection *)
                Lwt.async (fun () ->
                  Lwt.catch (fun () ->
                    let _order_start_time = Telemetry.start_timer () in
-                   Dio_engine.Order_executor.place_order ~token:auth_token order_request >>= function
+                   Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                    | result ->
                        begin match result with
                    | Ok result ->
@@ -979,7 +979,7 @@ let order_processing_loop () =
 
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
+                        Dio_engine.Order_executor.amend_order ~token:auth_token ~check_duplicate:false amend_request >>= function
                         | Ok result ->
                             incr orders_placed;
                             Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)"
@@ -1162,14 +1162,14 @@ let order_processing_loop () =
                  trigger_price_type = None;
                  display_qty = None;
                  fee_preference = None;
-                 duplicate_key = Dio_engine.Order_executor.Test.generate_duplicate_key order.symbol (match order.side with Buy -> "buy" | Sell -> "sell") order.qty order.price;
+                 duplicate_key = order.duplicate_key;
                } in
 
                (* Place the order using Lwt async but within mutex protection *)
                Lwt.async (fun () ->
                  Lwt.catch (fun () ->
                    let _order_start_time = Telemetry.start_timer () in
-                   Dio_engine.Order_executor.place_order ~token:auth_token order_request >>= function
+                   Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                    | result ->
                        begin match result with
                    | Ok result ->
@@ -1279,7 +1279,7 @@ let order_processing_loop () =
 
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
+                        Dio_engine.Order_executor.amend_order ~token:auth_token ~check_duplicate:false amend_request >>= function
                         | Ok result ->
                             incr orders_placed;
                             Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)"

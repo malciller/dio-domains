@@ -145,6 +145,7 @@ let create_place_order asset_symbol side qty price post_only strategy =
     post_only;
     userref = Some Strategy_common.strategy_userref_grid;  (* Tag order as Grid strategy *)
     strategy;
+    duplicate_key = generate_duplicate_key asset_symbol (match side with Buy -> "buy" | Sell -> "sell") qty price;
   }
 
 (** Create a strategy order for amending an existing order *)
@@ -161,6 +162,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy =
     post_only;
     userref = None;  (* Amends don't set userref *)
     strategy;
+    duplicate_key = ""; (* Not used for amend *)
   }
 
 (** Create a strategy order for cancelling an existing order *)
@@ -177,6 +179,7 @@ let create_cancel_order order_id asset_symbol strategy =
     post_only = false;
     userref = None;  (* Cancels don't set userref *)
     strategy;
+    duplicate_key = ""; (* Not used for cancel *)
   }
 
 (** Create a strategy order - backwards compatibility *)
@@ -233,10 +236,21 @@ let push_order order =
             (* Return early without pushing *)
             ())
    | _ ->
-       (* For Place and Amend operations, proceed normally *)
-       Mutex.lock order_buffer_mutex;
-       let write_result = OrderRingBuffer.write order_buffer order in
-       Mutex.unlock order_buffer_mutex;
+       (* Check for duplicates before pushing *)
+       let is_duplicate = match order.operation with
+         | Place -> not (InFlightOrders.add_in_flight_order order.duplicate_key)
+         | Amend -> (match order.order_id with Some oid -> not (InFlightAmendments.add_in_flight_amendment oid) | None -> false)
+         | _ -> false
+       in
+
+       if is_duplicate then begin
+         Logging.warn_f ~section "Duplicate %s detected (strategy): %s" operation_str order.symbol;
+         Telemetry.inc_counter (Telemetry.counter "strategy_duplicate_orders" ()) ()
+       end else begin
+         (* For Place and Amend operations, proceed normally *)
+         Mutex.lock order_buffer_mutex;
+         let write_result = OrderRingBuffer.write order_buffer order in
+         Mutex.unlock order_buffer_mutex;
 
        match write_result with
        | Some () ->
@@ -286,9 +300,16 @@ let push_order order =
             | Cancel -> (* Already handled above *)
                 ())
        | None ->
+           (* Remove from tracking if write failed *)
+           (match order.operation with
+            | Place -> ignore (InFlightOrders.remove_in_flight_order order.duplicate_key)
+            | Amend -> (match order.order_id with Some oid -> ignore (InFlightAmendments.remove_in_flight_amendment oid) | None -> ())
+            | _ -> ());
+
            Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
              operation_str (string_of_order_side order.side) order.symbol;
-           Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ())
+           Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
+       end)
 
 (** Main strategy execution function *)
 let execute_strategy
