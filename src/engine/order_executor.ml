@@ -224,7 +224,6 @@ let place_order
 let amend_order
     ~token
     ?retry_config
-    ?(check_duplicate=true)
     (request : amend_request) : (Kraken.Kraken_common_types.amend_order_result, string) result Lwt.t =
 
   (* Check for shutdown before accepting new amendments *)
@@ -259,6 +258,8 @@ let amend_order
 
         if should_skip_amendment then begin
           Logging.debug_f ~section "Skipping amendment for order %s: new price equals current price" request.order_id;
+          (* Remove from in-flight cache since amendment was skipped *)
+          let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
           (* Return a fake successful result to avoid disrupting the flow *)
           Lwt.return (Ok {
             Kraken.Kraken_common_types.amend_id = "skipped_no_change";
@@ -266,14 +267,6 @@ let amend_order
             cl_ord_id = request.cl_ord_id;
           })
         end else begin
-          (* Check for duplicate amendments *)
-          let is_duplicate = if check_duplicate then not (InFlightAmendments.add_in_flight_amendment request.order_id) else false in
-          
-          if is_duplicate then begin
-            let err = Printf.sprintf "Duplicate amendment detected for order %s" request.order_id in
-            Logging.warn_f ~section "%s" err;
-            Lwt.return (Error err)
-          end else begin
             Logging.info_f ~section "Amending order %s: %s" request.order_id
               (match request.new_limit_price with Some p -> Printf.sprintf "price=%.2f" p | None -> "");
 
@@ -307,7 +300,6 @@ let amend_order
             (* Remove from in-flight cache on success immediately, just like place_order *)
             let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
             Lwt.return result
-          end
         end
   )
 
