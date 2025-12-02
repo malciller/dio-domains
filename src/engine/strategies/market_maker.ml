@@ -43,8 +43,7 @@ let get_order_buffer () = order_buffer
 type strategy_state = {
   mutable last_buy_order_price: float option;
   mutable last_buy_order_id: string option;
-  mutable last_sell_order_price: float option;
-  mutable last_sell_order_id: string option;
+  mutable open_sell_orders: (string * float) list;  (* order_id * price *)
   mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
@@ -67,8 +66,7 @@ let get_strategy_state asset_symbol =
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
-          last_sell_order_price = None;
-          last_sell_order_id = None;
+          open_sell_orders = [];
           pending_orders = [];
           last_cycle = 0;
           last_order_time = 0.0;
@@ -289,12 +287,14 @@ let push_order order =
                   (string_of_order_side order.side) temp_order_id order_price order.symbol;
 
                 (* Update tracked order prices *)
-                (match order.side, order.price with
-                 | Buy, Some price ->
-                     state.last_buy_order_price <- Some price
-                 | Sell, Some price ->
-                     state.last_sell_order_price <- Some price
-                 | _ -> ())
+                 (match order.side, order.price with
+                  | Buy, Some price ->
+                      state.last_buy_order_price <- Some price
+                  | Sell, Some price ->
+                      (* Add sell order to tracking list - use temporary ID for now *)
+                      let order_id = temp_order_id in
+                      state.open_sell_orders <- (order_id, price) :: state.open_sell_orders
+                  | _ -> ())
             | Amend ->
                 (* For amendments, track as pending but don't add to sell orders yet *)
                 let temp_order_id = Printf.sprintf "pending_amend_%s"
@@ -531,8 +531,7 @@ let execute_strategy
           (* Sync strategy state with actual open orders first *)
           state.last_buy_order_price <- None;
           state.last_buy_order_id <- None;
-          state.last_sell_order_price <- None;
-          state.last_sell_order_id <- None;
+          state.open_sell_orders <- [];
 
           List.iter (fun (order_id, order_price, qty, side_str, _) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
@@ -541,8 +540,7 @@ let execute_strategy
                 (state.last_buy_order_price <- Some order_price;
                  state.last_buy_order_id <- Some order_id)
               else
-                (state.last_sell_order_price <- Some order_price;
-                 state.last_sell_order_id <- Some order_id)
+                state.open_sell_orders <- (order_id, order_price) :: state.open_sell_orders
           ) open_orders;
 
           (* Cancel all open buy orders *)
@@ -555,32 +553,28 @@ let execute_strategy
 
           (* Place/ensure sell orders for all available asset_balance at or above best_ask *)
           (* CRITICAL: Check for pending sell orders first to prevent duplicate spam *)
+          (* Place/ensure sell orders for all available asset_balance at or above best_ask *)
+          (* CRITICAL: Check for pending sell orders first to prevent duplicate spam *)
           let has_pending_sell = List.exists (fun (_, side, _, _) -> 
             side = Sell
           ) state.pending_orders in
           
-          (* Also check if there's already an open sell order for this symbol *)
-          let has_open_sell = match state.last_sell_order_id with
-            | Some _ -> true
-            | None -> false
-          in
-          
-          if has_pending_sell || has_open_sell then begin
-            if should_log then Logging.debug_f ~section "Skipping emergency sell for %s: already have pending=%B or open=%B sell order"
-              asset.symbol has_pending_sell has_open_sell
+          if has_pending_sell then begin
+             if should_log then Logging.debug_f ~section "Skipping emergency sell for %s: pending sell order exists" asset.symbol
           end else begin
-            (match available_asset_balance with
-             | Some ab when ab > 0.0 ->
-                 (* Round quantity to instrument precision, ensuring we don't exceed available balance *)
-                 let rounded_qty = round_qty ab asset.symbol ~max_qty:ab in
-                 if meets_min_qty asset.symbol rounded_qty then begin
+            match available_asset_balance with
+            | Some ab when ab > 0.0 ->
+                (* Round quantity to instrument precision, ensuring we don't exceed available balance *)
+                let rounded_qty = round_qty ab asset.symbol ~max_qty:ab in
+                
+                (* If we have free balance > min_qty, sell it. Do NOT cancel existing orders. *)
+                if meets_min_qty asset.symbol rounded_qty then begin
                    let sell_price = round_price ask asset.symbol in
                    let sell_order = create_place_order asset.symbol Sell rounded_qty (Some sell_price) true "MM" in
                    push_order sell_order;
-                   if should_log then Logging.debug_f ~section "Placed emergency sell order: %.8f @ %.2f for %s (raw: %.8f)" rounded_qty sell_price asset.symbol ab
-                 end
-                 (* Exit quietly if below minimum - don't spam logs for dust accumulation *)
-             | _ -> ())
+                   if should_log then Logging.info_f ~section "Placed emergency sell order for free balance: %.8f @ %.2f for %s" rounded_qty sell_price asset.symbol
+                end
+            | _ -> ()
           end;
 
           (* Stop execution for this trigger - will re-check on next trigger *)
@@ -606,8 +600,7 @@ let execute_strategy
           (* Sync strategy state with actual open orders *)
           state.last_buy_order_price <- None;
           state.last_buy_order_id <- None;
-          state.last_sell_order_price <- None;
-          state.last_sell_order_id <- None;
+          state.open_sell_orders <- [];
 
           List.iter (fun (order_id, order_price, qty, side_str, _) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
@@ -616,12 +609,32 @@ let execute_strategy
                 (state.last_buy_order_price <- Some order_price;
                  state.last_buy_order_id <- Some order_id)
               else
-                (state.last_sell_order_price <- Some order_price;
-                 state.last_sell_order_id <- Some order_id)
+                state.open_sell_orders <- (order_id, order_price) :: state.open_sell_orders
           ) open_orders;
 
           (* open_buy_count already calculated earlier for balance checks *)
-          if should_log then Logging.debug_f ~section "Buy order management for %s: open_buy_count=%d" asset.symbol open_buy_count;
+          if should_log then Logging.debug_f ~section "Order management for %s: open_buy_count=%d, open_sell_count=%d" 
+            asset.symbol open_buy_count (List.length state.open_sell_orders);
+
+          (* SELL ORDER MANAGEMENT - Aim for Exactly One Active Sell *)
+          let open_sell_count = List.length state.open_sell_orders in
+          
+          if open_sell_count > 1 then begin
+            (* If >1 open sell: Cancel all open sells AND buys to reset. Stop—next trigger will replace. *)
+            if should_log then Logging.debug_f ~section "Cancelling %d excess sell orders (and %d buys) for %s to reset" 
+              open_sell_count open_buy_count asset.symbol;
+            
+            List.iter (fun (order_id, _) ->
+              let cancel_order = create_cancel_order order_id asset.symbol "MM" in
+              push_order cancel_order
+            ) state.open_sell_orders;
+
+            List.iter (fun (order_id, _, _, _, _) ->
+              let cancel_order = create_cancel_order order_id asset.symbol "MM" in
+              push_order cancel_order
+            ) open_buy_orders;
+
+          end;
 
           (* BUY ORDER MANAGEMENT - Aim for Exactly One Active Buy at Profitable Level *)
           if open_buy_count > 1 then begin
@@ -810,8 +823,8 @@ let handle_order_acknowledged asset_symbol order_id side price =
        state.last_buy_order_id <- Some order_id;
        Logging.debug_f ~section "Updated buy order ID tracking: %s @ %.2f for %s" order_id price asset_symbol
    | Sell ->
-       state.last_sell_order_id <- Some order_id;
-       Logging.debug_f ~section "Updated sell order ID tracking: %s @ %.2f for %s" order_id price asset_symbol);
+       (* Don't update tracking here - rely on sync loop *)
+       Logging.debug_f ~section "Acknowledged sell order: %s @ %.2f for %s" order_id price asset_symbol);
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     (string_of_order_side side) order_id price asset_symbol
@@ -848,12 +861,12 @@ let handle_order_cancelled asset_symbol order_id =
        state.last_buy_order_price <- None;
        Logging.info_f ~section "Cancelled buy order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
    | _ -> ());
-  (match state.last_sell_order_id with
-   | Some sell_id when sell_id = order_id ->
-       state.last_sell_order_id <- None;
-       state.last_sell_order_price <- None;
-       Logging.info_f ~section "Cancelled sell order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
-   | _ -> ());
+  
+  (* Remove from sell order list if present *)
+  let original_sell_count = List.length state.open_sell_orders in
+  state.open_sell_orders <- List.filter (fun (id, _) -> id <> order_id) state.open_sell_orders;
+  if List.length state.open_sell_orders < original_sell_count then
+    Logging.info_f ~section "Cancelled sell order %s removed from tracking for %s (blacklisted)" order_id asset_symbol;
 
   Logging.info_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, added to blacklist)"
     order_id asset_symbol removed_pending
