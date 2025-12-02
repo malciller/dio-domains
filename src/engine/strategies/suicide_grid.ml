@@ -591,14 +591,21 @@ let execute_strategy
         state.last_cycle <- cycle
       end else if open_buy_count > 0 then begin
         (* Case 2: We have an open buy order - check for sell orders *)
-        if state.open_sell_orders <> [] then begin
+        (* Combine active sell orders with pending sell orders for spacing calculation *)
+        let all_sell_orders = state.open_sell_orders @ (
+          List.filter_map (fun (id, side, price, _) ->
+            if side = Sell then Some (id, price) else None
+          ) state.pending_orders
+        ) in
+
+        if all_sell_orders <> [] then begin
           (* Find the closest sell order *)
           let closest_sell_order = List.fold_left (fun acc (order_id, sell_price) ->
             match acc with
             | None -> Some (order_id, sell_price)
             | Some (_, best_price) ->
                 if sell_price < best_price then Some (order_id, sell_price) else acc
-          ) None state.open_sell_orders in
+          ) None all_sell_orders in
 
           match closest_sell_order, state.last_buy_order_price, state.last_buy_order_id with
           | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->

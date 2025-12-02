@@ -116,8 +116,7 @@ let test_order_cancellation () =
   (* Set up some tracked orders *)
   state.last_buy_order_id <- Some "buy123";
   state.last_buy_order_price <- Some 49000.0;
-  state.last_sell_order_id <- Some "sell456";
-  state.last_sell_order_price <- Some 51000.0;
+  state.open_sell_orders <- [("sell456", 51000.0)];
 
   (* Cancel the buy order *)
   Dio_strategies.Market_maker.Strategy.handle_order_cancelled "TEST2/USD" "buy123";
@@ -125,7 +124,10 @@ let test_order_cancellation () =
   (* Should clear buy order tracking *)
   check (option string) "buy order id cleared" None state.last_buy_order_id;
   check (option (float 0.)) "buy order price cleared" None state.last_buy_order_price;
-  check (option string) "sell order id preserved" (Some "sell456") state.last_sell_order_id
+  
+  (* Verify sell order preserved *)
+  let sell_preserved = List.exists (fun (id, _) -> id = "sell456") state.open_sell_orders in
+  check bool "sell order id preserved" true sell_preserved
 
 let test_minimum_quantity_check () =
   (* Test minimum quantity checking - this relies on Kraken instruments feed *)
@@ -252,6 +254,30 @@ let test_post_only_checks () =
 
   check bool "post-only checks handled" true true
 
+let test_full_balance_sell_on_pause () =
+  (* Test that full balance sell is triggered when strategy is paused (e.g. max exposure exceeded) *)
+  let asset = create_test_asset ~max_exposure:(Some "100.0") () in (* Low max exposure to trigger pause *)
+  let current_price = Some 50000.0 in
+  let top_of_book = Some (49950.0, 1.0, 50050.0, 1.0) in
+  let asset_balance = Some 0.5 in (* 0.5 * 50000 = 25000 > 100 max exposure *)
+  let quote_balance = Some 1000.0 in
+  
+  (* Clear buffer first *)
+  let buffer = Dio_strategies.Market_maker.get_order_buffer () in
+  while Dio_strategies.Strategy_common.OrderRingBuffer.read buffer <> None do () done;
+  
+  (* Execute strategy - should trigger pause and sell *)
+  Dio_strategies.Market_maker.Strategy.execute asset current_price top_of_book asset_balance quote_balance 0 0 [] 1;
+  
+  (* Check if a sell order was placed *)
+  match Dio_strategies.Strategy_common.OrderRingBuffer.read buffer with
+  | Some order ->
+      check bool "pause sell operation" true (order.Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Place);
+      check bool "pause sell side" true (order.side = Dio_strategies.Strategy_common.Sell);
+      check (float 0.000001) "pause sell qty" 0.5 order.qty; (* Should sell full balance *)
+      check string "pause sell strategy" "MM" order.strategy
+  | None -> fail "No sell order placed during pause"
+
 let () =
   run "Market Maker" [
     "initialization", [
@@ -284,6 +310,7 @@ let () =
       test_case "sell first placement" `Quick test_sell_first_placement_logic;
       test_case "profitability checks" `Quick test_profitability_checks;
       test_case "post-only checks" `Quick test_post_only_checks;
+      test_case "full balance sell on pause" `Quick test_full_balance_sell_on_pause;
     ];
     "config_parsing", [
       test_case "config parsing" `Quick test_config_parsing;

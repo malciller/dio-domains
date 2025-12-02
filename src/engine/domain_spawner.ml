@@ -49,9 +49,23 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
                | Some buy_price -> Printf.sprintf "Buy@%.2f" buy_price
                | None -> "Buy:none"
              in
-             let sell_info = match state.last_sell_order_price with
-               | Some sell_price -> Printf.sprintf "Sell@%.2f" sell_price
-               | None -> "Sell:none"
+             let sell_info =
+               if state.open_sell_orders = [] then
+                 "Sell:none"
+               else
+                 let best_price = match current_price with
+                   | Some price ->
+                       List.fold_left (fun acc (_, sell_price) ->
+                         match acc with
+                         | None -> Some sell_price
+                         | Some best -> if abs_float (sell_price -. price) < abs_float (best -. price) then Some sell_price else Some best
+                       ) None state.open_sell_orders
+                   | None -> 
+                       match state.open_sell_orders with (_, p)::_ -> Some p | [] -> None
+                 in
+                 match best_price with
+                 | Some p -> Printf.sprintf "Sell@%.2f" p
+                 | None -> "Sell:none"
              in
              Printf.sprintf " | Strategy: %s %s" buy_info sell_info)
     | _ ->
