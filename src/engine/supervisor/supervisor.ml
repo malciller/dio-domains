@@ -979,7 +979,7 @@ let order_processing_loop () =
 
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.amend_order ~token:auth_token ~check_duplicate:false amend_request >>= function
+                        Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                         | Ok result ->
                             incr orders_placed;
                             Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)"
@@ -1279,7 +1279,7 @@ let order_processing_loop () =
 
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.amend_order ~token:auth_token ~check_duplicate:false amend_request >>= function
+                        Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                         | Ok result ->
                             incr orders_placed;
                             Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)"
