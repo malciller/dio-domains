@@ -276,24 +276,33 @@ let push_order order =
            (* Handle different operations *)
            (match order.operation with
             | Place ->
-                (* Track order as pending - generate temporary ID until we get the real one from exchange *)
-                let temp_order_id = Printf.sprintf "pending_%s_%.2f"
-                  (string_of_order_side order.side)
-                  (Option.value order.price ~default:0.0) in
-                let order_price = Option.value order.price ~default:0.0 in
-                let timestamp = Unix.time () in
-                state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
-                Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
-                  (string_of_order_side order.side) temp_order_id order_price order.symbol;
+                (* Track order as pending - only for BUY orders since we never cancel sells *)
+                (match order.side with
+                 | Buy ->
+                     let temp_order_id = Printf.sprintf "pending_%s_%.2f"
+                       (string_of_order_side order.side)
+                       (Option.value order.price ~default:0.0) in
+                     let order_price = Option.value order.price ~default:0.0 in
+                     let timestamp = Unix.time () in
+                     state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
+                     Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
+                       (string_of_order_side order.side) temp_order_id order_price order.symbol
+                 | Sell ->
+                     (* Don't track sell orders as pending - we never cancel them *)
+                     Logging.debug_f ~section "Placed sell order (not tracked as pending): %s @ %.2f for %s"
+                       (string_of_order_side order.side)
+                       (Option.value order.price ~default:0.0)
+                       order.symbol);
 
                 (* Update tracked order prices *)
                  (match order.side, order.price with
                   | Buy, Some price ->
                       state.last_buy_order_price <- Some price
                   | Sell, Some price ->
-                      (* Add sell order to tracking list - use temporary ID for now *)
-                      let order_id = temp_order_id in
-                      state.open_sell_orders <- (order_id, price) :: state.open_sell_orders
+                      (* Add sell order to tracking list - generate temporary ID for tracking *)
+                      let temp_order_id = Printf.sprintf "pending_%s_%.2f"
+                        (string_of_order_side order.side) price in
+                      state.open_sell_orders <- (temp_order_id, price) :: state.open_sell_orders
                   | _ -> ())
             | Amend ->
                 (* For amendments, track as pending but don't add to sell orders yet *)
@@ -616,25 +625,8 @@ let execute_strategy
           if should_log then Logging.debug_f ~section "Order management for %s: open_buy_count=%d, open_sell_count=%d" 
             asset.symbol open_buy_count (List.length state.open_sell_orders);
 
-          (* SELL ORDER MANAGEMENT - Aim for Exactly One Active Sell *)
-          let open_sell_count = List.length state.open_sell_orders in
-          
-          if open_sell_count > 1 then begin
-            (* If >1 open sell: Cancel all open sells AND buys to reset. Stop—next trigger will replace. *)
-            if should_log then Logging.debug_f ~section "Cancelling %d excess sell orders (and %d buys) for %s to reset" 
-              open_sell_count open_buy_count asset.symbol;
-            
-            List.iter (fun (order_id, _) ->
-              let cancel_order = create_cancel_order order_id asset.symbol "MM" in
-              push_order cancel_order
-            ) state.open_sell_orders;
-
-            List.iter (fun (order_id, _, _, _, _) ->
-              let cancel_order = create_cancel_order order_id asset.symbol "MM" in
-              push_order cancel_order
-            ) open_buy_orders;
-
-          end;
+          (* SELL ORDER MANAGEMENT - Never cancel sell orders once placed *)
+          (* We allow multiple sell orders and never touch them after placement *)
 
           (* BUY ORDER MANAGEMENT - Aim for Exactly One Active Buy at Profitable Level *)
           if open_buy_count > 1 then begin
@@ -679,8 +671,7 @@ let execute_strategy
                 (* Place SELL order first, then BUY order *)
                 if can_place_sell then begin
                   let sell_price = round_price ask asset.symbol in
-                  (* Cancel any duplicates at the same price level first *)
-                  let _ = cancel_duplicate_orders asset.symbol sell_price Sell open_orders "MM" in
+                  (* Allow multiple sells at the same price level - no duplicate cancellation *)
                   let sell_order = create_place_order asset.symbol Sell qty (Some sell_price) true "MM" in
                   push_order sell_order;
 
