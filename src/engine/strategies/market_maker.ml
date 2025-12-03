@@ -276,33 +276,24 @@ let push_order order =
            (* Handle different operations *)
            (match order.operation with
             | Place ->
-                (* Track order as pending - only for BUY orders since we never cancel sells *)
-                (match order.side with
-                 | Buy ->
-                     let temp_order_id = Printf.sprintf "pending_%s_%.2f"
-                       (string_of_order_side order.side)
-                       (Option.value order.price ~default:0.0) in
-                     let order_price = Option.value order.price ~default:0.0 in
-                     let timestamp = Unix.time () in
-                     state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
-                     Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
-                       (string_of_order_side order.side) temp_order_id order_price order.symbol
-                 | Sell ->
-                     (* Don't track sell orders as pending - we never cancel them *)
-                     Logging.debug_f ~section "Placed sell order (not tracked as pending): %s @ %.2f for %s"
-                       (string_of_order_side order.side)
-                       (Option.value order.price ~default:0.0)
-                       order.symbol);
+                (* Track order as pending - generate temporary ID until we get the real one from exchange *)
+                let temp_order_id = Printf.sprintf "pending_%s_%.2f"
+                  (string_of_order_side order.side)
+                  (Option.value order.price ~default:0.0) in
+                let order_price = Option.value order.price ~default:0.0 in
+                let timestamp = Unix.time () in
+                state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
+                Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
+                  (string_of_order_side order.side) temp_order_id order_price order.symbol;
 
                 (* Update tracked order prices *)
                  (match order.side, order.price with
                   | Buy, Some price ->
                       state.last_buy_order_price <- Some price
                   | Sell, Some price ->
-                      (* Add sell order to tracking list - generate temporary ID for tracking *)
-                      let temp_order_id = Printf.sprintf "pending_%s_%.2f"
-                        (string_of_order_side order.side) price in
-                      state.open_sell_orders <- (temp_order_id, price) :: state.open_sell_orders
+                      (* Add sell order to tracking list - use temporary ID for now *)
+                      let order_id = temp_order_id in
+                      state.open_sell_orders <- (order_id, price) :: state.open_sell_orders
                   | _ -> ())
             | Amend ->
                 (* For amendments, track as pending but don't add to sell orders yet *)
