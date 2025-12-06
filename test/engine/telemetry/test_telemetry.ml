@@ -1,5 +1,7 @@
 open Alcotest
 open Unix  (* For sleepf *)
+open Lwt.Infix
+module Memory_events = Dio_memory_tracing.Memory_events
 
 let test_counter_operations () =
   (* Test counter creation, increment, and reading *)
@@ -200,6 +202,21 @@ let test_buffer_overflow_protection () =
   (* Buffer should still be valid *)
   check int "buffer size after overflow" Telemetry.memory_config.rate_buffer_capacity buffer.Telemetry.size
 
+let test_memory_event_bus_delivery () =
+  let subscription = Memory_events.subscribe_memory_events () in
+  Memory_events.publish_cleanup_request ();
+  let received =
+    Lwt_main.run (
+      Lwt.pick [
+        (Lwt_stream.get subscription.stream >|= fun evt -> evt);
+        (Lwt_unix.sleep 0.1 >|= fun () -> None)
+      ])
+  in
+  subscription.close ();
+  match received with
+  | Some Memory_events.CleanupRequested -> ()
+  | _ -> fail "Expected CleanupRequested event on memory event bus"
+
 let () =
   run "Telemetry" [
     "counters", [
@@ -233,5 +250,6 @@ let () =
       test_case "memory pressure detection" `Quick test_memory_pressure;
       test_case "buffer capacity adjustment" `Quick test_buffer_capacity_adjustment;
       test_case "buffer overflow protection" `Quick test_buffer_overflow_protection;
+      test_case "memory event bus delivery" `Quick test_memory_event_bus_delivery;
     ];
   ]

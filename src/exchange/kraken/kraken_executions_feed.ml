@@ -5,13 +5,13 @@
 
 open Lwt.Infix
 open Concurrency
+module Memory_events = Dio_memory_tracing.Memory_events
 
 let section = "kraken_executions"
 (* TODO: Magic number - ring_buffer_size should be configurable *)
 let ring_buffer_size = 128
 
-(** Global flag to track if cleanup loop is running *)
-let cleanup_loop_started = Atomic.make false
+let cleanup_handlers_started = Atomic.make false
 
 (** Safely force Conduit context with error handling *)
 let get_conduit_ctx () =
@@ -326,6 +326,75 @@ let get_all_symbols () =
   let result = !symbols in
   Mutex.unlock global_orders_mutex;
   result
+
+(** Safety cleanup for stale orders and event-driven triggers *)
+let cleanup_stale_orders () =
+  let now = Unix.gettimeofday () in
+  let stale_threshold = 24.0 *. 3600.0 in (* 24 hours *)
+  let stale_orders = ref [] in
+  
+  let all_symbols = get_all_symbols () in
+  List.iter (fun symbol ->
+    let store = get_symbol_store symbol in
+    Mutex.lock global_orders_mutex;
+    
+    Hashtbl.iter (fun order_id order ->
+      if now -. order.last_updated > stale_threshold then
+        stale_orders := (symbol, order_id) :: !stale_orders
+    ) store.open_orders;
+    
+    Mutex.unlock global_orders_mutex;
+  ) all_symbols;
+  
+  let removed_count = List.length !stale_orders in
+  if removed_count > 0 then begin
+    Logging.info_f ~section "Safety cleanup: removing %d orders older than 24h" removed_count;
+    
+    List.iter (fun (symbol, order_id) ->
+      let store = get_symbol_store symbol in
+      Mutex.lock global_orders_mutex;
+      
+      if Hashtbl.mem store.open_orders order_id then begin
+        Hashtbl.remove store.open_orders order_id;
+        Hashtbl.remove order_to_symbol order_id;
+        Logging.debug_f ~section "Removed stale order during safety cleanup: %s [%s]" order_id symbol
+      end;
+      
+      Mutex.unlock global_orders_mutex;
+    ) !stale_orders;
+    
+    Telemetry.inc_counter (Telemetry.counter "execution_orders_cleaned_safety" ()) ~value:removed_count ();
+  end
+
+let trigger_stale_order_cleanup ~reason () =
+  Lwt.async (fun () ->
+    Logging.debug_f ~section "Triggering stale order cleanup (reason=%s)" reason;
+    cleanup_stale_orders ();
+    Lwt.return_unit
+  )
+
+let start_cleanup_handlers () =
+  if Atomic.compare_and_set cleanup_handlers_started false true then begin
+    let subscription = Memory_events.subscribe_memory_events () in
+    Lwt.async (fun () ->
+      let rec loop () =
+        Lwt_stream.get subscription.stream >>= function
+        | Some (Memory_events.MemoryPressure _) ->
+            trigger_stale_order_cleanup ~reason:"memory_pressure" ();
+            loop ()
+        | Some Memory_events.CleanupRequested ->
+            trigger_stale_order_cleanup ~reason:"cleanup_requested" ();
+            loop ()
+        | Some Memory_events.MemoryGrowth _ ->
+            loop ()
+        | None ->
+            subscription.close ();
+            Logging.info ~section "Execution cleanup memory event stream closed";
+            Lwt.return_unit
+      in
+      loop ()
+    )
+  end
 
 (** Get count of open orders for a symbol *)
 let[@inline always] count_open_orders symbol =
@@ -753,6 +822,8 @@ let handle_update json on_heartbeat =
           on_heartbeat ()
       | None -> ()
     ) data
+    ;
+    trigger_stale_order_cleanup ~reason:"execution_update" ()
   with exn ->
     Logging.error_f ~section "Failed to process execution update: %s"
       (Printexc.to_string exn)
@@ -845,45 +916,6 @@ let start_message_handler conn token on_failure on_heartbeat =
   in
   msg_loop ()
 
-(** Periodic cleanup of very old orders (safety net) *)
-let cleanup_stale_orders () =
-  let now = Unix.gettimeofday () in
-  let stale_threshold = 24.0 *. 3600.0 in (* 24 hours *)
-  let stale_orders = ref [] in
-  
-  let all_symbols = get_all_symbols () in
-  List.iter (fun symbol ->
-    let store = get_symbol_store symbol in
-    Mutex.lock global_orders_mutex;
-    
-    Hashtbl.iter (fun order_id order ->
-      if now -. order.last_updated > stale_threshold then
-        stale_orders := (symbol, order_id) :: !stale_orders
-    ) store.open_orders;
-    
-    Mutex.unlock global_orders_mutex;
-  ) all_symbols;
-  
-  let removed_count = List.length !stale_orders in
-  if removed_count > 0 then begin
-    Logging.info_f ~section "Safety cleanup: removing %d orders older than 24h" removed_count;
-    
-    List.iter (fun (symbol, order_id) ->
-      let store = get_symbol_store symbol in
-      Mutex.lock global_orders_mutex;
-      
-      if Hashtbl.mem store.open_orders order_id then begin
-        Hashtbl.remove store.open_orders order_id;
-        Hashtbl.remove order_to_symbol order_id;
-        Logging.debug_f ~section "Removed stale order during safety cleanup: %s [%s]" order_id symbol
-      end;
-      
-      Mutex.unlock global_orders_mutex;
-    ) !stale_orders;
-    
-    Telemetry.inc_counter (Telemetry.counter "execution_orders_cleaned_safety" ()) ~value:removed_count ();
-  end
-
 (** WebSocket connection to Kraken authenticated endpoint - establishes connection and starts message handler *)
 let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
@@ -901,20 +933,11 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.info ~section "Executions WebSocket established, subscribing...";
-    
-    (* Start periodic safety cleanup in background - singleton pattern *)
-    if Atomic.compare_and_set cleanup_loop_started false true then begin
-      Logging.info ~section "Starting singleton stale orders cleanup loop";
-      Lwt.async (fun () ->
-        let rec cleanup_loop () =
-          Lwt_unix.sleep 3600.0 >>= fun () -> (* Run every hour *)
-          cleanup_stale_orders ();
-          cleanup_loop ()
-        in
-        cleanup_loop ()
-      )
-    end;
-    
+
+    (* Ensure cleanup handlers are active *)
+    start_cleanup_handlers ();
+    trigger_stale_order_cleanup ~reason:"connect" ();
+
     (* Call on_connected callback after successful connection and before starting message handler *)
     on_connected ();
     start_message_handler conn token on_failure on_heartbeat >>= fun () ->
@@ -936,5 +959,6 @@ let initialize symbols =
     Logging.debug_f ~section "Created lock-free execution store for %s" symbol
   ) symbols;
 
-  Logging.info ~section "Execution stores initialized - now operating lock-free"
+  Logging.info ~section "Execution stores initialized - now operating lock-free";
+  start_cleanup_handlers ()
 

@@ -2,6 +2,7 @@
 (* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
+module Memory_events = Dio_memory_tracing.Memory_events
 
 let section = "kraken_orderbook"
 
@@ -22,8 +23,8 @@ let get_conduit_ctx () =
 let orderbook_depth = 25
 let ring_buffer_size = 64
 
-(** Global flag to track if cleanup loop is running *)
-let cleanup_loop_started = Atomic.make false
+(** Global flag to track if cleanup handlers are running *)
+let cleanup_handlers_started = Atomic.make false
 
 (** Shared CRC32 implementation for checksum calculations *)
 let crc32_table =
@@ -769,36 +770,6 @@ let process_orderbook_message ~reset json on_heartbeat =
       (Printexc.to_string exn);
     None
 
-let handle_message message on_heartbeat =
-  Logging.debug_f ~section "Received orderbook WebSocket message (length=%d)"
-    (String.length message);
-  try
-    let json = Yojson.Safe.from_string message in
-    let open Yojson.Safe.Util in
-    let channel = member "channel" json |> to_string_option in
-    let msg_type = member "type" json |> to_string_option in
-    let method_type = member "method" json |> to_string_option in
-    Logging.debug_f ~section "Message parsed: channel=%s type=%s method=%s"
-      (match channel with Some c -> c | None -> "none")
-      (match msg_type with Some t -> t | None -> "none")
-      (match method_type with Some m -> m | None -> "none");
-
-    match channel, msg_type, method_type with
-    | Some "book", Some "snapshot", _ -> ignore (process_orderbook_message ~reset:true json on_heartbeat)
-    | Some "book", Some "update", _ -> ignore (process_orderbook_message ~reset:false json on_heartbeat)
-    | Some "heartbeat", _, _ -> on_heartbeat () (* Update connection heartbeat *)
-    | _, _, Some "subscribe" ->
-        let result = member "result" json in
-        let symbol = member "symbol" result |> to_string in
-        Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol
-    | Some "status", _, _ ->
-        Logging.debug_f ~section "Status message received"
-    | _ ->
-        Logging.debug_f ~section "Unhandled orderbook payload: %s" message
-  with exn ->
-    Logging.error_f ~section "Error handling orderbook message: %s - %s"
-      (Printexc.to_string exn) message
-
 let[@inline always] get_latest_orderbook symbol =
   match store_opt symbol with
   | Some store -> RingBuffer.read_latest store.buffer
@@ -909,6 +880,72 @@ let prune_stale_data () =
     Logging.info_f ~section "Orderbook cleanup: removed %d stale stores, trimmed %d active stores (%d -> %d total stores)"
       stores_removed stores_trimmed total_stores_before total_stores_after
 
+(** Event-driven trigger for orderbook cleanup *)
+let trigger_orderbook_cleanup ~reason () =
+  Lwt.async (fun () ->
+    Logging.debug_f ~section "Triggering orderbook cleanup (reason=%s)" reason;
+    prune_stale_data ();
+    Lwt.return_unit
+  )
+
+(** Start listening to memory events to initiate cleanups under pressure *)
+let start_cleanup_handlers () =
+  if Atomic.compare_and_set cleanup_handlers_started false true then begin
+    let subscription = Memory_events.subscribe_memory_events () in
+    Lwt.async (fun () ->
+      let rec loop () =
+        Lwt_stream.get subscription.stream >>= function
+        | Some (Memory_events.MemoryPressure _) ->
+            trigger_orderbook_cleanup ~reason:"memory_pressure" ();
+            loop ()
+        | Some Memory_events.CleanupRequested ->
+            trigger_orderbook_cleanup ~reason:"cleanup_requested" ();
+            loop ()
+        | Some Memory_events.MemoryGrowth _ ->
+            loop ()
+        | None ->
+            subscription.close ();
+            Logging.info ~section "Orderbook cleanup memory event stream closed";
+            Lwt.return_unit
+      in
+      loop ()
+    )
+  end
+
+let handle_message message on_heartbeat =
+  Logging.debug_f ~section "Received orderbook WebSocket message (length=%d)"
+    (String.length message);
+  try
+    let json = Yojson.Safe.from_string message in
+    let open Yojson.Safe.Util in
+    let channel = member "channel" json |> to_string_option in
+    let msg_type = member "type" json |> to_string_option in
+    let method_type = member "method" json |> to_string_option in
+    Logging.debug_f ~section "Message parsed: channel=%s type=%s method=%s"
+      (match channel with Some c -> c | None -> "none")
+      (match msg_type with Some t -> t | None -> "none")
+      (match method_type with Some m -> m | None -> "none");
+
+    match channel, msg_type, method_type with
+  | Some "book", Some "snapshot", _ ->
+      ignore (process_orderbook_message ~reset:true json on_heartbeat);
+      trigger_orderbook_cleanup ~reason:"orderbook_snapshot" ()
+  | Some "book", Some "update", _ ->
+      ignore (process_orderbook_message ~reset:false json on_heartbeat);
+      trigger_orderbook_cleanup ~reason:"orderbook_update" ()
+    | Some "heartbeat", _, _ -> on_heartbeat () (* Update connection heartbeat *)
+    | _, _, Some "subscribe" ->
+        let result = member "result" json in
+        let symbol = member "symbol" result |> to_string in
+        Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol
+    | Some "status", _, _ ->
+        Logging.debug_f ~section "Status message received"
+    | _ ->
+        Logging.debug_f ~section "Unhandled orderbook payload: %s" message
+  with exn ->
+    Logging.error_f ~section "Error handling orderbook message: %s - %s"
+      (Printexc.to_string exn) message
+
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
   let start_time = Unix.gettimeofday () in
   let timeout_ref = ref false in
@@ -1010,17 +1047,8 @@ let initialize symbols =
   ) symbols;
   Logging.debug_f ~section "Orderbook feed stores initialized";
 
-  (* Start periodic cleanup of stale data - singleton pattern *)
-  if Atomic.compare_and_set cleanup_loop_started false true then begin
-    Logging.info ~section "Starting singleton orderbook cleanup loop";
-    Lwt.async (fun () ->
-      let rec cleanup_loop () =
-        let%lwt () = Lwt_unix.sleep 300.0 in (* Clean up every 5 minutes *)
-        prune_stale_data ();
-        cleanup_loop ()
-      in
-      cleanup_loop ()
-    )
-  end;
+  (* Enable event-driven cleanup *)
+  start_cleanup_handlers ();
+  trigger_orderbook_cleanup ~reason:"init" ();
 
   Lwt.return_unit
