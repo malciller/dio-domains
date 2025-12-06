@@ -463,7 +463,6 @@ let prune_stale_metrics () =
 
 (** Global flags to track if cleanup loops are running *)
 let adjustment_loop_started = Atomic.make false
-let pruning_loop_started = Atomic.make false
 
 (** Start event-driven capacity adjustment loop with explicit periodic pruning *)
 let start_capacity_adjuster () =
@@ -490,19 +489,6 @@ let start_capacity_adjuster () =
         adjustment_loop ()
       in
       adjustment_loop ()
-    )
-  end;
-  
-  (* Start separate explicit pruning loop every 60 seconds - singleton *)
-  if Atomic.compare_and_set pruning_loop_started false true then begin
-    Logging.info ~section:"telemetry" "Starting singleton metrics pruning loop";
-    Lwt.async (fun () ->
-      let rec pruning_loop () =
-        Lwt_unix.sleep 60.0 >>= fun () ->
-        ignore (prune_stale_metrics ());
-        pruning_loop ()
-      in
-      pruning_loop ()
     )
   end
 

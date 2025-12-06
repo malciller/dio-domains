@@ -26,7 +26,7 @@
     {
       "symbol": "SOL/USD",
       "qty": "0.09",
-      "grid_interval": "5.0",
+      "grid_interval": "2.5",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
@@ -40,7 +40,7 @@
     {
       "symbol": "TRX/USD",
       "qty": "40.0",
-      "grid_interval": "5.0",
+      "grid_interval": "2.5",
       "sell_mult": "0.999",
       "strategy": "Grid"
     },

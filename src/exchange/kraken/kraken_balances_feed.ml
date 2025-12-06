@@ -3,6 +3,7 @@
 
 open Lwt.Infix
 open Concurrency
+module Memory_events = Dio_memory_tracing.Memory_events
 
 let section = "kraken_balances"
 
@@ -109,6 +110,9 @@ let configured_assets : (string, unit) Hashtbl.t = Hashtbl.create 16
 let dynamic_assets_cap = 50  (* Maximum number of non-configured assets to track *)
 let configured_assets_mutex = Mutex.create ()
 
+(** Track cleanup handler subscription so we only attach once *)
+let cleanup_handlers_started = Atomic.make false
+
 (** Check if balance data is stale (older than threshold) *)
 let is_balance_stale asset threshold_seconds =
   try
@@ -202,6 +206,109 @@ let wait_for_balance_data_lwt assets timeout_seconds =
 
 let wait_for_balance_data = wait_for_balance_data_lwt
 
+(** Cleanup dynamic (non-configured) assets to prevent unbounded growth.
+    Configured assets are retained indefinitely regardless of staleness. *)
+let cleanup_dynamic_assets () =
+  Mutex.lock balance_stores_mutex;
+  Mutex.lock configured_assets_mutex;
+
+  (* Collect all assets and classify them *)
+  let all_assets = ref [] in
+  Hashtbl.iter (fun asset _ -> all_assets := asset :: !all_assets) balance_stores;
+
+  let configured = ref [] in
+  let dynamic = ref [] in
+
+  List.iter (fun asset ->
+    if Hashtbl.mem configured_assets asset then
+      configured := asset :: !configured
+    else
+      dynamic := asset :: !dynamic
+  ) !all_assets;
+
+  (* Sort dynamic assets by last update time (most recent first) *)
+  let dynamic_with_times = List.map (fun asset ->
+    let last_update = try
+      Mutex.lock balance_update_mutex;
+      let time = Hashtbl.find last_balance_update asset in
+      Mutex.unlock balance_update_mutex;
+      time
+    with Not_found ->
+      Mutex.unlock balance_update_mutex;
+      0.0  (* Never updated *)
+    in
+    last_update
+  ) !dynamic in
+
+  let dynamic_sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t2 t1)
+    (List.combine !dynamic dynamic_with_times) in
+
+  (* Keep only the most recently updated dynamic assets up to the cap *)
+  let dynamic_to_keep = List.map fst (List.filteri (fun i _ -> i < dynamic_assets_cap) dynamic_sorted) in
+  let dynamic_to_remove = List.filter (fun asset -> not (List.mem asset dynamic_to_keep)) !dynamic in
+
+  (* Remove excess dynamic assets *)
+  let removed_count = List.length dynamic_to_remove in
+  List.iter (fun asset ->
+    Hashtbl.remove balance_stores asset;
+    Mutex.lock balance_update_mutex;
+    Hashtbl.remove last_balance_update asset;
+    Mutex.unlock balance_update_mutex;
+    
+    (* Explicitly remove associated telemetry metrics to free memory immediately *)
+    Telemetry.remove_metric "balance_stale_assets" ~labels:[("asset", asset)] ();
+  ) dynamic_to_remove;
+
+  Mutex.unlock configured_assets_mutex;
+  Mutex.unlock balance_stores_mutex;
+
+  if removed_count > 0 then
+    Logging.info_f ~section "Cleaned up %d dynamic balance assets, keeping %d configured + %d recent dynamic"
+      removed_count (List.length !configured) (List.length dynamic_to_keep)
+
+(** Trigger dynamic asset cleanup in an event-driven manner *)
+let trigger_dynamic_asset_cleanup ~reason () =
+  Lwt.async (fun () ->
+    Logging.debug_f ~section "Triggering dynamic asset cleanup (reason=%s)" reason;
+    cleanup_dynamic_assets ();
+    Lwt.return_unit
+  )
+
+let maybe_cleanup_after_balance_update () =
+  (* Avoid holding the mutex longer than necessary *)
+  let asset_count =
+    Mutex.lock balance_stores_mutex;
+    let count = Hashtbl.length balance_stores in
+    Mutex.unlock balance_stores_mutex;
+    count
+  in
+  if asset_count > dynamic_assets_cap then
+    trigger_dynamic_asset_cleanup ~reason:"dynamic_asset_cap_exceeded" ()
+
+(** Start listening to memory events to initiate cleanups under pressure *)
+let start_cleanup_handlers () =
+  if Atomic.compare_and_set cleanup_handlers_started false true then begin
+    let subscription = Memory_events.subscribe_memory_events () in
+    Lwt.async (fun () ->
+      let rec loop () =
+        Lwt_stream.get subscription.stream >>= function
+        | Some (Memory_events.MemoryPressure _) ->
+            trigger_dynamic_asset_cleanup ~reason:"memory_pressure" ();
+            loop ()
+        | Some Memory_events.CleanupRequested ->
+            trigger_dynamic_asset_cleanup ~reason:"cleanup_requested" ();
+            loop ()
+        | Some Memory_events.MemoryGrowth _ ->
+            loop ()
+        | None ->
+            subscription.close ();
+            Logging.info ~section "Balance cleanup memory event stream closed";
+            Lwt.return_unit
+      in
+      loop ()
+    )
+  end
+
 (** Parse balance snapshot from WebSocket *)
 let parse_snapshot json on_heartbeat =
   try
@@ -244,6 +351,9 @@ let parse_snapshot json on_heartbeat =
           (Printexc.to_string exn)
     ) data;
     
+    (* Event-driven cleanup after snapshot processing to cap dynamic assets *)
+    maybe_cleanup_after_balance_update ();
+
     Some ()
   with exn ->
     Logging.warn_f ~section "Failed to parse balance snapshot: %s" 
@@ -291,6 +401,9 @@ let parse_update json on_heartbeat =
           (Printexc.to_string exn)
     ) data;
     
+    (* Event-driven cleanup based on observed asset growth *)
+    maybe_cleanup_after_balance_update ();
+
     Some ()
   with exn ->
     Logging.warn_f ~section "Failed to parse balance update: %s" 
@@ -422,7 +535,10 @@ let initialize assets =
 
   (* Mark initialization complete *)
   Atomic.set initialized true;
-  Logging.info ~section "Balance stores initialized - now thread-safe"
+  Logging.info ~section "Balance stores initialized - now thread-safe";
+  (* Attach event-driven cleanup handlers *)
+  start_cleanup_handlers ();
+  ()
 
 (** Check for stale balance data and log warnings *)
 let check_stale_balances assets =
@@ -441,69 +557,6 @@ let check_stale_balances assets =
   if !stale_count > 0 then
     Logging.warn_f ~section "%d assets have stale balance data" !stale_count
 
-(** Cleanup dynamic (non-configured) assets to prevent unbounded growth.
-    Configured assets are retained indefinitely regardless of staleness. *)
-let cleanup_dynamic_assets () =
-  Mutex.lock balance_stores_mutex;
-  Mutex.lock configured_assets_mutex;
-
-  (* Collect all assets and classify them *)
-  let all_assets = ref [] in
-  Hashtbl.iter (fun asset _ -> all_assets := asset :: !all_assets) balance_stores;
-
-  let configured = ref [] in
-  let dynamic = ref [] in
-
-  List.iter (fun asset ->
-    if Hashtbl.mem configured_assets asset then
-      configured := asset :: !configured
-    else
-      dynamic := asset :: !dynamic
-  ) !all_assets;
-
-  (* Sort dynamic assets by last update time (most recent first) *)
-  let dynamic_with_times = List.map (fun asset ->
-    let last_update = try
-      Mutex.lock balance_update_mutex;
-      let time = Hashtbl.find last_balance_update asset in
-      Mutex.unlock balance_update_mutex;
-      time
-    with Not_found ->
-      Mutex.unlock balance_update_mutex;
-      0.0  (* Never updated *)
-    in
-    last_update
-  ) !dynamic in
-
-  let dynamic_sorted = List.sort (fun (_, t1) (_, t2) -> Float.compare t2 t1)
-    (List.combine !dynamic dynamic_with_times) in
-
-  (* Keep only the most recently updated dynamic assets up to the cap *)
-  let dynamic_to_keep = List.map fst (List.filteri (fun i _ -> i < dynamic_assets_cap) dynamic_sorted) in
-  let dynamic_to_remove = List.filter (fun asset -> not (List.mem asset dynamic_to_keep)) !dynamic in
-
-  (* Remove excess dynamic assets *)
-  let removed_count = List.length dynamic_to_remove in
-  List.iter (fun asset ->
-    Hashtbl.remove balance_stores asset;
-    Mutex.lock balance_update_mutex;
-    Hashtbl.remove last_balance_update asset;
-    Mutex.unlock balance_update_mutex;
-    
-    (* Explicitly remove associated telemetry metrics to free memory immediately *)
-    Telemetry.remove_metric "balance_stale_assets" ~labels:[("asset", asset)] ();
-    (* Also try to remove any other asset-specific metrics if they exist *)
-    (* Note: We can't easily know all metric names without tracking them, 
-       but this handles the one we know is created with dynamic labels *)
-  ) dynamic_to_remove;
-
-  Mutex.unlock configured_assets_mutex;
-  Mutex.unlock balance_stores_mutex;
-
-  if removed_count > 0 then
-    Logging.info_f ~section "Cleaned up %d dynamic balance assets, keeping %d configured + %d recent dynamic"
-      removed_count (List.length !configured) (List.length dynamic_to_keep)
-
 (** Restart the balance feed connection - useful when feed becomes stale.
     Note: The supervisor handles actual reconnection via heartbeat monitoring.
     This function is kept for backward compatibility but does minimal work. *)
@@ -516,18 +569,4 @@ let restart_connection () =
 let subscribe_balance_updates () =
   let subscription = BalanceUpdateEventBus.subscribe balance_update_event_bus in
   (subscription.stream, subscription.close)
-
-
-
-(* Start periodic cleanup of dynamic assets *)
-let () =
-  Lwt.async (fun () ->
-    let rec cleanup_loop () =
-      (* TODO: Magic number - 600.0 seconds cleanup interval should be configurable *)
-      let%lwt () = Lwt_unix.sleep 600.0 in (* Clean up every 10 minutes *)
-      cleanup_dynamic_assets ();
-      cleanup_loop ()
-    in
-    cleanup_loop ()
-  )
 
