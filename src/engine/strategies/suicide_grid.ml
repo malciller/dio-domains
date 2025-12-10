@@ -132,6 +132,10 @@ let can_place_sell_order (_qty : float) (_sell_mult : float) asset_balance asset
   asset_balance >= asset_needed
 
 (** Create a strategy order for placing a new order *)
+let generate_side_duplicate_key asset_symbol side =
+  (* Allow only one in-flight order per asset+side regardless of price/qty *)
+  Printf.sprintf "%s|%s|grid" asset_symbol (string_of_order_side side)
+
 let create_place_order asset_symbol side qty price post_only strategy =
   {
     operation = Place;
@@ -145,7 +149,7 @@ let create_place_order asset_symbol side qty price post_only strategy =
     post_only;
     userref = Some Strategy_common.strategy_userref_grid;  (* Tag order as Grid strategy *)
     strategy;
-    duplicate_key = generate_duplicate_key asset_symbol (match side with Buy -> "buy" | Sell -> "sell") qty price;
+    duplicate_key = generate_side_duplicate_key asset_symbol side;
   }
 
 (** Create a strategy order for amending an existing order *)

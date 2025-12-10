@@ -53,6 +53,16 @@ let test_legacy_order_creation () =
   check bool "legacy order post_only" true order.post_only;
   check string "legacy order strategy" "Grid" order.strategy
 
+let test_duplicate_key_per_side () =
+  (* Ensure duplicate key is per asset+side, not price/qty *)
+  let open Dio_strategies in
+  let buy1 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Buy 0.001 (Some 50000.0) true "Grid" in
+  let buy2 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Buy 0.002 (Some 51000.0) true "Grid" in
+  let sell1 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Sell 0.003 (Some 52000.0) true "Grid" in
+
+  check string "same key for buy side" buy1.duplicate_key buy2.duplicate_key;
+  check bool "different key for opposite side" true (buy1.duplicate_key <> sell1.duplicate_key)
+
 let test_config_parsing () =
   (* Test configuration value parsing *)
   let test_parse str default expected =
@@ -162,6 +172,7 @@ let () =
       test_case "amend order" `Quick test_order_creation_amend;
       test_case "cancel order" `Quick test_order_creation_cancel;
       test_case "legacy order" `Quick test_legacy_order_creation;
+      test_case "duplicate key per side" `Quick test_duplicate_key_per_side;
     ];
     "config", [
       test_case "config parsing" `Quick test_config_parsing;
