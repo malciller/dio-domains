@@ -1,4 +1,0 @@
----
-alwaysApply: true
----
-Always explicitly destroy newly created data structures at the end of their life cycle.
