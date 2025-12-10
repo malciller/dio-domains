@@ -1,4 +1,0 @@
----
-alwaysApply: true
----
-- All data structure access must follow established safe access mutex locking/unlocking pattern.
