@@ -3,5 +3,5 @@
  (public_name dio)
  (name main)
  (modes exe)
- (libraries dio.kraken lwt supervisor mirage-crypto-rng.unix)
+(libraries dio.kraken dio.cmc lwt supervisor mirage-crypto-rng.unix)
  (preprocess (pps lwt_ppx)))

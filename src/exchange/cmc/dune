@@ -1,0 +1,6 @@
+ (library
+  (name cmc)
+  (public_name dio.cmc)
+  (libraries yojson cohttp-lwt-unix lwt lwt.unix logging dotenv)
+  (preprocess (pps lwt_ppx))
+  (modules Fear_and_greed))

@@ -5,49 +5,49 @@
     {
       "symbol": "BTC/USD",
       "qty": "0.001",
-      "grid_interval": "0.75",
+      "grid_interval": [0.75, 1.25],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "PAXG/USD",
       "qty": "0.0029",
-      "grid_interval": "1.0",
+      "grid_interval": [1.0, 1.0],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "ETH/USD",
       "qty": "0.005",
-      "grid_interval": "5.0",
+      "grid_interval": [2.5, 5.0],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "SOL/USD",
       "qty": "0.09",
-      "grid_interval": "2.5",
+      "grid_interval": [2.5, 5.0],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "ADA/USD",
       "qty": "30.0",
-      "grid_interval": "5.0",
+      "grid_interval": [2.5, 5.0],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "TRX/USD",
       "qty": "40.0",
-      "grid_interval": "2.5",
+      "grid_interval": [2.5, 5.0],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "USDG/USD",
       "qty": "100.0",
-      "min_usd_balance": "500.0",
+      "min_usd_balance": "1000.0",
       "strategy": "MM"
     }
   ]

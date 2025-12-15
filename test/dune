@@ -7,4 +7,5 @@
 (subdir engine/config)
 (subdir engine/domain_spawner)
 (subdir exchange/kraken)
+(subdir exchange/cmc)
 (subdir order_cache)

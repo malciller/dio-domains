@@ -1,4 +1,5 @@
 open Config
+module Fear_and_greed = Cmc.Fear_and_greed
 
 let section = "domain_spawner"
 
@@ -29,6 +30,20 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   
   (* Fetch fees at domain startup using the provided fetcher *)
   let asset_with_fees = fee_fetcher asset in
+
+  (* Resolve grid interval once using Fear & Greed (cached) *)
+  let resolved_grid_interval =
+    if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
+      let fallback = let (lo, hi) = asset_with_fees.grid_interval in (lo +. hi) /. 2.0 in
+      let fng = Fear_and_greed.fetch_value ~fallback () in
+      let resolved = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.grid_interval ~fear_and_greed:fng in
+      let (lo, hi) = asset_with_fees.grid_interval in
+      Logging.info_f ~section "Resolved grid_interval for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
+        asset_with_fees.exchange asset_with_fees.symbol resolved fng lo hi;
+      Some resolved
+    else
+      None
+  in
   
   (* Create telemetry metrics for this asset *)
   let asset_label = asset_with_fees.exchange ^ "/" ^ asset_with_fees.symbol in
@@ -118,11 +133,18 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
   (* Initialize strategy for this asset based on strategy type *)
   let (grid_strategy_asset, mm_strategy_asset) =
     if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
+      let grid_interval =
+        match resolved_grid_interval with
+        | Some g -> g
+        | None ->
+            let (lo, hi) = asset_with_fees.grid_interval in
+            (lo +. hi) /. 2.0
+      in
       (Some {
         Dio_strategies.Suicide_grid.exchange = asset_with_fees.exchange;
         symbol = asset_with_fees.symbol;
         qty = asset_with_fees.qty;
-        grid_interval = asset_with_fees.grid_interval;
+        grid_interval;
         sell_mult = asset_with_fees.sell_mult;
         strategy = asset_with_fees.strategy;
         maker_fee = asset_with_fees.maker_fee;

@@ -1,12 +1,12 @@
 let test_parse_trading_config_valid () =
-  let json_str = {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "grid_interval": "0.5", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002}|} in
+  let json_str = {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "grid_interval": [0.5, 1.0], "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002}|} in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
 
   Alcotest.(check string) "symbol" "BTC/USD" config.symbol;
   Alcotest.(check string) "exchange" "kraken" config.exchange;
   Alcotest.(check string) "qty" "0.001" config.qty;
-  Alcotest.(check string) "grid_interval" "0.5" config.grid_interval;
+  Alcotest.(check (pair (float 0.0001) (float 0.0001))) "grid_interval" (0.5, 1.0) config.grid_interval;
   Alcotest.(check string) "sell_mult" "1.1" config.sell_mult;
   Alcotest.(check string) "strategy" "market_maker" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee" (Some 0.001) config.maker_fee;
@@ -20,7 +20,7 @@ let test_parse_trading_config_defaults () =
   Alcotest.(check string) "symbol" "ETH/USD" config.symbol;
   Alcotest.(check string) "exchange default" "kraken" config.exchange;
   Alcotest.(check string) "qty" "0.01" config.qty;
-  Alcotest.(check string) "grid_interval default" "1.0" config.grid_interval;
+  Alcotest.(check (pair (float 0.0001) (float 0.0001))) "grid_interval default" (1.0, 1.0) config.grid_interval;
   Alcotest.(check string) "sell_mult default" "1.0" config.sell_mult;
   Alcotest.(check string) "strategy" "suicide_grid" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
