@@ -26,7 +26,7 @@ type trading_config = {
   exchange: string;
   symbol: string;
   qty: string;
-  grid_interval: string;
+  grid_interval: float;
   sell_mult: string;
   strategy: string;
   maker_fee: float option;
@@ -439,7 +439,7 @@ let execute_strategy
 
       (* Parse configuration values *)
       let qty = parse_config_float asset.qty "qty" 0.001 asset.exchange asset.symbol in
-      let grid_interval = parse_config_float asset.grid_interval "grid_interval" 1.0 asset.exchange asset.symbol in
+      let grid_interval = asset.grid_interval in
       let sell_mult = parse_config_float asset.sell_mult "sell_mult" 1.0 asset.exchange asset.symbol in
 
       (* Calculate required balances *)

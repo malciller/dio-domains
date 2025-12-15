@@ -3,6 +3,8 @@
 (** Enable backtraces for better error reporting *)
 let () = Printexc.record_backtrace true
 
+module Fear_and_greed = Cmc.Fear_and_greed
+
 (** Set up atexit handler for final logging *)
 let () =
   at_exit (fun () ->
@@ -129,6 +131,16 @@ let usage_msg = "Dio Trading Engine\n\nUsage: " ^ Sys.argv.(0) ^ "\n\nStarts the
 
 (** Initialize the trading engine synchronously (for websocket setup) *)
 let init_trading_engine_sync () =
+  (* Fetch Fear & Greed once before any Kraken processes start *)
+  let () =
+    try
+      let value = Fear_and_greed.fetch_and_cache_sync ~fallback:50.0 () in
+      Logging.info_f ~section:"main" "Startup Fear & Greed index: %.2f" value
+    with exn ->
+      Logging.warn_f ~section:"main" "Failed to fetch Fear & Greed at startup, using fallbacks: %s"
+        (Printexc.to_string exn)
+  in
+
   (* Start supervisor monitoring for websocket connections and get configs with fees *)
   let configs_with_fees = Supervisor.start_monitoring () in
 

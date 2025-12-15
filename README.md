@@ -26,6 +26,7 @@ Create `.env`:
 ```bash
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_API_SECRET=your_kraken_api_secret
+CMC_API_KEY=your_cmc_api_key              # Fear & Greed index (optional fallback to default)
 ```
 
 Edit `config.json` (example):
@@ -37,7 +38,7 @@ Edit `config.json` (example):
     {
       "symbol": "BTC/USD",            // Pair to trade
       "qty": "0.0002",                // Base asset quantity per order
-      "grid_interval": "0.33",        // Distance between buy/sell orders (as price units)
+      "grid_interval": [0.25, 1.25],  // Min/Max grid spacing (%); resolved once from Fear & Greed
       "sell_mult": "0.999",           // Sell amount multiplier (qty * sell_mult = sell order size)
       "strategy": "Grid"              // Strategy name: "Grid"
     },
@@ -61,6 +62,7 @@ Edit `config.json` (example):
 
 - GRID: Maintains buy/sell ladders around price with configurable spacing and size.
 - MM (Adaptive Market Maker): Dynamically adapts its quoting style based on market fees—uses a greedy quoting approach for no-fee markets and a conservative, profit-guaranteeing strategy where trading fees apply. Always ensures configured profit margins are met by factoring in fees as necessary.
+- Fear & Greed: Grid spacing is resolved once at startup using CoinMarketCap Fear & Greed; provide `CMC_API_KEY` for live values or fallback defaults are used.
 
 ## Key Features
 
