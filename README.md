@@ -108,7 +108,7 @@ dune build @doc
 # Build and run the project
 dune build
 ./_build/default/bin/main.exe
-
+```
 ## Logging
 
 - Debug, Info, Warning, Error — timestamped by component.
