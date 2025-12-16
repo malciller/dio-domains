@@ -863,6 +863,7 @@ let order_processing_loop () =
                  display_qty = None;
                  fee_preference = None;
                  duplicate_key = order.duplicate_key;
+                 exchange = order.exchange;
                } in
 
                (* Place the order using Lwt async but within mutex protection *)
@@ -975,6 +976,7 @@ let order_processing_loop () =
                       new_display_qty = None;
                       deadline = None;
                       symbol = Some order.symbol;
+                      exchange = order.exchange;
                     } in
 
                     Lwt.async (fun () ->
@@ -1071,7 +1073,13 @@ let order_processing_loop () =
                 | Some target_order_id ->
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.cancel_order ~token:auth_token ~order_id:target_order_id >>= function
+                        let request : Dio_engine.Order_executor.cancel_request = {
+                          exchange = order.exchange;
+                          order_ids = Some [target_order_id];
+                          cl_ord_ids = None;
+                          order_userrefs = None;
+                        } in
+                        Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                         | Ok results ->
                             let count = List.length results in
                             orders_placed := !orders_placed + count;
@@ -1163,6 +1171,7 @@ let order_processing_loop () =
                  display_qty = None;
                  fee_preference = None;
                  duplicate_key = order.duplicate_key;
+                 exchange = order.exchange;
                } in
 
                (* Place the order using Lwt async but within mutex protection *)
@@ -1275,6 +1284,7 @@ let order_processing_loop () =
                       new_display_qty = None;
                       deadline = None;
                       symbol = Some order.symbol;
+                      exchange = order.exchange;
                     } in
 
                     Lwt.async (fun () ->
@@ -1371,7 +1381,13 @@ let order_processing_loop () =
                 | Some target_order_id ->
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.cancel_order ~token:auth_token ~order_id:target_order_id >>= function
+                        let request : Dio_engine.Order_executor.cancel_request = {
+                          exchange = order.exchange;
+                          order_ids = Some [target_order_id];
+                          cl_ord_ids = None;
+                          order_userrefs = None;
+                        } in
+                        Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                         | Ok results ->
                             let count = List.length results in
                             orders_placed := !orders_placed + count;

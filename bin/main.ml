@@ -58,6 +58,10 @@ let setup_signal_handlers () =
   Sys.set_signal Sys.sigint (Sys.Signal_handle handle_graceful_shutdown);
   Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_graceful_shutdown)
 
+(* Forcing initialization of Kraken module to register exchange logic *)
+let () = ignore (Kraken.Kraken_module.Kraken_impl.name)
+
+
 (** Fatal signal handler for crashes *)
 let setup_fatal_signal_handlers () =
   let handle_fatal_signal signum =

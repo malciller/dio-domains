@@ -2,7 +2,6 @@ open Lwt.Infix
 open Cohttp_lwt_unix
 
 let section = "kraken_get_fee"
-(* TODO: Hardcoded endpoint should be configurable *)
 let endpoint = "https://api.kraken.com"
 
 type fee_info = {
