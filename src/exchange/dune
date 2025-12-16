@@ -1,0 +1,5 @@
+(library
+ (name dio_exchange)
+ (public_name dio.exchange)
+ (libraries lwt)
+ (modules Exchange_intf))

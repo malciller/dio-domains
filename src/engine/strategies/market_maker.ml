@@ -12,7 +12,11 @@ let section = "market_maker"
 let log_interval = 1000000
 
 (** Use common types from Strategy_common module *)
+
+(** Use common types from Strategy_common module *)
 open Strategy_common
+module Exchange = Dio_exchange.Exchange_intf
+
 
 
 (** Utility function to take first n elements from a list *)
@@ -99,25 +103,33 @@ let parse_config_float_opt config value_name exchange symbol =
         None
 
 (** Round price to appropriate precision for the symbol *)
-let round_price price symbol =
+let round_price price symbol exchange =
   (* Use float-based rounding to avoid string allocation overhead *)
-  match Kraken.Kraken_instruments_feed.get_price_increment symbol with
-  | Some increment ->
-      Float.round (price /. increment) *. increment
+  let increment = match Exchange.Registry.get exchange with
+  | Some (module Ex : Exchange.S) -> Ex.get_price_increment ~symbol
+  | None -> None
+  in
+  match increment with
+  | Some inc ->
+      Float.round (price /. inc) *. inc
   | None ->
-      Logging.warn_f ~section "No price increment info for %s, using default rounding" symbol;
+      Logging.warn_f ~section "No price increment info for %s/%s, using default rounding" exchange symbol;
       Float.round price  (* Default: 0 decimal places *)
 
 (** Round quantity to appropriate precision for the symbol, ensuring we don't exceed max_qty *)
-let round_qty qty symbol ~max_qty =
+let round_qty qty symbol exchange ~max_qty =
   (* Round DOWN to qty_increment to ensure we don't try to sell more than we have *)
-  match Kraken.Kraken_instruments_feed.get_qty_increment symbol with
-  | Some increment ->
-      let rounded = Float.floor (qty /. increment) *. increment in
+  let increment = match Exchange.Registry.get exchange with
+  | Some (module Ex : Exchange.S) -> Ex.get_qty_increment ~symbol
+  | None -> None
+  in
+  match increment with
+  | Some inc ->
+      let rounded = Float.floor (qty /. inc) *. inc in
       (* Ensure we don't exceed the maximum available quantity *)
       Float.min rounded max_qty
   | None ->
-      Logging.warn_f ~section "No qty increment info for %s, using 8 decimal places" symbol;
+      Logging.warn_f ~section "No qty increment info for %s/%s, using 8 decimal places" exchange symbol;
       let rounded = Float.floor (qty *. 100000000.0) /. 100000000.0 in
       Float.min rounded max_qty
 
@@ -135,19 +147,24 @@ let get_fee_for_asset (asset : trading_config) =
 
 
 (** Check if quantity meets minimum order size for a symbol *)
-let meets_min_qty symbol qty =
-  match Kraken.Kraken_instruments_feed.get_qty_min symbol with
+let meets_min_qty symbol qty exchange =
+  let min_qty_opt = match Exchange.Registry.get exchange with
+  | Some (module Ex : Exchange.S) -> Ex.get_qty_min ~symbol
+  | None -> None
+  in
+  match min_qty_opt with
   | Some min_qty -> qty >= min_qty
   | None -> 
-      Logging.warn_f ~section "No qty_min found for %s, assuming qty %.8f is valid" symbol qty;
+      Logging.warn_f ~section "No qty_min found for %s/%s, assuming qty %.8f is valid" exchange symbol qty;
       true  (* If we can't find min_qty, assume it's valid to avoid blocking *)
 
 (** Create a strategy order for placing a new order *)
-let create_place_order asset_symbol side qty price post_only strategy =
+let create_place_order asset_symbol side qty price post_only strategy exchange =
   {
     operation = Place;
     order_id = None;
     symbol = asset_symbol;
+    exchange;
     side;
     order_type = "limit";
     qty;
@@ -160,11 +177,12 @@ let create_place_order asset_symbol side qty price post_only strategy =
   }
 
 (** Create a strategy order for amending an existing order *)
-let create_amend_order order_id asset_symbol side qty price post_only strategy =
+let create_amend_order order_id asset_symbol side qty price post_only strategy exchange =
   {
     operation = Amend;
     order_id = Some order_id;
     symbol = asset_symbol;
+    exchange;
     side;
     order_type = "limit";
     qty;
@@ -177,11 +195,12 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy =
   }
 
 (** Create a strategy order for cancelling an existing order *)
-let create_cancel_order order_id asset_symbol strategy =
+let create_cancel_order order_id asset_symbol strategy exchange =
   {
     operation = Cancel;
     order_id = Some order_id;
     symbol = asset_symbol;
+    exchange;
     side = Buy;  (* Not relevant for cancel *)
     order_type = "limit";  (* Not relevant for cancel *)
     qty = 0.0;  (* Not relevant for cancel *)
@@ -320,7 +339,7 @@ let push_order order =
        end)
 
 (** Cancel any existing orders at the same price level (duplicate guard) *)
-let cancel_duplicate_orders asset_symbol target_price target_side open_orders strategy =
+let cancel_duplicate_orders asset_symbol target_price target_side open_orders strategy exchange =
   let duplicates = List.filter (fun (order_id, order_price, qty, side_str, _) ->
     let is_cancelled = List.exists (fun (cancelled_id, _) ->
       cancelled_id = order_id) (get_strategy_state asset_symbol).cancelled_orders in
@@ -330,7 +349,7 @@ let cancel_duplicate_orders asset_symbol target_price target_side open_orders st
   ) open_orders in
 
   List.iter (fun (order_id, _, _, _, _) ->
-    let cancel_order = create_cancel_order order_id asset_symbol strategy in
+    let cancel_order = create_cancel_order order_id asset_symbol strategy exchange in
     push_order cancel_order;
     Logging.debug_f ~section "Cancelling duplicate order %s for %s at price %.8f"
       order_id asset_symbol target_price
@@ -544,9 +563,9 @@ let execute_strategy
           ) open_orders;
 
           (* Cancel all open buy orders *)
-          (match state.last_buy_order_id with
+           (match state.last_buy_order_id with
            | Some buy_id ->
-               let cancel_order = create_cancel_order buy_id asset.symbol "MM" in
+               let cancel_order = create_cancel_order buy_id asset.symbol "MM" asset.exchange in
                push_order cancel_order;
                if should_log then Logging.debug_f ~section "Cancelling buy order due to pause: %s for %s" buy_id asset.symbol
            | None -> ());
@@ -565,12 +584,12 @@ let execute_strategy
             match available_asset_balance with
             | Some ab when ab > 0.0 ->
                 (* Round quantity to instrument precision, ensuring we don't exceed available balance *)
-                let rounded_qty = round_qty ab asset.symbol ~max_qty:ab in
+                let rounded_qty = round_qty ab asset.symbol asset.exchange ~max_qty:ab in
                 
                 (* If we have free balance > min_qty, sell it. Do NOT cancel existing orders. *)
-                if meets_min_qty asset.symbol rounded_qty then begin
-                   let sell_price = round_price ask asset.symbol in
-                   let sell_order = create_place_order asset.symbol Sell rounded_qty (Some sell_price) true "MM" in
+                if meets_min_qty asset.symbol rounded_qty asset.exchange then begin
+                   let sell_price = round_price ask asset.symbol asset.exchange in
+                   let sell_order = create_place_order asset.symbol Sell rounded_qty (Some sell_price) true "MM" asset.exchange in
                    push_order sell_order;
                    if should_log then Logging.info_f ~section "Placed emergency sell order for free balance: %.8f @ %.2f for %s" rounded_qty sell_price asset.symbol
                 end
@@ -624,7 +643,7 @@ let execute_strategy
             (* If >1 open buy: Cancel all open buys. Stop—next trigger will replace. *)
             if should_log then Logging.debug_f ~section "Cancelling %d excess buy orders for %s" open_buy_count asset.symbol;
             List.iter (fun (order_id, _, _, _, _) ->
-              let cancel_order = create_cancel_order order_id asset.symbol "MM" in
+              let cancel_order = create_cancel_order order_id asset.symbol "MM" asset.exchange in
               push_order cancel_order
             ) open_buy_orders;
             (* Next trigger will place new orders *)
@@ -635,7 +654,7 @@ let execute_strategy
 
             (* Calculate buy price based on fee logic *)
             let buy_price_raw = if fee = 0.0 then bid else ask -. (fee *. 2.0 +. 0.0001) in
-            let buy_price = round_price buy_price_raw asset.symbol in
+            let buy_price = round_price buy_price_raw asset.symbol asset.exchange in
 
             (* Profitability Guard: Never place/amend if calculated spread < required (2x fee + 0.01%) *)
             (* For zero-fee assets, any spread is profitable, so skip this check *)
@@ -657,20 +676,20 @@ let execute_strategy
                   | None, _ -> true        (* No constraint *)
                 in
 
-                let can_place_sell = meets_min_qty asset.symbol qty in
+                let can_place_sell = meets_min_qty asset.symbol qty asset.exchange in
 
                 (* Place SELL order first, then BUY order *)
                 if can_place_sell then begin
-                  let sell_price = round_price ask asset.symbol in
+                  let sell_price = round_price ask asset.symbol asset.exchange in
                   (* Allow multiple sells at the same price level - no duplicate cancellation *)
-                  let sell_order = create_place_order asset.symbol Sell qty (Some sell_price) true "MM" in
+                  let sell_order = create_place_order asset.symbol Sell qty (Some sell_price) true "MM" asset.exchange in
                   push_order sell_order;
 
                   (* Place buy order only if it meets all criteria *)
                   if can_place_buy then begin
                     (* Cancel any duplicates at the same price level first *)
-                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy open_orders "MM" in
-                    let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true "MM" in
+                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy open_orders "MM" asset.exchange in
+                    let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true "MM" asset.exchange in
                     push_order buy_order;
 
                     if should_log then Logging.info_f ~section "Placed order pair for %s: buy %.8f @ %.2f, sell %.8f @ %.2f (fee=%.6f)"
@@ -685,7 +704,7 @@ let execute_strategy
                 end
               end else begin
                 if should_log then Logging.warn_f ~section "Post-only violation for %s: buy_price=%.8f > bid=%.8f or sell_price=%.8f < ask=%.8f"
-                  asset.symbol buy_price bid (round_price ask asset.symbol) ask;
+                  asset.symbol buy_price bid (round_price ask asset.symbol asset.exchange) ask;
               end
             end else begin
               (* This should never happen for zero-fee assets since profitability_ok is always true *)
@@ -704,15 +723,15 @@ let execute_strategy
                   | None -> fee  (* Use the fee already calculated above *)
                 in
                 let required_buy_price_raw = if amendment_fee = 0.0 then bid else ask -. (amendment_fee *. 2.0 +. 0.0001) in
-                let required_buy_price = round_price required_buy_price_raw asset.symbol in
+                let required_buy_price = round_price required_buy_price_raw asset.symbol asset.exchange in
 
                 if should_log then Logging.debug_f ~section "Checking buy order for %s: current=%.8f, required=%.8f, bid=%.8f, ask=%.8f, fee=%.6f"
                   asset.symbol current_buy_price required_buy_price bid ask amendment_fee;
 
                 (* Check if price matches required level *)
                 let price_diff = abs_float (required_buy_price -. current_buy_price) in
-                let min_move_threshold = match Kraken.Kraken_instruments_feed.get_price_increment asset.symbol with
-                  | Some increment -> increment
+                let min_move_threshold = match Exchange.Registry.get asset.exchange with
+                  | Some (module Ex : Exchange.S) -> Option.value (Ex.get_price_increment ~symbol:asset.symbol) ~default:0.01
                   | None -> 0.01
                 in
 
@@ -746,13 +765,13 @@ let execute_strategy
                     | None, _ -> true        (* No constraint *)
                   in
 
-                  if should_log then Logging.debug_f ~section "Amendment checks for %s: profit_ok=%B, post_only_ok=%B, balance_ok=%B, price=%.8f, fee=%.6f"
+                    if should_log then Logging.debug_f ~section "Amendment checks for %s: profit_ok=%B, post_only_ok=%B, balance_ok=%B, price=%.8f, fee=%.6f"
                     asset.symbol profitability_ok (required_buy_price <= bid) amendment_balance_ok required_buy_price amendment_fee;
 
                   if profitability_ok && required_buy_price <= bid && amendment_balance_ok then begin
                     (* Cancel any duplicates at the new price level first *)
-                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy open_orders "MM" in
-                    let amend_order = create_amend_order buy_order_id asset.symbol Buy qty (Some required_buy_price) true "MM" in
+                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy open_orders "MM" asset.exchange in
+                    let amend_order = create_amend_order buy_order_id asset.symbol Buy qty (Some required_buy_price) true "MM" asset.exchange in
                     push_order amend_order;
                     state.last_buy_order_price <- Some required_buy_price;
                     if should_log then Logging.info_f ~section "Amended buy order for %s: %.8f -> %.8f (spread=%.2f%%, reason=book shift)"
@@ -763,7 +782,7 @@ let execute_strategy
                     end else begin
                       if should_log then Logging.warn_f ~section "Cannot amend buy order for %s: checks failed (profit=%B, post_only=%B, balance=%B) - CANCELLING"
                         asset.symbol profitability_ok (required_buy_price <= bid) amendment_balance_ok;
-                      let cancel_order = create_cancel_order buy_order_id asset.symbol "MM" in
+                      let cancel_order = create_cancel_order buy_order_id asset.symbol "MM" asset.exchange in
                       push_order cancel_order
                     end
                   end

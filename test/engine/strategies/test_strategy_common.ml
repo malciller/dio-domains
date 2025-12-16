@@ -21,6 +21,7 @@ let create_test_order ?(operation=Dio_strategies.Strategy_common.Place)
     userref;
     strategy;
     duplicate_key;
+    exchange = "kraken";
   }
 
 let test_order_side_conversion () =

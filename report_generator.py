@@ -1305,6 +1305,7 @@ def markdown_to_html(markdown_text):
         else:
             # End of table
             if in_table and table_data:
+                html_lines.append('<div class="table-container">')
                 html_lines.append('<table>')
                 for i, row in enumerate(table_data):
                     if i == 0:
@@ -1358,6 +1359,7 @@ def markdown_to_html(markdown_text):
                             html_lines.append(f'<td>{cell}</td>')
                         html_lines.append('</tr>')
                 html_lines.append('</tbody></table>')
+                html_lines.append('</div>')
                 table_data = []
                 in_table = False
 
@@ -1457,6 +1459,7 @@ def markdown_to_html(markdown_text):
 
     # Handle any remaining table
     if in_table and table_data:
+        html_lines.append('<div class="table-container">')
         html_lines.append('<table>')
         headers = table_data[0]
         for i, row in enumerate(table_data):
@@ -1510,6 +1513,7 @@ def markdown_to_html(markdown_text):
                     html_lines.append(f'<td>{cell}</td>')
                 html_lines.append('</tr>')
         html_lines.append('</tbody></table>')
+        html_lines.append('</div>')
         table_data = []
         in_table = False
         current_table_type = None
@@ -1622,10 +1626,17 @@ def generate_html_report(markdown_content, output_file='portfolio_report.html'):
             letter-spacing: 0.03em;
         }}
 
+        .table-container {{
+            width: 100%;
+            overflow-x: auto;
+            margin: 15px 0;
+            border-radius: 4px;
+        }}
+
         table {{
             width: auto;
+            min-width: 100%;
             border-collapse: collapse;
-            margin: 15px 0;
             font-size: 0.85rem;
             background: var(--tertiary-gray);
             border: 1px solid var(--border-light);
@@ -1749,13 +1760,19 @@ def generate_html_report(markdown_content, output_file='portfolio_report.html'):
                 font-size: 1.8rem;
             }}
 
+            .table-container {{
+                margin: 15px -5px;
+            }}
+
             table {{
                 font-size: 0.75rem;
-                margin: 15px 0;
+                margin: 0;
+                min-width: 600px; /* Ensure minimum width for readability */
             }}
 
             th, td {{
                 padding: 12px 15px;
+                white-space: nowrap; /* Prevent text wrapping in narrow cells */
             }}
 
             h2 {{

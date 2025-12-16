@@ -51,6 +51,7 @@ type strategy_order = {
   post_only: bool;
   userref: int option;  (* Strategy identifier: 1=GRID, 2=MM, 3=ARB *)
   strategy: string;     (* Strategy name for order processing *)
+  exchange: string;     (* Exchange to execute order on *)
   duplicate_key: string; (* Unique key for duplicate detection *)
 }
 

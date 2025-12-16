@@ -1,5 +1,4 @@
 (** Kraken WebSocket Authentication Token Generator *)
-(* TODO: Hardcoded endpoint should be configurable *)
 
 open Lwt.Infix
 open Cohttp_lwt_unix
