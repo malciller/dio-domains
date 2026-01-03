@@ -33,10 +33,24 @@ Edit `config.json` (example):
 ```json
 {
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
-  "logging_sections": "",    // Filter logs by section (optional, comma-separated)  
+  "logging_sections": "",             // Filter logs by section (optional, comma-separated)
+  "gc": {
+    "space_overhead": 20,             // GC memory overhead % (default: 120)
+    "max_overhead": 80,               // Triggers compaction when exceeded (default: 500)
+    "allocation_policy": 2,           // 0=next-fit, 1=first-fit, 2=best-fit
+    "minor_heap_size_kb": 2048,       // Minor heap size in KB
+    "major_heap_increment": 15,       // Major heap growth %
+    "target_heap_mb": 50,             // Hard limit - forces Gc.compact() when exceeded
+    "check_interval_seconds": 5,      // Memory monitor check interval
+    "high_heap_mb": 40,               // High pressure threshold (MB)
+    "medium_heap_mb": 25,             // Medium pressure threshold (MB)
+    "high_fragmentation_percent": 40, // High fragmentation threshold (%)
+    "medium_fragmentation_percent": 25
+  },
   "trading": [
     {
       "symbol": "BTC/USD",            // Pair to trade
+      "exchange": "kraken",           // Exchange name: "kraken", "hyperliquid"
       "qty": "0.0002",                // Base asset quantity per order
       "grid_interval": [0.25, 1.25],  // Min/Max grid spacing (%); resolved once from Fear & Greed
       "sell_mult": "0.999",           // Sell amount multiplier (qty * sell_mult = sell order size)
@@ -44,9 +58,10 @@ Edit `config.json` (example):
     },
     {
       "symbol": "USDG/USD",           // Pair to trade
+      "exchange": "kraken",           // Exchange name: "kraken", "hyperliquid"
       "qty": "100.0",                 // Trade size per market making quote
-      "min_usd_balance": "500.0",     // Minimum USD balance required to run this strategy. Optional, but required if no max_exposure.
-      "max_exposure": "500.0",        // Maximum asset balance allowed before pausing strategy. Optional, but required if no min_usd_balance.
+      "min_usd_balance": "500.0",     // Minimum USD balance required to run this strategy
+      "max_exposure": "500.0",        // Maximum asset balance allowed before pausing strategy
       "strategy": "MM"                // Strategy name: "MM"
     }
   ]
@@ -85,10 +100,12 @@ Edit `config.json` (example):
   - **Order Executor**: Asynchronous order placement, amendment, and cancellation with duplicate detection.
   - **Telemetry**: Real-time performance monitoring and metrics collection.
   - **Logging**: Structured logging with configurable levels and sections.
-- **Exchange Integration (Kraken)**:
+- **Exchange Integration - Kraken**:
   - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
   - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
   - **Authentication**: Secure token generation and management.
+- **Exchange Integration - Hyperliquid**:
+  - **In Progress**
 
 ## Development
 

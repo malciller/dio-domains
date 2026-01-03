@@ -527,8 +527,6 @@ let start_response_cleanup_handlers () =
         | Some Memory_events.CleanupRequested ->
             cleanup_stale_response_entries ~reason:"cleanup_requested" () >>= fun () ->
             loop ()
-        | Some Memory_events.MemoryGrowth _ ->
-            loop ()
         | None ->
             (* Stream closed; explicitly close subscription to free resources *)
             subscription.close ();
