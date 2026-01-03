@@ -3,6 +3,26 @@
 (** Enable backtraces for better error reporting *)
 let () = Printexc.record_backtrace true
 
+(** Configure GC settings from config.json *)
+let gc_config =
+  let config = Dio_engine.Config.read_config () in
+  config.gc
+
+let () =
+  let open Dio_engine.Config in
+  let gc_control = Gc.get () in
+  Gc.set {
+    gc_control with
+    space_overhead = gc_config.space_overhead;
+    max_overhead = gc_config.max_overhead;
+    minor_heap_size = gc_config.minor_heap_size_kb * 1024 / (Sys.word_size / 8);
+    major_heap_increment = gc_config.major_heap_increment;
+    allocation_policy = gc_config.allocation_policy;
+  };
+  Gc.compact ();
+  Logging.info_f ~section:"main" "GC configured: space_overhead=%d%%, max_overhead=%d%%, target_heap=%dMB"
+    gc_config.space_overhead gc_config.max_overhead gc_config.target_heap_mb
+
 module Fear_and_greed = Cmc.Fear_and_greed
 
 (** Set up atexit handler for final logging *)
@@ -167,9 +187,17 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
-  (* Start memory cleanup coordinator *)
+  (* Start memory cleanup coordinator with config from config.json *)
   Logging.info ~section:"main" "Starting memory cleanup coordinator...";
-  Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ();
+  let monitor_config : Dio_memory_tracing.Cleanup_coordinator.monitor_config = {
+    check_interval_seconds = gc_config.check_interval_seconds;
+    target_heap_mb = gc_config.target_heap_mb;
+    high_heap_mb = gc_config.high_heap_mb;
+    medium_heap_mb = gc_config.medium_heap_mb;
+    high_fragmentation_percent = gc_config.high_fragmentation_percent;
+    medium_fragmentation_percent = gc_config.medium_fragmentation_percent;
+  } in
+  Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
   Logging.info ~section:"main" "Memory cleanup coordinator started";
 
   (* Basic GC statistics reporting *)

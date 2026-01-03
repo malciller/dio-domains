@@ -385,8 +385,6 @@ let start_cleanup_handlers () =
         | Some Memory_events.CleanupRequested ->
             trigger_stale_order_cleanup ~reason:"cleanup_requested" ();
             loop ()
-        | Some Memory_events.MemoryGrowth _ ->
-            loop ()
         | None ->
             subscription.close ();
             Logging.info ~section "Execution cleanup memory event stream closed";

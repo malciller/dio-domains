@@ -298,8 +298,6 @@ let start_cleanup_handlers () =
         | Some Memory_events.CleanupRequested ->
             trigger_dynamic_asset_cleanup ~reason:"cleanup_requested" ();
             loop ()
-        | Some Memory_events.MemoryGrowth _ ->
-            loop ()
         | None ->
             subscription.close ();
             Logging.info ~section "Balance cleanup memory event stream closed";

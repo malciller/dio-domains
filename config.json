@@ -1,6 +1,19 @@
 {
   "logging_level": "info",
   "logging_sections": "",
+  "gc": {
+    "space_overhead": 20,
+    "max_overhead": 80,
+    "allocation_policy": 2,
+    "minor_heap_size_kb": 2048,
+    "major_heap_increment": 15,
+    "target_heap_mb": 50,
+    "check_interval_seconds": 5,
+    "high_heap_mb": 40,
+    "medium_heap_mb": 25,
+    "high_fragmentation_percent": 40.0,
+    "medium_fragmentation_percent": 25.0
+  },
   "trading": [
     {
       "symbol": "BTC/USD",

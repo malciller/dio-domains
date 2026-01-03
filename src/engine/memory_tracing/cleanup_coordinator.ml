@@ -122,10 +122,6 @@ let handle_memory_pressure_event event =
       Logging.info_f ~section:"cleanup_coordinator" "Cleanup completed in %.3fs: telemetry=%d, event_buses=%d, event_registries=%d"
         (end_time -. start_time) telemetry_cleaned event_bus_cleaned event_registry_cleaned
 
-  | Memory_events.MemoryGrowth _ ->
-      (* Just track growth, don't cleanup yet *)
-      ()
-
   | Memory_events.CleanupRequested ->
       Logging.info ~section:"cleanup_coordinator" "Manual cleanup requested";
       let telemetry_cleaned = cleanup_telemetry () in
@@ -165,8 +161,88 @@ let get_all_event_bus_stats () =
 (** Global flag to track if cleanup coordinator is running *)
 let coordinator_started = Atomic.make false
 
+(** Memory monitor configuration - passed from main.ml via gc_config *)
+type monitor_config = {
+  check_interval_seconds: float;
+  target_heap_mb: int;
+  high_heap_mb: int;
+  medium_heap_mb: int;
+  high_fragmentation_percent: float;
+  medium_fragmentation_percent: float;
+}
+
+(** Global shutdown flag for memory monitor *)
+let monitor_shutdown = Atomic.make false
+
+(** Signal shutdown to memory monitor *)
+let signal_shutdown () =
+  Atomic.set monitor_shutdown true
+
+(** Start the automated memory monitor loop *)
+let start_memory_monitor ~config () =
+  Logging.info_f ~section:"cleanup_coordinator" "Starting memory monitor loop (check interval: %.1fs)" config.check_interval_seconds;
+  
+  let rec monitor_loop () =
+    if Atomic.get monitor_shutdown then begin
+      Logging.info ~section:"cleanup_coordinator" "Memory monitor shutting down";
+      Lwt.return_unit
+    end else begin
+      Lwt_unix.sleep config.check_interval_seconds >>= fun () ->
+      
+      if Atomic.get monitor_shutdown then
+        Lwt.return_unit
+      else begin
+        (* Check GC stats for memory pressure *)
+        let gc_stats = Gc.stat () in
+        let heap_mb = gc_stats.heap_words * (Sys.word_size / 8) / 1048576 in
+        let live_mb = gc_stats.live_words * (Sys.word_size / 8) / 1048576 in
+        let fragmentation_percent =
+          if gc_stats.heap_words > 0 then
+            100.0 *. (1.0 -. (float_of_int gc_stats.live_words /. float_of_int gc_stats.heap_words))
+          else 0.0
+        in
+        
+        (* HARD LIMIT: Always compact if heap exceeds target *)
+        if heap_mb > config.target_heap_mb then begin
+          Logging.info_f ~section:"cleanup_coordinator" 
+            "Heap exceeded target (%dMB > %dMB), forcing compaction (live=%dMB, frag=%.1f%%)"
+            heap_mb config.target_heap_mb live_mb fragmentation_percent;
+          Gc.compact ();
+          let post_gc = Gc.stat () in
+          let post_heap_mb = post_gc.heap_words * (Sys.word_size / 8) / 1048576 in
+          let post_live_mb = post_gc.live_words * (Sys.word_size / 8) / 1048576 in
+          Logging.info_f ~section:"cleanup_coordinator" 
+            "Post-compaction: heap=%dMB, live=%dMB (freed %dMB)"
+            post_heap_mb post_live_mb (heap_mb - post_heap_mb)
+        end;
+        
+        (* Determine pressure level and publish event if warranted *)
+        let pressure_level =
+          if heap_mb >= config.high_heap_mb || fragmentation_percent >= config.high_fragmentation_percent then
+            Some `High
+          else if heap_mb >= config.medium_heap_mb || fragmentation_percent >= config.medium_fragmentation_percent then
+            Some `Medium
+          else
+            None
+        in
+        
+        (match pressure_level with
+        | Some level ->
+            Logging.debug_f ~section:"cleanup_coordinator" 
+              "Memory pressure detected: level=%s, heap=%dMB, live=%dMB, frag=%.1f%%"
+              (match level with `High -> "high" | `Medium -> "medium")
+              heap_mb live_mb fragmentation_percent;
+            Memory_events.publish_memory_pressure level heap_mb live_mb fragmentation_percent
+        | None -> ());
+        
+        monitor_loop ()
+      end
+    end
+  in
+  Lwt.async monitor_loop
+
 (** Start the cleanup coordinator - singleton pattern *)
-let start_cleanup_coordinator () =
+let start_cleanup_coordinator ~monitor_config () =
   if Atomic.compare_and_set coordinator_started false true then begin
     Logging.info ~section:"cleanup_coordinator" "Starting singleton memory cleanup coordinator";
 
@@ -186,6 +262,9 @@ let start_cleanup_coordinator () =
       in
       process_events ()
     );
+
+    (* Start the memory monitor to publish pressure events *)
+    start_memory_monitor ~config:monitor_config ();
 
     Logging.info ~section:"cleanup_coordinator" "Memory cleanup coordinator started"
   end else
