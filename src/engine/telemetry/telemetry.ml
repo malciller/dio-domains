@@ -346,17 +346,17 @@ let adjust_buffer_capacities () =
 
     (match pressure with
      | Low ->
-         (* Increase capacities up to max limits *)
-         memory_config.rate_buffer_capacity <- min 500 (memory_config.rate_buffer_capacity * 6 / 5);
-         memory_config.histogram_capacity <- min 30000 (memory_config.histogram_capacity * 6 / 5)
+         (* Increase capacities up to max limits - reduced from 500/30000 *)
+         memory_config.rate_buffer_capacity <- min 200 (memory_config.rate_buffer_capacity * 6 / 5);
+         memory_config.histogram_capacity <- min 5000 (memory_config.histogram_capacity * 6 / 5)
      | Medium ->
          (* Keep current capacities *)
          ()
      | High ->
          (* Decrease capacities with minimum limits - ensure enough samples for smooth metrics *)
-         (* At 2k samples/sec (1/100 sampling), 10000 samples = ~5s, 15000 samples = ~7.5s *)
+         (* At 2k samples/sec (1/100 sampling), 2000 samples = ~1s, 5000 samples = ~2.5s *)
          memory_config.rate_buffer_capacity <- max 50 (memory_config.rate_buffer_capacity * 7 / 10);
-         memory_config.histogram_capacity <- max 10000 (memory_config.histogram_capacity * 7 / 10);
+         memory_config.histogram_capacity <- max 2000 (memory_config.histogram_capacity * 7 / 10);
 
          Logging.debug_f ~section:"telemetry" "Reduced buffer capacities due to high memory pressure: rate %d->%d, histogram %d->%d"
            old_rate_capacity memory_config.rate_buffer_capacity
