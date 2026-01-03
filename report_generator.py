@@ -10,6 +10,7 @@ import urllib.parse
 import json
 import time
 
+
 def safe_decimal(value, default='0'):
     if not value or value == '':
         return Decimal(default)
@@ -17,6 +18,77 @@ def safe_decimal(value, default='0'):
         return Decimal(value)
     except (InvalidOperation, ValueError):
         return Decimal(default)
+
+class InventoryManager:
+    def __init__(self, method='FIFO'):
+        self.method = method.upper()
+        # inventory items: [quantity, price_per_unit, date] for HIFO tie-breaking (date is optional but good)
+        # simplistic: [quantity, price]
+        self.inventory = [] 
+
+    def buy(self, quantity, price):
+        # We store as mutable list so we can decrease quantity
+        self.inventory.append([quantity, price])
+
+    def sell(self, quantity, price):
+        """
+        Process a sell and return (realized_gain, cost_basis)
+        """
+        remaining_qty = quantity
+        total_gain = Decimal(0)
+        total_cost_basis = Decimal(0)
+        
+        while remaining_qty > 0 and self.inventory:
+            if self.method == 'FIFO':
+                # Take from front
+                lot_index = 0
+            else: # HIFO
+                # Find highest price
+                # Tie-breaker: FIFO (lowest index)
+                best_price = -1
+                best_index = -1
+                for i, lot in enumerate(self.inventory):
+                    if lot[1] > best_price:
+                        best_price = lot[1]
+                        best_index = i
+                    elif lot[1] == best_price and best_index == -1:
+                        best_index = i
+                
+                lot_index = best_index
+            
+            if lot_index == -1:
+                # Should not happen if inventory is not empty
+                print(f"Warning: Could not find lot for {self.method} strategy")
+                break
+                
+            lot = self.inventory[lot_index]
+            available_qty = lot[0]
+            lot_price = lot[1]
+            
+            qty_taken = min(remaining_qty, available_qty)
+            
+            # Calculate gain on this chunk
+            gain = qty_taken * (price - lot_price)
+            cost = qty_taken * lot_price
+            
+            total_gain += gain
+            total_cost_basis += cost
+            
+            # Update lot
+            lot[0] -= qty_taken
+            remaining_qty -= qty_taken
+            
+            # If lot is empty, remove it
+            # For FIFO (index 0), pop(0) is O(N) but lists are fast enough for reasonable N
+            # For HIFO, pop(index) is O(N)
+            if lot[0] < Decimal('0.00000001'): # Floating point tolerance or just <= 0
+                self.inventory.pop(lot_index)
+                
+        return total_gain, total_cost_basis
+
+    def get_remaining_inventory(self):
+        return self.inventory
+
 
 def process_ledger_data(csv_file):
     """Process Kraken ledger CSV file and extract relevant data"""
@@ -425,8 +497,12 @@ def extract_trades_from_ledger(ledger_entries):
     return trades
 
 def compute_metrics(trades, period_name):
-    inventories = defaultdict(deque)
-    realized_gains = defaultdict(Decimal)
+    # We now track both FIFO and HIFO for comparison
+    fifo_managers = defaultdict(lambda: InventoryManager('FIFO'))
+    hifo_managers = defaultdict(lambda: InventoryManager('HIFO'))
+    
+    realized_gains_fifo = defaultdict(Decimal)
+    realized_gains_hifo = defaultdict(Decimal)
     
     volume_by_symbol = defaultdict(lambda: {'quantity': Decimal(0), 'usd_value': Decimal(0)})
     total_volume = {'quantity': Decimal(0), 'usd_value': Decimal(0)}
@@ -434,18 +510,7 @@ def compute_metrics(trades, period_name):
     trade_counts = defaultdict(int)
     total_trades = 0
     
-    buy_trades = defaultdict(list)
-    sell_trades = defaultdict(list)
-    trade_times = []
-    fees_by_symbol = defaultdict(Decimal)
     total_fees = Decimal(0)
-    
-    margin_used = defaultdict(Decimal)
-    total_margin = Decimal(0)
-    
-    total_cost = Decimal(0)
-    total_cost_usd = Decimal(0)
-    total_net = Decimal(0)
     
     for trade in trades:
         symbol = trade['symbol']
@@ -453,10 +518,6 @@ def compute_metrics(trades, period_name):
         price = trade['price']
         trade_value = quantity * price
         fee = trade['fee']
-        cost = trade['cost']
-        costusd = trade['costusd']
-        net = trade['net']
-        margin = trade['margin']
         
         volume_by_symbol[symbol]['quantity'] += quantity
         volume_by_symbol[symbol]['usd_value'] += trade_value
@@ -465,75 +526,59 @@ def compute_metrics(trades, period_name):
         
         trade_counts[symbol] += 1
         total_trades += 1
-        
-        fees_by_symbol[symbol] += fee
         total_fees += fee
         
-        margin_used[symbol] += margin
-        total_margin += margin
-        
-        total_cost += cost
-        total_cost_usd += costusd
-        total_net += net
-        
-        trade_times.append(trade['dt'])
-        
         if trade['side'] == 'buy':
-            buy_trades[symbol].append({'price': price, 'quantity': quantity, 'time': trade['time']})
+            fifo_managers[symbol].buy(quantity, price)
+            hifo_managers[symbol].buy(quantity, price)
         elif trade['side'] == 'sell':
-            sell_trades[symbol].append({'price': price, 'quantity': quantity, 'time': trade['time']})
-        
-        if trade['side'] == 'buy':
-            inventories[symbol].append((trade['quantity'], trade['price']))
-        elif trade['side'] == 'sell':
-            sell_qty = trade['quantity']
-            sell_price = trade['price']
-            gain = Decimal(0)
+            # Calculate FIFO Gain
+            gain_fifo, _ = fifo_managers[symbol].sell(quantity, price)
+            gain_fifo -= fee
+            realized_gains_fifo[symbol] += gain_fifo
             
-            while sell_qty > 0 and inventories[symbol]:
-                buy_qty, buy_price = inventories[symbol].popleft()
-                qty_to_sell = min(sell_qty, buy_qty)
-                profit = qty_to_sell * (sell_price - buy_price)
-                gain += profit
-                sell_qty -= qty_to_sell
-                buy_qty -= qty_to_sell
-                if buy_qty > 0:
-                    inventories[symbol].appendleft((buy_qty, buy_price))
-            
-            gain -= fee
-            realized_gains[symbol] += gain
+            # Calculate HIFO Gain
+            gain_hifo, _ = hifo_managers[symbol].sell(quantity, price)
+            gain_hifo -= fee
+            realized_gains_hifo[symbol] += gain_hifo
     
-    total_gains = sum(realized_gains.values())
+    total_gains_fifo = sum(realized_gains_fifo.values())
+    total_gains_hifo = sum(realized_gains_hifo.values())
     
     lines = []
     if period_name != "All Time":
         lines.append(f"# {period_name}")
     lines.append("## All-Time Asset Analysis")
-    lines.append("| Symbol | Gains | Volume(USD) | Gains/Vol% | Trades | Avg Gain |")
+    lines.append("| Symbol | Gains (FIFO) | Gains (HIFO) | Diff | Volume(USD) | Ret % (FIFO) | Ret % (HIFO) | Trades | Avg Gain |")
     
-    sorted_symbols = sorted(volume_by_symbol.keys(), key=lambda s: realized_gains.get(s, Decimal(0)), reverse=True)
+    sorted_symbols = sorted(volume_by_symbol.keys(), key=lambda s: realized_gains_fifo.get(s, Decimal(0)), reverse=True)
+    
     winning_assets = 0
     total_assets = len(volume_by_symbol)
     
     for symbol in sorted_symbols:
-        gain = realized_gains.get(symbol, Decimal(0))
+        gain_fifo = realized_gains_fifo.get(symbol, Decimal(0))
+        gain_hifo = realized_gains_hifo.get(symbol, Decimal(0))
+        diff = gain_hifo - gain_fifo
+        
         volume = volume_by_symbol[symbol]
         trades_count = trade_counts[symbol]
         
-        gains_per_volume_pct = (gain / volume['usd_value'] * 100) if volume['usd_value'] > 0 else Decimal(0)
+        ret_fifo = (gain_fifo / volume['usd_value'] * 100) if volume['usd_value'] > 0 else Decimal(0)
+        ret_hifo = (gain_hifo / volume['usd_value'] * 100) if volume['usd_value'] > 0 else Decimal(0)
+        avg_gain = gain_fifo / trades_count if trades_count > 0 else Decimal(0)
         
-        avg_gain = gain / trades_count if trades_count > 0 else Decimal(0)
-        
-        if gain > 0:
+        if gain_fifo > 0:
             winning_assets += 1
         
-        lines.append(f"| {symbol} | ${gain:,.2f} | ${volume['usd_value']:,.0f} | {gains_per_volume_pct:.2f}% | {trades_count} | ${avg_gain:,.2f} |")
+        lines.append(f"| {symbol} | ${gain_fifo:,.2f} | ${gain_hifo:,.2f} | ${diff:,.2f} | ${volume['usd_value']:,.0f} | {ret_fifo:.2f}% | {ret_hifo:.2f}% | {trades_count} | ${avg_gain:,.2f} |")
     
-    total_gains_per_volume_pct = (total_gains / total_volume['usd_value'] * 100) if total_volume['usd_value'] > 0 else Decimal(0)
-    avg_gain_per_trade = total_gains / total_trades if total_trades > 0 else Decimal(0)
-    win_rate = (winning_assets / total_assets * 100) if total_assets > 0 else Decimal(0)
+    total_ret_fifo = (total_gains_fifo / total_volume['usd_value'] * 100) if total_volume['usd_value'] > 0 else Decimal(0)
+    total_ret_hifo = (total_gains_hifo / total_volume['usd_value'] * 100) if total_volume['usd_value'] > 0 else Decimal(0)
+    avg_gain_per_trade = total_gains_fifo / total_trades if total_trades > 0 else Decimal(0)
+    diff_total = total_gains_hifo - total_gains_fifo
     
-    lines.append(f"| <b>TOTAL</b> | <b>${total_gains:,.2f}</b> | <b>${total_volume['usd_value']:,.0f}</b> | <b>{total_gains_per_volume_pct:.2f}%</b> | <b>{total_trades}</b> | <b>${avg_gain_per_trade:,.2f}</b> |")
+    lines.append(f"| <b>TOTAL</b> | <b>${total_gains_fifo:,.2f}</b> | <b>${total_gains_hifo:,.2f}</b> | <b>${diff_total:,.2f}</b> | <b>${total_volume['usd_value']:,.0f}</b> | <b>{total_ret_fifo:.2f}%</b> | <b>{total_ret_hifo:.2f}%</b> | <b>{total_trades}</b> | <b>${avg_gain_per_trade:,.2f}</b> |")
 
     return '\n'.join(lines)
 
@@ -915,12 +960,13 @@ def calculate_gains(csv_file):
 
         # Trading Performance
         lines.append("## Monthly Performance")
-        lines.append("| Month | Gains | Volume USD | Return % | ROC % | Trades | Avg Gain | Fees | Fees % | Capital | Margin |")
-        lines.append("|-------|-------|------------|----------|-------|--------|----------|------|--------|---------|--------|")
+        lines.append("| Month | Gains (FIFO) | Gains (HIFO) | Ret % (FIFO) | Ret % (HIFO) | ROC % (FIFO) | ROC % (HIFO) | Trades | Fees | Capital |")
+        lines.append("|-------|--------------|--------------|--------------|--------------|--------------|--------------|--------|------|---------|")
         
         cumulative_trades = []
         cumulative_metrics = {
-            'gains': Decimal(0),
+            'gains_fifo': Decimal(0),
+            'gains_hifo': Decimal(0),
             'volume_usd': Decimal(0),
             'trades': 0,
             'fees': Decimal(0),
@@ -944,28 +990,18 @@ def calculate_gains(csv_file):
 
             monthly_capital[month] = capital_available
 
+        # Persistent managers for the monthly loop
+        monthly_fifo_managers = defaultdict(lambda: InventoryManager('FIFO'))
+        monthly_hifo_managers = defaultdict(lambda: InventoryManager('HIFO'))
+
         # Process each month cumulatively
         for month in sorted_months:
             month_trades = monthly_trades[month]
 
-            # Build inventory from all previous trades (without calculating gains)
-            temp_inventories = defaultdict(deque)
-            for trade in cumulative_trades:
-                if trade['side'] == 'buy':
-                    temp_inventories[trade['symbol']].append((trade['quantity'], trade['price']))
-                elif trade['side'] == 'sell':
-                    sell_qty = trade['quantity']
-                    while sell_qty > 0 and temp_inventories[trade['symbol']]:
-                        buy_qty, buy_price = temp_inventories[trade['symbol']].popleft()
-                        qty_to_sell = min(sell_qty, buy_qty)
-                        sell_qty -= qty_to_sell
-                        buy_qty -= qty_to_sell
-                        if buy_qty > 0:
-                            temp_inventories[trade['symbol']].appendleft((buy_qty, buy_price))
-
             # Calculate monthly metrics for this month only
             monthly_metrics = {
-                'gains': Decimal(0),
+                'gains_fifo': Decimal(0),
+                'gains_hifo': Decimal(0),
                 'volume_usd': Decimal(0),
                 'trades': 0,
                 'fees': Decimal(0),
@@ -974,31 +1010,8 @@ def calculate_gains(csv_file):
                 'net': Decimal(0)
             }
 
-            # Now calculate gains from this month's trades only
-            monthly_gains_this_month = Decimal(0)
             for trade in month_trades:
-                if trade['side'] == 'buy':
-                    temp_inventories[trade['symbol']].append((trade['quantity'], trade['price']))
-                elif trade['side'] == 'sell':
-                    sell_qty = trade['quantity']
-                    sell_price = trade['price']
-                    gain = Decimal(0)
-
-                    while sell_qty > 0 and temp_inventories[trade['symbol']]:
-                        buy_qty, buy_price = temp_inventories[trade['symbol']].popleft()
-                        qty_to_sell = min(sell_qty, buy_qty)
-                        profit = qty_to_sell * (sell_price - buy_price)
-                        gain += profit
-                        sell_qty -= qty_to_sell
-                        buy_qty -= qty_to_sell
-                        if buy_qty > 0:
-                            temp_inventories[trade['symbol']].appendleft((buy_qty, buy_price))
-
-                    gain -= trade['fee']
-                    # Attribute the gain to the month when the sell occurred
-                    monthly_gains_this_month += gain
-
-                # Track monthly metrics
+                # Update shared metrics
                 quantity = trade['quantity']
                 price = trade['price']
                 trade_value = quantity * price
@@ -1006,6 +1019,7 @@ def calculate_gains(csv_file):
                 costusd = trade['costusd']
                 net = trade['net']
                 margin = trade['margin']
+                symbol = trade['symbol']
 
                 monthly_metrics['volume_usd'] += trade_value
                 monthly_metrics['trades'] += 1
@@ -1014,61 +1028,67 @@ def calculate_gains(csv_file):
                 monthly_metrics['cost_usd'] += costusd
                 monthly_metrics['net'] += net
 
-            monthly_metrics['gains'] = monthly_gains_this_month
+                # Update FIFO
+                if trade['side'] == 'buy':
+                    monthly_fifo_managers[symbol].buy(quantity, price)
+                elif trade['side'] == 'sell':
+                    gain, _ = monthly_fifo_managers[symbol].sell(quantity, price)
+                    monthly_metrics['gains_fifo'] += (gain - fee)
+
+                # Update HIFO
+                if trade['side'] == 'buy':
+                    monthly_hifo_managers[symbol].buy(quantity, price)
+                elif trade['side'] == 'sell':
+                    gain, _ = monthly_hifo_managers[symbol].sell(quantity, price)
+                    monthly_metrics['gains_hifo'] += (gain - fee)
 
             # Add this month's trades to cumulative
             cumulative_trades.extend(month_trades)
 
             # Add this month's metrics to cumulative totals
-            for trade in month_trades:
-                quantity = trade['quantity']
-                price = trade['price']
-                trade_value = quantity * price
-                fee = trade['fee']
-                costusd = trade['costusd']
-                net = trade['net']
-                margin = trade['margin']
-
-                cumulative_metrics['volume_usd'] += trade_value
-                cumulative_metrics['trades'] += 1
-                cumulative_metrics['fees'] += fee
-                cumulative_metrics['margin'] += margin
-                cumulative_metrics['cost_usd'] += costusd
-                cumulative_metrics['net'] += net
-
+            cumulative_metrics['volume_usd'] += monthly_metrics['volume_usd']
+            cumulative_metrics['trades'] += monthly_metrics['trades']
+            cumulative_metrics['fees'] += monthly_metrics['fees']
+            cumulative_metrics['margin'] += monthly_metrics['margin']
+            cumulative_metrics['cost_usd'] += monthly_metrics['cost_usd']
+            cumulative_metrics['net'] += monthly_metrics['net']
+            
             # Update cumulative gains
-            cumulative_metrics['gains'] += monthly_gains_this_month
+            cumulative_metrics['gains_fifo'] += monthly_metrics['gains_fifo']
+            cumulative_metrics['gains_hifo'] += monthly_metrics['gains_hifo']
 
             # Calculate percentages based on MONTHLY metrics
-            return_pct = (monthly_metrics['gains'] / monthly_metrics['volume_usd'] * 100) if monthly_metrics['volume_usd'] > 0 else Decimal(0)
-            avg_gain = monthly_metrics['gains'] / monthly_metrics['trades'] if monthly_metrics['trades'] > 0 else Decimal(0)
-            fees_pct = (monthly_metrics['fees'] / monthly_metrics['volume_usd'] * 100) if monthly_metrics['volume_usd'] > 0 else Decimal(0)
-
+            ret_fifo = (monthly_metrics['gains_fifo'] / monthly_metrics['volume_usd'] * 100) if monthly_metrics['volume_usd'] > 0 else Decimal(0)
+            ret_hifo = (monthly_metrics['gains_hifo'] / monthly_metrics['volume_usd'] * 100) if monthly_metrics['volume_usd'] > 0 else Decimal(0)
+            
             # Calculate Return on Capital
             capital = monthly_capital[month]
-            roc_pct = (monthly_metrics['gains'] / capital * 100) if capital > 0 else Decimal(0)
+            roc_fifo = (monthly_metrics['gains_fifo'] / capital * 100) if capital > 0 else Decimal(0)
+            roc_hifo = (monthly_metrics['gains_hifo'] / capital * 100) if capital > 0 else Decimal(0)
 
-            lines.append(f"| {month} | ${monthly_metrics['gains']:,.2f} | ${monthly_metrics['volume_usd']:,.0f} | {return_pct:.2f}% | {roc_pct:.2f}% | {monthly_metrics['trades']} | ${avg_gain:,.2f} | ${monthly_metrics['fees']:,.2f} | {fees_pct:.2f}% | ${capital:,.0f} | ${monthly_metrics['margin']:,.2f} |")
+            lines.append(f"| {month} | ${monthly_metrics['gains_fifo']:,.2f} | ${monthly_metrics['gains_hifo']:,.2f} | {ret_fifo:.2f}% | {ret_hifo:.2f}% | {roc_fifo:.2f}% | {roc_hifo:.2f}% | {monthly_metrics['trades']} | ${monthly_metrics['fees']:,.2f} | ${capital:,.0f} |")
         
         # All Time totals (use final cumulative metrics)
         total_metrics = cumulative_metrics.copy()
         total_capital = sum(amount for _, amount in capital_contributions)
 
-        total_return_pct = (total_metrics['gains'] / total_metrics['volume_usd'] * 100) if total_metrics['volume_usd'] > 0 else Decimal(0)
-        total_avg_gain = total_metrics['gains'] / total_metrics['trades'] if total_metrics['trades'] > 0 else Decimal(0)
-        total_fees_pct = (total_metrics['fees'] / total_metrics['volume_usd'] * 100) if total_metrics['volume_usd'] > 0 else Decimal(0)
-        total_roc_pct = (total_metrics['gains'] / total_capital * 100) if total_capital > 0 else Decimal(0)
+        total_ret_fifo = (total_metrics['gains_fifo'] / total_metrics['volume_usd'] * 100) if total_metrics['volume_usd'] > 0 else Decimal(0)
+        total_ret_hifo = (total_metrics['gains_hifo'] / total_metrics['volume_usd'] * 100) if total_metrics['volume_usd'] > 0 else Decimal(0)
+        
+        total_roc_fifo = (total_metrics['gains_fifo'] / total_capital * 100) if total_capital > 0 else Decimal(0)
+        total_roc_hifo = (total_metrics['gains_hifo'] / total_capital * 100) if total_capital > 0 else Decimal(0)
 
-        lines.append(f"| **All Time** | **${total_metrics['gains']:,.2f}** | **${total_metrics['volume_usd']:,.0f}** | **{total_return_pct:.2f}%** | **{total_roc_pct:.2f}%** | **{total_metrics['trades']}** | **${total_avg_gain:,.2f}** | **${total_metrics['fees']:,.2f}** | **{total_fees_pct:.2f}%** | **${total_capital:,.0f}** | **${total_metrics['margin']:,.2f}** |")
+        lines.append(f"| **All Time** | **${total_metrics['gains_fifo']:,.2f}** | **${total_metrics['gains_hifo']:,.2f}** | **{total_ret_fifo:.2f}%** | **{total_ret_hifo:.2f}%** | **{total_roc_fifo:.2f}%** | **{total_roc_hifo:.2f}%** | **{total_metrics['trades']}** | **${total_metrics['fees']:,.2f}** | **${total_capital:,.0f}** |")
         
         lines.append("")
 
         # Asset Performance Details
-        lines.append("### Realized Gains by Asset")
+        lines.append("### Realized Gains by Asset (FIFO)")
 
-        # Calculate per-asset per-month metrics using proper FIFO accounting
+        # Calculate per-asset per-month metrics
         asset_monthly_data = defaultdict(lambda: defaultdict(lambda: {
-            'gains': Decimal(0),
+            'gains_fifo': Decimal(0),
+            'gains_hifo': Decimal(0),
             'volume_usd': Decimal(0),
             'trades': 0,
             'fees': Decimal(0),
@@ -1081,13 +1101,15 @@ def calculate_gains(csv_file):
         for trade in trades:
             asset_all_trades[trade['symbol']].append(trade)
 
-        # For each asset, process ALL its trades chronologically to get correct FIFO gains
+        # For each asset, process ALL its trades chronologically to get correct gains
         for symbol, asset_trades in asset_all_trades.items():
             # Sort trades chronologically for this asset
             asset_trades.sort(key=lambda x: x['dt'])
 
-            inventory = deque()
-            monthly_gains_tracker = defaultdict(Decimal)
+            fifo_manager = InventoryManager('FIFO')
+            hifo_manager = InventoryManager('HIFO')
+            monthly_gains_tracker_fifo = defaultdict(Decimal)
+            monthly_gains_tracker_hifo = defaultdict(Decimal)
 
             for trade in asset_trades:
                 trade_month = trade['dt'].strftime('%Y-%m')
@@ -1101,34 +1123,29 @@ def calculate_gains(csv_file):
                 asset_monthly_data[symbol][trade_month]['cost_usd'] += trade['costusd']
 
                 if trade['side'] == 'buy':
-                    inventory.append((trade['quantity'], trade['price']))
+                    fifo_manager.buy(trade['quantity'], trade['price'])
+                    hifo_manager.buy(trade['quantity'], trade['price'])
                 elif trade['side'] == 'sell':
-                    sell_qty = trade['quantity']
-                    sell_price = trade['price']
-                    gain = Decimal(0)
-
-                    while sell_qty > 0 and inventory:
-                        buy_qty, buy_price = inventory.popleft()
-                        qty_to_sell = min(sell_qty, buy_qty)
-                        profit = qty_to_sell * (sell_price - buy_price)
-                        gain += profit
-                        sell_qty -= qty_to_sell
-                        buy_qty -= qty_to_sell
-                        if buy_qty > 0:
-                            inventory.appendleft((buy_qty, buy_price))
-
-                    gain -= trade['fee']
-                    # Attribute the gain to the month when the sell occurred
-                    monthly_gains_tracker[trade_month] += gain
+                    # FIFO
+                    gain_fifo, _ = fifo_manager.sell(trade['quantity'], trade['price'])
+                    gain_fifo -= trade['fee']
+                    monthly_gains_tracker_fifo[trade_month] += gain_fifo
+                    
+                    # HIFO
+                    gain_hifo, _ = hifo_manager.sell(trade['quantity'], trade['price'])
+                    gain_hifo -= trade['fee']
+                    monthly_gains_tracker_hifo[trade_month] += gain_hifo
 
             # Store the calculated monthly gains
-            for month, gains in monthly_gains_tracker.items():
-                asset_monthly_data[symbol][month]['gains'] = gains
+            for month, gains in monthly_gains_tracker_fifo.items():
+                asset_monthly_data[symbol][month]['gains_fifo'] = gains
+            for month, gains in monthly_gains_tracker_hifo.items():
+                asset_monthly_data[symbol][month]['gains_hifo'] = gains
 
         # Build detailed tables for each metric
         all_assets = sorted(asset_monthly_data.keys())
 
-        # Table 1: Gains
+        # Table 1: Gains (FIFO)
         lines.append("| Asset | " + " | ".join(sorted_months) + " | **Total** |")
         lines.append("| " + " | ".join(["---"] * (len(sorted_months) + 2)) + " |")
 
@@ -1136,20 +1153,47 @@ def calculate_gains(csv_file):
             row_data = [f"**{symbol}**"]
             for month in sorted_months:
                 if month in asset_monthly_data[symbol]:
-                    gains = asset_monthly_data[symbol][month]['gains']
+                    gains = asset_monthly_data[symbol][month]['gains_fifo']
                     row_data.append(f"${gains:,.2f}")
                 else:
                     row_data.append("-")
             # Total gains for this asset
-            total_gains = sum(asset_monthly_data[symbol][m]['gains'] for m in asset_monthly_data[symbol])
+            total_gains = sum(asset_monthly_data[symbol][m]['gains_fifo'] for m in asset_monthly_data[symbol])
             row_data.append(f"**${total_gains:,.2f}**")
             lines.append("| " + " | ".join(row_data) + " |")
 
-        # Total row for gains
+        # Total row for gains FIFO
         lines.append("| **TOTAL** | " + " | ".join([
-            f"**${sum(asset_monthly_data[symbol][month]['gains'] for symbol in all_assets if month in asset_monthly_data[symbol]):,.2f}**"
+            f"**${sum(asset_monthly_data[symbol][month]['gains_fifo'] for symbol in all_assets if month in asset_monthly_data[symbol]):,.2f}**"
             for month in sorted_months
-        ]) + f" | **${total_metrics['gains']:,.2f}** |")
+        ]) + f" | **${total_metrics['gains_fifo']:,.2f}** |")
+
+        lines.append("")
+        
+        # Table 1b: Gains (HIFO)
+        lines.append("### Realized Gains by Asset (HIFO)")
+        lines.append("| Asset | " + " | ".join(sorted_months) + " | **Total** |")
+        lines.append("| " + " | ".join(["---"] * (len(sorted_months) + 2)) + " |")
+
+        for symbol in all_assets:
+            row_data = [f"**{symbol}**"]
+            for month in sorted_months:
+                if month in asset_monthly_data[symbol]:
+                    gains = asset_monthly_data[symbol][month]['gains_hifo']
+                    row_data.append(f"${gains:,.2f}")
+                else:
+                    row_data.append("-")
+            # Total gains for this asset
+            total_gains = sum(asset_monthly_data[symbol][m]['gains_hifo'] for m in asset_monthly_data[symbol])
+            row_data.append(f"**${total_gains:,.2f}**")
+            lines.append("| " + " | ".join(row_data) + " |")
+
+        # Total row for gains HIFO
+        lines.append("| **TOTAL** | " + " | ".join([
+            f"**${sum(asset_monthly_data[symbol][month]['gains_hifo'] for symbol in all_assets if month in asset_monthly_data[symbol]):,.2f}**"
+            for month in sorted_months
+        ]) + f" | **${total_metrics['gains_hifo']:,.2f}** |")
+
 
         lines.append("")
         lines.append("### Trading Volume by Asset")
@@ -1188,14 +1232,14 @@ def calculate_gains(csv_file):
             row_data = [f"**{symbol}**"]
             for month in sorted_months:
                 if month in asset_monthly_data[symbol]:
-                    gains = asset_monthly_data[symbol][month]['gains']
+                    gains = asset_monthly_data[symbol][month]['gains_fifo']
                     volume = asset_monthly_data[symbol][month]['volume_usd']
                     return_pct = (gains / volume * 100) if volume > 0 else Decimal(0)
                     row_data.append(f"{return_pct:.2f}%")
                 else:
                     row_data.append("-")
             # Total return % for this asset
-            total_gains = sum(asset_monthly_data[symbol][m]['gains'] for m in asset_monthly_data[symbol])
+            total_gains = sum(asset_monthly_data[symbol][m]['gains_fifo'] for m in asset_monthly_data[symbol])
             total_volume = sum(asset_monthly_data[symbol][m]['volume_usd'] for m in asset_monthly_data[symbol])
             total_return_pct = (total_gains / total_volume * 100) if total_volume > 0 else Decimal(0)
             row_data.append(f"**{total_return_pct:.2f}%**")
@@ -1203,10 +1247,10 @@ def calculate_gains(csv_file):
 
         # Total row for return %
         lines.append("| **TOTAL** | " + " | ".join([
-            f"**{(sum(asset_monthly_data[symbol][month]['gains'] for symbol in all_assets if month in asset_monthly_data[symbol]) / sum(asset_monthly_data[symbol][month]['volume_usd'] for symbol in all_assets if month in asset_monthly_data[symbol]) * 100):.2f}%**"
+            f"**{(sum(asset_monthly_data[symbol][month]['gains_fifo'] for symbol in all_assets if month in asset_monthly_data[symbol]) / sum(asset_monthly_data[symbol][month]['volume_usd'] for symbol in all_assets if month in asset_monthly_data[symbol]) * 100):.2f}%**"
             if sum(asset_monthly_data[symbol][month]['volume_usd'] for symbol in all_assets if month in asset_monthly_data[symbol]) > 0 else "**-**"
             for month in sorted_months
-        ]) + f" | **{(total_metrics['gains'] / total_metrics['volume_usd'] * 100):.2f}%** |")
+        ]) + f" | **{(total_metrics['gains_fifo'] / total_metrics['volume_usd'] * 100):.2f}%** |")
 
         lines.append("")
         lines.append("### Trade Count by Asset")
