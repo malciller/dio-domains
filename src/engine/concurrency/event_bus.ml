@@ -63,9 +63,11 @@ module Make (Payload : PAYLOAD) = struct
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in
       let filtered = List.filter (fun sub ->
-        not sub.closed &&
-        (now -. sub.created_at) <= max_age_seconds &&
-        (now -. sub.last_used) <= max_unused_seconds
+        sub.persistent || (
+          not sub.closed &&
+          (now -. sub.created_at) <= max_age_seconds &&
+          (now -. sub.last_used) <= max_unused_seconds
+        )
       ) current in
       let removed_count = List.length current - List.length filtered in
       if removed_count > 0 then begin
@@ -149,9 +151,9 @@ module Make (Payload : PAYLOAD) = struct
                 (sub.push payload >|= fun () ->
                    (* Only update last_used on successful push *)
                    sub.last_used <- now);
-                (Lwt_unix.sleep 0.001 >|= fun () ->
+                (Lwt_unix.sleep 0.050 >|= fun () ->
                    (* Timeout - subscriber is too slow *)
-                   Logging.warn_f ~section:"event_bus" "Subscriber too slow (1ms timeout), dropping: %s" bus.topic;
+                   Logging.warn_f ~section:"event_bus" "Subscriber too slow (50ms timeout), dropping: %s" bus.topic;
                    sub.closed <- true)
               ]
             )
