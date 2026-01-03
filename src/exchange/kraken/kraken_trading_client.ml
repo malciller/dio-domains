@@ -524,9 +524,9 @@ let start_response_cleanup_handlers () =
         | Some (Memory_events.MemoryPressure _) ->
             cleanup_stale_response_entries ~reason:"memory_pressure" () >>= fun () ->
             loop ()
-        | Some Memory_events.CleanupRequested ->
-            cleanup_stale_response_entries ~reason:"cleanup_requested" () >>= fun () ->
+        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
             loop ()
+
         | None ->
             (* Stream closed; explicitly close subscription to free resources *)
             subscription.close ();

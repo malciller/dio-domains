@@ -15,6 +15,7 @@ type memory_event =
       fragmentation_percent: float;
     }
   | CleanupRequested
+  | Heartbeat
 
 (** Event bus for memory pressure events *)
 module MemoryEventBus = Event_bus.Make(struct
@@ -37,9 +38,13 @@ let publish_memory_pressure level heap_mb live_mb fragmentation_percent =
 let publish_cleanup_request () =
   MemoryEventBus.publish memory_event_bus CleanupRequested
 
+(** Publish heartbeat event *)
+let publish_heartbeat () =
+  MemoryEventBus.publish memory_event_bus Heartbeat
+
 (** Subscribe to memory pressure events *)
-let subscribe_memory_events () =
-  MemoryEventBus.subscribe memory_event_bus
+let subscribe_memory_events ?persistent () =
+  MemoryEventBus.subscribe ?persistent memory_event_bus
 
 (** Get subscriber statistics for monitoring *)
 let get_subscriber_stats () =

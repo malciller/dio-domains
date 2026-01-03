@@ -58,6 +58,7 @@ let setup_signal_handlers () =
       (* Signal shutdown to all components *)
       Dio_engine.Order_executor.signal_shutdown ();
       Kraken.Kraken_trading_client.signal_shutdown ();
+      Dio_memory_tracing.Cleanup_coordinator.signal_shutdown ();
 
       (* Stop all supervised domains *)
       Dio_engine.Domain_spawner.stop_all_domains ();
@@ -187,7 +188,7 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
-  (* Start memory cleanup coordinator with config from config.json *)
+  (* Start memory cleanup coordinator directly *)
   Logging.info ~section:"main" "Starting memory cleanup coordinator...";
   let monitor_config : Dio_memory_tracing.Cleanup_coordinator.monitor_config = {
     check_interval_seconds = gc_config.check_interval_seconds;
@@ -197,8 +198,64 @@ let () =
     high_fragmentation_percent = gc_config.high_fragmentation_percent;
     medium_fragmentation_percent = gc_config.medium_fragmentation_percent;
   } in
+
+  (* Start the coordinator initially *)
   Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
-  Logging.info ~section:"main" "Memory cleanup coordinator started";
+
+  (* Start watchdog thread for cleanup coordinator - runs for lifecycle of app *)
+  let _cleanup_watchdog_thread = Thread.create (fun () ->
+    let stall_threshold = 30.0 in
+    let check_interval = 10.0 in
+    let restart_count = ref 0 in
+    Logging.info ~section:"main" "Cleanup coordinator watchdog thread started";
+    
+    try
+      while not (Atomic.get shutdown_requested) do
+        (* Sleep loop with shutdown check *)
+        let rec sleep_loop remaining =
+          if remaining <= 0.0 || Atomic.get shutdown_requested then ()
+          else begin
+            let sleep_time = min remaining 0.5 in
+            Thread.delay sleep_time;
+            sleep_loop (remaining -. sleep_time)
+          end
+        in
+        sleep_loop check_interval;
+
+        if not (Atomic.get shutdown_requested) then begin
+          let last_heartbeat = Dio_memory_tracing.Cleanup_coordinator.get_last_heartbeat () in
+          let now = Unix.gettimeofday () in
+          let stall_time = now -. last_heartbeat in
+          
+          (* Log heartbeat check at INFO level for visibility *)
+          Logging.info_f ~section:"main" "Cleanup watchdog check: stall=%.1fs threshold=%.1fs" 
+            stall_time stall_threshold;
+          
+          if stall_time > stall_threshold then begin
+            incr restart_count;
+            Logging.warn_f ~section:"main" 
+              "Cleanup coordinator stalled (no heartbeat for %.1fs), restarting (restart #%d)..." 
+              stall_time !restart_count;
+              
+            (* Stop current instance *)
+            Dio_memory_tracing.Cleanup_coordinator.stop_cleanup_coordinator ();
+            
+            (* Small delay to allow cleanup *)
+            Thread.delay 0.5;
+            
+            (* Use Lwt_preemptive.run_in_main to properly schedule Lwt operations from this thread *)
+            Lwt_preemptive.run_in_main (fun () ->
+              Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
+              Lwt.return_unit
+            );
+            Logging.info ~section:"main" "Cleanup coordinator restarted successfully"
+          end
+        end
+      done;
+      Logging.info ~section:"main" "Cleanup coordinator watchdog thread exiting (shutdown requested)"
+    with exn ->
+      Logging.error_f ~section:"main" "Cleanup coordinator watchdog thread exception: %s" (Printexc.to_string exn)
+  ) () in
 
   (* Basic GC statistics reporting *)
   let start_time = Unix.gettimeofday () in

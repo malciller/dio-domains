@@ -295,9 +295,9 @@ let start_cleanup_handlers () =
         | Some (Memory_events.MemoryPressure _) ->
             trigger_dynamic_asset_cleanup ~reason:"memory_pressure" ();
             loop ()
-        | Some Memory_events.CleanupRequested ->
-            trigger_dynamic_asset_cleanup ~reason:"cleanup_requested" ();
+        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
             loop ()
+
         | None ->
             subscription.close ();
             Logging.info ~section "Balance cleanup memory event stream closed";

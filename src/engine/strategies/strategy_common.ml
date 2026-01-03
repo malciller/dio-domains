@@ -9,12 +9,6 @@
     These are non-unique identifiers that group all orders from a strategy together *)
 let strategy_userref_grid = 1  (* Grid strategy *)
 let strategy_userref_mm = 2    (* Market maker strategy *)
-let strategy_userref_arb = 3   (* Arbitrage strategy *)
-
-(** Legacy aliases for backward compatibility *)
-let strategy_prefix_grid = strategy_userref_grid
-let strategy_prefix_mm = strategy_userref_mm
-let strategy_prefix_arb = strategy_userref_arb
 
 (** Check if a userref matches a specific strategy *)
 let is_strategy_order strategy_userref order_userref =
