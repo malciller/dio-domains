@@ -107,6 +107,12 @@ module InFlightOrders = struct
 
     Mutex.unlock mutex;
     (0, !removed) (* drift, trimmed *)
+
+  (** Return cleanup function for event registry integration *)
+  let get_cleanup_fn () =
+    fun () ->
+      let (drift, trimmed) = cleanup () in
+      Some (Some drift, Some trimmed)
 end
 
 (** In-flight amendment cache to prevent duplicate amendments *)
@@ -166,6 +172,12 @@ module InFlightAmendments = struct
 
     Mutex.unlock mutex;
     (0, !removed) (* drift, trimmed *)
+
+  (** Return cleanup function for event registry integration *)
+  let get_cleanup_fn () =
+    fun () ->
+      let (drift, trimmed) = cleanup () in
+      Some (Some drift, Some trimmed)
 end
 
 (** Lock-free ring buffer for strategy orders *)

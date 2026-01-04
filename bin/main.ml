@@ -202,6 +202,14 @@ let () =
   (* Start the coordinator initially *)
   Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
 
+  (* Register in-flight order caches for periodic cleanup *)
+  Dio_memory_tracing.Cleanup_coordinator.register_event_registry 
+    "in_flight_orders" 
+    (Dio_strategies.Strategy_common.InFlightOrders.get_cleanup_fn ());
+  Dio_memory_tracing.Cleanup_coordinator.register_event_registry 
+    "in_flight_amendments" 
+    (Dio_strategies.Strategy_common.InFlightAmendments.get_cleanup_fn ());
+
   (* Start watchdog thread for cleanup coordinator - runs for lifecycle of app *)
   let _cleanup_watchdog_thread = Thread.create (fun () ->
     let stall_threshold = 30.0 in
@@ -302,6 +310,11 @@ let () =
           
           Logging.info_f ~section:"memory" "Telemetry: %d metrics" telemetry_metrics;
           Logging.info_f ~section:"memory" "Domains: %d registered" domain_count;
+
+          let in_flight_orders_size = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
+          let in_flight_amendments_size = Dio_strategies.Strategy_common.InFlightAmendments.get_registry_size () in
+          Logging.info_f ~section:"memory" "In-flight: orders=%d amendments=%d"
+            in_flight_orders_size in_flight_amendments_size;
 
           Logging.info ~section:"memory" "=== END MEMORY STATISTICS ===";
         )
