@@ -8,7 +8,7 @@
     "minor_heap_size_kb": 2048,
     "major_heap_increment": 15,
     "target_heap_mb": 256,
-    "check_interval_seconds": 5,
+    "check_interval_seconds": 10,
     "high_heap_mb": 200,
     "medium_heap_mb": 128,
     "high_fragmentation_percent": 40.0,
