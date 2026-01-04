@@ -98,25 +98,8 @@ let create_connection_snapshots () : connection_snapshot list =
     snapshot
   ) conn_list
 
-(** Update telemetry metrics from snapshots (called from cache updater) *)
-let update_telemetry_from_snapshots snapshots =
-  List.iter (fun snapshot ->
-    (* Pre-create all metric objects once *)
-    let uptime_gauge = Telemetry.gauge "connection_uptime_seconds" ~labels:[("name", snapshot.name)] () in
-    let heartbeat_gauge = Telemetry.gauge "connection_heartbeat_active" ~labels:[("name", snapshot.name)] () in
-    let cb_state_gauge = Telemetry.gauge "circuit_breaker_state" ~labels:[("name", snapshot.name)] () in
-    let cb_failures_gauge = Telemetry.gauge "circuit_breaker_failures" ~labels:[("name", snapshot.name)] () in
-    let reconnect_gauge = Telemetry.gauge "connection_reconnect_attempts" ~labels:[("name", snapshot.name)] () in
-    let total_gauge = Telemetry.gauge "connection_total_count" ~labels:[("name", snapshot.name)] () in
-
-    (* Update all metrics *)
-    Telemetry.set_gauge uptime_gauge snapshot.uptime;
-    Telemetry.set_gauge heartbeat_gauge (if snapshot.heartbeat_active then 1.0 else 0.0);
-    Telemetry.set_gauge cb_state_gauge snapshot.circuit_breaker_state;
-    Telemetry.set_gauge cb_failures_gauge (float_of_int snapshot.circuit_breaker_failures);
-    Telemetry.set_gauge reconnect_gauge (float_of_int snapshot.reconnect_attempts);
-    Telemetry.set_gauge total_gauge (float_of_int snapshot.total_connections);
-  ) snapshots
+(** Update telemetry metrics from snapshots - no-op since telemetry is removed *)
+let update_telemetry_from_snapshots _snapshots = ()
 
 (** Start background updater - singleton pattern *)
 let start_cache_updater () =

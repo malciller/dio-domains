@@ -9,7 +9,7 @@
   lwt.unix
   dotenv
   logging
-  telemetry
+  
   uri
   threads
   websocket-lwt-unix

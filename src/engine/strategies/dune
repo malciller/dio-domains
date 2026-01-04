@@ -1,5 +1,5 @@
 (library
  (name dio_strategies)
  (public_name dio.strategies)
- (libraries yojson logging telemetry dio.kraken lwt unix)
+ (libraries yojson logging  dio.kraken lwt unix)
  (modules Strategy_common Suicide_grid Market_maker Fee_cache))

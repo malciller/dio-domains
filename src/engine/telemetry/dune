@@ -1,5 +1,0 @@
-(library
- (name telemetry)
- (public_name dio.telemetry)
- (libraries unix logging lwt lwt.unix mtime mtime.clock concurrency))
-

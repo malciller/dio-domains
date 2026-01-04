@@ -4,7 +4,7 @@
  (modules supervisor supervisor_cache supervisor_types)
  (libraries
   logging
-  telemetry
+  
   threads
   lwt.unix
   dio.engine

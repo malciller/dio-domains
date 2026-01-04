@@ -244,7 +244,6 @@ let push_order order =
                     order.symbol
                     order.qty
                     (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
-                  Telemetry.inc_counter (Telemetry.counter "strategy_orders_generated" ()) ();
 
                   (* Update strategy state *)
                   state.last_order_time <- Unix.time ();
@@ -255,7 +254,6 @@ let push_order order =
               | None ->
                   Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
                     operation_str (string_of_order_side order.side) order.symbol;
-                  Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
             end
         | None ->
             Logging.warn_f ~section "Cancel operation missing order_id for %s" order.symbol;
@@ -271,7 +269,6 @@ let push_order order =
 
        if is_duplicate then begin
          Logging.warn_f ~section "Duplicate %s detected (strategy): %s" operation_str order.symbol;
-         Telemetry.inc_counter (Telemetry.counter "strategy_duplicate_orders" ()) ()
        end else begin
          (* For Place and Amend operations, proceed normally *)
          Mutex.lock order_buffer_mutex;
@@ -286,7 +283,6 @@ let push_order order =
              order.symbol
              order.qty
              (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
-           Telemetry.inc_counter (Telemetry.counter "strategy_orders_generated" ()) ();
 
            (* Update strategy state *)
            let state = get_strategy_state order.symbol in
@@ -335,7 +331,6 @@ let push_order order =
 
            Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
              operation_str (string_of_order_side order.side) order.symbol;
-           Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
        end)
 
 (** Cancel any existing orders at the same price level (duplicate guard) *)

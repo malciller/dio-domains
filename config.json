@@ -11,8 +11,8 @@
     "check_interval_seconds": 10,
     "high_heap_mb": 200,
     "medium_heap_mb": 128,
-    "high_fragmentation_percent": 40.0,
-    "medium_fragmentation_percent": 25.0
+    "high_fragmentation_percent": 60.0,
+    "medium_fragmentation_percent": 40.0
   },
   "trading": [
     {

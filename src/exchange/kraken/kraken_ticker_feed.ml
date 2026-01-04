@@ -143,7 +143,6 @@ let parse_ticker json on_heartbeat =
           Hashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f last=%.2f"
             symbol ticker.bid ticker.ask ticker.last;
-          Telemetry.inc_counter (Telemetry.counter "ticker_updates" ()) ();
           (* Update connection heartbeat *)
           on_heartbeat ()
         with exn ->

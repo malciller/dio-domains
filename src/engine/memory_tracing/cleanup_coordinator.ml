@@ -31,13 +31,8 @@ let register_event_registry name cleanup_fn =
   event_registry_registry := (name, cleanup_fn) :: !event_registry_registry;
   Logging.debug_f ~section:"cleanup_coordinator" "Registered event registry for cleanup: %s" name
 
-(** Perform telemetry cleanup *)
-let cleanup_telemetry () =
-  let start_time = Unix.gettimeofday () in
-  let removed_count = Telemetry.prune_stale_metrics () in
-  let end_time = Unix.gettimeofday () in
-  Logging.info_f ~section:"cleanup_coordinator" "Telemetry cleanup completed in %.3fs, removed %d metrics" (end_time -. start_time) removed_count;
-  removed_count
+(** Telemetry cleanup - no-op since telemetry is removed *)
+let cleanup_telemetry () = 0
 
 (** Perform event bus cleanup *)
 let cleanup_event_buses () =

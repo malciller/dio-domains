@@ -160,7 +160,6 @@ let parse_ws_response json : Kraken_common_types.ws_response =
   end
 
 let resolve_response req_id (response : Kraken_common_types.ws_response) =
-  let start_time = Telemetry.start_timer () in
   Logging.debug_f ~section "resolve_response called for req_id=%d (method=%s, success=%b)"
     req_id response.method_ response.success;
   (* Minimize mutex hold time - only hold during critical section *)
@@ -192,9 +191,8 @@ let resolve_response req_id (response : Kraken_common_types.ws_response) =
         (try
           Logging.debug_f ~section "Waking up waiter for req_id=%d" req_id;
           Lwt.wakeup_later wakener response;
-          let duration = Telemetry.record_duration Telemetry.Common.api_duration start_time in
-          Logging.debug_f ~section "Successfully matched response for req_id=%d in %.3fms (method=%s, success=%b)"
-            req_id (duration *. 1000.0) response.method_ response.success
+          Logging.debug_f ~section "Successfully matched response for req_id=%d (method=%s, success=%b)"
+            req_id response.method_ response.success
         with Invalid_argument _ ->
           (* Promise was already resolved (likely by timeout) - this is expected *)
           Logging.debug_f ~section "Promise for req_id=%d was already resolved (likely timeout), response discarded" req_id);
@@ -279,7 +277,6 @@ let reset_state conn ~notify_failure reason =
 let handle_frame frame ~expected_generation =
   notify_heartbeat ();
   (* Track frame processing *)
-  Telemetry.inc_counter (Telemetry.counter "websocket_frames_received" ()) ();
 
   (* Parse frame first to extract req_id, then check generation and response table atomically *)
   (try
@@ -326,7 +323,6 @@ let handle_frame frame ~expected_generation =
                (Printf.sprintf "Unhandled trading message: %s" (Yojson.Safe.to_string json));
              Lwt.return_unit)
    with exn ->
-     Telemetry.inc_counter (Telemetry.counter "websocket_frame_errors" ()) ();
      Logging.error ~section
        (Printf.sprintf "Failed to handle trading frame synchronously: %s" (Printexc.to_string exn));
      Lwt.return_unit) >>= fun () ->
@@ -603,12 +599,10 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
         ] >>= function
         | `Response response ->
             (* Track successful response *)
-            Telemetry.inc_counter Telemetry.Common.api_requests ();
             Logging.debug_f ~section "Request req_id=%d: response received successfully" req_id;
             Lwt.return response
         | `Timeout ->
             (* Track timeout for monitoring *)
-            Telemetry.inc_counter (Telemetry.counter "websocket_timeouts" ()) ();
 
             (* Check if request is still in table before removing *)
             Lwt_mutex.with_lock state.mutex (fun () ->
@@ -640,7 +634,6 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
                     (* Response arrived after timeout but before we gave up - success! *)
                     Logging.info_f ~section "Request req_id=%d: response arrived just after timeout (within 10ms grace period)" req_id;
                     (* Track successful response *)
-                    Telemetry.inc_counter Telemetry.Common.api_requests ();
                     Logging.debug_f ~section "Request req_id=%d: response received successfully (timeout race resolved)" req_id;
                     Lwt.return response
                 | `Still_timeout ->
@@ -667,7 +660,6 @@ let send_ping ~req_id ~timeout_ms : Kraken_common_types.ws_response Lwt.t =
   send_message ~message_str ~req_id ~expected_method:"ping" ~timeout_ms
 
 let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_types.ws_response Lwt.t =
-  let start_time = Telemetry.start_timer () in
   let message = `Assoc [
       ("method", `String method_);
       ("params", params);
@@ -676,8 +668,6 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
   let message_str = json_to_string_precise symbol message in
   Logging.debug ~section (Printf.sprintf "Sending WebSocket message: %s" message_str);
   send_message ~message_str ~req_id ~expected_method:method_ ~timeout_ms >>= fun response ->
-  let _ = Telemetry.record_duration Telemetry.Common.api_duration start_time in
-  Telemetry.inc_counter Telemetry.Common.api_requests ();
   Lwt.return response
 
 (** Clean up stale response table entries (older than 30 seconds) - event-driven *)
