@@ -701,7 +701,6 @@ let process_orderbook_message ~reset json on_heartbeat =
             symbol
             (Array.length orderbook.bids)
             (Array.length orderbook.asks);
-          Telemetry.inc_counter (Telemetry.counter "orderbook_updates" ()) ();
 
           (* Update last sequence on successful write *)
           let current_sequence =

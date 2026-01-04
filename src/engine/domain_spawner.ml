@@ -49,14 +49,6 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
       None
   in
   
-  (* Create telemetry metrics for this asset *)
-  Logging.info_f ~section "Initializing metrics for %s/%s" asset_with_fees.exchange asset_with_fees.symbol;
-  let asset_label = asset_with_fees.exchange ^ "/" ^ asset_with_fees.symbol in
-  let cycles_counter = Telemetry.asset_counter "domain_cycles" asset_label ~track_rate:true ~rate_window:30.0 () in
-  let cycle_duration_hist = Telemetry.asset_histogram "domain_cycle_duration_seconds" asset_label () in
-  let open_buy_orders_gauge = Telemetry.asset_gauge "open_buy_orders" asset_label () in
-  let open_sell_orders_gauge = Telemetry.asset_gauge "open_sell_orders" asset_label () in
-  let execution_events_consumed_counter = Telemetry.asset_counter "execution_events_consumed" asset_label () in
 
   let format_distance_info asset_symbol current_price strategy_type =
     match strategy_type with
@@ -209,13 +201,9 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
       Logging.info_f ~section "Entering domain loop for %s. is_running=%B" key (Atomic.get state.is_running);
 
       let cycle_count = ref 0 in
-      let telemetry_batch = ref 0 in
-      let cycle_sample_counter = ref 0 in
       while Atomic.get state.is_running do
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
-        let cycle_start = Telemetry.start_timer_v2 () in
         incr cycle_count;
-        incr telemetry_batch;
         
         (* Minimal logging in hot loop *)
         if !cycle_count mod 1000000 = 0 then
@@ -271,7 +259,6 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
           let new_events = Ex.read_execution_events ~symbol:asset_with_fees.symbol ~start_pos:!exec_read_pos in
           let event_count = List.length new_events in
           if event_count > 0 then begin
-            Telemetry.inc_counter execution_events_consumed_counter ~value:event_count ();
             
             List.iter (fun (event : Types.execution_event) ->
               match event.order_status with
@@ -464,24 +451,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
              asset_with_fees.exchange asset_with_fees.symbol (t *. 100.)
          | None, None -> ());
 
-        (* Record individual cycle duration *)
-        cycle_sample_counter := (!cycle_sample_counter + 1) mod 100;
-        if !cycle_sample_counter = 0 then
-          Telemetry.record_duration_v2 cycle_duration_hist cycle_start |> ignore;
 
-        (* Batch telemetry updates *)
-        if !telemetry_batch >= 1000 then begin
-          let (open_buy_count, open_sell_count) = 
-             (* Recalculate from all_open_orders derived from generic get_open_orders *)
-             let buys = List.fold_left (fun acc (_, _, _, side, _) -> if side = "buy" then acc + 1 else acc) 0 all_open_orders in
-             let sells = List.fold_left (fun acc (_, _, _, side, _) -> if side = "sell" then acc + 1 else acc) 0 all_open_orders in
-             (buys, sells)
-          in
-          Telemetry.inc_counter cycles_counter ~value:1000 ();
-          Telemetry.set_gauge open_buy_orders_gauge (float_of_int open_buy_count);
-          Telemetry.set_gauge open_sell_orders_gauge (float_of_int open_sell_count);
-          telemetry_batch := 0
-        end;
 
         (* Yield to allow other threads (websockets) to run *)
         Domain.cpu_relax ();

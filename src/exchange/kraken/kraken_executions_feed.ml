@@ -161,7 +161,6 @@ module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 (** Write execution event to buffer with telemetry *)
 let write_execution_event buffer event =
   RingBuffer.write buffer event;
-  Telemetry.inc_counter (Telemetry.counter "execution_events_produced" ()) ()
 
 (** Per-symbol execution store *)
 type symbol_store = {
@@ -313,7 +312,6 @@ let cleanup_stale_orders () =
       Mutex.unlock global_orders_mutex;
     ) !stale_orders;
     
-    Telemetry.inc_counter (Telemetry.counter "execution_orders_cleaned_safety" ()) ~value:removed_count ();
   end
 
 let trigger_stale_order_cleanup ~reason () =
@@ -691,7 +689,6 @@ let handle_snapshot json on_heartbeat =
           update_open_orders store event;
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
-          Telemetry.inc_counter (Telemetry.counter "execution_snapshot_items" ()) ();
           
           (* Track this order ID as active *)
           Hashtbl.replace snapshot_order_ids event.order_id ();
@@ -739,7 +736,6 @@ let handle_snapshot json on_heartbeat =
         Mutex.unlock global_orders_mutex;
       ) !stale_orders;
       
-      Telemetry.inc_counter (Telemetry.counter "execution_orders_reconciled" ()) ~value:removed_count ();
     end;
     
     Logging.debug_f ~section "Execution snapshot processed and reconciled"
@@ -765,7 +761,6 @@ let handle_update json on_heartbeat =
           (* Publish order update event to event bus *)
           OrderUpdateEventBus.publish order_update_event_bus event;
 
-          Telemetry.inc_counter (Telemetry.counter "execution_updates" ()) ();
           (* Update connection heartbeat *)
           on_heartbeat ()
       | None -> ()
@@ -806,7 +801,6 @@ let handle_message message on_heartbeat =
         | Some true -> 
             Logging.info ~section "Subscribed to executions feed";
             Logging.debug_f ~section "Subscription response: %s" message;
-            Telemetry.inc_counter (Telemetry.counter "executions_subscribed" ()) ()
         | Some false -> 
             let error = member "error" json |> to_string_option in
             Logging.error_f ~section "Subscription failed: %s" 

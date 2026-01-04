@@ -305,10 +305,8 @@ let () =
           Logging.info_f ~section:"memory" "Stores: ticker=%d orderbook=%d executions=%d balances=%d"
             ticker_stores orderbook_stores executions_stores balances_stores;
 
-          let telemetry_metrics = Hashtbl.length Telemetry.metrics in
+
           let domain_count = Hashtbl.length Dio_engine.Domain_spawner.domain_registry in
-          
-          Logging.info_f ~section:"memory" "Telemetry: %d metrics" telemetry_metrics;
           Logging.info_f ~section:"memory" "Domains: %d registered" domain_count;
 
           let in_flight_orders_size = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
