@@ -21,7 +21,7 @@ let test_initialization () =
 
 let test_order_creation_place () =
   (* Test creating place orders *)
-  let order = Dio_strategies.Market_maker.create_place_order "BTC/USD" Dio_strategies.Strategy_common.Buy 0.001 (Some 50000.0) true "MM" in
+  let order = Dio_strategies.Market_maker.create_place_order "BTC/USD" Dio_strategies.Strategy_common.Buy 0.001 (Some 50000.0) true "MM" "kraken" in
 
   check bool "place order operation" true (order.operation = Dio_strategies.Strategy_common.Place);
   check string "place order symbol" "BTC/USD" order.symbol;
@@ -33,7 +33,7 @@ let test_order_creation_place () =
 
 let test_order_creation_amend () =
   (* Test creating amend orders *)
-  let order = Dio_strategies.Market_maker.create_amend_order "order123" "BTC/USD" Dio_strategies.Strategy_common.Sell 0.001 (Some 51000.0) true "MM" in
+  let order = Dio_strategies.Market_maker.create_amend_order "order123" "BTC/USD" Dio_strategies.Strategy_common.Sell 0.001 (Some 51000.0) true "MM" "kraken" in
 
   check bool "amend order operation" true (order.operation = Dio_strategies.Strategy_common.Amend);
   check (option string) "amend order id" (Some "order123") order.order_id;
@@ -46,7 +46,7 @@ let test_order_creation_amend () =
 
 let test_order_creation_cancel () =
   (* Test creating cancel orders *)
-  let order = Dio_strategies.Market_maker.create_cancel_order "order456" "BTC/USD" "MM" in
+  let order = Dio_strategies.Market_maker.create_cancel_order "order456" "BTC/USD" "MM" "kraken" in
 
   check bool "cancel order operation" true (order.operation = Dio_strategies.Strategy_common.Cancel);
   check (option string) "cancel order id" (Some "order456") order.order_id;
@@ -72,7 +72,7 @@ let test_fee_calculation () =
 let test_price_rounding () =
   (* Test price rounding - this is tricky to test without mocking Kraken instruments feed *)
   (* For now, just test that the function doesn't crash and returns a reasonable value *)
-  let rounded = Dio_strategies.Market_maker.round_price 50000.12345678 "BTC/USD" in
+  let rounded = Dio_strategies.Market_maker.round_price 50000.12345678 "BTC/USD" "kraken" in
   (* Should return a float, even if no precision info is available *)
   check bool "price rounding non-negative" true (rounded >= 0.0)
 
@@ -132,7 +132,7 @@ let test_order_cancellation () =
 let test_minimum_quantity_check () =
   (* Test minimum quantity checking - this relies on Kraken instruments feed *)
   (* For now, just test that it doesn't crash *)
-  let result = Dio_strategies.Market_maker.meets_min_qty "BTC/USD" 0.001 in
+  let result = Dio_strategies.Market_maker.meets_min_qty "BTC/USD" 0.001 "kraken" in
   (* Result depends on feed data, but should be boolean *)
   check bool "min qty returns bool" true (result = true || result = false)
 
@@ -174,7 +174,7 @@ let test_duplicate_cancellation () =
   state.cancelled_orders <- [("order1", Unix.time ())];  (* Mark order1 as cancelled *)
 
   (* Count duplicates cancelled *)
-  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders "MM" in
+  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders "MM" "kraken" in
 
   (* Should cancel 1 duplicate (order2), order1 is already cancelled *)
   check int "duplicate cancellation count" 1 cancelled_count

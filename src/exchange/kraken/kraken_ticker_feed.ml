@@ -27,50 +27,8 @@ type ticker = {
   timestamp: float;
 }
 
-(** Lock-free ring buffer for ticker data using atomics *)
-module RingBuffer = struct
-  type 'a t = {
-    data: 'a option Atomic.t array;
-    write_pos: int Atomic.t;
-    size: int;
-  }
-
-  let create size =
-    {
-      data = Array.init size (fun _ -> Atomic.make None);
-      write_pos = Atomic.make 0;
-      size;
-    }
-
-  (* Lock-free write - single writer *)
-  let write buffer value =
-    let pos = Atomic.get buffer.write_pos in
-    Atomic.set buffer.data.(pos) (Some value);
-    let new_pos = (pos + 1) mod buffer.size in
-    Atomic.set buffer.write_pos new_pos
-
-  (* Wait-free read - multiple readers *)
-  let read_latest buffer =
-    let pos = Atomic.get buffer.write_pos in
-    let read_pos = if pos = 0 then buffer.size - 1 else pos - 1 in
-    Atomic.get buffer.data.(read_pos)
-
-  (** Read events from last known position - for domain consumers *)
-  let read_since buffer last_pos =
-    let current_pos = Atomic.get buffer.write_pos in
-    if last_pos = current_pos then
-      []
-    else
-      let rec collect acc pos =
-        if pos = current_pos then
-          List.rev acc
-        else
-          match Atomic.get buffer.data.(pos) with
-          | Some event -> collect (event :: acc) ((pos + 1) mod buffer.size)
-          | None -> collect acc ((pos + 1) mod buffer.size)
-      in
-      collect [] last_pos
-end
+(** Lock-free ring buffer for ticker data - shared implementation *)
+module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
 (** Per-symbol ticker storage with readiness signalling *)
 type store = {
@@ -125,7 +83,7 @@ let[@inline always] read_ticker_events symbol last_pos =
 (** Get current write position for tracking consumption *)
 let[@inline always] get_current_position symbol =
   match store_opt symbol with
-  | Some store -> Atomic.get store.buffer.write_pos
+  | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 
 (** Check if we have price data for a symbol *)
@@ -185,7 +143,6 @@ let parse_ticker json on_heartbeat =
           Hashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f last=%.2f"
             symbol ticker.bid ticker.ask ticker.last;
-          Telemetry.inc_counter (Telemetry.counter "ticker_updates" ()) ();
           (* Update connection heartbeat *)
           on_heartbeat ()
         with exn ->

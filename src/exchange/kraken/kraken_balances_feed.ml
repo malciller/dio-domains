@@ -256,7 +256,6 @@ let cleanup_dynamic_assets () =
     Mutex.unlock balance_update_mutex;
     
     (* Explicitly remove associated telemetry metrics to free memory immediately *)
-    Telemetry.remove_metric "balance_stale_assets" ~labels:[("asset", asset)] ();
   ) dynamic_to_remove;
 
   Mutex.unlock configured_assets_mutex;
@@ -295,11 +294,9 @@ let start_cleanup_handlers () =
         | Some (Memory_events.MemoryPressure _) ->
             trigger_dynamic_asset_cleanup ~reason:"memory_pressure" ();
             loop ()
-        | Some Memory_events.CleanupRequested ->
-            trigger_dynamic_asset_cleanup ~reason:"cleanup_requested" ();
+        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
             loop ()
-        | Some Memory_events.MemoryGrowth _ ->
-            loop ()
+
         | None ->
             subscription.close ();
             Logging.info ~section "Balance cleanup memory event stream closed";
@@ -343,7 +340,6 @@ let parse_snapshot json on_heartbeat =
         let total_balance = BalanceStore.get_balance store in
         Logging.debug_f ~section "Balance snapshot total: %s = %.8f"
           asset total_balance;
-        Telemetry.inc_counter (Telemetry.counter "balance_updates" ()) ();
         (* Update connection heartbeat *)
         on_heartbeat ()
       with exn ->
@@ -393,7 +389,6 @@ let parse_update json on_heartbeat =
 
         Logging.info_f ~section "Balance update: %s %+.8f (new: %.8f) [%s]"
           asset amount balance tx_type;
-        Telemetry.inc_counter (Telemetry.counter "balance_updates" ()) ();
         (* Update connection heartbeat *)
         on_heartbeat ()
       with exn ->
@@ -548,7 +543,6 @@ let check_stale_balances assets =
     if is_balance_stale asset 300.0 then begin (* 5 minutes threshold *)
       Logging.warn_f ~section "Balance data for %s is stale (>5 minutes old)" asset;
       incr stale_count;
-      Telemetry.inc_counter (Telemetry.counter "balance_stale_assets" ~labels:[("asset", asset)] ()) ()
     end else
       Logging.debug_f ~section "Balance data for %s is fresh" asset
   ) assets;

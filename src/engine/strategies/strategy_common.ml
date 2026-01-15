@@ -9,12 +9,6 @@
     These are non-unique identifiers that group all orders from a strategy together *)
 let strategy_userref_grid = 1  (* Grid strategy *)
 let strategy_userref_mm = 2    (* Market maker strategy *)
-let strategy_userref_arb = 3   (* Arbitrage strategy *)
-
-(** Legacy aliases for backward compatibility *)
-let strategy_prefix_grid = strategy_userref_grid
-let strategy_prefix_mm = strategy_userref_mm
-let strategy_prefix_arb = strategy_userref_arb
 
 (** Check if a userref matches a specific strategy *)
 let is_strategy_order strategy_userref order_userref =
@@ -51,6 +45,7 @@ type strategy_order = {
   post_only: bool;
   userref: int option;  (* Strategy identifier: 1=GRID, 2=MM, 3=ARB *)
   strategy: string;     (* Strategy name for order processing *)
+  exchange: string;     (* Exchange to execute order on *)
   duplicate_key: string; (* Unique key for duplicate detection *)
 }
 
@@ -112,6 +107,12 @@ module InFlightOrders = struct
 
     Mutex.unlock mutex;
     (0, !removed) (* drift, trimmed *)
+
+  (** Return cleanup function for event registry integration *)
+  let get_cleanup_fn () =
+    fun () ->
+      let (drift, trimmed) = cleanup () in
+      Some (Some drift, Some trimmed)
 end
 
 (** In-flight amendment cache to prevent duplicate amendments *)
@@ -171,6 +172,12 @@ module InFlightAmendments = struct
 
     Mutex.unlock mutex;
     (0, !removed) (* drift, trimmed *)
+
+  (** Return cleanup function for event registry integration *)
+  let get_cleanup_fn () =
+    fun () ->
+      let (drift, trimmed) = cleanup () in
+      Some (Some drift, Some trimmed)
 end
 
 (** Lock-free ring buffer for strategy orders *)

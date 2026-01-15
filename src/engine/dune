@@ -1,5 +1,15 @@
 (library
  (name dio_engine)
  (public_name dio.engine)
-(libraries yojson logging telemetry dio.kraken dio.strategies dio.cmc threads dio.concurrency dio.memory_tracing)
+ (libraries
+  yojson
+  logging
+  
+  dio.kraken
+  dio.strategies
+  dio.cmc
+  threads
+  dio.concurrency
+  dio.memory_tracing
+  dio.exchange)
  (modules Config Domain_spawner Order_executor))

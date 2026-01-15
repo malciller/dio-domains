@@ -155,63 +155,12 @@ type open_order = {
   last_updated: float;
 }
 
-(** Lock-free ring buffer for execution events using atomics *)
-module RingBuffer = struct
-  type 'a t = {
-    data: 'a option Atomic.t array;
-    write_pos: int Atomic.t;
-    size: int;
-  }
+(** Lock-free ring buffer for execution events - shared implementation *)
+module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-  let create size =
-    {
-      data = Array.init size (fun _ -> Atomic.make None);
-      write_pos = Atomic.make 0;
-      size;
-    }
-
-  (** Lock-free write - producer side *)
-  let write buffer value =
-    let pos = Atomic.get buffer.write_pos in
-    Atomic.set buffer.data.(pos) (Some value);
-    let new_pos = (pos + 1) mod buffer.size in
-    Atomic.set buffer.write_pos new_pos;
-    Telemetry.inc_counter (Telemetry.counter "execution_events_produced" ()) ()
-
-  (** Wait-free read - consumer side *)
-  let read_latest buffer =
-    let pos = Atomic.get buffer.write_pos in
-    let read_pos = if pos = 0 then buffer.size - 1 else pos - 1 in
-    Atomic.get buffer.data.(read_pos)
-
-  (** Read events from last known position - for domain consumers *)
-  let read_since buffer last_pos =
-    let current_pos = Atomic.get buffer.write_pos in
-    if last_pos = current_pos then
-      []
-    else
-      let rec collect acc pos =
-        if pos = current_pos then
-          List.rev acc
-        else
-          match Atomic.get buffer.data.(pos) with
-          | Some event -> collect (event :: acc) ((pos + 1) mod buffer.size)
-          | None -> collect acc ((pos + 1) mod buffer.size)
-      in
-      collect [] last_pos
-
-  (** Read all events currently in the buffer *)
-  let read_all buffer =
-    let rec collect_all acc i =
-      if i >= buffer.size then
-        List.rev acc
-      else
-        match Atomic.get buffer.data.(i) with
-        | Some event -> collect_all (event :: acc) (i + 1)
-        | None -> collect_all acc (i + 1)
-    in
-    collect_all [] 0
-end
+(** Write execution event to buffer with telemetry *)
+let write_execution_event buffer event =
+  RingBuffer.write buffer event;
 
 (** Per-symbol execution store *)
 type symbol_store = {
@@ -363,7 +312,6 @@ let cleanup_stale_orders () =
       Mutex.unlock global_orders_mutex;
     ) !stale_orders;
     
-    Telemetry.inc_counter (Telemetry.counter "execution_orders_cleaned_safety" ()) ~value:removed_count ();
   end
 
 let trigger_stale_order_cleanup ~reason () =
@@ -382,11 +330,9 @@ let start_cleanup_handlers () =
         | Some (Memory_events.MemoryPressure _) ->
             trigger_stale_order_cleanup ~reason:"memory_pressure" ();
             loop ()
-        | Some Memory_events.CleanupRequested ->
-            trigger_stale_order_cleanup ~reason:"cleanup_requested" ();
+        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
             loop ()
-        | Some Memory_events.MemoryGrowth _ ->
-            loop ()
+
         | None ->
             subscription.close ();
             Logging.info ~section "Execution cleanup memory event stream closed";
@@ -426,7 +372,7 @@ let[@inline always] read_execution_events symbol last_pos =
 (** Get current write position for tracking consumption *)
 let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
-  Atomic.get store.events_buffer.write_pos
+  RingBuffer.get_position store.events_buffer
 
 (** Update open orders based on execution event *)
 let update_open_orders store (event : execution_event) =
@@ -739,11 +685,10 @@ let handle_snapshot json on_heartbeat =
       match parse_execution_event item with
       | Some event ->
           let store = get_symbol_store event.symbol in
-          RingBuffer.write store.events_buffer event;
+          write_execution_event store.events_buffer event;
           update_open_orders store event;
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
-          Telemetry.inc_counter (Telemetry.counter "execution_snapshot_items" ()) ();
           
           (* Track this order ID as active *)
           Hashtbl.replace snapshot_order_ids event.order_id ();
@@ -791,7 +736,6 @@ let handle_snapshot json on_heartbeat =
         Mutex.unlock global_orders_mutex;
       ) !stale_orders;
       
-      Telemetry.inc_counter (Telemetry.counter "execution_orders_reconciled" ()) ~value:removed_count ();
     end;
     
     Logging.debug_f ~section "Execution snapshot processed and reconciled"
@@ -809,7 +753,7 @@ let handle_update json on_heartbeat =
       match parse_execution_event item with
       | Some event ->
           let store = get_symbol_store event.symbol in
-          RingBuffer.write store.events_buffer event;
+          write_execution_event store.events_buffer event;
           update_open_orders store event;
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
@@ -817,7 +761,6 @@ let handle_update json on_heartbeat =
           (* Publish order update event to event bus *)
           OrderUpdateEventBus.publish order_update_event_bus event;
 
-          Telemetry.inc_counter (Telemetry.counter "execution_updates" ()) ();
           (* Update connection heartbeat *)
           on_heartbeat ()
       | None -> ()
@@ -858,7 +801,6 @@ let handle_message message on_heartbeat =
         | Some true -> 
             Logging.info ~section "Subscribed to executions feed";
             Logging.debug_f ~section "Subscription response: %s" message;
-            Telemetry.inc_counter (Telemetry.counter "executions_subscribed" ()) ()
         | Some false -> 
             let error = member "error" json |> to_string_option in
             Logging.error_f ~section "Subscription failed: %s" 

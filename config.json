@@ -1,51 +1,89 @@
 {
   "logging_level": "info",
   "logging_sections": "",
+  "gc": {
+    "space_overhead": 20,
+    "max_overhead": 80,
+    "allocation_policy": 2,
+    "minor_heap_size_kb": 2048,
+    "major_heap_increment": 15,
+    "target_heap_mb": 50,
+    "check_interval_seconds": 10,
+    "high_heap_mb": 45,
+    "medium_heap_mb": 35,
+    "high_fragmentation_percent": 60.0,
+    "medium_fragmentation_percent": 40.0
+  },
   "trading": [
     {
       "symbol": "BTC/USD",
+      "exchange": "kraken",
       "qty": "0.001",
-      "grid_interval": [0.75, 1.25],
+      "grid_interval": [
+        0.75,
+        1.5
+      ],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "PAXG/USD",
+      "exchange": "kraken",
       "qty": "0.0029",
-      "grid_interval": [1.0, 1.0],
+      "grid_interval": [
+        1.0,
+        1.0
+      ],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "ETH/USD",
+      "exchange": "kraken",
       "qty": "0.005",
-      "grid_interval": [2.5, 5.0],
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "SOL/USD",
+      "exchange": "kraken",
       "qty": "0.09",
-      "grid_interval": [2.5, 5.0],
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "ADA/USD",
+      "exchange": "kraken",
       "qty": "30.0",
-      "grid_interval": [2.5, 5.0],
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "TRX/USD",
+      "exchange": "kraken",
       "qty": "40.0",
-      "grid_interval": [2.5, 5.0],
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
       "sell_mult": "0.999",
       "strategy": "Grid"
     },
     {
       "symbol": "USDG/USD",
+      "exchange": "kraken",
       "qty": "100.0",
       "min_usd_balance": "1000.0",
       "strategy": "MM"
