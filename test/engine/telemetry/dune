@@ -1,3 +1,0 @@
-(test
- (name test_telemetry)
- (libraries dio.telemetry dio.memory_tracing alcotest lwt.unix))

@@ -3,6 +3,26 @@
 (** Enable backtraces for better error reporting *)
 let () = Printexc.record_backtrace true
 
+(** Configure GC settings from config.json *)
+let gc_config =
+  let config = Dio_engine.Config.read_config () in
+  config.gc
+
+let () =
+  let open Dio_engine.Config in
+  let gc_control = Gc.get () in
+  Gc.set {
+    gc_control with
+    space_overhead = gc_config.space_overhead;
+    max_overhead = gc_config.max_overhead;
+    minor_heap_size = gc_config.minor_heap_size_kb * 1024 / (Sys.word_size / 8);
+    major_heap_increment = gc_config.major_heap_increment;
+    allocation_policy = gc_config.allocation_policy;
+  };
+  Gc.compact ();
+  Logging.info_f ~section:"main" "GC configured: space_overhead=%d%%, max_overhead=%d%%, target_heap=%dMB"
+    gc_config.space_overhead gc_config.max_overhead gc_config.target_heap_mb
+
 module Fear_and_greed = Cmc.Fear_and_greed
 
 (** Set up atexit handler for final logging *)
@@ -38,6 +58,7 @@ let setup_signal_handlers () =
       (* Signal shutdown to all components *)
       Dio_engine.Order_executor.signal_shutdown ();
       Kraken.Kraken_trading_client.signal_shutdown ();
+      Dio_memory_tracing.Cleanup_coordinator.signal_shutdown ();
 
       (* Stop all supervised domains *)
       Dio_engine.Domain_spawner.stop_all_domains ();
@@ -57,6 +78,10 @@ let setup_signal_handlers () =
   in
   Sys.set_signal Sys.sigint (Sys.Signal_handle handle_graceful_shutdown);
   Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_graceful_shutdown)
+
+(* Forcing initialization of Kraken module to register exchange logic *)
+let () = ignore (Kraken.Kraken_module.Kraken_impl.name)
+
 
 (** Fatal signal handler for crashes *)
 let setup_fatal_signal_handlers () =
@@ -163,10 +188,82 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
-  (* Start memory cleanup coordinator *)
+  (* Start memory cleanup coordinator directly *)
   Logging.info ~section:"main" "Starting memory cleanup coordinator...";
-  Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ();
-  Logging.info ~section:"main" "Memory cleanup coordinator started";
+  let monitor_config : Dio_memory_tracing.Cleanup_coordinator.monitor_config = {
+    check_interval_seconds = gc_config.check_interval_seconds;
+    target_heap_mb = gc_config.target_heap_mb;
+    high_heap_mb = gc_config.high_heap_mb;
+    medium_heap_mb = gc_config.medium_heap_mb;
+    high_fragmentation_percent = gc_config.high_fragmentation_percent;
+    medium_fragmentation_percent = gc_config.medium_fragmentation_percent;
+  } in
+
+  (* Start the coordinator initially *)
+  Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
+
+  (* Register in-flight order caches for periodic cleanup *)
+  Dio_memory_tracing.Cleanup_coordinator.register_event_registry 
+    "in_flight_orders" 
+    (Dio_strategies.Strategy_common.InFlightOrders.get_cleanup_fn ());
+  Dio_memory_tracing.Cleanup_coordinator.register_event_registry 
+    "in_flight_amendments" 
+    (Dio_strategies.Strategy_common.InFlightAmendments.get_cleanup_fn ());
+
+  (* Start watchdog thread for cleanup coordinator - runs for lifecycle of app *)
+  let _cleanup_watchdog_thread = Thread.create (fun () ->
+    let stall_threshold = 30.0 in
+    let check_interval = 10.0 in
+    let restart_count = ref 0 in
+    Logging.info ~section:"main" "Cleanup coordinator watchdog thread started";
+    
+    try
+      while not (Atomic.get shutdown_requested) do
+        (* Sleep loop with shutdown check *)
+        let rec sleep_loop remaining =
+          if remaining <= 0.0 || Atomic.get shutdown_requested then ()
+          else begin
+            let sleep_time = min remaining 0.5 in
+            Thread.delay sleep_time;
+            sleep_loop (remaining -. sleep_time)
+          end
+        in
+        sleep_loop check_interval;
+
+        if not (Atomic.get shutdown_requested) then begin
+          let last_heartbeat = Dio_memory_tracing.Cleanup_coordinator.get_last_heartbeat () in
+          let now = Unix.gettimeofday () in
+          let stall_time = now -. last_heartbeat in
+          
+          (* Log heartbeat check at INFO level for visibility *)
+          Logging.info_f ~section:"main" "Cleanup watchdog check: stall=%.1fs threshold=%.1fs" 
+            stall_time stall_threshold;
+          
+          if stall_time > stall_threshold then begin
+            incr restart_count;
+            Logging.warn_f ~section:"main" 
+              "Cleanup coordinator stalled (no heartbeat for %.1fs), restarting (restart #%d)..." 
+              stall_time !restart_count;
+              
+            (* Stop current instance *)
+            Dio_memory_tracing.Cleanup_coordinator.stop_cleanup_coordinator ();
+            
+            (* Small delay to allow cleanup *)
+            Thread.delay 0.5;
+            
+            (* Use Lwt_preemptive.run_in_main to properly schedule Lwt operations from this thread *)
+            Lwt_preemptive.run_in_main (fun () ->
+              Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
+              Lwt.return_unit
+            );
+            Logging.info ~section:"main" "Cleanup coordinator restarted successfully"
+          end
+        end
+      done;
+      Logging.info ~section:"main" "Cleanup coordinator watchdog thread exiting (shutdown requested)"
+    with exn ->
+      Logging.error_f ~section:"main" "Cleanup coordinator watchdog thread exception: %s" (Printexc.to_string exn)
+  ) () in
 
   (* Basic GC statistics reporting *)
   let start_time = Unix.gettimeofday () in
@@ -208,11 +305,14 @@ let () =
           Logging.info_f ~section:"memory" "Stores: ticker=%d orderbook=%d executions=%d balances=%d"
             ticker_stores orderbook_stores executions_stores balances_stores;
 
-          let telemetry_metrics = Hashtbl.length Telemetry.metrics in
+
           let domain_count = Hashtbl.length Dio_engine.Domain_spawner.domain_registry in
-          
-          Logging.info_f ~section:"memory" "Telemetry: %d metrics" telemetry_metrics;
           Logging.info_f ~section:"memory" "Domains: %d registered" domain_count;
+
+          let in_flight_orders_size = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
+          let in_flight_amendments_size = Dio_strategies.Strategy_common.InFlightAmendments.get_registry_size () in
+          Logging.info_f ~section:"memory" "In-flight: orders=%d amendments=%d"
+            in_flight_orders_size in_flight_amendments_size;
 
           Logging.info ~section:"memory" "=== END MEMORY STATISTICS ===";
         )

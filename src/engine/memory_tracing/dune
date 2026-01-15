@@ -1,5 +1,5 @@
 (library
  (name dio_memory_tracing)
  (public_name dio.memory_tracing)
- (libraries lwt threads dio.concurrency logging telemetry)
+ (libraries lwt threads dio.concurrency logging )
  (modules Memory_events Cleanup_coordinator))

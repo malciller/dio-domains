@@ -264,48 +264,8 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
 
   result
 
-(** Lock-free ring buffer for orderbook data using atomics *)
-module RingBuffer = struct
-  type 'a t = {
-    data: 'a option Atomic.t array;
-    write_pos: int Atomic.t;
-    size: int;
-  }
-
-  let create size =
-    {
-      data = Array.init size (fun _ -> Atomic.make None);
-      write_pos = Atomic.make 0;
-      size;
-    }
-
-  let write buffer value =
-    let pos = Atomic.get buffer.write_pos in
-    Atomic.set buffer.data.(pos) (Some value);
-    let new_pos = (pos + 1) mod buffer.size in
-    Atomic.set buffer.write_pos new_pos
-
-  let read_latest buffer =
-    let pos = Atomic.get buffer.write_pos in
-    let read_pos = if pos = 0 then buffer.size - 1 else pos - 1 in
-    Atomic.get buffer.data.(read_pos)
-
-  (** Read events from last known position - for domain consumers *)
-  let read_since buffer last_pos =
-    let current_pos = Atomic.get buffer.write_pos in
-    if last_pos = current_pos then
-      []
-    else
-      let rec collect acc pos =
-        if pos = current_pos then
-          List.rev acc
-        else
-          match Atomic.get buffer.data.(pos) with
-          | Some event -> collect (event :: acc) ((pos + 1) mod buffer.size)
-          | None -> collect acc ((pos + 1) mod buffer.size)
-      in
-      collect [] last_pos
-end
+(** Lock-free ring buffer for orderbook data - shared implementation *)
+module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
 module PriceMap = Map.Make (struct
   type t = string
@@ -741,7 +701,6 @@ let process_orderbook_message ~reset json on_heartbeat =
             symbol
             (Array.length orderbook.bids)
             (Array.length orderbook.asks);
-          Telemetry.inc_counter (Telemetry.counter "orderbook_updates" ()) ();
 
           (* Update last sequence on successful write *)
           let current_sequence =
@@ -792,7 +751,7 @@ let[@inline always] read_orderbook_events symbol last_pos =
 (** Get current write position for tracking consumption *)
 let[@inline always] get_current_position symbol =
   match store_opt symbol with
-  | Some store -> Atomic.get store.buffer.write_pos
+  | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 
 let get_top_levels ?(depth = orderbook_depth) symbol =
@@ -898,11 +857,9 @@ let start_cleanup_handlers () =
         | Some (Memory_events.MemoryPressure _) ->
             trigger_orderbook_cleanup ~reason:"memory_pressure" ();
             loop ()
-        | Some Memory_events.CleanupRequested ->
-            trigger_orderbook_cleanup ~reason:"cleanup_requested" ();
+        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
             loop ()
-        | Some Memory_events.MemoryGrowth _ ->
-            loop ()
+
         | None ->
             subscription.close ();
             Logging.info ~section "Orderbook cleanup memory event stream closed";

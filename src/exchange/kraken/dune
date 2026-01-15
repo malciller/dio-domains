@@ -1,7 +1,20 @@
 (library
  (name kraken)
  (public_name dio.kraken)
- (libraries yojson base64 digestif lwt lwt.unix dotenv logging telemetry uri
-            threads websocket-lwt-unix concurrency dio.memory_tracing)
- (preprocess (pps lwt_ppx))
-)
+ (libraries
+  yojson
+  base64
+  digestif
+  lwt
+  lwt.unix
+  dotenv
+  logging
+  
+  uri
+  threads
+  websocket-lwt-unix
+  concurrency
+  dio.memory_tracing
+  dio.exchange)
+ (preprocess
+  (pps lwt_ppx)))

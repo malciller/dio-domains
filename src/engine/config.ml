@@ -17,8 +17,40 @@ type logging_config = {
   sections: string list;
 }
 
+(** GC and memory monitor configuration *)
+type gc_config = {
+  (* OCaml GC settings *)
+  space_overhead: int;
+  max_overhead: int;
+  allocation_policy: int;
+  minor_heap_size_kb: int;
+  major_heap_increment: int;
+  (* Memory monitor settings *)
+  target_heap_mb: int;
+  check_interval_seconds: float;
+  high_heap_mb: int;
+  medium_heap_mb: int;
+  high_fragmentation_percent: float;
+  medium_fragmentation_percent: float;
+}
+
+let default_gc_config = {
+  space_overhead = 20;
+  max_overhead = 80;
+  allocation_policy = 2;
+  minor_heap_size_kb = 2048;
+  major_heap_increment = 15;
+  target_heap_mb = 50;
+  check_interval_seconds = 5.0;
+  high_heap_mb = 40;
+  medium_heap_mb = 25;
+  high_fragmentation_percent = 40.0;
+  medium_fragmentation_percent = 25.0;
+}
+
 type config = {
   logging: logging_config;
+  gc: gc_config;
   trading: trading_config list;
 }
 
@@ -91,6 +123,33 @@ let parse_logging_config json : logging_config =
   let sections = sections_str |> String.split_on_char ',' |> List.map String.trim |> List.filter ((<>) "") in
   { level; sections }
 
+(** Parse GC configuration *)
+let parse_gc_config json : gc_config =
+  let open Yojson.Basic.Util in
+  let gc_json = json |> member "gc" in
+  let int_or default field =
+    gc_json |> member field |> to_int_option |> Option.value ~default
+  in
+  let float_or default field =
+    match gc_json |> member field with
+    | `Float f -> f
+    | `Int i -> float_of_int i
+    | _ -> default
+  in
+  {
+    space_overhead = int_or default_gc_config.space_overhead "space_overhead";
+    max_overhead = int_or default_gc_config.max_overhead "max_overhead";
+    allocation_policy = int_or default_gc_config.allocation_policy "allocation_policy";
+    minor_heap_size_kb = int_or default_gc_config.minor_heap_size_kb "minor_heap_size_kb";
+    major_heap_increment = int_or default_gc_config.major_heap_increment "major_heap_increment";
+    target_heap_mb = int_or default_gc_config.target_heap_mb "target_heap_mb";
+    check_interval_seconds = float_or default_gc_config.check_interval_seconds "check_interval_seconds";
+    high_heap_mb = int_or default_gc_config.high_heap_mb "high_heap_mb";
+    medium_heap_mb = int_or default_gc_config.medium_heap_mb "medium_heap_mb";
+    high_fragmentation_percent = float_or default_gc_config.high_fragmentation_percent "high_fragmentation_percent";
+    medium_fragmentation_percent = float_or default_gc_config.medium_fragmentation_percent "medium_fragmentation_percent";
+  }
+
 
 (** Read and parse engine configuration from config.json *)
 let read_config () : config =
@@ -98,7 +157,8 @@ let read_config () : config =
     let json = Yojson.Basic.from_file "config.json" in
     let open Yojson.Basic.Util in
     let logging = parse_logging_config json in
+    let gc = parse_gc_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
-    { logging; trading }
+    { logging; gc; trading }
   with
-  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = [] }; trading = [] }
+  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = [] }; gc = default_gc_config; trading = [] }

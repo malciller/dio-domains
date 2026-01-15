@@ -15,6 +15,8 @@ let section = "suicide_grid"
 
 (** Use common types from Strategy_common module *)
 open Strategy_common
+module Exchange = Dio_exchange.Exchange_intf
+
 
 (** Utility function to take first n elements from a list *)
 let rec take n = function
@@ -90,38 +92,33 @@ let parse_config_float config value_name default exchange symbol =
       default
 
 (** Round price to appropriate precision for the symbol *)
-let round_price price symbol =
-  (* Fetch price precision from Kraken instruments feed cache *)
-  match Kraken.Kraken_instruments_feed.get_precision_info symbol with
-  | Some (price_precision, qty_precision) ->
-      Logging.debug_f ~section "Rounding price %.8f for %s with precision %d (qty_precision: %d)" price symbol price_precision qty_precision;
-      (* Clamp to exact decimal precision by formatting as string and parsing back *)
-      (* This ensures we never exceed the allowed decimal places *)
-      let clamped_str = Printf.sprintf "%.*f" price_precision price in
-      let rounded_price = (try float_of_string clamped_str
-       with Failure _ ->
-         Logging.warn_f ~section "Failed to parse clamped price '%s' for %s, using original" clamped_str symbol;
-         price) in
-      Logging.debug_f ~section "Rounded price %.8f -> '%s' -> %.8f for %s" price clamped_str rounded_price symbol;
-      rounded_price
+let round_price price symbol exchange =
+  (* Fetch price precision from generic Exchange interface *)
+  let increment = match Exchange.Registry.get exchange with
+  | Some (module Ex : Exchange.S) -> Ex.get_price_increment ~symbol
+  | None -> None
+  in
+  match increment with
+  | Some inc ->
+      Float.round (price /. inc) *. inc
   | None ->
-      Logging.warn_f ~section "No price precision info for %s, using default rounding" symbol;
+      Logging.warn_f ~section "No price increment info for %s/%s, using default rounding" exchange symbol;
       Float.round price  (* Default: 0 decimal places *)
 
 (** Get minimum price increment for the symbol *)
-let get_price_increment symbol =
-  (* Fetch price increment from Kraken instruments feed cache synchronously *)
-  match Kraken.Kraken_instruments_feed.get_price_increment symbol with
-  | Some increment -> increment
+let get_price_increment symbol exchange =
+  (* Fetch price increment from generic Exchange interface *)
+  match Exchange.Registry.get exchange with
+  | Some (module Ex : Exchange.S) -> Option.value (Ex.get_price_increment ~symbol) ~default:0.01
   | None ->
-      Logging.warn_f ~section "No price increment info for %s, using default 0.01" symbol;
+      Logging.warn_f ~section "No price increment info for %s/%s, using default 0.01" exchange symbol;
       0.01  (* Default fallback *)
 
 (** Calculate grid price based on current price and interval *)
-let calculate_grid_price current_price grid_interval_pct is_above symbol =
+let calculate_grid_price current_price grid_interval_pct is_above symbol exchange =
   let interval = current_price *. (grid_interval_pct /. 100.0) in
   let raw_price = if is_above then current_price +. interval else current_price -. interval in
-  round_price raw_price symbol
+  round_price raw_price symbol exchange
 
 (** Check if we can place a buy order based on quote balance *)
 let can_place_buy_order (_qty : float) quote_balance quote_needed =
@@ -136,11 +133,12 @@ let generate_side_duplicate_key asset_symbol side =
   (* Allow only one in-flight order per asset+side regardless of price/qty *)
   Printf.sprintf "%s|%s|grid" asset_symbol (string_of_order_side side)
 
-let create_place_order asset_symbol side qty price post_only strategy =
+let create_place_order asset_symbol side qty price post_only strategy exchange =
   {
     operation = Place;
     order_id = None;
     symbol = asset_symbol;
+    exchange;
     side;
     order_type = "limit";
     qty;
@@ -153,11 +151,12 @@ let create_place_order asset_symbol side qty price post_only strategy =
   }
 
 (** Create a strategy order for amending an existing order *)
-let create_amend_order order_id asset_symbol side qty price post_only strategy =
+let create_amend_order order_id asset_symbol side qty price post_only strategy exchange =
   {
     operation = Amend;
     order_id = Some order_id;
     symbol = asset_symbol;
+    exchange;
     side;
     order_type = "limit";
     qty;
@@ -170,11 +169,12 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy =
   }
 
 (** Create a strategy order for cancelling an existing order *)
-let create_cancel_order order_id asset_symbol strategy =
+let create_cancel_order order_id asset_symbol strategy exchange =
   {
     operation = Cancel;
     order_id = Some order_id;
     symbol = asset_symbol;
+    exchange;
     side = Buy;  (* Not relevant for cancel *)
     order_type = "limit";  (* Not relevant for cancel *)
     qty = 0.0;  (* Not relevant for cancel *)
@@ -187,8 +187,8 @@ let create_cancel_order order_id asset_symbol strategy =
   }
 
 (** Create a strategy order - backwards compatibility *)
-let create_order asset_symbol side qty price post_only =
-  create_place_order asset_symbol side qty price post_only "Grid"
+let create_order asset_symbol side qty price post_only exchange =
+  create_place_order asset_symbol side qty price post_only "Grid" exchange
 
 (** Push order to ringbuffer with telemetry *)
 let push_order order =
@@ -222,7 +222,6 @@ let push_order order =
                     order.symbol
                     order.qty
                     (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
-                  Telemetry.inc_counter (Telemetry.counter "strategy_orders_generated" ()) ();
 
                   (* Update strategy state *)
                   state.last_order_time <- Unix.time ();
@@ -233,7 +232,6 @@ let push_order order =
               | None ->
                   Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
                     operation_str (string_of_order_side order.side) order.symbol;
-                  Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
             end
         | None ->
             Logging.warn_f ~section "Cancel operation missing order_id for %s" order.symbol;
@@ -249,7 +247,6 @@ let push_order order =
 
        if is_duplicate then begin
          Logging.warn_f ~section "Duplicate %s detected (strategy): %s" operation_str order.symbol;
-         Telemetry.inc_counter (Telemetry.counter "strategy_duplicate_orders" ()) ()
        end else begin
          (* For Place and Amend operations, proceed normally *)
          Mutex.lock order_buffer_mutex;
@@ -264,7 +261,6 @@ let push_order order =
              order.symbol
              order.qty
              (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
-           Telemetry.inc_counter (Telemetry.counter "strategy_orders_generated" ()) ();
 
            (* Update strategy state *)
            let state = get_strategy_state order.symbol in
@@ -312,7 +308,6 @@ let push_order order =
 
            Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
              operation_str (string_of_order_side order.side) order.symbol;
-           Telemetry.inc_counter (Telemetry.counter "strategy_orders_dropped" ()) ()
        end)
 
 (** Main strategy execution function *)
@@ -533,7 +528,7 @@ let execute_strategy
 
         (* Cancel all buy orders *)
         List.iter (fun (order_id, _) ->
-          let cancel_order = create_cancel_order order_id asset.symbol "Grid" in
+          let cancel_order = create_cancel_order order_id asset.symbol "Grid" asset.exchange in
           push_order cancel_order;
           Logging.debug_f ~section "Cancelling excess buy order: %s for %s" order_id asset.symbol
         ) !buy_orders;
@@ -546,11 +541,11 @@ let execute_strategy
         state.last_cycle <- cycle
       end else if open_buy_count = 0 then begin
         (* NO OPEN BUY: Place sell + buy, then enforce 2x grid spacing *)
-        let sell_price = calculate_grid_price price grid_interval true asset.symbol in
-        let buy_price = calculate_grid_price price grid_interval false asset.symbol in
+        let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
+        let buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
         
         (* Place sell order - attempt regardless of balance *)
-        let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true in
+        let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
         push_order sell_order;
         Logging.debug_f ~section "Placed sell order for %s: %.8f @ %.2f"
           asset.symbol (qty *. sell_mult) sell_price;
@@ -558,7 +553,7 @@ let execute_strategy
         (* Place buy order *)
         (match quote_balance with
          | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-             let order = create_order asset.symbol Buy qty (Some buy_price) true in
+             let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
              push_order order;
              state.last_buy_order_price <- Some buy_price;
              Logging.debug_f ~section "Placed buy order for %s: %.8f @ %.2f"
@@ -574,14 +569,13 @@ let execute_strategy
                  | Some best_sp -> if sp < best_sp then Some sp else acc
                else acc
              ) None all_sells in
-             
-             (match closest_sell with
-              | Some cs_price ->
-                  let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
-                  let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol in
-                  let min_move_threshold = get_price_increment asset.symbol in
-                  
-                  if abs_float (target_buy -. buy_price) > min_move_threshold then
+                          (match closest_sell with
+               | Some cs_price ->
+                   let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
+                   let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
+                   let min_move_threshold = get_price_increment asset.symbol asset.exchange in
+                   
+                   if abs_float (target_buy -. buy_price) > min_move_threshold then
                     Logging.debug_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
                       asset.symbol buy_price target_buy cs_price
               | None -> ())
@@ -619,11 +613,11 @@ let execute_strategy
               let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
 
               (* Always calculate exact 2x target from sell *)
-              let exact_target = round_price (sell_price -. double_grid_interval) asset.symbol in
+              let exact_target = round_price (sell_price -. double_grid_interval) asset.symbol asset.exchange in
               
               if distance > double_grid_interval then begin
                 (* Distance > 2x: Trail upward ONLY to maintain grid_interval below current price *)
-                let proposed_buy_price = calculate_grid_price price grid_interval false asset.symbol in
+                let proposed_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
                 
                 (* ONLY trail upward - never move buy order down *)
                 if proposed_buy_price > current_buy_price then begin
@@ -641,7 +635,7 @@ let execute_strategy
                   in
                   
                   let price_diff = abs_float (target_buy_price -. current_buy_price) in
-                  let min_move_threshold = get_price_increment asset.symbol in
+                  let min_move_threshold = get_price_increment asset.symbol asset.exchange in
                   
                   (* Check if this order is already being amended *)
                   let is_being_amended = List.exists (fun (id, _, _, _) ->
@@ -654,7 +648,7 @@ let execute_strategy
                   if not is_being_amended && not is_in_flight && price_diff > min_move_threshold && target_buy_price <> current_buy_price then begin
                     (match quote_balance with
                      | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                         let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" in
+                         let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
                          push_order order;
                          state.last_buy_order_price <- Some target_buy_price;
                          let target_distance = sell_price -. target_buy_price in
@@ -674,7 +668,7 @@ let execute_strategy
               end else begin
                 (* Distance <= 2x: Enforce exact 2x spacing *)
                 let price_diff = abs_float (exact_target -. current_buy_price) in
-                let min_move_threshold = get_price_increment asset.symbol in
+                let min_move_threshold = get_price_increment asset.symbol asset.exchange in
 
                 (* Check if this order is already being amended *)
                 let is_being_amended = List.exists (fun (id, _, _, _) ->
@@ -687,7 +681,7 @@ let execute_strategy
                 if not is_being_amended && not is_in_flight && price_diff > min_move_threshold && exact_target <> current_buy_price then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" in
+                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" asset.exchange in
                        push_order order;
                        state.last_buy_order_price <- Some exact_target;
                        Logging.debug_f ~section "Amended buy %s for %s (enforcing 2x): sell@%.2f, buy@%.2f -> %.2f (dist: %.2f <= 2x: %.2f)"
@@ -705,17 +699,17 @@ let execute_strategy
           | _ ->
               (* No buy order tracked, place sell and buy orders *)
               (* Place sell order grid_interval above current price - attempt regardless of balance *)
-              let sell_price = calculate_grid_price price grid_interval true asset.symbol in
-              let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true in
+              let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
+              let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
               push_order sell_order;
               Logging.debug_f ~section "Placed sell order for %s: %.8f @ %.2f (attempt regardless of balance)"
                 asset.symbol (qty *. sell_mult) sell_price;
 
               (* Place buy order grid_interval below current price *)
-              let target_buy_price = calculate_grid_price price grid_interval false asset.symbol in
+              let target_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
               (match quote_balance with
                | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                   let order = create_place_order asset.symbol Buy qty (Some target_buy_price) true "Grid" in
+                   let order = create_place_order asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
                    push_order order;
                    state.last_buy_order_price <- Some target_buy_price;
                    Logging.debug_f ~section "Placed buy order at grid_interval below current price: buy@%.2f"
@@ -727,14 +721,13 @@ let execute_strategy
                    Logging.debug_f ~section "No quote balance data available for buy order decision")
         end else begin
           (* No sell orders: trail current price by grid_interval (upward only) *)
-          match state.last_buy_order_price, state.last_buy_order_id with
-          | Some current_buy_price, Some buy_order_id ->
-              let target_buy_price = calculate_grid_price price grid_interval false asset.symbol in
-              
-              (* Only trail upward - move buy up if target is higher than current *)
-              if target_buy_price > current_buy_price then begin
-                let price_diff = target_buy_price -. current_buy_price in
-                let min_move_threshold = get_price_increment asset.symbol in
+           match state.last_buy_order_price, state.last_buy_order_id with
+           | Some current_buy_price, Some buy_order_id ->
+               let target_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
+                            (* Only trail upward - move buy up if target is higher than current *)
+               if target_buy_price > current_buy_price then begin
+                 let price_diff = target_buy_price -. current_buy_price in
+                 let min_move_threshold = get_price_increment asset.symbol asset.exchange in
 
                 (* Check if this order is already being amended *)
                 let is_being_amended = List.exists (fun (id, _, _, _) ->
@@ -747,7 +740,7 @@ let execute_strategy
                 if not is_being_amended && not is_in_flight && price_diff > min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" in
+                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
                        push_order order;
                        state.last_buy_order_price <- Some target_buy_price;
                        Logging.debug_f ~section "Trailing buy %s for %s: %.2f -> %.2f (no sell anchors)"

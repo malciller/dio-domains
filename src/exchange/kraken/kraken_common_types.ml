@@ -31,7 +31,6 @@ let sign ~secret ~path ~body ~nonce =
   | Ok encoded -> encoded
   | Error (`Msg msg) -> failwith ("Base64 encoding failed: " ^ msg)
 
-(* TODO: Awkward naming - method_ with underscore due to OCaml keyword conflict, consider alternative naming *)
 (** Common response structure for Kraken WebSocket API *)
 type ws_response = {
   method_: string;

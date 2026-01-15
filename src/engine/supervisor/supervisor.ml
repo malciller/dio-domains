@@ -151,13 +151,11 @@ let set_state conn new_state =
       Atomic.set conn.ping_failures 0;  (* Reset ping failures on connect *)
       conn.reconnect_attempts <- 0;
       conn.total_connections <- conn.total_connections + 1;
-      Telemetry.set_gauge (Telemetry.gauge "connection_state" ~labels:[("name", conn.name)] ()) (1.0);
       Logging.info_f ~section "[%s] Connection established (total: %d)"
         conn.name conn.total_connections
   | Disconnected ->
       conn.last_disconnected <- Some (Unix.time ());
       conn.last_connecting <- None;  (* Clear connecting timestamp *)
-      Telemetry.set_gauge (Telemetry.gauge "connection_state" ~labels:[("name", conn.name)] ()) (0.0);
       Logging.warn_f ~section "[%s] Connection lost" conn.name
   | Connecting ->
       conn.last_connecting <- Some (Unix.time ());  (* Record when we started connecting *)
@@ -167,8 +165,6 @@ let set_state conn new_state =
       conn.last_disconnected <- Some (Unix.time ());
       conn.last_connecting <- None;  (* Clear connecting timestamp *)
       conn.reconnect_attempts <- conn.reconnect_attempts + 1;
-      Telemetry.set_gauge (Telemetry.gauge "connection_state" ~labels:[("name", conn.name)] ()) (-1.0);
-      Telemetry.inc_counter (Telemetry.counter "connection_failures" ~labels:[("name", conn.name)] ()) ();
       Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)"
         conn.name reason conn.reconnect_attempts);
   
@@ -231,7 +227,6 @@ let circuit_breaker_allows_connection conn =
         | Some failure_time when current_time -. failure_time > 300.0 ->  (* 5 minutes timeout *)
             conn.circuit_breaker <- HalfOpen;
             Logging.info_f ~section "[%s] Circuit breaker HALF-OPEN (testing recovery)" conn.name;
-            Telemetry.inc_counter (Telemetry.counter "circuit_breaker_half_open" ~labels:[("name", conn.name)] ()) ();
             true
         | _ -> false
         end
@@ -256,7 +251,6 @@ let update_circuit_breaker conn success =
     if conn.circuit_breaker_failures >= 5 then begin  (* Open after 5 consecutive failures *)
       conn.circuit_breaker <- Open;
       Logging.warn_f ~section "[%s] Circuit breaker OPEN after %d consecutive failures" conn.name conn.circuit_breaker_failures;
-      Telemetry.inc_counter (Telemetry.counter "circuit_breaker_tripped" ~labels:[("name", conn.name)] ()) ();
     end
   end;
   Mutex.unlock conn.mutex
@@ -863,12 +857,12 @@ let order_processing_loop () =
                  display_qty = None;
                  fee_preference = None;
                  duplicate_key = order.duplicate_key;
+                 exchange = order.exchange;
                } in
 
                (* Place the order using Lwt async but within mutex protection *)
                Lwt.async (fun () ->
                  Lwt.catch (fun () ->
-                   let _order_start_time = Telemetry.start_timer () in
                    Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                    | result ->
                        begin match result with
@@ -880,7 +874,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                          (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                          result.order_id;
-                       Telemetry.inc_counter Telemetry.Common.orders_placed ();
 
                        (* Notify strategy that order was acknowledged *)
                        (match order.price with
@@ -914,7 +907,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                          (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                          err;
-                       Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                        (* Notify strategy that order was rejected *)
                        (match order.price with
@@ -937,7 +929,6 @@ let order_processing_loop () =
                  ) (fun exn ->
                    Logging.error_f ~section "✗ Exception placing order %s %s: %s"
                      (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                   Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                    (* For exceptions, also notify strategy that order placement failed *)
                    (match order.price with
@@ -975,6 +966,7 @@ let order_processing_loop () =
                       new_display_qty = None;
                       deadline = None;
                       symbol = Some order.symbol;
+                      exchange = order.exchange;
                     } in
 
                     Lwt.async (fun () ->
@@ -988,7 +980,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                               result.amend_id;
-                            Telemetry.inc_counter (Telemetry.counter "orders_amended" ()) ();
 
                             (* Notify strategy that amendment was acknowledged *)
                             (match order.price with
@@ -1014,7 +1005,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                               err;
-                            Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                             (* Notify strategy that amendment was rejected *)
                             (match order.price with
@@ -1038,7 +1028,6 @@ let order_processing_loop () =
                           (match order.side with
                           | Buy -> "buy"
                           | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                        Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                         (* For exceptions, also notify strategy that amendment failed *)
                         (match order.price with
@@ -1062,7 +1051,6 @@ let order_processing_loop () =
                 | None ->
                     Logging.error_f ~section "Amendment request missing target order ID for %s %s"
                       (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol;
-                    Telemetry.inc_counter Telemetry.Common.orders_failed ()
                )
 
            | Cancel ->
@@ -1071,12 +1059,17 @@ let order_processing_loop () =
                 | Some target_order_id ->
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.cancel_order ~token:auth_token ~order_id:target_order_id >>= function
+                        let request : Dio_engine.Order_executor.cancel_request = {
+                          exchange = order.exchange;
+                          order_ids = Some [target_order_id];
+                          cl_ord_ids = None;
+                          order_userrefs = None;
+                        } in
+                        Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                         | Ok results ->
                             let count = List.length results in
                             orders_placed := !orders_placed + count;
                             Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
-                            Telemetry.inc_counter (Telemetry.counter "orders_cancelled" ()) ~value:count ();
 
                             (* Clean up pending cancellation tracking *)
                             (match order.strategy with
@@ -1090,7 +1083,6 @@ let order_processing_loop () =
                             Lwt.return_unit
                         | Error err ->
                             Logging.error_f ~section "✗ Order cancellation failed: %s - %s" target_order_id err;
-                            Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                             (* Clean up pending cancellation tracking on failure *)
                             (match order.strategy with
@@ -1103,7 +1095,6 @@ let order_processing_loop () =
                             Lwt.return_unit
                       ) (fun exn ->
                         Logging.error_f ~section "✗ Exception cancelling order %s: %s" target_order_id (Printexc.to_string exn);
-                        Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                         (* Clean up pending cancellation tracking on exception *)
                         (match order.strategy with
@@ -1118,7 +1109,6 @@ let order_processing_loop () =
                     )
                 | None ->
                     Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
-                    Telemetry.inc_counter Telemetry.Common.orders_failed ()
                )
           );
           Mutex.unlock order_mutex
@@ -1163,12 +1153,12 @@ let order_processing_loop () =
                  display_qty = None;
                  fee_preference = None;
                  duplicate_key = order.duplicate_key;
+                 exchange = order.exchange;
                } in
 
                (* Place the order using Lwt async but within mutex protection *)
                Lwt.async (fun () ->
                  Lwt.catch (fun () ->
-                   let _order_start_time = Telemetry.start_timer () in
                    Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                    | result ->
                        begin match result with
@@ -1180,7 +1170,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                          (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                          result.order_id;
-                       Telemetry.inc_counter Telemetry.Common.orders_placed ();
 
                        (* Notify strategy that order was acknowledged *)
                        (match order.price with
@@ -1214,7 +1203,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                          (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                          err;
-                       Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                        (* Notify strategy that order was rejected *)
                        (match order.price with
@@ -1237,7 +1225,6 @@ let order_processing_loop () =
                  ) (fun exn ->
                    Logging.error_f ~section "✗ Exception placing order %s %s: %s"
                      (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                   Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                    (* For exceptions, also notify strategy that order placement failed *)
                    (match order.price with
@@ -1275,6 +1262,7 @@ let order_processing_loop () =
                       new_display_qty = None;
                       deadline = None;
                       symbol = Some order.symbol;
+                      exchange = order.exchange;
                     } in
 
                     Lwt.async (fun () ->
@@ -1288,7 +1276,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                               result.amend_id;
-                            Telemetry.inc_counter (Telemetry.counter "orders_amended" ()) ();
 
                             (* Notify strategy that amendment was acknowledged *)
                             (match order.price with
@@ -1314,7 +1301,6 @@ let order_processing_loop () =
                           | Sell -> "sell") order.symbol order.qty
                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                               err;
-                            Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                             (* Notify strategy that amendment was rejected *)
                             (match order.price with
@@ -1338,7 +1324,6 @@ let order_processing_loop () =
                           (match order.side with
                           | Buy -> "buy"
                           | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                        Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                         (* For exceptions, also notify strategy that amendment failed *)
                         (match order.price with
@@ -1362,7 +1347,6 @@ let order_processing_loop () =
                 | None ->
                     Logging.error_f ~section "Amendment request missing target order ID for %s %s"
                       (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol;
-                    Telemetry.inc_counter Telemetry.Common.orders_failed ()
                )
 
            | Cancel ->
@@ -1371,12 +1355,17 @@ let order_processing_loop () =
                 | Some target_order_id ->
                     Lwt.async (fun () ->
                       Lwt.catch (fun () ->
-                        Dio_engine.Order_executor.cancel_order ~token:auth_token ~order_id:target_order_id >>= function
+                        let request : Dio_engine.Order_executor.cancel_request = {
+                          exchange = order.exchange;
+                          order_ids = Some [target_order_id];
+                          cl_ord_ids = None;
+                          order_userrefs = None;
+                        } in
+                        Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                         | Ok results ->
                             let count = List.length results in
                             orders_placed := !orders_placed + count;
                             Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
-                            Telemetry.inc_counter (Telemetry.counter "orders_cancelled" ()) ~value:count ();
 
                             (* Clean up pending cancellation tracking *)
                             (match order.strategy with
@@ -1390,7 +1379,6 @@ let order_processing_loop () =
                             Lwt.return_unit
                         | Error err ->
                             Logging.error_f ~section "✗ Order cancellation failed: %s - %s" target_order_id err;
-                            Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                             (* Clean up pending cancellation tracking on failure *)
                             (match order.strategy with
@@ -1403,7 +1391,6 @@ let order_processing_loop () =
                             Lwt.return_unit
                       ) (fun exn ->
                         Logging.error_f ~section "✗ Exception cancelling order %s: %s" target_order_id (Printexc.to_string exn);
-                        Telemetry.inc_counter Telemetry.Common.orders_failed ();
 
                         (* Clean up pending cancellation tracking on exception *)
                         (match order.strategy with
@@ -1418,7 +1405,6 @@ let order_processing_loop () =
                     )
                 | None ->
                     Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
-                    Telemetry.inc_counter Telemetry.Common.orders_failed ()
                )
           );
           Mutex.unlock order_mutex
@@ -1506,4 +1492,5 @@ let stop_all () =
     set_state conn Disconnected
   ) connections;
   Mutex.unlock registry_mutex
+
 
