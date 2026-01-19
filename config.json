@@ -85,7 +85,7 @@
       "symbol": "USDG/USD",
       "exchange": "kraken",
       "qty": "100.0",
-      "min_usd_balance": "1000.0",
+      "min_usd_balance": "900.0",
       "strategy": "MM"
     }
   ]
