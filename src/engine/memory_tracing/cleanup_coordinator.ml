@@ -239,23 +239,10 @@ let start_memory_monitor ~config ~generation () =
           else 0.0
         in
         
-        (* HARD LIMIT: Always compact if heap exceeds target *)
-        if heap_mb > config.target_heap_mb then begin
-          Logging.info_f ~section:"cleanup_coordinator" 
-            "Heap exceeded target (%dMB > %dMB), forcing compaction (live=%dMB, frag=%.1f%%)"
-            heap_mb config.target_heap_mb live_mb fragmentation_percent;
-          Gc.compact ();
-          let post_gc = Gc.stat () in
-          let post_heap_mb = post_gc.heap_words * (Sys.word_size / 8) / 1048576 in
-          let post_live_mb = post_gc.live_words * (Sys.word_size / 8) / 1048576 in
-          Logging.info_f ~section:"cleanup_coordinator" 
-            "Post-compaction: heap=%dMB, live=%dMB (freed %dMB)"
-            post_heap_mb post_live_mb (heap_mb - post_heap_mb)
-        end;
-        
-        (* Determine pressure level and publish event if warranted *)
+        (* Determine pressure level — treat exceeding target_heap_mb as High *)
         let pressure_level =
-          if heap_mb >= config.high_heap_mb || fragmentation_percent >= config.high_fragmentation_percent then
+          if heap_mb > config.target_heap_mb || heap_mb >= config.high_heap_mb
+             || fragmentation_percent >= config.high_fragmentation_percent then
             Some `High
           else if heap_mb >= config.medium_heap_mb || fragmentation_percent >= config.medium_fragmentation_percent then
             Some `Medium
@@ -265,7 +252,7 @@ let start_memory_monitor ~config ~generation () =
         
         (match pressure_level with
         | Some level ->
-            Logging.debug_f ~section:"cleanup_coordinator" 
+            Logging.info_f ~section:"cleanup_coordinator" 
               "Memory pressure detected: level=%s, heap=%dMB, live=%dMB, frag=%.1f%%"
               (match level with `High -> "high" | `Medium -> "medium")
               heap_mb live_mb fragmentation_percent;
