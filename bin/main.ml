@@ -212,7 +212,7 @@ let () =
 
   (* Start watchdog thread for cleanup coordinator - runs for lifecycle of app *)
   let _cleanup_watchdog_thread = Thread.create (fun () ->
-    let stall_threshold = 30.0 in
+    let stall_threshold = 300.0 in
     let check_interval = 10.0 in
     let restart_count = ref 0 in
     Logging.info ~section:"main" "Cleanup coordinator watchdog thread started";
