@@ -22,21 +22,35 @@ def safe_decimal(value, default='0'):
 class InventoryManager:
     def __init__(self, method='FIFO'):
         self.method = method.upper()
-        # inventory items: [quantity, price_per_unit, date] for HIFO tie-breaking (date is optional but good)
-        # simplistic: [quantity, price]
+        # inventory items: [quantity, price_per_unit, date, txid]
         self.inventory = [] 
 
-    def buy(self, quantity, price):
+    def buy(self, quantity, price, date, txid):
         # We store as mutable list so we can decrease quantity
-        self.inventory.append([quantity, price])
+        self.inventory.append([quantity, price, date, txid])
 
-    def sell(self, quantity, price):
+    def sell(self, quantity, price, sell_date, sell_txid):
         """
-        Process a sell and return (realized_gain, cost_basis)
+        Process a sell and return (realized_gain, cost_basis, matches)
+        matches is a list of dicts:
+        {
+            'quantity': Decimal,
+            'cost_basis': Decimal,
+            'proceeds': Decimal,
+            'gain': Decimal,
+            'term': 'Short'|'Long',
+            'buy_date': datetime,
+            'sell_date': datetime,
+            'buy_txid': str,
+            'sell_txid': str,
+            'buy_price': Decimal,
+            'sell_price': Decimal
+        }
         """
         remaining_qty = quantity
         total_gain = Decimal(0)
         total_cost_basis = Decimal(0)
+        matches = []
         
         while remaining_qty > 0 and self.inventory:
             if self.method == 'FIFO':
@@ -44,7 +58,7 @@ class InventoryManager:
                 lot_index = 0
             else: # HIFO
                 # Find highest price
-                # Tie-breaker: FIFO (lowest index)
+                # Tie-breaker: FIFO (lowest index aka oldest date for same price)
                 best_price = -1
                 best_index = -1
                 for i, lot in enumerate(self.inventory):
@@ -64,27 +78,58 @@ class InventoryManager:
             lot = self.inventory[lot_index]
             available_qty = lot[0]
             lot_price = lot[1]
+            lot_date = lot[2]
+            lot_txid = lot[3]
             
             qty_taken = min(remaining_qty, available_qty)
             
             # Calculate gain on this chunk
-            gain = qty_taken * (price - lot_price)
-            cost = qty_taken * lot_price
+            chunk_proceeds = qty_taken * price
+            chunk_cost = qty_taken * lot_price
+            chunk_gain = chunk_proceeds - chunk_cost
             
-            total_gain += gain
-            total_cost_basis += cost
+            # Determine Term (Short vs Long)
+            # Long term if held > 1 year
+            term = 'Short'
+            if sell_date and lot_date:
+                # Precise 365 days check? Usually generic > 365 days or year boundary
+                # IRS rule: > 1 year. So buy date + 1 year <= sell_date
+                # e.g. Buy Jan 1 2023. Long term starts Jan 2 2024.
+                try:
+                    one_year_later = lot_date.replace(year=lot_date.year + 1)
+                except ValueError: 
+                    # Handle leap year Feb 29 -> Mar 1
+                     one_year_later = lot_date + timedelta(days=366) if (lot_date.month == 2 and lot_date.day == 29) else lot_date.replace(year=lot_date.year + 1)
+
+                if sell_date >= one_year_later:
+                    term = 'Long'
+
+            matches.append({
+                'quantity': qty_taken,
+                'cost_basis': chunk_cost,
+                'proceeds': chunk_proceeds,
+                'gain': chunk_gain,
+                'term': term,
+                'buy_date': lot_date,
+                'sell_date': sell_date,
+                'buy_txid': lot_txid,
+                'sell_txid': sell_txid,
+                'buy_price': lot_price,
+                'sell_price': price
+            })
+            
+            total_gain += chunk_gain
+            total_cost_basis += chunk_cost
             
             # Update lot
             lot[0] -= qty_taken
             remaining_qty -= qty_taken
             
             # If lot is empty, remove it
-            # For FIFO (index 0), pop(0) is O(N) but lists are fast enough for reasonable N
-            # For HIFO, pop(index) is O(N)
-            if lot[0] < Decimal('0.00000001'): # Floating point tolerance or just <= 0
+            if lot[0] < Decimal('0.00000001'): # Floating point tolerance
                 self.inventory.pop(lot_index)
                 
-        return total_gain, total_cost_basis
+        return total_gain, total_cost_basis, matches
 
     def get_remaining_inventory(self):
         return self.inventory
@@ -447,6 +492,7 @@ def extract_trades_from_ledger(ledger_entries):
                 trade = {
                     'time': buy_entry['time'],
                     'dt': buy_entry['dt'],
+                    'txid': buy_entry['txid'], # Use buy txid for the trade record
                     'symbol': f"{buy_entry['asset']}/USD",
                     'side': 'buy',
                     'quantity': buy_entry['amount'],
@@ -462,6 +508,7 @@ def extract_trades_from_ledger(ledger_entries):
                 trade = {
                     'time': sell_entry['time'],
                     'dt': sell_entry['dt'],
+                    'txid': sell_entry['txid'], # Use sell txid for the trade record
                     'symbol': f"{sell_entry['asset']}/USD",
                     'side': 'sell',
                     'quantity': abs(sell_entry['amount']),
@@ -481,6 +528,7 @@ def extract_trades_from_ledger(ledger_entries):
                 trade = {
                     'time': buy_entry['time'],
                     'dt': buy_entry['dt'],
+                    'txid': buy_entry['txid'],
                     'symbol': f"{buy_entry['asset']}/{sell_entry['asset']}",
                     'side': 'buy',
                     'quantity': buy_entry['amount'],
@@ -504,6 +552,13 @@ def compute_metrics(trades, period_name):
     realized_gains_fifo = defaultdict(Decimal)
     realized_gains_hifo = defaultdict(Decimal)
     
+    # Store detailed tax liability data
+    # structure: year -> { 'short_term': Decimal, 'long_term': Decimal, 'total': Decimal }
+    tax_liability_by_year = defaultdict(lambda: {'short_term': Decimal(0), 'long_term': Decimal(0), 'total': Decimal(0)})
+    
+    # Matching details for audit
+    hifo_matches = []
+    
     volume_by_symbol = defaultdict(lambda: {'quantity': Decimal(0), 'usd_value': Decimal(0)})
     total_volume = {'quantity': Decimal(0), 'usd_value': Decimal(0)}
     
@@ -518,6 +573,8 @@ def compute_metrics(trades, period_name):
         price = trade['price']
         trade_value = quantity * price
         fee = trade['fee']
+        dt = trade['dt']
+        txid = trade.get('txid', 'N/A')
         
         volume_by_symbol[symbol]['quantity'] += quantity
         volume_by_symbol[symbol]['usd_value'] += trade_value
@@ -529,25 +586,63 @@ def compute_metrics(trades, period_name):
         total_fees += fee
         
         if trade['side'] == 'buy':
-            fifo_managers[symbol].buy(quantity, price)
-            hifo_managers[symbol].buy(quantity, price)
+            fifo_managers[symbol].buy(quantity, price, dt, txid)
+            hifo_managers[symbol].buy(quantity, price, dt, txid)
         elif trade['side'] == 'sell':
             # Calculate FIFO Gain
-            gain_fifo, _ = fifo_managers[symbol].sell(quantity, price)
+            gain_fifo, _, _ = fifo_managers[symbol].sell(quantity, price, dt, txid) # Ignore matches for FIFO
             gain_fifo -= fee
             realized_gains_fifo[symbol] += gain_fifo
             
             # Calculate HIFO Gain
-            gain_hifo, _ = hifo_managers[symbol].sell(quantity, price)
+            gain_hifo, _, matches = hifo_managers[symbol].sell(quantity, price, dt, txid)
             gain_hifo -= fee
             realized_gains_hifo[symbol] += gain_hifo
-    
+            
+            # Record Tax Liability from matches
+            tax_year = dt.year
+            
+            for match in matches:
+                # Pro-rate fee for each match based on quantity fraction?
+                # Or just subtract fee from total gain.
+                # To be precise, we distribute fee proportional to proceeds or quantity.
+                # Simple approach: subtract full trade fee from the gain_hifo total (done above).
+                # But for Year/Term split, we need to distribute fee.
+                
+                # Fraction of this trade that this match represents:
+                match_fraction = match['quantity'] / quantity
+                match_fee = fee * match_fraction
+                match_gain_net = match['gain'] - match_fee
+                
+                term_key = 'short_term' if match['term'] == 'Short' else 'long_term'
+                tax_liability_by_year[tax_year][term_key] += match_gain_net
+                tax_liability_by_year[tax_year]['total'] += match_gain_net
+                
+                # Store match detail
+                match_detail = match.copy()
+                match_detail['symbol'] = symbol
+                match_detail['net_gain'] = match_gain_net
+                hifo_matches.append(match_detail)
+
     total_gains_fifo = sum(realized_gains_fifo.values())
     total_gains_hifo = sum(realized_gains_hifo.values())
     
     lines = []
     if period_name != "All Time":
         lines.append(f"# {period_name}")
+
+    # --- Tax Liability Section ---
+    lines.append("## Annual Tax Liability (HIFO Spec ID)")
+    lines.append("| Tax Year | Short Term Gain | Long Term Gain | Total Realized Gain |")
+    lines.append("|----------|-----------------|----------------|---------------------|")
+    
+    sorted_years = sorted(tax_liability_by_year.keys())
+    for year in sorted_years:
+        data = tax_liability_by_year[year]
+        lines.append(f"| {year} | ${data['short_term']:,.2f} | ${data['long_term']:,.2f} | ${data['total']:,.2f} |")
+    
+    lines.append("")
+
     lines.append("## All-Time Asset Analysis")
     lines.append("| Symbol | Gains (FIFO) | Gains (HIFO) | Diff | Volume(USD) | Ret % (FIFO) | Ret % (HIFO) | Trades | Avg Gain |")
     
@@ -580,7 +675,36 @@ def compute_metrics(trades, period_name):
     
     lines.append(f"| <b>TOTAL</b> | <b>${total_gains_fifo:,.2f}</b> | <b>${total_gains_hifo:,.2f}</b> | <b>${diff_total:,.2f}</b> | <b>${total_volume['usd_value']:,.0f}</b> | <b>{total_ret_fifo:.2f}%</b> | <b>{total_ret_hifo:.2f}%</b> | <b>{total_trades}</b> | <b>${avg_gain_per_trade:,.2f}</b> |")
 
-    return '\n'.join(lines)
+    return '\n'.join(lines), hifo_matches
+
+def generate_audit_csv(matches, filename='spec_id_audit.csv'):
+    """Generate a CSV file with detailed HIFO matches for audit purposes."""
+    if not matches:
+        print("No matches to write to audit CSV.")
+        return
+
+    fieldnames = [
+        'symbol', 'term', 'gain', 'net_gain', 'quantity', 'proceeds', 'cost_basis',
+        'sell_date', 'sell_price', 'sell_txid', 
+        'buy_date', 'buy_price', 'buy_txid'
+    ]
+    
+    try:
+        with open(filename, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for match in matches:
+                # Format dates
+                row = match.copy()
+                if isinstance(row['sell_date'], datetime):
+                    row['sell_date'] = row['sell_date'].strftime('%Y-%m-%d %H:%M:%S')
+                if isinstance(row['buy_date'], datetime):
+                    row['buy_date'] = row['buy_date'].strftime('%Y-%m-%d %H:%M:%S')
+                writer.writerow(row)
+        print(f"Spec ID Audit CSV generated: {filename}")
+    except Exception as e:
+        print(f"Error generating audit CSV: {e}")
+
 
 def calculate_gains(csv_file):
     # Process ledger data
@@ -1021,6 +1145,9 @@ def calculate_gains(csv_file):
                 margin = trade['margin']
                 symbol = trade['symbol']
 
+                dt = trade['dt']
+                txid = trade.get('txid', 'N/A')
+
                 monthly_metrics['volume_usd'] += trade_value
                 monthly_metrics['trades'] += 1
                 monthly_metrics['fees'] += fee
@@ -1030,16 +1157,16 @@ def calculate_gains(csv_file):
 
                 # Update FIFO
                 if trade['side'] == 'buy':
-                    monthly_fifo_managers[symbol].buy(quantity, price)
+                    monthly_fifo_managers[symbol].buy(quantity, price, dt, txid)
                 elif trade['side'] == 'sell':
-                    gain, _ = monthly_fifo_managers[symbol].sell(quantity, price)
+                    gain, _, _ = monthly_fifo_managers[symbol].sell(quantity, price, dt, txid)
                     monthly_metrics['gains_fifo'] += (gain - fee)
 
                 # Update HIFO
                 if trade['side'] == 'buy':
-                    monthly_hifo_managers[symbol].buy(quantity, price)
+                    monthly_hifo_managers[symbol].buy(quantity, price, dt, txid)
                 elif trade['side'] == 'sell':
-                    gain, _ = monthly_hifo_managers[symbol].sell(quantity, price)
+                    gain, _, _ = monthly_hifo_managers[symbol].sell(quantity, price, dt, txid)
                     monthly_metrics['gains_hifo'] += (gain - fee)
 
             # Add this month's trades to cumulative
@@ -1123,16 +1250,16 @@ def calculate_gains(csv_file):
                 asset_monthly_data[symbol][trade_month]['cost_usd'] += trade['costusd']
 
                 if trade['side'] == 'buy':
-                    fifo_manager.buy(trade['quantity'], trade['price'])
-                    hifo_manager.buy(trade['quantity'], trade['price'])
+                    fifo_manager.buy(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
+                    hifo_manager.buy(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
                 elif trade['side'] == 'sell':
                     # FIFO
-                    gain_fifo, _ = fifo_manager.sell(trade['quantity'], trade['price'])
+                    gain_fifo, _, _ = fifo_manager.sell(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
                     gain_fifo -= trade['fee']
                     monthly_gains_tracker_fifo[trade_month] += gain_fifo
                     
                     # HIFO
-                    gain_hifo, _ = hifo_manager.sell(trade['quantity'], trade['price'])
+                    gain_hifo, _, _ = hifo_manager.sell(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
                     gain_hifo -= trade['fee']
                     monthly_gains_tracker_hifo[trade_month] += gain_hifo
 
@@ -1280,7 +1407,10 @@ def calculate_gains(csv_file):
 
         lines.append("")
 
-        detailed_all_time = compute_metrics(trades, 'All Time')
+        detailed_all_time, hifo_matches = compute_metrics(trades, 'All Time')
+        
+        # Generate Spec ID Audit CSV
+        generate_audit_csv(hifo_matches)
         lines.append(detailed_all_time)
     
     return '\n'.join(lines)
@@ -1565,11 +1695,12 @@ def markdown_to_html(markdown_text):
     return '\n'.join(html_lines)
 
 def split_report_content(markdown_content):
-    """Split the markdown content into three sections for tabs."""
+    """Split the markdown content into sections for tabs."""
     lines = markdown_content.split('\n')
     sections = {
         'portfolio': [],
         'trading': [],
+        'tax': [],
         'analysis': []
     }
 
@@ -1579,6 +1710,8 @@ def split_report_content(markdown_content):
         # Check for section transitions
         if line.startswith('## Monthly Performance'):
             current_section = 'trading'
+        elif line.startswith('## Annual Tax Liability'):
+            current_section = 'tax'
         elif line.startswith('## All-Time Asset Analysis'):
             current_section = 'analysis'
 
@@ -1596,6 +1729,7 @@ def generate_html_report(markdown_content, output_file='portfolio_report.html'):
     # Convert each section to HTML
     portfolio_content = markdown_to_html('\n'.join(sections['portfolio']))
     trading_content = markdown_to_html('\n'.join(sections['trading']))
+    tax_content = markdown_to_html('\n'.join(sections['tax']))
     analysis_content = markdown_to_html('\n'.join(sections['analysis']))
     
     current_date = datetime.now().strftime("%B %d, %Y at %I:%M %p")
@@ -1870,8 +2004,62 @@ def generate_html_report(markdown_content, output_file='portfolio_report.html'):
         .collapsible-content.expanded {{
             max-height: 5000px; /* Large enough for most content */
         }}
+        /* Tabs */
+        .tabs {{
+            display: flex;
+            border-bottom: 2px solid var(--border-light);
+            margin-bottom: 20px;
+            overflow-x: auto;
+        }}
+
+        .tab-button {{
+            background: transparent;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }}
+
+        .tab-button:hover {{
+            color: var(--text-primary);
+        }}
+
+        .tab-button.active {{
+            color: var(--accent-gold);
+            border-bottom: 2px solid var(--accent-gold);
+        }}
+
+        .tab-content {{
+            display: none;
+            animation: fadeIn 0.3s ease;
+        }}
+
+        @keyframes fadeIn {{
+            from {{ opacity: 0; }}
+            to {{ opacity: 1; }}
+        }}
     </style>
     <script>
+        function openTab(evt, tabName) {{
+            var i, tabcontent, tablinks;
+            tabcontent = document.getElementsByClassName("tab-content");
+            for (i = 0; i < tabcontent.length; i++) {{
+                tabcontent[i].style.display = "none";
+            }}
+            tablinks = document.getElementsByClassName("tab-button");
+            for (i = 0; i < tablinks.length; i++) {{
+                tablinks[i].className = tablinks[i].className.replace(" active", "");
+            }}
+            document.getElementById(tabName).style.display = "block";
+            evt.currentTarget.className += " active";
+        }}
+
         function toggleSection(header) {{
             const content = header.nextElementSibling;
             const isExpanded = content.classList.contains('expanded');
@@ -1901,9 +2089,28 @@ def generate_html_report(markdown_content, output_file='portfolio_report.html'):
     <h1>Kraken Portfolio Report</h1>
     <p style="color: var(--text-secondary); margin-bottom: 30px;">Generated on: {current_date}</p>
 
-    {portfolio_content}
-    {trading_content}
-    {analysis_content}
+    <div class="tabs">
+        <button class="tab-button" onclick="openTab(event, 'portfolio')">Portfolio Overview</button>
+        <button class="tab-button active" onclick="openTab(event, 'trading')">Monthly Performance</button>
+        <button class="tab-button" onclick="openTab(event, 'tax')">Tax Liability</button>
+        <button class="tab-button" onclick="openTab(event, 'analysis')">Asset Analysis</button>
+    </div>
+
+    <div id="portfolio" class="tab-content">
+        {portfolio_content}
+    </div>
+
+    <div id="trading" class="tab-content" style="display: block;">
+        {trading_content}
+    </div>
+    
+    <div id="tax" class="tab-content">
+        {tax_content}
+    </div>
+
+    <div id="analysis" class="tab-content">
+        {analysis_content}
+    </div>
 </body>
 </html>"""
 
