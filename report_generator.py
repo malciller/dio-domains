@@ -25,9 +25,19 @@ class InventoryManager:
         # inventory items: [quantity, price_per_unit, date, txid]
         self.inventory = [] 
 
-    def buy(self, quantity, price, date, txid):
+    def buy(self, quantity, price, date, txid, fee=Decimal(0)):
         # We store as mutable list so we can decrease quantity
-        self.inventory.append([quantity, price, date, txid])
+        # NOTE: 'price' from extract_trades_from_ledger is ALREADY fee-inclusive.
+        # For buys:  price = (|usd_amount| + usd_fee) / crypto_qty
+        # For sells: price = (usd_amount - usd_fee) / crypto_qty
+        # The Kraken ledger 'amount' is the GROSS execution value; fees are separate.
+        # So fees are baked into price at derivation time — we do NOT add them again here.
+        adjusted_unit_price = price
+        
+        # We also store the unit_buy_fee separately for reporting/audit
+        unit_buy_fee = fee / quantity if quantity > 0 else Decimal(0)
+        
+        self.inventory.append([quantity, adjusted_unit_price, date, txid, unit_buy_fee])
 
     def sell(self, quantity, price, sell_date, sell_txid):
         """
@@ -80,13 +90,16 @@ class InventoryManager:
             lot_price = lot[1]
             lot_date = lot[2]
             lot_txid = lot[3]
+            # Handle legacy inventory or new inventory with fee info
+            lot_unit_buy_fee = lot[4] if len(lot) > 4 else Decimal(0)
             
             qty_taken = min(remaining_qty, available_qty)
             
             # Calculate gain on this chunk
-            chunk_proceeds = qty_taken * price
+            # Proceeds here are NET proceeds (because price is derived from Net Ledger Amount)
+            chunk_net_proceeds = qty_taken * price
             chunk_cost = qty_taken * lot_price
-            chunk_gain = chunk_proceeds - chunk_cost
+            chunk_net_gain = chunk_net_proceeds - chunk_cost
             
             # Determine Term (Short vs Long)
             # Long term if held > 1 year
@@ -101,24 +114,25 @@ class InventoryManager:
                     # Handle leap year Feb 29 -> Mar 1
                      one_year_later = lot_date + timedelta(days=366) if (lot_date.month == 2 and lot_date.day == 29) else lot_date.replace(year=lot_date.year + 1)
 
-                if sell_date >= one_year_later:
+                if sell_date > one_year_later:
                     term = 'Long'
 
             matches.append({
                 'quantity': qty_taken,
                 'cost_basis': chunk_cost,
-                'proceeds': chunk_proceeds,
-                'gain': chunk_gain,
+                'proceeds': chunk_net_proceeds,
+                'gain': chunk_net_gain,
                 'term': term,
                 'buy_date': lot_date,
                 'sell_date': sell_date,
                 'buy_txid': lot_txid,
                 'sell_txid': sell_txid,
                 'buy_price': lot_price,
-                'sell_price': price
+                'sell_price': price,
+                'buy_fee': lot_unit_buy_fee * qty_taken
             })
             
-            total_gain += chunk_gain
+            total_gain += chunk_net_gain
             total_cost_basis += chunk_cost
             
             # Update lot
@@ -489,6 +503,9 @@ def extract_trades_from_ledger(ledger_entries):
             # Create trade record
             if sell_entry['asset'] == 'USD' or sell_entry['asset'].endswith('USD'):
                 # Buying crypto with USD
+                # Ledger 'amount' is GROSS execution value; fee is separate.
+                # True cost basis = |usd_amount| + usd_fee
+                total_cost = abs(sell_entry['amount']) + sell_entry['fee'] + buy_entry['fee']
                 trade = {
                     'time': buy_entry['time'],
                     'dt': buy_entry['dt'],
@@ -496,15 +513,18 @@ def extract_trades_from_ledger(ledger_entries):
                     'symbol': f"{buy_entry['asset']}/USD",
                     'side': 'buy',
                     'quantity': buy_entry['amount'],
-                    'price': abs(sell_entry['amount']) / buy_entry['amount'] if buy_entry['amount'] != 0 else Decimal(0),
+                    'price': total_cost / buy_entry['amount'] if buy_entry['amount'] != 0 else Decimal(0),
                     'fee': sell_entry['fee'] + buy_entry['fee'],
-                    'cost': abs(sell_entry['amount']),
-                    'costusd': abs(sell_entry['amount']),
+                    'cost': total_cost,
+                    'costusd': total_cost,
                     'net': buy_entry['amount'],
                     'margin': Decimal(0)
                 }
             elif buy_entry['asset'] == 'USD' or buy_entry['asset'].endswith('USD'):
                 # Selling crypto for USD
+                # Ledger 'amount' is GROSS execution value; fee is separate.
+                # True net proceeds = usd_amount - usd_fee
+                net_proceeds = buy_entry['amount'] - (sell_entry['fee'] + buy_entry['fee'])
                 trade = {
                     'time': sell_entry['time'],
                     'dt': sell_entry['dt'],
@@ -512,10 +532,10 @@ def extract_trades_from_ledger(ledger_entries):
                     'symbol': f"{sell_entry['asset']}/USD",
                     'side': 'sell',
                     'quantity': abs(sell_entry['amount']),
-                    'price': buy_entry['amount'] / abs(sell_entry['amount']) if sell_entry['amount'] != 0 else Decimal(0),
+                    'price': net_proceeds / abs(sell_entry['amount']) if sell_entry['amount'] != 0 else Decimal(0),
                     'fee': sell_entry['fee'] + buy_entry['fee'],
-                    'cost': buy_entry['amount'],
-                    'costusd': buy_entry['amount'],
+                    'cost': net_proceeds,
+                    'costusd': net_proceeds,
                     'net': abs(sell_entry['amount']),
                     'margin': Decimal(0)
                 }
@@ -586,42 +606,43 @@ def compute_metrics(trades, period_name):
         total_fees += fee
         
         if trade['side'] == 'buy':
-            fifo_managers[symbol].buy(quantity, price, dt, txid)
-            hifo_managers[symbol].buy(quantity, price, dt, txid)
+            fifo_managers[symbol].buy(quantity, price, dt, txid, fee)
+            hifo_managers[symbol].buy(quantity, price, dt, txid, fee)
         elif trade['side'] == 'sell':
+            # Prices are fee-inclusive (buy price includes buy fee, sell price excludes sell fee)
+            # so gain = net_proceeds - cost_basis is already the true net gain.
+            
             # Calculate FIFO Gain
-            gain_fifo, _, _ = fifo_managers[symbol].sell(quantity, price, dt, txid) # Ignore matches for FIFO
-            gain_fifo -= fee
+            gain_fifo, _, _ = fifo_managers[symbol].sell(quantity, price, dt, txid)
             realized_gains_fifo[symbol] += gain_fifo
             
             # Calculate HIFO Gain
             gain_hifo, _, matches = hifo_managers[symbol].sell(quantity, price, dt, txid)
-            gain_hifo -= fee
             realized_gains_hifo[symbol] += gain_hifo
             
             # Record Tax Liability from matches
             tax_year = dt.year
             
             for match in matches:
-                # Pro-rate fee for each match based on quantity fraction?
-                # Or just subtract fee from total gain.
-                # To be precise, we distribute fee proportional to proceeds or quantity.
-                # Simple approach: subtract full trade fee from the gain_hifo total (done above).
-                # But for Year/Term split, we need to distribute fee.
-                
-                # Fraction of this trade that this match represents:
+                # Fraction of this trade that this match represents
                 match_fraction = match['quantity'] / quantity
-                match_fee = fee * match_fraction
-                match_gain_net = match['gain'] - match_fee
+                match_sell_fee = fee * match_fraction
                 
+                # Prices are fee-inclusive, so match['gain'] and match['proceeds'] are already net.
+                # Identity: proceeds - cost_basis = gain (net gain)
+                match_net_gain = match['gain']
+
                 term_key = 'short_term' if match['term'] == 'Short' else 'long_term'
-                tax_liability_by_year[tax_year][term_key] += match_gain_net
-                tax_liability_by_year[tax_year]['total'] += match_gain_net
+                tax_liability_by_year[tax_year][term_key] += match_net_gain
+                tax_liability_by_year[tax_year]['total'] += match_net_gain
                 
-                # Store match detail
+                # Store match detail for audit CSV
                 match_detail = match.copy()
                 match_detail['symbol'] = symbol
-                match_detail['net_gain'] = match_gain_net
+                match_detail['sell_fee'] = match_sell_fee
+                match_detail['net_gain'] = match_net_gain
+                
+                # buy_fee is already in match from the sell() logic
                 hifo_matches.append(match_detail)
 
     total_gains_fifo = sum(realized_gains_fifo.values())
@@ -684,7 +705,8 @@ def generate_audit_csv(matches, filename='spec_id_audit.csv'):
         return
 
     fieldnames = [
-        'symbol', 'term', 'gain', 'net_gain', 'quantity', 'proceeds', 'cost_basis',
+        'symbol', 'term', 'gain', 'buy_fee', 'sell_fee', 'net_gain',
+        'quantity', 'proceeds', 'cost_basis',
         'sell_date', 'sell_price', 'sell_txid', 
         'buy_date', 'buy_price', 'buy_txid'
     ]
@@ -1157,17 +1179,17 @@ def calculate_gains(csv_file):
 
                 # Update FIFO
                 if trade['side'] == 'buy':
-                    monthly_fifo_managers[symbol].buy(quantity, price, dt, txid)
+                    monthly_fifo_managers[symbol].buy(quantity, price, dt, txid, fee)
                 elif trade['side'] == 'sell':
                     gain, _, _ = monthly_fifo_managers[symbol].sell(quantity, price, dt, txid)
-                    monthly_metrics['gains_fifo'] += (gain - fee)
+                    monthly_metrics['gains_fifo'] += gain
 
                 # Update HIFO
                 if trade['side'] == 'buy':
-                    monthly_hifo_managers[symbol].buy(quantity, price, dt, txid)
+                    monthly_hifo_managers[symbol].buy(quantity, price, dt, txid, fee)
                 elif trade['side'] == 'sell':
                     gain, _, _ = monthly_hifo_managers[symbol].sell(quantity, price, dt, txid)
-                    monthly_metrics['gains_hifo'] += (gain - fee)
+                    monthly_metrics['gains_hifo'] += gain
 
             # Add this month's trades to cumulative
             cumulative_trades.extend(month_trades)
@@ -1250,17 +1272,15 @@ def calculate_gains(csv_file):
                 asset_monthly_data[symbol][trade_month]['cost_usd'] += trade['costusd']
 
                 if trade['side'] == 'buy':
-                    fifo_manager.buy(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
-                    hifo_manager.buy(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
+                    fifo_manager.buy(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'), trade['fee'])
+                    hifo_manager.buy(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'), trade['fee'])
                 elif trade['side'] == 'sell':
                     # FIFO
                     gain_fifo, _, _ = fifo_manager.sell(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
-                    gain_fifo -= trade['fee']
                     monthly_gains_tracker_fifo[trade_month] += gain_fifo
                     
                     # HIFO
                     gain_hifo, _, _ = hifo_manager.sell(trade['quantity'], trade['price'], trade['dt'], trade.get('txid', 'N/A'))
-                    gain_hifo -= trade['fee']
                     monthly_gains_tracker_hifo[trade_month] += gain_hifo
 
             # Store the calculated monthly gains

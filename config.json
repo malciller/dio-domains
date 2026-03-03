@@ -27,61 +27,6 @@
       "strategy": "Grid"
     },
     {
-      "symbol": "PAXG/USD",
-      "exchange": "kraken",
-      "qty": "0.0029",
-      "grid_interval": [
-        1.0,
-        1.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
-      "symbol": "ETH/USD",
-      "exchange": "kraken",
-      "qty": "0.005",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
-      "symbol": "SOL/USD",
-      "exchange": "kraken",
-      "qty": "0.09",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
-      "symbol": "ADA/USD",
-      "exchange": "kraken",
-      "qty": "30.0",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
-      "symbol": "TRX/USD",
-      "exchange": "kraken",
-      "qty": "40.0",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
       "symbol": "USDG/USD",
       "exchange": "kraken",
       "qty": "100.0",

@@ -79,23 +79,8 @@ let fetch_value ?(fallback = 50.0) () =
   | Some v -> v
   | None -> set_cached fallback
 
-(* Return 0–4 based on fear_and_greed value *)
-let grid_index_of_fng fng =
-  match fng with
-  | f when f < 20. -> 0
-  | f when f < 40. -> 1
-  | f when f < 60. -> 2
-  | f when f < 80. -> 3
-  | _ -> 4
-
-(* Compute the 5 grid levels a, x, y, z, b *)
-let compute_grid_levels (a, b) =
-  let step = (b -. a) /. 4. in
-  Array.init 5 (fun i -> a +. (float_of_int i *. step))
-
-(* Get the grid value based on fear_and_greed *)
-let grid_value_for_fng ~grid_interval ~fear_and_greed =
-  let levels = compute_grid_levels grid_interval in
-  let idx = grid_index_of_fng fear_and_greed in
-  levels.(idx)
+(* Get the grid value based on fear_and_greed using linear interpolation (0-100 range) *)
+let grid_value_for_fng ~grid_interval:(min_val, max_val) ~fear_and_greed =
+  let fng = max 0.0 (min 100.0 fear_and_greed) in
+  min_val +. (fng *. (max_val -. min_val) /. 100.0)
 
