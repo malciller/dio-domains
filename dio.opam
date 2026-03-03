@@ -8,7 +8,6 @@ authors: ["Cal Miller <malciller@gmail.com>"]
 license: "LICENSE"
 tags: ["trading" "finance" "multicore" "ocaml" "domains"]
 homepage: "https://github.com/malciller/dio"
-doc: "https://url/to/documentation"
 bug-reports: "https://github.com/malciller/dio/issues"
 depends: [
   "ocaml"

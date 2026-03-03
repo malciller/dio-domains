@@ -13,8 +13,6 @@
 
 (license LICENSE)
 
-(documentation https://url/to/documentation)
-
 (package
  (name dio)
  (synopsis "Domain-Oriented Trading Engine")
