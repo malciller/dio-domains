@@ -521,6 +521,7 @@ let start_response_cleanup_handlers () =
             cleanup_stale_response_entries ~reason:"memory_pressure" () >>= fun () ->
             loop ()
         | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
+            cleanup_stale_response_entries ~reason:"heartbeat" () >>= fun () ->
             loop ()
 
         | None ->
