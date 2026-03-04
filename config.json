@@ -31,8 +31,8 @@
       "exchange": "kraken",
       "qty": "0.0029",
       "grid_interval": [
-        1.0,
-        1.0
+        2.5,
+        5.0
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"
@@ -51,7 +51,7 @@
     {
       "symbol": "SOL/USD",
       "exchange": "kraken",
-      "qty": "0.09",
+      "qty": "0.14",
       "grid_interval": [
         2.5,
         5.0
@@ -62,7 +62,7 @@
     {
       "symbol": "ADA/USD",
       "exchange": "kraken",
-      "qty": "30.0",
+      "qty": "45.0",
       "grid_interval": [
         2.5,
         5.0
