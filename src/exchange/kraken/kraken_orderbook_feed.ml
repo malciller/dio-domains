@@ -858,6 +858,7 @@ let start_cleanup_handlers () =
             trigger_orderbook_cleanup ~reason:"memory_pressure" ();
             loop ()
         | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
+            trigger_orderbook_cleanup ~reason:"heartbeat" ();
             loop ()
 
         | None ->
@@ -885,11 +886,9 @@ let handle_message message on_heartbeat =
 
     match channel, msg_type, method_type with
   | Some "book", Some "snapshot", _ ->
-      ignore (process_orderbook_message ~reset:true json on_heartbeat);
-      trigger_orderbook_cleanup ~reason:"orderbook_snapshot" ()
+      ignore (process_orderbook_message ~reset:true json on_heartbeat)
   | Some "book", Some "update", _ ->
-      ignore (process_orderbook_message ~reset:false json on_heartbeat);
-      trigger_orderbook_cleanup ~reason:"orderbook_update" ()
+      ignore (process_orderbook_message ~reset:false json on_heartbeat)
     | Some "heartbeat", _, _ -> on_heartbeat () (* Update connection heartbeat *)
     | _, _, Some "subscribe" ->
         let result = member "result" json in

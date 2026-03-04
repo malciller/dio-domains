@@ -331,6 +331,7 @@ let start_cleanup_handlers () =
             trigger_stale_order_cleanup ~reason:"memory_pressure" ();
             loop ()
         | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
+            trigger_stale_order_cleanup ~reason:"heartbeat" ();
             loop ()
 
         | None ->
@@ -765,8 +766,6 @@ let handle_update json on_heartbeat =
           on_heartbeat ()
       | None -> ()
     ) data
-    ;
-    trigger_stale_order_cleanup ~reason:"execution_update" ()
   with exn ->
     Logging.error_f ~section "Failed to process execution update: %s"
       (Printexc.to_string exn)
@@ -878,7 +877,6 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
 
     (* Ensure cleanup handlers are active *)
     start_cleanup_handlers ();
-    trigger_stale_order_cleanup ~reason:"connect" ();
 
     (* Call on_connected callback after successful connection and before starting message handler *)
     on_connected ();
