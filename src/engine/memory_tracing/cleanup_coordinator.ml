@@ -242,9 +242,9 @@ let start_memory_monitor ~config ~generation () =
         (* Determine pressure level — treat exceeding target_heap_mb as High *)
         let pressure_level =
           if heap_mb > config.target_heap_mb || heap_mb >= config.high_heap_mb
-             || fragmentation_percent >= config.high_fragmentation_percent then
+             || (fragmentation_percent >= config.high_fragmentation_percent && heap_mb > 50) then
             Some `High
-          else if heap_mb >= config.medium_heap_mb || fragmentation_percent >= config.medium_fragmentation_percent then
+          else if heap_mb >= config.medium_heap_mb || (fragmentation_percent >= config.medium_fragmentation_percent && heap_mb > 50) then
             Some `Medium
           else
             None
