@@ -40,7 +40,7 @@
     {
       "symbol": "ETH/USD",
       "exchange": "kraken",
-      "qty": "0.005",
+      "qty": "0.006",
       "grid_interval": [
         2.5,
         5.0
