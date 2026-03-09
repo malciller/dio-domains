@@ -100,11 +100,11 @@ Edit `config.json` (example):
   - **Order Executor**: Asynchronous order placement, amendment, and cancellation with duplicate detection.
   - **Telemetry**: Real-time performance monitoring and metrics collection.
   - **Logging**: Structured logging with configurable levels and sections.
-- **Exchange Integration - Kraken**:
+- **External Integration - Kraken**:
   - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
   - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
   - **Authentication**: Secure token generation and management.
-- **Exchange Integration - Hyperliquid**:
+- **External Integration - Hyperliquid**:
   - **In Progress**
 
 ## Development
@@ -137,7 +137,7 @@ dune build
     - Trading strategies: `src/engine/strategies/`
     - Domain management: `src/engine/domain_spawner.ml`
     - Connection supervision: `src/engine/supervisor/`
-    - WebSocket feeds: `src/exchange/kraken/`
+    - WebSocket feeds: `src/external/kraken/`
     - Dashboard UI: `src/ui/`
 3. Commit (`git commit -m "..."`)
 4. Push (`git push origin feature/xyz`)
