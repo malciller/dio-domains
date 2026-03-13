@@ -10,6 +10,7 @@
   dio.cmc
   threads
   dio.concurrency
+  dio.latency_profiling
   dio.memory_tracing
   dio.exchange)
  (modules Config Domain_spawner Order_executor))

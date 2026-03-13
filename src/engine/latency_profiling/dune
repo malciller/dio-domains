@@ -1,0 +1,6 @@
+(library
+ (name dio_latency_profiling)
+ (public_name dio.latency_profiling)
+ (wrapped false)
+ (libraries logging mtime mtime.clock.os)
+ (modules Latency_profiler))
