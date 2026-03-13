@@ -21,7 +21,7 @@
       "qty": "0.001",
       "grid_interval": [
         0.75,
-        2.5
+        2.0
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"

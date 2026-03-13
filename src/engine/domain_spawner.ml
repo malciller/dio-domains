@@ -216,8 +216,15 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
       let last_sell_count = ref 0 in
 
       let cycle_count = ref 0 in
-      let last_log_time = ref (Unix.gettimeofday ()) in
+
+      let prof_ticker = Latency_profiler.create (asset_with_fees.symbol ^ ":ticker") in
+      let prof_ob = Latency_profiler.create (asset_with_fees.symbol ^ ":ob") in
+      let prof_exec = Latency_profiler.create (asset_with_fees.symbol ^ ":exec") in
+      let prof_strategy = Latency_profiler.create (asset_with_fees.symbol ^ ":strategy") in
+      let prof_cycle = Latency_profiler.create (asset_with_fees.symbol ^ ":cycle") in
+
       while Atomic.get state.is_running do
+        let cycle_start = Mtime_clock.now_ns () in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
@@ -229,6 +236,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         (* Consume ticker events *)
         let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
         if ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) then begin
+          let start_ticker = Mtime_clock.now_ns () in
           let new_tickers = Ex.read_ticker_events ~symbol:asset_with_fees.symbol ~start_pos:!ticker_read_pos in
           ticker_read_pos := ticker_pos;
           
@@ -237,12 +245,15 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
             should_execute_strategy := true;
             Logging.debug_f ~section "Asset [%s/%s]: Consumed ticker event - price=$%.2f"
               asset_with_fees.exchange asset_with_fees.symbol ((ticker.bid +. ticker.ask) /. 2.0)
-          ) new_tickers
+          ) new_tickers;
+          let stop_ticker = Mtime_clock.now_ns () in
+          Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
         end;
         
         (* Consume orderbook events *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
         if ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) then begin
+          let start_ob = Mtime_clock.now_ns () in
           let new_orderbooks = Ex.read_orderbook_events ~symbol:asset_with_fees.symbol ~start_pos:!orderbook_read_pos in
           orderbook_read_pos := ob_pos;
           
@@ -257,7 +268,9 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
                 asset_with_fees.exchange asset_with_fees.symbol
                 bid_price bid_size ask_price ask_size
             end
-          ) new_orderbooks
+          ) new_orderbooks;
+          let stop_ob = Mtime_clock.now_ns () in
+          Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
         end;
         
         (* Consume ticker events *)
@@ -265,6 +278,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         (* Consume execution events *)
         let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
         if current_pos <> !exec_read_pos then begin
+          let start_exec = Mtime_clock.now_ns () in
           let new_events = Ex.read_execution_events ~symbol:asset_with_fees.symbol ~start_pos:!exec_read_pos in
           let event_count = List.length new_events in
           if event_count > 0 then begin
@@ -319,6 +333,8 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
             ) new_events
           end;
           exec_read_pos := current_pos;
+          let stop_exec = Mtime_clock.now_ns () in
+          Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub stop_exec start_exec))
         end;
 
         (* Mock balance check throttling *)
@@ -333,6 +349,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         (* Add fallback: execute every 10000 cycles (~2 seconds at 200k/sec) to prevent getting stuck *)
         let should_execute = !should_execute_strategy || (!cycle_count mod 10000 = 0) in
         if should_execute then begin
+          let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Reset flag *)
 
           (* Get open orders for strategy sync - only when executing strategy *)
@@ -403,34 +420,21 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
           (match mm_strategy_asset with
            | Some asset ->
                Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
-           | None -> ())
+           | None -> ());
+          let stop_strat = Mtime_clock.now_ns () in
+          Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat))
         end;
         
         (* Log cycle stats *)
-        let cycle = !cycle_count in
-        if cycle mod 1000000 = 0 then begin
-          let now_time = Unix.gettimeofday () in
-          let elapsed = max 0.000001 (now_time -. !last_log_time) in
-          let cycles = 1_000_000.0 in
-          let cps = cycles /. elapsed in
-          let mhz = cps /. 1_000_000.0 in
-          let hz_str = Printf.sprintf " | %.2fs/M (%.0f cycles/s | %.2f MHz)" elapsed cps mhz in
-          last_log_time := now_time;
-
+        (* Log cycle stats every 1M cycles *)
+        if !cycle_count mod 1000000 = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
-              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s%s"
-                asset_with_fees.exchange asset_with_fees.symbol cycle price
+              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
+                asset_with_fees.exchange asset_with_fees.symbol !cycle_count price
                 bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
-                !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy) hz_str
-          | Some price, None ->
-              Logging.info_f ~section "[%s/%s] C#%d - $%.2f (orderbook loading...) | %d buy / %d sell%s%s"
-                asset_with_fees.exchange asset_with_fees.symbol cycle price !last_buy_count !last_sell_count
-                (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy) hz_str
-          | None, _ ->
-              Logging.info_f ~section "[%s/%s] C#%d - no price data yet | %d buy / %d sell%s%s"
-                asset_with_fees.exchange asset_with_fees.symbol cycle !last_buy_count !last_sell_count
-                (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy) hz_str)
+                !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
+          | _ -> ())
         end;
         (match asset_with_fees.maker_fee, asset_with_fees.taker_fee with
          | Some m, Some t -> Logging.debug_f ~section "Asset [%s/%s]: Cached fees maker=%.4f%% taker=%.4f%%" 
@@ -446,6 +450,18 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         (* Yield to allow other threads (websockets) to run *)
         if not should_execute then Domain.cpu_relax ();
         Domain.cpu_relax ();
+
+        let cycle_stop = Mtime_clock.now_ns () in
+        let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
+        Latency_profiler.record prof_cycle cycle_span;
+
+        (* Report latencies *)
+        Latency_profiler.report prof_ticker;
+        Latency_profiler.report prof_ob;
+        Latency_profiler.report prof_exec;
+        Latency_profiler.report prof_strategy;
+        Latency_profiler.report prof_cycle;
+
         ()
       done
 
