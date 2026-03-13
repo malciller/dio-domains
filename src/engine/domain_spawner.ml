@@ -197,10 +197,26 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
 
       let key = domain_key asset_with_fees in
       let state = Hashtbl.find domain_registry key in
-      
+
       Logging.info_f ~section "Entering domain loop for %s. is_running=%B" key (Atomic.get state.is_running);
+      
+      (* Get balances for asset and quote currency - once before loop *)
+      let (base_asset, quote_currency) =
+        if String.contains asset_with_fees.symbol '/' then
+          let parts = String.split_on_char '/' asset_with_fees.symbol in
+          (List.nth parts 0, List.nth parts 1)
+        else
+          (asset_with_fees.symbol, "USD")
+      in
+
+      (* Cache for infrequent info logging *)
+      let last_asset_balance = ref 0.0 in
+      let last_quote_balance = ref 0.0 in
+      let last_buy_count = ref 0 in
+      let last_sell_count = ref 0 in
 
       let cycle_count = ref 0 in
+      let last_log_time = ref (Unix.gettimeofday ()) in
       while Atomic.get state.is_running do
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
@@ -244,14 +260,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
           ) new_orderbooks
         end;
         
-        (* Get balances for asset and quote currency *)
-        let (base_asset, quote_currency) =
-          if String.contains asset_with_fees.symbol '/' then
-            let parts = String.split_on_char '/' asset_with_fees.symbol in
-            (List.nth parts 0, List.nth parts 1)
-          else
-            (asset_with_fees.symbol, "USD")
-        in
+        (* Consume ticker events *)
         
         (* Consume execution events *)
         let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
@@ -312,91 +321,13 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
           exec_read_pos := current_pos;
         end;
 
-        (* Get open orders for strategy sync *)
-        let orders = Ex.get_open_orders ~symbol:asset_with_fees.symbol in
-        (* Map to internal format used by existing strategies:
-           (order_id, price, remaining_qty, side_str, order_userref) 
-        *)
-        let all_open_orders = List.filter_map (fun (order : Types.open_order) ->
-          match order.limit_price with
-          | Some price -> 
-              let side_str = match order.side with
-                | Types.Buy -> "buy"
-                | Types.Sell -> "sell"
-              in
-              Some (order.order_id, price, order.remaining_qty, side_str, order.user_ref)
-          | None -> None
-        ) orders in
-
-        (* Filter orders by strategy based on userref *)
-        let filter_orders_by_strategy strategy_name strategy_userref =
-          (* Always log for first few cycles to debug filtering *)
-          let should_log = !cycle_count < 10 || !cycle_count mod 100000 = 0 in
-          
-          if should_log && List.length all_open_orders > 0 then
-            Logging.debug_f ~section "Filtering %d total orders on %s for %s strategy (userref=%d)"
-              (List.length all_open_orders) asset_with_fees.symbol strategy_name strategy_userref;
-          
-          let filtered = List.filter (fun (order_id, _, _, _, userref_opt) ->
-            match userref_opt with
-            | Some userref -> 
-                let matches = Dio_strategies.Strategy_common.is_strategy_order strategy_userref userref in
-                if should_log then
-                  Logging.debug_f ~section "Order %s: userref=%d, matches=%B"
-                    order_id userref matches;
-                matches
-            | None -> 
-                if should_log then
-                  Logging.debug_f ~section "Order %s has no userref, ignoring for strategy filtering" order_id;
-                false  (* Orders without userref are ignored - likely manual orders *)
-          ) all_open_orders in
-          
-          if should_log then
-            Logging.debug_f ~section "Filtered %d orders for %s strategy from %d total orders on %s"
-              (List.length filtered) strategy_name (List.length all_open_orders) asset_with_fees.symbol;
-          filtered
-        in
-
-        (* Get strategy-specific open orders *)
-        (* let grid_open_orders = filter_orders_by_strategy "Grid" Dio_strategies.Strategy_common.strategy_userref_grid in *)
-        let mm_open_orders = filter_orders_by_strategy "MM" Dio_strategies.Strategy_common.strategy_userref_mm in
-
-        (* Calculate buy/sell counts from grid strategy orders *)
-        let (grid_open_buy_count, grid_open_sell_count) =
-          List.fold_left (fun (buys, sells) (_, _, _, side_str, userref_opt) ->
-            if side_str = "buy" then
-              (* Only count buy orders with grid tag *)
-              (match userref_opt with
-               | Some userref when Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref -> (buys + 1, sells)
-               | _ -> (buys, sells))
-            else
-              (* Count ALL sell orders regardless of tag *)
-              (buys, sells + 1)
-          ) (0, 0) all_open_orders
-        in
-
-        (* Calculate buy/sell counts from MM strategy orders *)
-        let (mm_open_buy_count, mm_open_sell_count) =
-          List.fold_left (fun (buys, sells) (_, _, _, side_str, _) ->
-            if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1)
-          ) (0, 0) mm_open_orders
-        in
-
-        (* Lock-free balance queries *)
-        let asset_balance =
-          try Some (Ex.get_balance ~asset:base_asset)
-          with _ -> None
-        in
-        let quote_balance =
-          try Some (Ex.get_balance ~asset:quote_currency)
-          with _ -> None
-        in
-
-        (* Check for balance changes every 10 cycles (~2 seconds at 200k/sec) *)
-        let now = Unix.time () in
-        if now -. !last_balance_check > 2.0 then begin
-          last_balance_check := now;
-        end;
+        (* Mock balance check throttling *)
+        if !cycle_count mod 10000 = 0 then (
+          let now = Unix.time () in
+          if now -. !last_balance_check > 2.0 then begin
+            last_balance_check := now;
+          end
+        );
 
         (* Execute strategy based on type - only when triggered by events (event-driven) *)
         (* Add fallback: execute every 10000 cycles (~2 seconds at 200k/sec) to prevent getting stuck *)
@@ -404,43 +335,102 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         if should_execute then begin
           should_execute_strategy := false;  (* Reset flag *)
 
+          (* Get open orders for strategy sync - only when executing strategy *)
+          let orders = Ex.get_open_orders ~symbol:asset_with_fees.symbol in
+          (* Map to internal format used by existing strategies:
+             (order_id, price, remaining_qty, side_str, order_userref) 
+          *)
+          let all_open_orders = List.filter_map (fun (order : Types.open_order) ->
+            match order.limit_price with
+            | Some price -> 
+                let side_str = match order.side with
+                  | Types.Buy -> "buy"
+                  | Types.Sell -> "sell"
+                in
+                Some (order.order_id, price, order.remaining_qty, side_str, order.user_ref)
+            | None -> None
+          ) orders in
+
+          (* Filter orders by strategy based on userref *)
+          let filter_orders_by_strategy _strategy_name strategy_userref =
+            List.filter (fun (_order_id, _, _, _, userref_opt) ->
+              match userref_opt with
+              | Some userref -> Dio_strategies.Strategy_common.is_strategy_order strategy_userref userref
+              | None -> false
+            ) all_open_orders
+          in
+
+          (* Get strategy-specific open orders *)
+          let mm_open_orders = filter_orders_by_strategy "MM" Dio_strategies.Strategy_common.strategy_userref_mm in
+
+          (* Calculate buy/sell counts from grid strategy orders *)
+          let (grid_open_buy_count, grid_open_sell_count) =
+            List.fold_left (fun (buys, sells) (_, _, _, side_str, userref_opt) ->
+              if side_str = "buy" then
+                (match userref_opt with
+                 | Some userref when Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref -> (buys + 1, sells)
+                 | _ -> (buys, sells))
+              else
+                (buys, sells + 1)
+            ) (0, 0) all_open_orders
+          in
+
+          (* Calculate buy/sell counts from MM strategy orders *)
+          let (mm_open_buy_count, mm_open_sell_count) =
+            List.fold_left (fun (buys, sells) (_, _, _, side_str, _) ->
+              if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1)
+            ) (0, 0) mm_open_orders
+          in
+
+          (* Lock-free balance queries *)
+          (match Ex.get_balance ~asset:base_asset with
+           | bal -> last_asset_balance := bal
+           | exception _ -> ());
+          (match Ex.get_balance ~asset:quote_currency with
+           | bal -> last_quote_balance := bal
+           | exception _ -> ());
+          
+          let asset_balance = Some !last_asset_balance in
+          let quote_balance = Some !last_quote_balance in
+          
+          last_buy_count := grid_open_buy_count + mm_open_buy_count;
+          last_sell_count := grid_open_sell_count + mm_open_sell_count;
+
           (match grid_strategy_asset with
            | Some asset ->
-               (* Pass ALL open orders to Grid strategy so it can see all sell orders for positioning *)
                Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
            | None -> ());
           (match mm_strategy_asset with
            | Some asset ->
                Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
-           | None -> ());
+           | None -> ())
         end;
-        
-        (* Calculate total order counts across all strategies for logging *)
-        let total_open_buy_count = grid_open_buy_count + mm_open_buy_count in
-        let total_open_sell_count = grid_open_sell_count + mm_open_sell_count in
         
         (* Log cycle stats *)
         let cycle = !cycle_count in
         if cycle mod 1000000 = 0 then begin
-          (match !current_price, !top_of_book, asset_balance, quote_balance with
-          | Some price, Some (bid_price, _bid_size, ask_price, _ask_size), Some asset_bal, Some quote_bal ->
-              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
+          let now_time = Unix.gettimeofday () in
+          let elapsed = max 0.000001 (now_time -. !last_log_time) in
+          let cycles = 1_000_000.0 in
+          let cps = cycles /. elapsed in
+          let mhz = cps /. 1_000_000.0 in
+          let hz_str = Printf.sprintf " | %.2fs/M (%.0f cycles/s | %.2f MHz)" elapsed cps mhz in
+          last_log_time := now_time;
+
+          (match !current_price, !top_of_book with
+          | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
+              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s%s"
                 asset_with_fees.exchange asset_with_fees.symbol cycle price
-                bid_price ask_price base_asset asset_bal quote_currency quote_bal
-                total_open_buy_count total_open_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
-          | Some price, Some (bid_price, _bid_size, ask_price, _ask_size), _, _ ->
-              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %d buy / %d sell%s"
-                asset_with_fees.exchange asset_with_fees.symbol cycle price
-                bid_price ask_price total_open_buy_count total_open_sell_count
-                (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
-          | Some price, None, _, _ ->
-              Logging.info_f ~section "[%s/%s] C#%d - $%.2f (orderbook loading...) | %d buy / %d sell%s"
-                asset_with_fees.exchange asset_with_fees.symbol cycle price total_open_buy_count total_open_sell_count
-                (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
-          | None, _, _, _ ->
-              Logging.info_f ~section "[%s/%s] C#%d - no price/orderbook data yet | %d buy / %d sell%s"
-                asset_with_fees.exchange asset_with_fees.symbol cycle total_open_buy_count total_open_sell_count
-                (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy))
+                bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
+                !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy) hz_str
+          | Some price, None ->
+              Logging.info_f ~section "[%s/%s] C#%d - $%.2f (orderbook loading...) | %d buy / %d sell%s%s"
+                asset_with_fees.exchange asset_with_fees.symbol cycle price !last_buy_count !last_sell_count
+                (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy) hz_str
+          | None, _ ->
+              Logging.info_f ~section "[%s/%s] C#%d - no price data yet | %d buy / %d sell%s%s"
+                asset_with_fees.exchange asset_with_fees.symbol cycle !last_buy_count !last_sell_count
+                (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy) hz_str)
         end;
         (match asset_with_fees.maker_fee, asset_with_fees.taker_fee with
          | Some m, Some t -> Logging.debug_f ~section "Asset [%s/%s]: Cached fees maker=%.4f%% taker=%.4f%%" 
@@ -454,6 +444,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
 
 
         (* Yield to allow other threads (websockets) to run *)
+        if not should_execute then Domain.cpu_relax ();
         Domain.cpu_relax ();
         ()
       done
