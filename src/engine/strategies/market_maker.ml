@@ -238,6 +238,7 @@ let push_order order =
 
               match write_result with
               | Some () ->
+                  Strategy_common.OrderSignal.broadcast ();
                   Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
                     operation_str
                     (string_of_order_side order.side)
@@ -277,6 +278,7 @@ let push_order order =
 
        match write_result with
        | Some () ->
+           Strategy_common.OrderSignal.broadcast ();
            Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
              operation_str
              (string_of_order_side order.side)

@@ -191,79 +191,83 @@ type monitor_config = {
 (** Global shutdown flag for memory monitor *)
 let monitor_shutdown = Atomic.make false
 
+(** Condition variable to signal shutdown without polling *)
+let shutdown_cond = Lwt_condition.create ()
+
 (** Signal shutdown to memory monitor *)
 let signal_shutdown () =
   Logging.info ~section:"cleanup_coordinator" "Cleanup coordinator shutdown signaled";
   Atomic.set monitor_shutdown true;
-  Atomic.set coordinator_running false
+  Atomic.set coordinator_running false;
+  Lwt_condition.broadcast shutdown_cond ()
 
 (** Stop cleanup coordinator to allow restart *)
 let stop_cleanup_coordinator () =
   Logging.info ~section:"cleanup_coordinator" "Stopping cleanup coordinator for restart";
   Atomic.set monitor_shutdown true;
-  Atomic.set coordinator_running false
+  Atomic.set coordinator_running false;
+  Lwt_condition.broadcast shutdown_cond ()
 
-(** Start the automated memory monitor loop - returns Lwt.t that completes when stopped *)
+let memory_alarm = ref None
+
+(** Start the automated memory monitor using GC alarms - returns Lwt.t that completes when stopped *)
 let start_memory_monitor ~config ~generation () =
-  Logging.info_f ~section:"cleanup_coordinator" "Starting memory monitor loop (check interval: %.1fs, generation: %d)" 
-    config.check_interval_seconds generation;
+  Logging.info_f ~section:"cleanup_coordinator" "Starting memory monitor via GC alarm (generation: %d)" generation;
   
-  let rec monitor_loop () =
-    (* Check generation - if we're not the current generation, exit immediately *)
-    if Atomic.get run_generation <> generation then begin
-      Logging.info_f ~section:"cleanup_coordinator" "Memory monitor (gen %d) detected new generation (%d), exiting"
-        generation (Atomic.get run_generation);
-      Lwt.return_unit
-    end else if Atomic.get monitor_shutdown || not (Atomic.get coordinator_running) then begin
-      Logging.info_f ~section:"cleanup_coordinator" "Memory monitor (gen %d) shutting down" generation;
-      Lwt.return_unit
-    end else begin
-      (* Use a simpler sleep that is friendly to Lwt *)
-      Lwt_unix.sleep config.check_interval_seconds >>= fun () ->
+  let alarm_fn () =
+    if Atomic.get run_generation = generation && not (Atomic.get monitor_shutdown) && Atomic.get coordinator_running then begin
+      (* Publish heartbeat to verify consumer is alive *)
+      Memory_events.publish_heartbeat ();
       
-      if Atomic.get run_generation <> generation then
-        Lwt.return_unit
-      else if Atomic.get monitor_shutdown || not (Atomic.get coordinator_running) then
-        Lwt.return_unit
-      else begin
-        (* Publish heartbeat to verify consumer is alive *)
-        Memory_events.publish_heartbeat ();
-        
-        (* Check GC stats for memory pressure *)
-        let gc_stats = Gc.stat () in
-        let heap_mb = gc_stats.heap_words * (Sys.word_size / 8) / 1048576 in
-        let live_mb = gc_stats.live_words * (Sys.word_size / 8) / 1048576 in
-        let fragmentation_percent =
-          if gc_stats.heap_words > 0 then
-            100.0 *. (1.0 -. (float_of_int gc_stats.live_words /. float_of_int gc_stats.heap_words))
-          else 0.0
-        in
-        
-        (* Determine pressure level — treat exceeding target_heap_mb as High *)
-        let pressure_level =
-          if heap_mb > config.target_heap_mb || heap_mb >= config.high_heap_mb
-             || (fragmentation_percent >= config.high_fragmentation_percent && heap_mb > 50) then
-            Some `High
-          else if heap_mb >= config.medium_heap_mb || (fragmentation_percent >= config.medium_fragmentation_percent && heap_mb > 50) then
-            Some `Medium
-          else
-            None
-        in
-        
-        (match pressure_level with
-        | Some level ->
-            Logging.info_f ~section:"cleanup_coordinator" 
-              "Memory pressure detected: level=%s, heap=%dMB, live=%dMB, frag=%.1f%%"
-              (match level with `High -> "high" | `Medium -> "medium")
-              heap_mb live_mb fragmentation_percent;
-            Memory_events.publish_memory_pressure level heap_mb live_mb fragmentation_percent
-        | None -> ());
-        
-        monitor_loop ()
-      end
+      (* Check GC stats for memory pressure *)
+      let gc_stats = Gc.stat () in
+      let heap_mb = gc_stats.heap_words * (Sys.word_size / 8) / 1048576 in
+      let live_mb = gc_stats.live_words * (Sys.word_size / 8) / 1048576 in
+      let fragmentation_percent =
+        if gc_stats.heap_words > 0 then
+          100.0 *. (1.0 -. (float_of_int gc_stats.live_words /. float_of_int gc_stats.heap_words))
+        else 0.0
+      in
+      
+      (* Determine pressure level — treat exceeding target_heap_mb as High *)
+      let pressure_level =
+        if heap_mb > config.target_heap_mb || heap_mb >= config.high_heap_mb
+           || (fragmentation_percent >= config.high_fragmentation_percent && heap_mb > 50) then
+          Some `High
+        else if heap_mb >= config.medium_heap_mb || (fragmentation_percent >= config.medium_fragmentation_percent && heap_mb > 50) then
+          Some `Medium
+        else
+          None
+      in
+      
+      match pressure_level with
+      | Some level ->
+          Logging.info_f ~section:"cleanup_coordinator" 
+            "Memory pressure detected by GC alarm: level=%s, heap=%dMB, live=%dMB, frag=%.1f%%"
+            (match level with `High -> "high" | `Medium -> "medium")
+            heap_mb live_mb fragmentation_percent;
+          Memory_events.publish_memory_pressure level heap_mb live_mb fragmentation_percent
+      | None -> ()
     end
   in
-  monitor_loop ()
+  
+  (* Clean up old alarm if it exists *)
+  (match !memory_alarm with
+   | Some alarm -> Gc.delete_alarm alarm
+   | None -> ());
+   
+  memory_alarm := Some (Gc.create_alarm alarm_fn);
+  
+  let rec wait_for_shutdown () =
+    if Atomic.get monitor_shutdown || Atomic.get run_generation <> generation || not (Atomic.get coordinator_running) then begin
+      (match !memory_alarm with
+       | Some alarm -> Gc.delete_alarm alarm; memory_alarm := None
+       | None -> ());
+      Lwt.return_unit
+    end else
+      Lwt_condition.wait shutdown_cond >>= fun () -> wait_for_shutdown ()
+  in
+  wait_for_shutdown ()
 
 (** Start the cleanup coordinator - can be restarted after stopping
     Returns an Lwt.t that completes when the coordinator stops (for supervisor restart detection) *)

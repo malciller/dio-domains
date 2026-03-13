@@ -871,6 +871,7 @@ let start_cleanup_handlers () =
   end
 
 let handle_message message on_heartbeat =
+  Concurrency.Tick_event_bus.publish_tick ();
   Logging.debug_f ~section "Received orderbook WebSocket message (length=%d)"
     (String.length message);
   try

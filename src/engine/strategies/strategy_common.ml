@@ -249,3 +249,10 @@ module OrderRingBuffer = struct
     read_n [] 0
 end
 
+(** Global order signal for event-driven order processing *)
+module OrderSignal = struct
+  let condition = Lwt_condition.create ()
+  let broadcast () = Lwt_condition.broadcast condition ()
+  let wait () = Lwt_condition.wait condition
+end
+

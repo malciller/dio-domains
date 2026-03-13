@@ -347,6 +347,23 @@ let parse_snapshot json on_heartbeat =
           (Printexc.to_string exn)
     ) data;
     
+    (* Ensure all initialized balance stores are marked as updated even if they had 0 balance 
+       and were omitted from the snapshot *)
+    let now = Unix.time () in
+    Mutex.lock balance_stores_mutex;
+    let all_assets = Hashtbl.fold (fun asset _ acc -> asset :: acc) balance_stores [] in
+    Mutex.unlock balance_stores_mutex;
+
+    List.iter (fun asset ->
+      let store = get_balance_store asset in
+      if Atomic.get store.last_updated <= 0.0 then begin
+        Atomic.set store.last_updated now;
+        update_balance_timestamp asset;
+        Logging.debug_f ~section "Balance snapshot: Marked zero-balance asset %s as updated" asset
+      end
+    ) all_assets;
+    notify_ready ();
+
     (* Event-driven cleanup after snapshot processing to cap dynamic assets *)
     maybe_cleanup_after_balance_update ();
 
@@ -407,6 +424,7 @@ let parse_update json on_heartbeat =
 
 (** WebSocket message handler *)
 let handle_message message on_heartbeat =
+  Concurrency.Tick_event_bus.publish_tick ();
   try
     let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in
