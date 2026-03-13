@@ -14,7 +14,7 @@
   threads
   websocket-lwt-unix
   concurrency
-  dio.memory_tracing
+  dio.memory_management
   dio.exchange)
  (preprocess
   (pps lwt_ppx)))

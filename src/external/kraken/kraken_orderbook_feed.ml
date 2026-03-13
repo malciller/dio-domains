@@ -2,7 +2,7 @@
 (* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
-module Memory_events = Dio_memory_tracing.Memory_events
+module Memory_events = Dio_memory_management.Memory_events
 
 let section = "kraken_orderbook"
 

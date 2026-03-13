@@ -10,6 +10,6 @@
   dio.engine
   dio.kraken
   dio.concurrency
-  dio.memory_tracing)
+  dio.memory_management)
  (preprocess
   (pps lwt_ppx)))

@@ -6,7 +6,7 @@
 
 open Lwt.Infix
 open Concurrency
-module Memory_events = Dio_memory_tracing.Memory_events
+module Memory_events = Dio_memory_management.Memory_events
 
 let section = "kraken_trading_client"
 
