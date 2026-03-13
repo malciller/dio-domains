@@ -214,11 +214,10 @@ let notify_ready store =
       ())
   end
 
-(** Check if we have execution data for a symbol *)
 let has_execution_data symbol =
   try
     let store = get_symbol_store symbol in
-    Atomic.get store.last_event_time > 0.0
+    Atomic.get store.ready
   with _ -> false
 
 (** Wait until execution data is available for symbols *)
@@ -739,6 +738,12 @@ let handle_snapshot json on_heartbeat =
       
     end;
     
+    (* Mark all initialized stores as ready, even if they had no events in the snapshot *)
+    List.iter (fun symbol ->
+      let store = get_symbol_store symbol in
+      notify_ready store;
+    ) all_symbols;
+    
     Logging.debug_f ~section "Execution snapshot processed and reconciled"
   with exn ->
     Logging.error_f ~section "Failed to process execution snapshot: %s"
@@ -772,6 +777,7 @@ let handle_update json on_heartbeat =
 
 (** WebSocket message handler *)
 let handle_message message on_heartbeat =
+  Concurrency.Tick_event_bus.publish_tick ();
   try
     let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in

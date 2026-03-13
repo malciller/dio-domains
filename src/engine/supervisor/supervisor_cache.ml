@@ -3,7 +3,7 @@
     respecting the concurrency model.
 *)
 
-open Lwt.Infix
+
 open Concurrency
 
 (** Open supervisor types to access types *)
@@ -101,52 +101,34 @@ let create_connection_snapshots () : connection_snapshot list =
 (** Update telemetry metrics from snapshots - no-op since telemetry is removed *)
 let update_telemetry_from_snapshots _snapshots = ()
 
-(** Start background updater - singleton pattern *)
-let start_cache_updater () =
-  if Atomic.compare_and_set polling_loop_started false true then begin
-    Logging.info ~section:"supervisor_cache" "Starting singleton supervisor cache polling loop";
-    Lwt.async (fun () ->
-      let rec polling_loop () =
-        let now = Unix.time () in
-        let time_since_last = now -. cache.last_update in
-        let in_backoff = now < cache.backoff_until in
-
-        if in_backoff then
-          Lwt_unix.sleep 1.0 >>= polling_loop
-        else if time_since_last >= cache.update_interval then (
-          (try
-            let snapshots = create_connection_snapshots () in
-            cache.current_snapshots <- snapshots;
-            cache.last_update <- now;
-            cache.consecutive_failures <- 0;
-            cache.backoff_until <- 0.0;
-
-            (* Update telemetry from snapshots *)
-            update_telemetry_from_snapshots snapshots;
-
-            (* Publish to event bus *)
-            ConnectionSnapshotEventBus.publish cache.snapshot_event_bus snapshots;
-            safe_broadcast_update_condition cache;
-          with exn ->
-            cache.consecutive_failures <- cache.consecutive_failures + 1;
-            let backoff_seconds = min 60.0 (2.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 5))) in
-            cache.backoff_until <- now +. backoff_seconds;
-            Logging.warn_f ~section:"supervisor_cache" "Failed to update connection snapshots: %s" (Printexc.to_string exn)
-          );
-          Lwt_unix.sleep 1.0 >>= polling_loop
-        ) else
-          Lwt_unix.sleep 1.0 >>= polling_loop
-      in
-      Lwt_unix.sleep 1.0 >>= polling_loop
-    )
-  end
+(** Force an immediate cache update *)
+let force_update () =
+  let now = Unix.time () in
+  try
+    let snapshots = create_connection_snapshots () in
+    cache.current_snapshots <- snapshots;
+    cache.last_update <- now;
+    cache.consecutive_failures <- 0;
+    cache.backoff_until <- 0.0;
+    
+    (* Update telemetry from snapshots *)
+    update_telemetry_from_snapshots snapshots;
+    
+    (* Publish to event bus *)
+    ConnectionSnapshotEventBus.publish cache.snapshot_event_bus snapshots;
+    safe_broadcast_update_condition cache;
+  with exn ->
+    cache.consecutive_failures <- cache.consecutive_failures + 1;
+    let backoff_seconds = min 60.0 (2.0 *. (2.0 ** float_of_int (min cache.consecutive_failures 5))) in
+    cache.backoff_until <- now +. backoff_seconds;
+    Logging.warn_f ~section:"supervisor_cache" "Failed to update connection snapshots: %s" (Printexc.to_string exn)
 
 (** Initialize cache *)
 let init () =
   if !initialized then ()
   else (
     initialized := true;
-    start_cache_updater ();
+    force_update ();
     Logging.info ~section:"supervisor_cache" "Supervisor cache initialized"
   )
 

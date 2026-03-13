@@ -275,6 +275,7 @@ let reset_state conn ~notify_failure reason =
 
 
 let handle_frame frame ~expected_generation =
+  Concurrency.Tick_event_bus.publish_tick ();
   notify_heartbeat ();
   (* Track frame processing *)
 

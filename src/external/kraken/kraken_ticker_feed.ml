@@ -157,6 +157,7 @@ let parse_ticker json on_heartbeat =
 
 (** WebSocket message handler *)
 let handle_message message on_heartbeat =
+  Concurrency.Tick_event_bus.publish_tick ();
   try
     let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in

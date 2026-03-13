@@ -171,7 +171,7 @@ let set_state conn new_state =
   Mutex.unlock conn.mutex;
   
   (* Log state transitions *)
-  if old_state <> new_state then
+  if old_state <> new_state then begin
     Logging.debug_f ~section "[%s] State transition: %s -> %s" 
       conn.name 
       (match old_state with
@@ -183,7 +183,11 @@ let set_state conn new_state =
        | Disconnected -> "Disconnected"
        | Connecting -> "Connecting"
        | Connected -> "Connected"
-       | Failed _ -> "Failed")
+       | Failed _ -> "Failed");
+       
+    (* Immediately propagate changes to the supervisor cache via event-driven update *)
+    Supervisor_cache.force_update ()
+  end
 
 (** Get connection state *)
 let get_state conn =
@@ -317,152 +321,158 @@ let restart conn =
 (** Monitor all connections and report status *)
 let monitor_loop () =
   let cycle_count = ref 0 in
-  while not (Atomic.get shutdown_requested) do
-    try
-      interruptible_sleep 2.0;  (* Check every 2 seconds for faster reconnection detection *)
-      if Atomic.get shutdown_requested then raise Exit;
+  let subscription = Concurrency.Tick_event_bus.subscribe_ticks () in
+  let last_check_time = ref 0.0 in
+  let rec loop () =
+    if Atomic.get shutdown_requested then Lwt.return_unit
+    else
+      Lwt_stream.get subscription.Concurrency.Tick_event_bus.stream >>= function
+      | None -> Lwt.return_unit
+      | Some () ->
+          if Atomic.get shutdown_requested then Lwt.return_unit else begin
+            let current_time = Unix.time () in
+            (* Throttle full connection checks to maximum once per second to avoid excessive CPU on high tick rates *)
+            if current_time -. !last_check_time < 1.0 then loop ()
+            else begin
+              last_check_time := current_time;
+              try
+                incr cycle_count;
 
-      incr cycle_count;
+                Mutex.lock registry_mutex;
+                let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
+                Mutex.unlock registry_mutex;
+              
+                (* Check each connection and trigger auto-restart if needed *)
+                List.iter (fun conn ->
+                  if Atomic.get shutdown_requested then () else
+                  (* Get all state information atomically *)
+                  Mutex.lock conn.mutex;
+                  let state = conn.state in
+                  let attempts = conn.reconnect_attempts in
+                  let last_disconnected = conn.last_disconnected in
+                  let last_connecting = conn.last_connecting in
+                  let has_connect_fn = Option.is_some conn.connect_fn in
+                  Mutex.unlock conn.mutex;
 
-      Mutex.lock registry_mutex;
-      let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
-      Mutex.unlock registry_mutex;
-    
-    (* Check each connection and trigger auto-restart if needed *)
-    List.iter (fun conn ->
-      if Atomic.get shutdown_requested then () else
-      (* Get all state information atomically *)
-      Mutex.lock conn.mutex;
-      let state = conn.state in
-      let attempts = conn.reconnect_attempts in
-      let last_disconnected = conn.last_disconnected in
-      let last_connecting = conn.last_connecting in
-      let has_connect_fn = Option.is_some conn.connect_fn in
-      Mutex.unlock conn.mutex;
+                  (* Health monitoring and backup restart logic *)
+                  match state, has_connect_fn with
+                  | Failed reason, true ->
+                      (* Check current state atomically to avoid race conditions *)
+                      Mutex.lock conn.mutex;
+                      let current_state = conn.state in
+                      Mutex.unlock conn.mutex;
 
-      (* Health monitoring and backup restart logic *)
-      match state, has_connect_fn with
-      | Failed reason, true ->
-          (* Check current state atomically to avoid race conditions *)
-          Mutex.lock conn.mutex;
-          let current_state = conn.state in
-          Mutex.unlock conn.mutex;
+                      if current_state <> Connecting then begin
+                        (* Calculate backoff delay: 2s, 4s, 6s, ... max 30s *)
+                        let delay = min 30.0 (2.0 *. Float.of_int attempts) in
 
-          if current_state <> Connecting then begin
-            (* Calculate backoff delay: 2s, 4s, 6s, ... max 30s *)
-            let delay = min 30.0 (2.0 *. Float.of_int attempts) in
+                        (* Check if enough time has passed since last disconnect *)
+                        let should_reconnect =
+                          match last_disconnected with
+                          | Some t -> current_time -. t >= delay
+                          | None -> true
+                        in
 
-            (* Check if enough time has passed since last disconnect *)
-            let should_reconnect =
-              match last_disconnected with
-              | Some t -> Unix.time () -. t >= delay
-              | None -> true
-            in
+                        if should_reconnect then begin
+                          Logging.info_f ~section "[%s] Backup auto-reconnecting after %.1fs backoff (reason: %s)..." conn.name delay reason;
+                          start_async conn
+                        end
+                      end
+                  | Disconnected, true ->
+                      (* Connection is disconnected but not failed - might be intentional shutdown *)
+                      (* Only restart if it's been disconnected for more than 60 seconds *)
+                      let should_reconnect =
+                        match last_disconnected with
+                        | Some t -> current_time -. t >= 60.0
+                        | None -> false
+                      in
 
-            if should_reconnect then begin
-              Logging.info_f ~section "[%s] Backup auto-reconnecting after %.1fs backoff (reason: %s)..." conn.name delay reason;
-              start_async conn
+                      if should_reconnect then begin
+                        Logging.warn_f ~section "[%s] Connection disconnected for >60s, restarting..." conn.name;
+                        start_async conn
+                      end
+                  | Connecting, _ ->
+                      (* Already connecting, check for stuck connections *)
+                      let stuck_time = match last_connecting with
+                        | Some t -> current_time -. t
+                        | None -> 0.0  (* Shouldn't happen if state logic is correct, but defensive *)
+                      in
+                      if stuck_time > 120.0 then begin  (* Stuck for more than 2 minutes *)
+                        Logging.error_f ~section "[%s] Connection stuck in 'Connecting' state for %.0fs, restarting..." conn.name stuck_time;
+                        (* Atomically set state and restart to avoid race conditions *)
+                        Mutex.lock conn.mutex;
+                        let current_state = conn.state in
+                        Mutex.unlock conn.mutex;
+
+                        if current_state = Connecting then begin
+                          set_state conn Disconnected;
+                          start_async conn
+                        end
+                      end
+                  | Connected, _ ->
+                      (* For trading connections, use active ping/pong monitoring *)
+                      if String.equal conn.name "kraken_trading_ws" then begin
+                        let should_ping =
+                          match conn.last_ping_sent with
+                          | None -> true  (* Never pinged before *)
+                          | Some last_ping -> current_time -. last_ping >= 15.0  (* Ping every 15 seconds to stay under 30s timeout *)
+                        in
+
+                        if should_ping then begin
+                          (* Send ping asynchronously *)
+                          conn.last_ping_sent <- Some current_time;
+                          Lwt.async (fun () ->
+                            let req_id = next_ping_req_id () in
+                            Lwt.catch
+                              (fun () ->
+                                Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
+                                if response.success then begin
+                                  Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
+                                  Atomic.set conn.ping_failures 0;  (* Reset failure count on success *)
+                                  update_data_heartbeat conn;  (* Update heartbeat since we got a response *)
+                                  Lwt.return_unit
+                                end else begin
+                                  Logging.warn_f ~section "[%s] Ping failed: %s" conn.name
+                                    (match response.error with Some e -> e | None -> "unknown error");
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit
+                                end
+                              )
+                              (fun exn ->
+                                Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit
+                              )
+                          )
+                        end;
+
+                        (* Check for ping failures - done here to avoid mutex deadlock in async callback *)
+                        let ping_failures = Atomic.get conn.ping_failures in
+                        if ping_failures >= 3 then begin
+                          Logging.error_f ~section "[%s] Ping failed %d times, marking connection as failed"
+                            conn.name ping_failures;
+                          set_state conn (Failed "ping timeout");
+                        end
+                      end else begin
+                        (* For non-trading connections, monitor data heartbeat *)
+                        match conn.last_data_received with
+                        | Some last_data when current_time -. last_data > 60.0 ->  (* No data for 60 seconds *)
+                            Logging.warn_f ~section "[%s] No data received for %.0fs, marking connection as failed"
+                              conn.name (current_time -. last_data);
+                            set_state conn (Failed "data timeout")
+                        | _ -> ()
+                      end
+                  | _ -> ()
+                ) conn_list;
+                loop ()
+              with exn ->
+                Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);
+                Logging.error_f ~section "Monitor loop continuing after exception...";
+                loop ()
             end
           end
-      | Disconnected, true ->
-          (* Connection is disconnected but not failed - might be intentional shutdown *)
-          (* Only restart if it's been disconnected for more than 60 seconds *)
-          let should_reconnect =
-            match last_disconnected with
-            | Some t -> Unix.time () -. t >= 60.0
-            | None -> false
-          in
-
-          if should_reconnect then begin
-            Logging.warn_f ~section "[%s] Connection disconnected for >60s, restarting..." conn.name;
-            start_async conn
-          end
-      | Connecting, _ ->
-          (* Already connecting, check for stuck connections *)
-          let stuck_time = match last_connecting with
-            | Some t -> Unix.time () -. t
-            | None -> 0.0  (* Shouldn't happen if state logic is correct, but defensive *)
-          in
-          if stuck_time > 120.0 then begin  (* Stuck for more than 2 minutes *)
-            Logging.error_f ~section "[%s] Connection stuck in 'Connecting' state for %.0fs, restarting..." conn.name stuck_time;
-            (* Atomically set state and restart to avoid race conditions *)
-            Mutex.lock conn.mutex;
-            let current_state = conn.state in
-            Mutex.unlock conn.mutex;
-
-            if current_state = Connecting then begin
-              set_state conn Disconnected;
-              start_async conn
-            end
-          end
-      | Connected, _ ->
-          (* Connected and healthy - implement heartbeat monitoring for all connections *)
-          let current_time = Unix.time () in
-
-          (* For trading connections, use active ping/pong monitoring *)
-          if String.equal conn.name "kraken_trading_ws" then begin
-            let should_ping =
-              match conn.last_ping_sent with
-              | None -> true  (* Never pinged before *)
-              | Some last_ping -> current_time -. last_ping >= 15.0  (* Ping every 15 seconds to stay under 30s timeout *)
-            in
-
-            if should_ping then begin
-              (* Send ping asynchronously *)
-              conn.last_ping_sent <- Some current_time;
-              Lwt.async (fun () ->
-                let req_id = next_ping_req_id () in
-                Lwt.catch
-                  (fun () ->
-                    Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
-                    if response.success then begin
-                      Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
-                      Atomic.set conn.ping_failures 0;  (* Reset failure count on success *)
-                      update_data_heartbeat conn;  (* Update heartbeat since we got a response *)
-                      Lwt.return_unit
-                    end else begin
-                      Logging.warn_f ~section "[%s] Ping failed: %s" conn.name
-                        (match response.error with Some e -> e | None -> "unknown error");
-                      Atomic.incr conn.ping_failures;
-                      (* Note: State transition will be handled by main monitor loop *)
-                      Lwt.return_unit
-                    end
-                  )
-                  (fun exn ->
-                    Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
-                    Atomic.incr conn.ping_failures;
-                    (* Note: State transition will be handled by main monitor loop *)
-                    Lwt.return_unit
-                  )
-              )
-            end;
-
-            (* Check for ping failures - done here to avoid mutex deadlock in async callback *)
-            let ping_failures = Atomic.get conn.ping_failures in
-            if ping_failures >= 3 then begin
-              Logging.error_f ~section "[%s] Ping failed %d times, marking connection as failed"
-                conn.name ping_failures;
-              set_state conn (Failed "ping timeout");
-            end
-          end else begin
-            (* For non-trading connections, monitor data heartbeat *)
-            match conn.last_data_received with
-            | Some last_data when current_time -. last_data > 60.0 ->  (* No data for 60 seconds *)
-                Logging.warn_f ~section "[%s] No data received for %.0fs, marking connection as failed"
-                  conn.name (current_time -. last_data);
-                set_state conn (Failed "data timeout")
-            | _ -> ()
-          end
-      | _ -> ()
-    ) conn_list;
-    
-    (* Telemetry updates are handled by supervisor_cache event-driven updates *)
-    with 
-    | Exit -> ()
-    | exn ->
-      Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);
-      Logging.error_f ~section "Monitor loop continuing after exception..."
-  done
+  in
+  Lwt.async (fun () -> loop ())
 
 (** Initialize all websocket feeds and connections *)
 let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.t) =
@@ -792,27 +802,31 @@ let order_processing_loop () =
   let orders_placed = ref 0 in
   let order_mutex = Mutex.create () in
 
-  while not (Atomic.get shutdown_requested) do
-    interruptible_sleep 1.0;  (* Process orders every second *)
-    if Atomic.get shutdown_requested then () else begin
-    incr cycle_count;
+  let rec loop () =
+    if Atomic.get shutdown_requested then Lwt.return_unit
+    else begin
+      OrderSignal.wait () >>= fun () ->
+      if Atomic.get shutdown_requested then Lwt.return_unit
+      else begin
+        incr cycle_count;
 
-    (* Check if trading WebSocket is connected *)
-    if not (Kraken.Kraken_trading_client.is_connected ()) then begin
-      (* Check if reconnection is in progress to avoid false alerts *)
-      let is_reconnecting =
+        (* Check if trading WebSocket is connected *)
+        if not (Kraken.Kraken_trading_client.is_connected ()) then begin
+          (* Check if reconnection is in progress to avoid false alerts *)
+          let is_reconnecting =
+            try
+              let trading_conn = Hashtbl.find connections "kraken_trading_ws" in
+              get_state trading_conn = Connecting
+            with Not_found -> false
+          in
+          if not is_reconnecting then
+            Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
+          (* Clear any pending orders to avoid stale amendments *)
+          ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);
+          ignore (Dio_strategies.Market_maker.Strategy.get_pending_orders 1000);
+          loop ()
+        end else begin
         try
-          let trading_conn = Hashtbl.find connections "kraken_trading_ws" in
-          get_state trading_conn = Connecting
-        with Not_found -> false
-      in
-      if not is_reconnecting then
-        Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
-      (* Clear any pending orders to avoid stale amendments *)
-      ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);
-      ignore (Dio_strategies.Market_maker.Strategy.get_pending_orders 1000)
-    end else begin
-    try
       (* Get pending orders from suicide grid strategy *)
       let pending_grid_orders = Dio_strategies.Suicide_grid.Strategy.get_pending_orders 100 in
 
@@ -1414,27 +1428,31 @@ let order_processing_loop () =
             (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
       ) pending_mm_orders;
 
-      (* Log progress every 100 cycles (~100 seconds) *)
+      (* Log progress every 100 cycles *)
       if !cycle_count mod 100 = 0 then
         Logging.info_f ~section "Order processing: %d orders placed, %d grid + %d mm pending in current batch"
-          !orders_placed (List.length pending_grid_orders) (List.length pending_mm_orders)
+          !orders_placed (List.length pending_grid_orders) (List.length pending_mm_orders);
+
+      loop ()
 
     with exn ->
       Logging.error_f ~section "Exception in order processing loop: %s" (Printexc.to_string exn);
+      loop ()
     end;
     end;
-
-  done
+    end
+  in
+  Lwt.async loop
 
 (** Start the supervisor monitoring thread and initialize all feeds *)
 let start_monitoring () =
   Logging.info ~section "Starting connection supervisor";
 
   (* Start the monitoring thread first *)
-  let _monitor_thread = Thread.create monitor_loop () in
+  monitor_loop ();
 
   (* Start the order processing thread *)
-  let _order_thread = Thread.create order_processing_loop () in
+  order_processing_loop ();
 
   (* Initialize all feeds and get configs with fees and token *)
   (* Use Lwt_main.run here to handle the promise from initialize_feeds *)
