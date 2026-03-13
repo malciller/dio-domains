@@ -3,7 +3,7 @@
 [![OCaml](https://img.shields.io/badge/Language-OCaml-blue.svg)](https://ocaml.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-High-performance OCaml 5.2 trading engine for Kraken featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, circuit breaker connection management, and real-time telemetry. Built for high-frequency trading with WebSocket data feeds, asynchronous order execution.
+High-performance OCaml 5.2 trading engine for Kraken featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, tick-driven event architecture, and real-time latency profiling. Built for high-frequency trading with WebSocket data feeds and asynchronous order execution.
 
 ## Requirements
 
@@ -35,17 +35,17 @@ Edit `config.json` (example):
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
   "logging_sections": "",             // Filter logs by section (optional, comma-separated)
   "gc": {
-    "space_overhead": 20,             // GC memory overhead % (default: 120)
+    "space_overhead": 40,             // GC memory overhead % (default: 120)
     "max_overhead": 80,               // Triggers compaction when exceeded (default: 500)
     "allocation_policy": 2,           // 0=next-fit, 1=first-fit, 2=best-fit
-    "minor_heap_size_kb": 2048,       // Minor heap size in KB
+    "minor_heap_size_kb": 32768,      // Minor heap size in KB
     "major_heap_increment": 15,       // Major heap growth %
-    "target_heap_mb": 50,             // Hard limit - forces Gc.compact() when exceeded
-    "check_interval_seconds": 5,      // Memory monitor check interval
-    "high_heap_mb": 40,               // High pressure threshold (MB)
-    "medium_heap_mb": 25,             // Medium pressure threshold (MB)
-    "high_fragmentation_percent": 40, // High fragmentation threshold (%)
-    "medium_fragmentation_percent": 25
+    "target_heap_mb": 256,            // Hard limit - forces Gc.compact() when exceeded
+    "check_interval_seconds": 60,     // Memory monitor check interval
+    "high_heap_mb": 256,              // High pressure threshold (MB)
+    "medium_heap_mb": 180,            // Medium pressure threshold (MB)
+    "high_fragmentation_percent": 60, // High fragmentation threshold (%)
+    "medium_fragmentation_percent": 40
   },
   "trading": [
     {
@@ -76,15 +76,15 @@ Edit `config.json` (example):
 ## Strategies
 
 - GRID: Maintains buy/sell ladders around price with configurable spacing and size.
-- MM (Adaptive Market Maker): Dynamically adapts its quoting style based on market fees—uses a greedy quoting approach for no-fee markets and a conservative, profit-guaranteeing strategy where trading fees apply. Always ensures configured profit margins are met by factoring in fees as necessary.
-- Fear & Greed: Grid spacing is resolved once at startup using CoinMarketCap Fear & Greed; provide `CMC_API_KEY` for live values or fallback defaults are used.
+- MM (Adaptive Market Maker): Dynamically adapts its quoting style based on market fees—uses a greedy quoting approach for no-fee markets and a conservative, profit-guaranteeing strategy where trading fees apply.
+- Fear & Greed: Grid spacing is resolved once at domain startup using linear interpolation between configured `grid_interval` [min, max] based on the CoinMarketCap Fear & Greed index; provide `CMC_API_KEY` for live values.
 
 ## Key Features
 
 - **Domain-Based Parallelism**: Each trading asset runs in its own OCaml domain for true parallel execution without GIL limitations
-- **Lock-Free Communication**: Event-driven architecture with ring buffers for high-throughput data processing
+- **Tick-Driven Architecture**: Event-driven engine with a global tick bus and lock-free ring buffers for high-throughput data processing
+- **High-Performance Latency Profiling**: Real-time histogram-based profiling (p50-p999) of hot loops and strategy execution
 - **Circuit Breaker Protection**: Automatic connection management with health monitoring and graceful degradation
-- **Real-Time Telemetry**: Comprehensive metrics collection for performance monitoring and debugging
 - **High-Frequency Trading**: Optimized for low-latency execution with microsecond-precision timing
 - **Fault Tolerance**: Supervised domains with automatic restart and exponential backoff
 
@@ -94,11 +94,11 @@ Edit `config.json` (example):
 - **Domain Spawner**: Manages OCaml domains for parallel strategy execution - each trading asset runs in its own isolated domain with supervision and auto-restart capabilities.
 - **Supervisor**: Orchestrates WebSocket connections with circuit breaker patterns, heartbeat monitoring, and connection health management.
 - **Engine Core**:
-  - **Concurrency**: Lock-free event bus and registry for inter-domain communication.
-  - **Config**: Configuration management and validation.
-  - **Strategies**: High-frequency trading algorithms (Grid, Adaptive Market Maker) running in parallel domains.
-  - **Order Executor**: Asynchronous order placement, amendment, and cancellation with duplicate detection.
-  - **Telemetry**: Real-time performance monitoring and metrics collection.
+  - **Concurrency**: Lock-free global tick bus and event registry for inter-domain communication.
+  - **Memory Management**: Cleanup Coordinator triggered by GC alarms to manage memory pressure and prevent fragmentation.
+  - **Latency Profiling**: Histogram-based statistics tracking for microsecond-precision performance monitoring.
+  - **Strategies**: High-frequency trading algorithms (Grid, MM) running in parallel domains with F&G integration.
+  - **Order Executor**: Asynchronous order placement and amendment with duplicate detection.
   - **Logging**: Structured logging with configurable levels and sections.
 - **External Integration - Kraken**:
   - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
@@ -136,6 +136,9 @@ dune build
 2. Create branch (`git checkout -b feature/xyz`)
     - Trading strategies: `src/engine/strategies/`
     - Domain management: `src/engine/domain_spawner.ml`
+    - Concurrency & Bus: `src/engine/concurrency/`
+    - Latency Profiling: `src/engine/latency_profiling/`
+    - Memory Management: `src/engine/memory_management/`
     - Connection supervision: `src/engine/supervisor/`
     - WebSocket feeds: `src/external/kraken/`
     - Dashboard UI: `src/ui/`
