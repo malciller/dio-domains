@@ -58,7 +58,7 @@ let setup_signal_handlers () =
       (* Signal shutdown to all components *)
       Dio_engine.Order_executor.signal_shutdown ();
       Kraken.Kraken_trading_client.signal_shutdown ();
-      Dio_memory_tracing.Cleanup_coordinator.signal_shutdown ();
+      Dio_memory_management.Cleanup_coordinator.signal_shutdown ();
 
       (* Stop all supervised domains *)
       Dio_engine.Domain_spawner.stop_all_domains ();
@@ -190,7 +190,7 @@ let () =
 
   (* Start memory cleanup coordinator directly *)
   Logging.info ~section:"main" "Starting memory cleanup coordinator...";
-  let monitor_config : Dio_memory_tracing.Cleanup_coordinator.monitor_config = {
+  let monitor_config : Dio_memory_management.Cleanup_coordinator.monitor_config = {
     check_interval_seconds = gc_config.check_interval_seconds;
     target_heap_mb = gc_config.target_heap_mb;
     high_heap_mb = gc_config.high_heap_mb;
@@ -200,13 +200,13 @@ let () =
   } in
 
   (* Start the coordinator initially *)
-  Dio_memory_tracing.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
+  Dio_memory_management.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
 
   (* Register in-flight order caches for periodic cleanup *)
-  Dio_memory_tracing.Cleanup_coordinator.register_event_registry 
+  Dio_memory_management.Cleanup_coordinator.register_event_registry 
     "in_flight_orders" 
     (Dio_strategies.Strategy_common.InFlightOrders.get_cleanup_fn ());
-  Dio_memory_tracing.Cleanup_coordinator.register_event_registry 
+  Dio_memory_management.Cleanup_coordinator.register_event_registry 
     "in_flight_amendments" 
     (Dio_strategies.Strategy_common.InFlightAmendments.get_cleanup_fn ());
 
