@@ -410,8 +410,8 @@ let monitor_loop () =
                         end
                       end
                   | Connected, _ ->
-                      (* For trading connections, use active ping/pong monitoring *)
-                      if String.equal conn.name "kraken_trading_ws" then begin
+                      (* For authenticated connections, use active ping/pong monitoring *)
+                      if String.equal conn.name "kraken_auth_ws" then begin
                         let should_ping =
                           match conn.last_ping_sent with
                           | None -> true  (* Never pinged before *)
@@ -573,80 +573,48 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   set_connect_fn orderbook_conn (Some orderbook_connect_fn);
   start_async orderbook_conn;
 
-  (* Balances feed *)
-  let balances_conn = register ~name:"kraken_balances_ws" ~connect_fn:None in
-  let balances_connect_fn () =
-    (* Wrap the connection in try-catch for proper error handling *)
-    Lwt.catch (fun () ->
-      let on_failure reason = set_state balances_conn (Failed reason) in
-      let on_heartbeat () = update_data_heartbeat balances_conn in
-      let on_connected () = set_state balances_conn Connected in
-      Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-      (* Connection function completed - this shouldn't happen for WebSocket connections *)
-      Lwt.return_unit
-    ) (fun exn ->
-      let error_msg = Printexc.to_string exn in
-      Logging.error_f ~section "[%s] Connection failed during establishment: %s" balances_conn.name error_msg;
-      set_state balances_conn (Failed error_msg);
-      Lwt.return_unit
-    )
-  in
-  set_connect_fn balances_conn (Some balances_connect_fn);
-  start_async balances_conn;
-
-  (* Executions feed *)
-  let executions_conn = register ~name:"kraken_executions_ws" ~connect_fn:None in
-  let executions_connect_fn () =
-    (* Wrap the connection in try-catch for proper error handling *)
-    Lwt.catch (fun () ->
-      let on_failure reason = set_state executions_conn (Failed reason) in
-      let on_heartbeat () = update_data_heartbeat executions_conn in
-      let on_connected () = set_state executions_conn Connected in
-      Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-      (* Connection function completed - this shouldn't happen for WebSocket connections *)
-      Lwt.return_unit
-    ) (fun exn ->
-      let error_msg = Printexc.to_string exn in
-      Logging.error_f ~section "[%s] Connection failed during establishment: %s" executions_conn.name error_msg;
-      set_state executions_conn (Failed error_msg);
-      Lwt.return_unit
-    )
-  in
-  set_connect_fn executions_conn (Some executions_connect_fn);
-  start_async executions_conn;
-
-  (* Trading client for order operations *)
-  let trading_conn = register ~name:"kraken_trading_ws" ~connect_fn:None in
-  let trading_connect_fn () =
+  (* Single unified authenticated WebSocket connection for trading, balances, and executions *)
+  let auth_ws_conn = register ~name:"kraken_auth_ws" ~connect_fn:None in
+  let auth_ws_connect_fn () =
     (* Wrap the connection in try-catch for proper error handling *)
     Lwt.catch (fun () ->
       let on_failure reason =
-        set_state trading_conn (Failed reason);
+        set_state auth_ws_conn (Failed reason);
         (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
         Lwt.async (fun () ->
           Lwt.catch (fun () ->
             Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
-            start_async trading_conn;
+            start_async auth_ws_conn;
             Lwt.return_unit
           ) (fun exn ->
-            Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" trading_conn.name (Printexc.to_string exn);
+            Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" auth_ws_conn.name (Printexc.to_string exn);
             Lwt.return_unit
           )
         )
       in
-      let on_connected () = set_state trading_conn Connected in
+      let on_heartbeat () = update_data_heartbeat auth_ws_conn in
+      let on_connected () =
+        set_state auth_ws_conn Connected;
+        (* Trigger individual feed subscriptions on the unified connection *)
+        Lwt.async (fun () ->
+          Lwt.join [
+            Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+            Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+          ]
+        )
+      in
       Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
       (* Connection function completed - this shouldn't happen for WebSocket connections *)
       Lwt.return_unit
     ) (fun exn ->
       let error_msg = Printexc.to_string exn in
-      Logging.error_f ~section "[%s] Connection failed during establishment: %s" trading_conn.name error_msg;
-      set_state trading_conn (Failed error_msg);
+      Logging.error_f ~section "[%s] Connection failed during establishment: %s" auth_ws_conn.name error_msg;
+      set_state auth_ws_conn (Failed error_msg);
       Lwt.return_unit
     )
   in
-  set_connect_fn trading_conn (Some trading_connect_fn);
-  start_async trading_conn;
+  set_connect_fn auth_ws_conn (Some auth_ws_connect_fn);
+  start_async auth_ws_conn;
 
   (* Wait for trading client connection to be fully established before proceeding *)
   (* This prevents a race condition where domains start trading before the WebSocket is ready *)
@@ -815,8 +783,8 @@ let order_processing_loop () =
           (* Check if reconnection is in progress to avoid false alerts *)
           let is_reconnecting =
             try
-              let trading_conn = Hashtbl.find connections "kraken_trading_ws" in
-              get_state trading_conn = Connecting
+              let auth_conn = Hashtbl.find connections "kraken_auth_ws" in
+              get_state auth_conn = Connecting
             with Not_found -> false
           in
           if not is_reconnecting then

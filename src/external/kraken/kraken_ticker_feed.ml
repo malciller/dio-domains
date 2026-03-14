@@ -4,18 +4,8 @@ open Lwt.Infix
 
 let section = "kraken_ticker"
 
-(* TODO: Duplicate function - also exists in kraken_trading_client.ml, should be moved to common utilities *)
 (** Safely force Conduit context with error handling *)
-let get_conduit_ctx () =
-  try
-    Lazy.force Conduit_lwt_unix.default_ctx
-  with
-  | CamlinternalLazy.Undefined ->
-      Logging.error ~section "Conduit context was accessed before initialization - this should not happen";
-      raise (Failure "Conduit context not initialized - ensure main.ml initializes it before domain spawning")
-  | exn ->
-      Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
-      raise exn
+let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 
 (** Ticker data *)
 type ticker = {
@@ -231,8 +221,8 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
     | _ -> failwith "Failed to resolve ws.kraken.com"
   in
   let client = `TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443) in
-  let ctx = get_conduit_ctx () in
-  Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
+  let _ctx = get_conduit_ctx () in
+  Websocket_lwt_unix.connect ~ctx:_ctx client uri >>= fun conn ->
 
     Logging.info ~section "WebSocket established, subscribing to ticker feed";
     (* Call on_connected callback after successful connection and before starting message handler *)
