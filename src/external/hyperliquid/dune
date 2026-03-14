@@ -1,0 +1,5 @@
+(library
+ (name hyperliquid)
+ (public_name dio.hyperliquid)
+ (libraries lwt lwt.unix cohttp-lwt-unix yojson websocket-lwt-unix digestif secp256k1 msgpck mtime mtime.clock.os dio_exchange concurrency logging conduit-lwt-unix)
+ (preprocess (pps lwt_ppx)))

@@ -488,26 +488,36 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                       |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken")
                       |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
 
-  Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
+  let hyperliquid_symbols = configs
+                      |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid")
+                      |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
 
-  (* Start initialization sequence as a promise chain *)
+  let%lwt auth_token =
+    if List.length kraken_symbols > 0 then begin
+      Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
 
-  (* Initialize data stores for websocket feeds *)
-  Logging.info ~section "Step 1: Initializing ticker feed stores...";
-  Kraken.Kraken_ticker_feed.initialize kraken_symbols;
+      Logging.info ~section "Step 1: Initializing ticker feed stores...";
+      Kraken.Kraken_ticker_feed.initialize kraken_symbols;
 
-  Logging.info ~section "Step 2: Initializing instruments feed stores...";
-  let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
+      Logging.info ~section "Step 2: Initializing instruments feed stores...";
+      let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
 
-  Logging.info ~section "Step 3: Initializing orderbook feed stores...";
-  let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
+      Logging.info ~section "Step 3: Initializing orderbook feed stores...";
+      let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
 
-  Logging.info ~section "Step 4: Getting authentication token...";
-  let%lwt auth_token = Kraken.Kraken_generate_auth_token.get_token () in
-  Logging.info ~section "Authentication token obtained";
+      Logging.info ~section "Step 4: Getting authentication token...";
+      let%lwt token = Kraken.Kraken_generate_auth_token.get_token () in
+      Logging.info ~section "Authentication token obtained";
 
-  (* Store token globally for reuse by order executor *)
-  Token_store.set (Some auth_token);
+      (* Store token globally for reuse by order executor *)
+      Token_store.set (Some token);
+
+      Logging.info ~section "Step 6: Initializing executions feed stores...";
+      Kraken.Kraken_executions_feed.initialize kraken_symbols;
+
+      Lwt.return token
+    end else Lwt.return ""
+  in
 
   Logging.info ~section "Step 5: Initializing balances feed stores...";
   (* Extract all unique assets from trading symbols *)
@@ -517,168 +527,219 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                   |> List.sort_uniq String.compare
                   |> fun assets -> "USD" :: assets in  (* Add USD as quote currency *)
   let () = try
-    Kraken.Kraken_balances_feed.initialize all_assets;
-    Logging.info ~section "Balances feed stores initialized";
+    if List.length kraken_symbols > 0 then begin
+      Kraken.Kraken_balances_feed.initialize all_assets;
+      Logging.info ~section "Balances feed stores initialized";
+    end
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
   in
 
-  Logging.info ~section "Step 6: Initializing executions feed stores...";
-  Kraken.Kraken_executions_feed.initialize kraken_symbols;
-
   (* Register and start supervised websocket connections *)
   Logging.info ~section "Step 7: Starting supervised websocket connections...";
 
-  (* Ticker feed *)
-  let ticker_conn = register ~name:"kraken_ticker_ws" ~connect_fn:None in
-  let ticker_connect_fn () =
-    (* Wrap the connection in try-catch for proper error handling *)
-    Lwt.catch (fun () ->
-      let on_failure reason = set_state ticker_conn (Failed reason) in
-      let on_heartbeat () = update_data_heartbeat ticker_conn in
-      let on_connected () = set_state ticker_conn Connected in
-      Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-      (* Connection function completed - this shouldn't happen for WebSocket connections *)
-      Lwt.return_unit
-    ) (fun exn ->
-      let error_msg = Printexc.to_string exn in
-      Logging.error_f ~section "[%s] Connection failed during establishment: %s" ticker_conn.name error_msg;
-      set_state ticker_conn (Failed error_msg);
-      Lwt.return_unit
-    )
-  in
-  set_connect_fn ticker_conn (Some ticker_connect_fn);
-  start_async ticker_conn;
+  if List.length kraken_symbols > 0 then begin
+    (* Ticker feed *)
+    let ticker_conn = register ~name:"kraken_ticker_ws" ~connect_fn:None in
+    let ticker_connect_fn () =
+      (* Wrap the connection in try-catch for proper error handling *)
+      Lwt.catch (fun () ->
+        let on_failure reason = set_state ticker_conn (Failed reason) in
+        let on_heartbeat () = update_data_heartbeat ticker_conn in
+        let on_connected () = set_state ticker_conn Connected in
+        Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+        (* Connection function completed - this shouldn't happen for WebSocket connections *)
+        Lwt.return_unit
+      ) (fun exn ->
+        let error_msg = Printexc.to_string exn in
+        Logging.error_f ~section "[%s] Connection failed during establishment: %s" ticker_conn.name error_msg;
+        set_state ticker_conn (Failed error_msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn ticker_conn (Some ticker_connect_fn);
+    start_async ticker_conn;
 
-  (* Orderbook feed *)
-  let orderbook_conn = register ~name:"kraken_orderbook_ws" ~connect_fn:None in
-  let orderbook_connect_fn () =
-    (* Clear orderbook stores before reconnecting to ensure clean state *)
-    Kraken.Kraken_orderbook_feed.clear_all_stores ();
-    (* Wrap the connection in try-catch for proper error handling *)
-    Lwt.catch (fun () ->
-      let on_failure reason = set_state orderbook_conn (Failed reason) in
-      let on_heartbeat () = update_data_heartbeat orderbook_conn in
-      let on_connected () = set_state orderbook_conn Connected in
-      Kraken.Kraken_orderbook_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-      (* Connection function completed - this shouldn't happen for WebSocket connections *)
-      Lwt.return_unit
-    ) (fun exn ->
-      let error_msg = Printexc.to_string exn in
-      Logging.error_f ~section "[%s] Connection failed during establishment: %s" orderbook_conn.name error_msg;
-      set_state orderbook_conn (Failed error_msg);
-      Lwt.return_unit
-    )
-  in
-  set_connect_fn orderbook_conn (Some orderbook_connect_fn);
-  start_async orderbook_conn;
+    (* Orderbook feed *)
+    let orderbook_conn = register ~name:"kraken_orderbook_ws" ~connect_fn:None in
+    let orderbook_connect_fn () =
+      (* Clear orderbook stores before reconnecting to ensure clean state *)
+      Kraken.Kraken_orderbook_feed.clear_all_stores ();
+      (* Wrap the connection in try-catch for proper error handling *)
+      Lwt.catch (fun () ->
+        let on_failure reason = set_state orderbook_conn (Failed reason) in
+        let on_heartbeat () = update_data_heartbeat orderbook_conn in
+        let on_connected () = set_state orderbook_conn Connected in
+        Kraken.Kraken_orderbook_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+        (* Connection function completed - this shouldn't happen for WebSocket connections *)
+        Lwt.return_unit
+      ) (fun exn ->
+        let error_msg = Printexc.to_string exn in
+        Logging.error_f ~section "[%s] Connection failed during establishment: %s" orderbook_conn.name error_msg;
+        set_state orderbook_conn (Failed error_msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn orderbook_conn (Some orderbook_connect_fn);
+    start_async orderbook_conn;
 
-  (* Single unified authenticated WebSocket connection for trading, balances, and executions *)
-  let auth_ws_conn = register ~name:"kraken_auth_ws" ~connect_fn:None in
-  let auth_ws_connect_fn () =
-    (* Wrap the connection in try-catch for proper error handling *)
-    Lwt.catch (fun () ->
-      let on_failure reason =
-        set_state auth_ws_conn (Failed reason);
-        (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
-        Lwt.async (fun () ->
-          Lwt.catch (fun () ->
-            Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
-            start_async auth_ws_conn;
-            Lwt.return_unit
-          ) (fun exn ->
-            Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" auth_ws_conn.name (Printexc.to_string exn);
-            Lwt.return_unit
+    (* Single unified authenticated WebSocket connection for trading, balances, and executions *)
+    let auth_ws_conn = register ~name:"kraken_auth_ws" ~connect_fn:None in
+    let auth_ws_connect_fn () =
+      (* Wrap the connection in try-catch for proper error handling *)
+      Lwt.catch (fun () ->
+        let on_failure reason =
+          set_state auth_ws_conn (Failed reason);
+          (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
+          Lwt.async (fun () ->
+            Lwt.catch (fun () ->
+              Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
+              start_async auth_ws_conn;
+              Lwt.return_unit
+            ) (fun exn ->
+              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" auth_ws_conn.name (Printexc.to_string exn);
+              Lwt.return_unit
+            )
           )
-        )
-      in
-      let on_heartbeat () = update_data_heartbeat auth_ws_conn in
-      let on_connected () =
-        set_state auth_ws_conn Connected;
-        (* Trigger individual feed subscriptions on the unified connection *)
-        Lwt.async (fun () ->
-          Lwt.join [
-            Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
-            Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
-          ]
-        )
-      in
-      Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
-      (* Connection function completed - this shouldn't happen for WebSocket connections *)
-      Lwt.return_unit
-    ) (fun exn ->
-      let error_msg = Printexc.to_string exn in
-      Logging.error_f ~section "[%s] Connection failed during establishment: %s" auth_ws_conn.name error_msg;
-      set_state auth_ws_conn (Failed error_msg);
-      Lwt.return_unit
-    )
-  in
-  set_connect_fn auth_ws_conn (Some auth_ws_connect_fn);
-  start_async auth_ws_conn;
+        in
+        let on_heartbeat () = update_data_heartbeat auth_ws_conn in
+        let on_connected () =
+          set_state auth_ws_conn Connected;
+          (* Trigger individual feed subscriptions on the unified connection *)
+          Lwt.async (fun () ->
+            Lwt.join [
+              Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+              Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+            ]
+          )
+        in
+        Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
+        (* Connection function completed - this shouldn't happen for WebSocket connections *)
+        Lwt.return_unit
+      ) (fun exn ->
+        let error_msg = Printexc.to_string exn in
+        Logging.error_f ~section "[%s] Connection failed during establishment: %s" auth_ws_conn.name error_msg;
+        set_state auth_ws_conn (Failed error_msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn auth_ws_conn (Some auth_ws_connect_fn);
+    start_async auth_ws_conn;
+  end;
+
+  if List.length hyperliquid_symbols > 0 then begin
+    Logging.info ~section "Step 7.5: Starting Hyperliquid unified connection...";
+    let hl_ws_conn = register ~name:"hyperliquid_ws" ~connect_fn:None in
+    let hl_ws_connect_fn () =
+      Lwt.catch (fun () ->
+        let on_failure reason =
+          set_state hl_ws_conn (Failed reason);
+          Lwt.async (fun () ->
+            Lwt.catch (fun () ->
+              Lwt_unix.sleep 0.1 >>= fun () ->
+              start_async hl_ws_conn;
+              Lwt.return_unit
+            ) (fun exn ->
+              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" hl_ws_conn.name (Printexc.to_string exn);
+              Lwt.return_unit
+            )
+          )
+        in
+        let on_connected () =
+          set_state hl_ws_conn Connected;
+          Lwt.async (fun () ->
+            Lwt_list.iter_s (fun sym ->
+               let msg1 = `Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String sym)])] in
+               Hyperliquid.Hyperliquid_ws.subscribe msg1 >>= fun () ->
+               (match Token_store.get () with
+               | Some t ->
+                   let msg2 = `Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "webData2"); ("user", `String t)])] in
+                   Hyperliquid.Hyperliquid_ws.subscribe msg2
+               | None -> Lwt.return_unit)
+            ) hyperliquid_symbols
+          )
+        in
+        Hyperliquid.Hyperliquid_ws.connect_and_monitor ~on_failure ~on_connected >>= fun () ->
+        Lwt.return_unit
+      ) (fun exn ->
+        let error_msg = Printexc.to_string exn in
+        Logging.error_f ~section "[%s] Connection failed during establishment: %s" hl_ws_conn.name error_msg;
+        set_state hl_ws_conn (Failed error_msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn hl_ws_conn (Some hl_ws_connect_fn);
+    start_async hl_ws_conn
+  end;
 
   (* Wait for trading client connection to be fully established before proceeding *)
   (* This prevents a race condition where domains start trading before the WebSocket is ready *)
-  Logging.info ~section "Waiting for trading client to be ready...";
-  let%lwt trading_client_ready = 
-    let timeout = 10.0 in
-    let start_time = Unix.gettimeofday () in
-    let rec wait_loop () =
-      let elapsed = Unix.gettimeofday () -. start_time in
-      if elapsed >= timeout then
-        Lwt.return false
-      else if Kraken.Kraken_trading_client.is_connected () then
-        Lwt.return true
-      else
-        Lwt_unix.sleep 0.1 >>= fun () ->
+  let%lwt () =
+    if List.length kraken_symbols > 0 then begin
+      Logging.info ~section "Waiting for trading client to be ready...";
+      let%lwt trading_client_ready = 
+        let timeout = 10.0 in
+        let start_time = Unix.gettimeofday () in
+        let rec wait_loop () =
+          let elapsed = Unix.gettimeofday () -. start_time in
+          if elapsed >= timeout then
+            Lwt.return false
+          else if Kraken.Kraken_trading_client.is_connected () then
+            Lwt.return true
+          else
+            Lwt_unix.sleep 0.1 >>= fun () ->
+            wait_loop ()
+        in
         wait_loop ()
-    in
-    wait_loop ()
+      in
+      if not trading_client_ready then
+        Logging.warn ~section "Timeout waiting for trading client connection, continuing anyway..."
+      else
+        Logging.info ~section "✓ Trading client connected and ready";
+
+      (* Wait for executions data FIRST to avoid race condition *)
+      Logging.info ~section "Waiting for executions feed to be ready...";
+      let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
+      if not executions_ready then
+        Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
+      else
+        Logging.info ~section "✓ Executions feed ready";
+
+      (* Wait for initial data from all websocket feeds *)
+      Logging.info ~section "Waiting for initial market data from all feeds...";
+
+      (* Wait for ticker data *)
+      let%lwt ticker_ready = Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0 in
+      if not ticker_ready then
+        Logging.warn ~section "Timeout waiting for ticker data, continuing anyway..."
+      else
+        Logging.info ~section "✓ Ticker feed ready";
+
+      (* Wait for orderbook data *)
+      let%lwt orderbook_ready = Kraken.Kraken_orderbook_feed.wait_for_orderbook_data kraken_symbols 10.0 in
+      if not orderbook_ready then
+        Logging.warn ~section "Timeout waiting for orderbook data, continuing anyway..."
+      else
+        Logging.info ~section "✓ Orderbook feed ready";
+
+      (* Wait for executions data again *)
+      let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
+      if not executions_ready then
+        Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
+      else
+        Logging.info ~section "✓ Executions feed ready";
+
+      (* Wait for balance data *)
+      let%lwt balances_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
+      if not balances_ready then
+        Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
+      else
+        Logging.info ~section "✓ Balances feed ready";
+
+      Logging.info ~section "All feeds initialized with market data!";
+      Lwt.return_unit
+    end else Lwt.return_unit
   in
-  if not trading_client_ready then
-    Logging.warn ~section "Timeout waiting for trading client connection, continuing anyway..."
-  else
-    Logging.info ~section "✓ Trading client connected and ready";
-
-  (* Wait for executions data FIRST to avoid race condition *)
-  Logging.info ~section "Waiting for executions feed to be ready...";
-  let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
-  if not executions_ready then
-    Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
-  else
-    Logging.info ~section "✓ Executions feed ready";
-
-  (* Wait for initial data from all websocket feeds *)
-  Logging.info ~section "Waiting for initial market data from all feeds...";
-
-  (* Wait for ticker data *)
-  let%lwt ticker_ready = Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0 in
-  if not ticker_ready then
-    Logging.warn ~section "Timeout waiting for ticker data, continuing anyway..."
-  else
-    Logging.info ~section "✓ Ticker feed ready";
-
-  (* Wait for orderbook data *)
-  let%lwt orderbook_ready = Kraken.Kraken_orderbook_feed.wait_for_orderbook_data kraken_symbols 10.0 in
-  if not orderbook_ready then
-    Logging.warn ~section "Timeout waiting for orderbook data, continuing anyway..."
-  else
-    Logging.info ~section "✓ Orderbook feed ready";
-
-  (* Wait for executions data again *)
-  let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
-  if not executions_ready then
-    Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
-  else
-    Logging.info ~section "✓ Executions feed ready";
-
-  (* Wait for balance data *)
-  let%lwt balances_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
-  if not balances_ready then
-    Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
-  else
-    Logging.info ~section "✓ Balances feed ready";
-
-  Logging.info ~section "All feeds initialized with market data!";
 
   (* Fetch fees for all assets *)
   Logging.info ~section "Step 8: Fetching trading fees for all assets...";
@@ -770,19 +831,24 @@ let order_processing_loop () =
   let orders_placed = ref 0 in
   let order_mutex = Mutex.create () in
 
+  let config = Dio_engine.Config.read_config () in
+  let has_kraken = List.exists (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken") config.trading in
+  let has_hl = List.exists (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") config.trading in
+
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
     else begin
-      (* Check if trading WebSocket is connected *)
-      if not (Kraken.Kraken_trading_client.is_connected ()) then begin
+      (* Check if trading WebSockets are connected for configured exchanges *)
+      let kraken_ok = (not has_kraken) || Kraken.Kraken_trading_client.is_connected () in
+      let hl_ok = (not has_hl) || Hyperliquid.Hyperliquid_ws.is_connected () in
+
+      if not kraken_ok || not hl_ok then begin
         let is_reconnecting =
-          try
-            let auth_conn = Hashtbl.find connections "kraken_auth_ws" in
-            get_state auth_conn = Connecting
-          with Not_found -> false
+          (not kraken_ok && try Hashtbl.find connections "kraken_auth_ws" |> get_state = Connecting with Not_found -> false) ||
+          (not hl_ok && try Hashtbl.find connections "hyperliquid_ws" |> get_state = Connecting with Not_found -> false)
         in
         if not is_reconnecting then
-          Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
+          Logging.warn ~section "Trading WebSockets not fully connected, skipping order processing";
 
         (* Clear any pending orders to avoid stale placement/amendments when we reconnect *)
         ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);

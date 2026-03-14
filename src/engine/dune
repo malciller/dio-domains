@@ -6,6 +6,7 @@
   logging
   
   dio.kraken
+  dio.hyperliquid
   dio.strategies
   dio.cmc
   threads
