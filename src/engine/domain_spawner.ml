@@ -456,11 +456,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         Latency_profiler.record prof_cycle cycle_span;
 
         (* Report latencies *)
-        Latency_profiler.report prof_ticker;
-        Latency_profiler.report prof_ob;
-        Latency_profiler.report prof_exec;
-        Latency_profiler.report prof_strategy;
-        Latency_profiler.report prof_cycle;
+        Latency_profiler.report ~sample_threshold:100 prof_ticker;
+        Latency_profiler.report ~sample_threshold:100 prof_ob;
+        Latency_profiler.report ~sample_threshold:1 prof_exec;
+        Latency_profiler.report ~sample_threshold:1000 prof_strategy;
+        Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
 
         ()
       done

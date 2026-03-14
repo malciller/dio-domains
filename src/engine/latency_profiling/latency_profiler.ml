@@ -15,7 +15,6 @@ type t = {
   bucket_count : int;
   mutable samples : int;
   mutable overflow : int;
-  mutable last_report_ns : int64;
 }
 
 let create ?(bucket_us=1) ?(max_latency_us=10_000) name = 
@@ -27,7 +26,6 @@ let create ?(bucket_us=1) ?(max_latency_us=10_000) name =
     bucket_count = count;
     samples = 0;
     overflow = 0;
-    last_report_ns = Mtime_clock.now_ns ();
   }
 
 let record t span =
@@ -61,13 +59,8 @@ let reset t =
   t.samples <- 0;
   t.overflow <- 0
 
-let report ?(min_elapsed_s=5.0) t =
-  let now = Mtime_clock.now_ns () in
-  let elapsed_ns = Int64.sub now t.last_report_ns in
-  let elapsed_s = Int64.to_float elapsed_ns /. 1_000_000_000. in
-  
-  if elapsed_s >= min_elapsed_s && t.samples >= 1 then (
-    t.last_report_ns <- now;
+let report ?(sample_threshold=1) t =
+  if t.samples >= sample_threshold then (
 
     let p50 = percentile t 0.50 in
     let p90 = percentile t 0.90 in
