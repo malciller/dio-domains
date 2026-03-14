@@ -993,6 +993,7 @@ let order_processing_loop () =
                                 order_ids = Some [target_order_id];
                                 cl_ord_ids = None;
                                 order_userrefs = None;
+                                symbol = Some order.symbol;
                               } in
                               Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                               | Ok results ->
@@ -1186,7 +1187,7 @@ let order_processing_loop () =
                       | Some target_order_id ->
                           Lwt.async (fun () ->
                             Lwt.catch (fun () ->
-                              let request : Dio_engine.Order_executor.cancel_request = { exchange = order.exchange; order_ids = Some [target_order_id]; cl_ord_ids = None; order_userrefs = None; } in
+                              let request : Dio_engine.Order_executor.cancel_request = { exchange = order.exchange; order_ids = Some [target_order_id]; cl_ord_ids = None; order_userrefs = None; symbol = Some order.symbol; } in
                               Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                               | Ok results ->
                                   let count = List.length results in
