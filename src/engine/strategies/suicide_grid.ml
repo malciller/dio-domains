@@ -53,6 +53,7 @@ type strategy_state = {
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
+  mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
 (** Global strategy state store *)
@@ -76,6 +77,7 @@ let get_strategy_state asset_symbol =
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
           last_cleanup_time = 0.0;
+          mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
         new_state
@@ -330,6 +332,9 @@ let execute_strategy
 
   let state = get_strategy_state asset.symbol in
 
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+
   (* Throttle order placement - wait at least 1 second between orders *)
   (* Keep order placement throttle, but allow logic to run every cycle *)
   let now = Unix.time () in
@@ -343,10 +348,19 @@ let execute_strategy
       
       (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
       let original_pending_count = List.length state.pending_orders in
-      state.pending_orders <- List.filter (fun (order_id, _, _, timestamp) ->
+      state.pending_orders <- List.filter (fun (order_id, side, _, timestamp) ->
         let age = now -. timestamp in
         if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
           Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
+          
+          (* Clean up global trackers to allow immediate re-placement *)
+          if String.starts_with ~prefix:"pending_amend_" order_id then begin
+            let target_oid = String.sub order_id 14 (String.length order_id - 14) in
+            ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
+          end else begin
+            let duplicate_key = generate_side_duplicate_key asset.symbol side in
+            ignore (InFlightOrders.remove_in_flight_order duplicate_key)
+          end;
           false
         end else
           true
@@ -488,42 +502,15 @@ let execute_strategy
         (match state.last_buy_order_price with Some p -> Printf.sprintf "%.2f" p | None -> "none")
         (List.length state.open_sell_orders)
     end;
-    (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
-    let now = Unix.time () in
-    let original_pending_count = List.length state.pending_orders in
-    state.pending_orders <- List.filter (fun (order_id, _, _, timestamp) ->
-      let age = now -. timestamp in
-      if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
-        Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
-        false
-      end else
-        true
-    ) state.pending_orders;
 
-    (* Enforce hard limit of 50 pending orders to prevent memory growth *)
-    if List.length state.pending_orders > 50 then begin
-      let excess = List.length state.pending_orders - 50 in
-      state.pending_orders <- take 50 state.pending_orders;  (* Keep most recent 50 *)
-      Logging.warn_f ~section "Truncated %d excess pending orders for %s (kept 50)" excess asset.symbol;
-    end;
+    let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
+    let sell_order_pending = List.exists (fun (_, side, _, _) -> side = Sell) state.pending_orders in
 
-    (* Log cleanup summary occasionally *)
-    let cleaned_pending = original_pending_count - List.length state.pending_orders in
-    if cleaned_pending > 0 && cycle mod 100000 = 0 then
-      Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_pending asset.symbol;
-
-    if state.pending_orders <> [] then begin
+    if buy_order_pending && sell_order_pending then begin
         (* Only log every 100,000 iterations to avoid spam *)
-        if cycle mod 100000 = 0 then begin
-          Logging.debug_f ~section "Waiting for %d pending orders before placing new orders for %s: [%s]"
-            (List.length state.pending_orders) asset.symbol
-            (String.concat "; " (List.map (fun (order_id, side, price, _) ->
-              Printf.sprintf "%s %s@%.2f" (string_of_order_side side) order_id price
-            ) state.pending_orders))
-        end;
-        (* Update cycle counter *)
-        state.last_cycle <- cycle
-      end else if open_buy_count > 1 then begin
+        if cycle mod 100000 = 0 then
+            Logging.debug_f ~section "Waiting for pending orders (both sides) to complete for %s" asset.symbol;
+    end else if open_buy_count > 1 then begin
         (* Case 0: Multiple buy orders exist - cancel all buy orders to maintain single buy order policy *)
         Logging.debug_f ~section "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order policy"
           open_buy_count asset.symbol;
@@ -541,7 +528,7 @@ let execute_strategy
 
         (* Update cycle counter *)
         state.last_cycle <- cycle
-      end else if open_buy_count = 0 then begin
+      end else if open_buy_count = 0 && not buy_order_pending then begin
         (* NO OPEN BUY: Place sell + buy, then enforce 2x grid spacing *)
         let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
         let buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
@@ -597,8 +584,12 @@ let execute_strategy
             if side = Sell then Some (id, price) else None
           ) state.pending_orders
         ) in
-
-        if all_sell_orders <> [] then begin
+        
+        (* Skip Sell placement/amendment if a Sell is already pending *)
+        if sell_order_pending then begin
+            if cycle mod 100000 = 0 then
+                Logging.debug_f ~section "Waiting for pending sell order to complete for %s" asset.symbol;
+        end else if all_sell_orders <> [] then begin
           (* Find the closest sell order *)
           let closest_sell_order = List.fold_left (fun acc (order_id, sell_price) ->
             match acc with
@@ -766,21 +757,38 @@ let execute_strategy
         (* No action needed for other cases *)
         state.last_cycle <- cycle
       end
-  end
+  end);
+  ()
 end
 
 
 (** Handle order placement success - update pending order status *)
 let handle_order_acknowledged asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
-  (* Remove from pending orders - match by side and approximate price, or by amend order_id *)
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+  (* Remove from pending orders - match by category: placements, amendments, or fallback for tests *)
   state.pending_orders <- List.filter (fun (pending_id, s, p, _) ->
-    (* Match regular orders by side and price, or amend orders by order_id *)
-    let matches_side_price = s = side && abs_float (p -. price) < 0.01 in
+    (* 1. Match regular placements by side (any pending_buy/pending_sell for that side) *)
+    let is_placement_prefix = String.starts_with ~prefix:"pending_buy_" pending_id ||
+                              String.starts_with ~prefix:"pending_sell_" pending_id in
+    let matches_side_placement = is_placement_prefix && s = side in
+    
+    (* 2. Match amend orders by order_id *)
     let matches_amend = String.starts_with ~prefix:"pending_amend_" pending_id &&
+                       String.length pending_id > 14 &&
                        String.sub pending_id 14 (String.length pending_id - 14) = order_id in
-    not (matches_side_price || matches_amend)
+    
+    (* 3. Fallback for tests or legacy IDs that don't use prefixes *)
+    let matches_fallback = not (String.starts_with ~prefix:"pending_" pending_id) &&
+                          s = side && abs_float (p -. price) < 0.01 in
+    
+    not (matches_side_placement || matches_amend || matches_fallback)
   ) state.pending_orders;
+
+  (* Clean up global placement trackers to allow subsequent placements now that we have the real order *)
+  let duplicate_key = generate_side_duplicate_key asset_symbol side in
+  ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
   (* Update buy order tracking if this is a buy order acknowledgment *)
   (match side with
@@ -791,17 +799,35 @@ let handle_order_acknowledged asset_symbol order_id side price =
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     (string_of_order_side side) order_id price asset_symbol
+  )
 
 (** Handle order placement failure - remove from pending and potentially trigger re-evaluation *)
 let handle_order_rejected asset_symbol side price =
   let state = get_strategy_state asset_symbol in
-  (* Remove from pending orders *)
-  state.pending_orders <- List.filter (fun (_, s, p, _) ->
-    not (s = side && abs_float (p -. price) < 0.01)  (* Allow small price difference *)
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+  (* Remove from pending orders - match by side for regular placements or fallback for tests *)
+  state.pending_orders <- List.filter (fun (pending_id, s, p, _) ->
+    let is_placement_prefix = String.starts_with ~prefix:"pending_buy_" pending_id ||
+                              String.starts_with ~prefix:"pending_sell_" pending_id in
+    let matches_side_placement = is_placement_prefix && s = side in
+    
+    (* Rejections for amends match by ID or price fallback *)
+    let matches_amend_prefix = String.starts_with ~prefix:"pending_amend_" pending_id in
+    
+    let matches_fallback = (not (String.starts_with ~prefix:"pending_" pending_id) || matches_amend_prefix) &&
+                          s = side && abs_float (p -. price) < 0.01 in
+    
+    not (matches_side_placement || matches_fallback)
   ) state.pending_orders;
-  Logging.debug_f ~section "Order rejected and removed from pending: %s @ %.2f for %s"
-    (string_of_order_side side) price asset_symbol;
-  ()
+
+  (* Clean up global trackers to allow immediate re-placement after rejection *)
+  let duplicate_key = generate_side_duplicate_key asset_symbol side in
+  ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+
+  Logging.debug_f ~section "Order rejected and removed from pending/trackers: %s @ %.2f for %s"
+    (string_of_order_side side) price asset_symbol
+  )
 
   (* For buy order rejections, this signals no buy order exists, which is valid for re-evaluation *)
   (* We don't need to do anything special here - the strategy will re-evaluate on next cycle *)
@@ -809,25 +835,36 @@ let handle_order_rejected asset_symbol side price =
 (** Handle order cancellation - remove from pending and tracked orders *)
 let handle_order_cancelled asset_symbol order_id =
   let state = get_strategy_state asset_symbol in
-  
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
   (* Add to cancelled orders blacklist to prevent re-adding during sync *)
   let now = Unix.time () in
   state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
   
-  (* Remove from pending orders if it's there *)
+  (* Determine if this was the tracked buy order to know which side to clear trackers for *)
+  let is_buy = match state.last_buy_order_id with
+    | Some id when id = order_id -> true
+    | _ -> false
+  in
+  let cancelled_side = if is_buy then Buy else Sell in
+
+  (* Remove from pending orders if it's there (matches by order_id OR side for ghost placements) *)
   let original_pending_count = List.length state.pending_orders in
-  state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
-    pending_id <> order_id
+  state.pending_orders <- List.filter (fun (pending_id, s, _, _) ->
+    let matches_id = pending_id = order_id in
+    let is_ghost_placement = (s = cancelled_side) && 
+                            (String.starts_with ~prefix:"pending_buy_" pending_id || 
+                             String.starts_with ~prefix:"pending_sell_" pending_id) in
+    not (matches_id || is_ghost_placement)
   ) state.pending_orders;
   let removed_pending = original_pending_count - List.length state.pending_orders in
   
   (* If this was a tracked buy order, clear it *)
-  (match state.last_buy_order_id with
-   | Some buy_id when buy_id = order_id ->
+  if is_buy then begin
        state.last_buy_order_id <- None;
        state.last_buy_order_price <- None;
        Logging.debug_f ~section "Cancelled buy order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
-   | _ -> ());
+  end;
   
   (* Remove from sell orders list *)
   let original_sell_count = List.length state.open_sell_orders in
@@ -835,14 +872,22 @@ let handle_order_cancelled asset_symbol order_id =
     sell_id <> order_id
   ) state.open_sell_orders;
   let removed_sell = original_sell_count - List.length state.open_sell_orders in
+
+  (* Clean up global placement trackers to allow immediate re-placement *)
+  ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Buy));
+  ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Sell));
   
   Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
     order_id asset_symbol removed_pending removed_sell
+  )
 
 (** Clean up pending cancellation tracking for a completed order *)
 let cleanup_pending_cancellation asset_symbol order_id =
   let state = get_strategy_state asset_symbol in
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
   Hashtbl.remove state.pending_cancellations order_id
+  )
 
 (** Get pending orders from ringbuffer for processing *)
 let get_pending_orders max_orders =

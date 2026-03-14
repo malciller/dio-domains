@@ -26,19 +26,16 @@
   lwt
   lwt_ppx
   lwt_ssl
-  mirage-crypto
   mirage-crypto-rng
   cohttp-lwt-unix
   websocket-lwt-unix
   dotenv
   base64
   digestif
-  domainslib
   uri
   conduit-lwt-unix
   ipaddr
   alcotest
-  cpuid
   mtime)
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
