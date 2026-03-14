@@ -34,8 +34,8 @@ Edit `config.json` (example):
 {
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
   "logging_sections": "",             // Filter logs by section (optional, comma-separated)
-  "logging_cycle_debug_mod": 1000000,   // Cycle interval for debug logs (logging_level must be debug)
-  "logging_cycle_info_mod": 1000000,    // Cycle interval for info stats (logging_level must be info or debug)
+  "logging_cycle_debug_mod": 1000000,   // Cycle interval for debug logs (logging_level must be debug for visibility)
+  "logging_cycle_info_mod": 1000000,    // Cycle interval for info stats (logging_level must be info or debug for visibility)
   "engine": {
     "balance_check_mod": 10000,         // Cycle interval for balance checks
     "strategy_fallback_mod": 10000      // Cycle interval for strategy fallback execution
