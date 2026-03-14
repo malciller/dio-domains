@@ -1,19 +1,6 @@
 {
   "logging_level": "info",
   "logging_sections": "",
-  "gc": {
-    "space_overhead": 40,
-    "max_overhead": 80,
-    "allocation_policy": 2,
-    "minor_heap_size_kb": 32768,
-    "major_heap_increment": 15,
-    "target_heap_mb": 256,
-    "check_interval_seconds": 60,
-    "high_heap_mb": 256,
-    "medium_heap_mb": 180,
-    "high_fragmentation_percent": 60.0,
-    "medium_fragmentation_percent": 40.0
-  },
   "logging_cycle_debug_mod": 1000000,
   "logging_cycle_info_mod": 1000000,
   "engine": {
