@@ -797,7 +797,7 @@ let start_message_handler _conn _token _on_failure _on_heartbeat =
   Lwt.return_unit
 
 (** WebSocket connection to Kraken authenticated endpoint - establishes connection and starts message handler *)
-let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
+let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.info ~section "Registering executions subscription on unified authenticated connection";
   
   let subscribe_msg = `Assoc [
@@ -814,17 +814,23 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
   Kraken_trading_client.subscribe subscribe_msg >>= fun () ->
   on_connected ();
   
-  let open Kraken_trading_client in
-  let sub = message_stream () in
+  let buffer = Kraken_trading_client.get_message_buffer () in
+  let condition = Kraken_trading_client.get_message_condition () in
+  let read_pos = ref (Ring_buffer.RingBuffer.get_position buffer) in
+  
   let rec loop () =
-    let open Event_bus.Make(struct type t = Yojson.Safe.t end) in
-    Lwt_stream.get sub.stream >>= function
-    | Some json ->
-        handle_message (Yojson.Safe.to_string json) on_heartbeat;
-        loop ()
-    | None ->
-        on_failure "Unified authenticated connection closed";
-        Lwt.return_unit
+    Lwt_condition.wait condition >>= fun () ->
+    let new_messages = Ring_buffer.RingBuffer.read_since buffer !read_pos in
+    read_pos := Ring_buffer.RingBuffer.get_position buffer;
+    
+    List.iter (fun json ->
+      handle_message (Yojson.Safe.to_string json) on_heartbeat
+    ) new_messages;
+    
+    if Atomic.get Kraken_trading_client.shutdown_requested then
+      Lwt.return_unit
+    else
+      loop ()
   in
   loop ()
 

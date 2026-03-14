@@ -55,11 +55,9 @@ type connection_with_generation = {
   generation: int;
 }
 
-module Message_bus = Event_bus.Make (struct
-  type t = Yojson.Safe.t
-end)
-
-let message_bus = Message_bus.create "kraken_auth_messages"
+module RingBuffer = Ring_buffer.RingBuffer
+let message_buffer = RingBuffer.create 1000
+let message_condition = Lwt_condition.create ()
 
 type state = {
   mutex: Lwt_mutex.t;
@@ -84,6 +82,9 @@ let state = {
   connected = Atomic.make false;
   subscriptions = [];
 }
+
+let get_message_buffer () = message_buffer
+let get_message_condition () = message_condition
 
 let heartbeat_bus = Heartbeat_bus.create "kraken_trading_heartbeat"
 let connection_bus = Connection_bus.create "kraken_trading_connection"
@@ -321,9 +322,10 @@ let handle_frame frame ~expected_generation =
          (match member "channel" json |> to_string_option with
           | Some "heartbeat" -> Lwt.return_unit
           | _ ->
-             Logging.debug_f ~section "Unhandled trading message: %s" (Yojson.Safe.to_string json);
-             Message_bus.publish message_bus json;
-             Lwt.return_unit)
+              Logging.debug_f ~section "Unhandled trading message: %s" (Yojson.Safe.to_string json);
+              RingBuffer.write message_buffer json;
+              Lwt_condition.broadcast message_condition ();
+              Lwt.return_unit)
    with exn ->
      Logging.error ~section
        (Printf.sprintf "Failed to handle trading frame synchronously: %s" (Printexc.to_string exn));
@@ -673,7 +675,6 @@ let subscribe message =
         Lwt.return_unit
   )
 
-let message_stream () = Message_bus.subscribe message_bus
 
 (** Clean up stale response table entries (older than 30 seconds) - event-driven *)
 let is_connected () = Atomic.get state.connected

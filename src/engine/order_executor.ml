@@ -285,8 +285,6 @@ let place_order
                   Lwt.fail exn
                 )
               >>= fun result ->
-              (* Remove from in-flight cache on success *)
-              let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
               Lwt.return result
         end
   )
