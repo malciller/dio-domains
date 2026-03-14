@@ -1,3 +1,8 @@
+
+src/legacy/
+
+
+
 *.annot
 *.cmo
 *.cma
@@ -15,6 +20,10 @@
 .vscode/
 .cursor/
 __pycache__
+*.pdf
+*.py
+portfolio_report.md
+
 
 # Files containing detailed information about the compilation (generated
 # by `ocamlc`/`ocamlopt` when invoked using the option `-bin-annot`).
@@ -40,3 +49,5 @@ _opam/
 # env file
 .env
 .DS_Store
+
+

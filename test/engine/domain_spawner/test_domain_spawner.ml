@@ -31,7 +31,13 @@ let test_spawn_domains_basic () =
   ] in
 
   (* Spawn domains for the assets *)
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets mock_fee_fetcher assets in
+  let config = {
+    Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
+    gc = Dio_engine.Config.default_gc_config;
+    engine = Dio_engine.Config.default_engine_config;
+    trading = assets
+  } in
+  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher assets in
 
   (* Verify correct number of domains created *)
   Alcotest.(check int) "correct number of domains" (List.length assets) (List.length domains)
@@ -41,7 +47,13 @@ let test_spawn_domains_empty () =
   (* Clear any existing domain registry state from previous tests *)
   Dio_engine.Domain_spawner.clear_domain_registry ();
 
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets mock_fee_fetcher [] in
+  let config = {
+    Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
+    gc = Dio_engine.Config.default_gc_config;
+    engine = Dio_engine.Config.default_engine_config;
+    trading = []
+  } in
+  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [] in
 
   Alcotest.(check int) "empty domains list length" 0 (List.length domains)
 
@@ -90,7 +102,13 @@ let test_domain_error_handling () =
   } in
 
   (* This should not crash the test runner, domains should handle errors internally *)
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets mock_fee_fetcher [failing_asset] in
+  let config = {
+    Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
+    gc = Dio_engine.Config.default_gc_config;
+    engine = Dio_engine.Config.default_engine_config;
+    trading = [failing_asset]
+  } in
+  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [failing_asset] in
   (* Give domains a moment to potentially fail *)
   Unix.sleepf 0.1;
   (* If we get here, domains were created successfully (even if they fail internally) *)

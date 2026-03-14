@@ -212,7 +212,7 @@ let create_cancel_order order_id asset_symbol strategy exchange =
     duplicate_key = ""; (* Not used for cancel *)
   }
 
-(** Push order to ringbuffer with telemetry *)
+(** Push order to ringbuffer *)
 let push_order order =
   let operation_str = match order.operation with
     | Place -> "place"

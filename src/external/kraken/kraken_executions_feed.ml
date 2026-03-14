@@ -5,7 +5,6 @@
 
 open Lwt.Infix
 open Concurrency
-module Memory_events = Dio_memory_management.Memory_events
 
 let section = "kraken_executions"
 (* TODO: Magic number - ring_buffer_size should be configurable *)
@@ -158,7 +157,7 @@ type open_order = {
 (** Lock-free ring buffer for execution events - shared implementation *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Write execution event to buffer with telemetry *)
+(** Write execution event to buffer *)
 let write_execution_event buffer event =
   RingBuffer.write buffer event;
 
@@ -320,27 +319,6 @@ let trigger_stale_order_cleanup ~reason () =
     Lwt.return_unit
   )
 
-let start_cleanup_handlers () =
-  if Atomic.compare_and_set cleanup_handlers_started false true then begin
-    let subscription = Memory_events.subscribe_memory_events () in
-    Lwt.async (fun () ->
-      let rec loop () =
-        Lwt_stream.get subscription.stream >>= function
-        | Some (Memory_events.MemoryPressure _) ->
-            trigger_stale_order_cleanup ~reason:"memory_pressure" ();
-            loop ()
-        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
-            trigger_stale_order_cleanup ~reason:"heartbeat" ();
-            loop ()
-
-        | None ->
-            subscription.close ();
-            Logging.info ~section "Execution cleanup memory event stream closed";
-            Lwt.return_unit
-      in
-      loop ()
-    )
-  end
 
 (** Get count of open orders for a symbol *)
 let[@inline always] count_open_orders symbol =
@@ -881,8 +859,6 @@ let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
 
     Logging.info ~section "Executions WebSocket established, subscribing...";
 
-    (* Ensure cleanup handlers are active *)
-    start_cleanup_handlers ();
 
     (* Call on_connected callback after successful connection and before starting message handler *)
     on_connected ();
@@ -906,5 +882,3 @@ let initialize symbols =
   ) symbols;
 
   Logging.info ~section "Execution stores initialized - now operating lock-free";
-  start_cleanup_handlers ()
-

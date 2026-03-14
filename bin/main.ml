@@ -58,7 +58,6 @@ let setup_signal_handlers () =
       (* Signal shutdown to all components *)
       Dio_engine.Order_executor.signal_shutdown ();
       Kraken.Kraken_trading_client.signal_shutdown ();
-      Dio_memory_management.Cleanup_coordinator.signal_shutdown ();
 
       (* Stop all supervised domains *)
       Dio_engine.Domain_spawner.stop_all_domains ();
@@ -155,7 +154,7 @@ let speclist = []
 let usage_msg = "Dio Trading Engine\n\nUsage: " ^ Sys.argv.(0) ^ "\n\nStarts the trading engine."
 
 (** Initialize the trading engine synchronously (for websocket setup) *)
-let init_trading_engine_sync () =
+let init_trading_engine_sync (config : Dio_engine.Config.config) =
   (* Fetch Fear & Greed once before any Kraken processes start *)
   let () =
     try
@@ -171,7 +170,7 @@ let init_trading_engine_sync () =
 
   (* Initialize supervised domains for consuming asset-specific data *)
   Logging.info ~section:"main" "Initializing supervised asset domains...";
-  let _supervisor_thread = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets (fun x -> x) configs_with_fees in
+  let _supervisor_thread = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets config (fun x -> x) configs_with_fees in
   Logging.info_f ~section:"main" "%d supervised asset domains initialized!" (List.length configs_with_fees);
 
   configs_with_fees
@@ -187,29 +186,6 @@ let () =
 
   (* Initialize logging system *)
   Logging.init ();
-
-  (* Start memory cleanup coordinator directly *)
-  Logging.info ~section:"main" "Starting memory cleanup coordinator...";
-  let monitor_config : Dio_memory_management.Cleanup_coordinator.monitor_config = {
-    check_interval_seconds = gc_config.check_interval_seconds;
-    target_heap_mb = gc_config.target_heap_mb;
-    high_heap_mb = gc_config.high_heap_mb;
-    medium_heap_mb = gc_config.medium_heap_mb;
-    high_fragmentation_percent = gc_config.high_fragmentation_percent;
-    medium_fragmentation_percent = gc_config.medium_fragmentation_percent;
-  } in
-
-  (* Start the coordinator initially *)
-  Dio_memory_management.Cleanup_coordinator.start_cleanup_coordinator ~monitor_config ();
-
-  (* Register in-flight order caches for periodic cleanup *)
-  Dio_memory_management.Cleanup_coordinator.register_event_registry 
-    "in_flight_orders" 
-    (Dio_strategies.Strategy_common.InFlightOrders.get_cleanup_fn ());
-  Dio_memory_management.Cleanup_coordinator.register_event_registry 
-    "in_flight_amendments" 
-    (Dio_strategies.Strategy_common.InFlightAmendments.get_cleanup_fn ());
-
 
 
   (* Basic GC statistics reporting *)
@@ -312,7 +288,7 @@ let () =
   try
     (* Initialize trading engine synchronously *)
     Logging.info ~section:"main" "Initializing trading engine...";
-    let _configs = init_trading_engine_sync () in
+    let _configs = init_trading_engine_sync config in
 
     (* Initialize order executor asynchronously - this can run in background *)
     let _order_executor_promise = init_order_executor_async () in

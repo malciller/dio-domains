@@ -6,7 +6,7 @@
 
 open Lwt.Infix
 open Concurrency
-module Memory_events = Dio_memory_management.Memory_events
+
 
 let section = "kraken_trading_client"
 
@@ -510,30 +510,6 @@ let cleanup_stale_response_entries ~reason () =
         Lwt.return_unit
       )
 
-(** Start listening to memory pressure events to trigger cleanup as needed *)
-let start_response_cleanup_handlers () =
-  if Atomic.compare_and_set cleanup_handler_started false true then begin
-    Logging.info ~section "Starting event-driven response cleanup handlers";
-    let subscription = Memory_events.subscribe_memory_events () in
-    Lwt.async (fun () ->
-      let rec loop () =
-        Lwt_stream.get subscription.stream >>= function
-        | Some (Memory_events.MemoryPressure _) ->
-            cleanup_stale_response_entries ~reason:"memory_pressure" () >>= fun () ->
-            loop ()
-        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
-            cleanup_stale_response_entries ~reason:"heartbeat" () >>= fun () ->
-            loop ()
-
-        | None ->
-            (* Stream closed; explicitly close subscription to free resources *)
-            subscription.close ();
-            Logging.info ~section "Response cleanup memory event stream closed";
-            Lwt.return_unit
-      in
-      loop ()
-    )
-  end
 
 let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
   (* Check for shutdown before sending new requests *)
@@ -676,12 +652,10 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
 let is_connected () = Atomic.get state.connected
 
 let init token : unit Lwt.t = 
-  start_response_cleanup_handlers ();
   Lwt.async (fun () -> cleanup_stale_response_entries ~reason:"init" ());
   ensure_connection token
 
 let connect_and_monitor token ~on_failure ~on_connected = 
-  start_response_cleanup_handlers ();
   Lwt.async (fun () -> cleanup_stale_response_entries ~reason:"connect" ());
   ensure_connection ~on_failure ~on_connected token
 

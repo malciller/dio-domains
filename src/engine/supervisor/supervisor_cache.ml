@@ -98,8 +98,6 @@ let create_connection_snapshots () : connection_snapshot list =
     snapshot
   ) conn_list
 
-(** Update telemetry metrics from snapshots - no-op since telemetry is removed *)
-let update_telemetry_from_snapshots _snapshots = ()
 
 (** Force an immediate cache update *)
 let force_update () =
@@ -111,8 +109,6 @@ let force_update () =
     cache.consecutive_failures <- 0;
     cache.backoff_until <- 0.0;
     
-    (* Update telemetry from snapshots *)
-    update_telemetry_from_snapshots snapshots;
     
     (* Publish to event bus *)
     ConnectionSnapshotEventBus.publish cache.snapshot_event_bus snapshots;

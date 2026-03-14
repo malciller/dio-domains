@@ -3,7 +3,6 @@
 
 open Lwt.Infix
 open Concurrency
-module Memory_events = Dio_memory_management.Memory_events
 
 let section = "kraken_balances"
 
@@ -255,7 +254,7 @@ let cleanup_dynamic_assets () =
     Hashtbl.remove last_balance_update asset;
     Mutex.unlock balance_update_mutex;
     
-    (* Explicitly remove associated telemetry metrics to free memory immediately *)
+
   ) dynamic_to_remove;
 
   Mutex.unlock configured_assets_mutex;
@@ -282,29 +281,9 @@ let maybe_cleanup_after_balance_update () =
     count
   in
   if asset_count > dynamic_assets_cap then
-    trigger_dynamic_asset_cleanup ~reason:"dynamic_asset_cap_exceeded" ()
+    (**** trigger_dynamic_asset_cleanup ~reason:"dynamic_asset_cap_exceeded" () ****)
+    ()
 
-(** Start listening to memory events to initiate cleanups under pressure *)
-let start_cleanup_handlers () =
-  if Atomic.compare_and_set cleanup_handlers_started false true then begin
-    let subscription = Memory_events.subscribe_memory_events () in
-    Lwt.async (fun () ->
-      let rec loop () =
-        Lwt_stream.get subscription.stream >>= function
-        | Some (Memory_events.MemoryPressure _) ->
-            trigger_dynamic_asset_cleanup ~reason:"memory_pressure" ();
-            loop ()
-        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
-            loop ()
-
-        | None ->
-            subscription.close ();
-            Logging.info ~section "Balance cleanup memory event stream closed";
-            Lwt.return_unit
-      in
-      loop ()
-    )
-  end
 
 (** Parse balance snapshot from WebSocket *)
 let parse_snapshot json on_heartbeat =
@@ -365,7 +344,7 @@ let parse_snapshot json on_heartbeat =
     notify_ready ();
 
     (* Event-driven cleanup after snapshot processing to cap dynamic assets *)
-    maybe_cleanup_after_balance_update ();
+    (**** maybe_cleanup_after_balance_update (); ****)
 
     Some ()
   with exn ->
@@ -414,7 +393,7 @@ let parse_update json on_heartbeat =
     ) data;
     
     (* Event-driven cleanup based on observed asset growth *)
-    maybe_cleanup_after_balance_update ();
+    (**** maybe_cleanup_after_balance_update (); ****)
 
     Some ()
   with exn ->
@@ -549,8 +528,6 @@ let initialize assets =
   (* Mark initialization complete *)
   Atomic.set initialized true;
   Logging.info ~section "Balance stores initialized - now thread-safe";
-  (* Attach event-driven cleanup handlers *)
-  start_cleanup_handlers ();
   ()
 
 (** Check for stale balance data and log warnings *)
@@ -565,7 +542,6 @@ let check_stale_balances assets =
       Logging.debug_f ~section "Balance data for %s is fresh" asset
   ) assets;
 
-  (* Update telemetry for stale balance count *)
   if !stale_count > 0 then
     Logging.warn_f ~section "%d assets have stale balance data" !stale_count
 
