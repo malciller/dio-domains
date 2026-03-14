@@ -23,6 +23,24 @@ module InFlightOrders = Dio_strategies.Strategy_common.InFlightOrders
 (** In-flight amendment cache to prevent duplicate amendments *)
 module InFlightAmendments = Dio_strategies.Strategy_common.InFlightAmendments
 
+(** Profilers cache for external requests *)
+let profilers : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
+let profilers_mutex = Mutex.create ()
+
+let get_profiler symbol operation =
+  let key = Printf.sprintf "%s:%s" symbol operation in
+  Mutex.lock profilers_mutex;
+  let profiler =
+    match Hashtbl.find_opt profilers key with
+    | Some p -> p
+    | None ->
+        let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
+        Hashtbl.add profilers key p;
+        p
+  in
+  Mutex.unlock profilers_mutex;
+  profiler
+
 (* Open the Exchange Interface Types *)
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
@@ -74,6 +92,7 @@ type cancel_request = {
   order_ids: string list option;
   cl_ord_ids: string list option;
   order_userrefs: int list option;
+  symbol: string option;
 }
 
 (** Generate a hash key for duplicate order detection *)
@@ -260,6 +279,9 @@ let place_order
                  For now, `Exchange.place_order` takes `token`.
               *)
 
+              let profiler = get_profiler request.symbol "place" in
+              let start_time = Mtime_clock.now_ns () in
+
               Lwt.catch
                 (fun () ->
                   Ex.place_order
@@ -285,6 +307,10 @@ let place_order
                   Lwt.fail exn
                 )
               >>= fun result ->
+              let stop_time = Mtime_clock.now_ns () in
+              let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
+              Latency_profiler.record profiler span;
+              Latency_profiler.report ~min_elapsed_s:0.0 profiler;
               Lwt.return result
         end
   )
@@ -347,6 +373,12 @@ let amend_order
                 
                 let ex_retry_config = retry_config in
 
+                let profiler = match request.symbol with
+                  | Some sym -> get_profiler sym "amend"
+                  | None -> get_profiler "unknown" "amend"
+                in
+                let start_time = Mtime_clock.now_ns () in
+
                 Lwt.catch
                   (fun () ->
                     Ex.amend_order
@@ -368,6 +400,10 @@ let amend_order
                     Lwt.fail exn
                   )
                 >>= fun result ->
+                let stop_time = Mtime_clock.now_ns () in
+                let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
+                Latency_profiler.record profiler span;
+                Latency_profiler.report ~min_elapsed_s:0.0 profiler;
                 (* Remove from in-flight cache on success immediately, just like place_order *)
                 let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
                 Lwt.return result
@@ -405,6 +441,12 @@ let cancel_orders
 
             let ex_retry_config = retry_config in
 
+            let profiler = match request.symbol with
+              | Some sym -> get_profiler sym "cancel"
+              | None -> get_profiler request.exchange "cancel"
+            in
+            let start_time = Mtime_clock.now_ns () in
+
             Ex.cancel_orders
               ~token
               ?order_ids:request.order_ids
@@ -412,6 +454,12 @@ let cancel_orders
               ?order_userrefs:request.order_userrefs
               ?retry_config:ex_retry_config
               ()
+            >>= fun result ->
+            let stop_time = Mtime_clock.now_ns () in
+            let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
+            Latency_profiler.record profiler span;
+            Latency_profiler.report ~min_elapsed_s:0.0 profiler;
+            Lwt.return result
   )
 
 (** Close the trading client connection *)
