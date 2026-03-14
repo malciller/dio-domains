@@ -11,7 +11,7 @@
     {
       "symbol": "BTC/USD",
       "exchange": "kraken",
-      "qty": "0.001",
+      "qty": "0.0011",
       "grid_interval": [
         0.75,
         2.0
