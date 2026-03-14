@@ -34,19 +34,6 @@ Edit `config.json` (example):
 {
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
   "logging_sections": "",             // Filter logs by section (optional, comma-separated)
-  "gc": {
-    "space_overhead": 40,             // GC memory overhead % (default: 120)
-    "max_overhead": 80,               // Triggers compaction when exceeded (default: 500)
-    "allocation_policy": 2,           // 0=next-fit, 1=first-fit, 2=best-fit
-    "minor_heap_size_kb": 32768,      // Minor heap size in KB
-    "major_heap_increment": 15,       // Major heap growth %
-    "target_heap_mb": 256,            // Hard limit - forces Gc.compact() when exceeded
-    "check_interval_seconds": 60,     // Memory monitor check interval
-    "high_heap_mb": 256,              // High pressure threshold (MB)
-    "medium_heap_mb": 180,            // Medium pressure threshold (MB)
-    "high_fragmentation_percent": 60, // High fragmentation threshold (%)
-    "medium_fragmentation_percent": 40
-  },
   "logging_cycle_debug_mod": 1000000,   // Cycle interval for debug logs (logging_level must be debug)
   "logging_cycle_info_mod": 1000000,    // Cycle interval for info stats (logging_level must be info or debug)
   "engine": {
@@ -101,7 +88,6 @@ Edit `config.json` (example):
 - **Supervisor**: Orchestrates WebSocket connections with circuit breaker patterns, heartbeat monitoring, and connection health management.
 - **Engine Core**:
   - **Concurrency**: Lock-free global tick bus and event registry for inter-domain communication.
-  - **Memory Management**: Cleanup Coordinator triggered by GC alarms to manage memory pressure and prevent fragmentation.
   - **Latency Profiling**: Histogram-based statistics tracking for microsecond-precision performance monitoring.
   - **Strategies**: High-frequency trading algorithms (Grid, MM) running in parallel domains with F&G integration.
   - **Order Executor**: Asynchronous order placement and amendment with duplicate detection.
@@ -144,7 +130,6 @@ dune build
     - Domain management: `src/engine/domain_spawner.ml`
     - Concurrency & Bus: `src/engine/concurrency/`
     - Latency Profiling: `src/engine/latency_profiling/`
-    - Memory Management: `src/engine/memory_management/`
     - Connection supervision: `src/engine/supervisor/`
     - WebSocket feeds: `src/external/kraken/`
     - Dashboard UI: `src/ui/`
