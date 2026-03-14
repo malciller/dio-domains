@@ -1,5 +1,0 @@
-(library
- (name dio_memory_management)
- (public_name dio.memory_management)
- (libraries lwt threads dio.concurrency logging)
- (modules Memory_events Cleanup_coordinator))

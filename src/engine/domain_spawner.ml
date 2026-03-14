@@ -29,7 +29,7 @@ let shutdown_requested = Atomic.make false
 
 
 (** The worker function executed by each domain for a trading asset *)
-let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset : trading_config) =
+let asset_domain_worker (config : config) (fee_fetcher : trading_config -> trading_config) (asset : trading_config) =
   Random.self_init ();  (* Initialize random state for this domain *)
   
   (* Fetch fees at domain startup using the provided fetcher *)
@@ -229,7 +229,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         incr cycle_count;
         
         (* Minimal logging in hot loop *)
-        if !cycle_count mod 1000000 = 0 then
+        if !cycle_count mod config.logging.cycle_debug_mod = 0 then
           Logging.debug_f ~section "Asset [%s/%s] cycle #%d"
             asset_with_fees.exchange asset_with_fees.symbol !cycle_count;
         
@@ -338,7 +338,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         end;
 
         (* Mock balance check throttling *)
-        if !cycle_count mod 10000 = 0 then (
+        if !cycle_count mod config.engine.balance_check_mod = 0 then (
           let now = Unix.time () in
           if now -. !last_balance_check > 2.0 then begin
             last_balance_check := now;
@@ -346,8 +346,8 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         );
 
         (* Execute strategy based on type - only when triggered by events (event-driven) *)
-        (* Add fallback: execute every 10000 cycles (~2 seconds at 200k/sec) to prevent getting stuck *)
-        let should_execute = !should_execute_strategy || (!cycle_count mod 10000 = 0) in
+        (* Add fallback: execute every X cycles to prevent getting stuck *)
+        let should_execute = !should_execute_strategy || (!cycle_count mod config.engine.strategy_fallback_mod = 0) in
         if should_execute then begin
           let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Reset flag *)
@@ -427,7 +427,7 @@ let asset_domain_worker (fee_fetcher : trading_config -> trading_config) (asset 
         
         (* Log cycle stats *)
         (* Log cycle stats every 1M cycles *)
-        if !cycle_count mod 1000000 = 0 then begin
+        if !cycle_count mod config.logging.cycle_info_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
               Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
@@ -483,7 +483,7 @@ let register_domain asset =
   state
 
 (** Start a supervised domain *)
-let start_domain state fee_fetcher =
+let start_domain config state fee_fetcher =
   let asset = state.asset in
   let key = domain_key asset in
 
@@ -512,7 +512,7 @@ let start_domain state fee_fetcher =
 
       (* Exception handling for robustness *)
       try
-        asset_domain_worker fee_fetcher asset;
+        asset_domain_worker config fee_fetcher asset;
         Logging.info_f ~section "Domain for %s/%s completed normally" asset.exchange asset.symbol
       with exn ->
         Logging.critical_f ~section "Domain for %s/%s crashed (CAUGHT IN SPAWNER): %s"
@@ -569,7 +569,7 @@ let domain_needs_restart state =
   needs_restart
 
 (** Domain supervisor monitoring loop *)
-let supervisor_loop fee_fetcher =
+let supervisor_loop config fee_fetcher =
   let section = "domain_supervisor" in
   Logging.info ~section "Domain supervisor started";
 
@@ -600,7 +600,7 @@ let supervisor_loop fee_fetcher =
           if time_since_restart >= backoff_delay then (
             Logging.warn_f ~section "Restarting crashed domain %s (attempt #%d, backoff %.1fs)"
               key restart_count backoff_delay;
-            ignore (start_domain state fee_fetcher)
+            ignore (start_domain config state fee_fetcher)
           )
         )
       ) domains
@@ -612,7 +612,7 @@ let supervisor_loop fee_fetcher =
   done
 
 (** Spawn supervised domains for assets *)
-let spawn_supervised_domains_for_assets (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : Thread.t =
+let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : Thread.t =
   Logging.debug_f ~section "Spawning supervised domains for %d assets..." (List.length assets);
 
   (* Initialize strategy modules *)
@@ -630,13 +630,13 @@ let spawn_supervised_domains_for_assets (fee_fetcher : trading_config -> trading
   Mutex.unlock registry_mutex;
 
   List.iter (fun state ->
-    ignore (start_domain state fee_fetcher)
+    ignore (start_domain config state fee_fetcher)
   ) all_states;
 
 
 
   (* Start supervisor thread *)
-  let supervisor_thread = Thread.create supervisor_loop fee_fetcher in
+  let supervisor_thread = Thread.create (supervisor_loop config) fee_fetcher in
   Logging.info ~section "Domain supervisor thread started";
   supervisor_thread
 
@@ -685,9 +685,9 @@ let stop_all_domains () =
   wait_for_stop 10.0
 
 (** Legacy function for backward compatibility - returns empty list since domains are now supervised *)
-let spawn_domains_for_assets (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : unit Domain.t list =
+let spawn_domains_for_assets (config : config) (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : unit Domain.t list =
   Logging.warn ~section "spawn_domains_for_assets is deprecated, use spawn_supervised_domains_for_assets instead";
-  ignore (spawn_supervised_domains_for_assets fee_fetcher assets);
+  ignore (spawn_supervised_domains_for_assets config fee_fetcher assets);
 
   (* Return the list of domain handles for compatibility *)
   Mutex.lock registry_mutex;
@@ -698,6 +698,7 @@ let spawn_domains_for_assets (fee_fetcher : trading_config -> trading_config) (a
 
 (* Entrypoint to spawn config domains; call in main program as appropriate *)
 let spawn_config_domains (fee_fetcher : trading_config -> trading_config) () : unit Domain.t list =
-  let configs = (read_config ()).trading in
+  let full_config = read_config () in
+  let configs = full_config.trading in
   Logging.debug_f ~section "Preparing to spawn domains for %d assets..." (List.length configs);
-  spawn_domains_for_assets fee_fetcher configs
+  spawn_domains_for_assets full_config fee_fetcher configs

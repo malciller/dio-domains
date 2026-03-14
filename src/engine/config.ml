@@ -15,6 +15,18 @@ type trading_config = {
 type logging_config = {
   level: Logging.level;
   sections: string list;
+  cycle_debug_mod: int;
+  cycle_info_mod: int;
+}
+
+type engine_config = {
+  balance_check_mod: int;
+  strategy_fallback_mod: int;
+}
+
+let default_engine_config = {
+  balance_check_mod = 10000;
+  strategy_fallback_mod = 10000;
 }
 
 (** GC and memory monitor configuration *)
@@ -51,6 +63,7 @@ let default_gc_config = {
 type config = {
   logging: logging_config;
   gc: gc_config;
+  engine: engine_config;
   trading: trading_config list;
 }
 
@@ -116,12 +129,26 @@ let parse_logging_config json : logging_config =
   let open Yojson.Basic.Util in
   let level_str = json |> member "logging_level" |> to_string_option |> Option.value ~default:"info" in
   let sections_str = json |> member "logging_sections" |> to_string_option |> Option.value ~default:"" in
+  let cycle_debug_mod = json |> member "logging_cycle_debug_mod" |> to_int_option |> Option.value ~default:1000000 in
+  let cycle_info_mod = json |> member "logging_cycle_info_mod" |> to_int_option |> Option.value ~default:1000000 in
   let level = match Logging.level_of_string level_str with
     | Some lvl -> lvl
     | None -> Logging.warn_f ~section:"config" "Unknown logging level '%s', defaulting to INFO" level_str; Logging.INFO
   in
   let sections = sections_str |> String.split_on_char ',' |> List.map String.trim |> List.filter ((<>) "") in
-  { level; sections }
+  { level; sections; cycle_debug_mod; cycle_info_mod }
+
+(** Parse engine configuration *)
+let parse_engine_config json : engine_config =
+  let open Yojson.Basic.Util in
+  let engine_json = json |> member "engine" in
+  let int_or default field =
+    engine_json |> member field |> to_int_option |> Option.value ~default
+  in
+  {
+    balance_check_mod = int_or default_engine_config.balance_check_mod "balance_check_mod";
+    strategy_fallback_mod = int_or default_engine_config.strategy_fallback_mod "strategy_fallback_mod";
+  }
 
 (** Parse GC configuration *)
 let parse_gc_config json : gc_config =
@@ -158,7 +185,8 @@ let read_config () : config =
     let open Yojson.Basic.Util in
     let logging = parse_logging_config json in
     let gc = parse_gc_config json in
+    let engine = parse_engine_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
-    { logging; gc; trading }
+    { logging; gc; engine; trading }
   with
-  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = [] }; gc = default_gc_config; trading = [] }
+  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 }; gc = default_gc_config; engine = default_engine_config; trading = [] }

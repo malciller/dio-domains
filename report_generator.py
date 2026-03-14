@@ -1,14 +1,100 @@
 import csv
 from collections import defaultdict, deque
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import statistics
 import argparse
-from datetime import timedelta
 import urllib.request
 import urllib.parse
 import json
 import time
+import os
+import re
+
+try:
+    import pypdf
+    HAS_PYPDF = True
+except ImportError:
+    HAS_PYPDF = False
+
+# Cache for historical prices: {(asset, date): Decimal}
+HISTORICAL_PRICE_CACHE = {}
+
+def get_historical_price(asset, dt):
+    """
+    Fetch historical daily OHLC price from Kraken for an asset at a specific datetime.
+    Uses interval=1440 (daily) and takes the 'close' price of the day.
+    """
+    # Normalize to date for daily resolution
+    date_key = dt.date()
+    cache_key = (asset, date_key)
+    
+    if cache_key in HISTORICAL_PRICE_CACHE:
+        return HISTORICAL_PRICE_CACHE[cache_key]
+    
+    # Kraken pair mapping
+    asset_map = {
+        'ADA': 'ADAUSD',
+        'BTC': 'XXBTZUSD',
+        'DOT': 'DOTUSD',
+        'ETH': 'XETHZUSD',
+        'SOL': 'SOLUSD',
+        'TRX': 'TRXUSD',
+        'XRP': 'XXRPZUSD',
+        'INJ': 'INJUSD',
+        'KSM': 'KSMUSD',
+        'BABY': 'BABYUSD',
+        'EIGEN': 'EIGENUSD',
+        'USDG': 'USDGUSD',
+        'PAXG': 'PAXGUSD'
+    }
+    
+    if asset not in asset_map:
+        return None
+    
+    pair = asset_map[asset]
+    # Timestamp for the start of the day
+    since = int(time.mktime(date_key.timetuple()))
+    
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=1440&since={since}"
+    try:
+        # Respect API limits
+        time.sleep(0.5) 
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            
+        if data.get('error'):
+            return None
+            
+        # The result key is often the pair name (e.g. 'ADAUSD' or 'XETHZUSD')
+        # We find the first key that isn't 'last'
+        result_key = None
+        for k in data.get('result', {}).keys():
+            if k != 'last':
+                result_key = k
+                break
+        
+        if not result_key or not data['result'][result_key]:
+            return None
+            
+        # OHLC structure: [time, open, high, low, close, vwap, volume, count]
+        # We match the timestamp as closely as possible
+        day_start = since
+        best_price = None
+        for ohlc in data['result'][result_key]:
+            ohlc_time = int(ohlc[0])
+            if ohlc_time >= day_start:
+                best_price = Decimal(ohlc[4]) # Close price
+                break
+        
+        if best_price:
+            HISTORICAL_PRICE_CACHE[cache_key] = best_price
+            return best_price
+            
+    except Exception as e:
+        print(f"Error fetching historical price for {asset} on {date_key}: {e}")
+        
+    return None
 
 
 def safe_decimal(value, default='0'):
@@ -19,7 +105,168 @@ def safe_decimal(value, default='0'):
     except (InvalidOperation, ValueError):
         return Decimal(default)
 
+class KrakenStockParser:
+    """Parses Kraken Stocks trade confirmation PDFs."""
+    
+    def __init__(self):
+        # Regex to find blocks. We look for ORDER ID as the start of a trade block.
+        self.order_pattern = re.compile(r'ORDER ID:\s*([a-f0-9\-]+)', re.IGNORECASE)
+        self.symbol_pattern = re.compile(r'SYMBOL:\s*([A-Z]+)', re.IGNORECASE)
+        
+        # Date pattern for "Jul 10, 2025"
+        self.date_pattern = re.compile(r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})')
+
+    def parse_file(self, pdf_path):
+        """Extract trades from a single PDF file."""
+        if not os.path.exists(pdf_path):
+            return []
+            
+        try:
+            with open(pdf_path, 'rb') as f:
+                reader = pypdf.PdfReader(f)
+                full_text = ""
+                for page in reader.pages:
+                    full_text += page.extract_text() + "\n"
+        except Exception as e:
+            print(f"Error reading {pdf_path}: {e}")
+            return []
+
+        # Normalize and split into lines
+        lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+        
+        trades = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if 'ORDER ID:' in line:
+                trade = self._parse_trade_block(lines, i)
+                if trade:
+                    trades.append(trade)
+                    # Skip ahead to avoid re-parsing the same block content
+                    i += 1
+                    continue
+            i += 1
+            
+        return trades
+
+    def _parse_trade_block(self, lines, start_index):
+        """Parses a single trade block starting from ORDER ID."""
+        trade = {'source': 'pdf'}
+        
+        # 1. Extract Order ID
+        line = lines[start_index]
+        match = self.order_pattern.search(line)
+        if match:
+            trade['txid'] = match.group(1)
+        else:
+            if start_index + 1 < len(lines):
+                trade['txid'] = lines[start_index + 1].strip()
+        
+        # 2. Find Symbol
+        curr = start_index
+        found_symbol = False
+        while curr < len(lines) and curr < start_index + 10:
+            if 'SYMBOL:' in lines[curr]:
+                match = self.symbol_pattern.search(lines[curr])
+                if match:
+                    trade['symbol'] = match.group(1)
+                    found_symbol = True
+                else:
+                    if curr + 1 < len(lines):
+                        # Handle cases like "1/5SYMBOL:" followed by "VTI"
+                        sym = lines[curr+1].strip()
+                        if sym.isupper() and 1 <= len(sym) <= 5:
+                            trade['symbol'] = sym
+                            found_symbol = True
+                break
+            curr += 1
+            
+        if not found_symbol:
+            return None
+
+        # 3. Find Trade Data (stating after "Trade Date" or similar headers)
+        curr = start_index
+        found_header = False
+        while curr < len(lines) and curr < start_index + 30:
+            if 'Trade Date' in lines[curr]:
+                found_header = True
+                break
+            curr += 1
+            
+        if not found_header:
+            return None
+
+        # Values follow headers
+        data_start = curr + 1
+        data_lines = []
+        while data_start < len(lines) and len(data_lines) < 10:
+            if self.date_pattern.search(lines[data_start]) or 'ORDER ID:' in lines[data_start]:
+                if self.date_pattern.search(lines[data_start]):
+                    data_lines.append(lines[data_start])
+                break
+            data_lines.append(lines[data_start])
+            data_start += 1
+            
+        if len(data_lines) < 5:
+            return None
+            
+        try:
+            trade['side'] = data_lines[0].lower()
+            trade['quantity'] = abs(Decimal(data_lines[1].replace(',', '')))
+            trade['price'] = Decimal(data_lines[3].replace(',', ''))
+            
+            if len(data_lines) == 6: 
+                trade['gross'] = Decimal(data_lines[4].replace(',', ''))
+                trade['net'] = trade['gross']
+                trade['fee'] = Decimal(0)
+                trade['date_str'] = data_lines[5]
+            elif len(data_lines) == 7: 
+                trade['gross'] = Decimal(data_lines[4].replace(',', ''))
+                trade['net'] = Decimal(data_lines[5].replace(',', ''))
+                trade['fee'] = Decimal(0)
+                trade['date_str'] = data_lines[6]
+            elif len(data_lines) == 8: 
+                trade['gross'] = Decimal(data_lines[4].replace(',', ''))
+                trade['fee'] = Decimal(data_lines[5].replace(',', ''))
+                trade['net'] = Decimal(data_lines[6].replace(',', ''))
+                trade['date_str'] = data_lines[7]
+            else:
+                return None
+                
+            trade['dt'] = datetime.strptime(trade['date_str'], '%b %d, %Y')
+            trade['time'] = trade['dt'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            trade_record = {
+                'time': trade['time'],
+                'dt': trade['dt'],
+                'txid': trade['txid'],
+                'symbol': f"{trade['symbol']}/USD",
+                'side': trade['side'],
+                'quantity': trade['quantity'],
+                'price': trade['price'],
+                'fee': trade['fee'],
+                'cost': abs(trade['gross']),
+                'costusd': abs(trade['gross']),
+                'net': trade['quantity'],
+                'margin': Decimal(0),
+                'asset': trade['symbol']
+            }
+            return trade_record
+            
+        except Exception:
+            return None
+
+    def parse_directory(self, directory):
+        """Parse all PDFs in a directory."""
+        all_trades = []
+        for filename in os.listdir(directory):
+            if filename.endswith(".pdf"):
+                path = os.path.join(directory, filename)
+                all_trades.extend(self.parse_file(path))
+        return sorted(all_trades, key=lambda x: x['dt'])
+
 class InventoryManager:
+
     def __init__(self, method='FIFO'):
         self.method = method.upper()
         # inventory items: [quantity, price_per_unit, date, txid]
@@ -191,7 +438,7 @@ def calculate_portfolio_balances(ledger_entries):
         asset_wallet_entries[entry['asset']][entry['wallet']].append(entry)
 
     # Exclude stock/ETF assets that are not part of the crypto portfolio
-    exclude_assets = {'VTI', 'QQQ', 'SCHD'}
+    exclude_assets = {}#{'VTI', 'QQQ', 'SCHD'}
 
     # For each asset, sum balances across all wallets
     for asset, wallet_entries in asset_wallet_entries.items():
@@ -228,7 +475,7 @@ def analyze_rewards_by_asset(ledger_entries):
     })
 
     for entry in ledger_entries:
-        if entry['type'] == 'earn':
+        if entry['type'] == 'earn' and entry['subtype'] == 'reward':
             asset = entry['asset']
             amount = entry['amount']
             dt = entry['dt']
@@ -252,6 +499,64 @@ def analyze_rewards_by_asset(ledger_entries):
             data['avg_reward'] = data['total_amount'] / data['transaction_count']
 
     return dict(rewards_by_asset)
+
+def analyze_staking_income(ledger_entries):
+    """
+    Per Rev. Rul. 2023-14: staking/earn rewards are ordinary income at FMV on the date received.
+    FMV is taken from the Kraken ledger 'amountusd' field for each earn entry.
+
+    Returns:
+        earn_lots: list of dicts — one per earn entry, containing the data needed to add the
+                   earned quantity to the asset's inventory with the correct cost basis (FMV at
+                   receipt). Used by calculate_gains() to feed InventoryManager.buy().
+        income_by_year: dict { year: { 'total': Decimal, 'by_asset': { asset: Decimal } } }
+                        Used to generate the Schedule 1 / ordinary income section of the report.
+    """
+    earn_lots = []
+    income_by_year = defaultdict(lambda: {'total': Decimal(0), 'by_asset': defaultdict(Decimal)})
+
+    for entry in ledger_entries:
+        if entry['type'] != 'earn' or entry['subtype'] != 'reward':
+            continue
+
+        asset = entry['asset']
+        quantity = entry['amount']
+        dt = entry['dt']
+        txid = entry['txid']
+        year = dt.year
+
+        # FMV at receipt: use amountusd if Kraken provided it, otherwise fallback to historical lookup.
+        fmv_usd = entry.get('amountusd')
+        if fmv_usd is None or fmv_usd == Decimal(0):
+            # Try historical lookup
+            hist_price = get_historical_price(asset, dt)
+            if hist_price:
+                fmv_usd = quantity * hist_price
+                print(f"INFO: Recovered FMV for earn entry {txid} ({asset}) using historical price: ${hist_price:.4f}")
+            else:
+                print(f"WARNING: earn entry txid={txid} asset={asset} date={dt.date()} "
+                      f"has no amountusd and historical lookup failed. "
+                      f"This reward will show as $0 ordinary income.")
+                fmv_usd = Decimal(0)
+        else:
+            fmv_usd = abs(fmv_usd)  # amountusd should be positive for earn, but guard anyway
+
+        # Per-unit cost basis = FMV / quantity (for inventory storage)
+        unit_fmv = fmv_usd / quantity if quantity > 0 else Decimal(0)
+
+        earn_lots.append({
+            'asset': asset,
+            'quantity': quantity,
+            'fmv_usd': fmv_usd,       # total USD income recognised this lot
+            'unit_fmv': unit_fmv,      # per-unit cost basis for future disposal
+            'dt': dt,
+            'txid': txid,
+        })
+
+        income_by_year[year]['total'] += fmv_usd
+        income_by_year[year]['by_asset'][asset] += fmv_usd
+
+    return earn_lots, dict(income_by_year)
 
 def analyze_asset_balance_history(ledger_entries):
     """Track balance changes over time for each asset, excluding stock investments"""
@@ -361,6 +666,7 @@ def analyze_deposit_withdrawal_patterns(ledger_entries):
             capital_flow['net_flow'][asset] -= amount
 
     # Subtract 1600 from USDC deposit amount for capital flow analysis
+
     if 'USDC' in capital_flow['deposits']:
         capital_flow['deposits']['USDC']['total'] -= Decimal('1600')
         capital_flow['net_flow']['USDC'] -= Decimal('1600')
@@ -479,92 +785,210 @@ def fetch_prices_individually(assets, asset_map, base_url):
     return prices
 
 def extract_trades_from_ledger(ledger_entries):
-    """Extract trading data from ledger entries"""
-    trades_by_refid = defaultdict(list)
-    
-    # Group trade entries by refid (each trade generates 2+ ledger entries)
+    """
+    Extract trading data from ledger entries.
+    Handles multi-leg trades (grouping by asset per refid) and coalesces 
+    split fills across different refids that occur at the same timestamp.
+    """
+    # 1. Group by refid
+    ledger_trades_by_refid = defaultdict(list)
     for entry in ledger_entries:
         if entry['type'] == 'trade' and entry['subtype'] == 'tradespot':
-            trades_by_refid[entry['refid']].append(entry)
+            ledger_trades_by_refid[entry['refid']].append(entry)
     
-    trades = []
-    for refid, entries in trades_by_refid.items():
-        if len(entries) == 2:  # Normal trade has exactly 2 entries
-            # Determine which is the base and which is the quote
-            entry1, entry2 = entries
-            
-            # The entry with negative amount is usually what we're selling (giving up)
-            # The entry with positive amount is what we're buying (receiving)
-            if entry1['amount'] < 0:
-                sell_entry, buy_entry = entry1, entry2
-            else:
-                sell_entry, buy_entry = entry2, entry1
-            
-            # Create trade record
-            if sell_entry['asset'] == 'USD' or sell_entry['asset'].endswith('USD'):
-                # Buying crypto with USD
-                # Ledger 'amount' is GROSS execution value; fee is separate.
-                # True cost basis = |usd_amount| + usd_fee
-                total_cost = abs(sell_entry['amount']) + sell_entry['fee'] + buy_entry['fee']
-                trade = {
-                    'time': buy_entry['time'],
-                    'dt': buy_entry['dt'],
-                    'txid': buy_entry['txid'], # Use buy txid for the trade record
-                    'symbol': f"{buy_entry['asset']}/USD",
-                    'side': 'buy',
-                    'quantity': buy_entry['amount'],
-                    'price': total_cost / buy_entry['amount'] if buy_entry['amount'] != 0 else Decimal(0),
-                    'fee': sell_entry['fee'] + buy_entry['fee'],
-                    'cost': total_cost,
-                    'costusd': total_cost,
-                    'net': buy_entry['amount'],
-                    'margin': Decimal(0)
+    # 2. Collapse each refid into per-asset totals
+    # This handles multi-wallet pulls (e.g. 3 entries for 2 assets)
+    collapsed_refids = {}
+    for refid, entries in ledger_trades_by_refid.items():
+        assets = {}
+        for e in entries:
+            a = e['asset']
+            if a not in assets:
+                assets[a] = {
+                    'amount': Decimal(0),
+                    'fee': Decimal(0),
+                    'amountusd': Decimal(0),
+                    'time': e['time'],
+                    'dt': e['dt'],
+                    'txid': e['txid']
                 }
-            elif buy_entry['asset'] == 'USD' or buy_entry['asset'].endswith('USD'):
-                # Selling crypto for USD
-                # Ledger 'amount' is GROSS execution value; fee is separate.
-                # True net proceeds = usd_amount - usd_fee
-                net_proceeds = buy_entry['amount'] - (sell_entry['fee'] + buy_entry['fee'])
-                trade = {
-                    'time': sell_entry['time'],
-                    'dt': sell_entry['dt'],
-                    'txid': sell_entry['txid'], # Use sell txid for the trade record
-                    'symbol': f"{sell_entry['asset']}/USD",
-                    'side': 'sell',
-                    'quantity': abs(sell_entry['amount']),
-                    'price': net_proceeds / abs(sell_entry['amount']) if sell_entry['amount'] != 0 else Decimal(0),
-                    'fee': sell_entry['fee'] + buy_entry['fee'],
-                    'cost': net_proceeds,
-                    'costusd': net_proceeds,
-                    'net': abs(sell_entry['amount']),
-                    'margin': Decimal(0)
-                }
-            else:
-                # Crypto-to-crypto trade - use USD values if available
-                usd_value = None
-                if sell_entry['amountusd'] and buy_entry['amountusd']:
-                    usd_value = max(abs(sell_entry['amountusd']), abs(buy_entry['amountusd']))
+            assets[a]['amount'] += e['amount']
+            assets[a]['fee'] += e['fee']
+            if e['amountusd']:
+                assets[a]['amountusd'] += e['amountusd']
+        collapsed_refids[refid] = assets
+
+    # 3. Handle split fills across different refids
+    # Specifically: if a refid only has 1 asset (orphan), try to merge it into 
+    # another refid at the SAME timestamp that shares that same asset.
+    final_trades_data = []
+    processed_refids = set()
+    
+    # Pre-calculate asset sets and timestamps for all refids
+    refid_meta = {
+        r: {
+            'dt': next(iter(collapsed_refids[r].values()))['dt'],
+            'assets': set(collapsed_refids[r].keys())
+        }
+        for r in collapsed_refids
+    }
+    
+    # Sort for consistent processing
+    sorted_refids = sorted(collapsed_refids.keys(), key=lambda r: refid_meta[r]['dt'])
+    
+    for i, refid in enumerate(sorted_refids):
+        if refid in processed_refids:
+            continue
+            
+        current_assets = collapsed_refids[refid]
+        current_dt = refid_meta[refid]['dt']
+        
+        # We start with this refid
+        merged_assets = {a: dict(d) for a, d in current_assets.items()}
+        processed_refids.add(refid)
+        
+        # Look ahead for orphans to merge into this trade, or if this is an orphan, merge it.
+        for j in range(i + 1, len(sorted_refids)):
+            other_refid = sorted_refids[j]
+            if other_refid in processed_refids:
+                continue
                 
-                trade = {
-                    'time': buy_entry['time'],
-                    'dt': buy_entry['dt'],
-                    'txid': buy_entry['txid'],
-                    'symbol': f"{buy_entry['asset']}/{sell_entry['asset']}",
-                    'side': 'buy',
-                    'quantity': buy_entry['amount'],
-                    'price': abs(sell_entry['amount']) / buy_entry['amount'] if buy_entry['amount'] != 0 else Decimal(0),
-                    'fee': sell_entry['fee'] + buy_entry['fee'],
-                    'cost': abs(sell_entry['amount']),
-                    'costusd': usd_value if usd_value else abs(sell_entry['amount']),
-                    'net': buy_entry['amount'],
-                    'margin': Decimal(0)
-                }
+            other_dt = refid_meta[other_refid]['dt']
+            if other_dt != current_dt:
+                if (other_dt - current_dt).total_seconds() > 1:
+                    break
+                continue
             
-            trades.append(trade)
+            # Merge condition:
+            # 1. One side is an orphan AND
+            # 2. They share that asset
+            other_asset_set = refid_meta[other_refid]['assets']
+            current_asset_set = set(merged_assets.keys())
+            
+            shared = other_asset_set & current_asset_set
+            is_orphan_involved = len(other_asset_set) == 1 or len(current_asset_set) == 1
+            
+            if shared and is_orphan_involved:
+                processed_refids.add(other_refid)
+                for asset, data in collapsed_refids[other_refid].items():
+                    if asset not in merged_assets:
+                        merged_assets[asset] = {
+                            'amount': Decimal(0), 'fee': Decimal(0), 'amountusd': Decimal(0),
+                            'time': data['time'], 'dt': data['dt'], 'txid': data['txid']
+                        }
+                    merged_assets[asset]['amount'] += data['amount']
+                    merged_assets[asset]['fee'] += data['fee']
+                    merged_assets[asset]['amountusd'] += data['amountusd']
+        
+        final_trades_data.append(merged_assets)
+
+    trades = []
+    for assets in final_trades_data:
+        # Ignore dust: total amount in either side must be non-zero
+        if all(abs(a['amount']) < Decimal('1e-10') for a in assets.values()):
+            continue
+
+        # We expect exactly 2 assets for a standard trade
+        if len(assets) != 2:
+            asset_keys = list(assets.keys())
+            if len(assets) > 2:
+                print(f"WARNING: Complex trade skipped (too many assets): {asset_keys}")
+            # Silently skip single-entry "orphans" that couldn't be merged (likely non-trade adjustments)
+            continue
+
+        asset_a_key, asset_b_key = assets.keys()
+        asset_a, asset_b = assets[asset_a_key], assets[asset_b_key]
+        
+        # Determine Buy vs Sell side
+        # Usually positive amount is Buy, negative is Sell
+        if asset_a['amount'] > 0:
+            buy_asset_key, buy_data = asset_a_key, asset_a
+            sell_asset_key, sell_data = asset_b_key, asset_b
+        else:
+            buy_asset_key, buy_data = asset_b_key, asset_b
+            sell_asset_key, sell_data = asset_a_key, asset_a
+
+        # Validate that we have one positive and one negative (approx)
+        if not (buy_data['amount'] > 0 and sell_data['amount'] < 0):
+             print(f"WARNING: Merged trade {buy_asset_key}/{sell_asset_key} has non-standard amounts "
+                   f"({buy_data['amount']}, {sell_data['amount']}). Skipping.")
+             continue
+
+        # Standard processing
+        if sell_asset_key == 'USD' or sell_asset_key.endswith('USD'):
+            # Buying crypto with USD
+            total_cost = abs(sell_data['amount']) + sell_data['fee'] + buy_data['fee']
+            trade = {
+                'time': buy_data['time'],
+                'dt': buy_data['dt'],
+                'txid': buy_data['txid'],
+                'symbol': f"{buy_asset_key}/USD",
+                'side': 'buy',
+                'quantity': buy_data['amount'],
+                'price': total_cost / buy_data['amount'] if buy_data['amount'] != 0 else Decimal(0),
+                'fee': sell_data['fee'] + buy_data['fee'],
+                'cost': total_cost,
+                'costusd': total_cost,
+                'net': buy_data['amount'],
+                'margin': Decimal(0)
+            }
+        elif buy_asset_key == 'USD' or buy_asset_key.endswith('USD'):
+            # Selling crypto for USD (buy side is USD)
+            net_proceeds = buy_data['amount'] - (sell_data['fee'] + buy_data['fee'])
+            trade = {
+                'time': sell_data['time'],
+                'dt': sell_data['dt'],
+                'txid': sell_data['txid'],
+                'symbol': f"{sell_asset_key}/USD",
+                'side': 'sell',
+                'quantity': abs(sell_data['amount']),
+                'price': net_proceeds / abs(sell_data['amount']) if sell_data['amount'] != 0 else Decimal(0),
+                'fee': sell_data['fee'] + buy_data['fee'],
+                'cost': net_proceeds,
+                'costusd': net_proceeds,
+                'net': abs(sell_data['amount']),
+                'margin': Decimal(0)
+            }
+        else:
+            # Crypto-to-crypto
+            usd_value = None
+            if sell_data['amountusd'] and buy_data['amountusd']:
+                usd_value = max(abs(sell_data['amountusd']), abs(buy_data['amountusd']))
+            
+            # Fallback for C2C missing USD
+            if not usd_value or usd_value == 0:
+                # Try historical lookup for either asset
+                price_a = get_historical_price(buy_asset_key, buy_data['dt'])
+                price_b = get_historical_price(sell_asset_key, sell_data['dt'])
+                if price_a:
+                    usd_value = buy_data['amount'] * price_a
+                elif price_b:
+                    usd_value = abs(sell_data['amount']) * price_b
+            
+            if not usd_value or usd_value == 0:
+                print(f"WARNING: C2C trade {buy_asset_key}/{sell_asset_key} missing amountusd. "
+                      f"FMV unknown, gain calculation may be incorrect. txid: {buy_data['txid']}")
+
+            trade = {
+                'time': buy_data['time'],
+                'dt': buy_data['dt'],
+                'txid': buy_data['txid'],
+                'symbol': f"{buy_asset_key}/{sell_asset_key}",
+                'side': 'buy',
+                'quantity': buy_data['amount'],
+                'price': abs(sell_data['amount']) / buy_data['amount'] if buy_data['amount'] != 0 else Decimal(0),
+                'fee': sell_data['fee'] + buy_data['fee'],
+                'cost': abs(sell_data['amount']),
+                'costusd': usd_value if usd_value else abs(sell_data['amount']),
+                'net': buy_data['amount'],
+                'margin': Decimal(0)
+            }
+        
+        trades.append(trade)
     
     return trades
 
-def compute_metrics(trades, period_name):
+def compute_metrics(trades, period_name, earn_lots=None):
     # We now track both FIFO and HIFO for comparison
     fifo_managers = defaultdict(lambda: InventoryManager('FIFO'))
     hifo_managers = defaultdict(lambda: InventoryManager('HIFO'))
@@ -573,8 +997,14 @@ def compute_metrics(trades, period_name):
     realized_gains_hifo = defaultdict(Decimal)
     
     # Store detailed tax liability data
-    # structure: year -> { 'short_term': Decimal, 'long_term': Decimal, 'total': Decimal }
-    tax_liability_by_year = defaultdict(lambda: {'short_term': Decimal(0), 'long_term': Decimal(0), 'total': Decimal(0)})
+    # structure: year -> { 'short_term': Decimal, 'long_term': Decimal, 'total': Decimal, 'proceeds': Decimal, 'cost_basis': Decimal }
+    tax_liability_by_year = defaultdict(lambda: {
+        'short_term': Decimal(0), 
+        'long_term': Decimal(0), 
+        'total': Decimal(0),
+        'proceeds': Decimal(0),
+        'cost_basis': Decimal(0)
+    })
     
     # Matching details for audit
     hifo_matches = []
@@ -586,8 +1016,24 @@ def compute_metrics(trades, period_name):
     total_trades = 0
     
     total_fees = Decimal(0)
-    
+
+    # --- Seed inventory with earn lots (cost basis = FMV at receipt) ---
+    # Earn lots must be added to inventory IN DATE ORDER before any trade at the same time
+    # so that a sell of a staked coin sees the correct basis.
+    if earn_lots:
+        for lot in sorted(earn_lots, key=lambda x: x['dt']):
+            asset = lot['asset']
+            # The earn lot forms a /USD synthetic symbol so the inventory key matches trades.
+            symbol = f"{asset}/USD"
+            fifo_managers[symbol].buy(
+                lot['quantity'], lot['unit_fmv'], lot['dt'], lot['txid'], fee=Decimal(0)
+            )
+            hifo_managers[symbol].buy(
+                lot['quantity'], lot['unit_fmv'], lot['dt'], lot['txid'], fee=Decimal(0)
+            )
+
     for trade in trades:
+
         symbol = trade['symbol']
         quantity = trade['quantity']
         price = trade['price']
@@ -635,6 +1081,8 @@ def compute_metrics(trades, period_name):
                 term_key = 'short_term' if match['term'] == 'Short' else 'long_term'
                 tax_liability_by_year[tax_year][term_key] += match_net_gain
                 tax_liability_by_year[tax_year]['total'] += match_net_gain
+                tax_liability_by_year[tax_year]['proceeds'] += match['proceeds']
+                tax_liability_by_year[tax_year]['cost_basis'] += match['cost_basis']
                 
                 # Store match detail for audit CSV
                 match_detail = match.copy()
@@ -654,13 +1102,13 @@ def compute_metrics(trades, period_name):
 
     # --- Tax Liability Section ---
     lines.append("## Annual Tax Liability (HIFO Spec ID)")
-    lines.append("| Tax Year | Short Term Gain | Long Term Gain | Total Realized Gain |")
-    lines.append("|----------|-----------------|----------------|---------------------|")
+    lines.append("| Tax Year | Total Proceeds | Total Cost Basis | Short Term Gain | Long Term Gain | Total Realized Gain |")
+    lines.append("|----------|----------------|------------------|-----------------|----------------|---------------------|")
     
     sorted_years = sorted(tax_liability_by_year.keys())
     for year in sorted_years:
         data = tax_liability_by_year[year]
-        lines.append(f"| {year} | ${data['short_term']:,.2f} | ${data['long_term']:,.2f} | ${data['total']:,.2f} |")
+        lines.append(f"| {year} | ${data['proceeds']:,.2f} | ${data['cost_basis']:,.2f} | ${data['short_term']:,.2f} | ${data['long_term']:,.2f} | ${data['total']:,.2f} |")
     
     lines.append("")
 
@@ -728,7 +1176,7 @@ def generate_audit_csv(matches, filename='spec_id_audit.csv'):
         print(f"Error generating audit CSV: {e}")
 
 
-def calculate_gains(csv_file):
+def calculate_gains(csv_file, stocks_dir=None):
     # Process ledger data
     ledger_entries = process_ledger_data(csv_file)
     
@@ -742,8 +1190,29 @@ def calculate_gains(csv_file):
     # Extract trades from ledger
     trades = extract_trades_from_ledger(ledger_entries)
 
-    # Analyze rewards by asset
+    # Integration: Load stock trades from PDFs if requested
+    if stocks_dir:
+        if not HAS_PYPDF:
+            print("WARNING: --stocks-dir provided but 'pypdf' is not installed. Skipping PDF parsing.")
+            print("Install it with: pip install pypdf")
+        else:
+            print(f"Parsing stock trade confirmations from: {stocks_dir}")
+            pdf_parser = KrakenStockParser()
+            stock_trades = pdf_parser.parse_directory(stocks_dir)
+            if stock_trades:
+                print(f"Successfully loaded {len(stock_trades)} trades from PDF confirmations.")
+                trades.extend(stock_trades)
+                # Sort consolidated trades by time
+                trades.sort(key=lambda x: x['dt'])
+            else:
+                print("No stock trades found in the specified directory.")
+
+    # Analyze rewards by asset (display / historical)
     rewards_analysis = analyze_rewards_by_asset(ledger_entries)
+
+    # Analyze staking income (ordinary income + earn-lot cost basis)
+    # Per Rev. Rul. 2023-14: staking rewards are taxable as ordinary income at FMV on receipt.
+    earn_lots, staking_income_by_year = analyze_staking_income(ledger_entries)
 
     # Analyze balance history
     balance_history = analyze_asset_balance_history(ledger_entries)
@@ -791,6 +1260,46 @@ def calculate_gains(csv_file):
     # Create comprehensive report structure
     lines = []
 
+    # --- Staking Ordinary Income (Schedule 1) ---
+    # Must appear before cap-gains sections so the taxpayer sees ordinary income first.
+    if staking_income_by_year:
+        lines.append("## Staking / Earn Ordinary Income (Schedule 1 / Form 1040 Line 8z)")
+        lines.append("> Per Rev. Rul. 2023-14: staking rewards are ordinary income at FMV on the date received.")
+        lines.append("> Report these amounts on Schedule 1 (Additional Income), Line 8z.")
+        lines.append("> The same FMV is used as the cost basis for any future disposal of these coins.")
+        lines.append("")
+        lines.append("| Tax Year | Staking Ordinary Income | Notes |")
+        lines.append("|----------|------------------------|-------|")
+        all_staking_income_total = Decimal(0)
+        for year in sorted(staking_income_by_year.keys()):
+            year_total = staking_income_by_year[year]['total']
+            all_staking_income_total += year_total
+            has_unknown = any(
+                lot['fmv_usd'] == Decimal(0)
+                for lot in earn_lots
+                if lot['dt'].year == year
+            )
+            note = '⚠ Some FMVs unknown — see WARNING output' if has_unknown else 'FMV from Kraken amountusd'
+            lines.append(f"| {year} | ${year_total:,.2f} | {note} |")
+        lines.append(f"| **All Years** | **${all_staking_income_total:,.2f}** | |")
+        lines.append("")
+
+        # Per-asset breakdown
+        lines.append("### Staking Income by Asset")
+        lines.append("| Asset | " + " | ".join(str(y) for y in sorted(staking_income_by_year.keys())) + " | Total |")
+        lines.append("|-------|" + "|".join(["---"] * (len(staking_income_by_year) + 1)) + "|")
+        all_earn_assets = sorted({lot['asset'] for lot in earn_lots})
+        for asset in all_earn_assets:
+            row = [asset]
+            asset_total = Decimal(0)
+            for year in sorted(staking_income_by_year.keys()):
+                amt = staking_income_by_year[year]['by_asset'].get(asset, Decimal(0))
+                asset_total += amt
+                row.append(f"${amt:,.2f}")
+            row.append(f"**${asset_total:,.2f}**")
+            lines.append("| " + " | ".join(row) + " |")
+        lines.append("")
+
     # Portfolio Overview Section
     if portfolio_value > 0:
         lines.append(f"### Total Portfolio Value: ${portfolio_value:.2f}")
@@ -809,7 +1318,9 @@ def calculate_gains(csv_file):
                 is_inactive = False
                 if asset in balance_history and balance_history[asset]:
                     last_activity = balance_history[asset][-1]['date']
-                    days_since_activity = (datetime.now() - last_activity).days
+                    now_utc = datetime.now(timezone.utc)
+                    last_activity_naive = last_activity.replace(tzinfo=None) if last_activity.tzinfo else last_activity
+                    days_since_activity = (now_utc.replace(tzinfo=None) - last_activity_naive).days
                     is_inactive = days_since_activity > 30
 
                 if is_inactive:
@@ -872,7 +1383,9 @@ def calculate_gains(csv_file):
             is_inactive = False
             if asset in balance_history and balance_history[asset]:
                 last_activity = balance_history[asset][-1]['date']
-                days_since_activity = (datetime.now() - last_activity).days
+                now_utc = datetime.now(timezone.utc)
+                last_activity_naive = last_activity.replace(tzinfo=None) if last_activity.tzinfo else last_activity
+                days_since_activity = (now_utc.replace(tzinfo=None) - last_activity_naive).days
                 is_inactive = days_since_activity > 30
 
             if is_inactive:
@@ -940,7 +1453,9 @@ def calculate_gains(csv_file):
                 is_inactive = False
                 if asset in balance_history and balance_history[asset]:
                     last_activity = balance_history[asset][-1]['date']
-                    days_since_activity = (datetime.now() - last_activity).days
+                    now_utc = datetime.now(timezone.utc)
+                    last_activity_naive = last_activity.replace(tzinfo=None) if last_activity.tzinfo else last_activity
+                    days_since_activity = (now_utc.replace(tzinfo=None) - last_activity_naive).days
                     is_inactive = days_since_activity > 30
 
                 if is_inactive:
@@ -991,7 +1506,9 @@ def calculate_gains(csv_file):
             is_inactive = False
             if history:
                 last_activity = history[-1]['date']
-                days_since_activity = (datetime.now() - last_activity).days
+                now_utc = datetime.now(timezone.utc)
+                last_activity_naive = last_activity.replace(tzinfo=None) if last_activity.tzinfo else last_activity
+                days_since_activity = (now_utc.replace(tzinfo=None) - last_activity_naive).days
                 is_inactive = days_since_activity > 30
 
             if is_inactive:
@@ -1427,7 +1944,7 @@ def calculate_gains(csv_file):
 
         lines.append("")
 
-        detailed_all_time, hifo_matches = compute_metrics(trades, 'All Time')
+        detailed_all_time, hifo_matches = compute_metrics(trades, 'All Time', earn_lots=earn_lots)
         
         # Generate Spec ID Audit CSV
         generate_audit_csv(hifo_matches)
@@ -2142,11 +2659,13 @@ def generate_html_report(markdown_content, output_file='portfolio_report.html'):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate portfolio report from Kraken ledger CSV.")
     parser.add_argument('csv_file', nargs='?', default='ledgers.csv', help='Input CSV file (Kraken ledger format)')
+    parser.add_argument('--stocks-dir', '-s', default=None, help='Directory containing Kraken Stocks PDF trade confirmations')
     parser.add_argument('--output', '-o', default='portfolio_report.md', help='Output file (supports .md, .html extensions)')
     parser.add_argument('--format', '-f', choices=['md', 'html'], default='md', help='Output format')
     args = parser.parse_args()
 
-    report = calculate_gains(args.csv_file)
+    report = calculate_gains(args.csv_file, stocks_dir=args.stocks_dir)
+
     if report:
         if args.format == 'html':
             # Generate HTML version

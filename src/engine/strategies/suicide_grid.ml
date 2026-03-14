@@ -190,7 +190,7 @@ let create_cancel_order order_id asset_symbol strategy exchange =
 let create_order asset_symbol side qty price post_only exchange =
   create_place_order asset_symbol side qty price post_only "Grid" exchange
 
-(** Push order to ringbuffer with telemetry *)
+(** Push order to ringbuffer *)
 let push_order order =
   let operation_str = match order.operation with
     | Place -> "place"

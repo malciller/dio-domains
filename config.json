@@ -14,6 +14,12 @@
     "high_fragmentation_percent": 60.0,
     "medium_fragmentation_percent": 40.0
   },
+  "logging_cycle_debug_mod": 1000000,
+  "logging_cycle_info_mod": 1000000,
+  "engine": {
+    "balance_check_mod": 10000,
+    "strategy_fallback_mod": 10000
+  },
   "trading": [
     {
       "symbol": "BTC/USD",

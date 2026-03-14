@@ -42,7 +42,25 @@ let test_parse_logging_config_valid () =
   let config = Dio_engine.Config.parse_logging_config json in
 
   Alcotest.(check bool) "debug level" true (config.level = Logging.DEBUG);
-  Alcotest.(check (list string)) "sections" ["engine"; "trading"; "api"] config.sections
+  Alcotest.(check (list string)) "sections" ["engine"; "trading"; "api"] config.sections;
+  Alcotest.(check int) "cycle_debug_mod" 1000000 config.cycle_debug_mod;
+  Alcotest.(check int) "cycle_info_mod" 1000000 config.cycle_info_mod
+
+let test_parse_engine_config_valid () =
+  let json_str = {|{"engine": {"balance_check_mod": 5000, "strategy_fallback_mod": 2000}}|} in
+  let json = Yojson.Basic.from_string json_str in
+  let config = Dio_engine.Config.parse_engine_config json in
+
+  Alcotest.(check int) "balance_check_mod" 5000 config.balance_check_mod;
+  Alcotest.(check int) "strategy_fallback_mod" 2000 config.strategy_fallback_mod
+
+let test_parse_engine_config_defaults () =
+  let json_str = {|{"engine": {}}|} in
+  let json = Yojson.Basic.from_string json_str in
+  let config = Dio_engine.Config.parse_engine_config json in
+
+  Alcotest.(check int) "balance_check_mod default" 10000 config.balance_check_mod;
+  Alcotest.(check int) "strategy_fallback_mod default" 10000 config.strategy_fallback_mod
 
 let test_parse_logging_config_defaults () =
   let json_str = {|{}|} in
@@ -50,7 +68,9 @@ let test_parse_logging_config_defaults () =
   let config = Dio_engine.Config.parse_logging_config json in
 
   Alcotest.(check bool) "info level default" true (config.level = Logging.INFO);
-  Alcotest.(check (list string)) "empty sections default" [] config.sections
+  Alcotest.(check (list string)) "empty sections default" [] config.sections;
+  Alcotest.(check int) "cycle_debug_mod default" 1000000 config.cycle_debug_mod;
+  Alcotest.(check int) "cycle_info_mod default" 1000000 config.cycle_info_mod
 
 let test_parse_logging_config_invalid_level () =
   let json_str = {|{"logging_level": "invalid_level", "logging_sections": "test"}|} in
@@ -89,6 +109,10 @@ let () =
       Alcotest.test_case "logging defaults" `Quick test_parse_logging_config_defaults;
       Alcotest.test_case "invalid level" `Quick test_parse_logging_config_invalid_level;
       Alcotest.test_case "empty sections" `Quick test_parse_logging_config_empty_sections;
+    ];
+    "engine_config", [
+      Alcotest.test_case "valid engine config" `Quick test_parse_engine_config_valid;
+      Alcotest.test_case "engine defaults" `Quick test_parse_engine_config_defaults;
     ];
     "file_handling", [
       Alcotest.test_case "config defaults" `Quick test_read_config_defaults;

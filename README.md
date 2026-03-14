@@ -47,6 +47,12 @@ Edit `config.json` (example):
     "high_fragmentation_percent": 60, // High fragmentation threshold (%)
     "medium_fragmentation_percent": 40
   },
+  "logging_cycle_debug_mod": 1000000,   // Cycle interval for debug logs (logging_level must be debug)
+  "logging_cycle_info_mod": 1000000,    // Cycle interval for info stats (logging_level must be info or debug)
+  "engine": {
+    "balance_check_mod": 10000,         // Cycle interval for balance checks
+    "strategy_fallback_mod": 10000      // Cycle interval for strategy fallback execution
+  },
   "trading": [
     {
       "symbol": "BTC/USD",            // Pair to trade

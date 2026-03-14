@@ -2,7 +2,6 @@
 (* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
-module Memory_events = Dio_memory_management.Memory_events
 
 let section = "kraken_orderbook"
 
@@ -847,28 +846,7 @@ let trigger_orderbook_cleanup ~reason () =
     Lwt.return_unit
   )
 
-(** Start listening to memory events to initiate cleanups under pressure *)
-let start_cleanup_handlers () =
-  if Atomic.compare_and_set cleanup_handlers_started false true then begin
-    let subscription = Memory_events.subscribe_memory_events () in
-    Lwt.async (fun () ->
-      let rec loop () =
-        Lwt_stream.get subscription.stream >>= function
-        | Some (Memory_events.MemoryPressure _) ->
-            trigger_orderbook_cleanup ~reason:"memory_pressure" ();
-            loop ()
-        | Some (Memory_events.CleanupRequested | Memory_events.Heartbeat) ->
-            trigger_orderbook_cleanup ~reason:"heartbeat" ();
-            loop ()
 
-        | None ->
-            subscription.close ();
-            Logging.info ~section "Orderbook cleanup memory event stream closed";
-            Lwt.return_unit
-      in
-      loop ()
-    )
-  end
 
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
@@ -1004,8 +982,5 @@ let initialize symbols =
   ) symbols;
   Logging.debug_f ~section "Orderbook feed stores initialized";
 
-  (* Enable event-driven cleanup *)
-  start_cleanup_handlers ();
-  trigger_orderbook_cleanup ~reason:"init" ();
 
   Lwt.return_unit
