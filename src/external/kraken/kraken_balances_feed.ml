@@ -6,18 +6,10 @@ open Concurrency
 
 let section = "kraken_balances"
 
-(* TODO: Duplicate function - also exists in kraken_trading_client.ml, should be moved to common utilities *)
+open Kraken_common_types
+
 (** Safely force Conduit context with error handling *)
-let get_conduit_ctx () =
-  try
-    Lazy.force Conduit_lwt_unix.default_ctx
-  with
-  | CamlinternalLazy.Undefined ->
-      Logging.error ~section "Conduit context was accessed before initialization - this should not happen";
-      raise (Failure "Conduit context not initialized - ensure main.ml initializes it before domain spawning")
-  | exn ->
-      Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
-      raise exn
+let get_conduit_ctx = get_conduit_ctx
 
 (** Balance data per asset - stored atomically *)
 type balance_data = {
@@ -438,8 +430,14 @@ let handle_message message on_heartbeat =
 
 
 (** Message handling loop - runs in background *)
-let start_message_handler conn token on_failure on_heartbeat =
-  (* Subscribe to balances *)
+(* Obsolete - now handled by unified connection hub *)
+let start_message_handler _conn _token _on_failure _on_heartbeat =
+  Lwt.return_unit
+
+(** WebSocket connection to Kraken authenticated endpoint - establishes connection and starts message handler *)
+let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
+  Logging.info ~section "Registering balances subscription on unified authenticated connection";
+  
   let subscribe_msg = `Assoc [
     ("method", `String "subscribe");
     ("params", `Assoc [
@@ -448,58 +446,23 @@ let start_message_handler conn token on_failure on_heartbeat =
       ("snapshot", `Bool true)
     ])
   ] in
-  let msg_str = Yojson.Safe.to_string subscribe_msg in
-  Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ()) >>= fun () ->
-
-  (* Message loop *)
-  let rec msg_loop () =
-    Lwt.catch (fun () ->
-      Websocket_lwt_unix.read conn >>= function
-      | {Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _} ->
-          Logging.warn ~section "WebSocket connection closed by server";
-          on_failure "Connection closed by server";
-          Lwt.return_unit
-      | frame ->
-          let content = frame.Websocket.Frame.content in
-          handle_message content on_heartbeat;
-          msg_loop ()
-    ) (function
-      | End_of_file ->
-          Logging.warn ~section "Balances WebSocket connection closed unexpectedly (End_of_file)";
-          (* Notify supervisor of connection failure *)
-          on_failure "Connection closed unexpectedly (End_of_file)";
-          Lwt.return_unit
-      | exn ->
-          Logging.error_f ~section "Balances WebSocket error during read: %s" (Printexc.to_string exn);
-          (* Notify supervisor of connection failure *)
-          on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
-          Lwt.return_unit
-    )
+  
+  Kraken_trading_client.subscribe subscribe_msg >>= fun () ->
+  on_connected ();
+  
+  let open Kraken_trading_client in
+  let sub = message_stream () in
+  let rec loop () =
+    let open Event_bus.Make(struct type t = Yojson.Safe.t end) in
+    Lwt_stream.get sub.stream >>= function
+    | Some json ->
+        handle_message (Yojson.Safe.to_string json) on_heartbeat;
+        loop ()
+    | None ->
+        on_failure "Unified authenticated connection closed";
+        Lwt.return_unit
   in
-  msg_loop ()
-
-(** WebSocket connection to Kraken authenticated endpoint - establishes connection and starts message handler *)
-let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
-  let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
-
-  Logging.info_f ~section "Connecting to Kraken authenticated WebSocket...";
-  (* Resolve hostname to IP *)
-  Lwt_unix.getaddrinfo "ws-auth.kraken.com" "443" [Unix.AI_FAMILY Unix.PF_INET] >>= fun addresses ->
-  let ip = match addresses with
-    | {Unix.ai_addr = Unix.ADDR_INET (addr, _); _} :: _ ->
-        Ipaddr_unix.of_inet_addr addr
-    | _ -> failwith "Failed to resolve ws-auth.kraken.com"
-  in
-  let client = `TLS (`Hostname "ws-auth.kraken.com", `IP ip, `Port 443) in
-  let ctx = get_conduit_ctx () in
-  Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
-
-    Logging.info ~section "Authenticated WebSocket established, subscribing to balances";
-    (* Call on_connected callback after successful connection and before starting message handler *)
-    on_connected ();
-    start_message_handler conn token on_failure on_heartbeat >>= fun () ->
-    Logging.info ~section "Balances WebSocket connection closed";
-    Lwt.return_unit
+  loop ()
 
 (** Initialize balances feed data stores *)
 let initialize assets =

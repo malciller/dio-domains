@@ -10,17 +10,10 @@ open Concurrency
 
 let section = "kraken_trading_client"
 
+open Kraken_common_types
+
 (** Safely force Conduit context with error handling *)
-let get_conduit_ctx () =
-  try
-    Lazy.force Conduit_lwt_unix.default_ctx
-  with
-  | CamlinternalLazy.Undefined ->
-      Logging.error ~section "Conduit context was accessed before initialization - this should not happen";
-      raise (Failure "Conduit context not initialized - ensure main.ml initializes it before domain spawning")
-  | exn ->
-      Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
-      raise exn
+let get_conduit_ctx = get_conduit_ctx
 
 (** Global shutdown flag for trading client *)
 let shutdown_requested = Atomic.make false
@@ -62,6 +55,12 @@ type connection_with_generation = {
   generation: int;
 }
 
+module Message_bus = Event_bus.Make (struct
+  type t = Yojson.Safe.t
+end)
+
+let message_bus = Message_bus.create "kraken_auth_messages"
+
 type state = {
   mutex: Lwt_mutex.t;
   mutable conn: connection_with_generation option;
@@ -71,6 +70,7 @@ type state = {
   responses: (Kraken_common_types.ws_response Lwt.u * string * float) Response_table.t;  (* wakener * expected_method * timestamp *)
   mutable on_failure: (string -> unit) option;
   connected: bool Atomic.t;
+  mutable subscriptions: Yojson.Safe.t list; (* List of subscription messages to re-send on connect *)
 }
 
 let state = {
@@ -82,6 +82,7 @@ let state = {
   responses = Response_table.create 32;
   on_failure = None;
   connected = Atomic.make false;
+  subscriptions = [];
 }
 
 let heartbeat_bus = Heartbeat_bus.create "kraken_trading_heartbeat"
@@ -320,8 +321,8 @@ let handle_frame frame ~expected_generation =
          (match member "channel" json |> to_string_option with
           | Some "heartbeat" -> Lwt.return_unit
           | _ ->
-             Logging.debug ~section
-               (Printf.sprintf "Unhandled trading message: %s" (Yojson.Safe.to_string json));
+             Logging.debug_f ~section "Unhandled trading message: %s" (Yojson.Safe.to_string json);
+             Message_bus.publish message_bus json;
              Lwt.return_unit)
    with exn ->
      Logging.error ~section
@@ -460,6 +461,16 @@ let ensure_connection ?on_failure ?on_connected token =
           Logging.debug_f ~section "Reader task registered in state (generation %d)" generation;
           notify_connection `Connected;
           Logging.debug_f ~section "Connection `Connected notification sent (generation %d)" generation;
+          (* Re-send all registered subscriptions *)
+          Lwt_mutex.with_lock state.mutex (fun () ->
+            Lwt.return state.subscriptions
+          ) >>= fun subs ->
+          Lwt_list.iter_s (fun sub ->
+            let content = Yojson.Safe.to_string sub in
+            Logging.info_f ~section "Re-subscribing on unified authenticated connection: %s" content;
+            Websocket_lwt_unix.write conn (Websocket.Frame.create ~content ())
+          ) (List.rev subs) >>= fun () ->
+
           (* Call on_connected callback if provided *)
           (match on_connected with Some f -> f () | None -> ());
           Logging.debug_f ~section "on_connected callback called (generation %d)" generation;
@@ -647,6 +658,22 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
   Logging.debug ~section (Printf.sprintf "Sending WebSocket message: %s" message_str);
   send_message ~message_str ~req_id ~expected_method:method_ ~timeout_ms >>= fun response ->
   Lwt.return response
+
+let subscribe message =
+  Lwt_mutex.with_lock state.mutex (fun () ->
+    if not (List.mem message state.subscriptions) then
+      state.subscriptions <- message :: state.subscriptions;
+    match state.conn with
+    | Some conn_with_gen ->
+        let content = Yojson.Safe.to_string message in
+        Logging.info_f ~section "Sending subscription on unified authenticated connection: %s" content;
+        Websocket_lwt_unix.write conn_with_gen.conn (Websocket.Frame.create ~content ())
+    | None ->
+        Logging.info_f ~section "Subscription registered, will be sent when connected: %s" (Yojson.Safe.to_string message);
+        Lwt.return_unit
+  )
+
+let message_stream () = Message_bus.subscribe message_bus
 
 (** Clean up stale response table entries (older than 30 seconds) - event-driven *)
 let is_connected () = Atomic.get state.connected

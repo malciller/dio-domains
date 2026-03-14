@@ -1,4 +1,20 @@
 (** Common Kraken API types and utilities *)
+(** Common Kraken API types and utilities *)
+
+let section = "kraken_common"
+
+(** Safely force Conduit context with error handling *)
+let get_conduit_ctx () =
+  try
+    Lazy.force Conduit_lwt_unix.default_ctx
+  with
+  | CamlinternalLazy.Undefined ->
+      Logging.error ~section "Conduit context was accessed before initialization - this should not happen";
+      raise (Failure "Conduit context not initialized - ensure main.ml initializes it before domain spawning")
+  | exn ->
+      Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
+      raise exn
+
 (* TODO: Magic number - 1000.0 should be defined as a constant for milliseconds conversion *)
 
 let nonce () : string =
