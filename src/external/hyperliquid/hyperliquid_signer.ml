@@ -165,11 +165,11 @@ let address_of_private_key_hex ~private_key_hex =
   "0x" ^ hex_of_bytes addr_bytes
 
 (** Final wrapper for Hyperliquid L1 Action *)
-let sign_l1_action ~private_key_hex ~action_msgpack ~nonce ~is_mainnet ~vault_address =
+let sign_l1_action ?expires_after ~private_key_hex ~action_msgpack ~nonce ~is_mainnet ~vault_address () =
   let pkey_clean = if String.starts_with ~prefix:"0x" private_key_hex then String.sub private_key_hex 2 (String.length private_key_hex - 2) else private_key_hex in
   let private_key_raw = bytes_of_hex pkey_clean in
   
-  let action_hash_raw = action_hash ~action_msgpack ~nonce ~vault_address ~expires_after:None in
+  let action_hash_raw = action_hash ~action_msgpack ~nonce ~vault_address ~expires_after in
   
   let source_str = if is_mainnet then "a" else "b" in
   let agent_hash = hash_agent ~source_str ~connection_id_raw:action_hash_raw in

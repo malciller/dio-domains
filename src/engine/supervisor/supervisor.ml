@@ -832,6 +832,19 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Logging.warn ~section "Timeout waiting for Hyperliquid balance data, continuing anyway..."
       else
         Logging.info ~section "✓ Hyperliquid balances feed ready";
+      
+      let%lwt executions_ready = Hyperliquid.Hyperliquid_executions_feed.wait_for_execution_data hyperliquid_symbols 10.0 in
+      if not executions_ready then
+        Logging.warn ~section "Timeout waiting for Hyperliquid executions data (webData2 snapshot), continuing anyway..."
+      else
+        Logging.info ~section "✓ Hyperliquid executions feed ready";
+
+      let%lwt ticker_ready = Hyperliquid.Hyperliquid_ticker_feed.wait_for_price_data hyperliquid_symbols 10.0 in
+      if not ticker_ready then
+        Logging.warn ~section "Timeout waiting for Hyperliquid ticker data, continuing anyway..."
+      else
+        Logging.info ~section "✓ Hyperliquid ticker feed ready";
+      
       Lwt.return_unit
     end else Lwt.return_unit
   in
@@ -1105,9 +1118,11 @@ let order_processing_loop () =
                  | Amend ->
                      (match order.order_id with
                       | Some target_order_id ->
-                          let amend_request = {
-                            Dio_engine.Order_executor.order_id = target_order_id;
+                          let amend_request : Dio_engine.Order_executor.amend_request = {
+                            order_id = target_order_id;
                             cl_ord_id = None;
+                            side = Dio_strategies.Strategy_common.string_of_order_side order.side;
+                            duplicate_key = order.duplicate_key;
                             new_quantity = Some order.qty;
                             new_limit_price = order.price;
                             limit_price_type = None;
@@ -1313,9 +1328,11 @@ let order_processing_loop () =
                  | Amend ->
                      (match order.order_id with
                       | Some target_order_id ->
-                          let amend_request = {
-                            Dio_engine.Order_executor.order_id = target_order_id;
+                          let amend_request : Dio_engine.Order_executor.amend_request = {
+                            order_id = target_order_id;
                             cl_ord_id = None;
+                            side = Dio_strategies.Strategy_common.string_of_order_side order.side;
+                            duplicate_key = order.duplicate_key;
                             new_quantity = Some order.qty;
                             new_limit_price = order.price;
                             limit_price_type = None;
