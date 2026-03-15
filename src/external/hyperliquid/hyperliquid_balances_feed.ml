@@ -210,14 +210,3 @@ let _processor_task =
 
 let initialize () =
   Logging.info ~section "Initializing Hyperliquid balances feed"
-
-let rec balance_refresh_loop ~testnet () =
-  fetch_spot_balances_rest ~testnet () >>= fun () ->
-  Lwt_unix.sleep 10.0 >>= fun () ->
-  balance_refresh_loop ~testnet ()
-
-let start_refresh_loop ~testnet () =
-  Lwt.async (fun () ->
-    Logging.info ~section "Starting Hyperliquid 10s balance refresh loop";
-    balance_refresh_loop ~testnet ()
-  )

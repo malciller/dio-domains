@@ -101,6 +101,20 @@ let pack_cancel_action ~cancels =
     (String "cancels", List (List.map pack_cancel_wire cancels));
   ]
 
+(** Modify Action (single) - Use batchModify instead for better compatibility *)
+let pack_modify_wire ~oid ~order =
+  Map [
+    (String "oid", Int64 oid);
+    (String "order", pack_order_wire order);
+  ]
+
+let pack_batch_modify_action ~modifies ~grouping =
+  Map [
+    (String "type", String "batchModify");
+    (String "modifies", List (List.map (fun (oid, order) -> pack_modify_wire ~oid ~order) modifies));
+    (String "grouping", String grouping);
+  ]
+
 (** Cancel by Cloid Action *)
 let pack_cancel_by_cloid_action ~cancels =
   Map [

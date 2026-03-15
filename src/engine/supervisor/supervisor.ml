@@ -534,7 +534,6 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Hyperliquid.Hyperliquid_orderbook_feed.initialize hyperliquid_symbols;
       Hyperliquid.Hyperliquid_balances_feed.initialize ();
       let%lwt () = Hyperliquid.Hyperliquid_balances_feed.fetch_initial_balances ~testnet () in
-      Hyperliquid.Hyperliquid_balances_feed.start_refresh_loop ~testnet ();
       Hyperliquid.Hyperliquid_instruments_feed.initialize_symbols ~testnet hyperliquid_symbols
     end else Lwt.return_unit
   in
@@ -718,7 +717,27 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                     ("user", `String wallet)
                   ])
                 ] in
-                Hyperliquid.Hyperliquid_ws.subscribe spot_msg
+                Hyperliquid.Hyperliquid_ws.subscribe spot_msg >>= fun () ->
+
+                (* 5. Subscribe to userEvents for real-time fills and status changes *)
+                let user_events_msg = `Assoc [
+                  ("method", `String "subscribe");
+                  ("subscription", `Assoc [
+                    ("type", `String "userEvents");
+                    ("user", `String wallet)
+                  ])
+                ] in
+                Hyperliquid.Hyperliquid_ws.subscribe user_events_msg >>= fun () ->
+
+                (* 6. Subscribe to orderUpdates for real-time order status *)
+                let order_updates_msg = `Assoc [
+                  ("method", `String "subscribe");
+                  ("subscription", `Assoc [
+                    ("type", `String "orderUpdates");
+                    ("user", `String wallet)
+                  ])
+                ] in
+                Hyperliquid.Hyperliquid_ws.subscribe order_updates_msg
             | None -> 
                 Logging.warn ~section "No wallet address available for Hyperliquid webData2 subscription. Set HYPERLIQUID_WALLET_ADDRESS.";
                 Lwt.return_unit)

@@ -80,7 +80,7 @@ let initialize_symbols ~testnet _symbols =
         let info = { symbol; sz_decimals; max_leverage = None; asset_index = 10000 + index } in
         Hashtbl.replace pair_cache symbol info;
         let alias = Printf.sprintf "@%d" index in
-        let alias_info = { symbol = alias; sz_decimals; max_leverage = None; asset_index = 10000 + index } in
+        let alias_info = { symbol; sz_decimals; max_leverage = None; asset_index = 10000 + index } in
         Hashtbl.replace pair_cache alias alias_info
       with exn ->
         Logging.warn_f ~section "Failed to parse spot item: %s" (Printexc.to_string exn)
@@ -118,6 +118,15 @@ let get_asset_index symbol =
   match info_opt with
   | Some info -> Some info.asset_index
   | None -> None
+
+let resolve_symbol coin =
+  Mutex.lock cache_mutex;
+  let res = match Hashtbl.find_opt pair_cache coin with
+    | Some info -> Some info.symbol
+    | None -> None
+  in
+  Mutex.unlock cache_mutex;
+  res
 
 (** Round price to 5 significant figures, max 6 decimals *)
 let round_price_to_tick price =
