@@ -1,8 +1,4 @@
-
-src/legacy/
-
-
-/hyperliquid-python-sdk/
+reference/
 *.annot
 *.cmo
 *.cma
