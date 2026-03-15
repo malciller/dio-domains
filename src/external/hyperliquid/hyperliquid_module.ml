@@ -5,6 +5,8 @@ module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 module ExTypes = Exchange.Types
 
+let section = "hyperliquid_module"
+
 let is_mainnet = ref true
 let set_network mainnet = is_mainnet := mainnet
 
@@ -53,9 +55,106 @@ let order_action_to_json orders grouping =
     ("grouping", `String grouping)
   ]
 
+let batch_modify_action_to_json modifies grouping =
+  let modifies_json = `List (List.map (fun (oid_str, order) ->
+    `Assoc [
+      ("oid", `Intlit oid_str);
+      ("order", order_wire_to_json order)
+    ]
+  ) modifies) in
+  `Assoc [
+    ("type", `String "batchModify");
+    ("modifies", modifies_json);
+    ("grouping", `String grouping)
+  ]
+
+let parse_order_response _symbol nonce cl_ord_id _rounded_qty _rounded_limit_price response_json =
+  let open Yojson.Safe.Util in
+  try
+    let data = member "data" response_json in
+    let hl_response = member "response" data in
+    let hl_type = member "type" hl_response |> to_string_option in
+    let hl_payload = member "payload" hl_response in
+
+    match hl_type with
+    | Some "error" -> Error (to_string hl_payload)
+    | Some "action" ->
+        begin
+          let status = member "status" hl_payload |> to_string_option in
+          if status = Some "err" then
+            let err_msg = 
+              match member "response" hl_payload with
+              | `String s -> s
+              | `Assoc _ as resp -> member "data" resp |> to_string_option |> Option.value ~default:(Yojson.Safe.to_string resp)
+              | _ -> "Unknown error"
+            in
+            Error err_msg
+          else
+            let __response = member "response" hl_payload in
+            let response_type = member "type" __response |> to_string_option in
+
+            match response_type with
+            | Some "order"
+            | Some "modify"
+            | Some "batchModify" ->
+                begin
+                  let raw_data = member "data" __response in
+                  let statuses = match raw_data with
+                    | `Assoc pairs -> (match List.assoc_opt "statuses" pairs with Some (`List l) -> l | _ -> [])
+                    | _ -> []
+                  in
+                  match statuses with
+                  | [status] ->
+                      (* Try resting first, then filled *)
+                      let resting = member "resting" status in
+                      let filled = member "filled" status in
+                      
+                      let oid_json = 
+                        if resting <> `Null then member "oid" resting
+                        else if filled <> `Null then member "oid" filled
+                        else `Null
+                      in
+                      
+                      let oid = match oid_json with
+                        | `Int i -> string_of_int i
+                        | `Intlit s -> s
+                        | `String s -> s
+                        | _ -> 
+                            Logging.debug_f ~section "Could not find oid in order status: %s" (Yojson.Safe.to_string status);
+                            Printf.sprintf "hl-%Ld" nonce
+                      in
+                      Ok (oid, cl_ord_id)
+                  | [] ->
+                      let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
+                      Logging.debug_f ~section "Empty statuses list in success response, using mock ID: %s" mock_order_id;
+                      Ok (mock_order_id, cl_ord_id)
+                  | statuses -> 
+                      Logging.debug_f ~section "Unexpected number of statuses in response: %d. JSON: %s" (List.length statuses) (Yojson.Safe.to_string response_json);
+                      Error "Unexpected number of statuses in response"
+                end
+            | Some t -> Error (Printf.sprintf "Unknown action response type: %s" t)
+            | None -> 
+                Logging.debug_f ~section "No type found in action response: %s" (Yojson.Safe.to_string __response);
+                if status = Some "ok" then
+                   let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
+                   Ok (mock_order_id, cl_ord_id)
+                else
+                   Error "No type found in action response"
+        end
+    | Some "info" ->
+        (* We don't expect 'info' in place_order, but handle for completeness *)
+        let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
+        Ok (mock_order_id, cl_ord_id)
+    | Some t -> Error (Printf.sprintf "Unknown outer response type: %s" t)
+    | None -> Error "No type found in outer response"
+  with exn ->
+    Logging.error_f ~section "Parsing error in Hyperliquid order response: %s. JSON: %s" 
+      (Printexc.to_string exn) (Yojson.Safe.to_string response_json);
+    Error (Printf.sprintf "Parsing error: %s" (Printexc.to_string exn))
+
 module Hyperliquid_impl : Exchange.S = struct
   let name = "hyperliquid"
-  let section = "hyperliquid_module"
+  let section = section
 
   (* Internal cache for fees *)
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
@@ -86,7 +185,7 @@ module Hyperliquid_impl : Exchange.S = struct
       ?time_in_force:_
       ?post_only:_
       ?reduce_only
-      ?order_userref:_
+      ?order_userref
       ?cl_ord_id
       ?trigger_price:_
       ?display_qty:_
@@ -112,15 +211,12 @@ module Hyperliquid_impl : Exchange.S = struct
     | Ok () ->
     let rounded_qty = Hyperliquid_instruments_feed.round_qty_to_lot symbol qty in
     let rounded_limit_price = match limit_price with
-      | Some p -> Some (Hyperliquid_instruments_feed.round_price_to_tick p)
-      | None -> None
+      | Some p -> Hyperliquid_instruments_feed.round_price_to_tick p
+      | None -> 0.0 (* Hyperliquid requires a price for limit orders, for market we should handle separately if needed *)
     in
 
-    Logging.info_f ~section "Placing %s order on HL: %s %s %f (rounded: %f) @ %s"
-      hl_side symbol hl_order_type qty rounded_qty 
-      (match limit_price, rounded_limit_price with 
-       | Some p, Some rp -> Printf.sprintf "%f (rounded: %f)" p rp 
-       | _ -> "market");
+    Logging.info_f ~section "Placing %s order on HL: %s %s %f (rounded: %f) @ %f"
+      hl_side symbol hl_order_type qty rounded_qty rounded_limit_price;
 
     let wire_order = 
       let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
@@ -135,7 +231,7 @@ module Hyperliquid_impl : Exchange.S = struct
       ~asset_index
       ~ot:(Hyperliquid_actions.hl_order_type order_type None)
       ~side
-      ~limit_price:rounded_limit_price
+      ~limit_price:(Some rounded_limit_price)
       ~reduce_only
       ~cl_ord_id
     in
@@ -172,7 +268,6 @@ module Hyperliquid_impl : Exchange.S = struct
       ])
     ] in
     
-    (* Assuming vault address is needed in the WS request if using one *)
     let payload : Yojson.Safe.t = match vault_address with
       | Some addr -> 
           let req = Yojson.Safe.Util.member "request" payload in
@@ -194,81 +289,158 @@ module Hyperliquid_impl : Exchange.S = struct
     Hyperliquid_ws.send_request ~json:payload ~req_id ~timeout_ms:10000 >>= fun response_json ->
     Logging.debug_f ~section "Hyperliquid order raw response: %s" (Yojson.Safe.to_string response_json);
 
-    (* Try to parse response *)
-    begin try
-      let open Yojson.Safe.Util in
-      let data = member "data" response_json in
-      let __response = member "response" data in
-      let response_type = member "type" __response |> to_string in
+    match parse_order_response symbol nonce cl_ord_id rounded_qty (Some rounded_limit_price) response_json with
+    | Ok (oid, cl_ord_id) ->
+        let hl_side = match side with Types.Buy -> Hyperliquid_executions_feed.Buy | Types.Sell -> Hyperliquid_executions_feed.Sell in
+        Hyperliquid_executions_feed.inject_order
+          ~symbol
+          ~order_id:oid
+          ~side:hl_side
+          ~qty:rounded_qty
+          ~price:rounded_limit_price
+          ?user_ref:order_userref
+          ?cl_ord_id
+          ();
 
-      if response_type = "order" then
-        let statuses = member "data" __response |> member "statuses" |> to_list in
-        match statuses with
-        | [status] ->
-            let oid = member "resting" status |> member "oid" |> to_string in
-            Lwt.return (Ok {
-              Dio_exchange.Exchange_intf.Types.order_id = oid;
-              cl_ord_id = cl_ord_id;
-              order_userref = None;
-            })
-        | _ ->
-            (* Fallback if multiple statuses or unexpected format, though we sent 1 order *)
-            let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
-            Lwt.return (Ok {
-              Dio_exchange.Exchange_intf.Types.order_id = mock_order_id;
-              cl_ord_id = cl_ord_id;
-              order_userref = None;
-            })
-      else if response_type = "cancel" then
-        let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
         Lwt.return (Ok {
-          Dio_exchange.Exchange_intf.Types.order_id = mock_order_id;
+          Dio_exchange.Exchange_intf.Types.order_id = oid;
           cl_ord_id = cl_ord_id;
-          order_userref = None;
+          order_userref = order_userref;
         })
-      else if response_type = "error" then
-        let error_msg = member "data" __response |> to_string in
-        Lwt.return (Error error_msg)
-      else if response_type = "action" then
-        (* WebSocket order/cancel response: payload has status "ok" or "err" and optional "response" message *)
-        let payload = member "payload" __response in
-        let status = member "status" payload |> to_string in
-        if status = "err" then
-          let err_msg = try member "response" payload |> to_string with _ -> "Unknown error" in
-          Lwt.return (Error err_msg)
-        else
-          let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
-          Lwt.return (Ok {
-            Dio_exchange.Exchange_intf.Types.order_id = mock_order_id;
-            cl_ord_id = cl_ord_id;
-            order_userref = None;
-          })
-      else
-        Lwt.return (Error "Unknown response type from Hyperliquid")
-    with exn ->
-      let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
-      Logging.warn_f ~section "Failed to parse HL response, mocking success: %s" (Printexc.to_string exn);
-      Lwt.return (Ok {
-        Dio_exchange.Exchange_intf.Types.order_id = mock_order_id;
-        cl_ord_id = cl_ord_id;
-        order_userref = None;
-      })
-    end
+    | Error err -> Lwt.return (Error err)
+
+  let get_open_order ~symbol ~order_id =
+    match Hyperliquid_executions_feed.get_open_order symbol order_id with
+    | Some o -> Some {
+        Types.order_id = o.order_id;
+        symbol = o.symbol;
+        side = side_of_hl_side o.side;
+        qty = o.order_qty;
+        cum_qty = o.cum_qty;
+        remaining_qty = o.remaining_qty;
+        limit_price = o.limit_price;
+        status = status_of_hl_status o.order_status;
+        user_ref = o.order_userref;
+        cl_ord_id = o.cl_ord_id;
+      }
+    | None -> None
 
   (** Amend an existing order *)
   let amend_order
       ~token:_
-      ~order_id:_
-      ?cl_ord_id:_
-      ?qty:_
-      ?limit_price:_
+      ~order_id
+      ?cl_ord_id
+      ?qty
+      ?limit_price
       ?post_only:_
       ?trigger_price:_
       ?display_qty:_
-      ?symbol:_
+      ?symbol
       ?retry_config:_
       () =
-    Lwt.return (Error "Hyperliquid order amendment not yet implemented natively (requires cancel+replace flow)")
+
+    if symbol = None then Lwt.return (Error "Symbol required for Hyperliquid amendment") else
+    let symbol = Option.get symbol in
+    
+    match get_open_order ~symbol ~order_id with
+    | None -> 
+        Logging.error_f ~section "Order %s not found for amendment on %s" order_id symbol;
+        Lwt.return (Error (Printf.sprintf "Order %s not found" order_id))
+    | Some (current : Types.open_order) ->
+        let rounded_qty = match qty with
+          | Some q -> Hyperliquid_instruments_feed.round_qty_to_lot symbol q
+          | None -> current.qty
+        in
+        let rounded_limit_price = match limit_price with
+          | Some p -> Hyperliquid_instruments_feed.round_price_to_tick p
+          | None -> Option.value current.limit_price ~default:0.0
+        in
+
+        let vault_address = None in
+        let private_key_hex = match Sys.getenv_opt "HYPERLIQUID_PRIVATE_KEY" with
+          | Some key -> String.trim key
+          | None -> failwith "HYPERLIQUID_PRIVATE_KEY environment variable not set"
+        in
+
+        let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
+          | Some idx -> idx
+          | None -> 0
+        in
+
+        let wire_order = Hyperliquid_actions.to_hl_order_wire
+          ~qty:rounded_qty
+          ~symbol
+          ~asset_index
+          ~ot:(Hyperliquid_actions.hl_order_type ExTypes.Limit None)
+          ~side:current.side
+          ~limit_price:(Some rounded_limit_price)
+          ~reduce_only:None
+          ~cl_ord_id:(match cl_ord_id with Some _ -> cl_ord_id | None -> current.cl_ord_id)
+        in
+
+        let msgpack_val = Hyperliquid_types.pack_batch_modify_action 
+          ~modifies:[(Int64.of_string order_id, wire_order)]
+          ~grouping:"na"
+        in
+        let action_msgpack = Hyperliquid_types.serialize_action msgpack_val in
+        let action_json = batch_modify_action_to_json [(order_id, wire_order)] "na" in
+
+        let nonce = get_nonce () in
+        let (r, s, v) = Hyperliquid_signer.sign_l1_action
+          ~private_key_hex
+          ~action_msgpack
+          ~nonce
+          ~is_mainnet:(!is_mainnet)
+          ~vault_address
+        in
+
+        let req_id = Random.int 1000000 in
+        let payload : Yojson.Safe.t = `Assoc [
+          ("method", `String "post");
+          ("id", `Int req_id);
+          ("request", `Assoc [
+            ("type", `String "action");
+            ("payload", `Assoc [
+              ("action", action_json);
+              ("nonce", `Intlit (Int64.to_string nonce));
+              ("signature", `Assoc [
+                ("r", `String r);
+                ("s", `String s);
+                ("v", `Int v)
+              ])
+            ])
+          ])
+        ] in
+
+        let payload = match vault_address with
+          | Some addr -> 
+              let req = Yojson.Safe.Util.member "request" payload in
+              let payload_obj = Yojson.Safe.Util.member "payload" req in
+              let new_payload_obj : Yojson.Safe.t = match payload_obj with
+                | `Assoc pairs -> `Assoc (("vaultAddress", `String addr) :: pairs)
+                | _ -> payload_obj
+              in
+              let new_req : Yojson.Safe.t = match req with
+                | `Assoc pairs -> `Assoc (("payload", new_payload_obj) :: List.filter (fun (k,_) -> k <> "payload") pairs)
+                | _ -> req
+              in
+              (match payload with
+              | `Assoc pairs -> `Assoc (("request", new_req) :: List.filter (fun (k,_) -> k <> "request") pairs)
+              | _ -> payload : Yojson.Safe.t)
+          | None -> payload
+        in
+
+        Logging.info_f ~section "Amending order %s on HL: %s %.4f @ %.4f"
+          order_id symbol rounded_qty rounded_limit_price;
+
+        Hyperliquid_ws.send_request ~json:payload ~req_id ~timeout_ms:10000 >>= fun response ->
+        Logging.debug_f ~section "Hyperliquid amendment raw response: %s" (Yojson.Safe.to_string response);
+        match parse_order_response symbol nonce cl_ord_id rounded_qty (Some rounded_limit_price) response with
+        | Ok (new_oid, new_cl_ord_id) ->
+            Lwt.return (Ok { ExTypes.amend_id = new_oid; order_id = new_oid; cl_ord_id = new_cl_ord_id })
+        | Error e -> 
+            Logging.error_f ~section "HL amendment failed: %s" e;
+            Lwt.return (Error e)
 
   (** Cancel orders *)
   let cancel_orders
@@ -391,22 +563,35 @@ module Hyperliquid_impl : Exchange.S = struct
       begin try
         let open Yojson.Safe.Util in
         let data = member "data" response_json in
-        let __response = member "response" data in
-        let response_type = member "type" __response |> to_string in
-        
-        if response_type = "cancel" then
-          (* Map back to our inputs to simulate successful cancel IDs *)
-          let response_items = match order_ids with
-            | Some ids -> 
-                List.map (fun id -> { Dio_exchange.Exchange_intf.Types.order_id = id; cl_ord_id = None }) ids
-            | None -> []
-          in
-          Lwt.return (Ok response_items)
-        else if response_type = "error" then
-          let error_msg = member "data" __response |> to_string in
-          Lwt.return (Error error_msg)
-        else
-          Lwt.return (Error "Unknown response type from Hyperliquid")
+        let hl_response = member "response" data in
+        let hl_type = member "type" hl_response |> to_string_option in
+        let hl_payload = member "payload" hl_response in
+
+        match hl_type with
+        | Some "error" -> Lwt.return (Error (to_string hl_payload))
+        | Some "action" ->
+            begin
+              let status = member "status" hl_payload |> to_string_option in
+              if status = Some "ok" then
+                let inner_response = member "response" hl_payload in
+                let response_type = member "type" inner_response |> to_string in
+                
+                if response_type = "cancel" then
+                  (* Map back to our inputs to simulate successful cancel IDs *)
+                  let response_items = match order_ids with
+                    | Some ids -> 
+                        List.map (fun id -> { Dio_exchange.Exchange_intf.Types.order_id = id; cl_ord_id = None }) ids
+                    | None -> []
+                  in
+                  Lwt.return (Ok response_items)
+                else
+                  Lwt.return (Error ("Unknown inner response type: " ^ response_type))
+              else
+                let error_msg = member "response" hl_payload |> to_string in
+                Lwt.return (Error error_msg)
+            end
+        | Some t -> Lwt.return (Error ("Unknown outer response type: " ^ t))
+        | None -> Lwt.return (Error "No type found in outer response")
       with exn ->
         Logging.warn_f ~section "Failed to parse HL response: %s" (Printexc.to_string exn);
         let response_items = match order_ids with
@@ -433,22 +618,6 @@ module Hyperliquid_impl : Exchange.S = struct
 
   let get_balance ~asset =
     Hyperliquid_balances_feed.get_balance asset
-
-  let get_open_order ~symbol ~order_id =
-    match Hyperliquid_executions_feed.get_open_order symbol order_id with
-    | Some o -> Some {
-        Types.order_id = o.order_id;
-        symbol = o.symbol;
-        side = side_of_hl_side o.side;
-        qty = o.order_qty;
-        cum_qty = o.cum_qty;
-        remaining_qty = o.remaining_qty;
-        limit_price = o.limit_price;
-        status = status_of_hl_status o.order_status;
-        user_ref = o.order_userref;
-        cl_ord_id = o.cl_ord_id;
-      }
-    | None -> None
 
   let get_open_orders ~symbol =
     let orders = Hyperliquid_executions_feed.get_open_orders symbol in

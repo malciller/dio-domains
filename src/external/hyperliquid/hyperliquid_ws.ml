@@ -75,7 +75,8 @@ let handle_frame (frame : Websocket.Frame.t) =
         in
         
         (* post responses are logged in hyperliquid_module as "Hyperliquid order raw response" *)
-        let is_noisy = List.mem channel ["pong"; "post"] in
+        (* pong is noisy, but we want to see post for now for debugging timeouts *)
+        let is_noisy = List.mem channel ["pong"] in
 
         if not is_noisy then begin
           let log_msg =
@@ -92,16 +93,25 @@ let handle_frame (frame : Websocket.Frame.t) =
         (* Check if it's a response to a request *)
         let is_response = 
           let id_opt = 
-            match Yojson.Safe.Util.member "id" json with
-            | `Int id -> Some id
-            | _ -> 
-                (* If not at root, check inside "data" object (Hyperliquid puts it there for "post" channel) *)
-                (match Yojson.Safe.Util.member "data" json with
-                 | `Assoc _ as data_obj -> 
-                     (match Yojson.Safe.Util.member "id" data_obj with
-                      | `Int id -> Some id
-                      | _ -> None)
-                 | _ -> None)
+            let rec find_id node =
+              match node with
+              | `Assoc pairs ->
+                  (match List.assoc_opt "id" pairs with
+                   | Some (`Int id) -> Some id
+                   | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+                   | Some (`String s) -> (try Some (int_of_string s) with _ -> None)
+                   | Some (`Float f) -> Some (int_of_float f)
+                   | _ -> 
+                       (* If not at this level, check inside "data" or "response" *)
+                       (match List.assoc_opt "data" pairs with
+                        | Some next_node -> find_id next_node
+                        | None -> 
+                            (match List.assoc_opt "response" pairs with
+                             | Some next_node -> find_id next_node
+                             | None -> None)))
+              | _ -> None
+            in
+            find_id json
           in
           match id_opt with
           | Some id ->
@@ -113,11 +123,17 @@ let handle_frame (frame : Websocket.Frame.t) =
                     Response_table.remove responses id;
                     Lwt.wakeup_later wakener json;
                     Lwt.return_unit
-                  with Not_found -> Lwt.return_unit
+                  with Not_found -> 
+                    if channel = "post" then
+                      Logging.info_f ~section "Received 'post' response for unknown req_id %d: %s" id (Yojson.Safe.to_string json);
+                    Lwt.return_unit
                 )
               );
               true
-          | None -> false
+          | None -> 
+              if channel = "post" then
+                Logging.warn_f ~section "Received 'post' message without identifiable ID: %s" (Yojson.Safe.to_string json);
+              false
         in
         
         if not is_response then begin

@@ -806,9 +806,9 @@ let handle_order_acknowledged asset_symbol order_id side price =
     not (matches_side_placement || matches_amend || matches_fallback)
   ) state.pending_orders;
 
-  (* Clean up global placement trackers to allow subsequent placements now that we have the real order *)
-  let duplicate_key = generate_side_duplicate_key asset_symbol side in
-  ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+  (* Clean up global placement trackers - DISABLED: we want to keep them until confirmed in feed or timed out *)
+  (* let duplicate_key = generate_side_duplicate_key asset_symbol side in *)
+  (* ignore (InFlightOrders.remove_in_flight_order duplicate_key); *)
 
   (* Update buy order tracking if this is a buy order acknowledgment *)
   (match side with
