@@ -192,7 +192,7 @@ module Hyperliquid_impl : Exchange.S = struct
     in
 
     Hyperliquid_ws.send_request ~json:payload ~req_id ~timeout_ms:10000 >>= fun response_json ->
-    Logging.info_f ~section "Hyperliquid order raw response: %s" (Yojson.Safe.to_string response_json);
+    Logging.debug_f ~section "Hyperliquid order raw response: %s" (Yojson.Safe.to_string response_json);
 
     (* Try to parse response *)
     begin try
