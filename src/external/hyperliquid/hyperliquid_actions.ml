@@ -12,7 +12,7 @@ let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force opt
     | None -> Gtc
   in
   match ot with
-  | ExTypes.Limit -> Limit { tif }
+  | ExTypes.Limit -> Limit { tif = Alo }
   | ExTypes.Market -> Limit { tif = Ioc } (* Market orders are usually IOC limits in HL *)
   | ExTypes.StopLoss -> Trigger { triggerPx = "0.0"; isMarket = true; tpsl = Sl }
   | ExTypes.TakeProfit -> Trigger { triggerPx = "0.0"; isMarket = true; tpsl = Tp }
