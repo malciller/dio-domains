@@ -137,35 +137,79 @@ let process_market_data json =
         in
         
         Logging.debug_f ~section "Processing webData2 with %d orders" (List.length open_orders_json);
-        (* Clear all open orders before updating from the full list in webData2 *)
-        Hashtbl.iter (fun _ store -> Hashtbl.clear store.open_orders) stores;
         
+        (* Build a map of the new open orders by order_id *)
+        let new_orders = Hashtbl.create (List.length open_orders_json) in
         List.iter (fun o ->
           let coin = member "coin" o |> to_string in
           match find_registered_symbol coin with
           | Some symbol ->
-              let store = ensure_store symbol in
               let side = if (member "side" o |> to_string) = "B" then Buy else Sell in
               let order_id = (match member "oid" o with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
               let limit_price = (match member "limitPx" o with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
               let qty = (match member "sz" o with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
-              
-              let order = {
-                order_id;
-                symbol;
-                side;
-                order_qty = qty;
-                cum_qty = 0.0; (* webData2 doesn't give cum_qty easily *)
-                remaining_qty = qty;
-                limit_price = Some limit_price;
-                order_status = NewStatus;
-                order_userref = None; (* webData2 doesn't include userref *)
-                cl_ord_id = None;
-                last_updated = Unix.gettimeofday ();
-              } in
-              Hashtbl.replace store.open_orders order_id order
+              Hashtbl.replace new_orders order_id (symbol, side, limit_price, qty)
           | None -> ()
         ) open_orders_json;
+
+        let now = Unix.gettimeofday () in
+
+        (* Compute diff, update store.open_orders, and emit events *)
+        Hashtbl.iter (fun _ store ->
+          let to_remove = ref [] in
+          Hashtbl.iter (fun order_id (current_order : open_order) ->
+            if not (Hashtbl.mem new_orders order_id) then begin
+              (* Order is no longer open - emit cancellation/fill event *)
+              to_remove := order_id :: !to_remove;
+              let event : execution_event = {
+                order_id;
+                symbol = current_order.symbol;
+                order_status = CanceledStatus; (* Assume canceled if it disappears *)
+                limit_price = current_order.limit_price;
+                side = current_order.side;
+                order_qty = current_order.order_qty;
+                cum_qty = current_order.cum_qty;
+                timestamp = now;
+              } in
+              RingBuffer.write store.events_buffer event
+            end
+          ) store.open_orders;
+          
+          List.iter (fun order_id -> Hashtbl.remove store.open_orders order_id) !to_remove;
+        ) stores;
+
+        (* Add new orders that were not previously in store.open_orders *)
+        Hashtbl.iter (fun order_id (symbol, side, limit_price, qty) ->
+          let store = ensure_store symbol in
+          if not (Hashtbl.mem store.open_orders order_id) then begin
+            let order : open_order = {
+              order_id;
+              symbol;
+              side;
+              order_qty = qty;
+              cum_qty = 0.0;
+              remaining_qty = qty;
+              limit_price = Some limit_price;
+              order_status = NewStatus;
+              order_userref = None;
+              cl_ord_id = None;
+              last_updated = now;
+            } in
+            Hashtbl.replace store.open_orders order_id order;
+            
+            let event : execution_event = {
+              order_id;
+              symbol;
+              order_status = NewStatus;
+              limit_price = Some limit_price;
+              side;
+              order_qty = qty;
+              cum_qty = 0.0;
+              timestamp = now;
+            } in
+            RingBuffer.write store.events_buffer event
+          end
+        ) new_orders;
         
         (* Signal readiness for all stores *)
         Hashtbl.iter (fun _ store -> notify_ready store) stores;

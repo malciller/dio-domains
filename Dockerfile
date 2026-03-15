@@ -5,7 +5,7 @@
 # ────────────────────────────────────────────────────────────────────────────────
 
 # 1.  Base image
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 ENV QEMU_CPU=host
 
 # 2.  System dependencies
