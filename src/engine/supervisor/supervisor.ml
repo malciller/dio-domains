@@ -534,6 +534,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Hyperliquid.Hyperliquid_orderbook_feed.initialize hyperliquid_symbols;
       Hyperliquid.Hyperliquid_balances_feed.initialize ();
       let%lwt () = Hyperliquid.Hyperliquid_balances_feed.fetch_initial_balances ~testnet () in
+      Hyperliquid.Hyperliquid_balances_feed.start_refresh_loop ~testnet ();
       Hyperliquid.Hyperliquid_instruments_feed.initialize_symbols ~testnet hyperliquid_symbols
     end else Lwt.return_unit
   in

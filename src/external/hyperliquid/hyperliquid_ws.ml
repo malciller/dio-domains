@@ -74,24 +74,37 @@ let handle_frame (frame : Websocket.Frame.t) =
           try member "channel" json |> to_string with _ -> ""
         in
         
-        let is_noisy = List.mem channel ["pong"] in
-        
+        (* post responses are logged in hyperliquid_module as "Hyperliquid order raw response" *)
+        let is_noisy = List.mem channel ["pong"; "post"] in
+
         if not is_noisy then begin
-          let log_msg = 
+          let log_msg =
             if String.length frame.Websocket.Frame.content > 1000 then
               String.sub frame.Websocket.Frame.content 0 1000 ^ "... [TRUNCATED]"
             else frame.Websocket.Frame.content
           in
           if channel = "webData2" then
-            Logging.info_f ~section "webData2 received: %s" log_msg
+            Logging.debug_f ~section "webData2 received: %s" log_msg
           else
-            Logging.info_f ~section "Raw WS message: %s" log_msg
+            Logging.debug_f ~section "Raw WS message: %s" log_msg
         end;
         
         (* Check if it's a response to a request *)
         let is_response = 
-          match Yojson.Safe.Util.member "id" json with
-          | `Int id ->
+          let id_opt = 
+            match Yojson.Safe.Util.member "id" json with
+            | `Int id -> Some id
+            | _ -> 
+                (* If not at root, check inside "data" object (Hyperliquid puts it there for "post" channel) *)
+                (match Yojson.Safe.Util.member "data" json with
+                 | `Assoc _ as data_obj -> 
+                     (match Yojson.Safe.Util.member "id" data_obj with
+                      | `Int id -> Some id
+                      | _ -> None)
+                 | _ -> None)
+          in
+          match id_opt with
+          | Some id ->
               (* It's a response with an ID *)
               Lwt.async (fun () ->
                 Lwt_mutex.with_lock responses_mutex (fun () ->
@@ -104,7 +117,7 @@ let handle_frame (frame : Websocket.Frame.t) =
                 )
               );
               true
-          | _ -> false
+          | None -> false
         in
         
         if not is_response then begin

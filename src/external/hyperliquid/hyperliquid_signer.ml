@@ -148,6 +148,22 @@ let sign_hash ~private_key_raw ~msg_hash_raw =
   let v_eth = v + 27 in
   (hex_r, hex_s, v_eth)
 
+(** Derive Ethereum address (0x-prefixed hex) from private key hex.
+    Used to ensure HYPERLIQUID_PRIVATE_KEY matches HYPERLIQUID_WALLET_ADDRESS. *)
+let address_of_private_key_hex ~private_key_hex =
+  let pkey_clean = if String.starts_with ~prefix:"0x" private_key_hex then String.sub private_key_hex 2 (String.length private_key_hex - 2) else private_key_hex in
+  let private_key_raw = bytes_of_hex pkey_clean in
+  let ctx = Secp256k1.Context.create [Secp256k1.Context.Sign] in
+  let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
+  let pubkey = Secp256k1.Key.neuterize_exn ctx seckey in
+  (* Uncompressed public key (65 bytes: 04 || x || y), then keccak256, then last 20 bytes = address *)
+  let pubkey_buf = Secp256k1.Key.to_bytes ~compress:false ctx pubkey in
+  let pubkey_str = Array1.dim pubkey_buf |> fun n -> let s = Bytes.create n in for i = 0 to n - 1 do Bytes.set s i (Array1.get pubkey_buf i) done; Bytes.to_string s in
+  let hash = Digestif.KECCAK_256.digest_string pubkey_str in
+  let hash_raw = Digestif.KECCAK_256.to_raw_string hash in
+  let addr_bytes = String.sub hash_raw 12 20 in
+  "0x" ^ hex_of_bytes addr_bytes
+
 (** Final wrapper for Hyperliquid L1 Action *)
 let sign_l1_action ~private_key_hex ~action_msgpack ~nonce ~is_mainnet ~vault_address =
   let pkey_clean = if String.starts_with ~prefix:"0x" private_key_hex then String.sub private_key_hex 2 (String.length private_key_hex - 2) else private_key_hex in

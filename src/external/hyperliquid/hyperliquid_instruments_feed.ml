@@ -118,3 +118,33 @@ let get_asset_index symbol =
   match info_opt with
   | Some info -> Some info.asset_index
   | None -> None
+
+(** Round price to 5 significant figures, max 6 decimals *)
+let round_price_to_tick price =
+  if price <= 0.0 then price
+  else
+    (* Find the exponent to determine sig figs *)
+    let exp = floor (log10 price) in
+    (* We want 5 significant figures, so we shift by 4 - exp *)
+    let shift = 4. -. exp in
+    let multiplier = 10. ** shift in
+    let rounded = floor (price *. multiplier +. 0.5) /. multiplier in
+    
+    (* Hyperliquid supports at most 6 decimals *)
+    let max_decimals = 6. in
+    let dec_multiplier = 10. ** max_decimals in
+    floor (rounded *. dec_multiplier +. 0.5) /. dec_multiplier
+
+(** Round quantity to the instrument's szDecimals (lot size) *)
+let round_qty_to_lot symbol qty =
+  Mutex.lock cache_mutex;
+  let info_opt = Hashtbl.find_opt pair_cache symbol in
+  Mutex.unlock cache_mutex;
+  match info_opt with
+  | Some info ->
+      let multiplier = 10. ** (float_of_int info.sz_decimals) in
+      (* Use floor down to ensure we never over-allocate qty, which is typical for trading *)
+      floor (qty *. multiplier) /. multiplier
+  | None ->
+      (* Fallback: don't round if we don't know the asset *)
+      qty

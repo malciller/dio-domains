@@ -100,14 +100,27 @@ module Hyperliquid_impl : Exchange.S = struct
       | _ -> "limit"
     in
 
-    let vault_address = Sys.getenv_opt "HYPERLIQUID_VAULT_ADDRESS" |> Option.map (fun s -> String.trim s |> String.lowercase_ascii) in
+    let vault_address = None in
     let private_key_hex = match Sys.getenv_opt "HYPERLIQUID_PRIVATE_KEY" with
       | Some key -> String.trim key
       | None -> failwith "HYPERLIQUID_PRIVATE_KEY environment variable not set"
     in
+    let _wallet_from_env = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim in
+    let _agent_from_env = Sys.getenv_opt "HYPERLIQUID_AGENT_ADDRESS" |> Option.map String.trim in
+    (Lwt.return (Ok ())) >>= function
+    | Error e -> Lwt.return (Error e)
+    | Ok () ->
+    let rounded_qty = Hyperliquid_instruments_feed.round_qty_to_lot symbol qty in
+    let rounded_limit_price = match limit_price with
+      | Some p -> Some (Hyperliquid_instruments_feed.round_price_to_tick p)
+      | None -> None
+    in
 
-    Logging.info_f ~section "Placing %s order on HL: %s %s %f @ %s"
-      hl_side symbol hl_order_type qty (match limit_price with Some p -> string_of_float p | None -> "market");
+    Logging.info_f ~section "Placing %s order on HL: %s %s %f (rounded: %f) @ %s"
+      hl_side symbol hl_order_type qty rounded_qty 
+      (match limit_price, rounded_limit_price with 
+       | Some p, Some rp -> Printf.sprintf "%f (rounded: %f)" p rp 
+       | _ -> "market");
 
     let wire_order = 
       let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
@@ -117,12 +130,12 @@ module Hyperliquid_impl : Exchange.S = struct
             0
       in
       Hyperliquid_actions.to_hl_order_wire
-      ~qty
+      ~qty:rounded_qty
       ~symbol
       ~asset_index
       ~ot:(Hyperliquid_actions.hl_order_type order_type None)
       ~side
-      ~limit_price
+      ~limit_price:rounded_limit_price
       ~reduce_only
       ~cl_ord_id
     in
@@ -179,15 +192,15 @@ module Hyperliquid_impl : Exchange.S = struct
     in
 
     Hyperliquid_ws.send_request ~json:payload ~req_id ~timeout_ms:10000 >>= fun response_json ->
-    Logging.info_f ~section "Hyperliquid order payload sent via WebSocket, received response";
-    
+    Logging.info_f ~section "Hyperliquid order raw response: %s" (Yojson.Safe.to_string response_json);
+
     (* Try to parse response *)
     begin try
       let open Yojson.Safe.Util in
       let data = member "data" response_json in
       let __response = member "response" data in
       let response_type = member "type" __response |> to_string in
-      
+
       if response_type = "order" then
         let statuses = member "data" __response |> member "statuses" |> to_list in
         match statuses with
@@ -216,6 +229,20 @@ module Hyperliquid_impl : Exchange.S = struct
       else if response_type = "error" then
         let error_msg = member "data" __response |> to_string in
         Lwt.return (Error error_msg)
+      else if response_type = "action" then
+        (* WebSocket order/cancel response: payload has status "ok" or "err" and optional "response" message *)
+        let payload = member "payload" __response in
+        let status = member "status" payload |> to_string in
+        if status = "err" then
+          let err_msg = try member "response" payload |> to_string with _ -> "Unknown error" in
+          Lwt.return (Error err_msg)
+        else
+          let mock_order_id = Printf.sprintf "hl-%Ld" nonce in
+          Lwt.return (Ok {
+            Dio_exchange.Exchange_intf.Types.order_id = mock_order_id;
+            cl_ord_id = cl_ord_id;
+            order_userref = None;
+          })
       else
         Lwt.return (Error "Unknown response type from Hyperliquid")
     with exn ->
@@ -252,11 +279,16 @@ module Hyperliquid_impl : Exchange.S = struct
       ?retry_config:_
       () =
     
-    let vault_address = Sys.getenv_opt "HYPERLIQUID_VAULT_ADDRESS" in
+    let vault_address = None in
     let private_key_hex = match Sys.getenv_opt "HYPERLIQUID_PRIVATE_KEY" with
-      | Some key -> key
+      | Some key -> String.trim key
       | None -> failwith "HYPERLIQUID_PRIVATE_KEY environment variable not set"
     in
+    let _wallet_from_env = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim in
+    let _agent_from_env = Sys.getenv_opt "HYPERLIQUID_AGENT_ADDRESS" |> Option.map String.trim in
+    (Lwt.return (Ok ())) >>= function
+    | Error e -> Lwt.return (Error e)
+    | Ok () ->
     let nonce = get_nonce () in
 
     Logging.info_f ~section "Cancelling HL orders: %s" 

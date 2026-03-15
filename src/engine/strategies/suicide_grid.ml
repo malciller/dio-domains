@@ -349,10 +349,10 @@ let execute_strategy
   match current_price, top_of_book with
   | None, _ -> 
       if cycle mod 1000 = 0 then
-        Logging.info_f ~section "Strategy for %s skipping: no price data" asset.symbol
+        Logging.debug_f ~section "Strategy for %s skipping: no price data" asset.symbol
   | Some price, _ ->
       if cycle mod 100000 = 0 then
-        Logging.info_f ~section "Strategy for %s executing: price=%.2f, open_buys=%d, open_sells=%d" 
+        Logging.debug_f ~section "Strategy for %s executing: price=%.2f, open_buys=%d, open_sells=%d" 
           asset.symbol price open_buy_count _open_sell_count;
 
       (* Efficient cleanup logic - run every cycle but use scan-and-remove to avoid allocation *)
