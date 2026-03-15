@@ -53,9 +53,7 @@ type strategy_state = {
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
-  mutable last_balance_warn_time: float; (* Last time balance/duplicate warning was logged *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
-  
 }
 
 (** Global strategy state store *)
@@ -79,7 +77,6 @@ let get_strategy_state asset_symbol =
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
           last_cleanup_time = 0.0;
-          last_balance_warn_time = 0.0;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -170,7 +167,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy e
     post_only;
     userref = None;  (* Amends don't set userref *)
     strategy;
-    duplicate_key = Printf.sprintf "%s|%s|amend|%s" asset_symbol (string_of_order_side side) order_id;
+    duplicate_key = ""; (* Not used for amend *)
   }
 
 (** Create a strategy order for cancelling an existing order *)
@@ -252,12 +249,7 @@ let push_order order =
        in
 
        if is_duplicate then begin
-         let state = get_strategy_state order.symbol in
-         let now = Unix.gettimeofday () in
-         if now -. state.last_balance_warn_time > 30.0 then begin
-           Logging.warn_f ~section "Duplicate %s detected (strategy): %s (spam suppressed)" operation_str order.symbol;
-           state.last_balance_warn_time <- now;
-         end;
+         Logging.warn_f ~section "Duplicate %s detected (strategy): %s" operation_str order.symbol;
        end else begin
          (* For Place and Amend operations, proceed normally *)
          Mutex.lock order_buffer_mutex;
@@ -348,13 +340,8 @@ let execute_strategy
   let now = Unix.time () in
   
   match current_price, top_of_book with
-  | None, _ -> 
-      if cycle mod 1000 = 0 then
-        Logging.debug_f ~section "Strategy for %s skipping: no price data" asset.symbol
+  | None, _ -> ()  (* No price data available yet *)
   | Some price, _ ->
-      if cycle mod 100000 = 0 then
-        Logging.debug_f ~section "Strategy for %s executing: price=%.2f, open_buys=%d, open_sells=%d" 
-          asset.symbol price open_buy_count _open_sell_count;
 
       (* Efficient cleanup logic - run every cycle but use scan-and-remove to avoid allocation *)
       (* This prevents accumulation while maintaining HFT responsiveness *)
@@ -427,7 +414,6 @@ let execute_strategy
       (* Filter out recently cancelled orders to avoid race condition *)
       let buy_orders = ref [] in
       let sell_orders = ref [] in
-      let rogue_buy_orders = ref [] in
 
       List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         (* Skip if this order was recently cancelled *)
@@ -435,36 +421,15 @@ let execute_strategy
         if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
-            (* For buy orders, include those with the grid tag.
-               Others for this symbol are tracked for potential adoption. *)
+            (* For buy orders, only include those with the grid tag *)
             (match userref_opt with
              | Some userref when userref = Strategy_common.strategy_userref_grid ->
                  buy_orders := (order_id, order_price) :: !buy_orders
-             | None ->
-                 (* Loose tracking: keep track of untagged orders for adoption *)
-                 rogue_buy_orders := (order_id, order_price) :: !rogue_buy_orders
-             | Some _ ->
-                 (* Order tagged for another strategy - truly rogue for us *)
-                 ignore ())
+             | _ -> ())
           else
             (* For sell orders, include ALL open sell orders regardless of tag *)
             sell_orders := (order_id, order_price) :: !sell_orders
       ) open_orders;
-
-      (* Adoption logic: if we have no tagged buys, adopt the first untagged one *)
-      if !buy_orders = [] && !rogue_buy_orders <> [] then begin
-        let (oid, px) = List.hd !rogue_buy_orders in
-        Logging.debug_f ~section "Adopting untagged buy order %s at %.4f for %s" oid px asset.symbol;
-        buy_orders := [(oid, px)];
-        rogue_buy_orders := List.tl !rogue_buy_orders
-      end;
-
-      (* Cancel any remaining extra buy orders to maintain single buy order policy *)
-      List.iter (fun (order_id, _) ->
-        Logging.warn_f ~section "Cancelling extra/rogue untagged buy order %s for %s" order_id asset.symbol;
-        let cancel_order = create_cancel_order order_id asset.symbol "Grid" asset.exchange in
-        push_order cancel_order
-      ) !rogue_buy_orders;
 
       (* Set the buy order price and ID (take the highest buy order if multiple) *)
       (match !buy_orders with
@@ -604,19 +569,11 @@ let execute_strategy
                       asset.symbol buy_price target_buy cs_price
               | None -> ())
          | Some quote_bal ->
-             let now_t = Unix.gettimeofday () in
-             if now_t -. state.last_balance_warn_time > 30.0 then begin
-               Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f"
-                 asset.symbol quote_needed quote_bal;
-               state.last_balance_warn_time <- now_t
-             end
+             Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f"
+               asset.symbol quote_needed quote_bal
          | None ->
-             let now_t = Unix.gettimeofday () in
-             if now_t -. state.last_balance_warn_time > 30.0 then begin
-               Logging.warn_f ~section "No quote balance data available for %s buy order"
-                 asset.symbol;
-               state.last_balance_warn_time <- now_t
-             end
+             Logging.warn_f ~section "No quote balance data available for %s buy order"
+               asset.symbol
         );
         state.last_cycle <- cycle
       end else if open_buy_count > 0 then begin
@@ -833,15 +790,12 @@ let handle_order_acknowledged asset_symbol order_id side price =
   let duplicate_key = generate_side_duplicate_key asset_symbol side in
   ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
-  (* Update buy order tracking if this is a buy order *)
-  match side with
-  | Buy ->
-      state.last_buy_order_id <- Some order_id;
-      state.last_buy_order_price <- Some price;
-  | Sell ->
-      (* For sell orders, add to open_sell_orders if not already present *)
-      if not (List.exists (fun (oid, _p) -> oid = order_id) state.open_sell_orders) then
-        state.open_sell_orders <- (order_id, price) :: state.open_sell_orders;
+  (* Update buy order tracking if this is a buy order acknowledgment *)
+  (match side with
+   | Buy ->
+       state.last_buy_order_id <- Some order_id;
+       Logging.debug_f ~section "Updated buy order ID tracking: %s @ %.2f for %s" order_id price asset_symbol
+   | Sell -> ());
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     (string_of_order_side side) order_id price asset_symbol

@@ -5,11 +5,10 @@
  (modes exe)
  (libraries
   dio.kraken
-  dio.hyperliquid
   dio.cmc
   dio.strategies
   lwt
-  dio.supervisor
+  supervisor
   mirage-crypto-rng.unix)
  (preprocess
   (pps lwt_ppx)))

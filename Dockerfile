@@ -5,7 +5,7 @@
 # ────────────────────────────────────────────────────────────────────────────────
 
 # 1.  Base image
-FROM ubuntu:24.04
+FROM ubuntu:22.04
 ENV QEMU_CPU=host
 
 # 2.  System dependencies
@@ -26,7 +26,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     opam \
     ca-certificates \
     netbase \
-    libsecp256k1-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # 3.  OPAM + OCaml switch (5.2.0)

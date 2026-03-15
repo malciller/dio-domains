@@ -488,55 +488,26 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                       |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken")
                       |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
 
-  let hyperliquid_symbols = configs
-                      |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid")
-                      |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
+  Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
 
-  let%lwt auth_token =
-    if List.length kraken_symbols > 0 then begin
-      Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
+  (* Start initialization sequence as a promise chain *)
 
-      Logging.info ~section "Step 1: Initializing ticker feed stores...";
-      Kraken.Kraken_ticker_feed.initialize kraken_symbols;
+  (* Initialize data stores for websocket feeds *)
+  Logging.info ~section "Step 1: Initializing ticker feed stores...";
+  Kraken.Kraken_ticker_feed.initialize kraken_symbols;
 
-      Logging.info ~section "Step 2: Initializing instruments feed stores...";
-      let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
+  Logging.info ~section "Step 2: Initializing instruments feed stores...";
+  let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
 
-      Logging.info ~section "Step 3: Initializing orderbook feed stores...";
-      let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
+  Logging.info ~section "Step 3: Initializing orderbook feed stores...";
+  let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
 
-      Logging.info ~section "Step 4: Getting authentication token...";
-      let%lwt token = Kraken.Kraken_generate_auth_token.get_token () in
-      Logging.info ~section "Authentication token obtained";
+  Logging.info ~section "Step 4: Getting authentication token...";
+  let%lwt auth_token = Kraken.Kraken_generate_auth_token.get_token () in
+  Logging.info ~section "Authentication token obtained";
 
-      (* Store token globally for reuse by order executor *)
-      Token_store.set (Some token);
-
-      Logging.info ~section "Step 6: Initializing executions feed stores...";
-      Kraken.Kraken_executions_feed.initialize kraken_symbols;
-
-      Lwt.return token
-    end else Lwt.return ""
-  in
-
-  let%lwt () =
-    if List.length hyperliquid_symbols > 0 then begin
-      let hl_configs = configs |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") in
-      let testnet = List.exists (fun cfg -> cfg.Dio_engine.Config.testnet) hl_configs in
-      if testnet then Logging.info ~section "Hyperliquid will use TESTNET endpoints";
-      
-      (* Update network flag in hyperliquid_module *)
-      Hyperliquid.Hyperliquid_module.set_network (not testnet);
-
-      Logging.info ~section "Step 5.5: Initializing Hyperliquid feed stores...";
-      Hyperliquid.Hyperliquid_executions_feed.initialize hyperliquid_symbols;
-      Hyperliquid.Hyperliquid_ticker_feed.initialize hyperliquid_symbols;
-      Hyperliquid.Hyperliquid_orderbook_feed.initialize hyperliquid_symbols;
-      Hyperliquid.Hyperliquid_balances_feed.initialize ();
-      let%lwt () = Hyperliquid.Hyperliquid_balances_feed.fetch_initial_balances ~testnet () in
-      Hyperliquid.Hyperliquid_instruments_feed.initialize_symbols ~testnet hyperliquid_symbols
-    end else Lwt.return_unit
-  in
+  (* Store token globally for reuse by order executor *)
+  Token_store.set (Some auth_token);
 
   Logging.info ~section "Step 5: Initializing balances feed stores...";
   (* Extract all unique assets from trading symbols *)
@@ -546,308 +517,168 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                   |> List.sort_uniq String.compare
                   |> fun assets -> "USD" :: assets in  (* Add USD as quote currency *)
   let () = try
-    if List.length kraken_symbols > 0 then begin
-      Kraken.Kraken_balances_feed.initialize all_assets;
-      Logging.info ~section "Balances feed stores initialized";
-    end
+    Kraken.Kraken_balances_feed.initialize all_assets;
+    Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
   in
 
+  Logging.info ~section "Step 6: Initializing executions feed stores...";
+  Kraken.Kraken_executions_feed.initialize kraken_symbols;
+
   (* Register and start supervised websocket connections *)
   Logging.info ~section "Step 7: Starting supervised websocket connections...";
 
-  if List.length kraken_symbols > 0 then begin
-    (* Ticker feed *)
-    let ticker_conn = register ~name:"kraken_ticker_ws" ~connect_fn:None in
-    let ticker_connect_fn () =
-      (* Wrap the connection in try-catch for proper error handling *)
-      Lwt.catch (fun () ->
-        let on_failure reason = set_state ticker_conn (Failed reason) in
-        let on_heartbeat () = update_data_heartbeat ticker_conn in
-        let on_connected () = set_state ticker_conn Connected in
-        Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-        (* Connection function completed - this shouldn't happen for WebSocket connections *)
-        Lwt.return_unit
-      ) (fun exn ->
-        let error_msg = Printexc.to_string exn in
-        Logging.error_f ~section "[%s] Connection failed during establishment: %s" ticker_conn.name error_msg;
-        set_state ticker_conn (Failed error_msg);
-        Lwt.return_unit
-      )
-    in
-    set_connect_fn ticker_conn (Some ticker_connect_fn);
-    start_async ticker_conn;
+  (* Ticker feed *)
+  let ticker_conn = register ~name:"kraken_ticker_ws" ~connect_fn:None in
+  let ticker_connect_fn () =
+    (* Wrap the connection in try-catch for proper error handling *)
+    Lwt.catch (fun () ->
+      let on_failure reason = set_state ticker_conn (Failed reason) in
+      let on_heartbeat () = update_data_heartbeat ticker_conn in
+      let on_connected () = set_state ticker_conn Connected in
+      Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
+      Lwt.return_unit
+    ) (fun exn ->
+      let error_msg = Printexc.to_string exn in
+      Logging.error_f ~section "[%s] Connection failed during establishment: %s" ticker_conn.name error_msg;
+      set_state ticker_conn (Failed error_msg);
+      Lwt.return_unit
+    )
+  in
+  set_connect_fn ticker_conn (Some ticker_connect_fn);
+  start_async ticker_conn;
 
-    (* Orderbook feed *)
-    let orderbook_conn = register ~name:"kraken_orderbook_ws" ~connect_fn:None in
-    let orderbook_connect_fn () =
-      (* Clear orderbook stores before reconnecting to ensure clean state *)
-      Kraken.Kraken_orderbook_feed.clear_all_stores ();
-      (* Wrap the connection in try-catch for proper error handling *)
-      Lwt.catch (fun () ->
-        let on_failure reason = set_state orderbook_conn (Failed reason) in
-        let on_heartbeat () = update_data_heartbeat orderbook_conn in
-        let on_connected () = set_state orderbook_conn Connected in
-        Kraken.Kraken_orderbook_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-        (* Connection function completed - this shouldn't happen for WebSocket connections *)
-        Lwt.return_unit
-      ) (fun exn ->
-        let error_msg = Printexc.to_string exn in
-        Logging.error_f ~section "[%s] Connection failed during establishment: %s" orderbook_conn.name error_msg;
-        set_state orderbook_conn (Failed error_msg);
-        Lwt.return_unit
-      )
-    in
-    set_connect_fn orderbook_conn (Some orderbook_connect_fn);
-    start_async orderbook_conn;
+  (* Orderbook feed *)
+  let orderbook_conn = register ~name:"kraken_orderbook_ws" ~connect_fn:None in
+  let orderbook_connect_fn () =
+    (* Clear orderbook stores before reconnecting to ensure clean state *)
+    Kraken.Kraken_orderbook_feed.clear_all_stores ();
+    (* Wrap the connection in try-catch for proper error handling *)
+    Lwt.catch (fun () ->
+      let on_failure reason = set_state orderbook_conn (Failed reason) in
+      let on_heartbeat () = update_data_heartbeat orderbook_conn in
+      let on_connected () = set_state orderbook_conn Connected in
+      Kraken.Kraken_orderbook_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
+      Lwt.return_unit
+    ) (fun exn ->
+      let error_msg = Printexc.to_string exn in
+      Logging.error_f ~section "[%s] Connection failed during establishment: %s" orderbook_conn.name error_msg;
+      set_state orderbook_conn (Failed error_msg);
+      Lwt.return_unit
+    )
+  in
+  set_connect_fn orderbook_conn (Some orderbook_connect_fn);
+  start_async orderbook_conn;
 
-    (* Single unified authenticated WebSocket connection for trading, balances, and executions *)
-    let auth_ws_conn = register ~name:"kraken_auth_ws" ~connect_fn:None in
-    let auth_ws_connect_fn () =
-      (* Wrap the connection in try-catch for proper error handling *)
-      Lwt.catch (fun () ->
-        let on_failure reason =
-          set_state auth_ws_conn (Failed reason);
-          (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
-          Lwt.async (fun () ->
-            Lwt.catch (fun () ->
-              Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
-              start_async auth_ws_conn;
-              Lwt.return_unit
-            ) (fun exn ->
-              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" auth_ws_conn.name (Printexc.to_string exn);
-              Lwt.return_unit
-            )
+  (* Single unified authenticated WebSocket connection for trading, balances, and executions *)
+  let auth_ws_conn = register ~name:"kraken_auth_ws" ~connect_fn:None in
+  let auth_ws_connect_fn () =
+    (* Wrap the connection in try-catch for proper error handling *)
+    Lwt.catch (fun () ->
+      let on_failure reason =
+        set_state auth_ws_conn (Failed reason);
+        (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
+        Lwt.async (fun () ->
+          Lwt.catch (fun () ->
+            Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
+            start_async auth_ws_conn;
+            Lwt.return_unit
+          ) (fun exn ->
+            Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" auth_ws_conn.name (Printexc.to_string exn);
+            Lwt.return_unit
           )
-        in
-        let on_heartbeat () = update_data_heartbeat auth_ws_conn in
-        let on_connected () =
-          set_state auth_ws_conn Connected;
-          (* Trigger individual feed subscriptions on the unified connection *)
-          Lwt.async (fun () ->
-            Lwt.join [
-              Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
-              Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
-            ]
-          )
-        in
-        Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
-        (* Connection function completed - this shouldn't happen for WebSocket connections *)
-        Lwt.return_unit
-      ) (fun exn ->
-        let error_msg = Printexc.to_string exn in
-        Logging.error_f ~section "[%s] Connection failed during establishment: %s" auth_ws_conn.name error_msg;
-        set_state auth_ws_conn (Failed error_msg);
-        Lwt.return_unit
-      )
-    in
-    set_connect_fn auth_ws_conn (Some auth_ws_connect_fn);
-    start_async auth_ws_conn;
-  end;
-
-  if List.length hyperliquid_symbols > 0 then begin
-    Logging.info ~section "Step 7.5: Starting Hyperliquid unified connection...";
-    let hl_ws_conn = register ~name:"hyperliquid_ws" ~connect_fn:None in
-    let hl_configs = configs |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") in
-    let testnet = List.exists (fun cfg -> cfg.Dio_engine.Config.testnet) hl_configs in
-    let hl_ws_connect_fn () =
-      Lwt.catch (fun () ->
-        let on_failure reason =
-          set_state hl_ws_conn (Failed reason);
-          Lwt.async (fun () ->
-            Lwt.catch (fun () ->
-              Lwt_unix.sleep 0.1 >>= fun () ->
-              start_async hl_ws_conn;
-              Lwt.return_unit
-            ) (fun exn ->
-              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" hl_ws_conn.name (Printexc.to_string exn);
-              Lwt.return_unit
-            )
-          )
-        in
-        let on_connected () =
-          set_state hl_ws_conn Connected;
-          Lwt.async (fun () ->
-            Logging.info ~section "Hyperliquid WebSocket connected, sending subscriptions...";
-            
-            (* 1. Subscribe to allMids (global) *)
-            let ticker_msg = `Assoc [
-              ("method", `String "subscribe");
-              ("subscription", `Assoc [
-                ("type", `String "allMids")
-              ])
-            ] in
-            Hyperliquid.Hyperliquid_ws.subscribe ticker_msg >>= fun () ->
-            
-            (* 2. Subscribe to l2Book for each coin *)
-            Lwt_list.iter_s (fun sym ->
-              let coin = match String.split_on_char '/' sym with
-                | [c; _] -> c
-                | _ -> sym
-              in
-              let book_msg = `Assoc [
-                ("method", `String "subscribe");
-                ("subscription", `Assoc [
-                  ("type", `String "l2Book");
-                  ("coin", `String coin)
-                ])
-              ] in
-              Hyperliquid.Hyperliquid_ws.subscribe book_msg
-            ) hyperliquid_symbols >>= fun () ->
-
-            (* 3. Subscribe to webData2 (user account data) *)
-            let wallet_opt = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim in
-            (match wallet_opt with
-            | Some wallet ->
-                let msg2 = `Assoc [
-                  ("method", `String "subscribe");
-                  ("subscription", `Assoc [
-                    ("type", `String "webData2");
-                    ("user", `String wallet)
-                  ])
-                ] in
-                Hyperliquid.Hyperliquid_ws.subscribe msg2 >>= fun () ->
-
-                (* 4. Subscribe to spotState for spot wallet balances *)
-                let spot_msg = `Assoc [
-                  ("method", `String "subscribe");
-                  ("subscription", `Assoc [
-                    ("type", `String "spotState");
-                    ("user", `String wallet)
-                  ])
-                ] in
-                Hyperliquid.Hyperliquid_ws.subscribe spot_msg >>= fun () ->
-
-                (* 5. Subscribe to userEvents for real-time fills and status changes *)
-                let user_events_msg = `Assoc [
-                  ("method", `String "subscribe");
-                  ("subscription", `Assoc [
-                    ("type", `String "userEvents");
-                    ("user", `String wallet)
-                  ])
-                ] in
-                Hyperliquid.Hyperliquid_ws.subscribe user_events_msg >>= fun () ->
-
-                (* 6. Subscribe to orderUpdates for real-time order status *)
-                let order_updates_msg = `Assoc [
-                  ("method", `String "subscribe");
-                  ("subscription", `Assoc [
-                    ("type", `String "orderUpdates");
-                    ("user", `String wallet)
-                  ])
-                ] in
-                Hyperliquid.Hyperliquid_ws.subscribe order_updates_msg
-            | None -> 
-                Logging.warn ~section "No wallet address available for Hyperliquid webData2 subscription. Set HYPERLIQUID_WALLET_ADDRESS.";
-                Lwt.return_unit)
-          )
-        in
-        Hyperliquid.Hyperliquid_ws.connect_and_monitor ~on_failure ~on_connected ~testnet >>= fun () ->
-        Lwt.return_unit
-      ) (fun exn ->
-        let error_msg = Printexc.to_string exn in
-        Logging.error_f ~section "[%s] Connection failed during establishment: %s" hl_ws_conn.name error_msg;
-        set_state hl_ws_conn (Failed error_msg);
-        Lwt.return_unit
-      )
-    in
-    set_connect_fn hl_ws_conn (Some hl_ws_connect_fn);
-    start_async hl_ws_conn
-  end;
+        )
+      in
+      let on_heartbeat () = update_data_heartbeat auth_ws_conn in
+      let on_connected () =
+        set_state auth_ws_conn Connected;
+        (* Trigger individual feed subscriptions on the unified connection *)
+        Lwt.async (fun () ->
+          Lwt.join [
+            Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+            Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+          ]
+        )
+      in
+      Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
+      (* Connection function completed - this shouldn't happen for WebSocket connections *)
+      Lwt.return_unit
+    ) (fun exn ->
+      let error_msg = Printexc.to_string exn in
+      Logging.error_f ~section "[%s] Connection failed during establishment: %s" auth_ws_conn.name error_msg;
+      set_state auth_ws_conn (Failed error_msg);
+      Lwt.return_unit
+    )
+  in
+  set_connect_fn auth_ws_conn (Some auth_ws_connect_fn);
+  start_async auth_ws_conn;
 
   (* Wait for trading client connection to be fully established before proceeding *)
   (* This prevents a race condition where domains start trading before the WebSocket is ready *)
-  let%lwt () =
-    if List.length kraken_symbols > 0 then begin
-      Logging.info ~section "Waiting for trading client to be ready...";
-      let%lwt trading_client_ready = 
-        let timeout = 10.0 in
-        let start_time = Unix.gettimeofday () in
-        let rec wait_loop () =
-          let elapsed = Unix.gettimeofday () -. start_time in
-          if elapsed >= timeout then
-            Lwt.return false
-          else if Kraken.Kraken_trading_client.is_connected () then
-            Lwt.return true
-          else
-            Lwt_unix.sleep 0.1 >>= fun () ->
-            wait_loop ()
-        in
+  Logging.info ~section "Waiting for trading client to be ready...";
+  let%lwt trading_client_ready = 
+    let timeout = 10.0 in
+    let start_time = Unix.gettimeofday () in
+    let rec wait_loop () =
+      let elapsed = Unix.gettimeofday () -. start_time in
+      if elapsed >= timeout then
+        Lwt.return false
+      else if Kraken.Kraken_trading_client.is_connected () then
+        Lwt.return true
+      else
+        Lwt_unix.sleep 0.1 >>= fun () ->
         wait_loop ()
-      in
-      if not trading_client_ready then
-        Logging.warn ~section "Timeout waiting for trading client connection, continuing anyway..."
-      else
-        Logging.info ~section "✓ Trading client connected and ready";
-
-      (* Wait for executions data FIRST to avoid race condition *)
-      Logging.info ~section "Waiting for executions feed to be ready...";
-      let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
-      if not executions_ready then
-        Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
-      else
-        Logging.info ~section "✓ Executions feed ready";
-
-      (* Wait for initial data from all websocket feeds *)
-      Logging.info ~section "Waiting for initial market data from all feeds...";
-
-      (* Wait for ticker data *)
-      let%lwt ticker_ready = Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0 in
-      if not ticker_ready then
-        Logging.warn ~section "Timeout waiting for ticker data, continuing anyway..."
-      else
-        Logging.info ~section "✓ Ticker feed ready";
-
-      (* Wait for orderbook data *)
-      let%lwt orderbook_ready = Kraken.Kraken_orderbook_feed.wait_for_orderbook_data kraken_symbols 10.0 in
-      if not orderbook_ready then
-        Logging.warn ~section "Timeout waiting for orderbook data, continuing anyway..."
-      else
-        Logging.info ~section "✓ Orderbook feed ready";
-
-      (* Wait for executions data again *)
-      let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
-      if not executions_ready then
-        Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
-      else
-        Logging.info ~section "✓ Executions feed ready";
-
-      let%lwt balances_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
-      if not balances_ready then
-        Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
-      else
-        Logging.info ~section "✓ Balances feed ready";
-
-      Logging.info ~section "All feeds initialized with market data!";
-      Lwt.return_unit
-    end else Lwt.return_unit
+    in
+    wait_loop ()
   in
+  if not trading_client_ready then
+    Logging.warn ~section "Timeout waiting for trading client connection, continuing anyway..."
+  else
+    Logging.info ~section "✓ Trading client connected and ready";
 
-  let%lwt () =
-    if List.length hyperliquid_symbols > 0 then begin
-      Logging.info ~section "Waiting for Hyperliquid initial data...";
-      let%lwt balances_ready = Hyperliquid.Hyperliquid_balances_feed.wait_for_balance_data hyperliquid_symbols 10.0 in
-      if not balances_ready then
-        Logging.warn ~section "Timeout waiting for Hyperliquid balance data, continuing anyway..."
-      else
-        Logging.info ~section "✓ Hyperliquid balances feed ready";
-      
-      let%lwt executions_ready = Hyperliquid.Hyperliquid_executions_feed.wait_for_execution_data hyperliquid_symbols 10.0 in
-      if not executions_ready then
-        Logging.warn ~section "Timeout waiting for Hyperliquid executions data (webData2 snapshot), continuing anyway..."
-      else
-        Logging.info ~section "✓ Hyperliquid executions feed ready";
+  (* Wait for executions data FIRST to avoid race condition *)
+  Logging.info ~section "Waiting for executions feed to be ready...";
+  let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
+  if not executions_ready then
+    Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
+  else
+    Logging.info ~section "✓ Executions feed ready";
 
-      let%lwt ticker_ready = Hyperliquid.Hyperliquid_ticker_feed.wait_for_price_data hyperliquid_symbols 10.0 in
-      if not ticker_ready then
-        Logging.warn ~section "Timeout waiting for Hyperliquid ticker data, continuing anyway..."
-      else
-        Logging.info ~section "✓ Hyperliquid ticker feed ready";
-      
-      Lwt.return_unit
-    end else Lwt.return_unit
-  in
+  (* Wait for initial data from all websocket feeds *)
+  Logging.info ~section "Waiting for initial market data from all feeds...";
+
+  (* Wait for ticker data *)
+  let%lwt ticker_ready = Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0 in
+  if not ticker_ready then
+    Logging.warn ~section "Timeout waiting for ticker data, continuing anyway..."
+  else
+    Logging.info ~section "✓ Ticker feed ready";
+
+  (* Wait for orderbook data *)
+  let%lwt orderbook_ready = Kraken.Kraken_orderbook_feed.wait_for_orderbook_data kraken_symbols 10.0 in
+  if not orderbook_ready then
+    Logging.warn ~section "Timeout waiting for orderbook data, continuing anyway..."
+  else
+    Logging.info ~section "✓ Orderbook feed ready";
+
+  (* Wait for executions data again *)
+  let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
+  if not executions_ready then
+    Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
+  else
+    Logging.info ~section "✓ Executions feed ready";
+
+  (* Wait for balance data *)
+  let%lwt balances_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
+  if not balances_ready then
+    Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
+  else
+    Logging.info ~section "✓ Balances feed ready";
+
+  Logging.info ~section "All feeds initialized with market data!";
 
   (* Fetch fees for all assets *)
   Logging.info ~section "Step 8: Fetching trading fees for all assets...";
@@ -900,39 +731,6 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         (* Add small delay between requests to ensure unique nonces *)
         let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
         Lwt.return result
-      end else if asset.Dio_engine.Config.exchange = "hyperliquid" then begin
-        Logging.debug_f ~section "Fetching Hyperliquid fees for %s..." asset.Dio_engine.Config.symbol;
-        let hl_configs = configs |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") in
-        let testnet = List.exists (fun cfg -> cfg.Dio_engine.Config.testnet) hl_configs in
-        let%lwt fee_info_opt = Hyperliquid.Hyperliquid_get_fee.get_fee_info ~testnet asset.Dio_engine.Config.symbol in
-        match fee_info_opt with
-        | Some fee_info ->
-            let maker = Option.value fee_info.Hyperliquid.Hyperliquid_get_fee.maker_fee ~default:0.0 in
-            let taker = Option.value fee_info.Hyperliquid.Hyperliquid_get_fee.taker_fee ~default:0.0 in
-            Logging.debug_f ~section "Retrieved Hyperliquid fees for %s: maker=%.4f%% taker=%.4f%%"
-              asset.Dio_engine.Config.symbol (maker *. 100.) (taker *. 100.);
-            
-            Dio_strategies.Fee_cache.store_fees 
-              ~exchange:asset.Dio_engine.Config.exchange 
-              ~symbol:asset.Dio_engine.Config.symbol 
-              ~maker_fee:maker 
-              ~taker_fee:taker 
-              ~ttl_seconds:600.0;
-            
-            Lwt.return { asset with
-              Dio_engine.Config.maker_fee = Some maker;
-              Dio_engine.Config.taker_fee = Some taker }
-        | None ->
-            Logging.warn_f ~section "Failed to fetch Hyperliquid fees for %s, using defaults" asset.Dio_engine.Config.symbol;
-            Dio_strategies.Fee_cache.store_fees 
-              ~exchange:asset.Dio_engine.Config.exchange 
-              ~symbol:asset.Dio_engine.Config.symbol 
-              ~maker_fee:0.0002 
-              ~taker_fee:0.0005 
-              ~ttl_seconds:600.0;
-            Lwt.return { asset with
-              Dio_engine.Config.maker_fee = Some 0.0002;
-              Dio_engine.Config.taker_fee = Some 0.0005 }
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
         (* Store default fees in cache for unsupported exchanges *)
@@ -970,25 +768,21 @@ let order_processing_loop () =
   let section = "order_processor" in
   let cycle_count = ref 0 in
   let orders_placed = ref 0 in
-
-  let config = Dio_engine.Config.read_config () in
-  let has_kraken = List.exists (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken") config.trading in
-  let has_hl = List.exists (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") config.trading in
+  let order_mutex = Mutex.create () in
 
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
     else begin
-      (* Check if trading WebSockets are connected for configured exchanges *)
-      let kraken_ok = (not has_kraken) || Kraken.Kraken_trading_client.is_connected () in
-      let hl_ok = (not has_hl) || Hyperliquid.Hyperliquid_ws.is_connected () in
-
-      if not kraken_ok || not hl_ok then begin
+      (* Check if trading WebSocket is connected *)
+      if not (Kraken.Kraken_trading_client.is_connected ()) then begin
         let is_reconnecting =
-          (not kraken_ok && try Hashtbl.find connections "kraken_auth_ws" |> get_state = Connecting with Not_found -> false) ||
-          (not hl_ok && try Hashtbl.find connections "hyperliquid_ws" |> get_state = Connecting with Not_found -> false)
+          try
+            let auth_conn = Hashtbl.find connections "kraken_auth_ws" in
+            get_state auth_conn = Connecting
+          with Not_found -> false
         in
         if not is_reconnecting then
-          Logging.warn ~section "Trading WebSockets not fully connected, skipping order processing";
+          Logging.warn ~section "Trading WebSocket not connected, skipping order processing";
 
         (* Clear any pending orders to avoid stale placement/amendments when we reconnect *)
         ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);
@@ -1010,11 +804,11 @@ let order_processing_loop () =
             (* Process suicide grid orders *)
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
+              Mutex.lock order_mutex;
               try
                 (* Get authentication token *)
                 let auth_token = match Token_store.get () with
                   | Some token -> token
-                  | None when order.exchange = "hyperliquid" -> "hl_dummy"
                   | None ->
                     Logging.warn ~section "No auth token available for order operations";
                     raise (Failure "No auth token")
@@ -1118,11 +912,9 @@ let order_processing_loop () =
                  | Amend ->
                      (match order.order_id with
                       | Some target_order_id ->
-                          let amend_request : Dio_engine.Order_executor.amend_request = {
-                            order_id = target_order_id;
+                          let amend_request = {
+                            Dio_engine.Order_executor.order_id = target_order_id;
                             cl_ord_id = None;
-                            side = Dio_strategies.Strategy_common.string_of_order_side order.side;
-                            duplicate_key = order.duplicate_key;
                             new_quantity = Some order.qty;
                             new_limit_price = order.price;
                             limit_price_type = None;
@@ -1232,7 +1024,9 @@ let order_processing_loop () =
                       | None -> Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                      )
                 );
+                Mutex.unlock order_mutex
               with exn ->
+                Mutex.unlock order_mutex;
                 Logging.error_f ~section "Error processing order %s %s: %s"
                   (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_grid_orders;
@@ -1240,11 +1034,11 @@ let order_processing_loop () =
             (* Process market maker orders *)
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
+              Mutex.lock order_mutex;
               try
                 (* Get authentication token *)
                 let auth_token = match Token_store.get () with
                   | Some token -> token
-                  | None when order.exchange = "hyperliquid" -> "hl_dummy"
                   | None ->
                     Logging.warn ~section "No auth token available for order operations";
                     raise (Failure "No auth token")
@@ -1328,11 +1122,9 @@ let order_processing_loop () =
                  | Amend ->
                      (match order.order_id with
                       | Some target_order_id ->
-                          let amend_request : Dio_engine.Order_executor.amend_request = {
-                            order_id = target_order_id;
+                          let amend_request = {
+                            Dio_engine.Order_executor.order_id = target_order_id;
                             cl_ord_id = None;
-                            side = Dio_strategies.Strategy_common.string_of_order_side order.side;
-                            duplicate_key = order.duplicate_key;
                             new_quantity = Some order.qty;
                             new_limit_price = order.price;
                             limit_price_type = None;
@@ -1425,7 +1217,9 @@ let order_processing_loop () =
                       | None -> Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                      )
                 );
+                Mutex.unlock order_mutex
               with exn ->
+                Mutex.unlock order_mutex;
                 Logging.error_f ~section "Error processing order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_mm_orders;
 
@@ -1511,3 +1305,5 @@ let stop_all () =
     set_state conn Disconnected
   ) connections;
   Mutex.unlock registry_mutex
+
+

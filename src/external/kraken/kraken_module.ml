@@ -4,8 +4,9 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
-module Kraken_impl : Exchange.S = struct
+module Kraken_impl = struct
   let name = "kraken"
+  let section = "kraken_module"
 
   (* Internal cache for fees *)
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
@@ -287,11 +288,6 @@ module Kraken_impl : Exchange.S = struct
 
   let get_qty_min ~symbol =
     Kraken_instruments_feed.get_qty_min symbol
-
-  let round_price_to_tick ~symbol price =
-    match Kraken_instruments_feed.get_price_increment symbol with
-    | Some tick -> Float.round (price /. tick) *. tick
-    | None -> price
 
   let get_fees ~symbol =
     match Hashtbl.find_opt fee_cache symbol with

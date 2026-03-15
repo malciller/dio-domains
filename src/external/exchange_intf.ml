@@ -193,14 +193,8 @@ module type S = sig
   (** Get minimum order quantity for a symbol *)
   val get_qty_min : symbol:string -> float option
 
-  (** Round price to the exchange's tick size/rule *)
-  val round_price_to_tick : symbol:string -> float -> float
-
   (** Get maker/taker fees for a symbol (if cached by exchange) *)
   val get_fees : symbol:string -> (float option * float option)
-
-  (** Initialize fee information for a list of symbols *)
-  val initialize_fees : string list -> unit Lwt.t
 end
 
 (** Registry for managing multiple exchange implementations *)

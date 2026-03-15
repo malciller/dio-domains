@@ -27,8 +27,6 @@ depends: [
   "ipaddr"
   "alcotest"
   "mtime"
-  "msgpck"
-  "secp256k1"
   "odoc" {with-doc}
 ]
 build: [
