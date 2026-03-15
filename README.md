@@ -69,7 +69,8 @@ Edit `config.json` (example):
       "qty": "0.001",                 // Base asset quantity per order
       "grid_interval": [0.1, 0.5],    // Min/Max grid spacing (%)
       "sell_mult": "1.0",             // Sell amount multiplier
-      "strategy": "Grid"              // Strategy name: "Grid"
+      "strategy": "Grid",             // Strategy name: "Grid"
+      "testnet": true                 // Use testnet
     }
   ]
 }
