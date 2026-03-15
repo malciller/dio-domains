@@ -13,12 +13,12 @@
       "exchange": "hyperliquid",
       "qty": "0.3",
       "grid_interval": [
-        0.15,
-        0.75
+        27.15,
+        28.15
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "testnet": false
+      "testnet": true
     }
   ]
 }
