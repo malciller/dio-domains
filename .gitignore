@@ -2,7 +2,7 @@
 src/legacy/
 
 
-
+/hyperliquid-python-sdk/
 *.annot
 *.cmo
 *.cma
