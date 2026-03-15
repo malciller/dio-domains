@@ -51,8 +51,9 @@ let action_hash ~action_msgpack ~nonce ~vault_address ~expires_after =
   (* 3. vault_address *)
   (match vault_address with
   | None -> Buffer.add_char buf '\x00'
-  | Some addr -> 
+  | Some addr_raw -> 
       Buffer.add_char buf '\x01';
+      let addr = String.lowercase_ascii addr_raw in
       (* Convert 0x string to bytes *)
       let clean_addr = if String.starts_with ~prefix:"0x" addr then String.sub addr 2 (String.length addr - 2) else addr in
       let addr_bytes = bytes_of_hex clean_addr in
@@ -79,15 +80,19 @@ let keccak256_str s =
 let domain_type_hash = keccak256_str "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
 let domain_name_hash = keccak256_str "Exchange"
 let domain_version_hash = keccak256_str "1"
-let domain_chain_id = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x39" (* 1337 in 32-bye BE *)
 let domain_contract = String.make 32 '\x00'
 
 let hash_domain () =
+  let chain_id_bytes = 
+    let b = Bytes.make 32 '\x00' in
+    Bytes.set_int64_be b 24 (Int64.of_int 1337);
+    Bytes.to_string b
+  in
   let buf = Buffer.create 160 in
   Buffer.add_string buf domain_type_hash;
   Buffer.add_string buf domain_name_hash;
   Buffer.add_string buf domain_version_hash;
-  Buffer.add_string buf domain_chain_id;
+  Buffer.add_string buf chain_id_bytes;
   Buffer.add_string buf domain_contract;
   keccak256_str (Buffer.contents buf)
 

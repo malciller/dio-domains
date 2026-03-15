@@ -53,6 +53,7 @@ type strategy_state = {
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
+  mutable last_balance_warn_time: float; (* Last time balance/duplicate warning was logged *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -77,6 +78,7 @@ let get_strategy_state asset_symbol =
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
           last_cleanup_time = 0.0;
+          last_balance_warn_time = 0.0;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -249,7 +251,12 @@ let push_order order =
        in
 
        if is_duplicate then begin
-         Logging.warn_f ~section "Duplicate %s detected (strategy): %s" operation_str order.symbol;
+         let state = get_strategy_state order.symbol in
+         let now = Unix.gettimeofday () in
+         if now -. state.last_balance_warn_time > 30.0 then begin
+           Logging.warn_f ~section "Duplicate %s detected (strategy): %s (spam suppressed)" operation_str order.symbol;
+           state.last_balance_warn_time <- now;
+         end;
        end else begin
          (* For Place and Amend operations, proceed normally *)
          Mutex.lock order_buffer_mutex;
@@ -340,8 +347,13 @@ let execute_strategy
   let now = Unix.time () in
   
   match current_price, top_of_book with
-  | None, _ -> ()  (* No price data available yet *)
+  | None, _ -> 
+      if cycle mod 1000 = 0 then
+        Logging.info_f ~section "Strategy for %s skipping: no price data" asset.symbol
   | Some price, _ ->
+      if cycle mod 100000 = 0 then
+        Logging.info_f ~section "Strategy for %s executing: price=%.2f, open_buys=%d, open_sells=%d" 
+          asset.symbol price open_buy_count _open_sell_count;
 
       (* Efficient cleanup logic - run every cycle but use scan-and-remove to avoid allocation *)
       (* This prevents accumulation while maintaining HFT responsiveness *)
@@ -569,11 +581,19 @@ let execute_strategy
                       asset.symbol buy_price target_buy cs_price
               | None -> ())
          | Some quote_bal ->
-             Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f"
-               asset.symbol quote_needed quote_bal
+             let now_t = Unix.gettimeofday () in
+             if now_t -. state.last_balance_warn_time > 30.0 then begin
+               Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f"
+                 asset.symbol quote_needed quote_bal;
+               state.last_balance_warn_time <- now_t
+             end
          | None ->
-             Logging.warn_f ~section "No quote balance data available for %s buy order"
-               asset.symbol
+             let now_t = Unix.gettimeofday () in
+             if now_t -. state.last_balance_warn_time > 30.0 then begin
+               Logging.warn_f ~section "No quote balance data available for %s buy order"
+                 asset.symbol;
+               state.last_balance_warn_time <- now_t
+             end
         );
         state.last_cycle <- cycle
       end else if open_buy_count > 0 then begin

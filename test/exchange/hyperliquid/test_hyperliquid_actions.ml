@@ -19,6 +19,7 @@ let test_to_hl_order_wire () =
   let wire = Hyperliquid.Hyperliquid_actions.to_hl_order_wire 
       ~qty:0.5 
       ~symbol:"BTC" 
+      ~asset_index:0
       ~ot:hl_ot 
       ~side:Dio_exchange.Exchange_intf.Types.Buy 
       ~limit_price:(Some 50000.0) 
@@ -27,14 +28,15 @@ let test_to_hl_order_wire () =
   in
   
   Alcotest.(check bool) "is buy" true wire.b;
-  Alcotest.(check string) "price formatted" "50000.00000000" wire.p;
-  Alcotest.(check string) "size formatted" "0.50000000" wire.s;
+  Alcotest.(check string) "price formatted" "50000" wire.p;
+  Alcotest.(check string) "size formatted" "0.5" wire.s;
   Alcotest.(check bool) "reduce_only matches" true wire.r;
   Alcotest.(check (option string)) "cl_ord_id matches" (Some "test_id") wire.c;
   
   let wire2 = Hyperliquid.Hyperliquid_actions.to_hl_order_wire 
       ~qty:1.0 
       ~symbol:"ETH" 
+      ~asset_index:0
       ~ot:hl_ot 
       ~side:Dio_exchange.Exchange_intf.Types.Sell 
       ~limit_price:None 

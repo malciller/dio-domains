@@ -519,6 +519,25 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     end else Lwt.return ""
   in
 
+  let%lwt () =
+    if List.length hyperliquid_symbols > 0 then begin
+      let hl_configs = configs |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") in
+      let testnet = List.exists (fun cfg -> cfg.Dio_engine.Config.testnet) hl_configs in
+      if testnet then Logging.info ~section "Hyperliquid will use TESTNET endpoints";
+      
+      (* Update network flag in hyperliquid_module *)
+      Hyperliquid.Hyperliquid_module.set_network (not testnet);
+
+      Logging.info ~section "Step 5.5: Initializing Hyperliquid feed stores...";
+      Hyperliquid.Hyperliquid_executions_feed.initialize hyperliquid_symbols;
+      Hyperliquid.Hyperliquid_ticker_feed.initialize hyperliquid_symbols;
+      Hyperliquid.Hyperliquid_orderbook_feed.initialize hyperliquid_symbols;
+      Hyperliquid.Hyperliquid_balances_feed.initialize ();
+      let%lwt () = Hyperliquid.Hyperliquid_balances_feed.fetch_initial_balances ~testnet () in
+      Hyperliquid.Hyperliquid_instruments_feed.initialize_symbols ~testnet hyperliquid_symbols
+    end else Lwt.return_unit
+  in
+
   Logging.info ~section "Step 5: Initializing balances feed stores...";
   (* Extract all unique assets from trading symbols *)
   let all_assets = configs
@@ -630,6 +649,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   if List.length hyperliquid_symbols > 0 then begin
     Logging.info ~section "Step 7.5: Starting Hyperliquid unified connection...";
     let hl_ws_conn = register ~name:"hyperliquid_ws" ~connect_fn:None in
+    let hl_configs = configs |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") in
+    let testnet = List.exists (fun cfg -> cfg.Dio_engine.Config.testnet) hl_configs in
     let hl_ws_connect_fn () =
       Lwt.catch (fun () ->
         let on_failure reason =
@@ -648,18 +669,61 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         let on_connected () =
           set_state hl_ws_conn Connected;
           Lwt.async (fun () ->
+            Logging.info ~section "Hyperliquid WebSocket connected, sending subscriptions...";
+            
+            (* 1. Subscribe to allMids (global) *)
+            let ticker_msg = `Assoc [
+              ("method", `String "subscribe");
+              ("subscription", `Assoc [
+                ("type", `String "allMids")
+              ])
+            ] in
+            Hyperliquid.Hyperliquid_ws.subscribe ticker_msg >>= fun () ->
+            
+            (* 2. Subscribe to l2Book for each coin *)
             Lwt_list.iter_s (fun sym ->
-               let msg1 = `Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String sym)])] in
-               Hyperliquid.Hyperliquid_ws.subscribe msg1 >>= fun () ->
-               (match Token_store.get () with
-               | Some t ->
-                   let msg2 = `Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "webData2"); ("user", `String t)])] in
-                   Hyperliquid.Hyperliquid_ws.subscribe msg2
-               | None -> Lwt.return_unit)
-            ) hyperliquid_symbols
+              let coin = match String.split_on_char '/' sym with
+                | [c; _] -> c
+                | _ -> sym
+              in
+              let book_msg = `Assoc [
+                ("method", `String "subscribe");
+                ("subscription", `Assoc [
+                  ("type", `String "l2Book");
+                  ("coin", `String coin)
+                ])
+              ] in
+              Hyperliquid.Hyperliquid_ws.subscribe book_msg
+            ) hyperliquid_symbols >>= fun () ->
+
+            (* 3. Subscribe to webData2 (user account data) *)
+            let wallet_opt = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim in
+            (match wallet_opt with
+            | Some wallet ->
+                let msg2 = `Assoc [
+                  ("method", `String "subscribe");
+                  ("subscription", `Assoc [
+                    ("type", `String "webData2");
+                    ("user", `String wallet)
+                  ])
+                ] in
+                Hyperliquid.Hyperliquid_ws.subscribe msg2 >>= fun () ->
+
+                (* 4. Subscribe to spotState for spot wallet balances *)
+                let spot_msg = `Assoc [
+                  ("method", `String "subscribe");
+                  ("subscription", `Assoc [
+                    ("type", `String "spotState");
+                    ("user", `String wallet)
+                  ])
+                ] in
+                Hyperliquid.Hyperliquid_ws.subscribe spot_msg
+            | None -> 
+                Logging.warn ~section "No wallet address available for Hyperliquid webData2 subscription. Set HYPERLIQUID_WALLET_ADDRESS.";
+                Lwt.return_unit)
           )
         in
-        Hyperliquid.Hyperliquid_ws.connect_and_monitor ~on_failure ~on_connected >>= fun () ->
+        Hyperliquid.Hyperliquid_ws.connect_and_monitor ~on_failure ~on_connected ~testnet >>= fun () ->
         Lwt.return_unit
       ) (fun exn ->
         let error_msg = Printexc.to_string exn in
@@ -729,7 +793,6 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       else
         Logging.info ~section "✓ Executions feed ready";
 
-      (* Wait for balance data *)
       let%lwt balances_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
       if not balances_ready then
         Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
@@ -737,6 +800,18 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Logging.info ~section "✓ Balances feed ready";
 
       Logging.info ~section "All feeds initialized with market data!";
+      Lwt.return_unit
+    end else Lwt.return_unit
+  in
+
+  let%lwt () =
+    if List.length hyperliquid_symbols > 0 then begin
+      Logging.info ~section "Waiting for Hyperliquid initial data...";
+      let%lwt balances_ready = Hyperliquid.Hyperliquid_balances_feed.wait_for_balance_data hyperliquid_symbols 10.0 in
+      if not balances_ready then
+        Logging.warn ~section "Timeout waiting for Hyperliquid balance data, continuing anyway..."
+      else
+        Logging.info ~section "✓ Hyperliquid balances feed ready";
       Lwt.return_unit
     end else Lwt.return_unit
   in
@@ -792,6 +867,39 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         (* Add small delay between requests to ensure unique nonces *)
         let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
         Lwt.return result
+      end else if asset.Dio_engine.Config.exchange = "hyperliquid" then begin
+        Logging.debug_f ~section "Fetching Hyperliquid fees for %s..." asset.Dio_engine.Config.symbol;
+        let hl_configs = configs |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid") in
+        let testnet = List.exists (fun cfg -> cfg.Dio_engine.Config.testnet) hl_configs in
+        let%lwt fee_info_opt = Hyperliquid.Hyperliquid_get_fee.get_fee_info ~testnet asset.Dio_engine.Config.symbol in
+        match fee_info_opt with
+        | Some fee_info ->
+            let maker = Option.value fee_info.Hyperliquid.Hyperliquid_get_fee.maker_fee ~default:0.0 in
+            let taker = Option.value fee_info.Hyperliquid.Hyperliquid_get_fee.taker_fee ~default:0.0 in
+            Logging.debug_f ~section "Retrieved Hyperliquid fees for %s: maker=%.4f%% taker=%.4f%%"
+              asset.Dio_engine.Config.symbol (maker *. 100.) (taker *. 100.);
+            
+            Dio_strategies.Fee_cache.store_fees 
+              ~exchange:asset.Dio_engine.Config.exchange 
+              ~symbol:asset.Dio_engine.Config.symbol 
+              ~maker_fee:maker 
+              ~taker_fee:taker 
+              ~ttl_seconds:600.0;
+            
+            Lwt.return { asset with
+              Dio_engine.Config.maker_fee = Some maker;
+              Dio_engine.Config.taker_fee = Some taker }
+        | None ->
+            Logging.warn_f ~section "Failed to fetch Hyperliquid fees for %s, using defaults" asset.Dio_engine.Config.symbol;
+            Dio_strategies.Fee_cache.store_fees 
+              ~exchange:asset.Dio_engine.Config.exchange 
+              ~symbol:asset.Dio_engine.Config.symbol 
+              ~maker_fee:0.0002 
+              ~taker_fee:0.0005 
+              ~ttl_seconds:600.0;
+            Lwt.return { asset with
+              Dio_engine.Config.maker_fee = Some 0.0002;
+              Dio_engine.Config.taker_fee = Some 0.0005 }
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
         (* Store default fees in cache for unsupported exchanges *)
@@ -829,7 +937,6 @@ let order_processing_loop () =
   let section = "order_processor" in
   let cycle_count = ref 0 in
   let orders_placed = ref 0 in
-  let order_mutex = Mutex.create () in
 
   let config = Dio_engine.Config.read_config () in
   let has_kraken = List.exists (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken") config.trading in
@@ -870,11 +977,11 @@ let order_processing_loop () =
             (* Process suicide grid orders *)
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
-              Mutex.lock order_mutex;
               try
                 (* Get authentication token *)
                 let auth_token = match Token_store.get () with
                   | Some token -> token
+                  | None when order.exchange = "hyperliquid" -> "hl_dummy"
                   | None ->
                     Logging.warn ~section "No auth token available for order operations";
                     raise (Failure "No auth token")
@@ -1090,9 +1197,7 @@ let order_processing_loop () =
                       | None -> Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                      )
                 );
-                Mutex.unlock order_mutex
               with exn ->
-                Mutex.unlock order_mutex;
                 Logging.error_f ~section "Error processing order %s %s: %s"
                   (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_grid_orders;
@@ -1100,11 +1205,11 @@ let order_processing_loop () =
             (* Process market maker orders *)
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
-              Mutex.lock order_mutex;
               try
                 (* Get authentication token *)
                 let auth_token = match Token_store.get () with
                   | Some token -> token
+                  | None when order.exchange = "hyperliquid" -> "hl_dummy"
                   | None ->
                     Logging.warn ~section "No auth token available for order operations";
                     raise (Failure "No auth token")
@@ -1283,9 +1388,7 @@ let order_processing_loop () =
                       | None -> Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                      )
                 );
-                Mutex.unlock order_mutex
               with exn ->
-                Mutex.unlock order_mutex;
                 Logging.error_f ~section "Error processing order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_mm_orders;
 
@@ -1371,5 +1474,3 @@ let stop_all () =
     set_state conn Disconnected
   ) connections;
   Mutex.unlock registry_mutex
-
-
