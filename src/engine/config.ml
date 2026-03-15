@@ -10,7 +10,6 @@ type trading_config = {
   strategy: string;
   maker_fee: float option;
   taker_fee: float option;
-  testnet: bool; (** If true, use exchange testnet endpoints *)
 }
 
 type logging_config = {
@@ -93,7 +92,6 @@ let parse_config json =
     strategy = json |> member "strategy" |> to_string;
     maker_fee = json |> member "maker_fee" |> to_option to_float;
     taker_fee = json |> member "taker_fee" |> to_option to_float;
-    testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false;
   }
 
 (** Parse logging configuration *)

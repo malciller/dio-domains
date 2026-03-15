@@ -30,3 +30,4 @@ Maintenance Rules (Apply Last, After Every Action/Event):2x Grid Lock: Always re
 Post-Only Guard: Pre-place/amend: Buy ≤ current bid? Sell ≥ current ask? Skip if no.
 No Clutter: Cancel duplicates at same price. Enforce single buy; allow multiple sells (they're just anchors).
 Sell Reference Only: Never place/amend sells except on buy reset—use existing ones purely for buy positioning (no "if sell exists" branches).
+

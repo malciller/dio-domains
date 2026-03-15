@@ -1,4 +1,8 @@
-reference/
+
+src/legacy/
+
+
+
 *.annot
 *.cmo
 *.cma

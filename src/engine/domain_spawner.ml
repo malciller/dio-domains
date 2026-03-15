@@ -386,9 +386,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               if side_str = "buy" then
                 (match userref_opt with
                  | Some userref when Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref -> (buys + 1, sells)
-                 | None when asset_with_fees.strategy = "Grid" -> 
-                     (* Loose tracking: Claim untagged buys for Grid strategy if it's the domain's strategy *)
-                     (buys + 1, sells)
                  | _ -> (buys, sells))
               else
                 (buys, sells + 1)

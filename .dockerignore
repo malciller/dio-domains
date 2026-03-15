@@ -9,4 +9,3 @@ node_modules
 *.swo
 *.py
 *.csv
-/reference/*

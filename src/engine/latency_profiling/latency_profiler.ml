@@ -61,7 +61,7 @@ let reset t =
 
 let report ?(sample_threshold=1) t =
   if t.samples >= sample_threshold then (
-(* commented out for hyperliquid testing
+
     let p50 = percentile t 0.50 in
     let p90 = percentile t 0.90 in
     let p95 = percentile t 0.95 in
@@ -74,7 +74,7 @@ let report ?(sample_threshold=1) t =
     else
       Logging.info_f ~section "[%s] latency (us): p50=%.2f p90=%.2f p95=%.2f p99=%.2f p999=%.2f samples=%d"
         t.name p50 p90 p95 p99 p999 t.samples;
-      *)
+
     reset t
   )
 

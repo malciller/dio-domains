@@ -75,7 +75,6 @@ type amend_request = {
   exchange: string;
   order_id: string;
   cl_ord_id: string option;
-  side: order_side; (* Required for duplicate_key generation/tracking *)
   new_quantity: float option; (* New quantity for the order *)
   new_limit_price: float option;
   limit_price_type: string option; (* Ignored by generic interface, kept for now or remove if unused *)
@@ -85,7 +84,6 @@ type amend_request = {
   new_display_qty: float option;
   deadline: string option; (* Ignored by generic interface *)
   symbol: string option; (* Required for some exchanges or precision handling *)
-  duplicate_key: string; (* Key for shared in-flight tracking *)
 }
 
 (** Cancel request structure *)
@@ -327,10 +325,10 @@ let amend_order
   if Atomic.get shutdown_requested then
     Lwt.return (Error "Order amendment cancelled due to shutdown")
   else
-    (* Event-driven cleanup: clean up stale entries when orders are managed *)
-    let (_drift, trimmed) = InFlightOrders.cleanup () in
+    (* Event-driven cleanup: clean up stale entries when orders are amended *)
+    let (_drift, trimmed) = InFlightAmendments.cleanup () in
     if trimmed > 0 then
-      Logging.debug_f ~section "InFlightOrders registry cleaned up: removed %d stale entries" trimmed;
+      Logging.debug_f ~section "InFlightAmendments registry cleaned up: removed %d stale entries" trimmed;
     with_error_handling ~operation_name:"amend_order" (fun () ->
     match validate_amend_request request with
     | Error err ->
@@ -342,27 +340,16 @@ let amend_order
             Logging.error_f ~section "%s" e;
             Lwt.return (Error e)
         | Ok (module Ex) ->
-            (* Check for duplicate operations (shared with place_order) *)
-            let is_duplicate = not (InFlightOrders.add_in_flight_order request.duplicate_key) in
-            
-            if is_duplicate then begin
-              let err = Printf.sprintf "Duplicate amendment detected: %s %s %s"
-                request.side (Option.value request.symbol ~default:"?") request.duplicate_key in
-              Logging.warn_f ~section "%s" err;
-              Lwt.return (Error err)
-            end else begin
-            
             (* Check if new price is the same as current price to avoid unnecessary amendments *)
             let should_skip_amendment = match request.symbol, request.new_limit_price with
               | Some symbol, Some new_price ->
                   (match Ex.get_open_order ~symbol ~order_id:request.order_id with
                    | Some current_order ->
                        (match current_order.limit_price with
-                     | Some current_price ->
-                         (* Round the new price using exchange implementation for accurate comparison *)
-                         let rounded_new_price = Ex.round_price_to_tick ~symbol new_price in
-                         abs_float (rounded_new_price -. current_price) < 0.000001
-                     | None -> false)
+                        | Some current_price ->
+                            (* Use small epsilon for floating point comparison *)
+                            abs_float (new_price -. current_price) < 0.000001
+                        | None -> false)
                    | None ->
                        Logging.warn_f ~section "Order %s not found in open orders cache, proceeding with amendment" request.order_id;
                        false)
@@ -372,7 +359,7 @@ let amend_order
             if should_skip_amendment then begin
               Logging.debug_f ~section "Skipping amendment for order %s: new price equals current price" request.order_id;
               (* Remove from in-flight cache since amendment was skipped *)
-              let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
+              let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
               (* Return a fake successful result to avoid disrupting the flow *)
               Lwt.return (Ok {
                  Types.
@@ -409,7 +396,7 @@ let amend_order
                   )
                   (fun exn ->
                     (* Remove from in-flight cache on error *)
-                    let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
+                    let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
                     Lwt.fail exn
                   )
                 >>= fun result ->
@@ -417,10 +404,9 @@ let amend_order
                 let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
                 Latency_profiler.record profiler span;
                 Latency_profiler.report ~sample_threshold:1 profiler;
-                (* Remove from in-flight cache on result, just like place_order *)
-                let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
+                (* Remove from in-flight cache on success immediately, just like place_order *)
+                let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
                 Lwt.return result
-            end
             end
   )
 

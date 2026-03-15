@@ -36,9 +36,7 @@
   conduit-lwt-unix
   ipaddr
   alcotest
-  mtime
-  msgpck
-  secp256k1)
+  mtime)
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
 

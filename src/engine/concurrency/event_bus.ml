@@ -1,43 +1,228 @@
-(** Generic publish/subscribe event bus using Lwt_stream *)
+(** Lightweight event bus for lock-free, snapshot-based fan-out.
+
+    Producers publish immutable payloads; subscribers receive a stream of
+    snapshots via `Lwt_stream`. Internally each topic maintains an
+    atomically-swapped snapshot (`Atomic.t`) and a list of Lwt push
+    functions. This keeps the hot path lock-free while delivering events to
+    cooperative consumers.
+*)
+
+open Lwt.Infix
 
 module type PAYLOAD = sig
   type t
 end
 
-module Make (P : PAYLOAD) = struct
-  type payload = P.t
+(** Global registry of all event buses for monitoring and cleanup *)
+type bus_ops = {
+  topic: string;
+  cleanup: unit -> int option;
+  stats: unit -> (int * int * int);
+}
+
+let registry : bus_ops list Atomic.t = Atomic.make []
+
+let register ops =
+  let rec loop () =
+    let old = Atomic.get registry in
+    if Atomic.compare_and_set registry old (ops :: old) then ()
+    else loop ()
+  in
+  loop ()
+
+let iter_buses f =
+  List.iter f (Atomic.get registry)
+
+module Make (Payload : PAYLOAD) = struct
+  type snapshot = Payload.t
 
   type subscription = {
-    stream: payload Lwt_stream.t;
-    close: unit -> unit;
+    stream: snapshot Lwt_stream.t;
+    close: unit -> unit;  (* Function to close this subscription's stream *)
+  }
+
+  type subscriber = {
+    push: snapshot -> unit Lwt.t;
+    close: unit -> unit;  (* Function to close this subscriber's stream *)
+    mutable closed: bool;
+    created_at: float;  (* Track when subscriber was created *)
+    mutable last_used: float;  (* Track when subscriber was last used *)
+    persistent: bool;  (* Mark persistent subscribers that should not be force cleaned *)
   }
 
   type t = {
-    name: string;
-    mutable pushers: (payload option -> unit) list;
-    mutex: Mutex.t;
+    topic: string;
+    latest: snapshot option Atomic.t;
+    subscribers: subscriber list Atomic.t;
+    mutable publish_count: int;  (* Counter for event-driven cleanup *)
   }
 
-  let create name = { name; pushers = []; mutex = Mutex.create () }
-
-  let topic bus = bus.name
-
-  let subscribe bus =
-    let (stream, push) = Lwt_stream.create () in
-    Mutex.lock bus.mutex;
-    bus.pushers <- push :: bus.pushers;
-    Mutex.unlock bus.mutex;
-    let close () =
-      Mutex.lock bus.mutex;
-      bus.pushers <- List.filter (fun p -> p != push) bus.pushers;
-      Mutex.unlock bus.mutex;
-      push None
+  (** Clean up stale subscribers (older than max_age_seconds or unused for too long) *)
+  let cleanup_stale_subscribers bus ?(max_age_seconds=60.0) ?(max_unused_seconds=30.0) () =
+    let now = Unix.time () in
+    let rec try_cleanup () =
+      let current = Atomic.get bus.subscribers in
+      let filtered = List.filter (fun sub ->
+        sub.persistent || (
+          not sub.closed &&
+          (now -. sub.created_at) <= max_age_seconds &&
+          (now -. sub.last_used) <= max_unused_seconds
+        )
+      ) current in
+      let removed_count = List.length current - List.length filtered in
+      if removed_count > 0 then begin
+        Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length filtered);
+        if Atomic.compare_and_set bus.subscribers current filtered then
+          Some removed_count
+        else try_cleanup ()
+      end else None
     in
-    { stream; close }
+    try_cleanup ()
+
+  (** Force cleanup all stale subscribers regardless of age (for dashboard memory management) *)
+  let force_cleanup_stale_subscribers bus () =
+    let now = Unix.time () in
+    let rec try_cleanup () =
+      let current = Atomic.get bus.subscribers in
+      let filtered = List.filter (fun sub ->
+        (* Keep persistent subscribers *)
+        sub.persistent ||
+        (* Keep non-closed subscribers that have been used within the last 10 seconds *)
+        (not sub.closed && (now -. sub.last_used) <= 10.0)
+      ) current in
+      let removed_count = List.length current - List.length filtered in
+      if removed_count > 0 then begin
+        Logging.debug_f ~section:"event_bus" "Force cleaned %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length filtered);
+        if Atomic.compare_and_set bus.subscribers current filtered then
+          Some removed_count
+        else try_cleanup ()
+      end else None
+    in
+    try_cleanup ()
+
+  (** Get subscriber statistics for monitoring *)
+  let get_subscriber_stats bus =
+    let subs = Atomic.get bus.subscribers in
+    let now = Unix.time () in
+    let total = List.length subs in
+    let active = List.length (List.filter (fun sub -> not sub.closed) subs) in
+    let stale = List.length (List.filter (fun sub ->
+      sub.closed || (now -. sub.last_used) > 300.0
+    ) subs) in
+    (total, active, stale)
+
+  let create ?initial topic =
+    let bus = {
+      topic;
+      latest = Atomic.make initial;
+      subscribers = Atomic.make [];
+      publish_count = 0;
+    } in
+    (* Register with global registry *)
+    register {
+      topic;
+      cleanup = (fun () -> cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 ());
+      stats = (fun () -> get_subscriber_stats bus);
+    };
+    bus
+
+  let topic bus = bus.topic
+
+  let latest bus = Atomic.get bus.latest
+
+  (** Clear the latest snapshot to prevent memory retention *)
+  let clear_latest bus = Atomic.set bus.latest None
 
   let publish bus payload =
-    Mutex.lock bus.mutex;
-    let pushers = bus.pushers in
-    Mutex.unlock bus.mutex;
-    List.iter (fun push -> push (Some payload)) pushers
+    Atomic.set bus.latest (Some payload);
+    let now = Unix.time () in
+    let subs = Atomic.get bus.subscribers in
+    (* Filter out closed subscribers and validate each one before pushing *)
+    let active_subs = List.filter (fun sub -> not sub.closed) subs in
+    List.iter (fun sub ->
+      (* Double-check subscriber is still active before pushing *)
+      if not sub.closed then begin
+        (* Make pushes non-blocking to prevent backpressure *)
+        Lwt.async (fun () ->
+          Lwt.catch
+            (fun () ->
+              (* Use timeout to detect blocking/slow consumers *)
+              Lwt.pick [
+                (sub.push payload >|= fun () ->
+                   (* Only update last_used on successful push *)
+                   sub.last_used <- now);
+                (Lwt_unix.sleep 0.050 >|= fun () ->
+                   (* Timeout - subscriber is too slow *)
+                   Logging.warn_f ~section:"event_bus" "Subscriber too slow (50ms timeout), dropping: %s" bus.topic;
+                   sub.closed <- true)
+              ]
+            )
+            (fun exn ->
+              (* Mark subscriber as closed on push failure (including timeout) *)
+              Logging.debug_f ~section:"event_bus" "Subscriber push failed/timed out, marking closed: %s" (Printexc.to_string exn);
+              sub.closed <- true;
+              Lwt.return_unit
+            )
+        )
+      end
+    ) active_subs;
+
+    (* Event-driven cleanup: run cleanup every 100 publications to avoid overhead *)
+    bus.publish_count <- bus.publish_count + 1;
+    if bus.publish_count mod 100 = 0 then
+      match cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 () with
+      | Some removed_count ->
+          Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s" removed_count bus.topic
+      | None -> ()
+
+  let subscribe ?(persistent=false) bus =
+    (* Use bounded stream to prevent unbounded memory growth *)
+    let stream, push_source = Lwt_stream.create_bounded 1000 in
+    let now = Unix.time () in
+    let subscriber = {
+      push = (fun payload -> push_source#push payload);
+      close = (fun () -> push_source#close);
+      closed = false;
+      created_at = now;
+      last_used = now;
+      persistent;
+    } in
+    let rec try_add () =
+      let current = Atomic.get bus.subscribers in
+      if List.exists (fun s -> s == subscriber) current then ()
+      else if Atomic.compare_and_set bus.subscribers current (subscriber :: current) then ()
+      else try_add ()
+    in
+    let rec try_remove () =
+      let current = Atomic.get bus.subscribers in
+      let filtered = List.filter (fun s -> s != subscriber) current in
+      if Atomic.compare_and_set bus.subscribers current filtered then () else try_remove ()
+    in
+    try_add ();
+    (* Use finalize pattern to guarantee cleanup when stream closes *)
+    Lwt.async (fun () ->
+      Lwt.finalize
+        (fun () -> Lwt_stream.closed stream)
+        (fun () ->
+          subscriber.closed <- true;
+          try_remove ();
+          Lwt.return_unit
+        )
+    );
+    (match Atomic.get bus.latest with
+    | Some payload -> Lwt.async (fun () -> push_source#push payload)
+    | None -> ());
+    { stream; close = subscriber.close }
+
+  let await_next bus timeout =
+    let subscription = subscribe bus in
+    Lwt.finalize
+      (fun () ->
+        Lwt.pick [
+          (Lwt_stream.get subscription.stream >|= fun evt -> evt);
+          (Lwt_unix.sleep timeout >|= fun () -> None)
+        ])
+      (fun () -> subscription.close (); Lwt.return_unit)
 end
+
+
