@@ -67,6 +67,31 @@ let get_current_position symbol =
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 
+let has_price_data symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> Atomic.get store.ready
+  | None -> false
+
+let wait_for_price_data symbols timeout_seconds =
+  let open Lwt.Infix in
+  let deadline = Unix.gettimeofday () +. timeout_seconds in
+  let rec loop () =
+    if List.for_all has_price_data symbols then
+      Lwt.return_true
+    else
+      let remaining = deadline -. Unix.gettimeofday () in
+      if remaining <= 0.0 then
+        Lwt.return_false
+      else
+        Lwt.pick [
+          (Lwt_condition.wait ready_condition >|= fun () -> `Again);
+          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
+        ] >>= function
+        | `Again -> loop ()
+        | `Timeout -> Lwt.return (List.for_all has_price_data symbols)
+  in
+  loop ()
+
 let find_registered_symbol coin =
   let result = ref None in
   Hashtbl.iter (fun registered_symbol _ ->

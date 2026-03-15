@@ -25,6 +25,9 @@ let tpsl_to_string = function
   | Hyperliquid_types.Tp -> "tp"
   | Hyperliquid_types.Sl -> "sl"
 
+
+
+  
 let order_type_wire_to_json = function
   | Hyperliquid_types.Limit l ->
       `Assoc [("limit", `Assoc [("tif", `String (tif_to_string l.tif))])]
@@ -68,6 +71,13 @@ let batch_modify_action_to_json modifies grouping =
     ("grouping", `String grouping)
   ]
 
+let modify_action_to_json oid order =
+  `Assoc [
+    ("type", `String "modify");
+    ("oid", `Intlit oid);
+    ("order", order_wire_to_json order)
+  ]
+
 let parse_order_response _symbol nonce cl_ord_id _rounded_qty _rounded_limit_price response_json =
   let open Yojson.Safe.Util in
   try
@@ -96,6 +106,7 @@ let parse_order_response _symbol nonce cl_ord_id _rounded_qty _rounded_limit_pri
             match response_type with
             | Some "order"
             | Some "modify"
+            | Some "cancel"
             | Some "batchModify" ->
                 begin
                   let raw_data = member "data" __response in
@@ -218,6 +229,14 @@ module Hyperliquid_impl : Exchange.S = struct
     Logging.info_f ~section "Placing %s order on HL: %s %s %f (rounded: %f) @ %f"
       hl_side symbol hl_order_type qty rounded_qty rounded_limit_price;
 
+    let cl_ord_id = match cl_ord_id with
+      | Some id -> Some id
+      | None ->
+          match order_userref with
+          | Some ur -> Some (Printf.sprintf "0x%032x" ur)
+          | None -> None
+    in
+
     let wire_order = 
       let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
         | Some idx -> idx
@@ -241,12 +260,15 @@ module Hyperliquid_impl : Exchange.S = struct
     let action_json = order_action_to_json [wire_order] "na" in
 
     let nonce = get_nonce () in
+    let expires_after = Int64.add nonce (Int64.of_int 300_000) in
     let (r, s, v) = Hyperliquid_signer.sign_l1_action
+      ~expires_after
       ~private_key_hex
       ~action_msgpack
       ~nonce
       ~is_mainnet:(!is_mainnet)
       ~vault_address
+      ()
     in
 
     let req_id = Random.int 1000000 in
@@ -263,7 +285,8 @@ module Hyperliquid_impl : Exchange.S = struct
             ("r", `String r);
             ("s", `String s);
             ("v", `Int v)
-          ])
+          ]);
+          ("expiresAfter", `Intlit (Int64.to_string expires_after))
         ])
       ])
     ] in
@@ -325,94 +348,131 @@ module Hyperliquid_impl : Exchange.S = struct
       }
     | None -> None
 
-  (** Amend an existing order *)
-  let amend_order
-      ~token:_
-      ~order_id
-      ?cl_ord_id
-      ?qty
-      ?limit_price
-      ?post_only:_
-      ?trigger_price:_
-      ?display_qty:_
-      ?symbol
-      ?retry_config:_
-      () =
 
-    if symbol = None then Lwt.return (Error "Symbol required for Hyperliquid amendment") else
+(** Amend an existing order – single "modify" action *)
+let amend_order
+    ~token:_
+    ~order_id
+    ?cl_ord_id
+    ?qty
+    ?limit_price
+    ?post_only:_
+    ?trigger_price:_
+    ?display_qty:_
+    ?symbol
+    ?retry_config:_
+    () =
+
+  if symbol = None then
+    Lwt.return (Error "Symbol required for Hyperliquid amendment")
+  else
     let symbol = Option.get symbol in
     
     match get_open_order ~symbol ~order_id with
     | None -> 
-        Logging.error_f ~section "Order %s not found for amendment on %s" order_id symbol;
+        Logging.error_f ~section "Cannot amend: order %s not found for %s" order_id symbol;
         Lwt.return (Error (Printf.sprintf "Order %s not found" order_id))
-    | Some (current : Types.open_order) ->
-        let rounded_qty = match qty with
+
+    | Some current ->
+
+        let rounded_qty =
+          match qty with
           | Some q -> Hyperliquid_instruments_feed.round_qty_to_lot symbol q
           | None -> current.qty
         in
-        let rounded_limit_price = match limit_price with
+
+        let rounded_limit_price =
+          match limit_price with
           | Some p -> Hyperliquid_instruments_feed.round_price_to_tick p
-          | None -> Option.value current.limit_price ~default:0.0
+          | None -> Option.value ~default:0.0 current.limit_price
+        in
+
+        let private_key_hex =
+          match Sys.getenv_opt "HYPERLIQUID_PRIVATE_KEY" with
+          | Some k -> String.trim k
+          | None -> failwith "HYPERLIQUID_PRIVATE_KEY not set"
         in
 
         let vault_address = None in
-        let private_key_hex = match Sys.getenv_opt "HYPERLIQUID_PRIVATE_KEY" with
-          | Some key -> String.trim key
-          | None -> failwith "HYPERLIQUID_PRIVATE_KEY environment variable not set"
+
+        let asset_index =
+          match Hyperliquid_instruments_feed.get_asset_index symbol with
+          | Some i -> i
+          | None ->
+              Logging.warn_f ~section "No asset index for %s" symbol;
+              0
         in
 
-        let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
-          | Some idx -> idx
-          | None -> 0
+        let wire_order =
+          Hyperliquid_actions.to_hl_order_wire
+            ~qty:rounded_qty
+            ~symbol
+            ~asset_index
+            ~ot:(Hyperliquid_actions.hl_order_type ExTypes.Limit None)
+            ~side:current.side
+            ~limit_price:(Some rounded_limit_price)
+            ~reduce_only:None
+            ~cl_ord_id:(match cl_ord_id with
+              | Some id -> Some id
+              | None -> 
+                  match current.user_ref with
+                  | Some ur -> Some (Printf.sprintf "0x%032x" ur)
+                  | None -> current.cl_ord_id)
         in
 
-        let wire_order = Hyperliquid_actions.to_hl_order_wire
-          ~qty:rounded_qty
-          ~symbol
-          ~asset_index
-          ~ot:(Hyperliquid_actions.hl_order_type ExTypes.Limit None)
-          ~side:current.side
-          ~limit_price:(Some rounded_limit_price)
-          ~reduce_only:None
-          ~cl_ord_id:(match cl_ord_id with Some _ -> cl_ord_id | None -> current.cl_ord_id)
+        let oid_int64 =
+          try Int64.of_string order_id
+          with _ ->
+            failwith (Printf.sprintf "order_id must be numeric string, got: %s" order_id)
         in
 
-        let msgpack_val = Hyperliquid_types.pack_batch_modify_action 
-          ~modifies:[(Int64.of_string order_id, wire_order)]
-          ~grouping:"na"
+        (* Canonical MsgPack action — same as SDK *)
+        let msgpack_val =
+          Hyperliquid_types.pack_modify_action
+            ~oid:oid_int64
+            ~order:wire_order
         in
-        let action_msgpack = Hyperliquid_types.serialize_action msgpack_val in
-        let action_json = batch_modify_action_to_json [(order_id, wire_order)] "na" in
+
+        let action_msgpack = Hyperliquid_types.serialize_action msgpack_val in  
+
+        let action_json = modify_action_to_json (Int64.to_string oid_int64) wire_order in
 
         let nonce = get_nonce () in
-        let (r, s, v) = Hyperliquid_signer.sign_l1_action
-          ~private_key_hex
-          ~action_msgpack
-          ~nonce
-          ~is_mainnet:(!is_mainnet)
-          ~vault_address
+        let expires_after = Int64.add nonce (Int64.of_int 300_000) in
+        let (r, s, v) =
+          Hyperliquid_signer.sign_l1_action
+            ~expires_after
+            ~private_key_hex
+            ~action_msgpack
+            ~nonce
+            ~is_mainnet:(!is_mainnet)
+            ~vault_address
+            ()
         in
 
-        let req_id = Random.int 1000000 in
-        let payload : Yojson.Safe.t = `Assoc [
-          ("method", `String "post");
-          ("id", `Int req_id);
-          ("request", `Assoc [
-            ("type", `String "action");
-            ("payload", `Assoc [
-              ("action", action_json);
-              ("nonce", `Intlit (Int64.to_string nonce));
-              ("signature", `Assoc [
-                ("r", `String r);
-                ("s", `String s);
-                ("v", `Int v)
+        let req_id = Random.int 1_000_000 in
+
+        let payload : Yojson.Safe.t =
+          `Assoc [
+            ("method", `String "post");
+            ("id", `Int req_id);
+            ("request", `Assoc [
+              ("type", `String "action");
+              ("payload", `Assoc [
+                ("action", action_json);
+                ("nonce", `Intlit (Int64.to_string nonce));
+                ("signature", `Assoc [
+                  ("r", `String r);
+                  ("s", `String s);
+                  ("v", `Int v)
+                ]);
+                ("expiresAfter", `Intlit (Int64.to_string expires_after))
               ])
             ])
-          ])
-        ] in
+          ]
+        in
 
-        let payload = match vault_address with
+        let payload : Yojson.Safe.t = match vault_address with
           | Some addr -> 
               let req = Yojson.Safe.Util.member "request" payload in
               let payload_obj = Yojson.Safe.Util.member "payload" req in
@@ -430,17 +490,47 @@ module Hyperliquid_impl : Exchange.S = struct
           | None -> payload
         in
 
-        Logging.info_f ~section "Amending order %s on HL: %s %.4f @ %.4f"
+        Logging.info_f ~section "Amending %s on %s: qty=%.4f @ %.4f"
           order_id symbol rounded_qty rounded_limit_price;
 
-        Hyperliquid_ws.send_request ~json:payload ~req_id ~timeout_ms:10000 >>= fun response ->
-        Logging.debug_f ~section "Hyperliquid amendment raw response: %s" (Yojson.Safe.to_string response);
-        match parse_order_response symbol nonce cl_ord_id rounded_qty (Some rounded_limit_price) response with
+        Logging.debug_f ~section "Signed modify action: %s"
+          (Yojson.Safe.to_string action_json);
+
+        Hyperliquid_ws.send_request
+          ~json:payload
+          ~req_id
+          ~timeout_ms:15000
+        >>= fun response_json ->
+
+        Logging.debug_f ~section "Raw modify response: %s"
+          (Yojson.Safe.to_string response_json);
+
+        match parse_order_response symbol nonce cl_ord_id rounded_qty (Some rounded_limit_price) response_json with
         | Ok (new_oid, new_cl_ord_id) ->
-            Lwt.return (Ok { ExTypes.amend_id = new_oid; order_id = new_oid; cl_ord_id = new_cl_ord_id })
-        | Error e -> 
-            Logging.error_f ~section "HL amendment failed: %s" e;
+            Logging.info_f ~section "Modify OK → new oid %s" new_oid;
+
+            (* Proactively inject the amended order state *)
+            let hl_side = match current.side with Types.Buy -> Hyperliquid_executions_feed.Buy | Types.Sell -> Hyperliquid_executions_feed.Sell in
+            Hyperliquid_executions_feed.inject_order
+              ~symbol
+              ~order_id:new_oid
+              ~side:hl_side
+              ~qty:rounded_qty
+              ~price:rounded_limit_price
+              ?user_ref:current.user_ref
+              ?cl_ord_id:new_cl_ord_id
+              ();
+
+            Lwt.return (Ok {
+              ExTypes.amend_id = new_oid;
+              order_id = new_oid;
+              cl_ord_id = new_cl_ord_id
+            })
+
+        | Error e ->
+            Logging.error_f ~section "Modify failed: %s" e;
             Lwt.return (Error e)
+
 
   (** Cancel orders *)
   let cancel_orders
@@ -508,12 +598,15 @@ module Hyperliquid_impl : Exchange.S = struct
     if action_msgpack = "" then
       Lwt.return (Ok [])
     else begin
+      let expires_after = Int64.add nonce (Int64.of_int 300_000) in
       let (r, s, v) = Hyperliquid_signer.sign_l1_action
+        ~expires_after
         ~private_key_hex
         ~action_msgpack
         ~nonce
         ~is_mainnet:(!is_mainnet)
         ~vault_address
+        ()
       in
 
       let req_id = Random.int 1000000 in
@@ -529,7 +622,8 @@ module Hyperliquid_impl : Exchange.S = struct
               ("r", `String r);
               ("s", `String s);
               ("v", `Int v)
-            ])
+            ]);
+            ("expiresAfter", `Intlit (Int64.to_string expires_after))
           ])
         ])
       ] in
@@ -689,6 +783,9 @@ module Hyperliquid_impl : Exchange.S = struct
 
   let get_qty_min ~symbol =
     Hyperliquid_instruments_feed.get_qty_min symbol
+
+  let round_price_to_tick ~symbol:_ price =
+    Hyperliquid_instruments_feed.round_price_to_tick price
 
   let get_fees ~symbol =
     match Hashtbl.find_opt fee_cache symbol with

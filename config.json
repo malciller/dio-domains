@@ -18,7 +18,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "testnet": false
+      "testnet": true
     }
   ]
 }

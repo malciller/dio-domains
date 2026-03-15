@@ -55,6 +55,7 @@ type strategy_state = {
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
   mutable last_balance_warn_time: float; (* Last time balance/duplicate warning was logged *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
+  
 }
 
 (** Global strategy state store *)
@@ -169,7 +170,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy e
     post_only;
     userref = None;  (* Amends don't set userref *)
     strategy;
-    duplicate_key = ""; (* Not used for amend *)
+    duplicate_key = Printf.sprintf "%s|%s|amend|%s" asset_symbol (string_of_order_side side) order_id;
   }
 
 (** Create a strategy order for cancelling an existing order *)
@@ -426,6 +427,7 @@ let execute_strategy
       (* Filter out recently cancelled orders to avoid race condition *)
       let buy_orders = ref [] in
       let sell_orders = ref [] in
+      let rogue_buy_orders = ref [] in
 
       List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         (* Skip if this order was recently cancelled *)
@@ -433,15 +435,36 @@ let execute_strategy
         if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
-            (* For buy orders, only include those with the grid tag *)
+            (* For buy orders, include those with the grid tag.
+               Others for this symbol are tracked for potential adoption. *)
             (match userref_opt with
              | Some userref when userref = Strategy_common.strategy_userref_grid ->
                  buy_orders := (order_id, order_price) :: !buy_orders
-             | _ -> ())
+             | None ->
+                 (* Loose tracking: keep track of untagged orders for adoption *)
+                 rogue_buy_orders := (order_id, order_price) :: !rogue_buy_orders
+             | Some _ ->
+                 (* Order tagged for another strategy - truly rogue for us *)
+                 ignore ())
           else
             (* For sell orders, include ALL open sell orders regardless of tag *)
             sell_orders := (order_id, order_price) :: !sell_orders
       ) open_orders;
+
+      (* Adoption logic: if we have no tagged buys, adopt the first untagged one *)
+      if !buy_orders = [] && !rogue_buy_orders <> [] then begin
+        let (oid, px) = List.hd !rogue_buy_orders in
+        Logging.debug_f ~section "Adopting untagged buy order %s at %.4f for %s" oid px asset.symbol;
+        buy_orders := [(oid, px)];
+        rogue_buy_orders := List.tl !rogue_buy_orders
+      end;
+
+      (* Cancel any remaining extra buy orders to maintain single buy order policy *)
+      List.iter (fun (order_id, _) ->
+        Logging.warn_f ~section "Cancelling extra/rogue untagged buy order %s for %s" order_id asset.symbol;
+        let cancel_order = create_cancel_order order_id asset.symbol "Grid" asset.exchange in
+        push_order cancel_order
+      ) !rogue_buy_orders;
 
       (* Set the buy order price and ID (take the highest buy order if multiple) *)
       (match !buy_orders with
@@ -806,16 +829,19 @@ let handle_order_acknowledged asset_symbol order_id side price =
     not (matches_side_placement || matches_amend || matches_fallback)
   ) state.pending_orders;
 
-  (* Clean up global placement trackers - DISABLED: we want to keep them until confirmed in feed or timed out *)
-  (* let duplicate_key = generate_side_duplicate_key asset_symbol side in *)
-  (* ignore (InFlightOrders.remove_in_flight_order duplicate_key); *)
+  (* Clean up global placement trackers to allow subsequent placements now that we have the real order *)
+  let duplicate_key = generate_side_duplicate_key asset_symbol side in
+  ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
-  (* Update buy order tracking if this is a buy order acknowledgment *)
-  (match side with
-   | Buy ->
-       state.last_buy_order_id <- Some order_id;
-       Logging.debug_f ~section "Updated buy order ID tracking: %s @ %.2f for %s" order_id price asset_symbol
-   | Sell -> ());
+  (* Update buy order tracking if this is a buy order *)
+  match side with
+  | Buy ->
+      state.last_buy_order_id <- Some order_id;
+      state.last_buy_order_price <- Some price;
+  | Sell ->
+      (* For sell orders, add to open_sell_orders if not already present *)
+      if not (List.exists (fun (oid, _p) -> oid = order_id) state.open_sell_orders) then
+        state.open_sell_orders <- (order_id, price) :: state.open_sell_orders;
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     (string_of_order_side side) order_id price asset_symbol
