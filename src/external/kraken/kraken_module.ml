@@ -4,9 +4,8 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
-module Kraken_impl = struct
+module Kraken_impl : Exchange.S = struct
   let name = "kraken"
-  let section = "kraken_module"
 
   (* Internal cache for fees *)
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16

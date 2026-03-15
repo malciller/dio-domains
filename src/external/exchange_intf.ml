@@ -195,6 +195,9 @@ module type S = sig
 
   (** Get maker/taker fees for a symbol (if cached by exchange) *)
   val get_fees : symbol:string -> (float option * float option)
+
+  (** Initialize fee information for a list of symbols *)
+  val initialize_fees : string list -> unit Lwt.t
 end
 
 (** Registry for managing multiple exchange implementations *)
