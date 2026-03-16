@@ -186,13 +186,26 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (None, None)
       in
       
-      (* Set exec position to current to skip any snapshot events that occurred before this domain started *)
+      (* Set exec position to current to skip any snapshot events that occurred before this domain started.
+         Exception: for Hyperliquid, start from 0 so that webData2-generated NewStatus exec events
+         (inserted into the ring buffer during startup snapshot processing) are seen by the domain
+         loop and trigger handle_order_acknowledged for any pre-existing orders.  Without this,
+         exec_read_pos is captured *after* webData2 fires, the existing buy event is skipped,
+         last_buy_order_id stays None, and the strategy places a duplicate buy on startup. *)
       Logging.info_f ~section "About to get execution feed position for %s" asset_with_fees.symbol;
       begin try
-        exec_read_pos := Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol;
-        Logging.info_f ~section "Got execution feed position %d" !exec_read_pos;
-        Logging.debug_f ~section "Domain for %s/%s starting consumption from exec position %d"
-          asset_with_fees.exchange asset_with_fees.symbol !exec_read_pos
+        if asset_with_fees.exchange = "hyperliquid" then begin
+          (* For Hyperliquid: always start from 0 so webData2 snapshot events (which carry
+             pre-existing open orders as NewStatus exec entries) are processed and
+             handle_order_acknowledged is called — restoring last_buy_order_id on startup. *)
+          exec_read_pos := 0;
+          Logging.info_f ~section "Hyperliquid domain for %s starting from exec position 0 (full replay)" asset_with_fees.symbol
+        end else begin
+          exec_read_pos := Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol;
+          Logging.info_f ~section "Got execution feed position %d" !exec_read_pos;
+          Logging.debug_f ~section "Domain for %s/%s starting consumption from exec position %d"
+            asset_with_fees.exchange asset_with_fees.symbol !exec_read_pos
+        end
       with exn ->
         Logging.info_f ~section "Caught exception in get_execution_feed_position: %s" (Printexc.to_string exn);
         Logging.error_f ~section "Failed to get execution position for %s/%s: %s (starting from 0)"
