@@ -10,6 +10,7 @@ type trading_config = {
   strategy: string;
   maker_fee: float option;
   taker_fee: float option;
+  testnet: bool;
 }
 
 type logging_config = {
@@ -81,6 +82,7 @@ let parse_config json =
   let open Yojson.Basic.Util in
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
+  let testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false in
   {
     exchange;
     symbol;
@@ -92,6 +94,7 @@ let parse_config json =
     strategy = json |> member "strategy" |> to_string;
     maker_fee = json |> member "maker_fee" |> to_option to_float;
     taker_fee = json |> member "taker_fee" |> to_option to_float;
+    testnet;
   }
 
 (** Parse logging configuration *)

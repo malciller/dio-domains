@@ -341,15 +341,25 @@ let amend_order
             Lwt.return (Error e)
         | Ok (module Ex) ->
             (* Check if new price is the same as current price to avoid unnecessary amendments *)
+            (* Diagnostic: log the full-precision requested price *)
+            (match request.new_limit_price with
+             | Some p -> Logging.info_f ~section "Amendment price check for order %s: requested=%.10f" request.order_id p
+             | None -> ());
             let should_skip_amendment = match request.symbol, request.new_limit_price with
               | Some symbol, Some new_price ->
                   (match Ex.get_open_order ~symbol ~order_id:request.order_id with
                    | Some current_order ->
                        (match current_order.limit_price with
                         | Some current_price ->
-                            (* Use small epsilon for floating point comparison *)
-                            abs_float (new_price -. current_price) < 0.000001
-                        | None -> false)
+                            (* Use price tick as epsilon: if difference < 1 tick, prices are effectively
+                               identical after exchange rounding and we should not re-amend *)
+                            let tick = Option.value (Ex.get_price_increment ~symbol) ~default:0.01 in
+                            let diff = abs_float (new_price -. current_price) in
+                            Logging.info_f ~section "Amendment skip check %s: stored=%.10f requested=%.10f diff=%.10f tick=%.10f" request.order_id current_price new_price diff tick;
+                            diff < tick
+                        | None ->
+                            Logging.info_f ~section "Amendment skip check %s: stored order has no limit_price, proceeding" request.order_id;
+                            false)
                    | None ->
                        Logging.warn_f ~section "Order %s not found in open orders cache, proceeding with amendment" request.order_id;
                        false)
@@ -357,19 +367,22 @@ let amend_order
             in
 
             if should_skip_amendment then begin
-              Logging.debug_f ~section "Skipping amendment for order %s: new price equals current price" request.order_id;
+              Logging.info_f ~section "Skipping amendment for order %s: price unchanged at %.10f" request.order_id (Option.value request.new_limit_price ~default:0.0);
               (* Remove from in-flight cache since amendment was skipped *)
               let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
-              (* Return a fake successful result to avoid disrupting the flow *)
+              
+              (* Return sentinel value so supervisor calls handle_order_amendment_skipped,
+                 not handle_order_amended — the latter would clear tracking state incorrectly *)
               Lwt.return (Ok {
                  Types.
-                 amend_id = "skipped_no_change";
-                 order_id = request.order_id;
+                 original_order_id = request.order_id;
+                 new_order_id = request.order_id;
+                 amend_id = Some "skipped_no_change";
                  cl_ord_id = request.cl_ord_id;
               })
             end else begin
                 Logging.info_f ~section "Amending order %s on %s: %s" request.order_id request.exchange
-                  (match request.new_limit_price with Some p -> Printf.sprintf "price=%.2f" p | None -> "");
+                  (match request.new_limit_price with Some p -> Printf.sprintf "price=%.10f" p | None -> "");
                 
                 let ex_retry_config = retry_config in
 

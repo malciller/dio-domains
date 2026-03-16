@@ -17,7 +17,8 @@ let test_spawn_domains_basic () =
       max_exposure = None;
       strategy = "suicide_grid";
       maker_fee = None;
-      taker_fee = None };
+      taker_fee = None;
+      testnet = false };
     { Dio_engine.Config.exchange = "kraken";
       symbol = "ETH/USD";
       qty = "0.01";
@@ -27,7 +28,8 @@ let test_spawn_domains_basic () =
       max_exposure = Some "500.0";
       strategy = "MM";
       maker_fee = None;
-      taker_fee = None }
+      taker_fee = None;
+      testnet = false }
   ] in
 
   (* Spawn domains for the assets *)
@@ -67,7 +69,8 @@ let test_fee_fetcher_integration () =
     max_exposure = None;
     strategy = "suicide_grid";
     maker_fee = None;
-    taker_fee = None
+    taker_fee = None;
+    testnet = false
   } in
 
   (* Verify fee fetcher adds fees correctly *)
@@ -96,7 +99,8 @@ let test_domain_error_handling () =
     max_exposure = None;
     strategy = "invalid_strategy";
     maker_fee = None;
-    taker_fee = None
+    taker_fee = None;
+    testnet = false
   } in
 
   (* This should not crash the test runner, domains should handle errors internally *)

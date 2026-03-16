@@ -2,6 +2,6 @@
  (name supervisor)
  (public_name dio.supervisor)
  (modules supervisor supervisor_cache supervisor_types)
- (libraries logging threads lwt.unix dio.engine dio.kraken dio.concurrency)
+ (libraries logging threads lwt.unix dio.engine dio.kraken dio.hyperliquid dio.concurrency)
  (preprocess
   (pps lwt_ppx)))

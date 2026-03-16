@@ -1,0 +1,39 @@
+(test
+ (name test_hyperliquid_actions)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_types)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_signer)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_ws)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_balances)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_executions_feed)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_instruments_feed)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_orderbook_feed)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_ticker_feed)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_module)
+ (libraries dio.hyperliquid alcotest))

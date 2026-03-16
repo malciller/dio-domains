@@ -134,9 +134,10 @@ module Kraken_impl = struct
     >|= function
     | Ok (res : Kraken_common_types.amend_order_result) ->
         Ok {
-          Types.amend_id = res.amend_id;
-          order_id = res.order_id;
-          cl_ord_id = res.cl_ord_id;
+          Types.original_order_id = res.order_id;
+          Types.new_order_id = res.order_id;
+          Types.amend_id = Some res.amend_id;
+          Types.cl_ord_id = res.cl_ord_id;
         }
     | Error e -> Error e
 
@@ -288,6 +289,11 @@ module Kraken_impl = struct
 
   let get_qty_min ~symbol =
     Kraken_instruments_feed.get_qty_min symbol
+
+  let round_price ~symbol ~price =
+    match Kraken_instruments_feed.get_price_increment symbol with
+    | Some inc -> Float.round (price /. inc) *. inc
+    | None -> price
 
   let get_fees ~symbol =
     match Hashtbl.find_opt fee_cache symbol with

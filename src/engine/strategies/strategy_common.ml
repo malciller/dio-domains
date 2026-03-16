@@ -256,3 +256,23 @@ module OrderSignal = struct
   let wait () = Lwt_condition.wait condition
 end
 
+(** Strategy Implementation Interface *)
+module type S = sig
+  type config
+  val execute : 
+    config -> float option -> (float * float * float * float) option -> 
+    float option -> float option -> int -> int -> 
+    (string * float * float * string * int option) list -> int -> unit
+    
+  val get_pending_orders : int -> strategy_order list
+  val handle_order_acknowledged : string -> string -> order_side -> float -> unit
+  val handle_order_rejected : string -> order_side -> float -> unit
+  val handle_order_cancelled : string -> string -> unit
+  val handle_order_amended : string -> string -> string -> order_side -> float -> unit
+  val handle_order_amendment_skipped : string -> string -> order_side -> float -> unit
+  val handle_order_amendment_failed : string -> string -> order_side -> string -> unit
+  val cleanup_pending_cancellation : string -> string -> unit
+  val cleanup_strategy_state : string -> unit
+  val init : unit -> unit
+end
+

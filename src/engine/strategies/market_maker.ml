@@ -54,6 +54,7 @@ type strategy_state = {
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
+  mutex: Mutex.t;  (* Thread safety for modifying strategy state *)
 }
 
 (** Global strategy state store *)
@@ -77,6 +78,7 @@ let get_strategy_state asset_symbol =
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
           last_cleanup_time = 0.0;
+          mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
         new_state
@@ -104,17 +106,12 @@ let parse_config_float_opt config value_name exchange symbol =
 
 (** Round price to appropriate precision for the symbol *)
 let round_price price symbol exchange =
-  (* Use float-based rounding to avoid string allocation overhead *)
-  let increment = match Exchange.Registry.get exchange with
-  | Some (module Ex : Exchange.S) -> Ex.get_price_increment ~symbol
-  | None -> None
-  in
-  match increment with
-  | Some inc ->
-      Float.round (price /. inc) *. inc
+  match Exchange.Registry.get exchange with
+  | Some (module Ex : Exchange.S) -> Ex.round_price ~symbol ~price
   | None ->
-      Logging.warn_f ~section "No price increment info for %s/%s, using default rounding" exchange symbol;
+      Logging.warn_f ~section "No exchange found for %s/%s, using default rounding" exchange symbol;
       Float.round price  (* Default: 0 decimal places *)
+
 
 (** Round quantity to appropriate precision for the symbol, ensuring we don't exceed max_qty *)
 let round_qty qty symbol exchange ~max_qty =
@@ -818,8 +815,9 @@ let handle_order_acknowledged asset_symbol order_id side price =
   (* Update buy/sell order tracking if this is a buy/sell order acknowledgment *)
   (match side with
    | Buy ->
-       state.last_buy_order_id <- Some order_id;
-       Logging.debug_f ~section "Updated buy order ID tracking: %s @ %.2f for %s" order_id price asset_symbol
+    state.last_buy_order_id <- Some order_id;
+    state.last_buy_order_price <- Some price;
+    Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
    | Sell ->
        (* Don't update tracking here - rely on sync loop *)
        Logging.debug_f ~section "Acknowledged sell order: %s @ %.2f for %s" order_id price asset_symbol);
@@ -869,6 +867,95 @@ let handle_order_cancelled asset_symbol order_id =
   Logging.info_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, added to blacklist)"
     order_id asset_symbol removed_pending
 
+(** Handle Cancel-Replace Order Amendment - swap old ID for new ID *)
+let handle_order_amended asset_symbol old_order_id new_order_id side price =
+  let state = get_strategy_state asset_symbol in
+  
+  (* 1. Remove the pending amend entry using old_order_id or new_order_id *)
+  state.pending_orders <- List.filter (fun (pending_id, _s, _p, _) ->
+    let matches_amend = String.starts_with ~prefix:"pending_amend_" pending_id &&
+                       (String.sub pending_id 14 (String.length pending_id - 14) = old_order_id ||
+                        String.sub pending_id 14 (String.length pending_id - 14) = new_order_id) in
+    not matches_amend
+  ) state.pending_orders;
+
+  (* 2. Update the active order tracking - swap old ID to new ID *)
+  (match side with
+   | Buy ->
+       (match state.last_buy_order_id with
+        | Some target_id when target_id = old_order_id ->
+            state.last_buy_order_id <- Some new_order_id;
+            state.last_buy_order_price <- Some price;
+            Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s" 
+              old_order_id new_order_id price asset_symbol
+        | _ -> 
+            state.last_buy_order_id <- Some new_order_id;
+            state.last_buy_order_price <- Some price;
+            Logging.debug_f ~section "Set buy order ID via amend: %s @ %.2f for %s" 
+              new_order_id price asset_symbol)
+   | Sell ->
+       let original_sell_count = List.length state.open_sell_orders in
+       state.open_sell_orders <- (new_order_id, price) :: 
+          List.filter (fun (id, _) -> id <> old_order_id) state.open_sell_orders;
+       if List.length state.open_sell_orders = original_sell_count then
+         Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
+           old_order_id new_order_id price asset_symbol
+       else
+         Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
+           new_order_id price asset_symbol);
+           
+  Logging.debug_f ~section "Order amended and tracking updated: %s %s -> %s @ %.2f for %s"
+    (string_of_order_side side) old_order_id new_order_id price asset_symbol
+
+(** Handle Skipped Order Amendment - clear pending lock but don't swap IDs *)
+let handle_order_amendment_skipped asset_symbol order_id side price =
+  let state = get_strategy_state asset_symbol in
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+    (* 1. Remove the pending amend entry using order_id *)
+    state.pending_orders <- List.filter (fun (pending_id, _s, _p, _) ->
+      let matches_amend = String.starts_with ~prefix:"pending_amend_" pending_id &&
+                         String.length pending_id > 14 &&
+                         String.sub pending_id 14 (String.length pending_id - 14) = order_id in
+      not matches_amend
+    ) state.pending_orders;
+    
+    Logging.debug_f ~section "Order amendment skipped for identical price, removed tracking guard: %s %s @ %.2f for %s"
+      (string_of_order_side side) order_id price asset_symbol
+  )
+
+(** Handle order amendment failure - clear tracking so we can try to place a replacement *)
+let handle_order_amendment_failed asset_symbol order_id side reason =
+  let state = get_strategy_state asset_symbol in
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+    (* 1. Remove the pending amend entry *)
+    state.pending_orders <- List.filter (fun (pending_id, _s, _p, _) ->
+      let matches_amend = String.starts_with ~prefix:"pending_amend_" pending_id &&
+                         String.length pending_id > 14 &&
+                         String.sub pending_id 14 (String.length pending_id - 14) = order_id in
+      not matches_amend
+    ) state.pending_orders;
+
+    (* 2. If this was the main tracked order, step down tracking *)
+    (match side with
+     | Buy ->
+         (match state.last_buy_order_id with
+          | Some target_id when target_id = order_id ->
+              state.last_buy_order_id <- None;
+              state.last_buy_order_price <- None;
+              Logging.info_f ~section "Amendment failed for buy order %s: cleared tracking (%s)" order_id reason
+          | _ -> ())
+     | Sell ->
+         let original = List.length state.open_sell_orders in
+         state.open_sell_orders <- List.filter (fun (sell_id, _) -> sell_id <> order_id) state.open_sell_orders;
+         if List.length state.open_sell_orders < original then
+           Logging.info_f ~section "Amendment failed for sell order %s: cleared tracking (%s)" order_id reason);
+           
+    (* Clear global in-flight trackers so we don't get stuck *)
+    ignore (InFlightOrders.remove_in_flight_order (Strategy_common.generate_duplicate_key asset_symbol (match side with Buy -> "buy" | Sell -> "sell") 0.0 (Some 0.0)));
+  )
+
 (** Clean up pending cancellation tracking for a completed order *)
 let cleanup_pending_cancellation asset_symbol order_id =
   let state = get_strategy_state asset_symbol in
@@ -902,6 +989,8 @@ let init () =
 
 (** Strategy module interface *)
 module Strategy = struct
+  type config = trading_config
+  
   (** Clean up strategy state for a symbol when domain stops *)
   let cleanup_strategy_state symbol =
     Mutex.lock strategy_states_mutex;
@@ -917,6 +1006,9 @@ module Strategy = struct
   let handle_order_acknowledged = handle_order_acknowledged
   let handle_order_rejected = handle_order_rejected
   let handle_order_cancelled = handle_order_cancelled
+  let handle_order_amended = handle_order_amended
+  let handle_order_amendment_skipped = handle_order_amendment_skipped
+  let handle_order_amendment_failed = handle_order_amendment_failed
   let cleanup_pending_cancellation = cleanup_pending_cancellation
   let cleanup_strategy_state = cleanup_strategy_state
   let init = init

@@ -5,6 +5,10 @@
 
 High-performance OCaml 5.2 trading engine for Kraken featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, tick-driven event architecture, and real-time latency profiling. Built for high-frequency trading with WebSocket data feeds and asynchronous order execution.
 
+> [!WARNING]
+> **Hyperliquid integration is EXPERIMENTAL.** Testing is ongoing; features may be incomplete or unstable. **Grid strategy Integrated, MM strategy not yet supported.**
+
+
 ## Requirements
 
 - OCaml 5.2.0 (opam)
@@ -26,7 +30,9 @@ Create `.env`:
 ```bash
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_API_SECRET=your_kraken_api_secret
-CMC_API_KEY=your_cmc_api_key              # Fear & Greed index (optional fallback to default)
+HYPERLIQUID_WALLET_ADDRESS=your_hyperliquid_wallet_address # For L1 auth
+HYPERLIQUID_PRIVATE_KEY=your_hyperliquid_private_key       # For L1 signature generation
+CMC_API_KEY=your_cmc_api_key                               # Fear & Greed index (optional fallback to default)
 ```
 
 Edit `config.json` (example):
@@ -56,6 +62,15 @@ Edit `config.json` (example):
       "min_usd_balance": "500.0",     // Minimum USD balance required to run this strategy
       "max_exposure": "500.0",        // Maximum asset balance allowed before pausing strategy
       "strategy": "MM"                // Strategy name: "MM"
+    },
+    {
+      "symbol": "BTC/USD",            // Pair to trade
+      "exchange": "hyperliquid",      // Exchange name: "kraken", "hyperliquid"
+      "qty": "0.001",                 // Base asset quantity per order
+      "grid_interval": [0.1, 0.5],    // Min/Max grid spacing (%)
+      "sell_mult": "1.0",             // Sell amount multiplier
+      "strategy": "Grid",             // Strategy name: "Grid"
+      "testnet": true                 // Use testnet
     }
   ]
 }
@@ -97,7 +112,7 @@ Edit `config.json` (example):
   - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
   - **Authentication**: Secure token generation and management.
 - **External Integration - Hyperliquid**:
-  - **In Progress**
+  - **Experimental**: Integration is currently under active development and testing. **Use at your own peril.**
 
 ## Development
 
