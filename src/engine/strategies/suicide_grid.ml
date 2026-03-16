@@ -908,8 +908,7 @@ let handle_order_cancelled asset_symbol order_id side =
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
 
     (* Clean up global placement trackers to allow immediate re-placement *)
-    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Buy));
-    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Sell));
+    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol cancelled_side));
     
     Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
       order_id asset_symbol removed_pending removed_sell
@@ -996,14 +995,34 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
       not matches_amend
     ) state.pending_orders;
 
-    (* 2. If this was the main tracked order, step down tracking *)
+    (* 2. Determine whether to clear buy tracking.
+       "Order not found" on Hyperliquid is a cancel-replace race: the strategy tried to
+       amend an order whose cancel-replace hasn't landed in the open-orders cache yet.
+       The order DOES exist (already acknowledged via handle_order_acknowledged with the
+       new ID). Clearing last_buy_order_id here would make effective_buy_count=0 and
+       trigger a fresh buy placement — exactly the observed spam loop.
+       For genuine errors (e.g. rejected, invalid qty) the order is truly gone, so we
+       must clear tracking so the strategy can replace it next cycle. *)
+    let is_cache_miss =
+      let lower = String.lowercase_ascii reason in
+      let contains s fragment =
+        let sl = String.length s and fl = String.length fragment in
+        let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
+        loop 0
+      in
+      contains lower "order not found" || contains lower "not found for amendment"
+    in
     (match side with
      | Buy ->
          (match state.last_buy_order_id with
           | Some target_id when target_id = order_id ->
-              state.last_buy_order_id <- None;
-              state.last_buy_order_price <- None;
-              Logging.info_f ~section "Amendment failed for buy order %s: cleared tracking (%s)" order_id reason
+              if is_cache_miss then
+                Logging.info_f ~section "Amendment failed for buy order %s (cache miss, keeping tracking): %s" order_id reason
+              else begin
+                state.last_buy_order_id <- None;
+                state.last_buy_order_price <- None;
+                Logging.info_f ~section "Amendment failed for buy order %s: cleared tracking (%s)" order_id reason
+              end
           | _ -> ())
      | Sell ->
          let original = List.length state.open_sell_orders in

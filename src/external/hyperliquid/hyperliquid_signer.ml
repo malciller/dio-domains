@@ -172,7 +172,7 @@ let sign_l1_action ?expires_after ~private_key_hex ~action_msgpack ~nonce ~is_ma
   let action_hash_raw = action_hash ~action_msgpack ~nonce ~vault_address ~expires_after in
   
   let source_str = if is_mainnet then "a" else "b" in
-  let chain_id = if is_mainnet then 98019 else 1337 in
+  let chain_id = 1337 in
   let agent_hash = hash_agent ~source_str ~connection_id_raw:action_hash_raw in
   
   let msg_hash = eip712_digest ~chain_id ~hash_struct:agent_hash in

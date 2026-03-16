@@ -133,7 +133,22 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let top_of_book = ref None in
 
       (* Track when to execute strategies (event-driven) *)
-      let should_execute_strategy = ref true in  (* Start with true to execute on first cycle *)
+      let should_execute_strategy = ref true in
+      (* Hard gate for Hyperliquid: block ALL strategy execution (including strategy_fallback_mod
+         cycles) until we've had at least one opportunity to process any existing exec events.
+         webData2 arrives ~1-2s after connection; if there are live orders, their exec events
+         call handle_order_acknowledged so the strategy has correct state before placing anything.
+         If there are NO live orders (no exec events ever), hl_exec_checked ensures the gate
+         opens after the first cycle, allowing the strategy to place its initial buy order. *)
+      let hl_exec_ready = ref (asset_with_fees.exchange <> "hyperliquid") in
+      (* Tracks whether we've done at least one exec position check - used as fallback for
+         Hyperliquid assets with no open orders that generate no exec events. *)
+      let hl_exec_checked = ref false in
+      (* Record when this domain started - used to delay the no-open-orders fallback
+         until webData2 has had time to arrive (~200-500ms) and populate exec events
+         for any live orders. Without this, the fallback fired on cycle 1 before
+         webData2 arrived, causing the strategy to place duplicate orders. *)
+      let domain_start_time = Unix.time () in
       let last_balance_check = ref 0.0 in
 
       (* Initialize strategy for this asset based on strategy type *)
@@ -338,9 +353,34 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               | _ -> ()
             ) new_events
           end;
+          (* First exec event batch received - allow strategy to run now *)
+          if not !hl_exec_ready then begin
+            hl_exec_ready := true;
+            Logging.info_f ~section "[%s/%s] First exec event batch received, strategy now active"
+              asset_with_fees.exchange asset_with_fees.symbol
+          end;
           exec_read_pos := current_pos;
+          hl_exec_checked := true;
           let stop_exec = Mtime_clock.now_ns () in
           Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub stop_exec start_exec))
+        end;
+        (* Fallback: if exec position hasn't changed since startup (no new events),
+           we still need to unblock the strategy after confirming the current position.
+           This covers Hyperliquid assets with no open orders - the absence of exec
+           events is valid data meaning there's nothing to reconcile.
+           Guard: wait 2s after domain start so webData2 (~200-500ms latency) has time
+           to arrive and trigger handle_order_acknowledged for any live orders first.
+           If live orders exist they generate exec events within that window and
+           hl_exec_ready is set by the normal path above. *)
+        if not !hl_exec_ready && not !hl_exec_checked && asset_with_fees.exchange = "hyperliquid"
+           && (Unix.time () -. domain_start_time) >= 2.0 then begin
+          let current_pos_now = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
+          if current_pos_now = !exec_read_pos then begin
+            hl_exec_checked := true;
+            hl_exec_ready := true;
+            Logging.info_f ~section "[%s/%s] No exec events after 2s - strategy now active (no open orders)"
+              asset_with_fees.exchange asset_with_fees.symbol
+          end
         end;
 
         (* Mock balance check throttling *)
@@ -353,7 +393,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
         (* Execute strategy based on type - only when triggered by events (event-driven) *)
         (* Add fallback: execute every X cycles to prevent getting stuck *)
-        let should_execute = !should_execute_strategy || (!cycle_count mod config.engine.strategy_fallback_mod = 0) in
+        let should_execute = !hl_exec_ready && (!should_execute_strategy || (!cycle_count mod config.engine.strategy_fallback_mod = 0)) in
         if should_execute then begin
           let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Reset flag *)
@@ -390,11 +430,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let (grid_open_buy_count, grid_open_sell_count) =
             List.fold_left (fun (buys, sells) (_, _, _, side_str, userref_opt) ->
               (* Only count orders that match the grid strategy userref.
-                 The old fallback '| _ -> (buys + 1, sells)' counted ALL buys as grid,
-                 causing double-counting when last_buy_count = grid + mm. *)
+                 Hyperliquid orders have no userref, so fall back to exchange-based
+                 detection (same logic as filter_orders_by_strategy).
+                 Previously `None -> false` caused grid_open_buy_count=0 for all
+                 Hyperliquid orders, making effective_buy_count rely solely on
+                 the fragile has_tracked_buy flag and triggering buy order spam. *)
               let is_grid_order = match userref_opt with
                 | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref
-                | None -> false
+                | None -> asset_with_fees.exchange = "hyperliquid"
               in
               if is_grid_order then
                 (if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1))
