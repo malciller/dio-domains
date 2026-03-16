@@ -542,11 +542,17 @@ let execute_strategy
         (* Update cycle counter *)
         state.last_cycle <- cycle
       end else if effective_buy_count = 0 && not buy_order_pending then begin
-        (* NO OPEN BUY: Place sell + buy, then enforce 2x grid spacing *)
+        (* NO OPEN BUY: Place sell + buy.
+           When a buy fills, any existing sell's InFlightOrders key is still live,
+           which would block the new sell via duplicate detection.
+           Force-clear the sell key so a fresh sell is always placed alongside the new buy. *)
         let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
         let buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
-        
-        (* Place sell order - attempt regardless of balance *)
+
+        (* Force-clear any stale sell InFlight guard so the new sell always goes through *)
+        ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
+
+        (* Place sell order - always, regardless of existing sells *)
         let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
         if push_order sell_order then
           Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
@@ -704,7 +710,15 @@ let execute_strategy
           | _ ->
               Logging.debug_f ~section "Buy order tracking lost for %s, will re-place on next cycle" asset.symbol
         end else begin
-          (* No sell orders: trail current price by grid_interval (upward only) *)
+          (* No sell orders: place a sell immediately, then trail the buy *)
+          (* This handles the case where a sell fills and the buy is still open -
+             the buy must always have a paired sell. *)
+          let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
+          let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
+          if push_order sell_order then
+            Logging.info_f ~section "Placed sell order for %s (no sell anchor): %.8f @ %.4f"
+              asset.symbol (qty *. sell_mult) sell_price;
+
            match state.last_buy_order_price, state.last_buy_order_id with
            | Some current_buy_price, Some buy_order_id ->
                let target_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
