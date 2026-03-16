@@ -76,7 +76,14 @@ let initialize_symbols ~testnet _symbols =
         in
         let base_name, sz_decimals = Hashtbl.find spot_info_by_token_idx base_idx in
         let quote_name, _ = Hashtbl.find spot_info_by_token_idx quote_idx in
-        let symbol = base_name ^ "/" ^ quote_name in
+        (* Map wrapper spot tokens to normal names (e.g. UBTC -> BTC) *)
+        let canon_base = match base_name with
+          | "UBTC" -> "BTC"
+          | "UETH" -> "ETH"
+          | "USOL" -> "SOL"
+          | _ -> base_name
+        in
+        let symbol = canon_base ^ "/" ^ quote_name in
         let info = { symbol; sz_decimals; max_leverage = None; asset_index = 10000 + index } in
         Hashtbl.replace pair_cache symbol info;
         let alias = Printf.sprintf "@%d" index in
@@ -107,6 +114,23 @@ let initialize symbols =
   Mutex.unlock cache_mutex;
   Logging.info_f ~section "Initialized Hyperliquid instruments feed with %d mock symbols" (List.length symbols)
 
+(** Look up a symbol in the cache, with a fallback for perp pairs expressed as BASE/USDC.
+    Config uses "BTC/USDC" but perps are cached as just "BTC" (index 0..N-1).
+    Spot pairs are stored as "BASE/QUOTE" directly (index 10000+). *)
+let lookup_info symbol =
+  Mutex.lock cache_mutex;
+  let direct = Hashtbl.find_opt pair_cache symbol in
+  let result = match direct with
+    | Some _ as r -> r
+    | None ->
+        (* Try stripping the quote suffix to find a perp: "BTC/USDC" -> "BTC" *)
+        (match String.split_on_char '/' symbol with
+         | base :: _ -> Hashtbl.find_opt pair_cache base
+         | [] -> None)
+  in
+  Mutex.unlock cache_mutex;
+  result
+
 (** Get the tick size / price increment for a symbol *)
 let get_price_increment _symbol =
   (* Hyperliquid uses 5 significant figures for price, up to 6 decimals.
@@ -114,10 +138,7 @@ let get_price_increment _symbol =
   Some 0.00001
 
 let get_qty_increment symbol =
-  Mutex.lock cache_mutex;
-  let info_opt = Hashtbl.find_opt pair_cache symbol in
-  Mutex.unlock cache_mutex;
-  match info_opt with
+  match lookup_info symbol with
   | Some info -> Some (10.0 ** (-. float_of_int info.sz_decimals))
   | None -> None
 
@@ -125,10 +146,7 @@ let get_qty_min symbol =
   get_qty_increment symbol
 
 let get_asset_index symbol =
-  Mutex.lock cache_mutex;
-  let info_opt = Hashtbl.find_opt pair_cache symbol in
-  Mutex.unlock cache_mutex;
-  match info_opt with
+  match lookup_info symbol with
   | Some info -> Some info.asset_index
   | None -> None
 
@@ -164,10 +182,7 @@ let get_subscription_coin symbol =
 let round_price_to_tick_for_symbol symbol price =
   if price <= 0.0 then price
   else begin
-    Mutex.lock cache_mutex;
-    let info_opt = Hashtbl.find_opt pair_cache symbol in
-    Mutex.unlock cache_mutex;
-    let sz_decimals, is_spot = match info_opt with
+    let sz_decimals, is_spot = match lookup_info symbol with
       | Some info -> info.sz_decimals, (info.max_leverage = None)
       | None -> 0, false
     in
@@ -199,10 +214,7 @@ let round_price_to_tick price =
 
 (** Round quantity to the instrument's szDecimals (lot size) *)
 let round_qty_to_lot symbol qty =
-  Mutex.lock cache_mutex;
-  let info_opt = Hashtbl.find_opt pair_cache symbol in
-  Mutex.unlock cache_mutex;
-  match info_opt with
+  match lookup_info symbol with
   | Some info ->
       let multiplier = 10. ** (float_of_int info.sz_decimals) in
       (* Use floor down to ensure we never over-allocate qty, which is typical for trading *)

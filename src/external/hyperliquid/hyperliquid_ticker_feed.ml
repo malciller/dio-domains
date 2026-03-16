@@ -94,11 +94,16 @@ let wait_for_price_data symbols timeout_seconds =
 
 let find_registered_symbol coin =
   (* Use instruments feed to resolve coin to canonical symbol.
-     This correctly maps @N (spot) -> HYPE/USDC and HYPE (perp) -> HYPE,
-     preventing the perp mid from being used as the spot price. *)
+     - Spot pairs: coin="@107" -> resolve -> "HYPE/USDC" -> found in stores ✓
+     - Perps:      coin="BTC"  -> resolve -> "BTC"        -> NOT in stores (keyed "BTC/USDC")
+                   so fall back to trying "BTC/USDC" to match config-style symbol. *)
   match Hyperliquid_instruments_feed.resolve_symbol coin with
   | Some symbol ->
-      if Hashtbl.mem stores symbol then Some symbol else None
+      if Hashtbl.mem stores symbol then Some symbol
+      else
+        let usdc_symbol = symbol ^ "/USDC" in
+        if Hashtbl.mem stores usdc_symbol then Some usdc_symbol
+        else None
   | None -> None
 
 let process_market_data json =
