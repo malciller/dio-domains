@@ -513,21 +513,16 @@ let execute_strategy
     end;
 
     let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
-    (* For Hyperliquid: sell orders are not tracked as pending, so always false.
-       Kraken retains existing sell_order_pending behavior. *)
-    let sell_order_pending = asset.exchange <> "hyperliquid" &&
-      List.exists (fun (_, side, _, _) -> side = Sell) state.pending_orders in
-
     (* Effective buy count: use max of webData2 count and our own tracking.
        webData2 snapshots can be stale during cancel-replace amendments.
        last_buy_order_id is set immediately by orderUpdates events. *)
     let has_tracked_buy = state.last_buy_order_id <> None in
     let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
 
-    if buy_order_pending && sell_order_pending then begin
+    if buy_order_pending then begin
         (* Only log every 100,000 iterations to avoid spam *)
         if cycle mod 100000 = 0 then
-            Logging.debug_f ~section "Waiting for pending orders (both sides) to complete for %s" asset.symbol;
+            Logging.debug_f ~section "Waiting for pending buy order to complete for %s" asset.symbol;
     end else if effective_buy_count > 1 then begin
         (* Case 0: Multiple buy orders exist - cancel all buy orders to maintain single buy order policy *)
         Logging.info_f ~section "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order policy"
@@ -603,11 +598,7 @@ let execute_strategy
           ) state.pending_orders
         ) in
         
-        (* Skip Sell placement/amendment if a Sell is already pending *)
-        if sell_order_pending then begin
-            if cycle mod 100000 = 0 then
-                Logging.debug_f ~section "Waiting for pending sell order to complete for %s" asset.symbol;
-        end else if all_sell_orders <> [] then begin
+        if all_sell_orders <> [] then begin
           (* Find the closest sell order *)
           let closest_sell_order = List.fold_left (fun acc (order_id, sell_price) ->
             match acc with
@@ -711,28 +702,7 @@ let execute_strategy
                 end
               end
           | _ ->
-              (* No buy order tracked, place sell and buy orders *)
-              (* Place sell order grid_interval above current price - attempt regardless of balance *)
-              let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
-              let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
-              if push_order sell_order then
-                Logging.debug_f ~section "Placed sell order for %s: %.8f @ %.2f (attempt regardless of balance)"
-                    asset.symbol (qty *. sell_mult) sell_price;
-
-              (* Place buy order grid_interval below current price *)
-              let target_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
-              (match quote_balance with
-               | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                   let order = create_place_order asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
-                   ignore (push_order order);
-                   state.last_buy_order_price <- Some target_buy_price;
-                   Logging.debug_f ~section "Placed buy order at grid_interval below current price: buy@%.2f"
-                     target_buy_price
-               | Some _ ->
-                   Logging.debug_f ~section "Insufficient quote balance for buy order: need %.2f, have %.2f"
-                     quote_needed (Option.value quote_balance ~default:0.0)
-               | None ->
-                   Logging.debug_f ~section "No quote balance data available for buy order decision")
+              Logging.debug_f ~section "Buy order tracking lost for %s, will re-place on next cycle" asset.symbol
         end else begin
           (* No sell orders: trail current price by grid_interval (upward only) *)
            match state.last_buy_order_price, state.last_buy_order_id with
@@ -872,7 +842,7 @@ let handle_order_rejected asset_symbol side price =
   (* We don't need to do anything special here - the strategy will re-evaluate on next cycle *)
 
 (** Handle order cancellation - remove from pending and tracked orders *)
-let handle_order_cancelled asset_symbol order_id =
+let handle_order_cancelled asset_symbol order_id side =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -905,12 +875,7 @@ let handle_order_cancelled asset_symbol order_id =
     let now = Unix.time () in
     state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
     
-    (* Determine if this was the tracked buy order to know which side to clear trackers for *)
-    let is_buy = match state.last_buy_order_id with
-      | Some id when id = order_id -> true
-      | _ -> false
-    in
-    let cancelled_side = if is_buy then Buy else Sell in
+    let cancelled_side = side in
 
     (* Remove from pending orders if it's there (matches by order_id OR side for ghost placements) *)
     let original_pending_count = List.length state.pending_orders in
@@ -924,7 +889,12 @@ let handle_order_cancelled asset_symbol order_id =
     let removed_pending = original_pending_count - List.length state.pending_orders in
     
     (* If this was a tracked buy order, clear it *)
-    if is_buy then begin
+    let was_tracked_buy = match state.last_buy_order_id with
+      | Some id when id = order_id -> true
+      | _ -> false
+    in
+    
+    if was_tracked_buy then begin
          state.last_buy_order_id <- None;
          state.last_buy_order_price <- None;
          Logging.debug_f ~section "Cancelled buy order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
@@ -958,6 +928,14 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                           String.sub pending_id 14 (String.length pending_id - 14) = new_order_id) in
       not matches_amend
     ) state.pending_orders;
+
+    (* 1.5 Add old order ID to cancelled orders blacklist to prevent it from acting as a ghost order
+       if the exchange's data feed (e.g. Hyperliquid webData2) takes a few seconds to drop the old order.
+       CRITICAL: Only blacklist if IDs differ, as Kraken amendments often preserve the original order ID! *)
+    if old_order_id <> new_order_id then begin
+      let now = Unix.time () in
+      state.cancelled_orders <- (old_order_id, now) :: state.cancelled_orders;
+    end;
 
     (* 2. Update the active order tracking - swap old ID to new ID *)
     (match side with

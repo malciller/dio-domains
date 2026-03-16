@@ -87,9 +87,24 @@ let get_credentials () =
   in
   (pkey, wallet)
 
+let last_nonce = ref 0L
+let nonce_mutex = Mutex.create ()
+
+let get_next_nonce () =
+  Mutex.lock nonce_mutex;
+  let current_time_ms = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
+  let next_nonce = if current_time_ms <= !last_nonce then
+    Int64.add !last_nonce 1L
+  else
+    current_time_ms
+  in
+  last_nonce := next_nonce;
+  Mutex.unlock nonce_mutex;
+  next_nonce
+
 let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
   let (pkey, _wallet) = get_credentials () in
-  let nonce = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
+  let nonce = get_next_nonce () in
   let (r, s, v) = Hyperliquid_signer.sign_l1_action
     ~private_key_hex:pkey
     ~action_msgpack
@@ -173,21 +188,31 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only ?reduce_only ?cl_
   | Ok res ->
       let open Yojson.Safe.Util in
       (try
-        let response = member "response" res in
-        let data = member "data" response in
-        let statuses = member "statuses" data |> to_list in
-        match statuses with
-        | s :: _ ->
-            let resting = member "resting" s in
-            if resting <> `Null then
-              match resting |> member "oid" |> to_int64_opt with
-              | Some oid -> Ok { order_id = oid }
-              | None -> Error (Printf.sprintf "Failed to find oid in resting status: %s" (Yojson.Safe.to_string s))
-            else
-              (match member "error" s |> to_string_option with
-               | Some err -> Error (Printf.sprintf "HL Order Rejected: %s" err)
-               | None -> Error (Printf.sprintf "Failed to find oid or error in HL response: %s" (Yojson.Safe.to_string res)))
-        | [] -> Error "Empty status list in response"
+        (* Check for error status first - response may be a string, not an object *)
+        let status = member "status" res |> to_string_option in
+        match status with
+        | Some "err" ->
+            let err_msg = match member "response" res with
+              | `String s -> s
+              | other -> Yojson.Safe.to_string other
+            in
+            Error (Printf.sprintf "HL Order Rejected: %s" err_msg)
+        | _ ->
+            let response = member "response" res in
+            let data = member "data" response in
+            let statuses = member "statuses" data |> to_list in
+            match statuses with
+            | s :: _ ->
+                let resting = member "resting" s in
+                if resting <> `Null then
+                  match resting |> member "oid" |> to_int64_opt with
+                  | Some oid -> Ok { order_id = oid }
+                  | None -> Error (Printf.sprintf "Failed to find oid in resting status: %s" (Yojson.Safe.to_string s))
+                else
+                  (match member "error" s |> to_string_option with
+                   | Some err -> Error (Printf.sprintf "HL Order Rejected: %s" err)
+                   | None -> Error (Printf.sprintf "Failed to find oid or error in HL response: %s" (Yojson.Safe.to_string res)))
+            | [] -> Error "Empty status list in response"
       with exn -> Error (Printf.sprintf "Failed to parse HL response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res)))
   | Error e -> Error e
 

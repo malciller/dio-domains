@@ -285,24 +285,30 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             
             List.iter (fun (event : Types.execution_event) ->
               match event.order_status with
-              | Types.Canceled | Types.Filled ->
+              | Types.Canceled | Types.Filled | Types.Rejected | Types.Expired ->
                   should_execute_strategy := true;
                   let status_desc = match event.order_status with
                     | Types.Canceled -> "cancelled"
                     | Types.Filled -> "filled"
+                    | Types.Rejected -> "rejected"
+                    | Types.Expired -> "expired"
                     | _ -> "terminated"
+                  in
+                  let side = match event.side with
+                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
+                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                   in
                   (match grid_strategy_asset with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled
-                         asset_with_fees.symbol event.order_id;
+                         asset_with_fees.symbol event.order_id side;
                        Logging.info_f ~section "Notified Grid strategy about %s order %s for %s"
                          status_desc event.order_id asset_with_fees.symbol
                    | None -> ());
                   (match mm_strategy_asset with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_cancelled
-                         asset_with_fees.symbol event.order_id;
+                         asset_with_fees.symbol event.order_id side;
                        Logging.debug_f ~section "Notified MM strategy about %s order %s for %s"
                          status_desc event.order_id asset_with_fees.symbol
                    | None -> ())
@@ -383,12 +389,17 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (* Calculate buy/sell counts from grid strategy orders *)
           let (grid_open_buy_count, grid_open_sell_count) =
             List.fold_left (fun (buys, sells) (_, _, _, side_str, userref_opt) ->
-              if side_str = "buy" then
-                (match userref_opt with
-                 | Some userref when Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref -> (buys + 1, sells)
-                 | _ -> (buys + 1, sells))
+              (* Only count orders that match the grid strategy userref.
+                 The old fallback '| _ -> (buys + 1, sells)' counted ALL buys as grid,
+                 causing double-counting when last_buy_count = grid + mm. *)
+              let is_grid_order = match userref_opt with
+                | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref
+                | None -> false
+              in
+              if is_grid_order then
+                (if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1))
               else
-                (buys, sells + 1)
+                (buys, sells)
             ) (0, 0) all_open_orders
           in
 

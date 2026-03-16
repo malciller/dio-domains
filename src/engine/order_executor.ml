@@ -343,7 +343,7 @@ let amend_order
             (* Check if new price is the same as current price to avoid unnecessary amendments *)
             (* Diagnostic: log the full-precision requested price *)
             (match request.new_limit_price with
-             | Some p -> Logging.info_f ~section "Amendment price check for order %s: requested=%.10f" request.order_id p
+             | Some p -> Logging.debug_f ~section "Amendment price check for order %s: requested=%.10f" request.order_id p
              | None -> ());
             let should_skip_amendment = match request.symbol, request.new_limit_price with
               | Some symbol, Some new_price ->
@@ -351,14 +351,13 @@ let amend_order
                    | Some current_order ->
                        (match current_order.limit_price with
                         | Some current_price ->
-                            (* Use price tick as epsilon: if difference < 1 tick, prices are effectively
-                               identical after exchange rounding and we should not re-amend *)
-                            let tick = Option.value (Ex.get_price_increment ~symbol) ~default:0.01 in
-                            let diff = abs_float (new_price -. current_price) in
-                            Logging.info_f ~section "Amendment skip check %s: stored=%.10f requested=%.10f diff=%.10f tick=%.10f" request.order_id current_price new_price diff tick;
-                            diff < tick
+                            (* Apply exchange-specific rounding BEFORE comparing *)
+                            let rounded_new_price = Ex.round_price ~symbol ~price:new_price in
+                            let rounded_current_price = Ex.round_price ~symbol ~price:current_price in
+                            let diff = abs_float (rounded_new_price -. rounded_current_price) in
+                            (* If rounding makes them identical, skip the amendment *)
+                            diff < 0.000000001
                         | None ->
-                            Logging.info_f ~section "Amendment skip check %s: stored order has no limit_price, proceeding" request.order_id;
                             false)
                    | None ->
                        Logging.warn_f ~section "Order %s not found in open orders cache, proceeding with amendment" request.order_id;
@@ -367,7 +366,7 @@ let amend_order
             in
 
             if should_skip_amendment then begin
-              Logging.info_f ~section "Skipping amendment for order %s: price unchanged at %.10f" request.order_id (Option.value request.new_limit_price ~default:0.0);
+
               (* Remove from in-flight cache since amendment was skipped *)
               let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
               

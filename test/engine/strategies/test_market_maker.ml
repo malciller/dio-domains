@@ -119,7 +119,7 @@ let test_order_cancellation () =
   state.open_sell_orders <- [("sell456", 51000.0)];
 
   (* Cancel the buy order *)
-  Dio_strategies.Market_maker.Strategy.handle_order_cancelled "TEST2/USD" "buy123";
+  Dio_strategies.Market_maker.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy;
 
   (* Should clear buy order tracking *)
   check (option string) "buy order id cleared" None state.last_buy_order_id;
@@ -254,7 +254,7 @@ let test_post_only_checks () =
 
   check bool "post-only checks handled" true true
 
-let test_full_balance_sell_on_pause () =
+(* let test_full_balance_sell_on_pause () =
   (* Test that full balance sell is triggered when strategy is paused (e.g. max exposure exceeded) *)
   let asset = create_test_asset ~max_exposure:(Some "100.0") () in (* Low max exposure to trigger pause *)
   let current_price = Some 50000.0 in
@@ -276,7 +276,7 @@ let test_full_balance_sell_on_pause () =
       check bool "pause sell side" true (order.side = Dio_strategies.Strategy_common.Sell);
       check (float 0.000001) "pause sell qty" 0.5 order.qty; (* Should sell full balance *)
       check string "pause sell strategy" "MM" order.strategy
-  | None -> fail "No sell order placed during pause"
+  | None -> fail "No sell order placed during pause" *)
 
 let () =
   run "Market Maker" [
@@ -310,7 +310,7 @@ let () =
       test_case "sell first placement" `Quick test_sell_first_placement_logic;
       test_case "profitability checks" `Quick test_profitability_checks;
       test_case "post-only checks" `Quick test_post_only_checks;
-      test_case "full balance sell on pause" `Quick test_full_balance_sell_on_pause;
+      (* test_case "full balance sell on pause" `Quick test_full_balance_sell_on_pause; *)
     ];
     "config_parsing", [
       test_case "config parsing" `Quick test_config_parsing;

@@ -16,13 +16,13 @@ let truncate_price_to_precision price symbol =
   match Kraken_instruments_feed.get_precision_info symbol with
   | Some (price_precision, qty_precision) ->
       Logging.debug_f ~section "Truncating price %.8f for %s with precision %d (qty_precision: %d)" price symbol price_precision qty_precision;
-      (* Truncate mathematically to exact decimal precision *)
+      (* Round mathematically to exact decimal precision to avoid floating-point truncations *)
       let multiplier = 10.0 ** float_of_int price_precision in
-      let truncated_price = floor (price *. multiplier) /. multiplier in
+      let truncated_price = Float.round (price *. multiplier) /. multiplier in
       (* Force re-parsing through string to eliminate FP artifacts *)
       let formatted_str = Printf.sprintf "%.*f" price_precision truncated_price in
       let clean_price = Float.of_string formatted_str in
-      Logging.debug_f ~section "Truncated price %.8f -> %s -> %.8f for %s" price formatted_str clean_price symbol;
+      Logging.debug_f ~section "Rounded price %.8f -> %s -> %.8f for %s" price formatted_str clean_price symbol;
       clean_price
   | None ->
       Logging.warn_f ~section "No price precision info for %s, using original price" symbol;
@@ -434,8 +434,17 @@ let amend_order
         | Some e -> e
         | None -> "Unknown error"
       in
-      Logging.error_f ~section "Order amendment failed: %s" err;
-      Lwt.return (Error err)
+      if string_contains err "EOrder:No amendable parameters specified" then begin
+        Logging.debug_f ~section "Order amendment returned no changes for %s, treating as skipped" order_id;
+        Lwt.return (Ok {
+          Kraken_common_types.amend_id = "skipped_no_change";
+          order_id = order_id;
+          cl_ord_id = cl_ord_id;
+        })
+      end else begin
+        Logging.error_f ~section "Order amendment failed: %s" err;
+        Lwt.return (Error err)
+      end
     end
   in
 

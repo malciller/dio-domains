@@ -113,7 +113,7 @@ let get_open_order symbol order_id =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
   let keys = Hashtbl.fold (fun k _ acc -> k :: acc) store.open_orders [] in
-  Logging.info_f ~section "get_open_order lookup: symbol=%s, order_id=%s, store_keys=[%s]" symbol order_id (String.concat "," keys);
+  Logging.debug_f ~section "get_open_order lookup: symbol=%s, order_id=%s, store_keys=[%s]" symbol order_id (String.concat "," keys);
   let order = Hashtbl.find_opt store.open_orders order_id in
   Mutex.unlock store.orders_mutex;
   order
