@@ -922,6 +922,7 @@ let order_processing_loop () =
                      (* Fire-and-forget: just send the order, don't touch strategy tracking.
                       The consumer thread handles all tracking via WS execution events. *)
                      Lwt.async (fun () ->
+                       let%lwt () = Lwt.pause () in
                        Lwt.catch (fun () ->
                          Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                          | Ok result ->
@@ -959,7 +960,8 @@ let order_processing_loop () =
                       | Some target_order_id ->
                           let amend_request = {
                             Dio_engine.Order_executor.order_id = target_order_id;
-                            cl_ord_id = None;
+                            (* Pass side as fallback for HL amend when open_orders cache misses *)
+                            cl_ord_id = Some (match order.side with Buy -> "buy" | Sell -> "sell");
                             new_quantity = Some order.qty;
                             new_limit_price = order.price;
                             limit_price_type = None;
@@ -975,6 +977,7 @@ let order_processing_loop () =
                           (* Fire-and-forget: just send the amendment, don't touch strategy tracking.
                            The consumer thread handles all tracking via WS execution events. *)
                           Lwt.async (fun () ->
+                             let%lwt () = Lwt.pause () in
                              Lwt.catch (fun () ->
                                Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                                | Ok result ->
@@ -1014,6 +1017,7 @@ let order_processing_loop () =
                      (match order.order_id with
                       | Some target_order_id ->
                           Lwt.async (fun () ->
+                            let%lwt () = Lwt.pause () in
                             Lwt.catch (fun () ->
                               let request : Dio_engine.Order_executor.cancel_request = {
                                 exchange = order.exchange;
@@ -1099,6 +1103,7 @@ let order_processing_loop () =
                      (* Fire-and-forget: just send the order, don't touch strategy tracking.
                       The consumer thread handles all tracking via WS execution events. *)
                      Lwt.async (fun () ->
+                       let%lwt () = Lwt.pause () in
                        Lwt.catch (fun () ->
                          Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                          | Ok result ->
@@ -1152,6 +1157,7 @@ let order_processing_loop () =
                           } in
 
                           Lwt.async (fun () ->
+                            let%lwt () = Lwt.pause () in
                             Lwt.catch (fun () ->
                               Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                               | Ok result ->
@@ -1206,6 +1212,7 @@ let order_processing_loop () =
                      (match order.order_id with
                       | Some target_order_id ->
                           Lwt.async (fun () ->
+                            let%lwt () = Lwt.pause () in
                             Lwt.catch (fun () ->
                               let request : Dio_engine.Order_executor.cancel_request = { exchange = order.exchange; order_ids = Some [target_order_id]; cl_ord_ids = None; order_userrefs = None; symbol = Some order.symbol; } in
                               Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function

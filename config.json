@@ -84,14 +84,14 @@
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.3",
+      "qty": "0.35",
       "grid_interval": [
-        0.32,
-        0.75
+        0.23,
+        0.35
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "testnet": true
+      "testnet": false
     }
   ]
 }

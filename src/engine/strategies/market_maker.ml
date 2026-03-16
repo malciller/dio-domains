@@ -1057,8 +1057,7 @@ let handle_order_cancelled asset_symbol order_id side =
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
 
     (* Clean up global placement trackers to allow immediate re-placement *)
-    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Buy));
-    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Sell));
+    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol cancelled_side));
     
     Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
       order_id asset_symbol removed_pending removed_sell
@@ -1153,24 +1152,22 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
        get here the order is genuinely dead or unreachable. Clearing allows recovery. *)
     (match side with
      | Buy ->
-         let is_dead = String.starts_with ~prefix:"Cannot modify canceled or filled order" reason || 
-                       String.starts_with ~prefix:"Order not found" reason in
-         
          (match state.last_buy_order_id with
           | Some target_id when target_id = order_id ->
               state.last_buy_order_id <- None;
               state.last_buy_order_price <- None;
-              if is_dead then begin
-                let now = Unix.time () in
-                state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
-              end;
+              let now = Unix.time () in
+              state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
               Logging.info_f ~section "Amendment failed for buy order %s: cleared tracking (%s)" order_id reason
           | _ -> ())
      | Sell ->
          let original = List.length state.open_sell_orders in
          state.open_sell_orders <- List.filter (fun (sell_id, _) -> sell_id <> order_id) state.open_sell_orders;
-         if List.length state.open_sell_orders < original then
-           Logging.info_f ~section "Amendment failed for sell order %s: cleared tracking (%s)" order_id reason);
+         if List.length state.open_sell_orders < original then begin
+           let now = Unix.time () in
+           state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
+           Logging.info_f ~section "Amendment failed for sell order %s: cleared tracking (%s)" order_id reason
+         end);
            
     (* Clear global in-flight trackers so we don't get stuck *)
     ignore (InFlightAmendments.remove_in_flight_amendment order_id);

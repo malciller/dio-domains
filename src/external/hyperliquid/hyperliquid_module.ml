@@ -85,8 +85,23 @@ module Hyperliquid_impl = struct
       ()
     >|= function
     | Ok res ->
+        let order_id_str = Int64.to_string res.Hyperliquid_actions.order_id in
+        (* Proactively populate open_orders so that find_order_everywhere succeeds
+           when the strategy tries to amend immediately after placement.
+           Without this, open_orders stays empty until the next webData2 (~1.5s),
+           causing every amendment in that window to fail with "Order not found". *)
+        let hl_side = match side with Types.Buy -> Hyperliquid_executions_feed.Buy | _ -> Hyperliquid_executions_feed.Sell in
+        Hyperliquid_executions_feed.inject_order
+          ~symbol
+          ~order_id:order_id_str
+          ~side:hl_side
+          ~qty:sz_rounded
+          ~price:px_rounded
+          ?user_ref:(match order_userref with Some u -> Some u | None -> None)
+          ?cl_ord_id:constructed_cl_ord_id
+          ();
         Ok {
-          Types.order_id = Int64.to_string res.Hyperliquid_actions.order_id;
+          Types.order_id = order_id_str;
           cl_ord_id = None;
           order_userref = None;
         }
