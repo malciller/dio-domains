@@ -480,27 +480,49 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   (* Get trading configurations *)
   let config = Dio_engine.Config.read_config () in
-  let configs = config.trading in
-  Logging.info_f ~section "Loaded %d trading configuration(s)" (List.length configs);
+  let app_configs = config.trading in
+  Logging.info_f ~section "Loaded %d trading configuration(s)" (List.length app_configs);
 
   (* Extract Kraken symbols for websocket connections *)
-  let kraken_symbols = configs
+  let kraken_symbols = app_configs
                       |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken")
                       |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
 
+  (* Extract Hyperliquid symbols *)
+  let hyperliquid_symbols = app_configs
+                           |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid")
+                           |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
+  let has_hyperliquid = List.length hyperliquid_symbols > 0 in
+  let hyperliquid_testnet =
+    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> cfg.exchange = "hyperliquid") with
+    | Some cfg -> cfg.testnet
+    | None -> false in
+
+  (* Configure the Hyperliquid module with the testnet flag from config *)
+  if has_hyperliquid then
+    Hyperliquid.Module.Hyperliquid_impl.set_testnet hyperliquid_testnet;
+
   Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
+  if has_hyperliquid then
+    Logging.info_f ~section "Connecting to %d Hyperliquid websockets..." (List.length hyperliquid_symbols);
 
   (* Start initialization sequence as a promise chain *)
 
   (* Initialize data stores for websocket feeds *)
   Logging.info ~section "Step 1: Initializing ticker feed stores...";
   Kraken.Kraken_ticker_feed.initialize kraken_symbols;
+  if has_hyperliquid then Hyperliquid.Ticker_feed.initialize hyperliquid_symbols;
 
   Logging.info ~section "Step 2: Initializing instruments feed stores...";
   let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
+  let%lwt () = 
+    if has_hyperliquid then Hyperliquid.Instruments_feed.initialize_symbols ~testnet:hyperliquid_testnet hyperliquid_symbols
+    else Lwt.return_unit
+  in
 
   Logging.info ~section "Step 3: Initializing orderbook feed stores...";
   let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
+  if has_hyperliquid then Hyperliquid.Orderbook_feed.initialize hyperliquid_symbols;
 
   Logging.info ~section "Step 4: Getting authentication token...";
   let%lwt auth_token = Kraken.Kraken_generate_auth_token.get_token () in
@@ -511,13 +533,19 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   Logging.info ~section "Step 5: Initializing balances feed stores...";
   (* Extract all unique assets from trading symbols *)
-  let all_assets = configs
+  let all_assets = app_configs
                   |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol)
-                  |> List.map (fun symbol -> String.split_on_char '/' symbol |> List.hd)  (* Get base asset *)
+                  |> List.map (fun symbol -> 
+                      if String.contains symbol '/' then String.split_on_char '/' symbol |> List.hd
+                      else symbol (* For Hyperliquid which might not use / in config *))
                   |> List.sort_uniq String.compare
                   |> fun assets -> "USD" :: assets in  (* Add USD as quote currency *)
+  let all_assets = if has_hyperliquid then "USDC" :: all_assets else all_assets in
+  let all_assets = List.sort_uniq String.compare all_assets in
+  
   let () = try
     Kraken.Kraken_balances_feed.initialize all_assets;
+    if has_hyperliquid then Hyperliquid.Balances.initialize ~testnet:hyperliquid_testnet all_assets;
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
@@ -525,9 +553,36 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   Logging.info ~section "Step 6: Initializing executions feed stores...";
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
+  if has_hyperliquid then Hyperliquid.Executions_feed.initialize hyperliquid_symbols;
 
   (* Register and start supervised websocket connections *)
   Logging.info ~section "Step 7: Starting supervised websocket connections...";
+  
+  (* Hyperliquid connections *)
+  if has_hyperliquid then begin
+     let hl_ws_conn = register ~name:"hyperliquid_ws" ~connect_fn:None in
+     let hl_ws_connect_fn () =
+       Lwt.catch (fun () ->
+         let on_failure reason = set_state hl_ws_conn (Failed reason) in
+         let on_heartbeat () = update_data_heartbeat hl_ws_conn in
+         let on_connected () =
+           set_state hl_ws_conn Connected;
+           let wallet = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.value ~default:"" in
+           Lwt.async (fun () -> Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet)
+         in
+         Hyperliquid.Ws.connect_and_monitor 
+           ~testnet:hyperliquid_testnet 
+           ~on_failure ~on_connected ~on_heartbeat
+       ) (fun exn ->
+         let error_msg = Printexc.to_string exn in
+         Logging.error_f ~section "[%s] Connection failed: %s" hl_ws_conn.name error_msg;
+         set_state hl_ws_conn (Failed error_msg);
+         Lwt.return_unit
+       )
+     in
+     set_connect_fn hl_ws_conn (Some hl_ws_connect_fn);
+     start_async hl_ws_conn;
+  end;
 
   (* Ticker feed *)
   let ticker_conn = register ~name:"kraken_ticker_ws" ~connect_fn:None in
@@ -666,13 +721,24 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   (* Wait for executions data again *)
   let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
-  if not executions_ready then
+  let%lwt hl_executions_ready = 
+    if has_hyperliquid then Hyperliquid.Executions_feed.wait_for_execution_data hyperliquid_symbols 10.0 
+    else Lwt.return_true 
+  in
+  if not (executions_ready && hl_executions_ready) then
     Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
   else
     Logging.info ~section "✓ Executions feed ready";
 
   (* Wait for balance data *)
-  let%lwt balances_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
+  let%lwt balances_ready = 
+    let%lwt kraken_ready = Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0 in
+    let%lwt hl_ready = 
+      if has_hyperliquid then Hyperliquid.Balances.wait_until_ready ()
+      else Lwt.return_true
+    in
+    Lwt.return (kraken_ready && hl_ready)
+  in
   if not balances_ready then
     Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
   else
@@ -731,6 +797,22 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         (* Add small delay between requests to ensure unique nonces *)
         let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
         Lwt.return result
+      end else if asset.Dio_engine.Config.exchange = "hyperliquid" then begin
+        Logging.debug_f ~section "Fetching fees for %s on Hyperliquid..." asset.Dio_engine.Config.symbol;
+        let%lwt fee_info_res = Hyperliquid.Get_fee.get_fee_info ~testnet:hyperliquid_testnet asset.Dio_engine.Config.symbol in
+        let%lwt result = match fee_info_res with
+        | Some fee_info ->
+            let maker = Option.value fee_info.maker_fee ~default:0.0002 in
+            let taker = Option.value fee_info.taker_fee ~default:0.0005 in
+            Logging.debug_f ~section "Retrieved fees for Hyperliquid: maker=%.4f%% taker=%.4f%%" (maker *. 100.) (taker *. 100.);
+            Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:maker ~taker_fee:taker ~ttl_seconds:600.0;
+            Lwt.return { asset with Dio_engine.Config.maker_fee = Some maker; Dio_engine.Config.taker_fee = Some taker }
+        | None ->
+            Logging.warn_f ~section "Failed to fetch HL fees for %s, using defaults" asset.Dio_engine.Config.symbol;
+            Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:0.0002 ~taker_fee:0.0005 ~ttl_seconds:600.0;
+            Lwt.return { asset with Dio_engine.Config.maker_fee = Some 0.0002; Dio_engine.Config.taker_fee = Some 0.0005 }
+        in
+        Lwt.return result
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
         (* Store default fees in cache for unsupported exchanges *)
@@ -759,7 +841,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.return { asset with
         Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
         Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *)
-  ) configs in
+  ) app_configs in
 
   Lwt.return (configs_with_fees, auth_token)
 
@@ -837,74 +919,37 @@ let order_processing_loop () =
                        exchange = order.exchange;
                      } in
 
+                     (* Fire-and-forget: just send the order, don't touch strategy tracking.
+                      The consumer thread handles all tracking via WS execution events. *)
                      Lwt.async (fun () ->
                        Lwt.catch (fun () ->
                          Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
-                         | result ->
-                             begin match result with
                          | Ok result ->
                              orders_placed := !orders_placed + 1;
                              Logging.info_f ~section "✓ Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                result.order_id;
-
-                             (* Notify strategy that order was acknowledged *)
-                             (match order.price with
-                              | Some price ->
-                                  (match order.strategy with
-                                   | "Grid" ->
-                                       Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
-                                         order.symbol result.order_id
-                                         (match order.side with Buy -> Buy | Sell -> Sell)
-                                         price
-                                   | "MM" ->
-                                       Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
-                                         order.symbol result.order_id
-                                         (match order.side with Buy -> Buy | Sell -> Sell)
-                                         price
-                                   | _ ->
-                                       Logging.warn_f ~section "Unknown strategy '%s' for order acknowledgment: %s" order.strategy result.order_id
-                                  )
-                              | None ->
-                                  Logging.warn_f ~section "Order acknowledged but no price available for strategy update: %s" result.order_id
-                             );
                              Lwt.return_unit
                          | Error err ->
                              Logging.error_f ~section "✗ Order placement failed: %s %s %.8f @ %s - %s"
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                err;
-
-                             (* Notify strategy that order was rejected *)
+                             (* Notify strategy so it cleans up pending/in-flight state *)
                              (match order.price with
                               | Some price ->
-                                  (match order.strategy with
-                                   | "Grid" ->
-                                       Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                                   | "MM" ->
-                                       Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                                   | _ ->
-                                       Logging.warn_f ~section "Unknown strategy '%s' for order rejection: %s" order.strategy err
-                                  )
-                              | None ->
-                                  Logging.warn_f ~section "Order rejected but no price available for strategy update: %s" err
-                             );
+                                  Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                              | None -> ());
                              Lwt.return_unit
-                             end
                        ) (fun exn ->
                          Logging.error_f ~section "✗ Exception placing order %s %s: %s"
                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
+                         (* Notify strategy so it cleans up pending/in-flight state *)
                          (match order.price with
                           | Some price ->
-                              (match order.strategy with
-                               | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                               | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                               | _ -> Logging.warn_f ~section "Unknown strategy '%s' for order exception: %s" order.strategy (Printexc.to_string exn)
-                              )
-                          | None ->
-                              Logging.warn_f ~section "Order exception but no price available for strategy update: %s" (Printexc.to_string exn)
-                         );
+                              Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                          | None -> ());
                          Lwt.return_unit
                        )
                      )
@@ -927,59 +972,41 @@ let order_processing_loop () =
                             exchange = order.exchange;
                           } in
 
+                          (* Fire-and-forget: just send the amendment, don't touch strategy tracking.
+                           The consumer thread handles all tracking via WS execution events. *)
                           Lwt.async (fun () ->
-                            Lwt.catch (fun () ->
-                              Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
-                              | Ok result ->
-                                  orders_placed := !orders_placed + 1;
-                                  Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)"
-                                    (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
-                                    (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
-                                    result.amend_id;
-
-                                  (match order.price with
-                                   | Some price ->
-                                       (match order.strategy with
-                                        | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged order.symbol result.order_id order.side price
-                                        | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_acknowledged order.symbol result.order_id order.side price
-                                        | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment acknowledgment: %s" order.strategy result.order_id
-                                       )
-                                   | None ->
-                                       Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.order_id
-                                  );
-                                  Lwt.return_unit
-                              | Error err ->
-                                  Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s"
-                                    (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
-                                    (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
-                                    err;
-                                  (match order.price with
-                                   | Some price ->
-                                       (match order.strategy with
-                                        | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                                        | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                                        | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
-                                       )
-                                   | None ->
-                                       Logging.warn_f ~section "Amendment rejected but no price available for strategy update: %s" err
-                                  );
-                                  Lwt.return_unit
-                            ) (fun exn ->
-                              Logging.error_f ~section "✗ Exception amending order %s %s: %s"
-                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                              (match order.price with
-                               | Some price ->
+                             Lwt.catch (fun () ->
+                               Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
+                               | Ok result ->
+                                   orders_placed := !orders_placed + 1;
+                                   Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
+                                     (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
+                                     (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                                     (match result.Dio_exchange.Exchange_intf.Types.amend_id with Some id -> id | None -> "none")
+                                     result.Dio_exchange.Exchange_intf.Types.new_order_id;
+                                   Lwt.return_unit
+                               | Error err ->
+                                   Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s"
+                                     (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
+                                     (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                                     err;
                                    (match order.strategy with
-                                    | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                                    | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                                    | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
-                                   )
-                               | None ->
-                                   Logging.warn_f ~section "Amendment exception but no price available for strategy update: %s" (Printexc.to_string exn)
-                              );
-                              Lwt.return_unit
-                            )
-                          )
+                                    | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                    | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                    | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment failure: %s" order.strategy err
+                                   );
+                                   Lwt.return_unit
+                             ) (fun exn ->
+                               Logging.error_f ~section "✗ Exception amending order %s %s: %s"
+                                 (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
+                               (match order.strategy with
+                                | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
+                               );
+                               Lwt.return_unit
+                             )
+                           )
                       | None -> Logging.error_f ~section "Amendment request missing target order ID for %s %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol;
                      )
 
@@ -1141,40 +1168,46 @@ let order_processing_loop () =
                             Lwt.catch (fun () ->
                               Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                               | Ok result ->
-                                  orders_placed := !orders_placed + 1;
-                                  Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s)" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") result.amend_id;
-                                  (match order.price with
-                                   | Some price ->
-                                       (match order.strategy with
-                                        | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged order.symbol result.order_id order.side price
-                                        | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_acknowledged order.symbol result.order_id order.side price
-                                        | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment acknowledgment: %s" order.strategy result.order_id
-                                       )
-                                   | None -> Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.order_id
-                                  );
-                                  Lwt.return_unit
+                                  if result.amend_id = Some "skipped_no_change" then begin
+                                      Logging.debug_f ~section "Amendment skipped for %s %s %.8f @ %s (no price change)" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+                                      (match order.price with
+                                       | Some price ->
+                                           (match order.strategy with
+                                            | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
+                                            | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
+                                            | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment skipped acknowledgment: %s" order.strategy result.new_order_id
+                                           )
+                                       | None -> Logging.warn_f ~section "Amendment skipped but no price available for strategy update: %s" result.new_order_id
+                                      );
+                                      Lwt.return_unit
+                                  end else begin
+                                      orders_placed := !orders_placed + 1;
+                                      Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") (match result.amend_id with Some id -> id | None -> "none") result.new_order_id;
+                                      (match order.price with
+                                       | Some price ->
+                                           (match order.strategy with
+                                            | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
+                                            | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
+                                            | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment acknowledgment: %s" order.strategy result.new_order_id
+                                           )
+                                       | None -> Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.new_order_id
+                                      );
+                                      Lwt.return_unit
+                                  end
                               | Error err ->
                                   Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") err;
-                                  (match order.price with
-                                   | Some price ->
-                                       (match order.strategy with
-                                        | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                                        | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                                        | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
-                                       )
-                                   | None -> Logging.warn_f ~section "Amendment rejected but no price available for strategy update: %s" err
+                                  (match order.strategy with
+                                   | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                   | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                   | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
                                   );
                                   Lwt.return_unit
                             ) (fun exn ->
                               Logging.error_f ~section "✗ Exception amending order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                              (match order.price with
-                               | Some price ->
-                                   (match order.strategy with
-                                    | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                                    | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                                    | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
-                                   )
-                               | None -> Logging.warn_f ~section "Amendment exception but no price available for strategy update: %s" (Printexc.to_string exn)
+                              (match order.strategy with
+                               | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                               | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                               | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
                               );
                               Lwt.return_unit
                             )

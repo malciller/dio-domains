@@ -1,0 +1,22 @@
+(library
+ (name hyperliquid)
+ (public_name dio.hyperliquid)
+ (libraries
+  yojson
+  base64
+  digestif
+  lwt
+  lwt.unix
+  dotenv
+  logging
+  msgpck
+  secp256k1
+  uri
+  threads
+  websocket-lwt-unix
+  conduit-lwt-unix
+  ipaddr.unix
+  concurrency
+  dio.exchange)
+ (preprocess
+  (pps lwt_ppx)))

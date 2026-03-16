@@ -54,8 +54,9 @@ module Types = struct
 
   (** Result of order amendment *)
   type amend_order_result = {
-    amend_id: string;
-    order_id: string;
+    original_order_id: string;
+    new_order_id: string;
+    amend_id: string option;
     cl_ord_id: string option;
   }
 
@@ -192,6 +193,11 @@ module type S = sig
 
   (** Get minimum order quantity for a symbol *)
   val get_qty_min : symbol:string -> float option
+
+  (** Round a price to the exchange's valid precision for a symbol.
+      For Hyperliquid: 5 significant figures, capped at (MAX_DECIMALS - szDecimals) decimal places.
+      For Kraken: nearest price_increment tick. *)
+  val round_price : symbol:string -> price:float -> float
 
   (** Get maker/taker fees for a symbol (if cached by exchange) *)
   val get_fees : symbol:string -> (float option * float option)

@@ -62,6 +62,7 @@ let setup_signal_handlers () =
 
 (* Forcing initialization of Kraken module to register exchange logic *)
 let () = ignore (Kraken.Kraken_module.Kraken_impl.name)
+let () = ignore (Hyperliquid.Module.Hyperliquid_impl.name)
 
 
 (** Fatal signal handler for crashes *)

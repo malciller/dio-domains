@@ -296,7 +296,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled
                          asset_with_fees.symbol event.order_id;
-                       Logging.debug_f ~section "Notified Grid strategy about %s order %s for %s"
+                       Logging.info_f ~section "Notified Grid strategy about %s order %s for %s"
                          status_desc event.order_id asset_with_fees.symbol
                    | None -> ());
                   (match mm_strategy_asset with
@@ -318,7 +318,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                         | Some _ ->
                             Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
                               asset_with_fees.symbol event.order_id side price;
-                            Logging.debug_f ~section "Notified Grid strategy about acknowledged order %s for %s"
+                            Logging.info_f ~section "Notified Grid strategy about acknowledged order %s for %s"
                               event.order_id asset_with_fees.symbol
                         | None -> ());
                        (match mm_strategy_asset with
@@ -373,7 +373,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             List.filter (fun (_order_id, _, _, _, userref_opt) ->
               match userref_opt with
               | Some userref -> Dio_strategies.Strategy_common.is_strategy_order strategy_userref userref
-              | None -> false
+              | None -> asset_with_fees.exchange = "hyperliquid"
             ) all_open_orders
           in
 
@@ -386,7 +386,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               if side_str = "buy" then
                 (match userref_opt with
                  | Some userref when Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref -> (buys + 1, sells)
-                 | _ -> (buys, sells))
+                 | _ -> (buys + 1, sells))
               else
                 (buys, sells + 1)
             ) (0, 0) all_open_orders
@@ -430,7 +430,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count mod config.logging.cycle_info_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
-              Logging.debug_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
+              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
                 asset_with_fees.exchange asset_with_fees.symbol !cycle_count price
                 bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
                 !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
