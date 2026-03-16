@@ -1051,6 +1051,8 @@ let order_processing_loop () =
                       | None -> Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                      )
                 );
+                
+                (* Unlock order_mutex immediately after initiating Lwt.async requests so callbacks can run *)
                 Mutex.unlock order_mutex
               with exn ->
                 Mutex.unlock order_mutex;
@@ -1094,54 +1096,39 @@ let order_processing_loop () =
                        exchange = order.exchange;
                      } in
 
+                     (* Fire-and-forget: just send the order, don't touch strategy tracking.
+                      The consumer thread handles all tracking via WS execution events. *)
                      Lwt.async (fun () ->
                        Lwt.catch (fun () ->
                          Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
-                         | result ->
-                             begin match result with
                          | Ok result ->
                              orders_placed := !orders_placed + 1;
                              Logging.info_f ~section "✓ Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                result.order_id;
-                             (match order.price with
-                              | Some price ->
-                                  (match order.strategy with
-                                   | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged order.symbol result.order_id (match order.side with Buy -> Buy | Sell -> Sell) price
-                                   | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_acknowledged order.symbol result.order_id (match order.side with Buy -> Buy | Sell -> Sell) price
-                                   | _ -> Logging.warn_f ~section "Unknown strategy '%s' for order acknowledgment: %s" order.strategy result.order_id
-                                  )
-                              | None -> Logging.warn_f ~section "Order acknowledged but no price available for strategy update: %s" result.order_id
-                             );
                              Lwt.return_unit
                          | Error err ->
                              Logging.error_f ~section "✗ Order placement failed: %s %s %.8f @ %s - %s"
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                err;
+                             (* Notify strategy so it cleans up pending/in-flight state *)
+                             Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side err;
                              (match order.price with
                               | Some price ->
-                                  (match order.strategy with
-                                   | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                                   | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                                   | _ -> Logging.warn_f ~section "Unknown strategy '%s' for order rejection: %s" order.strategy err
-                                  )
-                              | None -> Logging.warn_f ~section "Order rejected but no price available for strategy update: %s" err
-                             );
+                                  Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
+                              | None -> ());
                              Lwt.return_unit
-                             end
                        ) (fun exn ->
-                         Logging.error_f ~section "✗ Exception placing order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
+                         Logging.error_f ~section "✗ Exception placing order %s %s: %s"
+                           (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
+                         (* Notify strategy so it cleans up pending/in-flight state *)
+                         Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
                          (match order.price with
                           | Some price ->
-                              (match order.strategy with
-                               | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                               | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
-                               | _ -> Logging.warn_f ~section "Unknown strategy '%s' for order exception: %s" order.strategy (Printexc.to_string exn)
-                              )
-                          | None -> Logging.warn_f ~section "Order exception but no price available for strategy update: %s" (Printexc.to_string exn)
-                         );
+                              Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
+                          | None -> ());
                          Lwt.return_unit
                        )
                      )
@@ -1250,6 +1237,8 @@ let order_processing_loop () =
                       | None -> Logging.error_f ~section "Cancel request missing target order ID for %s" order.symbol;
                      )
                 );
+                
+                (* Unlock order_mutex immediately after initiating Lwt.async requests so callbacks can run *)
                 Mutex.unlock order_mutex
               with exn ->
                 Mutex.unlock order_mutex;
