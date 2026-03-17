@@ -7,12 +7,28 @@ This document outlines the requirements and architecture for integrating a new e
 The trading engine uses a modular architecture where exchanges are implemented as modules satisfying a common interface (`Exchange.S`). The `order_executor.ml` component acts as the bridge between strategies and specific exchange implementations.
 
 ### Directory Structure
-- **Interface**: `src/exchange/exchange_intf.ml`
-- ** implementations**: `src/exchange/<exchange_name>/` (e.g., `src/exchange/kraken/`)
+- **Interface**: `src/external/exchange_intf.ml`
+- **Implementations**: `src/external/<exchange_name>/` (e.g., `src/external/kraken/`, `src/external/hyperliquid/`)
+
+### Current Implementations
+
+Both exchange modules follow the same concurrency and safety patterns:
+
+| Pattern | Description |
+|---------|-------------|
+| **Ring Buffers** | Lock-free `Concurrency.Ring_buffer.RingBuffer` for all feed data (tickers, executions, orderbook) |
+| **Global Order Index** | `order_to_symbol` Hashtbl for O(1) order lookups across symbols |
+| **Double-Checked Locking** | Mutex-protected store initialization to prevent TOCTOU races |
+| **Atomic Flags** | `Atomic.t` for all shared boolean/float state (readiness, timestamps, config) |
+| **Retry with Backoff** | Exponential backoff on transient API errors (timeouts, 5xx, rate limits) |
+| **Crash Recovery** | Self-restarting processor tasks with backoff on failure |
+| **Stale Order Cleanup** | Periodic removal of orders older than 24h to prevent unbounded growth |
+| **Event Bus** | `Concurrency.Event_bus` for publishing order/balance updates |
+| **Inline Hot Paths** | `[@inline always]` on all frequently-called accessor functions |
 
 ## Requirements for New Exchanges
 
-To add a new exchange, you must implement the `Exchange.S` module type defined in `src/exchange/exchange_intf.ml`.
+To add a new exchange, you must implement the `Exchange.S` module type defined in `src/external/exchange_intf.ml`.
 
 ### 1. Minimal Interface Implementation
 
@@ -33,7 +49,19 @@ Your module must implement the following core capabilities:
     - `get_qty_increment`: Step size for quantity.
     - `get_fees`: Maker/Taker fee structure.
 
-### 2. Registration
+### 2. Concurrency Requirements
+
+New integrations **must** follow the established patterns:
+
+- Use `Mutex.t` (not `Lwt_mutex`) for protecting shared data structures accessed from multiple domains.
+- Use `Atomic.t` for all shared flags and scalar state — never bare `ref`.
+- Use double-checked locking for lazy store initialization (`ensure_store` / `get_symbol_store`).
+- Hold locks for the entire read-modify-write cycle — never release between read and write.
+- Use `Lwt_list.fold_left_s` or sequential processing for accumulating results — never share mutable `ref` across concurrent Lwt promises.
+- Implement retry with exponential backoff on all REST API operations.
+- Processor tasks must self-restart on crash (re-subscribe and resume after delay).
+
+### 3. Registration
 
 Register your exchange in `Exchange.Registry` at startup (usually in your module's initialization or `bin/main.ml`):
 ```ocaml
@@ -73,7 +101,11 @@ For `amend_order`:
 
 ## Implementation Checklist
 
-- [ ] Create `src/exchange/<name>/<name>_actions.ml` implementing the specific REST/WS calls.
-- [ ] Create `src/exchange/<name>/<name>.ml` implementing the `Exchange.S` interface.
-- [ ] Ensure `amend_order` respects precision rules for the specific API.
-- [ ] Register the module in the main entry point.
+- [ ] Create `src/external/<name>/` directory
+- [ ] Create `<name>_actions.ml` implementing REST/WS calls with retry logic
+- [ ] Create `<name>_module.ml` implementing the `Exchange.S` interface
+- [ ] Create feed modules (`_ticker_feed.ml`, `_executions_feed.ml`, etc.) with ring buffers, double-checked locking, and crash recovery
+- [ ] Ensure `amend_order` respects precision rules for the specific API
+- [ ] Use `Atomic.t` for shared flags, `Mutex.t` for shared data structures
+- [ ] Add self-restarting processor tasks with backoff
+- [ ] Register the module in the main entry point
