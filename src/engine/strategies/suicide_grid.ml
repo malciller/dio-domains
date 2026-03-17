@@ -549,18 +549,18 @@ let execute_strategy
         let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
         let buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
 
-        (* Force-clear any stale sell InFlight guard so the new sell always goes through *)
-        ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
-
-        (* Place sell order - always, regardless of existing sells *)
-        let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
-        if push_order sell_order then
-          Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-            asset.symbol (qty *. sell_mult) sell_price;
-
-        (* Place buy order *)
+        (* Place buy order and sell order together *)
         (match quote_balance with
          | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
+             (* Force-clear any stale sell InFlight guard so the new sell always goes through *)
+             ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
+             
+             (* Place sell order alongside buy *)
+             let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
+             if push_order sell_order then
+               Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+                 asset.symbol (qty *. sell_mult) sell_price;
+                 
              let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
              if push_order order then begin
              state.last_buy_order_price <- Some buy_price;
@@ -710,14 +710,9 @@ let execute_strategy
           | _ ->
               Logging.debug_f ~section "Buy order tracking lost for %s, will re-place on next cycle" asset.symbol
         end else begin
-          (* No sell orders: place a sell immediately, then trail the buy *)
-          (* This handles the case where a sell fills and the buy is still open -
-             the buy must always have a paired sell. *)
-          let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
-          let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
-          if push_order sell_order then
-            Logging.info_f ~section "Placed sell order for %s (no sell anchor): %.8f @ %.4f"
-              asset.symbol (qty *. sell_mult) sell_price;
+          (* No sell orders: just trail the buy *)
+          (* We do NOT place a standalone sell order here; sell orders are only
+             placed alongside new buy orders. *)
 
            match state.last_buy_order_price, state.last_buy_order_id with
            | Some current_buy_price, Some buy_order_id ->
@@ -854,6 +849,41 @@ let handle_order_rejected asset_symbol side price =
 
   (* For buy order rejections, this signals no buy order exists, which is valid for re-evaluation *)
   (* We don't need to do anything special here - the strategy will re-evaluate on next cycle *)
+
+(** Handle order fill - fully clear tracking and pending amends *)
+let handle_order_filled asset_symbol order_id side =
+  let state = get_strategy_state asset_symbol in
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+    (* 1. Remove any pending amend matching this order ID *)
+    state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
+      not (String.starts_with ~prefix:"pending_amend_" pending_id &&
+           String.length pending_id > 14 &&
+           String.sub pending_id 14 (String.length pending_id - 14) = order_id)
+    ) state.pending_orders;
+
+    (* 2. Remove from sell orders tracking if it was a sell order *)
+    state.open_sell_orders <- List.filter (fun (sell_id, _) ->
+      sell_id <> order_id
+    ) state.open_sell_orders;
+
+    (* 3. Clear buy order tracking if it was the tracked buy order *)
+    let was_tracked_buy = match state.last_buy_order_id with
+      | Some id when id = order_id -> true
+      | _ -> false
+    in
+    if was_tracked_buy then begin
+      state.last_buy_order_id <- None;
+      state.last_buy_order_price <- None;
+      Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
+    end;
+
+    (* 4. Clear global placement trackers so strategy can replace immediately *)
+    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
+
+    Logging.debug_f ~section "Order FILLED and cleaned up explicitly: %s for %s"
+      order_id asset_symbol
+  )
 
 (** Handle order cancellation - remove from pending and tracked orders *)
 let handle_order_cancelled asset_symbol order_id side =
@@ -1100,6 +1130,7 @@ module Strategy = struct
   let handle_order_acknowledged = handle_order_acknowledged
   let handle_order_rejected = handle_order_rejected
   let handle_order_cancelled = handle_order_cancelled
+  let handle_order_filled = handle_order_filled
   let handle_order_amended = handle_order_amended
   let handle_order_amendment_skipped = handle_order_amendment_skipped
   let handle_order_amendment_failed = handle_order_amendment_failed

@@ -360,8 +360,8 @@ let amend_order
                         | None ->
                             false)
                    | None ->
-                       Logging.warn_f ~section "Order %s not found in open orders cache, proceeding with amendment" request.order_id;
-                       false)
+                       Logging.debug_f ~section "Order %s not found in open orders cache, skipping amendment to avoid spam" request.order_id;
+                       true)
               | _ -> false
             in
 

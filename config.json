@@ -20,17 +20,6 @@
       "strategy": "Grid"
     },
     {
-      "symbol": "PAXG/USD",
-      "exchange": "kraken",
-      "qty": "0.0029",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
       "symbol": "USDG/USD",
       "exchange": "kraken",
       "qty": "100.0",
@@ -43,7 +32,7 @@
       "qty": "0.0002",
       "grid_interval": [
         0.23,
-        0.35
+        0.75
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"
@@ -54,7 +43,7 @@
       "qty": "0.35",
       "grid_interval": [
         0.23,
-        0.35
+        0.75
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",

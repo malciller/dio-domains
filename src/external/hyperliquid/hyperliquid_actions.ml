@@ -7,10 +7,10 @@ open Lwt.Infix
 (** Convert Exchange standard order type to Hyperliquid order type (with TIF) *)
 let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force option) : order_type_wire =
   let tif = match tif_opt with
-    | Some ExTypes.GTC -> Gtc
+    | Some ExTypes.GTC -> Alo
     | Some ExTypes.IOC -> Ioc
     | Some ExTypes.FOK -> Ioc (* HL doesn't support FOK natively in the same way, best effort IOC *)
-    | None -> Gtc
+    | None -> Alo
   in
   match ot with
   | ExTypes.Limit -> Limit { tif = Alo }
@@ -139,13 +139,13 @@ let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
     Lwt.return (Error (Printf.sprintf "HTTP Error %d: %s" status body_str))
 
 (** Place order *)
-let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only ?reduce_only ?cl_ord_id ~testnet () =
+let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?cl_ord_id ~testnet () =
   let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
     | Some idx -> idx
     | None -> failwith (Printf.sprintf "Unknown symbol: %s" symbol)
   in
   
-  let tif = if Option.value post_only ~default:true then Alo else Gtc in
+  let tif = Alo in
   let ot = Limit { tif } in
   
   let order_wire = {
@@ -229,7 +229,7 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
     p = format_number px;
     s = format_number sz;
     r = false;
-    t = Limit { tif = Gtc };
+    t = Limit { tif = Alo };
     c = cl_ord_id;
   } in
   
@@ -242,7 +242,7 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
     "p", `String (format_number px);
     "s", `String (format_number sz);
     "r", `Bool false;
-    "t", `Assoc ["limit", `Assoc ["tif", `String "Gtc"]]
+    "t", `Assoc ["limit", `Assoc ["tif", `String "Alo"]]
   ] in
   let order_json = match cl_ord_id with
     | Some c -> order_json @ ["c", `String c]
