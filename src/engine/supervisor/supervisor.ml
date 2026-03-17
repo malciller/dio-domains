@@ -931,6 +931,13 @@ let order_processing_loop () =
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                result.order_id;
+                              (* Immediately notify strategy so inflight flags + order tracking
+                                 are updated without waiting for the async execution feed *)
+                              (match order.price with
+                               | Some price ->
+                                   Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
+                                     order.symbol result.order_id order.side price
+                               | None -> ());
                              Lwt.return_unit
                          | Error err ->
                              Logging.error_f ~section "✗ Order placement failed: %s %s %.8f @ %s - %s"
@@ -938,6 +945,7 @@ let order_processing_loop () =
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                err;
                              (* Notify strategy so it cleans up pending/in-flight state *)
+                             Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side err;
                              (match order.price with
                               | Some price ->
                                   Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
@@ -947,6 +955,7 @@ let order_processing_loop () =
                          Logging.error_f ~section "✗ Exception placing order %s %s: %s"
                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
                          (* Notify strategy so it cleans up pending/in-flight state *)
+                         Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
                          (match order.price with
                           | Some price ->
                               Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
@@ -960,8 +969,7 @@ let order_processing_loop () =
                       | Some target_order_id ->
                           let amend_request = {
                             Dio_engine.Order_executor.order_id = target_order_id;
-                            (* Pass side as fallback for HL amend when open_orders cache misses *)
-                            cl_ord_id = Some (match order.side with Buy -> "buy" | Sell -> "sell");
+                            cl_ord_id = None;
                             new_quantity = Some order.qty;
                             new_limit_price = order.price;
                             limit_price_type = None;

@@ -272,6 +272,7 @@ module type S = sig
   val handle_order_amended : string -> string -> string -> order_side -> float -> unit
   val handle_order_amendment_skipped : string -> string -> order_side -> float -> unit
   val handle_order_amendment_failed : string -> string -> order_side -> string -> unit
+  val handle_order_failed : string -> order_side -> string -> unit
   val cleanup_pending_cancellation : string -> string -> unit
   val cleanup_strategy_state : string -> unit
   val init : unit -> unit
