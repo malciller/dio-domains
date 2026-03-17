@@ -25,16 +25,25 @@ type store = {
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
+let initialization_mutex = Mutex.create ()
 
+(** Get or create store for a symbol - thread-safe with double-checked locking *)
 let ensure_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store
   | None ->
-      let store = {
-        buffer = RingBuffer.create 100;
-        ready = Atomic.make false;
-      } in
-      Hashtbl.add stores symbol store;
+      Mutex.lock initialization_mutex;
+      let store = match Hashtbl.find_opt stores symbol with
+        | Some store -> store
+        | None ->
+            let store = {
+              buffer = RingBuffer.create 100;
+              ready = Atomic.make false;
+            } in
+            Hashtbl.add stores symbol store;
+            store
+      in
+      Mutex.unlock initialization_mutex;
       store
 
 let notify_ready store =
@@ -44,7 +53,7 @@ let notify_ready store =
   end
 
 (** Get latest ticker for a symbol *)
-let get_latest_ticker symbol =
+let[@inline always] get_latest_ticker symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.read_latest store.buffer
   | None -> None
@@ -56,18 +65,18 @@ let[@inline always] get_latest_price symbol =
   | Some ticker -> Some ((ticker.bid +. ticker.ask) /. 2.0)
 
 (** Read ticker events since last position *)
-let read_ticker_events symbol last_pos =
+let[@inline always] read_ticker_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 
 (** Get current write position *)
-let get_current_position symbol =
+let[@inline always] get_current_position symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 
-let has_price_data symbol =
+let[@inline always] has_price_data symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> Atomic.get store.ready
   | None -> false
@@ -182,16 +191,17 @@ let process_market_data json =
   | _ -> ()
 
 let _processor_task =
-  let sub = Hyperliquid_ws.subscribe_market_data () in
-  Lwt.async (fun () ->
-    Logging.info ~section "Starting Hyperliquid ticker processor task";
+  let rec run () =
+    let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
+      Logging.info ~section "Starting Hyperliquid ticker processor task";
       Lwt_stream.iter process_market_data sub.stream
     ) (fun exn ->
-      Logging.error_f ~section "Hyperliquid ticker processor task crashed: %s" (Printexc.to_string exn);
-      Lwt.return_unit
+      Logging.error_f ~section "Hyperliquid ticker processor task crashed: %s. Restarting in 5s..." (Printexc.to_string exn);
+      Lwt.bind (Lwt_unix.sleep 5.0) (fun () -> run ())
     )
-  )
+  in
+  Lwt.async run
 
 let initialize symbols =
   Logging.info_f ~section "Initializing Hyperliquid ticker feed for %d symbols" (List.length symbols);

@@ -9,9 +9,9 @@ module Hyperliquid_impl = struct
   let section = "hyperliquid_module"
 
   (* Configuration *)
-  let is_testnet = ref true
+  let is_testnet = Atomic.make true
   let set_testnet testnet =
-    is_testnet := testnet;
+    Atomic.set is_testnet testnet;
     Logging.info_f ~section "Hyperliquid module configured for %s" (if testnet then "testnet" else "mainnet")
 
   (* Internal cache for fees *)
@@ -81,7 +81,7 @@ module Hyperliquid_impl = struct
       ?post_only
       ?reduce_only
       ?cl_ord_id:constructed_cl_ord_id
-      ~testnet:!is_testnet
+      ~testnet:(Atomic.get is_testnet)
       ()
     >|= function
     | Ok res ->
@@ -153,7 +153,7 @@ module Hyperliquid_impl = struct
               ~px:px_rounded
               ~sz:sz_rounded
               ?cl_ord_id:constructed_cl_ord_id
-              ~testnet:!is_testnet
+              ~testnet:(Atomic.get is_testnet)
               ()
         >|= function
         | Ok res ->
@@ -177,44 +177,35 @@ module Hyperliquid_impl = struct
     match order_ids with
     | None -> Lwt.return (Ok [])
     | Some ids ->
-        (* Hyperliquid cancel takes symbol and list of ids? 
-           Actually Hyperliquid_actions.cancel_orders takes coin and list of ids. 
-           But Exchange_intf doesn't pass coin here! 
-           Wait, Kraken_actions.cancel_orders doesn't either, but it might not need it.
-           Hyperliquid REQUIRES coin for cancellation.
-           Wait, there's another cancel that takes just IDs? No.
-           I'll need to look at how Kraken handles this or if I need to change the interface (unlikely).
-           Kraken module just calls Kraken_actions.cancel_orders.
-        *)
-        (* Group IDs by symbol *)
+        (* Group IDs by symbol for Hyperliquid's per-coin cancel API *)
         let symbol_map = Hashtbl.create 4 in
         List.iter (fun id ->
           match Hyperliquid_executions_feed.find_order_everywhere id with
           | Some o ->
               let existing = try Hashtbl.find symbol_map o.symbol with _ -> [] in
               Hashtbl.replace symbol_map o.symbol (id :: existing)
-          | None -> () (* Skip or handle error *)
+          | None -> ()
         ) ids;
         
-        let results = ref [] in
-        let errors = ref [] in
-        
-        Hashtbl.fold (fun symbol ids_for_symbol acc ->
-          (Hyperliquid_actions.cancel_orders
+        (* Process each symbol group sequentially to avoid shared-state races *)
+        let symbol_groups = Hashtbl.fold (fun sym ids acc -> (sym, ids) :: acc) symbol_map [] in
+        Lwt_list.fold_left_s (fun (results_acc, errors_acc) (symbol, ids_for_symbol) ->
+          Hyperliquid_actions.cancel_orders
             ~symbol
             ~order_ids:(List.map Int64.of_string ids_for_symbol)
-            ~testnet:!is_testnet
+            ~testnet:(Atomic.get is_testnet)
           >|= function
-          | Ok () -> 
-              results := !results @ (List.map (fun id -> { Types.order_id = id; cl_ord_id = None }) ids_for_symbol)
-          | Error e -> errors := e :: !errors
-          ) :: acc
-        ) symbol_map [] |> Lwt.join >>= fun () ->
+          | Ok () ->
+              let new_results = List.map (fun id -> { Types.order_id = id; cl_ord_id = None }) ids_for_symbol in
+              (new_results @ results_acc, errors_acc)
+          | Error e ->
+              (results_acc, e :: errors_acc)
+        ) ([], []) symbol_groups >>= fun (results, errors) ->
         
-        if !errors <> [] then
-          Lwt.return (Error (String.concat "; " !errors))
+        if errors <> [] then
+          Lwt.return (Error (String.concat "; " errors))
         else
-          Lwt.return (Ok !results)
+          Lwt.return (Ok results)
 
   (** Market Data Access *)
   
@@ -326,7 +317,7 @@ module Hyperliquid_impl = struct
 
   let initialize_fees symbols =
     Lwt_list.iter_p (fun symbol ->
-      Hyperliquid_get_fee.get_fee_info ~testnet:!is_testnet symbol >|= function
+      Hyperliquid_get_fee.get_fee_info ~testnet:(Atomic.get is_testnet) symbol >|= function
       | Some info ->
           let maker = Option.value info.maker_fee ~default:0.0 in
           let taker = Option.value info.taker_fee ~default:0.0 in

@@ -29,16 +29,25 @@ type store = {
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
+let initialization_mutex = Mutex.create ()
 
+(** Get or create store for a symbol - thread-safe with double-checked locking *)
 let ensure_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store
   | None ->
-      let store = {
-        buffer = RingBuffer.create ring_buffer_size;
-        ready = Atomic.make false;
-      } in
-      Hashtbl.add stores symbol store;
+      Mutex.lock initialization_mutex;
+      let store = match Hashtbl.find_opt stores symbol with
+        | Some store -> store
+        | None ->
+            let store = {
+              buffer = RingBuffer.create ring_buffer_size;
+              ready = Atomic.make false;
+            } in
+            Hashtbl.add stores symbol store;
+            store
+      in
+      Mutex.unlock initialization_mutex;
       store
 
 let notify_ready store =
@@ -151,16 +160,18 @@ let wait_for_orderbook_data symbols timeout_seconds =
   loop ()
 
 let _processor_task =
-  let sub = Hyperliquid_ws.subscribe_market_data () in
-  Lwt.async (fun () ->
-    Logging.info ~section "Starting Hyperliquid orderbook processor task";
+  let rec run () =
+    let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
+      Logging.info ~section "Starting Hyperliquid orderbook processor task";
       Lwt_stream.iter process_market_data sub.stream
     ) (fun exn ->
-      Logging.error_f ~section "Hyperliquid orderbook processor task crashed: %s" (Printexc.to_string exn);
-      Lwt.return_unit
+      Logging.error_f ~section "Hyperliquid orderbook processor task crashed: %s. Restarting in 5s..." (Printexc.to_string exn);
+      Lwt_unix.sleep 5.0 >>= fun () ->
+      run ()
     )
-  )
+  in
+  Lwt.async run
 
 let initialize symbols =
   Logging.info_f ~section "Initializing Hyperliquid orderbook feed for %d symbols" (List.length symbols);

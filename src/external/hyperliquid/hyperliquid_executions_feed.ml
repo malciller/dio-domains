@@ -80,6 +80,9 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
+(** Global order_id -> symbol mapping for O(1) lookups (mirrors Kraken's pattern) *)
+let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 128
+
 (** Get or create store for a symbol - thread-safe initialization *)
 let get_symbol_store symbol =
   match Hashtbl.find_opt stores symbol with
@@ -109,44 +112,92 @@ let notify_ready store =
     (try Lwt_condition.broadcast ready_condition () with _ -> ())
   end
 
-let get_open_order symbol order_id =
+let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
-  let keys = Hashtbl.fold (fun k _ acc -> k :: acc) store.open_orders [] in
-  Logging.debug_f ~section "get_open_order lookup: symbol=%s, order_id=%s, store_keys=[%s]" symbol order_id (String.concat "," keys);
   let order = Hashtbl.find_opt store.open_orders order_id in
   Mutex.unlock store.orders_mutex;
   order
 
 let find_order_everywhere order_id =
-  let result = ref None in
-  Hashtbl.iter (fun _ store ->
-    if Option.is_none !result then begin
+  (* Use order_to_symbol index for O(1) lookup instead of iterating all stores *)
+  Mutex.lock initialization_mutex;
+  let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
+  Mutex.unlock initialization_mutex;
+  match symbol_opt with
+  | Some symbol ->
+      let store = get_symbol_store symbol in
       Mutex.lock store.orders_mutex;
-      (match Hashtbl.find_opt store.open_orders order_id with
-       | Some o -> result := Some o
-       | None -> ());
-      Mutex.unlock store.orders_mutex
-    end
-  ) stores;
-  !result
+      let order = Hashtbl.find_opt store.open_orders order_id in
+      Mutex.unlock store.orders_mutex;
+      order
+  | None -> None
 
-let get_open_orders symbol =
+let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
   let orders = Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [] in
   Mutex.unlock store.orders_mutex;
   orders
 
-let get_current_position symbol =
+(** Get all symbols that have execution stores (initialized symbols) *)
+let get_all_symbols () =
+  Mutex.lock initialization_mutex;
+  let symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
+  Mutex.unlock initialization_mutex;
+  symbols
+
+(** Safety cleanup for stale orders - matches Kraken's cleanup_stale_orders pattern *)
+let cleanup_stale_orders () =
+  let now = Unix.gettimeofday () in
+  let stale_threshold = 24.0 *. 3600.0 in (* 24 hours *)
+  let stale_orders = ref [] in
+  
+  let all_symbols = get_all_symbols () in
+  List.iter (fun symbol ->
+    let store = get_symbol_store symbol in
+    Mutex.lock store.orders_mutex;
+    Hashtbl.iter (fun order_id (order : open_order) ->
+      if now -. order.last_updated > stale_threshold then
+        stale_orders := (symbol, order_id) :: !stale_orders
+    ) store.open_orders;
+    Mutex.unlock store.orders_mutex;
+  ) all_symbols;
+  
+  let removed_count = List.length !stale_orders in
+  if removed_count > 0 then begin
+    Logging.info_f ~section "Safety cleanup: removing %d orders older than 24h" removed_count;
+    
+    List.iter (fun (_symbol, order_id) ->
+      let store = get_symbol_store _symbol in
+      Mutex.lock store.orders_mutex;
+      if Hashtbl.mem store.open_orders order_id then begin
+        Hashtbl.remove store.open_orders order_id;
+        Mutex.lock initialization_mutex;
+        Hashtbl.remove order_to_symbol order_id;
+        Mutex.unlock initialization_mutex;
+        Logging.debug_f ~section "Removed stale order during safety cleanup: %s [%s]" order_id _symbol
+      end;
+      Mutex.unlock store.orders_mutex;
+    ) !stale_orders
+  end
+
+let trigger_stale_order_cleanup ~reason () =
+  Lwt.async (fun () ->
+    Logging.debug_f ~section "Triggering stale order cleanup (reason=%s)" reason;
+    cleanup_stale_orders ();
+    Lwt.return_unit
+  )
+
+let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
   RingBuffer.get_position store.events_buffer
 
-let read_execution_events symbol last_pos =
+let[@inline always] read_execution_events symbol last_pos =
   let store = get_symbol_store symbol in
   RingBuffer.read_since store.events_buffer last_pos
 
-let has_execution_data symbol =
+let[@inline always] has_execution_data symbol =
   let store = get_symbol_store symbol in
   Atomic.get store.ready
 
@@ -183,6 +234,10 @@ let update_orders_internal ?user_ref store (event : execution_event) =
 
   if is_terminal then begin
     Hashtbl.remove store.open_orders event.order_id;
+    (* Remove from global index *)
+    Mutex.lock initialization_mutex;
+    Hashtbl.remove order_to_symbol event.order_id;
+    Mutex.unlock initialization_mutex;
   end else begin
     (* UserRef Recovery Logic:
        1. Use explicitly provided user_ref (from proactive inject_order)
@@ -231,6 +286,10 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     } in
     
     Hashtbl.replace store.open_orders event.order_id order;
+    (* Add to global index *)
+    Mutex.lock initialization_mutex;
+    Hashtbl.replace order_to_symbol event.order_id event.symbol;
+    Mutex.unlock initialization_mutex;
   end;
   Mutex.unlock store.orders_mutex;
   
@@ -383,6 +442,7 @@ let process_user_events data_json =
           List.iter (Hashtbl.remove store.processed_tids) !to_remove;
           Mutex.unlock store.tids_mutex;
 
+          (* Hold lock for entire read-compute-write cycle to prevent double-counted fills *)
           Mutex.lock store.orders_mutex;
           let (existing_order : open_order option) = Hashtbl.find_opt store.open_orders order_id in
           let cum_qty = match existing_order with Some o -> o.cum_qty +. size | None -> size in
@@ -391,10 +451,9 @@ let process_user_events data_json =
           let status = if is_filled then FilledStatus else PartiallyFilledStatus in
           let limit_price = match existing_order with Some o -> o.limit_price | None -> Some price in
           let cl_ord_id = match existing_order with Some o -> o.cl_ord_id | None -> None in
-          Mutex.unlock store.orders_mutex;
-          
           let cum_cost = match existing_order with Some o -> o.cum_cost +. (size *. price) | None -> size *. price in
           let avg_price = if cum_qty > 0.0 then cum_cost /. cum_qty else price in
+          Mutex.unlock store.orders_mutex;
           
           let event : execution_event = {
             order_id; symbol; 
@@ -563,16 +622,18 @@ let process_market_data json =
     Logging.error_f ~section "Failed to process Hyperliquid executions data: %s" (Printexc.to_string exn)
 
 let _processor_task =
-  let sub = Hyperliquid_ws.subscribe_market_data () in
-  Lwt.async (fun () ->
-    Logging.info ~section "Starting Hyperliquid executions processor task";
+  let rec run () =
+    let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
+      Logging.info ~section "Starting Hyperliquid executions processor task";
       Lwt_stream.iter process_market_data sub.stream
     ) (fun exn ->
-      Logging.error_f ~section "Hyperliquid executions processor task crashed: %s" (Printexc.to_string exn);
-      Lwt.return_unit
+      Logging.error_f ~section "Hyperliquid executions processor task crashed: %s. Restarting in 5s..." (Printexc.to_string exn);
+      Lwt_unix.sleep 5.0 >>= fun () ->
+      run ()
     )
-  )
+  in
+  Lwt.async run
 
 let initialize symbols =
   Logging.info ~section "Initializing Hyperliquid executions feed";
