@@ -179,23 +179,9 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     | _ -> false
   in
   
-  let existing_order = 
-    match Hashtbl.find_opt store.open_orders event.order_id with
-    | Some o -> Some o
-    | None -> 
-        (match event.cl_ord_id with
-         | Some clid -> 
-             Hashtbl.fold (fun _ (o : open_order) acc -> 
-               if o.cl_ord_id = Some clid then Some o else acc
-             ) store.open_orders None
-         | None -> None)
-  in
+  let existing_order = Hashtbl.find_opt store.open_orders event.order_id in
 
   if is_terminal then begin
-    (match existing_order with
-     | Some existing when existing.order_id <> event.order_id ->
-         Hashtbl.remove store.open_orders existing.order_id
-     | _ -> ());
     Hashtbl.remove store.open_orders event.order_id;
   end else begin
     (* UserRef Recovery Logic:
@@ -244,10 +230,6 @@ let update_orders_internal ?user_ref store (event : execution_event) =
       last_updated = now;
     } in
     
-    (match existing_order with
-     | Some existing when existing.order_id <> event.order_id ->
-         Hashtbl.remove store.open_orders existing.order_id
-     | _ -> ());
     Hashtbl.replace store.open_orders event.order_id order;
   end;
   Mutex.unlock store.orders_mutex;
@@ -549,21 +531,12 @@ let process_market_data json =
           
           let existing_order = 
             Mutex.lock store.orders_mutex;
-            let o = match Hashtbl.find_opt store.open_orders order_id with
-              | Some o -> Some o
-              | None -> 
-                  (match cl_ord_id with
-                   | Some clid -> 
-                       Hashtbl.fold (fun _ (o: open_order) acc -> 
-                         if o.cl_ord_id = Some clid then Some o else acc
-                       ) store.open_orders None
-                   | None -> None)
-            in
+            let o = Hashtbl.find_opt store.open_orders order_id in
             Mutex.unlock store.orders_mutex;
             o
           in
 
-          if Option.is_none existing_order || (match existing_order with Some o -> o.order_id <> order_id | None -> false) then begin
+          if Option.is_none existing_order then begin
             let user_ref = match existing_order with Some o -> o.order_userref | None -> None in
             let event : execution_event = {
               order_id; symbol; 
