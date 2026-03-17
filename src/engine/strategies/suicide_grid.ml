@@ -591,45 +591,54 @@ let execute_strategy
         let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
         let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns sell_cooldown_key in
 
-        (* Place buy order and sell order together *)
-        (match quote_balance with
-         | Some _ when is_buy_on_cooldown || is_sell_on_cooldown ->
-             Logging.debug_f ~section "Skipping order placement for %s due to rate limit cooldown" asset.symbol
-         | Some _ when state.inflight_buy || state.inflight_sell ->
-             Logging.debug_f ~section "Skipping order placement for %s: inflight buy=%B sell=%B" asset.symbol state.inflight_buy state.inflight_sell
-         | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-             (* Place sell order alongside buy *)
+        (* Always try to place the sell order if we have NO OPEN BUY (meaning a previous buy filled and we need a sell for it),
+           even if we don't have quote balance for the NEXT buy order. *)
+        (match asset_balance with
+         | Some asset_bal when not is_sell_on_cooldown && not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
              let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
              if push_order sell_order then
                Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                 asset.symbol (qty *. sell_mult) sell_price;
-                 
+                 asset.symbol (qty *. sell_mult) sell_price
+         | Some asset_bal when not is_sell_on_cooldown && not state.inflight_sell ->
+             Logging.debug_f ~section "Insufficient asset balance for %s sell order: need %.8f, have %.8f"
+                 asset.symbol asset_needed asset_bal
+         | _ -> ()
+        );
+
+        (* Place buy order if we have quote balance *)
+        (match quote_balance with
+         | Some _ when is_buy_on_cooldown ->
+             Logging.debug_f ~section "Skipping buy order placement for %s due to rate limit cooldown" asset.symbol
+         | Some _ when state.inflight_buy ->
+             Logging.debug_f ~section "Skipping buy order placement for %s: inflight buy=%B" asset.symbol state.inflight_buy
+         | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
              let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
              if push_order order then begin
-             state.last_buy_order_price <- Some buy_price;
-             Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
-               asset.symbol qty buy_price;
+               state.last_buy_order_price <- Some buy_price;
+               Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
+                 asset.symbol qty buy_price;
              
-             (* Enforce exactly 2x grid_interval spacing *)
-             (* Find closest sell above buy (including the one we just placed) *)
-             let all_sells = (("new_sell", sell_price) :: state.open_sell_orders) in
-             let closest_sell = List.fold_left (fun acc (_, sp) ->
-               if sp > buy_price then
-                 match acc with
-                 | None -> Some sp
-                 | Some best_sp -> if sp < best_sp then Some sp else acc
-               else acc
-             ) None all_sells in
-                          (match closest_sell with
-               | Some cs_price ->
-                   let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
-                   let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
-                   let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
-                   
-                   if abs_float (target_buy -. buy_price) > min_move_threshold then
-                    Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
-                      asset.symbol buy_price target_buy cs_price
-              | None -> ()) end
+               (* Enforce exactly 2x grid_interval spacing *)
+               (* Find closest sell above buy (including the one we just potentially placed) *)
+               let all_sells = (("new_sell", sell_price) :: state.open_sell_orders) in
+               let closest_sell = List.fold_left (fun acc (_, sp) ->
+                 if sp > buy_price then
+                   match acc with
+                   | None -> Some sp
+                   | Some best_sp -> if sp < best_sp then Some sp else acc
+                 else acc
+               ) None all_sells in
+               (match closest_sell with
+                | Some cs_price ->
+                    let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
+                    let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
+                    let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
+                    
+                    if abs_float (target_buy -. buy_price) > min_move_threshold then
+                     Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
+                       asset.symbol buy_price target_buy cs_price
+                | None -> ())
+             end
          | Some quote_bal ->
              Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f"
                asset.symbol quote_needed quote_bal
@@ -1141,11 +1150,13 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     in
     
     let is_cache_miss = contains_fragment lower_reason "order not found" || contains_fragment lower_reason "not found for amendment" in
+    let is_cannot_modify = contains_fragment lower_reason "cannot modify canceled or filled" in
+    let is_margin_error = contains_fragment lower_reason "insufficient" || contains_fragment lower_reason "margin" in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
 
     let cooldown_duration = 
       if is_rate_limit then 10.0
-      else if is_cache_miss then 0.5
+      else if is_cache_miss || is_cannot_modify || is_margin_error then 0.5
       else 2.0
     in
 
@@ -1153,16 +1164,36 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     let now = Unix.time () in
     Hashtbl.replace state.amend_cooldowns order_id (now +. cooldown_duration);
 
-    (* Log exactly what tracking we are taking action on. We no longer 
-       auto-clear tracking on amendment failures to prevent replacement loops *)
-    (match side with
-     | Buy ->
-         (match state.last_buy_order_id with
-          | Some target_id when target_id = order_id ->
-              Logging.info_f ~section "Amendment failed for buy order %s: %s. Applying %.1fs cooldown (keeping tracking)." order_id reason cooldown_duration
-          | _ -> ())
-     | Sell ->
-         Logging.info_f ~section "Amendment failed for sell order %s: %s. Applying %.1fs cooldown (keeping tracking)." order_id reason cooldown_duration);
+    (* If the order is definitely gone (canceled or filled), we MUST clear tracking 
+       so the grid can replace it. Otherwise we get stuck trying to amend it forever. *)
+    let is_order_gone = is_cache_miss || is_cannot_modify || is_margin_error in
+    
+    if is_order_gone then begin
+      (match side with
+       | Buy ->
+           (match state.last_buy_order_id with
+            | Some target_id when target_id = order_id ->
+                state.last_buy_order_id <- None;
+                state.last_buy_order_price <- None;
+                Logging.info_f ~section "Amendment failed for buy order %s: %s. Order is gone, cleared tracking." order_id reason
+            | _ -> ())
+       | Sell ->
+           let original_sell_count = List.length state.open_sell_orders in
+           state.open_sell_orders <- List.filter (fun (sell_id, _) -> sell_id <> order_id) state.open_sell_orders;
+           if List.length state.open_sell_orders < original_sell_count then
+             Logging.info_f ~section "Amendment failed for sell order %s: %s. Order is gone, cleared tracking." order_id reason)
+    end else begin
+      (* Log exactly what tracking we are taking action on. We no longer 
+         auto-clear tracking on other amendment failures to prevent replacement loops *)
+      (match side with
+       | Buy ->
+           (match state.last_buy_order_id with
+            | Some target_id when target_id = order_id ->
+                Logging.info_f ~section "Amendment failed for buy order %s: %s. Applying %.1fs cooldown (keeping tracking)." order_id reason cooldown_duration
+            | _ -> ())
+       | Sell ->
+           Logging.info_f ~section "Amendment failed for sell order %s: %s. Applying %.1fs cooldown (keeping tracking)." order_id reason cooldown_duration);
+    end;
            
     (* Clear global in-flight trackers so we don't get stuck *)
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));

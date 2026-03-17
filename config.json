@@ -49,22 +49,11 @@
       "strategy": "MM"
     },
     {
-      "symbol": "BTC/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.0002",
-      "grid_interval": [
-        0.15,
-        0.5
-      ],
-      "sell_mult": "1.0",
-      "strategy": "Grid"
-    },
-    {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
       "qty": "0.35",
       "grid_interval": [
-        0.15,
+        0.2,
         0.5
       ],
       "sell_mult": "1.0",
