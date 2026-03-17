@@ -37,3 +37,7 @@
 (test
  (name test_hyperliquid_module)
  (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_get_fee)
+ (libraries dio.hyperliquid alcotest))
