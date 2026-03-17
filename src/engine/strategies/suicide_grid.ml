@@ -52,7 +52,10 @@ type strategy_state = {
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
+  mutable amend_cooldowns: (string, float) Hashtbl.t; (* order_id -> timestamp until which amends are blocked *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
+  mutable inflight_buy: bool;   (* true while a buy Place is sent but not yet ack'd/rejected/failed *)
+  mutable inflight_sell: bool;  (* true while a sell Place is sent but not yet ack'd/rejected/failed *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -76,7 +79,10 @@ let get_strategy_state asset_symbol =
           last_order_time = 0.0;
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
+          amend_cooldowns = Hashtbl.create 16;
           last_cleanup_time = 0.0;
+          inflight_buy = false;
+          inflight_sell = false;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -111,6 +117,16 @@ let get_price_increment symbol exchange =
       Logging.warn_f ~section "No price increment info for %s/%s, using default 0.01" exchange symbol;
       0.01  (* Default fallback *)
 
+(** Get minimum price movement required to trigger an amendment *)
+let get_min_move_threshold price grid_interval_pct symbol exchange =
+  let base_increment = get_price_increment symbol exchange in
+  if exchange = "hyperliquid" then
+    (* For Hyperliquid, require at least 25% of grid_interval OR 10x base increment to avoid rate limits *)
+    let pct_based = price *. (grid_interval_pct *. 0.25 /. 100.0) in
+    max (base_increment *. 10.0) pct_based
+  else
+    base_increment
+
 (** Calculate grid price based on current price and interval *)
 let calculate_grid_price current_price grid_interval_pct is_above symbol exchange =
   let interval = current_price *. (grid_interval_pct /. 100.0) in
@@ -131,6 +147,7 @@ let generate_side_duplicate_key asset_symbol side =
   Printf.sprintf "%s|%s|grid" asset_symbol (string_of_order_side side)
 
 let create_place_order asset_symbol side qty price post_only strategy exchange =
+  let tif = if exchange = "hyperliquid" then "Alo" else "GTC" in
   {
     operation = Place;
     order_id = None;
@@ -140,7 +157,7 @@ let create_place_order asset_symbol side qty price post_only strategy exchange =
     order_type = "limit";
     qty;
     price;
-    time_in_force = "GTC";
+    time_in_force = tif;
     post_only;
     userref = Some Strategy_common.strategy_userref_grid;  (* Tag order as Grid strategy *)
     strategy;
@@ -149,6 +166,7 @@ let create_place_order asset_symbol side qty price post_only strategy exchange =
 
 (** Create a strategy order for amending an existing order *)
 let create_amend_order order_id asset_symbol side qty price post_only strategy exchange =
+  let tif = if exchange = "hyperliquid" then "Alo" else "GTC" in
   {
     operation = Amend;
     order_id = Some order_id;
@@ -158,7 +176,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy e
     order_type = "limit";
     qty;
     price;
-    time_in_force = "GTC";
+    time_in_force = tif;
     post_only;
     userref = None;  (* Amends don't set userref *)
     strategy;
@@ -266,32 +284,38 @@ let push_order order =
            let state = get_strategy_state order.symbol in
            state.last_order_time <- Unix.time ();
 
-           (* Handle different operations *)
-           (match order.operation with
-            | Place ->
-                (* For Hyperliquid: skip pending tracking for sell orders entirely.
-                   Sells are fire-and-forget; tracking them creates ghost entries
-                   that cause re-placement loops during cancel-replace amendments.
-                   Kraken retains existing pending sell tracking behavior. *)
-                let skip_pending = order.exchange = "hyperliquid" && order.side = Sell in
-                if not skip_pending then begin
-                  (* Track order as pending - generate temporary ID until we get the real one from exchange *)
-                  let temp_order_id = Printf.sprintf "pending_%s_%.2f"
-                    (string_of_order_side order.side)
-                    (Option.value order.price ~default:0.0) in
-                  let order_price = Option.value order.price ~default:0.0 in
-                  let timestamp = Unix.time () in
-                  state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
-                  Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
-                    (string_of_order_side order.side) temp_order_id order_price order.symbol;
+            (* Set inflight flags for Place operations *)
+            (match order.operation, order.side with
+             | Place, Buy -> state.inflight_buy <- true
+             | Place, Sell -> state.inflight_sell <- true
+             | _ -> ());
 
-                  (* Track sell orders in state for grid logic (Kraken only) *)
-                  (match order.side, order.price with
-                   | Sell, Some price ->
-                       state.open_sell_orders <- (temp_order_id, price) :: state.open_sell_orders;
-                       Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" temp_order_id price order.symbol
-                   | _ -> ())
-                end
+            (* Handle different operations *)
+            (match order.operation with
+             | Place ->
+                 (* For Hyperliquid: skip pending tracking for sell orders entirely.
+                    Sells are fire-and-forget; tracking them creates ghost entries
+                    that cause re-placement loops during cancel-replace amendments.
+                    Kraken retains existing pending sell tracking behavior. *)
+                 let skip_pending = order.exchange = "hyperliquid" && order.side = Sell in
+                 if not skip_pending then begin
+                   (* Track order as pending - generate temporary ID until we get the real one from exchange *)
+                   let temp_order_id = Printf.sprintf "pending_%s_%.2f"
+                     (string_of_order_side order.side)
+                     (Option.value order.price ~default:0.0) in
+                   let order_price = Option.value order.price ~default:0.0 in
+                   let timestamp = Unix.time () in
+                   state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
+                   Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
+                     (string_of_order_side order.side) temp_order_id order_price order.symbol;
+
+                   (* Track sell orders in state for grid logic (Kraken only) *)
+                   (match order.side, order.price with
+                    | Sell, Some price ->
+                        state.open_sell_orders <- (temp_order_id, price) :: state.open_sell_orders;
+                        Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" temp_order_id price order.symbol
+                    | _ -> ())
+                 end
             | Amend ->
                 (* For amendments, track as pending but don't add to sell orders yet *)
                 let temp_order_id = Printf.sprintf "pending_amend_%s"
@@ -361,7 +385,9 @@ let execute_strategy
             ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
           end else begin
             let duplicate_key = generate_side_duplicate_key asset.symbol side in
-            ignore (InFlightOrders.remove_in_flight_order duplicate_key)
+            ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+            (* Fallback: clear inflight flags for stale placements *)
+            (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
           end;
           false
         end else
@@ -404,6 +430,17 @@ let execute_strategy
         Logging.debug_f ~section "Removing stale pending cancellation %s for %s" order_id asset.symbol;
         Hashtbl.remove state.pending_cancellations order_id
       ) !to_remove;
+
+      (* Clean up expired amend cooldowns *)
+      let to_remove_cooldowns = ref [] in
+      Hashtbl.iter (fun order_id expiry_time ->
+        if now > expiry_time then
+          to_remove_cooldowns := order_id :: !to_remove_cooldowns
+      ) state.amend_cooldowns;
+
+      List.iter (fun order_id ->
+        Hashtbl.remove state.amend_cooldowns order_id
+      ) !to_remove_cooldowns;
 
       (* Sync strategy state with actual open orders from exchange *)
       (* Clear existing tracked orders *)
@@ -549,12 +586,18 @@ let execute_strategy
         let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
         let buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
 
+        let buy_cooldown_key = "place_Buy" in
+        let sell_cooldown_key = "place_Sell" in
+        let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
+        let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns sell_cooldown_key in
+
         (* Place buy order and sell order together *)
         (match quote_balance with
+         | Some _ when is_buy_on_cooldown || is_sell_on_cooldown ->
+             Logging.debug_f ~section "Skipping order placement for %s due to rate limit cooldown" asset.symbol
+         | Some _ when state.inflight_buy || state.inflight_sell ->
+             Logging.debug_f ~section "Skipping order placement for %s: inflight buy=%B sell=%B" asset.symbol state.inflight_buy state.inflight_sell
          | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-             (* Force-clear any stale sell InFlight guard so the new sell always goes through *)
-             ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
-             
              (* Place sell order alongside buy *)
              let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
              if push_order sell_order then
@@ -581,7 +624,7 @@ let execute_strategy
                | Some cs_price ->
                    let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
                    let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
-                   let min_move_threshold = get_price_increment asset.symbol asset.exchange in
+                   let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
                    
                    if abs_float (target_buy -. buy_price) > min_move_threshold then
                     Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
@@ -642,7 +685,7 @@ let execute_strategy
                       proposed_buy_price
                   in
                   
-                  let min_move_threshold = get_price_increment asset.symbol asset.exchange in
+                  let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
                   let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                   let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
                   
@@ -653,8 +696,9 @@ let execute_strategy
                   ) state.pending_orders in
                   
                   let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
-                  
-                  if not is_being_amended && not is_in_flight && price_diff_rounded >= min_move_threshold && target_buy_price <> current_buy_price_rounded then begin
+                  let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
+
+                  if not is_being_amended && not is_in_flight && not is_on_cooldown && price_diff_rounded >= min_move_threshold && target_buy_price <> current_buy_price_rounded then begin
                     (match quote_balance with
                      | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                          let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
@@ -679,7 +723,7 @@ let execute_strategy
                 let exact_target_rounded = exact_target in
                 let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                 let price_diff_rounded = round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) asset.symbol asset.exchange in
-                let min_move_threshold = get_price_increment asset.symbol asset.exchange in
+                let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
 
                 (* Check if this order is already being amended *)
                 let is_being_amended = List.exists (fun (id, _, _, _) ->
@@ -688,8 +732,9 @@ let execute_strategy
                 ) state.pending_orders in
 
                 let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+                let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
 
-                if not is_being_amended && not is_in_flight && price_diff_rounded >= min_move_threshold && exact_target_rounded <> current_buy_price_rounded then begin
+                if not is_being_amended && not is_in_flight && not is_on_cooldown && price_diff_rounded >= min_move_threshold && exact_target_rounded <> current_buy_price_rounded then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" asset.exchange in
@@ -719,7 +764,7 @@ let execute_strategy
                let target_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
                             (* Only trail upward - move buy up if target is higher than current *)
                if target_buy_price > current_buy_price then begin
-                 let min_move_threshold = get_price_increment asset.symbol asset.exchange in
+                 let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
                  let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                  let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
 
@@ -730,8 +775,9 @@ let execute_strategy
                 ) state.pending_orders in
 
                 let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+                let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
 
-                if not is_being_amended && not is_in_flight && price_diff_rounded >= min_move_threshold then begin
+                if not is_being_amended && not is_in_flight && not is_on_cooldown && price_diff_rounded >= min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
@@ -796,8 +842,10 @@ let handle_order_acknowledged asset_symbol order_id side price =
    | Buy ->
     state.last_buy_order_id <- Some order_id;
     state.last_buy_order_price <- Some price;
+    state.inflight_buy <- false;
     Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
-   | Sell -> ());
+   | Sell ->
+    state.inflight_sell <- false);
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     order_id (string_of_order_side side) price asset_symbol
@@ -811,12 +859,29 @@ let handle_order_failed asset_symbol side reason =
     (* Remove from pending orders *)
     state.pending_orders <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
     
+    (* Clear inflight flags *)
+    (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+    
     (* Clear global in-flight trackers *)
     let duplicate_key = generate_side_duplicate_key asset_symbol side in
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
     
-    Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker."
-      asset_symbol (string_of_order_side side) reason
+    let lower_reason = String.lowercase_ascii reason in
+    let contains_fragment s fragment =
+      let sl = String.length s and fl = String.length fragment in
+      let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
+      loop 0
+    in
+    let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
+    let cooldown = if is_rate_limit then 10.0 else 2.0 in
+    
+    (* Apply cooldown to prevent placement spam on rate limit *)
+    let now = Unix.time () in
+    let cooldown_key = Printf.sprintf "place_%s" (string_of_order_side side) in
+    Hashtbl.replace state.amend_cooldowns cooldown_key (now +. cooldown);
+
+    Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker, applied %.1fs placement cooldown."
+      asset_symbol (string_of_order_side side) reason cooldown
   )
 
 (** Handle order placement failure - remove from pending and potentially trigger re-evaluation *)
@@ -839,11 +904,19 @@ let handle_order_rejected asset_symbol side price =
     not (matches_side_placement || matches_fallback)
   ) state.pending_orders;
 
+  (* Clear inflight flags *)
+  (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+
   (* Clean up global trackers to allow immediate re-placement after rejection *)
   let duplicate_key = generate_side_duplicate_key asset_symbol side in
   ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
-  Logging.debug_f ~section "Order rejected and removed from pending/trackers: %s @ %.2f for %s"
+  (* Apply short cooldown to prevent placement spam on immediate rejection *)
+  let now = Unix.time () in
+  let cooldown_key = Printf.sprintf "place_%s" (string_of_order_side side) in
+  Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+
+  Logging.debug_f ~section "Order rejected and removed from pending/trackers (applied 2s cooldown): %s @ %.2f for %s"
     (string_of_order_side side) price asset_symbol
   )
 
@@ -878,7 +951,8 @@ let handle_order_filled asset_symbol order_id side =
       Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
     end;
 
-    (* 4. Clear global placement trackers so strategy can replace immediately *)
+    (* 4. Clear inflight flags and global placement trackers so strategy can replace immediately *)
+    (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
 
     Logging.debug_f ~section "Order FILLED and cleaned up explicitly: %s for %s"
@@ -897,7 +971,7 @@ let handle_order_cancelled asset_symbol order_id side =
     String.starts_with ~prefix:"pending_amend_" pending_id &&
     let target_id = String.sub pending_id 14 (String.length pending_id - 14) in
     target_id = order_id
-  ) state.pending_orders in
+  ) state.pending_orders || Hashtbl.mem state.amend_cooldowns order_id in
 
   if is_cancel_replace then begin
     (* Cancel-replace: clean up the pending_amend entry but keep guards alive *)
@@ -951,7 +1025,8 @@ let handle_order_cancelled asset_symbol order_id side =
     ) state.open_sell_orders;
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
 
-    (* Clean up global placement trackers to allow immediate re-placement *)
+    (* Clear inflight flags and global placement trackers to allow immediate re-placement *)
+    (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol cancelled_side));
     
     Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
@@ -1006,6 +1081,13 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
            Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
              new_order_id price asset_symbol);
              
+    (* Apply a short cooldown to avoid amending the newly amended order
+       before the exchange's WebSocket open-orders cache catches up.
+       This prevents race-condition duplicate amends on Hyperliquid. *)
+    let now = Unix.time () in
+    Hashtbl.replace state.amend_cooldowns old_order_id (now +. 10.0);
+    Hashtbl.replace state.amend_cooldowns new_order_id (now +. 10.0);
+
     Logging.debug_f ~section "Order amended and tracking updated: %s %s -> %s @ %.2f for %s"
       (string_of_order_side side) old_order_id new_order_id price asset_symbol
   )
@@ -1040,39 +1122,39 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     ) state.pending_orders;
 
     (* 2. Determine whether to clear buy tracking.
-       "Order not found" on Hyperliquid is a cancel-replace race: the strategy tried to
-       amend an order whose cancel-replace hasn't landed in the open-orders cache yet.
-       The order DOES exist (already acknowledged via handle_order_acknowledged with the
-       new ID). Clearing last_buy_order_id here would make effective_buy_count=0 and
-       trigger a fresh buy placement — exactly the observed spam loop.
-       For genuine errors (e.g. rejected, invalid qty) the order is truly gone, so we
-       must clear tracking so the strategy can replace it next cycle. *)
-    let is_cache_miss =
-      let lower = String.lowercase_ascii reason in
-      let contains s fragment =
-        let sl = String.length s and fl = String.length fragment in
-        let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
-        loop 0
-      in
-      contains lower "order not found" || contains lower "not found for amendment"
+       For Hyperliquid, the REST Cancel-Replace structure means the open order
+       was untouched on the book even if the amend request failed. We apply a cooldown
+       instead of dropping tracking, which would induce a spamming duplicate placement loop. *)
+    let lower_reason = String.lowercase_ascii reason in
+    let contains_fragment s fragment =
+      let sl = String.length s and fl = String.length fragment in
+      let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
+      loop 0
     in
+    
+    let is_cache_miss = contains_fragment lower_reason "order not found" || contains_fragment lower_reason "not found for amendment" in
+    let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
+
+    let cooldown_duration = 
+      if is_rate_limit then 10.0
+      else if is_cache_miss then 0.5
+      else 2.0
+    in
+
+    (* Apply cooldown to prevent spamming failed amends *)
+    let now = Unix.time () in
+    Hashtbl.replace state.amend_cooldowns order_id (now +. cooldown_duration);
+
+    (* Log exactly what tracking we are taking action on. We no longer 
+       auto-clear tracking on amendment failures to prevent replacement loops *)
     (match side with
      | Buy ->
          (match state.last_buy_order_id with
           | Some target_id when target_id = order_id ->
-              if is_cache_miss then
-                Logging.info_f ~section "Amendment failed for buy order %s (cache miss, keeping tracking): %s" order_id reason
-              else begin
-                state.last_buy_order_id <- None;
-                state.last_buy_order_price <- None;
-                Logging.info_f ~section "Amendment failed for buy order %s: cleared tracking (%s)" order_id reason
-              end
+              Logging.info_f ~section "Amendment failed for buy order %s: %s. Applying %.1fs cooldown (keeping tracking)." order_id reason cooldown_duration
           | _ -> ())
      | Sell ->
-         let original = List.length state.open_sell_orders in
-         state.open_sell_orders <- List.filter (fun (sell_id, _) -> sell_id <> order_id) state.open_sell_orders;
-         if List.length state.open_sell_orders < original then
-           Logging.info_f ~section "Amendment failed for sell order %s: cleared tracking (%s)" order_id reason);
+         Logging.info_f ~section "Amendment failed for sell order %s: %s. Applying %.1fs cooldown (keeping tracking)." order_id reason cooldown_duration);
            
     (* Clear global in-flight trackers so we don't get stuck *)
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
@@ -1134,6 +1216,7 @@ module Strategy = struct
   let handle_order_amended = handle_order_amended
   let handle_order_amendment_skipped = handle_order_amendment_skipped
   let handle_order_amendment_failed = handle_order_amendment_failed
+  let handle_order_failed = handle_order_failed
   let cleanup_pending_cancellation = cleanup_pending_cancellation
   let cleanup_strategy_state = cleanup_strategy_state
   let init = init
