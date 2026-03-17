@@ -16,7 +16,17 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
                bubblewrap darcs g++-multilib gcc-multilib m4 make mercurial \
-               musl-tools rsync
+               musl-tools rsync autoconf automake libtool
+
+      - name: Build libsecp256k1 with schnorrsig support
+        run: |
+          git clone https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1
+          cd /tmp/secp256k1
+          ./autogen.sh
+          ./configure --enable-module-schnorrsig --enable-module-recovery
+          make
+          sudo make install
+          sudo ldconfig
 
       - uses: ocaml/setup-ocaml@v2
         with:
