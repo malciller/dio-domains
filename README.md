@@ -30,8 +30,9 @@ Create `.env`:
 ```bash
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_API_SECRET=your_kraken_api_secret
-HYPERLIQUID_WALLET_ADDRESS=your_hyperliquid_wallet_address # For L1 auth
-HYPERLIQUID_PRIVATE_KEY=your_hyperliquid_private_key       # For L1 signature generation
+HYPERLIQUID_WALLET_ADDRESS=your_hyperliquid_wallet_address  # public wallet address
+HYPERLIQUID_AGENT_ADDRESS=your_hyperliquid_agent_address    # For L1 auth
+HYPERLIQUID_PRIVATE_KEY=your_hyperliquid_private_key        # For L1 signature generation
 CMC_API_KEY=your_cmc_api_key                               # Fear & Greed index (optional fallback to default)
 ```
 
