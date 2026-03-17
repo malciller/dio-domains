@@ -955,6 +955,14 @@ let handle_order_filled asset_symbol order_id side =
     (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
 
+    (* 5. When a buy fills, also clear the Sell side's InFlightOrders guard.
+       The strategy places buy+sell together; the previous sell's guard would
+       block the new sell via duplicate detection. *)
+    if side = Buy then begin
+      ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Sell));
+      state.inflight_sell <- false
+    end;
+
     Logging.debug_f ~section "Order FILLED and cleaned up explicitly: %s for %s"
       order_id asset_symbol
   )
