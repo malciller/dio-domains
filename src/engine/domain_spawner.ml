@@ -313,11 +313,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             
             List.iter (fun (event : Types.execution_event) ->
               match event.order_status with
-              | Types.Canceled | Types.Filled | Types.Rejected | Types.Expired ->
+              | Types.Canceled | Types.Rejected | Types.Expired ->
                   should_execute_strategy := true;
                   let status_desc = match event.order_status with
                     | Types.Canceled -> "cancelled"
-                    | Types.Filled -> "filled"
                     | Types.Rejected -> "rejected"
                     | Types.Expired -> "expired"
                     | _ -> "terminated"
@@ -339,6 +338,26 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                          asset_with_fees.symbol event.order_id side;
                        Logging.debug_f ~section "Notified MM strategy about %s order %s for %s"
                          status_desc event.order_id asset_with_fees.symbol
+                   | None -> ())
+              | Types.Filled ->
+                  should_execute_strategy := true;
+                  let side = match event.side with
+                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
+                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
+                  in
+                  (match grid_strategy_asset with
+                   | Some _ ->
+                       Dio_strategies.Suicide_grid.Strategy.handle_order_filled
+                         asset_with_fees.symbol event.order_id side;
+                       Logging.info_f ~section "Notified Grid strategy about filled order %s for %s"
+                         event.order_id asset_with_fees.symbol
+                   | None -> ());
+                  (match mm_strategy_asset with
+                   | Some _ ->
+                       Dio_strategies.Market_maker.Strategy.handle_order_filled
+                         asset_with_fees.symbol event.order_id side;
+                       Logging.debug_f ~section "Notified MM strategy about filled order %s for %s"
+                         event.order_id asset_with_fees.symbol
                    | None -> ())
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;

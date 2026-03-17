@@ -981,13 +981,28 @@ let order_processing_loop () =
                              Lwt.catch (fun () ->
                                Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                                | Ok result ->
-                                   orders_placed := !orders_placed + 1;
-                                   Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
-                                     (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
-                                     (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
-                                     (match result.Dio_exchange.Exchange_intf.Types.amend_id with Some id -> id | None -> "none")
-                                     result.Dio_exchange.Exchange_intf.Types.new_order_id;
-                                   Lwt.return_unit
+                                   if result.Dio_exchange.Exchange_intf.Types.amend_id = Some "skipped_no_change" then begin
+                                       Logging.debug_f ~section "Amendment skipped for %s %s %.8f @ %s (no price change)" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+                                       (match order.price with
+                                        | Some price ->
+                                            Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
+                                        | None -> Logging.warn_f ~section "Amendment skipped but no price available for strategy update: %s" result.Dio_exchange.Exchange_intf.Types.new_order_id
+                                       );
+                                       Lwt.return_unit
+                                   end else begin
+                                       orders_placed := !orders_placed + 1;
+                                       Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
+                                         (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
+                                         (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                                         (match result.Dio_exchange.Exchange_intf.Types.amend_id with Some id -> id | None -> "none")
+                                         result.Dio_exchange.Exchange_intf.Types.new_order_id;
+                                       (match order.price with
+                                        | Some price ->
+                                            Dio_strategies.Suicide_grid.Strategy.handle_order_amended order.symbol target_order_id result.Dio_exchange.Exchange_intf.Types.new_order_id order.side price
+                                        | None -> Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.Dio_exchange.Exchange_intf.Types.new_order_id
+                                       );
+                                       Lwt.return_unit
+                                   end
                                | Error err ->
                                    Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s"
                                      (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
