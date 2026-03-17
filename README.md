@@ -64,13 +64,20 @@ Edit `config.json` (example):
       "strategy": "MM"                // Strategy name: "MM"
     },
     {
-      "symbol": "BTC/USD",            // Pair to trade
+      "symbol": "BTC/USDC",            // Pair to trade
       "exchange": "hyperliquid",      // Exchange name: "kraken", "hyperliquid"
       "qty": "0.001",                 // Base asset quantity per order
       "grid_interval": [0.1, 0.5],    // Min/Max grid spacing (%)
       "sell_mult": "1.0",             // Sell amount multiplier
       "strategy": "Grid",             // Strategy name: "Grid"
       "testnet": true                 // Use testnet
+    },
+    {
+      "symbol": "HYPE/USDC",          // Pair to trade
+      "exchange": "hyperliquid",      // Exchange name: "kraken", "hyperliquid"
+      "qty": "1.0",                 // Trade size per market making quote
+      "strategy": "MM",               // Strategy name: "MM"
+      "testnet": false                // Use testnet
     }
   ]
 }
