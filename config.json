@@ -20,6 +20,28 @@
       "strategy": "Grid"
     },
     {
+      "symbol": "ETH/USD",
+      "exchange": "kraken",
+      "qty": "0.006",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "SOL/USD",
+      "exchange": "kraken",
+      "qty": "0.14",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
       "symbol": "USDG/USD",
       "exchange": "kraken",
       "qty": "100.0",

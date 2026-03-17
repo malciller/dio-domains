@@ -245,16 +245,18 @@ let fetch_initial_balances ~testnet () =
   fetch_spot_balances_rest ~testnet ()
 
 let _processor_task =
-  let sub = Hyperliquid_ws.subscribe_market_data () in
-  Lwt.async (fun () ->
-    Logging.info ~section "Starting Hyperliquid balances processor task";
+  let rec run () =
+    let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
+      Logging.info ~section "Starting Hyperliquid balances processor task";
       Lwt_stream.iter process_market_data sub.stream
     ) (fun exn ->
-      Logging.error_f ~section "Hyperliquid balances processor task crashed: %s" (Printexc.to_string exn);
-      Lwt.return_unit
+      Logging.error_f ~section "Hyperliquid balances processor task crashed: %s. Restarting in 5s..." (Printexc.to_string exn);
+      Lwt_unix.sleep 5.0 >>= fun () ->
+      run ()
     )
-  )
+  in
+  Lwt.async run
 
 let initialize ~testnet assets =
   Logging.info_f ~section "Initializing Hyperliquid balances feed for %d assets (testnet=%b)" (List.length assets) testnet;
