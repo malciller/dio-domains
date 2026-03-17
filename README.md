@@ -3,16 +3,13 @@
 [![OCaml](https://img.shields.io/badge/Language-OCaml-blue.svg)](https://ocaml.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-High-performance OCaml 5.2 trading engine for Kraken featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, tick-driven event architecture, and real-time latency profiling. Built for high-frequency trading with WebSocket data feeds and asynchronous order execution.
-
-> [!WARNING]
-> **Hyperliquid integration is EXPERIMENTAL.** Testing is ongoing; features may be incomplete or unstable.
+High-performance OCaml 5.2 trading engine for Kraken and Hyperliquid featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, tick-driven event architecture, and real-time latency profiling. Built for high-frequency trading with WebSocket data feeds and asynchronous order execution.
 
 
 ## Requirements
 
 - OCaml 5.2.0 (opam)
-- Kraken API key/secret
+- Kraken API key/secret and/or Hyperliquid wallet/key
 - macOS/Linux/WSL
 
 ## Quick Start
@@ -115,12 +112,14 @@ Edit `config.json` (example):
   - **Strategies**: High-frequency trading algorithms (Grid, MM) running in parallel domains with F&G integration.
   - **Order Executor**: Asynchronous order placement and amendment with duplicate detection.
   - **Logging**: Structured logging with configurable levels and sections.
-- **External Integration - Kraken**:
+- **External Integration — Kraken**:
   - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
   - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
   - **Authentication**: Secure token generation and management.
-- **External Integration - Hyperliquid**:
-  - **Experimental**: Integration is currently under active development and testing. **Use at your own peril.**
+- **External Integration — Hyperliquid**:
+  - **WebSocket Feeds**: Real-time ticker (allMids), L2 orderbook, balance (webData2/spotState), and execution data with ring buffer storage.
+  - **REST Actions**: Authenticated order placement, amendment, and cancellation with L1 signature generation and retry with exponential backoff.
+  - **Concurrency**: Global order index, double-checked locking on stores, self-restarting processor tasks, and stale-order cleanup.
 
 ## Development
 
@@ -154,7 +153,9 @@ dune build
     - Concurrency & Bus: `src/engine/concurrency/`
     - Latency Profiling: `src/engine/latency_profiling/`
     - Connection supervision: `src/engine/supervisor/`
-    - WebSocket feeds: `src/external/kraken/`
+    - WebSocket feeds (Kraken): `src/external/kraken/`
+    - WebSocket feeds (Hyperliquid): `src/external/hyperliquid/`
+    - Exchange interface: `src/external/exchange_intf.ml`
     - Dashboard UI: `src/ui/`
 3. Commit (`git commit -m "..."`)
 4. Push (`git push origin feature/xyz`)
