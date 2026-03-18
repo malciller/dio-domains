@@ -364,7 +364,13 @@ let process_order_updates data_json =
         | Some symbol ->
             let status = member "status" order_update |> to_string in
             let price = (match member "limitPx" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
-            let qty = (match member "sz" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
+            let qty = 
+              match member "origSz" order_obj with 
+              | `String s -> float_of_string s 
+              | `Float f -> f 
+              | `Int i -> float_of_int i 
+              | _ -> (match member "sz" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0)
+            in
             let side = if (member "side" order_obj |> to_string) = "B" then Buy else Sell in
             let cl_ord_id = member "cloid" order_obj |> to_string_option in
             

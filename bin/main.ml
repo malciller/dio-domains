@@ -59,6 +59,35 @@ let close_hedged_positions () =
           Client.post ~headers ~body url >>= fun (_resp, resp_body) ->
           Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
           
+          (* Step 1: Cancel any open hedge orders *)
+          let open_orders_body = Printf.sprintf {|{"type":"openOrders","user":"%s"}|} wallet in
+          let open_orders_req = Cohttp_lwt.Body.of_string open_orders_body in
+          Client.post ~headers ~body:open_orders_req url >>= fun (_resp2, resp_body2) ->
+          Cohttp_lwt.Body.to_string resp_body2 >>= fun orders_str ->
+          (try
+            let open Yojson.Safe.Util in
+            let orders_json = Yojson.Safe.from_string orders_str in
+            let open_orders = match orders_json with `List l -> l | _ -> [] in
+            let hedge_orders = List.filter_map (fun o ->
+              let coin = member "coin" o |> to_string in
+              let oid = match member "oid" o with `Int i -> Some (Int64.of_int i) | `Intlit s -> Some (Int64.of_string s) | _ -> None in
+              if List.mem coin active_symbols then
+                Option.map (fun id -> (coin, id)) oid
+              else None
+            ) open_orders in
+            if hedge_orders <> [] then begin
+              Logging.warn_f ~section:"main" "Found %d open hedge orders to cancel on shutdown" (List.length hedge_orders);
+              Lwt_list.iter_s (fun (symbol, oid) ->
+                Logging.info_f ~section:"main" "Cancelling open hedge order %Ld for %s" oid symbol;
+                Hyperliquid.Actions.cancel_orders ~symbol ~order_ids:[oid] ~testnet >>= function
+                | Ok () -> Logging.info_f ~section:"main" "✓ Cancelled hedge order %Ld" oid; Lwt.return_unit
+                | Error err -> Logging.error_f ~section:"main" "✗ Failed to cancel hedge order %Ld: %s" oid err; Lwt.return_unit
+              ) hedge_orders
+            end else
+              Lwt.return_unit
+          with _ -> Lwt.return_unit) >>= fun () ->
+
+          (* Step 2: Close any open hedge positions *)
           let open Yojson.Safe.Util in
           let json = Yojson.Safe.from_string body_str in
           let asset_positions = member "assetPositions" json |> to_list in
