@@ -1380,6 +1380,26 @@ let order_processing_loop () =
                        Lwt.async (fun () ->
                          let%lwt () = Lwt.pause () in
                          Lwt.catch (fun () ->
+             (* Transfer USDC from spot to perp before placing hedge order *)
+             let estimate_price = match order.price with
+               | Some p -> p
+               | None ->
+                   match Hyperliquid.Ticker_feed.get_latest_ticker order.symbol with
+                   | Some t -> (t.bid +. t.ask) /. 2.0
+                   | None -> 0.0
+             in
+             let transfer_amount = order.qty *. estimate_price *. 1.1 in
+             (if transfer_amount > 0.0 then begin
+               Logging.info_f ~section "Transferring $%.2f USDC spot->perp for %s hedge" transfer_amount order.symbol;
+               Hyperliquid.Module.Hyperliquid_impl.transfer_usd ~amount:transfer_amount ~to_perp:true >>= function
+               | Ok () ->
+                   Logging.info_f ~section "USDC transfer complete ($%.2f spot->perp)" transfer_amount;
+                   Lwt.return_unit
+               | Error err ->
+                   Logging.warn_f ~section "USDC transfer failed: %s (proceeding with hedge anyway)" err;
+                   Lwt.return_unit
+             end else
+               Lwt.return_unit) >>= fun () ->
                            Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                            | Ok result ->
                                orders_placed := !orders_placed + 1;

@@ -354,6 +354,13 @@ module Hyperliquid_impl = struct
           Hashtbl.replace fee_cache symbol (maker, taker, spot_m, spot_t)
       | None -> ()
     ) symbols
+
+  (** Transfer USDC from spot to perp wallet (or vice versa) *)
+  let transfer_usd ~amount ~to_perp =
+    Hyperliquid_actions.usd_class_transfer
+      ~amount
+      ~to_perp
+      ~testnet:(Atomic.get is_testnet)
 end
 
 (* Register the module *)

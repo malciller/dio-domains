@@ -399,3 +399,36 @@ let cancel_orders ~symbol ~order_ids ~testnet =
     | Error e -> Error e
   in
   retry_with_backoff ~config:default_retry_config ~f:cancel_orders_once ~is_retriable:is_retriable_error
+
+(** Transfer USDC between spot and perp wallets via usdClassTransfer *)
+let usd_class_transfer ~amount ~to_perp ~testnet =
+  let transfer_once () =
+    let amount_str = format_number amount in
+    let action = pack_usd_class_transfer_action ~amount:amount_str ~to_perp in
+    let action_msgpack = serialize_action action in
+
+    let action_json = `Assoc [
+      "type", `String "usdClassTransfer";
+      "amount", `String amount_str;
+      "toPerp", `Bool to_perp;
+    ] in
+
+    let is_mainnet = not testnet in
+
+    post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet >|= function
+    | Ok res ->
+        let open Yojson.Safe.Util in
+        (try
+          let status = member "status" res |> to_string_option in
+          match status with
+          | Some "err" ->
+              let err_msg = match member "response" res with
+                | `String s -> s
+                | other -> Yojson.Safe.to_string other
+              in
+              Error (Printf.sprintf "HL Transfer Rejected: %s" err_msg)
+          | _ -> Ok ()
+        with exn -> Error (Printf.sprintf "Failed to parse HL transfer response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res)))
+    | Error e -> Error e
+  in
+  retry_with_backoff ~config:default_retry_config ~f:transfer_once ~is_retriable:is_retriable_error

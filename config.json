@@ -11,21 +11,21 @@
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.15",
+      "qty": "0.35",
       "grid_interval": [
         0.2,
         0.5
       ],
       "sell_mult": "1.0",
       "strategy": "Grid",
-      "testnet": true
+      "testnet": false
     }
   ],
   "hedging": [
     {
       "source_symbol": "HYPE/USDC",
       "hedge_symbol": "HYPE",
-      "testnet": true
+      "testnet": false
     }
   ]
 }
