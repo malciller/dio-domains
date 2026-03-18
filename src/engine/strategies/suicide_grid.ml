@@ -576,6 +576,10 @@ let execute_strategy
         state.last_buy_order_price <- None;
         state.last_buy_order_id <- None;
 
+        (* Apply cooldown to prevent re-entering this branch before exchange acks the cancels *)
+        let cooldown_key = "place_Buy" in
+        Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+
         (* Update cycle counter *)
         state.last_cycle <- cycle
       end else if effective_buy_count = 0 && not buy_order_pending then begin
@@ -640,8 +644,13 @@ let execute_strategy
                 | None -> ())
              end
          | Some quote_bal ->
-             Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f"
-               asset.symbol quote_needed quote_bal
+             (* Apply cooldown to avoid tight-looping; re-check after sells may have freed liquidity *)
+             let cooldown_key = "place_Buy" in
+             if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
+               Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f (waiting 5s for liquidity)"
+                 asset.symbol quote_needed quote_bal;
+               Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 5.0)
+             end
          | None ->
              Logging.warn_f ~section "No quote balance data available for %s buy order"
                asset.symbol
@@ -886,7 +895,7 @@ let handle_order_failed asset_symbol side reason =
     
     (* Apply cooldown to prevent placement spam on rate limit *)
     let now = Unix.time () in
-    let cooldown_key = Printf.sprintf "place_%s" (string_of_order_side side) in
+    let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
     Hashtbl.replace state.amend_cooldowns cooldown_key (now +. cooldown);
 
     Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker, applied %.1fs placement cooldown."
@@ -922,7 +931,7 @@ let handle_order_rejected asset_symbol side price =
 
   (* Apply short cooldown to prevent placement spam on immediate rejection *)
   let now = Unix.time () in
-  let cooldown_key = Printf.sprintf "place_%s" (string_of_order_side side) in
+  let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
   Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
 
   Logging.debug_f ~section "Order rejected and removed from pending/trackers (applied 2s cooldown): %s @ %.2f for %s"
