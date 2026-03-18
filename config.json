@@ -25,7 +25,8 @@
     {
       "source_symbol": "HYPE/USDC",
       "hedge_symbol": "HYPE",
-      "testnet": false
+      "testnet": false,
+      "max_basis_bps": 15
     }
   ]
 }

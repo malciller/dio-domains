@@ -243,6 +243,7 @@ module Kraken_impl = struct
         side = side_of_kraken_side e.side;
         remaining_qty = e.order_qty -. e.cum_qty;
         filled_qty = e.cum_qty; (* Assuming cum_qty is filled_qty *)
+        avg_price = e.avg_price;
         timestamp = e.timestamp;
       }
     ) events

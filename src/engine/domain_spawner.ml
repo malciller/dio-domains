@@ -365,7 +365,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (match List.find_opt (fun (h: Config.hedging_config) -> h.source_symbol = asset_with_fees.symbol) config.hedging with
                    | Some hedge_cfg ->
                        Dio_strategies.Auto_hedger.handle_order_filled
-                         hedge_cfg.testnet asset_with_fees.exchange hedge_cfg.hedge_symbol side event.filled_qty
+                         hedge_cfg.testnet asset_with_fees.exchange hedge_cfg.hedge_symbol side event.filled_qty event.avg_price hedge_cfg.max_basis_bps
                    | None -> ())
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
