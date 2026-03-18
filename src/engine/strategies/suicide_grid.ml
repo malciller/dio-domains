@@ -463,10 +463,16 @@ let execute_strategy
       let buy_orders = ref [] in
       let sell_orders = ref [] in
 
-      List.iter (fun (order_id, order_price, qty, side_str, _userref_opt) ->
+      List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         (* Skip if this order was recently cancelled *)
         let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-        if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)
+        
+        let is_our_strategy = match userref_opt with
+          | Some ref_val -> ref_val = Strategy_common.strategy_userref_grid
+          | None -> false
+        in
+        
+        if not is_cancelled && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
             (* Treat ALL buy orders as grid buys to enforce single-buy-order policy across all exchanges *)

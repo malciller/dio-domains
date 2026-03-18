@@ -213,14 +213,14 @@ let is_retriable_error err =
   string_contains err_lower "too many cumulative requests"
 
 (** Place order with retry logic *)
-let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?cl_ord_id ~testnet () =
+let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?cl_ord_id ?time_in_force ~testnet () =
   let place_order_once () =
     let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
       | Some idx -> idx
       | None -> failwith (Printf.sprintf "Unknown symbol: %s" symbol)
     in
     
-    let tif = Alo in
+    let tif = Option.value time_in_force ~default:Gtc in
     let ot = Limit { tif } in
     
     let order_wire = {
