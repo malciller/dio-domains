@@ -76,6 +76,16 @@ Edit `config.json` (example):
       "qty": "1.0",                 // Trade size per market making quote
       "strategy": "MM",               // Strategy name: "MM"
       "testnet": false                // Use testnet
+    },
+    {
+      "symbol": "HYPE/USDC",          // Pair to trade (spot)
+      "exchange": "hyperliquid",      // Exchange name (must be "hyperliquid")
+      "qty": "0.35",                  // Base asset quantity per order
+      "grid_interval": [0.25, 0.5],   // Min/Max grid spacing (%)
+      "sell_mult": "1.0",             // Sell amount multiplier
+      "strategy": "Grid",             // Strategy name: "Grid"
+      "testnet": false,               // Use testnet
+      "hedge": true                   // Enable auto-hedge (Hyperliquid only)
     }
   ]
 }
@@ -91,6 +101,7 @@ Edit `config.json` (example):
 - GRID: Maintains buy/sell ladders around price with configurable spacing and size.
 - MM (Adaptive Market Maker): Dynamically adapts its quoting style based on market fees—uses a greedy quoting approach for no-fee markets and a conservative, profit-guaranteeing strategy where trading fees apply.
 - Fear & Greed: Grid spacing is resolved once at domain startup using linear interpolation between configured `grid_interval` [min, max] based on the CoinMarketCap Fear & Greed index; provide `CMC_API_KEY` for live values.
+- Auto-Hedge (Hyperliquid only): Single-short-per-cycle delta hedge on perps. Spot buy fills open a perp short; spot sell fills close it. Enable with `"hedge": true` in the trading config. Kraken is not supported.
 
 ## Key Features
 

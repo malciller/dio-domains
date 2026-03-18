@@ -83,6 +83,10 @@ let parse_config json =
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
   let testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false in
   let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
+  if hedge && exchange = "kraken" then begin
+    Logging.critical_f ~section "hedge=true is not supported on Kraken (symbol=%s). Auto-hedging requires Hyperliquid perps." symbol;
+    exit 1
+  end;
   {
     exchange;
     symbol;

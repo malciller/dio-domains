@@ -2,12 +2,52 @@
   "logging_level": "info",
   "logging_sections": "",
   "logging_cycle_debug_mod": 1000000,
-  "logging_cycle_info_mod": 10000000,
+  "logging_cycle_info_mod": 1000000,
   "engine": {
     "balance_check_mod": 10000,
     "strategy_fallback_mod": 10000
   },
   "trading": [
+    {
+      "symbol": "BTC/USD",
+      "exchange": "kraken",
+      "qty": "0.0011",
+      "grid_interval": [
+        0.75,
+        2.5
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "ETH/USD",
+      "exchange": "kraken",
+      "qty": "0.006",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "SOL/USD",
+      "exchange": "kraken",
+      "qty": "0.14",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "USDG/USD",
+      "exchange": "kraken",
+      "qty": "100.0",
+      "min_usd_balance": "900.0",
+      "strategy": "MM"
+    },
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
@@ -19,7 +59,7 @@
       "sell_mult": "1.0",
       "strategy": "Grid",
       "testnet": false,
-      "hedge": true
+      "hedge": false
     }
   ]
 }
