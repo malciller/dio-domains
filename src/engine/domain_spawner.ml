@@ -363,8 +363,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (* Trigger Auto-Hedging module *)
                   if asset_with_fees.hedge then begin
                     let hedge_symbol = String.split_on_char '/' asset_with_fees.symbol |> List.hd in
+                    (* Query the PERP orderbook (keyed by base asset e.g. "HYPE", not "HYPE/USDC") *)
+                    let perp_tob = Ex.get_top_of_book ~symbol:hedge_symbol in
                     Dio_strategies.Auto_hedger.handle_order_filled
-                      asset_with_fees.testnet asset_with_fees.exchange hedge_symbol side event.filled_qty event.avg_price
+                      asset_with_fees.testnet asset_with_fees.exchange hedge_symbol side event.filled_qty event.avg_price perp_tob
                   end
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
