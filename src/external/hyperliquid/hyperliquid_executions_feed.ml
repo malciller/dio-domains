@@ -320,7 +320,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
   } in
   
   update_orders_internal ?user_ref store event;
-  Logging.info_f ~section "Proactively injected open order: %s [%s] %s side %.8f @ %.2f (cloid: %s, userref: %s)"
+  Logging.info_f ~section "Proactively injected open order: %s [%s] %s side %.8f limit_px=%.2f (cloid: %s, userref: %s)"
     order_id symbol (if side = Buy then "buy" else "sell") qty price
     (Option.value cl_ord_id ~default:"none")
     (match user_ref with Some u -> string_of_int u | None -> "none")
@@ -357,12 +357,28 @@ let process_order_updates data_json =
       List.iter (fun order_update ->
         let order_obj = member "order" order_update in
         let coin = member "coin" order_obj |> to_string in
-        match find_registered_symbol coin with
+        let order_id = (match member "oid" order_obj with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
+        
+        let symbol_opt = 
+          Mutex.lock initialization_mutex;
+          let res = Hashtbl.find_opt order_to_symbol order_id in
+          Mutex.unlock initialization_mutex;
+          match res with
+          | Some s -> Some s
+          | None -> find_registered_symbol coin
+        in
+        
+        match symbol_opt with
         | Some symbol ->
-            let order_id = (match member "oid" order_obj with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
             let status = member "status" order_update |> to_string in
             let price = (match member "limitPx" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
-            let qty = (match member "sz" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
+            let qty = 
+              match member "origSz" order_obj with 
+              | `String s -> float_of_string s 
+              | `Float f -> f 
+              | `Int i -> float_of_int i 
+              | _ -> (match member "sz" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0)
+            in
             let side = if (member "side" order_obj |> to_string) = "B" then Buy else Sell in
             let cl_ord_id = member "cloid" order_obj |> to_string_option in
             
@@ -388,6 +404,28 @@ let process_order_updates data_json =
               | _ -> Unknown status
             in
             
+            let existing_order = 
+              Mutex.lock store.orders_mutex;
+              let o = Hashtbl.find_opt store.open_orders order_id in
+              Mutex.unlock store.orders_mutex;
+              o
+            in
+            
+            let new_cum_qty = match status with
+              | "filled" -> qty
+              | _ -> (match existing_order with Some o -> o.cum_qty | None -> 0.0)
+            in
+            
+            let new_cum_cost = match status with
+              | "filled" -> qty *. price
+              | _ -> (match existing_order with Some o -> o.cum_cost | None -> 0.0)
+            in
+            
+            let new_avg_price = match status with
+              | "filled" -> price
+              | _ -> (match existing_order with Some o -> o.avg_price | None -> 0.0)
+            in
+            
             let event : execution_event = {
               order_id;
               symbol;
@@ -396,15 +434,15 @@ let process_order_updates data_json =
               limit_price = Some price;
               side;
               order_qty = qty;
-              cum_qty = 0.0;
-              cum_cost = 0.0;
-              avg_price = 0.0;
+              cum_qty = new_cum_qty;
+              cum_cost = new_cum_cost;
+              avg_price = new_avg_price;
               timestamp = now;
               trade_id = None;
-              last_qty = None;
-              last_price = None;
+              last_qty = (if status = "filled" then Some qty else None);
+              last_price = (if status = "filled" then Some price else None);
               fee = None;
-              cl_ord_id;
+              cl_ord_id = (match cl_ord_id with Some _ -> cl_ord_id | None -> (match existing_order with Some o -> o.cl_ord_id | None -> None));
             } in
             
             update_orders_internal store event;
@@ -425,9 +463,19 @@ let process_user_events data_json =
   let fills = try member "fills" data_json |> to_list with _ -> [] in
   List.iter (fun fill ->
     let coin = member "coin" fill |> to_string in
-    match find_registered_symbol coin with
+    let order_id = (match member "oid" fill with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
+    
+    let symbol_opt = 
+      Mutex.lock initialization_mutex;
+      let res = Hashtbl.find_opt order_to_symbol order_id in
+      Mutex.unlock initialization_mutex;
+      match res with
+      | Some s -> Some s
+      | None -> find_registered_symbol coin
+    in
+    
+    match symbol_opt with
     | Some symbol ->
-        let order_id = (match member "oid" fill with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
         let price = member "px" fill |> to_string |> float_of_string in
         let size = member "sz" fill |> to_string |> float_of_string in
         let side = if member "side" fill |> to_string = "B" then Buy else Sell in
@@ -490,9 +538,19 @@ let process_user_events data_json =
   let non_user_cancels = try member "nonUserCancel" data_json |> to_list with _ -> [] in
   List.iter (fun nuc ->
     let coin = member "coin" nuc |> to_string in
-    match find_registered_symbol coin with
+    let order_id = (match member "oid" nuc with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
+    
+    let symbol_opt = 
+      Mutex.lock initialization_mutex;
+      let res = Hashtbl.find_opt order_to_symbol order_id in
+      Mutex.unlock initialization_mutex;
+      match res with
+      | Some s -> Some s
+      | None -> find_registered_symbol coin
+    in
+    
+    match symbol_opt with
     | Some symbol ->
-        let order_id = (match member "oid" nuc with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
         let store = get_symbol_store symbol in
         let now = Unix.gettimeofday () in
         
@@ -547,7 +605,18 @@ let process_market_data json =
         let new_orders_map = Hashtbl.create 16 in
         List.iter (fun o ->
           let coin = member "coin" o |> to_string in
-          match find_registered_symbol coin with
+          let order_id = (match member "oid" o with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
+          
+          let symbol_opt = 
+            Mutex.lock initialization_mutex;
+            let res = Hashtbl.find_opt order_to_symbol order_id in
+            Mutex.unlock initialization_mutex;
+            match res with
+            | Some s -> Some s
+            | None -> find_registered_symbol coin
+          in
+          
+          match symbol_opt with
           | Some symbol ->
               let side = if (member "side" o |> to_string) = "B" then Buy else Sell in
               let order_id = (match member "oid" o with `Int i -> string_of_int i | `String s -> s | _ -> "0") in

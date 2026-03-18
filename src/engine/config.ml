@@ -11,6 +11,7 @@ type trading_config = {
   maker_fee: float option;
   taker_fee: float option;
   testnet: bool;
+  hedge: bool;
 }
 
 type logging_config = {
@@ -29,8 +30,6 @@ let default_engine_config = {
   balance_check_mod = 10000;
   strategy_fallback_mod = 10000;
 }
-
-
 
 type config = {
   logging: logging_config;
@@ -83,6 +82,7 @@ let parse_config json =
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
   let testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false in
+  let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
   {
     exchange;
     symbol;
@@ -95,6 +95,7 @@ let parse_config json =
     maker_fee = json |> member "maker_fee" |> to_option to_float;
     taker_fee = json |> member "taker_fee" |> to_option to_float;
     testnet;
+    hedge;
   }
 
 (** Parse logging configuration *)
@@ -122,8 +123,6 @@ let parse_engine_config json : engine_config =
     balance_check_mod = int_or default_engine_config.balance_check_mod "balance_check_mod";
     strategy_fallback_mod = int_or default_engine_config.strategy_fallback_mod "strategy_fallback_mod";
   }
-
-
 
 
 (** Read and parse engine configuration from config.json *)

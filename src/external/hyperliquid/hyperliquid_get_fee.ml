@@ -5,6 +5,8 @@ type fee_info = {
   exchange: string;
   maker_fee: float option;
   taker_fee: float option;
+  spot_maker_fee: float option;
+  spot_taker_fee: float option;
 }
 
 (** Load API credentials from .env file *)
@@ -21,7 +23,12 @@ let parse_fee_info body_str =
     let maker = member "userAddRate" json |> to_string_option |> Option.map float_of_string in
     let taker = member "userCrossRate" json |> to_string_option |> Option.map float_of_string in
     
-    Logging.debug_f ~section "Retrieved Hyperliquid fees: maker=%s, taker=%s" 
+    (* Spot fees are currently static on Hyperliquid for most users: 0% maker, 0.1% taker *)
+    (* However, we store them explicitly so the Engine and Hedger can access them *)
+    let spot_maker = Some 0.0 in
+    let spot_taker = Some 0.001 in
+    
+    Logging.debug_f ~section "Retrieved Hyperliquid fees: perp_maker=%s, perp_taker=%s, spot_maker=0.0%%, spot_taker=0.1%%" 
       (Option.map (fun f -> Printf.sprintf "%.4f%%" (f *. 100.)) maker |> Option.value ~default:"None")
       (Option.map (fun f -> Printf.sprintf "%.4f%%" (f *. 100.)) taker |> Option.value ~default:"None");
       
@@ -29,6 +36,8 @@ let parse_fee_info body_str =
       exchange = "hyperliquid";
       maker_fee = maker;
       taker_fee = taker;
+      spot_maker_fee = spot_maker;
+      spot_taker_fee = spot_taker;
     }
   with exn ->
     Logging.error_f ~section "Failed to parse Hyperliquid fee response: %s (JSON: %s)" (Printexc.to_string exn) body_str;

@@ -56,7 +56,7 @@ let subscribe json =
     match !active_connection with
     | Some conn ->
         let msg = Yojson.Safe.to_string json in
-        Logging.info_f ~section "Sending subscription: %s" msg;
+        Logging.debug_f ~section "Sending subscription: %s" msg;
         Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg ())
     | None ->
         Logging.warn ~section "Cannot subscribe: WebSocket not connected";
@@ -161,7 +161,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
           (* Debug log for data messages occasionally *)
           if not is_noisy then
             if channel = "webData2" then
-              Logging.info_f ~section "Broadcasting webData2 data message"
+              Logging.debug ~section "Broadcasting webData2 data message"
             else
               Logging.debug_f ~section "Broadcasting data message: channel=%s" channel;
           broadcast_message json

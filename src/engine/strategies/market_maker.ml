@@ -9,7 +9,14 @@
 *)
 
 let section = "market_maker"
-let log_interval = 1000000
+let log_interval =
+  try
+    let json = Yojson.Basic.from_file "config.json" in
+    let open Yojson.Basic.Util in
+    match json |> member "logging_cycle_info_mod" |> to_int_option with
+    | Some i -> i
+    | None -> 10000000
+  with _ -> 10000000
 
 (** Use common types from Strategy_common module *)
 
@@ -612,10 +619,16 @@ let execute_strategy
           let buy_orders = ref [] in
           let sell_orders = ref [] in
 
-          List.iter (fun (order_id, order_price, qty, side_str, _userref_opt) ->
+          List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
             (* Skip if this order was recently cancelled *)
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)
+            
+            let is_our_strategy = match userref_opt with
+              | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
+              | None -> false
+            in
+
+            if not is_cancelled && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
               (* Use actual order side from exchange, not price-based classification *)
               if side_str = "buy" then
                 (* Treat ALL buy orders as grid buys to enforce single-buy-order policy across all exchanges *)
@@ -699,9 +712,15 @@ let execute_strategy
           let buy_orders = ref [] in
           let sell_orders = ref [] in
 
-          List.iter (fun (order_id, order_price, qty, side_str, _) ->
+          List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            if not is_cancelled && qty > 0.0 then
+            
+            let is_our_strategy = match userref_opt with
+              | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
+              | None -> false
+            in
+
+            if not is_cancelled && qty > 0.0 && is_our_strategy then
               if side_str = "buy" then
                 buy_orders := (order_id, order_price) :: !buy_orders
               else

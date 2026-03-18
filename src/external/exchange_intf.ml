@@ -88,6 +88,7 @@ module Types = struct
     side: order_side;
     remaining_qty: float;
     filled_qty: float;
+    avg_price: float;
     timestamp: float;
   }
 

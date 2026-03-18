@@ -1,4 +1,5 @@
 
+open Lwt.Infix
 
 (** Enable backtraces for better error reporting *)
 let () = Printexc.record_backtrace true
@@ -23,6 +24,142 @@ let force_exit_requested = Atomic.make false
 (** Fatal signal tracking - None if no fatal signal received, Some signal_number if fatal signal occurred *)
 let fatal_signal_received = Atomic.make None
 
+(** Fetch clearinghouse state and close perps *)
+let close_hedged_positions () =
+  let config = Dio_engine.Config.read_config () in
+  let hedge_configs = config.trading
+    |> List.filter (fun (t: Dio_engine.Config.trading_config) -> t.hedge)
+    |> List.map (fun (t: Dio_engine.Config.trading_config) ->
+         let hedge_symbol = String.split_on_char '/' t.symbol |> List.hd in
+         (hedge_symbol, t.testnet))
+  in
+  if hedge_configs = [] then Lwt.return_unit
+  else begin
+    Logging.info ~section:"main" "Fetching active Hyperliquid Perp positions for graceful shutdown...";
+    
+    let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+      | Some w -> w
+      | None ->
+          Logging.warn ~section:"main" "HYPERLIQUID_WALLET_ADDRESS not set, cannot close hedges!";
+          ""
+    in
+    if wallet = "" then Lwt.return_unit
+    else begin
+      (* Group by testnet environment to avoid duplicate REST calls *)
+      let testnet_map = Hashtbl.create 2 in
+      List.iter (fun (hedge_symbol, testnet) ->
+        let existing = try Hashtbl.find testnet_map testnet with _ -> [] in
+        Hashtbl.replace testnet_map testnet (hedge_symbol :: existing)
+      ) hedge_configs;
+      
+      let testnet_envs = Hashtbl.fold (fun tnet syms acc -> (tnet, syms) :: acc) testnet_map [] in
+      
+      Lwt_list.iter_s (fun (testnet, active_symbols) ->
+        let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
+        Lwt.catch (fun () ->
+          let open Cohttp_lwt_unix in
+          let url = Uri.of_string (base_url ^ "/info") in
+          let body_json = Printf.sprintf {|{"type":"clearinghouseState","user":"%s"}|} wallet in
+          let body = Cohttp_lwt.Body.of_string body_json in
+          let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+          Client.post ~headers ~body url >>= fun (_resp, resp_body) ->
+          Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
+          
+          (* Step 1: Cancel any open hedge orders *)
+          let open_orders_body = Printf.sprintf {|{"type":"openOrders","user":"%s"}|} wallet in
+          let open_orders_req = Cohttp_lwt.Body.of_string open_orders_body in
+          Client.post ~headers ~body:open_orders_req url >>= fun (_resp2, resp_body2) ->
+          Cohttp_lwt.Body.to_string resp_body2 >>= fun orders_str ->
+          (try
+            let open Yojson.Safe.Util in
+            let orders_json = Yojson.Safe.from_string orders_str in
+            let open_orders = match orders_json with `List l -> l | _ -> [] in
+            let hedge_orders = List.filter_map (fun o ->
+              let coin = member "coin" o |> to_string in
+              let oid = match member "oid" o with `Int i -> Some (Int64.of_int i) | `Intlit s -> Some (Int64.of_string s) | _ -> None in
+              if List.mem coin active_symbols then
+                Option.map (fun id -> (coin, id)) oid
+              else None
+            ) open_orders in
+            if hedge_orders <> [] then begin
+              Logging.warn_f ~section:"main" "Found %d open hedge orders to cancel on shutdown" (List.length hedge_orders);
+              Lwt_list.iter_s (fun (symbol, oid) ->
+                Logging.info_f ~section:"main" "Cancelling open hedge order %Ld for %s" oid symbol;
+                Hyperliquid.Actions.cancel_orders ~symbol ~order_ids:[oid] ~testnet >>= function
+                | Ok () -> Logging.info_f ~section:"main" "✓ Cancelled hedge order %Ld" oid; Lwt.return_unit
+                | Error err -> Logging.error_f ~section:"main" "✗ Failed to cancel hedge order %Ld: %s" oid err; Lwt.return_unit
+              ) hedge_orders
+            end else
+              Lwt.return_unit
+          with _ -> Lwt.return_unit) >>= fun () ->
+
+          (* Step 2: Close any open hedge positions *)
+          let open Yojson.Safe.Util in
+          let json = Yojson.Safe.from_string body_str in
+          let asset_positions = member "assetPositions" json |> to_list in
+          
+          let close_orders = List.filter_map (fun item ->
+            try
+              let pos = member "position" item in
+              let coin = member "coin" pos |> to_string in
+              let szi_str = member "szi" pos |> to_string in
+              let szi = float_of_string szi_str in
+              
+              if szi <> 0.0 && List.mem coin active_symbols then begin
+                let is_buy = szi < 0.0 in (* If short (negative), buy to close. If long (positive), sell to close *)
+                let qty_abs = Float.abs szi in
+                Some (coin, is_buy, qty_abs)
+              end else None
+            with _ -> None
+          ) asset_positions in
+          
+          if close_orders = [] then begin
+            Logging.info ~section:"main" "No open Hedger perp positions detected for closure.";
+            Lwt.return_unit
+          end else begin
+            Logging.warn_f ~section:"main" "Executing Market Orders to liquidate %d open Hedger perp positions!" (List.length close_orders);
+            Lwt_list.iter_s (fun (symbol, is_buy, qty) ->
+              let auth_token = match Supervisor.Token_store.get () with
+                | Some token -> token
+                | None -> "temp_token"
+              in
+              let request = {
+                Dio_engine.Order_executor.order_type = "market";
+                side = if is_buy then "buy" else "sell";
+                quantity = qty;
+                symbol = symbol;
+                limit_price = None;
+                time_in_force = Some "IOC";
+                post_only = Some false;
+                margin = None;
+                reduce_only = Some true; (* Crucially safely reduce only the hedge! *)
+                order_userref = Some 3; (* strategy_userref_hedge *)
+                cl_ord_id = None;
+                trigger_price = None;
+                trigger_price_type = None;
+                display_qty = None;
+                fee_preference = None;
+                duplicate_key = "hedge_close_" ^ symbol ^ "_" ^ string_of_float (Unix.gettimeofday ());
+                exchange = "hyperliquid";
+              } in
+              Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false request >>= function
+              | Ok res ->
+                  Logging.info_f ~section:"main" "✓ Hedge %s successfully closed: %s %.8f (Order ID: %s)" 
+                    symbol (if is_buy then "Buy" else "Sell") qty res.Dio_exchange.Exchange_intf.Types.order_id;
+                  Lwt.return_unit
+              | Error err ->
+                  Logging.error_f ~section:"main" "✗ Hedge %s closure failed: %s" symbol err;
+                  Lwt.return_unit
+            ) close_orders
+          end
+        ) (fun exn ->
+          Logging.error_f ~section:"main" "Failed to retrieve open perp positions for shutdown: %s" (Printexc.to_string exn);
+          Lwt.return_unit
+        )
+      ) testnet_envs
+    end
+  end
+
 (** Signal handler for graceful shutdown *)
 let setup_signal_handlers () =
   let handle_force_exit _signum =
@@ -32,25 +169,31 @@ let setup_signal_handlers () =
   let handle_graceful_shutdown _signum =
     if not (Atomic.get shutdown_requested) then (
       Atomic.set shutdown_requested true;
-      Logging.warn ~section:"main" "Shutdown signal received, cleaning up...";
+      Logging.warn ~section:"main" "Shutdown signal received, initiating pre-flight cleanup...";
 
       (* Install force exit handler for subsequent signals *)
       Sys.set_signal Sys.sigint (Sys.Signal_handle handle_force_exit);
 
-      (* Signal shutdown to all components *)
-      Dio_engine.Order_executor.signal_shutdown ();
-      Kraken.Kraken_trading_client.signal_shutdown ();
+      Lwt.async (fun () ->
+        (* Liquidate hedges synchronously inside the Lwt loop BEFORE tearing down network feeds *)
+        close_hedged_positions () >>= fun () ->
+        
+        (* Signal shutdown to all components *)
+        Dio_engine.Order_executor.signal_shutdown ();
+        Kraken.Kraken_trading_client.signal_shutdown ();
 
-      (* Stop all supervised domains *)
-      Dio_engine.Domain_spawner.stop_all_domains ();
+        (* Stop all supervised domains *)
+        Dio_engine.Domain_spawner.stop_all_domains ();
 
-      (* Stop all websocket connections *)
-      Supervisor.stop_all ();
+        (* Stop all websocket connections *)
+        Supervisor.stop_all ();
 
-      (* Signal shutdown condition to allow graceful shutdown *)
-      Lwt_condition.broadcast shutdown_condition ();
+        (* Signal shutdown condition to allow graceful shutdown *)
+        Lwt_condition.broadcast shutdown_condition ();
 
-      Logging.info ~section:"main" "Shutdown cleanup initiated, force exit available with second Ctrl+C..."
+        Logging.info ~section:"main" "Shutdown cleanup initiated, force exit available with second Ctrl+C...";
+        Lwt.return_unit
+      )
     ) else if not (Atomic.get force_exit_requested) then (
       Atomic.set force_exit_requested true;
       Logging.critical ~section:"main" "Second shutdown signal received - forcing immediate exit";

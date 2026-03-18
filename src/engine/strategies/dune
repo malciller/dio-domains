@@ -2,4 +2,4 @@
  (name dio_strategies)
  (public_name dio.strategies)
  (libraries yojson logging  dio.kraken lwt lwt.unix unix)
- (modules Strategy_common Suicide_grid Market_maker Fee_cache))
+ (modules Strategy_common Suicide_grid Market_maker Fee_cache Auto_hedger))

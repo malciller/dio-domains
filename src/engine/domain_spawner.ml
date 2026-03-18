@@ -358,7 +358,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                          asset_with_fees.symbol event.order_id side;
                        Logging.debug_f ~section "Notified MM strategy about filled order %s for %s"
                          event.order_id asset_with_fees.symbol
-                   | None -> ())
+                   | None -> ());
+                  
+                  (* Trigger Auto-Hedging module *)
+                  if asset_with_fees.hedge then begin
+                    let hedge_symbol = String.split_on_char '/' asset_with_fees.symbol |> List.hd in
+                    (* Query the PERP orderbook (keyed by base asset e.g. "HYPE", not "HYPE/USDC") *)
+                    let perp_tob = Ex.get_top_of_book ~symbol:hedge_symbol in
+                    Dio_strategies.Auto_hedger.handle_order_filled
+                      asset_with_fees.testnet asset_with_fees.exchange hedge_symbol side event.filled_qty event.avg_price perp_tob
+                  end
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
                   (match event.limit_price with
@@ -451,7 +460,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             List.filter (fun (_order_id, _, _, _, userref_opt) ->
               match userref_opt with
               | Some userref -> Dio_strategies.Strategy_common.is_strategy_order strategy_userref userref
-              | None -> asset_with_fees.exchange = "hyperliquid"
+              | None -> false
             ) all_open_orders
           in
 
@@ -469,7 +478,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  the fragile has_tracked_buy flag and triggering buy order spam. *)
               let is_grid_order = match userref_opt with
                 | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref
-                | None -> asset_with_fees.exchange = "hyperliquid"
+                | None -> false
               in
               if is_grid_order then
                 (if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1))

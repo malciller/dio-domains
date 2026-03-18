@@ -463,10 +463,16 @@ let execute_strategy
       let buy_orders = ref [] in
       let sell_orders = ref [] in
 
-      List.iter (fun (order_id, order_price, qty, side_str, _userref_opt) ->
+      List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         (* Skip if this order was recently cancelled *)
         let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-        if not is_cancelled && qty > 0.0 then (* Only count orders with remaining quantity *)
+        
+        let is_our_strategy = match userref_opt with
+          | Some ref_val -> ref_val = Strategy_common.strategy_userref_grid
+          | None -> false
+        in
+        
+        if not is_cancelled && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
             (* Treat ALL buy orders as grid buys to enforce single-buy-order policy across all exchanges *)
@@ -773,9 +779,17 @@ let execute_strategy
           | _ ->
               Logging.debug_f ~section "Buy order tracking lost for %s, will re-place on next cycle" asset.symbol
         end else begin
-          (* No sell orders: just trail the buy *)
-          (* We do NOT place a standalone sell order here; sell orders are only
-             placed alongside new buy orders. *)
+          (* No sell orders exist but we have an active buy.
+             This happens on startup or after all sells fill.
+             Place a sell to ensure both sides of the grid are active. *)
+          (match asset_balance with
+           | Some asset_bal when not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
+               let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
+               let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
+               if push_order sell_order then
+                 Logging.info_f ~section "Placed missing sell order for %s: %.8f @ %.4f (buy already active)"
+                   asset.symbol (qty *. sell_mult) sell_price
+           | _ -> ());
 
            match state.last_buy_order_price, state.last_buy_order_id with
            | Some current_buy_price, Some buy_order_id ->

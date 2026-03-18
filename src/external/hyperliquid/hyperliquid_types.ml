@@ -136,6 +136,13 @@ let pack_cancel_by_cloid_action ~(cancels : cancel_by_cloid_wire list) : t =
       )
   ]
 
+let pack_usd_class_transfer_action ~amount ~to_perp =
+  Map [
+    String "type",    String "usdClassTransfer";
+    String "amount",  String amount;
+    String "toPerp",  Bool to_perp;
+  ]
+
 let serialize_action (msg : t) : string =
   let buf = Buffer.create 512 in
   ignore (Msgpck.StringBuf.write buf msg);
