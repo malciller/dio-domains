@@ -14,8 +14,8 @@ module Hyperliquid_impl = struct
     Atomic.set is_testnet testnet;
     Logging.info_f ~section "Hyperliquid module configured for %s" (if testnet then "testnet" else "mainnet")
 
-  (* Internal cache for fees *)
-  let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
+  (* Internal cache for fees: symbol -> (perp_maker, perp_taker, spot_maker, spot_taker) *)
+  let fee_cache : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 16
 
   (* Helpers for type conversion *)
   let string_of_order_type = function
@@ -50,7 +50,7 @@ module Hyperliquid_impl = struct
       ~qty
       ~symbol
       ?limit_price
-      ?time_in_force:_
+      ?time_in_force
       ?post_only
       ?reduce_only
       ?order_userref
@@ -61,8 +61,30 @@ module Hyperliquid_impl = struct
       () =
     
     let is_limit = match order_type with Types.Limit -> true | _ -> false in
-    let px = Option.value limit_price ~default:0.0 in
     let side_bool = match side with Types.Buy -> true | Types.Sell -> false in
+    let px = match limit_price with
+      | Some p -> p
+      | None ->
+          match order_type with
+          | Types.Market ->
+              (* Hyperliquid market orders are IOC limit orders. 
+                 We compute an aggressive limit price with 5% slippage from the ticker. *)
+              (match Hyperliquid_ticker_feed.get_latest_ticker symbol with
+              | Some t ->
+                  if side_bool then t.ask *. 1.05 (* Buy: 5% above ask *)
+                  else t.bid *. 0.95 (* Sell: 5% below bid *)
+              | None ->
+                  Logging.warn_f ~section "No ticker available for market order on %s, using 0.0" symbol;
+                  0.0)
+          | _ -> 0.0
+    in
+
+    let hl_tif = match time_in_force with
+      | Some Types.IOC -> Hyperliquid_types.Ioc
+      | Some Types.GTC -> Hyperliquid_types.Gtc
+      | Some Types.FOK -> Hyperliquid_types.Ioc
+      | None -> if Option.value post_only ~default:false then Hyperliquid_types.Alo else Hyperliquid_types.Gtc
+    in
 
     let px_rounded = Hyperliquid_instruments_feed.round_price_to_tick_for_symbol symbol px in
     let sz_rounded = Hyperliquid_instruments_feed.round_qty_to_lot symbol qty in
@@ -81,6 +103,7 @@ module Hyperliquid_impl = struct
       ?post_only
       ?reduce_only
       ?cl_ord_id:constructed_cl_ord_id
+      ~time_in_force:hl_tif
       ~testnet:(Atomic.get is_testnet)
       ()
     >|= function
@@ -266,8 +289,9 @@ module Hyperliquid_impl = struct
         order_status = status_of_hyperliquid_status e.order_status;
         limit_price = e.limit_price;
         side = side_of_hyperliquid_side e.side;
-        remaining_qty = e.order_qty -. e.cum_qty;
+        remaining_qty = max 0.0 (e.order_qty -. e.cum_qty);
         filled_qty = e.cum_qty;
+        avg_price = e.avg_price;
         timestamp = e.timestamp;
       }
     ) events
@@ -312,7 +336,12 @@ module Hyperliquid_impl = struct
 
   let get_fees ~symbol =
     match Hashtbl.find_opt fee_cache symbol with
-    | Some f -> (Some (fst f), Some (snd f))
+    | Some (pm, pt, _sm, _st) -> (Some pm, Some pt)
+    | None -> (None, None)
+    
+  let get_spot_fees ~symbol =
+    match Hashtbl.find_opt fee_cache symbol with
+    | Some (_pm, _pt, sm, st) -> (Some sm, Some st)
     | None -> (None, None)
 
   let initialize_fees symbols =
@@ -321,9 +350,18 @@ module Hyperliquid_impl = struct
       | Some info ->
           let maker = Option.value info.maker_fee ~default:0.0 in
           let taker = Option.value info.taker_fee ~default:0.0 in
-          Hashtbl.replace fee_cache symbol (maker, taker)
+          let spot_m = Option.value info.spot_maker_fee ~default:0.0 in
+          let spot_t = Option.value info.spot_taker_fee ~default:0.0 in
+          Hashtbl.replace fee_cache symbol (maker, taker, spot_m, spot_t)
       | None -> ()
     ) symbols
+
+  (** Transfer USDC from spot to perp wallet (or vice versa) *)
+  let transfer_usd ~amount ~to_perp =
+    Hyperliquid_actions.usd_class_transfer
+      ~amount
+      ~to_perp
+      ~testnet:(Atomic.get is_testnet)
 end
 
 (* Register the module *)

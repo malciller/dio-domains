@@ -18,7 +18,8 @@ let test_spawn_domains_basic () =
       strategy = "suicide_grid";
       maker_fee = None;
       taker_fee = None;
-      testnet = false };
+      testnet = false;
+      hedge = false };
     { Dio_engine.Config.exchange = "kraken";
       symbol = "ETH/USD";
       qty = "0.01";
@@ -29,14 +30,15 @@ let test_spawn_domains_basic () =
       strategy = "MM";
       maker_fee = None;
       taker_fee = None;
-      testnet = false }
+      testnet = false;
+      hedge = false }
   ] in
 
   (* Spawn domains for the assets *)
   let config = {
     Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
     engine = Dio_engine.Config.default_engine_config;
-    trading = assets
+    trading = assets;
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher assets in
 
@@ -51,7 +53,7 @@ let test_spawn_domains_empty () =
   let config = {
     Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
     engine = Dio_engine.Config.default_engine_config;
-    trading = []
+    trading = [];
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [] in
 
@@ -70,7 +72,8 @@ let test_fee_fetcher_integration () =
     strategy = "suicide_grid";
     maker_fee = None;
     taker_fee = None;
-    testnet = false
+    testnet = false;
+    hedge = false
   } in
 
   (* Verify fee fetcher adds fees correctly *)
@@ -100,14 +103,15 @@ let test_domain_error_handling () =
     strategy = "invalid_strategy";
     maker_fee = None;
     taker_fee = None;
-    testnet = false
+    testnet = false;
+    hedge = false
   } in
 
   (* This should not crash the test runner, domains should handle errors internally *)
   let config = {
     Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
     engine = Dio_engine.Config.default_engine_config;
-    trading = [failing_asset]
+    trading = [failing_asset];
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [failing_asset] in
   (* Give domains a moment to potentially fail *)

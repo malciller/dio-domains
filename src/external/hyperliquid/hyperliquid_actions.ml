@@ -213,14 +213,14 @@ let is_retriable_error err =
   string_contains err_lower "too many cumulative requests"
 
 (** Place order with retry logic *)
-let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?cl_ord_id ~testnet () =
+let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?cl_ord_id ?time_in_force ~testnet () =
   let place_order_once () =
     let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
       | Some idx -> idx
       | None -> failwith (Printf.sprintf "Unknown symbol: %s" symbol)
     in
     
-    let tif = Alo in
+    let tif = Option.value time_in_force ~default:Gtc in
     let ot = Limit { tif } in
     
     let order_wire = {
@@ -278,10 +278,15 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?c
               match statuses with
               | s :: _ ->
                   let resting = member "resting" s in
+                  let filled = member "filled" s in
                   if resting <> `Null then
                     match resting |> member "oid" |> to_int64_opt with
                     | Some oid -> Ok { order_id = oid }
                     | None -> Error (Printf.sprintf "Failed to find oid in resting status: %s" (Yojson.Safe.to_string s))
+                  else if filled <> `Null then
+                    match filled |> member "oid" |> to_int64_opt with
+                    | Some oid -> Ok { order_id = oid }
+                    | None -> Error (Printf.sprintf "Failed to find oid in filled status: %s" (Yojson.Safe.to_string s))
                   else
                     (match member "error" s |> to_string_option with
                      | Some err -> Error (Printf.sprintf "HL Order Rejected: %s" err)
@@ -394,3 +399,36 @@ let cancel_orders ~symbol ~order_ids ~testnet =
     | Error e -> Error e
   in
   retry_with_backoff ~config:default_retry_config ~f:cancel_orders_once ~is_retriable:is_retriable_error
+
+(** Transfer USDC between spot and perp wallets via usdClassTransfer *)
+let usd_class_transfer ~amount ~to_perp ~testnet =
+  let transfer_once () =
+    let amount_str = format_number amount in
+    let action = pack_usd_class_transfer_action ~amount:amount_str ~to_perp in
+    let action_msgpack = serialize_action action in
+
+    let action_json = `Assoc [
+      "type", `String "usdClassTransfer";
+      "amount", `String amount_str;
+      "toPerp", `Bool to_perp;
+    ] in
+
+    let is_mainnet = not testnet in
+
+    post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet >|= function
+    | Ok res ->
+        let open Yojson.Safe.Util in
+        (try
+          let status = member "status" res |> to_string_option in
+          match status with
+          | Some "err" ->
+              let err_msg = match member "response" res with
+                | `String s -> s
+                | other -> Yojson.Safe.to_string other
+              in
+              Error (Printf.sprintf "HL Transfer Rejected: %s" err_msg)
+          | _ -> Ok ()
+        with exn -> Error (Printf.sprintf "Failed to parse HL transfer response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res)))
+    | Error e -> Error e
+  in
+  retry_with_backoff ~config:default_retry_config ~f:transfer_once ~is_retriable:is_retriable_error

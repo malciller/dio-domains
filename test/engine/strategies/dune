@@ -9,3 +9,7 @@
 (test
  (name test_suicide_grid)
  (libraries dio.strategies dio.engine alcotest))
+
+(test
+ (name test_auto_hedger)
+ (libraries dio.strategies dio.engine alcotest))
