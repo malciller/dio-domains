@@ -582,6 +582,10 @@ let execute_strategy
         state.last_buy_order_price <- None;
         state.last_buy_order_id <- None;
 
+        (* Apply cooldown to prevent re-entering this branch before exchange acks the cancels *)
+        let cooldown_key = "place_Buy" in
+        Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+
         (* Update cycle counter *)
         state.last_cycle <- cycle
       end else if effective_buy_count = 0 && not buy_order_pending then begin
@@ -646,8 +650,13 @@ let execute_strategy
                 | None -> ())
              end
          | Some quote_bal ->
-             Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f"
-               asset.symbol quote_needed quote_bal
+             (* Apply cooldown to avoid tight-looping; re-check after sells may have freed liquidity *)
+             let cooldown_key = "place_Buy" in
+             if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
+               Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f (waiting 5min for liquidity)"
+                 asset.symbol quote_needed quote_bal;
+               Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 300.0)
+             end
          | None ->
              Logging.warn_f ~section "No quote balance data available for %s buy order"
                asset.symbol
@@ -896,11 +905,12 @@ let handle_order_failed asset_symbol side reason =
       loop 0
     in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
-    let cooldown = if is_rate_limit then 10.0 else 2.0 in
+    let is_balance_issue = contains_fragment lower_reason "insufficient" || contains_fragment lower_reason "insufficient funds" in
+    let cooldown = if is_rate_limit then 10.0 else if is_balance_issue then 300.0 else 2.0 in
     
     (* Apply cooldown to prevent placement spam on rate limit *)
     let now = Unix.time () in
-    let cooldown_key = Printf.sprintf "place_%s" (string_of_order_side side) in
+    let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
     Hashtbl.replace state.amend_cooldowns cooldown_key (now +. cooldown);
 
     Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker, applied %.1fs placement cooldown."
@@ -934,13 +944,22 @@ let handle_order_rejected asset_symbol side price =
   let duplicate_key = generate_side_duplicate_key asset_symbol side in
   ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
-  (* Apply short cooldown to prevent placement spam on immediate rejection *)
+  (* Apply short cooldown to prevent placement spam on immediate rejection.
+     BUT: don't overwrite a longer cooldown already set by handle_order_failed
+     (e.g. 300s for insufficient balance). The HTTP response arrives first and
+     sets the long cooldown; this WS event arrives ~25ms later. *)
   let now = Unix.time () in
-  let cooldown_key = Printf.sprintf "place_%s" (string_of_order_side side) in
-  Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+  let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
+  let new_expiry = now +. 2.0 in
+  let existing_expiry = match Hashtbl.find_opt state.amend_cooldowns cooldown_key with
+    | Some t -> t
+    | None -> 0.0
+  in
+  if new_expiry > existing_expiry then
+    Hashtbl.replace state.amend_cooldowns cooldown_key new_expiry;
 
-  Logging.debug_f ~section "Order rejected and removed from pending/trackers (applied 2s cooldown): %s @ %.2f for %s"
-    (string_of_order_side side) price asset_symbol
+  Logging.debug_f ~section "Order rejected and removed from pending/trackers (cooldown: %.0fs): %s @ %.2f for %s"
+    (max new_expiry existing_expiry -. now) (string_of_order_side side) price asset_symbol
   )
 
   (* For buy order rejections, this signals no buy order exists, which is valid for re-evaluation *)

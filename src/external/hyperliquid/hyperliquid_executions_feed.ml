@@ -342,6 +342,14 @@ let find_registered_symbol coin =
       Mutex.unlock initialization_mutex;
       !result
 
+(** Detect Hyperliquid-specific rejection status strings.
+    HL uses statuses like "badAloPxRejected", "insufficientSpotBalanceRejected",
+    "tickRejected", "perpMarginRejected", etc. instead of a generic "rejected". *)
+let is_rejection_status s =
+  let suffix = "Rejected" in
+  let slen = String.length s and sfxlen = String.length suffix in
+  slen > sfxlen && String.sub s (slen - sfxlen) sfxlen = suffix
+
 let process_order_updates data_json =
   let open Yojson.Safe.Util in
   match data_json with
@@ -383,6 +391,7 @@ let process_order_updates data_json =
               | "canceled" -> CanceledStatus
               | "rejected" -> RejectedStatus
               | "marginCanceled" -> CanceledStatus
+              | s when is_rejection_status s -> RejectedStatus
               | s -> UnknownStatus s
             in
             
@@ -391,6 +400,7 @@ let process_order_updates data_json =
               | "filled" -> Filled
               | "canceled" | "marginCanceled" -> Canceled
               | "rejected" -> Rejected
+              | s when is_rejection_status s -> Rejected
               | _ -> Unknown status
             in
             
@@ -439,7 +449,7 @@ let process_order_updates data_json =
             
             (match order_status with
              | FilledStatus | CanceledStatus | RejectedStatus ->
-                 Logging.info_f ~section "Order %s: %s [%s]" (String.uppercase_ascii status) order_id symbol
+                 Logging.info_f ~section "Order %s: %s [%s] (reason: %s)" (String.uppercase_ascii status) order_id symbol status
              | NewStatus ->
                  Logging.debug_f ~section "Order OPEN: %s [%s] %.8f @ %.2f" order_id symbol qty price
              | _ -> ());
