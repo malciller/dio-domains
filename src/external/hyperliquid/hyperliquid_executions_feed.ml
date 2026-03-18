@@ -320,7 +320,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
   } in
   
   update_orders_internal ?user_ref store event;
-  Logging.info_f ~section "Proactively injected open order: %s [%s] %s side %.8f @ %.2f (cloid: %s, userref: %s)"
+  Logging.info_f ~section "Proactively injected open order: %s [%s] %s side %.8f limit_px=%.2f (cloid: %s, userref: %s)"
     order_id symbol (if side = Buy then "buy" else "sell") qty price
     (Option.value cl_ord_id ~default:"none")
     (match user_ref with Some u -> string_of_int u | None -> "none")
