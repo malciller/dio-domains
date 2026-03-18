@@ -47,6 +47,18 @@
       "qty": "100.0",
       "min_usd_balance": "900.0",
       "strategy": "MM"
+    },
+    {
+      "symbol": "HYPE/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.35",
+      "grid_interval": [
+        0.2,
+        0.5
+      ],
+      "sell_mult": "1.0",
+      "strategy": "Grid",
+      "testnet": false
     }
   ]
 }
