@@ -167,7 +167,6 @@ dune build
     - WebSocket feeds (Kraken): `src/external/kraken/`
     - WebSocket feeds (Hyperliquid): `src/external/hyperliquid/`
     - Exchange interface: `src/external/exchange_intf.ml`
-    - Dashboard UI: `src/ui/`
 3. Commit (`git commit -m "..."`)
 4. Push (`git push origin feature/xyz`)
 5. Open PR
