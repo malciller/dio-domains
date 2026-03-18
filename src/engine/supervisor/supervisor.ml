@@ -488,10 +488,18 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                       |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken")
                       |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
 
-  (* Extract Hyperliquid symbols *)
+  (* Extract Hyperliquid symbols (including base asset for spot pairs to enable perp hedging prices) *)
   let hyperliquid_symbols = app_configs
                            |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid")
-                           |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
+                           |> List.fold_left (fun acc cfg ->
+                                let sym = cfg.Dio_engine.Config.symbol in
+                                if String.contains sym '/' then
+                                  let base_asset = String.split_on_char '/' sym |> List.hd in
+                                  base_asset :: sym :: acc
+                                else
+                                  sym :: acc
+                              ) []
+                           |> List.sort_uniq String.compare in
   let has_hyperliquid = List.length hyperliquid_symbols > 0 in
   let hyperliquid_testnet =
     match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> cfg.exchange = "hyperliquid") with
@@ -869,6 +877,7 @@ let order_processing_loop () =
         (* Clear any pending orders to avoid stale placement/amendments when we reconnect *)
         ignore (Dio_strategies.Suicide_grid.Strategy.get_pending_orders 1000);
         ignore (Dio_strategies.Market_maker.Strategy.get_pending_orders 1000);
+        ignore (Dio_strategies.Auto_hedger.get_pending_orders 1000);
 
         (* Wait for reconnection before checking again *)
         Lwt_unix.sleep 1.0 >>= loop
@@ -876,8 +885,9 @@ let order_processing_loop () =
         (* Check for pending orders from strategies *)
         let pending_grid_orders = Dio_strategies.Suicide_grid.Strategy.get_pending_orders 100 in
         let pending_mm_orders = Dio_strategies.Market_maker.Strategy.get_pending_orders 100 in
+        let pending_hedge_orders = Dio_strategies.Auto_hedger.get_pending_orders 100 in
 
-        if pending_grid_orders = [] && pending_mm_orders = [] then
+        if pending_grid_orders = [] && pending_mm_orders = [] && pending_hedge_orders = [] then
           (* No orders to process, wait for a signal *)
           OrderSignal.wait () >>= loop
         else begin
@@ -1275,9 +1285,76 @@ let order_processing_loop () =
                 Logging.error_f ~section "Error processing order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_mm_orders;
 
+            (* Process auto hedger orders *)
+            List.iter (fun order ->
+              if Atomic.get shutdown_requested then () else
+              Mutex.lock order_mutex;
+              try
+                let auth_token = match Token_store.get () with
+                  | Some token -> token
+                  | None ->
+                    Logging.warn ~section "No auth token available for hedge order operations";
+                    raise (Failure "No auth token")
+                in
+
+                (match order.operation with
+                 | Place ->
+                     let order_request = {
+                       Dio_engine.Order_executor.order_type = order.order_type;
+                       side = (match order.side with Buy -> "buy" | Sell -> "sell");
+                       quantity = order.qty;
+                       symbol = order.symbol;
+                       limit_price = order.price;
+                       time_in_force = Some order.time_in_force;
+                       post_only = Some order.post_only;
+                       margin = None;
+                       reduce_only = None;
+                       order_userref = order.userref;
+                       cl_ord_id = None;
+                       trigger_price = None;
+                       trigger_price_type = None;
+                       display_qty = None;
+                       fee_preference = None;
+                       duplicate_key = order.duplicate_key;
+                       exchange = order.exchange;
+                     } in
+
+                     Lwt.async (fun () ->
+                       let%lwt () = Lwt.pause () in
+                       Lwt.catch (fun () ->
+                         Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
+                         | Ok result ->
+                             orders_placed := !orders_placed + 1;
+                             Logging.info_f ~section "✓ Hedger order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
+                               (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
+                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                               result.order_id;
+                             Lwt.return_unit
+                         | Error err ->
+                             Logging.error_f ~section "✗ Hedger order placement failed: %s %s %.8f @ %s - %s"
+                               (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
+                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                               err;
+                             Lwt.return_unit
+                       ) (fun exn ->
+                         Logging.error_f ~section "✗ Exception placing hedger order %s %s: %s"
+                           (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
+                         Lwt.return_unit
+                       )
+                     )
+                 | _ -> Logging.warn_f ~section "Auto hedger only supports Place operations, got other for %s" order.symbol
+                );
+                
+                Mutex.unlock order_mutex
+              with exn ->
+                Mutex.unlock order_mutex;
+                Logging.error_f ~section "Error processing hedge order %s %s: %s"
+                  (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
+            ) pending_hedge_orders;
+
             if !cycle_count mod 100 = 0 then
-              Logging.info_f ~section "Order processing: %d orders placed, %d grid + %d mm pending in current batch"
-                !orders_placed (List.length pending_grid_orders) (List.length pending_mm_orders);
+              Logging.info_f ~section "Order processing: %d orders placed, %d grid + %d mm + %d hedge pending in current batch"
+                !orders_placed (List.length pending_grid_orders) (List.length pending_mm_orders) (List.length pending_hedge_orders);
 
             (* Small pause to allow other tasks to run before checking again *)
             Lwt.pause () >>= loop

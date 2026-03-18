@@ -36,7 +36,8 @@ let test_spawn_domains_basic () =
   let config = {
     Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
     engine = Dio_engine.Config.default_engine_config;
-    trading = assets
+    trading = assets;
+    hedging = []
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher assets in
 
@@ -51,7 +52,8 @@ let test_spawn_domains_empty () =
   let config = {
     Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
     engine = Dio_engine.Config.default_engine_config;
-    trading = []
+    trading = [];
+    hedging = []
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [] in
 
@@ -107,7 +109,8 @@ let test_domain_error_handling () =
   let config = {
     Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
     engine = Dio_engine.Config.default_engine_config;
-    trading = [failing_asset]
+    trading = [failing_asset];
+    hedging = []
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [failing_asset] in
   (* Give domains a moment to potentially fail *)

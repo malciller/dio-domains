@@ -358,6 +358,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                          asset_with_fees.symbol event.order_id side;
                        Logging.debug_f ~section "Notified MM strategy about filled order %s for %s"
                          event.order_id asset_with_fees.symbol
+                   | None -> ());
+                  
+                  (* Trigger Auto-Hedging module *)
+                  let config = Config.read_config () in
+                  (match List.find_opt (fun (h: Config.hedging_config) -> h.source_symbol = asset_with_fees.symbol) config.hedging with
+                   | Some hedge_cfg ->
+                       Dio_strategies.Auto_hedger.handle_order_filled
+                         asset_with_fees.exchange hedge_cfg.hedge_symbol side event.filled_qty
                    | None -> ())
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
