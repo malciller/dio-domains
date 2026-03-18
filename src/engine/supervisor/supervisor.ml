@@ -517,11 +517,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   (* Start initialization sequence as a promise chain *)
 
-  (* Collect hedge symbols for auto-hedger pricing *)
-  let hedge_symbols =
-    List.map (fun (h: Dio_engine.Config.hedging_config) -> h.hedge_symbol) config.hedging
-  in
-  let all_hyperliquid_symbols = hyperliquid_symbols @ hedge_symbols |> List.sort_uniq String.compare in
+  let all_hyperliquid_symbols = hyperliquid_symbols |> List.sort_uniq String.compare in
 
   (* Initialize data stores for websocket feeds *)
   Logging.info ~section "Step 1: Initializing ticker feed stores...";

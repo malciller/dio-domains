@@ -27,7 +27,13 @@ let fatal_signal_received = Atomic.make None
 (** Fetch clearinghouse state and close perps *)
 let close_hedged_positions () =
   let config = Dio_engine.Config.read_config () in
-  if config.hedging = [] then Lwt.return_unit
+  let hedge_configs = config.trading
+    |> List.filter (fun (t: Dio_engine.Config.trading_config) -> t.hedge)
+    |> List.map (fun (t: Dio_engine.Config.trading_config) ->
+         let hedge_symbol = String.split_on_char '/' t.symbol |> List.hd in
+         (hedge_symbol, t.testnet))
+  in
+  if hedge_configs = [] then Lwt.return_unit
   else begin
     Logging.info ~section:"main" "Fetching active Hyperliquid Perp positions for graceful shutdown...";
     
@@ -41,10 +47,10 @@ let close_hedged_positions () =
     else begin
       (* Group by testnet environment to avoid duplicate REST calls *)
       let testnet_map = Hashtbl.create 2 in
-      List.iter (fun (h: Dio_engine.Config.hedging_config) ->
-        let existing = try Hashtbl.find testnet_map h.testnet with _ -> [] in
-        Hashtbl.replace testnet_map h.testnet (h.hedge_symbol :: existing)
-      ) config.hedging;
+      List.iter (fun (hedge_symbol, testnet) ->
+        let existing = try Hashtbl.find testnet_map testnet with _ -> [] in
+        Hashtbl.replace testnet_map testnet (hedge_symbol :: existing)
+      ) hedge_configs;
       
       let testnet_envs = Hashtbl.fold (fun tnet syms acc -> (tnet, syms) :: acc) testnet_map [] in
       

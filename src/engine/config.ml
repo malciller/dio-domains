@@ -11,6 +11,7 @@ type trading_config = {
   maker_fee: float option;
   taker_fee: float option;
   testnet: bool;
+  hedge: bool;
 }
 
 type logging_config = {
@@ -30,20 +31,10 @@ let default_engine_config = {
   strategy_fallback_mod = 10000;
 }
 
-
-
-type hedging_config = {
-  source_symbol: string;
-  hedge_symbol: string;
-  testnet: bool;
-  max_basis_bps: float;  (** Max basis tolerance in bps for hedge to fill. Default 15 bps = 0.15% *)
-}
-
 type config = {
   logging: logging_config;
   engine: engine_config;
   trading: trading_config list;
-  hedging: hedging_config list;
 }
 
 (** Internal section tag for logging *)
@@ -91,6 +82,7 @@ let parse_config json =
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
   let testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false in
+  let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
   {
     exchange;
     symbol;
@@ -103,6 +95,7 @@ let parse_config json =
     maker_fee = json |> member "maker_fee" |> to_option to_float;
     taker_fee = json |> member "taker_fee" |> to_option to_float;
     testnet;
+    hedge;
   }
 
 (** Parse logging configuration *)
@@ -132,24 +125,6 @@ let parse_engine_config json : engine_config =
   }
 
 
-
-
-(** Parse a single hedging config from JSON *)
-let parse_hedging_config json : hedging_config =
-  let open Yojson.Basic.Util in
-  let max_basis_bps = match json |> member "max_basis_bps" with
-    | `Float f -> f
-    | `Int i -> float_of_int i
-    | `String s -> (try float_of_string s with _ -> 15.0)
-    | _ -> 15.0  (* Default: 15 bps = 0.15% *)
-  in
-  {
-    source_symbol = json |> member "source_symbol" |> to_string;
-    hedge_symbol = json |> member "hedge_symbol" |> to_string;
-    testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false;
-    max_basis_bps;
-  }
-
 (** Read and parse engine configuration from config.json *)
 let read_config () : config =
   try
@@ -158,11 +133,6 @@ let read_config () : config =
     let logging = parse_logging_config json in
     let engine = parse_engine_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
-    let hedging_json = json |> member "hedging" in
-    let hedging = match hedging_json with
-      | `Null -> []
-      | _ -> hedging_json |> to_list |> List.map parse_hedging_config
-    in
-    { logging; engine; trading; hedging }
+    { logging; engine; trading }
   with
-  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 }; engine = default_engine_config; trading = []; hedging = [] }
+  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 }; engine = default_engine_config; trading = [] }
