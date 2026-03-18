@@ -36,6 +36,7 @@ type hedging_config = {
   source_symbol: string;
   hedge_symbol: string;
   testnet: bool;
+  max_basis_bps: float;  (** Max basis tolerance in bps for hedge to fill. Default 15 bps = 0.15% *)
 }
 
 type config = {
@@ -136,10 +137,17 @@ let parse_engine_config json : engine_config =
 (** Parse a single hedging config from JSON *)
 let parse_hedging_config json : hedging_config =
   let open Yojson.Basic.Util in
+  let max_basis_bps = match json |> member "max_basis_bps" with
+    | `Float f -> f
+    | `Int i -> float_of_int i
+    | `String s -> (try float_of_string s with _ -> 15.0)
+    | _ -> 15.0  (* Default: 15 bps = 0.15% *)
+  in
   {
     source_symbol = json |> member "source_symbol" |> to_string;
     hedge_symbol = json |> member "hedge_symbol" |> to_string;
     testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false;
+    max_basis_bps;
   }
 
 (** Read and parse engine configuration from config.json *)

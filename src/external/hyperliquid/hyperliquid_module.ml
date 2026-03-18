@@ -291,6 +291,7 @@ module Hyperliquid_impl = struct
         side = side_of_hyperliquid_side e.side;
         remaining_qty = max 0.0 (e.order_qty -. e.cum_qty);
         filled_qty = e.cum_qty;
+        avg_price = e.avg_price;
         timestamp = e.timestamp;
       }
     ) events

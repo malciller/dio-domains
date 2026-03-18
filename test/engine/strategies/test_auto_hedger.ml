@@ -7,13 +7,13 @@ let setup () =
 
 let test_ignore_wrong_exchange () =
   setup ();
-  Auto_hedger.handle_order_filled false "kraken" "HYPE" Buy 100.0;
+  Auto_hedger.handle_order_filled false "kraken" "HYPE" Buy 100.0 42.50 15.0;
   let pending = Auto_hedger.get_pending_orders 10 in
   Alcotest.(check int) "Buffer should be empty" 0 (List.length pending)
 
 let test_hedge_valid_spot () =
   setup ();
-  Auto_hedger.handle_order_filled false "hyperliquid" "HYPE" Buy 100.0;
+  Auto_hedger.handle_order_filled false "hyperliquid" "HYPE" Buy 100.0 42.50 15.0;
   let pending = Auto_hedger.get_pending_orders 10 in
   Alcotest.(check int) "One hedge order generated" 1 (List.length pending);
   let order = List.hd pending in
@@ -24,7 +24,7 @@ let test_hedge_valid_spot () =
 
 let test_hedge_close_short () =
   setup ();
-  Auto_hedger.handle_order_filled false "hyperliquid" "HYPE" Sell 50.0;
+  Auto_hedger.handle_order_filled false "hyperliquid" "HYPE" Sell 50.0 43.00 15.0;
   let pending = Auto_hedger.get_pending_orders 10 in
   Alcotest.(check int) "One hedge order generated" 1 (List.length pending);
   let order = List.hd pending in
