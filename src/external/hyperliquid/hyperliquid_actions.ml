@@ -278,10 +278,15 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?c
               match statuses with
               | s :: _ ->
                   let resting = member "resting" s in
+                  let filled = member "filled" s in
                   if resting <> `Null then
                     match resting |> member "oid" |> to_int64_opt with
                     | Some oid -> Ok { order_id = oid }
                     | None -> Error (Printf.sprintf "Failed to find oid in resting status: %s" (Yojson.Safe.to_string s))
+                  else if filled <> `Null then
+                    match filled |> member "oid" |> to_int64_opt with
+                    | Some oid -> Ok { order_id = oid }
+                    | None -> Error (Printf.sprintf "Failed to find oid in filled status: %s" (Yojson.Safe.to_string s))
                   else
                     (match member "error" s |> to_string_option with
                      | Some err -> Error (Printf.sprintf "HL Order Rejected: %s" err)

@@ -365,7 +365,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (match List.find_opt (fun (h: Config.hedging_config) -> h.source_symbol = asset_with_fees.symbol) config.hedging with
                    | Some hedge_cfg ->
                        Dio_strategies.Auto_hedger.handle_order_filled
-                         asset_with_fees.exchange hedge_cfg.hedge_symbol side event.filled_qty
+                         hedge_cfg.testnet asset_with_fees.exchange hedge_cfg.hedge_symbol side event.filled_qty
                    | None -> ())
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
@@ -459,7 +459,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             List.filter (fun (_order_id, _, _, _, userref_opt) ->
               match userref_opt with
               | Some userref -> Dio_strategies.Strategy_common.is_strategy_order strategy_userref userref
-              | None -> asset_with_fees.exchange = "hyperliquid"
+              | None -> false
             ) all_open_orders
           in
 
@@ -477,7 +477,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  the fragile has_tracked_buy flag and triggering buy order spam. *)
               let is_grid_order = match userref_opt with
                 | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref
-                | None -> asset_with_fees.exchange = "hyperliquid"
+                | None -> false
               in
               if is_grid_order then
                 (if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1))
