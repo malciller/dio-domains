@@ -361,12 +361,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                    | None -> ());
                   
                   (* Trigger Auto-Hedging module *)
-                  let config = Config.read_config () in
-                  (match List.find_opt (fun (h: Config.hedging_config) -> h.source_symbol = asset_with_fees.symbol) config.hedging with
-                   | Some hedge_cfg ->
-                       Dio_strategies.Auto_hedger.handle_order_filled
-                         hedge_cfg.testnet asset_with_fees.exchange hedge_cfg.hedge_symbol side event.filled_qty event.avg_price hedge_cfg.max_basis_bps
-                   | None -> ())
+                  if asset_with_fees.hedge then begin
+                    let hedge_symbol = String.split_on_char '/' asset_with_fees.symbol |> List.hd in
+                    Dio_strategies.Auto_hedger.handle_order_filled
+                      asset_with_fees.testnet asset_with_fees.exchange hedge_symbol side event.filled_qty event.avg_price
+                  end
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
                   (match event.limit_price with
