@@ -785,11 +785,8 @@ let handle_message message on_heartbeat =
         | None -> ())
     | Some "status", _, _ ->
         Logging.debug ~section "Status message received"
-    | Some "balances", _, _ ->
-        (* Messages for the balances channel are handled independently by kraken_balances_feed *)
-        ()
     | _ ->
-        Logging.debug_f ~section "Unhandled execution message: %s" message
+        Logging.info_f ~section "Unhandled execution message: %s" message
   with exn ->
     Logging.error_f ~section "Error handling message: %s - %s" 
       (Printexc.to_string exn) message
