@@ -57,11 +57,14 @@ type strategy_state = {
   mutable open_sell_orders: (string * float) list;  (* order_id * price *)
   mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
-  mutable last_order_time: float;  (* Unix timestamp of last order placement *)
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
   mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
-  mutable last_order_change_cycle: int;  (* Cycle when last order was placed/amended - amendment cooldown *)
+  mutable inflight_buy: bool;         (* true while a buy Place is sent but not yet ack'd/rejected/failed *)
+  mutable inflight_sell: bool;        (* true while a sell Place is sent but not yet ack'd/rejected/failed *)
+  mutable capital_low: bool;          (* true when quote balance is insufficient; buy+sell paused *)
+  mutable asset_low: bool;            (* true when asset balance is insufficient; sell+buy paused *)
+  mutable capital_low_logged: bool;   (* suppresses repeat capital_low log spam *)
   mutex: Mutex.t;  (* Thread safety for modifying strategy state *)
 }
 
@@ -82,11 +85,14 @@ let get_strategy_state asset_symbol =
           open_sell_orders = [];
           pending_orders = [];
           last_cycle = 0;
-          last_order_time = 0.0;
           cancelled_orders = [];
           pending_cancellations = Hashtbl.create 16;
           last_cleanup_time = 0.0;
-          last_order_change_cycle = 0;
+          inflight_buy = false;
+          inflight_sell = false;
+          capital_low = false;
+          asset_low = false;
+          capital_low_logged = false;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -275,12 +281,11 @@ let push_order order =
                     order.qty
                     (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
 
-                  (* Update strategy state *)
-                  state.last_order_time <- Unix.time ();
-                  (* Add to pending cancellations tracking *)
-                  Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
-                  Logging.debug_f ~section "Cancelling order for %s (target: %s)"
-                    order.symbol target_order_id;
+
+                   (* Add to pending cancellations tracking *)
+                   Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
+                   Logging.debug_f ~section "Cancelling order for %s (target: %s)"
+                     order.symbol target_order_id;
                   true
               | None ->
                   Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
@@ -317,13 +322,18 @@ let push_order order =
              order.qty
              (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
 
-           (* Update strategy state *)
-           let state = get_strategy_state order.symbol in
-           state.last_order_time <- Unix.time ();
+            (* Update strategy state *)
+            let state = get_strategy_state order.symbol in
 
-           (* Handle different operations *)
-           (match order.operation with
-            | Place ->
+            (* Set inflight flags for Place operations *)
+            (match order.operation, order.side with
+             | Place, Buy -> state.inflight_buy <- true
+             | Place, Sell -> state.inflight_sell <- true
+             | _ -> ());
+
+            (* Handle different operations *)
+            (match order.operation with
+             | Place ->
                 (* For Hyperliquid: skip pending tracking for sell orders entirely.
                    Sells are fire-and-forget; tracking them creates ghost entries
                    that cause re-placement loops during cancel-replace amendments.
@@ -409,6 +419,46 @@ let execute_strategy
 
   let state = get_strategy_state asset.symbol in
 
+  (* --- Asset-low check: clear flag when asset balance recovers --- *)
+  (match asset_balance with
+   | Some asset_bal ->
+       let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
+       if state.asset_low && asset_bal >= qty_f then begin
+         state.asset_low <- false;
+         state.inflight_sell <- false;
+         ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
+         Logging.info_f ~section "Asset balance restored for %s (have %.8f, need %.8f) - resuming order placement"
+           asset.symbol asset_bal qty_f
+       end
+   | None -> ()
+  );
+
+  (* --- Capital-low fast path: skip strategy when quote balance is known to be
+     insufficient for a buy order.  When balance recovers we clear the flag
+     and resume normally. --- *)
+  (match quote_balance, current_price with
+   | Some quote_bal, Some price ->
+       let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
+       let quote_needed_fast = price *. qty_f in
+       if state.capital_low && quote_bal < quote_needed_fast then begin
+         (* Still low: skip entire strategy body to avoid order spam *)
+         ()
+       end else if state.capital_low && quote_bal >= quote_needed_fast then begin
+         (* Balance has recovered: clear flag and fall through to normal logic *)
+         state.capital_low <- false;
+         state.capital_low_logged <- false;
+         state.inflight_buy <- false;
+         ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Buy));
+         Logging.info_f ~section "Capital restored for %s (have %.2f, need %.2f) - resuming strategy"
+           asset.symbol quote_bal quote_needed_fast
+       end
+       (* capital_low=false: fall through normally *)
+   | _ -> () (* No balance/price data yet, fall through *)
+  );
+
+  (* Only proceed with main strategy if balance flags are clear *)
+  if not state.capital_low && not state.asset_low then begin
+
   let now = Unix.time () in
 
       (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
@@ -424,7 +474,9 @@ let execute_strategy
         ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
       end else begin
         let duplicate_key = generate_side_duplicate_key asset.symbol side in
-        ignore (InFlightOrders.remove_in_flight_order duplicate_key)
+        ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+        (* Fallback: clear inflight flags for stale placements *)
+        (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
       end;
       false
     end else
@@ -566,7 +618,7 @@ let execute_strategy
         let exposure_ok = match max_exposure_opt, available_asset_balance with
           | Some max_exp, Some ab ->
               (* Check if we can place a sell order without exceeding max exposure *)
-              (* After selling qty, our exposure would be: (ab - qty) * mid_price <= max_exp *)
+              (* After selling qty, our exposure would be: (ab -. qty) *. mid_price <= max_exp *)
               let new_exposure = (ab -. qty) *. mid_price in
               new_exposure <= max_exp
           | Some _, None -> false  (* If max_exp is set but we have no asset balance data, fail *)
@@ -657,12 +709,9 @@ let execute_strategy
           (* CRITICAL: Check for pending sell orders first to prevent duplicate spam *)
           (* Place/ensure sell orders for all available asset_balance at or above best_ask *)
           (* CRITICAL: Check for pending sell orders first to prevent duplicate spam *)
-          let has_pending_sell = List.exists (fun (_, side, _, _) -> 
-            side = Sell
-          ) state.pending_orders in
-          
-          if has_pending_sell then begin
-             if should_log then Logging.debug_f ~section "Skipping emergency sell for %s: pending sell order exists" asset.symbol
+                    (* CRITICAL: Check inflight flag to prevent duplicate spam *)
+           if state.inflight_sell then begin
+              if should_log then Logging.debug_f ~section "Skipping emergency sell for %s: sell order in-flight" asset.symbol
           end else begin
             match available_asset_balance with
             | Some ab when ab > 0.0 ->
@@ -750,15 +799,12 @@ let execute_strategy
             
             state.last_buy_order_price <- None;
             state.last_buy_order_id <- None;
-            state.last_cycle <- cycle
-
-          end else if actual_open_buy_count = 0 then begin
+            state.last_cycle <- cycle           end else if actual_open_buy_count = 0 then begin
             (* If 0 open buys: Place new buy+sell PAIR.
-               Guard: Don't place if a buy order is still pending/in-flight,
+               Guard: Don't place if a buy order is still in-flight,
                matching suicide_grid's established pattern. *)
-            let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
-            if buy_order_pending then begin
-              if should_log then Logging.debug_f ~section "Skipping pair placement for %s: buy order still pending" asset.symbol
+            if state.inflight_buy then begin
+              if should_log then Logging.debug_f ~section "Skipping pair placement for %s: buy order in-flight" asset.symbol
             end else begin
             if should_log then Logging.debug_f ~section "No buy orders for %s, placing new pair" asset.symbol;
 
@@ -903,6 +949,8 @@ let execute_strategy
         state.last_cycle <- cycle
       end
 
+  end (* capital_low / asset_low guard *)
+
 
 (* Helper to generate a duplicate key for InFlightOrders based on asset and side *)
 (* MUST match the key format used by create_place_order / push_order (line 173) *)
@@ -942,7 +990,6 @@ let handle_order_acknowledged asset_symbol order_id side price =
    | Buy ->
     state.last_buy_order_id <- Some order_id;
     state.last_buy_order_price <- Some price;
-    state.last_order_change_cycle <- state.last_cycle;
     Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
    | Sell -> ());
 
@@ -957,10 +1004,42 @@ let handle_order_failed asset_symbol side reason =
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
     (* Remove from pending orders *)
     state.pending_orders <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
+
+    (* Clear inflight flags *)
+    (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
     
     (* Clear global in-flight trackers *)
     let duplicate_key = generate_side_duplicate_key asset_symbol side in
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+
+    (* Detect insufficient balance errors from the exchange *)
+    let lower_reason = String.lowercase_ascii reason in
+    let contains_fragment s fragment =
+      let sl = String.length s and fl = String.length fragment in
+      let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
+      loop 0
+    in
+    let is_insufficient_balance = contains_fragment lower_reason "insufficient funds"
+      || contains_fragment lower_reason "insufficient spot balance" in
+
+    (* Set balance flags when the exchange reports insufficient balance.
+       capital_low (buy side) and asset_low (sell side) halt further placement
+       until balance actually recovers (event-driven, no timers). *)
+    (match side with
+     | Buy when is_insufficient_balance ->
+         if not state.capital_low then begin
+           state.capital_low <- true;
+           state.capital_low_logged <- true;
+           Logging.warn_f ~section "Exchange rejected buy for %s with insufficient funds - setting capital_low flag"
+             asset_symbol
+         end
+     | Sell when is_insufficient_balance ->
+         if not state.asset_low then begin
+           state.asset_low <- true;
+           Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance - setting asset_low flag"
+             asset_symbol
+         end
+     | _ -> ());
     
     Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker."
       asset_symbol (string_of_order_side side) reason
@@ -985,6 +1064,9 @@ let handle_order_rejected asset_symbol side price =
     
     not (matches_side_placement || matches_fallback)
   ) state.pending_orders;
+
+  (* Clear inflight flags *)
+  (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
 
   (* Clean up global trackers to allow immediate re-placement after rejection *)
   let duplicate_key = generate_side_duplicate_key asset_symbol side in
@@ -1133,14 +1215,12 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
           | Some target_id when target_id = old_order_id ->
               state.last_buy_order_id <- Some new_order_id;
               state.last_buy_order_price <- Some price;
-              state.last_order_change_cycle <- state.last_cycle;
               Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s" 
                 old_order_id new_order_id price asset_symbol
           | _ -> 
               (* Fallback in case state got wiped or mismatched *)
               state.last_buy_order_id <- Some new_order_id;
               state.last_buy_order_price <- Some price;
-              state.last_order_change_cycle <- state.last_cycle;
               Logging.debug_f ~section "Set buy order ID via amend: %s @ %.2f for %s" 
                 new_order_id price asset_symbol)
      | Sell ->

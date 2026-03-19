@@ -197,5 +197,6 @@ let read_config () : config =
     Logging.critical_f ~section "Failed to parse config.json: %s" msg;
     exit 1
   | Sys_error msg ->
-    Logging.critical_f ~section "Cannot read config.json: %s" msg;
-    exit 1
+    Logging.warn_f ~section "Cannot read config.json: %s — using defaults" msg;
+    { logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
+      engine = default_engine_config; trading = [] }
