@@ -741,9 +741,11 @@ let execute_strategy
         let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
 
         (* Place sell order first - sell and buy are always paired.
-           asset_low flag blocks entry to this entire branch at the top level. *)
+           asset_low flag blocks entry to this entire branch at the top level.
+           Always attempt the sell regardless of local balance — let the exchange
+           be the final arbiter.  If it rejects, handle_order_failed sets asset_low. *)
         (match asset_balance with
-         | Some asset_bal when not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
+         | Some _asset_bal when not state.inflight_sell ->
              let sell_qty =
                if asset.exchange = "hyperliquid" then begin
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
@@ -765,9 +767,6 @@ let execute_strategy
              if push_order sell_order then
                Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
                  asset.symbol sell_qty sell_price
-         | Some asset_bal when not state.inflight_sell ->
-             Logging.debug_f ~section "Insufficient asset balance for %s sell order: need %.8f, have %.8f"
-                 asset.symbol asset_needed asset_bal
          | _ -> ()
         );
 
