@@ -56,6 +56,8 @@ type strategy_state = {
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
   mutable inflight_buy: bool;   (* true while a buy Place is sent but not yet ack'd/rejected/failed *)
   mutable inflight_sell: bool;  (* true while a sell Place is sent but not yet ack'd/rejected/failed *)
+  mutable capital_low: bool;    (* true when quote balance is insufficient to place next buy; strategy paused *)
+  mutable capital_low_logged: bool; (* true once we have logged the capital-low warning to suppress repeat spam *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -83,6 +85,8 @@ let get_strategy_state asset_symbol =
           last_cleanup_time = 0.0;
           inflight_buy = false;
           inflight_sell = false;
+          capital_low = false;
+          capital_low_logged = false;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -357,6 +361,32 @@ let execute_strategy
   if cycle mod 100 = 0 then begin
 
   let state = get_strategy_state asset.symbol in
+
+  (* --- Capital-low fast path: skip strategy when quote balance is known to be
+     insufficient for a buy order. We still allow the FIRST loop through (capital_low=false)
+     so that any accrued sell orders from previously filled buys are placed and can free
+     capital. After that first pass, capital_low is set and we short-circuit here. ---
+     When balance recovers we clear the flag and resume normally. *)
+  (match quote_balance with
+   | Some quote_bal ->
+       let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
+       let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
+       if state.capital_low && quote_bal < quote_needed_fast then begin
+         (* Still low: skip entire strategy body to avoid order spam *)
+         ()
+       end else if state.capital_low && quote_bal >= quote_needed_fast then begin
+         (* Balance has recovered: clear flag and fall through to normal logic *)
+         state.capital_low <- false;
+         state.capital_low_logged <- false;
+         Logging.info_f ~section "Capital restored for %s (have %.2f, need %.2f) - resuming strategy"
+           asset.symbol quote_bal quote_needed_fast
+       end
+       (* capital_low=false: fall through normally *)
+   | None -> () (* No balance data yet, fall through *)
+  );
+
+  (* Only proceed with main strategy if capital_low flag is clear *)
+  if not state.capital_low then begin
 
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -650,12 +680,17 @@ let execute_strategy
                 | None -> ())
              end
          | Some quote_bal ->
-             (* Apply cooldown to avoid tight-looping; re-check after sells may have freed liquidity *)
+             (* Apply short cooldown to stop hard spin; then raise capital_low flag so the
+                domain loop short-circuits on future iterations until balance recovers. *)
              let cooldown_key = "place_Buy" in
              if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
-               Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f (waiting 5min for liquidity)"
-                 asset.symbol quote_needed quote_bal;
-               Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 300.0)
+               if not state.capital_low_logged then begin
+                 Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f - pausing buy side until capital recovers"
+                   asset.symbol quote_needed quote_bal;
+                 state.capital_low_logged <- true
+               end;
+               Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+               state.capital_low <- true
              end
          | None ->
              Logging.warn_f ~section "No quote balance data available for %s buy order"
@@ -838,6 +873,7 @@ let execute_strategy
       end
   end);
   ()
+  end  (* if not state.capital_low *)
 end
 
 
@@ -905,8 +941,7 @@ let handle_order_failed asset_symbol side reason =
       loop 0
     in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
-    let is_balance_issue = contains_fragment lower_reason "insufficient" || contains_fragment lower_reason "insufficient funds" in
-    let cooldown = if is_rate_limit then 10.0 else if is_balance_issue then 300.0 else 2.0 in
+    let cooldown = if is_rate_limit then 10.0 else 2.0 in
     
     (* Apply cooldown to prevent placement spam on rate limit *)
     let now = Unix.time () in
@@ -945,9 +980,7 @@ let handle_order_rejected asset_symbol side price =
   ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
   (* Apply short cooldown to prevent placement spam on immediate rejection.
-     BUT: don't overwrite a longer cooldown already set by handle_order_failed
-     (e.g. 300s for insufficient balance). The HTTP response arrives first and
-     sets the long cooldown; this WS event arrives ~25ms later. *)
+     BUT: don't overwrite a longer cooldown already set by handle_order_failed. *)
   let now = Unix.time () in
   let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
   let new_expiry = now +. 2.0 in
