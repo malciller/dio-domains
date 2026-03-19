@@ -573,24 +573,9 @@ let execute_strategy
           | None, _ -> true        (* If no max_exposure constraint, always pass *)
         in
 
-        (* Calculate projected balances for better logging *)
-        let projected_buy_balance = match available_quote_balance with
-          | Some qb -> Some (qb -. (bid *. qty))
-          | None -> None
-        in
-        let projected_sell_exposure = match available_asset_balance with
-          | Some ab -> Some ((ab -. qty) *. mid_price)
-          | None -> None
-        in
 
-        if should_log then Logging.info_f ~section "Strategy check for %s: open_buy_count=%d, bid=%.8f, ask=%.8f, current_exposure=%.2f, projected_sell_exposure=%s, max_exposure=%s, current_usd=%s, projected_buy_usd=%s, min_usd=%s, exposure_ok=%B, usd_ok=%B"
-          asset.symbol open_buy_count bid ask exposure_value
-          (match projected_sell_exposure with Some pe -> Printf.sprintf "%.2f" pe | None -> "N/A")
-          (match max_exposure_opt with Some me -> Printf.sprintf "%.2f" me | None -> "unlimited")
-          (match available_quote_balance with Some qb -> string_of_float qb | None -> "None")
-          (match projected_buy_balance with Some pb -> Printf.sprintf "%.2f" pb | None -> "N/A")
-          (match min_usd_balance_opt with Some mb -> Printf.sprintf "%.2f" mb | None -> "unlimited")
-          exposure_ok usd_balance_ok;
+        if should_log then Logging.info_f ~section "Strategy check for %s: open_buy_count=%d, bid=%.8f, ask=%.8f, exposure_ok=%B, usd_ok=%B"
+          asset.symbol open_buy_count bid ask exposure_ok usd_balance_ok;
 
         (* EXPOSURE & BALANCE CHECKS (Pause/Protect if Failed) *)
         if not exposure_ok || not usd_balance_ok then begin
