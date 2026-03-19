@@ -364,19 +364,6 @@ module Hyperliquid_impl = struct
       ~testnet:(Atomic.get is_testnet)
 end
 
-let post_info ~testnet payload =
-  let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
-  let url = Uri.of_string (base_url ^ "/info") in
-  let body_str = Yojson.Safe.to_string payload in
-  let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-  Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string body_str) url >>= fun (resp, resp_body) ->
-  Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
-  let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-  if status >= 200 && status < 300 then
-    Lwt.return (Ok (Yojson.Safe.from_string body_str))
-  else
-    Lwt.return (Error (Printf.sprintf "HTTP Error %d: %s" status body_str))
-
 (** WS-based initialization helpers that orchestrate between WS and feeds *)
 let rec wait_for_ws_connected () =
   if Hyperliquid_ws.is_connected () then Lwt.return_unit
@@ -386,24 +373,42 @@ let initialize_instruments_ws () =
   let section = "hyperliquid_startup" in
   Lwt.catch (fun () ->
     wait_for_ws_connected () >>= fun () ->
-    
-    let fetch_meta () =
-      post_info ~testnet:(Atomic.get Hyperliquid_impl.is_testnet) (`Assoc ["type", `String "meta"]) >>= function
-      | Ok res -> Lwt.return res
-      | Error e -> Lwt.fail_with ("Perp info fetch failed: " ^ e)
+    let open Yojson.Safe.Util in
+    let req_id_perp = Hyperliquid_actions.next_ws_req_id () in
+    let ws_frame_perp = `Assoc [
+      "method", `String "post";
+      "id", `Int req_id_perp;
+      "request", `Assoc [
+        "type", `String "info";
+        "payload", `Assoc [ "type", `String "meta" ]
+      ]
+    ] in
+    let extract_ws_payload resp =
+      try 
+        let p = resp |> member "data" |> member "response" |> member "payload" in
+        let d = member "data" p in
+        if d = `Null then p else d
+      with _ -> resp
     in
-    let fetch_spot_meta () =
-      post_info ~testnet:(Atomic.get Hyperliquid_impl.is_testnet) (`Assoc ["type", `String "spotMeta"]) >>= function
-      | Ok res -> Lwt.return res
-      | Error e -> Lwt.fail_with ("Spot info fetch failed: " ^ e)
-    in
     
-    fetch_meta () >>= fun payload_perp ->
-    fetch_spot_meta () >>= fun payload_spot ->
+    Hyperliquid_ws.send_request ~json:ws_frame_perp ~req_id:req_id_perp ~timeout_ms:5000 >>= fun resp_perp ->
+    let payload_perp = extract_ws_payload resp_perp in
+    
+    let req_id_spot = Hyperliquid_actions.next_ws_req_id () in
+    let ws_frame_spot = `Assoc [
+      "method", `String "post";
+      "id", `Int req_id_spot;
+      "request", `Assoc [
+        "type", `String "info";
+        "payload", `Assoc [ "type", `String "spotMeta" ]
+      ]
+    ] in
+    Hyperliquid_ws.send_request ~json:ws_frame_spot ~req_id:req_id_spot ~timeout_ms:5000 >>= fun resp_spot ->
+    let payload_spot = extract_ws_payload resp_spot in
     
     Hyperliquid_instruments_feed.process_meta_response payload_perp payload_spot
   ) (fun exn ->
-    Logging.error_f ~section "Failed to fetch instruments via REST fallback: %s" (Printexc.to_string exn);
+    Logging.error_f ~section "Failed to fetch instruments via WS: %s" (Printexc.to_string exn);
     Hyperliquid_instruments_feed.notify_ready ();
     Lwt.return_unit
   )
@@ -454,15 +459,13 @@ let fetch_spot_balances_ws () =
           try
             let coin = member "coin" item |> to_string in
             let total = parse_json_float (member "total" item) in
-            let hold = parse_json_float (member "hold" item) in
-            let available = total -. hold in
             let store = Hyperliquid_balances.get_balance_store coin in
-            Hyperliquid_balances.BalanceStore.update_wallet store available "spot" "account";
+            Hyperliquid_balances.BalanceStore.update_wallet store total "spot" "account";
             
             if coin = "USDC" then
-              Logging.info_f ~section "Initial Spot USDC balance: %.6f (hold: %.6f)" available hold
+              Logging.info_f ~section "Initial Spot USDC balance: %.6f" total
             else
-              Logging.debug_f ~section "Initial Spot balance: %s = %.6f (total: %.6f)" coin available total
+              Logging.debug_f ~section "Initial Spot balance: %s = %.6f" coin total
           with exn ->
             Logging.warn_f ~section "Failed to parse spot balance entry: %s" (Printexc.to_string exn)
         ) balances;
@@ -472,6 +475,43 @@ let fetch_spot_balances_ws () =
     ) (fun exn ->
       Logging.error_f ~section "Failed to fetch spot balances via WS: %s" (Printexc.to_string exn);
       Hyperliquid_balances.notify_ready ();
+      Lwt.return_unit
+    )
+  end
+
+let fetch_open_orders_ws () =
+  let section = "hyperliquid_startup" in
+  let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+    | Some w -> w
+    | None -> ""
+  in
+  if wallet = "" then Lwt.return_unit
+  else begin
+    let req_id = Hyperliquid_actions.next_ws_req_id () in
+    let ws_frame = `Assoc [
+      "method", `String "post";
+      "id", `Int req_id;
+      "request", `Assoc [
+        "type", `String "info";
+        "payload", `Assoc [
+          "type", `String "openOrders";
+          "user", `String wallet
+        ]
+      ]
+    ] in
+    Lwt.catch (fun () ->
+      wait_for_ws_connected () >>= fun () ->
+      Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000 >>= fun resp_frame ->
+      let open Yojson.Safe.Util in
+      (* Extract payload: data.response.payload.data or data.response.payload *)
+      let response_node = try resp_frame |> member "data" |> member "response" with _ -> `Null in
+      let payload = try response_node |> member "payload" with _ -> `Null in
+      let data_node = try payload |> member "data" with _ -> `Null in
+      let orders_json = if data_node <> `Null then data_node else payload in
+      Hyperliquid_executions_feed.inject_open_orders orders_json;
+      Lwt.return_unit
+    ) (fun exn ->
+      Logging.error_f ~section "Failed to fetch open orders via WS: %s" (Printexc.to_string exn);
       Lwt.return_unit
     )
   end

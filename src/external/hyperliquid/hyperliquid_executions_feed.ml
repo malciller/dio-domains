@@ -618,3 +618,58 @@ let initialize symbols =
     let _ = get_symbol_store symbol in
     Logging.debug_f ~section "Created Hyperliquid executions buffer for %s" symbol
   ) symbols
+
+let inject_open_orders data_json =
+  let open Yojson.Safe.Util in
+  try
+    let orders = to_list data_json in
+    let count = ref 0 in
+    List.iter (fun order_obj ->
+      try
+        let coin = member "coin" order_obj |> to_string in
+        let order_id = match member "oid" order_obj with `Int i -> string_of_int i | `String s -> s | _ -> "0" in
+        let symbol_opt = find_registered_symbol coin in
+        
+        match symbol_opt with
+        | Some symbol ->
+            let price = match member "limitPx" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0 in
+            let qty = 
+              match member "origSz" order_obj with 
+              | `String s -> float_of_string s 
+              | `Float f -> f 
+              | `Int i -> float_of_int i 
+              | _ -> (match member "sz" order_obj with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0)
+            in
+            let side = if (member "side" order_obj |> to_string) = "B" then Buy else Sell in
+            let cl_ord_id = member "cloid" order_obj |> to_string_option in
+            let timestamp_ms = match member "timestamp" order_obj with `Int i -> float_of_int i | `Float f -> f | `String s -> float_of_string s | _ -> Unix.gettimeofday () *. 1000.0 in
+            
+            let store = get_symbol_store symbol in
+            
+            let event : execution_event = {
+              order_id;
+              symbol;
+              exec_type = New;
+              order_status = NewStatus;
+              limit_price = Some price;
+              side;
+              order_qty = qty;
+              cum_qty = 0.0;
+              cum_cost = 0.0;
+              avg_price = 0.0;
+              timestamp = timestamp_ms /. 1000.0;
+              trade_id = None;
+              last_qty = None;
+              last_price = None;
+              fee = None;
+              cl_ord_id;
+            } in
+            update_orders_internal store event;
+            incr count;
+            Logging.info_f ~section "Injected startup open order: %s [%s] %s %.8f @ %.2f" order_id symbol (if side = Buy then "buy" else "sell") qty price
+        | None -> ()
+      with exn -> Logging.warn_f ~section "Failed to parse open order entry: %s" (Printexc.to_string exn)
+    ) orders;
+    Logging.info_f ~section "Injected %d initial open orders from snapshot" !count
+  with exn ->
+    Logging.error_f ~section "Failed to inject open orders: %s" (Printexc.to_string exn)

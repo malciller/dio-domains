@@ -600,6 +600,12 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Executions_feed.initialize hyperliquid_symbols;
 
+  (* Fetch existing open orders SYNCHRONOUSLY before domains start to prevent duplicates *)
+  let%lwt () =
+    if has_hyperliquid then Hyperliquid.Module.fetch_open_orders_ws ()
+    else Lwt.return_unit
+  in
+
   (* Register and start remaining supervised websocket connections *)
   Logging.info ~section "Step 7: Starting Kraken websocket connections...";
 

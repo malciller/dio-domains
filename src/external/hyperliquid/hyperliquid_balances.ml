@@ -176,13 +176,11 @@ let process_market_data json =
           try
             let coin = member "coin" item |> to_string in
             let total = parse_json_float (member "total" item) in
-            let hold = parse_json_float (member "hold" item) in
-            let available = total -. hold in
             let store = get_balance_store coin in
-            BalanceStore.update_wallet store available "spot" "account";
+            BalanceStore.update_wallet store total "spot" "account";
 
             if coin = "USDC" then
-              Logging.debug_f ~section "spotState USDC: %.2f (total: %.2f, hold: %.2f)" available total hold
+              Logging.debug_f ~section "spotState USDC: %.2f (total: %.2f)" total (BalanceStore.get_balance store)
           with exn ->
             Logging.warn_f ~section "Failed to parse spotState entry: %s" (Printexc.to_string exn)
         ) balances
