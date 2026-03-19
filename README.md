@@ -5,11 +5,8 @@
 
 High-performance OCaml 5.2 trading engine for Kraken and Hyperliquid featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, tick-driven event architecture, and real-time latency profiling. Built for high-frequency trading with WebSocket data feeds and asynchronous order execution.
 
-
 > [!WARNING]
 > **Auto-hedge for Hyperliquid is EXPERIMENTAL.** Testing is ongoing; features may be incomplete or unstable.
-
-
 
 ## Requirements
 
@@ -87,7 +84,7 @@ Edit `config.json` (example):
       "exchange": "hyperliquid",      // Exchange name (must be "hyperliquid")
       "qty": "0.35",                  // Base asset quantity per order
       "grid_interval": [0.25, 0.5],   // Min/Max grid spacing (%)
-      "sell_mult": "1.0",             // Sell amount multiplier
+      "sell_mult": "0.999",           // Sell amount multiplier (triggers discrete accumulation on Hyperliquid)
       "strategy": "Grid",             // Strategy name: "Grid"
       "testnet": false,               // Use testnet
       "hedge": true                   // Enable auto-hedge (Hyperliquid only)
@@ -103,10 +100,19 @@ Edit `config.json` (example):
 
 ## Strategies
 
-- GRID: Maintains buy/sell ladders around price with configurable spacing and size.
-- MM (Adaptive Market Maker): Dynamically adapts its quoting style based on market fees—uses a greedy quoting approach for no-fee markets and a conservative, profit-guaranteeing strategy where trading fees apply.
-- Fear & Greed: Grid spacing is resolved once at domain startup using linear interpolation between configured `grid_interval` [min, max] based on the CoinMarketCap Fear & Greed index; provide `CMC_API_KEY` for live values.
-- Auto-Hedge (Hyperliquid only): Single-short-per-cycle delta hedge on perps. Spot buy fills open a perp short; spot sell fills close it. Enable with `"hedge": true` in the trading config. Kraken is not supported.
+**Grid**: Maintains buy/sell ladders around price with configurable spacing and size. Acts as a market maker with optional DCA accumulation via `sell_mult`. On Kraken, sells use `qty * sell_mult` directly. On Hyperliquid, discrete sizing rules apply (see below).
+
+**MM (Adaptive Market Maker)**: Dynamically adapts quoting style based on market fees. Uses greedy quoting for no-fee markets and conservative profit-guaranteeing quotes where fees apply.
+
+**Fear & Greed**: Grid spacing is resolved once at domain startup using linear interpolation between configured `grid_interval` [min, max] based on the CoinMarketCap Fear & Greed index. Provide `CMC_API_KEY` for live values.
+
+**Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge on perps. Spot buy fills open a perp short; spot sell fills close it. Enable with `"hedge": true`. Kraken is not supported.
+
+### Hyperliquid Discrete Sizing
+
+Hyperliquid enforces discrete order sizes via `szDecimals` (e.g. HYPE uses 2 decimal places, so the lot increment is 0.01). When `sell_mult < 1.0`, the desired sell quantity often falls between valid lot boundaries and must be floored, creating rounding loss that exceeds the intended skim. For example, `0.35 * 0.999 = 0.34965` floors to `0.34`, losing 0.01 HYPE per cycle (~2.86%) instead of the intended ~0.1%.
+
+To handle this, the Grid strategy uses profit-gated accumulation. Most cycles sell the full `qty` (1:1), growing quote balance through grid spread profits. Once realized net profit (accounting for quantity and maker fees on both legs) exceeds the rounding cost plus a $0.01 USDC buffer, a single `sell_mult` sell is triggered to accumulate base asset. This is adaptive: fast markets accumulate faster, slow markets wait longer.
 
 ## Key Features
 
@@ -120,7 +126,7 @@ Edit `config.json` (example):
 ## Architecture
 
 - **Main Entry Point**: Command-line interface with dashboard and headless modes, signal handling for graceful shutdown.
-- **Domain Spawner**: Manages OCaml domains for parallel strategy execution - each trading asset runs in its own isolated domain with supervision and auto-restart capabilities.
+- **Domain Spawner**: Manages OCaml domains for parallel strategy execution. Each trading asset runs in its own isolated domain with supervision and auto-restart capabilities.
 - **Supervisor**: Orchestrates WebSocket connections with circuit breaker patterns, heartbeat monitoring, and connection health management.
 - **Engine Core**:
   - **Concurrency**: Lock-free global tick bus and event registry for inter-domain communication.
@@ -128,11 +134,11 @@ Edit `config.json` (example):
   - **Strategies**: High-frequency trading algorithms (Grid, MM) running in parallel domains with F&G integration.
   - **Order Executor**: Asynchronous order placement and amendment with duplicate detection.
   - **Logging**: Structured logging with configurable levels and sections.
-- **External Integration — Kraken**:
+- **External Integration (Kraken)**:
   - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
   - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
   - **Authentication**: Secure token generation and management.
-- **External Integration — Hyperliquid**:
+- **External Integration (Hyperliquid)**:
   - **WebSocket Feeds**: Real-time ticker (allMids), L2 orderbook, balance (webData2/spotState), and execution data with ring buffer storage.
   - **REST Actions**: Authenticated order placement, amendment, and cancellation with L1 signature generation and retry with exponential backoff.
   - **Concurrency**: Global order index, double-checked locking on stores, self-restarting processor tasks, and stale-order cleanup.
@@ -158,7 +164,7 @@ dune build
 ```
 ## Logging
 
-- Debug, Info, Warning, Error — timestamped by component.
+- Debug, Info, Warning, Error, timestamped by component.
 
 ## Contributing
 
@@ -180,6 +186,6 @@ Guidelines: add tests, update docs, keep CI green.
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See `LICENSE`.
 
-Legal: Provided “as is”, without warranty. Trading involves risk.
+Legal: Provided "as is", without warranty. Trading involves risk.
