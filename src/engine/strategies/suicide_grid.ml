@@ -62,6 +62,7 @@ type strategy_state = {
   mutable capital_low: bool;    (* true when quote balance is insufficient to place next buy; strategy paused *)
   mutable capital_low_logged: bool; (* true once we have logged the capital-low warning to suppress repeat spam *)
   mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
+  mutable accumulation_cycles: int; (* cycles since last sell_mult sell; Hyperliquid discrete sizing *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -93,6 +94,7 @@ let get_strategy_state asset_symbol =
           capital_low = false;
           capital_low_logged = false;
           reserved_quote = 0.0;
+          accumulation_cycles = 0;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -168,6 +170,30 @@ let get_price_increment symbol exchange =
   | None ->
       Logging.warn_f ~section "No price increment info for %s/%s, using default 0.01" exchange symbol;
       0.01  (* Default fallback *)
+
+(** Get quantity increment (lot size) for the symbol *)
+let get_qty_increment_val symbol exchange =
+  match Exchange.Registry.get exchange with
+  | Some (module Ex : Exchange.S) -> Option.value (Ex.get_qty_increment ~symbol) ~default:0.01
+  | None -> 0.01
+
+(** Round quantity down to valid lot size for the exchange *)
+let round_qty qty symbol exchange =
+  let increment = get_qty_increment_val symbol exchange in
+  let inv = 1.0 /. increment in
+  floor (qty *. inv) /. inv
+
+(** Compute how many 1:1 sell cycles are needed before triggering one sell_mult sell.
+    Returns (cycles_needed, rounded_sell_qty).
+    Works dynamically from qty, sell_mult, and the exchange's lot increment. *)
+let compute_accumulation_cycles qty sell_mult symbol exchange =
+  let rounded_sell = round_qty (qty *. sell_mult) symbol exchange in
+  let rounding_diff = qty -. rounded_sell in
+  let per_cycle_skim = qty *. (1.0 -. sell_mult) in
+  if rounding_diff <= 0.0 || per_cycle_skim <= 0.0 then
+    (1, rounded_sell)  (* no rounding loss or no skim: every cycle is sell_mult *)
+  else
+    (int_of_float (ceil (rounding_diff /. per_cycle_skim)), rounded_sell)
 
 (** Get minimum price movement required to trigger an amendment *)
 let get_min_move_threshold price grid_interval_pct symbol exchange =
@@ -411,8 +437,11 @@ let execute_strategy
    (match asset_balance with
     | Some asset_bal ->
         let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
-        let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
-        let asset_needed_fast = qty_f *. sell_mult_f in
+        let asset_needed_fast =
+          if asset.exchange = "hyperliquid" then qty_f  (* 1:1 sells need full qty *)
+          else let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
+               qty_f *. sell_mult_f
+        in
         if state.asset_low && asset_bal >= asset_needed_fast then begin
           state.asset_low <- false;
           state.inflight_sell <- false;
@@ -616,7 +645,10 @@ let execute_strategy
 
       (* Calculate required balances *)
       let quote_needed = price *. qty in
-      let asset_needed = qty *. sell_mult in
+      let asset_needed =
+        if asset.exchange = "hyperliquid" then qty  (* most sells are 1:1 on Hyperliquid *)
+        else qty *. sell_mult
+      in
 
   (* Log current balance status for debugging - throttled to every 10,000 cycles *)
   if cycle mod 10000 = 0 then
@@ -713,10 +745,30 @@ let execute_strategy
            asset_low flag blocks entry to this entire branch at the top level. *)
         (match asset_balance with
          | Some asset_bal when not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
-             let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
-             if push_order sell_order then
+             let sell_qty =
+               if asset.exchange = "hyperliquid" then begin
+                 let (cycles_needed, rounded_sell) =
+                   compute_accumulation_cycles qty sell_mult asset.symbol asset.exchange in
+                 if state.accumulation_cycles >= cycles_needed - 1 then begin
+                   (* Trigger sell_mult sell: accumulated enough 1:1 profit to cover rounding cost *)
+                   state.accumulation_cycles <- 0;
+                   Logging.info_f ~section
+                     "Accumulation sell for %s: %.8f (sell_mult) after %d 1:1 cycles"
+                     asset.symbol rounded_sell cycles_needed;
+                   rounded_sell
+                 end else
+                   qty  (* 1:1 sell *)
+               end else
+                 qty *. sell_mult
+             in
+             let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+             if push_order sell_order then begin
+               (* Increment accumulation counter only on successful push (Hyperliquid) *)
+               if asset.exchange = "hyperliquid" then
+                 state.accumulation_cycles <- state.accumulation_cycles + 1;
                Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                 asset.symbol (qty *. sell_mult) sell_price
+                 asset.symbol sell_qty sell_price
+             end
          | Some asset_bal when not state.inflight_sell ->
              Logging.debug_f ~section "Insufficient asset balance for %s sell order: need %.8f, have %.8f"
                  asset.symbol asset_needed asset_bal
