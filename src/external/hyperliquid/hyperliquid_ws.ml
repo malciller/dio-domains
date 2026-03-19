@@ -16,6 +16,12 @@ let is_connected () = Atomic.get is_connected_ref
 let active_connection = ref None
 let connection_mutex = Lwt_mutex.create ()
 
+(** Condition variable used to unblock domain workers waiting for Hyperliquid data.
+    Signaled on every incoming WS frame and on WS disconnect.
+    Delegates to Concurrency.Exchange_wakeup which is visible from all library layers. *)
+let signal_new_data () = Concurrency.Exchange_wakeup.signal ()
+let wait_for_data () = Concurrency.Exchange_wakeup.wait ()
+
 (** Global subscriber list *)
 let pushers : (Yojson.Safe.t option -> unit) list ref = ref []
 let pushers_mutex = Mutex.create ()
@@ -35,7 +41,8 @@ let broadcast_message json =
   let ps = !pushers in
   Mutex.unlock pushers_mutex;
   if ps = [] then Logging.warn ~section "No subscribers for WebSocket message!";
-  List.iter (fun push -> push (Some json)) ps
+  List.iter (fun push -> push (Some json)) ps;
+  signal_new_data ()  (* wake any domain workers blocked in wait_for_data *)
 
 (** Subscribe to all incoming market data messages. *)
 let subscribe_market_data () =
@@ -172,6 +179,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   | Websocket.Frame.Opcode.Close ->
       Logging.info ~section "WebSocket connection closed by server";
       Atomic.set is_connected_ref false;
+      signal_new_data ();  (* unblock waiting domain workers so they re-check is_running *)
       Lwt.return_unit
   | _ -> Lwt.return_unit
 

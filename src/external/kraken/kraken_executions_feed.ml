@@ -749,6 +749,7 @@ let handle_update json on_heartbeat =
 (** WebSocket message handler *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
+  Concurrency.Exchange_wakeup.signal ();  (* wake domain workers blocked in wait() *)
   try
     let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in

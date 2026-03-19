@@ -369,9 +369,6 @@ let execute_strategy
     (open_orders : (string * float * float * string * int option) list)  (* order_id, price, remaining_qty, side, userref *)
     (cycle : int) =
 
-  (* Only execute strategy periodically to avoid excessive order generation *)
-  if cycle mod 100 = 0 then begin
-
   let state = get_strategy_state asset.symbol in
 
   (* --- Capital-low fast path: skip strategy when quote balance is known to be
@@ -393,6 +390,10 @@ let execute_strategy
          (* Balance has recovered: clear flag and fall through to normal logic *)
          state.capital_low <- false;
          state.capital_low_logged <- false;
+         (* Flush the buy-side placement cooldown so the strategy can place immediately.
+            Without this, the 2s cooldown set when capital_low was first triggered
+            would block the first buy attempt even after balance recovers. *)
+         Hashtbl.remove state.amend_cooldowns "place_Buy";
          Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, other_reserved %.2f) - resuming strategy"
            asset.symbol available_quote quote_needed_fast other_reserved
        end
@@ -898,7 +899,6 @@ let execute_strategy
       end
   end);
   ()
-  end  (* if not state.capital_low *)
 end
 
 
