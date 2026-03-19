@@ -529,13 +529,19 @@ let execute_strategy
 
       (* Set the buy order price and ID (take the highest buy order if multiple) *)
       (match !buy_orders with
-       | [] -> ()
+       | [] ->
+           (* No open buy - clear reservation so available-balance check is accurate *)
+           state.reserved_quote <- 0.0
        | orders ->
            let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
              if price > acc_price then (order_id, price) else (acc_id, acc_price)
            ) (List.hd orders) (List.tl orders) in
            state.last_buy_order_price <- Some best_price;
-           state.last_buy_order_id <- Some best_order_id);
+           state.last_buy_order_id <- Some best_order_id;
+           (* Sync reserved_quote from the actual open buy so the capital_low check
+              uses the real exchange-reserved amount even after a restart. *)
+           let qty = (try float_of_string asset.qty with Failure _ -> 0.001) in
+           state.reserved_quote <- best_price *. qty);
 
       (* Set sell orders *)
       state.open_sell_orders <- !sell_orders;
