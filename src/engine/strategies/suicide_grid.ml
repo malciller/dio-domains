@@ -62,7 +62,8 @@ type strategy_state = {
   mutable capital_low: bool;    (* true when quote balance is insufficient to place next buy; strategy paused *)
   mutable capital_low_logged: bool; (* true once we have logged the capital-low warning to suppress repeat spam *)
   mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
-  mutable accumulation_cycles: int; (* cycles since last sell_mult sell; Hyperliquid discrete sizing *)
+  mutable accumulated_profit: float;    (* realized PnL from completed buy→sell pairs; Hyperliquid discrete sizing *)
+  mutable last_buy_fill_price: float option; (* price of the most recent buy fill; used to compute profit on sell fill *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -94,7 +95,8 @@ let get_strategy_state asset_symbol =
           capital_low = false;
           capital_low_logged = false;
           reserved_quote = 0.0;
-          accumulation_cycles = 0;
+          accumulated_profit = 0.0;
+          last_buy_fill_price = None;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -747,28 +749,26 @@ let execute_strategy
          | Some asset_bal when not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
              let sell_qty =
                if asset.exchange = "hyperliquid" then begin
-                 let (cycles_needed, rounded_sell) =
-                   compute_accumulation_cycles qty sell_mult asset.symbol asset.exchange in
-                 if state.accumulation_cycles >= cycles_needed - 1 then begin
-                   (* Trigger sell_mult sell: accumulated enough 1:1 profit to cover rounding cost *)
-                   state.accumulation_cycles <- 0;
+                 let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
+                 let rounding_diff = qty -. rounded_sell in
+                 let quote_min = 0.01 in  (* smallest USDC denomination — profit buffer *)
+                 let required_profit = rounding_diff *. price +. quote_min in
+                 if required_profit > 0.0 && state.accumulated_profit >= required_profit then begin
+                   (* Profit-gated: enough realized profit to cover the rounding cost *)
+                   state.accumulated_profit <- state.accumulated_profit -. required_profit;
                    Logging.info_f ~section
-                     "Accumulation sell for %s: %.8f (sell_mult) after %d 1:1 cycles"
-                     asset.symbol rounded_sell cycles_needed;
+                     "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f)"
+                     asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit;
                    rounded_sell
                  end else
-                   qty  (* 1:1 sell *)
+                   qty  (* 1:1 sell until profit covers rounding cost *)
                end else
                  qty *. sell_mult
              in
              let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-             if push_order sell_order then begin
-               (* Increment accumulation counter only on successful push (Hyperliquid) *)
-               if asset.exchange = "hyperliquid" then
-                 state.accumulation_cycles <- state.accumulation_cycles + 1;
+             if push_order sell_order then
                Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
                  asset.symbol sell_qty sell_price
-             end
          | Some asset_bal when not state.inflight_sell ->
              Logging.debug_f ~section "Insufficient asset balance for %s sell order: need %.8f, have %.8f"
                  asset.symbol asset_needed asset_bal
@@ -1182,10 +1182,28 @@ let handle_order_filled asset_symbol order_id side =
       | _ -> false
     in
     if was_tracked_buy then begin
+      (* Record buy fill price for profit calculation on matching sell fill *)
+      state.last_buy_fill_price <- state.last_buy_order_price;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
       Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
     end;
+
+    (* Compute realized profit on sell fills (Hyperliquid discrete sizing accumulator).
+       We track accumulated spread (sell_price - buy_price) as a proxy for realized
+       profit-per-unit.  The accumulation trigger in execute_strategy compares this
+       against rounding_diff * current_price, both implicitly per-unit of base qty. *)
+    (match side with
+     | Sell ->
+         let sell_price_opt = List.assoc_opt order_id state.open_sell_orders in
+         (match sell_price_opt, state.last_buy_fill_price with
+          | Some sell_price, Some buy_price when sell_price > buy_price ->
+              let spread_profit = sell_price -. buy_price in
+              state.accumulated_profit <- state.accumulated_profit +. spread_profit;
+              Logging.debug_f ~section "Realized spread for %s: %.4f (sell@%.4f - buy@%.4f), accumulated: %.4f"
+                asset_symbol spread_profit sell_price buy_price state.accumulated_profit
+          | _ -> ())
+     | Buy -> ());
 
     (* 4. Clear inflight flags, reservation, and global placement trackers so strategy can replace immediately *)
     (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
