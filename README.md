@@ -101,9 +101,8 @@ Edit `config.json` (example):
 
 ## Strategies
 
-**Grid**: Maintains buy/sell ladders around price with configurable spacing and size. Acts as a market maker with optional DCA accumulation via `sell_mult`. On Kraken, sells use `qty * sell_mult` directly. On Hyperliquid, discrete sizing rules apply (see below).
+**Grid**: Maintains buy/sell ladders around price with configurable spacing and size. Acts as a market maker with optional DCA accumulation via `sell_mult`. On Kraken, sells use `qty * sell_mult` directly.
 
-***Hyperliquid Discrete Sizing***
 Hyperliquid enforces discrete order sizes via `szDecimals` (e.g. HYPE uses 2 decimal places, so the lot increment is 0.01). When `sell_mult < 1.0`, the desired sell quantity often falls between valid lot boundaries and must be floored, creating rounding loss that exceeds the intended skim. For example, `0.35 * 0.999 = 0.34965` floors to `0.34`, losing 0.01 HYPE per cycle (~2.86%) instead of the intended ~0.1%.
 
 To handle this, the Grid strategy uses profit-gated accumulation. Most cycles sell the full `qty` (1:1), growing quote balance through grid spread profits. Once realized net profit (accounting for quantity and maker fees on both legs) exceeds the rounding cost plus `accumulation_buffer`, a single `sell_mult` sell is triggered to accumulate base asset. The `accumulation_buffer` parameter (default: 0.01 USDC) sets the minimum quote profit required on top of the rounding cost before accumulation triggers. This is adaptive: fast markets accumulate faster, slow markets wait longer. Kraken is unaffected.
