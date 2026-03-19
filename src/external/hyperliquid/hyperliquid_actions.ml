@@ -212,6 +212,77 @@ let is_retriable_error err =
   string_contains err_lower "too many requests" ||
   string_contains err_lower "too many cumulative requests"
 
+(** --- WebSocket req_id counter --- *)
+
+let ws_req_id_counter = Atomic.make 1
+
+let next_ws_req_id () =
+  let id = Atomic.fetch_and_add ws_req_id_counter 1 in
+  id
+
+(** Send a signed action over the WebSocket `post` channel.
+    Fails with an error if the WebSocket is not connected - no REST fallback.
+
+    WS response shape:
+      { "id": N, "response": { "type": "action",
+          "payload": { "status": "ok", "response": { ... } } } }
+    We extract response.payload which is identical to the REST response shape,
+    so all downstream parsers work unchanged. *)
+let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
+  if not (Hyperliquid_ws.is_connected ()) then
+    Lwt.return (Error "Hyperliquid WS not connected - order rejected")
+  else begin
+    let (pkey, _wallet) = get_credentials () in
+    let nonce = get_next_nonce () in
+    let (r, s, v) = Hyperliquid_signer.sign_l1_action
+      ~private_key_hex:pkey
+      ~action_msgpack
+      ~nonce
+      ~is_mainnet
+      ~vault_address:None
+      ()
+    in
+    let req_id = next_ws_req_id () in
+    let ws_frame = `Assoc [
+      "method",  `String "post";
+      "id",      `Int req_id;
+      "request", `Assoc [
+        "type",    `String "action";
+        "payload", `Assoc [
+          "action",    action_json;
+          "nonce",     `Intlit (Int64.to_string nonce);
+          "signature", `Assoc [
+            "r", `String r;
+            "s", `String s;
+            "v", `Int v
+          ]
+        ]
+      ]
+    ] in
+    Logging.debug_f ~section "Sending WS post action: req_id=%d" req_id;
+    Lwt.catch
+      (fun () ->
+        Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:10000 >>= fun resp ->
+        (* Full WS broadcast frame shape:
+             { "channel":"post", "data": { "id": N,
+                 "response": { "type":"action",
+                   "payload": { "status":"ok", "response": {...} } } } }
+           Extract data.response.payload → identical to REST response shape. *)
+        let open Yojson.Safe.Util in
+        let payload =
+          try resp |> member "data" |> member "response" |> member "payload"
+          with _ -> resp
+        in
+        Logging.info_f ~section "Hyperliquid order raw WS response: %s" (Yojson.Safe.to_string payload);
+        Lwt.return (Ok payload)
+      )
+      (fun exn ->
+        let err = Printexc.to_string exn in
+        Logging.error_f ~section "WS post failed for req_id=%d: %s" req_id err;
+        Lwt.return (Error (Printf.sprintf "WS order failed: %s" err))
+      )
+  end
+
 (** Place order with retry logic *)
 let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?cl_ord_id ?time_in_force ~testnet () =
   let place_order_once () =
@@ -259,7 +330,7 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?c
     
     let is_mainnet = not testnet in
     
-    post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet >|= function
+    post_exchange_ws ~testnet ~action_json ~action_msgpack ~is_mainnet >>= function
     | Ok res ->
         let open Yojson.Safe.Util in
         (try
@@ -270,7 +341,7 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?c
                 | `String s -> s
                 | other -> Yojson.Safe.to_string other
               in
-              Error (Printf.sprintf "HL Order Rejected: %s" err_msg)
+              Lwt.return (Error (Printf.sprintf "HL Order Rejected: %s" err_msg))
           | _ ->
               let response = member "response" res in
               let data = member "data" response in
@@ -281,19 +352,19 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?c
                   let filled = member "filled" s in
                   if resting <> `Null then
                     match resting |> member "oid" |> to_int64_opt with
-                    | Some oid -> Ok { order_id = oid }
-                    | None -> Error (Printf.sprintf "Failed to find oid in resting status: %s" (Yojson.Safe.to_string s))
+                    | Some oid -> Lwt.return (Ok { order_id = oid })
+                    | None -> Lwt.return (Error (Printf.sprintf "Failed to find oid in resting status: %s" (Yojson.Safe.to_string s)))
                   else if filled <> `Null then
                     match filled |> member "oid" |> to_int64_opt with
-                    | Some oid -> Ok { order_id = oid }
-                    | None -> Error (Printf.sprintf "Failed to find oid in filled status: %s" (Yojson.Safe.to_string s))
+                    | Some oid -> Lwt.return (Ok { order_id = oid })
+                    | None -> Lwt.return (Error (Printf.sprintf "Failed to find oid in filled status: %s" (Yojson.Safe.to_string s)))
                   else
                     (match member "error" s |> to_string_option with
-                     | Some err -> Error (Printf.sprintf "HL Order Rejected: %s" err)
-                     | None -> Error (Printf.sprintf "Failed to find oid or error in HL response: %s" (Yojson.Safe.to_string res)))
-              | [] -> Error "Empty status list in response"
-        with exn -> Error (Printf.sprintf "Failed to parse HL response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res)))
-    | Error e -> Error e
+                     | Some err -> Lwt.return (Error (Printf.sprintf "HL Order Rejected: %s" err))
+                     | None -> Lwt.return (Error (Printf.sprintf "Failed to find oid or error in HL response: %s" (Yojson.Safe.to_string res))))
+              | [] -> Lwt.return (Error "Empty status list in response")
+        with exn -> Lwt.return (Error (Printf.sprintf "Failed to parse HL response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res))))
+    | Error e -> Lwt.return (Error e)
   in
   retry_with_backoff ~config:default_retry_config ~f:place_order_once ~is_retriable:is_retriable_error
 
@@ -339,7 +410,7 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
     
     let is_mainnet = not testnet in
     
-    post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet >|= function
+    post_exchange_ws ~testnet ~action_json ~action_msgpack ~is_mainnet >>= function
     | Ok res ->
         let open Yojson.Safe.Util in
         (try
@@ -350,13 +421,13 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
                 | `String s -> s
                 | other -> Yojson.Safe.to_string other
               in
-              Error (Printf.sprintf "HL Amendment Rejected: %s" err_msg)
+              Lwt.return (Error (Printf.sprintf "HL Amendment Rejected: %s" err_msg))
           | _ ->
               let response = member "response" res in
               let response_type = member "type" response |> to_string_option in
               (match response_type with
                | Some "default" ->
-                   Ok { amend_id = order_id; order_id = order_id }
+                   Lwt.return (Ok { amend_id = order_id; order_id = order_id })
                | _ ->
                    let data = member "data" response in
                    let statuses = member "statuses" data |> to_list in
@@ -365,15 +436,15 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
                        let resting = member "resting" s in
                        if resting <> `Null then
                          match resting |> member "oid" |> to_int64_opt with
-                         | Some new_oid -> Ok { amend_id = new_oid; order_id = order_id }
-                         | None -> Error (Printf.sprintf "Failed to find new oid in resting status: %s" (Yojson.Safe.to_string s))
+                         | Some new_oid -> Lwt.return (Ok { amend_id = new_oid; order_id = order_id })
+                         | None -> Lwt.return (Error (Printf.sprintf "Failed to find new oid in resting status: %s" (Yojson.Safe.to_string s)))
                        else
                          (match member "error" s |> to_string_option with
-                          | Some err -> Error (Printf.sprintf "HL Amendment Rejected: %s" err)
-                          | None -> Error (Printf.sprintf "Failed to find oid or error in HL amend response: %s" (Yojson.Safe.to_string res)))
-                   | [] -> Error "Empty status list in response")
-        with exn -> Error (Printf.sprintf "Failed to parse HL response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res)))
-    | Error e -> Error e
+                          | Some err -> Lwt.return (Error (Printf.sprintf "HL Amendment Rejected: %s" err))
+                          | None -> Lwt.return (Error (Printf.sprintf "Failed to find oid or error in HL amend response: %s" (Yojson.Safe.to_string res))))
+                   | [] -> Lwt.return (Error "Empty status list in response"))
+        with exn -> Lwt.return (Error (Printf.sprintf "Failed to parse HL response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res))))
+    | Error e -> Lwt.return (Error e)
   in
   retry_with_backoff ~config:default_retry_config ~f:amend_order_once ~is_retriable:is_retriable_error
 
@@ -394,9 +465,9 @@ let cancel_orders ~symbol ~order_ids ~testnet =
     ] in
     
     let is_mainnet = not testnet in
-    post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet >|= function
-    | Ok _ -> Ok ()
-    | Error e -> Error e
+    post_exchange_ws ~testnet ~action_json ~action_msgpack ~is_mainnet >>= function
+    | Ok _ -> Lwt.return (Ok ())
+    | Error e -> Lwt.return (Error e)
   in
   retry_with_backoff ~config:default_retry_config ~f:cancel_orders_once ~is_retriable:is_retriable_error
 
