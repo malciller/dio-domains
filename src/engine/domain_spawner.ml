@@ -170,6 +170,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             strategy = asset_with_fees.strategy;
             maker_fee = asset_with_fees.maker_fee;
             taker_fee = asset_with_fees.taker_fee;
+            accumulation_buffer = asset_with_fees.accumulation_buffer;
           }, None)
         else if asset_with_fees.strategy = "MM" then
           (None, Some {

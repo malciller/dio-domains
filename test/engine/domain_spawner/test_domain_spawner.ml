@@ -19,7 +19,8 @@ let test_spawn_domains_basic () =
       maker_fee = None;
       taker_fee = None;
       testnet = false;
-      hedge = false };
+      hedge = false;
+      accumulation_buffer = 0.01 };
     { Dio_engine.Config.exchange = "kraken";
       symbol = "ETH/USD";
       qty = "0.01";
@@ -31,7 +32,8 @@ let test_spawn_domains_basic () =
       maker_fee = None;
       taker_fee = None;
       testnet = false;
-      hedge = false }
+      hedge = false;
+      accumulation_buffer = 0.01 }
   ] in
 
   (* Spawn domains for the assets *)
@@ -73,7 +75,8 @@ let test_fee_fetcher_integration () =
     maker_fee = None;
     taker_fee = None;
     testnet = false;
-    hedge = false
+    hedge = false;
+    accumulation_buffer = 0.01
   } in
 
   (* Verify fee fetcher adds fees correctly *)
@@ -104,7 +107,8 @@ let test_domain_error_handling () =
     maker_fee = None;
     taker_fee = None;
     testnet = false;
-    hedge = false
+    hedge = false;
+    accumulation_buffer = 0.01
   } in
 
   (* This should not crash the test runner, domains should handle errors internally *)
