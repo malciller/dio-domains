@@ -57,6 +57,7 @@
         0.75
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": 0.05,
       "strategy": "Grid",
       "testnet": false,
       "hedge": false

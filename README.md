@@ -87,7 +87,8 @@ Edit `config.json` (example):
       "sell_mult": "0.999",           // Sell amount multiplier (triggers discrete accumulation on Hyperliquid)
       "strategy": "Grid",             // Strategy name: "Grid"
       "testnet": false,               // Use testnet
-      "hedge": true                   // Enable auto-hedge (Hyperliquid only)
+      "hedge": true,                  // Enable auto-hedge (Hyperliquid only)
+      "accumulation_buffer": 0.01     // Min quote profit buffer before triggering sell_mult accumulation (default: 0.01)
     }
   ]
 }
@@ -112,7 +113,7 @@ Edit `config.json` (example):
 
 Hyperliquid enforces discrete order sizes via `szDecimals` (e.g. HYPE uses 2 decimal places, so the lot increment is 0.01). When `sell_mult < 1.0`, the desired sell quantity often falls between valid lot boundaries and must be floored, creating rounding loss that exceeds the intended skim. For example, `0.35 * 0.999 = 0.34965` floors to `0.34`, losing 0.01 HYPE per cycle (~2.86%) instead of the intended ~0.1%.
 
-To handle this, the Grid strategy uses profit-gated accumulation. Most cycles sell the full `qty` (1:1), growing quote balance through grid spread profits. Once realized net profit (accounting for quantity and maker fees on both legs) exceeds the rounding cost plus a $0.01 USDC buffer, a single `sell_mult` sell is triggered to accumulate base asset. This is adaptive: fast markets accumulate faster, slow markets wait longer.
+To handle this, the Grid strategy uses profit-gated accumulation. Most cycles sell the full `qty` (1:1), growing quote balance through grid spread profits. Once realized net profit (accounting for quantity and maker fees on both legs) exceeds the rounding cost plus `accumulation_buffer`, a single `sell_mult` sell is triggered to accumulate base asset. The `accumulation_buffer` parameter (default: 0.01 USDC) sets the minimum quote profit required on top of the rounding cost before accumulation triggers. This is adaptive: fast markets accumulate faster, slow markets wait longer. Kraken is unaffected.
 
 ## Key Features
 

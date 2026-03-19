@@ -33,6 +33,7 @@ type trading_config = {
   strategy: string;
   maker_fee: float option;
   taker_fee: float option;
+  accumulation_buffer: float;
 }
 
 (** Global order ringbuffer - shared across all strategy domains *)
@@ -747,8 +748,7 @@ let execute_strategy
                if asset.exchange = "hyperliquid" then begin
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
                  let rounding_diff = qty -. rounded_sell in
-                 let quote_min = 0.01 in  (* smallest USDC denomination — profit buffer *)
-                 let required_profit = rounding_diff *. sell_price +. quote_min in
+                 let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
                  if required_profit > 0.0 && state.accumulated_profit >= required_profit then begin
                    (* Profit-gated: enough realized profit to cover the rounding cost *)
                    state.accumulated_profit <- state.accumulated_profit -. required_profit;

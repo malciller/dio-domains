@@ -12,6 +12,7 @@ type trading_config = {
   taker_fee: float option;
   testnet: bool;
   hedge: bool;
+  accumulation_buffer: float;  (** minimum quote profit buffer before triggering sell_mult accumulation *)
 }
 
 type logging_config = {
@@ -100,6 +101,7 @@ let parse_config json =
     taker_fee = json |> member "taker_fee" |> to_option to_float;
     testnet;
     hedge;
+    accumulation_buffer = json |> member "accumulation_buffer" |> to_option to_float |> Option.value ~default:0.01;
   }
 
 (** Parse logging configuration *)
