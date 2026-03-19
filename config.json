@@ -15,15 +15,16 @@
       "strategy": "MM"
     },
     {
-      "symbol": "HYPE/USDC",
+      "symbol": "BTC/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.35",
+      "qty": "0.0002",
       "grid_interval": [
         0.25,
-        0.75
+        0.5
+        
       ],
       "sell_mult": "0.999",
-      "accumulation_buffer": 0.05,
+      "accumulation_buffer": 1.00,
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
