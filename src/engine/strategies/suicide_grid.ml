@@ -64,6 +64,8 @@ type strategy_state = {
   mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
   mutable accumulated_profit: float;    (* realized PnL from completed buy→sell pairs; Hyperliquid discrete sizing *)
   mutable last_buy_fill_price: float option; (* price of the most recent buy fill; used to compute profit on sell fill *)
+  mutable grid_qty: float;              (* cached config qty for profit calc in fill handler *)
+  mutable maker_fee: float;             (* cached maker fee rate for profit calc in fill handler *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -97,6 +99,8 @@ let get_strategy_state asset_symbol =
           reserved_quote = 0.0;
           accumulated_profit = 0.0;
           last_buy_fill_price = None;
+          grid_qty = 0.0;
+          maker_fee = 0.0;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -184,18 +188,6 @@ let round_qty qty symbol exchange =
   let increment = get_qty_increment_val symbol exchange in
   let inv = 1.0 /. increment in
   floor (qty *. inv) /. inv
-
-(** Compute how many 1:1 sell cycles are needed before triggering one sell_mult sell.
-    Returns (cycles_needed, rounded_sell_qty).
-    Works dynamically from qty, sell_mult, and the exchange's lot increment. *)
-let compute_accumulation_cycles qty sell_mult symbol exchange =
-  let rounded_sell = round_qty (qty *. sell_mult) symbol exchange in
-  let rounding_diff = qty -. rounded_sell in
-  let per_cycle_skim = qty *. (1.0 -. sell_mult) in
-  if rounding_diff <= 0.0 || per_cycle_skim <= 0.0 then
-    (1, rounded_sell)  (* no rounding loss or no skim: every cycle is sell_mult *)
-  else
-    (int_of_float (ceil (rounding_diff /. per_cycle_skim)), rounded_sell)
 
 (** Get minimum price movement required to trigger an amendment *)
 let get_min_move_threshold price grid_interval_pct symbol exchange =
@@ -645,6 +637,10 @@ let execute_strategy
       let grid_interval = asset.grid_interval in
       let sell_mult = parse_config_float asset.sell_mult "sell_mult" 1.0 asset.exchange asset.symbol in
 
+      (* Cache config values in state so handle_order_filled can compute real PnL *)
+      state.grid_qty <- qty;
+      state.maker_fee <- (match asset.maker_fee with Some f -> f | None -> 0.0);
+
       (* Calculate required balances *)
       let quote_needed = price *. qty in
       let asset_needed =
@@ -752,7 +748,7 @@ let execute_strategy
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
                  let rounding_diff = qty -. rounded_sell in
                  let quote_min = 0.01 in  (* smallest USDC denomination — profit buffer *)
-                 let required_profit = rounding_diff *. price +. quote_min in
+                 let required_profit = rounding_diff *. sell_price +. quote_min in
                  if required_profit > 0.0 && state.accumulated_profit >= required_profit then begin
                    (* Profit-gated: enough realized profit to cover the rounding cost *)
                    state.accumulated_profit <- state.accumulated_profit -. required_profit;
@@ -1171,12 +1167,15 @@ let handle_order_filled asset_symbol order_id side =
            String.sub pending_id 14 (String.length pending_id - 14) = order_id)
     ) state.pending_orders;
 
-    (* 2. Remove from sell orders tracking if it was a sell order *)
+    (* 2. Look up sell price BEFORE filtering — needed for profit calculation *)
+    let sell_fill_price = List.assoc_opt order_id state.open_sell_orders in
+
+    (* 3. Remove from sell orders tracking if it was a sell order *)
     state.open_sell_orders <- List.filter (fun (sell_id, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
 
-    (* 3. Clear buy order tracking if it was the tracked buy order *)
+    (* 4. Clear buy order tracking if it was the tracked buy order *)
     let was_tracked_buy = match state.last_buy_order_id with
       | Some id when id = order_id -> true
       | _ -> false
@@ -1189,19 +1188,22 @@ let handle_order_filled asset_symbol order_id side =
       Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
     end;
 
-    (* Compute realized profit on sell fills (Hyperliquid discrete sizing accumulator).
-       We track accumulated spread (sell_price - buy_price) as a proxy for realized
-       profit-per-unit.  The accumulation trigger in execute_strategy compares this
-       against rounding_diff * current_price, both implicitly per-unit of base qty. *)
+    (* 5. Compute realized net profit on sell fills (Hyperliquid discrete sizing accumulator).
+       profit = (sell_price - buy_price) * qty - maker fees on both legs *)
     (match side with
      | Sell ->
-         let sell_price_opt = List.assoc_opt order_id state.open_sell_orders in
-         (match sell_price_opt, state.last_buy_fill_price with
+         (match sell_fill_price, state.last_buy_fill_price with
           | Some sell_price, Some buy_price when sell_price > buy_price ->
-              let spread_profit = sell_price -. buy_price in
-              state.accumulated_profit <- state.accumulated_profit +. spread_profit;
-              Logging.debug_f ~section "Realized spread for %s: %.4f (sell@%.4f - buy@%.4f), accumulated: %.4f"
-                asset_symbol spread_profit sell_price buy_price state.accumulated_profit
+              let qty = state.grid_qty in
+              let gross = (sell_price -. buy_price) *. qty in
+              let fees = (sell_price *. qty *. state.maker_fee)
+                       +. (buy_price *. qty *. state.maker_fee) in
+              let net_profit = gross -. fees in
+              if net_profit > 0.0 then begin
+                state.accumulated_profit <- state.accumulated_profit +. net_profit;
+                Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f buy@%.4f x %.8f), accumulated: %.6f"
+                  asset_symbol net_profit gross fees sell_price buy_price qty state.accumulated_profit
+              end
           | _ -> ())
      | Buy -> ());
 
