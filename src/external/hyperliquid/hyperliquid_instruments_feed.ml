@@ -1,6 +1,5 @@
 (** Hyperliquid Instruments Feed *)
 
-open Lwt.Infix
 
 let section = "hyperliquid_instruments_feed"
 
@@ -14,33 +13,25 @@ type pair_info = {
 let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 128
 let cache_mutex = Mutex.create ()
 
-(** Fetch instrument metadata from Hyperliquid REST API *)
-let initialize_symbols ~testnet _symbols =
-  let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
+let is_ready = Atomic.make false
+let ready_condition = Lwt_condition.create ()
+
+let wait_until_ready () =
+  if Atomic.get is_ready then Lwt.return_unit
+  else Lwt_condition.wait ready_condition
+
+let notify_ready () =
+  Atomic.set is_ready true;
+  Lwt_condition.broadcast ready_condition ()
+
+(** Process instrument metadata from JSON payloads (called by higher level component pushing WS data) *)
+let process_meta_response payload_perp payload_spot =
   Lwt.catch (fun () ->
-    let open Cohttp_lwt_unix in
-    let url = Uri.of_string (base_url ^ "/info") in
-    
-    (* Fetch Perpetuals Metadata *)
-    let body_perp = Cohttp_lwt.Body.of_string "{\"type\":\"meta\"}" in
-    let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-    Client.post ~headers ~body:body_perp url >>= fun (_resp, resp_body) ->
-    Cohttp_lwt.Body.to_string resp_body >>= fun body_str_perp ->
-    Logging.info_f ~section "Raw perp meta response: %s" (if String.length body_str_perp > 500 then String.sub body_str_perp 0 500 ^ "..." else body_str_perp);
-    
-    (* Fetch Spot Metadata *)
-    let body_spot = Cohttp_lwt.Body.of_string "{\"type\":\"spotMeta\"}" in
-    Client.post ~headers ~body:body_spot url >>= fun (_resp, resp_body_spot) ->
-    Cohttp_lwt.Body.to_string resp_body_spot >>= fun body_str_spot ->
-    Logging.info_f ~section "Raw spot meta response: %s" (if String.length body_str_spot > 500 then String.sub body_str_spot 0 500 ^ "..." else body_str_spot);
-    
     let open Yojson.Safe.Util in
-    let json_perp = Yojson.Safe.from_string body_str_perp in
-    let universe_perp = member "universe" json_perp |> to_list in
     
-    let json_spot = Yojson.Safe.from_string body_str_spot in
-    let universe_spot = member "universe" json_spot |> to_list in
-    let tokens_spot = member "tokens" json_spot |> to_list in
+    let universe_perp = member "universe" payload_perp |> to_list in
+    let universe_spot = member "universe" payload_spot |> to_list in
+    let tokens_spot = member "tokens" payload_spot |> to_list in
     
     let spot_info_by_token_idx = Hashtbl.create 512 in
     List.iter (fun t ->
@@ -94,10 +85,12 @@ let initialize_symbols ~testnet _symbols =
     ) universe_spot;
     Mutex.unlock cache_mutex;
     
-    Logging.info_f ~section "Initialized Hyperliquid instrument feed with %d perps and %d spot pairs" (List.length universe_perp) (List.length universe_spot);
+    Logging.info_f ~section "Initialized Hyperliquid instrument feed via WS payload with %d perps and %d spot pairs" (List.length universe_perp) (List.length universe_spot);
+    notify_ready ();
     Lwt.return_unit
   ) (fun exn ->
-    Logging.error_f ~section "Failed to fetch Hyperliquid instruments: %s" (Printexc.to_string exn);
+    Logging.error_f ~section "Failed to process Hyperliquid instruments: %s" (Printexc.to_string exn);
+    notify_ready ();
     Lwt.return_unit
   )
 

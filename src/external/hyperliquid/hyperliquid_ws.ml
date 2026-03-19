@@ -78,6 +78,10 @@ let subscribe_to_feeds ~symbols ~wallet =
     if wallet <> "" then
       let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "webData2"); ("user", `String wallet)])]) in
       let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "userEvents"); ("user", `String wallet)])]) in
+      let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "spotState"); ("user", `String wallet)])]) in
+      let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "userFills"); ("user", `String wallet)])]) in
+      let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "userFundings"); ("user", `String wallet)])]) in
+      let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "userNonFundingLedgerUpdates"); ("user", `String wallet)])]) in
       subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "orderUpdates"); ("user", `String wallet)])])
     else Lwt.return_unit
   in

@@ -584,118 +584,16 @@ let process_market_data json =
     | Some "orderUpdates" ->
         let data = member "data" json in
         process_order_updates data
-    | Some "userEvents" ->
+    | Some "userEvents"
+    | Some "userFills" ->
         let data = member "data" json in
         process_user_events data
     | Some "webData2" ->
-        let data = member "data" json in
-        
-        let fills = try member "fills" data |> to_list with _ -> [] in
-        if List.length fills > 0 then begin
-           process_user_events (`Assoc [("fills", `List fills)])
-        end;
-
-        let open_orders_json = match member "openOrders" data with
-          | `List l -> l
-          | _ -> []
-        in
-        
-        Logging.debug_f ~section "Processing webData2 snapshot with %d orders" (List.length open_orders_json);
-        
-        let new_orders_map = Hashtbl.create 16 in
-        List.iter (fun o ->
-          let coin = member "coin" o |> to_string in
-          let order_id = (match member "oid" o with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
-          
-          let symbol_opt = 
-            Mutex.lock initialization_mutex;
-            let res = Hashtbl.find_opt order_to_symbol order_id in
-            Mutex.unlock initialization_mutex;
-            match res with
-            | Some s -> Some s
-            | None -> find_registered_symbol coin
-          in
-          
-          match symbol_opt with
-          | Some symbol ->
-              let side = if (member "side" o |> to_string) = "B" then Buy else Sell in
-              let order_id = (match member "oid" o with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
-              let cl_ord_id = member "cloid" o |> to_string_option in
-              let limit_price = (match member "limitPx" o with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
-              let qty = (match member "sz" o with `String s -> float_of_string s | `Float f -> f | `Int i -> float_of_int i | _ -> 0.0) in
-              Hashtbl.replace new_orders_map order_id (symbol, side, limit_price, qty, cl_ord_id)
-          | None -> ()
-        ) open_orders_json;
-
-        let now = Unix.gettimeofday () in
-        let events_to_process = ref [] in
-
-        Hashtbl.iter (fun _ symbol_store ->
-          Mutex.lock symbol_store.orders_mutex;
-          Hashtbl.iter (fun order_id (current_order : open_order) ->
-            if not (Hashtbl.mem new_orders_map order_id) then begin
-              if now -. current_order.last_updated > 5.0 then begin
-                let reconciled = ref false in
-                Hashtbl.iter (fun _ (_, _, _, _, clid_opt) ->
-                   if clid_opt = current_order.cl_ord_id && Option.is_some clid_opt then reconciled := true
-                ) new_orders_map;
-
-                if not !reconciled then begin
-                  let event : execution_event = {
-                    order_id; symbol = current_order.symbol; 
-                    exec_type = Canceled;
-                    order_status = CanceledStatus; 
-                    limit_price = current_order.limit_price; side = current_order.side;
-                    order_qty = current_order.order_qty; cum_qty = current_order.cum_qty;
-                    cum_cost = current_order.cum_cost; avg_price = current_order.avg_price;
-                    timestamp = now; trade_id = None; last_qty = None; last_price = None; fee = None;
-                    cl_ord_id = current_order.cl_ord_id;
-                  } in
-                  events_to_process := (symbol_store, event) :: !events_to_process;
-                end
-              end
-            end
-          ) symbol_store.open_orders;
-          Mutex.unlock symbol_store.orders_mutex;
-        ) stores;
-
-        List.iter (fun (store, event) -> 
-          update_orders_internal store event;
-          Logging.debug_f ~section "Removing order %s from %s (missing from snapshot and >5s old)" event.order_id event.symbol
-        ) !events_to_process;
-
-        Hashtbl.iter (fun order_id (symbol, side, limit_price, qty, cl_ord_id) ->
-          let store = get_symbol_store symbol in
-          
-          let existing_order = 
-            Mutex.lock store.orders_mutex;
-            let o = Hashtbl.find_opt store.open_orders order_id in
-            Mutex.unlock store.orders_mutex;
-            o
-          in
-
-          if Option.is_none existing_order then begin
-            let user_ref = match existing_order with Some o -> o.order_userref | None -> None in
-            let event : execution_event = {
-              order_id; symbol; 
-              exec_type = New;
-              order_status = NewStatus; limit_price = Some limit_price;
-              side; order_qty = qty; cum_qty = 0.0; 
-              cum_cost = 0.0; avg_price = 0.0;
-              timestamp = now; trade_id = None;
-              last_qty = None; last_price = None; fee = None; cl_ord_id;
-            } in
-            update_orders_internal ?user_ref store event;
-            Logging.debug_f ~section "Order ADDED from webData2: %s [%s] %.8f @ %.2f%s" 
-              order_id symbol qty limit_price
-              (if Option.is_some user_ref then " (tagged)" else "")
-          end;
-        ) new_orders_map;
-        
-        Mutex.lock initialization_mutex;
-        Hashtbl.iter (fun _ store -> notify_ready store) stores;
-        Mutex.unlock initialization_mutex;
-        Logging.debug_f ~section "Synced %d open orders from Hyperliquid webData2 snapshot" (List.length open_orders_json)
+        (* webData2 parsing for openOrders and fills removed.
+           We now rely entirely on targeted websocket feeds:
+           orderUpdates, userFills, userEvents for real-time pushing,
+           which replaces the need for this snapshot polling loop. *)
+        ()
     | _ -> ()
   with exn -> 
     Logging.error_f ~section "Failed to process Hyperliquid executions data: %s" (Printexc.to_string exn)

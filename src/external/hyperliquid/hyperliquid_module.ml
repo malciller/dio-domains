@@ -364,6 +364,118 @@ module Hyperliquid_impl = struct
       ~testnet:(Atomic.get is_testnet)
 end
 
+let post_info ~testnet payload =
+  let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
+  let url = Uri.of_string (base_url ^ "/info") in
+  let body_str = Yojson.Safe.to_string payload in
+  let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+  Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string body_str) url >>= fun (resp, resp_body) ->
+  Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
+  let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+  if status >= 200 && status < 300 then
+    Lwt.return (Ok (Yojson.Safe.from_string body_str))
+  else
+    Lwt.return (Error (Printf.sprintf "HTTP Error %d: %s" status body_str))
+
+(** WS-based initialization helpers that orchestrate between WS and feeds *)
+let rec wait_for_ws_connected () =
+  if Hyperliquid_ws.is_connected () then Lwt.return_unit
+  else Lwt_unix.sleep 0.1 >>= wait_for_ws_connected
+
+let initialize_instruments_ws () =
+  let section = "hyperliquid_startup" in
+  Lwt.catch (fun () ->
+    wait_for_ws_connected () >>= fun () ->
+    
+    let fetch_meta () =
+      post_info ~testnet:(Atomic.get Hyperliquid_impl.is_testnet) (`Assoc ["type", `String "meta"]) >>= function
+      | Ok res -> Lwt.return res
+      | Error e -> Lwt.fail_with ("Perp info fetch failed: " ^ e)
+    in
+    let fetch_spot_meta () =
+      post_info ~testnet:(Atomic.get Hyperliquid_impl.is_testnet) (`Assoc ["type", `String "spotMeta"]) >>= function
+      | Ok res -> Lwt.return res
+      | Error e -> Lwt.fail_with ("Spot info fetch failed: " ^ e)
+    in
+    
+    fetch_meta () >>= fun payload_perp ->
+    fetch_spot_meta () >>= fun payload_spot ->
+    
+    Hyperliquid_instruments_feed.process_meta_response payload_perp payload_spot
+  ) (fun exn ->
+    Logging.error_f ~section "Failed to fetch instruments via REST fallback: %s" (Printexc.to_string exn);
+    Hyperliquid_instruments_feed.notify_ready ();
+    Lwt.return_unit
+  )
+
+let fetch_spot_balances_ws () =
+  let section = "hyperliquid_startup" in
+  let parse_json_float json =
+    match json with
+    | `String s -> (try float_of_string s with _ -> 0.0)
+    | `Float f -> f
+    | `Int i -> float_of_int i
+    | _ -> 0.0
+  in
+  let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+    | Some w -> w
+    | None -> ""
+  in
+  if wallet = "" then Lwt.return_unit
+  else begin
+    let req_id = Hyperliquid_actions.next_ws_req_id () in
+    let ws_frame = `Assoc [
+      "method", `String "post";
+      "id", `Int req_id;
+      "request", `Assoc [
+        "type", `String "info";
+        "payload", `Assoc [
+          "type", `String "spotClearinghouseState";
+          "user", `String wallet
+        ]
+      ]
+    ] in
+    Lwt.catch (fun () ->
+      wait_for_ws_connected () >>= fun () ->
+      Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000 >>= fun resp_frame ->
+      let open Yojson.Safe.Util in
+      let response_node = try resp_frame |> member "data" |> member "response" with _ -> `Null in
+      let payload = try response_node |> member "payload" with _ -> `Null in
+      
+      let balances_node = try payload |> member "data" |> member "balances" with _ -> `Null in
+      
+      if balances_node = `Null then begin
+        Logging.warn_f ~section "Balances node is null! Raw WS response: %s" (Yojson.Safe.to_string resp_frame);
+        Hyperliquid_balances.notify_ready ();
+        Lwt.return_unit
+      end else begin
+        let balances = balances_node |> to_list in
+        List.iter (fun item ->
+          try
+            let coin = member "coin" item |> to_string in
+            let total = parse_json_float (member "total" item) in
+            let hold = parse_json_float (member "hold" item) in
+            let available = total -. hold in
+            let store = Hyperliquid_balances.get_balance_store coin in
+            Hyperliquid_balances.BalanceStore.update_wallet store available "spot" "account";
+            
+            if coin = "USDC" then
+              Logging.info_f ~section "Initial Spot USDC balance: %.6f (hold: %.6f)" available hold
+            else
+              Logging.debug_f ~section "Initial Spot balance: %s = %.6f (total: %.6f)" coin available total
+          with exn ->
+            Logging.warn_f ~section "Failed to parse spot balance entry: %s" (Printexc.to_string exn)
+        ) balances;
+        Hyperliquid_balances.notify_ready ();
+        Lwt.return_unit
+      end
+    ) (fun exn ->
+      Logging.error_f ~section "Failed to fetch spot balances via WS: %s" (Printexc.to_string exn);
+      Hyperliquid_balances.notify_ready ();
+      Lwt.return_unit
+    )
+  end
+
 (* Register the module *)
 let () =
   Exchange.Registry.register (module Hyperliquid_impl)

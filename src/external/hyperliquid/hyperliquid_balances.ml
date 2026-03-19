@@ -129,53 +129,6 @@ let parse_json_float json =
   | `Int i -> float_of_int i
   | _ -> 0.0
 
-(* --- REST: clearinghouseState --- *)
-
-let fetch_spot_balances_rest ~testnet () =
-  let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
-  let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
-    | Some w -> w
-    | None ->
-        Logging.warn ~section "HYPERLIQUID_WALLET_ADDRESS not set, cannot fetch spot balances via REST";
-        ""
-  in
-  if wallet = "" then Lwt.return_unit
-  else begin
-    Lwt.catch (fun () ->
-      let open Cohttp_lwt_unix in
-      let url = Uri.of_string (base_url ^ "/info") in
-      let body_json = Printf.sprintf {|{"type":"spotClearinghouseState","user":"%s"}|} wallet in
-      let body = Cohttp_lwt.Body.of_string body_json in
-      let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-      Client.post ~headers ~body url >>= fun (_resp, resp_body) ->
-      Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
-
-      let open Yojson.Safe.Util in
-      let json = Yojson.Safe.from_string body_str in
-      let balances = member "balances" json |> to_list in
-      
-      List.iter (fun item ->
-        try
-          let coin = member "coin" item |> to_string in
-          let total = parse_json_float (member "total" item) in
-          let store = get_balance_store coin in
-          BalanceStore.update_wallet store total "spot" "account";
-          
-          if coin = "USDC" then
-            Logging.info_f ~section "Initial Spot USDC balance: %.6f" total
-          else
-            Logging.debug_f ~section "Initial Spot balance: %s = %.6f" coin total
-        with exn ->
-          Logging.warn_f ~section "Failed to parse spot balance entry: %s" (Printexc.to_string exn)
-      ) balances;
-      
-      notify_ready ();
-      Lwt.return_unit
-    ) (fun exn ->
-      Logging.error_f ~section "Failed to fetch spot balances via REST: %s" (Printexc.to_string exn);
-      Lwt.return_unit
-    )
-  end
 
 (* --- WS message handler --- *)
 
@@ -223,11 +176,13 @@ let process_market_data json =
           try
             let coin = member "coin" item |> to_string in
             let total = parse_json_float (member "total" item) in
+            let hold = parse_json_float (member "hold" item) in
+            let available = total -. hold in
             let store = get_balance_store coin in
-            BalanceStore.update_wallet store total "spot" "account";
+            BalanceStore.update_wallet store available "spot" "account";
 
             if coin = "USDC" then
-              Logging.debug_f ~section "spotState USDC: %.2f (total: %.2f)" total (BalanceStore.get_balance store)
+              Logging.debug_f ~section "spotState USDC: %.2f (total: %.2f, hold: %.2f)" available total hold
           with exn ->
             Logging.warn_f ~section "Failed to parse spotState entry: %s" (Printexc.to_string exn)
         ) balances
@@ -239,10 +194,6 @@ let process_market_data json =
   | _ -> ()
 
 (* --- Initialization --- *)
-
-let fetch_initial_balances ~testnet () =
-  Logging.info ~section "Fetching initial spot balances via REST API...";
-  fetch_spot_balances_rest ~testnet ()
 
 let _processor_task =
   let rec run () =
@@ -263,8 +214,5 @@ let initialize ~testnet assets =
   
   (* Pre-create stores for requested assets *)
   List.iter (fun asset -> ignore (get_balance_store asset)) assets;
-
-  (* Trigger initial fetch via REST *)
-  Lwt.async (fun () -> fetch_initial_balances ~testnet ());
   
   Logging.info ~section "Hyperliquid balance stores initialized"
