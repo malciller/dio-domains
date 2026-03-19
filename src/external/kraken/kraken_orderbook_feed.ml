@@ -382,7 +382,7 @@ let ensure_store symbol =
         last_sequence = Atomic.make None;
         last_update = Unix.time ();
       } in
-      Hashtbl.add stores symbol store;
+        Hashtbl.add stores symbol store;
       store
 
 let store_opt symbol = Hashtbl.find_opt stores symbol
@@ -395,7 +395,8 @@ let notify_ready store =
     with _ ->
       (* Ignore all exceptions during broadcast - waiters may have been cancelled *)
       ())
-  end
+  end;
+  Concurrency.Exchange_wakeup.signal ()  (* wake domain workers blocked in wait() *)
 
 let is_effectively_zero size =
   (* Remove leading zeros and check if empty or all zeros *)

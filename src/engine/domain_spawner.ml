@@ -543,8 +543,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
 
         (* Yield to allow other threads (websockets) to run *)
-        if not should_execute then Domain.cpu_relax ();
-        Domain.cpu_relax ();
+        (* Event-driven: block until the next WS frame signals new data.
+           No timers, no magic numbers — only real WS events wake us. *)
+        if not !should_execute_strategy then
+          Concurrency.Exchange_wakeup.wait ();
+
 
         let cycle_stop = Mtime_clock.now_ns () in
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
@@ -643,6 +646,11 @@ let stop_domain state =
        Logging.debug_f ~section "Cleaned up MM strategy state for %s" symbol
    | _ ->
        Logging.debug_f ~section "No cleanup needed for strategy %s" state.asset.strategy);
+
+  (* Unblock any domain worker blocked in Exchange_wakeup.wait so it can
+     see is_running=false and exit the while loop cleanly. *)
+  Concurrency.Exchange_wakeup.signal ();
+
 
   (match Atomic.get state.domain_handle with
    | Some handle ->
