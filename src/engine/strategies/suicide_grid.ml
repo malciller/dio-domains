@@ -58,6 +58,7 @@ type strategy_state = {
   mutable inflight_sell: bool;  (* true while a sell Place is sent but not yet ack'd/rejected/failed *)
   mutable capital_low: bool;    (* true when quote balance is insufficient to place next buy; strategy paused *)
   mutable capital_low_logged: bool; (* true once we have logged the capital-low warning to suppress repeat spam *)
+  mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -87,6 +88,7 @@ let get_strategy_state asset_symbol =
           inflight_sell = false;
           capital_low = false;
           capital_low_logged = false;
+          reserved_quote = 0.0;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -94,6 +96,16 @@ let get_strategy_state asset_symbol =
   in
   Mutex.unlock strategy_states_mutex;
   state
+
+(** Sum the reserved_quote of all strategy states EXCEPT the given symbol.
+    Used to compute available quote balance = total_balance - other_domains_reserved. *)
+let get_reserved_quote_excluding symbol =
+  Mutex.lock strategy_states_mutex;
+  let total = Hashtbl.fold (fun key state acc ->
+    if key <> symbol then acc +. state.reserved_quote else acc
+  ) strategy_states 0.0 in
+  Mutex.unlock strategy_states_mutex;
+  total
 
 (** Parse configuration values to floats *)
 let parse_config_float config value_name default exchange symbol =
@@ -371,15 +383,18 @@ let execute_strategy
    | Some quote_bal ->
        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
        let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
-       if state.capital_low && quote_bal < quote_needed_fast then begin
+       (* Available balance = total balance minus quote reserved by OTHER domains' open buys *)
+       let other_reserved = get_reserved_quote_excluding asset.symbol in
+       let available_quote = quote_bal -. other_reserved in
+       if state.capital_low && available_quote < quote_needed_fast then begin
          (* Still low: skip entire strategy body to avoid order spam *)
          ()
-       end else if state.capital_low && quote_bal >= quote_needed_fast then begin
+       end else if state.capital_low && available_quote >= quote_needed_fast then begin
          (* Balance has recovered: clear flag and fall through to normal logic *)
          state.capital_low <- false;
          state.capital_low_logged <- false;
-         Logging.info_f ~section "Capital restored for %s (have %.2f, need %.2f) - resuming strategy"
-           asset.symbol quote_bal quote_needed_fast
+         Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, other_reserved %.2f) - resuming strategy"
+           asset.symbol available_quote quote_needed_fast other_reserved
        end
        (* capital_low=false: fall through normally *)
    | None -> () (* No balance data yet, fall through *)
@@ -651,46 +666,50 @@ let execute_strategy
              Logging.debug_f ~section "Skipping buy order placement for %s due to rate limit cooldown" asset.symbol
          | Some _ when state.inflight_buy ->
              Logging.debug_f ~section "Skipping buy order placement for %s: inflight buy=%B" asset.symbol state.inflight_buy
-         | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-             let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
-             if push_order order then begin
-               state.last_buy_order_price <- Some buy_price;
-               Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
-                 asset.symbol qty buy_price;
-             
-               (* Enforce exactly 2x grid_interval spacing *)
-               (* Find closest sell above buy (including the one we just potentially placed) *)
-               let all_sells = (("new_sell", sell_price) :: state.open_sell_orders) in
-               let closest_sell = List.fold_left (fun acc (_, sp) ->
-                 if sp > buy_price then
-                   match acc with
-                   | None -> Some sp
-                   | Some best_sp -> if sp < best_sp then Some sp else acc
-                 else acc
-               ) None all_sells in
-               (match closest_sell with
-                | Some cs_price ->
-                    let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
-                    let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
-                    let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
-                    
-                    if abs_float (target_buy -. buy_price) > min_move_threshold then
-                     Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
-                       asset.symbol buy_price target_buy cs_price
-                | None -> ())
-             end
          | Some quote_bal ->
-             (* Apply short cooldown to stop hard spin; then raise capital_low flag so the
-                domain loop short-circuits on future iterations until balance recovers. *)
-             let cooldown_key = "place_Buy" in
-             if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
-               if not state.capital_low_logged then begin
-                 Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, have %.2f - pausing buy side until capital recovers"
-                   asset.symbol quote_needed quote_bal;
-                 state.capital_low_logged <- true
-               end;
-               Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
-               state.capital_low <- true
+             (* Use available quote: subtract what other domains have locked in open buys *)
+             let other_reserved = get_reserved_quote_excluding asset.symbol in
+             let available_quote = quote_bal -. other_reserved in
+             if can_place_buy_order qty available_quote quote_needed then begin
+               let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
+               if push_order order then begin
+                 state.last_buy_order_price <- Some buy_price;
+                 (* Record this domain's reservation so other domains see it immediately *)
+                 state.reserved_quote <- buy_price *. qty;
+                 Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f (available %.2f, reserved %.2f)"
+                   asset.symbol qty buy_price available_quote state.reserved_quote;
+
+                 (* Enforce exactly 2x grid_interval spacing *)
+                 let all_sells = (("new_sell", sell_price) :: state.open_sell_orders) in
+                 let closest_sell = List.fold_left (fun acc (_, sp) ->
+                   if sp > buy_price then
+                     match acc with
+                     | None -> Some sp
+                     | Some best_sp -> if sp < best_sp then Some sp else acc
+                   else acc
+                 ) None all_sells in
+                 (match closest_sell with
+                  | Some cs_price ->
+                      let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
+                      let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
+                      let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
+                      if abs_float (target_buy -. buy_price) > min_move_threshold then
+                        Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
+                          asset.symbol buy_price target_buy cs_price
+                  | None -> ())
+               end
+             end else begin
+               (* Insufficient available quote (accounting for other domains' reservations) *)
+               let cooldown_key = "place_Buy" in
+               if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
+                 if not state.capital_low_logged then begin
+                   Logging.warn_f ~section "Insufficient quote balance for %s buy order: need %.2f, available %.2f (total %.2f, other_reserved %.2f) - pausing buy side"
+                     asset.symbol quote_needed available_quote quote_bal other_reserved;
+                   state.capital_low_logged <- true
+                 end;
+                 Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+                 state.capital_low <- true
+               end
              end
          | None ->
              Logging.warn_f ~section "No quote balance data available for %s buy order"
@@ -929,7 +948,10 @@ let handle_order_failed asset_symbol side reason =
     
     (* Clear inflight flags *)
     (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
-    
+
+    (* Release quote reservation on buy failures *)
+    (match side with Buy -> state.reserved_quote <- 0.0 | Sell -> ());
+
     (* Clear global in-flight trackers *)
     let duplicate_key = generate_side_duplicate_key asset_symbol side in
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
@@ -941,8 +963,23 @@ let handle_order_failed asset_symbol side reason =
       loop 0
     in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
+    let is_insufficient_funds = contains_fragment lower_reason "insufficient funds" in
     let cooldown = if is_rate_limit then 10.0 else 2.0 in
-    
+
+    (* If the exchange itself rejected due to insufficient funds, set capital_low so the
+       strategy fast-path halts further buy attempts until balance actually recovers.
+       This handles the case where local balance appears sufficient but Kraken's internal
+       available balance (net of open order reserves) is not. Only applies to buy side. *)
+    (match side with
+     | Buy when is_insufficient_funds ->
+         if not state.capital_low then begin
+           state.capital_low <- true;
+           state.capital_low_logged <- true;
+           Logging.warn_f ~section "Exchange rejected buy for %s with insufficient funds - setting capital_low flag to pause buy side"
+             asset_symbol
+         end
+     | _ -> ());
+
     (* Apply cooldown to prevent placement spam on rate limit *)
     let now = Unix.time () in
     let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
@@ -1026,8 +1063,10 @@ let handle_order_filled asset_symbol order_id side =
       Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
     end;
 
-    (* 4. Clear inflight flags and global placement trackers so strategy can replace immediately *)
+    (* 4. Clear inflight flags, reservation, and global placement trackers so strategy can replace immediately *)
     (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+    (* Release quote reservation when buy fills (funds are now in the asset, not quote) *)
+    (match side with Buy -> state.reserved_quote <- 0.0 | Sell -> ());
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
 
     (* 5. When a buy fills, also clear the Sell side's InFlightOrders guard.
@@ -1089,6 +1128,9 @@ let handle_order_cancelled asset_symbol order_id side =
     ) state.pending_orders;
     let removed_pending = original_pending_count - List.length state.pending_orders in
     
+    (* Release quote reservation on genuine cancellation of buy orders *)
+    (match side with Buy -> state.reserved_quote <- 0.0 | Sell -> ());
+
     (* If this was a tracked buy order, clear it *)
     let was_tracked_buy = match state.last_buy_order_id with
       | Some id when id = order_id -> true
