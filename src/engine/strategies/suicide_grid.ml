@@ -58,6 +58,7 @@ type strategy_state = {
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
   mutable inflight_buy: bool;   (* true while a buy Place is sent but not yet ack'd/rejected/failed *)
   mutable inflight_sell: bool;  (* true while a sell Place is sent but not yet ack'd/rejected/failed *)
+  mutable asset_low: bool;      (* true when asset balance is insufficient to place next sell; sell+buy paused *)
   mutable capital_low: bool;    (* true when quote balance is insufficient to place next buy; strategy paused *)
   mutable capital_low_logged: bool; (* true once we have logged the capital-low warning to suppress repeat spam *)
   mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
@@ -88,6 +89,7 @@ let get_strategy_state asset_symbol =
           last_cleanup_time = 0.0;
           inflight_buy = false;
           inflight_sell = false;
+          asset_low = false;
           capital_low = false;
           capital_low_logged = false;
           reserved_quote = 0.0;
@@ -405,6 +407,22 @@ let execute_strategy
 
   let state = get_strategy_state asset.symbol in
 
+   (* --- Asset-low check: clear flag when asset balance recovers --- *)
+   (match asset_balance with
+    | Some asset_bal ->
+        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
+        let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
+        let asset_needed_fast = qty_f *. sell_mult_f in
+        if state.asset_low && asset_bal >= asset_needed_fast then begin
+          state.asset_low <- false;
+          state.inflight_sell <- false;
+          ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
+          Logging.info_f ~section "Asset balance restored for %s (have %.8f, need %.8f) - resuming sell+buy placement"
+            asset.symbol asset_bal asset_needed_fast
+        end
+    | None -> ()
+   );
+
   (* --- Capital-low fast path: skip strategy when quote balance is known to be
      insufficient for a buy order. We still allow the FIRST loop through (capital_low=false)
      so that any accrued sell orders from previously filled buys are placed and can free
@@ -442,7 +460,7 @@ let execute_strategy
   );
 
   (* Only proceed with main strategy if capital_low flag is clear *)
-  if not state.capital_low then begin
+  if not state.capital_low && not state.asset_low then begin
 
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -689,19 +707,17 @@ let execute_strategy
         let buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
 
         let buy_cooldown_key = "place_Buy" in
-        let sell_cooldown_key = "place_Sell" in
         let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
-        let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns sell_cooldown_key in
 
-        (* Always try to place the sell order if we have NO OPEN BUY (meaning a previous buy filled and we need a sell for it),
-           even if we don't have quote balance for the NEXT buy order. *)
+        (* Place sell order first - sell and buy are always paired.
+           asset_low flag blocks entry to this entire branch at the top level. *)
         (match asset_balance with
-         | Some asset_bal when not is_sell_on_cooldown && not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
+         | Some asset_bal when not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
              let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
              if push_order sell_order then
                Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
                  asset.symbol (qty *. sell_mult) sell_price
-         | Some asset_bal when not is_sell_on_cooldown && not state.inflight_sell ->
+         | Some asset_bal when not state.inflight_sell ->
              Logging.debug_f ~section "Insufficient asset balance for %s sell order: need %.8f, have %.8f"
                  asset.symbol asset_needed asset_bal
          | _ -> ()
@@ -890,17 +906,8 @@ let execute_strategy
               Logging.debug_f ~section "Buy order tracking lost for %s, will re-place on next cycle" asset.symbol
         end else begin
           (* No sell orders exist but we have an active buy.
-             This happens on startup or after all sells fill.
-             Place a sell to ensure both sides of the grid are active. *)
-          (match asset_balance with
-           | Some asset_bal when not state.inflight_sell && can_place_sell_order qty sell_mult asset_bal asset_needed ->
-               let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
-               let sell_order = create_order asset.symbol Sell (qty *. sell_mult) (Some sell_price) true asset.exchange in
-               if push_order sell_order then
-                 Logging.info_f ~section "Placed missing sell order for %s: %.8f @ %.4f (buy already active)"
-                   asset.symbol (qty *. sell_mult) sell_price
-           | _ -> ());
-
+             Trail the buy without sell anchors - sells are only placed
+             in the effective_buy_count=0 branch after a buy fills. *)
            match state.last_buy_order_price, state.last_buy_order_id with
            | Some current_buy_price, Some buy_order_id ->
                let target_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
@@ -1018,30 +1025,38 @@ let handle_order_failed asset_symbol side reason =
       loop 0
     in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
-    let is_insufficient_funds = contains_fragment lower_reason "insufficient funds" in
+    let is_insufficient_balance = contains_fragment lower_reason "insufficient funds"
+      || contains_fragment lower_reason "insufficient spot balance" in
     let cooldown = if is_rate_limit then 10.0 else 2.0 in
 
-    (* If the exchange itself rejected due to insufficient funds, set capital_low so the
-       strategy fast-path halts further buy attempts until balance actually recovers.
-       This handles the case where local balance appears sufficient but Kraken's internal
-       available balance (net of open order reserves) is not. Only applies to buy side. *)
+    (* Set balance flags when the exchange reports insufficient balance.
+       capital_low (buy side) and asset_low (sell side) halt further placement
+       until balance actually recovers (event-driven, no timers). *)
     (match side with
-     | Buy when is_insufficient_funds ->
+     | Buy when is_insufficient_balance ->
          if not state.capital_low then begin
            state.capital_low <- true;
            state.capital_low_logged <- true;
-           Logging.warn_f ~section "Exchange rejected buy for %s with insufficient funds - setting capital_low flag to pause buy side"
+           Logging.warn_f ~section "Exchange rejected buy for %s with insufficient funds - setting capital_low flag"
+             asset_symbol
+         end
+     | Sell when is_insufficient_balance ->
+         if not state.asset_low then begin
+           state.asset_low <- true;
+           Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance - setting asset_low flag"
              asset_symbol
          end
      | _ -> ());
 
-    (* Apply cooldown to prevent placement spam on rate limit *)
+    (* Apply timer cooldown only for buy-side rate limits; sell side uses asset_low flag *)
     let now = Unix.time () in
-    let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
-    Hashtbl.replace state.amend_cooldowns cooldown_key (now +. cooldown);
+    (match side with
+     | Buy ->
+         Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. cooldown)
+     | Sell -> ());
 
-    Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker, applied %.1fs placement cooldown."
-      asset_symbol (string_of_order_side side) reason cooldown
+    Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker."
+      asset_symbol (string_of_order_side side) reason
   )
 
 (** Handle order placement failure - remove from pending and potentially trigger re-evaluation *)
@@ -1071,20 +1086,22 @@ let handle_order_rejected asset_symbol side price =
   let duplicate_key = generate_side_duplicate_key asset_symbol side in
   ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
-  (* Apply short cooldown to prevent placement spam on immediate rejection.
+  (* Apply short cooldown for buy side only; sell side uses asset_low flag.
      BUT: don't overwrite a longer cooldown already set by handle_order_failed. *)
-  let now = Unix.time () in
-  let cooldown_key = match side with Buy -> "place_Buy" | Sell -> "place_Sell" in
-  let new_expiry = now +. 2.0 in
-  let existing_expiry = match Hashtbl.find_opt state.amend_cooldowns cooldown_key with
-    | Some t -> t
-    | None -> 0.0
-  in
-  if new_expiry > existing_expiry then
-    Hashtbl.replace state.amend_cooldowns cooldown_key new_expiry;
+  (match side with
+   | Buy ->
+       let now = Unix.time () in
+       let new_expiry = now +. 2.0 in
+       let existing_expiry = match Hashtbl.find_opt state.amend_cooldowns "place_Buy" with
+         | Some t -> t
+         | None -> 0.0
+       in
+       if new_expiry > existing_expiry then
+         Hashtbl.replace state.amend_cooldowns "place_Buy" new_expiry
+   | Sell -> ());
 
-  Logging.debug_f ~section "Order rejected and removed from pending/trackers (cooldown: %.0fs): %s @ %.2f for %s"
-    (max new_expiry existing_expiry -. now) (string_of_order_side side) price asset_symbol
+  Logging.debug_f ~section "Order rejected and removed from pending/trackers: %s @ %.2f for %s"
+    (string_of_order_side side) price asset_symbol
   )
 
   (* For buy order rejections, this signals no buy order exists, which is valid for re-evaluation *)
