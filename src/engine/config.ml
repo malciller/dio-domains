@@ -41,6 +41,30 @@ type config = {
 (** Internal section tag for logging *)
 let section = "config"
 
+(** Known keys at each config level *)
+let known_top_level_keys =
+  [ "logging_level"; "logging_sections"; "logging_cycle_debug_mod";
+    "logging_cycle_info_mod"; "engine"; "trading" ]
+
+let known_engine_keys =
+  [ "balance_check_mod"; "strategy_fallback_mod" ]
+
+let known_trading_keys =
+  [ "symbol"; "exchange"; "qty"; "grid_interval"; "sell_mult";
+    "min_usd_balance"; "max_exposure"; "strategy"; "maker_fee";
+    "taker_fee"; "testnet"; "hedge"; "accumulation_buffer" ]
+
+(** Validate that all keys in a JSON object are in the allowed set.
+    Logs critical for each unknown key and returns true if any were found. *)
+let validate_keys ~context ~allowed json =
+  let open Yojson.Basic.Util in
+  let actual = json |> to_assoc |> List.map fst in
+  let unknown = List.filter (fun k -> not (List.mem k allowed)) actual in
+  List.iter (fun k ->
+    Logging.critical_f ~section "Unknown config key '%s' in %s" k context
+  ) unknown;
+  unknown <> []
+
 (** Parse grid_interval from JSON, accepting:
     - list [min, max]
     - single number/string -> treated as (v, v) for backward compatibility *)
@@ -79,15 +103,34 @@ let parse_grid_interval json exchange symbol =
 
 (** Parse a single trading config from JSON *)
 let parse_config json =
+  if validate_keys ~context:"trading entry" ~allowed:known_trading_keys json then
+    exit 1;
   let open Yojson.Basic.Util in
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
+  (* testnet, hedge, accumulation_buffer are Hyperliquid-only keys *)
+  if exchange <> "hyperliquid" then begin
+    let hl_only = [ "testnet"; "hedge"; "accumulation_buffer" ] in
+    let actual = json |> to_assoc |> List.map fst in
+    let bad = List.filter (fun k -> List.mem k hl_only) actual in
+    if bad <> [] then begin
+      List.iter (fun k ->
+        Logging.critical_f ~section "Key '%s' is only valid for hyperliquid (found in %s/%s)" k exchange symbol
+      ) bad;
+      exit 1
+    end
+  end;
+  let strategy = json |> member "strategy" |> to_string in
+  (* grid_interval is only valid for Grid strategies *)
+  if strategy <> "Grid" then begin
+    let actual = json |> to_assoc |> List.map fst in
+    if List.mem "grid_interval" actual then begin
+      Logging.critical_f ~section "Key 'grid_interval' is only valid for Grid strategy (found in %s/%s with strategy=%s)" exchange symbol strategy;
+      exit 1
+    end
+  end;
   let testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false in
   let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
-  if hedge && exchange = "kraken" then begin
-    Logging.critical_f ~section "hedge=true is not supported on Kraken (symbol=%s). Auto-hedging requires Hyperliquid perps." symbol;
-    exit 1
-  end;
   {
     exchange;
     symbol;
@@ -96,7 +139,7 @@ let parse_config json =
     sell_mult = json |> member "sell_mult" |> to_string_option |> Option.value ~default:"1.0";
     min_usd_balance = json |> member "min_usd_balance" |> to_string_option;
     max_exposure = json |> member "max_exposure" |> to_string_option;
-    strategy = json |> member "strategy" |> to_string;
+    strategy;
     maker_fee = json |> member "maker_fee" |> to_option to_float;
     taker_fee = json |> member "taker_fee" |> to_option to_float;
     testnet;
@@ -136,9 +179,23 @@ let read_config () : config =
   try
     let json = Yojson.Basic.from_file "config.json" in
     let open Yojson.Basic.Util in
+    (* Validate top-level keys *)
+    if validate_keys ~context:"top-level" ~allowed:known_top_level_keys json then
+      exit 1;
+    (* Validate engine keys if present *)
+    (match json |> member "engine" with
+     | `Null -> ()
+     | engine_json ->
+       if validate_keys ~context:"engine" ~allowed:known_engine_keys engine_json then
+         exit 1);
     let logging = parse_logging_config json in
     let engine = parse_engine_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
     { logging; engine; trading }
   with
-  | Yojson.Json_error _ | Sys_error _ -> { logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 }; engine = default_engine_config; trading = [] }
+  | Yojson.Json_error msg ->
+    Logging.critical_f ~section "Failed to parse config.json: %s" msg;
+    exit 1
+  | Sys_error msg ->
+    Logging.critical_f ~section "Cannot read config.json: %s" msg;
+    exit 1
