@@ -524,10 +524,38 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Kraken.Kraken_ticker_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Ticker_feed.initialize all_hyperliquid_symbols;
 
+  Logging.info ~section "Step 1.5: Starting Hyperliquid websocket connection early...";
+  if has_hyperliquid then begin
+     let hl_ws_conn = register ~name:"hyperliquid_ws" ~connect_fn:None in
+     let hl_ws_connect_fn () =
+       Lwt.catch (fun () ->
+         let on_failure reason = set_state hl_ws_conn (Failed reason) in
+         let on_heartbeat () = update_data_heartbeat hl_ws_conn in
+         let on_connected () =
+           set_state hl_ws_conn Connected;
+           let wallet = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.value ~default:"" in
+           Lwt.async (fun () -> 
+             Hyperliquid.Instruments_feed.wait_until_ready () >>= fun () ->
+             Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet)
+         in
+         Hyperliquid.Ws.connect_and_monitor 
+           ~testnet:hyperliquid_testnet 
+           ~on_failure ~on_connected ~on_heartbeat
+       ) (fun exn ->
+         let error_msg = Printexc.to_string exn in
+         Logging.error_f ~section "[%s] Connection failed: %s" hl_ws_conn.name error_msg;
+         set_state hl_ws_conn (Failed error_msg);
+         Lwt.return_unit
+       )
+     in
+     set_connect_fn hl_ws_conn (Some hl_ws_connect_fn);
+     start_async hl_ws_conn;
+  end;
+
   Logging.info ~section "Step 2: Initializing instruments feed stores...";
   let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
   let%lwt () = 
-    if has_hyperliquid then Hyperliquid.Instruments_feed.initialize_symbols ~testnet:hyperliquid_testnet all_hyperliquid_symbols
+    if has_hyperliquid then Hyperliquid.Module.initialize_instruments_ws ()
     else Lwt.return_unit
   in
 
@@ -559,7 +587,10 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   
   let () = try
     Kraken.Kraken_balances_feed.initialize all_assets;
-    if has_hyperliquid then Hyperliquid.Balances.initialize ~testnet:hyperliquid_testnet all_assets;
+    if has_hyperliquid then begin
+      Hyperliquid.Balances.initialize ~testnet:hyperliquid_testnet all_assets;
+      Lwt.async (fun () -> Hyperliquid.Module.fetch_spot_balances_ws ())
+    end;
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
@@ -569,34 +600,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Executions_feed.initialize hyperliquid_symbols;
 
-  (* Register and start supervised websocket connections *)
-  Logging.info ~section "Step 7: Starting supervised websocket connections...";
-  
-  (* Hyperliquid connections *)
-  if has_hyperliquid then begin
-     let hl_ws_conn = register ~name:"hyperliquid_ws" ~connect_fn:None in
-     let hl_ws_connect_fn () =
-       Lwt.catch (fun () ->
-         let on_failure reason = set_state hl_ws_conn (Failed reason) in
-         let on_heartbeat () = update_data_heartbeat hl_ws_conn in
-         let on_connected () =
-           set_state hl_ws_conn Connected;
-           let wallet = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.value ~default:"" in
-           Lwt.async (fun () -> Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet)
-         in
-         Hyperliquid.Ws.connect_and_monitor 
-           ~testnet:hyperliquid_testnet 
-           ~on_failure ~on_connected ~on_heartbeat
-       ) (fun exn ->
-         let error_msg = Printexc.to_string exn in
-         Logging.error_f ~section "[%s] Connection failed: %s" hl_ws_conn.name error_msg;
-         set_state hl_ws_conn (Failed error_msg);
-         Lwt.return_unit
-       )
-     in
-     set_connect_fn hl_ws_conn (Some hl_ws_connect_fn);
-     start_async hl_ws_conn;
-  end;
+  (* Register and start remaining supervised websocket connections *)
+  Logging.info ~section "Step 7: Starting Kraken websocket connections...";
 
   (* Ticker feed *)
   if has_kraken then begin
