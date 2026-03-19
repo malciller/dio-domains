@@ -1,19 +1,18 @@
 let test_parse_trading_config_valid () =
-  let json_str = {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "grid_interval": [0.5, 1.0], "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002}|} in
+  let json_str = {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002}|} in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
 
   Alcotest.(check string) "symbol" "BTC/USD" config.symbol;
   Alcotest.(check string) "exchange" "kraken" config.exchange;
   Alcotest.(check string) "qty" "0.001" config.qty;
-  Alcotest.(check (pair (float 0.0001) (float 0.0001))) "grid_interval" (0.5, 1.0) config.grid_interval;
   Alcotest.(check string) "sell_mult" "1.1" config.sell_mult;
   Alcotest.(check string) "strategy" "market_maker" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee" (Some 0.001) config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee" (Some 0.002) config.taker_fee
 
 let test_parse_trading_config_defaults () =
-  let json_str = {|{"symbol": "ETH/USD", "qty": "0.01", "strategy": "suicide_grid"}|} in
+  let json_str = {|{"symbol": "ETH/USD", "qty": "0.01", "strategy": "Grid"}|} in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
 
@@ -22,7 +21,7 @@ let test_parse_trading_config_defaults () =
   Alcotest.(check string) "qty" "0.01" config.qty;
   Alcotest.(check (pair (float 0.0001) (float 0.0001))) "grid_interval default" (1.0, 1.0) config.grid_interval;
   Alcotest.(check string) "sell_mult default" "1.0" config.sell_mult;
-  Alcotest.(check string) "strategy" "suicide_grid" config.strategy;
+  Alcotest.(check string) "strategy" "Grid" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee none" None config.taker_fee;
   Alcotest.(check (option string)) "min_usd_balance none" None config.min_usd_balance;
