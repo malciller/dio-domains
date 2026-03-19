@@ -316,15 +316,14 @@ let () =
 
   (* Basic GC statistics reporting *)
   let start_time = Unix.gettimeofday () in
-  let last_report_time = ref start_time in
-  let report_interval = 30.0 in  (* Report every 30 seconds *)
+  let mem_cycle_count = ref 0 in
 
-  let report_memory_stats () =
+  let report_memory_stats ~cycle_info_mod () =
     if Atomic.get shutdown_requested then ()
-    else
-      let now = Unix.gettimeofday () in
-      if now -. !last_report_time >= report_interval then (
-        last_report_time := now;
+    else begin
+      incr mem_cycle_count;
+      if !mem_cycle_count mod cycle_info_mod = 0 then begin
+        let now = Unix.gettimeofday () in
         let runtime = now -. start_time in
         let current_gc_stats = Gc.stat () in
 
@@ -333,7 +332,7 @@ let () =
           let heap_mb = current_gc_stats.heap_words * (Sys.word_size / 8) / 1048576 in
           let live_mb = current_gc_stats.live_words * (Sys.word_size / 8) / 1048576 in
 
-          Logging.info_f ~section:"memory" "=== MEMORY STATISTICS (Runtime: %.1fs) ===" runtime;
+          Logging.info_f ~section:"memory" "=== MEMORY STATISTICS (Runtime: %.1fs, Cycle: %d) ===" runtime !mem_cycle_count;
           Logging.info_f ~section:"memory" "Main Domain: heap=%dMB live=%dMB free=%dMB"
             heap_mb live_mb (heap_mb - live_mb);
 
@@ -365,17 +364,18 @@ let () =
 
           Logging.info ~section:"memory" "=== END MEMORY STATISTICS ===";
         )
-      )
+      end
+    end
   in
 
   (* Start periodic memory reporting thread *)
   let memory_reporter_thread = Thread.create (fun () ->
+    (* Read config here so cycle_info_mod is available to the thread *)
+    let cfg = Dio_engine.Config.read_config () in
+    let cycle_info_mod = cfg.logging.cycle_info_mod in
     try
       while not (Atomic.get shutdown_requested) do
-        let now = Unix.gettimeofday () in
-        if now -. !last_report_time >= report_interval then (
-          report_memory_stats ()
-        );
+        report_memory_stats ~cycle_info_mod ();
         let delay_time = if Atomic.get shutdown_requested then 0.001 else 0.1 in
         Thread.delay delay_time
       done
