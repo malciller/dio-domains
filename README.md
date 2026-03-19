@@ -6,6 +6,11 @@
 High-performance OCaml 5.2 trading engine for Kraken and Hyperliquid featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, tick-driven event architecture, and real-time latency profiling. Built for high-frequency trading with WebSocket data feeds and asynchronous order execution.
 
 
+> [!WARNING]
+> **Auto-hedge for Hyperliquid is EXPERIMENTAL.** Testing is ongoing; features may be incomplete or unstable.
+
+
+
 ## Requirements
 
 - OCaml 5.2.0 (opam)
