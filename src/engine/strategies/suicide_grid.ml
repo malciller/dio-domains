@@ -69,6 +69,8 @@ type strategy_state = {
   mutable grid_qty: float;              (* cached config qty for profit calc in fill handler *)
   mutable maker_fee: float;             (* cached maker fee rate for profit calc in fill handler *)
   mutable exchange_id: string;          (* cached exchange name for persistence decisions *)
+  mutable startup_replay: bool;  (* true during startup fill replay; gates profit calculation *)
+  mutable last_fill_oid: string option; (* OID of last fill that credited profit; resumption point *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -86,6 +88,7 @@ let get_strategy_state asset_symbol =
         (* Load persisted state for this symbol (survives Docker restarts) *)
         let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
         let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
+        let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
@@ -109,6 +112,8 @@ let get_strategy_state asset_symbol =
           grid_qty = 0.0;
           maker_fee = 0.0;
           exchange_id = "";
+          startup_replay = (persisted_last_fill_oid <> None);  (* replay gate active if we have a resumption point *)
+          last_fill_oid = persisted_last_fill_oid;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -781,7 +786,7 @@ let execute_strategy
                    (* Persist both values so they survive Docker restarts *)
                    Hyperliquid.State_persistence.save ~symbol:asset.symbol
                      ~reserved_base:state.reserved_base
-                     ~accumulated_profit:state.accumulated_profit;
+                     ~accumulated_profit:state.accumulated_profit ();
                    Logging.info_f ~section
                      "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
                      asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base;
@@ -1222,7 +1227,23 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
     end;
 
     (* 5. Compute realized net profit on sell fills (Hyperliquid discrete sizing accumulator).
-       profit = (sell_price - buy_price) * qty - maker fees on both legs *)
+       profit = (sell_price - buy_price) * qty - maker fees on both legs
+       During startup_replay, skip profit calculation for fills already persisted
+       (OID <= last_fill_oid). Tracking state (buy/sell IDs, inflight flags) is
+       still updated above so the strategy enters the correct operational state. *)
+    let skip_profit_calc =
+      state.startup_replay &&
+      (match state.last_fill_oid with
+       | Some persisted_oid ->
+           (* OIDs are monotonically increasing integers on Hyperliquid *)
+           (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
+            with _ -> false)
+       | None -> false)
+    in
+    if skip_profit_calc then
+      Logging.debug_f ~section "Skipping startup replay fill %s for %s (already persisted, last_fill_oid=%s)"
+        order_id asset_symbol (Option.value state.last_fill_oid ~default:"none")
+    else
     (match side with
      | Sell ->
           (match state.last_buy_fill_price with
@@ -1234,11 +1255,13 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
               let net_profit = gross -. fees in
               if net_profit > 0.0 then begin
                 state.accumulated_profit <- state.accumulated_profit +. net_profit;
+                state.last_fill_oid <- Some order_id;
                 (* Persist so profit progress survives Docker restarts *)
                 if state.exchange_id = "hyperliquid" then
                   Hyperliquid.State_persistence.save ~symbol:asset_symbol
                     ~reserved_base:state.reserved_base
-                    ~accumulated_profit:state.accumulated_profit;
+                    ~accumulated_profit:state.accumulated_profit
+                    ~last_fill_oid:order_id ();
                 Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f buy@%.4f x %.8f), accumulated: %.6f"
                   asset_symbol net_profit gross fees sell_fill_price buy_price qty state.accumulated_profit
               end
@@ -1549,4 +1572,18 @@ module Strategy = struct
   let cleanup_pending_cancellation = cleanup_pending_cancellation
   let cleanup_strategy_state = cleanup_strategy_state
   let init = init
+
+  (** Clear the startup_replay flag so all subsequent fills are processed normally.
+      Called by domain_spawner once the first exec event batch has been consumed. *)
+  let set_startup_replay_done symbol =
+    let state = get_strategy_state symbol in
+    Mutex.lock state.mutex;
+    if state.startup_replay then begin
+      state.startup_replay <- false;
+      Logging.info_f ~section "Startup replay complete for %s (last_fill_oid=%s, accumulated_profit=%.6f)"
+        symbol
+        (Option.value state.last_fill_oid ~default:"none")
+        state.accumulated_profit
+    end;
+    Mutex.unlock state.mutex
 end
