@@ -1083,20 +1083,22 @@ let order_processing_loop () =
                                          Logging.debug_f ~section "Amendment skipped for %s %s %.8f @ %s (no price change)" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
                                          (match order.price with
                                           | Some price ->
-                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
+                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped
+                                                order.symbol target_order_id order.side price
                                           | None -> Logging.warn_f ~section "Amendment skipped but no price available for strategy update: %s" result.Dio_exchange.Exchange_intf.Types.new_order_id
                                          );
                                          Lwt.return_unit
                                      end else begin
                                          orders_placed := !orders_placed + 1;
-                                         Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
+                                         Logging.debug_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
                                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                            (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                            (match result.Dio_exchange.Exchange_intf.Types.amend_id with Some id -> id | None -> "none")
                                            result.Dio_exchange.Exchange_intf.Types.new_order_id;
                                          (match order.price with
                                           | Some price ->
-                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amended order.symbol target_order_id result.Dio_exchange.Exchange_intf.Types.new_order_id order.side price
+                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amended
+                                                order.symbol target_order_id result.Dio_exchange.Exchange_intf.Types.new_order_id order.side price
                                           | None -> Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.Dio_exchange.Exchange_intf.Types.new_order_id
                                          );
                                          Lwt.return_unit
@@ -1301,7 +1303,7 @@ let order_processing_loop () =
                                         Lwt.return_unit
                                     end else begin
                                         orders_placed := !orders_placed + 1;
-                                        Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") (match result.amend_id with Some id -> id | None -> "none") result.new_order_id;
+                                        Logging.debug_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") (match result.amend_id with Some id -> id | None -> "none") result.new_order_id;
                                         (match order.price with
                                          | Some price ->
                                              (match order.strategy with
@@ -1463,7 +1465,7 @@ let order_processing_loop () =
             ) pending_hedge_orders;
 
             if !cycle_count mod 100 = 0 then
-              Logging.info_f ~section "Order processing: %d orders placed, %d grid + %d mm + %d hedge pending in current batch"
+              Logging.debug_f ~section "Order processing: %d orders placed, %d grid + %d mm + %d hedge pending in current batch"
                 !orders_placed (List.length pending_grid_orders) (List.length pending_mm_orders) (List.length pending_hedge_orders);
 
             (* Small pause to allow other tasks to run before checking again *)

@@ -342,7 +342,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
   } in
   
   update_orders_internal ?user_ref store event;
-  Logging.info_f ~section "Proactively injected open order: %s [%s] %s side %.8f limit_px=%.2f (cloid: %s, userref: %s)"
+  Logging.debug_f ~section "Proactively injected open order: %s [%s] %s side %.8f limit_px=%.2f (cloid: %s, userref: %s)"
     order_id symbol (if side = Buy then "buy" else "sell") qty price
     (Option.value cl_ord_id ~default:"none")
     (match user_ref with Some u -> string_of_int u | None -> "none")
@@ -470,8 +470,10 @@ let process_order_updates data_json =
             update_orders_internal store event;
             
             (match order_status with
-             | FilledStatus | CanceledStatus | RejectedStatus ->
+             | FilledStatus | RejectedStatus ->
                  Logging.info_f ~section "Order %s: %s [%s] (reason: %s)" (String.uppercase_ascii status) order_id symbol status
+             | CanceledStatus ->
+                 Logging.debug_f ~section "Order %s: %s [%s] (reason: %s)" (String.uppercase_ascii status) order_id symbol status
              | NewStatus ->
                  Logging.debug_f ~section "Order OPEN: %s [%s] %.8f @ %.2f" order_id symbol qty price
              | _ -> ());
@@ -689,7 +691,7 @@ let inject_open_orders data_json =
             } in
             update_orders_internal store event;
             incr count;
-            Logging.info_f ~section "Injected startup open order: %s [%s] %s %.8f @ %.2f" order_id symbol (if side = Buy then "buy" else "sell") qty price
+            Logging.debug_f ~section "Injected startup open order: %s [%s] %s %.8f @ %.2f" order_id symbol (if side = Buy then "buy" else "sell") qty price
         | None -> ()
       with exn -> Logging.warn_f ~section "Failed to parse open order entry: %s" (Printexc.to_string exn)
     ) orders;

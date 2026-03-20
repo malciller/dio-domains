@@ -363,12 +363,12 @@ let rec reader_loop conn generation =
     )
 
 let start_reader conn generation =
-  Logging.info_f ~section "Starting WebSocket reader loop (generation %d)" generation;
+  Logging.debug_f ~section "Starting WebSocket reader loop (generation %d)" generation;
   let task =
     Lwt.catch
       (fun () ->
         reader_loop conn generation >>= fun () ->
-        Logging.info_f ~section "Reader loop completed normally (generation %d)" generation;
+        Logging.debug_f ~section "Reader loop completed normally (generation %d)" generation;
         Lwt.return_unit
       )
       (fun exn ->
@@ -469,7 +469,7 @@ let ensure_connection ?on_failure ?on_connected token =
           ) >>= fun subs ->
           Lwt_list.iter_s (fun sub ->
             let content = Yojson.Safe.to_string sub in
-            Logging.info_f ~section "Re-subscribing on unified authenticated connection: %s" content;
+            Logging.debug_f ~section "Re-subscribing on unified authenticated connection: %s" content;
             Websocket_lwt_unix.write conn (Websocket.Frame.create ~content ())
           ) (List.rev subs) >>= fun () ->
 
@@ -477,7 +477,7 @@ let ensure_connection ?on_failure ?on_connected token =
           (match on_connected with Some f -> f () | None -> ());
           Logging.debug_f ~section "on_connected callback called (generation %d)" generation;
           (* Wait for the reader task to complete (only happens on error/disconnect) *)
-          Logging.info_f ~section "Waiting for reader task to complete (generation %d)" generation;
+          Logging.debug_f ~section "Waiting for reader task to complete (generation %d)" generation;
           reader >>= fun () ->
           Logging.warn_f ~section "Reader task completed unexpectedly (generation %d)" generation;
           Lwt.return_unit
@@ -623,7 +623,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
                 ] >>= function
                 | `Response response ->
                     (* Response arrived after timeout but before we gave up - success! *)
-                    Logging.info_f ~section "Request req_id=%d: response arrived just after timeout (within 10ms grace period)" req_id;
+                    Logging.debug_f ~section "Request req_id=%d: response arrived just after timeout (within 10ms grace period)" req_id;
                     (* Track successful response *)
                     Logging.debug_f ~section "Request req_id=%d: response received successfully (timeout race resolved)" req_id;
                     Lwt.return response
@@ -668,7 +668,7 @@ let subscribe message =
     match state.conn with
     | Some conn_with_gen ->
         let content = Yojson.Safe.to_string message in
-        Logging.info_f ~section "Sending subscription on unified authenticated connection: %s" content;
+        Logging.debug_f ~section "Sending subscription on unified authenticated connection: %s" content;
         Websocket_lwt_unix.write conn_with_gen.conn (Websocket.Frame.create ~content ())
     | None ->
         Logging.info_f ~section "Subscription registered, will be sent when connected: %s" (Yojson.Safe.to_string message);

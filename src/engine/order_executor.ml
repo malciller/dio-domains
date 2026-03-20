@@ -261,7 +261,7 @@ let place_order
           Logging.warn_f ~section "%s" err;
           Lwt.return (Error err)
         end else begin
-          Logging.info_f ~section "Placing %s order on %s: %s %s %f @ %s" 
+          Logging.debug_f ~section "Placing %s order on %s: %s %s %f @ %s" 
             request.side request.exchange request.symbol request.order_type request.quantity
             (match request.limit_price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
 
@@ -380,7 +380,7 @@ let amend_order
                  cl_ord_id = request.cl_ord_id;
               })
             end else begin
-                Logging.info_f ~section "Amending order %s on %s: %s" request.order_id request.exchange
+                Logging.debug_f ~section "Amending order %s on %s: %s" request.order_id request.exchange
                   (match request.new_limit_price with Some p -> Printf.sprintf "price=%.10f" p | None -> "");
                 
                 let ex_retry_config = retry_config in
