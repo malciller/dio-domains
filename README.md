@@ -114,8 +114,6 @@ To handle this, the Grid strategy uses profit-gated accumulation. Most cycles se
 **Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge on perps. Spot buy fills open a perp short; spot sell fills close it. Enable with `"hedge": true`. Kraken is not supported.
 
 
-
-
 ## Key Features
 
 - **Domain-Based Parallelism**: Each trading asset runs in its own OCaml domain for true parallel execution without GIL limitations
@@ -164,6 +162,59 @@ dune build @doc
 dune build
 ./_build/default/bin/main.exe
 ```
+
+### Hyperliquid State Persistence
+
+The Grid strategy persists accumulation state to disk so `reserved_base`, `accumulated_profit`, and `last_fill_oid` survive restarts.
+
+**State file**: `data/accumulated_state.json` (local dev) or `/app/data/accumulated_state.json` (Docker).
+
+```json
+{
+  "HYPE/USDC": {
+    "reserved_base": 0.15,
+    "accumulated_profit": 0.482716,
+    "last_fill_oid": "355883830672"
+  }
+}
+```
+
+State is written atomically (temp file + rename) with a mutex for multi-domain safety. On startup the strategy loads persisted values; missing fields default to `0.0` / `None`.
+
+#### Docker
+
+Mount a host volume for the `data/` directory so state survives container rebuilds:
+
+```bash
+docker run -v /path/on/host/data:/app/data --env-file .env dio
+```
+
+#### OS-Specific Notes
+
+**macOS / Linux** — No additional setup needed. The `data/` directory is created automatically on first write.
+
+**Windows (WSL2 — recommended)** — Run inside WSL2 (Ubuntu 22.04+). The Unix build toolchain and `Sys.rename` atomicity work as-is:
+
+```bash
+# Inside WSL2
+opam install . --deps-only
+dune build
+./_build/default/bin/main.exe
+```
+
+> [!TIP]
+> Store the project and `data/` directory **inside the WSL filesystem** (e.g. `~/dio-domains/`), not on a `/mnt/c/` Windows mount. NTFS mounts have poor `inotify` support and `Sys.rename` across filesystem boundaries can fail silently.
+
+**Windows (native — advanced)** — Requires MSVC or MinGW OCaml. Key differences:
+
+1. **Atomic rename**: `Sys.rename` on Windows fails if the target file is open by another process (e.g. antivirus scanner). Exclude `data/` from real-time scanning.
+2. **Path separators**: `Filename.concat` handles `\` vs `/` correctly.
+3. **Docker path**: `/app` detection doesn't trigger on native Windows — state always writes to `./data/`.
+4. **libsecp256k1**: Must be compiled manually. See the [secp256k1 build docs](https://github.com/bitcoin-core/secp256k1#building-on-windows).
+
+> [!WARNING]
+> Native Windows is not actively tested. WSL2 or Docker is strongly recommended.
+
 ## Logging
 
 - Debug, Info, Warning, Error, timestamped by component.
