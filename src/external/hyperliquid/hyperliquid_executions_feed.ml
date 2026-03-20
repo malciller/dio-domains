@@ -140,6 +140,22 @@ let[@inline always] get_open_orders symbol =
   Mutex.unlock store.orders_mutex;
   orders
 
+(** Remove a single open order by ID — used to clean up the old order entry
+    after a successful cancel-replace amendment so it doesn't appear as a
+    ghost duplicate in get_open_orders. *)
+let remove_open_order ~symbol ~order_id =
+  let store = get_symbol_store symbol in
+  Mutex.lock store.orders_mutex;
+  let existed = Hashtbl.mem store.open_orders order_id in
+  if existed then begin
+    Hashtbl.remove store.open_orders order_id;
+    Mutex.lock initialization_mutex;
+    Hashtbl.remove order_to_symbol order_id;
+    Mutex.unlock initialization_mutex;
+    Logging.debug_f ~section "Removed old order %s [%s] after amendment" order_id symbol
+  end;
+  Mutex.unlock store.orders_mutex
+
 (** Get all symbols that have execution stores (initialized symbols) *)
 let get_all_symbols () =
   Mutex.lock initialization_mutex;

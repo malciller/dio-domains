@@ -92,6 +92,7 @@ let get_strategy_state asset_symbol =
         let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
         let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
         let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
+        let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
@@ -111,7 +112,7 @@ let get_strategy_state asset_symbol =
           reserved_quote = 0.0;
           accumulated_profit = persisted_accumulated_profit;
           reserved_base = persisted_reserved_base;
-          last_buy_fill_price = None;
+          last_buy_fill_price = persisted_last_buy_fill_price;
           grid_qty = 0.0;
           maker_fee = 0.0;
           exchange_id = "";
@@ -1285,6 +1286,14 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
       state.last_buy_fill_price <- Some fill_price;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
+      (* Persist buy fill price so it survives Docker restarts.
+         Without this, sell fills after restart have no buy_price reference
+         and silently skip profit calculation. *)
+      if state.exchange_id = "hyperliquid" then
+        Hyperliquid.State_persistence.save ~symbol:asset_symbol
+          ~reserved_base:state.reserved_base
+          ~accumulated_profit:state.accumulated_profit
+          ~last_buy_fill_price:fill_price ();
       (* Credit anticipated base so the sell guard sees the incoming asset before
          the balance feed catches up (race: exec feed is faster than balance feed) *)
       if state.grid_qty > 0.0 then begin
@@ -1337,12 +1346,15 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
               if net_profit > 0.0 then begin
                 state.accumulated_profit <- state.accumulated_profit +. net_profit;
                 state.last_fill_oid <- Some order_id;
-                (* Persist so profit progress survives Docker restarts *)
+                (* Persist so profit progress survives Docker restarts.
+                   Also persist current last_buy_fill_price so the next
+                   sell after a restart still has a buy reference. *)
                 if state.exchange_id = "hyperliquid" then
                   Hyperliquid.State_persistence.save ~symbol:asset_symbol
                     ~reserved_base:state.reserved_base
                     ~accumulated_profit:state.accumulated_profit
-                    ~last_fill_oid:order_id ();
+                    ~last_fill_oid:order_id
+                    ?last_buy_fill_price:state.last_buy_fill_price ();
                 Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f buy@%.4f x %.8f), accumulated: %.6f"
                   asset_symbol net_profit gross fees sell_fill_price buy_price qty state.accumulated_profit
               end
