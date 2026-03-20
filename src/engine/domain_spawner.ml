@@ -510,7 +510,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  the fragile has_tracked_buy flag and triggering buy order spam. *)
               let is_grid_order = match userref_opt with
                 | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref
-                | None -> false
+                | None -> asset_with_fees.exchange = "hyperliquid"
               in
               if is_grid_order then
                 (if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1))
