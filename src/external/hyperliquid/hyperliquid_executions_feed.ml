@@ -182,6 +182,28 @@ let cleanup_stale_orders () =
     ) !stale_orders
   end
 
+(** Clear all open orders across all stores - used on WebSocket reconnection
+    to prevent stale phantom orders from blocking new order placement. *)
+let clear_all_open_orders () =
+  let all_symbols = get_all_symbols () in
+  let total_removed = ref 0 in
+  List.iter (fun symbol ->
+    let store = get_symbol_store symbol in
+    Mutex.lock store.orders_mutex;
+    let count = Hashtbl.length store.open_orders in
+    total_removed := !total_removed + count;
+    Hashtbl.clear store.open_orders;
+    Mutex.unlock store.orders_mutex;
+  ) all_symbols;
+  (* Clear global index *)
+  Mutex.lock initialization_mutex;
+  Hashtbl.clear order_to_symbol;
+  Mutex.unlock initialization_mutex;
+  if !total_removed > 0 then
+    Logging.info_f ~section "Cleared %d stale open orders on reconnection" !total_removed
+  else
+    Logging.info ~section "No open orders to clear on reconnection"
+
 let trigger_stale_order_cleanup ~reason () =
   Lwt.async (fun () ->
     Logging.debug_f ~section "Triggering stale order cleanup (reason=%s)" reason;

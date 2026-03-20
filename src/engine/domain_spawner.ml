@@ -349,14 +349,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (match grid_strategy_asset with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_filled
-                         asset_with_fees.symbol event.order_id side;
+                         asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price;
                        Logging.info_f ~section "Notified Grid strategy about filled order %s for %s"
                          event.order_id asset_with_fees.symbol
                    | None -> ());
                   (match mm_strategy_asset with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_filled
-                         asset_with_fees.symbol event.order_id side;
+                         asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price;
                        Logging.debug_f ~section "Notified MM strategy about filled order %s for %s"
                          event.order_id asset_with_fees.symbol
                    | None -> ());

@@ -35,6 +35,60 @@ end)
 let responses : (Yojson.Safe.t Lwt.u * float) Response_table.t = Response_table.create 32
 let responses_mutex = Lwt_mutex.create ()
 
+(** Consecutive ping failures tracked by supervisor *)
+let ping_failures = Atomic.make 0
+let reset_ping_failures () = Atomic.set ping_failures 0
+let get_ping_failures () = Atomic.get ping_failures
+let incr_ping_failures () = Atomic.incr ping_failures
+
+(** Pong tracking for active ping/pong monitoring.
+    Hyperliquid pong responses are {"channel": "pong"} with NO id field,
+    so we cannot use the ID-matched send_request mechanism. Instead we
+    fire-and-forget the ping and wait on a dedicated condition variable. *)
+let last_pong_time = ref 0.0
+let pong_condition = Lwt_condition.create ()
+
+(** Fail all pending response waiters on disconnect — mirrors Kraken's
+    fail_all_pending / reset_state pattern. Without this, in-flight
+    send_request calls hang until their individual timeouts (up to 5s). *)
+let fail_all_pending reason =
+  Lwt.async (fun () ->
+    Lwt_mutex.with_lock responses_mutex (fun () ->
+      let count = Response_table.length responses in
+      if count > 0 then
+        Logging.info_f ~section "Failing %d pending response waiters (reason: %s)" count reason;
+      Response_table.iter (fun req_id (wakener, _timestamp) ->
+        (try
+          Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "WebSocket disconnected: %s" reason))
+        with Invalid_argument _ ->
+          Logging.debug_f ~section "Pending req_id %d already resolved during fail_all_pending" req_id)
+      ) responses;
+      Response_table.clear responses;
+      Lwt.return_unit
+    )
+  )
+
+(** Clean up stale response table entries older than 30s — prevents memory leaks.
+    Mirrors Kraken's cleanup_stale_response_entries pattern. *)
+let cleanup_stale_responses () =
+  Lwt_mutex.with_lock responses_mutex (fun () ->
+    let now = Unix.time () in
+    let stale = ref [] in
+    Response_table.iter (fun req_id (wakener, timestamp) ->
+      if now -. timestamp > 30.0 then
+        stale := (req_id, wakener, timestamp) :: !stale
+    ) responses;
+    List.iter (fun (req_id, wakener, timestamp) ->
+      Response_table.remove responses req_id;
+      Logging.debug_f ~section "Cleaned up stale response entry for req_id=%d (age: %.1fs)" req_id (now -. timestamp);
+      (try Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
+       with Invalid_argument _ -> ())
+    ) !stale;
+    if !stale <> [] then
+      Logging.debug_f ~section "Cleaned up %d stale response table entries" (List.length !stale);
+    Lwt.return_unit
+  )
+
 (** Broadcast to all subscribers *)
 let broadcast_message json =
   Mutex.lock pushers_mutex;
@@ -106,6 +160,12 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
           try member "channel" json |> to_string with _ -> ""
         in
         
+        (* Detect pong responses for active ping monitoring *)
+        if channel = "pong" then begin
+          last_pong_time := Unix.gettimeofday ();
+          (try Lwt_condition.broadcast pong_condition () with _ -> ())
+        end;
+
         (* post responses are logged in hyperliquid_module as "Hyperliquid order raw response" *)
         (* pong is noisy, but we want to see post for now for debugging timeouts *)
         let is_noisy = List.mem channel ["pong"] in
@@ -182,7 +242,12 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
       Lwt.return_unit
   | Websocket.Frame.Opcode.Close ->
       Logging.info ~section "WebSocket connection closed by server";
-      Atomic.set is_connected_ref false;
+      Lwt_mutex.with_lock connection_mutex (fun () ->
+        active_connection := None;
+        Atomic.set is_connected_ref false;
+        Lwt.return_unit
+      ) >>= fun () ->
+      fail_all_pending "Connection closed by server";
       signal_new_data ();  (* unblock waiting domain workers so they re-check is_running *)
       Lwt.return_unit
   | _ -> Lwt.return_unit
@@ -211,36 +276,50 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
       Lwt.return_unit
     ) >>= fun () ->
     on_connected ();
+    reset_ping_failures ();
     
-    (* Start heartbeat task *)
-    let rec heartbeat () =
-      if Atomic.get is_connected_ref then
-        Lwt.catch (fun () ->
-          let ping_msg = `Assoc [("method", `String "ping")] in
-          subscribe ping_msg >>= fun () ->
-          Lwt_unix.sleep 30.0 >>= heartbeat
-        ) (fun _ -> Lwt.return_unit)
-      else Lwt.return_unit
-    in
-    Lwt.async heartbeat;
+    (* No internal heartbeat loop — supervisor owns ping/pong monitoring,
+       matching the Kraken auth WS pattern for consistent supervision. *)
 
     let rec loop () =
       Websocket_lwt_unix.read conn >>= fun frame ->
       handle_frame ~on_heartbeat frame >>= fun () ->
       if Atomic.get is_connected_ref then loop () else Lwt.return_unit
     in
-    Lwt.catch loop (fun exn ->
-      Lwt_mutex.with_lock connection_mutex (fun () ->
-        active_connection := None;
-        Atomic.set is_connected_ref false;
-        Lwt.return_unit
-      ) >>= fun () ->
-      Lwt.fail exn
-    )
+    Lwt.catch loop (function
+      | End_of_file ->
+          Logging.warn ~section "WebSocket connection closed unexpectedly (End_of_file)";
+          Lwt_mutex.with_lock connection_mutex (fun () ->
+            active_connection := None;
+            Atomic.set is_connected_ref false;
+            Lwt.return_unit
+          ) >>= fun () ->
+          fail_all_pending "Connection closed unexpectedly (End_of_file)";
+          Lwt.fail_with "Connection closed unexpectedly (End_of_file)"
+      | exn ->
+          Logging.error_f ~section "WebSocket read error: %s" (Printexc.to_string exn);
+          Lwt_mutex.with_lock connection_mutex (fun () ->
+            active_connection := None;
+            Atomic.set is_connected_ref false;
+            Lwt.return_unit
+          ) >>= fun () ->
+          fail_all_pending (Printexc.to_string exn);
+          Lwt.fail exn
+    ) >>= fun () ->
+    (* Read loop exited normally (e.g. server Close frame).
+       Treat this as a connection failure so supervisor triggers restart. *)
+    Lwt_mutex.with_lock connection_mutex (fun () ->
+      active_connection := None;
+      Atomic.set is_connected_ref false;
+      Lwt.return_unit
+    ) >>= fun () ->
+    fail_all_pending "WebSocket closed by server";
+    Lwt.fail_with "WebSocket closed by server"
   ) (fun exn ->
     let error_msg = Printexc.to_string exn in
     Logging.error_f ~section "WebSocket connection error: %s" error_msg;
     Atomic.set is_connected_ref false;
+    fail_all_pending error_msg;
     on_failure error_msg;
     Lwt.return_unit
   )
@@ -249,6 +328,10 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
 let send_request ~json ~req_id ~timeout_ms =
   let waiter, wakener = Lwt.wait () in
   Lwt_mutex.with_lock responses_mutex (fun () ->
+    (* Backpressure check: clean up stale entries if table is growing large *)
+    let pending_count = Response_table.length responses in
+    if pending_count > 10 then
+      Logging.warn_f ~section "Response table size is high: %d pending requests" pending_count;
     Response_table.add responses req_id (wakener, Unix.time ());
     Lwt.return_unit
   ) >>= fun () ->
@@ -268,3 +351,34 @@ let send_request ~json ~req_id ~timeout_ms =
       | `Resolved -> waiter
     )
   ]
+
+(** Send a ping and wait for pong — used by supervisor for active health monitoring.
+    Hyperliquid pong = {"channel":"pong"} with NO id field, so we use a
+    dedicated condition variable instead of the ID-matched send_request. *)
+let send_ping ~req_id:_ ~timeout_ms =
+  let ping_msg = `Assoc [("method", `String "ping")] in
+  let send_time = Unix.gettimeofday () in
+  Lwt.catch (fun () ->
+    subscribe ping_msg >>= fun () ->
+    let timeout = float_of_int timeout_ms /. 1000.0 in
+    Lwt.pick [
+      (Lwt_condition.wait pong_condition >>= fun () ->
+       Logging.debug ~section "Pong received";
+       reset_ping_failures ();
+       Lwt.return true);
+      (Lwt_unix.sleep timeout >>= fun () ->
+       (* Check if pong arrived but we missed the condition signal *)
+       if !last_pong_time > send_time then begin
+         reset_ping_failures ();
+         Lwt.return true
+       end else begin
+         Logging.warn ~section "Ping timed out (no pong received)";
+         incr_ping_failures ();
+         Lwt.return false
+       end)
+    ]
+  ) (fun exn ->
+    Logging.warn_f ~section "Ping send failed: %s" (Printexc.to_string exn);
+    incr_ping_failures ();
+    Lwt.return false
+  )
