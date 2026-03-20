@@ -805,12 +805,14 @@ let execute_strategy
                 accumulated base asset.  The available balance must exclude:
                 1. reserved_base — accumulated base that must never be sold
                 2. qty already locked in open sell orders on the exchange
+                Uses the open_orders parameter (authoritative exchange data) rather than
+                state.open_sell_orders which may be empty after startup/reconnection.
                 Kraken does not use reserved_base so the check is skipped. *)
              let balance_ok =
                if asset.exchange = "hyperliquid" then
-                 let locked_in_sells = List.fold_left (fun acc (_, _sell_price) ->
-                   acc +. qty  (* each open sell order locks one grid_qty of base asset *)
-                 ) 0.0 state.open_sell_orders in
+                 let locked_in_sells = List.fold_left (fun acc (_oid, _price, remaining_qty, side_str, _uref) ->
+                   if side_str = "sell" then acc +. remaining_qty else acc
+                 ) 0.0 open_orders in
                  let available = asset_bal -. state.reserved_base -. locked_in_sells in
                  if available >= sell_qty then true
                  else begin
