@@ -186,7 +186,28 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         else
           (None, None)
       in
-      
+
+      (* Early-init strategy state so fill handlers have correct config values
+         before the first execute_strategy call.  The domain loop consumes exec
+         events (which call handle_order_filled) BEFORE execute_strategy, so
+         without this, exchange_id/grid_qty/maker_fee are still at their
+         defaults (""/0.0/0.0) and the profit calc + persistence save silently
+         produce nothing. *)
+      (match grid_strategy_asset with
+       | Some asset ->
+           let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
+           st.exchange_id <- asset.exchange;
+           st.grid_qty <- (try float_of_string asset.qty with Failure _ -> 0.001);
+           st.maker_fee <- (match asset.maker_fee with
+             | Some f -> f
+             | None ->
+                 match Dio_strategies.Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
+                 | Some cached -> cached
+                 | None -> 0.0);
+           Logging.debug_f ~section "Early-init strategy state for %s: exchange_id=%s, grid_qty=%.8f, maker_fee=%.6f"
+             asset.symbol asset.exchange st.grid_qty st.maker_fee
+       | None -> ());
+
       (* Set exec position to current to skip any snapshot events that occurred before this domain started.
          Exception: for Hyperliquid, start from 0 so that webData2-generated NewStatus exec events
          (inserted into the ring buffer during startup snapshot processing) are seen by the domain
