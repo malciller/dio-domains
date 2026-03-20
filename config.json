@@ -9,19 +9,29 @@
   },
   "trading": [
     {
+      "symbol": "BTC/USD",
+      "exchange": "kraken",
+      "qty": "0.0002",
+      "grid_interval": [
+        0.75,
+        2.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
       "symbol": "USDG/USD",
       "exchange": "kraken",
       "qty": "100.0",
       "strategy": "MM"
     },
     {
-      "symbol": "BTC/USDC",
+      "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.0002",
+      "qty": "0.35",
       "grid_interval": [
-        0.25,
-        0.5
-        
+        0.18,
+        0.75
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": 1.00,

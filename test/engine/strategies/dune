@@ -8,7 +8,7 @@
 
 (test
  (name test_suicide_grid)
- (libraries dio.strategies dio.engine alcotest))
+ (libraries dio.strategies dio.engine dio.hyperliquid alcotest))
 
 (test
  (name test_auto_hedger)

@@ -11,3 +11,4 @@ module Instruments_feed = Hyperliquid_instruments_feed
 module Get_fee = Hyperliquid_get_fee
 module Module = Hyperliquid_module
 module Types = Hyperliquid_types
+module State_persistence = Hyperliquid_state_persistence
