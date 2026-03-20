@@ -175,6 +175,8 @@ let test_accumulation_profit_tracking () =
   state.accumulated_profit <- 0.0;
   state.grid_qty <- 0.35;
   state.maker_fee <- 0.0004;
+  (* Clear startup replay gate so fills are processed normally *)
+  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done symbol;
 
   (* Simulate buy fill: sets last_buy_fill_price *)
   state.last_buy_order_id <- Some "buy001";
@@ -301,6 +303,8 @@ let test_accumulation_full_lifecycle () =
   state.accumulated_profit <- 0.0;
   state.grid_qty <- 0.35;         (* 0.35 asset *)
   state.maker_fee <- 0.0004;
+  (* Clear startup replay gate so fills are processed normally *)
+  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done symbol;
 
   let buy_price = 39.50 in        (* USDC per asset *)
   let sell_price = 39.90 in       (* USDC per asset *)
@@ -387,6 +391,9 @@ let test_accumulation_multi_strategy_isolation () =
   hype.accumulated_profit <- 0.0;
   hype.grid_qty <- 0.35;     (* 0.35 HYPE (asset) *)
   hype.maker_fee <- 0.0004;
+  (* Clear startup replay gate so fills are processed normally *)
+  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done btc_sym;
+  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done hype_sym;
 
   (* Verify lot sizes are correct *)
   let btc_rounded = round_qty_hl (0.0002 *. 0.999) btc_sym in

@@ -71,6 +71,7 @@ type strategy_state = {
   mutable exchange_id: string;          (* cached exchange name for persistence decisions *)
   mutable startup_replay: bool;  (* true during startup fill replay; gates profit calculation *)
   mutable last_fill_oid: string option; (* OID of last fill that credited profit; resumption point *)
+  mutable highest_startup_oid: string option; (* highest fill OID seen during startup replay; used to bootstrap new strategies *)
   mutable anticipated_base_credit: float;  (* base qty from buy fills not yet reflected in balance feed *)
   mutable last_seen_asset_balance: float;  (* last asset_bal seen; used to detect balance feed catching up *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
@@ -114,8 +115,9 @@ let get_strategy_state asset_symbol =
           grid_qty = 0.0;
           maker_fee = 0.0;
           exchange_id = "";
-          startup_replay = (persisted_last_fill_oid <> None);  (* replay gate active if we have a resumption point *)
+          startup_replay = true;  (* always gate profit calc during startup; set_startup_replay_done clears *)
           last_fill_oid = persisted_last_fill_oid;
+          highest_startup_oid = None;
           anticipated_base_credit = 0.0;
           last_seen_asset_balance = 0.0;
           mutex = Mutex.create ();
@@ -1297,7 +1299,19 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
        profit = (sell_price - buy_price) * qty - maker fees on both legs
        During startup_replay, skip profit calculation for fills already persisted
        (OID <= last_fill_oid). Tracking state (buy/sell IDs, inflight flags) is
-       still updated above so the strategy enters the correct operational state. *)
+       still updated above so the strategy enters the correct operational state.
+       Also track the highest OID seen during startup for new-strategy bootstrapping. *)
+    (* Track highest OID during startup replay for new-strategy bootstrapping *)
+    if state.startup_replay then begin
+      let dominated = match state.highest_startup_oid with
+        | None -> true
+        | Some prev ->
+            (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev) > 0
+             with _ -> false)
+      in
+      if dominated then
+        state.highest_startup_oid <- Some order_id
+    end;
     let skip_profit_calc =
       state.startup_replay &&
       (match state.last_fill_oid with
@@ -1305,7 +1319,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
            (* OIDs are monotonically increasing integers on Hyperliquid *)
            (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
             with _ -> false)
-       | None -> false)
+       | None -> true  (* New strategy: no persisted OID — skip ALL fills during startup replay *))
     in
     if skip_profit_calc then
       Logging.debug_f ~section "Skipping startup replay fill %s for %s (already persisted, last_fill_oid=%s)"
@@ -1650,7 +1664,26 @@ module Strategy = struct
       Logging.info_f ~section "Startup replay complete for %s (last_fill_oid=%s, accumulated_profit=%.6f)"
         symbol
         (Option.value state.last_fill_oid ~default:"none")
-        state.accumulated_profit
+        state.accumulated_profit;
+      (* Bootstrap persistent state for new Hyperliquid suicide_grid strategies.
+         If we have never persisted state for this symbol (last_fill_oid=None)
+         but saw fill events during startup, establish an anchor point so the
+         next restart can resume from a known position. *)
+      if state.last_fill_oid = None
+         && state.highest_startup_oid <> None
+         && state.exchange_id = "hyperliquid" then begin
+        state.last_fill_oid <- state.highest_startup_oid;
+        Hyperliquid.State_persistence.save ~symbol
+          ~reserved_base:state.reserved_base
+          ~accumulated_profit:state.accumulated_profit
+          ~last_fill_oid:(Option.get state.highest_startup_oid) ();
+        Logging.info_f ~section
+          "Bootstrapped initial state for %s (last_fill_oid=%s, reserved_base=%.8f, accumulated_profit=%.6f)"
+          symbol
+          (Option.get state.highest_startup_oid)
+          state.reserved_base
+          state.accumulated_profit
+      end
     end;
     Mutex.unlock state.mutex
 end
