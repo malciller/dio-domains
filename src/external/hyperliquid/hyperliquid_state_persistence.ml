@@ -1,13 +1,15 @@
 (**
    Persistent state for strategy accumulation tracking.
 
-   Saves/loads reserved_base (base asset accumulated via sell_mult),
-   accumulated_profit (USDC realized PnL), and last_fill_oid
-   (the OID of the last fill that updated profit) to a JSON file
-   so values survive Docker container restarts.
+    Saves/loads reserved_base (base asset accumulated via sell_mult),
+    accumulated_profit (USDC realized PnL), last_fill_oid
+    (the OID of the last fill that updated profit), and
+    last_buy_fill_price (the fill price of the most recent buy,
+    used to compute profit on the next sell fill) to a JSON file
+    so values survive Docker container restarts.
 
-   File: /app/data/accumulated_state.json (or ./data/ in dev)
-   Format: { "SYMBOL": { "reserved_base": float, "accumulated_profit": float, "last_fill_oid": string }, ... }
+    File: /app/data/accumulated_state.json (or ./data/ in dev)
+    Format: { "SYMBOL": { "reserved_base": float, "accumulated_profit": float, "last_fill_oid": string, "last_buy_fill_price": float }, ... }
 *)
 
 let section = "state_persistence"
@@ -53,6 +55,13 @@ let get_float (json : Yojson.Basic.t) ~symbol ~field ~default =
     json |> member symbol |> member field |> to_float
   with _ -> default
 
+(** Extract an optional float field from a symbol's JSON entry *)
+let get_float_opt (json : Yojson.Basic.t) ~symbol ~field =
+  let open Yojson.Basic.Util in
+  try
+    Some (json |> member symbol |> member field |> to_float)
+  with _ -> None
+
 (** Extract a string field from a symbol's JSON entry *)
 let get_string_opt (json : Yojson.Basic.t) ~symbol ~field =
   let open Yojson.Basic.Util in
@@ -97,9 +106,23 @@ let load_last_fill_oid ~symbol =
    | None -> ());
   result
 
-(** Save reserved_base, accumulated_profit, and optionally last_fill_oid for a symbol.
+(** Load last_buy_fill_price for a symbol. Returns None if missing. *)
+let load_last_buy_fill_price ~symbol =
+  Mutex.lock file_mutex;
+  let result =
+    try get_float_opt (read_state_file ()) ~symbol ~field:"last_buy_fill_price"
+    with _ -> None
+  in
+  Mutex.unlock file_mutex;
+  (match result with
+   | Some price -> Logging.info_f ~section "Loaded last_buy_fill_price=%.8f for %s" price symbol
+   | None -> ());
+  result
+
+(** Save reserved_base, accumulated_profit, and optionally last_fill_oid and
+    last_buy_fill_price for a symbol.
     Reads existing file, updates the symbol's entry, writes atomically. *)
-let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid () =
+let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price () =
   Mutex.lock file_mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock file_mutex) (fun () ->
     try
@@ -122,7 +145,16 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid () =
              | Some oid -> [("last_fill_oid", `String oid)]
              | None -> [])
       in
-      let new_entry = `Assoc (base_fields @ oid_field) in
+      (* Preserve existing last_buy_fill_price if not explicitly provided *)
+      let buy_price_field = match last_buy_fill_price with
+        | Some price -> [("last_buy_fill_price", `Float price)]
+        | None ->
+            let existing_price = get_float_opt existing ~symbol ~field:"last_buy_fill_price" in
+            (match existing_price with
+             | Some price -> [("last_buy_fill_price", `Float price)]
+             | None -> [])
+      in
+      let new_entry = `Assoc (base_fields @ oid_field @ buy_price_field) in
       let updated = List.filter (fun (k, _) -> k <> symbol) entries in
       let final = `Assoc ((symbol, new_entry) :: updated) in
 
@@ -135,9 +167,10 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid () =
         output_char oc '\n'
       );
       Sys.rename tmp path;
-      Logging.debug_f ~section "Persisted state for %s: reserved_base=%.8f, accumulated_profit=%.6f, last_fill_oid=%s"
+      Logging.debug_f ~section "Persisted state for %s: reserved_base=%.8f, accumulated_profit=%.6f, last_fill_oid=%s, last_buy_fill_price=%s"
         symbol reserved_base accumulated_profit
         (match last_fill_oid with Some o -> o | None -> "(unchanged)")
+        (match last_buy_fill_price with Some p -> Printf.sprintf "%.8f" p | None -> "(unchanged)")
     with exn ->
       Logging.warn_f ~section "Failed to persist state for %s: %s" symbol (Printexc.to_string exn)
   )

@@ -195,6 +195,11 @@ module Hyperliquid_impl = struct
               ?user_ref:existing.order_userref
               ?cl_ord_id:constructed_cl_ord_id
               ();
+            (* Remove the old order entry so get_open_orders doesn't return
+               both old and new IDs as ghost duplicates during the window
+               before the WS orderUpdates event marks the old one cancelled. *)
+            if new_order_id_str <> order_id then
+              Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
             Ok {
               Types.original_order_id = Int64.to_string res.order_id;
               Types.new_order_id = new_order_id_str;
