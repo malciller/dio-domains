@@ -595,7 +595,10 @@ let execute_strategy
       ) !to_remove_cooldowns;
 
       (* Sync strategy state with actual open orders from exchange *)
-      (* Clear existing tracked orders *)
+      (* For Hyperliquid: preserve sell orders that were set by handle_order_amended
+         but may not yet appear in exchange data due to WS lag.
+         Kraken clears as before since its data feed is authoritative. *)
+      let preserved_sells = if asset.exchange = "hyperliquid" then state.open_sell_orders else [] in
       state.open_sell_orders <- [];
       (* For Hyperliquid: preserve buy tracking across sync.
          webData2 lags behind execution events during cancel-replace amendments,
@@ -652,6 +655,18 @@ let execute_strategy
 
       (* Set sell orders *)
       state.open_sell_orders <- !sell_orders;
+
+      (* For Hyperliquid: merge any preserved sell orders that aren't in the
+         exchange-sourced list. This covers cancel-replace amendments where
+         the new order hasn't yet appeared in the order update stream. *)
+      if asset.exchange = "hyperliquid" then begin
+        List.iter (fun (preserved_id, preserved_price) ->
+          let already_present = List.exists (fun (id, _) -> id = preserved_id) state.open_sell_orders in
+          let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = preserved_id) state.cancelled_orders in
+          if not already_present && not is_cancelled then
+            state.open_sell_orders <- (preserved_id, preserved_price) :: state.open_sell_orders
+        ) preserved_sells
+      end;
 
       Logging.debug_f ~section "Synced %d open orders for %s: %d buys, %d sells"
         (List.length open_orders) asset.symbol

@@ -180,9 +180,24 @@ module Hyperliquid_impl = struct
               ()
         >|= function
         | Ok res ->
+            (* Proactively populate open_orders with the amended order so that
+               get_open_orders returns accurate data immediately.
+               Without this, there is a gap between the REST amend response and
+               the WS orderUpdates event where the order is invisible — causing
+               grid spacing calculations to use stale sell order prices. *)
+            let new_order_id_str = Int64.to_string res.amend_id in
+            Hyperliquid_executions_feed.inject_order
+              ~symbol:sym
+              ~order_id:new_order_id_str
+              ~side:existing.side
+              ~qty:sz_rounded
+              ~price:px_rounded
+              ?user_ref:existing.order_userref
+              ?cl_ord_id:constructed_cl_ord_id
+              ();
             Ok {
               Types.original_order_id = Int64.to_string res.order_id;
-              Types.new_order_id = Int64.to_string res.amend_id;
+              Types.new_order_id = new_order_id_str;
               Types.amend_id = None;
               Types.cl_ord_id = constructed_cl_ord_id;
             }
