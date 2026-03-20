@@ -166,6 +166,7 @@ let _processor_task =
       Logging.info ~section "Starting Hyperliquid orderbook processor task";
       Lwt_stream.iter process_market_data sub.stream
     ) (fun exn ->
+      sub.close ();
       Logging.error_f ~section "Hyperliquid orderbook processor task crashed: %s. Restarting in 5s..." (Printexc.to_string exn);
       Lwt_unix.sleep 5.0 >>= fun () ->
       run ()
