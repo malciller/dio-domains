@@ -786,7 +786,7 @@ let handle_message message on_heartbeat =
     | Some "status", _, _ ->
         Logging.debug ~section "Status message received"
     | _ ->
-        Logging.info_f ~section "Unhandled execution message: %s" message
+        Logging.debug_f ~section "Unhandled execution message: %s" message
   with exn ->
     Logging.error_f ~section "Error handling message: %s - %s" 
       (Printexc.to_string exn) message
