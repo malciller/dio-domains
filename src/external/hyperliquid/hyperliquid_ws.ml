@@ -89,13 +89,39 @@ let cleanup_stale_responses () =
     Lwt.return_unit
   )
 
+(** Close all subscriber streams — called on WS disconnect to unblock
+    Lwt_stream.iter in processor tasks and prevent orphaned push closures
+    from leaking memory. Pushing None terminates the Lwt_stream. *)
+let close_all_subscribers () =
+  Mutex.lock pushers_mutex;
+  let ps = !pushers in
+  pushers := [];
+  Mutex.unlock pushers_mutex;
+  let count = List.length ps in
+  if count > 0 then begin
+    Logging.info_f ~section "Closing %d subscriber streams on disconnect" count;
+    List.iter (fun push ->
+      (try push None with _ -> ())
+    ) ps
+  end
+
 (** Broadcast to all subscribers *)
 let broadcast_message json =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
   Mutex.unlock pushers_mutex;
   if ps = [] then Logging.warn ~section "No subscribers for WebSocket message!";
-  List.iter (fun push -> push (Some json)) ps;
+  let dead = ref [] in
+  List.iter (fun push ->
+    try push (Some json)
+    with _ -> dead := push :: !dead
+  ) ps;
+  (* Evict any dead pushers *)
+  if !dead <> [] then begin
+    Mutex.lock pushers_mutex;
+    pushers := List.filter (fun p -> not (List.memq p !dead)) !pushers;
+    Mutex.unlock pushers_mutex
+  end;
   signal_new_data ()  (* wake any domain workers blocked in wait_for_data *)
 
 (** Subscribe to all incoming market data messages. *)
@@ -248,6 +274,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
         Lwt.return_unit
       ) >>= fun () ->
       fail_all_pending "Connection closed by server";
+      close_all_subscribers ();
       signal_new_data ();  (* unblock waiting domain workers so they re-check is_running *)
       Lwt.return_unit
   | _ -> Lwt.return_unit
@@ -295,6 +322,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
             Lwt.return_unit
           ) >>= fun () ->
           fail_all_pending "Connection closed unexpectedly (End_of_file)";
+          close_all_subscribers ();
           Lwt.fail_with "Connection closed unexpectedly (End_of_file)"
       | exn ->
           Logging.error_f ~section "WebSocket read error: %s" (Printexc.to_string exn);
@@ -304,6 +332,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
             Lwt.return_unit
           ) >>= fun () ->
           fail_all_pending (Printexc.to_string exn);
+          close_all_subscribers ();
           Lwt.fail exn
     ) >>= fun () ->
     (* Read loop exited normally (e.g. server Close frame).
@@ -314,12 +343,14 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
       Lwt.return_unit
     ) >>= fun () ->
     fail_all_pending "WebSocket closed by server";
+    close_all_subscribers ();
     Lwt.fail_with "WebSocket closed by server"
   ) (fun exn ->
     let error_msg = Printexc.to_string exn in
     Logging.error_f ~section "WebSocket connection error: %s" error_msg;
     Atomic.set is_connected_ref false;
     fail_all_pending error_msg;
+    close_all_subscribers ();
     on_failure error_msg;
     Lwt.return_unit
   )
