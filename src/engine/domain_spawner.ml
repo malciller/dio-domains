@@ -398,6 +398,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (* First exec event batch received - allow strategy to run now *)
           if not !hl_exec_ready then begin
             hl_exec_ready := true;
+            (* Mark startup replay complete so profit calculation is no longer gated *)
+            (match grid_strategy_asset with
+             | Some _ ->
+                 Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
+             | None -> ());
             Logging.info_f ~section "[%s/%s] First exec event batch received, strategy now active"
               asset_with_fees.exchange asset_with_fees.symbol
           end;
@@ -420,6 +425,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           if current_pos_now = !exec_read_pos then begin
             hl_exec_checked := true;
             hl_exec_ready := true;
+            (* Mark startup replay complete so profit calculation is no longer gated *)
+            (match grid_strategy_asset with
+             | Some _ ->
+                 Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
+             | None -> ());
             Logging.info_f ~section "[%s/%s] No exec events after 2s - strategy now active (no open orders)"
               asset_with_fees.exchange asset_with_fees.symbol
           end

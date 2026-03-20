@@ -273,7 +273,7 @@ let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
           try resp |> member "data" |> member "response" |> member "payload"
           with _ -> resp
         in
-        Logging.info_f ~section "Hyperliquid order raw WS response: %s" (Yojson.Safe.to_string payload);
+        Logging.debug_f ~section "Hyperliquid order raw WS response: %s" (Yojson.Safe.to_string payload);
         Lwt.return (Ok payload)
       )
       (fun exn ->

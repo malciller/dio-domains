@@ -60,7 +60,7 @@ let get_fee_info ~testnet _symbol : fee_info option Lwt.t =
       Cohttp_lwt_unix.Client.post ~headers ~body url >>= fun (resp, resp_body) ->
       if Cohttp.Response.status resp |> Cohttp.Code.code_of_status |> fun c -> c >= 200 && c < 300 then
         Cohttp_lwt.Body.to_string resp_body >|= fun body_str ->
-        Logging.info_f ~section "Raw fee response: %s" body_str;
+        Logging.debug_f ~section "Raw fee response: %s" body_str;
         parse_fee_info body_str
       else
         Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
