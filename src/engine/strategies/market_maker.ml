@@ -1079,7 +1079,7 @@ let handle_order_rejected asset_symbol side price =
   (* We don't need to do anything special here - the strategy will re-evaluate on next cycle *)
 
 (** Handle order fill - fully clear tracking and pending amends *)
-let handle_order_filled asset_symbol order_id side =
+let handle_order_filled asset_symbol order_id side ~fill_price:_ =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->

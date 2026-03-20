@@ -268,7 +268,7 @@ module type S = sig
   val handle_order_acknowledged : string -> string -> order_side -> float -> unit
   val handle_order_rejected : string -> order_side -> float -> unit
   val handle_order_cancelled : string -> string -> order_side -> unit
-  val handle_order_filled : string -> string -> order_side -> unit
+  val handle_order_filled : string -> string -> order_side -> fill_price:float -> unit
   val handle_order_amended : string -> string -> string -> order_side -> float -> unit
   val handle_order_amendment_skipped : string -> string -> order_side -> float -> unit
   val handle_order_amendment_failed : string -> string -> order_side -> string -> unit

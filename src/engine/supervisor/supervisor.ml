@@ -296,6 +296,7 @@ let start_async conn =
               connect_fn () >>= fun () ->
               (* Connection function completed - this shouldn't happen for WebSocket connections *)
               Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
+              set_state conn (Failed "connection completed unexpectedly");
               Lwt.return_unit
             ) (fun exn ->
               let error_msg = Printexc.to_string exn in
@@ -411,7 +412,7 @@ let monitor_loop () =
                       end
                   | Connected, _ ->
                       (* For authenticated connections, use active ping/pong monitoring *)
-                      if String.equal conn.name "kraken_auth_ws" then begin
+                      if String.equal conn.name "kraken_auth_ws" || String.equal conn.name "hyperliquid_ws" then begin
                         let should_ping =
                           match conn.last_ping_sent with
                           | None -> true  (* Never pinged before *)
@@ -423,26 +424,47 @@ let monitor_loop () =
                           conn.last_ping_sent <- Some current_time;
                           Lwt.async (fun () ->
                             let req_id = next_ping_req_id () in
-                            Lwt.catch
-                              (fun () ->
-                                Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
-                                if response.success then begin
-                                  Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
-                                  Atomic.set conn.ping_failures 0;  (* Reset failure count on success *)
-                                  update_data_heartbeat conn;  (* Update heartbeat since we got a response *)
-                                  Lwt.return_unit
-                                end else begin
-                                  Logging.warn_f ~section "[%s] Ping failed: %s" conn.name
-                                    (match response.error with Some e -> e | None -> "unknown error");
+                            if String.equal conn.name "kraken_auth_ws" then
+                              Lwt.catch
+                                (fun () ->
+                                  Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
+                                  if response.success then begin
+                                    Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
+                                    Atomic.set conn.ping_failures 0;  (* Reset failure count on success *)
+                                    update_data_heartbeat conn;  (* Update heartbeat since we got a response *)
+                                    Lwt.return_unit
+                                  end else begin
+                                    Logging.warn_f ~section "[%s] Ping failed: %s" conn.name
+                                      (match response.error with Some e -> e | None -> "unknown error");
+                                    Atomic.incr conn.ping_failures;
+                                    Lwt.return_unit
+                                  end
+                                )
+                                (fun exn ->
+                                  Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
                                   Atomic.incr conn.ping_failures;
                                   Lwt.return_unit
-                                end
-                              )
-                              (fun exn ->
-                                Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
-                                Atomic.incr conn.ping_failures;
-                                Lwt.return_unit
-                              )
+                                )
+                            else (* hyperliquid_ws *)
+                              Lwt.catch
+                                (fun () ->
+                                  Hyperliquid.Ws.send_ping ~req_id ~timeout_ms:5000 >>= fun success ->
+                                  if success then begin
+                                    Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
+                                    Atomic.set conn.ping_failures 0;
+                                    update_data_heartbeat conn;
+                                    Lwt.return_unit
+                                  end else begin
+                                    Logging.warn_f ~section "[%s] Ping failed (req_id: %d)" conn.name req_id;
+                                    Atomic.incr conn.ping_failures;
+                                    Lwt.return_unit
+                                  end
+                                )
+                                (fun exn ->
+                                  Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit
+                                )
                           )
                         end;
 
@@ -529,14 +551,33 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
      let hl_ws_conn = register ~name:"hyperliquid_ws" ~connect_fn:None in
      let hl_ws_connect_fn () =
        Lwt.catch (fun () ->
-         let on_failure reason = set_state hl_ws_conn (Failed reason) in
+         let on_failure reason =
+           set_state hl_ws_conn (Failed reason);
+           (* Immediately trigger reconnection attempt — mirrors Kraken auth WS pattern
+              to avoid waiting for monitor loop's backoff cycle (2s+). *)
+           Lwt.async (fun () ->
+             Lwt.catch (fun () ->
+               Lwt_unix.sleep 0.1 >>= fun () ->
+               start_async hl_ws_conn;
+               Lwt.return_unit
+             ) (fun exn ->
+               Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" hl_ws_conn.name (Printexc.to_string exn);
+               Lwt.return_unit
+             )
+           )
+         in
          let on_heartbeat () = update_data_heartbeat hl_ws_conn in
          let on_connected () =
            set_state hl_ws_conn Connected;
            let wallet = Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.value ~default:"" in
            Lwt.async (fun () -> 
              Hyperliquid.Instruments_feed.wait_until_ready () >>= fun () ->
-             Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet)
+             Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet >>= fun () ->
+             (* Clear stale open orders and immediately re-fetch actual state
+                from exchange. Done sequentially to minimize the window where
+                the strategy could see 0 orders and spam new placements. *)
+             Hyperliquid.Executions_feed.clear_all_open_orders ();
+             Hyperliquid.Module.fetch_open_orders_ws ())
          in
          Hyperliquid.Ws.connect_and_monitor 
            ~testnet:hyperliquid_testnet 

@@ -504,7 +504,17 @@ let execute_strategy
   
   match current_price, top_of_book with
   | None, _ -> ()  (* No price data available yet *)
-  | Some price, _ ->
+  | Some price, top_opt ->
+      (* Use l2Book top-of-book bid/ask instead of allMids mid price.
+         l2Book updates per-block and tracks actual market state, while
+         allMids batches across all coins and can diverge from the fill price
+         during fast candle movements — causing sell order stacking on Hyperliquid.
+         Sell-side calcs use bid_price; buy-side calcs use ask_price.
+         Fallback to mid if orderbook data is unavailable. *)
+      let (bid_price, ask_price) = match top_opt with
+        | Some (bid, _, ask, _) when bid > 0.0 && ask > 0.0 -> (bid, ask)
+        | _ -> (price, price)
+      in
 
       (* Efficient cleanup logic - run every cycle but use scan-and-remove to avoid allocation *)
       (* This prevents accumulation while maintaining HFT responsiveness *)
@@ -653,7 +663,7 @@ let execute_strategy
       state.exchange_id <- asset.exchange;
 
       (* Calculate required balances *)
-      let quote_needed = price *. qty in
+      let quote_needed = ask_price *. qty in
       let asset_needed =
         if asset.exchange = "hyperliquid" then qty  (* most sells are 1:1 on Hyperliquid *)
         else qty *. sell_mult
@@ -744,18 +754,20 @@ let execute_strategy
            When a buy fills, any existing sell's InFlightOrders key is still live,
            which would block the new sell via duplicate detection.
            Force-clear the sell key so a fresh sell is always placed alongside the new buy. *)
-        let sell_price = calculate_grid_price price grid_interval true asset.symbol asset.exchange in
-        let buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
+        let sell_price = calculate_grid_price bid_price grid_interval true asset.symbol asset.exchange in
+        let buy_price = calculate_grid_price ask_price grid_interval false asset.symbol asset.exchange in
 
         let buy_cooldown_key = "place_Buy" in
         let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
 
         (* Place sell order first - sell and buy are always paired.
            asset_low flag blocks entry to this entire branch at the top level.
-           Guard: on Hyperliquid, ensure (asset_bal - reserved_base) >= sell_qty
-           so accumulated base asset is never accidentally sold. *)
+           Always attempt the sell regardless of local balance — cached balance
+           may be stale after a buy fill.  If the exchange rejects, asset_low
+           is set and won't clear until (asset_bal - reserved_base) >= needed,
+           protecting the accumulated base asset. *)
         (match asset_balance with
-         | Some asset_bal when not state.inflight_sell ->
+         | Some _asset_bal when not state.inflight_sell ->
              let sell_qty =
                if asset.exchange = "hyperliquid" then begin
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
@@ -779,25 +791,10 @@ let execute_strategy
                end else
                  qty *. sell_mult
              in
-             (* Sell guard: ensure we don't dip into reserved_base *)
-             let available_asset = asset_bal -. state.reserved_base in
-             if available_asset >= sell_qty then begin
-               let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-               if push_order sell_order then
-                 Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f (available %.8f, reserved %.8f)"
-                   asset.symbol sell_qty sell_price available_asset state.reserved_base
-             end else begin
-               if asset.exchange = "hyperliquid" then
-                 Logging.info_f ~section "Skipping sell for %s: available %.8f < needed %.8f (reserved_base %.8f protects accumulated asset)"
-                   asset.symbol available_asset sell_qty state.reserved_base
-               else begin
-                 (* Non-Hyperliquid: attempt sell and let exchange reject if needed *)
-                 let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-                 if push_order sell_order then
-                   Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                     asset.symbol sell_qty sell_price
-               end
-             end
+             let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+             if push_order sell_order then
+               Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+                 asset.symbol sell_qty sell_price
          | _ -> ()
         );
 
@@ -831,9 +828,9 @@ let execute_strategy
                  ) None all_sells in
                  (match closest_sell with
                   | Some cs_price ->
-                      let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
+                      let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
                       let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
-                      let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
+                      let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
                       if abs_float (target_buy -. buy_price) > min_move_threshold then
                         Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
                           asset.symbol buy_price target_buy cs_price
@@ -889,14 +886,14 @@ let execute_strategy
               (* Calculate distance from buy to sell as absolute dollar amount *)
               let distance = sell_price -. current_buy_price in
               (* Calculate 2x grid_interval as absolute dollar amount based on current price *)
-              let double_grid_interval = price *. (2.0 *. grid_interval /. 100.0) in
+              let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
 
               (* Always calculate exact 2x target from sell *)
               let exact_target = round_price (sell_price -. double_grid_interval) asset.symbol asset.exchange in
               
               if distance > double_grid_interval then begin
                 (* Distance > 2x: Trail upward ONLY to maintain grid_interval below current price *)
-                let proposed_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
+                let proposed_buy_price = calculate_grid_price ask_price grid_interval false asset.symbol asset.exchange in
                 
                 (* ONLY trail upward - never move buy order down *)
                 if proposed_buy_price > current_buy_price then begin
@@ -913,7 +910,7 @@ let execute_strategy
                       proposed_buy_price
                   in
                   
-                  let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
+                  let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
                   let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                   let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
                   
@@ -951,7 +948,7 @@ let execute_strategy
                 let exact_target_rounded = exact_target in
                 let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                 let price_diff_rounded = round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) asset.symbol asset.exchange in
-                let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
+                let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
 
                 (* Check if this order is already being amended *)
                 let is_being_amended = List.exists (fun (id, _, _, _) ->
@@ -988,10 +985,10 @@ let execute_strategy
              in the effective_buy_count=0 branch after a buy fills. *)
            match state.last_buy_order_price, state.last_buy_order_id with
            | Some current_buy_price, Some buy_order_id ->
-               let target_buy_price = calculate_grid_price price grid_interval false asset.symbol asset.exchange in
+               let target_buy_price = calculate_grid_price ask_price grid_interval false asset.symbol asset.exchange in
                             (* Only trail upward - move buy up if target is higher than current *)
                if target_buy_price > current_buy_price then begin
-                 let min_move_threshold = get_min_move_threshold price grid_interval asset.symbol asset.exchange in
+                 let min_move_threshold = get_min_move_threshold ask_price grid_interval asset.symbol asset.exchange in
                  let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                  let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
 
@@ -1186,7 +1183,7 @@ let handle_order_rejected asset_symbol side price =
   (* We don't need to do anything special here - the strategy will re-evaluate on next cycle *)
 
 (** Handle order fill - fully clear tracking and pending amends *)
-let handle_order_filled asset_symbol order_id side =
+let handle_order_filled asset_symbol order_id side ~fill_price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1197,8 +1194,14 @@ let handle_order_filled asset_symbol order_id side =
            String.sub pending_id 14 (String.length pending_id - 14) = order_id)
     ) state.pending_orders;
 
-    (* 2. Look up sell price BEFORE filtering — needed for profit calculation *)
-    let sell_fill_price = List.assoc_opt order_id state.open_sell_orders in
+    (* 2. Look up sell price BEFORE filtering — needed for profit calculation.
+       Use exec event fill_price as primary source; fall back to open_sell_orders
+       for backward compat. This fixes Hyperliquid amends where webData2 never
+       surfaces the replacement sell order. *)
+    let sell_fill_price = match List.assoc_opt order_id state.open_sell_orders with
+      | Some p -> p
+      | None -> fill_price  (* exec event fill price — always available *)
+    in
 
     (* 3. Remove from sell orders tracking if it was a sell order *)
     state.open_sell_orders <- List.filter (fun (sell_id, _) ->
@@ -1211,8 +1214,8 @@ let handle_order_filled asset_symbol order_id side =
       | _ -> false
     in
     if was_tracked_buy then begin
-      (* Record buy fill price for profit calculation on matching sell fill *)
-      state.last_buy_fill_price <- state.last_buy_order_price;
+      (* Record actual buy fill price for profit calculation on matching sell fill *)
+      state.last_buy_fill_price <- Some fill_price;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
       Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
@@ -1222,11 +1225,11 @@ let handle_order_filled asset_symbol order_id side =
        profit = (sell_price - buy_price) * qty - maker fees on both legs *)
     (match side with
      | Sell ->
-         (match sell_fill_price, state.last_buy_fill_price with
-          | Some sell_price, Some buy_price when sell_price > buy_price ->
+          (match state.last_buy_fill_price with
+           | Some buy_price when sell_fill_price > buy_price ->
               let qty = state.grid_qty in
-              let gross = (sell_price -. buy_price) *. qty in
-              let fees = (sell_price *. qty *. state.maker_fee)
+              let gross = (sell_fill_price -. buy_price) *. qty in
+              let fees = (sell_fill_price *. qty *. state.maker_fee)
                        +. (buy_price *. qty *. state.maker_fee) in
               let net_profit = gross -. fees in
               if net_profit > 0.0 then begin
@@ -1237,7 +1240,7 @@ let handle_order_filled asset_symbol order_id side =
                     ~reserved_base:state.reserved_base
                     ~accumulated_profit:state.accumulated_profit;
                 Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f buy@%.4f x %.8f), accumulated: %.6f"
-                  asset_symbol net_profit gross fees sell_price buy_price qty state.accumulated_profit
+                  asset_symbol net_profit gross fees sell_fill_price buy_price qty state.accumulated_profit
               end
           | _ -> ())
      | Buy -> ());
