@@ -107,6 +107,19 @@ let initialize symbols =
   Mutex.unlock cache_mutex;
   Logging.info_f ~section "Initialized Hyperliquid instruments feed with %d mock symbols" (List.length symbols)
 
+(** Register a single instrument with a custom sz_decimals for testing *)
+let register_test_instrument ~symbol ~sz_decimals =
+  Mutex.lock cache_mutex;
+  let max_leverage = if String.contains symbol '/' then None else Some 50 in
+  let asset_index = if String.contains symbol '/' then 10000 else 0 in
+  let info = { symbol; sz_decimals; max_leverage; asset_index } in
+  Hashtbl.replace pair_cache symbol info;
+  (* Also register the base asset as a perp alias so lookup_info fallback works *)
+  (match String.split_on_char '/' symbol with
+   | base :: _ when base <> symbol -> Hashtbl.replace pair_cache base info
+   | _ -> ());
+  Mutex.unlock cache_mutex
+
 (** Look up a symbol in the cache, with a fallback for perp pairs expressed as BASE/USDC.
     Config uses "BTC/USDC" but perps are cached as just "BTC" (index 0..N-1).
     Spot pairs are stored as "BASE/QUOTE" directly (index 10000+). *)

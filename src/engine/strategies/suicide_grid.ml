@@ -64,9 +64,11 @@ type strategy_state = {
   mutable capital_low_logged: bool; (* true once we have logged the capital-low warning to suppress repeat spam *)
   mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
   mutable accumulated_profit: float;    (* realized PnL from completed buy→sell pairs; Hyperliquid discrete sizing *)
+  mutable reserved_base: float;  (* base asset accumulated via sell_mult; excluded from sellable balance *)
   mutable last_buy_fill_price: float option; (* price of the most recent buy fill; used to compute profit on sell fill *)
   mutable grid_qty: float;              (* cached config qty for profit calc in fill handler *)
   mutable maker_fee: float;             (* cached maker fee rate for profit calc in fill handler *)
+  mutable exchange_id: string;          (* cached exchange name for persistence decisions *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -81,6 +83,9 @@ let get_strategy_state asset_symbol =
     match Hashtbl.find_opt strategy_states asset_symbol with
     | Some state -> state
     | None ->
+        (* Load persisted state for this symbol (survives Docker restarts) *)
+        let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
+        let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
@@ -98,10 +103,12 @@ let get_strategy_state asset_symbol =
           capital_low = false;
           capital_low_logged = false;
           reserved_quote = 0.0;
-          accumulated_profit = 0.0;
+          accumulated_profit = persisted_accumulated_profit;
+          reserved_base = persisted_reserved_base;
           last_buy_fill_price = None;
           grid_qty = 0.0;
           maker_fee = 0.0;
+          exchange_id = "";
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -429,6 +436,7 @@ let execute_strategy
   let state = get_strategy_state asset.symbol in
 
    (* --- Asset-low check: clear flag when asset balance recovers --- *)
+   (* Subtract reserved_base so accumulated base asset is protected from sells *)
    (match asset_balance with
     | Some asset_bal ->
         let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
@@ -437,12 +445,13 @@ let execute_strategy
           else let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
                qty_f *. sell_mult_f
         in
-        if state.asset_low && asset_bal >= asset_needed_fast then begin
+        let available_asset = asset_bal -. state.reserved_base in
+        if state.asset_low && available_asset >= asset_needed_fast then begin
           state.asset_low <- false;
           state.inflight_sell <- false;
           ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
-          Logging.info_f ~section "Asset balance restored for %s (have %.8f, need %.8f) - resuming sell+buy placement"
-            asset.symbol asset_bal asset_needed_fast
+          Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
+            asset.symbol asset_bal state.reserved_base available_asset asset_needed_fast
         end
     | None -> ()
    );
@@ -641,6 +650,7 @@ let execute_strategy
       (* Cache config values in state so handle_order_filled can compute real PnL *)
       state.grid_qty <- qty;
       state.maker_fee <- (match asset.maker_fee with Some f -> f | None -> 0.0);
+      state.exchange_id <- asset.exchange;
 
       (* Calculate required balances *)
       let quote_needed = price *. qty in
@@ -742,10 +752,10 @@ let execute_strategy
 
         (* Place sell order first - sell and buy are always paired.
            asset_low flag blocks entry to this entire branch at the top level.
-           Always attempt the sell regardless of local balance — let the exchange
-           be the final arbiter.  If it rejects, handle_order_failed sets asset_low. *)
+           Guard: on Hyperliquid, ensure (asset_bal - reserved_base) >= sell_qty
+           so accumulated base asset is never accidentally sold. *)
         (match asset_balance with
-         | Some _asset_bal when not state.inflight_sell ->
+         | Some asset_bal when not state.inflight_sell ->
              let sell_qty =
                if asset.exchange = "hyperliquid" then begin
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
@@ -754,19 +764,40 @@ let execute_strategy
                  if required_profit > 0.0 && state.accumulated_profit >= required_profit then begin
                    (* Profit-gated: enough realized profit to cover the rounding cost *)
                    state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                   let base_increment = qty -. rounded_sell in
+                   state.reserved_base <- state.reserved_base +. base_increment;
+                   (* Persist both values so they survive Docker restarts *)
+                   Hyperliquid.State_persistence.save ~symbol:asset.symbol
+                     ~reserved_base:state.reserved_base
+                     ~accumulated_profit:state.accumulated_profit;
                    Logging.info_f ~section
-                     "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f)"
-                     asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit;
+                     "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
+                     asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base;
                    rounded_sell
                  end else
                    qty  (* 1:1 sell until profit covers rounding cost *)
                end else
                  qty *. sell_mult
              in
-             let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-             if push_order sell_order then
-               Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                 asset.symbol sell_qty sell_price
+             (* Sell guard: ensure we don't dip into reserved_base *)
+             let available_asset = asset_bal -. state.reserved_base in
+             if available_asset >= sell_qty then begin
+               let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+               if push_order sell_order then
+                 Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f (available %.8f, reserved %.8f)"
+                   asset.symbol sell_qty sell_price available_asset state.reserved_base
+             end else begin
+               if asset.exchange = "hyperliquid" then
+                 Logging.info_f ~section "Skipping sell for %s: available %.8f < needed %.8f (reserved_base %.8f protects accumulated asset)"
+                   asset.symbol available_asset sell_qty state.reserved_base
+               else begin
+                 (* Non-Hyperliquid: attempt sell and let exchange reject if needed *)
+                 let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+                 if push_order sell_order then
+                   Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+                     asset.symbol sell_qty sell_price
+               end
+             end
          | _ -> ()
         );
 
@@ -1200,6 +1231,11 @@ let handle_order_filled asset_symbol order_id side =
               let net_profit = gross -. fees in
               if net_profit > 0.0 then begin
                 state.accumulated_profit <- state.accumulated_profit +. net_profit;
+                (* Persist so profit progress survives Docker restarts *)
+                if state.exchange_id = "hyperliquid" then
+                  Hyperliquid.State_persistence.save ~symbol:asset_symbol
+                    ~reserved_base:state.reserved_base
+                    ~accumulated_profit:state.accumulated_profit;
                 Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f buy@%.4f x %.8f), accumulated: %.6f"
                   asset_symbol net_profit gross fees sell_price buy_price qty state.accumulated_profit
               end

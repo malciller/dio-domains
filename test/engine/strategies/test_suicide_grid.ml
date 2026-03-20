@@ -271,26 +271,44 @@ let test_accumulation_gated_sell_sufficient () =
   check bool "profit debited correctly" true
     (abs_float (state.accumulated_profit -. expected_remaining) < 0.0001)
 
+(* Helper: round qty using instrument feed directly.
+   Production code goes through Exchange.Registry -> Hyperliquid_impl -> Instruments_feed,
+   but the test binary may not link the exchange module. This calls the feed directly. *)
+let round_qty_hl qty sym =
+  let inc = match Hyperliquid.Instruments_feed.get_qty_increment sym with Some v -> v | None -> 0.01 in
+  let inv = 1.0 /. inc in
+  floor (qty *. inv) /. inv
+
 let test_accumulation_full_lifecycle () =
-  (* End-to-end test: multiple buy→sell cycles accumulate enough profit
-     to eventually trigger a gated accumulation sell.
+  (* End-to-end test with realistic HYPE/USDC lot sizing.
+     HYPE sz_decimals=2 → lot=0.01 (asset)
      
-     With BTC-like prices: qty=0.0002, sell_mult=0.999, accumulation_buffer=1.00
-     Each profitable cycle at spread ~0.4%: net ≈ (84000*0.004)*0.0002 - fees ≈ $0.054
-     Need ~19 cycles to accumulate $1.00+ buffer *)
-  let symbol = "LIFECYCLE/USDC" in
+     qty=0.35 (asset), buy@39.50, sell@39.90 (USDC), sell_mult=0.999, buffer=0.05 USDC:
+       round_qty(0.35 * 0.999) = round_qty(0.34965) = 0.34 (asset, lot=0.01)
+       rounding_diff = 0.35 - 0.34 = 0.01 (asset)
+       required_profit = 0.01 * 39.90 + 0.05 = 0.449 (USDC)
+     Each cycle net profit:
+       gross = (39.90 - 39.50) * 0.35 = 0.14 (USDC)
+       fees  = (39.90*0.35 + 39.50*0.35) * 0.0004 = 0.011116 (USDC)
+       net   = 0.14 - 0.011116 ≈ 0.128884 (USDC)
+     Need ~4 cycles to reach 0.449 USDC *)
+  let symbol = "LIFECYCLE_HYPE/USDC" in
+
+  (* Register instrument with HYPE's real lot size: 2 decimal places *)
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+
   let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
   state.accumulated_profit <- 0.0;
-  state.grid_qty <- 0.0002;
+  state.grid_qty <- 0.35;         (* 0.35 asset *)
   state.maker_fee <- 0.0004;
 
-  let buy_price = 84000.0 in
-  let sell_price = 84336.0 in  (* +0.4% *)
-  let accumulation_buffer = 1.00 in
+  let buy_price = 39.50 in        (* USDC per asset *)
+  let sell_price = 39.90 in       (* USDC per asset *)
+  let accumulation_buffer = 0.05 in  (* USDC *)
   let sell_mult = 0.999 in
 
-  (* Run 20 profitable buy→sell cycles *)
-  for i = 1 to 20 do
+  (* Run 5 profitable buy→sell cycles *)
+  for i = 1 to 5 do
     let buy_id = Printf.sprintf "buy_%d" i in
     let sell_id = Printf.sprintf "sell_%d" i in
 
@@ -302,14 +320,20 @@ let test_accumulation_full_lifecycle () =
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol sell_id Dio_strategies.Strategy_common.Sell;
   done;
 
-  (* After 20 cycles profit should be meaningful *)
-  check bool "profit accumulated over 20 cycles" true (state.accumulated_profit > 0.0);
+  (* After 5 cycles: ~5 * 0.128884 ≈ 0.644 USDC accumulated *)
+  check bool "profit accumulated over 5 cycles" true (state.accumulated_profit > 0.0);
 
-  (* Now test the gating decision *)
-  let qty = 0.0002 in
-  let rounded_sell = Dio_strategies.Suicide_grid.round_qty (qty *. sell_mult) symbol "hyperliquid" in
+  (* Test the gating decision *)
+  let qty = 0.35 in  (* asset *)
+  let rounded_sell = round_qty_hl (qty *. sell_mult) symbol in
+  (* rounded_sell = 0.34 (asset), rounding_diff = 0.01 (asset) *)
   let rounding_diff = qty -. rounded_sell in
+  (* required_profit = 0.01 * 39.90 + 0.05 = 0.449 (USDC) *)
   let required_profit = rounding_diff *. sell_price +. accumulation_buffer in
+
+  check bool "rounded_sell is 0.34 (asset)" true (abs_float (rounded_sell -. 0.34) < 0.0001);
+  check bool "rounding_diff is 0.01 (asset)" true (abs_float (rounding_diff -. 0.01) < 0.0001);
+  check bool "required_profit ≈ 0.449 (USDC)" true (abs_float (required_profit -. 0.449) < 0.01);
 
   let profit_before = state.accumulated_profit in
   let can_accumulate = profit_before >= required_profit in
@@ -322,15 +346,116 @@ let test_accumulation_full_lifecycle () =
       qty
   in
 
-  if can_accumulate then begin
-    check bool "lifecycle: gated sell fires" true (sell_qty < qty);
-    check bool "lifecycle: profit debited" true (state.accumulated_profit < profit_before)
-  end else begin
-    check bool "lifecycle: 1:1 sell (not enough profit yet)" true
-      (abs_float (sell_qty -. qty) < 0.0001);
-    (* This is fine - just means we need more cycles for this accumulation_buffer *)
-    check bool "lifecycle: profit still growing" true (state.accumulated_profit > 0.0)
-  end
+  (* With 5 cycles (~0.644 USDC) vs required 0.449 USDC, gate should fire *)
+  check bool "lifecycle: enough profit to gate" true can_accumulate;
+  check bool "lifecycle: gated sell fires reduced qty 0.34 (asset)" true (sell_qty < qty);
+  check bool "lifecycle: sell qty = rounded_sell" true
+    (abs_float (sell_qty -. rounded_sell) < 0.0001);
+  check bool "lifecycle: profit debited" true (state.accumulated_profit < profit_before)
+
+let test_accumulation_multi_strategy_isolation () =
+  (* Test two strategies with different lot sizes running concurrently:
+     
+     BTC/USDC — sz_decimals=5 (lot=0.00001 asset)
+       qty=0.0002 (asset), price ~84000 USDC, buffer=1.00 USDC
+       round_qty(0.0002 * 0.999) = round_qty(0.00019980) = 0.00019 (asset)
+       rounding_diff = 0.0002 - 0.00019 = 0.00001 (asset)
+       required = 0.00001 * 84336 + 1.00 = 1.84336 (USDC)
+     
+     HYPE/USDC — sz_decimals=2 (lot=0.01 asset)
+       qty=0.35 (asset), price ~40 USDC, buffer=0.05 USDC
+       round_qty(0.35 * 0.999) = round_qty(0.34965) = 0.34 (asset)
+       rounding_diff = 0.35 - 0.34 = 0.01 (asset)
+       required = 0.01 * 39.90 + 0.05 = 0.449 (USDC) *)
+  let btc_sym = "ISO_BTC/USDC" in
+  let hype_sym = "ISO_HYPE/USDC" in
+
+  (* Register instruments with real lot sizes *)
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol:btc_sym ~sz_decimals:5;
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol:hype_sym ~sz_decimals:2;
+
+  let btc = Dio_strategies.Suicide_grid.get_strategy_state btc_sym in
+  let hype = Dio_strategies.Suicide_grid.get_strategy_state hype_sym in
+
+  (* Verify states are distinct objects *)
+  check bool "distinct state objects" true (btc != hype);
+
+  (* Reset both *)
+  btc.accumulated_profit <- 0.0;
+  btc.grid_qty <- 0.0002;    (* 0.0002 BTC (asset) *)
+  btc.maker_fee <- 0.0004;
+  hype.accumulated_profit <- 0.0;
+  hype.grid_qty <- 0.35;     (* 0.35 HYPE (asset) *)
+  hype.maker_fee <- 0.0004;
+
+  (* Verify lot sizes are correct *)
+  let btc_rounded = round_qty_hl (0.0002 *. 0.999) btc_sym in
+  let hype_rounded = round_qty_hl (0.35 *. 0.999) hype_sym in
+  check bool "BTC rounded_sell = 0.00019 (asset, lot=0.00001)" true
+    (abs_float (btc_rounded -. 0.00019) < 0.000001);
+  check bool "HYPE rounded_sell = 0.34 (asset, lot=0.01)" true
+    (abs_float (hype_rounded -. 0.34) < 0.0001);
+
+  (* --- BTC cycles: buy@84000 → sell@84336 USDC (+0.4%) --- *)
+  (* net = (84336 - 84000) * 0.0002 - fees = 0.0672 - 0.01345 ≈ 0.054 USDC per cycle *)
+  for i = 1 to 30 do
+    let buy_id = Printf.sprintf "btc_buy_%d" i in
+    let sell_id = Printf.sprintf "btc_sell_%d" i in
+    btc.last_buy_order_id <- Some buy_id;
+    btc.last_buy_order_price <- Some 84000.0;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym buy_id Dio_strategies.Strategy_common.Buy;
+    btc.open_sell_orders <- [(sell_id, 84336.0)];
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym sell_id Dio_strategies.Strategy_common.Sell;
+  done;
+
+  let btc_profit = btc.accumulated_profit in
+  check bool "BTC profit > 0 USDC after 30 cycles" true (btc_profit > 0.0);
+  check bool "HYPE profit still 0 after BTC cycles" true (abs_float hype.accumulated_profit < 0.0001);
+
+  (* --- HYPE cycles: buy@39.50 → sell@39.90 USDC (+1.0%) --- *)
+  (* net ≈ 0.128884 USDC per cycle *)
+  for i = 1 to 5 do
+    let buy_id = Printf.sprintf "hype_buy_%d" i in
+    let sell_id = Printf.sprintf "hype_sell_%d" i in
+    hype.last_buy_order_id <- Some buy_id;
+    hype.last_buy_order_price <- Some 39.50;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym buy_id Dio_strategies.Strategy_common.Buy;
+    hype.open_sell_orders <- [(sell_id, 39.90)];
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym sell_id Dio_strategies.Strategy_common.Sell;
+  done;
+
+  let hype_profit = hype.accumulated_profit in
+  check bool "HYPE profit > 0 USDC after 5 cycles" true (hype_profit > 0.0);
+  (* BTC profit must NOT have changed from HYPE's fills *)
+  check bool "BTC profit unchanged by HYPE fills" true
+    (abs_float (btc.accumulated_profit -. btc_profit) < 0.0001);
+
+  (* --- Test independent gating decisions --- *)
+
+  (* HYPE: required = 0.01 * 39.90 + 0.05 = 0.449 USDC
+     5 cycles * 0.128884 ≈ 0.644 USDC → should gate *)
+  let hype_diff = 0.35 -. hype_rounded in
+  let hype_required = hype_diff *. 39.90 +. 0.05 in
+  check bool "HYPE can gate (0.644 USDC >= 0.449 USDC)" true
+    (hype.accumulated_profit >= hype_required);
+
+  (* BTC: required = 0.00001 * 84336 + 1.00 = 1.84336 USDC
+     30 cycles * 0.054 ≈ 1.62 USDC → should NOT gate yet *)
+  let btc_diff = 0.0002 -. btc_rounded in
+  let btc_required = btc_diff *. 84336.0 +. 1.00 in
+  check bool "BTC cannot gate yet (1.62 USDC < 1.84 USDC)" true
+    (btc.accumulated_profit < btc_required);
+
+  Printf.printf "  BTC: accumulated=%.4f USDC, required=%.4f USDC, lot=0.00001\n"
+    btc.accumulated_profit btc_required;
+  Printf.printf "  HYPE: accumulated=%.4f USDC, required=%.4f USDC, lot=0.01\n"
+    hype.accumulated_profit hype_required;
+
+  (* --- Test reserved_quote (USDC) isolation --- *)
+  Dio_strategies.Suicide_grid.set_asset_reserved_quote btc 16.80;  (* 0.0002 * 84000 = 16.80 USDC *)
+  Dio_strategies.Suicide_grid.set_asset_reserved_quote hype 13.80; (* 0.35 * 39.42 ≈ 13.80 USDC *)
+  let total_reserved = Dio_strategies.Suicide_grid.get_total_reserved_quote () in
+  check bool "total reserved USDC includes both domains" true (total_reserved >= 30.0)
 
 let () =
   run "Suicide Grid" [
@@ -367,5 +492,6 @@ let () =
       test_case "gated sell - insufficient profit" `Quick test_accumulation_gated_sell_insufficient;
       test_case "gated sell - sufficient profit" `Quick test_accumulation_gated_sell_sufficient;
       test_case "full lifecycle (20 buy-sell cycles)" `Quick test_accumulation_full_lifecycle;
+      test_case "multi-strategy isolation (BTC + HYPE)" `Quick test_accumulation_multi_strategy_isolation;
     ];
   ]
