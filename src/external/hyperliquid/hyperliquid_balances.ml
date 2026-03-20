@@ -129,6 +129,16 @@ let parse_json_float json =
   | `Int i -> float_of_int i
   | _ -> 0.0
 
+(** Map Hyperliquid wrapped spot token names to canonical names.
+    The spot API returns e.g. "UBTC" for Bitcoin, but trading symbols
+    and balance queries use "BTC".  Must match the mapping in
+    hyperliquid_instruments_feed.ml process_meta_response. *)
+let canonicalize_coin = function
+  | "UBTC" -> "BTC"
+  | "UETH" -> "ETH"
+  | "USOL" -> "SOL"
+  | other -> other
+
 
 (* --- WS message handler --- *)
 
@@ -174,7 +184,8 @@ let process_market_data json =
         let balances = member "spotState" data |> member "balances" |> to_list in
         List.iter (fun item ->
           try
-            let coin = member "coin" item |> to_string in
+            let raw_coin = member "coin" item |> to_string in
+            let coin = canonicalize_coin raw_coin in
             let total = parse_json_float (member "total" item) in
             let store = get_balance_store coin in
             BalanceStore.update_wallet store total "spot" "account";
