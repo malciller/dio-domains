@@ -457,15 +457,13 @@ let fetch_spot_balances_ws () =
         let balances = balances_node |> to_list in
         List.iter (fun item ->
           try
-            let coin = member "coin" item |> to_string in
+            let raw_coin = member "coin" item |> to_string in
+            let coin = Hyperliquid_balances.canonicalize_coin raw_coin in
             let total = parse_json_float (member "total" item) in
             let store = Hyperliquid_balances.get_balance_store coin in
             Hyperliquid_balances.BalanceStore.update_wallet store total "spot" "account";
             
-            if coin = "USDC" then
-              Logging.info_f ~section "Initial Spot USDC balance: %.6f" total
-            else
-              Logging.debug_f ~section "Initial Spot balance: %s = %.6f" coin total
+            Logging.info_f ~section "Initial Spot %s balance: %.6f" coin total
           with exn ->
             Logging.warn_f ~section "Failed to parse spot balance entry: %s" (Printexc.to_string exn)
         ) balances;
