@@ -664,7 +664,12 @@ let execute_strategy
 
       (* Cache config values in state so handle_order_filled can compute real PnL *)
       state.grid_qty <- qty;
-      state.maker_fee <- (match asset.maker_fee with Some f -> f | None -> 0.0);
+      state.maker_fee <- (match asset.maker_fee with
+        | Some f -> f
+        | None ->
+            match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
+            | Some cached -> cached
+            | None -> 0.0);
       state.exchange_id <- asset.exchange;
 
       (* Calculate required balances *)
