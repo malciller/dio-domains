@@ -777,7 +777,7 @@ let execute_strategy
            is set and won't clear until (asset_bal - reserved_base) >= needed,
            protecting the accumulated base asset. *)
         (match asset_balance with
-         | Some _asset_bal when not state.inflight_sell ->
+         | Some asset_bal when not state.inflight_sell ->
              let sell_qty =
                if asset.exchange = "hyperliquid" then begin
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
@@ -801,10 +801,32 @@ let execute_strategy
                end else
                  qty *. sell_mult
              in
-             let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-             if push_order sell_order then
-               Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                 asset.symbol sell_qty sell_price
+             (* Proactive reserved_base guard (Hyperliquid only): ensure we never sell
+                accumulated base asset.  The available balance must exclude:
+                1. reserved_base — accumulated base that must never be sold
+                2. qty already locked in open sell orders on the exchange
+                Kraken does not use reserved_base so the check is skipped. *)
+             let balance_ok =
+               if asset.exchange = "hyperliquid" then
+                 let locked_in_sells = List.fold_left (fun acc (_, _sell_price) ->
+                   acc +. qty  (* each open sell order locks one grid_qty of base asset *)
+                 ) 0.0 state.open_sell_orders in
+                 let available = asset_bal -. state.reserved_base -. locked_in_sells in
+                 if available >= sell_qty then true
+                 else begin
+                   Logging.warn_f ~section
+                     "Sell order blocked for %s: available %.8f (bal %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+                     asset.symbol available asset_bal state.reserved_base locked_in_sells sell_qty;
+                   false
+                 end
+               else true
+             in
+             if balance_ok then begin
+               let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+               if push_order sell_order then
+                 Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+                   asset.symbol sell_qty sell_price
+             end
          | _ -> ()
         );
 
