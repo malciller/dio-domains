@@ -375,7 +375,7 @@ let parse_update json on_heartbeat =
         } in
         BalanceUpdateEventBus.publish balance_update_event_bus event_data;
 
-        Logging.info_f ~section "Balance update: %s %+.8f (new: %.8f) [%s]"
+        Logging.debug_f ~section "Balance update: %s %+.8f (new: %.8f) [%s]"
           asset amount balance tx_type;
         (* Update connection heartbeat *)
         on_heartbeat ()

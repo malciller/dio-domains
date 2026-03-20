@@ -374,12 +374,12 @@ let update_open_orders store (event : execution_event) =
       Hashtbl.remove order_to_symbol event.order_id;
       
       if is_terminal_status then
-        Logging.info_f ~section "Removed order: %s [%s] status=%s exec_type=%s"
+        Logging.debug_f ~section "Removed order: %s [%s] status=%s exec_type=%s"
           event.order_id event.symbol 
           (string_of_order_status event.order_status)
           (string_of_exec_type event.exec_type)
       else
-        Logging.info_f ~section "Removed order with zero remaining qty: %s [%s] status=%s exec_type=%s remaining=%.12f qty=%.12f"
+        Logging.debug_f ~section "Removed order with zero remaining qty: %s [%s] status=%s exec_type=%s remaining=%.12f qty=%.12f"
           event.order_id event.symbol
           (string_of_order_status event.order_status)
           (string_of_exec_type event.exec_type)
@@ -418,7 +418,7 @@ let update_open_orders store (event : execution_event) =
     Hashtbl.replace order_to_symbol event.order_id event.symbol;
     
     if was_present then begin
-      Logging.info_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
+      Logging.debug_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
         event.order_id event.symbol remaining_qty 
         (Option.value event.limit_price ~default:0.0) 
         event.cum_qty event.order_qty

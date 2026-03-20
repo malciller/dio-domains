@@ -115,13 +115,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
   in
 
   (* Look up exchange implementation *)
-  Logging.info_f ~section "Looking up exchange %s" asset_with_fees.exchange;
+  Logging.debug_f ~section "Looking up exchange %s" asset_with_fees.exchange;
   match Exchange.Registry.get asset_with_fees.exchange with
   | None ->
       Logging.error_f ~section "Unknown exchange '%s' for asset %s, aborting domain"
         asset_with_fees.exchange asset_with_fees.symbol
   | Some (module Ex) ->
-      Logging.info_f ~section "Found exchange module for %s" asset_with_fees.exchange;
+      Logging.debug_f ~section "Found exchange module for %s" asset_with_fees.exchange;
 
       (* Track ring buffer positions for this domain *)
       let exec_read_pos = ref 0 in
@@ -330,7 +330,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled
                          asset_with_fees.symbol event.order_id side;
-                       Logging.info_f ~section "Notified Grid strategy about %s order %s for %s"
+                       Logging.debug_f ~section "Notified Grid strategy about %s order %s for %s"
                          status_desc event.order_id asset_with_fees.symbol
                    | None -> ());
                   (match mm_strategy_asset with
@@ -350,7 +350,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_filled
                          asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price;
-                       Logging.info_f ~section "Notified Grid strategy about filled order %s for %s"
+                       Logging.debug_f ~section "Notified Grid strategy about filled order %s for %s"
                          event.order_id asset_with_fees.symbol
                    | None -> ());
                   (match mm_strategy_asset with
@@ -381,7 +381,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                         | Some _ ->
                             Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
                               asset_with_fees.symbol event.order_id side price;
-                            Logging.info_f ~section "Notified Grid strategy about acknowledged order %s for %s"
+                            Logging.debug_f ~section "Notified Grid strategy about acknowledged order %s for %s"
                               event.order_id asset_with_fees.symbol
                         | None -> ());
                        (match mm_strategy_asset with

@@ -257,7 +257,7 @@ let place_order
       | None -> params
     in
 
-    Logging.info_f ~section "Placing %s order: %s %s %f @ %s" side symbol order_type order_qty
+    Logging.debug_f ~section "Placing %s order: %s %s %f @ %s" side symbol order_type order_qty
       (match limit_price with Some p -> Printf.sprintf "%.6f" (truncate_price_to_precision p symbol) | None -> "market");
 
     (* Log the order parameters being sent *)
@@ -395,7 +395,7 @@ let amend_order
       | None -> params
     in
 
-    Logging.info_f ~section "Amending order %s: %s%s%s" order_id
+    Logging.debug_f ~section "Amending order %s: %s%s%s" order_id
       (match order_qty with Some qty -> Printf.sprintf "qty=%.8f" qty | None -> "")
       (match limit_price with Some p -> Printf.sprintf ", price=%.6f" (truncate_price_to_precision p symbol_str) | None -> "")
       (match deadline with Some d -> Printf.sprintf ", deadline=%s" d | None -> "");
@@ -482,7 +482,7 @@ let cancel_orders
       | None -> params
     in
 
-    Logging.info_f ~section "Cancelling orders: %s%s%s"
+    Logging.debug_f ~section "Cancelling orders: %s%s%s"
       (match order_ids with Some ids -> Printf.sprintf "order_ids=[%s]" (String.concat "," ids) | None -> "")
       (match cl_ord_ids with Some ids -> Printf.sprintf "cl_ord_ids=[%s]" (String.concat "," ids) | None -> "")
       (match order_userrefs with Some refs -> Printf.sprintf "userrefs=[%s]" (String.concat "," (List.map string_of_int refs)) | None -> "");

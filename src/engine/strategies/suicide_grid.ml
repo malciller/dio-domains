@@ -71,6 +71,8 @@ type strategy_state = {
   mutable exchange_id: string;          (* cached exchange name for persistence decisions *)
   mutable startup_replay: bool;  (* true during startup fill replay; gates profit calculation *)
   mutable last_fill_oid: string option; (* OID of last fill that credited profit; resumption point *)
+  mutable anticipated_base_credit: float;  (* base qty from buy fills not yet reflected in balance feed *)
+  mutable last_seen_asset_balance: float;  (* last asset_bal seen; used to detect balance feed catching up *)
   mutex: Mutex.t;  (* Per-asset mutex to prevent concurrent execution for the same symbol *)
 }
 
@@ -114,6 +116,8 @@ let get_strategy_state asset_symbol =
           exchange_id = "";
           startup_replay = (persisted_last_fill_oid <> None);  (* replay gate active if we have a resumption point *)
           last_fill_oid = persisted_last_fill_oid;
+          anticipated_base_credit = 0.0;
+          last_seen_asset_balance = 0.0;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -327,7 +331,7 @@ let push_order order =
                   state.last_order_time <- Unix.time ();
                   (* Add to pending cancellations tracking *)
                   Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
-                  Logging.info_f ~section "Cancelling order for %s (target: %s)"
+                  Logging.debug_f ~section "Cancelling order for %s (target: %s)"
                     order.symbol target_order_id;
                   true
               | None ->
@@ -408,7 +412,7 @@ let push_order order =
                 let order_price = Option.value order.price ~default:0.0 in
                 let timestamp = Unix.time () in
                 state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
-                Logging.info_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
+                Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
                   (string_of_order_side order.side) temp_order_id order_price order.symbol
                   (Option.value order.order_id ~default:"unknown")
             | Cancel -> (* Already handled above *)
@@ -440,6 +444,18 @@ let execute_strategy
 
   let state = get_strategy_state asset.symbol in
 
+   (* --- Anticipated balance credit decay: clear when balance feed catches up --- *)
+   (match asset_balance with
+    | Some asset_bal ->
+        if asset_bal > state.last_seen_asset_balance && state.anticipated_base_credit > 0.0 then begin
+          Logging.debug_f ~section "Balance feed caught up for %s: %.8f -> %.8f, clearing anticipated credit %.8f"
+            asset.symbol state.last_seen_asset_balance asset_bal state.anticipated_base_credit;
+          state.anticipated_base_credit <- 0.0
+        end;
+        state.last_seen_asset_balance <- asset_bal
+    | None -> ()
+   );
+
    (* --- Asset-low check: clear flag when asset balance recovers --- *)
    (* Subtract reserved_base so accumulated base asset is protected from sells *)
    (match asset_balance with
@@ -450,13 +466,13 @@ let execute_strategy
           else let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
                qty_f *. sell_mult_f
         in
-        let available_asset = asset_bal -. state.reserved_base in
+        let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit in
         if state.asset_low && available_asset >= asset_needed_fast then begin
           state.asset_low <- false;
           state.inflight_sell <- false;
           ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
-          Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
-            asset.symbol asset_bal state.reserved_base available_asset asset_needed_fast
+          Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
+            asset.symbol asset_bal state.reserved_base state.anticipated_base_credit available_asset asset_needed_fast
         end
     | None -> ()
    );
@@ -828,12 +844,12 @@ let execute_strategy
                  let locked_in_sells = List.fold_left (fun acc (_oid, _price, remaining_qty, side_str, _uref) ->
                    if side_str = "sell" then acc +. remaining_qty else acc
                  ) 0.0 open_orders in
-                 let available = asset_bal -. state.reserved_base -. locked_in_sells in
+                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells in
                  if available >= sell_qty then true
                  else begin
                    Logging.warn_f ~section
-                     "Sell order blocked for %s: available %.8f (bal %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-                     asset.symbol available asset_bal state.reserved_base locked_in_sells sell_qty;
+                     "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells sell_qty;
                    false
                  end
                else true
@@ -1267,6 +1283,13 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
       state.last_buy_fill_price <- Some fill_price;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
+      (* Credit anticipated base so the sell guard sees the incoming asset before
+         the balance feed catches up (race: exec feed is faster than balance feed) *)
+      if state.grid_qty > 0.0 then begin
+        state.anticipated_base_credit <- state.anticipated_base_credit +. state.grid_qty;
+        Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
+          asset_symbol state.grid_qty state.anticipated_base_credit order_id
+      end;
       Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
     end;
 
