@@ -640,7 +640,7 @@ let execute_strategy
         
         let is_our_strategy = match userref_opt with
           | Some ref_val -> ref_val = Strategy_common.strategy_userref_grid
-          | None -> false
+          | None -> asset.exchange = "hyperliquid"
         in
         
         if not is_cancelled && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
