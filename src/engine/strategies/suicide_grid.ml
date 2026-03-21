@@ -1508,18 +1508,29 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
     (* 2. Update the active order tracking - swap old ID to new ID *)
     (match side with
      | Buy ->
-         (match state.last_buy_order_id with
-          | Some target_id when target_id = old_order_id ->
-              state.last_buy_order_id <- Some new_order_id;
-              state.last_buy_order_price <- Some price;
-              Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s" 
-                old_order_id new_order_id price asset_symbol
-          | _ -> 
-              (* Fallback in case state got wiped or mismatched *)
-              state.last_buy_order_id <- Some new_order_id;
-              state.last_buy_order_price <- Some price;
-              Logging.debug_f ~section "Set buy order ID via amend: %s @ %.2f for %s" 
-                new_order_id price asset_symbol)
+          (* Check if old order was explicitly cancelled (race with multi-buy cleanup) *)
+          let is_blacklisted = List.exists (fun (cid, _) -> cid = old_order_id) state.cancelled_orders in
+          if is_blacklisted then
+            Logging.info_f ~section "Ignoring amendment for blacklisted buy order %s -> %s for %s"
+              old_order_id new_order_id asset_symbol
+          else
+          (match state.last_buy_order_id with
+           | Some target_id when target_id = old_order_id ->
+               state.last_buy_order_id <- Some new_order_id;
+               state.last_buy_order_price <- Some price;
+               Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s" 
+                 old_order_id new_order_id price asset_symbol
+           | _ -> 
+               (* Fallback: only install if new order is also not blacklisted *)
+               let is_new_blacklisted = List.exists (fun (cid, _) -> cid = new_order_id) state.cancelled_orders in
+               if not is_new_blacklisted then begin
+                 state.last_buy_order_id <- Some new_order_id;
+                 state.last_buy_order_price <- Some price;
+                 Logging.debug_f ~section "Set buy order ID via amend: %s @ %.2f for %s" 
+                   new_order_id price asset_symbol
+               end else
+                 Logging.info_f ~section "Ignoring amendment fallback for blacklisted order %s -> %s for %s"
+                   old_order_id new_order_id asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
          state.open_sell_orders <- (new_order_id, price) :: 
@@ -1608,8 +1619,15 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
             | Some target_id when target_id = order_id ->
                 state.last_buy_order_id <- None;
                 state.last_buy_order_price <- None;
+                (* Clear place_Buy cooldown so strategy can place a new buy immediately
+                   instead of waiting for a stale cooldown from the multi-buy cancel branch *)
+                Hashtbl.remove state.amend_cooldowns "place_Buy";
                 Logging.info_f ~section "Amendment failed for buy order %s: %s. Order is gone, cleared tracking." order_id reason
-            | _ -> ())
+            | _ ->
+                (* Order ID doesn't match tracking — already cleared by a previous call.
+                   Still clear cooldowns to unblock placement. *)
+                Hashtbl.remove state.amend_cooldowns "place_Buy";
+                Logging.debug_f ~section "Amendment failed for untracked buy order %s: %s. Cleared place_Buy cooldown." order_id reason)
        | Sell ->
            let original_sell_count = List.length state.open_sell_orders in
            state.open_sell_orders <- List.filter (fun (sell_id, _) -> sell_id <> order_id) state.open_sell_orders;
