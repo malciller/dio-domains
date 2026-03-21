@@ -83,6 +83,12 @@ let initialization_mutex = Mutex.create ()
 (** Global order_id -> symbol mapping for O(1) lookups (mirrors Kraken's pattern) *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 128
 
+(** Blacklist of order IDs removed by cancel-replace amendments.
+    Prevents late WS orderUpdates 'open' events from re-adding
+    orders that were already superseded by a newer cancel-replace. *)
+let amended_blacklist : (string, float) Hashtbl.t = Hashtbl.create 16
+let amended_blacklist_mutex = Mutex.create ()
+
 (** Get or create store for a symbol - thread-safe initialization *)
 let get_symbol_store symbol =
   match Hashtbl.find_opt stores symbol with
@@ -152,7 +158,11 @@ let remove_open_order ~symbol ~order_id =
     Mutex.lock initialization_mutex;
     Hashtbl.remove order_to_symbol order_id;
     Mutex.unlock initialization_mutex;
-    Logging.debug_f ~section "Removed old order %s [%s] after amendment" order_id symbol
+    (* Blacklist this ID so late WS orderUpdates events don't re-add it *)
+    Mutex.lock amended_blacklist_mutex;
+    Hashtbl.replace amended_blacklist order_id (Unix.gettimeofday ());
+    Mutex.unlock amended_blacklist_mutex;
+    Logging.debug_f ~section "Removed old order %s [%s] after amendment (blacklisted)" order_id symbol
   end;
   Mutex.unlock store.orders_mutex
 
@@ -196,7 +206,20 @@ let cleanup_stale_orders () =
       end;
       Mutex.unlock store.orders_mutex;
     ) !stale_orders
-  end
+  end;
+
+  (* Clean up stale amendment blacklist entries (>30s old) *)
+  Mutex.lock amended_blacklist_mutex;
+  let blacklist_to_remove = ref [] in
+  Hashtbl.iter (fun order_id timestamp ->
+    if now -. timestamp > 30.0 then
+      blacklist_to_remove := order_id :: !blacklist_to_remove
+  ) amended_blacklist;
+  List.iter (Hashtbl.remove amended_blacklist) !blacklist_to_remove;
+  let bl_removed = List.length !blacklist_to_remove in
+  Mutex.unlock amended_blacklist_mutex;
+  if bl_removed > 0 then
+    Logging.debug_f ~section "Cleaned up %d stale amendment blacklist entries" bl_removed
 
 (** Clear all open orders across all stores - used on WebSocket reconnection
     to prevent stale phantom orders from blocking new order placement. *)
@@ -270,6 +293,27 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   
   let existing_order = Hashtbl.find_opt store.open_orders event.order_id in
 
+  (* Check if this non-terminal order was superseded by a cancel-replace amendment.
+     If so, skip re-adding it — a late WS orderUpdates event would create a
+     phantom duplicate that triggers the multi-buy cancel branch.
+     Terminal events always process (to clean up tracking). *)
+  let is_superseded = if is_terminal then false else begin
+    Mutex.lock amended_blacklist_mutex;
+    let result = Hashtbl.mem amended_blacklist event.order_id in
+    Mutex.unlock amended_blacklist_mutex;
+    result
+  end in
+
+  if is_superseded then begin
+    Mutex.unlock store.orders_mutex;
+    Logging.debug_f ~section "Skipping late WS event for superseded order %s [%s]" event.order_id event.symbol;
+    (* Still write to ring buffer so exec event consumers see the event,
+       but do NOT add to open_orders hashtable *)
+    RingBuffer.write store.events_buffer event;
+    OrderUpdateEventBus.publish order_update_event_bus event;
+    notify_ready store
+  end else begin
+
   if is_terminal then begin
     Hashtbl.remove store.open_orders event.order_id;
     (* Remove from global index *)
@@ -334,6 +378,8 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   RingBuffer.write store.events_buffer event;
   OrderUpdateEventBus.publish order_update_event_bus event;
   notify_ready store
+
+  end
 
 let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
   let store = get_symbol_store symbol in
