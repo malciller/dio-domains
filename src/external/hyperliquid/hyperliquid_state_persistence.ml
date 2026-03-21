@@ -119,10 +119,23 @@ let load_last_buy_fill_price ~symbol =
    | None -> ());
   result
 
+(** Load last_sell_fill_price for a symbol. Returns None if missing. *)
+let load_last_sell_fill_price ~symbol =
+  Mutex.lock file_mutex;
+  let result =
+    try get_float_opt (read_state_file ()) ~symbol ~field:"last_sell_fill_price"
+    with _ -> None
+  in
+  Mutex.unlock file_mutex;
+  (match result with
+   | Some price -> Logging.info_f ~section "Loaded last_sell_fill_price=%.8f for %s" price symbol
+   | None -> ());
+  result
+
 (** Save reserved_base, accumulated_profit, and optionally last_fill_oid and
     last_buy_fill_price for a symbol.
     Reads existing file, updates the symbol's entry, writes atomically. *)
-let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price () =
+let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price ?last_sell_fill_price () =
   Mutex.lock file_mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock file_mutex) (fun () ->
     try
@@ -154,7 +167,16 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fil
              | Some price -> [("last_buy_fill_price", `Float price)]
              | None -> [])
       in
-      let new_entry = `Assoc (base_fields @ oid_field @ buy_price_field) in
+      (* Preserve existing last_sell_fill_price if not explicitly provided *)
+      let sell_price_field = match last_sell_fill_price with
+        | Some price -> [("last_sell_fill_price", `Float price)]
+        | None ->
+            let existing_price = get_float_opt existing ~symbol ~field:"last_sell_fill_price" in
+            (match existing_price with
+             | Some price -> [("last_sell_fill_price", `Float price)]
+             | None -> [])
+      in
+      let new_entry = `Assoc (base_fields @ oid_field @ buy_price_field @ sell_price_field) in
       let updated = List.filter (fun (k, _) -> k <> symbol) entries in
       let final = `Assoc ((symbol, new_entry) :: updated) in
 
