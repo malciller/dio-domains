@@ -65,7 +65,8 @@ type strategy_state = {
   mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
   mutable accumulated_profit: float;    (* realized PnL from completed buy→sell pairs; Hyperliquid discrete sizing *)
   mutable reserved_base: float;  (* base asset accumulated via sell_mult; excluded from sellable balance *)
-  mutable last_buy_fill_price: float option; (* price of the most recent buy fill; used to compute profit on sell fill *)
+  mutable last_buy_fill_price: float option; (* price of the most recent buy fill; used to compute profit on first sell after buy *)
+  mutable last_sell_fill_price: float option; (* price of the most recent sell fill; used as cost basis for consecutive sells *)
   mutable grid_qty: float;              (* cached config qty for profit calc in fill handler *)
   mutable maker_fee: float;             (* cached maker fee rate for profit calc in fill handler *)
   mutable exchange_id: string;          (* cached exchange name for persistence decisions *)
@@ -93,6 +94,7 @@ let get_strategy_state asset_symbol =
         let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
         let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
         let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
+        let persisted_last_sell_fill_price = Hyperliquid.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
@@ -113,6 +115,7 @@ let get_strategy_state asset_symbol =
           accumulated_profit = persisted_accumulated_profit;
           reserved_base = persisted_reserved_base;
           last_buy_fill_price = persisted_last_buy_fill_price;
+          last_sell_fill_price = persisted_last_sell_fill_price;
           grid_qty = 0.0;
           maker_fee = 0.0;
           exchange_id = "";
@@ -1284,6 +1287,8 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
     if was_tracked_buy then begin
       (* Record actual buy fill price for profit calculation on matching sell fill *)
       state.last_buy_fill_price <- Some fill_price;
+      (* Clear last_sell_fill_price: next sell is the first after this buy *)
+      state.last_sell_fill_price <- None;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
       (* Persist buy fill price so it survives Docker restarts.
@@ -1293,7 +1298,8 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
         Hyperliquid.State_persistence.save ~symbol:asset_symbol
           ~reserved_base:state.reserved_base
           ~accumulated_profit:state.accumulated_profit
-          ~last_buy_fill_price:fill_price ();
+          ~last_buy_fill_price:fill_price
+          ~last_sell_fill_price:0.0 ();
       (* Credit anticipated base so the sell guard sees the incoming asset before
          the balance feed catches up (race: exec feed is faster than balance feed) *)
       if state.grid_qty > 0.0 then begin
@@ -1336,16 +1342,32 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
     else
     (match side with
      | Sell ->
-          (match state.last_buy_fill_price with
-           | Some buy_price when sell_fill_price > buy_price ->
+          (* Determine cost basis: use last_sell_fill_price for consecutive sells
+             (ladder steps), otherwise use last_buy_fill_price (first sell after buy) *)
+          let cost_basis = match state.last_sell_fill_price with
+            | Some prev_sell when prev_sell > 0.0 -> Some prev_sell
+            | _ -> state.last_buy_fill_price
+          in
+          (match cost_basis with
+           | Some base_price when sell_fill_price > base_price ->
               let qty = state.grid_qty in
-              let gross = (sell_fill_price -. buy_price) *. qty in
+              let gross = (sell_fill_price -. base_price) *. qty in
               let fees = (sell_fill_price *. qty *. state.maker_fee)
-                       +. (buy_price *. qty *. state.maker_fee) in
+                       +. (base_price *. qty *. state.maker_fee) in
               let net_profit = gross -. fees in
               if net_profit > 0.0 then begin
                 state.accumulated_profit <- state.accumulated_profit +. net_profit;
-                state.last_fill_oid <- Some order_id;
+                (* Only advance last_fill_oid forward — never regress to a lower OID.
+                   Old sells (low OIDs placed earlier) can fill after newer sells;
+                   regressing would cause double-counting on restart replay. *)
+                let should_update_oid = match state.last_fill_oid with
+                  | Some prev_oid ->
+                      (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
+                       with _ -> true)
+                  | None -> true
+                in
+                if should_update_oid then
+                  state.last_fill_oid <- Some order_id;
                 (* Persist so profit progress survives Docker restarts.
                    Also persist current last_buy_fill_price so the next
                    sell after a restart still has a buy reference. *)
@@ -1353,12 +1375,17 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
                   Hyperliquid.State_persistence.save ~symbol:asset_symbol
                     ~reserved_base:state.reserved_base
                     ~accumulated_profit:state.accumulated_profit
-                    ~last_fill_oid:order_id
-                    ?last_buy_fill_price:state.last_buy_fill_price ();
-                Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f buy@%.4f x %.8f), accumulated: %.6f"
-                  asset_symbol net_profit gross fees sell_fill_price buy_price qty state.accumulated_profit
-              end
-          | _ -> ())
+                    ~last_fill_oid:(Option.get state.last_fill_oid)
+                    ?last_buy_fill_price:state.last_buy_fill_price
+                    ~last_sell_fill_price:sell_fill_price ();
+                Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
+                  asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
+              end;
+              (* Always record sell fill price for consecutive sell detection *)
+              state.last_sell_fill_price <- Some sell_fill_price
+          | _ ->
+              (* Sell at or below cost basis — still record for consecutive sell tracking *)
+              state.last_sell_fill_price <- Some sell_fill_price)
      | Buy -> ());
 
     (* 4. Clear inflight flags, reservation, and global placement trackers so strategy can replace immediately *)
