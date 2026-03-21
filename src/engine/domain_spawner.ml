@@ -279,7 +279,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         incr cycle_count;
         
         (* Minimal logging in hot loop *)
-        if !cycle_count mod config.logging.cycle_debug_mod = 0 then
+        if !cycle_count mod config.cycle_mod = 0 then
           Logging.debug_f ~section "Asset [%s/%s] cycle #%d"
             asset_with_fees.exchange asset_with_fees.symbol !cycle_count;
         
@@ -457,7 +457,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         end;
 
         (* Mock balance check throttling *)
-        if !cycle_count mod config.engine.balance_check_mod = 0 then (
+        if !cycle_count mod config.cycle_mod = 0 then (
           let now = Unix.time () in
           if now -. !last_balance_check > 2.0 then begin
             last_balance_check := now;
@@ -466,7 +466,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
         (* Execute strategy based on type - only when triggered by events (event-driven) *)
         (* Add fallback: execute every X cycles to prevent getting stuck *)
-        let should_execute = !hl_exec_ready && (!should_execute_strategy || (!cycle_count mod config.engine.strategy_fallback_mod = 0)) in
+        let should_execute = !hl_exec_ready && (!should_execute_strategy || (!cycle_count mod config.cycle_mod = 0)) in
         if should_execute then begin
           let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Reset flag *)
@@ -554,7 +554,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         
         (* Log cycle stats *)
         (* Log cycle stats every 1M cycles *)
-        if !cycle_count mod config.logging.cycle_info_mod = 0 then begin
+        if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
               Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"

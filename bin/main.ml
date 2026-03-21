@@ -355,7 +355,7 @@ let () =
 
   (* Register GC alarm — fires after every major GC cycle, no thread needed *)
   let cfg_for_alarm = Dio_engine.Config.read_config () in
-  let mem_alarm_mod = cfg_for_alarm.logging.cycle_info_mod in
+  let mem_alarm_mod = cfg_for_alarm.cycle_mod in
   let _memory_alarm = Gc.create_alarm (fun () ->
     report_memory_stats ~cycle_info_mod:mem_alarm_mod ()
   ) in

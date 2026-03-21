@@ -13,7 +13,7 @@ let log_interval =
   try
     let json = Yojson.Basic.from_file "config.json" in
     let open Yojson.Basic.Util in
-    match json |> member "logging_cycle_info_mod" |> to_int_option with
+    match json |> member "cycle_mod" |> to_int_option with
     | Some i -> i
     | None -> 10000000
   with _ -> 10000000
