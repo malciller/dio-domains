@@ -164,7 +164,11 @@ let _processor_task =
     let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid orderbook processor task";
-      Lwt_stream.iter process_market_data sub.stream
+      let%lwt () = Lwt_stream.iter process_market_data sub.stream in
+      (* Stream ended normally (disconnect pushed None) — re-subscribe *)
+      sub.close ();
+      Logging.info ~section "Orderbook stream ended (disconnect), re-subscribing in 1s...";
+      Lwt_unix.sleep 1.0 >>= fun () -> run ()
     ) (fun exn ->
       sub.close ();
       Logging.error_f ~section "Hyperliquid orderbook processor task crashed: %s. Restarting in 5s..." (Printexc.to_string exn);
