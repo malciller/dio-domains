@@ -790,6 +790,12 @@ let execute_strategy
         state.last_buy_order_price <- None;
         state.last_buy_order_id <- None;
 
+        (* Blacklist all cancelled buy order IDs so racing amendments
+           don't reinstall them via handle_order_amended fallback *)
+        List.iter (fun (order_id, _) ->
+          state.cancelled_orders <- (order_id, now) :: state.cancelled_orders
+        ) !buy_orders;
+
         (* Apply cooldown to prevent re-entering this branch before exchange acks the cancels *)
         let cooldown_key = "place_Buy" in
         Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
@@ -1520,17 +1526,18 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                state.last_buy_order_price <- Some price;
                Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s" 
                  old_order_id new_order_id price asset_symbol
-           | _ -> 
-               (* Fallback: only install if new order is also not blacklisted *)
-               let is_new_blacklisted = List.exists (fun (cid, _) -> cid = new_order_id) state.cancelled_orders in
-               if not is_new_blacklisted then begin
-                 state.last_buy_order_id <- Some new_order_id;
-                 state.last_buy_order_price <- Some price;
-                 Logging.debug_f ~section "Set buy order ID via amend: %s @ %.2f for %s" 
-                   new_order_id price asset_symbol
-               end else
-                 Logging.info_f ~section "Ignoring amendment fallback for blacklisted order %s -> %s for %s"
-                   old_order_id new_order_id asset_symbol)
+             | _ -> 
+                (* Fallback: only install if neither old nor new order is blacklisted *)
+                let is_old_blacklisted = List.exists (fun (cid, _) -> cid = old_order_id) state.cancelled_orders in
+                let is_new_blacklisted = List.exists (fun (cid, _) -> cid = new_order_id) state.cancelled_orders in
+                if not is_old_blacklisted && not is_new_blacklisted then begin
+                  state.last_buy_order_id <- Some new_order_id;
+                  state.last_buy_order_price <- Some price;
+                  Logging.debug_f ~section "Set buy order ID via amend: %s @ %.2f for %s" 
+                    new_order_id price asset_symbol
+                end else
+                  Logging.info_f ~section "Ignoring amendment fallback for blacklisted order %s -> %s for %s"
+                    old_order_id new_order_id asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
          state.open_sell_orders <- (new_order_id, price) :: 
@@ -1613,6 +1620,9 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     let is_order_gone = is_cache_miss || is_cannot_modify || is_margin_error in
     
     if is_order_gone then begin
+      (* Blacklist the gone order ID so racing amendment events
+         don't reinstall it via handle_order_amended fallback *)
+      state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
       (match side with
        | Buy ->
            (match state.last_buy_order_id with
