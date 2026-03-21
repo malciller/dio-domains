@@ -836,7 +836,12 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let%lwt global_hl_fees = 
     if has_hyperliquid then begin
       Logging.info ~section "Fetching global Hyperliquid fees...";
-      Hyperliquid.Get_fee.get_fee_info ~testnet:hyperliquid_testnet ()
+      let%lwt fee_opt = Hyperliquid.Get_fee.get_fee_info ~testnet:hyperliquid_testnet () in
+      match fee_opt with
+      | Some fees -> Lwt.return_some fees
+      | None ->
+          Logging.error ~section "Fatal: Failed to fetch global Hyperliquid fees on startup. Exiting...";
+          exit 1
     end else Lwt.return_none
   in
 
@@ -874,17 +879,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
               Dio_engine.Config.maker_fee = fee_info.Kraken.Kraken_get_fee.maker_fee;
               Dio_engine.Config.taker_fee = fee_info.Kraken.Kraken_get_fee.taker_fee }
         | None ->
-            Logging.warn_f ~section "Failed to fetch fees for %s, using defaults" asset.Dio_engine.Config.symbol;
-            (* Store default fees in cache *)
-            Dio_strategies.Fee_cache.store_fees 
-              ~exchange:asset.Dio_engine.Config.exchange 
-              ~symbol:asset.Dio_engine.Config.symbol 
-              ~maker_fee:0.0025 
-              ~taker_fee:0.0040 
-              ~ttl_seconds:600.0;
-            Lwt.return { asset with
-              Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
-              Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *) in
+            Logging.error_f ~section "Fatal: Failed to fetch fees for %s. Exiting." asset.Dio_engine.Config.symbol;
+            exit 1 in
         (* Add small delay between requests to ensure unique nonces *)
         let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
         Lwt.return result
@@ -904,11 +900,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:maker ~taker_fee:taker ~ttl_seconds:600.0;
             Lwt.return { asset with Dio_engine.Config.maker_fee = Some maker; Dio_engine.Config.taker_fee = Some taker }
         | None ->
-            Logging.warn_f ~section "No global HL fees available, using defaults for %s" asset.Dio_engine.Config.symbol;
-            let default_maker = if is_spot then 0.0 else 0.0002 in
-            let default_taker = if is_spot then 0.001 else 0.0005 in
-            Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:default_maker ~taker_fee:default_taker ~ttl_seconds:600.0;
-            Lwt.return { asset with Dio_engine.Config.maker_fee = Some default_maker; Dio_engine.Config.taker_fee = Some default_taker }
+            Logging.error_f ~section "Fatal: No global HL fees available for %s. Exiting." asset.Dio_engine.Config.symbol;
+            exit 1
         in
         Lwt.return result
       end else begin
@@ -926,19 +919,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *)
       end
     with exn ->
-      Logging.warn_f ~section "Exception during fee fetching for %s: %s, using defaults"
+      Logging.error_f ~section "Fatal: Exception during fee fetching for %s: %s. Exiting."
         asset.Dio_engine.Config.symbol (Printexc.to_string exn);
-      (* Store default fees in cache when fetching fails *)
-      Dio_strategies.Fee_cache.store_fees 
-        ~exchange:asset.Dio_engine.Config.exchange 
-        ~symbol:asset.Dio_engine.Config.symbol 
-        ~maker_fee:0.0016 
-        ~taker_fee:0.0026 
-        ~ttl_seconds:600.0;
-      (* Provide default fee values when fetching fails to ensure strategies have fee data *)
-      Lwt.return { asset with
-        Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
-        Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *)
+      exit 1
   ) app_configs in
 
   Lwt.return (configs_with_fees, auth_token)
