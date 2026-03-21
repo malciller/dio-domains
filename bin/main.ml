@@ -314,7 +314,7 @@ let () =
   Logging.init ();
 
 
-  (* Basic GC statistics reporting *)
+  (* Event-driven memory reporting via GC alarm *)
   let start_time = Unix.gettimeofday () in
   let mem_cycle_count = ref 0 in
 
@@ -325,62 +325,40 @@ let () =
       if !mem_cycle_count mod cycle_info_mod = 0 then begin
         let now = Unix.gettimeofday () in
         let runtime = now -. start_time in
-        let current_gc_stats = Gc.stat () in
-
-        if Atomic.get shutdown_requested then ()
-        else (
-          let heap_mb = current_gc_stats.heap_words * (Sys.word_size / 8) / 1048576 in
-          let live_mb = current_gc_stats.live_words * (Sys.word_size / 8) / 1048576 in
-
-          Logging.info_f ~section:"memory" "=== MEMORY STATISTICS (Runtime: %.1fs, Cycle: %d) ===" runtime !mem_cycle_count;
-          Logging.info_f ~section:"memory" "Main Domain: heap=%dMB live=%dMB free=%dMB"
-            heap_mb live_mb (heap_mb - live_mb);
-
-          Logging.info_f ~section:"memory" "GC Activity: minor=%d major=%d compactions=%d"
-            current_gc_stats.minor_collections
-            current_gc_stats.major_collections
-            current_gc_stats.compactions;
-
-          (* Subsystem counts *)
-          Logging.info ~section:"memory" "";
-          Logging.info ~section:"memory" "--- SUBSYSTEM COUNTS ---";
-
-          let ticker_stores = Hashtbl.length Kraken.Kraken_ticker_feed.stores in
-          let orderbook_stores = Hashtbl.length Kraken.Kraken_orderbook_feed.stores in
-          let executions_stores = Hashtbl.length Kraken.Kraken_executions_feed.symbol_stores in
-          let balances_stores = Hashtbl.length Kraken.Kraken_balances_feed.balance_stores in
-
-          Logging.info_f ~section:"memory" "Stores: ticker=%d orderbook=%d executions=%d balances=%d"
-            ticker_stores orderbook_stores executions_stores balances_stores;
-
-
-          let domain_count = Hashtbl.length Dio_engine.Domain_spawner.domain_registry in
-          Logging.info_f ~section:"memory" "Domains: %d registered" domain_count;
-
-          let in_flight_orders_size = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
-          let in_flight_amendments_size = Dio_strategies.Strategy_common.InFlightAmendments.get_registry_size () in
-          Logging.info_f ~section:"memory" "In-flight: orders=%d amendments=%d"
-            in_flight_orders_size in_flight_amendments_size;
-
-          Logging.info ~section:"memory" "=== END MEMORY STATISTICS ===";
-        )
+        let s = Gc.quick_stat () in
+        let heap_mb = s.heap_words * (Sys.word_size / 8) / 1048576 in
+        let live_mb = s.live_words * (Sys.word_size / 8) / 1048576 in
+        let ts = let t = Unix.localtime now in
+          Printf.sprintf "%04d-%02d-%02d %02d:%02d:%02d"
+            (t.Unix.tm_year + 1900) (t.Unix.tm_mon + 1) t.Unix.tm_mday
+            t.Unix.tm_hour t.Unix.tm_min t.Unix.tm_sec in
+        Printf.fprintf stderr "%s INFO [memory] === MEMORY STATISTICS (Runtime: %.1fs, Cycle: %d) ===\n" ts runtime !mem_cycle_count;
+        Printf.fprintf stderr "%s INFO [memory] Main Domain: heap=%dMB live=%dMB free=%dMB\n" ts heap_mb live_mb (heap_mb - live_mb);
+        Printf.fprintf stderr "%s INFO [memory] GC Activity: minor=%d major=%d compactions=%d\n" ts s.minor_collections s.major_collections s.compactions;
+        Printf.fprintf stderr "%s INFO [memory]\n" ts;
+        Printf.fprintf stderr "%s INFO [memory] --- SUBSYSTEM COUNTS ---\n" ts;
+        let ticker_stores = Hashtbl.length Kraken.Kraken_ticker_feed.stores in
+        let orderbook_stores = Hashtbl.length Kraken.Kraken_orderbook_feed.stores in
+        let executions_stores = Hashtbl.length Kraken.Kraken_executions_feed.symbol_stores in
+        let balances_stores = Hashtbl.length Kraken.Kraken_balances_feed.balance_stores in
+        Printf.fprintf stderr "%s INFO [memory] Stores: ticker=%d orderbook=%d executions=%d balances=%d\n" ts ticker_stores orderbook_stores executions_stores balances_stores;
+        let domain_count = Hashtbl.length Dio_engine.Domain_spawner.domain_registry in
+        Printf.fprintf stderr "%s INFO [memory] Domains: %d registered\n" ts domain_count;
+        let in_flight_orders_size = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
+        let in_flight_amendments_size = Dio_strategies.Strategy_common.InFlightAmendments.get_registry_size () in
+        Printf.fprintf stderr "%s INFO [memory] In-flight: orders=%d amendments=%d\n" ts in_flight_orders_size in_flight_amendments_size;
+        Printf.fprintf stderr "%s INFO [memory] === END MEMORY STATISTICS ===\n" ts;
+        flush stderr
       end
     end
   in
 
-  (* Start periodic memory reporting thread *)
-  let memory_reporter_thread = Thread.create (fun () ->
-    (* Read config here so cycle_info_mod is available to the thread *)
-    let cfg = Dio_engine.Config.read_config () in
-    let cycle_info_mod = cfg.logging.cycle_info_mod in
-    try
-      while not (Atomic.get shutdown_requested) do
-        report_memory_stats ~cycle_info_mod ();
-        let delay_time = if Atomic.get shutdown_requested then 0.001 else 0.1 in
-        Thread.delay delay_time
-      done
-    with _ -> ()
-  ) () in
+  (* Register GC alarm — fires after every major GC cycle, no thread needed *)
+  let cfg_for_alarm = Dio_engine.Config.read_config () in
+  let mem_alarm_mod = cfg_for_alarm.logging.cycle_info_mod in
+  let _memory_alarm = Gc.create_alarm (fun () ->
+    report_memory_stats ~cycle_info_mod:mem_alarm_mod ()
+  ) in
 
   (* Read and apply logging configuration *)
   let config = Dio_engine.Config.read_config () in
@@ -437,26 +415,7 @@ let () =
     let shutdown_start = Unix.gettimeofday () in
     let force_exit_timeout = 3.0 in
 
-    (* Wait briefly for memory reporter thread, but don't wait forever *)
-    let memory_thread_timeout = 1.0 in  (* Only wait 1 second for memory thread *)
-    let memory_join_start = Unix.gettimeofday () in
-    let memory_joined = ref false in
-    let _memory_join_thread = Thread.create (fun () ->
-      try
-        Thread.join memory_reporter_thread;
-        memory_joined := true
-      with _ -> ()  (* Thread.join can raise exceptions *)
-    ) () in
-
-    (* Wait for memory thread with short timeout *)
-    while not !memory_joined && Unix.gettimeofday () -. memory_join_start < memory_thread_timeout do
-      Thread.delay 0.05  (* Very short delay for responsiveness *)
-    done;
-
-    if !memory_joined then
-      Logging.info ~section:"main" "Memory monitoring thread completed gracefully"
-    else
-      Logging.warn ~section:"main" "Memory monitoring thread did not complete, forcing shutdown";
+    (* No memory reporter thread to join — GC alarm is deregistered automatically on exit *)
 
     (* Force exit after total timeout to ensure process terminates *)
     let elapsed = Unix.gettimeofday () -. shutdown_start in
