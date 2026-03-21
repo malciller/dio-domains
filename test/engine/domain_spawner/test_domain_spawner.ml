@@ -38,8 +38,8 @@ let test_spawn_domains_basic () =
 
   (* Spawn domains for the assets *)
   let config = {
-    Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
-    engine = Dio_engine.Config.default_engine_config;
+    Dio_engine.Config.cycle_mod = 10000;
+    logging = { level = Logging.INFO; sections = [] };
     trading = assets;
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher assets in
@@ -53,8 +53,8 @@ let test_spawn_domains_empty () =
   Dio_engine.Domain_spawner.clear_domain_registry ();
 
   let config = {
-    Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
-    engine = Dio_engine.Config.default_engine_config;
+    Dio_engine.Config.cycle_mod = 10000;
+    logging = { level = Logging.INFO; sections = [] };
     trading = [];
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [] in
@@ -113,8 +113,8 @@ let test_domain_error_handling () =
 
   (* This should not crash the test runner, domains should handle errors internally *)
   let config = {
-    Dio_engine.Config.logging = { level = Logging.INFO; sections = []; cycle_debug_mod = 1000000; cycle_info_mod = 1000000 };
-    engine = Dio_engine.Config.default_engine_config;
+    Dio_engine.Config.cycle_mod = 10000;
+    logging = { level = Logging.INFO; sections = [] };
     trading = [failing_asset];
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [failing_asset] in
