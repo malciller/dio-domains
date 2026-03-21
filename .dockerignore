@@ -1,6 +1,8 @@
 _opam
 __pyache__
 _build
+utils
+reference
 *.log
 node_modules
 .git

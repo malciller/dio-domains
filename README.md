@@ -88,7 +88,7 @@ Edit `config.json` (example):
       "strategy": "Grid",             // Strategy name: "Grid"
       "testnet": false,               // Use testnet
       "hedge": true,                  // Enable auto-hedge (Hyperliquid only)
-      "accumulation_buffer": 0.01     // Min quote profit buffer before triggering sell_mult accumulation (default: 0.01)
+      "accumulation_buffer": 0.01     // Net quote profit required above rounding cost before triggering sell_mult accumulation (default: 0.01)
     }
   ]
 }
@@ -105,7 +105,7 @@ Edit `config.json` (example):
 
 Hyperliquid enforces discrete order sizes via `szDecimals` (e.g. HYPE uses 2 decimal places, so the lot increment is 0.01). When `sell_mult < 1.0`, the desired sell quantity often falls between valid lot boundaries and must be floored, creating rounding loss that exceeds the intended skim. For example, `0.35 * 0.999 = 0.34965` floors to `0.34`, losing 0.01 HYPE per cycle (~2.86%) instead of the intended ~0.1%.
 
-To handle this, the Grid strategy uses profit-gated accumulation. Most cycles sell the full `qty` (1:1), growing quote balance through grid spread profits. Once realized net profit (accounting for quantity and maker fees on both legs) exceeds the rounding cost plus `accumulation_buffer`, a single `sell_mult` sell is triggered to accumulate base asset. The `accumulation_buffer` parameter (default: 0.01 USDC) sets the minimum quote profit required on top of the rounding cost before accumulation triggers. This is adaptive: fast markets accumulate faster, slow markets wait longer. Kraken is unaffected.
+To handle this, the Grid strategy uses profit-gated accumulation. Most cycles sell the full `qty` (1:1), growing quote balance through grid spread profits. Once realized net profit (accounting for quantity and maker fees on both legs) exceeds the rounding cost plus `accumulation_buffer`, a single `sell_mult` sell is triggered to accumulate base asset. The effective threshold is `rounding_cost + accumulation_buffer`, where `rounding_cost = rounding_diff × sell_price` (the USDC value of the base being accumulated). The `accumulation_buffer` parameter (default: 0.01 USDC) represents the **net quote profit guaranteed above** the cost of the accumulated base — e.g. with `qty=0.35`, `sell_mult=0.999`, and HYPE at $39.55, the rounding cost is `0.01 × 39.55 ≈ 0.40 USDC`, so `accumulation_buffer: 2.50` yields an effective threshold of ~2.90 USDC. This is adaptive: fast markets accumulate faster, slow markets wait longer. Kraken is unaffected.
 
 **MM (Adaptive Market Maker)**: Dynamically adapts quoting style based on market fees. Uses greedy quoting for no-fee markets and conservative profit-guaranteeing quotes where fees apply.
 
