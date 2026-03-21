@@ -44,7 +44,7 @@ let parse_fee_info body_str =
     None
 
 (** Get user fees from Hyperliquid info endpoint *)
-let get_fee_info ~testnet _symbol : fee_info option Lwt.t =
+let get_fee_info ~testnet () : fee_info option Lwt.t =
   let open Lwt.Infix in
   let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
   Lwt.catch (fun () ->

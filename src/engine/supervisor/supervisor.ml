@@ -833,6 +833,13 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   (* Fetch fees for all assets *)
   Logging.info ~section "Step 8: Fetching trading fees for all assets...";
 
+  let%lwt global_hl_fees = 
+    if has_hyperliquid then begin
+      Logging.info ~section "Fetching global Hyperliquid fees...";
+      Hyperliquid.Get_fee.get_fee_info ~testnet:hyperliquid_testnet ()
+    end else Lwt.return_none
+  in
+
   (* Convert fee fetching to promise-based operations *)
   let%lwt configs_with_fees = Lwt_list.map_s (fun asset ->
     try
@@ -882,19 +889,26 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
         Lwt.return result
       end else if asset.Dio_engine.Config.exchange = "hyperliquid" then begin
-        Logging.debug_f ~section "Fetching fees for %s on Hyperliquid..." asset.Dio_engine.Config.symbol;
-        let%lwt fee_info_res = Hyperliquid.Get_fee.get_fee_info ~testnet:hyperliquid_testnet asset.Dio_engine.Config.symbol in
-        let%lwt result = match fee_info_res with
+        let is_spot = String.contains asset.Dio_engine.Config.symbol '/' in
+        let%lwt result = match global_hl_fees with
         | Some fee_info ->
-            let maker = Option.value fee_info.maker_fee ~default:0.0002 in
-            let taker = Option.value fee_info.taker_fee ~default:0.0005 in
-            Logging.debug_f ~section "Retrieved fees for Hyperliquid: maker=%.4f%% taker=%.4f%%" (maker *. 100.) (taker *. 100.);
+            let maker = 
+              if is_spot then Option.value fee_info.spot_maker_fee ~default:0.0
+              else Option.value fee_info.maker_fee ~default:0.0002 
+            in
+            let taker = 
+              if is_spot then Option.value fee_info.spot_taker_fee ~default:0.001
+              else Option.value fee_info.taker_fee ~default:0.0005 
+            in
+            Logging.debug_f ~section "Applying fees for Hyperliquid %s (spot=%b): maker=%.4f%% taker=%.4f%%" asset.Dio_engine.Config.symbol is_spot (maker *. 100.) (taker *. 100.);
             Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:maker ~taker_fee:taker ~ttl_seconds:600.0;
             Lwt.return { asset with Dio_engine.Config.maker_fee = Some maker; Dio_engine.Config.taker_fee = Some taker }
         | None ->
-            Logging.warn_f ~section "Failed to fetch HL fees for %s, using defaults" asset.Dio_engine.Config.symbol;
-            Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:0.0002 ~taker_fee:0.0005 ~ttl_seconds:600.0;
-            Lwt.return { asset with Dio_engine.Config.maker_fee = Some 0.0002; Dio_engine.Config.taker_fee = Some 0.0005 }
+            Logging.warn_f ~section "No global HL fees available, using defaults for %s" asset.Dio_engine.Config.symbol;
+            let default_maker = if is_spot then 0.0 else 0.0002 in
+            let default_taker = if is_spot then 0.001 else 0.0005 in
+            Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:default_maker ~taker_fee:default_taker ~ttl_seconds:600.0;
+            Lwt.return { asset with Dio_engine.Config.maker_fee = Some default_maker; Dio_engine.Config.taker_fee = Some default_taker }
         in
         Lwt.return result
       end else begin
