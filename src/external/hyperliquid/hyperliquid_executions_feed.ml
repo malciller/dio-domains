@@ -487,7 +487,7 @@ let process_order_updates data_json =
             
             (match order_status with
              | FilledStatus | RejectedStatus ->
-                 Logging.info_f ~section "Order %s: %s [%s] (reason: %s)" (String.uppercase_ascii status) order_id symbol status
+                 Logging.debug_f ~section "Order %s: %s [%s] (reason: %s)" (String.uppercase_ascii status) order_id symbol status
              | CanceledStatus ->
                  Logging.debug_f ~section "Order %s: %s [%s] (reason: %s)" (String.uppercase_ascii status) order_id symbol status
              | NewStatus ->
