@@ -365,16 +365,18 @@ module Hyperliquid_impl = struct
     | None -> (None, None)
 
   let initialize_fees symbols =
-    Lwt_list.iter_p (fun symbol ->
-      Hyperliquid_get_fee.get_fee_info ~testnet:(Atomic.get is_testnet) symbol >|= function
+    if symbols = [] then Lwt.return_unit
+    else
+      Hyperliquid_get_fee.get_fee_info ~testnet:(Atomic.get is_testnet) () >|= function
       | Some info ->
           let maker = Option.value info.maker_fee ~default:0.0 in
           let taker = Option.value info.taker_fee ~default:0.0 in
           let spot_m = Option.value info.spot_maker_fee ~default:0.0 in
           let spot_t = Option.value info.spot_taker_fee ~default:0.0 in
-          Hashtbl.replace fee_cache symbol (maker, taker, spot_m, spot_t)
+          List.iter (fun symbol ->
+            Hashtbl.replace fee_cache symbol (maker, taker, spot_m, spot_t)
+          ) symbols
       | None -> ()
-    ) symbols
 
   (** Transfer USDC from spot to perp wallet (or vice versa) *)
   let transfer_usd ~amount ~to_perp =
