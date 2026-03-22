@@ -25,7 +25,7 @@ __pycache__
 portfolio_report.md
 utils/
 reference/
-
+data/
 # Files containing detailed information about the compilation (generated
 # by `ocamlc`/`ocamlopt` when invoked using the option `-bin-annot`).
 # These files are typically useful for code inspection tools
