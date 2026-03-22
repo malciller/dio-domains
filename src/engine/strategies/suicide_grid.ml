@@ -645,11 +645,13 @@ let execute_strategy
         let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
 
         (* Skip if this buy order is the target of an in-flight amendment.
-           During cancel-replace, exchange data may briefly show the old order
+           For Kraken (cancel-replace): exchange data may briefly show the old order
            alongside the new one — counting both causes false multi-buy detection.
-           The strategy already tracks the order via last_buy_order_id, so
-           has_tracked_buy gives the correct effective_buy_count = 1. *)
-        let is_being_amended = side_str = "buy" && (
+           For Hyperliquid (WS modify): amendment is in-place, same order ID,
+           no intermediate cancelled state. The buy is always on the exchange,
+           so never filter it — hiding it makes grid_open_buy_count=0 and
+           relies on the fragile has_tracked_buy fallback. *)
+        let is_being_amended = asset.exchange <> "hyperliquid" && side_str = "buy" && (
           List.exists (fun (pending_id, _, _, _) ->
             String.starts_with ~prefix:"pending_amend_" pending_id &&
             String.length pending_id > 14 &&
@@ -1568,8 +1570,11 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
        before the exchange's WebSocket open-orders cache catches up.
        This prevents race-condition duplicate amends on Hyperliquid. *)
     let now = Unix.time () in
-    Hashtbl.replace state.amend_cooldowns old_order_id (now +. 10.0);
-    Hashtbl.replace state.amend_cooldowns new_order_id (now +. 10.0);
+    (* In-place modify (same ID): short cooldown as re-amendment throttle only.
+       Cancel-replace (different IDs): longer cooldown to cover WS data lag. *)
+    let cooldown = if old_order_id = new_order_id then 2.0 else 10.0 in
+    Hashtbl.replace state.amend_cooldowns old_order_id (now +. cooldown);
+    Hashtbl.replace state.amend_cooldowns new_order_id (now +. cooldown);
 
     Logging.debug_f ~section "Order amended and tracking updated: %s %s -> %s @ %.2f for %s"
       (string_of_order_side side) old_order_id new_order_id price asset_symbol
