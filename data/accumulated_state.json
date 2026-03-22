@@ -1,0 +1,14 @@
+{
+  "HYPE/USDC": {
+    "reserved_base": 0.0,
+    "accumulated_profit": 0.0,
+    "last_fill_oid": "356719894845",
+    "last_buy_fill_price": 39.597,
+    "last_sell_fill_price": 0.0
+  },
+  "BTC/USDC": {
+    "reserved_base": 0.0,
+    "accumulated_profit": 0.0,
+    "last_fill_oid": "356608158229"
+  }
+}
