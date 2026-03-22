@@ -643,13 +643,28 @@ let execute_strategy
       List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         (* Skip if this order was recently cancelled *)
         let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-        
+
+        (* Skip if this buy order is the target of an in-flight amendment.
+           During cancel-replace, exchange data may briefly show the old order
+           alongside the new one — counting both causes false multi-buy detection.
+           The strategy already tracks the order via last_buy_order_id, so
+           has_tracked_buy gives the correct effective_buy_count = 1. *)
+        let is_being_amended = side_str = "buy" && (
+          List.exists (fun (pending_id, _, _, _) ->
+            String.starts_with ~prefix:"pending_amend_" pending_id &&
+            String.length pending_id > 14 &&
+            String.sub pending_id 14 (String.length pending_id - 14) = order_id
+          ) state.pending_orders
+          || InFlightAmendments.is_in_flight order_id
+          || Hashtbl.mem state.amend_cooldowns order_id
+        ) in
+
         let is_our_strategy = match userref_opt with
           | Some ref_val -> ref_val = Strategy_common.strategy_userref_grid
           | None -> asset.exchange = "hyperliquid"
         in
         
-        if not is_cancelled && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
+        if not is_cancelled && not is_being_amended && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
             (* Treat ALL buy orders as grid buys to enforce single-buy-order policy across all exchanges *)
@@ -1665,7 +1680,23 @@ let cleanup_pending_cancellation asset_symbol order_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-  Hashtbl.remove state.pending_cancellations order_id
+  Hashtbl.remove state.pending_cancellations order_id;
+  (* Safety net: if cancelled order is the tracked buy, clear tracking.
+     Handles ghost orders from rapid amendments where the cancel response
+     arrives but handle_order_cancelled never fires (order didn't exist). *)
+  (match state.last_buy_order_id with
+   | Some id when id = order_id ->
+       state.last_buy_order_id <- None;
+       state.last_buy_order_price <- None;
+       set_asset_reserved_quote state 0.0;
+       state.inflight_buy <- false;
+       ignore (InFlightOrders.remove_in_flight_order
+         (generate_side_duplicate_key asset_symbol Buy));
+       Hashtbl.remove state.amend_cooldowns "place_Buy";
+       Logging.info_f ~section
+         "Cleared ghost buy tracking for %s after cancel cleanup of %s"
+         asset_symbol order_id
+   | _ -> ())
   )
 
 (** Get pending orders from ringbuffer for processing *)
