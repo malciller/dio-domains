@@ -32,7 +32,7 @@
         1.0
       ],
       "sell_mult": "0.999",
-      "accumulation_buffer": 2.50,
+      "accumulation_buffer": 1.50,
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
