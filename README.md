@@ -1,18 +1,35 @@
-# Dio
+```
+==========================================================================
+     ____  _
+    |  _ \(_) ___
+    | | | | |/ _ \
+    | |_| | | (_) |
+    |____/|_|\___/
+==========================================================================
+```
 
 [![OCaml](https://img.shields.io/badge/Language-OCaml-blue.svg)](https://ocaml.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-High-performance OCaml 5.2 trading engine for Kraken and Hyperliquid featuring domain-based parallel strategy execution. Each trading asset runs in its own isolated domain with lock-free communication, tick-driven event architecture, and real-time latency profiling. Built for high-frequency trading with WebSocket data feeds and asynchronous order execution.
+High-performance OCaml 5.2 trading engine for Kraken and Hyperliquid
+featuring domain-based parallel strategy execution. Each trading asset
+runs in its own isolated domain with lock-free communication,
+tick-driven event architecture, and real-time latency profiling.
+Built for high-frequency trading with WebSocket data feeds and
+asynchronous order execution.
 
 > [!WARNING]
 > **Auto-hedge for Hyperliquid is EXPERIMENTAL.** Testing is ongoing; features may be incomplete or unstable.
+
+---
 
 ## Requirements
 
 - OCaml 5.2.0 (opam)
 - Kraken API key/secret and/or Hyperliquid wallet/key
-- macOS/Linux/WSL
+- macOS / Linux / WSL
+
+---
 
 ## Quick Start
 
@@ -91,52 +108,149 @@ Edit `config.json` (example):
 
 ### Run
 ```bash
-./_build/default/bin/main.exe            
+./_build/default/bin/main.exe
 ```
+
+---
 
 ## Strategies
 
-**Grid**: Maintains buy/sell ladders around price with configurable spacing and size. Acts as a market maker with optional DCA accumulation via `sell_mult`. On Kraken, sells use `qty * sell_mult` directly.
+**Grid**: Maintains buy/sell ladders around price with configurable spacing
+and size. Acts as a market maker with optional DCA accumulation via
+`sell_mult`. On Kraken, sells use `qty * sell_mult` directly.
 
-Hyperliquid enforces discrete order sizes via `szDecimals` (e.g. HYPE uses 2 decimal places, so the lot increment is 0.01). When `sell_mult < 1.0`, the desired sell quantity often falls between valid lot boundaries and must be floored, creating rounding loss that exceeds the intended skim. For example, `0.35 * 0.999 = 0.34965` floors to `0.34`, losing 0.01 HYPE per cycle (~2.86%) instead of the intended ~0.1%.
+Hyperliquid enforces discrete order sizes via `szDecimals` (e.g. HYPE
+uses 2 decimal places, so the lot increment is 0.01). When
+`sell_mult < 1.0`, the desired sell quantity often falls between valid
+lot boundaries and must be floored, creating rounding loss that exceeds
+the intended skim. For example, `0.35 * 0.999 = 0.34965` floors to
+`0.34`, losing 0.01 HYPE per cycle (~2.86%) instead of the intended
+~0.1%.
 
-To handle this, the Grid strategy uses profit-gated accumulation. Most cycles sell the full `qty` (1:1), growing quote balance through grid spread profits. Once realized net profit (accounting for quantity and maker fees on both legs) exceeds the rounding cost plus `accumulation_buffer`, a single `sell_mult` sell is triggered to accumulate base asset. The effective threshold is `rounding_cost + accumulation_buffer`, where `rounding_cost = rounding_diff × sell_price` (the USDC value of the base being accumulated). The `accumulation_buffer` parameter (default: 0.01 USDC) represents the **net quote profit guaranteed above** the cost of the accumulated base — e.g. with `qty=0.35`, `sell_mult=0.999`, and HYPE at $39.55, the rounding cost is `0.01 × 39.55 ≈ 0.40 USDC`, so `accumulation_buffer: 2.50` yields an effective threshold of ~2.90 USDC. This is adaptive: fast markets accumulate faster, slow markets wait longer. Kraken is unaffected.
+To handle this, the Grid strategy uses profit-gated accumulation. Most
+cycles sell the full `qty` (1:1), growing quote balance through grid
+spread profits. Once realized net profit (accounting for quantity and
+maker fees on both legs) exceeds the rounding cost plus
+`accumulation_buffer`, a single `sell_mult` sell is triggered to
+accumulate base asset. The effective threshold is
+`rounding_cost + accumulation_buffer`, where
+`rounding_cost = rounding_diff x sell_price` (the USDC value of the
+base being accumulated). The `accumulation_buffer` parameter (default:
+0.01 USDC) represents the net quote profit guaranteed above the cost of
+the accumulated base. For example, with `qty=0.35`, `sell_mult=0.999`,
+and HYPE at $39.55, the rounding cost is `0.01 x 39.55 = 0.40 USDC`, so
+`accumulation_buffer: 2.50` yields an effective threshold of ~2.90 USDC.
+This is adaptive: fast markets accumulate faster, slow markets wait
+longer. Kraken is unaffected.
 
-**MM (Adaptive Market Maker)**: Dynamically adapts quoting style based on market fees. Uses greedy quoting for no-fee markets and conservative profit-guaranteeing quotes where fees apply.
+**MM (Adaptive Market Maker)**: Dynamically adapts quoting style based
+on market fees. Uses greedy quoting for no-fee markets and conservative
+profit-guaranteeing quotes where fees apply.
 
-**Fear & Greed**: Grid spacing is initially resolved at domain startup using linear interpolation between configured `grid_interval` [min, max] based on the CoinMarketCap Fear & Greed index. The index is dynamically re-evaluated at runtime whenever the underlying asset price moves by a significant threshold (e.g., +/- 3.5%) from the baseline, ensuring grid spacing adapts to changing market conditions. Provide `CMC_API_KEY` for live values.
+**Fear & Greed**: Grid spacing is initially resolved at domain startup
+using linear interpolation between configured `grid_interval` [min, max]
+based on the CoinMarketCap Fear & Greed index. The index is dynamically
+re-evaluated at runtime whenever the underlying asset price moves by a
+significant threshold (e.g., +/- 3.5%) from the baseline, ensuring grid
+spacing adapts to changing market conditions. Provide `CMC_API_KEY` for
+live values.
 
-**Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge on perps. Spot buy fills open a perp short; spot sell fills close it. Enable with `"hedge": true`. Kraken is not supported.
+**Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge
+on perps. Spot buy fills open a perp short; spot sell fills close it.
+Enable with `"hedge": true`. Kraken is not supported.
 
+---
 
 ## Key Features
 
-- **Domain-Based Parallelism**: Each trading asset runs in its own OCaml domain for true parallel execution without GIL limitations
-- **Tick-Driven Architecture**: Event-driven engine with a global tick bus and lock-free ring buffers for high-throughput data processing
-- **High-Performance Latency Profiling**: Real-time histogram-based profiling (p50-p999) of hot loops and strategy execution
-- **Circuit Breaker Protection**: Automatic connection management with health monitoring and graceful degradation
-- **High-Frequency Trading**: Optimized for low-latency execution with microsecond-precision timing
-- **Fault Tolerance**: Supervised domains with automatic restart and exponential backoff
+```
++--------------------------------------+
+|  Domain-Based Parallelism            |  Each trading asset runs in its own
+|                                      |  OCaml domain for true parallel
+|                                      |  execution without GIL limitations
++--------------------------------------+
+|  Tick-Driven Architecture            |  Event-driven engine with a global
+|                                      |  tick bus and lock-free ring buffers
+|                                      |  for high-throughput data processing
++--------------------------------------+
+|  Latency Profiling                   |  Real-time histogram-based profiling
+|                                      |  (p50-p999) of hot loops and
+|                                      |  strategy execution
++--------------------------------------+
+|  Circuit Breaker Protection          |  Automatic connection management
+|                                      |  with health monitoring and
+|                                      |  graceful degradation
++--------------------------------------+
+|  High-Frequency Trading              |  Optimized for low-latency execution
+|                                      |  with microsecond-precision timing
++--------------------------------------+
+|  Fault Tolerance                     |  Supervised domains with automatic
+|                                      |  restart and exponential backoff
++--------------------------------------+
+```
+
+---
+
+## Benchmarks
+
+All benchmarks run on hot-path components with sub-microsecond
+resolution. p50/p90/p99 values in microseconds.
+
+```
+------------------------------------------------------------------------------
+Benchmark                                       N  p50 (us)  p90 (us)  p99 (us) total (ms)
+------------------------------------------------------------------------------
+ringbuffer_write_read                       10000       1.00       1.00       1.00       0.43
+inflight_orders_ops                         10000       1.00       1.00       1.00       1.33
+inflight_amendments_ops                     10000       1.00       1.00       1.00       1.35
+fee_cache_store_get                          5000       1.00       1.00       1.00       4.53
+order_creation_place                         5000       1.00       1.00       1.00       0.41
+order_creation_amend                         5000       1.00       1.00       1.00       0.18
+config_parse_float                          10000       1.00       1.00       1.00       0.56
+price_calc_grid                             10000       1.00       1.00       1.00      16.10
+state_get_100_symbols                         100       3.00       3.00       4.00       0.23
+generate_duplicate_key                      10000       1.00       1.00       1.00       4.65
+------------------------------------------------------------------------------
+```
+
+---
 
 ## Architecture
 
-- **Main Entry Point**: Command-line interface with dashboard and headless modes, signal handling for graceful shutdown.
-- **Domain Spawner**: Manages OCaml domains for parallel strategy execution. Each trading asset runs in its own isolated domain with supervision and auto-restart capabilities.
-- **Supervisor**: Orchestrates WebSocket connections with circuit breaker patterns, heartbeat monitoring, and connection health management.
-- **Engine Core**:
-  - **Concurrency**: Lock-free global tick bus and event registry for inter-domain communication.
-  - **Latency Profiling**: Histogram-based statistics tracking for microsecond-precision performance monitoring.
-  - **Strategies**: High-frequency trading algorithms (Grid, MM) running in parallel domains with F&G integration.
-  - **Order Executor**: Asynchronous order placement and amendment with duplicate detection.
-  - **Logging**: Structured logging with configurable levels and sections.
-- **External Integration (Kraken)**:
-  - **WebSocket Feeds**: Real-time ticker, orderbook, balance, and execution data with ring buffer storage.
-  - **Trading Client**: Authenticated order operations with ping/pong heartbeat monitoring.
-  - **Authentication**: Secure token generation and management.
-- **External Integration (Hyperliquid)**:
-  - **WebSocket Feeds**: Real-time ticker (allMids), L2 orderbook, balance (webData2/spotState), and execution data with ring buffer storage.
-  - **REST Actions**: Authenticated order placement, amendment, and cancellation with L1 signature generation and retry with exponential backoff.
-  - **Concurrency**: Global order index, double-checked locking on stores, self-restarting processor tasks, and stale-order cleanup.
+```
++------------------+     +--------------------+     +--------------------+
+|   Main Entry     |---->|  Domain Spawner    |---->|  Strategy Domain   |
+|  (CLI, signals)  |     |  (per-asset mgmt)  |     |  (Grid / MM / ..) |
++------------------+     +--------------------+     +--------------------+
+                                  |                          |
+                                  v                          v
+                         +--------------------+     +--------------------+
+                         |   Supervisor       |     |  Order Executor    |
+                         | (circuit breaker,  |     |  (async placement, |
+                         |  heartbeat, health)|     |   dedup, amend)    |
+                         +--------------------+     +--------------------+
+                                  |                          |
+                                  v                          v
+               +---------------------------------------------+
+               |           Engine Core                       |
+               |  - Lock-free tick bus & event registry      |
+               |  - Histogram latency profiling (us)         |
+               |  - Structured logging (level + section)     |
+               +---------------------------------------------+
+                        |                        |
+                        v                        v
+          +-----------------------+   +-----------------------+
+          |  Kraken Integration   |   | Hyperliquid Integration|
+          | - WS: ticker, book,  |   | - WS: allMids, L2,    |
+          |   balance, exec      |   |   webData2, spotState  |
+          | - Trading client     |   | - REST: L1 sigs,       |
+          |   (auth, heartbeat)  |   |   retry + backoff      |
+          | - Ring buffer store  |   | - Global order index,  |
+          +-----------------------+   |   double-check locking |
+                                      +-----------------------+
+```
+
+---
 
 ## Development
 
@@ -160,9 +274,12 @@ dune build
 
 ### Hyperliquid State Persistence
 
-The Grid strategy persists accumulation state to disk so `reserved_base`, `accumulated_profit`, and `last_fill_oid` survive restarts.
+The Grid strategy persists accumulation state to disk so
+`reserved_base`, `accumulated_profit`, and `last_fill_oid` survive
+restarts.
 
-**State file**: `data/accumulated_state.json` (local dev) or `/app/data/accumulated_state.json` (Docker).
+**State file**: `data/accumulated_state.json` (local dev) or
+`/app/data/accumulated_state.json` (Docker).
 
 ```json
 {
@@ -174,11 +291,14 @@ The Grid strategy persists accumulation state to disk so `reserved_base`, `accum
 }
 ```
 
-State is written atomically (temp file + rename) with a mutex for multi-domain safety. On startup the strategy loads persisted values; missing fields default to `0.0` / `None`.
+State is written atomically (temp file + rename) with a mutex for
+multi-domain safety. On startup the strategy loads persisted values;
+missing fields default to `0.0` / `None`.
 
 #### Docker
 
-Mount a host volume for the `data/` directory so state survives container rebuilds:
+Mount a host volume for the `data/` directory so state survives
+container rebuilds:
 
 ```bash
 docker run -v /path/on/host/data:/app/data --env-file .env dio
@@ -186,9 +306,11 @@ docker run -v /path/on/host/data:/app/data --env-file .env dio
 
 #### OS-Specific Notes
 
-**macOS / Linux** — No additional setup needed. The `data/` directory is created automatically on first write.
+**macOS / Linux** -- No additional setup needed. The `data/` directory
+is created automatically on first write.
 
-**Windows (WSL2 — recommended)** — Run inside WSL2 (Ubuntu 22.04+). The Unix build toolchain and `Sys.rename` atomicity work as-is:
+**Windows (WSL2 -- recommended)** -- Run inside WSL2 (Ubuntu 22.04+).
+The Unix build toolchain and `Sys.rename` atomicity work as-is:
 
 ```bash
 # Inside WSL2
@@ -200,40 +322,51 @@ dune build
 > [!TIP]
 > Store the project and `data/` directory **inside the WSL filesystem** (e.g. `~/dio-domains/`), not on a `/mnt/c/` Windows mount. NTFS mounts have poor `inotify` support and `Sys.rename` across filesystem boundaries can fail silently.
 
-**Windows (native — advanced)** — Requires MSVC or MinGW OCaml. Key differences:
+**Windows (native -- advanced)** -- Requires MSVC or MinGW OCaml. Key
+differences:
 
 1. **Atomic rename**: `Sys.rename` on Windows fails if the target file is open by another process (e.g. antivirus scanner). Exclude `data/` from real-time scanning.
 2. **Path separators**: `Filename.concat` handles `\` vs `/` correctly.
-3. **Docker path**: `/app` detection doesn't trigger on native Windows — state always writes to `./data/`.
+3. **Docker path**: `/app` detection does not trigger on native Windows -- state always writes to `./data/`.
 4. **libsecp256k1**: Must be compiled manually. See the [secp256k1 build docs](https://github.com/bitcoin-core/secp256k1#building-on-windows).
 
 > [!WARNING]
 > Native Windows is not actively tested. WSL2 or Docker is strongly recommended.
 
+---
+
 ## Logging
 
 - Debug, Info, Warning, Error, timestamped by component.
 
+---
+
 ## Contributing
 
+```
 1. Fork
-2. Create branch (`git checkout -b feature/xyz`)
-    - Trading strategies: `src/engine/strategies/`
-    - Domain management: `src/engine/domain_spawner.ml`
-    - Concurrency & Bus: `src/engine/concurrency/`
-    - Latency Profiling: `src/engine/latency_profiling/`
-    - Connection supervision: `src/engine/supervisor/`
-    - WebSocket feeds (Kraken): `src/external/kraken/`
-    - WebSocket feeds (Hyperliquid): `src/external/hyperliquid/`
-    - Exchange interface: `src/external/exchange_intf.ml`
-3. Commit (`git commit -m "..."`)
-4. Push (`git push origin feature/xyz`)
+2. Create branch  -->  git checkout -b feature/xyz
+     - Trading strategies:       src/engine/strategies/
+     - Domain management:        src/engine/domain_spawner.ml
+     - Concurrency & Bus:        src/engine/concurrency/
+     - Latency Profiling:        src/engine/latency_profiling/
+     - Connection supervision:   src/engine/supervisor/
+     - WebSocket feeds (Kraken): src/external/kraken/
+     - WebSocket feeds (HL):     src/external/hyperliquid/
+     - Exchange interface:       src/external/exchange_intf.ml
+3. Commit  -->  git commit -m "..."
+4. Push    -->  git push origin feature/xyz
 5. Open PR
+```
 
 Guidelines: add tests, update docs, keep CI green.
+
+---
 
 ## License
 
 MIT. See `LICENSE`.
 
+```
 Legal: Provided "as is", without warranty. Trading involves risk.
+```
