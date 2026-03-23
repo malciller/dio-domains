@@ -393,11 +393,9 @@ let parse_update json on_heartbeat =
       (Printexc.to_string exn);
     None
 
-(** WebSocket message handler *)
-let handle_message message on_heartbeat =
-  Concurrency.Tick_event_bus.publish_tick ();
+(** WebSocket message handler - accepts pre-parsed JSON to avoid re-serialization *)
+let handle_message_json json on_heartbeat =
   try
-    let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in
     let channel = member "channel" json |> to_string_option in
     let msg_type = member "type" json |> to_string_option in
@@ -422,8 +420,17 @@ let handle_message message on_heartbeat =
         | None -> ())
     | Some "status", _, _ ->
         Logging.info ~section "Connected to Kraken authenticated WebSocket"
-    | _ ->
-        Logging.debug_f ~section "Unhandled: %s" message
+    | _ -> ()
+  with exn ->
+    Logging.error_f ~section "Error handling message: %s" 
+      (Printexc.to_string exn)
+
+(** WebSocket message handler - string version for backward compat *)
+let handle_message message on_heartbeat =
+  Concurrency.Tick_event_bus.publish_tick ();
+  try
+    let json = Yojson.Safe.from_string message in
+    handle_message_json json on_heartbeat
   with exn ->
     Logging.error_f ~section "Error handling message: %s - %s" 
       (Printexc.to_string exn) message
@@ -460,7 +467,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
     read_pos := Ring_buffer.RingBuffer.get_position buffer;
     
     List.iter (fun json ->
-      handle_message (Yojson.Safe.to_string json) on_heartbeat
+      handle_message_json json on_heartbeat
     ) new_messages;
     
     if Atomic.get Kraken_trading_client.shutdown_requested then

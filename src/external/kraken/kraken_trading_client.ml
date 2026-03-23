@@ -308,8 +308,8 @@ let handle_frame frame ~expected_generation =
                   Logging.debug_f ~section "Processing delayed response from old connection (expected_gen=%d, current_gen=%d, req_id=%d still pending)"
                     expected_generation current_gen req_id;
                 end;
-                Logging.debug_f ~section "Processing frame: req_id=%d, method=%s, generation=%d/%d"
-                  req_id method_name expected_generation current_gen;
+                Logging.debug_f ~section "Processing frame: req_id=%d, method=%s"
+                  req_id method_name;
                 (* Synchronously resolve response to prevent timeout race *)
                 resolve_response req_id response >>= fun () ->
                 Lwt.return_unit
@@ -322,7 +322,6 @@ let handle_frame frame ~expected_generation =
          (match member "channel" json |> to_string_option with
           | Some "heartbeat" -> Lwt.return_unit
           | _ ->
-              Logging.debug_f ~section "Unhandled trading message: %s" (Yojson.Safe.to_string json);
               RingBuffer.write message_buffer json;
               Lwt_condition.broadcast message_condition ();
               Lwt.return_unit)
@@ -335,7 +334,6 @@ let handle_frame frame ~expected_generation =
   Lwt.return_unit
 
 let rec reader_loop conn generation =
-  Logging.debug_f ~section "Reader loop iteration (generation %d)" generation;
   if Atomic.get shutdown_requested then begin
     Logging.info_f ~section "Reader loop shutting down (generation %d)" generation;
     Lwt.return_unit
@@ -347,8 +345,6 @@ let rec reader_loop conn generation =
           Logging.warn_f ~section "Trading WebSocket closed by server (generation %d)" generation;
           reset_state conn ~notify_failure:true "Connection closed by server"
       | frame ->
-          Logging.debug_f ~section "Received WebSocket frame (generation %d, content length: %d)"
-            generation (String.length frame.Websocket.Frame.content);
           handle_frame frame ~expected_generation:generation >>= fun () ->
           reader_loop conn generation
     )

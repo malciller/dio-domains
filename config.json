@@ -4,17 +4,6 @@
   "cycle_mod": 10000,
   "trading": [
     {
-      "symbol": "BTC/USD",
-      "exchange": "kraken",
-      "qty": "0.0002",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
       "symbol": "ETH/USD",
       "exchange": "kraken",
       "qty": "0.006",

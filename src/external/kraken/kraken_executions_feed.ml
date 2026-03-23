@@ -167,7 +167,27 @@ let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
 (** Global order_id to symbol mapping for handling minimal events *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 128
+let order_to_symbol_cap = 10_000  (* Prevent unbounded growth from pre-startup orders *)
 let global_orders_mutex = Mutex.create ()
+
+(** Evict oldest entries from order_to_symbol when exceeding cap.
+    Called under global_orders_mutex. *)
+let maybe_trim_order_to_symbol () =
+  let len = Hashtbl.length order_to_symbol in
+  if len > order_to_symbol_cap then begin
+    (* Remove ~25% of entries to avoid trimming on every insert *)
+    let to_remove = len - (order_to_symbol_cap * 3 / 4) in
+    let removed = ref 0 in
+    let keys_to_remove = ref [] in
+    Hashtbl.iter (fun k _ ->
+      if !removed < to_remove then begin
+        keys_to_remove := k :: !keys_to_remove;
+        incr removed
+      end
+    ) order_to_symbol;
+    List.iter (fun k -> Hashtbl.remove order_to_symbol k) !keys_to_remove;
+    Logging.info_f ~section "Trimmed order_to_symbol: %d -> %d entries" len (Hashtbl.length order_to_symbol)
+  end
 
 let initialization_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
@@ -416,6 +436,7 @@ let update_open_orders store (event : execution_event) =
     
     (* Add to global order mapping *)
     Hashtbl.replace order_to_symbol event.order_id event.symbol;
+    maybe_trim_order_to_symbol ();
     
     if was_present then begin
       Logging.debug_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
@@ -746,12 +767,10 @@ let handle_update json on_heartbeat =
     Logging.error_f ~section "Failed to process execution update: %s"
       (Printexc.to_string exn)
 
-(** WebSocket message handler *)
-let handle_message message on_heartbeat =
-  Concurrency.Tick_event_bus.publish_tick ();
+(** WebSocket message handler - accepts pre-parsed JSON to avoid re-serialization *)
+let handle_message_json json on_heartbeat =
   Concurrency.Exchange_wakeup.signal ();  (* wake domain workers blocked in wait() *)
   try
-    let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in
     let channel = member "channel" json |> to_string_option in
     let msg_type = member "type" json |> to_string_option in
@@ -777,7 +796,6 @@ let handle_message message on_heartbeat =
         (match success with
         | Some true -> 
             Logging.info ~section "Subscribed to executions feed";
-            Logging.debug_f ~section "Subscription response: %s" message;
         | Some false -> 
             let error = member "error" json |> to_string_option in
             Logging.error_f ~section "Subscription failed: %s" 
@@ -786,9 +804,19 @@ let handle_message message on_heartbeat =
     | Some "status", _, _ ->
         Logging.debug ~section "Status message received"
     | _ ->
-        Logging.debug_f ~section "Unhandled execution message: %s" message
+        ()
   with exn ->
-    Logging.error_f ~section "Error handling message: %s - %s" 
+    Logging.error_f ~section "Error handling message: %s" 
+      (Printexc.to_string exn)
+
+(** WebSocket message handler - string version for backward compat *)
+let handle_message message on_heartbeat =
+  Concurrency.Tick_event_bus.publish_tick ();
+  try
+    let json = Yojson.Safe.from_string message in
+    handle_message_json json on_heartbeat
+  with exn ->
+    Logging.error_f ~section "Error parsing message: %s - %s" 
       (Printexc.to_string exn) message
 
 
@@ -825,7 +853,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
     read_pos := Ring_buffer.RingBuffer.get_position buffer;
     
     List.iter (fun json ->
-      handle_message (Yojson.Safe.to_string json) on_heartbeat
+      handle_message_json json on_heartbeat
     ) new_messages;
     
     if Atomic.get Kraken_trading_client.shutdown_requested then

@@ -163,8 +163,7 @@ let handle_message message on_heartbeat =
         Logging.info_f ~section "Subscribed to %s ticker feed" symbol
     | Some "status", _ ->
         Logging.info ~section "Connected to Kraken WebSocket v2"
-    | _ ->
-        Logging.debug_f ~section "Unhandled: %s" message
+    | _ -> ()
   with exn ->
     Logging.error_f ~section "Error handling message: %s - %s"
       (Printexc.to_string exn) message

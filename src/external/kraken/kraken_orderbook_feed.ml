@@ -425,20 +425,11 @@ let int32_of_json json =
 
 let parse_level symbol price_json size_json =
   let pd, ld =
-    (* First try to get precision from instruments feed *)
     match get_precision_from_instruments symbol with
-    | Some (price_prec, qty_prec) ->
-        Logging.debug_f ~section "Found instruments precision for %s: price=%d qty=%d" symbol price_prec qty_prec;
-        (price_prec, qty_prec)
+    | Some (price_prec, qty_prec) -> (price_prec, qty_prec)
     | None ->
-        (* Fall back to decimals_tbl from AssetPairs API *)
-        try
-          let decimals = Hashtbl.find decimals_tbl symbol in
-          Logging.debug_f ~section "Found decimals_tbl for %s: %d, %d" symbol (fst decimals) (snd decimals);
-          decimals
-        with Not_found ->
-          Logging.debug_f ~section "No decimals found for %s, using defaults" symbol;
-          (8, 8)  (* Fallback defaults *)
+        (try Hashtbl.find decimals_tbl symbol
+         with Not_found -> (8, 8))
   in
 
   let price_str = to_decimal_str ~dec:pd price_json in
@@ -505,29 +496,15 @@ let build_orderbook store symbol entry =
   in
   let checksum =
     let checksum_json = member "checksum" entry in
-    Logging.debug_f ~section "Parsing checksum JSON: %s" (Yojson.Safe.to_string checksum_json);
     match checksum_json with
-    | `Int i ->
-        Logging.debug_f ~section "Checksum parsed as Int: %d" i;
-        Some (Int32.of_int i)
+    | `Int i -> Some (Int32.of_int i)
     | `Intlit s ->
-        Logging.debug_f ~section "Checksum parsed as Intlit: %s" s;
-        (try Some (Int32.of_string s) with exn ->
-          Logging.error_f ~section "Failed to parse Intlit checksum %s: %s" s (Printexc.to_string exn);
-          None)
+        (try Some (Int32.of_string s) with _ -> None)
     | `Float f ->
-        Logging.debug_f ~section "Checksum parsed as Float: %f" f;
-        (try Some (Int32.of_float f) with exn ->
-          Logging.error_f ~section "Failed to parse Float checksum %f: %s" f (Printexc.to_string exn);
-          None)
+        (try Some (Int32.of_float f) with _ -> None)
     | `String s ->
-        Logging.debug_f ~section "Checksum parsed as String: %s" s;
-        (try Some (Int32.of_string s) with exn ->
-          Logging.error_f ~section "Failed to parse String checksum %s: %s" s (Printexc.to_string exn);
-          None)
-    | json ->
-        Logging.error_f ~section "Unexpected checksum JSON type: %s" (Yojson.Safe.to_string json);
-        None
+        (try Some (Int32.of_string s) with _ -> None)
+    | _ -> None
   in
   {
     symbol;
@@ -580,14 +557,15 @@ let fetch_decimals symbols =
       Lwt.return ()
   )
 
+let notified_symbols_reusable : (string, store) Hashtbl.t = Hashtbl.create 16
+
 let process_orderbook_message ~reset json on_heartbeat =
   let open Yojson.Safe.Util in
   try
     let data = member "data" json |> to_list in
-    Logging.debug_f ~section "Processing orderbook message with %d entries (reset=%b)"
-      (List.length data) reset;
     (* Track symbols that successfully wrote to buffer in this message *)
-    let notified_symbols = Hashtbl.create 16 in
+    Hashtbl.clear notified_symbols_reusable;
+    let notified_symbols = notified_symbols_reusable in
     List.iter (fun entry ->
       try
         let symbol = member "symbol" entry |> to_string in
@@ -651,8 +629,6 @@ let process_orderbook_message ~reset json on_heartbeat =
         let asks_json = member "asks" entry in
         let bids = parse_levels symbol bids_json in
         let asks = parse_levels symbol asks_json in
-        Logging.debug_f ~section "Parsed levels for %s: bids=%d asks=%d"
-          symbol (List.length bids) (List.length asks);
 
         store.bids <- apply_levels store.bids bids;
         store.asks <- apply_levels store.asks asks;
@@ -668,9 +644,6 @@ let process_orderbook_message ~reset json on_heartbeat =
           (levels_to_array ~sort_desc:false store.asks 10) in
 
         let orderbook = build_orderbook store symbol entry in
-        Logging.debug_f ~section "Built orderbook for %s: bids=%d asks=%d checksum=%s"
-          symbol (Array.length orderbook.bids) (Array.length orderbook.asks)
-          (match orderbook.checksum with Some c -> Int32.to_string c | None -> "none");
 
         (* Verify checksum - only proceed if valid *)
         let checksum_valid =
@@ -686,21 +659,14 @@ let process_orderbook_message ~reset json on_heartbeat =
                 Atomic.set store.has_snapshot false;
                 Atomic.set store.last_sequence None;
                 false  (* Don't write to buffer *)
-              end else begin
-                Logging.debug_f ~section "Checksum match for %s: %ld" symbol calculated_checksum;
+              end else
                 true   (* Write to buffer *)
-              end
           | None -> true  (* No checksum to validate, proceed *)
         in
 
         if checksum_valid then begin
           RingBuffer.write store.buffer orderbook;
-          (* Record that this symbol should be notified (only once per message) *)
           Hashtbl.replace notified_symbols symbol store;
-          Logging.debug_f ~section "Orderbook written to ringbuffer: %s bids=%d asks=%d"
-            symbol
-            (Array.length orderbook.bids)
-            (Array.length orderbook.asks);
 
           (* Update last sequence on successful write *)
           let current_sequence =
@@ -851,18 +817,12 @@ let trigger_orderbook_cleanup ~reason () =
 
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
-  Logging.debug_f ~section "Received orderbook WebSocket message (length=%d)"
-    (String.length message);
   try
     let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in
     let channel = member "channel" json |> to_string_option in
     let msg_type = member "type" json |> to_string_option in
     let method_type = member "method" json |> to_string_option in
-    Logging.debug_f ~section "Message parsed: channel=%s type=%s method=%s"
-      (match channel with Some c -> c | None -> "none")
-      (match msg_type with Some t -> t | None -> "none")
-      (match method_type with Some m -> m | None -> "none");
 
     match channel, msg_type, method_type with
   | Some "book", Some "snapshot", _ ->
