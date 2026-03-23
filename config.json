@@ -18,7 +18,7 @@
         0.5
       ],
       "sell_mult": "0.999",
-      "accumulation_buffer": 2.50,
+      "accumulation_buffer": 1.00,
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
@@ -29,10 +29,10 @@
       "qty": "0.35",
       "grid_interval": [
         0.18,
-        1.0
+        1.15
       ],
       "sell_mult": "0.999",
-      "accumulation_buffer": 1.50,
+      "accumulation_buffer": 0.50,
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
