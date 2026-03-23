@@ -5,7 +5,8 @@
   - Only 1 open buy order may exist at once
   - Many sell orders may exist at a time
   - Orders are placed at grid intervals from current price
-  - Buy orders trail price movements, sell orders are placed above current price
+  - Buy orders trail price movements upwards gated by sell orders existing above it,
+    sell orders are placed above current price
 
   The strategy generates orders and pushes them to a ringbuffer for execution elsewhere.
 *)
@@ -137,20 +138,22 @@ let get_strategy_state asset_symbol =
     reservation_mutex is never held while waiting for state.mutex. **)
 let reservation_mutex = Mutex.create ()
 
-(** Inner sum - MUST be called with reservation_mutex already held. **)
-let get_total_reserved_quote_locked () =
+(** Inner sum - MUST be called with reservation_mutex already held.
+    Only sums reserved_quote for states matching the given exchange. *)
+let get_total_reserved_quote_locked ~exchange =
   Mutex.lock strategy_states_mutex;
   let total = Hashtbl.fold (fun _key state acc ->
-    acc +. state.reserved_quote
+    if state.exchange_id = exchange then acc +. state.reserved_quote
+    else acc
   ) strategy_states 0.0 in
   Mutex.unlock strategy_states_mutex;
   total
 
-(** Public read: acquires reservation_mutex then sums all assets.
+(** Public read: acquires reservation_mutex then sums same-exchange assets.
     Safe to call from outside state.mutex (capital-low fast-path). *)
-let get_total_reserved_quote () =
+let get_total_reserved_quote ~exchange =
   Mutex.lock reservation_mutex;
-  let total = get_total_reserved_quote_locked () in
+  let total = get_total_reserved_quote_locked ~exchange in
   Mutex.unlock reservation_mutex;
   total
 
@@ -167,7 +170,7 @@ let set_asset_reserved_quote state v =
     If balance_ok, state.reserved_quote is set to reserve_amount before returning. *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
   Mutex.lock reservation_mutex;
-  let total_reserved = get_total_reserved_quote_locked () in
+  let total_reserved = get_total_reserved_quote_locked ~exchange:state.exchange_id in
   let available = quote_bal -. total_reserved in
   let ok = available >= quote_needed in
   if ok then state.reserved_quote <- reserve_amount;
@@ -504,7 +507,7 @@ let execute_strategy
        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
        let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
        (* Available balance = total balance minus ALL domains' reserved quote *)
-       let total_reserved = get_total_reserved_quote () in
+       let total_reserved = get_total_reserved_quote ~exchange:state.exchange_id in
        let available_quote = quote_bal -. total_reserved in
        if state.capital_low && available_quote < quote_needed_fast then begin
          (* Still low: skip entire strategy body to avoid order spam *)

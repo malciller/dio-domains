@@ -92,52 +92,49 @@ let log level section_name message =
     end
   end
 
-(* Public API *)
-let debug_f ~section fmt =
-  Printf.ksprintf (fun msg ->
-    if will_log DEBUG section then
-      Lwt.async (fun () -> log DEBUG section msg)
-    else
-      ()
-  ) fmt
+(* Public API - zero-allocation when log level is disabled.
+   Printf.ifprintf consumes format arguments without allocating a string.
+   Printf.ksprintf allocates a Buffer + string, so we only call it when needed. *)
+let debug_f ~section (fmt : ('a, unit, string, unit) format4) =
+  if will_log DEBUG section then
+    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log DEBUG section msg)) fmt
+  else
+    Printf.ifprintf () fmt
 
-let info_f ~section fmt =
-  Printf.ksprintf (fun msg ->
-    if will_log INFO section then
-      Lwt.async (fun () -> log INFO section msg)
-    else
-      ()
-  ) fmt
+let info_f ~section (fmt : ('a, unit, string, unit) format4) =
+  if will_log INFO section then
+    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log INFO section msg)) fmt
+  else
+    Printf.ifprintf () fmt
 
-let warn_f ~section fmt =
-  Printf.ksprintf (fun msg ->
-    if will_log WARN section then
-      Lwt.async (fun () -> log WARN section msg)
-    else
-      ()
-  ) fmt
+let warn_f ~section (fmt : ('a, unit, string, unit) format4) =
+  if will_log WARN section then
+    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log WARN section msg)) fmt
+  else
+    Printf.ifprintf () fmt
 
-let error_f ~section fmt =
-  Printf.ksprintf (fun msg ->
-    if will_log ERROR section then
-      Lwt.async (fun () -> log ERROR section msg)
-    else
-      ()
-  ) fmt
+let error_f ~section (fmt : ('a, unit, string, unit) format4) =
+  if will_log ERROR section then
+    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log ERROR section msg)) fmt
+  else
+    Printf.ifprintf () fmt
 
-let critical_f ~section fmt =
-  Printf.ksprintf (fun msg ->
-    if will_log CRITICAL section then
-      Lwt.async (fun () -> log CRITICAL section msg)
-    else
-      ()
-  ) fmt
+let critical_f ~section (fmt : ('a, unit, string, unit) format4) =
+  if will_log CRITICAL section then
+    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log CRITICAL section msg)) fmt
+  else
+    Printf.ifprintf () fmt
 
-let debug ~section msg = Lwt.async (fun () -> log DEBUG section msg)
-let info ~section msg = Lwt.async (fun () -> log INFO section msg)
-let warn ~section msg = Lwt.async (fun () -> log WARN section msg)
-let error ~section msg = Lwt.async (fun () -> log ERROR section msg)
-let critical ~section msg = Lwt.async (fun () -> log CRITICAL section msg)
+let debug ~section msg =
+  if will_log DEBUG section then Lwt.async (fun () -> log DEBUG section msg)
+let info ~section msg =
+  if will_log INFO section then Lwt.async (fun () -> log INFO section msg)
+let warn ~section msg =
+  if will_log WARN section then Lwt.async (fun () -> log WARN section msg)
+let error ~section msg =
+  if will_log ERROR section then Lwt.async (fun () -> log ERROR section msg)
+let critical ~section msg =
+  if will_log CRITICAL section then Lwt.async (fun () -> log CRITICAL section msg)
 
 (* Configuration *)
 let init () = ()

@@ -62,17 +62,22 @@ module Make (Payload : PAYLOAD) = struct
     let now = Unix.time () in
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in
-      let filtered = List.filter (fun sub ->
+      let to_keep, to_remove = List.partition (fun sub ->
         sub.persistent || (
           not sub.closed &&
           (now -. sub.created_at) <= max_age_seconds &&
           (now -. sub.last_used) <= max_unused_seconds
         )
       ) current in
-      let removed_count = List.length current - List.length filtered in
+      let removed_count = List.length to_remove in
       if removed_count > 0 then begin
-        Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length filtered);
-        if Atomic.compare_and_set bus.subscribers current filtered then
+        (* Close removed subscribers to release Lwt_stream + finalize promise *)
+        List.iter (fun sub ->
+          sub.closed <- true;
+          (try sub.close () with _ -> ())
+        ) to_remove;
+        Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
+        if Atomic.compare_and_set bus.subscribers current to_keep then
           Some removed_count
         else try_cleanup ()
       end else None
@@ -84,16 +89,19 @@ module Make (Payload : PAYLOAD) = struct
     let now = Unix.time () in
     let rec try_cleanup () =
       let current = Atomic.get bus.subscribers in
-      let filtered = List.filter (fun sub ->
-        (* Keep persistent subscribers *)
+      let to_keep, to_remove = List.partition (fun sub ->
         sub.persistent ||
-        (* Keep non-closed subscribers that have been used within the last 10 seconds *)
         (not sub.closed && (now -. sub.last_used) <= 10.0)
       ) current in
-      let removed_count = List.length current - List.length filtered in
+      let removed_count = List.length to_remove in
       if removed_count > 0 then begin
-        Logging.debug_f ~section:"event_bus" "Force cleaned %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length filtered);
-        if Atomic.compare_and_set bus.subscribers current filtered then
+        (* Close removed subscribers to release Lwt_stream + finalize promise *)
+        List.iter (fun sub ->
+          sub.closed <- true;
+          (try sub.close () with _ -> ())
+        ) to_remove;
+        Logging.debug_f ~section:"event_bus" "Force cleaned %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
+        if Atomic.compare_and_set bus.subscribers current to_keep then
           Some removed_count
         else try_cleanup ()
       end else None
@@ -135,45 +143,27 @@ module Make (Payload : PAYLOAD) = struct
 
   let publish bus payload =
     Atomic.set bus.latest (Some payload);
-    let now = Unix.time () in
     let subs = Atomic.get bus.subscribers in
-    (* Filter out closed subscribers and validate each one before pushing *)
-    let active_subs = List.filter (fun sub -> not sub.closed) subs in
+    (* Filter out closed subscribers inline — avoids allocating a new list *)
     List.iter (fun sub ->
-      (* Double-check subscriber is still active before pushing *)
       if not sub.closed then begin
-        (* Make pushes non-blocking to prevent backpressure *)
-        Lwt.async (fun () ->
-          Lwt.catch
-            (fun () ->
-              (* Use timeout to detect blocking/slow consumers *)
-              Lwt.pick [
-                (sub.push payload >|= fun () ->
-                   (* Only update last_used on successful push *)
-                   sub.last_used <- now);
-                (Lwt_unix.sleep 0.050 >|= fun () ->
-                   (* Timeout - subscriber is too slow *)
-                   Logging.warn_f ~section:"event_bus" "Subscriber too slow (50ms timeout), dropping: %s" bus.topic;
-                   sub.closed <- true)
-              ]
-            )
-            (fun exn ->
-              (* Mark subscriber as closed on push failure (including timeout) *)
-              Logging.debug_f ~section:"event_bus" "Subscriber push failed/timed out, marking closed: %s" (Printexc.to_string exn);
-              sub.closed <- true;
-              Lwt.return_unit
-            )
-        )
+        (* Try non-blocking push first to avoid Lwt.async/Lwt.pick/timer overhead *)
+        let push_result = sub.push payload in
+        if Lwt.is_sleeping push_result then begin
+          (* Stream is full — subscriber is too slow, close it immediately *)
+          Lwt.cancel push_result;
+          sub.closed <- true;
+          (try sub.close () with _ -> ())
+        end else begin
+          sub.last_used <- Unix.time ()
+        end
       end
-    ) active_subs;
+    ) subs;
 
-    (* Event-driven cleanup: run cleanup every 100 publications to avoid overhead *)
+    (* Event-driven cleanup: run cleanup every 100 publications *)
     bus.publish_count <- bus.publish_count + 1;
     if bus.publish_count mod 100 = 0 then
-      match cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 () with
-      | Some removed_count ->
-          Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s" removed_count bus.topic
-      | None -> ()
+      ignore (cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 ())
 
   let subscribe ?(persistent=false) bus =
     (* Use bounded stream to prevent unbounded memory growth *)

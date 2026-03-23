@@ -459,9 +459,11 @@ let test_accumulation_multi_strategy_isolation () =
     hype.accumulated_profit hype_required;
 
   (* --- Test reserved_quote (USDC) isolation --- *)
+  btc.exchange_id <- "hyperliquid";
+  hype.exchange_id <- "hyperliquid";
   Dio_strategies.Suicide_grid.set_asset_reserved_quote btc 16.80;  (* 0.0002 * 84000 = 16.80 USDC *)
   Dio_strategies.Suicide_grid.set_asset_reserved_quote hype 13.80; (* 0.35 * 39.42 ≈ 13.80 USDC *)
-  let total_reserved = Dio_strategies.Suicide_grid.get_total_reserved_quote () in
+  let total_reserved = Dio_strategies.Suicide_grid.get_total_reserved_quote ~exchange:"hyperliquid" in
   check bool "total reserved USDC includes both domains" true (total_reserved >= 30.0)
 
 let () =
