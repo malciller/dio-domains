@@ -46,7 +46,7 @@ Edit `config.json` (example):
       "symbol": "BTC/USD",            // Pair to trade
       "exchange": "kraken",           // Exchange name: "kraken", "hyperliquid"
       "qty": "0.0002",                // Base asset quantity per order
-      "grid_interval": [0.25, 1.25],  // Min/Max grid spacing (%); resolved once from Fear & Greed
+      "grid_interval": [0.25, 1.25],  // Min/Max grid spacing (%); resolved dynamically from Fear & Greed
       "sell_mult": "0.999",           // Sell amount multiplier (qty * sell_mult = sell order size)
       "strategy": "Grid"              // Strategy name: "Grid"
     },
@@ -104,7 +104,7 @@ To handle this, the Grid strategy uses profit-gated accumulation. Most cycles se
 
 **MM (Adaptive Market Maker)**: Dynamically adapts quoting style based on market fees. Uses greedy quoting for no-fee markets and conservative profit-guaranteeing quotes where fees apply.
 
-**Fear & Greed**: Grid spacing is resolved once at domain startup using linear interpolation between configured `grid_interval` [min, max] based on the CoinMarketCap Fear & Greed index. Provide `CMC_API_KEY` for live values.
+**Fear & Greed**: Grid spacing is initially resolved at domain startup using linear interpolation between configured `grid_interval` [min, max] based on the CoinMarketCap Fear & Greed index. The index is dynamically re-evaluated at runtime whenever the underlying asset price moves by a significant threshold (e.g., +/- 3.5%) from the baseline, ensuring grid spacing adapts to changing market conditions. Provide `CMC_API_KEY` for live values.
 
 **Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge on perps. Spot buy fills open a perp short; spot sell fills close it. Enable with `"hedge": true`. Kraken is not supported.
 
