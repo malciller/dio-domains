@@ -464,6 +464,12 @@ let execute_strategy
 
    (* --- Asset-low check: clear flag when asset balance recovers --- *)
    (* Subtract reserved_base so accumulated base asset is protected from sells *)
+   (* For Kraken: only clear when balance has genuinely increased (fill, deposit).
+      Kraken's "Insufficient funds" on sells can mean USD collateral is too low,
+      not that asset balance is insufficient. The local balance check would
+      immediately clear the flag every cycle, causing a tight retry loop.
+      For Hyperliquid: clear whenever available balance passes the threshold
+      (existing behavior). *)
    (match asset_balance with
     | Some asset_bal ->
         let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
@@ -473,7 +479,12 @@ let execute_strategy
                qty_f *. sell_mult_f
         in
         let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit in
-        if state.asset_low && available_asset >= asset_needed_fast then begin
+        let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
+        let should_clear =
+          if asset.exchange = "hyperliquid" then available_asset >= asset_needed_fast
+          else available_asset >= asset_needed_fast && balance_actually_changed
+        in
+        if state.asset_low && should_clear then begin
           state.asset_low <- false;
           state.inflight_sell <- false;
           ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
@@ -519,8 +530,10 @@ let execute_strategy
    | None -> () (* No balance data yet, fall through *)
   );
 
-  (* Only proceed with main strategy if capital_low flag is clear *)
-  if not state.capital_low && not state.asset_low then begin
+  (* Only proceed with main strategy if capital_low flag is clear.
+     asset_low is checked below only for sell+buy placement — order sync,
+     cleanup, and cancellation detection must always run. *)
+  if not state.capital_low then begin
 
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -617,22 +630,15 @@ let execute_strategy
       ) !to_remove_cooldowns;
 
       (* Sync strategy state with actual open orders from exchange *)
-      (* For Hyperliquid: preserve sell orders that were set by handle_order_amended
-         but may not yet appear in exchange data due to WS lag.
-         Kraken clears as before since its data feed is authoritative. *)
-      let preserved_sells = if asset.exchange = "hyperliquid" then state.open_sell_orders else [] in
+      (* Preserve sell orders that were set by handle_order_amended
+         or newly placed execution events but may not yet appear in exchange data due to WS lag. *)
+      let preserved_sells = state.open_sell_orders in
       state.open_sell_orders <- [];
-      (* For Hyperliquid: preserve buy tracking across sync.
-         webData2 lags behind execution events during cancel-replace amendments,
-         so the exchange may briefly report 0 buys while we know one exists.
-         The effective_buy_count logic (has_tracked_buy && open_buy_count=0 -> 1)
-         handles this, but only if we don't clear the tracking here.
-         Genuine cancellations clear tracking via handle_order_cancelled.
-         Kraken clears as before since its data feed is authoritative. *)
-      if asset.exchange <> "hyperliquid" then begin
-        state.last_buy_order_price <- None;
-        state.last_buy_order_id <- None
-      end;
+      (* Preserve buy tracking across sync for all exchanges.
+         Exchange open orders feed may lag behind execution events,
+         so it may briefly report 0 buys while we know one exists.
+         Genuine cancellations clear tracking via handle_order_cancelled. *)
+      
       (* Note: We don't clear pending_orders here - they should be managed by order placement responses *)
 
       (* Update with real orders from exchange - open_orders is (order_id, price, qty, side, userref) list *)
@@ -1209,12 +1215,17 @@ let handle_order_failed asset_symbol side reason =
            Logging.warn_f ~section "Exchange rejected buy for %s with insufficient funds - setting capital_low flag"
              asset_symbol
          end
+     | Sell when is_insufficient_balance && state.exchange_id = "hyperliquid" ->
+          if not state.asset_low then begin
+            state.asset_low <- true;
+            Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance - setting asset_low flag"
+              asset_symbol
+          end
      | Sell when is_insufficient_balance ->
-         if not state.asset_low then begin
-           state.asset_low <- true;
-           Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance - setting asset_low flag"
-             asset_symbol
-         end
+          (* Kraken: sell failures are fire-and-forget. Don't set asset_low;
+             the sell simply fails and the strategy continues placing the buy. *)
+          Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance (ignored, Kraken sell is fire-and-forget)"
+            asset_symbol
      | _ -> ());
 
     (* Apply timer cooldown only for buy-side rate limits; sell side uses asset_low flag *)
@@ -1441,7 +1452,7 @@ let handle_order_cancelled asset_symbol order_id side =
     String.starts_with ~prefix:"pending_amend_" pending_id &&
     let target_id = String.sub pending_id 14 (String.length pending_id - 14) in
     target_id = order_id
-  ) state.pending_orders || Hashtbl.mem state.amend_cooldowns order_id in
+  ) state.pending_orders in
 
   if is_cancel_replace then begin
     (* Cancel-replace: clean up the pending_amend entry but keep guards alive *)
