@@ -239,6 +239,11 @@ module Hyperliquid_impl = struct
             ~testnet:(Atomic.get is_testnet)
           >|= function
           | Ok () ->
+              (* Proactively remove cancelled orders from open_orders feed
+                 to prevent ghost orders if orderUpdates WS is lagging or missed *)
+              List.iter (fun id ->
+                Hyperliquid_executions_feed.remove_open_order ~symbol ~order_id:id
+              ) ids_for_symbol;
               let new_results = List.map (fun id -> { Types.order_id = id; cl_ord_id = None }) ids_for_symbol in
               (new_results @ results_acc, errors_acc)
           | Error e ->
