@@ -6,12 +6,12 @@ let endpoint = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest"
 let api_key_env = "CMC_API_KEY"
 
 (* Cache the fetched value for the lifetime of the process *)
-let cached_value : float option ref = ref None
+let cached_value : float option Atomic.t = Atomic.make None
 
-let clear_cache () = cached_value := None
+let clear_cache () = Atomic.set cached_value None
 
 let set_cached v =
-  cached_value := Some v;
+  Atomic.set cached_value (Some v);
   v
 
 let load_dotenv () =
@@ -61,7 +61,7 @@ let fetch_value_lwt ?(fallback = 50.0) () =
             Lwt.return (set_cached fallback)
 
 let fetch_and_cache_sync ?(fallback = 50.0) () =
-  match !cached_value with
+  match Atomic.get cached_value with
   | Some v -> v
   | None ->
       let value =
@@ -72,12 +72,20 @@ let fetch_and_cache_sync ?(fallback = 50.0) () =
       in
       set_cached value
 
-let get_cached () = !cached_value
+let get_cached () = Atomic.get cached_value
 
 let fetch_value ?(fallback = 50.0) () =
-  match !cached_value with
+  match Atomic.get cached_value with
   | Some v -> v
   | None -> set_cached fallback
+
+let force_fetch_async ?(fallback = 50.0) () =
+  ignore (Thread.create (fun () ->
+    try
+      ignore (Lwt_main.run (fetch_value_lwt ~fallback ()))
+    with exn ->
+      Logging.error_f ~section "Exception in async fetch fear-and-greed: %s" (Printexc.to_string exn)
+  ) ())
 
 (* Get the grid value based on fear_and_greed using linear interpolation (0-100 range) *)
 let grid_value_for_fng ~grid_interval:(min_val, max_val) ~fear_and_greed =
