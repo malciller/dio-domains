@@ -28,10 +28,14 @@ let use_colors = ref true
 let output_channel = ref stderr
 let enabled_sections = ref []
 let quiet_mode = ref false
-let log_callback = ref (fun _level _section _message -> Lwt.return_unit)
+let log_callback : (level -> string -> string -> unit Lwt.t) ref = ref (fun _level _section _message -> Lwt.return_unit)
 let set_enabled_sections secs = enabled_sections := secs
 let set_quiet_mode quiet = quiet_mode := quiet
 let set_log_callback callback = log_callback := callback
+
+(** Mutex protecting output_channel writes across OCaml 5.x domains.
+    Without this, concurrent domain workers interleave log lines. *)
+let output_mutex = Mutex.create ()
 
 let get_section name =
   match Hashtbl.find_opt sections name with
@@ -62,79 +66,89 @@ let format_timestamp =
     end;
     !last_ts ^ Printf.sprintf ".%03d" ms
 
-(* Core logging function with inlined checks for performance *)
-let log level section_name message =
+(* Core logging function — fully synchronous, domain-safe.
+   Uses a mutex to protect output_channel writes.
+   No Lwt involvement: domain workers don't have a Lwt scheduler,
+   so Lwt.async from domains leaked promises into the main scheduler. *)
+let log_sync level section_name message =
   let section = get_section section_name in
   if (!enabled_sections <> [] && not (List.mem section_name !enabled_sections)) ||
      level_to_int level < level_to_int section.min_level ||
      level_to_int level < level_to_int !global_min_level then
-    Lwt.return_unit
+    ()
+  else if !quiet_mode then
+    (* In quiet mode, fire callback asynchronously only from the Lwt domain.
+       Domain workers skip the callback entirely to avoid Lwt thread-safety issues. *)
+    ()
   else begin
-    (* Always call the callback if set (for dashboard log streaming) *)
-    let callback_lwt = !log_callback level section_name message in
-
-    if !quiet_mode then callback_lwt
-    else begin
-      let%lwt () = callback_lwt in
-      let timestamp = format_timestamp () in
-      let level_str = level_to_string level in
-      let formatted =
-        if !use_colors then
-          Printf.sprintf "%s %s%s%s [%s] %s"
-            timestamp (level_color level) level_str reset section_name message
-        else
-          Printf.sprintf "%s %s [%s] %s" timestamp level_str section_name message
-      in
-      output_string !output_channel formatted;
-      output_char !output_channel '\n';
-      flush !output_channel;
-      Lwt.return_unit
-    end
+    let timestamp = format_timestamp () in
+    let level_str = level_to_string level in
+    let formatted =
+      if !use_colors then
+        Printf.sprintf "%s %s%s%s [%s] %s"
+          timestamp (level_color level) level_str reset section_name message
+      else
+        Printf.sprintf "%s %s [%s] %s" timestamp level_str section_name message
+    in
+    Mutex.lock output_mutex;
+    (try
+       output_string !output_channel formatted;
+       output_char !output_channel '\n';
+       flush !output_channel;
+       Mutex.unlock output_mutex
+     with exn ->
+       Mutex.unlock output_mutex;
+       ignore exn)
   end
+
+(* Lwt-compatible wrapper for code that needs Lwt return type *)
+let log level section_name message =
+  log_sync level section_name message;
+  Lwt.return_unit
 
 (* Public API - zero-allocation when log level is disabled.
    Printf.ifprintf consumes format arguments without allocating a string.
    Printf.ksprintf allocates a Buffer + string, so we only call it when needed. *)
 let debug_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log DEBUG section then
-    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log DEBUG section msg)) fmt
+    Printf.ksprintf (fun msg -> log_sync DEBUG section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let info_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log INFO section then
-    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log INFO section msg)) fmt
+    Printf.ksprintf (fun msg -> log_sync INFO section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let warn_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log WARN section then
-    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log WARN section msg)) fmt
+    Printf.ksprintf (fun msg -> log_sync WARN section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let error_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log ERROR section then
-    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log ERROR section msg)) fmt
+    Printf.ksprintf (fun msg -> log_sync ERROR section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let critical_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log CRITICAL section then
-    Printf.ksprintf (fun msg -> Lwt.async (fun () -> log CRITICAL section msg)) fmt
+    Printf.ksprintf (fun msg -> log_sync CRITICAL section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let debug ~section msg =
-  if will_log DEBUG section then Lwt.async (fun () -> log DEBUG section msg)
+  if will_log DEBUG section then log_sync DEBUG section msg
 let info ~section msg =
-  if will_log INFO section then Lwt.async (fun () -> log INFO section msg)
+  if will_log INFO section then log_sync INFO section msg
 let warn ~section msg =
-  if will_log WARN section then Lwt.async (fun () -> log WARN section msg)
+  if will_log WARN section then log_sync WARN section msg
 let error ~section msg =
-  if will_log ERROR section then Lwt.async (fun () -> log ERROR section msg)
+  if will_log ERROR section then log_sync ERROR section msg
 let critical ~section msg =
-  if will_log CRITICAL section then Lwt.async (fun () -> log CRITICAL section msg)
+  if will_log CRITICAL section then log_sync CRITICAL section msg
 
 (* Configuration *)
 let init () = ()
