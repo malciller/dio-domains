@@ -65,6 +65,7 @@ type strategy_state = {
   mutable capital_low: bool;          (* true when quote balance is insufficient; buy+sell paused *)
   mutable asset_low: bool;            (* true when asset balance is insufficient; sell+buy paused *)
   mutable capital_low_logged: bool;   (* suppresses repeat capital_low log spam *)
+  mutable last_seen_asset_balance: float;  (* last balance value from feed; used to detect genuine changes *)
   mutex: Mutex.t;  (* Thread safety for modifying strategy state *)
 }
 
@@ -93,6 +94,7 @@ let get_strategy_state asset_symbol =
           capital_low = false;
           asset_low = false;
           capital_low_logged = false;
+          last_seen_asset_balance = 0.0;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -420,23 +422,35 @@ let execute_strategy
   let state = get_strategy_state asset.symbol in
 
   (* --- Asset-low check: clear flag when asset balance recovers --- *)
+  (* For Kraken: only clear when balance has genuinely increased (fill, deposit).
+     Kraken's "Insufficient funds" on sells can mean USD collateral is too low,
+     not that asset balance is insufficient. The local balance check would
+     immediately clear the flag every cycle, causing a tight retry loop.
+     For Hyperliquid: clear whenever available balance passes the threshold
+     (existing behavior). *)
   (match asset_balance with
    | Some asset_bal ->
        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
-       if state.asset_low && asset_bal >= qty_f then begin
+       let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
+       let should_clear =
+         if asset.exchange = "hyperliquid" then asset_bal >= qty_f
+         else asset_bal >= qty_f && balance_actually_changed
+       in
+       if state.asset_low && should_clear then begin
          state.asset_low <- false;
          state.inflight_sell <- false;
          ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
          Logging.info_f ~section "Asset balance restored for %s (have %.8f, need %.8f) - resuming order placement"
            asset.symbol asset_bal qty_f
-       end
+       end;
+       state.last_seen_asset_balance <- asset_bal
    | None -> ()
   );
 
   (* --- Capital-low fast path: skip strategy when quote balance is known to be
-     insufficient for a buy order.  When balance recovers we clear the flag
+     insufficient for a buy order. When balance recovers we clear the flag
      and resume normally. --- *)
-  (match quote_balance, current_price with
+  (match (quote_balance, current_price) with
    | Some quote_bal, Some price ->
        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
        let quote_needed_fast = price *. qty_f in
@@ -456,8 +470,10 @@ let execute_strategy
    | _ -> () (* No balance/price data yet, fall through *)
   );
 
-  (* Only proceed with main strategy if balance flags are clear *)
-  if not state.capital_low && not state.asset_low then begin
+  (* Only proceed with main strategy if capital_low flag is clear.
+     asset_low is checked below only for sell+buy placement -- order sync,
+     cleanup, and cancellation detection must always run. *)
+  if not state.capital_low then begin
 
   let now = Unix.time () in
 
@@ -1034,11 +1050,11 @@ let handle_order_failed asset_symbol side reason =
              asset_symbol
          end
      | Sell when is_insufficient_balance ->
-         if not state.asset_low then begin
-           state.asset_low <- true;
-           Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance - setting asset_low flag"
-             asset_symbol
-         end
+          (* Sell failures are fire-and-forget on Kraken.  "Insufficient funds"
+             on sells reflects USD collateral, not asset balance.  Don't set
+             asset_low; the sell simply fails and the strategy continues. *)
+          Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance (ignored, sell is fire-and-forget)"
+            asset_symbol
      | _ -> ());
     
     Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker."
