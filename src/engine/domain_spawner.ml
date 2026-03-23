@@ -152,7 +152,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let last_balance_check = ref 0.0 in
 
       (* Initialize strategy for this asset based on strategy type *)
-      let (grid_strategy_asset, mm_strategy_asset) =
+      let baseline_price = ref None in
+      let last_known_fng = ref (Fear_and_greed.fetch_value ()) in
+
+      let grid_strategy_asset_ref =
         if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
           let grid_interval =
             match resolved_grid_interval with
@@ -161,7 +164,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 let (lo, hi) = asset_with_fees.grid_interval in
                 (lo +. hi) /. 2.0
           in
-          (Some {
+          ref (Some {
             Dio_strategies.Suicide_grid.exchange = asset_with_fees.exchange;
             symbol = asset_with_fees.symbol;
             qty = asset_with_fees.qty;
@@ -171,9 +174,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             maker_fee = asset_with_fees.maker_fee;
             taker_fee = asset_with_fees.taker_fee;
             accumulation_buffer = asset_with_fees.accumulation_buffer;
-          }, None)
-        else if asset_with_fees.strategy = "MM" then
-          (None, Some {
+          })
+        else ref None
+      in
+      let mm_strategy_asset_ref =
+        if asset_with_fees.strategy = "MM" then
+          ref (Some {
             Dio_strategies.Market_maker.exchange = asset_with_fees.exchange;
             symbol = asset_with_fees.symbol;
             qty = asset_with_fees.qty;
@@ -183,8 +189,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             maker_fee = asset_with_fees.maker_fee;
             taker_fee = asset_with_fees.taker_fee;
           })
-        else
-          (None, None)
+        else ref None
       in
 
       (* Early-init strategy state so fill handlers have correct config values
@@ -193,7 +198,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
          without this, exchange_id/grid_qty/maker_fee are still at their
          defaults (""/0.0/0.0) and the profit calc + persistence save silently
          produce nothing. *)
-      (match grid_strategy_asset with
+      (match !grid_strategy_asset_ref with
        | Some asset ->
            let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
            st.exchange_id <- asset.exchange;
@@ -347,14 +352,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                     | Types.Buy -> Dio_strategies.Strategy_common.Buy
                     | Types.Sell -> Dio_strategies.Strategy_common.Sell
                   in
-                  (match grid_strategy_asset with
+                  (match !grid_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled
                          asset_with_fees.symbol event.order_id side;
                        Logging.debug_f ~section "Notified Grid strategy about %s order %s for %s"
                          status_desc event.order_id asset_with_fees.symbol
                    | None -> ());
-                  (match mm_strategy_asset with
+                  (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_cancelled
                          asset_with_fees.symbol event.order_id side;
@@ -367,14 +372,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                     | Types.Buy -> Dio_strategies.Strategy_common.Buy
                     | Types.Sell -> Dio_strategies.Strategy_common.Sell
                   in
-                  (match grid_strategy_asset with
+                  (match !grid_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_filled
                          asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price;
                        Logging.debug_f ~section "Notified Grid strategy about filled order %s for %s"
                          event.order_id asset_with_fees.symbol
                    | None -> ());
-                  (match mm_strategy_asset with
+                  (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_filled
                          asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price;
@@ -398,14 +403,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                          | Types.Buy -> Dio_strategies.Strategy_common.Buy
                          | Types.Sell -> Dio_strategies.Strategy_common.Sell
                        in
-                       (match grid_strategy_asset with
+                       (match !grid_strategy_asset_ref with
                         | Some _ ->
                             Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
                               asset_with_fees.symbol event.order_id side price;
                             Logging.debug_f ~section "Notified Grid strategy about acknowledged order %s for %s"
                               event.order_id asset_with_fees.symbol
                         | None -> ());
-                       (match mm_strategy_asset with
+                       (match !mm_strategy_asset_ref with
                         | Some _ ->
                             Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
                               asset_with_fees.symbol event.order_id side price;
@@ -420,7 +425,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           if not !hl_exec_ready then begin
             hl_exec_ready := true;
             (* Mark startup replay complete so profit calculation is no longer gated *)
-            (match grid_strategy_asset with
+            (match !grid_strategy_asset_ref with
              | Some _ ->
                  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
              | None -> ());
@@ -447,7 +452,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             hl_exec_checked := true;
             hl_exec_ready := true;
             (* Mark startup replay complete so profit calculation is no longer gated *)
-            (match grid_strategy_asset with
+            (match !grid_strategy_asset_ref with
              | Some _ ->
                  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
              | None -> ());
@@ -540,11 +545,42 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           last_buy_count := grid_open_buy_count + mm_open_buy_count;
           last_sell_count := grid_open_sell_count + mm_open_sell_count;
 
-          (match grid_strategy_asset with
+          (* Dynamic check for price movement to trigger F&G updates and adapt strategy *)
+          (match !current_price with
+           | Some cp ->
+               (match !baseline_price with
+                | None -> baseline_price := Some cp
+                | Some base ->
+                    let diff_pct = abs_float ((cp -. base) /. base) *. 100.0 in
+                    if diff_pct >= 3.5 then begin
+                      Logging.info_f ~section "[%s/%s] Price moved by %.2f%% from baseline $%.2f to $%.2f. Triggering dynamic Fear & Greed check."
+                        asset_with_fees.exchange asset_with_fees.symbol diff_pct base cp;
+                      baseline_price := Some cp;
+                      Fear_and_greed.force_fetch_async ()
+                    end)
+           | None -> ());
+
+          (* Apply updated F&G to strategy config dynamically *)
+          let current_fng = match Fear_and_greed.get_cached () with Some v -> v | None -> 50.0 in
+          if current_fng <> !last_known_fng then begin
+            last_known_fng := current_fng;
+            let (lo, hi) = asset_with_fees.grid_interval in
+            let new_interval = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.grid_interval ~fear_and_greed:current_fng in
+            Logging.info_f ~section "[%s/%s] Fear & Greed updated to %.2f. Re-evaluated grid_interval to %.4f (range %.4f-%.4f)"
+              asset_with_fees.exchange asset_with_fees.symbol current_fng new_interval lo hi;
+            
+            (match !grid_strategy_asset_ref with
+             | Some asset ->
+                 let new_asset = { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval } in
+                 grid_strategy_asset_ref := Some new_asset
+             | None -> ())
+          end;
+
+          (match !grid_strategy_asset_ref with
            | Some asset ->
                Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
            | None -> ());
-          (match mm_strategy_asset with
+          (match !mm_strategy_asset_ref with
            | Some asset ->
                Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
            | None -> ());
