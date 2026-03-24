@@ -22,8 +22,10 @@ let connection_mutex = Lwt_mutex.create ()
 let signal_new_data () = Concurrency.Exchange_wakeup.signal ()
 let wait_for_data () = Concurrency.Exchange_wakeup.wait ()
 
-(** Global subscriber list *)
-let pushers : (Yojson.Safe.t option -> unit) list ref = ref []
+(** Global subscriber list.
+    Each pusher is a function that accepts a Yojson.Safe.t option.
+    Bounded internally: returns true if the push succeeded, false if dropped. *)
+let pushers : (Yojson.Safe.t option -> bool) list ref = ref []
 let pushers_mutex = Mutex.create ()
 
 module Response_table = Hashtbl.Make (struct
@@ -101,11 +103,14 @@ let close_all_subscribers () =
   if count > 0 then begin
     Logging.info_f ~section "Closing %d subscriber streams on disconnect" count;
     List.iter (fun push ->
-      (try push None with _ -> ())
+      (try ignore (push None) with _ -> ())
     ) ps
   end
 
-(** Broadcast to all subscribers *)
+(** Broadcast to all subscribers.
+    Push is non-blocking: if a consumer's bounded stream is full, the message
+    is silently dropped for that consumer. This prevents unbounded memory growth
+    from slow consumers accumulating Yojson.Safe.t trees. *)
 let broadcast_message json =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
@@ -113,7 +118,7 @@ let broadcast_message json =
   if ps = [] then Logging.warn ~section "No subscribers for WebSocket message!";
   let dead = ref [] in
   List.iter (fun push ->
-    try push (Some json)
+    try ignore (push (Some json))
     with _ -> dead := push :: !dead
   ) ps;
   (* Evict any dead pushers *)
@@ -124,15 +129,35 @@ let broadcast_message json =
   end;
   signal_new_data ()  (* wake any domain workers blocked in wait_for_data *)
 
-(** Subscribe to all incoming market data messages. *)
+(** Subscribe to all incoming market data messages.
+    Uses a bounded stream (capacity 64) to prevent unbounded memory growth.
+    When the stream is full, new messages are silently dropped — consumers
+    will process the next available message when they catch up. *)
 let subscribe_market_data () =
-  let (stream, push) = Lwt_stream.create () in
+  let (stream, push_source) = Lwt_stream.create_bounded 64 in
+  (* Non-blocking push wrapper compatible with pushers list signature.
+     Returns true if pushed, false if dropped/closed. *)
+  let push_fn item =
+    match item with
+    | None ->
+        (* Close signal — always deliver *)
+        push_source#close;
+        true
+    | Some json ->
+        let p = push_source#push json in
+        if Lwt.is_sleeping p then begin
+          (* Stream is full — drop this message *)
+          Lwt.cancel p;
+          false
+        end else
+          true
+  in
   Mutex.lock pushers_mutex;
-  pushers := push :: !pushers;
+  pushers := push_fn :: !pushers;
   Mutex.unlock pushers_mutex;
   let close () =
     Mutex.lock pushers_mutex;
-    pushers := List.filter (fun p -> p != push) !pushers;
+    pushers := List.filter (fun p -> p != push_fn) !pushers;
     Mutex.unlock pushers_mutex
   in
   { stream; close }

@@ -653,29 +653,12 @@ let execute_strategy
         (* Skip if this order was recently cancelled *)
         let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
 
-        (* Skip if this buy order is the target of an in-flight amendment.
-           For Kraken (cancel-replace): exchange data may briefly show the old order
-           alongside the new one — counting both causes false multi-buy detection.
-           For Hyperliquid (WS modify): amendment is in-place, same order ID,
-           no intermediate cancelled state. The buy is always on the exchange,
-           so never filter it — hiding it makes grid_open_buy_count=0 and
-           relies on the fragile has_tracked_buy fallback. *)
-        let is_being_amended = asset.exchange <> "hyperliquid" && side_str = "buy" && (
-          List.exists (fun (pending_id, _, _, _) ->
-            String.starts_with ~prefix:"pending_amend_" pending_id &&
-            String.length pending_id > 14 &&
-            String.sub pending_id 14 (String.length pending_id - 14) = order_id
-          ) state.pending_orders
-          || InFlightAmendments.is_in_flight order_id
-          || Hashtbl.mem state.amend_cooldowns order_id
-        ) in
-
         let is_our_strategy = match userref_opt with
           | Some ref_val -> ref_val = Strategy_common.strategy_userref_grid
           | None -> asset.exchange = "hyperliquid"
         in
         
-        if not is_cancelled && not is_being_amended && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
+        if not is_cancelled && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
             (* Treat ALL buy orders as grid buys to enforce single-buy-order policy across all exchanges *)
@@ -790,11 +773,12 @@ let execute_strategy
     end;
 
     let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
-    (* Effective buy count: use max of webData2 count and our own tracking.
+    (* Effective buy count: use max of raw count and our own tracking.
        webData2 snapshots can be stale during cancel-replace amendments.
        last_buy_order_id is set immediately by orderUpdates events. *)
     let has_tracked_buy = state.last_buy_order_id <> None in
-    let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
+    let tracked_buy_count = List.length !buy_orders in
+    let effective_buy_count = if has_tracked_buy && tracked_buy_count = 0 then 1 else tracked_buy_count in
 
     if buy_order_pending then begin
         (* Only log every 100,000 iterations to avoid spam *)
@@ -1448,52 +1432,36 @@ let handle_order_cancelled asset_symbol order_id side =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-  (* Check if this cancellation is part of a cancel-replace amendment.
-     If pending_amend_<order_id> exists, a replacement order is incoming
-     and we should NOT remove the InFlightOrders guard or clear buy tracking. *)
-  let is_cancel_replace = List.exists (fun (pending_id, _, _, _) ->
-    String.starts_with ~prefix:"pending_amend_" pending_id &&
-    let target_id = String.sub pending_id 14 (String.length pending_id - 14) in
-    target_id = order_id
-  ) state.pending_orders in
-
-  if is_cancel_replace then begin
-    (* Cancel-replace: clean up the pending_amend entry but keep guards alive *)
-    state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
-      not (String.starts_with ~prefix:"pending_amend_" pending_id &&
-           String.sub pending_id 14 (String.length pending_id - 14) = order_id)
-    ) state.pending_orders;
-    
-    (* Remove the old order from sell orders tracking if present *)
-    state.open_sell_orders <- List.filter (fun (sell_id, _) ->
-      sell_id <> order_id
-    ) state.open_sell_orders;
-    
-    Logging.debug_f ~section "Cancel-replace detected for %s on %s: cleaned up pending_amend, kept InFlightOrders guard"
-      order_id asset_symbol
-  end else begin
     (* Genuine cancellation: full cleanup *)
     (* Add to cancelled orders blacklist to prevent re-adding during sync *)
-    let now = Unix.time () in
-    state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
-    
-    let cancelled_side = side in
-
-    (* Remove from pending orders if it's there (matches by order_id OR side for ghost placements) *)
+    (* 1. Remove any pending operations for this order *)
     let original_pending_count = List.length state.pending_orders in
-    state.pending_orders <- List.filter (fun (pending_id, s, _, _) ->
-      let matches_id = pending_id = order_id in
-      let is_ghost_placement = (s = cancelled_side) && 
-                              (String.starts_with ~prefix:"pending_buy_" pending_id || 
-                               String.starts_with ~prefix:"pending_sell_" pending_id) in
-      not (matches_id || is_ghost_placement)
+    state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
+      (* True if the pending_id matches order_id, OR if it's a pending amend matching the order_id *)
+      let matches = pending_id = order_id || 
+                   (String.starts_with ~prefix:"pending_amend_" pending_id && 
+                    String.length pending_id > 14 && 
+                    String.sub pending_id 14 (String.length pending_id - 14) = order_id) in
+      not matches
     ) state.pending_orders;
     let removed_pending = original_pending_count - List.length state.pending_orders in
     
-    (* Release this asset's quote reservation on genuine cancellation of buy orders *)
-    (match side with Buy -> set_asset_reserved_quote state 0.0 | Sell -> ());
+    (* Clear the pending cancellations tracking *)
+    Hashtbl.remove state.pending_cancellations order_id;
 
-    (* If this was a tracked buy order, clear it *)
+    (* 1.5 Add cancelled order ID to blacklist immediately.
+       This prevents race conditions where an old websocket update
+       re-adds the order to tracking before the exchange fully drops it *)
+    let now = Unix.time () in
+    state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
+
+    (* Clear amend cooldowns if any exist *)
+    Hashtbl.remove state.amend_cooldowns order_id;
+    ignore (InFlightAmendments.remove_in_flight_amendment order_id);
+
+    (* 2. Clear tracking conditionally depending on whether it's Buy or Sell *)
+    let cancelled_side = side in
+    
     let was_tracked_buy = match state.last_buy_order_id with
       | Some id when id = order_id -> true
       | _ -> false
@@ -1518,7 +1486,6 @@ let handle_order_cancelled asset_symbol order_id side =
     
     Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
       order_id asset_symbol removed_pending removed_sell
-  end
   )
 
 (** Handle Cancel-Replace Order Amendment - swap old ID for new ID *)
@@ -1558,17 +1525,11 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s" 
                  old_order_id new_order_id price asset_symbol
              | _ -> 
-                (* Fallback: only install if neither old nor new order is blacklisted *)
-                let is_old_blacklisted = List.exists (fun (cid, _) -> cid = old_order_id) state.cancelled_orders in
-                let is_new_blacklisted = List.exists (fun (cid, _) -> cid = new_order_id) state.cancelled_orders in
-                if not is_old_blacklisted && not is_new_blacklisted then begin
-                  state.last_buy_order_id <- Some new_order_id;
-                  state.last_buy_order_price <- Some price;
-                  Logging.debug_f ~section "Set buy order ID via amend: %s @ %.2f for %s" 
-                    new_order_id price asset_symbol
-                end else
-                  Logging.info_f ~section "Ignoring amendment fallback for blacklisted order %s -> %s for %s"
-                    old_order_id new_order_id asset_symbol)
+                (* Fallback removed. If we didn't track the old order, we MUST NOT install the new order 
+                   as the tracked buy, otherwise we resurrect ghost orders from stale orderUpdate websocket events 
+                   which causes duplicate orders/ghost order detection when combined with fresh placements. *)
+                Logging.info_f ~section "Ignoring amendment for untracked buy order %s -> %s for %s"
+                  old_order_id new_order_id asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
          state.open_sell_orders <- (new_order_id, price) :: 
@@ -1654,9 +1615,15 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     let is_order_gone = is_cache_miss || is_cannot_modify || is_margin_error in
     
     if is_order_gone then begin
+      (* Explicitly send a cancel order just in case it's wedged in the exchange's cache *)
+      let cancel_order = create_cancel_order order_id asset_symbol "Grid" state.exchange_id in
+      ignore (push_order cancel_order);
+
       (* Blacklist the gone order ID so racing amendment events
-         don't reinstall it via handle_order_amended fallback *)
-      state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
+         don't reinstall it via handle_order_amended fallback.
+         We set the timestamp 10 years in the future so it never expires from the 15s cleanup. *)
+      let far_future = now +. 315360000.0 in
+      state.cancelled_orders <- (order_id, far_future) :: state.cancelled_orders;
       (match side with
        | Buy ->
            (match state.last_buy_order_id with
