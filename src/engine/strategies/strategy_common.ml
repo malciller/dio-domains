@@ -60,7 +60,7 @@ let generate_duplicate_key symbol side quantity limit_price =
 (** In-flight order cache to prevent duplicate orders *)
 module InFlightOrders = struct
   (* Map duplicate_key -> timestamp *)
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
+  let registry : (string, float) Hashtbl.t = Hashtbl.create 16
   let mutex = Mutex.create ()
 
   (** Check if an order is already in-flight and add it if not *)
@@ -118,7 +118,7 @@ end
 (** In-flight amendment cache to prevent duplicate amendments *)
 module InFlightAmendments = struct
   (* Map order_id -> timestamp *)
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
+  let registry : (string, float) Hashtbl.t = Hashtbl.create 16
   let mutex = Mutex.create ()
 
   (** Check if an amendment is already in-flight and add it if not *)

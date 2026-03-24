@@ -127,7 +127,7 @@ let get_strategy_state asset_symbol =
           last_seen_asset_balance = 0.0;
           mutex = Mutex.create ();
         } in
-        Hashtbl.add strategy_states asset_symbol new_state;
+        Hashtbl.replace strategy_states asset_symbol new_state;
         new_state
   in
   Mutex.unlock strategy_states_mutex;

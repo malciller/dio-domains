@@ -240,11 +240,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         exec_read_pos := 0
       end;
       
-      (* Initialize ticker and orderbook positions to 0 - but better to get current to avoid old data *)
-      (* existing logic initialized to 0. We'll use get_xxx_position call if not 0? *)
-      (* Original code: ticker_read_pos := 0; orderbook_read_pos := 0; *)
-      ticker_read_pos := 0;
-      orderbook_read_pos := 0;
+      (* Initialize ticker and orderbook positions to current write position to skip stale
+         ring buffer data from before this domain started. Starting at 0 would cause the
+         domain to replay up to 128 historical entries (each containing large bids/asks arrays)
+         on every start/restart, creating N×128 large allocations with N active domains. *)
+      ticker_read_pos := Ex.get_ticker_position ~symbol:asset_with_fees.symbol;
+      orderbook_read_pos := Ex.get_orderbook_position ~symbol:asset_with_fees.symbol;
       
       Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
         asset_with_fees.exchange asset_with_fees.symbol asset_with_fees.strategy;
@@ -706,7 +707,7 @@ let stop_domain state =
   (* Clean up strategy state when domain stops *)
   let symbol = state.asset.symbol in
   (match state.asset.strategy with
-   | "Grid" ->
+   | "Grid" | "suicide_grid" ->
        Dio_strategies.Suicide_grid.Strategy.cleanup_strategy_state symbol;
        Logging.debug_f ~section "Cleaned up Grid strategy state for %s" symbol
    | "MM" ->

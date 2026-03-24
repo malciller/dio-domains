@@ -165,31 +165,49 @@ type symbol_store = {
 (** Global stores per symbol *)
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
-(** Global order_id to symbol mapping for handling minimal events *)
-let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 128
-let order_to_symbol_cap = 10_000  (* Prevent unbounded growth from pre-startup orders *)
-let global_orders_mutex = Mutex.create ()
+(** Global order_id to symbol mapping with adaptive startup cap + FIFO eviction.
+    Access must be protected by global_orders_mutex. *)
+let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
+(** FIFO insertion queue for oldest-entry eviction (O(1) pop) *)
+let order_to_symbol_queue : string Queue.t = Queue.create ()
+(** Mutable cap: max_int (uncapped) during startup, set once after first snapshot *)
+let order_to_symbol_cap : int ref = ref max_int
+let order_to_symbol_startup_done = Atomic.make false
 
-(** Evict oldest entries from order_to_symbol when exceeding cap.
-    Called under global_orders_mutex. *)
-let maybe_trim_order_to_symbol () =
-  let len = Hashtbl.length order_to_symbol in
-  if len > order_to_symbol_cap then begin
-    (* Remove ~25% of entries to avoid trimming on every insert *)
-    let to_remove = len - (order_to_symbol_cap * 3 / 4) in
-    let removed = ref 0 in
-    let keys_to_remove = ref [] in
-    Hashtbl.iter (fun k _ ->
-      if !removed < to_remove then begin
-        keys_to_remove := k :: !keys_to_remove;
-        incr removed
+(** Add order_id->symbol, evicting the oldest entry when over cap.
+    Ring-buffer semantics: newest always wins, oldest always goes.
+    Must be called while holding global_orders_mutex. *)
+let add_to_order_to_symbol order_id symbol =
+  if not (Hashtbl.mem order_to_symbol order_id) then
+    Queue.push order_id order_to_symbol_queue;
+  Hashtbl.replace order_to_symbol order_id symbol;
+  if Atomic.get order_to_symbol_startup_done then
+    while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
+      if Queue.is_empty order_to_symbol_queue then
+        order_to_symbol_cap := Hashtbl.length order_to_symbol
+      else begin
+        let oldest = Queue.pop order_to_symbol_queue in
+        Hashtbl.remove order_to_symbol oldest
       end
-    ) order_to_symbol;
-    List.iter (fun k -> Hashtbl.remove order_to_symbol k) !keys_to_remove;
-    Logging.info_f ~section "Trimmed order_to_symbol: %d -> %d entries" len (Hashtbl.length order_to_symbol)
+    done
+
+(** Lock the adaptive cap after the startup snapshot is fully consumed.
+    Cap = observed size + 50%% headroom, minimum 32.
+    Called exactly once at end of handle_snapshot; subsequent calls are no-ops. *)
+let lock_order_to_symbol_cap () =
+  if not (Atomic.exchange order_to_symbol_startup_done true) then begin
+    (* global_orders_mutex is already held by the caller (handle_snapshot) *)
+    let observed = Hashtbl.length order_to_symbol in
+    let cap = max 32 (observed + observed / 2 + 1) in
+    order_to_symbol_cap := cap;
+    Logging.info_f ~section
+      "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)" cap observed
   end
 
+let global_orders_mutex = Mutex.create ()
+(** Separate mutex for symbol_stores table initialization *)
 let initialization_mutex = Mutex.create ()
+
 let ready_condition = Lwt_condition.create ()
 
 (** Get or create store for a symbol - wait-free after init *)
@@ -434,9 +452,8 @@ let update_open_orders store (event : execution_event) =
     let was_present = Hashtbl.mem store.open_orders event.order_id in
     Hashtbl.replace store.open_orders event.order_id order;
     
-    (* Add to global order mapping *)
-    Hashtbl.replace order_to_symbol event.order_id event.symbol;
-    maybe_trim_order_to_symbol ();
+    (* Add to global order mapping with FIFO eviction when over adaptive cap *)
+    add_to_order_to_symbol event.order_id event.symbol;
 
     if not was_present && Hashtbl.length store.open_orders > 1000 then
       trigger_stale_order_cleanup ~reason:"open_orders_exceeds_1000" ();
@@ -739,7 +756,10 @@ let handle_snapshot json on_heartbeat =
       notify_ready store;
     ) all_symbols;
     
-    Logging.debug_f ~section "Execution snapshot processed and reconciled"
+    Logging.debug_f ~section "Execution snapshot processed and reconciled";
+    (* Lock adaptive cap now that startup snapshot is fully consumed.
+       Subsequent inserts will evict oldest entries when over cap. *)
+    lock_order_to_symbol_cap ()
   with exn ->
     Logging.error_f ~section "Failed to process execution snapshot: %s"
       (Printexc.to_string exn)
