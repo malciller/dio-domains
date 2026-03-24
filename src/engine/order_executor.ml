@@ -35,7 +35,9 @@ let get_profiler symbol operation =
     | Some p -> p
     | None ->
         let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
-        Hashtbl.add profilers key p;
+        Hashtbl.replace profilers key p;
+        if Hashtbl.length profilers > 64 then
+          Logging.warn_f ~section "profilers table unexpectedly large (%d entries)" (Hashtbl.length profilers);
         p
   in
   Mutex.unlock profilers_mutex;

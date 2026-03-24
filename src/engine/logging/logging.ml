@@ -40,7 +40,17 @@ let output_mutex = Mutex.create ()
 let get_section name =
   match Hashtbl.find_opt sections name with
   | Some s -> s
-  | None -> let s = { name; min_level = !global_min_level } in Hashtbl.add sections name s; s
+  | None ->
+      Mutex.lock output_mutex;
+      let s = match Hashtbl.find_opt sections name with
+        | Some s -> s
+        | None ->
+            let s = { name; min_level = !global_min_level } in
+            Hashtbl.replace sections name s;
+            s
+      in
+      Mutex.unlock output_mutex;
+      s
 
 (** Check if a log level will be enabled for a section (avoids allocation) *)
 let will_log level section_name =

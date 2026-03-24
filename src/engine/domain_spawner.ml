@@ -27,6 +27,37 @@ let registry_mutex = Mutex.create ()
 (** Global shutdown flag for domain supervisor *)
 let shutdown_requested = Atomic.make false
 
+(** Per-domain latency profiler cache — persists across restarts so profiler
+    objects (each ~800KB) are created once per symbol rather than on every
+    asset_domain_worker invocation. *)
+type domain_profilers = {
+  prof_ticker:   Latency_profiler.t;
+  prof_ob:       Latency_profiler.t;
+  prof_exec:     Latency_profiler.t;
+  prof_strategy: Latency_profiler.t;
+  prof_cycle:    Latency_profiler.t;
+}
+let domain_profiler_cache : (string, domain_profilers) Hashtbl.t = Hashtbl.create 8
+let profiler_cache_mutex = Mutex.create ()
+
+let get_domain_profilers symbol =
+  Mutex.lock profiler_cache_mutex;
+  let profs = match Hashtbl.find_opt domain_profiler_cache symbol with
+    | Some p -> p
+    | None ->
+        let p = {
+          prof_ticker   = Latency_profiler.create (symbol ^ ":ticker");
+          prof_ob       = Latency_profiler.create (symbol ^ ":ob");
+          prof_exec     = Latency_profiler.create (symbol ^ ":exec");
+          prof_strategy = Latency_profiler.create (symbol ^ ":strategy");
+          prof_cycle    = Latency_profiler.create (symbol ^ ":cycle");
+        } in
+        Hashtbl.replace domain_profiler_cache symbol p;
+        p
+  in
+  Mutex.unlock profiler_cache_mutex;
+  profs
+
 
 (** The worker function executed by each domain for a trading asset *)
 let asset_domain_worker (config : config) (fee_fetcher : trading_config -> trading_config) (asset : trading_config) =
@@ -50,7 +81,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
   in
   
 
-  let format_distance_info asset_symbol current_price strategy_type =
+  let _format_distance_info asset_symbol current_price strategy_type =
     match strategy_type with
     | "MM" ->
         let state = Dio_strategies.Market_maker.get_strategy_state asset_symbol in
@@ -246,6 +277,22 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
          on every start/restart, creating N×128 large allocations with N active domains. *)
       ticker_read_pos := Ex.get_ticker_position ~symbol:asset_with_fees.symbol;
       orderbook_read_pos := Ex.get_orderbook_position ~symbol:asset_with_fees.symbol;
+
+      (* Seed current_price and top_of_book from the exchange's live cache so that
+         cycle 1 can execute the strategy immediately without waiting for the next
+         incoming tick event for this specific symbol. Without this, both fields start
+         as None and the strategy bails at the `| None, _ -> ()` guard, leaving the
+         domain blocked until Kraken sends its next ticker — which can be seconds later
+         and differs per symbol, causing staggered startup execution. *)
+      (match Ex.get_ticker ~symbol:asset_with_fees.symbol with
+       | Some (bid, ask) ->
+           current_price := Some ((bid +. ask) /. 2.0);
+           Logging.info_f ~section "Seeded initial price for %s from cache: %.4f"
+             asset_with_fees.symbol (Option.get !current_price)
+       | None -> ());
+      (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
+       | Some _ as tob -> top_of_book := tob
+       | None -> ());
       
       Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
         asset_with_fees.exchange asset_with_fees.symbol asset_with_fees.strategy;
@@ -273,11 +320,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
       let cycle_count = ref 0 in
 
-      let prof_ticker = Latency_profiler.create (asset_with_fees.symbol ^ ":ticker") in
-      let prof_ob = Latency_profiler.create (asset_with_fees.symbol ^ ":ob") in
-      let prof_exec = Latency_profiler.create (asset_with_fees.symbol ^ ":exec") in
-      let prof_strategy = Latency_profiler.create (asset_with_fees.symbol ^ ":strategy") in
-      let prof_cycle = Latency_profiler.create (asset_with_fees.symbol ^ ":cycle") in
+      let { prof_ticker; prof_ob; prof_exec; prof_strategy; prof_cycle } =
+        get_domain_profilers asset_with_fees.symbol in
 
       while Atomic.get state.is_running do
         let cycle_start = Mtime_clock.now_ns () in
@@ -590,7 +634,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         end;
         
         (* Log cycle stats *)
-        (* Log cycle stats every 1M cycles *)
+        (* Log cycle stats every 1M cycles 
         if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
@@ -598,7 +642,19 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 asset_with_fees.exchange asset_with_fees.symbol !cycle_count price
                 bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
                 !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
-          | _ -> ())
+          | _ -> ());
+          (* GC telemetry: log once per symbol (keyed by BTC or the first symbol) to
+             show whether live_words tracks heap_words (structural leak) or diverges (GC lag). *)
+          if asset_with_fees.symbol = "BTC/USDC" || asset_with_fees.symbol = "ETH/USD" then begin
+            Gc.full_major ();  (* force collection to get accurate live_words *)
+            let gc = Gc.stat () in
+            let word_bytes = float_of_int (Sys.word_size / 8) in
+            let live_mb = float_of_int gc.Gc.live_words *. word_bytes /. 1048576.0 in
+            let heap_mb = float_of_int gc.Gc.heap_words *. word_bytes /. 1048576.0 in
+            let minor_mb = gc.Gc.minor_words *. word_bytes /. 1048576.0 in
+            Logging.info_f ~section "[GC/%s] live=%.1fMB heap=%.1fMB minor_total=%.0fMB major_coll=%d compactions=%d"
+              asset_with_fees.symbol live_mb heap_mb minor_mb gc.Gc.major_collections gc.Gc.compactions
+          end
         end;
         (match asset_with_fees.maker_fee, asset_with_fees.taker_fee with
          | Some m, Some t -> Logging.debug_f ~section "Asset [%s/%s]: Cached fees maker=%.4f%% taker=%.4f%%" 
@@ -608,7 +664,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
          | None, Some t -> Logging.debug_f ~section "Asset [%s/%s]: Cached taker fee %.4f%% (maker unknown)" 
              asset_with_fees.exchange asset_with_fees.symbol (t *. 100.)
          | None, None -> ());
-
+        *)
 
 
         (* Yield to allow other threads (websockets) to run *)
