@@ -290,7 +290,7 @@ let get_all_symbols () =
 (** Safety cleanup for stale orders and event-driven triggers *)
 let cleanup_stale_orders () =
   let now = Unix.gettimeofday () in
-  let stale_threshold = 24.0 *. 3600.0 in (* 24 hours *)
+  let stale_threshold = 3600.0 in (* 1 hour *)
   let stale_orders = ref [] in
   
   let all_symbols = get_all_symbols () in
@@ -308,7 +308,7 @@ let cleanup_stale_orders () =
   
   let removed_count = List.length !stale_orders in
   if removed_count > 0 then begin
-    Logging.info_f ~section "Safety cleanup: removing %d orders older than 24h" removed_count;
+    Logging.info_f ~section "Safety cleanup: removing %d orders older than 1h" removed_count;
     
     List.iter (fun (symbol, order_id) ->
       let store = get_symbol_store symbol in
@@ -437,6 +437,9 @@ let update_open_orders store (event : execution_event) =
     (* Add to global order mapping *)
     Hashtbl.replace order_to_symbol event.order_id event.symbol;
     maybe_trim_order_to_symbol ();
+
+    if not was_present && Hashtbl.length store.open_orders > 1000 then
+      trigger_stale_order_cleanup ~reason:"open_orders_exceeds_1000" ();
     
     if was_present then begin
       Logging.debug_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
@@ -843,25 +846,28 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Kraken_trading_client.subscribe subscribe_msg >>= fun () ->
   on_connected ();
   
-  let buffer = Kraken_trading_client.get_message_buffer () in
-  let condition = Kraken_trading_client.get_message_condition () in
-  let read_pos = ref (Ring_buffer.RingBuffer.get_position buffer) in
-  
-  let rec loop () =
-    Lwt_condition.wait condition >>= fun () ->
-    let new_messages = Ring_buffer.RingBuffer.read_since buffer !read_pos in
-    read_pos := Ring_buffer.RingBuffer.get_position buffer;
+  if not (Atomic.exchange cleanup_handlers_started true) then begin
+    let buffer = Kraken_trading_client.get_message_buffer () in
+    let condition = Kraken_trading_client.get_message_condition () in
+    let read_pos = ref (Ring_buffer.RingBuffer.get_position buffer) in
     
-    List.iter (fun json ->
-      handle_message_json json on_heartbeat
-    ) new_messages;
-    
-    if Atomic.get Kraken_trading_client.shutdown_requested then
-      Lwt.return_unit
-    else
-      loop ()
-  in
-  loop ()
+    let rec loop () =
+      Lwt_condition.wait condition >>= fun () ->
+      let new_messages = Ring_buffer.RingBuffer.read_since buffer !read_pos in
+      read_pos := Ring_buffer.RingBuffer.get_position buffer;
+      
+      List.iter (fun json ->
+        handle_message_json json on_heartbeat
+      ) new_messages;
+      
+      if Atomic.get Kraken_trading_client.shutdown_requested then
+        Lwt.return_unit
+      else
+        loop ()
+    in
+    Lwt.async loop
+  end;
+  Lwt.return_unit
 
 (** Subscribe to order update events *)
 let subscribe_order_updates () =

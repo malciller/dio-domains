@@ -29,6 +29,11 @@ module BalanceStore = struct
     last_updated: float;
   }
 
+  (* Hard cap on number of wallet entries per asset to prevent unbounded growth.
+     Kraken can push ledger events from many internal wallet IDs (spot, earn,
+     transfer, margin …) for the same asset. *)
+  let max_wallets = 10
+
   type t = {
     (* Store balances for all wallets of this asset *)
     wallets: (string, wallet_balance) Hashtbl.t;
@@ -57,6 +62,19 @@ module BalanceStore = struct
 
     Mutex.lock store.mutex;
     Hashtbl.replace store.wallets wallet_key wallet_data;
+
+    (* Evict oldest wallet entry if cap exceeded *)
+    if Hashtbl.length store.wallets > max_wallets then begin
+      let oldest_key = ref "" in
+      let oldest_time = ref Float.infinity in
+      Hashtbl.iter (fun k (v : wallet_balance) ->
+        if v.last_updated < !oldest_time then begin
+          oldest_time := v.last_updated;
+          oldest_key := k
+        end
+      ) store.wallets;
+      if !oldest_key <> "" then Hashtbl.remove store.wallets !oldest_key
+    end;
 
     (* Recalculate total balance across all wallets *)
     let total = Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0 in
@@ -273,8 +291,7 @@ let maybe_cleanup_after_balance_update () =
     count
   in
   if asset_count > dynamic_assets_cap then
-    (**** trigger_dynamic_asset_cleanup ~reason:"dynamic_asset_cap_exceeded" () ****)
-    ()
+    trigger_dynamic_asset_cleanup ~reason:"dynamic_asset_cap_exceeded" ()
 
 
 (** Parse balance snapshot from WebSocket *)
@@ -336,7 +353,7 @@ let parse_snapshot json on_heartbeat =
     notify_ready ();
 
     (* Event-driven cleanup after snapshot processing to cap dynamic assets *)
-    (**** maybe_cleanup_after_balance_update (); ****)
+    maybe_cleanup_after_balance_update ();
 
     Some ()
   with exn ->
@@ -385,7 +402,7 @@ let parse_update json on_heartbeat =
     ) data;
     
     (* Event-driven cleanup based on observed asset growth *)
-    (**** maybe_cleanup_after_balance_update (); ****)
+    maybe_cleanup_after_balance_update ();
 
     Some ()
   with exn ->
@@ -457,25 +474,28 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Kraken_trading_client.subscribe subscribe_msg >>= fun () ->
   on_connected ();
   
-  let buffer = Kraken_trading_client.get_message_buffer () in
-  let condition = Kraken_trading_client.get_message_condition () in
-  let read_pos = ref (Ring_buffer.RingBuffer.get_position buffer) in
-  
-  let rec loop () =
-    Lwt_condition.wait condition >>= fun () ->
-    let new_messages = Ring_buffer.RingBuffer.read_since buffer !read_pos in
-    read_pos := Ring_buffer.RingBuffer.get_position buffer;
+  if not (Atomic.exchange cleanup_handlers_started true) then begin
+    let buffer = Kraken_trading_client.get_message_buffer () in
+    let condition = Kraken_trading_client.get_message_condition () in
+    let read_pos = ref (Ring_buffer.RingBuffer.get_position buffer) in
     
-    List.iter (fun json ->
-      handle_message_json json on_heartbeat
-    ) new_messages;
-    
-    if Atomic.get Kraken_trading_client.shutdown_requested then
-      Lwt.return_unit
-    else
-      loop ()
-  in
-  loop ()
+    let rec loop () =
+      Lwt_condition.wait condition >>= fun () ->
+      let new_messages = Ring_buffer.RingBuffer.read_since buffer !read_pos in
+      read_pos := Ring_buffer.RingBuffer.get_position buffer;
+      
+      List.iter (fun json ->
+        handle_message_json json on_heartbeat
+      ) new_messages;
+      
+      if Atomic.get Kraken_trading_client.shutdown_requested then
+        Lwt.return_unit
+      else
+        loop ()
+    in
+    Lwt.async loop
+  end;
+  Lwt.return_unit
 
 (** Initialize balances feed data stores *)
 let initialize assets =
