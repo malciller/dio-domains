@@ -18,6 +18,31 @@ let section = "suicide_grid"
 open Strategy_common
 module Exchange = Dio_exchange.Exchange_intf
 
+(* ── exchange module cache ──────────────────────────────────────────────── *)
+(** Memoises Exchange.Registry.get by exchange name.  The registry hashtable
+    is walked only on the first call for each exchange; subsequent calls for
+    the same exchange string hit this 2-entry cache directly, eliminating the
+    repeated Hashtbl.find_opt on every round_price / get_price_increment call. *)
+let _exchange_module_cache : (string, (module Exchange.S)) Hashtbl.t =
+  Hashtbl.create 4
+
+let get_exchange_module exchange =
+  match Hashtbl.find_opt _exchange_module_cache exchange with
+  | Some m -> Some m
+  | None ->
+      (match Exchange.Registry.get exchange with
+       | Some m ->
+           Hashtbl.replace _exchange_module_cache exchange m;
+           Some m
+       | None -> None)
+
+(** Per-(symbol,exchange) cache of the resolved round_price closure.
+    Key = symbol ^ "|" ^ exchange  (e.g. "BTC\/USD|kraken").
+    Value = a direct (float -> float) that bypasses module dispatch on every call.
+    The table holds at most 2-3 entries in practice (one per traded pair). *)
+let _round_price_fn_cache : (string, float -> float) Hashtbl.t =
+  Hashtbl.create 8
+
 
 (** Utility function to take first n elements from a list *)
 let rec take n = function
@@ -187,19 +212,31 @@ let parse_config_float config value_name default exchange symbol =
         value_name config exchange symbol default;
       default
 
-(** Round price to appropriate precision for the symbol *)
+(** Round price to appropriate precision for the symbol.
+    Uses a per-(symbol,exchange) closure cache to avoid module dispatch overhead
+    on the hot path inside calculate_grid_price. *)
 let round_price price symbol exchange =
-  match Exchange.Registry.get exchange with
-  | Some (module Ex : Exchange.S) -> Ex.round_price ~symbol ~price
-  | None ->
-      Logging.warn_f ~section "No exchange found for %s/%s, using default rounding" exchange symbol;
-      Float.round price  (* Default: 0 decimal places *)
+  let key = symbol ^ "|" ^ exchange in
+  let fn =
+    match Hashtbl.find_opt _round_price_fn_cache key with
+    | Some f -> f
+    | None ->
+        let f = match get_exchange_module exchange with
+          | Some (module Ex : Exchange.S) -> (fun p -> Ex.round_price ~symbol ~price:p)
+          | None ->
+              Logging.warn_f ~section "No exchange found for %s/%s, using default rounding" exchange symbol;
+              Float.round
+        in
+        Hashtbl.replace _round_price_fn_cache key f;
+        f
+  in
+  fn price
 
 
 (** Get minimum price increment for the symbol *)
 let get_price_increment symbol exchange =
   (* Fetch price increment from generic Exchange interface *)
-  match Exchange.Registry.get exchange with
+  match get_exchange_module exchange with
   | Some (module Ex : Exchange.S) -> Option.value (Ex.get_price_increment ~symbol) ~default:0.01
   | None ->
       Logging.warn_f ~section "No price increment info for %s/%s, using default 0.01" exchange symbol;
@@ -207,7 +244,7 @@ let get_price_increment symbol exchange =
 
 (** Get quantity increment (lot size) for the symbol *)
 let get_qty_increment_val symbol exchange =
-  match Exchange.Registry.get exchange with
+  match get_exchange_module exchange with
   | Some (module Ex : Exchange.S) -> Option.value (Ex.get_qty_increment ~symbol) ~default:0.01
   | None -> 0.01
 
