@@ -63,6 +63,7 @@ type strategy_state = {
   mutable asset_low: bool;      (* true when asset balance is insufficient to place next sell; sell+buy paused *)
   mutable capital_low: bool;    (* true when quote balance is insufficient to place next buy; strategy paused *)
   mutable capital_low_logged: bool; (* true once we have logged the capital-low warning to suppress repeat spam *)
+  mutable capital_low_at_balance: float; (* quote_bal snapshot when capital_low was set; flag clears only when balance increases past this *)
   mutable reserved_quote: float; (* quote amount locked in the current open buy order for this symbol *)
   mutable accumulated_profit: float;    (* realized PnL from completed buy→sell pairs; Hyperliquid discrete sizing *)
   mutable reserved_base: float;  (* base asset accumulated via sell_mult; excluded from sellable balance *)
@@ -112,6 +113,7 @@ let get_strategy_state asset_symbol =
           asset_low = false;
           capital_low = false;
           capital_low_logged = false;
+          capital_low_at_balance = 0.0;
           reserved_quote = 0.0;
           accumulated_profit = persisted_accumulated_profit;
           reserved_base = persisted_reserved_base;
@@ -510,24 +512,29 @@ let execute_strategy
        let total_reserved = get_total_reserved_quote ~exchange:state.exchange_id in
        let available_quote = quote_bal -. total_reserved in
        if state.capital_low && available_quote < quote_needed_fast then begin
+         (* Stamp balance snapshot on first capital_low cycle so recovery requires
+            a real balance feed increase, not stale data re-read. *)
+         if state.capital_low_at_balance = 0.0 then
+           state.capital_low_at_balance <- quote_bal;
          (* Still low: skip entire strategy body to avoid order spam *)
          ()
-       end else if state.capital_low && available_quote >= quote_needed_fast then begin
-         (* Balance has recovered: clear flag and fall through to normal logic *)
+       end else if state.capital_low && quote_bal > state.capital_low_at_balance then begin
+         (* The balance feed has delivered a higher balance than what we saw when capital_low
+            was set. This means a real event (a fill crediting USD, or a cancel freeing reserve)
+            arrived. Only now is it safe to retry placement. Clearing on stale balance data
+            (same quote_bal as at rejection) caused a tight rejection loop. *)
          state.capital_low <- false;
          state.capital_low_logged <- false;
+         state.capital_low_at_balance <- 0.0;  (* reset snapshot for next episode *)
          (* Flush the buy-side placement cooldown so the strategy can place immediately.
             Without this, the 2s cooldown set when capital_low was first triggered
             would block the first buy attempt even after balance recovers. *)
          Hashtbl.remove state.amend_cooldowns "place_Buy";
-         (* Also clear inflight_buy and evict the InFlightOrders duplicate key.
-            When capital_low was set via an exchange rejection, the rejection handler
-            should have cleared these. A full reset
-            here guarantees the first buy attempt goes through immediately. *)
+         (* Also clear inflight_buy and evict the InFlightOrders duplicate key. *)
          state.inflight_buy <- false;
          ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Buy));
-         Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f) - resuming strategy"
-           asset.symbol available_quote quote_needed_fast total_reserved
+         Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at %.2f) - resuming strategy"
+           asset.symbol available_quote quote_needed_fast total_reserved state.capital_low_at_balance
        end
        (* capital_low=false: fall through normally *)
    | None -> () (* No balance data yet, fall through *)

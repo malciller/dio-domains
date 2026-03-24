@@ -259,13 +259,13 @@ let cleanup_stale_orders () =
   if bl_removed > 0 then
     Logging.debug_f ~section "Cleaned up %d stale amendment blacklist entries" bl_removed;
 
-  (* Clean up stale processed_tids (>1h old) across all stores *)
+  (* Clean up stale processed_tids (>10min old) across all stores *)
   List.iter (fun symbol ->
     let store = get_symbol_store symbol in
     Mutex.lock store.tids_mutex;
     let tids_to_remove = ref [] in
     Hashtbl.iter (fun tid arrival_time ->
-      if now -. arrival_time > 3600.0 then tids_to_remove := tid :: !tids_to_remove
+      if now -. arrival_time > 600.0 then tids_to_remove := tid :: !tids_to_remove
     ) store.processed_tids;
     List.iter (Hashtbl.remove store.processed_tids) !tids_to_remove;
     let tids_removed = List.length !tids_to_remove in
@@ -730,10 +730,10 @@ let process_market_data json =
   with exn -> 
     Logging.error_f ~section "Failed to process Hyperliquid executions data: %s" (Printexc.to_string exn)
 
-(** Periodic cleanup task — runs every 5 minutes to sweep stale data *)
+(** Periodic cleanup task — runs every 2 minutes to sweep stale data *)
 let _periodic_cleanup_task =
   let rec run () =
-    Lwt_unix.sleep 300.0 >>= fun () ->
+    Lwt_unix.sleep 120.0 >>= fun () ->
     Logging.debug ~section "Running periodic HL executions cleanup";
     cleanup_stale_orders ();
     run ()

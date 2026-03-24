@@ -57,56 +57,77 @@ module Make (Payload : PAYLOAD) = struct
     mutable publish_count: int;  (* Counter for event-driven cleanup *)
   }
 
-  (** Clean up stale subscribers (older than max_age_seconds or unused for too long) *)
+  (** Clean up stale subscribers (older than max_age_seconds or unused for too long) **)
   let cleanup_stale_subscribers bus ?(max_age_seconds=60.0) ?(max_unused_seconds=30.0) () =
     let now = Unix.time () in
-    let rec try_cleanup () =
-      let current = Atomic.get bus.subscribers in
-      let to_keep, to_remove = List.partition (fun sub ->
-        sub.persistent || (
-          not sub.closed &&
-          (now -. sub.created_at) <= max_age_seconds &&
-          (now -. sub.last_used) <= max_unused_seconds
-        )
-      ) current in
-      let removed_count = List.length to_remove in
-      if removed_count > 0 then begin
-        (* Close removed subscribers to release Lwt_stream + finalize promise *)
-        List.iter (fun sub ->
-          sub.closed <- true;
-          (try sub.close () with _ -> ())
-        ) to_remove;
-        Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
-        if Atomic.compare_and_set bus.subscribers current to_keep then
-          Some removed_count
-        else try_cleanup ()
-      end else None
-    in
-    try_cleanup ()
+    (* Fast path: check if any subscriber needs removal before allocating lists *)
+    let current = Atomic.get bus.subscribers in
+    let has_stale = List.exists (fun sub ->
+      not sub.persistent && (
+        sub.closed ||
+        (now -. sub.created_at) > max_age_seconds ||
+        (now -. sub.last_used) > max_unused_seconds
+      )
+    ) current in
+    if not has_stale then None
+    else begin
+      let rec try_cleanup () =
+        let current = Atomic.get bus.subscribers in
+        let to_keep = List.filter (fun sub ->
+          sub.persistent || (
+            not sub.closed &&
+            (now -. sub.created_at) <= max_age_seconds &&
+            (now -. sub.last_used) <= max_unused_seconds
+          )
+        ) current in
+        let removed_count = List.length current - List.length to_keep in
+        if removed_count > 0 then begin
+          let to_remove = List.filter (fun sub ->
+            not (List.memq sub to_keep)
+          ) current in
+          List.iter (fun sub ->
+            sub.closed <- true;
+            (try sub.close () with _ -> ())
+          ) to_remove;
+          Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
+          if Atomic.compare_and_set bus.subscribers current to_keep then
+            Some removed_count
+          else try_cleanup ()
+        end else None
+      in
+      try_cleanup ()
+    end
 
-  (** Force cleanup all stale subscribers regardless of age (for dashboard memory management) *)
+  (** Force cleanup all stale subscribers regardless of age (for dashboard memory management) **)
   let force_cleanup_stale_subscribers bus () =
     let now = Unix.time () in
-    let rec try_cleanup () =
-      let current = Atomic.get bus.subscribers in
-      let to_keep, to_remove = List.partition (fun sub ->
-        sub.persistent ||
-        (not sub.closed && (now -. sub.last_used) <= 10.0)
-      ) current in
-      let removed_count = List.length to_remove in
-      if removed_count > 0 then begin
-        (* Close removed subscribers to release Lwt_stream + finalize promise *)
-        List.iter (fun sub ->
-          sub.closed <- true;
-          (try sub.close () with _ -> ())
-        ) to_remove;
-        Logging.debug_f ~section:"event_bus" "Force cleaned %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
-        if Atomic.compare_and_set bus.subscribers current to_keep then
-          Some removed_count
-        else try_cleanup ()
-      end else None
-    in
-    try_cleanup ()
+    let current = Atomic.get bus.subscribers in
+    let has_stale = List.exists (fun sub ->
+      not sub.persistent && (sub.closed || (now -. sub.last_used) > 10.0)
+    ) current in
+    if not has_stale then None
+    else begin
+      let rec try_cleanup () =
+        let current = Atomic.get bus.subscribers in
+        let to_keep = List.filter (fun sub ->
+          sub.persistent ||
+          (not sub.closed && (now -. sub.last_used) <= 10.0)
+        ) current in
+        let removed_count = List.length current - List.length to_keep in
+        if removed_count > 0 then begin
+          let to_remove = List.filter (fun sub -> not (List.memq sub to_keep)) current in
+          List.iter (fun sub ->
+            sub.closed <- true;
+            (try sub.close () with _ -> ())
+          ) to_remove;
+          Logging.debug_f ~section:"event_bus" "Force cleaned %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
+          if Atomic.compare_and_set bus.subscribers current to_keep then
+            Some removed_count
+          else try_cleanup ()
+        end else None
+      in
+      try_cleanup ()
+    end
 
   (** Get subscriber statistics for monitoring *)
   let get_subscriber_stats bus =
