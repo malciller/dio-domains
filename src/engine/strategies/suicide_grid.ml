@@ -1344,9 +1344,14 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
       sell_id <> order_id
     ) state.open_sell_orders;
 
-    (* 4. Clear buy order tracking if it was the tracked buy order *)
-    let was_tracked_buy = match state.last_buy_order_id with
-      | Some id when id = order_id -> true
+    (* 4. Clear buy order tracking only on buy fills.
+       A sell fill must NEVER clear last_buy_order_id — the buy is still live
+       and just needs spacing adjustment, not a fresh placement cycle.
+       Failing to gate on [side = Buy] here caused sell fills to spuriously
+       clear buy tracking, making effective_buy_count=0 on the next cycle and
+       triggering a redundant buy placement alongside the still-open original. *)
+    let was_tracked_buy = match side, state.last_buy_order_id with
+      | Buy, Some id when id = order_id -> true
       | _ -> false
     in
     if was_tracked_buy then begin
