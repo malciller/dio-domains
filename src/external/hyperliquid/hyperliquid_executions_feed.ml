@@ -80,8 +80,46 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Global order_id -> symbol mapping for O(1) lookups (mirrors Kraken's pattern) *)
-let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 128
+(** Global order_id -> symbol mapping with adaptive startup cap + FIFO eviction.
+    Must be accessed under initialization_mutex. *)
+let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
+(** FIFO insertion queue for oldest-entry eviction *)
+let order_to_symbol_queue : string Queue.t = Queue.create ()
+(** Mutable cap: max_int during startup (uncapped), locked after first snapshot *)
+let order_to_symbol_cap : int ref = ref max_int
+let order_to_symbol_startup_done = Atomic.make false
+
+(** Add order_id->symbol, evicting the oldest entry when over cap.
+    Ring-buffer semantics: newest always wins, oldest always goes.
+    Must be called while holding initialization_mutex. *)
+let add_to_order_to_symbol order_id symbol =
+  if not (Hashtbl.mem order_to_symbol order_id) then
+    Queue.push order_id order_to_symbol_queue;
+  Hashtbl.replace order_to_symbol order_id symbol;
+  (* Enforce cap only after startup snapshot is complete *)
+  if Atomic.get order_to_symbol_startup_done then
+    while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
+      if Queue.is_empty order_to_symbol_queue then
+        (* Queue and table drifted — just accept current length as new cap *)
+        order_to_symbol_cap := Hashtbl.length order_to_symbol
+      else begin
+        let oldest = Queue.pop order_to_symbol_queue in
+        Hashtbl.remove order_to_symbol oldest
+      end
+    done
+
+(** Lock the adaptive cap after the startup snapshot is fully consumed.
+    Cap = observed size rounded up by 50%%, minimum 32.
+    Called exactly once; subsequent calls are no-ops. *)
+let mark_startup_complete () =
+  if not (Atomic.exchange order_to_symbol_startup_done true) then begin
+    (* initialization_mutex is already held by the caller (inject_open_orders) *)
+    let observed = Hashtbl.length order_to_symbol in
+    let cap = max 32 (observed + observed / 2 + 1) in
+    order_to_symbol_cap := cap;
+    Logging.info_f ~section
+      "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)" cap observed
+  end
 
 (** Blacklist of order IDs removed by cancel-replace amendments.
     Prevents late WS orderUpdates 'open' events from re-adding
@@ -219,7 +257,22 @@ let cleanup_stale_orders () =
   let bl_removed = List.length !blacklist_to_remove in
   Mutex.unlock amended_blacklist_mutex;
   if bl_removed > 0 then
-    Logging.debug_f ~section "Cleaned up %d stale amendment blacklist entries" bl_removed
+    Logging.debug_f ~section "Cleaned up %d stale amendment blacklist entries" bl_removed;
+
+  (* Clean up stale processed_tids (>1h old) across all stores *)
+  List.iter (fun symbol ->
+    let store = get_symbol_store symbol in
+    Mutex.lock store.tids_mutex;
+    let tids_to_remove = ref [] in
+    Hashtbl.iter (fun tid arrival_time ->
+      if now -. arrival_time > 3600.0 then tids_to_remove := tid :: !tids_to_remove
+    ) store.processed_tids;
+    List.iter (Hashtbl.remove store.processed_tids) !tids_to_remove;
+    let tids_removed = List.length !tids_to_remove in
+    Mutex.unlock store.tids_mutex;
+    if tids_removed > 0 then
+      Logging.debug_f ~section "Cleaned %d stale processed_tids for %s" tids_removed symbol
+  ) all_symbols
 
 (** Clear all open orders across all stores - used on WebSocket reconnection
     to prevent stale phantom orders from blocking new order placement. *)
@@ -234,9 +287,10 @@ let clear_all_open_orders () =
     Hashtbl.clear store.open_orders;
     Mutex.unlock store.orders_mutex;
   ) all_symbols;
-  (* Clear global index *)
+  (* Clear global index and eviction queue *)
   Mutex.lock initialization_mutex;
   Hashtbl.clear order_to_symbol;
+  Queue.clear order_to_symbol_queue;
   Mutex.unlock initialization_mutex;
   if !total_removed > 0 then
     Logging.info_f ~section "Cleared %d stale open orders on reconnection" !total_removed
@@ -368,9 +422,9 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     } in
     
     Hashtbl.replace store.open_orders event.order_id order;
-    (* Add to global index *)
+    (* Add to global index with FIFO eviction when over adaptive cap *)
     Mutex.lock initialization_mutex;
-    Hashtbl.replace order_to_symbol event.order_id event.symbol;
+    add_to_order_to_symbol event.order_id event.symbol;
     Mutex.unlock initialization_mutex;
   end;
   Mutex.unlock store.orders_mutex;
@@ -578,14 +632,6 @@ let process_user_events data_json =
         Mutex.unlock store.tids_mutex;
 
         if not already_processed then begin
-          Mutex.lock store.tids_mutex;
-          let to_remove = ref [] in
-          Hashtbl.iter (fun tid arrival_time ->
-            if now -. arrival_time > 3600.0 then to_remove := tid :: !to_remove
-          ) store.processed_tids;
-          List.iter (Hashtbl.remove store.processed_tids) !to_remove;
-          Mutex.unlock store.tids_mutex;
-
           (* Hold lock for entire read-compute-write cycle to prevent double-counted fills *)
           Mutex.lock store.orders_mutex;
           let (existing_order : open_order option) = Hashtbl.find_opt store.open_orders order_id in
@@ -684,6 +730,16 @@ let process_market_data json =
   with exn -> 
     Logging.error_f ~section "Failed to process Hyperliquid executions data: %s" (Printexc.to_string exn)
 
+(** Periodic cleanup task — runs every 5 minutes to sweep stale data *)
+let _periodic_cleanup_task =
+  let rec run () =
+    Lwt_unix.sleep 300.0 >>= fun () ->
+    Logging.debug ~section "Running periodic HL executions cleanup";
+    cleanup_stale_orders ();
+    run ()
+  in
+  Lwt.async run
+
 let _processor_task =
   let rec run () =
     let sub = Hyperliquid_ws.subscribe_market_data () in
@@ -761,6 +817,11 @@ let inject_open_orders data_json =
         | None -> ()
       with exn -> Logging.warn_f ~section "Failed to parse open order entry: %s" (Printexc.to_string exn)
     ) orders;
-    Logging.info_f ~section "Injected %d initial open orders from snapshot" !count
+    Logging.info_f ~section "Injected %d initial open orders from snapshot" !count;
+    (* Lock adaptive cap now that startup snapshot is fully consumed.
+       Subsequent inserts will evict oldest entries when over cap. *)
+    Mutex.lock initialization_mutex;
+    mark_startup_complete ();
+    Mutex.unlock initialization_mutex
   with exn ->
     Logging.error_f ~section "Failed to inject open orders: %s" (Printexc.to_string exn)

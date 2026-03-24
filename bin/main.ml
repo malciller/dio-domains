@@ -313,6 +313,19 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
+  (* Tune GC to prevent heap bloat in this long-running, allocation-heavy process.
+     space_overhead=20  : collect when live data could extend by only 20% waste (default 80).
+     minor_heap_size    : 2MB minor heap reduces promotion pressure on the major heap.
+     max_overhead=50    : cap maximum wasted space at 50% before forcing a full GC. *)
+  let () =
+    let g = Gc.get () in
+    Gc.set { g with
+      Gc.space_overhead = 20;
+      Gc.minor_heap_size = 262144;  (* words; on 64-bit this is ~2MB *)
+      Gc.max_overhead = 50;
+    }
+  in
+
 
   (* Event-driven memory reporting via GC alarm *)
   let start_time = Unix.gettimeofday () in
