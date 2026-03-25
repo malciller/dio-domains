@@ -79,8 +79,7 @@ type strategy_state = {
   mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
-  mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
-  mutable pending_cancellations: (string, float) Hashtbl.t;  (* order_id -> timestamp - track pending cancellation operations *)
+  mutable inflight_cancel_buy: bool;  (* true while a buy cancel has been sent but not yet confirmed by the order channel *)
   mutable amend_cooldowns: (string, float) Hashtbl.t; (* order_id -> timestamp until which amends are blocked *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
   mutable inflight_buy: bool;   (* true while a buy Place is sent but not yet ack'd/rejected/failed *)
@@ -129,8 +128,7 @@ let get_strategy_state asset_symbol =
           pending_orders = [];
           last_cycle = 0;
           last_order_time = 0.0;
-          cancelled_orders = [];
-          pending_cancellations = Hashtbl.create 16;
+          inflight_cancel_buy = false;
           amend_cooldowns = Hashtbl.create 16;
           last_cleanup_time = 0.0;
           inflight_buy = false;
@@ -349,43 +347,36 @@ let push_order order =
     | Cancel -> "cancel"
   in
 
-  (* Check for duplicate cancellations before pushing *)
+  (* For Cancel operations, set inflight_cancel_buy when cancelling a buy *)
   (match order.operation with
    | Cancel ->
        let state = get_strategy_state order.symbol in
        (match order.order_id with
         | Some target_order_id ->
-            if Hashtbl.mem state.pending_cancellations target_order_id then begin
-              Logging.debug_f ~section "Skipping duplicate cancellation for order %s (already pending)" target_order_id;
-              false
-            end else begin
-              (* Not a duplicate, proceed with pushing *)
-              Mutex.lock order_buffer_mutex;
-              let write_result = OrderRingBuffer.write order_buffer order in
-              Mutex.unlock order_buffer_mutex;
+            Mutex.lock order_buffer_mutex;
+            let write_result = OrderRingBuffer.write order_buffer order in
+            Mutex.unlock order_buffer_mutex;
 
-              match write_result with
-              | Some () ->
-                  Strategy_common.OrderSignal.broadcast ();
-                  Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
-                    operation_str
-                    (string_of_order_side order.side)
-                    order.symbol
-                    order.qty
-                    (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
-
-                  (* Update strategy state *)
-                  state.last_order_time <- Unix.time ();
-                  (* Add to pending cancellations tracking *)
-                  Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
-                  Logging.debug_f ~section "Cancelling order for %s (target: %s)"
-                    order.symbol target_order_id;
-                  true
-              | None ->
-                  Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
-                    operation_str (string_of_order_side order.side) order.symbol;
-                  false
-            end
+            (match write_result with
+            | Some () ->
+                Strategy_common.OrderSignal.broadcast ();
+                Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
+                  operation_str
+                  (string_of_order_side order.side)
+                  order.symbol
+                  order.qty
+                  (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+                state.last_order_time <- Unix.time ();
+                (* Gate the open_orders sync: hold until order channel confirms the cancel *)
+                if order.side = Buy then
+                  state.inflight_cancel_buy <- true;
+                Logging.debug_f ~section "Cancelling order for %s (target: %s)"
+                  order.symbol target_order_id;
+                true
+            | None ->
+                Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
+                  operation_str (string_of_order_side order.side) order.symbol;
+                false)
         | None ->
             Logging.warn_f ~section "Cancel operation missing order_id for %s" order.symbol;
             false)
@@ -639,30 +630,6 @@ let execute_strategy
       if cleaned_pending > 0 && cycle mod 100000 = 0 then
         Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_pending asset.symbol;
 
-      (* Clean up old cancelled orders from blacklist (older than 15 seconds) and enforce hard limit *)
-      state.cancelled_orders <- List.filter (fun (_, timestamp) ->
-        now -. timestamp < 15.0  (* Reduced from 30 to 15 seconds *)
-      ) state.cancelled_orders;
-
-      (* Enforce hard limit of 20 cancelled orders to prevent memory growth *)
-      if List.length state.cancelled_orders > 20 then begin
-        let excess = List.length state.cancelled_orders - 20 in
-        state.cancelled_orders <- take 20 state.cancelled_orders;  (* Keep most recent 20 *)
-        Logging.warn_f ~section "Truncated %d excess cancelled orders for %s (kept 20)" excess asset.symbol;
-      end;
-
-      (* Clean up old pending cancellations (older than 30 seconds) *)
-      (* Optimized scan and remove to avoid Hashtbl copy *)
-      let to_remove = ref [] in
-      Hashtbl.iter (fun order_id timestamp ->
-        if now -. timestamp > 30.0 then
-          to_remove := order_id :: !to_remove
-      ) state.pending_cancellations;
-
-      List.iter (fun order_id ->
-        Logging.debug_f ~section "Removing stale pending cancellation %s for %s" order_id asset.symbol;
-        Hashtbl.remove state.pending_cancellations order_id
-      ) !to_remove;
 
       (* Clean up expired amend cooldowns *)
       let to_remove_cooldowns = ref [] in
@@ -693,15 +660,12 @@ let execute_strategy
       let sell_orders = ref [] in
 
       List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
-        (* Skip if this order was recently cancelled *)
-        let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-
         let is_our_strategy = match userref_opt with
           | Some ref_val -> ref_val = Strategy_common.strategy_userref_grid
           | None -> asset.exchange = "hyperliquid"
         in
         
-        if not is_cancelled && qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
+        if qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
           (* Use actual order side from exchange, not price-based classification *)
           if side_str = "buy" then
             (* Treat ALL buy orders as grid buys to enforce single-buy-order policy across all exchanges *)
@@ -711,12 +675,17 @@ let execute_strategy
             sell_orders := (order_id, order_price) :: !sell_orders
       ) open_orders;
 
-      (* Set the buy order price and ID (take the highest buy order if multiple) *)
+      (* Set the buy order price and ID (take the highest buy order if multiple).
+         Gate: if a cancel is in flight, don't trust the open_orders snapshot —
+         the order channel hasn't confirmed the cancel yet so open_orders may still
+         report the order as open. Only the order channel (handle_order_cancelled)
+         clears inflight_cancel_buy. *)
       (match !buy_orders with
-       | [] ->
-           (* No open buy for this symbol - clear this asset's reservation *)
+       | [] when not state.inflight_cancel_buy && not state.inflight_buy ->
+           (* No open buy and no in-flight op — clear reservation *)
            set_asset_reserved_quote state 0.0
-       | orders ->
+       | orders when not state.inflight_cancel_buy && not state.inflight_buy ->
+           (* Safe to sync: no in-flight operation *)
            let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
              if price > acc_price then (order_id, price) else (acc_id, acc_price)
            ) (List.hd orders) (List.tl orders) in
@@ -725,7 +694,11 @@ let execute_strategy
            (* Sync per-asset reserved_quote from the actual open buy so the capital_low check
               uses the real exchange-reserved amount even after a restart. *)
            let qty = (try float_of_string asset.qty with Failure _ -> 0.001) in
-           set_asset_reserved_quote state (best_price *. qty));
+           set_asset_reserved_quote state (best_price *. qty)
+       | _ ->
+           (* In-flight cancel or place: open_orders may be stale.
+              Hold current state — order channel will resolve. *)
+           ());
 
       (* Set sell orders *)
       state.open_sell_orders <- !sell_orders;
@@ -736,8 +709,7 @@ let execute_strategy
       if asset.exchange = "hyperliquid" then begin
         List.iter (fun (preserved_id, preserved_price) ->
           let already_present = List.exists (fun (id, _) -> id = preserved_id) state.open_sell_orders in
-          let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = preserved_id) state.cancelled_orders in
-          if not already_present && not is_cancelled then
+          if not already_present then
             state.open_sell_orders <- (preserved_id, preserved_price) :: state.open_sell_orders
         ) preserved_sells
       end;
@@ -828,7 +800,10 @@ let execute_strategy
         if cycle mod 100000 = 0 then
             Logging.debug_f ~section "Waiting for pending buy order to complete for %s" asset.symbol;
     end else if effective_buy_count > 1 then begin
-        (* Case 0: Multiple buy orders exist - cancel all buy orders to maintain single buy order policy *)
+        (* Case 0: Multiple buy orders exist - cancel all buy orders to maintain single buy order policy.
+           This branch only fires at startup reconciliation when last_buy_order_id=None and
+           the order channel shows multiple buys. inflight_cancel_buy gates the sync until
+           handle_order_cancelled confirms each cancel. *)
         Logging.info_f ~section "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order policy"
           effective_buy_count asset.symbol;
 
@@ -840,14 +815,9 @@ let execute_strategy
         ) !buy_orders;
 
         (* Clear buy order tracking since we're cancelling all *)
-        state.last_buy_order_price <- None;
         state.last_buy_order_id <- None;
-
-        (* Blacklist all cancelled buy order IDs so racing amendments
-           don't reinstall them via handle_order_amended fallback *)
-        List.iter (fun (order_id, _) ->
-          state.cancelled_orders <- (order_id, now) :: state.cancelled_orders
-        ) !buy_orders;
+        state.last_buy_order_price <- None;
+        (* inflight_cancel_buy is already set by push_order for each cancel *)
 
         (* Apply cooldown to prevent re-entering this branch before exchange acks the cancels *)
         let cooldown_key = "place_Buy" in
@@ -1480,9 +1450,8 @@ let handle_order_cancelled asset_symbol order_id side =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-    (* Genuine cancellation: full cleanup *)
-    (* Add to cancelled orders blacklist to prevent re-adding during sync *)
-    (* 1. Remove any pending operations for this order *)
+    (* Order channel confirmed cancellation: authoritative source of truth.
+       1. Remove any pending operations for this order *)
     let original_pending_count = List.length state.pending_orders in
     state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
       (* True if the pending_id matches order_id, OR if it's a pending amend matching the order_id *)
@@ -1493,15 +1462,6 @@ let handle_order_cancelled asset_symbol order_id side =
       not matches
     ) state.pending_orders;
     let removed_pending = original_pending_count - List.length state.pending_orders in
-    
-    (* Clear the pending cancellations tracking *)
-    Hashtbl.remove state.pending_cancellations order_id;
-
-    (* 1.5 Add cancelled order ID to blacklist immediately.
-       This prevents race conditions where an old websocket update
-       re-adds the order to tracking before the exchange fully drops it *)
-    let now = Unix.time () in
-    state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
 
     (* Clear amend cooldowns if any exist *)
     Hashtbl.remove state.amend_cooldowns order_id;
@@ -1518,7 +1478,14 @@ let handle_order_cancelled asset_symbol order_id side =
     if was_tracked_buy then begin
          state.last_buy_order_id <- None;
          state.last_buy_order_price <- None;
-         Logging.debug_f ~section "Cancelled buy order %s removed from tracking for %s (blacklisted)" order_id asset_symbol
+         Logging.debug_f ~section "Cancelled buy order %s removed from tracking for %s" order_id asset_symbol
+    end;
+
+    (* Clear inflight_cancel_buy now that the order channel has confirmed — unblocks sync *)
+    if cancelled_side = Buy then begin
+      state.inflight_cancel_buy <- false;
+      (* Flush buy-side placement cooldown so strategy can place immediately *)
+      Hashtbl.remove state.amend_cooldowns "place_Buy"
     end;
     
     (* Remove from sell orders list *)
@@ -1532,7 +1499,7 @@ let handle_order_cancelled asset_symbol order_id side =
     (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol cancelled_side));
     
-    Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell, added to blacklist)"
+    Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell)"
       order_id asset_symbol removed_pending removed_sell
   )
 
@@ -1549,23 +1516,9 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
       not matches_amend
     ) state.pending_orders;
 
-    (* 1.5 Add old order ID to cancelled orders blacklist to prevent it from acting as a ghost order
-       if the exchange's data feed (e.g. Hyperliquid webData2) takes a few seconds to drop the old order.
-       CRITICAL: Only blacklist if IDs differ, as Kraken amendments often preserve the original order ID! *)
-    if old_order_id <> new_order_id then begin
-      let now = Unix.time () in
-      state.cancelled_orders <- (old_order_id, now) :: state.cancelled_orders;
-    end;
-
     (* 2. Update the active order tracking - swap old ID to new ID *)
     (match side with
      | Buy ->
-          (* Check if old order was explicitly cancelled (race with multi-buy cleanup) *)
-          let is_blacklisted = List.exists (fun (cid, _) -> cid = old_order_id) state.cancelled_orders in
-          if is_blacklisted then
-            Logging.info_f ~section "Ignoring amendment for blacklisted buy order %s -> %s for %s"
-              old_order_id new_order_id asset_symbol
-          else
           (match state.last_buy_order_id with
            | Some target_id when target_id = old_order_id ->
                state.last_buy_order_id <- Some new_order_id;
@@ -1673,11 +1626,9 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
       let cancel_order = create_cancel_order order_id asset_symbol "Grid" state.exchange_id in
       ignore (push_order cancel_order);
 
-      (* Blacklist the gone order ID so racing amendment events
-         don't reinstall it via handle_order_amended fallback.
-         We set the timestamp 10 years in the future so it never expires from the 15s cleanup. *)
-      let far_future = now +. 315360000.0 in
-      state.cancelled_orders <- (order_id, far_future) :: state.cancelled_orders;
+      (* Mark cancel in flight so the sync block doesn't reinstall this order *)
+      if side = Buy then
+        state.inflight_cancel_buy <- true;
       (match side with
        | Buy ->
            (match state.last_buy_order_id with
@@ -1715,29 +1666,11 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
   )
 
-(** Clean up pending cancellation tracking for a completed order *)
-let cleanup_pending_cancellation asset_symbol order_id =
-  let state = get_strategy_state asset_symbol in
-  Mutex.lock state.mutex;
-  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-  Hashtbl.remove state.pending_cancellations order_id;
-  (* Safety net: if cancelled order is the tracked buy, clear tracking.
-     Handles ghost orders from rapid amendments where the cancel response
-     arrives but handle_order_cancelled never fires (order didn't exist). *)
-  (match state.last_buy_order_id with
-   | Some id when id = order_id ->
-       state.last_buy_order_id <- None;
-       state.last_buy_order_price <- None;
-       set_asset_reserved_quote state 0.0;
-       state.inflight_buy <- false;
-       ignore (InFlightOrders.remove_in_flight_order
-         (generate_side_duplicate_key asset_symbol Buy));
-       Hashtbl.remove state.amend_cooldowns "place_Buy";
-       Logging.info_f ~section
-         "Cleared ghost buy tracking for %s after cancel cleanup of %s"
-         asset_symbol order_id
-   | _ -> ())
-  )
+(** No-op shim: pending_cancellations removed; cancel state is now tracked via
+    inflight_cancel_buy. The supervisor still calls this after every cancel
+    response, so we keep the signature to satisfy the Strategy interface. *)
+let cleanup_pending_cancellation _asset_symbol _order_id = ()
+
 
 (** Get pending orders from ringbuffer for processing *)
 let get_pending_orders max_orders =
