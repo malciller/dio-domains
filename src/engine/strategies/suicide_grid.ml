@@ -257,12 +257,11 @@ let round_qty qty symbol exchange =
 (** Get minimum price movement required to trigger an amendment *)
 let get_min_move_threshold price grid_interval_pct symbol exchange =
   let base_increment = get_price_increment symbol exchange in
-  if exchange = "hyperliquid" then
-    (* For Hyperliquid, require at least 25% of grid_interval OR 10x base increment to avoid rate limits *)
-    let pct_based = price *. (grid_interval_pct *. 0.25 /. 100.0) in
-    max (base_increment *. 10.0) pct_based
-  else
-    base_increment
+  (* Require at least 5% of one grid interval OR 10x base increment to avoid amendment spam.
+     Applied uniformly across exchanges — previously Kraken used only 1 tick ($0.01) which
+     caused constant amendments on high-price assets like ETH. *)
+  let pct_based = price *. (grid_interval_pct *. 0.05 /. 100.0) in
+  max (base_increment *. 10.0) pct_based
 
 (** Calculate grid price based on current price and interval *)
 let calculate_grid_price current_price grid_interval_pct is_above symbol exchange =
