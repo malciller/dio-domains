@@ -392,9 +392,9 @@ module Hyperliquid_impl = struct
 end
 
 (** WS-based initialization helpers that orchestrate between WS and feeds *)
-let rec wait_for_ws_connected () =
-  if Hyperliquid_ws.is_connected () then Lwt.return_unit
-  else Lwt_unix.sleep 0.1 >>= wait_for_ws_connected
+let wait_for_ws_connected () =
+  (* Delegates to the Lwt_mvar-based wait in hyperliquid_ws — zero polling *)
+  Hyperliquid_ws.wait_for_connected ()
 
 let initialize_instruments_ws () =
   let section = "hyperliquid_startup" in
@@ -534,6 +534,9 @@ let fetch_open_orders_ws () =
       let data_node = try payload |> member "data" with _ -> `Null in
       let orders_json = if data_node <> `Null then data_node else payload in
       Hyperliquid_executions_feed.inject_open_orders orders_json;
+      (* Signal domain workers: open-order snapshot is now fully injected.
+         Replaces the 2s wall-clock gate in domain_spawner with a real event. *)
+      Hyperliquid_executions_feed.set_startup_snapshot_done ();
       Lwt.return_unit
     ) (fun exn ->
       Logging.error_f ~section "Failed to fetch open orders via WS: %s" (Printexc.to_string exn);

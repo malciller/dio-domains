@@ -13,6 +13,18 @@ type subscription = {
 let is_connected_ref = Atomic.make false
 let is_connected () = Atomic.get is_connected_ref
 
+(** Mvar filled each time a new connection is established.
+    Consumers take from it to wait without polling; the mvar is
+    refilled after each successful connect so it remains available
+    for the next caller (e.g. after reconnect). *)
+let connected_wakeup : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
+
+(** Block until the WS is connected (or return immediately if already connected).
+    Uses connected_wakeup for zero-latency notification instead of sleep polling. *)
+let wait_for_connected () =
+  if Atomic.get is_connected_ref then Lwt.return_unit
+  else Lwt_mvar.take connected_wakeup
+
 let active_connection = ref None
 let connection_mutex = Lwt_mutex.create ()
 
@@ -325,6 +337,8 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     Lwt_mutex.with_lock connection_mutex (fun () ->
       active_connection := Some conn;
       Atomic.set is_connected_ref true;
+      (* Signal any waiters blocked in wait_for_connected() *)
+      Lwt.async (fun () -> Lwt_mvar.put connected_wakeup ());
       Lwt.return_unit
     ) >>= fun () ->
     on_connected ();

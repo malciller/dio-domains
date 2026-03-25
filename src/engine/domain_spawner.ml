@@ -175,11 +175,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       (* Tracks whether we've done at least one exec position check - used as fallback for
          Hyperliquid assets with no open orders that generate no exec events. *)
       let hl_exec_checked = ref false in
-      (* Record when this domain started - used to delay the no-open-orders fallback
-         until webData2 has had time to arrive (~200-500ms) and populate exec events
-         for any live orders. Without this, the fallback fired on cycle 1 before
-         webData2 arrived, causing the strategy to place duplicate orders. *)
-      let domain_start_time = Unix.time () in
       let last_balance_check = ref 0.0 in
 
       (* Initialize strategy for this asset based on strategy type *)
@@ -486,12 +481,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            we still need to unblock the strategy after confirming the current position.
            This covers Hyperliquid assets with no open orders - the absence of exec
            events is valid data meaning there's nothing to reconcile.
-           Guard: wait 2s after domain start so webData2 (~200-500ms latency) has time
-           to arrive and trigger handle_order_acknowledged for any live orders first.
-           If live orders exist they generate exec events within that window and
-           hl_exec_ready is set by the normal path above. *)
+           Gate: wait until the open-order snapshot injection is complete so the strategy
+           starts with accurate state. The snapshot fires set_startup_snapshot_done()
+           (typically 200-500ms) which wakes us immediately via Exchange_wakeup. *)
         if not !hl_exec_ready && not !hl_exec_checked && asset_with_fees.exchange = "hyperliquid"
-           && (Unix.time () -. domain_start_time) >= 2.0 then begin
+           && Hyperliquid.Executions_feed.is_startup_snapshot_done () then begin
           let current_pos_now = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
           if current_pos_now = !exec_read_pos then begin
             hl_exec_checked := true;
@@ -501,7 +495,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
              | Some _ ->
                  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
              | None -> ());
-            Logging.info_f ~section "[%s/%s] No exec events after 2s - strategy now active (no open orders)"
+            Logging.info_f ~section "[%s/%s] Snapshot done, no exec events - strategy now active (no open orders)"
               asset_with_fees.exchange asset_with_fees.symbol
           end
         end;
@@ -683,6 +677,17 @@ let register_domain asset =
   Logging.debug_f ~section "Registered domain for supervision: %s" key;
   state
 
+(** Condition variable signalled when a domain exits (crash or normal exit).
+    Allows supervisor_loop to react immediately instead of waiting the full 5s. *)
+let domain_died_mutex = Mutex.create ()
+let domain_died_cond = Condition.create ()
+
+(** Notify the supervisor that a domain has just died *)
+let notify_domain_died () =
+  Mutex.lock domain_died_mutex;
+  Condition.signal domain_died_cond;
+  Mutex.unlock domain_died_mutex
+
 (** Start a supervised domain *)
 let start_domain config state fee_fetcher =
   let asset = state.asset in
@@ -721,6 +726,7 @@ let start_domain config state fee_fetcher =
 
         (* Mark domain as stopped and allow restart *)
         Atomic.set state.is_running false;
+        notify_domain_died ();
         (* Do NOT clear domain_handle here - we need it to join the domain later *)
         (* Don't re-raise - domain should be restarted by supervisor *)
         ()
@@ -781,7 +787,18 @@ let supervisor_loop config fee_fetcher =
 
   while not (Atomic.get shutdown_requested) do
     try
-      Thread.delay 5.0;  (* Check every 5 seconds *)
+      (* Wait up to 5s for a domain-died signal or the periodic timeout.
+         We spawn a short-lived waker thread that signals after 5s so that
+         the Condition.wait returns even if no domain dies in that window. *)
+      Mutex.lock domain_died_mutex;
+      let _waker = Thread.create (fun () ->
+        Thread.delay 5.0;
+        Mutex.lock domain_died_mutex;
+        Condition.signal domain_died_cond;
+        Mutex.unlock domain_died_mutex
+      ) () in
+      Condition.wait domain_died_cond domain_died_mutex;
+      Mutex.unlock domain_died_mutex;
 
       (* Check for shutdown again after the delay *)
       if Atomic.get shutdown_requested then raise Exit;
