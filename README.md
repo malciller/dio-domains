@@ -200,16 +200,16 @@ resolution. p50/p90/p99 values in microseconds.
 ------------------------------------------------------------------------------
 Benchmark                                       N  p50 (µs)  p90 (µs)  p99 (µs) total (ms)
 ------------------------------------------------------------------------------
-ringbuffer_write_read                       10000       1.00       1.00       1.00       0.62
-inflight_orders_ops                         10000       1.00       1.00       1.00       1.96
-inflight_amendments_ops                     10000       1.00       1.00       1.00       2.19
-fee_cache_store_get                          5000       1.00       1.00       1.00       1.69
-order_creation_place                         5000       1.00       1.00       1.00       0.69
-order_creation_amend                         5000       1.00       1.00       1.00       0.31
-config_parse_float                          10000       1.00       1.00       1.00       0.97
-price_calc_grid                             10000       1.00       1.00       1.00       2.50
-state_get_100_symbols                         100       6.00       6.00       8.00       0.47
-generate_duplicate_key                      10000       1.00       1.00       2.00      10.08
+ringbuffer_write_read                       10000       1.00       1.00       1.00       0.70
+inflight_orders_ops                         10000       1.00       1.00       1.00       2.31
+inflight_amendments_ops                     10000       1.00       1.00       1.00       2.33
+fee_cache_store_get                          5000       1.00       1.00       1.00       1.97
+order_creation_place                         5000       1.00       1.00       1.00       0.71
+order_creation_amend                         5000       1.00       1.00       1.00       0.36
+config_parse_float                          10000       1.00       1.00       1.00       1.12
+price_calc_grid                             10000       1.00       1.00       1.00       2.58
+state_get_100_symbols                         100       4.00       4.00       6.00       0.36
+generate_duplicate_key                      10000       1.00       1.00       1.00       3.42
 ------------------------------------------------------------------------------
 ```
 
