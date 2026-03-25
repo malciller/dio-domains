@@ -557,7 +557,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
               to avoid waiting for monitor loop's backoff cycle (2s+). *)
            Lwt.async (fun () ->
              Lwt.catch (fun () ->
-               Lwt_unix.sleep 0.1 >>= fun () ->
+               Lwt.pause () >>= fun () ->
                start_async hl_ws_conn;
                Lwt.return_unit
              ) (fun exn ->
@@ -705,7 +705,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
           Lwt.async (fun () ->
             Lwt.catch (fun () ->
-              Lwt_unix.sleep 0.1 >>= fun () ->  (* Small delay to prevent tight loops *)
+              Lwt.pause () >>= fun () ->  (* Cooperative yield to avoid same-turn re-entry *)
               start_async auth_ws_conn;
               Lwt.return_unit
             ) (fun exn ->
@@ -881,8 +881,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         | None ->
             Logging.error_f ~section "Fatal: Failed to fetch fees for %s. Exiting." asset.Dio_engine.Config.symbol;
             exit 1 in
-        (* Add small delay between requests to ensure unique nonces *)
-        let%lwt () = Lwt_unix.sleep 0.05 in  (* 50ms delay *)
+        (* No nonce sleep needed: requests are sequential (Lwt_list.map_s) and
+           each HTTP round-trip takes >10ms, guaranteeing unique timestamps. *)
         Lwt.return result
       end else if asset.Dio_engine.Config.exchange = "hyperliquid" then begin
         let is_spot = String.contains asset.Dio_engine.Config.symbol '/' in

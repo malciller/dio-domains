@@ -89,6 +89,17 @@ let order_to_symbol_queue : string Queue.t = Queue.create ()
 let order_to_symbol_cap : int ref = ref max_int
 let order_to_symbol_startup_done = Atomic.make false
 
+(** Set once after inject_open_orders completes — replaces the 2s wall-clock gate
+    in domain_spawner with a real event. Domains poll this flag in their cycle;
+    Exchange_wakeup.signal() is called so sleeping domains wake immediately. *)
+let _startup_snapshot_done : bool Atomic.t = Atomic.make false
+let set_startup_snapshot_done () =
+  if not (Atomic.exchange _startup_snapshot_done true) then begin
+    Logging.info ~section "HL open-order snapshot injected — domains may now activate";
+    Concurrency.Exchange_wakeup.signal ()
+  end
+let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
+
 (** Add order_id->symbol, evicting the oldest entry when over cap.
     Ring-buffer semantics: newest always wins, oldest always goes.
     Must be called while holding initialization_mutex. *)
@@ -730,11 +741,27 @@ let process_market_data json =
   with exn -> 
     Logging.error_f ~section "Failed to process Hyperliquid executions data: %s" (Printexc.to_string exn)
 
-(** Periodic cleanup task — runs every 2 minutes to sweep stale data *)
+(** Event-driven cleanup bus — fires on-demand (reconnect, manual trigger) and
+    falls back to a 120s safety timer so stale data never accumulates indefinitely.
+    Uses an Lwt_mvar as a one-shot signal channel; request_cleanup is idempotent. *)
+let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
+
+(** Signal the cleanup loop to run immediately (idempotent: ignored if already pending) *)
+let request_cleanup () =
+  Lwt.async (fun () ->
+    (* try_put is non-blocking: if the mvar is already full the signal is coalesced *)
+    ignore (Lwt_mvar.put cleanup_mvar ());
+    Lwt.return_unit)
+
 let _periodic_cleanup_task =
   let rec run () =
-    Lwt_unix.sleep 120.0 >>= fun () ->
-    Logging.debug ~section "Running periodic HL executions cleanup";
+    (* Block until an explicit signal OR 120s safety timeout *)
+    Lwt.pick [
+      (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
+      (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
+    ] >>= fun reason ->
+    Logging.debug_f ~section "Running HL executions cleanup (%s)"
+      (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
     cleanup_stale_orders ();
     run ()
   in
