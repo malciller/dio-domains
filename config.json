@@ -52,6 +52,13 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
+    },
+    {
+      "symbol": "USDG/USD",
+      "exchange": "kraken",
+      "qty": "100.0",
+      "min_usd_balance": "500.0",
+      "strategy": "MM"
     }
   ]
 }

@@ -1087,7 +1087,7 @@ let order_processing_loop () =
                                          Lwt.return_unit
                                      end else begin
                                          orders_placed := !orders_placed + 1;
-                                         Logging.debug_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
+                                         Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
                                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                            (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                            (match result.Dio_exchange.Exchange_intf.Types.amend_id with Some id -> id | None -> "none")
@@ -1300,7 +1300,7 @@ let order_processing_loop () =
                                         Lwt.return_unit
                                     end else begin
                                         orders_placed := !orders_placed + 1;
-                                        Logging.debug_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") (match result.amend_id with Some id -> id | None -> "none") result.new_order_id;
+                                        Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") (match result.amend_id with Some id -> id | None -> "none") result.new_order_id;
                                         (match order.price with
                                          | Some price ->
                                              (match order.strategy with

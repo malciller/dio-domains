@@ -49,13 +49,21 @@ type strategy_order = {
   duplicate_key: string; (* Unique key for duplicate detection *)
 }
 
-(** Generate a hash key for duplicate order detection *)
+(** Generate a hash key for duplicate order detection.
+    Uses a single Buffer pass to avoid intermediate string allocations
+    from nested Printf.sprintf calls (was the hottest alloc in benchmarks). *)
 let generate_duplicate_key symbol side quantity limit_price =
-  let limit_price_str = match limit_price with
-    | Some p -> Printf.sprintf "%.8f" p
-    | None -> "market"
-  in
-  Printf.sprintf "%s|%s|%.8f|%s" symbol side quantity limit_price_str
+  let buf = Buffer.create 48 in
+  Buffer.add_string buf symbol;
+  Buffer.add_char   buf '|';
+  Buffer.add_string buf side;
+  Buffer.add_char   buf '|';
+  Buffer.add_string buf (string_of_float quantity);
+  Buffer.add_char   buf '|';
+  (match limit_price with
+   | Some p -> Buffer.add_string buf (string_of_float p)
+   | None   -> Buffer.add_string buf "market");
+  Buffer.contents buf
 
 (** In-flight order cache to prevent duplicate orders *)
 module InFlightOrders = struct

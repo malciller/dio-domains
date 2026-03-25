@@ -1571,8 +1571,14 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
            | Some target_id when target_id = old_order_id ->
                state.last_buy_order_id <- Some new_order_id;
                state.last_buy_order_price <- Some price;
-               Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s" 
-                 old_order_id new_order_id price asset_symbol
+               if old_order_id = new_order_id then
+                 (* In-place amendment (Kraken): same order ID, price updated only *)
+                 Logging.debug_f ~section "Updated buy price in tracking: %s @ %.2f for %s"
+                   old_order_id price asset_symbol
+               else
+                 (* Cancel-replace amendment (Hyperliquid): new order ID assigned *)
+                 Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s"
+                   old_order_id new_order_id price asset_symbol
              | _ -> 
                 (* Fallback removed. If we didn't track the old order, we MUST NOT install the new order 
                    as the tracked buy, otherwise we resurrect ghost orders from stale orderUpdate websocket events 
