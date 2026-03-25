@@ -81,7 +81,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
   in
   
 
-  let _format_distance_info asset_symbol current_price strategy_type =
+  let format_distance_info asset_symbol current_price strategy_type =
     match strategy_type with
     | "MM" ->
         let state = Dio_strategies.Market_maker.get_strategy_state asset_symbol in
@@ -634,7 +634,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         end;
         
         (* Log cycle stats *)
-        (* Log cycle stats every 1M cycles 
+        (* Log cycle stats every 1M cycles *)
         if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
@@ -643,30 +643,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
                 !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
           | _ -> ());
-          (* GC telemetry: log once per symbol (keyed by BTC or the first symbol) to
-             show whether live_words tracks heap_words (structural leak) or diverges (GC lag). *)
-          if asset_with_fees.symbol = "BTC/USDC" || asset_with_fees.symbol = "ETH/USD" then begin
-            Gc.full_major ();  (* force collection to get accurate live_words *)
-            let gc = Gc.stat () in
-            let word_bytes = float_of_int (Sys.word_size / 8) in
-            let live_mb = float_of_int gc.Gc.live_words *. word_bytes /. 1048576.0 in
-            let heap_mb = float_of_int gc.Gc.heap_words *. word_bytes /. 1048576.0 in
-            let minor_mb = gc.Gc.minor_words *. word_bytes /. 1048576.0 in
-            Logging.info_f ~section "[GC/%s] live=%.1fMB heap=%.1fMB minor_total=%.0fMB major_coll=%d compactions=%d"
-              asset_with_fees.symbol live_mb heap_mb minor_mb gc.Gc.major_collections gc.Gc.compactions
-          end
         end;
-        (match asset_with_fees.maker_fee, asset_with_fees.taker_fee with
-         | Some m, Some t -> Logging.debug_f ~section "Asset [%s/%s]: Cached fees maker=%.4f%% taker=%.4f%%" 
-             asset_with_fees.exchange asset_with_fees.symbol (m *. 100.) (t *. 100.)
-         | Some m, None -> Logging.debug_f ~section "Asset [%s/%s]: Cached maker fee %.4f%% (taker unknown)" 
-             asset_with_fees.exchange asset_with_fees.symbol (m *. 100.)
-         | None, Some t -> Logging.debug_f ~section "Asset [%s/%s]: Cached taker fee %.4f%% (maker unknown)" 
-             asset_with_fees.exchange asset_with_fees.symbol (t *. 100.)
-         | None, None -> ());
-        *)
-
-
+        
         (* Yield to allow other threads (websockets) to run *)
         (* Event-driven: block until the next WS frame signals new data.
            No timers, no magic numbers — only real WS events wake us. *)
