@@ -799,7 +799,7 @@ let execute_strategy
         (* Only log every 100,000 iterations to avoid spam *)
         if cycle mod 100000 = 0 then
             Logging.debug_f ~section "Waiting for pending buy order to complete for %s" asset.symbol;
-    end else if effective_buy_count > 1 then begin
+    end else if effective_buy_count > 1 && not state.inflight_cancel_buy then begin
         (* Case 0: Multiple buy orders exist - cancel all buy orders to maintain single buy order policy.
            This branch only fires at startup reconciliation when last_buy_order_id=None and
            the order channel shows multiple buys. inflight_cancel_buy gates the sync until
@@ -819,9 +819,6 @@ let execute_strategy
         state.last_buy_order_price <- None;
         (* inflight_cancel_buy is already set by push_order for each cancel *)
 
-        (* Apply cooldown to prevent re-entering this branch before exchange acks the cancels *)
-        let cooldown_key = "place_Buy" in
-        Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
 
         (* Update cycle counter *)
         state.last_cycle <- cycle
