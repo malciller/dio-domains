@@ -1,14 +1,12 @@
 (** Kraken Executions Feed - WebSocket v2 authenticated executions subscription with lock-free ring buffers
  *  Tracks open orders and order completions per asset using event-driven, lock-free architecture
  *)
-(* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
 open Concurrency
 
 let section = "kraken_executions"
-(* TODO: Magic number - ring_buffer_size should be configurable *)
-let ring_buffer_size = 128
+let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_executions
 
 let cleanup_handlers_started = Atomic.make false
 
@@ -64,11 +62,15 @@ let string_of_side = function
   | Buy -> "buy"
   | Sell -> "sell"
 
-(* TODO: Problematic default fallback - returns Buy for unknown side strings, should probably raise error or use Result type *)
-let side_of_string = function
+(* Silently defaults to Buy for unknown side strings to preserve backward-compat;
+   unknown values are logged as warnings during parsing. *)
+let side_of_string s =
+  match s with
   | "buy" -> Buy
   | "sell" -> Sell
-  | _ -> Buy
+  | other ->
+      Logging.warn_f ~section "Unknown order side %S, defaulting to Buy" other;
+      Buy
 
 (** Order status *)
 type order_status =
@@ -485,39 +487,14 @@ let update_open_orders store (event : execution_event) =
   
   Mutex.unlock global_orders_mutex
 
-(** Parse float from JSON *)
-let parse_float_opt json field =
-  try
-    let open Yojson.Safe.Util in
-    match member field json with
-    | `Float f -> Some f
-    | `Int i -> Some (float_of_int i)
-    | `String s -> (try Some (float_of_string s) with _ -> None)
-    | `Intlit s -> (try Some (float_of_string s) with _ -> None)
-    | _ -> None
-  with _ -> None
+(** Parse float from JSON - uses shared implementation from Kraken_common_types *)
+let parse_float_opt = Kraken_common_types.parse_float_opt
 
-(** Parse int64 from JSON *)
-let parse_int64_opt json field =
-  try
-    let open Yojson.Safe.Util in
-    match member field json with
-    | `Int i -> Some (Int64.of_int i)
-    | `Intlit s -> (try Some (Int64.of_string s) with _ -> None)
-    | `String s -> (try Some (Int64.of_string s) with _ -> None)
-    | _ -> None
-  with _ -> None
+(** Parse int64 from JSON - uses shared implementation from Kraken_common_types *)
+let parse_int64_opt = Kraken_common_types.parse_int64_opt
 
-(** Parse int from JSON *)
-let parse_int_opt json field =
-  try
-    let open Yojson.Safe.Util in
-    match member field json with
-    | `Int i -> Some i
-    | `Intlit s -> (try Some (int_of_string s) with _ -> None)
-    | `String s -> (try Some (int_of_string s) with _ -> None)
-    | _ -> None
-  with _ -> None
+(** Parse int from JSON - uses shared implementation from Kraken_common_types *)
+let parse_int_opt = Kraken_common_types.parse_int_opt
 
 (** Parse execution event from JSON data - handles both full and minimal events *)
 let parse_execution_event json =
