@@ -780,6 +780,21 @@ let domain_needs_restart state =
   Mutex.unlock state.mutex;
   needs_restart
 
+(** Single persistent waker: signals domain_died_cond every 5 seconds so
+    supervisor_loop's Condition.wait returns on a regular cadence without a
+    domain crashing.  Declared once here to replace the previous pattern of
+    spawning a new un-joined Thread.create on every loop iteration, which
+    leaked ~17 000 OS threads per day. *)
+let _supervisor_waker_thread : Thread.t =
+  Thread.create (fun () ->
+    while not (Atomic.get shutdown_requested) do
+      Thread.delay 5.0;
+      Mutex.lock domain_died_mutex;
+      Condition.signal domain_died_cond;
+      Mutex.unlock domain_died_mutex
+    done
+  ) ()
+
 (** Domain supervisor monitoring loop *)
 let supervisor_loop config fee_fetcher =
   let section = "domain_supervisor" in
@@ -787,16 +802,9 @@ let supervisor_loop config fee_fetcher =
 
   while not (Atomic.get shutdown_requested) do
     try
-      (* Wait up to 5s for a domain-died signal or the periodic timeout.
-         We spawn a short-lived waker thread that signals after 5s so that
-         the Condition.wait returns even if no domain dies in that window. *)
+      (* Wait up to 5s for a domain-died signal or the periodic tick from
+         _supervisor_waker_thread (started once at module load). *)
       Mutex.lock domain_died_mutex;
-      let _waker = Thread.create (fun () ->
-        Thread.delay 5.0;
-        Mutex.lock domain_died_mutex;
-        Condition.signal domain_died_cond;
-        Mutex.unlock domain_died_mutex
-      ) () in
       Condition.wait domain_died_cond domain_died_mutex;
       Mutex.unlock domain_died_mutex;
 
