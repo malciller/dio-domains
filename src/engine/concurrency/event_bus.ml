@@ -45,74 +45,25 @@ module Make (Payload : PAYLOAD) = struct
     push: snapshot -> unit Lwt.t;
     close: unit -> unit;  (* Function to close this subscriber's stream *)
     mutable closed: bool;
-    created_at: float;  (* Track when subscriber was created *)
-    mutable last_used: float;  (* Track when subscriber was last used *)
     persistent: bool;  (* Mark persistent subscribers that should not be force cleaned *)
   }
 
   type t = {
     topic: string;
-    latest: snapshot option Atomic.t;
     subscribers: subscriber list Atomic.t;
     mutable publish_count: int;  (* Counter for event-driven cleanup *)
   }
 
-  (** Clean up stale subscribers (older than max_age_seconds or unused for too long) **)
+  (** Clean up closed subscribers — only checks the closed flag, no syscalls *)
   let cleanup_stale_subscribers bus ?(max_age_seconds=60.0) ?(max_unused_seconds=30.0) () =
-    let now = Unix.time () in
-    (* Fast path: check if any subscriber needs removal before allocating lists *)
+    ignore max_age_seconds; ignore max_unused_seconds;
     let current = Atomic.get bus.subscribers in
-    let has_stale = List.exists (fun sub ->
-      not sub.persistent && (
-        sub.closed ||
-        (now -. sub.created_at) > max_age_seconds ||
-        (now -. sub.last_used) > max_unused_seconds
-      )
-    ) current in
-    if not has_stale then None
+    let has_closed = List.exists (fun sub -> not sub.persistent && sub.closed) current in
+    if not has_closed then None
     else begin
       let rec try_cleanup () =
         let current = Atomic.get bus.subscribers in
-        let to_keep = List.filter (fun sub ->
-          sub.persistent || (
-            not sub.closed &&
-            (now -. sub.created_at) <= max_age_seconds &&
-            (now -. sub.last_used) <= max_unused_seconds
-          )
-        ) current in
-        let removed_count = List.length current - List.length to_keep in
-        if removed_count > 0 then begin
-          let to_remove = List.filter (fun sub ->
-            not (List.memq sub to_keep)
-          ) current in
-          List.iter (fun sub ->
-            sub.closed <- true;
-            (try sub.close () with _ -> ())
-          ) to_remove;
-          Logging.debug_f ~section:"event_bus" "Cleaned up %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
-          if Atomic.compare_and_set bus.subscribers current to_keep then
-            Some removed_count
-          else try_cleanup ()
-        end else None
-      in
-      try_cleanup ()
-    end
-
-  (** Force cleanup all stale subscribers regardless of age (for dashboard memory management) **)
-  let force_cleanup_stale_subscribers bus () =
-    let now = Unix.time () in
-    let current = Atomic.get bus.subscribers in
-    let has_stale = List.exists (fun sub ->
-      not sub.persistent && (sub.closed || (now -. sub.last_used) > 10.0)
-    ) current in
-    if not has_stale then None
-    else begin
-      let rec try_cleanup () =
-        let current = Atomic.get bus.subscribers in
-        let to_keep = List.filter (fun sub ->
-          sub.persistent ||
-          (not sub.closed && (now -. sub.last_used) <= 10.0)
-        ) current in
+        let to_keep = List.filter (fun sub -> sub.persistent || not sub.closed) current in
         let removed_count = List.length current - List.length to_keep in
         if removed_count > 0 then begin
           let to_remove = List.filter (fun sub -> not (List.memq sub to_keep)) current in
@@ -120,7 +71,7 @@ module Make (Payload : PAYLOAD) = struct
             sub.closed <- true;
             (try sub.close () with _ -> ())
           ) to_remove;
-          Logging.debug_f ~section:"event_bus" "Force cleaned %d stale subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
+          Logging.debug_f ~section:"event_bus" "Cleaned up %d closed subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
           if Atomic.compare_and_set bus.subscribers current to_keep then
             Some removed_count
           else try_cleanup ()
@@ -129,41 +80,37 @@ module Make (Payload : PAYLOAD) = struct
       try_cleanup ()
     end
 
+  (** Force cleanup all closed subscribers (alias kept for API compatibility) **)
+  let force_cleanup_stale_subscribers bus () = cleanup_stale_subscribers bus ()
+
   (** Get subscriber statistics for monitoring *)
   let get_subscriber_stats bus =
     let subs = Atomic.get bus.subscribers in
-    let now = Unix.time () in
     let total = List.length subs in
     let active = List.length (List.filter (fun sub -> not sub.closed) subs) in
-    let stale = List.length (List.filter (fun sub ->
-      sub.closed || (now -. sub.last_used) > 300.0
-    ) subs) in
-    (total, active, stale)
+    let closed = List.length (List.filter (fun sub -> sub.closed) subs) in
+    (total, active, closed)
 
-  let create ?initial topic =
+  let create ?initial:_ topic =
     let bus = {
       topic;
-      latest = Atomic.make initial;
       subscribers = Atomic.make [];
       publish_count = 0;
     } in
     (* Register with global registry *)
     register {
       topic;
-      cleanup = (fun () -> cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 ());
+      cleanup = (fun () -> cleanup_stale_subscribers bus ());
       stats = (fun () -> get_subscriber_stats bus);
     };
     bus
 
   let topic bus = bus.topic
 
-  let latest bus = Atomic.get bus.latest
-
-  (** Clear the latest snapshot to prevent memory retention *)
-  let clear_latest bus = Atomic.set bus.latest None
-
   let publish bus payload =
-    Atomic.set bus.latest (Some payload);
+    (* Do NOT store payload in latest — retaining large Yojson trees / records causes
+       unbounded memory growth when payloads are large (e.g. l2Book with full bid/ask
+       arrays, webData2 snapshots, execution_event records). *)
     let subs = Atomic.get bus.subscribers in
     (* Filter out closed subscribers inline — avoids allocating a new list *)
     List.iter (fun sub ->
@@ -175,27 +122,24 @@ module Make (Payload : PAYLOAD) = struct
           Lwt.cancel push_result;
           sub.closed <- true;
           (try sub.close () with _ -> ())
-        end else begin
-          sub.last_used <- Unix.time ()
         end
+        (* last_used tracking removed: Unix.time() syscall on every hot-path publish
+           was measured as significant overhead at high WS frame rates. *)
       end
     ) subs;
 
     (* Event-driven cleanup: run cleanup every 100 publications *)
     bus.publish_count <- bus.publish_count + 1;
     if bus.publish_count mod 100 = 0 then
-      ignore (cleanup_stale_subscribers bus ~max_age_seconds:60.0 ~max_unused_seconds:30.0 ())
+      ignore (cleanup_stale_subscribers bus ())
 
   let subscribe ?(persistent=false) bus =
     (* Use bounded stream to prevent unbounded memory growth *)
     let stream, push_source = Lwt_stream.create_bounded 64 in
-    let now = Unix.time () in
     let subscriber = {
       push = (fun payload -> push_source#push payload);
       close = (fun () -> push_source#close);
       closed = false;
-      created_at = now;
-      last_used = now;
       persistent;
     } in
     let rec try_add () =
@@ -220,9 +164,8 @@ module Make (Payload : PAYLOAD) = struct
           Lwt.return_unit
         )
     );
-    (match Atomic.get bus.latest with
-    | Some payload -> Lwt.async (fun () -> push_source#push payload)
-    | None -> ());
+    (* Snapshot-on-subscribe removed: we no longer retain latest payloads since
+       large Yojson trees / records would be held indefinitely in the Atomic. *)
     { stream; close = subscriber.close }
 
   let await_next bus timeout =

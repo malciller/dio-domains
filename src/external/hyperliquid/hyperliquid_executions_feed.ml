@@ -55,13 +55,7 @@ type execution_event = {
   cl_ord_id: string option;
 }
 
-(** Event bus for order updates - publishes individual order changes *)
-module OrderUpdateEventBus = Concurrency.Event_bus.Make(struct
-  type t = execution_event
-end)
 
-(** Global order update event bus instance *)
-let order_update_event_bus = OrderUpdateEventBus.create "hyperliquid_order_update"
 
 (** Lock-free ring buffer for execution data *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
@@ -375,7 +369,6 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     (* Still write to ring buffer so exec event consumers see the event,
        but do NOT add to open_orders hashtable *)
     RingBuffer.write store.events_buffer event;
-    OrderUpdateEventBus.publish order_update_event_bus event;
     notify_ready store
   end else begin
 
@@ -441,7 +434,6 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   Mutex.unlock store.orders_mutex;
   
   RingBuffer.write store.events_buffer event;
-  OrderUpdateEventBus.publish order_update_event_bus event;
   notify_ready store
 
   end
