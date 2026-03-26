@@ -337,8 +337,11 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     Lwt_mutex.with_lock connection_mutex (fun () ->
       active_connection := Some conn;
       Atomic.set is_connected_ref true;
-      (* Signal any waiters blocked in wait_for_connected() *)
-      Lwt.async (fun () -> Lwt_mvar.put connected_wakeup ());
+      (* Signal any waiters blocked in wait_for_connected().
+         is_empty guard ensures we don't queue a blocking Lwt continuation
+         when the mvar already holds a signal (rapid reconnect scenario). *)
+      if Lwt_mvar.is_empty connected_wakeup then
+        Lwt.async (fun () -> Lwt_mvar.put connected_wakeup ());
       Lwt.return_unit
     ) >>= fun () ->
     on_connected ();
