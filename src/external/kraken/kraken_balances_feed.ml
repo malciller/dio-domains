@@ -1,5 +1,4 @@
 (** Kraken Balances Feed - WebSocket v2 authenticated balances subscription with lock-free atomics *)
-(* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
 open Concurrency
@@ -113,10 +112,11 @@ let ready_condition = Lwt_condition.create ()
 let last_balance_update : (string, float) Hashtbl.t = Hashtbl.create 32
 let balance_update_mutex = Mutex.create ()
 
+(** Maximum number of non-configured (dynamic) assets to track in the balances feed *)
+let dynamic_assets_cap = Kraken_common_types.default_dynamic_assets_cap
+
 (** Track configured assets (from trading config) vs dynamic assets *)
 let configured_assets : (string, unit) Hashtbl.t = Hashtbl.create 16
-(* TODO: Magic number - dynamic_assets_cap should be configurable *)
-let dynamic_assets_cap = 50  (* Maximum number of non-configured assets to track *)
 let configured_assets_mutex = Mutex.create ()
 
 (** Track cleanup handler subscription so we only attach once *)
@@ -263,8 +263,7 @@ let cleanup_dynamic_assets () =
     Mutex.lock balance_update_mutex;
     Hashtbl.remove last_balance_update asset;
     Mutex.unlock balance_update_mutex;
-    
-
+    Logging.debug_f ~section "Removed dynamic balance asset: %s" asset
   ) dynamic_to_remove;
 
   Mutex.unlock configured_assets_mutex;
@@ -501,9 +500,8 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
 let initialize assets =
   Logging.info_f ~section "Initializing balances feed for %d assets" (List.length assets);
 
-  (* TODO: Hardcoded common currencies - should be configurable or derived from trading pairs *)
-  (* Also create stores for common quote currencies *)
-  let all_assets = List.sort_uniq String.compare (assets @ ["USD"; "EUR"; "USDT"; "USDC"]) in
+  (* Common quote currencies always tracked regardless of configured pairs *)
+  let all_assets = List.sort_uniq String.compare (assets @ Kraken_common_types.default_configured_currencies) in
 
   (* Mark configured assets (from trading config) *)
   Mutex.lock configured_assets_mutex;
@@ -530,8 +528,8 @@ let initialize assets =
 let check_stale_balances assets =
   let stale_count = ref 0 in
   List.iter (fun asset ->
-    (* TODO: Magic number - 300.0 seconds staleness threshold should be configurable *)
-    if is_balance_stale asset 300.0 then begin (* 5 minutes threshold *)
+    (* Age threshold above which balance data is considered stale *)
+    if is_balance_stale asset Kraken_common_types.default_balance_staleness_threshold_s then begin (* 5 minutes threshold *)
       Logging.warn_f ~section "Balance data for %s is stale (>5 minutes old)" asset;
       incr stale_count;
     end else

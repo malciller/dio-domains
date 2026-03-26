@@ -1,26 +1,13 @@
 (** Kraken Orderbook Feed - WebSocket v2 depth subscription with ring buffer *)
-(* TODO: Extract duplicate utility functions (get_conduit_ctx) to common module *)
 
 open Lwt.Infix
 
 let section = "kraken_orderbook"
 
-(* TODO: Duplicate function - also exists in kraken_trading_client.ml, should be moved to common utilities *)
-(** Safely force Conduit context with error handling *)
-let get_conduit_ctx () =
-  try
-    Lazy.force Conduit_lwt_unix.default_ctx
-  with
-  | CamlinternalLazy.Undefined ->
-      Logging.error ~section "Conduit context was accessed before initialization - this should not happen";
-      raise (Failure "Conduit context not initialized - ensure main.ml initializes it before domain spawning")
-  | exn ->
-      Logging.error_f ~section "Failed to get Conduit context: %s" (Printexc.to_string exn);
-      raise exn
+let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 
-(* TODO: Magic numbers - orderbook_depth and ring_buffer_size should be configurable *)
-let orderbook_depth = 25
-let ring_buffer_size = 64
+let orderbook_depth = Kraken_common_types.default_orderbook_depth
+let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_orderbook
 
 (** Global flag to track if cleanup handlers are running *)
 let cleanup_handlers_started = Atomic.make false
@@ -134,51 +121,8 @@ let to_decimal_str ?(trim_trailing=true) ?dec json =
 
 (** Extract raw price/qty strings from JSON for checksum calculation *)
 let parse_checksum_level price_json qty_json =
-  let price_str = match price_json with
-    | `String s -> s
-    | `Float f -> 
-        (* Use same formatting as to_decimal_str but without decimal lookup *)
-        let s = Printf.sprintf "%.12f" f in
-        if String.contains s '.' then
-          let parts = String.split_on_char '.' s in
-          match parts with
-          | [whole; frac] ->
-              let len = String.length frac in
-              let rec rtrim i =
-                if i <= 0 then ""
-                else if frac.[i-1] = '0' then rtrim (i-1)
-                else String.sub frac 0 i
-              in
-              let frac_clean = rtrim len in
-              if String.length frac_clean = 0 then whole else whole ^ "." ^ frac_clean
-          | _ -> s
-        else s
-    | `Int i -> string_of_int i
-    | `Intlit s -> s
-    | _ -> "0"
-  in
-  let qty_str = match qty_json with
-    | `String s -> s
-    | `Float f ->
-        let s = Printf.sprintf "%.12f" f in
-        if String.contains s '.' then
-          let parts = String.split_on_char '.' s in
-          match parts with
-          | [whole; frac] ->
-              let len = String.length frac in
-              let rec rtrim i =
-                if i <= 0 then ""
-                else if frac.[i-1] = '0' then rtrim (i-1)
-                else String.sub frac 0 i
-              in
-              let frac_clean = rtrim len in
-              if String.length frac_clean = 0 then whole else whole ^ "." ^ frac_clean
-          | _ -> s
-        else s
-    | `Int i -> string_of_int i
-    | `Intlit s -> s
-    | _ -> "0"
-  in
+  let price_str = to_decimal_str ~trim_trailing:true price_json in
+  let qty_str   = to_decimal_str ~trim_trailing:true qty_json in
   (price_str, qty_str)
 
 (** Calculate CRC32 checksum per Kraken specification using top 10 levels *)
