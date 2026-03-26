@@ -746,12 +746,16 @@ let process_market_data json =
     Uses an Lwt_mvar as a one-shot signal channel; request_cleanup is idempotent. *)
 let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
-(** Signal the cleanup loop to run immediately (idempotent: ignored if already pending) *)
+(** Signal the cleanup loop to run immediately (idempotent: skipped if already pending).
+    Uses is_empty guard so no Lwt continuation is ever queued: the put only happens
+    when the mvar is empty (previous signal consumed), making this truly O(1). *)
 let request_cleanup () =
-  Lwt.async (fun () ->
-    (* try_put is non-blocking: if the mvar is already full the signal is coalesced *)
-    ignore (Lwt_mvar.put cleanup_mvar ());
-    Lwt.return_unit)
+  (* is_empty is a pure synchronous check.  Only put when the mvar is empty so we
+     never queue a blocking continuation inside Lwt.async — the original bug that
+     caused one Lwt closure to pile up per trigger_stale_order_cleanup call while
+     the cleanup task was sleeping (up to 120 s between drains). *)
+  if Lwt_mvar.is_empty cleanup_mvar then
+    Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
 
 let _periodic_cleanup_task =
   let rec run () =
