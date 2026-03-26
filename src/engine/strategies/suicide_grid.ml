@@ -1138,23 +1138,25 @@ let handle_order_acknowledged asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-  (* Remove from pending orders - match by category: placements, amendments, or fallback for tests *)
+  (* Remove from pending orders - only remove placement-prefix entries for this side.
+     pending_amend_* entries are owned exclusively by the amend lifecycle
+     (handle_order_amended / handle_order_amendment_skipped / handle_order_amendment_failed)
+     and must NOT be evicted here. On Hyperliquid (in-place modify, same order ID returned
+     after an amend), the placed order ID can collide with an in-flight amend's target ID;
+     removing that amend entry prematurely causes handle_order_amended to miss the pending
+     record and log "Ignoring amendment for untracked buy order". *)
   state.pending_orders <- List.filter (fun (pending_id, s, p, _) ->
     (* 1. Match regular placements by side (any pending_buy/pending_sell for that side) *)
     let is_placement_prefix = String.starts_with ~prefix:"pending_buy_" pending_id ||
                               String.starts_with ~prefix:"pending_sell_" pending_id in
     let matches_side_placement = is_placement_prefix && s = side in
     
-    (* 2. Match amend orders by order_id *)
-    let matches_amend = String.starts_with ~prefix:"pending_amend_" pending_id &&
-                       String.length pending_id > 14 &&
-                       String.sub pending_id 14 (String.length pending_id - 14) = order_id in
-    
-    (* 3. Fallback for tests or legacy IDs that don't use prefixes *)
+    (* 2. Fallback for tests or legacy IDs that don't use prefixes.
+          Explicitly exclude pending_amend_* so they are never touched here. *)
     let matches_fallback = not (String.starts_with ~prefix:"pending_" pending_id) &&
                           s = side && abs_float (p -. price) < 0.01 in
     
-    not (matches_side_placement || matches_amend || matches_fallback)
+    not (matches_side_placement || matches_fallback)
   ) state.pending_orders;
 
   (* NOTE: InFlightOrders key is intentionally NOT removed here.
