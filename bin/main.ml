@@ -1,8 +1,9 @@
 
 open Lwt.Infix
 
-(** Enable backtraces for better error reporting *)
-let () = Printexc.record_backtrace true
+(** Enable backtraces only when DIO_BACKTRACE is set (avoids allocation pressure in production) *)
+let () = Printexc.record_backtrace
+  (Sys.getenv_opt "DIO_BACKTRACE" |> Option.is_some)
 
 
 

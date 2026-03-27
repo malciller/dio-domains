@@ -72,8 +72,14 @@ ENV PATH="/usr/local/bin:/root/.opam/5.2.0/bin:${PATH}"
 # 11. Use jemalloc to prevent glibc arena fragmentation in OCaml 5
 ENV LD_PRELOAD=libjemalloc.so.2
 
-# 12. Expose metrics broadcast port
+# 12. jemalloc tuning: fast dirty/muzzy page decay, limited arenas for OCaml 5
+ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
+
+# 13. OCaml runtime GC defaults (belt-and-suspenders; config.json Gc.set overrides)
+ENV OCAMLRUNPARAM="s=2M,o=40,O=50,w=1"
+
+# 14. Expose metrics broadcast port
 EXPOSE 8080
 
-# 13. Default command
+# 15. Default command
 CMD ["dio"]
