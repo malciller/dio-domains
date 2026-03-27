@@ -80,6 +80,7 @@ type strategy_state = {
   mutable last_cycle: int;
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
   mutable inflight_cancel_buy: bool;  (* true while a buy cancel has been sent but not yet confirmed by the order channel *)
+  mutable inflight_amend_buy: bool;   (* true while a buy Amend is in-flight; gates the duplicate-buy cancel branch during inject→remove window *)
   mutable amend_cooldowns: (string, float) Hashtbl.t; (* order_id -> timestamp until which amends are blocked *)
   mutable last_cleanup_time: float; (* Last time cleanup was run *)
   mutable inflight_buy: bool;   (* true while a buy Place is sent but not yet ack'd/rejected/failed *)
@@ -129,6 +130,7 @@ let get_strategy_state asset_symbol =
           last_cycle = 0;
           last_order_time = 0.0;
           inflight_cancel_buy = false;
+          inflight_amend_buy = false;
           amend_cooldowns = Hashtbl.create 16;
           last_cleanup_time = 0.0;
           inflight_buy = false;
@@ -452,7 +454,10 @@ let push_order order =
                 state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
                 Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
                   (string_of_order_side order.side) temp_order_id order_price order.symbol
-                  (Option.value order.order_id ~default:"unknown")
+                  (Option.value order.order_id ~default:"unknown");
+                (* Gate duplicate-buy cancel branch for the inject->remove window *)
+                if order.side = Buy then
+                  state.inflight_amend_buy <- true
             | Cancel -> (* Already handled above *)
                 ());
            true
@@ -799,7 +804,7 @@ let execute_strategy
         (* Only log every 100,000 iterations to avoid spam *)
         if cycle mod 100000 = 0 then
             Logging.debug_f ~section "Waiting for pending buy order to complete for %s" asset.symbol;
-    end else if effective_buy_count > 1 && not state.inflight_cancel_buy then begin
+    end else if effective_buy_count > 1 && not state.inflight_cancel_buy && not state.inflight_amend_buy then begin
         (* Case 0: Multiple buy orders exist - cancel all buy orders to maintain single buy order policy.
            This branch only fires at startup reconciliation when last_buy_order_id=None and
            the order channel shows multiple buys. inflight_cancel_buy gates the sync until
@@ -1166,6 +1171,8 @@ let handle_order_acknowledged asset_symbol order_id side price =
     state.last_buy_order_id <- Some order_id;
     state.last_buy_order_price <- Some price;
     state.inflight_buy <- false;
+    (* Amendment window is over: the new order is now acknowledged by the exchange *)
+    state.inflight_amend_buy <- false;
     Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
    | Sell ->
     state.inflight_sell <- false);
@@ -1483,6 +1490,8 @@ let handle_order_cancelled asset_symbol order_id side =
     (* Clear inflight_cancel_buy now that the order channel has confirmed — unblocks sync *)
     if cancelled_side = Buy then begin
       state.inflight_cancel_buy <- false;
+      (* Safety: also clear amend gate if the order was cancelled mid-amendment *)
+      state.inflight_amend_buy <- false;
       (* Flush buy-side placement cooldown so strategy can place immediately *)
       Hashtbl.remove state.amend_cooldowns "place_Buy"
     end;
@@ -1556,6 +1565,13 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
     let cooldown = if old_order_id = new_order_id then 2.0 else 10.0 in
     Hashtbl.replace state.amend_cooldowns old_order_id (now +. cooldown);
     Hashtbl.replace state.amend_cooldowns new_order_id (now +. cooldown);
+
+    (* Amendment REST round-trip complete: clear the inflight gate.
+       handle_order_acknowledged will also clear it when the WS ack arrives,
+       but clearing here means the gate is lifted as soon as the REST response
+       is processed — the inject->remove window is already over at this point. *)
+    if side = Buy then
+      state.inflight_amend_buy <- false;
 
     Logging.debug_f ~section "Order amended and tracking updated: %s %s -> %s @ %.2f for %s"
       (string_of_order_side side) old_order_id new_order_id price asset_symbol
