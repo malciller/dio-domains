@@ -805,9 +805,8 @@ let start_periodic_tasks () =
       Logging.debug_f ~section "Running HL executions cleanup (%s)"
         (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
       cleanup_stale_orders ();
-      (* Break forwarding chain between cycles *)
-      Lwt.pause () >>= fun () ->
-      run ()
+      Lwt.async run;
+      Lwt.return_unit
     in
     Lwt.async run
   end

@@ -350,15 +350,26 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     (* No internal heartbeat loop — supervisor owns ping/pong monitoring,
        matching the Kraken auth WS pattern for consistent supervision. *)
 
+    let done_p, done_u = Lwt.wait () in
     let rec loop () =
-      Websocket_lwt_unix.read conn >>= fun frame ->
-      handle_frame ~on_heartbeat frame >>= fun () ->
-      if Atomic.get is_connected_ref then
-        (* Break forwarding chain between frame reads *)
-        Lwt.pause () >>= fun () -> loop ()
-      else Lwt.return_unit
+      Lwt.catch (fun () ->
+        Websocket_lwt_unix.read conn >>= fun frame ->
+        handle_frame ~on_heartbeat frame >>= fun () ->
+        if Atomic.get is_connected_ref then begin
+          (* Spawn next iteration independently — breaks Forward chain *)
+          Lwt.async loop;
+          Lwt.return_unit
+        end else begin
+          Lwt.wakeup_later done_u ();
+          Lwt.return_unit
+        end
+      ) (fun exn ->
+        Lwt.wakeup_later_exn done_u exn;
+        Lwt.return_unit
+      )
     in
-    Lwt.catch loop (function
+    Lwt.async loop;
+    Lwt.catch (fun () -> done_p) (function
       | End_of_file ->
           Logging.warn ~section "WebSocket connection closed unexpectedly (End_of_file)";
           Lwt_mutex.with_lock connection_mutex (fun () ->
