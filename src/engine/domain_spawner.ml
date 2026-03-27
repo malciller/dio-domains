@@ -632,7 +632,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
-              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
+              Logging.debug_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
                 asset_with_fees.exchange asset_with_fees.symbol !cycle_count price
                 bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
                 !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
@@ -640,8 +640,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         end;
         
         (* Yield to allow other threads (websockets) to run *)
-        (* Event-driven: block until the next WS frame signals new data.
-           No timers, no magic numbers — only real WS events wake us. *)
+        (* Event-driven: block until the next WS frame signals new data. *)
         if not !should_execute_strategy then
           Concurrency.Exchange_wakeup.wait ();
 
