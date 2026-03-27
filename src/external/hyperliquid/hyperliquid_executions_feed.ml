@@ -60,12 +60,17 @@ type execution_event = {
 (** Lock-free ring buffer for execution data *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
+(** Maximum number of trade IDs retained per symbol for deduplication.
+    Oldest entries are evicted FIFO when the cap is reached. *)
+let max_processed_tids = 256
+
 (** Per-symbol execution storage with readiness signalling *)
 type store = {
   events_buffer: execution_event RingBuffer.t;
   open_orders: (string, open_order) Hashtbl.t;
   ready: bool Atomic.t;
   processed_tids: (int64, float) Hashtbl.t; (* trade_id -> arrival_time for deduplication *)
+  processed_tids_queue: int64 Queue.t; (* FIFO eviction order *)
   orders_mutex: Mutex.t;
   tids_mutex: Mutex.t;
 }
@@ -145,7 +150,8 @@ let get_symbol_store symbol =
               events_buffer = RingBuffer.create 128;
               open_orders = Hashtbl.create 32;
               ready = Atomic.make false;
-              processed_tids = Hashtbl.create 128;
+              processed_tids = Hashtbl.create 32;
+              processed_tids_queue = Queue.create ();
               orders_mutex = Mutex.create ();
               tids_mutex = Mutex.create ();
             } in
@@ -656,8 +662,19 @@ let process_user_events data_json =
         let now = Unix.gettimeofday () in
         Mutex.lock store.tids_mutex;
         let already_processed = Hashtbl.mem store.processed_tids tid in
-        if not already_processed then
-          Hashtbl.add store.processed_tids tid now;
+        if not already_processed then begin
+          Hashtbl.replace store.processed_tids tid now;
+          Queue.push tid store.processed_tids_queue;
+          (* FIFO eviction when over cap *)
+          while Hashtbl.length store.processed_tids > max_processed_tids do
+            if Queue.is_empty store.processed_tids_queue then
+              ignore (Hashtbl.length store.processed_tids) (* queue drifted, let timer cleanup handle *)
+            else begin
+              let oldest = Queue.pop store.processed_tids_queue in
+              Hashtbl.remove store.processed_tids oldest
+            end
+          done
+        end;
         Mutex.unlock store.tids_mutex;
 
         if not already_processed then begin
