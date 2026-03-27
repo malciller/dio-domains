@@ -3,9 +3,9 @@
   "logging_sections": "",
   "cycle_mod": 10000,
   "gc": {
-    "minor_heap_size": 2097152,
-    "space_overhead": 40,
-    "max_overhead": 50,
+    "minor_heap_size": 524288,
+    "space_overhead": 120,
+    "max_overhead": 80,
     "window_size": 1,
     "allocation_policy": 2,
     "major_heap_increment": 15

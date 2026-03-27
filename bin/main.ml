@@ -362,30 +362,6 @@ let () =
           let free_kb = (s.heap_words - s.live_words) * (Sys.word_size / 8) / 1024 in
           Logging.info_f ~section:"memory" "heap=%dMB live=%dKB free=%dKB runtime=%.0fs gc_major=%d chunks=%d"
             heap_mb live_kb free_kb runtime s.major_collections s.heap_chunks;
-          let in_flight_orders = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
-          let in_flight_amendments = Dio_strategies.Strategy_common.InFlightAmendments.get_registry_size () in
-          let executions_stores = Hashtbl.length Kraken.Kraken_executions_feed.symbol_stores in
-          Logging.info_f ~section:"memory" "in_flight_orders=%d in_flight_amendments=%d kraken_exec_stores=%d"
-            in_flight_orders in_flight_amendments executions_stores;
-          (* Deep diagnostics: count HL execution feed hashtable entries *)
-          let hl_order_to_symbol = Hashtbl.length Hyperliquid.Executions_feed.order_to_symbol in
-          let hl_stores_count = Hashtbl.length Hyperliquid.Executions_feed.stores in
-          let hl_open_orders_total = Hashtbl.fold (fun _ (store : Hyperliquid.Executions_feed.store) acc ->
-            acc + Hashtbl.length store.open_orders
-          ) Hyperliquid.Executions_feed.stores 0 in
-          let hl_tids_total = Hashtbl.fold (fun _ (store : Hyperliquid.Executions_feed.store) acc ->
-            acc + Hashtbl.length store.processed_tids
-          ) Hyperliquid.Executions_feed.stores 0 in
-          (* Event bus subscriber stats *)
-          let bus_stats = ref [] in
-          Concurrency.Event_bus.iter_buses (fun ops ->
-            let (total, active, closed) = ops.stats () in
-            if total > 0 then
-              bus_stats := Printf.sprintf "%s:%d/%d/%d" ops.topic active closed total :: !bus_stats
-          );
-          Logging.info_f ~section:"memory" "hl_o2s=%d hl_stores=%d hl_open=%d hl_tids=%d buses=[%s]"
-            hl_order_to_symbol hl_stores_count hl_open_orders_total hl_tids_total
-            (String.concat "," !bus_stats);
           (* Spawn next cycle independently — breaks Forward chain *)
           Lwt.async loop;
           Lwt.return_unit
