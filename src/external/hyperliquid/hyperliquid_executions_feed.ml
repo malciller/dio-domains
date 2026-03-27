@@ -775,19 +775,23 @@ let request_cleanup () =
   if Lwt_mvar.is_empty cleanup_mvar then
     Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
 
-let _periodic_cleanup_task =
-  let rec run () =
-    (* Block until an explicit signal OR 120s safety timeout *)
-    Lwt.pick [
-      (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
-      (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
-    ] >>= fun reason ->
-    Logging.debug_f ~section "Running HL executions cleanup (%s)"
-      (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
-    cleanup_stale_orders ();
-    run ()
-  in
-  Lwt.async run
+let periodic_tasks_started = Atomic.make false
+
+let start_periodic_tasks () =
+  if not (Atomic.exchange periodic_tasks_started true) then begin
+    let rec run () =
+      (* Block until an explicit signal OR 120s safety timeout *)
+      Lwt.pick [
+        (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
+        (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
+      ] >>= fun reason ->
+      Logging.debug_f ~section "Running HL executions cleanup (%s)"
+        (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
+      cleanup_stale_orders ();
+      run ()
+    in
+    Lwt.async run
+  end
 
 let _processor_task =
   let rec run () =
@@ -809,6 +813,7 @@ let _processor_task =
   Lwt.async run
 
 let initialize symbols =
+  start_periodic_tasks ();
   Logging.info ~section "Initializing Hyperliquid executions feed";
   List.iter (fun symbol ->
     let _ = get_symbol_store symbol in
