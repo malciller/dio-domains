@@ -209,7 +209,7 @@ let _processor_task =
     let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid balances processor task";
-      let%lwt () = Lwt_stream.iter process_market_data sub.stream in
+      let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
       (* Stream ended normally (disconnect pushed None) — re-subscribe *)
       sub.close ();
       Logging.info ~section "Balances stream ended (disconnect), re-subscribing in 1s...";

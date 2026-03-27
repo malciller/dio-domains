@@ -56,13 +56,12 @@ type connection_with_generation = {
 }
 
 module RingBuffer = Ring_buffer.RingBuffer
-let message_buffer = RingBuffer.create 1000
+let message_buffer = RingBuffer.create 32
 let message_condition = Lwt_condition.create ()
 
 type state = {
   mutex: Lwt_mutex.t;
   mutable conn: connection_with_generation option;
-  mutable reader: unit Lwt.t option;
   mutable connecting: bool;
   mutable connection_generation: int;
   responses: (Kraken_common_types.ws_response Lwt.u * string * float) Response_table.t;  (* wakener * expected_method * timestamp *)
@@ -74,7 +73,6 @@ type state = {
 let state = {
   mutex = Lwt_mutex.create ();
   conn = None;
-  reader = None;
   connecting = false;
   connection_generation = 0;
   responses = Response_table.create 32;
@@ -82,6 +80,11 @@ let state = {
   connected = Atomic.make false;
   subscriptions = [];
 }
+
+(** Condition signalled when the reader loop exits (for any reason).
+    ensure_connection waits on this so the supervisor knows the connection
+    is still alive — without storing a persistent promise reference. *)
+let reader_done : unit Lwt_condition.t = Lwt_condition.create ()
 
 let get_message_buffer () = message_buffer
 let get_message_condition () = message_condition
@@ -230,32 +233,25 @@ let reset_state conn ~notify_failure reason =
         Logging.debug_f ~section "Resetting state: incrementing generation from %d to %d (reason: %s)"
           old_generation new_generation reason;
         let wakers = Response_table.fold (fun _ (wak, _, _) acc -> wak :: acc) state.responses [] in
-        let reader = state.reader in
         let pending_count = Response_table.length state.responses in
         if pending_count > 0 then
           Logging.debug_f ~section "Resetting state: failing %d pending requests" pending_count;
         Response_table.clear state.responses;
         state.conn <- None;
-        state.reader <- None;
         state.connecting <- false;
         state.connection_generation <- new_generation;
         Atomic.set state.connected false;
         let failure_cb = if notify_failure then state.on_failure else None in
-        Lwt.return (wakers, reader, true, failure_cb, pending_count)
+        Lwt.return (wakers, true, failure_cb, pending_count)
     | _ ->
         Logging.debug_f ~section "Resetting state: connection mismatch, not resetting (reason: %s)" reason;
         state.connecting <- false;
-        Lwt.return ([], None, false, None, 0)
-  ) >>= fun (wakers, reader_task, should_reset, failure_cb, pending_count) ->
+        Lwt.return ([], false, None, 0)
+  ) >>= fun (wakers, should_reset, failure_cb, pending_count) ->
   if not should_reset then Lwt.return_unit
   else begin
-    (* Cancel reader loop first to prevent it from processing more frames *)
-    (match reader_task with
-     | Some reader ->
-         Logging.debug_f ~section "Resetting state: cancelling reader task (%d pending requests)" pending_count;
-         Lwt.cancel reader;
-         Logging.debug ~section "Cancelled reader loop during reset_state"
-     | None -> ());
+    (* Reader loop will exit on its own when it notices generation mismatch *)
+    ignore pending_count;
 
     (* Close transport connection *)
     Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
@@ -338,6 +334,11 @@ let rec reader_loop conn generation =
     Logging.info_f ~section "Reader loop shutting down (generation %d)" generation;
     Lwt.return_unit
   end else
+  (* Check generation to detect connection reset — replaces Lwt.cancel *)
+  if state.connection_generation <> generation then begin
+    Logging.debug_f ~section "Reader loop exiting: generation mismatch (expected %d, current %d)" generation state.connection_generation;
+    Lwt.return_unit
+  end else
   Lwt.catch
     (fun () ->
       Websocket_lwt_unix.read conn >>= function
@@ -360,22 +361,26 @@ let rec reader_loop conn generation =
 
 let start_reader conn generation =
   Logging.debug_f ~section "Starting WebSocket reader loop (generation %d)" generation;
-  let task =
+  (* Fire-and-forget: do NOT store the returned promise.
+     Storing it in state.reader created a growing Lwt forwarding chain
+     (~100 bytes per WS frame) because the recursive reader_loop
+     forwards the promise on each >>= iteration. *)
+  Lwt.async (fun () ->
     Lwt.catch
       (fun () ->
         reader_loop conn generation >>= fun () ->
         Logging.debug_f ~section "Reader loop completed normally (generation %d)" generation;
+        Lwt_condition.broadcast reader_done ();
         Lwt.return_unit
       )
       (fun exn ->
          let reason = Printf.sprintf "Reader loop failed (generation %d): %s" generation (Printexc.to_string exn) in
          Logging.error ~section reason;
+         Lwt_condition.broadcast reader_done ();
          reset_state conn ~notify_failure:true reason
       )
-  in
-  Lwt.async (fun () -> task);
-  Logging.debug_f ~section "Reader task started asynchronously (generation %d)" generation;
-  task
+  );
+  Logging.debug_f ~section "Reader task started asynchronously (generation %d)" generation
 
 let connect _token : Websocket_lwt_unix.conn Lwt.t =
   let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
@@ -437,7 +442,6 @@ let ensure_connection ?on_failure ?on_connected token =
              let generation = state.connection_generation in
              state.connecting <- false;
              state.conn <- Some { conn; generation };
-             state.reader <- None;
              Atomic.set state.connected true;
              Lwt.return (Some (conn, generation)))
         )
@@ -452,11 +456,8 @@ let ensure_connection ?on_failure ?on_connected token =
           Lwt.return_unit
       | Some (conn, generation) ->
           Logging.info_f ~section "Connection established successfully (generation %d)" generation;
-          let reader = start_reader conn generation in
-          Lwt_mutex.with_lock state.mutex (fun () ->
-            state.reader <- Some reader;
-            Lwt.return_unit) >>= fun () ->
-          Logging.debug_f ~section "Reader task registered in state (generation %d)" generation;
+          start_reader conn generation;
+          Logging.debug_f ~section "Reader task started (generation %d)" generation;
           notify_connection `Connected;
           Logging.debug_f ~section "Connection `Connected notification sent (generation %d)" generation;
           (* Re-send all registered subscriptions *)
@@ -472,10 +473,11 @@ let ensure_connection ?on_failure ?on_connected token =
           (* Call on_connected callback if provided *)
           (match on_connected with Some f -> f () | None -> ());
           Logging.debug_f ~section "on_connected callback called (generation %d)" generation;
-          (* Wait for the reader task to complete (only happens on error/disconnect) *)
-          Logging.debug_f ~section "Waiting for reader task to complete (generation %d)" generation;
-          reader >>= fun () ->
-          Logging.warn_f ~section "Reader task completed unexpectedly (generation %d)" generation;
+          (* Wait for reader_done signal — keeps connection alive for supervisor.
+             No persistent promise reference: Lwt_condition.wait creates a
+             fresh sleeping promise each time, no forwarding chain. *)
+          Lwt_condition.wait reader_done >>= fun () ->
+          Logging.warn_f ~section "Reader completed (generation %d), connection function returning" generation;
           Lwt.return_unit
 
 let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
@@ -537,6 +539,8 @@ let start_periodic_tasks () =
       Logging.debug_f ~section "Running Kraken response table cleanup (%s)"
         (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
       cleanup_stale_response_entries ~reason:(match reason with `Signal -> "backpressure" | `Timeout -> "periodic") () >>= fun () ->
+      (* Break forwarding chain between cleanup cycles *)
+      Lwt.pause () >>= fun () ->
       run ()
     in
     Lwt.async run
@@ -731,8 +735,8 @@ let close () : unit Lwt.t =
     | None -> Lwt.return None
     | Some conn_with_gen ->
         state.conn <- None;
-        state.reader <- None;
         state.connecting <- false;
+        state.connection_generation <- state.connection_generation + 1;
         Atomic.set state.connected false;
         let pending = Response_table.fold (fun _ (wak, _, _) acc -> wak :: acc) state.responses [] in
         Response_table.clear state.responses;

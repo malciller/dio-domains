@@ -4,7 +4,7 @@ open Lwt.Infix
 
 let section = "hyperliquid_orderbook"
 
-let ring_buffer_size = 64
+let ring_buffer_size = 16
 
 type level = {
   price: float;
@@ -164,7 +164,7 @@ let _processor_task =
     let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid orderbook processor task";
-      let%lwt () = Lwt_stream.iter process_market_data sub.stream in
+      let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
       (* Stream ended normally (disconnect pushed None) — re-subscribe *)
       sub.close ();
       Logging.info ~section "Orderbook stream ended (disconnect), re-subscribing in 1s...";

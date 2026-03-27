@@ -11,10 +11,10 @@ let nonce_ms_multiplier = 1000.0
 let default_orderbook_depth = 25
 
 (** Default ring buffer size for the orderbook feed *)
-let default_ring_buffer_size_orderbook = 64
+let default_ring_buffer_size_orderbook = 16
 
 (** Default ring buffer size for the executions feed *)
-let default_ring_buffer_size_executions = 128
+let default_ring_buffer_size_executions = 32
 
 (** Maximum number of non-configured (dynamic) assets to track in the balances feed *)
 let default_dynamic_assets_cap = 50

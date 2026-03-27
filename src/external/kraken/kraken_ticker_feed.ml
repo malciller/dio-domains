@@ -191,6 +191,8 @@ let start_message_handler conn symbols on_failure on_heartbeat =
           Lwt.return_unit
       | frame ->
           handle_message frame.Websocket.Frame.content on_heartbeat;
+          (* Break forwarding chain between frame reads *)
+          Lwt.pause () >>= fun () ->
           msg_loop ()
     ) (function
       | End_of_file ->

@@ -146,7 +146,7 @@ let broadcast_message json =
     When the stream is full, new messages are silently dropped — consumers
     will process the next available message when they catch up. *)
 let subscribe_market_data () =
-  let (stream, push_source) = Lwt_stream.create_bounded 64 in
+  let (stream, push_source) = Lwt_stream.create_bounded 16 in
   (* Non-blocking push wrapper compatible with pushers list signature.
      Returns true if pushed, false if dropped/closed. *)
   let push_fn item =
@@ -353,7 +353,10 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     let rec loop () =
       Websocket_lwt_unix.read conn >>= fun frame ->
       handle_frame ~on_heartbeat frame >>= fun () ->
-      if Atomic.get is_connected_ref then loop () else Lwt.return_unit
+      if Atomic.get is_connected_ref then
+        (* Break forwarding chain between frame reads *)
+        Lwt.pause () >>= fun () -> loop ()
+      else Lwt.return_unit
     in
     Lwt.catch loop (function
       | End_of_file ->

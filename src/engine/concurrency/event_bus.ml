@@ -135,7 +135,7 @@ module Make (Payload : PAYLOAD) = struct
 
   let subscribe ?(persistent=false) bus =
     (* Use bounded stream to prevent unbounded memory growth *)
-    let stream, push_source = Lwt_stream.create_bounded 64 in
+    let stream, push_source = Lwt_stream.create_bounded 4 in
     let subscriber = {
       push = (fun payload -> push_source#push payload);
       close = (fun () -> push_source#close);
