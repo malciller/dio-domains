@@ -19,9 +19,19 @@ type logging_config = {
   sections: string list;
 }
 
+type gc_config = {
+  minor_heap_size: int;
+  space_overhead: int;
+  max_overhead: int;
+  window_size: int;
+  allocation_policy: int;
+  major_heap_increment: int;
+}
+
 type config = {
   cycle_mod: int;
   logging: logging_config;
+  gc: gc_config option;
   trading: trading_config list;
 }
 
@@ -31,9 +41,13 @@ let section = "config"
 (** Known keys at each config level *)
 let known_top_level_keys =
   [ "logging_level"; "logging_sections"; "cycle_mod";
-    "engine"; "trading" ]
+    "engine"; "trading"; "gc" ]
 
 let known_engine_keys = []
+
+let known_gc_keys =
+  [ "minor_heap_size"; "space_overhead"; "max_overhead";
+    "window_size"; "allocation_policy"; "major_heap_increment" ]
 
 let known_trading_keys =
   [ "symbol"; "exchange"; "qty"; "grid_interval"; "sell_mult";
@@ -145,6 +159,28 @@ let parse_logging_config json : logging_config =
   let sections = sections_str |> String.split_on_char ',' |> List.map String.trim |> List.filter ((<>) "") in
   { level; sections }
 
+(** Parse GC configuration *)
+let parse_gc_config json : gc_config option =
+  let open Yojson.Basic.Util in
+  match json |> member "gc" with
+  | `Null -> None
+  | gc_json ->
+      if validate_keys ~context:"gc" ~allowed:known_gc_keys gc_json then
+        exit 1;
+      let minor_heap_size = gc_json |> member "minor_heap_size" |> to_int_option |> Option.value ~default:8_388_608 in
+      let space_overhead = gc_json |> member "space_overhead" |> to_int_option |> Option.value ~default:80 in
+      let max_overhead = gc_json |> member "max_overhead" |> to_int_option |> Option.value ~default:150 in
+      let window_size = gc_json |> member "window_size" |> to_int_option |> Option.value ~default:10 in
+      let allocation_policy = gc_json |> member "allocation_policy" |> to_int_option |> Option.value ~default:2 in
+      let major_heap_increment = gc_json |> member "major_heap_increment" |> to_int_option |> Option.value ~default:100 in
+      Some {
+        minor_heap_size;
+        space_overhead;
+        max_overhead;
+        window_size;
+        allocation_policy;
+        major_heap_increment;
+      }
 
 (** Read and parse engine configuration from config.json *)
 let read_config () : config =
@@ -162,8 +198,9 @@ let read_config () : config =
          exit 1);
     let cycle_mod = json |> member "cycle_mod" |> to_int_option |> Option.value ~default:10000 in
     let logging = parse_logging_config json in
+    let gc = parse_gc_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
-    { cycle_mod; logging; trading }
+    { cycle_mod; logging; gc; trading }
   with
   | Yojson.Json_error msg ->
     Logging.critical_f ~section "Failed to parse config.json: %s" msg;
@@ -171,4 +208,4 @@ let read_config () : config =
   | Sys_error msg ->
     Logging.warn_f ~section "Cannot read config.json: %s — using defaults" msg;
     { cycle_mod = 10000; logging = { level = Logging.INFO; sections = [] };
-      trading = [] }
+      gc = None; trading = [] }

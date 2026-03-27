@@ -313,23 +313,27 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
-  (* Tune GC for high-throughput WebSocket JSON parsing.
-     - Increased minor_heap_size (64MB) to absorb rapid Yojson AST allocations.
-     - space_overhead (80) provides somewhat eager major collections to keep heap tight.
-     - window_size (10) smooths out pacing variations, reducing the sawtooth memory spikes.
-     - allocation_policy (2) for strict best-fit (OCaml 5 default, ensuring no fragmentation). *)
-  let () =
-    let g = Gc.get () in
-    Gc.set { g with
-      Gc.minor_heap_size = 8_388_608;  (* words; 64MB minor heap *)
-      Gc.space_overhead = 80;          (* Moderate major heap spacing *)
-      Gc.max_overhead = 150;           
-      Gc.window_size = 10;             (* Smooth out major GC pacing *)
-      Gc.allocation_policy = 2; 
-      Gc.major_heap_increment = 100;      
-    }
-  in
+  (* Read engine configuration *)
+  let config = Dio_engine.Config.read_config () in
 
+  (* Apply logging configuration *)
+  Logging.set_level config.logging.level;
+  Logging.set_enabled_sections config.logging.sections;
+
+  (* Apply GC configuration if present *)
+  (match config.gc with
+   | Some gc_cfg ->
+       Logging.info ~section:"main" "Applying GC configuration from config.json";
+       let g = Gc.get () in
+       Gc.set { g with
+         Gc.minor_heap_size = gc_cfg.minor_heap_size;
+         Gc.space_overhead = gc_cfg.space_overhead;
+         Gc.max_overhead = gc_cfg.max_overhead;
+         Gc.window_size = gc_cfg.window_size;
+         Gc.allocation_policy = gc_cfg.allocation_policy;
+         Gc.major_heap_increment = gc_cfg.major_heap_increment;
+       }
+   | None -> ());
 
   (* Lwt-based memory reporter: prints every 60s from the main Lwt domain.
      Replaces the previous Gc.create_alarm approach which had two problems:
@@ -365,11 +369,6 @@ let () =
       loop ()
     )
   in
-
-  (* Read and apply logging configuration *)
-  let config = Dio_engine.Config.read_config () in
-  Logging.set_level config.logging.level;
-  Logging.set_enabled_sections config.logging.sections;
 
   (* Initialize random number generator for crypto operations *)
   Mirage_crypto_rng_unix.use_default ();
