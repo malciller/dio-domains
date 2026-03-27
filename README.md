@@ -58,6 +58,14 @@ Edit `config.json` (example):
   "logging_level": "info",            // Log verbosity: debug, info, warning, error
   "logging_sections": "",             // Filter logs by section (optional, comma-separated)
   "cycle_mod": 10000,                 // Cycle interval for periodic checks and logs
+  "gc": {                             // OCaml 5 Tuning for high-throughput websockets
+    "minor_heap_size": 8388608,       // Words (64MB) to absorb JSON parsing bursts
+    "space_overhead": 80,             // Moderate major heap spacing
+    "max_overhead": 150,              // Safe compaction threshold 
+    "window_size": 10,                // Smooths major GC pacing
+    "allocation_policy": 2,           // Best-fit policy (OCaml 5 default)
+    "major_heap_increment": 100       // Double heap size on growth to prevent OS thrashing
+  },
   "trading": [
     {
       "symbol": "BTC/USD",            // Pair to trade
