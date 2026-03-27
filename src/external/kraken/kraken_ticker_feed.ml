@@ -181,33 +181,35 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   let msg_str = Yojson.Safe.to_string subscribe_msg in
   Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ()) >>= fun () ->
 
-  (* Message loop *)
+  (* Message loop — uses Lwt.async to break Forward chain *)
+  let done_p, done_u = Lwt.wait () in
   let rec msg_loop () =
     Lwt.catch (fun () ->
       Websocket_lwt_unix.read conn >>= function
       | {Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _} ->
           Logging.warn ~section "WebSocket connection closed by server";
           on_failure "Connection closed by server";
+          Lwt.wakeup_later done_u ();
           Lwt.return_unit
       | frame ->
           handle_message frame.Websocket.Frame.content on_heartbeat;
-          (* Break forwarding chain between frame reads *)
-          Lwt.pause () >>= fun () ->
-          msg_loop ()
+          Lwt.async msg_loop;
+          Lwt.return_unit
     ) (function
       | End_of_file ->
           Logging.warn ~section "Ticker WebSocket connection closed unexpectedly (End_of_file)";
-          (* Notify supervisor of connection failure *)
           on_failure "Connection closed unexpectedly (End_of_file)";
+          Lwt.wakeup_later done_u ();
           Lwt.return_unit
       | exn ->
           Logging.error_f ~section "Ticker WebSocket error during read: %s" (Printexc.to_string exn);
-          (* Notify supervisor of connection failure *)
           on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
+          Lwt.wakeup_later done_u ();
           Lwt.return_unit
     )
   in
-  msg_loop ()
+  Lwt.async msg_loop;
+  done_p
 
 (** WebSocket connection to Kraken - establishes connection and starts message handler *)
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =

@@ -386,9 +386,9 @@ let () =
           Logging.info_f ~section:"memory" "hl_o2s=%d hl_stores=%d hl_open=%d hl_tids=%d buses=[%s]"
             hl_order_to_symbol hl_stores_count hl_open_orders_total hl_tids_total
             (String.concat "," !bus_stats);
-          (* Break forwarding chain between reporter cycles *)
-          Lwt.pause () >>= fun () ->
-          loop ()
+          (* Spawn next cycle independently — breaks Forward chain *)
+          Lwt.async loop;
+          Lwt.return_unit
         end
       in
       loop ()

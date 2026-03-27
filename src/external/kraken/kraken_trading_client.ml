@@ -329,56 +329,54 @@ let handle_frame frame ~expected_generation =
   (* Any additional processing can happen here asynchronously *)
   Lwt.return_unit
 
-let rec reader_loop conn generation =
-  if Atomic.get shutdown_requested then begin
-    Logging.info_f ~section "Reader loop shutting down (generation %d)" generation;
-    Lwt.return_unit
-  end else
-  (* Check generation to detect connection reset — replaces Lwt.cancel *)
-  if state.connection_generation <> generation then begin
-    Logging.debug_f ~section "Reader loop exiting: generation mismatch (expected %d, current %d)" generation state.connection_generation;
-    Lwt.return_unit
-  end else
-  Lwt.catch
-    (fun () ->
-      Websocket_lwt_unix.read conn >>= function
-      | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
-          Logging.warn_f ~section "Trading WebSocket closed by server (generation %d)" generation;
-          reset_state conn ~notify_failure:true "Connection closed by server"
-      | frame ->
-          handle_frame frame ~expected_generation:generation >>= fun () ->
-          reader_loop conn generation
-    )
-    (function
-      | End_of_file ->
-          Logging.warn_f ~section "Trading WebSocket connection closed unexpectedly (End_of_file, generation %d)" generation;
-          reset_state conn ~notify_failure:true "Connection closed unexpectedly (End_of_file)"
-      | exn ->
-          let reason = Printf.sprintf "WebSocket read error (generation %d): %s" generation (Printexc.to_string exn) in
-          Logging.error ~section reason;
-          reset_state conn ~notify_failure:true reason
-    )
-
+(** Reader loop with true chain-breaking: each WS frame read spawns the
+    next iteration via [Lwt.async] and resolves the current promise immediately.
+    A [Lwt.wait ()] completion signal notifies [start_reader] when done. *)
 let start_reader conn generation =
   Logging.debug_f ~section "Starting WebSocket reader loop (generation %d)" generation;
-  (* Fire-and-forget: do NOT store the returned promise.
-     Storing it in state.reader created a growing Lwt forwarding chain
-     (~100 bytes per WS frame) because the recursive reader_loop
-     forwards the promise on each >>= iteration. *)
-  Lwt.async (fun () ->
+  let done_p, done_u = Lwt.wait () in
+  let rec loop () =
+    if Atomic.get shutdown_requested then begin
+      Logging.info_f ~section "Reader loop shutting down (generation %d)" generation;
+      Lwt.wakeup_later done_u ();
+      Lwt.return_unit
+    end else if state.connection_generation <> generation then begin
+      Logging.debug_f ~section "Reader loop exiting: generation mismatch (expected %d, current %d)" generation state.connection_generation;
+      Lwt.wakeup_later done_u ();
+      Lwt.return_unit
+    end else
     Lwt.catch
       (fun () ->
-        reader_loop conn generation >>= fun () ->
-        Logging.debug_f ~section "Reader loop completed normally (generation %d)" generation;
-        Lwt_condition.broadcast reader_done ();
-        Lwt.return_unit
+        Websocket_lwt_unix.read conn >>= function
+        | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
+            Logging.warn_f ~section "Trading WebSocket closed by server (generation %d)" generation;
+            Lwt.wakeup_later done_u ();
+            reset_state conn ~notify_failure:true "Connection closed by server"
+        | frame ->
+            handle_frame frame ~expected_generation:generation >>= fun () ->
+            (* Spawn next iteration independently — breaks Forward chain *)
+            Lwt.async loop;
+            Lwt.return_unit
       )
-      (fun exn ->
-         let reason = Printf.sprintf "Reader loop failed (generation %d): %s" generation (Printexc.to_string exn) in
-         Logging.error ~section reason;
-         Lwt_condition.broadcast reader_done ();
-         reset_state conn ~notify_failure:true reason
+      (function
+        | End_of_file ->
+            Logging.warn_f ~section "Trading WebSocket connection closed unexpectedly (End_of_file, generation %d)" generation;
+            Lwt.wakeup_later done_u ();
+            reset_state conn ~notify_failure:true "Connection closed unexpectedly (End_of_file)"
+        | exn ->
+            let reason = Printf.sprintf "WebSocket read error (generation %d): %s" generation (Printexc.to_string exn) in
+            Logging.error ~section reason;
+            Lwt.wakeup_later done_u ();
+            reset_state conn ~notify_failure:true reason
       )
+  in
+  Lwt.async loop;
+  (* When the reader loop completes (for any reason), signal reader_done
+     so ensure_connection's Lwt_condition.wait unblocks *)
+  Lwt.async (fun () ->
+    done_p >>= fun () ->
+    Lwt_condition.broadcast reader_done ();
+    Lwt.return_unit
   );
   Logging.debug_f ~section "Reader task started asynchronously (generation %d)" generation
 
@@ -539,9 +537,9 @@ let start_periodic_tasks () =
       Logging.debug_f ~section "Running Kraken response table cleanup (%s)"
         (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
       cleanup_stale_response_entries ~reason:(match reason with `Signal -> "backpressure" | `Timeout -> "periodic") () >>= fun () ->
-      (* Break forwarding chain between cleanup cycles *)
-      Lwt.pause () >>= fun () ->
-      run ()
+      (* Spawn next cycle independently — breaks Forward chain *)
+      Lwt.async run;
+      Lwt.return_unit
     in
     Lwt.async run
   end

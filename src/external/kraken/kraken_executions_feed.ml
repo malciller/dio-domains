@@ -393,9 +393,8 @@ let start_periodic_tasks () =
       Logging.debug_f ~section "Running Kraken executions cleanup (%s)"
         (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
       cleanup_stale_orders ();
-      (* Break forwarding chain between cycles *)
-      Lwt.pause () >>= fun () ->
-      run ()
+      Lwt.async run;
+      Lwt.return_unit
     in
     Lwt.async run
   end
@@ -909,10 +908,10 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
       
       if Atomic.get Kraken_trading_client.shutdown_requested then
         Lwt.return_unit
-      else
-        (* Break forwarding chain between iterations *)
-        Lwt.pause () >>= fun () ->
-        loop ()
+      else begin
+        Lwt.async loop;
+        Lwt.return_unit
+      end
     in
     Lwt.async loop
   end;
