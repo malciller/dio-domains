@@ -490,6 +490,8 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
       if Atomic.get Kraken_trading_client.shutdown_requested then
         Lwt.return_unit
       else
+        (* Break forwarding chain between iterations *)
+        Lwt.pause () >>= fun () ->
         loop ()
     in
     Lwt.async loop

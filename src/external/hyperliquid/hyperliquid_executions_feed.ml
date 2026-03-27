@@ -805,6 +805,8 @@ let start_periodic_tasks () =
       Logging.debug_f ~section "Running HL executions cleanup (%s)"
         (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
       cleanup_stale_orders ();
+      (* Break forwarding chain between cycles *)
+      Lwt.pause () >>= fun () ->
       run ()
     in
     Lwt.async run
@@ -815,7 +817,7 @@ let _processor_task =
     let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid executions processor task";
-      let%lwt () = Lwt_stream.iter process_market_data sub.stream in
+      let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
       (* Stream ended normally (disconnect pushed None) — re-subscribe *)
       sub.close ();
       Logging.info ~section "Executions stream ended (disconnect), re-subscribing in 1s...";

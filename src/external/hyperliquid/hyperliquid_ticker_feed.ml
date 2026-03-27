@@ -128,9 +128,6 @@ let process_market_data json =
       if mids <> [] then begin
         Logging.debug_f ~section "Received allMids with %d coins" (List.length mids);
         
-        (* Track symbols that successfully wrote to buffer in this message to notify once *)
-        let notified_symbols = Hashtbl.create 16 in
-        
         List.iter (fun (coin, mid_json) ->
           match find_registered_symbol coin with
           | Some symbol ->
@@ -146,15 +143,12 @@ let process_market_data json =
                 } in
                 let store = ensure_store symbol in
                 RingBuffer.write store.buffer ticker;
-                Hashtbl.replace notified_symbols symbol store;
+                notify_ready store;
                 Logging.debug_f ~section "Ticker: %s mid=%.2f" symbol mid
               with exn ->
                 Logging.warn_f ~section "Failed to parse mid for %s: %s" coin (Printexc.to_string exn))
           | None -> ()
-        ) mids;
-        
-        (* Notify readiness for all updated symbols (mirroring Kraken pattern) *)
-        Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols
+        ) mids
       end
   | Some "l2Book" ->
       let data = member "data" json in
@@ -195,7 +189,7 @@ let _processor_task =
     let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid ticker processor task";
-      let%lwt () = Lwt_stream.iter process_market_data sub.stream in
+      let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
       (* Stream ended normally (disconnect pushed None) — re-subscribe *)
       sub.close ();
       Logging.info ~section "Ticker stream ended (disconnect), re-subscribing in 1s...";
