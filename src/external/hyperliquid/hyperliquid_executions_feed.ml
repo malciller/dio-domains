@@ -277,7 +277,33 @@ let cleanup_stale_orders () =
     Mutex.unlock store.tids_mutex;
     if tids_removed > 0 then
       Logging.debug_f ~section "Cleaned %d stale processed_tids for %s" tids_removed symbol
-  ) all_symbols
+  ) all_symbols;
+
+  (* Purge orphaned entries from order_to_symbol_queue.
+     Terminal events (fill/cancel) remove order_ids from the Hashtbl via Hashtbl.remove
+     but do NOT remove them from the Queue (OCaml Queue has no O(1) remove by value).
+     Over time the queue accumulates one dead string entry per completed order — these
+     are never drained because the eviction while-loop only fires when the Hashtbl
+     exceeds its cap (which it doesn't, since terminals keep it small).
+     Fix: during each cleanup cycle, rebuild the queue keeping only entries still
+     present in the Hashtbl.  This is O(queue_length) but runs at most every 120s. *)
+  Mutex.lock initialization_mutex;
+  let original_queue_len = Queue.length order_to_symbol_queue in
+  if original_queue_len > 0 then begin
+    let temp = Queue.create () in
+    Queue.iter (fun order_id ->
+      if Hashtbl.mem order_to_symbol order_id then
+        Queue.push order_id temp
+    ) order_to_symbol_queue;
+    Queue.clear order_to_symbol_queue;
+    Queue.transfer temp order_to_symbol_queue;
+    let removed = original_queue_len - Queue.length order_to_symbol_queue in
+    if removed > 0 then
+      Logging.debug_f ~section
+        "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
+        removed original_queue_len (Queue.length order_to_symbol_queue)
+  end;
+  Mutex.unlock initialization_mutex
 
 (** Clear all open orders across all stores - used on WebSocket reconnection
     to prevent stale phantom orders from blocking new order placement. *)

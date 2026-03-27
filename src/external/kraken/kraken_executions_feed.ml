@@ -343,14 +343,58 @@ let cleanup_stale_orders () =
       Mutex.unlock global_orders_mutex;
     ) !stale_orders;
     
-  end
+  end;
 
-let trigger_stale_order_cleanup ~reason () =
-  Lwt.async (fun () ->
-    Logging.debug_f ~section "Triggering stale order cleanup (reason=%s)" reason;
+  (* Purge orphaned entries from order_to_symbol_queue.
+     Terminal events (fill/cancel) remove order_ids from `order_to_symbol` (the Hashtbl)
+     but cannot efficiently remove them from `order_to_symbol_queue` (OCaml Queue has no
+     O(1) remove-by-value).  Over time the queue accumulates one dead string entry per
+     completed order — these are never drained because the cap-eviction while-loop only
+     fires when Hashtbl.length > cap, which it doesn't since terminals keep it small.
+     Fix: rebuild the queue each cleanup cycle, keeping only entries still present in
+     the Hashtbl.  O(queue_length) cost, runs at most every 120s. *)
+  Mutex.lock global_orders_mutex;
+  let original_queue_len = Queue.length order_to_symbol_queue in
+  if original_queue_len > 0 then begin
+    let temp = Queue.create () in
+    Queue.iter (fun order_id ->
+      if Hashtbl.mem order_to_symbol order_id then
+        Queue.push order_id temp
+    ) order_to_symbol_queue;
+    Queue.clear order_to_symbol_queue;
+    Queue.transfer temp order_to_symbol_queue;
+    let removed = original_queue_len - Queue.length order_to_symbol_queue in
+    if removed > 0 then
+      Logging.debug_f ~section
+        "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
+        removed original_queue_len (Queue.length order_to_symbol_queue)
+  end;
+  Mutex.unlock global_orders_mutex
+
+(** Mvar-based idempotent cleanup signal — mirrors the HL executions feed pattern.
+    Prevents Lwt continuation stacking if trigger_stale_order_cleanup is called
+    faster than the cleanup task drains (e.g., rapid order bursts).  The put only
+    happens when the mvar is empty so we never queue a blocking continuation. *)
+let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
+
+let request_cleanup () =
+  if Lwt_mvar.is_empty cleanup_mvar then
+    Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
+
+let _periodic_cleanup_task =
+  let rec run () =
+    Lwt.pick [
+      (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
+      (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
+    ] >>= fun reason ->
+    Logging.debug_f ~section "Running Kraken executions cleanup (%s)"
+      (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
     cleanup_stale_orders ();
-    Lwt.return_unit
-  )
+    run ()
+  in
+  Lwt.async run
+
+let trigger_stale_order_cleanup ~reason:_ () = request_cleanup ()
 
 
 (** Get count of open orders for a symbol *)

@@ -320,7 +320,7 @@ let () =
   let () =
     let g = Gc.get () in
     Gc.set { g with
-      Gc.space_overhead = 20;
+      Gc.space_overhead = 60;  (* Raised from 20: value of 20 caused constant GC churn on Yojson parse-tree allocations *)
       Gc.minor_heap_size = 262144;  (* words; on 64-bit this is ~2MB *)
       Gc.max_overhead = 50;
     }
