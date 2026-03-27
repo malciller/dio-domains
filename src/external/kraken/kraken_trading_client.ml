@@ -478,6 +478,12 @@ let ensure_connection ?on_failure ?on_connected token =
           Logging.warn_f ~section "Reader task completed unexpectedly (generation %d)" generation;
           Lwt.return_unit
 
+let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
+
+let request_cleanup () =
+  if Lwt_mvar.is_empty cleanup_mvar then
+    Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
+
 let cleanup_stale_response_entries ~reason () =
   if Atomic.get shutdown_requested then Lwt.return_unit
   else
@@ -519,6 +525,22 @@ let cleanup_stale_response_entries ~reason () =
         Lwt.return_unit
       )
 
+let periodic_tasks_started = Atomic.make false
+
+let start_periodic_tasks () =
+  if not (Atomic.exchange periodic_tasks_started true) then begin
+    let rec run () =
+      Lwt.pick [
+        (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
+        (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
+      ] >>= fun reason ->
+      Logging.debug_f ~section "Running Kraken response table cleanup (%s)"
+        (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
+      cleanup_stale_response_entries ~reason:(match reason with `Signal -> "backpressure" | `Timeout -> "periodic") () >>= fun () ->
+      run ()
+    in
+    Lwt.async run
+  end
 
 let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
   (* Check for shutdown before sending new requests *)
@@ -548,7 +570,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             (* Log warning if response table is growing large *)
             if pending_count > 10 then begin
               Logging.warn_f ~section "Response table size is high: %d pending requests" pending_count;
-              Lwt.async (fun () -> cleanup_stale_response_entries ~reason:"backpressure" ())
+              request_cleanup ()
             end;
             Lwt.catch
               (fun () ->
@@ -657,9 +679,28 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
   send_message ~message_str ~req_id ~expected_method:method_ ~timeout_ms >>= fun response ->
   Lwt.return response
 
+let extract_channel_name message =
+  try
+    let open Yojson.Safe.Util in
+    match member "params" message with
+    | `Null -> None
+    | params ->
+        (match member "channel" params with
+         | `Null -> None
+         | channel_json -> Some (to_string channel_json))
+  with _ -> None
+
+let is_same_channel msg1 msg2 =
+  match extract_channel_name msg1, extract_channel_name msg2 with
+  | Some c1, Some c2 -> String.equal c1 c2
+  | _ -> false
+
 let subscribe message =
   Lwt_mutex.with_lock state.mutex (fun () ->
-    if not (List.mem message state.subscriptions) then
+    let has_channel = match extract_channel_name message with | Some _ -> true | None -> false in
+    if has_channel then
+      state.subscriptions <- message :: (List.filter (fun existing -> not (is_same_channel message existing)) state.subscriptions)
+    else if not (List.mem message state.subscriptions) then
       state.subscriptions <- message :: state.subscriptions;
     match state.conn with
     | Some conn_with_gen ->
@@ -676,10 +717,11 @@ let subscribe message =
 let is_connected () = Atomic.get state.connected
 
 let init token : unit Lwt.t = 
-  Lwt.async (fun () -> cleanup_stale_response_entries ~reason:"init" ());
+  request_cleanup ();
   ensure_connection token
 
 let connect_and_monitor token ~on_failure ~on_connected = 
+  start_periodic_tasks ();
   Lwt.async (fun () -> cleanup_stale_response_entries ~reason:"connect" ());
   ensure_connection ~on_failure ~on_connected token
 

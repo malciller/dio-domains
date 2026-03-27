@@ -381,18 +381,22 @@ let request_cleanup () =
   if Lwt_mvar.is_empty cleanup_mvar then
     Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
 
-let _periodic_cleanup_task =
-  let rec run () =
-    Lwt.pick [
-      (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
-      (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
-    ] >>= fun reason ->
-    Logging.debug_f ~section "Running Kraken executions cleanup (%s)"
-      (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
-    cleanup_stale_orders ();
-    run ()
-  in
-  Lwt.async run
+let periodic_tasks_started = Atomic.make false
+
+let start_periodic_tasks () =
+  if not (Atomic.exchange periodic_tasks_started true) then begin
+    let rec run () =
+      Lwt.pick [
+        (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
+        (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
+      ] >>= fun reason ->
+      Logging.debug_f ~section "Running Kraken executions cleanup (%s)"
+        (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
+      cleanup_stale_orders ();
+      run ()
+    in
+    Lwt.async run
+  end
 
 let trigger_stale_order_cleanup ~reason:_ () = request_cleanup ()
 
@@ -917,6 +921,7 @@ let subscribe_order_updates () =
 
 (** Initialize execution feed data stores *)
 let initialize symbols =
+  start_periodic_tasks ();
   Logging.info_f ~section "Initializing executions feed for %d symbols" (List.length symbols);
 
   (* Pre-create all symbol stores during initialization *)

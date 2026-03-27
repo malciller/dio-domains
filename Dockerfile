@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     libpq-dev \
     zlib1g-dev \
+    libjemalloc2 \
     make \
     g++ \
     git \
@@ -68,8 +69,11 @@ RUN eval $(opam env --switch=5.2.0) \
 # 10. Runtime PATH (opam binaries + app)
 ENV PATH="/usr/local/bin:/root/.opam/5.2.0/bin:${PATH}"
 
-# 11. Expose metrics broadcast port
+# 11. Use jemalloc to prevent glibc arena fragmentation in OCaml 5
+ENV LD_PRELOAD=libjemalloc.so.2
+
+# 12. Expose metrics broadcast port
 EXPOSE 8080
 
-# 12. Default command
+# 13. Default command
 CMD ["dio"]

@@ -76,6 +76,7 @@ type strategy_state = {
   mutable last_buy_order_price: float option;
   mutable last_buy_order_id: string option;
   mutable open_sell_orders: (string * float) list;  (* order_id * price *)
+  mutable recently_injected_sells: (string * float * float) list; (* order_id * price * timestamp *)
   mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
   mutable last_order_time: float;  (* Unix timestamp of last order placement *)
@@ -126,6 +127,7 @@ let get_strategy_state asset_symbol =
           last_buy_order_price = None;
           last_buy_order_id = None;
           open_sell_orders = [];
+          recently_injected_sells = [];
           pending_orders = [];
           last_cycle = 0;
           last_order_time = 0.0;
@@ -650,7 +652,11 @@ let execute_strategy
       (* Sync strategy state with actual open orders from exchange *)
       (* Preserve sell orders that were set by handle_order_amended
          or newly placed execution events but may not yet appear in exchange data due to WS lag. *)
-      let preserved_sells = state.open_sell_orders in
+      let now_time = Unix.gettimeofday () in
+      state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
+        now_time -. ts < 10.0
+      ) state.recently_injected_sells;
+      let preserved_sells = state.recently_injected_sells in
       state.open_sell_orders <- [];
       (* Preserve buy tracking across sync for all exchanges.
          Exchange open orders feed may lag behind execution events,
@@ -712,7 +718,7 @@ let execute_strategy
          exchange-sourced list. This covers cancel-replace amendments where
          the new order hasn't yet appeared in the order update stream. *)
       if asset.exchange = "hyperliquid" then begin
-        List.iter (fun (preserved_id, preserved_price) ->
+        List.iter (fun (preserved_id, preserved_price, _) ->
           let already_present = List.exists (fun (id, _) -> id = preserved_id) state.open_sell_orders in
           if not already_present then
             state.open_sell_orders <- (preserved_id, preserved_price) :: state.open_sell_orders
@@ -1175,7 +1181,8 @@ let handle_order_acknowledged asset_symbol order_id side price =
     state.inflight_amend_buy <- false;
     Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
    | Sell ->
-    state.inflight_sell <- false);
+    state.inflight_sell <- false;
+    state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells);
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     order_id (string_of_order_side side) price asset_symbol
@@ -1549,6 +1556,7 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
          let original_sell_count = List.length state.open_sell_orders in
          state.open_sell_orders <- (new_order_id, price) :: 
             List.filter (fun (sell_id, _) -> sell_id <> old_order_id) state.open_sell_orders;
+         state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
          if List.length state.open_sell_orders = original_sell_count then
            Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
              old_order_id new_order_id price asset_symbol

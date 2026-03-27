@@ -313,65 +313,58 @@ let () =
   (* Initialize logging system *)
   Logging.init ();
 
-  (* Tune GC to prevent heap bloat in this long-running, allocation-heavy process.
-     space_overhead=20  : collect when live data could extend by only 20% waste (default 80).
-     minor_heap_size    : 2MB minor heap reduces promotion pressure on the major heap.
-     max_overhead=50    : cap maximum wasted space at 50% before forcing a full GC. *)
+  (* Tune GC for high-throughput WebSocket JSON parsing.
+     - Increased minor_heap_size (64MB) to absorb rapid Yojson AST allocations.
+     - space_overhead (80) provides somewhat eager major collections to keep heap tight.
+     - window_size (10) smooths out pacing variations, reducing the sawtooth memory spikes.
+     - allocation_policy (2) for strict best-fit (OCaml 5 default, ensuring no fragmentation). *)
   let () =
     let g = Gc.get () in
     Gc.set { g with
-      Gc.space_overhead = 60;  (* Raised from 20: value of 20 caused constant GC churn on Yojson parse-tree allocations *)
-      Gc.minor_heap_size = 262144;  (* words; on 64-bit this is ~2MB *)
-      Gc.max_overhead = 50;
+      Gc.minor_heap_size = 8_388_608;  (* words; 64MB minor heap *)
+      Gc.space_overhead = 80;          (* Moderate major heap spacing *)
+      Gc.max_overhead = 150;           
+      Gc.window_size = 10;             (* Smooth out major GC pacing *)
+      Gc.allocation_policy = 2; 
+      Gc.major_heap_increment = 100;      
     }
   in
 
 
-  (* Event-driven memory reporting via GC alarm *)
+  (* Lwt-based memory reporter: prints every 60s from the main Lwt domain.
+     Replaces the previous Gc.create_alarm approach which had two problems:
+     1. GC alarm callbacks run in GC signal context — calling Mutex.lock from
+        inside them is unsafe on OCaml 5.x if the alarmed domain already holds
+        the lock (latent deadlock risk on InFlightOrders/Amendments mutexes).
+     2. cycle_mod=10000 with space_overhead=20 meant the alarm fired thousands
+        of times per minute but the counter never reached 10,000 — report never printed.
+     Lwt timer runs only in the main domain's scheduler thread, is always safe,
+     and prints on a predictable 60s wall-clock cadence. *)
   let start_time = Unix.gettimeofday () in
-  let mem_cycle_count = ref 0 in
-
-  let report_memory_stats ~cycle_info_mod () =
-    if Atomic.get shutdown_requested then ()
-    else begin
-      incr mem_cycle_count;
-      if !mem_cycle_count mod cycle_info_mod = 0 then begin
-        let now = Unix.gettimeofday () in
-        let runtime = now -. start_time in
-        let s = Gc.quick_stat () in
-        let heap_mb = s.heap_words * (Sys.word_size / 8) / 1048576 in
-        let live_mb = s.live_words * (Sys.word_size / 8) / 1048576 in
-        let ts = let t = Unix.localtime now in
-          Printf.sprintf "%04d-%02d-%02d %02d:%02d:%02d"
-            (t.Unix.tm_year + 1900) (t.Unix.tm_mon + 1) t.Unix.tm_mday
-            t.Unix.tm_hour t.Unix.tm_min t.Unix.tm_sec in
-        Printf.fprintf stderr "%s INFO [memory] === MEMORY STATISTICS (Runtime: %.1fs, Cycle: %d) ===\n" ts runtime !mem_cycle_count;
-        Printf.fprintf stderr "%s INFO [memory] Main Domain: heap=%dMB live=%dMB free=%dMB\n" ts heap_mb live_mb (heap_mb - live_mb);
-        Printf.fprintf stderr "%s INFO [memory] GC Activity: minor=%d major=%d compactions=%d\n" ts s.minor_collections s.major_collections s.compactions;
-        Printf.fprintf stderr "%s INFO [memory]\n" ts;
-        Printf.fprintf stderr "%s INFO [memory] --- SUBSYSTEM COUNTS ---\n" ts;
-        let ticker_stores = Hashtbl.length Kraken.Kraken_ticker_feed.stores in
-        let orderbook_stores = Hashtbl.length Kraken.Kraken_orderbook_feed.stores in
-        let executions_stores = Hashtbl.length Kraken.Kraken_executions_feed.symbol_stores in
-        let balances_stores = Hashtbl.length Kraken.Kraken_balances_feed.balance_stores in
-        Printf.fprintf stderr "%s INFO [memory] Stores: ticker=%d orderbook=%d executions=%d balances=%d\n" ts ticker_stores orderbook_stores executions_stores balances_stores;
-        let domain_count = Hashtbl.length Dio_engine.Domain_spawner.domain_registry in
-        Printf.fprintf stderr "%s INFO [memory] Domains: %d registered\n" ts domain_count;
-        let in_flight_orders_size = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
-        let in_flight_amendments_size = Dio_strategies.Strategy_common.InFlightAmendments.get_registry_size () in
-        Printf.fprintf stderr "%s INFO [memory] In-flight: orders=%d amendments=%d\n" ts in_flight_orders_size in_flight_amendments_size;
-        Printf.fprintf stderr "%s INFO [memory] === END MEMORY STATISTICS ===\n" ts;
-        flush stderr
-      end
-    end
+  let _memory_reporter =
+    Lwt.async (fun () ->
+      let rec loop () =
+        Lwt_unix.sleep 60.0 >>= fun () ->
+        if Atomic.get shutdown_requested then Lwt.return_unit
+        else begin
+          let now = Unix.gettimeofday () in
+          let runtime = now -. start_time in
+          let s = Gc.quick_stat () in
+          let heap_mb = s.heap_words * (Sys.word_size / 8) / 1048576 in
+          let live_mb = s.live_words * (Sys.word_size / 8) / 1048576 in
+          Logging.info_f ~section:"memory" "heap=%dMB live=%dMB free=%dMB runtime=%.0fs gc_major=%d"
+            heap_mb live_mb (heap_mb - live_mb) runtime s.major_collections;
+          let in_flight_orders = Dio_strategies.Strategy_common.InFlightOrders.get_registry_size () in
+          let in_flight_amendments = Dio_strategies.Strategy_common.InFlightAmendments.get_registry_size () in
+          let executions_stores = Hashtbl.length Kraken.Kraken_executions_feed.symbol_stores in
+          Logging.info_f ~section:"memory" "in_flight_orders=%d in_flight_amendments=%d kraken_exec_stores=%d"
+            in_flight_orders in_flight_amendments executions_stores;
+          loop ()
+        end
+      in
+      loop ()
+    )
   in
-
-  (* Register GC alarm — fires after every major GC cycle, no thread needed *)
-  let cfg_for_alarm = Dio_engine.Config.read_config () in
-  let mem_alarm_mod = cfg_for_alarm.cycle_mod in
-  let _memory_alarm = Gc.create_alarm (fun () ->
-    report_memory_stats ~cycle_info_mod:mem_alarm_mod ()
-  ) in
 
   (* Read and apply logging configuration *)
   let config = Dio_engine.Config.read_config () in
