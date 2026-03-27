@@ -180,24 +180,15 @@ module Hyperliquid_impl = struct
               ()
         >|= function
         | Ok res ->
-            (* Proactively populate open_orders with the amended order so that
-               get_open_orders returns accurate data immediately.
-               Without this, there is a gap between the REST amend response and
-               the WS orderUpdates event where the order is invisible — causing
-               grid spacing calculations to use stale sell order prices. *)
             let new_order_id_str = Int64.to_string res.amend_id in
-            Hyperliquid_executions_feed.inject_order
-              ~symbol:sym
-              ~order_id:new_order_id_str
-              ~side:existing.side
-              ~qty:sz_rounded
-              ~price:px_rounded
-              ?user_ref:existing.order_userref
-              ?cl_ord_id:constructed_cl_ord_id
-              ();
-            (* Remove the old order entry so get_open_orders doesn't return
-               both old and new IDs as ghost duplicates during the window
-               before the WS orderUpdates event marks the old one cancelled. *)
+            (* Do NOT proactively inject the new order into open_orders.
+               The old inject_order call caused a phantom duplicate: the new OID was
+               added while the old OID was still present (WS cancel hadn't fired yet),
+               making get_open_orders transiently return 2 buy orders and triggering
+               the cancel-all branch.  inflight_amend_buy + effective_buy_count now
+               bridge the REST→WS gap without synthetic injection.
+               We DO proactively remove the old order (ID-changing cancel-replace only)
+               to prevent a late WS "open" event from re-adding it as a ghost. *)
             if new_order_id_str <> order_id then
               Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
             Ok {
