@@ -307,52 +307,15 @@ let get_all_symbols () =
   Mutex.unlock global_orders_mutex;
   result
 
-(** Safety cleanup for stale orders and event-driven triggers *)
+(** Periodic maintenance: purge orphaned order_to_symbol_queue entries.
+    Terminal events (fill/cancel) remove order_ids from `order_to_symbol` (the Hashtbl)
+    but cannot efficiently remove them from `order_to_symbol_queue` (OCaml Queue has no
+    O(1) remove-by-value).  Over time the queue accumulates one dead string entry per
+    completed order — these are never drained because the cap-eviction while-loop only
+    fires when Hashtbl.length > cap, which it doesn't since terminals keep it small.
+    Fix: rebuild the queue each cleanup cycle, keeping only entries still present in
+    the Hashtbl.  O(queue_length) cost, runs at most every 120s. *)
 let cleanup_stale_orders () =
-  let now = Unix.gettimeofday () in
-  let stale_threshold = 3600.0 in (* 1 hour *)
-  let stale_orders = ref [] in
-  
-  let all_symbols = get_all_symbols () in
-  List.iter (fun symbol ->
-    let store = get_symbol_store symbol in
-    Mutex.lock global_orders_mutex;
-    
-    Hashtbl.iter (fun order_id order ->
-      if now -. order.last_updated > stale_threshold then
-        stale_orders := (symbol, order_id) :: !stale_orders
-    ) store.open_orders;
-    
-    Mutex.unlock global_orders_mutex;
-  ) all_symbols;
-  
-  let removed_count = List.length !stale_orders in
-  if removed_count > 0 then begin
-    Logging.info_f ~section "Safety cleanup: removing %d orders older than 1h" removed_count;
-    
-    List.iter (fun (symbol, order_id) ->
-      let store = get_symbol_store symbol in
-      Mutex.lock global_orders_mutex;
-      
-      if Hashtbl.mem store.open_orders order_id then begin
-        Hashtbl.remove store.open_orders order_id;
-        Hashtbl.remove order_to_symbol order_id;
-        Logging.debug_f ~section "Removed stale order during safety cleanup: %s [%s]" order_id symbol
-      end;
-      
-      Mutex.unlock global_orders_mutex;
-    ) !stale_orders;
-    
-  end;
-
-  (* Purge orphaned entries from order_to_symbol_queue.
-     Terminal events (fill/cancel) remove order_ids from `order_to_symbol` (the Hashtbl)
-     but cannot efficiently remove them from `order_to_symbol_queue` (OCaml Queue has no
-     O(1) remove-by-value).  Over time the queue accumulates one dead string entry per
-     completed order — these are never drained because the cap-eviction while-loop only
-     fires when Hashtbl.length > cap, which it doesn't since terminals keep it small.
-     Fix: rebuild the queue each cleanup cycle, keeping only entries still present in
-     the Hashtbl.  O(queue_length) cost, runs at most every 120s. *)
   Mutex.lock global_orders_mutex;
   let original_queue_len = Queue.length order_to_symbol_queue in
   if original_queue_len > 0 then begin
@@ -371,10 +334,9 @@ let cleanup_stale_orders () =
   end;
   Mutex.unlock global_orders_mutex
 
-(** Mvar-based idempotent cleanup signal — mirrors the HL executions feed pattern.
-    Prevents Lwt continuation stacking if trigger_stale_order_cleanup is called
-    faster than the cleanup task drains (e.g., rapid order bursts).  The put only
-    happens when the mvar is empty so we never queue a blocking continuation. *)
+(** Mvar-based idempotent cleanup signal.
+    Prevents Lwt continuation stacking if trigger is called
+    faster than the cleanup task drains. *)
 let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
 let request_cleanup () =
@@ -390,7 +352,7 @@ let start_periodic_tasks () =
         (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
         (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
       ] >>= fun reason ->
-      Logging.debug_f ~section "Running Kraken executions cleanup (%s)"
+      Logging.debug_f ~section "Running Kraken queue maintenance (%s)"
         (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
       cleanup_stale_orders ();
       Lwt.async run;
