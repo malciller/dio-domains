@@ -236,13 +236,25 @@ module Kraken_impl = struct
   let read_execution_events ~symbol ~start_pos =
     let events = Kraken_executions_feed.read_execution_events symbol start_pos in
     List.map (fun (e : Kraken_executions_feed.execution_event) ->
+      let remaining_qty = e.order_qty -. e.cum_qty in
+      (* Kraken sends exec_type=trade with order_status=partially_filled even
+         when the order is fully filled (cum_qty = order_qty). The subsequent
+         exec_type=filled event is "minimal" (no symbol field) and gets silently
+         dropped because the symbol mapping was already cleaned up by the trade
+         event. Normalize: if remaining_qty <= 0, override status to Filled so
+         the domain spawner dispatches to handle_order_filled, not
+         handle_order_acknowledged. *)
+      let effective_status =
+        if remaining_qty <= 0.0 && e.order_qty > 0.0 then Types.Filled
+        else status_of_kraken_status e.order_status
+      in
       { Types.
         order_id = e.order_id;
-        order_status = status_of_kraken_status e.order_status;
+        order_status = effective_status;
         limit_price = e.limit_price;
         side = side_of_kraken_side e.side;
-        remaining_qty = e.order_qty -. e.cum_qty;
-        filled_qty = e.cum_qty; (* Assuming cum_qty is filled_qty *)
+        remaining_qty;
+        filled_qty = e.cum_qty;
         avg_price = e.avg_price;
         timestamp = e.timestamp;
       }

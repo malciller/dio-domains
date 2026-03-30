@@ -421,8 +421,15 @@ let update_open_orders store (event : execution_event) =
     if Hashtbl.mem store.open_orders event.order_id then begin
       Hashtbl.remove store.open_orders event.order_id;
       
-      (* Remove from global order mapping *)
-      Hashtbl.remove order_to_symbol event.order_id;
+      (* Remove from global order mapping ONLY on explicit terminal status.
+         Kraken sends exec_type=trade with order_status=partially_filled even
+         when the order is fully filled (cum_qty = order_qty). The subsequent
+         exec_type=filled event is "minimal" (no symbol field) and needs the
+         order_to_symbol mapping to resolve the symbol. If we remove the mapping
+         here on is_effectively_filled, the filled event gets silently dropped
+         and the domain never learns about the fill. *)
+      if is_terminal_status then
+        Hashtbl.remove order_to_symbol event.order_id;
       
       if is_terminal_status then
         Logging.debug_f ~section "Removed order: %s [%s] status=%s exec_type=%s"

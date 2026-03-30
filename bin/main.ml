@@ -344,12 +344,12 @@ let () =
      2. cycle_mod=10000 with space_overhead=20 meant the alarm fired thousands
         of times per minute but the counter never reached 10,000 — report never printed.
      Lwt timer runs only in the main domain's scheduler thread, is always safe,
-     and prints on a predictable 60s wall-clock cadence. *)
+     and prints on a predictable 10min wall-clock cadence. *)
   let start_time = Unix.gettimeofday () in
   let _memory_reporter =
     Lwt.async (fun () ->
       let rec loop () =
-        Lwt_unix.sleep 60.0 >>= fun () ->
+        Lwt_unix.sleep 600.0 >>= fun () ->
         if Atomic.get shutdown_requested then Lwt.return_unit
         else begin
           let now = Unix.gettimeofday () in

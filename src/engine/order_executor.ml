@@ -362,8 +362,16 @@ let amend_order
                         | None ->
                             false)
                    | None ->
-                       Logging.debug_f ~section "Order %s not found in open orders cache, skipping amendment to avoid spam" request.order_id;
-                       true)
+                       (* Order not in local WS cache — this does NOT mean it's
+                          invalid. WS lag or brief cache churn during a previous
+                          amend can cause the order to be temporarily absent.
+                          Proceed with the amendment and let the exchange reject
+                          if the order truly no longer exists. Skipping here was
+                          the root cause of Kraken buy orders failing to trail
+                          upward (Hyperliquid uses cancel-replace so the old ID
+                          stays in cache until the amend fires, avoiding this). *)
+                       Logging.debug_f ~section "Order %s not found in open orders cache, proceeding with amendment (exchange will reject if invalid)" request.order_id;
+                       false)
               | _ -> false
             in
 
