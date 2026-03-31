@@ -438,21 +438,48 @@ let render_strategies _w json =
   let inactive_rows = List.filter_map (fun (is_q, img) -> if not is_q then Some img else None) non_strategy_rows in
   let quote_rows = List.filter_map (fun (is_q, img) -> if is_q then Some img else None) non_strategy_rows in
 
-  (* Compute total unrealized profit across all rows *)
-  let total_up = List.fold_left (fun acc (_symbol, data) ->
+  (* Compute total unrealized profit and hold value across strategies *)
+  let total_up_strats, total_hold_strats = List.fold_left (fun (up_acc, hold_acc) (_symbol, data) ->
     let strat = data |?> "strategy" in
+    let market = data |?> "market" in
+    
+    (* Calc holding value *)
+    let bid = market |?> "bid" |> to_float_d 0.0 in
+    let ask = market |?> "ask" |> to_float_d 0.0 in
+    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else (max bid ask) in
+    let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
+    
+    (* Calc UP *)
     let sell_orders = strat |?> "sell_orders" |> to_list_d in
-    acc +. List.fold_left (fun a s ->
+    let strat_up = List.fold_left (fun a s ->
       let sp = s |?> "price" |> to_float_d 0.0 in
       let sq = s |?> "qty" |> to_float_d 0.0 in
       if sp > 0.0 && sq > 0.0 then a +. (sp *. sq) else a
-    ) 0.0 sell_orders
-  ) 0.0 strats in
-  (* Add non-strategy sell order unrealized profit *)
-  let total_up = List.fold_left (fun acc (_, img_pair) ->
-    ignore img_pair; acc
-  ) total_up non_strategy_rows in
-  ignore total_up;
+    ) 0.0 sell_orders in
+    
+    (up_acc +. strat_up, hold_acc +. (base_bal *. mid))
+  ) (0.0, 0.0) strats in
+
+  (* Add non-strategy unrealized profit and hold value *)
+  let total_up_bals, total_hold_bals = List.fold_left (fun (up_acc, hold_acc) bal_json ->
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+    if balance <= 0.0 then (up_acc, hold_acc) else
+    let bid = bal_json |?> "bid" |> to_float_d 0.0 in
+    let ask = bal_json |?> "ask" |> to_float_d 0.0 in
+    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else (max bid ask) in
+    
+    let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
+    let bal_up = List.fold_left (fun a s ->
+      let sp = s |?> "price" |> to_float_d 0.0 in
+      let sq = s |?> "qty" |> to_float_d 0.0 in
+      if sp > 0.0 && sq > 0.0 then a +. (sp *. sq) else a
+    ) 0.0 sell_orders in
+    
+    (up_acc +. bal_up, hold_acc +. (balance *. mid))
+  ) (0.0, 0.0) all_balances in
+  
+  let total_up = total_up_strats +. total_up_bals in
+  let total_hold_val = total_hold_strats +. total_hold_bals in
 
   (* Section title *)
   let title = I.hcat [
@@ -460,20 +487,29 @@ let render_strategies _w json =
     I.string a_dim (String.make (max 0 (103 - 22)) ' ');
   ] in
 
-  (* Footer row with total unrealized profit, right-aligned to table edge *)
-  let up_label = Printf.sprintf " Σ uP: %s " (format_pnl total_up) in
+  (* Left main table: active → paused → inactive → quotes *)
+  let left_table = I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows) in
+
+  (* Right summary table for Hold Val and UP *)
+  let right_title = I.string a_title " SUMMARY" in
+  
+  let val_label = Printf.sprintf " %s " (format_price total_hold_val) in
+  let up_label = Printf.sprintf " %s " (format_pnl total_up) in
   let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_panel ++ st bold)
                 else A.(fg c_red ++ bg c_panel ++ st bold) in
-  (* Table columns: 1+14+5+3+12+12+10+12+8+6+8+12 = 103 *)
-  let table_width = 103 in
-  let gap = max 1 (table_width - String.length up_label) in
-  let footer = I.hcat [
-    I.string a_dim (String.make gap ' ');
+  
+  let right_table = I.vcat [
+    right_title;
+    I.string a_text " ";
+    I.string a_label " Total Hold Val";
+    I.string A.(fg c_bright ++ bg c_panel ++ st bold) val_label;
+    I.string a_text " ";
+    I.string a_label " Σ uP";
     I.string up_attr up_label;
   ] in
 
-  (* Assemble: active → paused → inactive → quotes → footer *)
-  I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows @ [footer])
+  (* Assemble side by side *)
+  I.hcat [ left_table; I.string a_text "    "; right_table ]
 
 (* ── Panel: Latencies ────────────────────────────────────────────── *)
 

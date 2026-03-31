@@ -241,10 +241,13 @@ let build_snapshot () =
           if is_configured then None
           else begin
             (* Try to get market data *)
+            let is_quote = (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || (asset = "USDT") || (asset = quote) || (asset = "USDe") in
             let ticker = Ex.get_ticker ~symbol in
             let bid_json, ask_json = match ticker with
               | Some (b, a) -> `Float b, `Float a
-              | None -> `Null, `Null
+              | None -> 
+                  if is_quote then `Float 1.0, `Float 1.0
+                  else `Null, `Null
             in
             (* Get open orders for this symbol *)
             let open_orders = Ex.get_open_orders ~symbol in
