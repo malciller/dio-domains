@@ -211,11 +211,11 @@ let render_header w json =
              + 3 + 4 + String.length (Printf.sprintf "%.0f" fng) in
   I.hcat (
     [ I.string a_header_bg (pad_right 3 " ");
-      I.string a_header_bg "DIO";
+      I.string a_header_bg "Dio";
       I.string A.(fg c_dim ++ bg c_panel) " │ ";
-      I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "UP %s" (format_duration uptime));
+      I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "up %s" (format_duration uptime));
       I.string A.(fg c_dim ++ bg c_panel) " │ ";
-      I.string A.(fg c_text ++ bg c_panel) "F&G ";
+      I.string A.(fg c_text ++ bg c_panel) "f&g ";
       I.string A.(fg (if fng >= 60.0 then c_green
                       else if fng >= 40.0 then c_yellow
                       else c_red) ++ bg c_panel ++ st bold)
@@ -544,6 +544,15 @@ let render_strategies _w json =
   let total_hold_val = total_hold_strats +. total_hold_bals in
   let total_accum_val = total_accum_val_strats +. total_accum_val_bals in
 
+  (* Sum all quote-currency balances — these are always $1 by definition *)
+  let total_quote_val = List.fold_left (fun acc bal_json ->
+    let asset   = bal_json |?> "asset"   |> to_string_d "" in
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT"
+                || asset = "ZUSD" || asset = "USDe" in
+    if is_quote && balance > 0.0 then acc +. balance else acc
+  ) 0.0 all_balances in
+
   (* Section title *)
   let title = I.hcat [
     I.string a_title " HOLDINGS & STRATEGY";
@@ -571,7 +580,11 @@ let render_strategies _w json =
     I.string a_label " Total Accum Val";
     I.string A.(fg c_bright ++ bg c_panel ++ st bold) accum_val_label;
     I.string a_text " ";
-    I.string a_label " Σ SELL VAL";
+    I.string a_label " Total $ Value";
+    I.string A.(fg c_cyan ++ bg c_panel ++ st bold)
+      (Printf.sprintf " %s " (format_price total_quote_val));
+    I.string a_text " ";
+    I.string a_label " Total Sell Val";
     I.string up_attr up_label;
   ] in
 
