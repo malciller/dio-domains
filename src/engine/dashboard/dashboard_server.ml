@@ -46,7 +46,7 @@ let watch_clients : Lwt_io.output_channel list ref = ref []
 let rec state_broadcaster () =
   let%lwt () = Lwt_unix.sleep 0.5 in
   let current_clients = !watch_clients in
-  if current_clients <> [] then begin
+  (if current_clients <> [] then begin
     Lwt.catch
       (fun () ->
         let json_str = Dashboard_state.snapshot_to_string () in
@@ -55,7 +55,7 @@ let rec state_broadcaster () =
       (fun exn -> 
         Logging.error_f ~section "Error in state_broadcaster: %s" (Printexc.to_string exn);
         Lwt.return_unit)
-  end else Lwt.return_unit
+  end else Lwt.return_unit)
   >>= fun () -> state_broadcaster ()
 
 (** Handle a single client connection *)
