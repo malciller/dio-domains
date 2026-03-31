@@ -106,7 +106,11 @@ Edit `config.json` (example):
 
 ### Run
 ```bash
+# Start the core trading engine
 ./_build/default/bin/main.exe
+
+# In a separate terminal, run the state monitoring dashboard
+./_build/default/bin/dashboard.exe
 ```
 
 ---
@@ -167,9 +171,18 @@ Enable with `"hedge": true`. Kraken is not supported.
 |                                      |  OCaml domain for true parallel
 |                                      |  execution without GIL limitations
 +--------------------------------------+
-|  Tick-Driven Architecture            |  Event-driven engine with a global
-|                                      |  tick bus and lock-free ring buffers
-|                                      |  for high-throughput data processing
+|  Event-Driven Architecture           |  Zero-latency pipeline using modern Lwt 
+|                                      |  condition variables and Mutexes. All
+|                                      |  polling loops are eliminated from the 
+|                                      |  hot path for instant strategy triggers
++--------------------------------------+
+|  Tick-Driven Execution               |  Global tick bus and lock-free ring
+|                                      |  buffers for high-throughput orderbook 
+|                                      |  and execution data processing
++--------------------------------------+
+|  Real-Time Dashboard                 |  Detached Curses-style terminal dashboard
+|                                      |  binary (communicates via UDS) for
+|                                      |  real-time monitoring without GC overhead
 +--------------------------------------+
 |  Latency Profiling                   |  Real-time histogram-based profiling
 |                                      |  (p50-p999) of hot loops and
@@ -265,9 +278,14 @@ dune build @doc
 ```
 
 ```bash
-# Build and run the project
+# Build the project
 dune build
+
+# Run the core engine
 ./_build/default/bin/main.exe
+
+# Run the dashboard monitor
+./_build/default/bin/dashboard.exe
 ```
 
 ### Hyperliquid State Persistence
