@@ -12,6 +12,17 @@ let engine_start_time = ref 0.0
 
 let set_start_time t = engine_start_time := t
 
+(** Trading config: cached after first read (static at runtime) *)
+let cached_config : Dio_engine.Config.config option ref = ref None
+
+let get_config () =
+  match !cached_config with
+  | Some c -> c
+  | None ->
+      let c = Dio_engine.Config.read_config () in
+      cached_config := Some c;
+      c
+
 (* ── JSON helpers ────────────────────────────────────────────────── *)
 
 let json_of_float_opt = function
@@ -146,7 +157,6 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
     "name", `String snap.name;
     "p50", `Float snap.p50;
     "p90", `Float snap.p90;
-    "p95", `Float snap.p95;
     "p99", `Float snap.p99;
     "p999", `Float snap.p999;
     "samples", `Int snap.samples;
@@ -186,7 +196,7 @@ let json_of_memory () =
 let build_snapshot () =
   let now = Unix.gettimeofday () in
   let uptime = now -. !engine_start_time in
-  let config = Dio_engine.Config.read_config () in
+  let config = get_config () in
 
   (* Connections *)
   let connections = Supervisor_cache.get_snapshots () in
