@@ -20,24 +20,43 @@ let socket_path () =
   let pid = Unix.getpid () in
   Printf.sprintf "/tmp/dio-%d.sock" pid
 
-(** Encode length-prefixed message: 4 bytes big-endian + payload *)
-let encode_message payload =
-  let len = String.length payload in
+(** Send a length-prefixed JSON response (zero-copy payload) *)
+let send_response oc json_str =
+  let len = String.length json_str in
   let header = Bytes.create 4 in
   Bytes.set_uint8 header 0 ((len lsr 24) land 0xff);
   Bytes.set_uint8 header 1 ((len lsr 16) land 0xff);
   Bytes.set_uint8 header 2 ((len lsr 8) land 0xff);
   Bytes.set_uint8 header 3 (len land 0xff);
-  Bytes.to_string header ^ payload
-
-(** Send a length-prefixed JSON response *)
-let send_response oc json_str =
-  let msg = encode_message json_str in
+  let header_str = Bytes.to_string header in
   Lwt.catch
     (fun () ->
-      Lwt_io.write oc msg >>= fun () ->
+      Lwt_io.write oc header_str >>= fun () ->
+      Lwt_io.write oc json_str >>= fun () ->
       Lwt_io.flush oc)
     (fun _exn -> Lwt.return_unit)
+
+(** Active client count for monitoring *)
+let active_clients = Atomic.make 0
+
+(** List of active output channels subscribed to watch mode *)
+let watch_clients : Lwt_io.output_channel list ref = ref []
+
+(** Central ticker that broadcasts state to all watching clients via 'W' every 500ms *)
+let rec state_broadcaster () =
+  let%lwt () = Lwt_unix.sleep 0.5 in
+  let current_clients = !watch_clients in
+  if current_clients <> [] then begin
+    Lwt.catch
+      (fun () ->
+        let json_str = Dashboard_state.snapshot_to_string () in
+        (* Broadcast to all asynchronously *)
+        Lwt_list.iter_p (fun oc -> send_response oc json_str) current_clients)
+      (fun exn -> 
+        Logging.error_f ~section "Error in state_broadcaster: %s" (Printexc.to_string exn);
+        Lwt.return_unit)
+  end else Lwt.return_unit
+  >>= fun () -> state_broadcaster ()
 
 (** Handle a single client connection *)
 let handle_client (ic, oc) =
@@ -56,40 +75,20 @@ let handle_client (ic, oc) =
               let%lwt () = send_response oc json_str in
               loop ()
           | 'W' ->
-              (* Watch mode: push snapshots every 500ms *)
-              let stopped = ref false in
-              let watch_loop =
-                let rec push () =
-                  if !stopped then Lwt.return_unit
-                  else
-                    Lwt.catch
-                      (fun () ->
-                        let json_str = Dashboard_state.snapshot_to_string () in
-                        let%lwt () = send_response oc json_str in
-                        let%lwt () = Lwt_unix.sleep 0.5 in
-                        push ())
-                      (fun _exn ->
-                        stopped := true;
-                        Lwt.return_unit)
-                in
-                push ()
+              (* Watch mode: subscribe to central state_broadcaster *)
+              watch_clients := oc :: !watch_clients;
+              (* Listen for 'Q' or disconnect to stop watch mode *)
+              let rec wait_for_quit () =
+                Lwt.catch
+                  (fun () ->
+                    let%lwt n = Lwt_io.read_into ic buf 0 1 in
+                    if n = 0 || Bytes.get buf 0 = 'Q' then Lwt.return_unit
+                    else wait_for_quit ())
+                  (fun _exn -> Lwt.return_unit)
               in
-              (* Also listen for 'Q' to stop watch mode *)
-              let wait_for_quit =
-                let rec wait () =
-                  Lwt.catch
-                    (fun () ->
-                      let%lwt n = Lwt_io.read_into ic buf 0 1 in
-                      if n = 0 then (stopped := true; Lwt.return_unit)
-                      else if Bytes.get buf 0 = 'Q' then (stopped := true; Lwt.return_unit)
-                      else wait ())
-                    (fun _exn ->
-                      stopped := true;
-                      Lwt.return_unit)
-                in
-                wait ()
-              in
-              let%lwt () = Lwt.pick [watch_loop; wait_for_quit] in
+              let%lwt () = wait_for_quit () in
+              (* Unsubscribe *)
+              watch_clients := List.filter (fun c -> c != oc) !watch_clients;
               Lwt.return_unit
           | 'Q' ->
               Lwt.return_unit  (* Close *)
@@ -103,9 +102,6 @@ let handle_client (ic, oc) =
         Lwt.return_unit)
   in
   loop ()
-
-(** Active client count for monitoring *)
-let active_clients = Atomic.make 0
 
 (** Start the UDS server as an Lwt fiber.
     Call this from main.ml after engine initialization. *)
@@ -123,10 +119,17 @@ let start ~start_time =
   Unix.chmod path 0o600;
   Logging.info_f ~section "Dashboard server listening on %s" path;
 
+  Lwt.async state_broadcaster;
+
   let rec accept_loop () =
     let%lwt (client_fd, _client_addr) = Lwt_unix.accept server_socket in
-    let _count = Atomic.fetch_and_add active_clients 1 in
-    Logging.info_f ~section "Dashboard client connected (active: %d)" (Atomic.get active_clients);
+    if Atomic.get active_clients >= 5 then begin
+      Logging.warn_f ~section "Dashboard client rejected: Max active clients (5) reached";
+      Lwt.catch (fun () -> Lwt_unix.close client_fd) (fun _ -> Lwt.return_unit) >>= fun () ->
+      accept_loop ()
+    end else begin
+      let _count = Atomic.fetch_and_add active_clients 1 in
+      Logging.info_f ~section "Dashboard client connected (active: %d)" (Atomic.get active_clients);
     Lwt.async (fun () ->
       let ic = Lwt_io.of_fd ~mode:Lwt_io.Input client_fd in
       let oc = Lwt_io.of_fd ~mode:Lwt_io.Output client_fd in
@@ -138,7 +141,8 @@ let start ~start_time =
           Lwt.catch
             (fun () -> Lwt_unix.close client_fd)
             (fun _exn -> Lwt.return_unit)));
-    accept_loop ()
+      accept_loop ()
+    end
   in
 
   (* Run accept loop, catch shutdown *)
