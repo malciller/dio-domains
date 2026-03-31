@@ -1,13 +1,3 @@
-```
-==========================================================================
-     ____  _
-    |  _ \(_) ___
-    | | | | |/ _ \
-    | |_| | | (_) |
-    |____/|_|\___/
-==========================================================================
-```
-
 [![OCaml](https://img.shields.io/badge/Language-OCaml-blue.svg)](https://ocaml.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
