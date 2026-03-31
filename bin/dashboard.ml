@@ -119,7 +119,7 @@ let c_red       = A.rgb_888 ~r:248 ~g:81  ~b:73
 let c_yellow    = A.rgb_888 ~r:210 ~g:153 ~b:34
 let c_cyan      = A.rgb_888 ~r:57  ~g:211 ~b:183
 let c_dim       = A.rgb_888 ~r:72  ~g:79  ~b:88
-let c_orange    = A.rgb_888 ~r:210 ~g:105 ~b:30
+let _c_orange   = A.rgb_888 ~r:210 ~g:105 ~b:30
 
 (* ── Attribute constructors ──────────────────────────────────────── *)
 
@@ -134,11 +134,15 @@ let a_cyan      = A.(fg c_cyan   ++ bg c_bg)
 let a_dim       = A.(fg c_dim    ++ bg c_bg)
 let a_border    = A.(fg c_border ++ bg c_bg)
 let a_header_bg = A.(fg c_bright ++ bg c_panel ++ st bold)
-let a_orange    = A.(fg c_orange ++ bg c_bg)
+let _a_orange   = A.(fg _c_orange ++ bg c_bg)
 
 (* ── Drawing primitives ──────────────────────────────────────────── *)
 
-let hline w = I.string a_border (String.make w '-')
+let hline w =
+  (* Build a UTF-8 thin horizontal rule using U+2500 (─) *)
+  let buf = Buffer.create (w * 3) in
+  for _ = 1 to w do Buffer.add_string buf "─" done;
+  I.string a_border (Buffer.contents buf)
 
 let pad_right w s =
   let len = String.length s in
@@ -148,6 +152,11 @@ let pad_right w s =
 let col w attr s = I.string attr (pad_right w s)
 
 let spacer = I.string a_text " "
+
+let format_pct f =
+  if abs_float f < 0.01 then "<0.01%"
+  else if abs_float f >= 10.0 then Printf.sprintf "%.1f%%" f
+  else Printf.sprintf "%.2f%%" f
 
 (* ── Panel: Header bar ───────────────────────────────────────────── *)
 
@@ -163,15 +172,15 @@ let render_header w json =
   I.hcat [
     I.string a_header_bg (pad_right 3 " ");
     I.string a_header_bg "DIO";
-    I.string A.(fg c_dim ++ bg c_panel) " | ";
+    I.string A.(fg c_dim ++ bg c_panel) " │ ";
     I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "UP %s" (format_duration uptime));
-    I.string A.(fg c_dim ++ bg c_panel) " | ";
+    I.string A.(fg c_dim ++ bg c_panel) " │ ";
     I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "HEAP %dMB" heap);
     I.string A.(fg c_dim ++ bg c_panel) " / ";
     I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "LIVE %dKB" live);
-    I.string A.(fg c_dim ++ bg c_panel) " | ";
+    I.string A.(fg c_dim ++ bg c_panel) " │ ";
     I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "GC %d" gc_major);
-    I.string A.(fg c_dim ++ bg c_panel) " | ";
+    I.string A.(fg c_dim ++ bg c_panel) " │ ";
     I.string A.(fg c_text ++ bg c_panel) "F&G ";
     I.string A.(fg (if fng >= 60.0 then c_green else if fng >= 40.0 then c_yellow else c_red) ++ bg c_panel ++ st bold) (Printf.sprintf "%.0f" fng);
     I.string A.(bg c_panel) (String.make (max 0 (w - 60)) ' ');
@@ -179,7 +188,7 @@ let render_header w json =
 
 (* ── Panel: Connections ──────────────────────────────────────────── *)
 
-let render_connections w json =
+let _render_connections w json =
   let conns = json |?> "connections" |> to_list_d in
   let title = I.hcat [
     I.string a_title " CONNECTIONS";
@@ -194,9 +203,9 @@ let render_connections w json =
     let state_attr = match state with
       | "Connected" -> a_green | "Connecting" -> a_yellow | _ -> a_red in
     let indicator = match state with
-      | "Connected" -> I.string a_green ">" 
-      | "Connecting" -> I.string a_yellow "~"
-      | _ -> I.string a_red "x" in
+      | "Connected" -> I.string a_green "●" 
+      | "Connecting" -> I.string a_yellow "◌"
+      | _ -> I.string a_red "✗" in
     let cb_attr = if cb = "Closed" then a_dim else a_red in
     I.hcat [
       I.string a_text " ";
@@ -214,12 +223,9 @@ let render_connections w json =
 
 (* ── Panel: Holdings & Strategy ──────────────────────────────────── *)
 
-let render_strategies w json =
+let render_strategies _w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
-  let title = I.hcat [
-    I.string a_title " HOLDINGS & STRATEGY";
-    I.string a_dim (String.make (max 0 (w - 22)) ' ');
-  ] in
+  let all_balances = json |?> "all_balances" |> to_list_d in
   (* Header row *)
   let header = I.hcat [
     I.string a_text " ";
@@ -230,10 +236,14 @@ let render_strategies w json =
     col 12 a_label "HOLDING";
     col 10 a_label "HOLD VAL";
     col 12 a_label "BUY @";
+    col 8 a_label "Δ BUY";
     col 6 a_label "SELLS";
+    col 8 a_label "Δ SELL";
     col 12 a_label "uP";
   ] in
-  let rows = List.map (fun (symbol, data) ->
+
+  (* Render strategy rows *)
+  let strategy_rows = List.map (fun (symbol, data) ->
     let exchange = data |?> "exchange" |> to_string_d "?" in
     let strat = data |?> "strategy" in
     let market = data |?> "market" in
@@ -263,15 +273,54 @@ let render_strategies w json =
       else acc
     ) 0.0 sell_orders in
 
-    (* Status indicator *)
+    (* Distance to pending buy order — only when strategy is active (not paused) *)
+    let buy_dist_pct =
+      if (not cap_low) && buy_price > 0.0 && mid > 0.0 then
+        Some (((buy_price -. mid) /. mid) *. 100.0)
+      else None
+    in
+
+    (* Distance to closest pending sell order *)
+    let closest_sell_dist_pct =
+      let sell_prices = List.filter_map (fun s ->
+        let sp = s |?> "price" |> to_float_d 0.0 in
+        if sp > 0.0 && mid > 0.0 then Some (((sp -. mid) /. mid) *. 100.0)
+        else None
+      ) sell_orders in
+      match sell_prices with
+      | [] -> None
+      | prices -> Some (List.fold_left (fun acc p -> if abs_float p < abs_float acc then p else acc) (List.hd prices) prices)
+    in
+
+    (* Status indicator: ▶ active, ⏸ paused *)
     let status_str, status_attr =
-      if cap_low then "C", a_red
-      else if asset_low then "A", a_orange
-      else ">", a_green
+      if cap_low || asset_low then "⏸", a_yellow
+      else "▶", a_green
     in
 
     let exch_tag = match exchange with
       | "kraken" -> "kr" | "hyperliquid" -> "hl" | e -> String.sub e 0 (min 2 (String.length e))
+    in
+
+    (* Buy distance formatting *)
+    let buy_dist_str, buy_dist_attr = match buy_dist_pct with
+      | None -> "--", a_dim
+      | Some d ->
+          let abs_d = abs_float d in
+          let attr = if abs_d < 0.5 then a_green
+                     else if abs_d < 2.0 then a_cyan
+                     else a_dim in
+          format_pct d, attr
+    in
+    (* Sell distance formatting *)
+    let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
+      | None -> "--", a_dim
+      | Some d ->
+          let abs_d = abs_float d in
+          let attr = if abs_d < 0.5 then a_yellow
+                     else if abs_d < 2.0 then a_cyan
+                     else a_dim in
+          format_pct d, attr
     in
 
     I.hcat [
@@ -284,26 +333,162 @@ let render_strategies w json =
       col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
       col 12 (if buy_price > 0.0 then a_green else a_dim)
         (if buy_price > 0.0 then format_price buy_price else "--");
+      col 8 buy_dist_attr buy_dist_str;
       col 6 (if sell_count > 0 then a_yellow else a_dim)
         (string_of_int sell_count);
+      col 8 sell_dist_attr sell_dist_str;
       col 12 (if unrealized_profit >= 0.0 then a_green else a_red)
         (format_pnl unrealized_profit);
     ]
   ) strats in
-  I.vcat (title :: header :: rows)
+
+  (* Split strategy rows into active vs paused *)
+  let active_rows, paused_rows = List.partition (fun (_symbol, data) ->
+    let strat = data |?> "strategy" in
+    let cap_low = strat |?> "capital_low" |> to_bool_d false in
+    let asset_low = strat |?> "asset_low" |> to_bool_d false in
+    not (cap_low || asset_low)
+  ) strats in
+  let active_images = List.map (fun (sym, _) ->
+    List.assoc sym (List.combine (List.map fst strats) strategy_rows)
+  ) active_rows in
+  let paused_images = List.map (fun (sym, _) ->
+    List.assoc sym (List.combine (List.map fst strats) strategy_rows)
+  ) paused_rows in
+
+  (* Render non-strategy balance rows from all_balances — now enriched with market + order data *)
+  let non_strategy_rows = List.filter_map (fun bal_json ->
+    let exchange = bal_json |?> "exchange" |> to_string_d "?" in
+    let asset = bal_json |?> "asset" |> to_string_d "?" in
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+
+    if balance <= 0.0 then None
+    else begin
+      let exch_tag = match exchange with
+        | "kraken" -> "kr" | "hyperliquid" -> "hl" | e -> String.sub e 0 (min 2 (String.length e))
+      in
+
+      (* Market data from enriched snapshot *)
+      let bid = bal_json |?> "bid" |> to_float_d 0.0 in
+      let ask = bal_json |?> "ask" |> to_float_d 0.0 in
+      let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0
+                else (max bid ask) in
+      let hold_value = balance *. mid in
+
+      (* Open sell orders *)
+      let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
+      let sell_count = bal_json |?> "sell_count" |> to_int_d 0 in
+
+      (* Unrealized profit from pending sells *)
+      let unrealized_profit = List.fold_left (fun acc s ->
+        let sp = s |?> "price" |> to_float_d 0.0 in
+        let sq = s |?> "qty" |> to_float_d 0.0 in
+        if sp > 0.0 && sq > 0.0 then acc +. (sp *. sq)
+        else acc
+      ) 0.0 sell_orders in
+
+      (* Distance to closest sell order *)
+      let closest_sell_dist_pct =
+        let sell_prices = List.filter_map (fun s ->
+          let sp = s |?> "price" |> to_float_d 0.0 in
+          if sp > 0.0 && mid > 0.0 then Some (((sp -. mid) /. mid) *. 100.0)
+          else None
+        ) sell_orders in
+        match sell_prices with
+        | [] -> None
+        | prices -> Some (List.fold_left (fun acc p -> if abs_float p < abs_float acc then p else acc) (List.hd prices) prices)
+      in
+      let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
+        | None -> "--", a_dim
+        | Some d ->
+            let abs_d = abs_float d in
+            let attr = if abs_d < 0.5 then a_yellow
+                       else if abs_d < 2.0 then a_cyan
+                       else a_dim in
+            format_pct d, attr
+      in
+
+      let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" in
+      let status_str, status_attr =
+        if is_quote then "$", a_green
+        else "⏹", a_red
+      in
+      let img = I.hcat [
+        I.string a_text " ";
+        col 14 a_dim (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
+        col 5 a_dim "--";
+        col 3 status_attr status_str;
+        col 12 a_text (if mid > 0.0 then format_price mid else "--");
+        col 12 a_text (format_qty balance);
+        col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
+        col 12 a_dim "--";
+        col 8 a_dim "--";
+        col 6 (if sell_count > 0 then a_yellow else a_dim)
+          (string_of_int sell_count);
+        col 8 sell_dist_attr sell_dist_str;
+        col 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green
+                else if unrealized_profit > 0.0 then a_dim else a_dim)
+          (if sell_count > 0 then format_pnl unrealized_profit else "--");
+      ] in
+      Some (is_quote, img)
+    end
+  ) all_balances in
+
+  (* Split non-strategy rows: inactive assets vs quote currencies *)
+  let inactive_rows = List.filter_map (fun (is_q, img) -> if not is_q then Some img else None) non_strategy_rows in
+  let quote_rows = List.filter_map (fun (is_q, img) -> if is_q then Some img else None) non_strategy_rows in
+
+  (* Compute total unrealized profit across all rows *)
+  let total_up = List.fold_left (fun acc (_symbol, data) ->
+    let strat = data |?> "strategy" in
+    let sell_orders = strat |?> "sell_orders" |> to_list_d in
+    acc +. List.fold_left (fun a s ->
+      let sp = s |?> "price" |> to_float_d 0.0 in
+      let sq = s |?> "qty" |> to_float_d 0.0 in
+      if sp > 0.0 && sq > 0.0 then a +. (sp *. sq) else a
+    ) 0.0 sell_orders
+  ) 0.0 strats in
+  (* Add non-strategy sell order unrealized profit *)
+  let total_up = List.fold_left (fun acc (_, img_pair) ->
+    ignore img_pair; acc
+  ) total_up non_strategy_rows in
+  ignore total_up;
+
+  (* Section title *)
+  let title = I.hcat [
+    I.string a_title " HOLDINGS & STRATEGY";
+    I.string a_dim (String.make (max 0 (103 - 22)) ' ');
+  ] in
+
+  (* Footer row with total unrealized profit, right-aligned to table edge *)
+  let up_label = Printf.sprintf " Σ uP: %s " (format_pnl total_up) in
+  let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_panel ++ st bold)
+                else A.(fg c_red ++ bg c_panel ++ st bold) in
+  (* Table columns: 1+14+5+3+12+12+10+12+8+6+8+12 = 103 *)
+  let table_width = 103 in
+  let gap = max 1 (table_width - String.length up_label) in
+  let footer = I.hcat [
+    I.string a_dim (String.make gap ' ');
+    I.string up_attr up_label;
+  ] in
+
+  (* Assemble: active → paused → inactive → quotes → footer *)
+  I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows @ [footer])
 
 (* ── Panel: Latencies ────────────────────────────────────────────── *)
 
 let render_latencies w json =
   let lats = match json |?> "latencies" with `Assoc l -> l | _ -> [] in
   let title = I.hcat [
-    I.string a_title " LATENCY PROFILING (us)";
+    I.string a_title " LATENCY PROFILING";
     I.string a_dim (String.make (max 0 (w - 25)) ' ');
   ] in
+  (* Adaptive metric column: use more space when terminal is wide enough *)
+  let metric_w = if w >= 100 then 14 else 8 in
   let header = I.hcat [
     I.string a_text " ";
     col 14 a_label "DOMAIN";
-    col 8 a_label "METRIC";
+    col metric_w a_label "METRIC";
     col 10 a_label "p50";
     col 10 a_label "p90";
     col 10 a_label "p99";
@@ -325,7 +510,7 @@ let render_latencies w json =
         Some (I.hcat [
           I.string a_text " ";
           col 14 a_bright (truncate_string 13 symbol);
-          col 8 a_cyan (truncate_string 7 label);
+          col metric_w a_cyan (truncate_string (metric_w - 1) label);
           col 10 a_text (format_latency_us p50);
           col 10 a_text (format_latency_us p90);
           col 10 p99_attr (format_latency_us p99);
@@ -407,17 +592,17 @@ let render_frame w h json =
     I.vcat [
       render_header w json;
       sep;
-      render_connections w json;
+      render_memory w json;
       sep;
       render_strategies w json;
       sep;
       render_latencies w json;
       sep;
-      render_memory w json;
-      sep;
       render_domains w json;
       sep;
-      I.string a_dim (pad_right w "  q: quit  |  refreshes every 500ms");
+      I.hcat [
+        I.string A.(fg c_dim ++ bg c_panel) (pad_right w "  q: quit  │  refreshes every 500ms");
+      ];
     ]
   in
   (* Render image to pipe via Notty, wrapped in synchronized output markers *)
