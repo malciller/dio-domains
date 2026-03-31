@@ -1627,7 +1627,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
       loop 0
     in
     
-    let is_cache_miss = contains_fragment lower_reason "order not found" || contains_fragment lower_reason "not found for amendment" in
+    let is_cache_miss = contains_fragment lower_reason "order not found" || contains_fragment lower_reason "not found for amendment" || contains_fragment lower_reason "unknown order" in
     let is_cannot_modify = contains_fragment lower_reason "cannot modify canceled or filled" in
     let is_margin_error = contains_fragment lower_reason "insufficient" || contains_fragment lower_reason "margin" in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
