@@ -163,10 +163,6 @@ let format_pct f =
 let render_header w json =
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
   let fng = json |?> "fear_and_greed" |> to_float_d 0.0 in
-  let mem = json |?> "memory" in
-  let heap = mem |?> "heap_mb" |> to_int_d 0 in
-  let live = mem |?> "live_kb" |> to_int_d 0 in
-  let gc_major = mem |?> "gc_major" |> to_int_d 0 in
   let _fng_attr = if fng >= 60.0 then a_green
     else if fng >= 40.0 then a_yellow else a_red in
   I.hcat [
@@ -174,12 +170,6 @@ let render_header w json =
     I.string a_header_bg "DIO";
     I.string A.(fg c_dim ++ bg c_panel) " │ ";
     I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "UP %s" (format_duration uptime));
-    I.string A.(fg c_dim ++ bg c_panel) " │ ";
-    I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "HEAP %dMB" heap);
-    I.string A.(fg c_dim ++ bg c_panel) " / ";
-    I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "LIVE %dKB" live);
-    I.string A.(fg c_dim ++ bg c_panel) " │ ";
-    I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "GC %d" gc_major);
     I.string A.(fg c_dim ++ bg c_panel) " │ ";
     I.string A.(fg c_text ++ bg c_panel) "F&G ";
     I.string A.(fg (if fng >= 60.0 then c_green else if fng >= 40.0 then c_yellow else c_red) ++ bg c_panel ++ st bold) (Printf.sprintf "%.0f" fng);
