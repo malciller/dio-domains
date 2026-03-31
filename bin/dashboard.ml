@@ -170,17 +170,54 @@ let format_pct f =
 
 let render_header w json =
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
-  let fng = json |?> "fear_and_greed" |> to_float_d 0.0 in
-  I.hcat [
-    I.string a_header_bg (pad_right 3 " ");
-    I.string a_header_bg "DIO";
-    I.string A.(fg c_dim ++ bg c_panel) " │ ";
-    I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "UP %s" (format_duration uptime));
-    I.string A.(fg c_dim ++ bg c_panel) " │ ";
-    I.string A.(fg c_text ++ bg c_panel) "F&G ";
-    I.string A.(fg (if fng >= 60.0 then c_green else if fng >= 40.0 then c_yellow else c_red) ++ bg c_panel ++ st bold) (Printf.sprintf "%.0f" fng);
-    I.string A.(bg c_panel) (String.make (max 0 (w - 60)) ' ');
-  ]
+  let fng    = json |?> "fear_and_greed" |> to_float_d 0.0 in
+  let conns  = json |?> "connections" |> to_list_d in
+  (* Build one ` │ ● tag` segment per connection, track total added width *)
+  let conn_imgs, conn_w = List.fold_right (fun c (imgs, w_acc) ->
+    let name  = c |?> "name"  |> to_string_d "?" in
+    let state = c |?> "state" |> to_string_d "?" in
+    (* Map connection name to a human-readable exchange label *)
+    let tag =
+      let n = String.lowercase_ascii name in
+      if String.length n >= 6 && String.sub n 0 6 = "kraken" then "kraken"
+      else begin
+        let hl = "hyperliquid" in
+        let hlen = String.length hl in
+        if String.length n >= hlen && String.sub n 0 hlen = hl then "hyperliquid"
+        else truncate_string 10 name
+      end
+    in
+    let dot_attr = match state with
+      | "Connected"  -> A.(fg c_green  ++ bg c_panel)
+      | "Connecting" -> A.(fg c_yellow ++ bg c_panel)
+      | _            -> A.(fg c_red    ++ bg c_panel)
+    in
+    let seg = I.hcat [
+      I.string A.(fg c_dim ++ bg c_panel) " │ ";
+      I.string dot_attr "●";
+      I.string A.(fg c_label ++ bg c_panel) (" " ^ tag);
+    ] in
+    (* Width = 3 (" │ ") + 1 ("●") + 1 (" ") + len(tag) *)
+    (seg :: imgs, w_acc + 3 + 1 + 1 + String.length tag)
+  ) conns ([], 0) in
+  (* Base width: 3 (lpad) + 3 (DIO) + 3 + 2+dur + 3 + 4 + fng_digits ≈ 25–30 *)
+  let base_w = 3 + 3 + 3 + (2 + String.length (format_duration uptime))
+             + 3 + 4 + String.length (Printf.sprintf "%.0f" fng) in
+  I.hcat (
+    [ I.string a_header_bg (pad_right 3 " ");
+      I.string a_header_bg "DIO";
+      I.string A.(fg c_dim ++ bg c_panel) " │ ";
+      I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "UP %s" (format_duration uptime));
+      I.string A.(fg c_dim ++ bg c_panel) " │ ";
+      I.string A.(fg c_text ++ bg c_panel) "F&G ";
+      I.string A.(fg (if fng >= 60.0 then c_green
+                      else if fng >= 40.0 then c_yellow
+                      else c_red) ++ bg c_panel ++ st bold)
+               (Printf.sprintf "%.0f" fng);
+    ]
+    @ conn_imgs
+    @ [ I.string A.(bg c_panel) (String.make (max 0 (w - base_w - conn_w)) ' ') ]
+  )
 
 (* ── Panel: Connections ──────────────────────────────────────────── *)
 
