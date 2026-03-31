@@ -764,25 +764,26 @@ let render_wait_screen w h msg =
   write_frame_bytes buf
 
 let render_frame w h json =
-  (* Build the composite image — clamp to terminal dimensions so no   *)
-  (* row ever wraps (hsnap) and no content overflows below (vsnap).   *)
+  (* Clip each section individually to w to prevent line-wrap / scroll.  *)
+  (* render_strategies renders left_table (=w) + separator + summary, so *)
+  (* it is intentionally wider than w and must NOT be clipped globally.  *)
+  let clip img = I.hsnap ~align:`Left w img in
   let img =
     let sep = hline w in
     I.vcat [
-      render_header w json;
+      clip (render_header w json);
       sep;
-      render_memory w json;
+      clip (render_memory w json);
       sep;
       render_strategies w json;
       sep;
-      render_latencies w json;
+      clip (render_latencies w json);
       sep;
-      render_domains w json;
+      clip (render_domains w json);
       sep;
-      I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  refreshes every 500ms");
+      clip (I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  refreshes every 500ms"));
     ]
-    |> I.hsnap ~align:`Left w   (* prevent line-wrap → infinite scroll *)
-    |> I.vsnap ~align:`Top  h   (* clip / pad to exact terminal height  *)
+    |> I.vsnap ~align:`Top h
   in
   (* Collect the Notty output into a local buffer, then flush atomically *)
   let buf = Buffer.create 65536 in
