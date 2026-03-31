@@ -118,31 +118,33 @@ let truncate_string n s =
 
 (* ── Color palette ───────────────────────────────────────────────── *)
 
-let c_bg        = A.rgb_888 ~r:13  ~g:17  ~b:23
-let c_panel     = A.rgb_888 ~r:22  ~g:27  ~b:34
-let c_border    = A.rgb_888 ~r:48  ~g:54  ~b:61
-let c_title     = A.rgb_888 ~r:88  ~g:166 ~b:255
-let c_label     = A.rgb_888 ~r:125 ~g:133 ~b:144
-let c_text      = A.rgb_888 ~r:201 ~g:209 ~b:217
-let c_bright    = A.rgb_888 ~r:240 ~g:246 ~b:252
-let c_green     = A.rgb_888 ~r:63  ~g:185 ~b:80
-let c_red       = A.rgb_888 ~r:248 ~g:81  ~b:73
-let c_yellow    = A.rgb_888 ~r:210 ~g:153 ~b:34
-let c_cyan      = A.rgb_888 ~r:57  ~g:211 ~b:183
-let c_dim       = A.rgb_888 ~r:72  ~g:79  ~b:88
+let c_bg         = A.rgb_888 ~r:10  ~g:13  ~b:20
+let c_panel      = A.rgb_888 ~r:18  ~g:22  ~b:32
+let c_section_bg = A.rgb_888 ~r:24  ~g:30  ~b:44
+let c_border     = A.rgb_888 ~r:38  ~g:46  ~b:62
+let c_title      = A.rgb_888 ~r:99  ~g:179 ~b:255
+let c_accent     = A.rgb_888 ~r:139 ~g:92  ~b:246
+let c_label      = A.rgb_888 ~r:110 ~g:120 ~b:138
+let c_text       = A.rgb_888 ~r:195 ~g:204 ~b:218
+let c_bright     = A.rgb_888 ~r:240 ~g:246 ~b:252
+let c_green      = A.rgb_888 ~r:74  ~g:222 ~b:128
+let c_red        = A.rgb_888 ~r:248 ~g:81  ~b:73
+let c_yellow     = A.rgb_888 ~r:250 ~g:176 ~b:5
+let c_cyan       = A.rgb_888 ~r:34  ~g:211 ~b:238
+let c_dim        = A.rgb_888 ~r:55  ~g:63  ~b:78
 (* ── Attribute constructors ──────────────────────────────────────── *)
 
-let a_title     = A.(fg c_title  ++ bg c_bg   ++ st bold)
-let a_label     = A.(fg c_label  ++ bg c_bg)
-let a_text      = A.(fg c_text   ++ bg c_bg)
-let a_bright    = A.(fg c_bright ++ bg c_bg   ++ st bold)
-let a_green     = A.(fg c_green  ++ bg c_bg)
-let a_red       = A.(fg c_red    ++ bg c_bg)
-let a_yellow    = A.(fg c_yellow ++ bg c_bg)
-let a_cyan      = A.(fg c_cyan   ++ bg c_bg)
-let a_dim       = A.(fg c_dim    ++ bg c_bg)
-let a_border    = A.(fg c_border ++ bg c_bg)
-let a_header_bg = A.(fg c_bright ++ bg c_panel ++ st bold)
+let a_title      = A.(fg c_title  ++ bg c_bg         ++ st bold)
+let a_label      = A.(fg c_label  ++ bg c_bg)
+let a_text       = A.(fg c_text   ++ bg c_bg)
+let a_bright     = A.(fg c_bright ++ bg c_bg         ++ st bold)
+let a_green      = A.(fg c_green  ++ bg c_bg)
+let a_red        = A.(fg c_red    ++ bg c_bg)
+let a_yellow     = A.(fg c_yellow ++ bg c_bg)
+let a_cyan       = A.(fg c_cyan   ++ bg c_bg)
+let a_dim        = A.(fg c_dim    ++ bg c_bg)
+let a_border     = A.(fg c_border ++ bg c_bg)
+
 
 (* ── Drawing primitives ──────────────────────────────────────────── *)
 
@@ -165,6 +167,16 @@ let format_pct f =
   if abs_float f < 0.01 then "<0.01%"
   else if abs_float f >= 10.0 then Printf.sprintf "%.1f%%" f
   else Printf.sprintf "%.2f%%" f
+
+(* ── Drawing helpers ──────────────────────────────────────── *)
+
+let section_title w label =
+  let lbl = "  " ^ label ^ "  " in
+  let pad = max 0 (w - String.length lbl) in
+  I.hcat [
+    I.string A.(fg c_title ++ bg c_section_bg ++ st bold) lbl;
+    I.string A.(bg c_section_bg) (String.make pad ' ');
+  ]
 
 (* ── Panel: Header bar ───────────────────────────────────────────── *)
 
@@ -201,25 +213,28 @@ let render_header w json =
               else A.(fg c_red   ++ bg c_panel)
     in
     let seg = I.hcat [
-      I.string A.(fg c_dim ++ bg c_panel) " │ ";
-      I.string dot_attr "●";
+      I.string A.(fg c_dim ++ bg c_panel) "  │  ";
+      I.string dot_attr "◉";
       I.string A.(fg c_label ++ bg c_panel) (" " ^ tag);
     ] in
-    (seg :: imgs, w_acc + 3 + 1 + 1 + String.length tag)
+    (seg :: imgs, w_acc + 5 + 1 + 1 + String.length tag)
   ) exch_connected ([], 0) in
-  let base_w = 3 + 3 + 3 + (2 + String.length (format_duration uptime))
-             + 3 + 4 + String.length (Printf.sprintf "%.0f" fng) in
+  let dur_str = format_duration uptime in
+  let fng_str = Printf.sprintf "%.0f" fng in
+  let base_w = 2 + 3 + 8 + 3 + String.length dur_str
+             + 5 + 4 + String.length fng_str in
   I.hcat (
-    [ I.string a_header_bg (pad_right 3 " ");
-      I.string a_header_bg "Dio";
-      I.string A.(fg c_dim ++ bg c_panel) " │ ";
-      I.string A.(fg c_text ++ bg c_panel) (Printf.sprintf "up %s" (format_duration uptime));
-      I.string A.(fg c_dim ++ bg c_panel) " │ ";
-      I.string A.(fg c_text ++ bg c_panel) "f&g ";
+    [ I.string A.(bg c_panel) "  ";
+      I.string A.(fg c_accent ++ bg c_panel ++ st bold) "Dio";
+      I.string A.(fg c_dim ++ bg c_panel) "        │  ";
+      I.string A.(fg c_label ++ bg c_panel) "up ";
+      I.string A.(fg c_text ++ bg c_panel) dur_str;
+      I.string A.(fg c_dim ++ bg c_panel) "  │  ";
+      I.string A.(fg c_label ++ bg c_panel) "f&g ";
       I.string A.(fg (if fng >= 60.0 then c_green
                       else if fng >= 40.0 then c_yellow
                       else c_red) ++ bg c_panel ++ st bold)
-               (Printf.sprintf "%.0f" fng);
+               fng_str;
     ]
     @ conn_imgs
     @ [ I.string A.(bg c_panel) (String.make (max 0 (w - base_w - conn_w)) ' ') ]
@@ -266,7 +281,7 @@ let exch_tag_of = function
   | "kraken" -> "kr" | "hyperliquid" -> "hl"
   | e -> String.sub e 0 (min 2 (String.length e))
 
-let render_strategies _w json =
+let render_strategies w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
   let all_balances = json |?> "all_balances" |> to_list_d in
   (* Header row *)
@@ -554,55 +569,45 @@ let render_strategies _w json =
   ) 0.0 all_balances in
 
   (* Section title *)
-  let title = I.hcat [
-    I.string a_title " HOLDINGS & STRATEGY";
-    I.string a_dim (String.make (max 0 (125 - 22)) ' ');
-  ] in
+  let title = section_title w "HOLDINGS & STRATEGY" in
 
   (* Left main table: active → paused → inactive → quotes *)
   let left_table = I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows) in
 
   (* Right summary table for Hold Val and UP *)
-  let right_title = I.string a_title " SUMMARY" in
-  
-  let val_label = Printf.sprintf " %s " (format_price total_hold_val) in
-  let accum_val_label = Printf.sprintf " %s " (format_price total_accum_val) in
-  let up_label = Printf.sprintf " %s " (format_pnl total_up) in
-  let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_panel ++ st bold)
-                else A.(fg c_red ++ bg c_panel ++ st bold) in
-  
+  let right_title = I.string A.(fg c_title ++ bg c_section_bg ++ st bold) "  SUMMARY  " in
+
+  let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_bg ++ st bold)
+                else A.(fg c_red   ++ bg c_bg ++ st bold) in
+
+  let sum_row lbl value_s vattr =
+    I.vcat [
+      I.string A.(fg c_label ++ bg c_bg) ("  " ^ lbl);
+      I.string vattr ("  " ^ value_s);
+      I.string a_text " ";
+    ]
+  in
+
   let right_table = I.vcat [
     right_title;
     I.string a_text " ";
-    I.string a_label " Total Hold Val";
-    I.string A.(fg c_bright ++ bg c_panel ++ st bold) val_label;
-    I.string a_text " ";
-    I.string a_label " Total Accum Val";
-    I.string A.(fg c_bright ++ bg c_panel ++ st bold) accum_val_label;
-    I.string a_text " ";
-    I.string a_label " Total $ Value";
-    I.string A.(fg c_cyan ++ bg c_panel ++ st bold)
-      (Printf.sprintf " %s " (format_price total_quote_val));
-    I.string a_text " ";
-    I.string a_label " Total Sell Val";
-    I.string up_attr up_label;
+    sum_row "Total Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
+    sum_row "Total Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
+    sum_row "Total $ Value"   (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
+    sum_row "Total Sell Val"  (format_pnl   total_up)        up_attr;
   ] in
 
-  (* Assemble side by side *)
-  I.hcat [ left_table; I.string a_text "    "; right_table ]
+  (* Assemble side by side with subtle vertical separator *)
+  I.hcat [ left_table; I.string A.(fg c_border ++ bg c_bg) "  │  "; right_table ]
 
 (* ── Panel: Latencies ────────────────────────────────────────────── *)
 
 let render_latencies w json =
   let lats = match json |?> "latencies" with `Assoc l -> l | _ -> [] in
-  let title = I.hcat [
-    I.string a_title " LATENCY PROFILING";
-    I.string a_dim (String.make (max 0 (w - 25)) ' ');
-  ] in
-  (* Adaptive metric column: use more space when terminal is wide enough *)
+  let title = section_title w "LATENCY PROFILING" in
   let metric_w = if w >= 100 then 14 else 8 in
   let header = I.hcat [
-    I.string a_text " ";
+    I.string a_text "  ";
     col 14 a_label "DOMAIN";
     col metric_w a_label "METRIC";
     col 10 a_label "p50";
@@ -613,29 +618,33 @@ let render_latencies w json =
   ] in
   let rows = List.concat_map (fun (symbol, metrics) ->
     let mlist = match metrics with `Assoc l -> l | _ -> [] in
-    List.filter_map (fun (label, data) ->
-      let p50 = data |?> "p50" |> to_float_d 0.0 in
-      let p90 = data |?> "p90" |> to_float_d 0.0 in
-      let p99 = data |?> "p99" |> to_float_d 0.0 in
-      let p999 = data |?> "p999" |> to_float_d 0.0 in
+    List.map (fun (label, data) ->
+      let p50     = data |?> "p50"     |> to_float_d 0.0 in
+      let p90     = data |?> "p90"     |> to_float_d 0.0 in
+      let p99     = data |?> "p99"     |> to_float_d 0.0 in
+      let p999    = data |?> "p999"    |> to_float_d 0.0 in
       let samples = data |?> "samples" |> to_int_d 0 in
-      if samples = 0 then None
-      else
-        let p99_attr =
-          if p99 > 5000.0 then a_red
-          else if p99 > 1000.0 then a_yellow
-          else a_text
-        in
-        Some (I.hcat [
-          I.string a_text " ";
-          col 14 a_bright (truncate_string 13 symbol);
-          col metric_w a_cyan (truncate_string (metric_w - 1) label);
-          col 10 a_text (format_latency_us p50);
-          col 10 a_text (format_latency_us p90);
-          col 10 p99_attr (format_latency_us p99);
-          col 10 (if p999 > 5000.0 then a_red else a_text) (format_latency_us p999);
-          col 10 a_dim (string_of_int samples);
-        ])
+      let empty   = samples = 0 in
+      let p99_attr =
+        if empty             then a_dim
+        else if p99 > 5000.0 then a_red
+        else if p99 > 1000.0 then a_yellow
+        else a_text
+      in
+      let lat_col attr f =
+        if empty then col 10 a_dim "--"
+        else col 10 attr (format_latency_us f)
+      in
+      I.hcat [
+        I.string a_text "  ";
+        col 14 (if empty then a_dim else a_bright) (truncate_string 13 symbol);
+        col metric_w (if empty then a_dim else a_cyan) (truncate_string (metric_w - 1) label);
+        lat_col a_text p50;
+        lat_col a_text p90;
+        lat_col p99_attr p99;
+        lat_col (if p999 > 5000.0 && not empty then a_red else a_text) p999;
+        col 10 a_dim (if empty then "--" else string_of_int samples);
+      ]
     ) mlist
   ) lats in
   if rows = [] then
@@ -647,102 +656,116 @@ let render_latencies w json =
 
 let render_memory w json =
   let mem = json |?> "memory" in
-  let title = I.hcat [
-    I.string a_title " MEMORY & GC";
-    I.string a_dim (String.make (max 0 (w - 14)) ' ');
-  ] in
-  let heap = mem |?> "heap_mb" |> to_int_d 0 in
-  let live = mem |?> "live_kb" |> to_int_d 0 in
-  let free = mem |?> "free_kb" |> to_int_d 0 in
-  let major = mem |?> "gc_major" |> to_int_d 0 in
-  let minor = mem |?> "gc_minor" |> to_int_d 0 in
+  let title = section_title w "MEMORY & GC" in
+  let heap    = mem |?> "heap_mb"     |> to_int_d 0 in
+  let live    = mem |?> "live_kb"     |> to_int_d 0 in
+  let free    = mem |?> "free_kb"     |> to_int_d 0 in
+  let major   = mem |?> "gc_major"    |> to_int_d 0 in
+  let minor   = mem |?> "gc_minor"    |> to_int_d 0 in
   let compact = mem |?> "compactions" |> to_int_d 0 in
-  let frags = mem |?> "fragments" |> to_int_d 0 in
-  let chunks = mem |?> "heap_chunks" |> to_int_d 0 in
-  let row = I.hcat [
-    I.string a_text " ";
-    I.string a_label "heap "; I.string a_text (Printf.sprintf "%dMB" heap); spacer; spacer;
-    I.string a_label "live "; I.string a_text (Printf.sprintf "%dKB" live); spacer; spacer;
-    I.string a_label "free "; I.string a_text (Printf.sprintf "%dKB" free); spacer; spacer;
-    I.string a_label "major "; I.string a_text (string_of_int major); spacer; spacer;
-    I.string a_label "minor "; I.string a_text (string_of_int minor); spacer; spacer;
-    I.string a_label "compact "; I.string a_text (string_of_int compact); spacer; spacer;
-    I.string a_label "frag "; I.string a_text (string_of_int frags); spacer; spacer;
-    I.string a_label "chunks "; I.string a_text (string_of_int chunks);
-    I.string a_dim (String.make (max 0 (w - 100)) ' ');
+  let frags   = mem |?> "fragments"   |> to_int_d 0 in
+  let chunks  = mem |?> "heap_chunks" |> to_int_d 0 in
+  let kv lbl v =
+    I.hcat [
+      I.string A.(fg c_label  ++ bg c_bg) (Printf.sprintf "  %-9s" lbl);
+      I.string A.(fg c_bright ++ bg c_bg) (Printf.sprintf "%-12s" v);
+    ]
+  in
+  let col1 = I.vcat [
+    kv "heap"    (Printf.sprintf "%dMB" heap);
+    kv "live"    (Printf.sprintf "%dKB" live);
+    kv "free"    (Printf.sprintf "%dKB" free);
+    kv "frag"    (string_of_int frags);
   ] in
-  I.vcat [title; row]
+  let col2 = I.vcat [
+    kv "major"   (string_of_int major);
+    kv "minor"   (string_of_int minor);
+    kv "compact" (string_of_int compact);
+    kv "chunks"  (string_of_int chunks);
+  ] in
+  let grid = I.hcat [col1; col2; I.string a_text (String.make (max 0 (w - 44)) ' ')] in
+  I.vcat [title; grid]
 
 (* ── Panel: Domains ──────────────────────────────────────────────── *)
 
 let render_domains w json =
   let now = Unix.gettimeofday () in
   let doms = json |?> "domains" |> to_list_d in
-  let title = I.hcat [
-    I.string a_title " DOMAINS";
-    I.string a_dim (String.make (max 0 (w - 10)) ' ');
-  ] in
+  let title = section_title w "DOMAINS" in
   let rows = List.map (fun d ->
-    let key = d |?> "key" |> to_string_d "?" in
-    let running = d |?> "running" |> to_bool_d false in
-    let restarts = d |?> "restart_count" |> to_int_d 0 in
-    let last_restart = d |?> "last_restart" |> to_float_d 0.0 in
+    let key          = d |?> "key"           |> to_string_d "?" in
+    let running      = d |?> "running"        |> to_bool_d false in
+    let restarts     = d |?> "restart_count"  |> to_int_d 0 in
+    let last_restart = d |?> "last_restart"   |> to_float_d 0.0 in
+    let ago_secs     = if last_restart > 0.0 then now -. last_restart else -1.0 in
     let ago_str =
-      if last_restart > 0.0 then
-        let secs = now -. last_restart in
-        if secs < 5.0 then "just now"
-        else format_duration secs ^ " ago"
-      else "--"
+      if ago_secs < 0.0      then "--"
+      else if ago_secs < 5.0 then "just now"
+      else format_duration ago_secs ^ " ago"
+    in
+    let recent = ago_secs >= 0.0 && ago_secs < 30.0 in
+    let restart_attr =
+      if restarts = 0 then a_dim
+      else if recent  then a_red
+      else a_yellow
     in
     I.hcat [
-      I.string a_text " ";
-      I.string (if running then a_green else a_red) (if running then ">" else "x"); spacer;
-      col 28 a_text (truncate_string 27 key); spacer;
-      I.string a_label "restarts:";
-      I.string (if restarts > 0 then a_yellow else a_dim) (string_of_int restarts);
-      I.string a_dim "  last:";
-      col (max 0 (w - 53)) (if restarts > 0 then a_yellow else a_dim) ago_str;
+      I.string a_text "  ";
+      I.string (if running then a_green else a_red) (if running then "\xe2\x96\xb6" else "\xe2\x96\xa0");
+      I.string a_text "  ";
+      col 30 (if running then a_text else a_dim) (truncate_string 29 key);
+      I.string a_label "restarts: ";
+      col 3 (if restarts > 0 then a_yellow else a_dim) (string_of_int restarts);
+      I.string a_dim "  last: ";
+      col (max 0 (w - 60)) restart_attr ago_str;
     ]
   ) doms in
   I.vcat (title :: rows)
 
 (* ── Full render ─────────────────────────────────────────────────── *)
 
-(* ── Pipe-buffered rendering for atomic frame writes ─────────────── *)
+(* ── Buffer-backed rendering for atomic frame writes ─────────────── *)
+(* We render into a Buffer via a custom out_channel, then write the   *)
+(* entire frame to stdout in one shot.  This avoids the non-blocking  *)
+(* pipe drain race that caused partial / overlapping frames.          *)
 
-let render_pipe_r, render_pipe_w = Unix.pipe ()
-let render_oc = Unix.out_channel_of_descr render_pipe_w
-let () = Unix.set_nonblock render_pipe_r
-
-let write_frame frame =
-  let len = String.length frame in
+let write_frame_bytes (buf : Buffer.t) =
+  let s   = Buffer.contents buf in
+  let len = String.length s in
   let rec write_all off remaining =
-    if remaining > 0 then
-      let n = Unix.write_substring Unix.stdout frame off remaining in
+    if remaining > 0 then begin
+      let n = Unix.write_substring Unix.stdout s off remaining in
       write_all (off + n) (remaining - n)
+    end
   in
   write_all 0 len
 
 let render_wait_screen w h msg =
   let img = I.string A.(fg c_yellow ++ bg c_bg) msg in
-  output_string render_oc "\027[?2026h";
-  output_string render_oc "\027[H";
-  Notty_unix.output_image ~cap:Cap.ansi ~fd:render_oc (I.vsnap h (I.hsnap w img));
-  output_string render_oc "\027[J";
-  output_string render_oc "\027[?2026l";
-  flush render_oc;
-  let buf = Buffer.create 1024 in
-  let tmp = Bytes.create 4096 in
+  let buf  = Buffer.create 4096 in
+  let (pr, pw) = Unix.pipe () in
+  let oc   = Unix.out_channel_of_descr pw in
+  output_string oc "\027[?2026h";
+  output_string oc "\027[H";
+  Notty_unix.output_image ~cap:Cap.ansi ~fd:oc (I.vsnap h (I.hsnap w img));
+  output_string oc "\027[J";
+  output_string oc "\027[?2026l";
+  flush oc;
+  Unix.close pw;
+  let tmp = Bytes.create 8192 in
   (try
     while true do
-      let n = Unix.read render_pipe_r tmp 0 4096 in
+      let n = Unix.read pr tmp 0 8192 in
       if n = 0 then raise Exit;
       Buffer.add_subbytes buf tmp 0 n
     done
   with _ -> ());
-  write_frame (Buffer.contents buf)
+  Unix.close pr;
+  write_frame_bytes buf
 
 let render_frame w h json =
+  (* Build the composite image — clamp to terminal dimensions so no   *)
+  (* row ever wraps (hsnap) and no content overflows below (vsnap).   *)
   let img =
     let sep = hline w in
     I.vcat [
@@ -756,29 +779,34 @@ let render_frame w h json =
       sep;
       render_domains w json;
       sep;
-      I.hcat [
-        I.string A.(fg c_dim ++ bg c_panel) (pad_right w "  q: quit  │  refreshes every 500ms");
-      ];
+      I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  refreshes every 500ms");
     ]
+    |> I.hsnap ~align:`Left w   (* prevent line-wrap → infinite scroll *)
+    |> I.vsnap ~align:`Top  h   (* clip / pad to exact terminal height  *)
   in
-  (* Render image to pipe via Notty, wrapped in synchronized output markers *)
-  output_string render_oc "\027[?2026h";  (* begin synchronized update *)
-  output_string render_oc "\027[H";      (* cursor home *)
-  Notty_unix.output_image ~cap:Cap.ansi ~fd:render_oc (I.vsnap h img);
-  output_string render_oc "\027[J";      (* clear to end of screen *)
-  output_string render_oc "\027[?2026l";  (* end synchronized update *)
-  flush render_oc;
-  (* Read entire rendered frame from pipe *)
-  let buf = Buffer.create 16384 in
+  (* Collect the Notty output into a local buffer, then flush atomically *)
+  let buf = Buffer.create 65536 in
+  let (pr, pw) = Unix.pipe () in
+  let oc = Unix.out_channel_of_descr pw in
+  output_string oc "\027[?2026h";   (* begin synchronized update *)
+  output_string oc "\027[H";        (* cursor home                *)
+  Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
+  output_string oc "\027[J";        (* clear to end of screen     *)
+  output_string oc "\027[?2026l";   (* end synchronized update    *)
+  flush oc;
+  Unix.close pw;                     (* EOF signals end of frame   *)
   let tmp = Bytes.create 8192 in
   (try
     while true do
-      let n = Unix.read render_pipe_r tmp 0 8192 in
+      let n = Unix.read pr tmp 0 8192 in
       if n = 0 then raise Exit;
       Buffer.add_subbytes buf tmp 0 n
     done
   with _ -> ());
-  Buffer.contents buf
+  Unix.close pr;
+  (* Single atomic write to stdout *)
+  write_frame_bytes buf;
+  Buffer.contents buf (* return for compatibility with call-site *)
 
 (* ── Main loop ───────────────────────────────────────────────────── *)
 
@@ -924,14 +952,8 @@ let () =
           | Some (w, h) -> (w, h)
           | None -> (80, 24)
         in
-        let frame = render_frame w h !last_json in
-        let len = String.length frame in
-        let rec write_all off remaining =
-          if remaining > 0 then
-            let n = Unix.write_substring Unix.stdout frame off remaining in
-            write_all (off + n) (remaining - n)
-        in
-        write_all 0 len
+        (* render_frame now does its own atomic write; return value unused *)
+        ignore (render_frame w h !last_json)
       end
     done;
     (* If we lost the connection (not a deliberate quit), try to reconnect *)
