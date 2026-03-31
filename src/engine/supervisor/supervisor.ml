@@ -1476,12 +1476,68 @@ let order_processing_loop () =
   in
   Lwt.async loop
 
+(** Periodically check for non-active assets with balances and subscribe their tickers *)
+let monitor_non_active_assets () =
+  let rec loop () =
+    if Atomic.get shutdown_requested then Lwt.return_unit
+    else
+      (* Yield and wait 10 seconds between checks *)
+      Lwt_unix.sleep 10.0 >>= fun () ->
+      if Atomic.get shutdown_requested then Lwt.return_unit else begin
+        let config = Dio_engine.Config.read_config () in
+        let configured_symbols = List.map (fun (tc : Dio_engine.Config.trading_config) ->
+          (tc.exchange, tc.symbol)
+        ) config.trading in
+        
+        let exchange_names = List.sort_uniq String.compare
+          (List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading) in
+          
+        Lwt_list.iter_s (fun exch_name ->
+          match Dio_exchange.Exchange_intf.Registry.get exch_name with
+          | None -> Lwt.return_unit
+          | Some (module Ex) ->
+              let balances = Ex.get_all_balances () in
+              Lwt_list.iter_s (fun (asset, bal) ->
+                if bal > 0.0 then begin
+                  let quote = match exch_name with
+                    | "hyperliquid" -> "USDC"
+                    | _ -> "USD"
+                  in
+                  let symbol = asset ^ "/" ^ quote in
+                  let is_configured = List.exists (fun (ex, sym) ->
+                    ex = exch_name && sym = symbol
+                  ) configured_symbols in
+                  
+                  let is_fiat_or_stable = 
+                    (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || 
+                    (asset = "USDT") || (asset = quote) || (asset = "USDe")
+                  in
+                  
+                  if not is_configured && not is_fiat_or_stable then begin
+                    match Ex.get_ticker ~symbol with
+                    | None ->
+                        (* Ticker missing for non-active asset with balance > 0, subscribe! *)
+                        Logging.info_f ~section "Balance found for non-active %s on %s, subscribing to ticker" symbol exch_name;
+                        Ex.subscribe_ticker ~symbol
+                    | Some _ -> Lwt.return_unit
+                  end else Lwt.return_unit
+                end else Lwt.return_unit
+              ) balances
+        ) exchange_names >>= fun () ->
+        loop ()
+      end
+  in
+  Lwt.async loop
+
 (** Start the supervisor monitoring thread and initialize all feeds *)
 let start_monitoring () =
   Logging.info ~section "Starting connection supervisor";
 
   (* Start the monitoring thread first *)
   monitor_loop ();
+
+  (* Start the non-active assets monitor *)
+  monitor_non_active_assets ();
 
   (* Start the order processing thread *)
   order_processing_loop ();

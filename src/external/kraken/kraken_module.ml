@@ -177,6 +177,9 @@ module Kraken_impl = struct
     | Some t -> Some (t.bid, t.ask)
     | None -> None
 
+  let subscribe_ticker ~symbol =
+    Kraken_ticker_feed.subscribe_ticker symbol
+
   let get_top_of_book ~symbol =
     match Kraken_orderbook_feed.get_best_bid_ask symbol with
     | Some (bp, bs, ap, as_val) -> 

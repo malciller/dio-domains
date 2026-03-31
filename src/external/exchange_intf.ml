@@ -154,6 +154,9 @@ module type S = sig
   (** Get current ticker (Best Bid, Best Ask) *)
   val get_ticker : symbol:string -> (float * float) option
 
+  (** Subscribe to ticker for a symbol dynamically *)
+  val subscribe_ticker : symbol:string -> unit Lwt.t
+
   (** Get top of orderbook (Bid Price, Bid Size, Ask Price, Ask Size) *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
 

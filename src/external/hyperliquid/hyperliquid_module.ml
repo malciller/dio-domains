@@ -253,6 +253,11 @@ module Hyperliquid_impl = struct
     | Some t -> Some (t.bid, t.ask)
     | None -> None
 
+  let subscribe_ticker ~symbol =
+    let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
+    Logging.info_f ~section "Dynamically subscribing to l2Book for %s (coin=%s)" symbol coin;
+    Hyperliquid_ws.subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String coin)])])
+
   let get_top_of_book ~symbol =
     match Hyperliquid_orderbook_feed.get_best_bid_ask symbol with
     | Some (bp, bs, ap, as_val) -> Some (bp, bs, ap, as_val)

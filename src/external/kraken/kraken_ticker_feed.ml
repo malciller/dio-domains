@@ -168,8 +168,31 @@ let handle_message message on_heartbeat =
       (Printexc.to_string exn) message
 
 
+(** Active WebSocket connection *)
+let active_conn = ref None
+
+(** Dynamically subscribe to a ticker feed for a symbol *)
+let subscribe_ticker symbol =
+  match !active_conn with
+  | Some conn ->
+      let _ = ensure_store symbol in
+      let subscribe_msg = `Assoc [
+        ("method", `String "subscribe");
+        ("params", `Assoc [
+          ("channel", `String "ticker");
+          ("symbol", `List [`String symbol])
+        ])
+      ] in
+      let msg_str = Yojson.Safe.to_string subscribe_msg in
+      Logging.info_f ~section "Dynamically subscribing to %s ticker feed" symbol;
+      Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
+  | None ->
+      Logging.warn_f ~section "Cannot dynamically subscribe to %s: ticker WS not connected" symbol;
+      Lwt.return_unit
+
 (** Message handling loop - runs in background *)
 let start_message_handler conn symbols on_failure on_heartbeat =
+  active_conn := Some conn;
   (* Subscribe to ticker for all symbols *)
   let subscribe_msg = `Assoc [
     ("method", `String "subscribe");
@@ -188,6 +211,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
       Websocket_lwt_unix.read conn >>= function
       | {Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _} ->
           Logging.warn ~section "WebSocket connection closed by server";
+          active_conn := None;
           on_failure "Connection closed by server";
           Lwt.wakeup_later done_u ();
           Lwt.return_unit
@@ -198,11 +222,13 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     ) (function
       | End_of_file ->
           Logging.warn ~section "Ticker WebSocket connection closed unexpectedly (End_of_file)";
+          active_conn := None;
           on_failure "Connection closed unexpectedly (End_of_file)";
           Lwt.wakeup_later done_u ();
           Lwt.return_unit
       | exn ->
           Logging.error_f ~section "Ticker WebSocket error during read: %s" (Printexc.to_string exn);
+          active_conn := None;
           on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
           Lwt.wakeup_later done_u ();
           Lwt.return_unit
