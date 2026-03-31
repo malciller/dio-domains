@@ -571,34 +571,34 @@ let render_strategies w json =
   (* Section title *)
   let title = section_title w "HOLDINGS & STRATEGY" in
 
-  (* Left main table: active → paused → inactive → quotes *)
-  let left_table = I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows) in
+  (* Main table: active → paused → inactive → quotes *)
+  let main_table = I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows) in
 
-  (* Right summary table for Hold Val and UP *)
-  let right_title = I.string A.(fg c_title ++ bg c_section_bg ++ st bold) "  SUMMARY  " in
-
+  (* Summary footer rendered as a horizontal bar below the table, within w *)
   let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_bg ++ st bold)
                 else A.(fg c_red   ++ bg c_bg ++ st bold) in
-
-  let sum_row lbl value_s vattr =
-    I.vcat [
-      I.string A.(fg c_label ++ bg c_bg) ("  " ^ lbl);
-      I.string vattr ("  " ^ value_s);
-      I.string a_text " ";
+  let pipe = I.string A.(fg c_border ++ bg c_bg) "  │  " in
+  let kv lbl value_s vattr =
+    I.hcat [
+      I.string A.(fg c_label ++ bg c_bg) ("  " ^ lbl ^ ": ");
+      I.string vattr value_s;
     ]
   in
-
-  let right_table = I.vcat [
-    right_title;
-    I.string a_text " ";
-    sum_row "Total Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
-    sum_row "Total Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
-    sum_row "Total $ Value"   (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
-    sum_row "Total Sell Val"  (format_pnl   total_up)        up_attr;
+  let summary_bar = I.hcat [
+    kv "Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
+    pipe;
+    kv "Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
+    pipe;
+    kv "Cash"      (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
+    pipe;
+    kv "Sell Val"  (format_pnl   total_up)        up_attr;
+  ] in
+  let summary_section = I.vcat [
+    I.string A.(fg c_title ++ bg c_section_bg ++ st bold) (pad_right w "  SUMMARY");
+    summary_bar;
   ] in
 
-  (* Assemble side by side with subtle vertical separator *)
-  I.hcat [ left_table; I.string A.(fg c_border ++ bg c_bg) "  │  "; right_table ]
+  I.vcat [ main_table; summary_section ]
 
 (* ── Panel: Latencies ────────────────────────────────────────────── *)
 
@@ -724,90 +724,75 @@ let render_domains w json =
 
 (* ── Full render ─────────────────────────────────────────────────── *)
 
-(* ── Buffer-backed rendering for atomic frame writes ─────────────── *)
-(* We render into a Buffer via a custom out_channel, then write the   *)
-(* entire frame to stdout in one shot.  This avoids the non-blocking  *)
-(* pipe drain race that caused partial / overlapping frames.          *)
+(* ── Pipe-buffered rendering for atomic frame writes ─────────────── *)
 
-let write_frame_bytes (buf : Buffer.t) =
-  let s   = Buffer.contents buf in
-  let len = String.length s in
+let render_pipe_r, render_pipe_w = Unix.pipe ()
+let render_oc = Unix.out_channel_of_descr render_pipe_w
+let () = Unix.set_nonblock render_pipe_r
+
+let write_frame frame =
+  let len = String.length frame in
   let rec write_all off remaining =
-    if remaining > 0 then begin
-      let n = Unix.write_substring Unix.stdout s off remaining in
+    if remaining > 0 then
+      let n = Unix.write_substring Unix.stdout frame off remaining in
       write_all (off + n) (remaining - n)
-    end
   in
   write_all 0 len
 
 let render_wait_screen w h msg =
   let img = I.string A.(fg c_yellow ++ bg c_bg) msg in
-  let buf  = Buffer.create 4096 in
-  let (pr, pw) = Unix.pipe () in
-  let oc   = Unix.out_channel_of_descr pw in
-  output_string oc "\027[?2026h";
-  output_string oc "\027[H";
-  Notty_unix.output_image ~cap:Cap.ansi ~fd:oc (I.vsnap h (I.hsnap w img));
-  output_string oc "\027[J";
-  output_string oc "\027[?2026l";
-  flush oc;
-  Unix.close pw;
-  let tmp = Bytes.create 8192 in
+  output_string render_oc "\027[?2026h";
+  output_string render_oc "\027[H";
+  Notty_unix.output_image ~cap:Cap.ansi ~fd:render_oc (I.vsnap h (I.hsnap w img));
+  output_string render_oc "\027[J";
+  output_string render_oc "\027[?2026l";
+  flush render_oc;
+  let buf = Buffer.create 1024 in
+  let tmp = Bytes.create 4096 in
   (try
     while true do
-      let n = Unix.read pr tmp 0 8192 in
+      let n = Unix.read render_pipe_r tmp 0 4096 in
       if n = 0 then raise Exit;
       Buffer.add_subbytes buf tmp 0 n
     done
   with _ -> ());
-  Unix.close pr;
-  write_frame_bytes buf
+  write_frame (Buffer.contents buf)
 
 let render_frame w h json =
-  (* Clip each section individually to w to prevent line-wrap / scroll.  *)
-  (* render_strategies renders left_table (=w) + separator + summary, so *)
-  (* it is intentionally wider than w and must NOT be clipped globally.  *)
-  let clip img = I.hsnap ~align:`Left w img in
   let img =
     let sep = hline w in
     I.vcat [
-      clip (render_header w json);
+      render_header w json;
       sep;
-      clip (render_memory w json);
+      render_memory w json;
       sep;
       render_strategies w json;
       sep;
-      clip (render_latencies w json);
+      render_latencies w json;
       sep;
-      clip (render_domains w json);
+      render_domains w json;
       sep;
-      clip (I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  refreshes every 500ms"));
+      I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  refreshes every 500ms");
     ]
-    |> I.vsnap ~align:`Top h
   in
-  (* Collect the Notty output into a local buffer, then flush atomically *)
-  let buf = Buffer.create 65536 in
-  let (pr, pw) = Unix.pipe () in
-  let oc = Unix.out_channel_of_descr pw in
-  output_string oc "\027[?2026h";   (* begin synchronized update *)
-  output_string oc "\027[H";        (* cursor home                *)
-  Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
-  output_string oc "\027[J";        (* clear to end of screen     *)
-  output_string oc "\027[?2026l";   (* end synchronized update    *)
-  flush oc;
-  Unix.close pw;                     (* EOF signals end of frame   *)
+  (* Render image to pipe via Notty, wrapped in synchronized output markers *)
+  output_string render_oc "\027[?2026h";  (* begin synchronized update *)
+  output_string render_oc "\027[H";      (* cursor home *)
+  Notty_unix.output_image ~cap:Cap.ansi ~fd:render_oc (I.vsnap h img);
+  output_string render_oc "\027[J";      (* clear to end of screen *)
+  output_string render_oc "\027[?2026l";  (* end synchronized update *)
+  flush render_oc;
+  (* Read entire rendered frame from pipe *)
+  let buf = Buffer.create 16384 in
   let tmp = Bytes.create 8192 in
   (try
     while true do
-      let n = Unix.read pr tmp 0 8192 in
+      let n = Unix.read render_pipe_r tmp 0 8192 in
       if n = 0 then raise Exit;
       Buffer.add_subbytes buf tmp 0 n
     done
   with _ -> ());
-  Unix.close pr;
-  (* Single atomic write to stdout *)
-  write_frame_bytes buf;
-  Buffer.contents buf (* return for compatibility with call-site *)
+  Buffer.contents buf
 
 (* ── Main loop ───────────────────────────────────────────────────── *)
 
@@ -953,8 +938,14 @@ let () =
           | Some (w, h) -> (w, h)
           | None -> (80, 24)
         in
-        (* render_frame now does its own atomic write; return value unused *)
-        ignore (render_frame w h !last_json)
+        let frame = render_frame w h !last_json in
+        let len = String.length frame in
+        let rec write_all off remaining =
+          if remaining > 0 then
+            let n = Unix.write_substring Unix.stdout frame off remaining in
+            write_all (off + n) (remaining - n)
+        in
+        write_all 0 len
       end
     done;
     (* If we lost the connection (not a deliberate quit), try to reconnect *)
