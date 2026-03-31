@@ -323,7 +323,7 @@ let render_strategies _w json =
       I.string a_text " ";
       col 14 a_bright (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
       col 5 a_cyan (truncate_string 4 stype);
-      col 3 status_attr status_str;
+      I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
       col 12 a_text (if mid > 0.0 then format_price mid else "--");
       col 12 a_text (if base_bal > 0.0 then format_qty base_bal else "0");
       col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
@@ -419,7 +419,7 @@ let render_strategies _w json =
         I.string a_text " ";
         col 14 a_dim (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
         col 5 a_dim "--";
-        col 3 status_attr status_str;
+        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
         col 12 a_text (if mid > 0.0 then format_price mid else "--");
         col 12 a_text (format_qty balance);
         col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
