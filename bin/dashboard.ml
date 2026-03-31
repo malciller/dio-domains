@@ -235,6 +235,8 @@ let render_strategies _w json =
     col 12 a_label "PRICE";
     col 12 a_label "HOLDING";
     col 10 a_label "HOLD VAL";
+    col 12 a_label "ACCUM QTY";
+    col 10 a_label "ACCUM VAL";
     col 12 a_label "BUY @";
     col 8 a_label "Δ BUY";
     col 6 a_label "SELLS";
@@ -265,13 +267,17 @@ let render_strategies _w json =
     let _grid_qty = strat |?> "grid_qty" |> to_float_d 0.0 in
 
     (* Unrealized profit: sum of mark proceeds for all pending sells *)
+    (* Unrealized profit and accumulated holdings from pending sells *)
     let sell_orders = strat |?> "sell_orders" |> to_list_d in
-    let unrealized_profit = List.fold_left (fun acc s ->
+    let unrealized_profit, pending_sell_qty = List.fold_left (fun (up, qty_acc) s ->
       let sp = s |?> "price" |> to_float_d 0.0 in
       let sq = s |?> "qty" |> to_float_d 0.0 in
-      if sp > 0.0 && sq > 0.0 then acc +. (sp *. sq)
-      else acc
-    ) 0.0 sell_orders in
+      if sp > 0.0 && sq > 0.0 then (up +. (sp *. sq), qty_acc +. sq)
+      else (up, qty_acc)
+    ) (0.0, 0.0) sell_orders in
+    
+    let accum_holding = max 0.0 (base_bal -. pending_sell_qty) in
+    let accum_hold_value = accum_holding *. mid in
 
     (* Distance to pending buy order — only when strategy is active (not paused) *)
     let buy_dist_pct =
@@ -331,6 +337,8 @@ let render_strategies _w json =
       col 12 a_text (if mid > 0.0 then format_price mid else "--");
       col 12 a_text (if base_bal > 0.0 then format_qty base_bal else "0");
       col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
+      col 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+      col 10 a_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
       col 12 (if buy_price > 0.0 then a_green else a_dim)
         (if buy_price > 0.0 then format_price buy_price else "--");
       col 8 buy_dist_attr buy_dist_str;
@@ -379,13 +387,18 @@ let render_strategies _w json =
       let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
       let sell_count = bal_json |?> "sell_count" |> to_int_d 0 in
 
-      (* Unrealized profit from pending sells *)
-      let unrealized_profit = List.fold_left (fun acc s ->
+      (* Unrealized profit and accumulated holdings from pending sells *)
+      let unrealized_profit, pending_sell_qty = List.fold_left (fun (up, qty_acc) s ->
         let sp = s |?> "price" |> to_float_d 0.0 in
         let sq = s |?> "qty" |> to_float_d 0.0 in
-        if sp > 0.0 && sq > 0.0 then acc +. (sp *. sq)
-        else acc
-      ) 0.0 sell_orders in
+        if sp > 0.0 && sq > 0.0 then (up +. (sp *. sq), qty_acc +. sq)
+        else (up, qty_acc)
+      ) (0.0, 0.0) sell_orders in
+      
+      let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
+      
+      let accum_holding = if is_quote then 0.0 else max 0.0 (balance -. pending_sell_qty) in
+      let accum_hold_value = accum_holding *. mid in
 
       (* Distance to closest sell order *)
       let closest_sell_dist_pct =
@@ -408,7 +421,6 @@ let render_strategies _w json =
             format_pct d, attr
       in
 
-      let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" in
       let status_str, status_attr =
         if is_quote then "$", a_green
         else "⏹", a_red
@@ -421,6 +433,8 @@ let render_strategies _w json =
         col 12 a_text (if mid > 0.0 then format_price mid else "--");
         col 12 a_text (format_qty balance);
         col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
+        col 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+        col 10 a_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
         col 12 a_dim "--";
         col 8 a_dim "--";
         col 6 (if sell_count > 0 then a_yellow else a_dim)
@@ -439,7 +453,7 @@ let render_strategies _w json =
   let quote_rows = List.filter_map (fun (is_q, img) -> if is_q then Some img else None) non_strategy_rows in
 
   (* Compute total unrealized profit and hold value across strategies *)
-  let total_up_strats, total_hold_strats = List.fold_left (fun (up_acc, hold_acc) (_symbol, data) ->
+  let total_up_strats, total_hold_strats, total_accum_val_strats = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) (_symbol, data) ->
     let strat = data |?> "strategy" in
     let market = data |?> "market" in
     
@@ -451,40 +465,50 @@ let render_strategies _w json =
     
     (* Calc UP *)
     let sell_orders = strat |?> "sell_orders" |> to_list_d in
-    let strat_up = List.fold_left (fun a s ->
+    let strat_up, pending_sell_qty = List.fold_left (fun (a, q_acc) s ->
       let sp = s |?> "price" |> to_float_d 0.0 in
       let sq = s |?> "qty" |> to_float_d 0.0 in
-      if sp > 0.0 && sq > 0.0 then a +. (sp *. sq) else a
-    ) 0.0 sell_orders in
+      if sp > 0.0 && sq > 0.0 then (a +. (sp *. sq), q_acc +. sq) else (a, q_acc)
+    ) (0.0, 0.0) sell_orders in
     
-    (up_acc +. strat_up, hold_acc +. (base_bal *. mid))
-  ) (0.0, 0.0) strats in
+    let accum_holding = max 0.0 (base_bal -. pending_sell_qty) in
+    let accum_hold_value = accum_holding *. mid in
+    
+    (up_acc +. strat_up, hold_acc +. (base_bal *. mid), accum_val_acc +. accum_hold_value)
+  ) (0.0, 0.0, 0.0) strats in
 
   (* Add non-strategy unrealized profit and hold value *)
-  let total_up_bals, total_hold_bals = List.fold_left (fun (up_acc, hold_acc) bal_json ->
+  let total_up_bals, total_hold_bals, total_accum_val_bals = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) bal_json ->
     let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-    if balance <= 0.0 then (up_acc, hold_acc) else
+    let asset = bal_json |?> "asset" |> to_string_d "?" in
+    if balance <= 0.0 then (up_acc, hold_acc, accum_val_acc) else
     let bid = bal_json |?> "bid" |> to_float_d 0.0 in
     let ask = bal_json |?> "ask" |> to_float_d 0.0 in
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else (max bid ask) in
     
+    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
+    
     let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
-    let bal_up = List.fold_left (fun a s ->
+    let bal_up, pending_sell_qty = List.fold_left (fun (a, q_acc) s ->
       let sp = s |?> "price" |> to_float_d 0.0 in
       let sq = s |?> "qty" |> to_float_d 0.0 in
-      if sp > 0.0 && sq > 0.0 then a +. (sp *. sq) else a
-    ) 0.0 sell_orders in
+      if sp > 0.0 && sq > 0.0 then (a +. (sp *. sq), q_acc +. sq) else (a, q_acc)
+    ) (0.0, 0.0) sell_orders in
     
-    (up_acc +. bal_up, hold_acc +. (balance *. mid))
-  ) (0.0, 0.0) all_balances in
+    let accum_holding = if is_quote then 0.0 else max 0.0 (balance -. pending_sell_qty) in
+    let accum_hold_value = accum_holding *. mid in
+    
+    (up_acc +. bal_up, hold_acc +. (balance *. mid), accum_val_acc +. accum_hold_value)
+  ) (0.0, 0.0, 0.0) all_balances in
   
   let total_up = total_up_strats +. total_up_bals in
   let total_hold_val = total_hold_strats +. total_hold_bals in
+  let total_accum_val = total_accum_val_strats +. total_accum_val_bals in
 
   (* Section title *)
   let title = I.hcat [
     I.string a_title " HOLDINGS & STRATEGY";
-    I.string a_dim (String.make (max 0 (103 - 22)) ' ');
+    I.string a_dim (String.make (max 0 (125 - 22)) ' ');
   ] in
 
   (* Left main table: active → paused → inactive → quotes *)
@@ -494,6 +518,7 @@ let render_strategies _w json =
   let right_title = I.string a_title " SUMMARY" in
   
   let val_label = Printf.sprintf " %s " (format_price total_hold_val) in
+  let accum_val_label = Printf.sprintf " %s " (format_price total_accum_val) in
   let up_label = Printf.sprintf " %s " (format_pnl total_up) in
   let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_panel ++ st bold)
                 else A.(fg c_red ++ bg c_panel ++ st bold) in
@@ -503,6 +528,9 @@ let render_strategies _w json =
     I.string a_text " ";
     I.string a_label " Total Hold Val";
     I.string A.(fg c_bright ++ bg c_panel ++ st bold) val_label;
+    I.string a_text " ";
+    I.string a_label " Total Accum Val";
+    I.string A.(fg c_bright ++ bg c_panel ++ st bold) accum_val_label;
     I.string a_text " ";
     I.string a_label " Σ uP";
     I.string up_attr up_label;
