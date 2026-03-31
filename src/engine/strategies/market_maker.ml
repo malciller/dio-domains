@@ -54,7 +54,7 @@ let get_order_buffer () = order_buffer
 type strategy_state = {
   mutable last_buy_order_price: float option;
   mutable last_buy_order_id: string option;
-  mutable open_sell_orders: (string * float) list;  (* order_id * price *)
+  mutable open_sell_orders: (string * float * float) list;  (* order_id * price * qty *)
   mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
   mutable cancelled_orders: (string * float) list;  (* order_id * timestamp - blacklist of recently cancelled orders *)
@@ -357,7 +357,7 @@ let push_order order =
                    | Sell, Some price ->
                        (* Add sell order to tracking list - use temporary ID for now *)
                        let order_id = temp_order_id in
-                       state.open_sell_orders <- (order_id, price) :: state.open_sell_orders
+                       state.open_sell_orders <- (order_id, price, order.qty) :: state.open_sell_orders
                    | _ -> ())
                 end
             | Amend ->
@@ -688,7 +688,7 @@ let execute_strategy
                 buy_orders := (order_id, order_price) :: !buy_orders
               else
                 (* For sell orders, include ALL open sell orders regardless of tag *)
-                sell_orders := (order_id, order_price) :: !sell_orders
+                sell_orders := (order_id, order_price, qty) :: !sell_orders
           ) open_orders;
 
           (* Set the buy order price and ID (take the highest buy order if multiple) *)
@@ -774,7 +774,7 @@ let execute_strategy
               if side_str = "buy" then
                 buy_orders := (order_id, order_price) :: !buy_orders
               else
-                sell_orders := (order_id, order_price) :: !sell_orders
+                sell_orders := (order_id, order_price, qty) :: !sell_orders
           ) open_orders;
 
           (* Set tracking variables to the actual data from the book *)
@@ -1107,7 +1107,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price:_ =
     ) state.pending_orders;
 
     (* 2. Remove from sell orders tracking if it was a sell order *)
-    state.open_sell_orders <- List.filter (fun (sell_id, _) ->
+    state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
 
@@ -1151,7 +1151,7 @@ let handle_order_cancelled asset_symbol order_id side =
     ) state.pending_orders;
     
     (* Remove the old order from sell orders tracking if present *)
-    state.open_sell_orders <- List.filter (fun (sell_id, _) ->
+    state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
     
@@ -1190,7 +1190,7 @@ let handle_order_cancelled asset_symbol order_id side =
     
     (* Remove from sell orders list *)
     let original_sell_count = List.length state.open_sell_orders in
-    state.open_sell_orders <- List.filter (fun (sell_id, _) ->
+    state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
@@ -1241,8 +1241,10 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                 new_order_id price asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
-         state.open_sell_orders <- (new_order_id, price) :: 
-            List.filter (fun (sell_id, _) -> sell_id <> old_order_id) state.open_sell_orders;
+         let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
+           | Some (_, _, q) -> q | None -> 0.0 in
+         state.open_sell_orders <- (new_order_id, price, old_qty) :: 
+            List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
          if List.length state.open_sell_orders = original_sell_count then
            Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
              old_order_id new_order_id price asset_symbol
@@ -1299,7 +1301,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
           | _ -> ())
      | Sell ->
          let original = List.length state.open_sell_orders in
-         state.open_sell_orders <- List.filter (fun (sell_id, _) -> sell_id <> order_id) state.open_sell_orders;
+         state.open_sell_orders <- List.filter (fun (sell_id, _, _) -> sell_id <> order_id) state.open_sell_orders;
          if List.length state.open_sell_orders < original then begin
            let now = Unix.time () in
            state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;

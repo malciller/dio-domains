@@ -50,7 +50,7 @@ let get_domain_profilers symbol =
           prof_ob       = Latency_profiler.create (symbol ^ ":ob");
           prof_exec     = Latency_profiler.create (symbol ^ ":exec");
           prof_strategy = Latency_profiler.create (symbol ^ ":strategy");
-          prof_cycle    = Latency_profiler.create (symbol ^ ":cycle");
+          prof_cycle    = Latency_profiler.create ~bucket_us:10 ~max_latency_us:1_000_000 (symbol ^ ":cycle");
         } in
         Hashtbl.replace domain_profiler_cache symbol p;
         p
@@ -98,13 +98,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                else
                  let best_price = match current_price with
                    | Some price ->
-                       List.fold_left (fun acc (_, sell_price) ->
+                       List.fold_left (fun acc (_, sell_price, _) ->
                          match acc with
                          | None -> Some sell_price
                          | Some best -> if abs_float (sell_price -. price) < abs_float (best -. price) then Some sell_price else Some best
                        ) None state.open_sell_orders
                    | None -> 
-                       match state.open_sell_orders with (_, p)::_ -> Some p | [] -> None
+                       match state.open_sell_orders with (_, p, _)::_ -> Some p | [] -> None
                  in
                  match best_price with
                  | Some p -> Printf.sprintf "Sell@%.2f" p
@@ -128,7 +128,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               if state.open_sell_orders = [] then
                 "Sell:none"
               else
-                let closest_sell = List.fold_left (fun acc (_, sell_price) ->
+                let closest_sell = List.fold_left (fun acc (_, sell_price, _) ->
                   match acc with
                   | None -> Some sell_price
                   | Some current_closest ->
@@ -553,8 +553,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  Hyperliquid orders, making effective_buy_count rely solely on
                  the fragile has_tracked_buy flag and triggering buy order spam. *)
               let is_grid_order = match userref_opt with
-                | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_grid userref
-                | None -> asset_with_fees.exchange = "hyperliquid"
+                | Some userref -> userref <> Dio_strategies.Strategy_common.strategy_userref_mm
+                | None -> true
               in
               if is_grid_order then
                 (if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1))
@@ -632,7 +632,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
-              Logging.info_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
+              Logging.debug_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
                 asset_with_fees.exchange asset_with_fees.symbol !cycle_count price
                 bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
                 !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
@@ -887,6 +887,24 @@ let clear_domain_registry () =
   Mutex.lock registry_mutex;
   Hashtbl.clear domain_registry;
   Mutex.unlock registry_mutex
+
+(** Get non-destructive latency profiler snapshots for all domains.
+    Returns (symbol, [(label, snapshot option)]) list.
+    Safe to call from the dashboard without resetting profiler data. *)
+let get_domain_profiler_snapshots () =
+  Mutex.lock profiler_cache_mutex;
+  let result = Hashtbl.fold (fun symbol profs acc ->
+    let snaps = [
+      "ticker",   Latency_profiler.snapshot profs.prof_ticker;
+      "orderbook", Latency_profiler.snapshot profs.prof_ob;
+      "execution", Latency_profiler.snapshot profs.prof_exec;
+      "strategy",  Latency_profiler.snapshot profs.prof_strategy;
+      "cycle",     Latency_profiler.snapshot profs.prof_cycle;
+    ] in
+    (symbol, snaps) :: acc
+  ) domain_profiler_cache [] in
+  Mutex.unlock profiler_cache_mutex;
+  result
 
 (** Stop all domains gracefully *)
 let stop_all_domains () =

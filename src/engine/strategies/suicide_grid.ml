@@ -75,7 +75,7 @@ let get_order_buffer () = order_buffer
 type strategy_state = {
   mutable last_buy_order_price: float option;
   mutable last_buy_order_id: string option;
-  mutable open_sell_orders: (string * float) list;  (* order_id * price *)
+  mutable open_sell_orders: (string * float * float) list;  (* order_id * price * qty *)
   mutable recently_injected_sells: (string * float * float) list; (* order_id * price * timestamp *)
   mutable pending_orders: (string * order_side * float * float) list;  (* order_id * side * price * timestamp - orders sent but not yet acknowledged *)
   mutable last_cycle: int;
@@ -443,7 +443,7 @@ let push_order order =
                    (* Track sell orders in state for grid logic (Kraken only) *)
                    (match order.side, order.price with
                     | Sell, Some price ->
-                        state.open_sell_orders <- (temp_order_id, price) :: state.open_sell_orders;
+                        state.open_sell_orders <- (temp_order_id, price, order.qty) :: state.open_sell_orders;
                         Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" temp_order_id price order.symbol
                     | _ -> ())
                  end
@@ -672,8 +672,8 @@ let execute_strategy
 
       List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
         let is_our_strategy = match userref_opt with
-          | Some ref_val -> ref_val = Strategy_common.strategy_userref_grid
-          | None -> asset.exchange = "hyperliquid"
+          | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
+          | None -> true
         in
         
         if qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity *)
@@ -683,7 +683,7 @@ let execute_strategy
             buy_orders := (order_id, order_price) :: !buy_orders
           else
             (* For sell orders, include ALL open sell orders regardless of tag *)
-            sell_orders := (order_id, order_price) :: !sell_orders
+            sell_orders := (order_id, order_price, qty) :: !sell_orders
       ) open_orders;
 
       (* Set the buy order price and ID (take the highest buy order if multiple).
@@ -719,9 +719,9 @@ let execute_strategy
          the new order hasn't yet appeared in the order update stream. *)
       if asset.exchange = "hyperliquid" then begin
         List.iter (fun (preserved_id, preserved_price, _) ->
-          let already_present = List.exists (fun (id, _) -> id = preserved_id) state.open_sell_orders in
+          let already_present = List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders in
           if not already_present then
-            state.open_sell_orders <- (preserved_id, preserved_price) :: state.open_sell_orders
+            state.open_sell_orders <- (preserved_id, preserved_price, state.grid_qty) :: state.open_sell_orders
         ) preserved_sells
       end;
 
@@ -926,8 +926,8 @@ let execute_strategy
                    asset.symbol qty buy_price available_quote state.reserved_quote;
 
                  (* Enforce exactly 2x grid_interval spacing *)
-                 let all_sells = (("new_sell", sell_price) :: state.open_sell_orders) in
-                 let closest_sell = List.fold_left (fun acc (_, sp) ->
+                 let all_sells = (("new_sell", sell_price, 0.0) :: state.open_sell_orders) in
+                 let closest_sell = List.fold_left (fun acc (_, sp, _) ->
                    if sp > buy_price then
                      match acc with
                      | None -> Some sp
@@ -976,13 +976,13 @@ let execute_strategy
         (* Combine active sell orders with pending sell orders for spacing calculation *)
         let all_sell_orders = state.open_sell_orders @ (
           List.filter_map (fun (id, side, price, _) ->
-            if side = Sell then Some (id, price) else None
+            if side = Sell then Some (id, price, 0.0) else None
           ) state.pending_orders
         ) in
         
         if all_sell_orders <> [] then begin
           (* Find the closest sell order *)
-          let closest_sell_order = List.fold_left (fun acc (order_id, sell_price) ->
+          let closest_sell_order = List.fold_left (fun acc (order_id, sell_price, _) ->
             match acc with
             | None -> Some (order_id, sell_price)
             | Some (_, best_price) ->
@@ -1316,13 +1316,13 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
        Use exec event fill_price as primary source; fall back to open_sell_orders
        for backward compat. This fixes Hyperliquid amends where webData2 never
        surfaces the replacement sell order. *)
-    let sell_fill_price = match List.assoc_opt order_id state.open_sell_orders with
-      | Some p -> p
+    let sell_fill_price = match List.find_opt (fun (id, _, _) -> id = order_id) state.open_sell_orders with
+      | Some (_, p, _) -> p
       | None -> fill_price  (* exec event fill price — always available *)
     in
 
     (* 3. Remove from sell orders tracking if it was a sell order *)
-    state.open_sell_orders <- List.filter (fun (sell_id, _) ->
+    state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
 
@@ -1505,7 +1505,7 @@ let handle_order_cancelled asset_symbol order_id side =
     
     (* Remove from sell orders list *)
     let original_sell_count = List.length state.open_sell_orders in
-    state.open_sell_orders <- List.filter (fun (sell_id, _) ->
+    state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
@@ -1554,8 +1554,10 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                   old_order_id new_order_id asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
-         state.open_sell_orders <- (new_order_id, price) :: 
-            List.filter (fun (sell_id, _) -> sell_id <> old_order_id) state.open_sell_orders;
+         let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
+           | Some (_, _, q) -> q | None -> state.grid_qty in
+         state.open_sell_orders <- (new_order_id, price, old_qty) :: 
+            List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
          state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
          if List.length state.open_sell_orders = original_sell_count then
            Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
@@ -1669,7 +1671,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
                 Logging.debug_f ~section "Amendment failed for untracked buy order %s: %s. Cleared place_Buy cooldown." order_id reason)
        | Sell ->
            let original_sell_count = List.length state.open_sell_orders in
-           state.open_sell_orders <- List.filter (fun (sell_id, _) -> sell_id <> order_id) state.open_sell_orders;
+           state.open_sell_orders <- List.filter (fun (sell_id, _, _) -> sell_id <> order_id) state.open_sell_orders;
            if List.length state.open_sell_orders < original_sell_count then
              Logging.info_f ~section "Amendment failed for sell order %s: %s. Order is gone, cleared tracking." order_id reason)
     end else begin
