@@ -724,39 +724,48 @@ let render_domains w json =
 
 (* ── Full render ─────────────────────────────────────────────────── *)
 
-(* ── Pipe-buffered rendering for atomic frame writes ─────────────── *)
+(* ── Atomic frame rendering ──────────────────────────────────────── *)
+(* Each render call opens a fresh blocking pipe, writes the frame,    *)
+(* closes the write end (giving clean EOF), then drains fully before  *)
+(* a single write to stdout.  This eliminates the EAGAIN race that    *)
+(* caused partial frames / click-to-scroll with the old global pipe.  *)
 
-let render_pipe_r, render_pipe_w = Unix.pipe ()
-let render_oc = Unix.out_channel_of_descr render_pipe_w
-let () = Unix.set_nonblock render_pipe_r
-
-let write_frame frame =
-  let len = String.length frame in
-  let rec write_all off remaining =
-    if remaining > 0 then
-      let n = Unix.write_substring Unix.stdout frame off remaining in
-      write_all (off + n) (remaining - n)
-  in
-  write_all 0 len
-
-let render_wait_screen w h msg =
-  let img = I.string A.(fg c_yellow ++ bg c_bg) msg in
-  output_string render_oc "\027[?2026h";
-  output_string render_oc "\027[H";
-  Notty_unix.output_image ~cap:Cap.ansi ~fd:render_oc (I.vsnap h (I.hsnap w img));
-  output_string render_oc "\027[J";
-  output_string render_oc "\027[?2026l";
-  flush render_oc;
-  let buf = Buffer.create 1024 in
-  let tmp = Bytes.create 4096 in
+let render_to_stdout (draw : out_channel -> unit) =
+  let (pr, pw) = Unix.pipe () in
+  let oc = Unix.out_channel_of_descr pw in
+  draw oc;
+  flush oc;
+  Unix.close pw;                    (* write-EOF lets drain loop finish cleanly *)
+  let buf = Buffer.create 65536 in
+  let tmp = Bytes.create 8192 in
   (try
     while true do
-      let n = Unix.read render_pipe_r tmp 0 4096 in
+      let n = Unix.read pr tmp 0 8192 in
       if n = 0 then raise Exit;
       Buffer.add_subbytes buf tmp 0 n
     done
   with _ -> ());
-  write_frame (Buffer.contents buf)
+  Unix.close pr;
+  let frame = Buffer.contents buf in
+  let len   = String.length frame in
+  let rec go off rem =
+    if rem > 0 then
+      let n = Unix.write_substring Unix.stdout frame off rem in
+      go (off + n) (rem - n)
+  in
+  go 0 len
+
+let render_wait_screen w h msg =
+  let img = I.string A.(fg c_yellow ++ bg c_bg) msg
+            |> I.hsnap ~align:`Left w
+            |> I.vsnap ~align:`Top  h
+  in
+  render_to_stdout (fun oc ->
+    output_string oc "\027[?2026h";
+    output_string oc "\027[H";
+    Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
+    output_string oc "\027[J";
+    output_string oc "\027[?2026l")
 
 let render_frame w h json =
   let img =
@@ -774,25 +783,15 @@ let render_frame w h json =
       sep;
       I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  refreshes every 500ms");
     ]
+    |> I.hsnap ~align:`Left w   (* clamp width: prevents line-wrap / scroll *)
+    |> I.vsnap ~align:`Top  h   (* clamp height: prevents overflow below     *)
   in
-  (* Render image to pipe via Notty, wrapped in synchronized output markers *)
-  output_string render_oc "\027[?2026h";  (* begin synchronized update *)
-  output_string render_oc "\027[H";      (* cursor home *)
-  Notty_unix.output_image ~cap:Cap.ansi ~fd:render_oc (I.vsnap h img);
-  output_string render_oc "\027[J";      (* clear to end of screen *)
-  output_string render_oc "\027[?2026l";  (* end synchronized update *)
-  flush render_oc;
-  (* Read entire rendered frame from pipe *)
-  let buf = Buffer.create 16384 in
-  let tmp = Bytes.create 8192 in
-  (try
-    while true do
-      let n = Unix.read render_pipe_r tmp 0 8192 in
-      if n = 0 then raise Exit;
-      Buffer.add_subbytes buf tmp 0 n
-    done
-  with _ -> ());
-  Buffer.contents buf
+  render_to_stdout (fun oc ->
+    output_string oc "\027[?2026h";   (* begin synchronized update *)
+    output_string oc "\027[H";        (* cursor home               *)
+    Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
+    output_string oc "\027[J";        (* clear to end of screen    *)
+    output_string oc "\027[?2026l")   (* end synchronized update   *)
 
 (* ── Main loop ───────────────────────────────────────────────────── *)
 
@@ -872,7 +871,7 @@ let () =
       | None ->
           let (w, h) = match Notty_unix.winsize Unix.stdout with
             | Some (w, h) -> (w, h) | None -> (80, 24) in
-          render_wait_screen w h "  ⏳ Waiting for engine...  (q to quit)";
+          render_wait_screen w h "  [...] Waiting for engine...  (q to quit)";
           (* Poll keyboard while waiting *)
           let ready, _, _ =
             try Unix.select [Unix.stdin] [] [] 2.0
@@ -932,20 +931,13 @@ let () =
             ())
       end;
 
-      (* 4. Render: buffer entire frame, write atomically *)
+      (* 4. Render: render_to_stdout writes atomically inside render_frame *)
       if not !quit && not !lost_connection then begin
         let (w, h) = match Notty_unix.winsize Unix.stdout with
           | Some (w, h) -> (w, h)
           | None -> (80, 24)
         in
-        let frame = render_frame w h !last_json in
-        let len = String.length frame in
-        let rec write_all off remaining =
-          if remaining > 0 then
-            let n = Unix.write_substring Unix.stdout frame off remaining in
-            write_all (off + n) (remaining - n)
-        in
-        write_all 0 len
+        render_frame w h !last_json
       end
     done;
     (* If we lost the connection (not a deliberate quit), try to reconnect *)
