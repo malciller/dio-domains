@@ -68,6 +68,7 @@ type state = {
   mutable on_failure: (string -> unit) option;
   connected: bool Atomic.t;
   mutable subscriptions: Yojson.Safe.t list; (* List of subscription messages to re-send on connect *)
+  connection_ready: unit Lwt_condition.t;  (* Signaled when connection attempt completes (success or failure) *)
 }
 
 let state = {
@@ -79,6 +80,7 @@ let state = {
   on_failure = None;
   connected = Atomic.make false;
   subscriptions = [];
+  connection_ready = Lwt_condition.create ();
 }
 
 (** Condition signalled when the reader loop exits (for any reason).
@@ -240,12 +242,15 @@ let reset_state conn ~notify_failure reason =
         state.conn <- None;
         state.connecting <- false;
         state.connection_generation <- new_generation;
+        (* Wake any ensure_connection callers blocked in the `Wait branch *)
+        Lwt_condition.broadcast state.connection_ready ();
         Atomic.set state.connected false;
         let failure_cb = if notify_failure then state.on_failure else None in
         Lwt.return (wakers, true, failure_cb, pending_count)
     | _ ->
         Logging.debug_f ~section "Resetting state: connection mismatch, not resetting (reason: %s)" reason;
         state.connecting <- false;
+        Lwt_condition.broadcast state.connection_ready ();
         Lwt.return ([], false, None, 0)
   ) >>= fun (wakers, should_reset, failure_cb, pending_count) ->
   if not should_reset then Lwt.return_unit
@@ -416,9 +421,9 @@ let ensure_connection ?on_failure ?on_connected token =
   ) >>= function
   | `Already -> Lwt.return_unit
   | `Wait ->
-      (* Wait for connection to complete, then call on_connected *)
+      (* Wait for connection to complete via condition signal (zero-latency wakeup) *)
       let rec wait_for_connection () =
-        Lwt_unix.sleep 0.1 >>= fun () ->
+        Lwt_condition.wait state.connection_ready >>= fun () ->
         Lwt_mutex.with_lock state.mutex (fun () ->
           if state.conn <> None then begin
             (match on_connected with Some f -> f () | None -> ());
@@ -441,11 +446,13 @@ let ensure_connection ?on_failure ?on_connected token =
              state.connecting <- false;
              state.conn <- Some { conn; generation };
              Atomic.set state.connected true;
+             Lwt_condition.broadcast state.connection_ready ();
              Lwt.return (Some (conn, generation)))
         )
         (fun exn ->
            Lwt_mutex.with_lock state.mutex (fun () ->
              state.connecting <- false;
+             Lwt_condition.broadcast state.connection_ready ();
              Lwt.return_unit) >>= fun () ->
            Lwt.fail exn
         ) >>= function
