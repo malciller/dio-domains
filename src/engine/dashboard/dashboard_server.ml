@@ -20,7 +20,9 @@ let socket_path () =
   let pid = Unix.getpid () in
   Printf.sprintf "/tmp/dio-%d.sock" pid
 
-(** Send a length-prefixed JSON response (zero-copy payload) *)
+(** Send a length-prefixed JSON response.
+    Propagates write errors to the caller. Callers that want to tolerate
+    client disconnects must catch exceptions themselves. *)
 let send_response oc json_str =
   let len = String.length json_str in
   let header = Bytes.create 4 in
@@ -29,12 +31,9 @@ let send_response oc json_str =
   Bytes.set_uint8 header 2 ((len lsr 8) land 0xff);
   Bytes.set_uint8 header 3 (len land 0xff);
   let header_str = Bytes.to_string header in
-  Lwt.catch
-    (fun () ->
-      Lwt_io.write oc header_str >>= fun () ->
-      Lwt_io.write oc json_str >>= fun () ->
-      Lwt_io.flush oc)
-    (fun _exn -> Lwt.return_unit)
+  Lwt_io.write oc header_str >>= fun () ->
+  Lwt_io.write oc json_str >>= fun () ->
+  Lwt_io.flush oc
 
 (** Active client count for monitoring *)
 let active_clients = Atomic.make 0
@@ -42,7 +41,8 @@ let active_clients = Atomic.make 0
 (** List of active output channels subscribed to watch mode *)
 let watch_clients : Lwt_io.output_channel list ref = ref []
 
-(** Central ticker that broadcasts state to all watching clients via 'W' every 500ms *)
+(** Central ticker that broadcasts state to all watching clients every 500ms.
+    Clients that fail a write (disconnected) are pruned from watch_clients. *)
 let rec state_broadcaster () =
   let%lwt () = Lwt_unix.sleep 0.5 in
   let current_clients = !watch_clients in
@@ -50,9 +50,15 @@ let rec state_broadcaster () =
     Lwt.catch
       (fun () ->
         let json_str = Dashboard_state.snapshot_to_string () in
-        (* Broadcast to all asynchronously *)
-        Lwt_list.iter_p (fun oc -> send_response oc json_str) current_clients)
-      (fun exn -> 
+        (* Broadcast sequentially; filter out any client whose write fails *)
+        let%lwt surviving = Lwt_list.filter_map_s (fun oc ->
+          Lwt.catch
+            (fun () -> send_response oc json_str >|= fun () -> Some oc)
+            (fun _ -> Lwt.return_none)
+        ) current_clients in
+        watch_clients := surviving;
+        Lwt.return_unit)
+      (fun exn ->
         Logging.error_f ~section "Error in state_broadcaster: %s" (Printexc.to_string exn);
         Lwt.return_unit)
   end else Lwt.return_unit)

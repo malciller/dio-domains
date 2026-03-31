@@ -12,19 +12,30 @@ open Notty
 
 let socket_path = ref ""
 
-(** Discover engine socket path by scanning /tmp/dio-*.sock *)
+(** Discover engine socket path by scanning /tmp/dio-*.sock.
+    Probes each candidate to discard stale sockets from crashed instances. *)
 let discover_socket () =
-  let entries = Sys.readdir "/tmp" in
+  let entries = try Sys.readdir "/tmp" with _ -> [||] in
   let socks = Array.to_list entries
-    |> List.filter (fun f -> 
+    |> List.filter (fun f ->
       String.length f > 4 && String.sub f 0 4 = "dio-" &&
       let len = String.length f in
       String.sub f (len - 5) 5 = ".sock")
     |> List.map (fun f -> "/tmp/" ^ f)
   in
-  match socks with
-  | [s] -> Some s
-  | s :: _ -> Some s  (* Take first if multiple *)
+  (* Probe each candidate: discard sockets that refuse connection *)
+  let live = List.filter (fun path ->
+    let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+    let ok = (try Unix.connect fd (Unix.ADDR_UNIX path); true
+               with Unix.Unix_error _ -> false) in
+    (try Unix.close fd with _ -> ());
+    ok
+  ) socks in
+  (match live with
+  | _ :: _ :: _ -> Printf.eprintf "Warning: multiple live engine sockets found, using first\n%!"
+  | _ -> ());
+  match live with
+  | s :: _ -> Some s
   | [] -> None
 
 (** Read exactly n bytes from fd *)
@@ -119,8 +130,6 @@ let c_red       = A.rgb_888 ~r:248 ~g:81  ~b:73
 let c_yellow    = A.rgb_888 ~r:210 ~g:153 ~b:34
 let c_cyan      = A.rgb_888 ~r:57  ~g:211 ~b:183
 let c_dim       = A.rgb_888 ~r:72  ~g:79  ~b:88
-let _c_orange   = A.rgb_888 ~r:210 ~g:105 ~b:30
-
 (* ── Attribute constructors ──────────────────────────────────────── *)
 
 let a_title     = A.(fg c_title  ++ bg c_bg   ++ st bold)
@@ -134,7 +143,6 @@ let a_cyan      = A.(fg c_cyan   ++ bg c_bg)
 let a_dim       = A.(fg c_dim    ++ bg c_bg)
 let a_border    = A.(fg c_border ++ bg c_bg)
 let a_header_bg = A.(fg c_bright ++ bg c_panel ++ st bold)
-let _a_orange   = A.(fg _c_orange ++ bg c_bg)
 
 (* ── Drawing primitives ──────────────────────────────────────────── *)
 
@@ -163,8 +171,6 @@ let format_pct f =
 let render_header w json =
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
   let fng = json |?> "fear_and_greed" |> to_float_d 0.0 in
-  let _fng_attr = if fng >= 60.0 then a_green
-    else if fng >= 40.0 then a_yellow else a_red in
   I.hcat [
     I.string a_header_bg (pad_right 3 " ");
     I.string a_header_bg "DIO";
@@ -178,7 +184,7 @@ let render_header w json =
 
 (* ── Panel: Connections ──────────────────────────────────────────── *)
 
-let _render_connections w json =
+let render_connections w json =
   let conns = json |?> "connections" |> to_list_d in
   let title = I.hcat [
     I.string a_title " CONNECTIONS";
@@ -213,6 +219,10 @@ let _render_connections w json =
 
 (* ── Panel: Holdings & Strategy ──────────────────────────────────── *)
 
+let exch_tag_of = function
+  | "kraken" -> "kr" | "hyperliquid" -> "hl"
+  | e -> String.sub e 0 (min 2 (String.length e))
+
 let render_strategies _w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
   let all_balances = json |?> "all_balances" |> to_list_d in
@@ -231,7 +241,7 @@ let render_strategies _w json =
     col 8 a_label "Δ BUY";
     col 6 a_label "SELLS";
     col 8 a_label "Δ SELL";
-    col 12 a_label "uP";
+    col 12 a_label "SELL VAL";
   ] in
 
   (* Render strategy rows *)
@@ -294,9 +304,7 @@ let render_strategies _w json =
       else "▶", a_green
     in
 
-    let exch_tag = match exchange with
-      | "kraken" -> "kr" | "hyperliquid" -> "hl" | e -> String.sub e 0 (min 2 (String.length e))
-    in
+    let exch_tag = exch_tag_of exchange in
 
     (* Buy distance formatting *)
     let buy_dist_str, buy_dist_attr = match buy_dist_pct with
@@ -362,9 +370,7 @@ let render_strategies _w json =
 
     if balance <= 0.0 then None
     else begin
-      let exch_tag = match exchange with
-        | "kraken" -> "kr" | "hyperliquid" -> "hl" | e -> String.sub e 0 (min 2 (String.length e))
-      in
+      let exch_tag = exch_tag_of exchange in
 
       (* Market data from enriched snapshot *)
       let bid = bal_json |?> "bid" |> to_float_d 0.0 in
@@ -522,7 +528,7 @@ let render_strategies _w json =
     I.string a_label " Total Accum Val";
     I.string A.(fg c_bright ++ bg c_panel ++ st bold) accum_val_label;
     I.string a_text " ";
-    I.string a_label " Σ uP";
+    I.string a_label " Σ SELL VAL";
     I.string up_attr up_label;
   ] in
 
@@ -559,8 +565,11 @@ let render_latencies w json =
       let samples = data |?> "samples" |> to_int_d 0 in
       if samples = 0 then None
       else
-        let p99_attr = if p99 > 1000.0 then a_yellow
-          else if p99 > 5000.0 then a_red else a_text in
+        let p99_attr =
+          if p99 > 5000.0 then a_red
+          else if p99 > 1000.0 then a_yellow
+          else a_text
+        in
         Some (I.hcat [
           I.string a_text " ";
           col 14 a_bright (truncate_string 13 symbol);
@@ -611,6 +620,7 @@ let render_memory w json =
 (* ── Panel: Domains ──────────────────────────────────────────────── *)
 
 let render_domains w json =
+  let now = Unix.gettimeofday () in
   let doms = json |?> "domains" |> to_list_d in
   let title = I.hcat [
     I.string a_title " DOMAINS";
@@ -620,12 +630,22 @@ let render_domains w json =
     let key = d |?> "key" |> to_string_d "?" in
     let running = d |?> "running" |> to_bool_d false in
     let restarts = d |?> "restart_count" |> to_int_d 0 in
+    let last_restart = d |?> "last_restart" |> to_float_d 0.0 in
+    let ago_str =
+      if last_restart > 0.0 then
+        let secs = now -. last_restart in
+        if secs < 5.0 then "just now"
+        else format_duration secs ^ " ago"
+      else "--"
+    in
     I.hcat [
       I.string a_text " ";
       I.string (if running then a_green else a_red) (if running then ">" else "x"); spacer;
       col 28 a_text (truncate_string 27 key); spacer;
       I.string a_label "restarts:";
-      col (max 0 (w - 44)) (if restarts > 0 then a_yellow else a_dim) (string_of_int restarts);
+      I.string (if restarts > 0 then a_yellow else a_dim) (string_of_int restarts);
+      I.string a_dim "  last:";
+      col (max 0 (w - 53)) (if restarts > 0 then a_yellow else a_dim) ago_str;
     ]
   ) doms in
   I.vcat (title :: rows)
@@ -638,13 +658,41 @@ let render_pipe_r, render_pipe_w = Unix.pipe ()
 let render_oc = Unix.out_channel_of_descr render_pipe_w
 let () = Unix.set_nonblock render_pipe_r
 
-(** Render the full dashboard image, serialize to ANSI via a pipe,
-    and return the entire frame as a string for a single write() call. *)
+let write_frame frame =
+  let len = String.length frame in
+  let rec write_all off remaining =
+    if remaining > 0 then
+      let n = Unix.write_substring Unix.stdout frame off remaining in
+      write_all (off + n) (remaining - n)
+  in
+  write_all 0 len
+
+let render_wait_screen w h msg =
+  let img = I.string A.(fg c_yellow ++ bg c_bg) msg in
+  output_string render_oc "\027[?2026h";
+  output_string render_oc "\027[H";
+  Notty_unix.output_image ~cap:Cap.ansi ~fd:render_oc (I.vsnap h (I.hsnap w img));
+  output_string render_oc "\027[J";
+  output_string render_oc "\027[?2026l";
+  flush render_oc;
+  let buf = Buffer.create 1024 in
+  let tmp = Bytes.create 4096 in
+  (try
+    while true do
+      let n = Unix.read render_pipe_r tmp 0 4096 in
+      if n = 0 then raise Exit;
+      Buffer.add_subbytes buf tmp 0 n
+    done
+  with _ -> ());
+  write_frame (Buffer.contents buf)
+
 let render_frame w h json =
   let img =
     let sep = hline w in
     I.vcat [
       render_header w json;
+      sep;
+      render_connections w json;
       sep;
       render_memory w json;
       sep;
@@ -687,26 +735,6 @@ let () =
   ] in
   Arg.parse speclist (fun _ -> ()) "dio-dashboard [--socket /tmp/dio-<pid>.sock]";
 
-  (* Discover or use provided socket *)
-  let path = if !socket_path <> "" then !socket_path
-    else match discover_socket () with
-      | Some p -> p
-      | None ->
-          Printf.eprintf "No engine socket found in /tmp/dio-*.sock\n";
-          Printf.eprintf "Is the engine running?\n";
-          exit 1
-  in
-
-  Printf.eprintf "Connecting to %s...\n%!" path;
-
-  let fd = try connect_and_watch path with
-    | Unix.Unix_error (e, _, _) ->
-        Printf.eprintf "Failed to connect: %s\n" (Unix.error_message e);
-        exit 1
-  in
-
-  Printf.eprintf "Connected. Launching dashboard...\n%!";
-
   (* ── Manual terminal setup (bypass Notty Term to avoid reader thread) ── *)
 
   (* Save original terminal attributes for cleanup *)
@@ -735,62 +763,126 @@ let () =
   let quit = ref false in
   let input_buf = Bytes.create 64 in
 
-  while not !quit do
-    (* 1. Wait for socket data or keyboard input, 100ms timeout *)
-    let ready, _, _ =
-      try Unix.select [fd; Unix.stdin] [] [] 0.1
-      with Unix.Unix_error _ -> ([], [], [])
+  (* ── Outer reconnect loop ────────────────────────────────────────── *)
+  (* On engine restart the socket path changes (new PID), so we
+     re-run discover_socket on each reconnect attempt.  A --socket
+     override is honoured only for the first connection; after a
+     disconnect we always auto-discover so we follow the new PID. *)
+  let fd_ref : Unix.file_descr option ref = ref None in
+
+  let try_connect () =
+    let path_opt =
+      if !socket_path <> "" && !fd_ref = None then
+        (* First connection: honour --socket override *)
+        Some !socket_path
+      else
+        discover_socket ()
     in
+    match path_opt with
+    | None -> None
+    | Some p ->
+        (try
+          let fd = connect_and_watch p in
+          fd_ref := Some fd;
+          Some fd
+        with Unix.Unix_error _ -> None)
+  in
 
-    (* 2. Check for keyboard input *)
-    if List.mem Unix.stdin ready then begin
-      let n = try Unix.read Unix.stdin input_buf 0 64 with _ -> 0 in
-      let rec check_bytes i =
-        if i >= n then ()
-        else begin
-          (match Bytes.get input_buf i with
-           | 'q' | 'Q' -> quit := true
-           | '\027' ->  (* Escape — could be bare Esc or start of sequence *)
-               if i + 1 >= n then quit := true  (* bare Esc *)
-               (* else it's an escape sequence, skip *)
-           | _ -> ());
-          check_bytes (i + 1)
-        end
+  let disconnect fd =
+    fd_ref := None;
+    last_json := `Assoc [];
+    (try let _ = Unix.write_substring fd "Q" 0 1 in () with _ -> ());
+    (try Unix.close fd with _ -> ())
+  in
+
+  (* Show wait screen until first connection *)
+  let rec wait_for_engine () =
+    if !quit then ()
+    else
+      match try_connect () with
+      | Some fd -> run_event_loop fd
+      | None ->
+          let (w, h) = match Notty_unix.winsize Unix.stdout with
+            | Some (w, h) -> (w, h) | None -> (80, 24) in
+          render_wait_screen w h "  ⏳ Waiting for engine...  (q to quit)";
+          (* Poll keyboard while waiting *)
+          let ready, _, _ =
+            try Unix.select [Unix.stdin] [] [] 2.0
+            with Unix.Unix_error _ -> ([], [], [])
+          in
+          if List.mem Unix.stdin ready then begin
+            let n = try Unix.read Unix.stdin input_buf 0 64 with _ -> 0 in
+            for i = 0 to n - 1 do
+              match Bytes.get input_buf i with
+              | 'q' | 'Q' | '\027' -> quit := true
+              | _ -> ()
+            done
+          end;
+          if not !quit then wait_for_engine ()
+
+  and run_event_loop fd =
+    (* Inner loop: read + render until disconnect or quit *)
+    let lost_connection = ref false in
+    while not !quit && not !lost_connection do
+      (* 1. Wait for socket data or keyboard input, 100ms timeout *)
+      let ready, _, _ =
+        try Unix.select [fd; Unix.stdin] [] [] 0.1
+        with Unix.Unix_error _ -> ([], [], [])
       in
-      check_bytes 0
-    end;
 
-    (* 3. Read socket data if available *)
-    if List.mem fd ready && not !quit then begin
-      (try
-        let msg = read_message fd in
-        (try last_json := Yojson.Basic.from_string msg with _ -> ())
-      with
-      | End_of_file -> quit := true
-      | _ -> ())
-    end;
+      (* 2. Check for keyboard input *)
+      if List.mem Unix.stdin ready then begin
+        let n = try Unix.read Unix.stdin input_buf 0 64 with _ -> 0 in
+        let rec check_bytes i =
+          if i >= n then ()
+          else begin
+            (match Bytes.get input_buf i with
+             | 'q' | 'Q' -> quit := true
+             | '\027' ->
+                 if i + 1 >= n then quit := true (* bare Esc *)
+             | _ -> ());
+            check_bytes (i + 1)
+          end
+        in
+        check_bytes 0
+      end;
 
-    (* 4. Render: buffer entire frame, write atomically *)
-    if not !quit then begin
-      let (w, h) = match Notty_unix.winsize Unix.stdout with
-        | Some (w, h) -> (w, h)
-        | None -> (80, 24)
-      in
-      let frame = render_frame w h !last_json in
-      (* Write entire frame — loop to handle partial writes over SSH/PTY *)
-      let len = String.length frame in
-      let rec write_all off remaining =
-        if remaining > 0 then
-          let n = Unix.write_substring Unix.stdout frame off remaining in
-          write_all (off + n) (remaining - n)
-      in
-      write_all 0 len
-    end
-  done;
+      (* 3. Read socket data if available *)
+      if List.mem fd ready && not !quit then begin
+        (try
+          let msg = read_message fd in
+          (try last_json := Yojson.Basic.from_string msg with _ -> ())
+        with
+        | End_of_file ->
+            disconnect fd;
+            lost_connection := true
+        | Unix.Unix_error _ ->
+            disconnect fd;
+            lost_connection := true
+        | _ ->
+            (* Other parse errors: keep last known state *)
+            ())
+      end;
 
-  (* Cleanup: send quit to engine, close socket *)
-  (try
-    let _ = Unix.write_substring fd "Q" 0 1 in
-    Unix.close fd
-  with _ -> ())
+      (* 4. Render: buffer entire frame, write atomically *)
+      if not !quit && not !lost_connection then begin
+        let (w, h) = match Notty_unix.winsize Unix.stdout with
+          | Some (w, h) -> (w, h)
+          | None -> (80, 24)
+        in
+        let frame = render_frame w h !last_json in
+        let len = String.length frame in
+        let rec write_all off remaining =
+          if remaining > 0 then
+            let n = Unix.write_substring Unix.stdout frame off remaining in
+            write_all (off + n) (remaining - n)
+        in
+        write_all 0 len
+      end
+    done;
+    (* If we lost the connection (not a deliberate quit), try to reconnect *)
+    if not !quit then wait_for_engine ()
+  in
+
+  wait_for_engine ()
 
