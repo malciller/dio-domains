@@ -1,0 +1,18 @@
+(library
+ (name dio_dashboard)
+ (public_name dio.dashboard)
+ (libraries
+  yojson
+  logging
+  lwt
+  lwt.unix
+  dio.engine
+  dio.strategies
+  dio.latency_profiling
+  dio.concurrency
+  dio.exchange
+  dio.supervisor
+  dio.cmc)
+ (modules Dashboard_server Dashboard_state)
+ (preprocess
+  (pps lwt_ppx)))

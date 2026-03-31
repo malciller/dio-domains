@@ -116,7 +116,7 @@ let test_order_cancellation () =
   (* Set up some tracked orders *)
   state.last_buy_order_id <- Some "buy123";
   state.last_buy_order_price <- Some 49000.0;
-  state.open_sell_orders <- [("sell456", 51000.0)];
+  state.open_sell_orders <- [("sell456", 51000.0, 1.0)];
 
   (* Cancel the buy order *)
   Dio_strategies.Market_maker.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy;
@@ -126,7 +126,7 @@ let test_order_cancellation () =
   check (option (float 0.)) "buy order price cleared" None state.last_buy_order_price;
   
   (* Verify sell order preserved *)
-  let sell_preserved = List.exists (fun (id, _) -> id = "sell456") state.open_sell_orders in
+  let sell_preserved = List.exists (fun (id, _, _) -> id = "sell456") state.open_sell_orders in
   check bool "sell order id preserved" true sell_preserved
 
 let test_minimum_quantity_check () =

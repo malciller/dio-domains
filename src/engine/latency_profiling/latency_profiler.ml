@@ -86,3 +86,33 @@ let time_it t f =
   let span = Span.of_uint64_ns (Int64.sub stop start) in
   record t span;
   res
+
+(** Non-destructive snapshot of current latency percentiles.
+    Safe to call from the dashboard without interfering with the
+    engine's periodic report-and-reset cycle. Returns None if
+    no samples have been recorded yet. *)
+type snapshot = {
+  name: string;
+  p50: float;
+  p90: float;
+  p95: float;
+  p99: float;
+  p999: float;
+  samples: int;
+  overflow: int;
+}
+
+let snapshot (prof : t) : snapshot option =
+  if prof.samples = 0 then None
+  else
+    let p50 = percentile prof 0.50 in
+    let p90 = percentile prof 0.90 in
+    let p95 = percentile prof 0.95 in
+    let p99 = percentile prof 0.99 in
+    let p999 = percentile prof 0.999 in
+    Some { name = prof.name; p50; p90; p95; p99; p999;
+           samples = prof.samples; overflow = prof.overflow }
+
+(** Get profiler name *)
+let name t = t.name
+

@@ -7,8 +7,20 @@
   dio.kraken
   dio.cmc
   dio.strategies
+  dio.dashboard
   lwt
   supervisor
   mirage-crypto-rng.unix)
  (preprocess
   (pps lwt_ppx)))
+
+(executable
+ (package dio)
+ (public_name dio-dashboard)
+ (name dashboard)
+ (modes exe)
+ (libraries
+  notty
+  notty.unix
+  yojson
+  unix))

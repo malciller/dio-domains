@@ -38,7 +38,8 @@
   alcotest
   mtime
   secp256k1
-  msgpck)
+  msgpck
+  notty)
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
 

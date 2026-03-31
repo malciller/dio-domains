@@ -29,6 +29,7 @@ depends: [
   "mtime"
   "secp256k1"
   "msgpck"
+  "notty"
   "odoc" {with-doc}
 ]
 build: [

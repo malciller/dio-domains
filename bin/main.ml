@@ -405,15 +405,23 @@ let () =
 
     Logging.info ~section:"main" "Trading engine ready, waiting for shutdown signal...";
 
-    (* Wait for shutdown signal *)
+    (* Wait for shutdown signal, with dashboard server running alongside *)
     (try
-      Lwt_main.run (Lwt_condition.wait shutdown_condition)
+      Lwt_main.run (
+        (* Start dashboard UDS server as background fiber *)
+        let start_time = Unix.gettimeofday () in
+        Lwt.async (fun () -> Dio_dashboard.Dashboard_server.start ~start_time);
+        Lwt_condition.wait shutdown_condition
+      )
     with e ->
       let backtrace = Printexc.get_backtrace () in
       Logging.critical_f ~section:"main" "Fatal exception in Lwt event loop: %s\nBacktrace:\n%s"
         (Printexc.to_string e) backtrace;
       exit 1
     );
+
+    (* Clean up dashboard socket *)
+    Dio_dashboard.Dashboard_server.shutdown ();
 
     Logging.info ~section:"main" "Shutdown signal received, shutting down...";
 

@@ -26,17 +26,6 @@
       "hedge": false
     },
     {
-      "symbol": "ETH/USD",
-      "exchange": "kraken",
-      "qty": "0.006",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
       "symbol": "SOL/USD",
       "exchange": "kraken",
       "qty": "0.14",
@@ -60,6 +49,17 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
+    },
+    {
+      "symbol": "ADA/USD",
+      "exchange": "kraken",
+      "qty": "50.0",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
     }
   ]
 }

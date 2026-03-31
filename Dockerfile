@@ -61,10 +61,11 @@ RUN eval $(opam env --switch=5.2.0) \
 # 8.  Copy the rest of the source tree
 COPY --chown=root:root . .
 
-# 9.  Build native executable
+# 9.  Build native executables (engine + dashboard)
 RUN eval $(opam env --switch=5.2.0) \
-    && dune build --profile=release bin/main.exe \
-    && cp _build/default/bin/main.exe /usr/local/bin/dio
+    && dune build --profile=release bin/main.exe bin/dashboard.exe \
+    && cp _build/default/bin/main.exe /usr/local/bin/dio \
+    && cp _build/default/bin/dashboard.exe /usr/local/bin/dio-dashboard
 
 # 10. Runtime PATH (opam binaries + app)
 ENV PATH="/usr/local/bin:/root/.opam/5.2.0/bin:${PATH}"

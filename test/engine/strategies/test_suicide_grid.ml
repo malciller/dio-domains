@@ -140,7 +140,7 @@ let test_order_cancellation () =
   (* Set up some tracked orders *)
   state.last_buy_order_id <- Some "buy123";
   state.last_buy_order_price <- Some 49000.0;
-  state.open_sell_orders <- [("sell456", 51000.0); ("sell789", 52000.0)];
+  state.open_sell_orders <- [("sell456", 51000.0, 1.0); ("sell789", 52000.0, 1.0)];
 
   (* Cancel the buy order *)
   Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy;
@@ -187,7 +187,7 @@ let test_accumulation_profit_tracking () =
   check (option (float 0.01)) "buy fill price recorded" (Some 39.50) state.last_buy_fill_price;
 
   (* Simulate sell fill at a higher price *)
-  state.open_sell_orders <- [("sell001", 39.90)];
+  state.open_sell_orders <- [("sell001", 39.90, 1.0)];
   Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol "sell001" Dio_strategies.Strategy_common.Sell ~fill_price:39.90;
 
   (* Verify profit was accumulated *)
@@ -320,7 +320,7 @@ let test_accumulation_full_lifecycle () =
     state.last_buy_order_price <- Some buy_price;
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol buy_id Dio_strategies.Strategy_common.Buy ~fill_price:buy_price;
 
-    state.open_sell_orders <- [(sell_id, sell_price)];
+    state.open_sell_orders <- [(sell_id, sell_price, 1.0)];
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol sell_id Dio_strategies.Strategy_common.Sell ~fill_price:sell_price;
   done;
 
@@ -411,7 +411,7 @@ let test_accumulation_multi_strategy_isolation () =
     btc.last_buy_order_id <- Some buy_id;
     btc.last_buy_order_price <- Some 84000.0;
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym buy_id Dio_strategies.Strategy_common.Buy ~fill_price:84000.0;
-    btc.open_sell_orders <- [(sell_id, 84336.0)];
+    btc.open_sell_orders <- [(sell_id, 84336.0, 1.0)];
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym sell_id Dio_strategies.Strategy_common.Sell ~fill_price:84336.0;
   done;
 
@@ -427,7 +427,7 @@ let test_accumulation_multi_strategy_isolation () =
     hype.last_buy_order_id <- Some buy_id;
     hype.last_buy_order_price <- Some 39.50;
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym buy_id Dio_strategies.Strategy_common.Buy ~fill_price:39.50;
-    hype.open_sell_orders <- [(sell_id, 39.90)];
+    hype.open_sell_orders <- [(sell_id, 39.90, 1.0)];
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym sell_id Dio_strategies.Strategy_common.Sell ~fill_price:39.90;
   done;
 
