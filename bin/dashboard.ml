@@ -171,36 +171,42 @@ let format_pct f =
 let render_header w json =
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
   let fng    = json |?> "fear_and_greed" |> to_float_d 0.0 in
-  let conns  = json |?> "connections" |> to_list_d in
-  (* Build one ` │ ● tag` segment per connection, track total added width *)
-  let conn_imgs, conn_w = List.fold_right (fun c (imgs, w_acc) ->
-    let name  = c |?> "name"  |> to_string_d "?" in
-    let state = c |?> "state" |> to_string_d "?" in
-    (* Map connection name to a human-readable exchange label *)
-    let tag =
-      let n = String.lowercase_ascii name in
-      if String.length n >= 6 && String.sub n 0 6 = "kraken" then "kraken"
-      else begin
-        let hl = "hyperliquid" in
-        let hlen = String.length hl in
-        if String.length n >= hlen && String.sub n 0 hlen = hl then "hyperliquid"
-        else truncate_string 10 name
+  (* Derive per-exchange connectivity: green if any strategy on the exchange
+     has a live bid/ask feed, red otherwise. Deduplicated and stable-sorted. *)
+  let exch_connected =
+    let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
+    let tbl = Hashtbl.create 4 in
+    List.iter (fun (_sym, data) ->
+      let exch = data |?> "exchange" |> to_string_d "" in
+      if exch <> "" then begin
+        let market = data |?> "market" in
+        let bid = market |?> "bid" |> to_float_d 0.0 in
+        let ask = market |?> "ask" |> to_float_d 0.0 in
+        let live = bid > 0.0 && ask > 0.0 in
+        let cur = try Hashtbl.find tbl exch with Not_found -> false in
+        Hashtbl.replace tbl exch (cur || live)
       end
+    ) strats;
+    let pairs = Hashtbl.fold (fun k v acc -> (k, v) :: acc) tbl [] in
+    List.sort (fun (a, _) (b, _) -> String.compare a b) pairs
+  in
+  let conn_imgs, conn_w = List.fold_right (fun (exch, live) (imgs, w_acc) ->
+    let tag = match exch with
+      | "kraken"       -> "kraken"
+      | "hyperliquid"  -> "hyperliquid"
+      | e              -> truncate_string 10 e
     in
-    let dot_attr = match state with
-      | "Connected"  -> A.(fg c_green  ++ bg c_panel)
-      | "Connecting" -> A.(fg c_yellow ++ bg c_panel)
-      | _            -> A.(fg c_red    ++ bg c_panel)
+    let dot_attr =
+      if live then A.(fg c_green ++ bg c_panel)
+              else A.(fg c_red   ++ bg c_panel)
     in
     let seg = I.hcat [
       I.string A.(fg c_dim ++ bg c_panel) " │ ";
       I.string dot_attr "●";
       I.string A.(fg c_label ++ bg c_panel) (" " ^ tag);
     ] in
-    (* Width = 3 (" │ ") + 1 ("●") + 1 (" ") + len(tag) *)
     (seg :: imgs, w_acc + 3 + 1 + 1 + String.length tag)
-  ) conns ([], 0) in
-  (* Base width: 3 (lpad) + 3 (DIO) + 3 + 2+dur + 3 + 4 + fng_digits ≈ 25–30 *)
+  ) exch_connected ([], 0) in
   let base_w = 3 + 3 + 3 + (2 + String.length (format_duration uptime))
              + 3 + 4 + String.length (Printf.sprintf "%.0f" fng) in
   I.hcat (
@@ -221,7 +227,7 @@ let render_header w json =
 
 (* ── Panel: Connections ──────────────────────────────────────────── *)
 
-let render_connections w json =
+let _render_connections w json =
   let conns = json |?> "connections" |> to_list_d in
   let title = I.hcat [
     I.string a_title " CONNECTIONS";
@@ -728,8 +734,6 @@ let render_frame w h json =
     let sep = hline w in
     I.vcat [
       render_header w json;
-      sep;
-      render_connections w json;
       sep;
       render_memory w json;
       sep;
