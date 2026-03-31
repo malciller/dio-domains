@@ -197,6 +197,13 @@ module Kraken_impl = struct
   let get_balance ~asset =
     Kraken_balances_feed.get_balance asset
 
+  let get_all_balances () =
+    let assets = Kraken_balances_feed.get_all_assets () in
+    List.filter_map (fun asset ->
+      let bal = Kraken_balances_feed.get_balance asset in
+      if bal > 0.0 then Some (asset, bal) else None
+    ) assets
+
   let get_open_order ~symbol ~order_id =
     match Kraken_executions_feed.get_open_order symbol order_id with
     | Some o -> Some {

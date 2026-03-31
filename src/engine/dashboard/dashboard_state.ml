@@ -216,6 +216,62 @@ let build_snapshot () =
     ]
   ) config.trading in
 
+  (* Collect all non-zero balances from every registered exchange,
+     enriched with market data and open orders for full visibility *)
+  let configured_symbols = List.map (fun (tc : Dio_engine.Config.trading_config) ->
+    (tc.exchange, tc.symbol)
+  ) config.trading in
+  let exchange_names = List.sort_uniq String.compare
+    (List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading) in
+  let all_balances = List.concat_map (fun exch_name ->
+    match Exchange.Registry.get exch_name with
+    | None -> []
+    | Some (module Ex) ->
+        List.filter_map (fun (asset, bal) ->
+          (* Infer the likely trading pair for this asset *)
+          let quote = match exch_name with
+            | "hyperliquid" -> "USDC"
+            | _ -> "USD"
+          in
+          let symbol = asset ^ "/" ^ quote in
+          (* Skip if this symbol is already a configured strategy *)
+          let is_configured = List.exists (fun (ex, sym) ->
+            ex = exch_name && sym = symbol
+          ) configured_symbols in
+          if is_configured then None
+          else begin
+            (* Try to get market data *)
+            let ticker = Ex.get_ticker ~symbol in
+            let bid_json, ask_json = match ticker with
+              | Some (b, a) -> `Float b, `Float a
+              | None -> `Null, `Null
+            in
+            (* Get open orders for this symbol *)
+            let open_orders = Ex.get_open_orders ~symbol in
+            let sell_orders = List.filter (fun (o : Exchange.Types.open_order) ->
+              o.side = Exchange.Types.Sell && o.remaining_qty > 0.0
+            ) open_orders in
+            let sell_orders_json = `List (List.map (fun (o : Exchange.Types.open_order) ->
+              `Assoc [
+                "id", `String o.order_id;
+                "price", `Float (Option.value o.limit_price ~default:0.0);
+                "qty", `Float o.remaining_qty;
+              ]
+            ) sell_orders) in
+            Some (`Assoc [
+              "exchange", `String exch_name;
+              "asset", `String asset;
+              "symbol", `String symbol;
+              "balance", `Float bal;
+              "bid", bid_json;
+              "ask", ask_json;
+              "sell_orders", sell_orders_json;
+              "sell_count", `Int (List.length sell_orders);
+            ])
+          end
+        ) (Ex.get_all_balances ())
+  ) exchange_names in
+
   `Assoc [
     "type", `String "snapshot";
     "timestamp", `Float now;
@@ -225,6 +281,7 @@ let build_snapshot () =
     "connections", `List (List.map json_of_connection_snapshot connections);
     "domains", json_of_domains ();
     "strategies", `Assoc strategies;
+    "all_balances", `List all_balances;
     "latencies", json_of_domain_latencies ();
   ]
 

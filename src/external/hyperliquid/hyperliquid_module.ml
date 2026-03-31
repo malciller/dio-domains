@@ -261,6 +261,13 @@ module Hyperliquid_impl = struct
   let get_balance ~asset =
     Hyperliquid_balances.get_balance asset
 
+  let get_all_balances () =
+    let assets = Hyperliquid_balances.get_all_assets () in
+    List.filter_map (fun asset ->
+      let bal = Hyperliquid_balances.get_balance asset in
+      if bal > 0.0 then Some (asset, bal) else None
+    ) assets
+
   let get_open_order ~symbol ~order_id =
     match Hyperliquid_executions_feed.get_open_order symbol order_id with
     | Some o -> Some {

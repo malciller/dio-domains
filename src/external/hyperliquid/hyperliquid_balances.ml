@@ -83,6 +83,12 @@ let get_balance_store asset =
 
 (* --- Public API --- *)
 
+let get_all_assets () =
+  Mutex.lock balance_stores_mutex;
+  let assets = Hashtbl.fold (fun asset _ acc -> asset :: acc) balance_stores [] in
+  Mutex.unlock balance_stores_mutex;
+  assets
+
 let get_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_balance store

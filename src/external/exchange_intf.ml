@@ -160,6 +160,9 @@ module type S = sig
   (** Get current asset balance *)
   val get_balance : asset:string -> float
 
+  (** Get all known asset balances (asset_name, balance) *)
+  val get_all_balances : unit -> (string * float) list
+
   (** Get details of a specific open order *)
   val get_open_order : symbol:string -> order_id:string -> Types.open_order option
 
