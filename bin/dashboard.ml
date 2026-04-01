@@ -585,11 +585,11 @@ let render_strategies w json =
     ]
   in
   let summary_bar = I.hcat [
-    kv "Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
+    kv "Cash"      (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
     pipe;
     kv "Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
     pipe;
-    kv "Cash"      (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
+    kv "Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
     pipe;
     kv "Sell Val"  (format_pnl   total_up)        up_attr;
   ] in
@@ -627,8 +627,8 @@ let render_latencies w json =
       let empty   = samples = 0 in
       let p99_attr =
         if empty             then a_dim
-        else if p99 > 5000.0 then a_red
-        else if p99 > 1000.0 then a_yellow
+        else if p99 > 1000.0 then a_red
+        else if p99 >  500.0 then a_yellow
         else a_text
       in
       let lat_col attr f =
@@ -642,7 +642,9 @@ let render_latencies w json =
         lat_col a_text p50;
         lat_col a_text p90;
         lat_col p99_attr p99;
-        lat_col (if p999 > 5000.0 && not empty then a_red else a_text) p999;
+        lat_col (if p999 > 1000.0 && not empty then a_red
+                 else if p999 > 500.0 && not empty then a_yellow
+                 else a_text) p999;
         col 10 a_dim (if empty then "--" else string_of_int samples);
       ]
     ) mlist
@@ -871,7 +873,7 @@ let () =
       | None ->
           let (w, h) = match Notty_unix.winsize Unix.stdout with
             | Some (w, h) -> (w, h) | None -> (80, 24) in
-          render_wait_screen w h "  [...] Waiting for engine...  (q to quit)";
+          render_wait_screen w h "Waiting for engine...  (q to quit)";
           (* Poll keyboard while waiting *)
           let ready, _, _ =
             try Unix.select [Unix.stdin] [] [] 2.0
