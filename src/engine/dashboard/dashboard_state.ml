@@ -118,23 +118,22 @@ let json_of_mm_strategy symbol =
 
 (* ── Market data per symbol ──────────────────────────────────────── *)
 
-let json_of_market_data exchange symbol =
+(** Split a trading symbol into (base_asset, quote_currency).
+    Computed once and passed down to avoid repeated list allocations. *)
+let split_symbol symbol =
+  if String.contains symbol '/' then
+    match String.split_on_char '/' symbol with
+    | base :: quote :: _ -> (base, quote)
+    | base :: _ -> (base, "USD")
+    | [] -> (symbol, "USD")
+  else (symbol, "USD")
+
+let json_of_market_data exchange symbol base_asset quote_currency =
   match Exchange.Registry.get exchange with
   | None -> `Null
   | Some (module Ex) ->
       let ticker = Ex.get_ticker ~symbol in
       let tob = Ex.get_top_of_book ~symbol in
-      let base_asset =
-        if String.contains symbol '/' then
-          String.split_on_char '/' symbol |> List.hd
-        else symbol
-      in
-      let quote_currency =
-        if String.contains symbol '/' then
-          let parts = String.split_on_char '/' symbol in
-          (match parts with _ :: q :: _ -> q | _ -> "USD")
-        else "USD"
-      in
       let base_balance = (try Ex.get_balance ~asset:base_asset with _ -> 0.0) in
       let quote_balance = (try Ex.get_balance ~asset:quote_currency with _ -> 0.0) in
       `Assoc [
@@ -214,7 +213,8 @@ let build_snapshot () =
       | "MM" -> json_of_mm_strategy tc.symbol
       | other -> `Assoc ["type", `String other]
     in
-    let market_json = json_of_market_data tc.exchange tc.symbol in
+    let (base_asset, quote_currency) = split_symbol tc.symbol in
+    let market_json = json_of_market_data tc.exchange tc.symbol base_asset quote_currency in
     tc.symbol, `Assoc [
       "exchange", `String tc.exchange;
       "strategy", strategy_json;
@@ -238,7 +238,7 @@ let build_snapshot () =
     | None -> []
     | Some (module Ex) ->
         List.filter_map (fun (asset, bal) ->
-          (* Infer the likely trading pair for this asset *)
+          (* Infer the likely trading pair for this asset; split once *)
           let quote = match exch_name with
             | "hyperliquid" -> "USDC"
             | _ -> "USD"
@@ -250,12 +250,11 @@ let build_snapshot () =
           ) configured_symbols in
           if is_configured then None
           else begin
-            (* Try to get market data *)
             let is_quote = (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || (asset = "USDT") || (asset = quote) || (asset = "USDe") in
             let ticker = Ex.get_ticker ~symbol in
             let bid_json, ask_json = match ticker with
               | Some (b, a) -> `Float b, `Float a
-              | None -> 
+              | None ->
                   if is_quote then `Float 1.0, `Float 1.0
                   else `Null, `Null
             in

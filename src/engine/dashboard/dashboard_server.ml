@@ -41,15 +41,35 @@ let active_clients = Atomic.make 0
 (** List of active output channels subscribed to watch mode *)
 let watch_clients : Lwt_io.output_channel list ref = ref []
 
+(** Snapshot string cache — reused across 500ms ticks to avoid rebuilding
+    the full Yojson AST on every broadcaster cycle. Invalidated after ~900ms
+    so the displayed data is never more than ~1s stale. *)
+let snapshot_cache_str = ref ""
+let snapshot_cache_time = ref 0.0
+let snapshot_cache_max_age = 0.9
+
 (** Central ticker that broadcasts state to all watching clients every 500ms.
-    Clients that fail a write (disconnected) are pruned from watch_clients. *)
+    Clients that fail a write (disconnected) are pruned from watch_clients.
+    The snapshot string is cached for up to snapshot_cache_max_age seconds
+    to avoid rebuilding the full Yojson AST on every 500ms tick. *)
 let rec state_broadcaster () =
   let%lwt () = Lwt_unix.sleep 0.5 in
   let current_clients = !watch_clients in
   (if current_clients <> [] then begin
     Lwt.catch
       (fun () ->
-        let json_str = Dashboard_state.snapshot_to_string () in
+        (* Reuse cached snapshot if fresh enough; otherwise rebuild and cache. *)
+        let now = Unix.gettimeofday () in
+        let json_str =
+          if now -. !snapshot_cache_time < snapshot_cache_max_age && !snapshot_cache_str <> ""
+          then !snapshot_cache_str
+          else begin
+            let s = Dashboard_state.snapshot_to_string () in
+            snapshot_cache_str := s;
+            snapshot_cache_time := now;
+            s
+          end
+        in
         (* Broadcast sequentially; filter out any client whose write fails *)
         let%lwt surviving = Lwt_list.filter_map_s (fun oc ->
           Lwt.catch

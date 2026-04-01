@@ -34,10 +34,27 @@ let get_profiler symbol operation =
     match Hashtbl.find_opt profilers key with
     | Some p -> p
     | None ->
+        (* Evict the entry with the fewest samples before inserting a new one.
+           This prevents unbounded growth if symbol naming ever varies (e.g.
+           exchange format differences on restart). *)
+        if Hashtbl.length profilers >= 64 then begin
+          let min_key = Hashtbl.fold (fun k p best ->
+            let count = match Latency_profiler.snapshot p with
+              | Some snap -> snap.Latency_profiler.samples
+              | None -> 0
+            in
+            match best with
+            | None -> Some (k, count)
+            | Some (_, s) when count < s -> Some (k, count)
+            | some -> some
+          ) profilers None in
+          Option.iter (fun (k, _) ->
+            Logging.warn_f ~section "profilers table at capacity (64); evicting stale entry '%s'" k;
+            Hashtbl.remove profilers k
+          ) min_key
+        end;
         let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
         Hashtbl.replace profilers key p;
-        if Hashtbl.length profilers > 64 then
-          Logging.warn_f ~section "profilers table unexpectedly large (%d entries)" (Hashtbl.length profilers);
         p
   in
   Mutex.unlock profilers_mutex;
