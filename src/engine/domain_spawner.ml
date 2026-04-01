@@ -639,12 +639,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           | _ -> ());
         end;
         
-        (* Yield to allow other threads (websockets) to run *)
-        (* Event-driven: block until the next WS frame signals new data. *)
-        if not !should_execute_strategy then
-          Concurrency.Exchange_wakeup.wait ();
-
-
+        (* Record cycle work time BEFORE blocking — we want to measure outliers
+           in active processing, not how long we slept waiting for the next frame. *)
         let cycle_stop = Mtime_clock.now_ns () in
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
         Latency_profiler.record prof_cycle cycle_span;
@@ -655,6 +651,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         Latency_profiler.report ~sample_threshold:1 prof_exec;
         Latency_profiler.report ~sample_threshold:1000 prof_strategy;
         Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
+
+        (* Yield to allow other threads (websockets) to run *)
+        (* Event-driven: block until the next WS frame signals new data. *)
+        if not !should_execute_strategy then
+          Concurrency.Exchange_wakeup.wait ();
 
         ()
       done
