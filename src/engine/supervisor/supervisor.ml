@@ -49,6 +49,11 @@ let shutdown_requested = Atomic.make false
 let shutdown_mutex = Mutex.create ()
 let shutdown_cond = Condition.create ()
 
+(** Timestamp of the last Supervisor_cache.force_update() call.
+    Used to rate-limit cache refreshes so that rapid reconnect bursts
+    do not trigger dozens of snapshot allocations per second. *)
+let last_supervisor_cache_update : float Atomic.t = Atomic.make 0.0
+
 (** Sleep for a specified duration, but wake up immediately if shutdown is requested *)
 let interruptible_sleep seconds =
   if Atomic.get shutdown_requested then ()
@@ -185,8 +190,16 @@ let set_state conn new_state =
        | Connected -> "Connected"
        | Failed _ -> "Failed");
        
-    (* Immediately propagate changes to the supervisor cache via event-driven update *)
-    Supervisor_cache.force_update ()
+    (* Propagate changes to the supervisor cache, but rate-limit to at most once
+       per second to avoid allocation bursts during rapid reconnect cycles.
+       The dashboard state_broadcaster picks up any interim delta at its next
+       500ms tick regardless. *)
+    let now = Unix.gettimeofday () in
+    let last = Atomic.get last_supervisor_cache_update in
+    if now -. last >= 1.0 then begin
+      Atomic.set last_supervisor_cache_update now;
+      Supervisor_cache.force_update ()
+    end
   end
 
 (** Get connection state *)
