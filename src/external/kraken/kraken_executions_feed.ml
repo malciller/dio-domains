@@ -298,6 +298,40 @@ let[@inline always] has_open_order symbol order_id =
   Mutex.unlock global_orders_mutex;
   exists
 
+(** Find an open order by ID across all symbols using the global order_to_symbol index.
+    Mirrors Hyperliquid's find_order_everywhere — O(1) lookup, no symbol required.
+    Returns None if the order is not in the local WS cache. *)
+let find_order_everywhere order_id =
+  Mutex.lock global_orders_mutex;
+  let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
+  Mutex.unlock global_orders_mutex;
+  match symbol_opt with
+  | None -> None
+  | Some symbol ->
+      let store = get_symbol_store symbol in
+      Mutex.lock global_orders_mutex;
+      let order = Hashtbl.find_opt store.open_orders order_id in
+      Mutex.unlock global_orders_mutex;
+      order
+
+(** Proactively update the limit_price of an open order in the local WS cache.
+    Called after a successful WS amend response to eliminate the stale-price
+    window that exists between REST confirm and WS exec_type=amended arrival.
+    No-op if the order is not currently tracked. *)
+let update_open_order_price ~symbol ~order_id ~new_price =
+  let store = get_symbol_store symbol in
+  Mutex.lock global_orders_mutex;
+  (match Hashtbl.find_opt store.open_orders order_id with
+   | Some order ->
+       let updated = { order with limit_price = Some new_price; last_updated = Unix.gettimeofday () } in
+       Hashtbl.replace store.open_orders order_id updated;
+       Logging.debug_f ~section "Proactively updated cached limit_price for %s [%s] -> %.8f"
+         order_id symbol new_price
+   | None ->
+       Logging.debug_f ~section "update_open_order_price: order %s [%s] not in cache, skipping"
+         order_id symbol);
+  Mutex.unlock global_orders_mutex
+
 (** Get all symbols that have execution stores (initialized symbols) *)
 let get_all_symbols () =
   Mutex.lock global_orders_mutex;

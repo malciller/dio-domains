@@ -116,30 +116,52 @@ module Kraken_impl = struct
       ?symbol
       ?retry_config
       () =
-    
-    let actual_retry_config = convert_retry_config retry_config in
 
-    Kraken_actions.amend_order
-      ~token
-      ~order_id
-      ?cl_ord_id
-      ?order_qty:qty
-      ?limit_price
-      ?post_only
-      ?trigger_price
-      ?display_qty
-      ?symbol
-      ?retry_config:actual_retry_config
-      ()
-    >|= function
-    | Ok (res : Kraken_common_types.amend_order_result) ->
-        Ok {
-          Types.original_order_id = res.order_id;
-          Types.new_order_id = res.order_id;
-          Types.amend_id = Some res.amend_id;
-          Types.cl_ord_id = res.cl_ord_id;
-        }
-    | Error e -> Error e
+    (* Mirror Hyperliquid: require the order to be in the local WS cache before
+       firing. If absent (WS lag, reconnect churn, genuinely gone) return Error
+       immediately so handle_order_amendment_failed fires and the strategy
+       self-corrects via fresh placement instead of silently stalling. *)
+    let sym = Option.value symbol ~default:"" in
+    match Kraken_executions_feed.find_order_everywhere order_id with
+    | None ->
+        Logging.warn_f ~section "amend_order: order %s not in local cache%s — returning error for clean recovery"
+          order_id (if sym <> "" then Printf.sprintf " [%s]" sym else "");
+        Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
+    | Some existing ->
+        (* Inherit qty from cached order when not explicitly provided,
+           mirroring how hyperliquid_module uses existing.order_qty. *)
+        let effective_qty = match qty with Some q -> q | None -> existing.order_qty in
+        let actual_retry_config = convert_retry_config retry_config in
+
+        Kraken_actions.amend_order
+          ~token
+          ~order_id
+          ?cl_ord_id
+          ~order_qty:effective_qty
+          ?limit_price
+          ?post_only
+          ?trigger_price
+          ?display_qty
+          ?symbol
+          ?retry_config:actual_retry_config
+          ()
+        >|= function
+        | Ok (res : Kraken_common_types.amend_order_result) ->
+            (* Proactively update the cached limit_price so the executor's
+               skip-check sees the new price immediately, without waiting for
+               the async exec_type=amended WS event to arrive. *)
+            (match limit_price with
+             | Some new_price when sym <> "" ->
+                 Kraken_executions_feed.update_open_order_price
+                   ~symbol:sym ~order_id ~new_price
+             | _ -> ());
+            Ok {
+              Types.original_order_id = res.order_id;
+              Types.new_order_id = res.order_id;
+              Types.amend_id = Some res.amend_id;
+              Types.cl_ord_id = res.cl_ord_id;
+            }
+        | Error e -> Error e
 
   (** Cancel orders *)
   let cancel_orders
