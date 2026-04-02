@@ -163,44 +163,6 @@ Enable with `"hedge": true`. Kraken is not supported.
 
 ---
 
-## Key Features
-
-```
-+--------------------------------------+
-|  Domain-Based Parallelism            |  Each trading asset runs in its own
-|                                      |  OCaml domain for true parallel
-|                                      |  execution without GIL limitations
-+--------------------------------------+
-|  Event-Driven Architecture           |  Zero-latency pipeline using modern Lwt 
-|                                      |  condition variables and Mutexes. All
-|                                      |  polling loops are eliminated from the 
-|                                      |  hot path for instant strategy triggers
-+--------------------------------------+
-|  Tick-Driven Execution               |  Global tick bus and lock-free ring
-|                                      |  buffers for high-throughput orderbook 
-|                                      |  and execution data processing
-+--------------------------------------+
-|  Real-Time Dashboard                 |  Detached Curses-style terminal dashboard
-|                                      |  binary (communicates via UDS) for
-|                                      |  real-time monitoring without GC overhead
-+--------------------------------------+
-|  Latency Profiling                   |  Real-time histogram-based profiling
-|                                      |  (p50-p999) of hot loops and
-|                                      |  strategy execution
-+--------------------------------------+
-|  Circuit Breaker Protection          |  Automatic connection management
-|                                      |  with health monitoring and
-|                                      |  graceful degradation
-+--------------------------------------+
-|  High-Frequency Trading              |  Optimized for low-latency execution
-|                                      |  with microsecond-precision timing
-+--------------------------------------+
-|  Fault Tolerance                     |  Supervised domains with automatic
-|                                      |  restart and exponential backoff
-+--------------------------------------+
-```
-
----
 
 ## Benchmarks
 
