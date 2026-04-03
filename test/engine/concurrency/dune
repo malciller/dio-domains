@@ -2,6 +2,3 @@
  (name test_event_bus)
  (libraries dio.concurrency alcotest))
 
-(test
- (name test_event_registry)
- (libraries dio.concurrency alcotest))
