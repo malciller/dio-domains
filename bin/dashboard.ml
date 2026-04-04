@@ -134,7 +134,6 @@ let c_cyan       = A.rgb_888 ~r:34  ~g:211 ~b:238
 let c_dim        = A.rgb_888 ~r:55  ~g:63  ~b:78
 (* ── Attribute constructors ──────────────────────────────────────── *)
 
-let a_title      = A.(fg c_title  ++ bg c_bg         ++ st bold)
 let a_label      = A.(fg c_label  ++ bg c_bg)
 let a_text       = A.(fg c_text   ++ bg c_bg)
 let a_bright     = A.(fg c_bright ++ bg c_bg         ++ st bold)
@@ -160,8 +159,6 @@ let pad_right w s =
   else s ^ String.make (w - len) ' '
 
 let col w attr s = I.string attr (pad_right w s)
-
-let spacer = I.string a_text " "
 
 let format_pct f =
   if abs_float f < 0.01 then "<0.01%"
@@ -240,41 +237,6 @@ let render_header w json =
     @ [ I.string A.(bg c_panel) (String.make (max 0 (w - base_w - conn_w)) ' ') ]
   )
 
-(* ── Panel: Connections ──────────────────────────────────────────── *)
-
-let _render_connections w json =
-  let conns = json |?> "connections" |> to_list_d in
-  let title = I.hcat [
-    I.string a_title " CONNECTIONS";
-    I.string a_dim (String.make (max 0 (w - 13)) ' ');
-  ] in
-  let rows = List.map (fun c ->
-    let name = c |?> "name" |> to_string_d "?" in
-    let state = c |?> "state" |> to_string_d "?" in
-    let uptime = c |?> "uptime_s" |> to_float_d 0.0 in
-    let cb = c |?> "circuit_breaker" |> to_string_d "?" in
-    let reconn = c |?> "reconnects" |> to_int_d 0 in
-    let state_attr = match state with
-      | "Connected" -> a_green | "Connecting" -> a_yellow | _ -> a_red in
-    let indicator = match state with
-      | "Connected" -> I.string a_green "●" 
-      | "Connecting" -> I.string a_yellow "◌"
-      | _ -> I.string a_red "✗" in
-    let cb_attr = if cb = "Closed" then a_dim else a_red in
-    I.hcat [
-      I.string a_text " ";
-      indicator; spacer;
-      col 22 a_text (truncate_string 22 name); spacer;
-      col 12 state_attr state; spacer;
-      col 7 a_label (format_duration uptime); spacer;
-      I.string a_label "rc:";
-      col 3 (if reconn > 0 then a_yellow else a_dim) (string_of_int reconn); spacer;
-      I.string a_label "cb:";
-      col (max 0 (w - 58)) cb_attr cb;
-    ]
-  ) conns in
-  I.vcat (title :: rows)
-
 (* ── Panel: Holdings & Strategy ──────────────────────────────────── *)
 
 let exch_tag_of = function
@@ -322,7 +284,6 @@ let render_strategies w json =
     (* Strategy data *)
     let buy_price = strat |?> "buy_price" |> to_float_d 0.0 in
     let sell_count = strat |?> "sell_count" |> to_int_d 0 in
-    let _grid_qty = strat |?> "grid_qty" |> to_float_d 0.0 in
 
     (* Unrealized profit: sum of mark proceeds for all pending sells *)
     (* Unrealized profit and accumulated holdings from pending sells *)

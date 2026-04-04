@@ -109,8 +109,6 @@ let test_constants () =
 let test_json_parsing_helpers () =
   (* Test JSON parsing helper functions *)
   try
-    let _int64_json = `Intlit "12345" in
-    let _int32_json = `Int 67890 in
 
     (* These functions exist and don't crash on valid input *)
     Alcotest.(check bool) "json parsing helpers don't crash" true true

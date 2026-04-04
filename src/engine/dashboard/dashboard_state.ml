@@ -2,8 +2,6 @@
     Reads engine state from various modules and serializes to JSON
     for transmission over Unix domain socket to the TUI dashboard. *)
 
-let _section = "dashboard_state"
-
 module Exchange = Dio_exchange.Exchange_intf
 module Fear_and_greed = Cmc.Fear_and_greed
 
