@@ -677,7 +677,6 @@ let parse_execution_event json =
                | None -> None)
         in
 
-        let _timestamp_str = member "timestamp" json |> to_string in
         (* Use current time for event timestamp - proper RFC3339 parsing can be added later if needed *)
         let timestamp = Unix.gettimeofday () in
 
