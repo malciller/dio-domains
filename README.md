@@ -78,6 +78,7 @@ Edit `config.json` (example):
       "exchange": "hyperliquid",      // Exchange name: "kraken", "hyperliquid"
       "qty": "0.001",                 // Base asset quantity per order
       "grid_interval": [0.1, 0.5],    // Min/Max grid spacing (%)
+      "accumulation_buffer": [0.75, 3.0], // Min/Max net quote profit buffer (USDC) for sell_mult accumulation; resolved dynamically from Fear & Greed
       "sell_mult": "1.0",             // Sell amount multiplier
       "strategy": "Grid",             // Strategy name: "Grid"
       "testnet": true                 // Use testnet
@@ -95,10 +96,10 @@ Edit `config.json` (example):
       "qty": "0.35",                  // Base asset quantity per order
       "grid_interval": [0.25, 0.5],   // Min/Max grid spacing (%)
       "sell_mult": "0.999",           // Sell amount multiplier (triggers discrete accumulation on Hyperliquid)
+      "accumulation_buffer": [0.5, 5.0], // Min/Max net quote profit buffer (USDC) for sell_mult accumulation; resolved dynamically from Fear & Greed
       "strategy": "Grid",             // Strategy name: "Grid"
       "testnet": false,               // Use testnet
-      "hedge": true,                  // Enable auto-hedge (Hyperliquid only)
-      "accumulation_buffer": 0.01     // Net quote profit required above rounding cost before triggering sell_mult accumulation (default: 0.01)
+      "hedge": true                // Enable auto-hedge (Hyperliquid only)
     }
   ]
 }
@@ -137,25 +138,33 @@ maker fees on both legs) exceeds the rounding cost plus
 accumulate base asset. The effective threshold is
 `rounding_cost + accumulation_buffer`, where
 `rounding_cost = rounding_diff x sell_price` (the USDC value of the
-base being accumulated). The `accumulation_buffer` parameter (default:
-0.01 USDC) represents the net quote profit guaranteed above the cost of
-the accumulated base. For example, with `qty=0.35`, `sell_mult=0.999`,
-and HYPE at $39.55, the rounding cost is `0.01 x 39.55 = 0.40 USDC`, so
-`accumulation_buffer: 2.50` yields an effective threshold of ~2.90 USDC.
-This is adaptive: fast markets accumulate faster, slow markets wait
-longer. Kraken is unaffected.
+base being accumulated).
+
+`accumulation_buffer` is configured as a `[min, max]` range and resolved
+via linear interpolation against the Fear & Greed index, just like
+`grid_interval`. Low F&G (fear) resolves closer to `min`, triggering
+accumulation sooner (accumulate more aggressively in fearful markets).
+High F&G (greed) resolves closer to `max`, requiring more profit before
+accumulating (more conservative in greedy markets). For example, with
+`qty=0.35`, `sell_mult=0.999`, `accumulation_buffer=[0.5, 5.0]`,
+and HYPE at $39.55: the rounding cost is `0.01 x 39.55 = 0.40 USDC`;
+at F&G=25 the resolved buffer is ~1.63 USDC (threshold ~2.03), while at
+F&G=75 it is ~3.88 USDC (threshold ~4.28). This is adaptive: fearful
+markets accumulate faster, greedy markets wait longer. Kraken is
+unaffected.
 
 **MM (Adaptive Market Maker)**: Dynamically adapts quoting style based
 on market fees. Uses greedy quoting for no-fee markets and conservative
 profit-guaranteeing quotes where fees apply.
 
-**Fear & Greed**: Grid spacing is initially resolved at domain startup
-using linear interpolation between configured `grid_interval` [min, max]
-based on the CoinMarketCap Fear & Greed index. The index is dynamically
-re-evaluated at runtime whenever the underlying asset price moves by a
-significant threshold (e.g., +/- 3.5%) from the baseline, ensuring grid
-spacing adapts to changing market conditions. Provide `CMC_API_KEY` for
-live values.
+**Fear & Greed**: Both `grid_interval` and `accumulation_buffer` are
+resolved at domain startup using linear interpolation between their
+configured `[min, max]` ranges based on the CoinMarketCap Fear & Greed
+index (0–100). The index is dynamically re-evaluated at runtime whenever
+the underlying asset price moves by a significant threshold (e.g.,
++/- 3.5%) from the baseline, ensuring both grid spacing and accumulation
+behavior adapt to changing market conditions. `accumulation_buffer`
+scaling is Hyperliquid-only. Provide `CMC_API_KEY` for live values.
 
 **Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge
 on perps. Spot buy fills open a perp short; spot sell fills close it.
