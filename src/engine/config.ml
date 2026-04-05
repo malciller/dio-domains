@@ -12,7 +12,7 @@ type trading_config = {
   taker_fee: float option;
   testnet: bool;
   hedge: bool;
-  accumulation_buffer: float;  (** minimum quote profit buffer before triggering sell_mult accumulation *)
+  accumulation_buffer: float * float;  (** min, max quote profit buffer; resolved dynamically from Fear & Greed *)
 }
 type logging_config = {
   level: Logging.level;
@@ -101,6 +101,42 @@ let parse_grid_interval json exchange symbol =
           default)
   | _ -> default
 
+(** Parse accumulation_buffer from JSON, accepting:
+    - list [min, max]
+    - single number/string -> treated as (v, v) for backward compatibility *)
+let parse_accumulation_buffer json exchange symbol =
+  let open Yojson.Basic.Util in
+  let default = (0.01, 0.01) in
+  let float_of_json = function
+    | `Float f -> Some f
+    | `Int i -> Some (float_of_int i)
+    | `String s -> (try Some (float_of_string s) with _ -> None)
+    | _ -> None
+  in
+  match json |> member "accumulation_buffer" with
+  | `List [lo; hi] -> (
+      match float_of_json lo, float_of_json hi with
+      | Some a, Some b ->
+          let low = min a b in
+          let high = max a b in
+          (low, high)
+      | _ ->
+          Logging.warn_f ~section "Invalid accumulation_buffer list for %s/%s, using default %.2f-%.2f"
+            exchange symbol (fst default) (snd default);
+          default)
+  | `List _ ->
+      Logging.warn_f ~section "accumulation_buffer must be a two-value list for %s/%s, using default %.2f-%.2f"
+        exchange symbol (fst default) (snd default);
+      default
+  | (`Float _ | `Int _ | `String _) as v -> (
+      match float_of_json v with
+      | Some x -> (x, x)
+      | None ->
+          Logging.warn_f ~section "Invalid accumulation_buffer value for %s/%s, using default %.2f-%.2f"
+            exchange symbol (fst default) (snd default);
+          default)
+  | _ -> default
+
 (** Parse a single trading config from JSON *)
 let parse_config json =
   if validate_keys ~context:"trading entry" ~allowed:known_trading_keys json then
@@ -144,7 +180,7 @@ let parse_config json =
     taker_fee = json |> member "taker_fee" |> to_option to_float;
     testnet;
     hedge;
-    accumulation_buffer = json |> member "accumulation_buffer" |> to_option to_float |> Option.value ~default:0.01;
+    accumulation_buffer = parse_accumulation_buffer json exchange symbol;
   }
 
 (** Parse logging configuration *)

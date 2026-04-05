@@ -79,6 +79,20 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
     else
       None
   in
+
+  (* Resolve accumulation_buffer once using Fear & Greed (cached) *)
+  let resolved_accumulation_buffer =
+    if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
+      let fallback = let (lo, hi) = asset_with_fees.accumulation_buffer in (lo +. hi) /. 2.0 in
+      let fng = Fear_and_greed.fetch_value ~fallback () in
+      let resolved = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:fng in
+      let (lo, hi) = asset_with_fees.accumulation_buffer in
+      Logging.info_f ~section "Resolved accumulation_buffer for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
+        asset_with_fees.exchange asset_with_fees.symbol resolved fng lo hi;
+      Some resolved
+    else
+      None
+  in
   
 
   let format_distance_info asset_symbol current_price strategy_type =
@@ -181,13 +195,20 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let baseline_price = ref None in
       let last_known_fng = ref (Fear_and_greed.fetch_value ()) in
 
-      let grid_strategy_asset_ref =
+       let grid_strategy_asset_ref =
         if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
           let grid_interval =
             match resolved_grid_interval with
             | Some g -> g
             | None ->
                 let (lo, hi) = asset_with_fees.grid_interval in
+                (lo +. hi) /. 2.0
+          in
+          let accumulation_buffer =
+            match resolved_accumulation_buffer with
+            | Some ab -> ab
+            | None ->
+                let (lo, hi) = asset_with_fees.accumulation_buffer in
                 (lo +. hi) /. 2.0
           in
           ref (Some {
@@ -199,7 +220,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             strategy = asset_with_fees.strategy;
             maker_fee = asset_with_fees.maker_fee;
             taker_fee = asset_with_fees.taker_fee;
-            accumulation_buffer = asset_with_fees.accumulation_buffer;
+            accumulation_buffer;
           })
         else ref None
       in
@@ -608,9 +629,15 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             Logging.info_f ~section "[%s/%s] Fear & Greed updated to %.2f. Re-evaluated grid_interval to %.4f (range %.4f-%.4f)"
               asset_with_fees.exchange asset_with_fees.symbol current_fng new_interval lo hi;
             
+            let (ab_lo, ab_hi) = asset_with_fees.accumulation_buffer in
+            let new_ab = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:current_fng in
+            Logging.info_f ~section "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"
+              asset_with_fees.exchange asset_with_fees.symbol new_ab ab_lo ab_hi;
+
             (match !grid_strategy_asset_ref with
              | Some asset ->
-                 let new_asset = { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval } in
+                 let new_asset = { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval;
+                                              Dio_strategies.Suicide_grid.accumulation_buffer = new_ab } in
                  grid_strategy_asset_ref := Some new_asset
              | None -> ())
           end;
