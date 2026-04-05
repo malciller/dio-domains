@@ -80,9 +80,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       None
   in
 
-  (* Resolve accumulation_buffer once using Fear & Greed (cached) *)
+  (* Resolve accumulation_buffer once using Fear & Greed (cached) — Hyperliquid only *)
   let resolved_accumulation_buffer =
-    if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
+    if asset_with_fees.exchange = "hyperliquid"
+       && (asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid") then
       let fallback = let (lo, hi) = asset_with_fees.accumulation_buffer in (lo +. hi) /. 2.0 in
       let fng = Fear_and_greed.fetch_value ~fallback () in
       let resolved = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:fng in
@@ -208,6 +209,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             match resolved_accumulation_buffer with
             | Some ab -> ab
             | None ->
+                (* Non-Hyperliquid: use midpoint (field is (0.01,0.01) default) *)
                 let (lo, hi) = asset_with_fees.accumulation_buffer in
                 (lo +. hi) /. 2.0
           in
@@ -629,17 +631,25 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             Logging.info_f ~section "[%s/%s] Fear & Greed updated to %.2f. Re-evaluated grid_interval to %.4f (range %.4f-%.4f)"
               asset_with_fees.exchange asset_with_fees.symbol current_fng new_interval lo hi;
             
-            let (ab_lo, ab_hi) = asset_with_fees.accumulation_buffer in
-            let new_ab = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:current_fng in
-            Logging.info_f ~section "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"
-              asset_with_fees.exchange asset_with_fees.symbol new_ab ab_lo ab_hi;
-
-            (match !grid_strategy_asset_ref with
-             | Some asset ->
-                 let new_asset = { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval;
-                                              Dio_strategies.Suicide_grid.accumulation_buffer = new_ab } in
-                 grid_strategy_asset_ref := Some new_asset
-             | None -> ())
+            (* Also update accumulation_buffer — Hyperliquid only *)
+            if asset_with_fees.exchange = "hyperliquid" then begin
+              let (ab_lo, ab_hi) = asset_with_fees.accumulation_buffer in
+              let new_ab = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:current_fng in
+              Logging.info_f ~section "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"
+                asset_with_fees.exchange asset_with_fees.symbol new_ab ab_lo ab_hi;
+              (match !grid_strategy_asset_ref with
+               | Some asset ->
+                   let new_asset = { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval;
+                                                Dio_strategies.Suicide_grid.accumulation_buffer = new_ab } in
+                   grid_strategy_asset_ref := Some new_asset
+               | None -> ())
+            end else begin
+              (match !grid_strategy_asset_ref with
+               | Some asset ->
+                   let new_asset = { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval } in
+                   grid_strategy_asset_ref := Some new_asset
+               | None -> ())
+            end
           end;
 
           (match !grid_strategy_asset_ref with
