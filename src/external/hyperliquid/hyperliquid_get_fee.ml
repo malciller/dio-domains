@@ -23,14 +23,40 @@ let parse_fee_info body_str =
     let maker = member "userAddRate" json |> to_string_option |> Option.map float_of_string in
     let taker = member "userCrossRate" json |> to_string_option |> Option.map float_of_string in
     
-    (* Spot fees are currently static on Hyperliquid for most users: 0% maker, 0.1% taker *)
-    (* However, we store them explicitly so the Engine and Hedger can access them *)
-    let spot_maker = Some 0.0 in
-    let spot_taker = Some 0.001 in
+    (* Parse user-specific spot fees from the API response.
+       Primary: userSpotAddRate / userSpotCrossRate (include referral & staking discounts).
+       Fallback: feeSchedule.spotAdd / feeSchedule.spotCross (base schedule rates).
+       Last resort: 0.0004 maker / 0.0007 taker (highest Hyperliquid default spot rates). *)
+    let spot_maker =
+      let user_rate = member "userSpotAddRate" json |> to_string_option |> Option.map float_of_string in
+      match user_rate with
+      | Some _ -> user_rate
+      | None ->
+          (try
+             let schedule = member "feeSchedule" json in
+             match member "spotAdd" schedule |> to_string_option |> Option.map float_of_string with
+             | Some _ as r -> r
+             | None -> Some 0.0004
+           with _ -> Some 0.0004)
+    in
+    let spot_taker =
+      let user_rate = member "userSpotCrossRate" json |> to_string_option |> Option.map float_of_string in
+      match user_rate with
+      | Some _ -> user_rate
+      | None ->
+          (try
+             let schedule = member "feeSchedule" json in
+             match member "spotCross" schedule |> to_string_option |> Option.map float_of_string with
+             | Some _ as r -> r
+             | None -> Some 0.0007
+           with _ -> Some 0.0007)
+    in
     
-    Logging.debug_f ~section "Retrieved Hyperliquid fees: perp_maker=%s, perp_taker=%s, spot_maker=0.0%%, spot_taker=0.1%%" 
+    Logging.debug_f ~section "Retrieved Hyperliquid fees: perp_maker=%s, perp_taker=%s, spot_maker=%s, spot_taker=%s" 
       (Option.map (fun f -> Printf.sprintf "%.4f%%" (f *. 100.)) maker |> Option.value ~default:"None")
-      (Option.map (fun f -> Printf.sprintf "%.4f%%" (f *. 100.)) taker |> Option.value ~default:"None");
+      (Option.map (fun f -> Printf.sprintf "%.4f%%" (f *. 100.)) taker |> Option.value ~default:"None")
+      (Option.map (fun f -> Printf.sprintf "%.4f%%" (f *. 100.)) spot_maker |> Option.value ~default:"None")
+      (Option.map (fun f -> Printf.sprintf "%.4f%%" (f *. 100.)) spot_taker |> Option.value ~default:"None");
       
     Some {
       exchange = "hyperliquid";
