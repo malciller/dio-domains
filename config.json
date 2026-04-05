@@ -20,7 +20,10 @@
         0.75
       ],
       "sell_mult": "0.999",
-      "accumulation_buffer": 0.75,
+      "accumulation_buffer": [
+        0.75,
+        4.5
+      ],
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
@@ -45,7 +48,10 @@
         2.25
       ],
       "sell_mult": "0.999",
-      "accumulation_buffer": 0.50,
+      "accumulation_buffer": [
+        0.5,
+        5.0
+      ],
       "strategy": "Grid",
       "testnet": false,
       "hedge": false

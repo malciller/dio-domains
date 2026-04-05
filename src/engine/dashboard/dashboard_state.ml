@@ -220,6 +220,8 @@ let build_snapshot () =
       "qty", `String tc.qty;
       "grid_interval_lo", `Float (fst tc.grid_interval);
       "grid_interval_hi", `Float (snd tc.grid_interval);
+      "accumulation_buffer_lo", `Float (fst tc.accumulation_buffer);
+      "accumulation_buffer_hi", `Float (snd tc.accumulation_buffer);
       "sell_mult", `String tc.sell_mult;
     ]
   ) config.trading in
