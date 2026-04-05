@@ -222,7 +222,7 @@ let render_header w json =
              + 5 + 4 + String.length fng_str in
   I.hcat (
     [ I.string A.(bg c_panel) "  ";
-      I.string A.(fg c_accent ++ bg c_panel ++ st bold) "Dio";
+      I.string A.(fg c_accent ++ bg c_panel ++ st bold) "Dio;";
       I.string A.(fg c_dim ++ bg c_panel) "        │  ";
       I.string A.(fg c_label ++ bg c_panel) "up ";
       I.string A.(fg c_text ++ bg c_panel) dur_str;
@@ -744,7 +744,7 @@ let render_frame w h json =
       sep;
       render_domains w json;
       sep;
-      I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  refreshes every 500ms");
+      I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  Diophant Solutions");
     ]
     |> I.hsnap ~align:`Left w   (* clamp width: prevents line-wrap / scroll *)
     |> I.vsnap ~align:`Top  h   (* clamp height: prevents overflow below     *)

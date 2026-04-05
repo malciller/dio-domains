@@ -1,10 +1,12 @@
 let test_parse_fee_info_valid () =
-  let json_str = {|{"userAddRate":"0.0001","userCrossRate":"0.0003"}|} in
+  let json_str = {|{"userAddRate":"0.0001","userCrossRate":"0.0003","userSpotAddRate":"0.00028","userSpotCrossRate":"0.00049"}|} in
   match Hyperliquid.Get_fee.parse_fee_info json_str with
   | Some info ->
       Alcotest.(check string) "exchange" "hyperliquid" info.exchange;
       Alcotest.(check (option (float 0.000001))) "maker" (Some 0.0001) info.maker_fee;
-      Alcotest.(check (option (float 0.000001))) "taker" (Some 0.0003) info.taker_fee
+      Alcotest.(check (option (float 0.000001))) "taker" (Some 0.0003) info.taker_fee;
+      Alcotest.(check (option (float 0.000001))) "spot_maker" (Some 0.00028) info.spot_maker_fee;
+      Alcotest.(check (option (float 0.000001))) "spot_taker" (Some 0.00049) info.spot_taker_fee
   | None -> Alcotest.fail "Expected Some fee_info"
 
 let test_parse_fee_info_malformed () =
@@ -17,15 +19,20 @@ let test_parse_fee_info_missing_fields () =
   match Hyperliquid.Get_fee.parse_fee_info json_str with
   | Some info ->
       Alcotest.(check (option (float 0.000001))) "maker None" None info.maker_fee;
-      Alcotest.(check (option (float 0.000001))) "taker None" None info.taker_fee
+      Alcotest.(check (option (float 0.000001))) "taker None" None info.taker_fee;
+      (* spot fees fall back to hardcoded defaults when API fields are missing *)
+      Alcotest.(check (option (float 0.000001))) "spot_maker default" (Some 0.0004) info.spot_maker_fee;
+      Alcotest.(check (option (float 0.000001))) "spot_taker default" (Some 0.0007) info.spot_taker_fee
   | None -> Alcotest.fail "Expected Some with None fields"
 
 let test_parse_fee_info_zero_rates () =
-  let json_str = {|{"userAddRate":"0.0","userCrossRate":"0.0"}|} in
+  let json_str = {|{"userAddRate":"0.0","userCrossRate":"0.0","userSpotAddRate":"0.0","userSpotCrossRate":"0.0"}|} in
   match Hyperliquid.Get_fee.parse_fee_info json_str with
   | Some info ->
       Alcotest.(check (option (float 0.000001))) "maker 0" (Some 0.0) info.maker_fee;
-      Alcotest.(check (option (float 0.000001))) "taker 0" (Some 0.0) info.taker_fee
+      Alcotest.(check (option (float 0.000001))) "taker 0" (Some 0.0) info.taker_fee;
+      Alcotest.(check (option (float 0.000001))) "spot_maker 0" (Some 0.0) info.spot_maker_fee;
+      Alcotest.(check (option (float 0.000001))) "spot_taker 0" (Some 0.0) info.spot_taker_fee
   | None -> Alcotest.fail "Expected Some fee_info"
 
 let () =

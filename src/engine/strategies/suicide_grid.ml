@@ -1404,8 +1404,17 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
            | Some base_price when sell_fill_price > base_price ->
               let qty = state.grid_qty in
               let gross = (sell_fill_price -. base_price) *. qty in
-              let fees = (sell_fill_price *. qty *. state.maker_fee)
-                       +. (base_price *. qty *. state.maker_fee) in
+              (* Hyperliquid spot: buy fee is deducted from received base asset
+                 (no quote impact); sell fee is deducted from received quote.
+                 Only the sell-side fee affects USDC balance growth.
+                 Kraken: both fees are deducted from quote currency. *)
+              let fees =
+                if state.exchange_id = "hyperliquid" then
+                  sell_fill_price *. qty *. state.maker_fee
+                else
+                  (sell_fill_price *. qty *. state.maker_fee)
+                  +. (base_price *. qty *. state.maker_fee)
+              in
               let net_profit = gross -. fees in
               if net_profit > 0.0 then begin
                 state.accumulated_profit <- state.accumulated_profit +. net_profit;
