@@ -474,7 +474,8 @@ let execute_strategy
      cleanup, and cancellation detection always execute regardless. *)
   if not state.capital_low then begin
 
-  let now = Unix.time () in
+  (* Single wall-clock timestamp for the entire cycle. *)
+  let now = Unix.gettimeofday () in
 
       (* Evict stale pending orders (older than 5s) and cap list at 50 entries *)
   let original_count = List.length state.pending_orders in

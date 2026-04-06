@@ -69,17 +69,21 @@ let balance_stores_mutex = Mutex.create ()
 let is_ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
+(** Double-checked lock: fast path is lock-free when the store already exists. *)
 let get_balance_store asset =
-  Mutex.lock balance_stores_mutex;
-  let store = match Hashtbl.find_opt balance_stores asset with
+  match Hashtbl.find_opt balance_stores asset with
   | Some store -> store
   | None ->
-      let store = BalanceStore.create () in
-      Hashtbl.add balance_stores asset store;
+      Mutex.lock balance_stores_mutex;
+      let store = match Hashtbl.find_opt balance_stores asset with
+      | Some store -> store
+      | None ->
+          let store = BalanceStore.create () in
+          Hashtbl.add balance_stores asset store;
+          store
+      in
+      Mutex.unlock balance_stores_mutex;
       store
-  in
-  Mutex.unlock balance_stores_mutex;
-  store
 
 (* Public query and readiness interface. *)
 

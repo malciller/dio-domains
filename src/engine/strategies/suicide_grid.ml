@@ -636,8 +636,9 @@ let execute_strategy
 
   if not state.capital_low then begin
 
-  (* Order placement throttle: allow logic to run every cycle. *)
-  let now = Unix.time () in
+  (* Single wall-clock timestamp for the entire cycle. Avoids redundant
+     gettimeofday(2) syscalls that accumulate 1-5us each. *)
+  let now = Unix.gettimeofday () in
   
   match current_price, top_of_book with
   | None, _ -> ()  (* No price data available yet *)
@@ -700,7 +701,7 @@ let execute_strategy
       (* Sync strategy state with actual open orders from exchange.
          Preserve sell orders set by handle_order_amended or newly placed
          execution events that may not yet appear in exchange data due to WS lag. *)
-      let now_time = Unix.gettimeofday () in
+      let now_time = now in
       state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
         now_time -. ts < 10.0
       ) state.recently_injected_sells;
