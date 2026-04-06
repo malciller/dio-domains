@@ -1,28 +1,28 @@
 (** Dashboard Unix Domain Socket Server
 
-    Runs inside the engine process as an Lwt fiber. Exposes engine state
-    to the separate dashboard binary via a UDS at /tmp/dio-{pid}.sock.
+    Runs as an Lwt fiber within the engine process. Exposes engine state
+    to the standalone dashboard binary over a UDS at /tmp/dio-{pid}.sock.
 
-    Protocol (length-prefixed JSON):
-      Client -> Server: 1-byte command
-        'S' = full state snapshot
-        'W' = watch mode (continuous push every 500ms)
-        'Q' = close connection
-      Server -> Client: 4-byte big-endian length + JSON payload
+    Wire protocol (length-prefixed JSON):
+      Client to Server: 1-byte ASCII command
+        'S' = request a single state snapshot
+        'W' = enter watch mode (server pushes state every 500 ms)
+        'Q' = close the connection
+      Server to Client: 4-byte big-endian length prefix followed by a JSON payload
 *)
 
 open Lwt.Infix
 
 let section = "dashboard_server"
 
-(** Socket path for this engine instance *)
+(** Returns the UDS path for the current engine process, keyed by PID. *)
 let socket_path () =
   let pid = Unix.getpid () in
   Printf.sprintf "/tmp/dio-%d.sock" pid
 
-(** Send a length-prefixed JSON response.
-    Propagates write errors to the caller. Callers that want to tolerate
-    client disconnects must catch exceptions themselves. *)
+(** Writes a length-prefixed JSON frame to [oc].
+    Encodes [json_str] length as a 4-byte big-endian header.
+    Propagates write errors; callers must handle client disconnects. *)
 let send_response oc json_str =
   let len = String.length json_str in
   let header = Bytes.create 4 in
@@ -35,30 +35,30 @@ let send_response oc json_str =
   Lwt_io.write oc json_str >>= fun () ->
   Lwt_io.flush oc
 
-(** Active client count for monitoring *)
+(** Atomic count of currently connected dashboard clients. *)
 let active_clients = Atomic.make 0
 
-(** List of active output channels subscribed to watch mode *)
+(** Mutable list of output channels subscribed to watch mode broadcasts. *)
 let watch_clients : Lwt_io.output_channel list ref = ref []
 
-(** Snapshot string cache — reused across 500ms ticks to avoid rebuilding
-    the full Yojson AST on every broadcaster cycle. Invalidated after ~900ms
-    so the displayed data is never more than ~1s stale. *)
+(** Cached serialized snapshot string and its generation timestamp.
+    Reused across 500 ms broadcast ticks to avoid repeated Yojson
+    serialization. Invalidated after [snapshot_cache_max_age] seconds
+    so displayed data remains within ~1 s of real-time. *)
 let snapshot_cache_str = ref ""
 let snapshot_cache_time = ref 0.0
 let snapshot_cache_max_age = 0.9
 
-(** Central ticker that broadcasts state to all watching clients every 500ms.
-    Clients that fail a write (disconnected) are pruned from watch_clients.
-    The snapshot string is cached for up to snapshot_cache_max_age seconds
-    to avoid rebuilding the full Yojson AST on every 500ms tick. *)
+(** Periodic broadcaster that pushes state to all watch-mode clients
+    every 500 ms. Uses the snapshot cache when valid; rebuilds otherwise.
+    Clients that fail a write are removed from [watch_clients]. *)
 let rec state_broadcaster () =
   let%lwt () = Lwt_unix.sleep 0.5 in
   let current_clients = !watch_clients in
   (if current_clients <> [] then begin
     Lwt.catch
       (fun () ->
-        (* Reuse cached snapshot if fresh enough; otherwise rebuild and cache. *)
+        (* Use cached snapshot if within max age; otherwise regenerate. *)
         let now = Unix.gettimeofday () in
         let json_str =
           if now -. !snapshot_cache_time < snapshot_cache_max_age && !snapshot_cache_str <> ""
@@ -70,7 +70,7 @@ let rec state_broadcaster () =
             s
           end
         in
-        (* Broadcast sequentially; filter out any client whose write fails *)
+        (* Broadcast sequentially; remove clients whose writes fail. *)
         let%lwt surviving = Lwt_list.filter_map_s (fun oc ->
           Lwt.catch
             (fun () -> send_response oc json_str >|= fun () -> Some oc)
@@ -84,26 +84,27 @@ let rec state_broadcaster () =
   end else Lwt.return_unit)
   >>= fun () -> state_broadcaster ()
 
-(** Handle a single client connection *)
+(** Handles a single client connection over [ic]/[oc].
+    Reads 1-byte commands in a loop until disconnect or 'Q'. *)
 let handle_client (ic, oc) =
   let buf = Bytes.create 1 in
   let rec loop () =
     Lwt.catch
       (fun () ->
         let%lwt n = Lwt_io.read_into ic buf 0 1 in
-        if n = 0 then Lwt.return_unit  (* Client disconnected *)
+        if n = 0 then Lwt.return_unit  (* EOF: client disconnected *)
         else
           let cmd = Bytes.get buf 0 in
           match cmd with
           | 'S' ->
-              (* Single snapshot *)
+              (* Respond with a single state snapshot. *)
               let json_str = Dashboard_state.snapshot_to_string () in
               let%lwt () = send_response oc json_str in
               loop ()
           | 'W' ->
-              (* Watch mode: subscribe to central state_broadcaster *)
+              (* Register this channel for periodic broadcast. *)
               watch_clients := oc :: !watch_clients;
-              (* Listen for 'Q' or disconnect to stop watch mode *)
+              (* Block until client sends 'Q' or disconnects. *)
               let rec wait_for_quit () =
                 Lwt.catch
                   (fun () ->
@@ -113,35 +114,37 @@ let handle_client (ic, oc) =
                   (fun _exn -> Lwt.return_unit)
               in
               let%lwt () = wait_for_quit () in
-              (* Unsubscribe *)
+              (* Unsubscribe from broadcast list. *)
               watch_clients := List.filter (fun c -> c != oc) !watch_clients;
               Lwt.return_unit
           | 'Q' ->
-              Lwt.return_unit  (* Close *)
+              Lwt.return_unit  (* Graceful close *)
           | _ ->
-              (* Unknown command — send error *)
+              (* Unrecognized command; respond with JSON error. *)
               let err = `Assoc ["error", `String "unknown command"] in
               let%lwt () = send_response oc (Yojson.Basic.to_string err) in
               loop ())
       (fun _exn ->
-        (* Connection error — client disconnected *)
+        (* Read error; treat as client disconnect. *)
         Lwt.return_unit)
   in
   loop ()
 
-(** Start the UDS server as an Lwt fiber.
-    Call this from main.ml after engine initialization. *)
+(** Starts the UDS server as an Lwt fiber.
+    Binds to the PID-keyed socket path, spawns the state broadcaster,
+    and enters an accept loop. Limits concurrent clients to 5.
+    Call after engine initialization. *)
 let start ~start_time =
   Dashboard_state.set_start_time start_time;
   let path = socket_path () in
-  (* Clean up any stale socket *)
+  (* Remove stale socket file from a previous run. *)
   (try Unix.unlink path with Unix.Unix_error _ -> ());
   let addr = Lwt_unix.ADDR_UNIX path in
   let server_socket = Lwt_unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   Lwt_unix.setsockopt server_socket Unix.SO_REUSEADDR true;
   let%lwt () = Lwt_unix.bind server_socket addr in
   Lwt_unix.listen server_socket 4;
-  (* Set socket permissions so only current user can connect *)
+  (* Restrict socket access to the current user. *)
   Unix.chmod path 0o600;
   Logging.info_f ~section "Dashboard server listening on %s" path;
 
@@ -171,7 +174,7 @@ let start ~start_time =
     end
   in
 
-  (* Run accept loop, catch shutdown *)
+  (* Accept connections until the server socket is closed or an error occurs. *)
   Lwt.catch
     (fun () -> accept_loop ())
     (fun exn ->
@@ -183,7 +186,7 @@ let start ~start_time =
       (try Unix.unlink path with _ -> ());
       Lwt.return_unit)
 
-(** Cleanup socket on shutdown *)
+(** Removes the UDS socket file. Call during engine shutdown. *)
 let shutdown () =
   let path = socket_path () in
   (try Unix.unlink path with _ -> ());

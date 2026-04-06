@@ -1,7 +1,14 @@
-(** Generic Exchange Interface definition *)
+(** Exchange interface definition.
 
-(** Common types used across exchange implementations *)
+    Defines the canonical module signature [S] that all exchange backends must
+    implement, a shared [Types] module for order lifecycle and market data
+    records, and a [Registry] for dynamic exchange lookup at runtime. *)
+
+(** Shared types for order management, market data events, and retry
+    configuration. Used uniformly across all exchange implementations. *)
 module Types = struct
+  (** Supported order types. [Other s] captures exchange-specific types
+      not covered by the standard variants. *)
   type order_type =
     | Limit
     | Market
@@ -12,22 +19,29 @@ module Types = struct
     | SettlPosition
     | Other of string
 
+  (** Direction of an order. *)
   type order_side =
     | Buy
     | Sell
 
+  (** Time-in-force policy governing order lifetime.
+      - [GTC]: Good-til-canceled.
+      - [IOC]: Immediate-or-cancel; unfilled portion is canceled.
+      - [FOK]: Fill-or-kill; entire quantity must fill or order is rejected. *)
   type time_in_force =
     | GTC
     | IOC
     | FOK
 
-  (** Result of order placement *)
+  (** Acknowledgment returned after successful order placement. *)
   type add_order_result = {
-    order_id: string;
-    cl_ord_id: string option;
-    order_userref: int option;
+    order_id: string;           (** Exchange-assigned order identifier. *)
+    cl_ord_id: string option;   (** Client-supplied order identifier, if provided. *)
+    order_userref: int option;  (** User reference integer, if provided. *)
   }
 
+  (** Lifecycle states of an order on the exchange. [Unknown s] captures
+      any status string not mapped to a known variant. *)
   type order_status =
     | Pending
     | New
@@ -38,74 +52,87 @@ module Types = struct
     | Rejected
     | Unknown of string
 
-  (** Open order details *)
+  (** Snapshot of a single open order, including fill progress and
+      optional client identifiers. *)
   type open_order = {
-    order_id: string;
-    symbol: string;
-    side: order_side;
-    qty: float;
-    cum_qty: float;
-    remaining_qty: float;
-    limit_price: float option;
-    status: order_status;
-    user_ref: int option;
-    cl_ord_id: string option;
+    order_id: string;         (** Exchange-assigned order identifier. *)
+    symbol: string;           (** Trading pair symbol. *)
+    side: order_side;         (** Buy or sell. *)
+    qty: float;               (** Original order quantity. *)
+    cum_qty: float;           (** Cumulative filled quantity. *)
+    remaining_qty: float;     (** Quantity remaining to be filled. *)
+    limit_price: float option;(** Limit price, if applicable. *)
+    status: order_status;     (** Current order lifecycle status. *)
+    user_ref: int option;     (** User reference integer, if set. *)
+    cl_ord_id: string option; (** Client order identifier, if set. *)
   }
 
-  (** Result of order amendment *)
+  (** Acknowledgment returned after successful order amendment. *)
   type amend_order_result = {
-    original_order_id: string;
-    new_order_id: string;
-    amend_id: string option;
-    cl_ord_id: string option;
+    original_order_id: string; (** Identifier of the amended order. *)
+    new_order_id: string;      (** Identifier assigned to the replacement order. *)
+    amend_id: string option;   (** Exchange-assigned amendment identifier, if any. *)
+    cl_ord_id: string option;  (** Client order identifier, if provided. *)
   }
 
-  (** Result of order cancellation *)
+  (** Acknowledgment returned after successful order cancellation. *)
   type cancel_order_result = {
-    order_id: string;
-    cl_ord_id: string option;
+    order_id: string;          (** Identifier of the canceled order. *)
+    cl_ord_id: string option;  (** Client order identifier, if provided. *)
   }
 
-  (** Ticker event data *)
+  (** Top-of-book ticker snapshot (best bid, best ask, timestamp). *)
   type ticker_event = {
-    bid: float;
-    ask: float;
-    timestamp: float;
+    bid: float;       (** Best bid price. *)
+    ask: float;       (** Best ask price. *)
+    timestamp: float; (** Unix timestamp of the snapshot. *)
   }
 
-  (** Orderbook update event data *)
+  (** Orderbook depth snapshot with arrays of (price, size) levels. *)
   type orderbook_event = {
-    bids: (float * float) array; (* price, size *)
-    asks: (float * float) array; (* price, size *)
-    timestamp: float;
+    bids: (float * float) array; (** Bid levels: (price, size). *)
+    asks: (float * float) array; (** Ask levels: (price, size). *)
+    timestamp: float;            (** Unix timestamp of the snapshot. *)
   }
 
-  (** Execution report/Order update event *)
+  (** Execution report describing a state change on an order. *)
   type execution_event = {
-    order_id: string;
-    order_status: order_status;
-    limit_price: float option;
-    side: order_side;
-    remaining_qty: float;
-    filled_qty: float;
-    avg_price: float;
-    timestamp: float;
+    order_id: string;              (** Exchange-assigned order identifier. *)
+    order_status: order_status;    (** Updated order status. *)
+    limit_price: float option;     (** Limit price, if applicable. *)
+    side: order_side;              (** Buy or sell. *)
+    remaining_qty: float;          (** Quantity remaining after this event. *)
+    filled_qty: float;             (** Cumulative filled quantity. *)
+    avg_price: float;              (** Volume-weighted average fill price. *)
+    timestamp: float;              (** Unix timestamp of the execution report. *)
   }
 
-  (** Configuration for retrying operations *)
+  (** Parameters controlling exponential backoff retry behavior. *)
   type retry_config = {
-    max_attempts: int;
-    base_delay_ms: float;
-    max_delay_ms: float;
-    backoff_factor: float;
+    max_attempts: int;     (** Maximum number of attempts (including the initial). *)
+    base_delay_ms: float;  (** Initial delay between retries, in milliseconds. *)
+    max_delay_ms: float;   (** Upper bound on delay between retries, in milliseconds. *)
+    backoff_factor: float; (** Multiplicative factor applied to the delay after each attempt. *)
   }
 end
 
-(** Signature that all exchange modules must implement *)
+(** Module signature that every exchange backend must satisfy.
+
+    Covers order lifecycle operations (place, amend, cancel), synchronous
+    market data accessors backed by ring buffers, position-based event feed
+    consumption, balance queries, instrument metadata, and fee retrieval. *)
 module type S = sig
+  (** Human-readable exchange name used as the registry key. *)
   val name : string
 
-  (** Place a new order *)
+  (** Submit a new order to the exchange.
+
+      Required parameters: [token] (auth), [order_type], [side], [qty],
+      [symbol]. Optional parameters control limit pricing, time-in-force,
+      post-only and reduce-only flags, user reference, client order id,
+      trigger price, iceberg display quantity, and retry behavior.
+
+      Returns [Ok add_order_result] on acceptance or [Error msg] on failure. *)
   val place_order :
     token:string ->
     order_type:Types.order_type ->
@@ -124,7 +151,10 @@ module type S = sig
     unit ->
     (Types.add_order_result, string) result Lwt.t
 
-  (** Amend an existing order *)
+  (** Amend an existing order (price, quantity, trigger, display qty).
+
+      Requires [token] and [order_id]. All mutable order fields are optional.
+      Returns [Ok amend_order_result] on acceptance or [Error msg] on failure. *)
   val amend_order :
     token:string ->
     order_id:string ->
@@ -139,7 +169,10 @@ module type S = sig
     unit ->
     (Types.amend_order_result, string) result Lwt.t
 
-  (** Cancel orders *)
+  (** Cancel one or more orders identified by order id, client order id,
+      or user reference. At least one identifier list should be non-empty.
+
+      Returns [Ok cancel_order_result list] or [Error msg]. *)
   val cancel_orders :
     token:string ->
     ?order_ids:string list ->
@@ -149,88 +182,112 @@ module type S = sig
     unit ->
     (Types.cancel_order_result list, string) result Lwt.t
 
-  (** Market Data Access *)
-  
-  (** Get current ticker (Best Bid, Best Ask) *)
+  (* ---- Market data accessors ---- *)
+
+  (** Return the current best bid and best ask for [symbol], or [None]
+      if no ticker data is available. *)
   val get_ticker : symbol:string -> (float * float) option
 
-  (** Subscribe to ticker for a symbol dynamically *)
+  (** Dynamically subscribe to the ticker feed for [symbol]. *)
   val subscribe_ticker : symbol:string -> unit Lwt.t
 
-  (** Get top of orderbook (Bid Price, Bid Size, Ask Price, Ask Size) *)
+  (** Return top-of-book as [(bid_price, bid_size, ask_price, ask_size)],
+      or [None] if orderbook data is unavailable. *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
 
-  (** Get current asset balance *)
+  (** Return the current balance for [asset]. Returns [0.0] if unknown. *)
   val get_balance : asset:string -> float
 
-  (** Get all known asset balances (asset_name, balance) *)
+  (** Return all cached asset balances as [(asset_name, balance)] pairs. *)
   val get_all_balances : unit -> (string * float) list
 
-  (** Get details of a specific open order *)
+  (** Look up a specific open order by [symbol] and [order_id].
+      Returns [None] if not found. *)
   val get_open_order : symbol:string -> order_id:string -> Types.open_order option
 
-  (** Get all open orders for a symbol *)
+  (** Return all open orders for [symbol]. *)
   val get_open_orders : symbol:string -> Types.open_order list
 
-  (** Get Position for Ticker Feed *)
+  (* ---- Ring buffer event feed consumption ---- *)
+
+  (** Return the current write position of the ticker ring buffer for
+      [symbol]. Used as the starting cursor for [read_ticker_events]. *)
   val get_ticker_position : symbol:string -> int
 
-  (** Read Ticker Events from specific position *)
+  (** Read ticker events from [start_pos] up to the current write position.
+      Returns a newly allocated list of events. *)
   val read_ticker_events : symbol:string -> start_pos:int -> Types.ticker_event list
 
-  (** Zero-allocation iteration over ticker events. Returns new read position. *)
+  (** Iterate over ticker events from [start_pos] without allocating an
+      intermediate list. Returns the new read position. *)
   val iter_ticker_events : symbol:string -> start_pos:int -> (Types.ticker_event -> unit) -> int
 
-  (** Get Position for Orderbook Feed *)
+  (** Return the current write position of the orderbook ring buffer for
+      [symbol]. Used as the starting cursor for [read_orderbook_events]. *)
   val get_orderbook_position : symbol:string -> int
 
-  (** Read Orderbook Events from specific position *)
+  (** Read orderbook events from [start_pos] up to the current write
+      position. Returns a newly allocated list of events. *)
   val read_orderbook_events : symbol:string -> start_pos:int -> Types.orderbook_event list
 
-  (** Zero-allocation iteration over orderbook events. Returns new read position. *)
+  (** Iterate over orderbook events from [start_pos] without allocating
+      an intermediate list. Returns the new read position. *)
   val iter_orderbook_events : symbol:string -> start_pos:int -> (Types.orderbook_event -> unit) -> int
 
-  (** Get position for consuming execution feed *)
+  (** Return the current write position of the execution feed ring buffer
+      for [symbol]. Used as the starting cursor for [read_execution_events]. *)
   val get_execution_feed_position : symbol:string -> int
 
-  (** Read Execution Events from specific position *)
+  (** Read execution events from [start_pos] up to the current write
+      position. Returns a newly allocated list of events. *)
   val read_execution_events : symbol:string -> start_pos:int -> Types.execution_event list
 
-  (** Zero-allocation iteration over execution events. Returns new read position. *)
+  (** Iterate over execution events from [start_pos] without allocating
+      an intermediate list. Returns the new read position. *)
   val iter_execution_events : symbol:string -> start_pos:int -> (Types.execution_event -> unit) -> int
 
-  (** Fold over open orders for a symbol without allocating an intermediate list. *)
+  (** Fold over open orders for [symbol] without allocating an intermediate
+      list. Applies [f] to each open order, threading the accumulator. *)
   val fold_open_orders : symbol:string -> init:'a -> f:('a -> Types.open_order -> 'a) -> 'a
 
-  (** Metadata Access *)
-  
-  (** Get price increment (tick size) for a symbol *)
+  (* ---- Instrument metadata ---- *)
+
+  (** Return the minimum price increment (tick size) for [symbol],
+      or [None] if instrument metadata is unavailable. *)
   val get_price_increment : symbol:string -> float option
 
-  (** Get quantity increment (step size) for a symbol *)
+  (** Return the minimum quantity increment (lot step) for [symbol],
+      or [None] if instrument metadata is unavailable. *)
   val get_qty_increment : symbol:string -> float option
 
-  (** Get minimum order quantity for a symbol *)
+  (** Return the minimum order quantity for [symbol], or [None] if
+      instrument metadata is unavailable. *)
   val get_qty_min : symbol:string -> float option
 
-  (** Round a price to the exchange's valid precision for a symbol.
-      For Hyperliquid: 5 significant figures, capped at (MAX_DECIMALS - szDecimals) decimal places.
-      For Kraken: nearest price_increment tick. *)
+  (** Round [price] to the exchange's valid precision for [symbol].
+      Hyperliquid: 5 significant figures, capped at
+      (MAX_DECIMALS - szDecimals) decimal places.
+      Kraken: nearest price_increment tick. *)
   val round_price : symbol:string -> price:float -> float
 
-  (** Get maker/taker fees for a symbol (if cached by exchange) *)
+  (** Return cached (maker_fee, taker_fee) for [symbol]. Each component
+      is [None] if the fee has not been fetched. *)
   val get_fees : symbol:string -> (float option * float option)
 end
 
-(** Registry for managing multiple exchange implementations *)
+(** Dynamic registry mapping exchange names to their [(module S)]
+    implementations. Backed by a [Hashtbl] for O(1) lookup. *)
 module Registry = struct
+  (** Internal hash table storing registered exchange modules, keyed by name. *)
   let _exchanges : (string, (module S)) Hashtbl.t = Hashtbl.create 4
 
-  (** Register an exchange module *)
+  (** Register an exchange module. Replaces any existing entry with the
+      same [Exchange.name]. *)
   let register (module Exchange : S) =
     Hashtbl.replace _exchanges Exchange.name (module Exchange)
 
-  (** Get an exchange module by name *)
+  (** Look up a registered exchange module by name. Returns [None] if
+      no module has been registered under that name. *)
   let get name =
     Hashtbl.find_opt _exchanges name
 end

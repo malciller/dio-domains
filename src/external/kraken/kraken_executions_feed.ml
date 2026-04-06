@@ -1,6 +1,4 @@
-(** Kraken Executions Feed - WebSocket v2 authenticated executions subscription with lock-free ring buffers
- *  Tracks open orders and order completions per asset using event-driven, lock-free architecture
- *)
+(** Kraken authenticated executions WebSocket feed. Tracks open orders and execution events per symbol via lock-free ring buffers for concurrent state synchronization. *)
 
 open Lwt.Infix
 open Concurrency
@@ -12,10 +10,10 @@ let cleanup_handlers_started = Atomic.make false
 
 open Kraken_common_types
 
-(** Safely force Conduit context with error handling *)
+(** Forces Conduit context evaluation with error handling. *)
 let get_conduit_ctx = get_conduit_ctx
 
-(** Execution event types from Kraken WebSocket *)
+(** Execution event types from the Kraken WebSocket API. *)
 type exec_type =
   | PendingNew
   | New
@@ -55,15 +53,14 @@ let exec_type_of_string = function
   | "rejected" -> Rejected
   | s -> Unknown s
 
-(** Order side *)
+(** Order side. *)
 type side = Buy | Sell
 
 let string_of_side = function
   | Buy -> "buy"
   | Sell -> "sell"
 
-(* Silently defaults to Buy for unknown side strings to preserve backward-compat;
-   unknown values are logged as warnings during parsing. *)
+(* Defaults to Buy for unrecognized side strings. Unknown values are logged as warnings. *)
 let side_of_string s =
   match s with
   | "buy" -> Buy
@@ -72,7 +69,7 @@ let side_of_string s =
       Logging.warn_f ~section "Unknown order side %S, defaulting to Buy" other;
       Buy
 
-(** Order status *)
+(** Order status. *)
 type order_status =
   | PendingNewStatus
   | NewStatus
@@ -103,7 +100,7 @@ let order_status_of_string = function
   | "rejected" -> RejectedStatus
   | s -> UnknownStatus s
 
-(** Execution event - represents an order status change or fill *)
+(** Execution event representing an order state transition or fill. *)
 type execution_event = {
   order_id: string;
   symbol: string;
@@ -124,15 +121,15 @@ type execution_event = {
   timestamp: float;
 }
 
-(** Event bus for order updates - publishes individual order changes *)
+(** Event bus for publishing individual order updates. *)
 module OrderUpdateEventBus = Event_bus.Make(struct
   type t = execution_event
 end)
 
-(** Global order update event bus instance *)
+(** Singleton order update event bus. *)
 let order_update_event_bus = OrderUpdateEventBus.create "order_update"
 
-(** Open order information *)
+(** Open order record. *)
 type open_order = {
   order_id: string;
   symbol: string;
@@ -144,19 +141,19 @@ type open_order = {
   avg_price: float;
   cum_cost: float;
   order_status: order_status;
-  order_userref: int option;  (* Optional numeric identifier for strategy filtering *)
-  cl_ord_id: string option;   (* Client order ID for additional tracking *)
+  order_userref: int option;  (* Optional numeric identifier for strategy-level filtering *)
+  cl_ord_id: string option;   (* Client order ID for supplementary tracking *)
   last_updated: float;
 }
 
-(** Lock-free ring buffer for execution events - shared implementation *)
+(** Lock-free ring buffer for execution events. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Write execution event to buffer *)
+(** Writes an execution event to the ring buffer. *)
 let write_execution_event buffer event =
   RingBuffer.write buffer event;
 
-(** Per-symbol execution store *)
+(** Per-symbol execution store holding events, open orders, and readiness state. *)
 type symbol_store = {
   events_buffer: execution_event RingBuffer.t;
   open_orders: (string, open_order) Hashtbl.t;
@@ -164,21 +161,18 @@ type symbol_store = {
   last_event_time: float Atomic.t;
 }
 
-(** Global stores per symbol *)
+(** Global symbol-to-store mapping. *)
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
-(** Global order_id to symbol mapping with adaptive startup cap + FIFO eviction.
-    Access must be protected by global_orders_mutex. *)
+(** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires global_orders_mutex. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
-(** FIFO insertion queue for oldest-entry eviction (O(1) pop) *)
+(** FIFO queue for O(1) oldest-entry eviction. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-(** Mutable cap: max_int (uncapped) during startup, set once after first snapshot *)
+(** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
 let order_to_symbol_cap : int ref = ref max_int
 let order_to_symbol_startup_done = Atomic.make false
 
-(** Add order_id->symbol, evicting the oldest entry when over cap.
-    Ring-buffer semantics: newest always wins, oldest always goes.
-    Must be called while holding global_orders_mutex. *)
+(** Inserts an order ID to symbol mapping. Evicts the oldest entry via FIFO when exceeding cap. Caller must hold global_orders_mutex. *)
 let add_to_order_to_symbol order_id symbol =
   if not (Hashtbl.mem order_to_symbol order_id) then
     Queue.push order_id order_to_symbol_queue;
@@ -193,12 +187,10 @@ let add_to_order_to_symbol order_id symbol =
       end
     done
 
-(** Lock the adaptive cap after the startup snapshot is fully consumed.
-    Cap = observed size + 50%% headroom, minimum 32.
-    Called exactly once at end of handle_snapshot; subsequent calls are no-ops. *)
+(** Locks the adaptive cap after the startup snapshot. Cap = max(32, observed * 1.5 + 1). Executes once. *)
 let lock_order_to_symbol_cap () =
   if not (Atomic.exchange order_to_symbol_startup_done true) then begin
-    (* global_orders_mutex is already held by the caller (handle_snapshot) *)
+    (* Caller (handle_snapshot) already holds global_orders_mutex. *)
     let observed = Hashtbl.length order_to_symbol in
     let cap = max 32 (observed + observed / 2 + 1) in
     order_to_symbol_cap := cap;
@@ -207,12 +199,12 @@ let lock_order_to_symbol_cap () =
   end
 
 let global_orders_mutex = Mutex.create ()
-(** Separate mutex for symbol_stores table initialization *)
+(** Mutex for symbol_stores table initialization. *)
 let initialization_mutex = Mutex.create ()
 
 let ready_condition = Lwt_condition.create ()
 
-(** Get or create store for a symbol - wait-free after init *)
+(** Retrieves or lazily creates a per-symbol store. Wait-free on the hot path after initial creation. *)
 let get_symbol_store symbol =
   match Hashtbl.find_opt symbol_stores symbol with
   | Some store -> store
@@ -235,14 +227,14 @@ let get_symbol_store symbol =
       Mutex.unlock initialization_mutex;
       store
 
-(** Notify that execution data is ready *)
+(** Marks the store as ready and broadcasts to any waiting consumers. *)
 let notify_ready store =
   if not (Atomic.get store.ready) then begin
     Atomic.set store.ready true;
     (try
       Lwt_condition.broadcast ready_condition ()
     with Invalid_argument _ ->
-      (* Ignore - some waiters may have timed out or been cancelled *)
+      (* Ignored: waiters may have timed out or been cancelled. *)
       ())
   end
 
@@ -252,7 +244,7 @@ let has_execution_data symbol =
     Atomic.get store.ready
   with _ -> false
 
-(** Wait until execution data is available for symbols *)
+(** Blocks until execution data is available for all specified symbols or timeout elapses. *)
 let wait_for_execution_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
@@ -274,7 +266,7 @@ let wait_for_execution_data_lwt symbols timeout_seconds =
 
 let wait_for_execution_data = wait_for_execution_data_lwt
 
-(** Get open orders for a symbol - hot path *)
+(** Returns the list of open orders for a symbol. Acquires global_orders_mutex. *)
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
@@ -282,7 +274,7 @@ let[@inline always] get_open_orders symbol =
   Mutex.unlock global_orders_mutex;
   orders
 
-(** Zero-allocation fold over open orders under the mutex *)
+(** Zero-allocation fold over open orders for a symbol. Holds global_orders_mutex for the duration. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
@@ -290,7 +282,7 @@ let[@inline always] fold_open_orders symbol ~init ~f =
   Mutex.unlock global_orders_mutex;
   result
 
-(** Get specific open order by ID *)
+(** Looks up a single open order by ID within a symbol store. *)
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
@@ -298,7 +290,7 @@ let[@inline always] get_open_order symbol order_id =
   Mutex.unlock global_orders_mutex;
   order_opt
 
-(** Check if order exists *)
+(** Returns true if the given order ID exists in the symbol's open orders. *)
 let[@inline always] has_open_order symbol order_id =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
@@ -306,9 +298,7 @@ let[@inline always] has_open_order symbol order_id =
   Mutex.unlock global_orders_mutex;
   exists
 
-(** Find an open order by ID across all symbols using the global order_to_symbol index.
-    Mirrors Hyperliquid's find_order_everywhere — O(1) lookup, no symbol required.
-    Returns None if the order is not in the local WS cache. *)
+(** Looks up an open order by ID across all symbols via the global order-to-symbol index. O(1) lookup; returns None if absent from cache. *)
 let find_order_everywhere order_id =
   Mutex.lock global_orders_mutex;
   let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
@@ -322,10 +312,7 @@ let find_order_everywhere order_id =
       Mutex.unlock global_orders_mutex;
       order
 
-(** Proactively update the limit_price of an open order in the local WS cache.
-    Called after a successful WS amend response to eliminate the stale-price
-    window that exists between REST confirm and WS exec_type=amended arrival.
-    No-op if the order is not currently tracked. *)
+(** Eagerly updates the cached limit price of an open order after a successful amend response, closing the stale-price window before the execution update arrives. No-op if the order is not tracked. *)
 let update_open_order_price ~symbol ~order_id ~new_price =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
@@ -340,7 +327,7 @@ let update_open_order_price ~symbol ~order_id ~new_price =
          order_id symbol);
   Mutex.unlock global_orders_mutex
 
-(** Get all symbols that have execution stores (initialized symbols) *)
+(** Returns all symbols with initialized execution stores. *)
 let get_all_symbols () =
   Mutex.lock global_orders_mutex;
   let symbols = ref [] in
@@ -349,14 +336,7 @@ let get_all_symbols () =
   Mutex.unlock global_orders_mutex;
   result
 
-(** Periodic maintenance: purge orphaned order_to_symbol_queue entries.
-    Terminal events (fill/cancel) remove order_ids from `order_to_symbol` (the Hashtbl)
-    but cannot efficiently remove them from `order_to_symbol_queue` (OCaml Queue has no
-    O(1) remove-by-value).  Over time the queue accumulates one dead string entry per
-    completed order — these are never drained because the cap-eviction while-loop only
-    fires when Hashtbl.length > cap, which it doesn't since terminals keep it small.
-    Fix: rebuild the queue each cleanup cycle, keeping only entries still present in
-    the Hashtbl.  O(queue_length) cost, runs at most every 120s. *)
+(** Periodic maintenance that purges orphaned order_to_symbol_queue entries. Terminal events remove map entries but cannot efficiently remove queue entries; this rebuilds the queue retaining only entries still present in the map. *)
 let cleanup_stale_orders () =
   Mutex.lock global_orders_mutex;
   let original_queue_len = Queue.length order_to_symbol_queue in
@@ -376,9 +356,7 @@ let cleanup_stale_orders () =
   end;
   Mutex.unlock global_orders_mutex
 
-(** Mvar-based idempotent cleanup signal.
-    Prevents Lwt continuation stacking if trigger is called
-    faster than the cleanup task drains. *)
+(** Idempotent Lwt_mvar cleanup signal. Prevents continuation stacking when triggers outpace consumption. *)
 let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
 let request_cleanup () =
@@ -406,7 +384,7 @@ let start_periodic_tasks () =
 let trigger_stale_order_cleanup ~reason:_ () = request_cleanup ()
 
 
-(** Get count of open orders for a symbol *)
+(** Returns the total count of open orders for a symbol. *)
 let[@inline always] count_open_orders symbol =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
@@ -414,7 +392,7 @@ let[@inline always] count_open_orders symbol =
   Mutex.unlock global_orders_mutex;
   count
 
-(** Get count of open orders by side for a symbol *)
+(** Returns (buy_count, sell_count) of open orders for a symbol. *)
 let[@inline always] count_open_orders_by_side symbol =
   let store = get_symbol_store symbol in
   Mutex.lock global_orders_mutex;
@@ -428,26 +406,26 @@ let[@inline always] count_open_orders_by_side symbol =
   Mutex.unlock global_orders_mutex;
   (!buys, !sells)
 
-(** Read latest execution events for a symbol since last position *)
+(** Reads execution events for a symbol since the given ring buffer position. *)
 let[@inline always] read_execution_events symbol last_pos =
   let store = get_symbol_store symbol in
   RingBuffer.read_since store.events_buffer last_pos
 
-(** Zero-allocation iteration over execution events since last position *)
+(** Zero-allocation iteration over execution events since the given position. *)
 let[@inline always] iter_execution_events symbol last_pos f =
   let store = get_symbol_store symbol in
   RingBuffer.iter_since store.events_buffer last_pos f
 
-(** Get current write position for tracking consumption *)
+(** Returns the current ring buffer write position for tracking consumption. *)
 let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
   RingBuffer.get_position store.events_buffer
 
-(** Update open orders based on execution event *)
+(** Reconciles the open orders table from an incoming execution event. *)
 let update_open_orders store (event : execution_event) =
   Mutex.lock global_orders_mutex;
   
-  (* Determine if order should be in open orders based on order_status (most reliable) *)
+  (* Determine terminal state primarily from order_status. *)
   let is_terminal_status = match event.order_status with
     | FilledStatus | CanceledStatus | ExpiredStatus | RejectedStatus -> true
     | PendingNewStatus | NewStatus | PartiallyFilledStatus | UnknownStatus _ -> false
@@ -464,17 +442,11 @@ let update_open_orders store (event : execution_event) =
   let is_effectively_filled = remaining_qty <= epsilon in
   
   if is_terminal_status || is_effectively_filled then begin
-    (* Terminal state - remove from open orders if present *)
+    (* Terminal: remove from open orders if present. *)
     if Hashtbl.mem store.open_orders event.order_id then begin
       Hashtbl.remove store.open_orders event.order_id;
       
-      (* Remove from global order mapping ONLY on explicit terminal status.
-         Kraken sends exec_type=trade with order_status=partially_filled even
-         when the order is fully filled (cum_qty = order_qty). The subsequent
-         exec_type=filled event is "minimal" (no symbol field) and needs the
-         order_to_symbol mapping to resolve the symbol. If we remove the mapping
-         here on is_effectively_filled, the filled event gets silently dropped
-         and the domain never learns about the fill. *)
+      (* Remove global mapping only on explicit terminal status to avoid dropping late fill events that rely on the index for symbol resolution. *)
       if is_terminal_status then
         Hashtbl.remove order_to_symbol event.order_id;
       
@@ -490,7 +462,7 @@ let update_open_orders store (event : execution_event) =
           (string_of_exec_type event.exec_type)
           remaining_qty event.order_qty
     end else begin
-      (* Terminal event for order we never tracked (e.g., canceled before we saw it) *)
+      (* Terminal event for an untracked order (e.g., pre-startup cancellation). *)
       if is_terminal_status then
         Logging.debug_f ~section "Terminal event for untracked order: %s [%s] status=%s"
           event.order_id event.symbol (string_of_order_status event.order_status)
@@ -499,7 +471,7 @@ let update_open_orders store (event : execution_event) =
           event.order_id event.symbol (string_of_order_status event.order_status)
     end
   end else begin
-    (* Non-terminal state - add or update in open orders *)
+    (* Non-terminal: upsert into open orders. *)
     let order = {
       order_id = event.order_id;
       symbol = event.symbol;
@@ -519,7 +491,7 @@ let update_open_orders store (event : execution_event) =
     let was_present = Hashtbl.mem store.open_orders event.order_id in
     Hashtbl.replace store.open_orders event.order_id order;
     
-    (* Add to global order mapping with FIFO eviction when over adaptive cap *)
+    (* Update global order-to-symbol index with FIFO eviction if cap exceeded. *)
     add_to_order_to_symbol event.order_id event.symbol;
 
     if not was_present && Hashtbl.length store.open_orders > 1000 then
@@ -540,7 +512,7 @@ let update_open_orders store (event : execution_event) =
         (string_of_order_status event.order_status)
     end;
     
-    (* Log trade fills separately for visibility *)
+    (* Log trade fills at info level for real-time monitoring. *)
     if event.exec_type = Trade then begin
       Logging.info_f ~section "Trade fill: %s [%s] qty=%.8f price=%.2f (total filled: %.8f/%.8f)"
         event.order_id event.symbol 
@@ -552,16 +524,16 @@ let update_open_orders store (event : execution_event) =
   
   Mutex.unlock global_orders_mutex
 
-(** Parse float from JSON - uses shared implementation from Kraken_common_types *)
+(** Parses an optional float from JSON. Delegates to Kraken_common_types. *)
 let parse_float_opt = Kraken_common_types.parse_float_opt
 
-(** Parse int64 from JSON - uses shared implementation from Kraken_common_types *)
+(** Parses an optional int64 from JSON. Delegates to Kraken_common_types. *)
 let parse_int64_opt = Kraken_common_types.parse_int64_opt
 
-(** Parse int from JSON - uses shared implementation from Kraken_common_types *)
+(** Parses an optional int from JSON. Delegates to Kraken_common_types. *)
 let parse_int_opt = Kraken_common_types.parse_int_opt
 
-(** Parse execution event from JSON data - handles both full and minimal events *)
+(** Parses an execution event from JSON. Handles both full and minimal (status-only) events by falling back to cached order data for missing fields. *)
 let parse_execution_event json =
   try
     let open Yojson.Safe.Util in
@@ -569,10 +541,10 @@ let parse_execution_event json =
     let exec_type_str = member "exec_type" json |> to_string in
     let order_status_str = member "order_status" json |> to_string in
 
-    (* Symbol may be missing in minimal status updates (e.g., cancellations) *)
+    (* Symbol may be absent in minimal status updates (e.g., cancellations). *)
     let symbol_opt = member "symbol" json |> to_string_option in
 
-    (* For minimal events, look up symbol from our mapping *)
+    (* Resolve symbol from the global order-to-symbol index for minimal events. *)
     let symbol = match symbol_opt with
       | Some s -> Some s
       | None ->
@@ -582,30 +554,29 @@ let parse_execution_event json =
           (match s with
            | Some sym -> Some sym
            | None ->
-               (* If we don't have the symbol, skip this event silently.
-                  This is expected for orders that existed before app startup. *)
+               (* Skip events with no symbol attribution, typical of pre-startup orders. *)
                Logging.debug_f ~section "Skipping event for unknown order %s (likely pre-startup order)" order_id;
                None)
     in
 
-    (* If we couldn't determine the symbol, return None *)
+    (* Return None if symbol could not be resolved. *)
     match symbol with
     | None -> None
     | Some sym ->
-        (* Get existing order to fill in missing fields for minimal events *)
+        (* Fetch existing order to fill in missing fields from minimal events. *)
         let store = get_symbol_store sym in
         Mutex.lock global_orders_mutex;
         let existing_order = Hashtbl.find_opt store.open_orders order_id in
         Mutex.unlock global_orders_mutex;
 
-        (* Extract fields from JSON, using existing order as fallback *)
+        (* Extract fields from JSON with fallback to existing order data. *)
         let side_str =
           match member "side" json |> to_string_option with
           | Some s -> s
           | None ->
               (match existing_order with
                | Some order -> string_of_side order.side
-               | None -> "buy")  (* Default if we have no existing data *)
+               | None -> "buy")  (* Default to buy when no prior data exists. *)
         in
 
         let order_qty =
@@ -656,7 +627,7 @@ let parse_execution_event json =
         let last_qty = parse_float_opt json "last_qty" in
         let last_price = parse_float_opt json "last_price" in
 
-        (* Parse fees - handle both single fee and fees array *)
+        (* Extract fee from fee_usd_equiv or the first entry in the fees array. *)
         let fee =
           match parse_float_opt json "fee_usd_equiv" with
           | Some f -> Some f
@@ -690,10 +661,10 @@ let parse_execution_event json =
                | None -> None)
         in
 
-        (* Use current time for event timestamp - proper RFC3339 parsing can be added later if needed *)
+        (* Use current wall-clock time as timestamp, avoiding full RFC3339 parsing. *)
         let timestamp = Unix.gettimeofday () in
 
-        (* Log when we're processing a minimal event *)
+        (* Log when processing a minimal event (symbol resolved from cache). *)
         if symbol_opt = None then
           Logging.debug_f ~section "Processing minimal event for order %s [%s]: status=%s exec_type=%s"
             order_id sym order_status_str exec_type_str;
@@ -723,7 +694,7 @@ let parse_execution_event json =
       (Yojson.Safe.to_string json);
     None
 
-(** Handle execution snapshot with reconciliation *)
+(** Processes an execution snapshot: ingests events and reconciles stale open orders. *)
 let handle_snapshot json on_heartbeat =
   try
     let open Yojson.Safe.Util in
@@ -731,7 +702,7 @@ let handle_snapshot json on_heartbeat =
     
     Logging.debug_f ~section "Processing execution snapshot with %d items" (List.length data);
     
-    (* Track which orders are present in the snapshot *)
+    (* Track order IDs present in this snapshot for reconciliation. *)
     let snapshot_order_ids = Hashtbl.create (List.length data) in
     
     List.iter (fun item ->
@@ -744,26 +715,24 @@ let handle_snapshot json on_heartbeat =
           notify_ready store;
           Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
           
-          (* Track this order ID as active *)
+          (* Mark order ID as active in snapshot *)
           Hashtbl.replace snapshot_order_ids event.order_id ();
           
-          (* Update connection heartbeat *)
+          (* Update heartbeat *)
           on_heartbeat ()
       | None -> ()
     ) data;
     
-    (* RECONCILIATION: Remove orders that are in our local cache but NOT in the snapshot *)
-    (* This fixes the memory leak where orders closed during disconnection would persist forever *)
+    (* Reconcile: remove locally cached orders absent from the snapshot to prevent stale entries after reconnection. *)
     let stale_orders = ref [] in
     
-    (* We need to check all symbol stores since the snapshot might contain a subset of symbols *)
-    (* However, Kraken sends a snapshot per connection, covering all subscribed symbols *)
+    (* Scan all symbol stores since snapshot covers all subscribed symbols. *)
     let all_symbols = get_all_symbols () in
     List.iter (fun symbol ->
       let store = get_symbol_store symbol in
       Mutex.lock global_orders_mutex;
       
-      (* Identify stale orders for this symbol *)
+      (* Collect orders not present in the snapshot. *)
       Hashtbl.iter (fun order_id _ ->
         if not (Hashtbl.mem snapshot_order_ids order_id) then
           stale_orders := (symbol, order_id) :: !stale_orders
@@ -772,7 +741,7 @@ let handle_snapshot json on_heartbeat =
       Mutex.unlock global_orders_mutex;
     ) all_symbols;
     
-    (* Remove the identified stale orders *)
+    (* Remove identified stale orders. *)
     let removed_count = List.length !stale_orders in
     if removed_count > 0 then begin
       Logging.info_f ~section "Reconciling open orders: removing %d stale orders not present in snapshot" removed_count;
@@ -792,21 +761,20 @@ let handle_snapshot json on_heartbeat =
       
     end;
     
-    (* Mark all initialized stores as ready, even if they had no events in the snapshot *)
+    (* Mark all initialized stores as ready regardless of whether they received snapshot events. *)
     List.iter (fun symbol ->
       let store = get_symbol_store symbol in
       notify_ready store;
     ) all_symbols;
     
     Logging.debug_f ~section "Execution snapshot processed and reconciled";
-    (* Lock adaptive cap now that startup snapshot is fully consumed.
-       Subsequent inserts will evict oldest entries when over cap. *)
+    (* Lock the adaptive order_to_symbol cap after startup snapshot ingestion. *)
     lock_order_to_symbol_cap ()
   with exn ->
     Logging.error_f ~section "Failed to process execution snapshot: %s"
       (Printexc.to_string exn)
 
-(** Handle execution update *)
+(** Processes incremental execution update messages. *)
 let handle_update json on_heartbeat =
   try
     let open Yojson.Safe.Util in
@@ -822,10 +790,10 @@ let handle_update json on_heartbeat =
           notify_ready store;
           Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
 
-          (* Publish order update event to event bus *)
+          (* Publish to order update event bus *)
           OrderUpdateEventBus.publish order_update_event_bus event;
 
-          (* Update connection heartbeat *)
+          (* Update heartbeat *)
           on_heartbeat ()
       | None -> ()
     ) data
@@ -833,7 +801,7 @@ let handle_update json on_heartbeat =
     Logging.error_f ~section "Failed to process execution update: %s"
       (Printexc.to_string exn)
 
-(** WebSocket message handler - accepts pre-parsed JSON to avoid re-serialization *)
+(** WebSocket message handler operating on pre-parsed JSON to avoid redundant serialization. *)
 let handle_message_json json on_heartbeat =
   try
     let open Yojson.Safe.Util in
@@ -855,7 +823,7 @@ let handle_message_json json on_heartbeat =
     | Some "executions", Some "update", _ ->
         handle_update json on_heartbeat
     | Some "heartbeat", _, _ ->
-        on_heartbeat () (* Update connection heartbeat *)
+        on_heartbeat ()
     | _, _, Some "subscribe" ->
         let success = member "success" json |> to_bool_option in
         (match success with
@@ -874,7 +842,7 @@ let handle_message_json json on_heartbeat =
     Logging.error_f ~section "Error handling message: %s" 
       (Printexc.to_string exn)
 
-(** WebSocket message handler - string version for backward compat *)
+(** WebSocket message handler accepting raw string input. Parses JSON then delegates to handle_message_json. *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   try
@@ -885,12 +853,11 @@ let handle_message message on_heartbeat =
       (Printexc.to_string exn) message
 
 
-(** Message handling loop - runs in background *)
-(* Obsolete - now handled by unified connection hub *)
+(** Deprecated. Superseded by the unified connection hub. Retained for interface compatibility. *)
 let start_message_handler _conn _token _on_failure _on_heartbeat =
   Lwt.return_unit
 
-(** WebSocket connection to Kraken authenticated endpoint - establishes connection and starts message handler *)
+(** Subscribes to the Kraken executions channel on the authenticated WebSocket and starts the message consumption loop. *)
 let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.info ~section "Registering executions subscription on unified authenticated connection";
   
@@ -933,17 +900,17 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   end;
   Lwt.return_unit
 
-(** Subscribe to order update events *)
+(** Creates a subscription to the order update event bus. Returns (stream, close_fn). *)
 let subscribe_order_updates () =
   let subscription = OrderUpdateEventBus.subscribe order_update_event_bus in
   (subscription.stream, subscription.close)
 
-(** Initialize execution feed data stores *)
+(** Initializes execution stores for the given symbols and starts periodic maintenance. *)
 let initialize symbols =
   start_periodic_tasks ();
   Logging.info_f ~section "Initializing executions feed for %d symbols" (List.length symbols);
 
-  (* Pre-create all symbol stores during initialization *)
+  (* Pre-create symbol stores so hot-path lookups are wait-free. *)
   List.iter (fun symbol ->
     let _store = get_symbol_store symbol in
     Logging.debug_f ~section "Created lock-free execution store for %s" symbol

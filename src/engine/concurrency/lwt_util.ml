@@ -1,22 +1,21 @@
-(** Lwt Utilities — memory-safe alternatives to standard Lwt combinators.
+(** Memory-safe alternatives to standard Lwt combinators.
 
-    [Lwt_stream.iter] and recursive [>>= fun () -> loop ()] patterns create
-    a growing chain of Lwt [Forward] nodes because [>>=] links each
-    iteration's promise to the next one.  Even [Lwt.pause ()] does not help:
-    it merely adds another [Forward] node to the chain.
+    [Lwt_stream.iter] and recursive [>>= fun () -> loop ()] patterns
+    accumulate Lwt [Forward] nodes because [>>=] chains each iteration's
+    promise to its successor. [Lwt.pause ()] does not mitigate this; it
+    appends an additional [Forward] node.
 
-    The ONLY way to break the chain is to resolve the current promise
-    immediately (via [Lwt.return_unit]) and spawn the next iteration as
-    an independent task (via [Lwt.async]).  This ensures no [Forward] node
-    links old iterations to new ones, so old promise nodes become unreachable
-    and can be garbage-collected. *)
+    The solution is to resolve the current promise immediately via
+    [Lwt.return_unit] and spawn the next iteration as an independent
+    task via [Lwt.async]. This severs the [Forward] chain so prior
+    promise nodes become unreachable and eligible for collection. *)
 
 open Lwt.Infix
 
-(** Consume a stream, calling [f] on each item synchronously.
-    Unlike [Lwt_stream.iter], this does NOT accumulate Lwt [Forward] nodes.
-    Each iteration is spawned independently via [Lwt.async], breaking the chain.
-    Returns a promise that resolves when the stream ends ([None]). *)
+(** Synchronously applies [f] to each element of [stream] without
+    accumulating Lwt [Forward] nodes. Each iteration is spawned via
+    [Lwt.async] to sever the promise chain. Returns a promise that
+    resolves when the stream is closed ([None]). *)
 let consume_stream f stream =
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
@@ -26,7 +25,7 @@ let consume_stream f stream =
         Lwt.return_unit
     | Some x ->
         f x;
-        (* Spawn next iteration independently — breaks the Forward chain.
+        (* Spawn next iteration independently to sever the Forward chain.
            The current promise resolves immediately with unit. *)
         Lwt.async loop;
         Lwt.return_unit

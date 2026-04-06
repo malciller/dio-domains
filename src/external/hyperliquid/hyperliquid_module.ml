@@ -1,4 +1,6 @@
-(** Hyperliquid Exchange Implementation *)
+(** Exchange_intf implementation for the Hyperliquid L1 DEX.
+    Bridges Hyperliquid-specific WebSocket feeds, REST actions, and instrument
+    metadata into the exchange-agnostic interface consumed by strategies. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -8,21 +10,22 @@ module Hyperliquid_impl = struct
   let name = "hyperliquid"
   let section = "hyperliquid_module"
 
-  (* Configuration *)
+  (* Testnet/mainnet toggle. Atomic for safe concurrent reads from feed threads. *)
   let is_testnet = Atomic.make true
   let set_testnet testnet =
     Atomic.set is_testnet testnet;
     Logging.info_f ~section "Hyperliquid module configured for %s" (if testnet then "testnet" else "mainnet")
 
-  (* Internal cache for fees: symbol -> (perp_maker, perp_taker, spot_maker, spot_taker) *)
+  (* Per-symbol fee cache. Maps symbol to (perp_maker, perp_taker, spot_maker, spot_taker).
+     Populated once during initialize_fees and read on every get_fees call. *)
   let fee_cache : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 16
 
-  (* Helpers for type conversion *)
+  (* Type conversion helpers: Hyperliquid-specific variants to Exchange_intf.Types *)
   let string_of_order_type = function
     | Types.Limit -> "limit"
     | Types.Market -> "market"
     | Types.Other s -> s
-    | _ -> "limit" (* Default to limit for others for now *)
+    | _ -> "limit" (* Fallback: unsupported order types default to limit *)
 
   let string_of_side = function
     | Types.Buy -> "buy"
@@ -42,9 +45,12 @@ module Hyperliquid_impl = struct
     | Hyperliquid_executions_feed.Buy -> Types.Buy
     | Hyperliquid_executions_feed.Sell -> Types.Sell
 
-  (** Place a new order *)
+  (** Place a new order on Hyperliquid.
+      Market orders are emulated as aggressive IOC limit orders with 5% slippage.
+      Prices and quantities are rounded to the instrument's tick and lot size
+      before submission. *)
   let place_order
-      ~token:_ (* Hyperliquid uses wallet address and private key from env *)
+      ~token:_ (* Unused: Hyperliquid authenticates via wallet address and private key from env *)
       ~order_type
       ~side
       ~qty
@@ -67,8 +73,8 @@ module Hyperliquid_impl = struct
       | None ->
           match order_type with
           | Types.Market ->
-              (* Hyperliquid market orders are IOC limit orders. 
-                 We compute an aggressive limit price with 5% slippage from the ticker. *)
+              (* Hyperliquid has no native market order type.
+                 Emulate via IOC limit order with 5% slippage from current BBO. *)
               (match Hyperliquid_ticker_feed.get_latest_ticker symbol with
               | Some t ->
                   if side_bool then t.ask *. 1.05 (* Buy: 5% above ask *)
@@ -109,10 +115,10 @@ module Hyperliquid_impl = struct
     >|= function
     | Ok res ->
         let order_id_str = Int64.to_string res.Hyperliquid_actions.order_id in
-        (* Proactively populate open_orders so that find_order_everywhere succeeds
-           when the strategy tries to amend immediately after placement.
-           Without this, open_orders stays empty until the next webData2 (~1.5s),
-           causing every amendment in that window to fail with "Order not found". *)
+        (* Proactively inject into open_orders so find_order_everywhere succeeds
+           for immediate post-placement amendments. Without this, the order is
+           invisible until the next webData2 push (~1.5s), and any amendment
+           in that window would fail with "Order not found". *)
         let hl_side = match side with Types.Buy -> Hyperliquid_executions_feed.Buy | _ -> Hyperliquid_executions_feed.Sell in
         Hyperliquid_executions_feed.inject_order
           ~symbol
@@ -130,7 +136,9 @@ module Hyperliquid_impl = struct
         }
     | Error e -> Error e
 
-  (** Amend an existing order *)
+  (** Amend an existing order (cancel-replace on Hyperliquid).
+      Looks up the current order state from the executions feed to fill in
+      any parameters not explicitly provided by the caller. *)
   let amend_order
       ~token:_
       ~order_id
@@ -147,7 +155,7 @@ module Hyperliquid_impl = struct
     match symbol with
     | None -> Lwt.return (Error "Symbol is required for Hyperliquid amendment")
     | Some sym ->
-        (* Lookup existing order to get side and current values if not provided *)
+        (* Resolve current order state for side, price, and qty defaults *)
         match Hyperliquid_executions_feed.find_order_everywhere order_id with
         | None -> Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
         | Some existing ->
@@ -181,14 +189,13 @@ module Hyperliquid_impl = struct
         >|= function
         | Ok res ->
             let new_order_id_str = Int64.to_string res.amend_id in
-            (* Do NOT proactively inject the new order into open_orders.
-               The old inject_order call caused a phantom duplicate: the new OID was
-               added while the old OID was still present (WS cancel hadn't fired yet),
-               making get_open_orders transiently return 2 buy orders and triggering
-               the cancel-all branch.  inflight_amend_buy + effective_buy_count now
-               bridge the REST→WS gap without synthetic injection.
-               We DO proactively remove the old order (ID-changing cancel-replace only)
-               to prevent a late WS "open" event from re-adding it as a ghost. *)
+            (* Do NOT inject the new OID into open_orders. Previous attempts
+               created phantom duplicates: the new OID was added while the old
+               OID persisted (WS cancel not yet received), causing get_open_orders
+               to return two entries and triggering spurious cancel-all logic.
+               The inflight_amend counter now bridges the REST-to-WS gap.
+               Only the old OID is removed (on ID change) to prevent a late
+               WS "open" event from re-adding it as a ghost order. *)
             if new_order_id_str <> order_id then
               Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
             Ok {
@@ -199,7 +206,9 @@ module Hyperliquid_impl = struct
             }
         | Error e -> Error e
 
-  (** Cancel orders *)
+  (** Cancel one or more orders by order ID.
+      Orders are grouped by symbol for Hyperliquid's per-coin cancel endpoint.
+      Each symbol group is processed sequentially to avoid shared-state races. *)
   let cancel_orders
       ~token:_
       ?order_ids
@@ -211,7 +220,7 @@ module Hyperliquid_impl = struct
     match order_ids with
     | None -> Lwt.return (Ok [])
     | Some ids ->
-        (* Group IDs by symbol for Hyperliquid's per-coin cancel API *)
+        (* Group order IDs by symbol; Hyperliquid requires per-coin cancel requests *)
         let symbol_map = Hashtbl.create 4 in
         List.iter (fun id ->
           match Hyperliquid_executions_feed.find_order_everywhere id with
@@ -221,7 +230,7 @@ module Hyperliquid_impl = struct
           | None -> ()
         ) ids;
         
-        (* Process each symbol group sequentially to avoid shared-state races *)
+        (* Process symbol groups sequentially to avoid concurrent mutation of shared state *)
         let symbol_groups = Hashtbl.fold (fun sym ids acc -> (sym, ids) :: acc) symbol_map [] in
         Lwt_list.fold_left_s (fun (results_acc, errors_acc) (symbol, ids_for_symbol) ->
           Hyperliquid_actions.cancel_orders
@@ -230,8 +239,8 @@ module Hyperliquid_impl = struct
             ~testnet:(Atomic.get is_testnet)
           >|= function
           | Ok () ->
-              (* Proactively remove cancelled orders from open_orders feed
-                 to prevent ghost orders if orderUpdates WS is lagging or missed *)
+              (* Proactively remove cancelled orders from open_orders.
+                 Prevents ghost entries if the orderUpdates WS message is delayed or lost. *)
               List.iter (fun id ->
                 Hyperliquid_executions_feed.remove_open_order ~symbol ~order_id:id
               ) ids_for_symbol;
@@ -246,7 +255,7 @@ module Hyperliquid_impl = struct
         else
           Lwt.return (Ok results)
 
-  (** Market Data Access *)
+  (** Market data accessors. Delegate to the corresponding feed modules. *)
   
   let get_ticker ~symbol =
     match Hyperliquid_ticker_feed.get_latest_ticker symbol with
@@ -400,7 +409,7 @@ module Hyperliquid_impl = struct
       f { Types. bids = map_levels ob.bids; asks = map_levels ob.asks; timestamp = ob.timestamp }
     )
 
-  (** Metadata Access *)
+  (** Instrument metadata and fee accessors *)
   
   let get_price_increment ~symbol = Hyperliquid_instruments_feed.get_price_increment symbol
   let get_qty_increment ~symbol = Hyperliquid_instruments_feed.get_qty_increment symbol
@@ -431,7 +440,7 @@ module Hyperliquid_impl = struct
           ) symbols
       | None -> ()
 
-  (** Transfer USDC from spot to perp wallet (or vice versa) *)
+  (** Transfer USDC between spot and perp sub-accounts *)
   let transfer_usd ~amount ~to_perp =
     Hyperliquid_actions.usd_class_transfer
       ~amount
@@ -439,9 +448,11 @@ module Hyperliquid_impl = struct
       ~testnet:(Atomic.get is_testnet)
 end
 
-(** WS-based initialization helpers that orchestrate between WS and feeds *)
+(** WebSocket-based initialization routines.
+    These helpers coordinate between the WS transport layer and the
+    domain-specific feed modules during startup. *)
 let wait_for_ws_connected () =
-  (* Delegates to the Lwt_mvar-based wait in hyperliquid_ws — zero polling *)
+  (* Delegates to the Lwt_mvar-based wait in hyperliquid_ws. No polling. *)
   Hyperliquid_ws.wait_for_connected ()
 
 let initialize_instruments_ws () =
@@ -576,14 +587,14 @@ let fetch_open_orders_ws () =
       wait_for_ws_connected () >>= fun () ->
       Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000 >>= fun resp_frame ->
       let open Yojson.Safe.Util in
-      (* Extract payload: data.response.payload.data or data.response.payload *)
+      (* Extract payload from data.response.payload.data, falling back to data.response.payload *)
       let response_node = try resp_frame |> member "data" |> member "response" with _ -> `Null in
       let payload = try response_node |> member "payload" with _ -> `Null in
       let data_node = try payload |> member "data" with _ -> `Null in
       let orders_json = if data_node <> `Null then data_node else payload in
       Hyperliquid_executions_feed.inject_open_orders orders_json;
-      (* Signal domain workers: open-order snapshot is now fully injected.
-         Replaces the 2s wall-clock gate in domain_spawner with a real event. *)
+      (* Signal that the open-order snapshot has been fully injected.
+         Domain workers block on this event instead of a fixed wall-clock delay. *)
       Hyperliquid_executions_feed.set_startup_snapshot_done ();
       Lwt.return_unit
     ) (fun exn ->
@@ -592,6 +603,6 @@ let fetch_open_orders_ws () =
     )
   end
 
-(* Register the module *)
+(* Register Hyperliquid_impl with the exchange registry at module load time *)
 let () =
   Exchange.Registry.register (module Hyperliquid_impl)

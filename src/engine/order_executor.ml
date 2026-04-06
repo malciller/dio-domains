@@ -1,29 +1,33 @@
 (** Order Execution Engine
 
-    This module provides a high-level interface for executing trading orders
-    through the generic Exchange interface. It handles order placement, modification,
-    and cancellation with proper error handling and retry logic, routing requests
-    to the appropriate exchange implementation.
+    Facade for executing trading orders through the generic [Exchange] interface.
+    Handles order placement, amendment, and cancellation with request validation,
+    duplicate detection via in-flight caches, retry logic for transient transport
+    errors, and per-symbol latency profiling. All requests are routed to the
+    concrete exchange implementation resolved from [Exchange.Registry].
 *)
 
 open Lwt.Infix
 
 let section = "order_executor"
 
-(** Global shutdown flag for order executor *)
+(** Atomic flag set to [true] when graceful shutdown is requested.
+    Checked before order placement and amendment to reject new requests. *)
 let shutdown_requested = Atomic.make false
 
-(** Signal shutdown to order executor *)
+(** Sets [shutdown_requested] to [true]. Subsequent place and amend calls
+    return [Error] immediately. Cancellations remain permitted. *)
 let signal_shutdown () =
   Atomic.set shutdown_requested true
 
-(** In-flight order cache to prevent duplicate orders *)
+(** Mutex-guarded hashtable of in-flight order keys for duplicate detection. *)
 module InFlightOrders = Dio_strategies.Strategy_common.InFlightOrders
 
-(** In-flight amendment cache to prevent duplicate amendments *)
+(** Mutex-guarded hashtable of in-flight amendment keys for duplicate detection. *)
 module InFlightAmendments = Dio_strategies.Strategy_common.InFlightAmendments
 
-(** Profilers cache for external requests *)
+(** Per-symbol, per-operation latency profiler cache.
+    Keyed by ["symbol:operation"]. Capped at 64 entries; see [get_profiler]. *)
 let profilers : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
 let profilers_mutex = Mutex.create ()
 
@@ -34,9 +38,8 @@ let get_profiler symbol operation =
     match Hashtbl.find_opt profilers key with
     | Some p -> p
     | None ->
-        (* Evict the entry with the fewest samples before inserting a new one.
-           This prevents unbounded growth if symbol naming ever varies (e.g.
-           exchange format differences on restart). *)
+        (* Evict the entry with the lowest sample count to keep table size
+           at most 64. Guards against unbounded growth from symbol churn. *)
         if Hashtbl.length profilers >= 64 then begin
           let min_key = Hashtbl.fold (fun k p best ->
             let count = match Latency_profiler.snapshot p with
@@ -60,23 +63,24 @@ let get_profiler symbol operation =
   Mutex.unlock profilers_mutex;
   profiler
 
-(* Open the Exchange Interface Types *)
+(* Exchange interface module and type aliases. *)
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
-(** Order types *)
+(** String aliases for order type and side.
+    Parsed into [Types.order_type] and [Types.side] before exchange dispatch. *)
 type order_type = string
 type order_side = string
 
-(** Order request structure *)
+(** Parameters for placing a new order via [place_order]. *)
 type order_request = {
-  exchange: string; (* Name of the exchange to use *)
+  exchange: string; (** Exchange name resolved via [Exchange.Registry]. *)
   order_type: order_type;
   side: order_side;
   quantity: float;
   symbol: string;
   limit_price: float option;
-  time_in_force: string option; (* "GTC", "IOC", "FOK" *)
+  time_in_force: string option; (** One of ["GTC"], ["IOC"], ["FOK"]. *)
   post_only: bool option;
   margin: bool option;
   reduce_only: bool option;
@@ -86,26 +90,26 @@ type order_request = {
   trigger_price_type: string option;
   display_qty: float option;
   fee_preference: string option;
-  duplicate_key: string; (* Hash for duplicate order detection *)
+  duplicate_key: string; (** Key for [InFlightOrders] duplicate detection. *)
 }
 
-(** Amend request structure *)
+(** Parameters for amending an existing order via [amend_order]. *)
 type amend_request = {
   exchange: string;
   order_id: string;
   cl_ord_id: string option;
-  new_quantity: float option; (* New quantity for the order *)
+  new_quantity: float option;
   new_limit_price: float option;
-  limit_price_type: string option; (* Ignored by generic interface, kept for now or remove if unused *)
+  limit_price_type: string option; (** Reserved; unused by generic interface. *)
   post_only: bool option;
   new_trigger_price: float option;
-  trigger_price_type: string option; (* Ignored by generic interface *)
+  trigger_price_type: string option; (** Reserved; unused by generic interface. *)
   new_display_qty: float option;
-  deadline: string option; (* Ignored by generic interface *)
-  symbol: string option; (* Required for some exchanges or precision handling *)
+  deadline: string option; (** Reserved; unused by generic interface. *)
+  symbol: string option; (** Required by some exchanges for price rounding and routing. *)
 }
 
-(** Cancel request structure *)
+(** Parameters for cancelling one or more orders via [cancel_orders]. *)
 type cancel_request = {
   exchange: string;
   order_ids: string list option;
@@ -114,10 +118,12 @@ type cancel_request = {
   symbol: string option;
 }
 
-(** Generate a hash key for duplicate order detection *)
+(** Alias for [Strategy_common.generate_duplicate_key]. Produces a hash key
+    from order parameters for [InFlightOrders] duplicate detection. *)
 let generate_duplicate_key = Dio_strategies.Strategy_common.generate_duplicate_key
 
-(** Validation functions *)
+(** Validates required fields and type-specific constraints on an [order_request].
+    Returns [Error msg] on the first violated constraint. *)
 let validate_order_request (request : order_request) : (unit, string) result =
   if request.exchange = "" then
     Error "Exchange name cannot be empty"
@@ -158,8 +164,8 @@ let validate_cancel_request (request : cancel_request) : (unit, string) result =
     else
       Ok ()
 
-(** Check if error is due to disconnected trading client *)
-(* TODO: Make this generic, currently somewhat specific to Lwt/Conduit error strings but broad enough *)
+(** Returns [true] if [exn_str] matches a transport-level connection failure.
+    Checks for common Lwt, Conduit, and TLS error substrings. *)
 let is_connection_error exn_str =
   let error_str = String.lowercase_ascii exn_str in
   let contains_substring haystack needle =
@@ -174,7 +180,9 @@ let is_connection_error exn_str =
   contains_substring error_str "tls:" ||
   contains_substring error_str "end_of_file"
 
-(** Enhanced error handling wrapper with retry for connection issues *)
+(** Wraps [f] with exception handling. On connection errors (as classified by
+    [is_connection_error]), retries up to [max_retries] times with [retry_delay]
+    seconds between attempts. Non-connection errors return [Error] immediately. *)
 let with_error_handling ~operation_name ?(max_retries=3) ?(retry_delay=1.0) f =
   let rec attempt retry_count =
     Lwt.catch
@@ -183,7 +191,7 @@ let with_error_handling ~operation_name ?(max_retries=3) ?(retry_delay=1.0) f =
         let exn_str = Printexc.to_string exn in
         let err = Printf.sprintf "%s failed: %s" operation_name exn_str in
 
-        (* Check if this is a connection-related error and we haven't exceeded retries *)
+        (* Retry transient connection errors up to max_retries. *)
         if is_connection_error exn_str && retry_count < max_retries then begin
           Logging.warn_f ~section "%s - connection error detected, retrying in %.1fs (attempt %d/%d)"
             err retry_delay (retry_count + 1) max_retries;
@@ -197,13 +205,13 @@ let with_error_handling ~operation_name ?(max_retries=3) ?(retry_delay=1.0) f =
   in
   attempt 0
 
-(** Helper to look up exchange module *)
+(** Resolves [name] to a first-class exchange module via [Exchange.Registry]. *)
 let get_exchange name =
   match Exchange.Registry.get name with
   | Some m -> Ok m
   | None -> Error (Printf.sprintf "Exchange '%s' not found in registry" name)
 
-(** Convert string types to Exchange types *)
+(** Parses a string to [Types.order_type]. Unrecognized values map to [Types.Other]. *)
 let parse_order_type = function
   | "limit" -> Types.Limit
   | "market" -> Types.Market
@@ -217,7 +225,7 @@ let parse_order_type = function
 let parse_side = function
   | "buy" -> Types.Buy
   | "sell" -> Types.Sell
-  | _ -> Types.Buy (* Default or Error? Existing code defaulted. *)
+  | _ -> Types.Buy (* Default: [Buy] for unrecognized input. *)
 
 let parse_time_in_force = function
   | "GTC" -> Types.GTC
@@ -225,42 +233,26 @@ let parse_time_in_force = function
   | "FOK" -> Types.FOK
   | _ -> Types.GTC
 
-(** Convert API results to Kraken types to maintain compatibility if possible, 
-    but we should really transition to generic types. 
-    However, existing code expects Kraken types if we don't update strategies.
-    Wait, strategies call place_order and expect a result.
-    If I change result type here, I break strategies.
-    The task is "Refactor Engine Components". Strategies come later.
-    But to compile, I must return matching types OR update strategies now.
-    Strategies use `Kraken_common_types.add_order_result`?
-    Let's check `market_maker.ml` imports.
-    `market_maker.ml` uses `Dio_engine.Order_executor.place_order`.
-    If I change the return type of `place_order`, `market_maker` might break if it inspects the result.
-    Actually, `market_maker` usually just checks `Ok/Error`.
-    But `amend_order` result has `amend_id`.
-    I defined generic results in `Exchange.Types` which look identical to Kraken ones.
-    I can alias or map them.
-    Since I am refactoring `Order_executor`, I should probably return `Exchange.Types` results.
-    And existing strategies might need minor updates if they depend on specific type names, 
-    but if the structure is compatible it might just work if OCaml infers structural equality? 
-    No, nominal typing.
-    I will update `Order_executor` to return `Exchange.Types` results.
-    And I will subsequently update strategies to use `Exchange.Types` in the next task step.
-    For now, `Order_executor` is the focus.
-*)
+(* NOTE: All return types use [Exchange.Types]. Strategies must depend on
+   [Exchange.Types], not exchange-specific types (OCaml nominal typing). *)
 
-(** Place a new order *)
+(** Places a new order on the target exchange.
+
+    Flow: shutdown check, in-flight cleanup, validation, duplicate detection
+    via [InFlightOrders], exchange dispatch, latency profiling.
+    Returns [Error] if shutdown is active, validation fails, or a duplicate
+    key is already in-flight. *)
 let place_order
     ~token
     ?retry_config
     ?(check_duplicate=true)
     (request : order_request) =
 
-  (* Check for shutdown before accepting new orders *)
+  (* Block new placements during graceful shutdown. *)
   if Atomic.get shutdown_requested then
     Lwt.return (Error "Order placement cancelled due to shutdown")
   else
-    (* Event-driven cleanup: clean up stale entries when orders are placed *)
+    (* Trim stale in-flight entries before each placement attempt. *)
     let (_drift, trimmed) = InFlightOrders.cleanup () in
     if trimmed > 0 then
       Logging.debug_f ~section "InFlightOrders registry cleaned up: removed %d stale entries" trimmed;
@@ -270,7 +262,7 @@ let place_order
         Logging.error_f ~section "Order validation failed: %s" err;
         Lwt.return (Error err)
     | Ok () ->
-        (* Check for duplicate orders *)
+        (* Duplicate detection: add returns false if key already exists. *)
         let is_duplicate = if check_duplicate then not (InFlightOrders.add_in_flight_order request.duplicate_key) else false in
         
         if is_duplicate then begin
@@ -292,11 +284,8 @@ let place_order
           | Ok (module Ex) ->
               let ex_retry_config = retry_config in
 
-              (* TODO: token is still passed but Generic Exchange might handle auth differently. 
-                 Kraken needs token for private generic calls if using WS, or keys if REST. 
-                 Kraken_module handles this. `token` arg depends on implementation.
-                 For now, `Exchange.place_order` takes `token`.
-              *)
+              (* Token semantics are exchange-dependent. Each module
+                 interprets the value per its authentication mechanism. *)
 
               let profiler = get_profiler request.symbol "place" in
               let start_time = Mtime_clock.now_ns () in
@@ -321,7 +310,7 @@ let place_order
                     ()
                 )
                 (fun exn ->
-                  (* Remove from in-flight cache on error *)
+                  (* Clear duplicate key from in-flight cache on exception. *)
                   let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
                   Lwt.fail exn
                 )
@@ -334,17 +323,22 @@ let place_order
         end
   )
 
-(** Amend an existing order *)
+(** Amends an existing order on the target exchange.
+
+    Performs no-op suppression: if the new price rounds to the same value
+    as the current price (per exchange tick size), the amendment is skipped
+    and a sentinel [amend_id = "skipped_no_change"] is returned.
+    Manages [InFlightAmendments] lifecycle and profiles latency. *)
 let amend_order
     ~token
     ?retry_config
     (request : amend_request) =
 
-  (* Check for shutdown before accepting new amendments *)
+  (* Block amendments during graceful shutdown. *)
   if Atomic.get shutdown_requested then
     Lwt.return (Error "Order amendment cancelled due to shutdown")
   else
-    (* Event-driven cleanup: clean up stale entries when orders are amended *)
+    (* Trim stale in-flight amendment entries before each attempt. *)
     let (_drift, trimmed) = InFlightAmendments.cleanup () in
     if trimmed > 0 then
       Logging.debug_f ~section "InFlightAmendments registry cleaned up: removed %d stale entries" trimmed;
@@ -359,8 +353,8 @@ let amend_order
             Logging.error_f ~section "%s" e;
             Lwt.return (Error e)
         | Ok (module Ex) ->
-            (* Check if new price is the same as current price to avoid unnecessary amendments *)
-            (* Diagnostic: log the full-precision requested price *)
+            (* No-op suppression: skip if exchange-rounded prices match.
+               Log full-precision requested price for diagnostics. *)
             (match request.new_limit_price with
              | Some p -> Logging.debug_f ~section "Amendment price check for order %s: requested=%.10f" request.order_id p
              | None -> ());
@@ -370,23 +364,22 @@ let amend_order
                    | Some current_order ->
                        (match current_order.limit_price with
                         | Some current_price ->
-                            (* Apply exchange-specific rounding BEFORE comparing *)
+                            (* Compare prices after exchange-specific tick rounding. *)
                             let rounded_new_price = Ex.round_price ~symbol ~price:new_price in
                             let rounded_current_price = Ex.round_price ~symbol ~price:current_price in
                             let diff = abs_float (rounded_new_price -. rounded_current_price) in
-                            (* If rounding makes them identical, skip the amendment *)
+                            (* Skip if difference is below epsilon (1e-9). *)
                             diff < 0.000000001
                         | None ->
                             false)
                    | None ->
-                       (* Order not in local WS cache — this does NOT mean it's
-                          invalid. WS lag or brief cache churn during a previous
-                          amend can cause the order to be temporarily absent.
-                          Proceed with the amendment and let the exchange reject
-                          if the order truly no longer exists. Skipping here was
-                          the root cause of Kraken buy orders failing to trail
-                          upward (Hyperliquid uses cancel-replace so the old ID
-                          stays in cache until the amend fires, avoiding this). *)
+                       (* Order absent from local WS cache. This does not imply
+                          the order is invalid: WS lag or cache churn during a
+                          prior amend can cause temporary absence. Proceed and
+                          let the exchange reject if the order no longer exists.
+                          Skipping here caused Kraken buy orders to fail trailing
+                          upward. Hyperliquid avoids this via cancel-replace,
+                          keeping the old ID in cache until the amend completes. *)
                        Logging.debug_f ~section "Order %s not found in open orders cache, proceeding with amendment (exchange will reject if invalid)" request.order_id;
                        false)
               | _ -> false
@@ -394,11 +387,12 @@ let amend_order
 
             if should_skip_amendment then begin
 
-              (* Remove from in-flight cache since amendment was skipped *)
+              (* Clear in-flight entry; amendment was suppressed as a no-op. *)
               let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
               
-              (* Return sentinel value so supervisor calls handle_order_amendment_skipped,
-                 not handle_order_amended — the latter would clear tracking state incorrectly *)
+              (* Return sentinel [amend_id = "skipped_no_change"] so the
+                 supervisor routes to [handle_order_amendment_skipped] rather
+                 than [handle_order_amended], preserving tracking state. *)
               Lwt.return (Ok {
                  Types.
                  original_order_id = request.order_id;
@@ -434,7 +428,7 @@ let amend_order
                       ()
                   )
                   (fun exn ->
-                    (* Remove from in-flight cache on error *)
+                    (* Clear in-flight entry on exception. *)
                     let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
                     Lwt.fail exn
                   )
@@ -443,13 +437,17 @@ let amend_order
                 let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
                 Latency_profiler.record profiler span;
                 Latency_profiler.report ~sample_threshold:1 profiler;
-                (* Remove from in-flight cache on success immediately, just like place_order *)
+                (* Clear in-flight entry after successful exchange response. *)
                 let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
                 Lwt.return result
             end
   )
 
-(** Cancel orders *)
+(** Cancels one or more orders on the target exchange.
+
+    At least one identifier list ([order_ids], [cl_ord_ids], or
+    [order_userrefs]) must be non-empty. Triggers [InFlightOrders]
+    cleanup and profiles latency. Not blocked by shutdown. *)
 let cancel_orders
     ~token
     ?retry_config
@@ -466,7 +464,7 @@ let cancel_orders
             Logging.error_f ~section "%s" e;
             Lwt.return (Error e)
         | Ok (module Ex) ->
-            (* Event-driven cleanup: clean up stale entries when orders are cancelled *)
+            (* Trim stale in-flight entries before each cancellation attempt. *)
             let (_drift, trimmed) = InFlightOrders.cleanup () in
             if trimmed > 0 then
               Logging.debug_f ~section "InFlightOrders registry cleaned up: removed %d stale entries" trimmed;
@@ -501,17 +499,14 @@ let cancel_orders
             Lwt.return result
   )
 
-(** Close the trading client connection *)
+(** Closes the underlying trading client connection.
+    TODO: Currently closes only the Kraken client. Multi-exchange teardown
+    requires iterating registered modules or delegating to [Exchange.Registry]. *)
 let close () : unit Lwt.t =
   Logging.info ~section "Closing order executor";
-  Kraken.Kraken_trading_client.close () 
-  (* TODO: This is still tightly coupled to Kraken's client close. 
-     We should probably have a generic shutdown or close method in the Registry/Exchange interface?
-     Or main.ml handles it. Order_executor might not need to know.
-     For now, leaving as-is but it only closes Kraken. 
-     If we have multiple exchanges, we need to close all of them.
-  *)
+  Kraken.Kraken_trading_client.close ()
 
-(** Initialize the order executor *)
+(** No-op initialization. Reserved for future setup (e.g., exchange
+    pre-connection, cache warming). *)
 let init : unit Lwt.t =
   Lwt.return_unit

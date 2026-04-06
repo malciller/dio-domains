@@ -1,42 +1,46 @@
-(** Supervisor types - shared between supervisor and supervisor_cache *)
+(** Shared type definitions for the connection supervisor and supervisor cache. *)
 
-(** Connection state *)
+(** Represents the lifecycle state of a supervised connection. *)
 type connection_state =
   | Disconnected
   | Connecting
   | Connected
-  | Failed of string
+  | Failed of string  (** Includes the error reason. *)
 
-(** Circuit breaker state *)
+(** Tri-state circuit breaker following the standard pattern. *)
 type circuit_breaker_state =
-  | Closed  (* Normal operation *)
-  | Open    (* Failing too much, temporarily disabled *)
-  | HalfOpen  (* Testing if service recovered *)
+  | Closed    (** Normal operation; requests pass through. *)
+  | Open      (** Failure threshold exceeded; requests are blocked. *)
+  | HalfOpen  (** Trial state; allows a single request to test recovery. *)
 
-(** Supervised connection *)
+(** Mutable record tracking the full state of a single supervised connection,
+    including health metrics, circuit breaker status, and reconnection logic. *)
 type supervised_connection = {
   name: string;
   mutable state: connection_state;
   mutable last_connected: float option;
   mutable last_disconnected: float option;
-  mutable last_connecting: float option;  (* Timestamp when entered Connecting state *)
-  mutable last_data_received: float option;  (* For heartbeat monitoring *)
-  mutable last_ping_sent: float option;  (* For ping/pong monitoring *)
-  ping_failures: int Atomic.t;  (* Consecutive ping failures *)
+  mutable last_connecting: float option;        (** Timestamp of last transition to [Connecting]. *)
+  mutable last_data_received: float option;     (** Used for heartbeat timeout detection. *)
+  mutable last_ping_sent: float option;         (** Used for ping/pong liveness checks. *)
+  ping_failures: int Atomic.t;                  (** Atomic counter of consecutive ping failures. *)
   mutable reconnect_attempts: int;
   mutable total_connections: int;
   mutable circuit_breaker: circuit_breaker_state;
-  mutable circuit_breaker_failures: int;  (* Consecutive failures *)
+  mutable circuit_breaker_failures: int;        (** Consecutive failure count for the circuit breaker. *)
   mutable circuit_breaker_last_failure: float option;
-  mutable connect_fn: (unit -> unit Lwt.t) option;  (* Optional - None for monitoring-only connections *)
+  mutable connect_fn: (unit -> unit Lwt.t) option;  (** [None] for monitoring-only (passive) connections. *)
   mutex: Mutex.t;
 }
 
-(** Global registry of supervised connections *)
+(** Global hashtable registry of all supervised connections, keyed by name. *)
 let connections : (string, supervised_connection) Hashtbl.t = Hashtbl.create 16
+
+(** Guards concurrent access to the [connections] registry. *)
 let registry_mutex = Mutex.create ()
 
-(** Safely get connection list for cache *)
+(** Snapshots the current connection list under the registry mutex,
+    then applies [f] to the snapshot outside the critical section. *)
 let with_connections_list f =
   Mutex.lock registry_mutex;
   let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in

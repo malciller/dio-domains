@@ -1,4 +1,5 @@
-(** Hyperliquid Orderbook Feed - WebSocket L2 depth subscription with ring buffer *)
+(** Hyperliquid L2 orderbook feed. Subscribes to WebSocket depth updates and stores
+    snapshots in per-symbol lock-free ring buffers. *)
 
 open Lwt.Infix
 
@@ -18,10 +19,10 @@ type orderbook = {
   timestamp: float;
 }
 
-(** Lock-free ring buffer for orderbook data *)
+(** Lock-free SPSC ring buffer for orderbook snapshots. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol orderbook storage and readiness signalling *)
+(** Per-symbol store containing a ring buffer and an atomic readiness flag. *)
 type store = {
   buffer: orderbook RingBuffer.t;
   ready: bool Atomic.t;
@@ -31,7 +32,8 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Get or create store for a symbol - thread-safe with double-checked locking *)
+(** Returns the store for [symbol], creating one if absent. Uses double-checked
+    locking via [initialization_mutex] for thread safety. *)
 let ensure_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store
@@ -57,15 +59,15 @@ let notify_ready store =
   end
 
 let find_registered_symbol coin =
-  (* Use instruments feed to resolve coin to canonical symbol.
-     - Spot pairs: coin="@107" -> resolve -> "HYPE/USDC" -> found in stores as "HYPE/USDC" ✓
-     - Perps:      coin="BTC"  -> resolve -> "BTC"        -> NOT in stores (keyed "BTC/USDC")
-                   so fall back to trying "BTC/USDC" to match config-style symbol. *)
+  (* Resolves a raw coin identifier to a registered store key.
+     Spot pairs (e.g. "@107") resolve directly to their canonical symbol.
+     Perp coins (e.g. "BTC") resolve to the base name; if not found in stores,
+     falls back to the "BASE/USDC" convention used by configuration. *)
   match Hyperliquid_instruments_feed.resolve_symbol coin with
   | Some symbol ->
       if Hashtbl.mem stores symbol then Some symbol
       else
-        (* Perp coins resolve to just the base name, but stores use BASE/USDC convention *)
+        (* Perp fallback: stores are keyed by BASE/USDC convention. *)
         let usdc_symbol = symbol ^ "/USDC" in
         if Hashtbl.mem stores usdc_symbol then Some usdc_symbol
         else None
@@ -124,19 +126,20 @@ let[@inline always] get_best_bid_ask symbol =
       Some (bid.price, bid.size, ask.price, ask.size)
   | _ -> None
 
-(** Read orderbook events since last position *)
+(** Returns all orderbook snapshots written since [last_pos]. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 
-(** Zero-allocation iteration over orderbook events since last position *)
+(** Iterates [f] over orderbook snapshots since [last_pos] without list allocation.
+    Returns the new cursor position. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
   | None -> last_pos
 
-(** Get current write position *)
+(** Returns the current ring buffer write position for [symbol]. *)
 let[@inline always] get_current_position symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.get_position store.buffer
@@ -172,7 +175,7 @@ let _processor_task =
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid orderbook processor task";
       let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
-      (* Stream ended normally (disconnect pushed None) — re-subscribe *)
+      (* Stream ended normally due to disconnect. Re-subscribe after backoff. *)
       sub.close ();
       Logging.info ~section "Orderbook stream ended (disconnect), re-subscribing in 1s...";
       Lwt_unix.sleep 1.0 >>= fun () -> run ()

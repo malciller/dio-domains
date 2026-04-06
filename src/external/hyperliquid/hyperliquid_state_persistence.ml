@@ -1,20 +1,29 @@
 (**
-   Persistent state for strategy accumulation tracking.
+   Persistent state management for strategy accumulation tracking.
 
-    Saves/loads reserved_base (base asset accumulated via sell_mult),
-    accumulated_profit (USDC realized PnL), last_fill_oid
-    (the OID of the last fill that updated profit), and
-    last_buy_fill_price (the fill price of the most recent buy,
-    used to compute profit on the next sell fill) to a JSON file
-    so values survive Docker container restarts.
+   Serializes and deserializes per-symbol state fields to a JSON file
+   so that values survive process and container restarts.
 
-    File: /app/data/accumulated_state.json (or ./data/ in dev)
-    Format: { "SYMBOL": { "reserved_base": float, "accumulated_profit": float, "last_fill_oid": string, "last_buy_fill_price": float }, ... }
+   Persisted fields per symbol:
+   - reserved_base: base asset quantity accumulated via sell_mult.
+   - accumulated_profit: realized PnL denominated in USDC.
+   - last_fill_oid: order ID of the most recent fill that updated profit.
+   - last_buy_fill_price: fill price of the most recent buy, used to
+     compute profit on the subsequent sell fill.
+   - last_sell_fill_price: fill price of the most recent sell.
+
+   Storage path: /app/data/accumulated_state.json (production),
+   ./data/accumulated_state.json (development).
+
+   File format:
+   { "SYMBOL": { "reserved_base": float, "accumulated_profit": float,
+     "last_fill_oid": string, "last_buy_fill_price": float,
+     "last_sell_fill_price": float }, ... }
 *)
 
 let section = "state_persistence"
 
-(** State file path — /app/data in Docker, ./data locally *)
+(** Base directory for state files. Resolves to /app/data in Docker, ./data locally. *)
 let state_dir =
   if Sys.file_exists "/app" then "/app/data"
   else "data"
@@ -22,10 +31,10 @@ let state_dir =
 let state_file () =
   Filename.concat state_dir "accumulated_state.json"
 
-(** File-level mutex for multi-domain safety *)
+(** Mutex guarding all file I/O for thread safety across domains. *)
 let file_mutex = Mutex.create ()
 
-(** Ensure the data directory exists *)
+(** Creates the state directory if it does not already exist. *)
 let ensure_dir () =
   if not (Sys.file_exists state_dir) then begin
     try Sys.mkdir state_dir 0o755
@@ -33,14 +42,14 @@ let ensure_dir () =
       Logging.warn_f ~section "Could not create state dir %s: %s" state_dir msg
   end
 
-(** Read the entire JSON file, returning a Yojson assoc *)
+(** Reads and parses the state file. Returns an empty assoc on missing or corrupt files. *)
 let read_state_file () : Yojson.Basic.t =
   let path = state_file () in
   if Sys.file_exists path then
     try Yojson.Basic.from_file path
     with
     | Yojson.Json_error msg ->
-        Logging.warn_f ~section "Corrupt state file %s: %s — starting fresh" path msg;
+        Logging.warn_f ~section "Corrupt state file %s: %s, starting fresh" path msg;
         `Assoc []
     | Sys_error msg ->
         Logging.warn_f ~section "Cannot read state file %s: %s" path msg;
@@ -48,28 +57,28 @@ let read_state_file () : Yojson.Basic.t =
   else
     `Assoc []
 
-(** Extract a float field from a symbol's JSON entry *)
+(** Extracts a float field from a symbol's JSON entry. Returns [default] if absent. *)
 let get_float (json : Yojson.Basic.t) ~symbol ~field ~default =
   let open Yojson.Basic.Util in
   try
     json |> member symbol |> member field |> to_float
   with _ -> default
 
-(** Extract an optional float field from a symbol's JSON entry *)
+(** Extracts an optional float field from a symbol's JSON entry. Returns [None] if absent. *)
 let get_float_opt (json : Yojson.Basic.t) ~symbol ~field =
   let open Yojson.Basic.Util in
   try
     Some (json |> member symbol |> member field |> to_float)
   with _ -> None
 
-(** Extract a string field from a symbol's JSON entry *)
+(** Extracts an optional string field from a symbol's JSON entry. Returns [None] if absent. *)
 let get_string_opt (json : Yojson.Basic.t) ~symbol ~field =
   let open Yojson.Basic.Util in
   try
     Some (json |> member symbol |> member field |> to_string)
   with _ -> None
 
-(** Load reserved_base for a symbol. Returns 0.0 if missing. *)
+(** Loads reserved_base for a symbol. Returns 0.0 if absent. Acquires file_mutex. *)
 let load_reserved_base ~symbol =
   Mutex.lock file_mutex;
   let result =
@@ -81,7 +90,7 @@ let load_reserved_base ~symbol =
     Logging.info_f ~section "Loaded reserved_base=%.8f for %s" result symbol;
   result
 
-(** Load accumulated_profit for a symbol. Returns 0.0 if missing. *)
+(** Loads accumulated_profit for a symbol. Returns 0.0 if absent. Acquires file_mutex. *)
 let load_accumulated_profit ~symbol =
   Mutex.lock file_mutex;
   let result =
@@ -93,7 +102,7 @@ let load_accumulated_profit ~symbol =
     Logging.info_f ~section "Loaded accumulated_profit=%.6f for %s" result symbol;
   result
 
-(** Load last_fill_oid for a symbol. Returns None if missing. *)
+(** Loads last_fill_oid for a symbol. Returns [None] if absent. Acquires file_mutex. *)
 let load_last_fill_oid ~symbol =
   Mutex.lock file_mutex;
   let result =
@@ -106,7 +115,7 @@ let load_last_fill_oid ~symbol =
    | None -> ());
   result
 
-(** Load last_buy_fill_price for a symbol. Returns None if missing. *)
+(** Loads last_buy_fill_price for a symbol. Returns [None] if absent. Acquires file_mutex. *)
 let load_last_buy_fill_price ~symbol =
   Mutex.lock file_mutex;
   let result =
@@ -119,7 +128,7 @@ let load_last_buy_fill_price ~symbol =
    | None -> ());
   result
 
-(** Load last_sell_fill_price for a symbol. Returns None if missing. *)
+(** Loads last_sell_fill_price for a symbol. Returns [None] if absent. Acquires file_mutex. *)
 let load_last_sell_fill_price ~symbol =
   Mutex.lock file_mutex;
   let result =
@@ -132,9 +141,10 @@ let load_last_sell_fill_price ~symbol =
    | None -> ());
   result
 
-(** Save reserved_base, accumulated_profit, and optionally last_fill_oid and
-    last_buy_fill_price for a symbol.
-    Reads existing file, updates the symbol's entry, writes atomically. *)
+(** Persists state for a symbol. Required fields: reserved_base, accumulated_profit.
+    Optional fields (last_fill_oid, last_buy_fill_price, last_sell_fill_price) are
+    preserved from disk when not explicitly provided. Performs a read-modify-write
+    cycle under file_mutex with atomic rename to prevent partial writes. *)
 let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price ?last_sell_fill_price () =
   Mutex.lock file_mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock file_mutex) (fun () ->
@@ -143,22 +153,22 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fil
       let existing = read_state_file () in
       let open Yojson.Basic.Util in
       let entries = try existing |> to_assoc with _ -> [] in
-      (* Build the entry fields *)
+      (* Construct required entry fields *)
       let base_fields = [
         ("reserved_base", `Float reserved_base);
         ("accumulated_profit", `Float accumulated_profit);
       ] in
-      (* Preserve existing last_fill_oid if not explicitly provided *)
+      (* Retain existing last_fill_oid when not explicitly supplied *)
       let oid_field = match last_fill_oid with
         | Some oid -> [("last_fill_oid", `String oid)]
         | None ->
-            (* Keep the existing value if present *)
+            (* Preserve value from disk if present *)
             let existing_oid = get_string_opt existing ~symbol ~field:"last_fill_oid" in
             (match existing_oid with
              | Some oid -> [("last_fill_oid", `String oid)]
              | None -> [])
       in
-      (* Preserve existing last_buy_fill_price if not explicitly provided *)
+      (* Retain existing last_buy_fill_price when not explicitly supplied *)
       let buy_price_field = match last_buy_fill_price with
         | Some price -> [("last_buy_fill_price", `Float price)]
         | None ->
@@ -167,7 +177,7 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fil
              | Some price -> [("last_buy_fill_price", `Float price)]
              | None -> [])
       in
-      (* Preserve existing last_sell_fill_price if not explicitly provided *)
+      (* Retain existing last_sell_fill_price when not explicitly supplied *)
       let sell_price_field = match last_sell_fill_price with
         | Some price -> [("last_sell_fill_price", `Float price)]
         | None ->
@@ -180,7 +190,7 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fil
       let updated = List.filter (fun (k, _) -> k <> symbol) entries in
       let final = `Assoc ((symbol, new_entry) :: updated) in
 
-      (* Atomic write: temp file + rename *)
+      (* Atomic write via temp file and rename *)
       let path = state_file () in
       let tmp = path ^ ".tmp" in
       let oc = open_out tmp in

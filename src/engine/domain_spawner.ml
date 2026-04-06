@@ -1,16 +1,16 @@
 open Config
 module Fear_and_greed = Cmc.Fear_and_greed
 
-(* Open Generic Exchange Interface *)
+(* Exchange interface and types *)
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
 let section = "domain_spawner"
 
-(** Get domain key for registry *)
+(** Construct a unique registry key from exchange and symbol. *)
 let domain_key asset = Printf.sprintf "%s/%s" asset.exchange asset.symbol
 
-(** Domain supervisor state *)
+(** Mutable state tracked per supervised domain. *)
 type domain_state = {
   asset: trading_config;
   domain_handle: unit Domain.t option Atomic.t;
@@ -20,16 +20,16 @@ type domain_state = {
   mutex: Mutex.t;
 }
 
-(** Global domain registry *)
+(** Global registry mapping domain keys to their supervisor state. *)
 let domain_registry : (string, domain_state) Hashtbl.t = Hashtbl.create 32
 let registry_mutex = Mutex.create ()
 
-(** Global shutdown flag for domain supervisor *)
+(** Atomic flag set to true when graceful shutdown is requested. *)
 let shutdown_requested = Atomic.make false
 
-(** Per-domain latency profiler cache — persists across restarts so profiler
-    objects (each ~800KB) are created once per symbol rather than on every
-    asset_domain_worker invocation. *)
+(** Per-symbol latency profiler cache. Persists across domain restarts so
+    profiler objects (each ~800KB) are allocated once per symbol rather than
+    on every asset_domain_worker invocation. *)
 type domain_profilers = {
   prof_ticker:   Latency_profiler.t;
   prof_ob:       Latency_profiler.t;
@@ -59,14 +59,16 @@ let get_domain_profilers symbol =
   profs
 
 
-(** The worker function executed by each domain for a trading asset *)
+(** Core worker function executed by each OCaml domain for a trading asset.
+    Runs the event-driven loop: consumes ring buffer events, executes strategy,
+    and blocks on Exchange_wakeup between cycles. *)
 let asset_domain_worker (config : config) (fee_fetcher : trading_config -> trading_config) (asset : trading_config) =
-  Random.self_init ();  (* Initialize random state for this domain *)
+  Random.self_init ();  (* Seed PRNG for this domain *)
   
-  (* Fetch fees at domain startup using the provided fetcher *)
+  (* Fetch exchange fee schedule at domain startup *)
   let asset_with_fees = fee_fetcher asset in
 
-  (* Resolve grid interval once using Fear & Greed (cached) *)
+  (* Resolve grid_interval once using the cached Fear & Greed index *)
   let resolved_grid_interval =
     if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid" then
       let fallback = let (lo, hi) = asset_with_fees.grid_interval in (lo +. hi) /. 2.0 in
@@ -80,7 +82,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       None
   in
 
-  (* Resolve accumulation_buffer once using Fear & Greed (cached) — Hyperliquid only *)
+  (* Resolve accumulation_buffer once via Fear & Greed. Hyperliquid only. *)
   let resolved_accumulation_buffer =
     if asset_with_fees.exchange = "hyperliquid"
        && (asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid") then
@@ -127,7 +129,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
              in
              Printf.sprintf " | Strategy: %s %s" buy_info sell_info)
     | _ ->
-        (* Default to grid strategy info *)
+        (* Grid strategy distance info (default branch) *)
         let state = Dio_strategies.Suicide_grid.get_strategy_state asset_symbol in
         match current_price with
         | None -> " | Strategy: no price data"
@@ -160,7 +162,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             Printf.sprintf " | Strategy: %s %s" buy_info sell_info
   in
 
-  (* Look up exchange implementation *)
+  (* Resolve exchange module from the registry *)
   Logging.debug_f ~section "Looking up exchange %s" asset_with_fees.exchange;
   match Exchange.Registry.get asset_with_fees.exchange with
   | None ->
@@ -169,29 +171,27 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
   | Some (module Ex) ->
       Logging.debug_f ~section "Found exchange module for %s" asset_with_fees.exchange;
 
-      (* Track ring buffer positions for this domain *)
+      (* Ring buffer read positions for this domain *)
       let exec_read_pos = ref 0 in
       let ticker_read_pos = ref 0 in
       let orderbook_read_pos = ref 0 in
 
-      (* Track latest market data from consumed events *)
+      (* Latest market data derived from consumed ring buffer events *)
       let current_price = ref None in
       let top_of_book = ref None in
 
-      (* Track when to execute strategies (event-driven) *)
+      (* Event-driven flag: true when new data warrants a strategy execution *)
       let should_execute_strategy = ref true in
-      (* Hard gate for Hyperliquid: block ALL strategy execution (including strategy_fallback_mod
-         cycles) until we've had at least one opportunity to process any existing exec events.
-         webData2 arrives ~1-2s after connection; if there are live orders, their exec events
-         call handle_order_acknowledged so the strategy has correct state before placing anything.
-         If there are NO live orders (no exec events ever), hl_exec_checked ensures the gate
-         opens after the first cycle, allowing the strategy to place its initial buy order. *)
+      (* Hyperliquid startup gate: blocks strategy execution until exec events
+         from the webData2 snapshot have been consumed, ensuring
+         handle_order_acknowledged restores state before any new orders.
+         Non-Hyperliquid domains start with the gate open (true). *)
       let hl_exec_ready = ref (asset_with_fees.exchange <> "hyperliquid") in
-      (* Tracks whether we've done at least one exec position check - used as fallback for
-         Hyperliquid assets with no open orders that generate no exec events. *)
+      (* Set after the first exec position check. Acts as a fallback to open the
+         hl_exec_ready gate for Hyperliquid assets with no open orders. *)
       let hl_exec_checked = ref false in
 
-      (* Initialize strategy for this asset based on strategy type *)
+      (* Initialize strategy configuration refs based on strategy type *)
       let baseline_price = ref None in
       let last_known_fng = ref (Fear_and_greed.fetch_value ()) in
 
@@ -208,7 +208,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             match resolved_accumulation_buffer with
             | Some ab -> ab
             | None ->
-                (* Non-Hyperliquid: use midpoint (field is (0.01,0.01) default) *)
+                (* Non-Hyperliquid: use midpoint of the configured range *)
                 let (lo, hi) = asset_with_fees.accumulation_buffer in
                 (lo +. hi) /. 2.0
           in
@@ -240,12 +240,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         else ref None
       in
 
-      (* Early-init strategy state so fill handlers have correct config values
-         before the first execute_strategy call.  The domain loop consumes exec
-         events (which call handle_order_filled) BEFORE execute_strategy, so
-         without this, exchange_id/grid_qty/maker_fee are still at their
-         defaults (""/0.0/0.0) and the profit calc + persistence save silently
-         produce nothing. *)
+      (* Pre-populate strategy state fields (exchange_id, grid_qty, maker_fee)
+         so that fill handlers invoked during exec event consumption have
+         correct values before the first execute_strategy call. Without this,
+         profit calculations and persistence writes use zero defaults. *)
       (match !grid_strategy_asset_ref with
        | Some asset ->
            let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
@@ -261,18 +259,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
              asset.symbol asset.exchange st.grid_qty st.maker_fee
        | None -> ());
 
-      (* Set exec position to current to skip any snapshot events that occurred before this domain started.
-         Exception: for Hyperliquid, start from 0 so that webData2-generated NewStatus exec events
-         (inserted into the ring buffer during startup snapshot processing) are seen by the domain
-         loop and trigger handle_order_acknowledged for any pre-existing orders.  Without this,
-         exec_read_pos is captured *after* webData2 fires, the existing buy event is skipped,
-         last_buy_order_id stays None, and the strategy places a duplicate buy on startup. *)
+      (* Initialize exec read position. Non-Hyperliquid: set to current write
+         position to skip pre-existing snapshot events. Hyperliquid: start from
+         0 to replay webData2-generated NewStatus events, which call
+         handle_order_acknowledged and restore last_buy_order_id for any
+         pre-existing orders, preventing duplicate buys on startup. *)
       Logging.info_f ~section "About to get execution feed position for %s" asset_with_fees.symbol;
       begin try
         if asset_with_fees.exchange = "hyperliquid" then begin
-          (* For Hyperliquid: always start from 0 so webData2 snapshot events (which carry
-             pre-existing open orders as NewStatus exec entries) are processed and
-             handle_order_acknowledged is called — restoring last_buy_order_id on startup. *)
+          (* Hyperliquid: replay from position 0 to process webData2 snapshot
+             events and restore order state via handle_order_acknowledged. *)
           exec_read_pos := 0;
           Logging.info_f ~section "Hyperliquid domain for %s starting from exec position 0 (full replay)" asset_with_fees.symbol
         end else begin
@@ -288,19 +284,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         exec_read_pos := 0
       end;
       
-      (* Initialize ticker and orderbook positions to current write position to skip stale
-         ring buffer data from before this domain started. Starting at 0 would cause the
-         domain to replay up to 128 historical entries (each containing large bids/asks arrays)
-         on every start/restart, creating N×128 large allocations with N active domains. *)
+      (* Set ticker and orderbook positions to current write position, skipping
+         stale ring buffer data. Starting at 0 would replay up to 128 historical
+         entries per symbol on every restart, causing excessive allocations. *)
       ticker_read_pos := Ex.get_ticker_position ~symbol:asset_with_fees.symbol;
       orderbook_read_pos := Ex.get_orderbook_position ~symbol:asset_with_fees.symbol;
 
-      (* Seed current_price and top_of_book from the exchange's live cache so that
-         cycle 1 can execute the strategy immediately without waiting for the next
-         incoming tick event for this specific symbol. Without this, both fields start
-         as None and the strategy bails at the `| None, _ -> ()` guard, leaving the
-         domain blocked until Kraken sends its next ticker — which can be seconds later
-         and differs per symbol, causing staggered startup execution. *)
+      (* Seed current_price and top_of_book from the exchange live cache so
+         the first cycle can execute immediately rather than waiting for the
+         next incoming tick event. Without this, both fields start as None
+         and strategy execution is deferred until the next ticker arrives. *)
       (match Ex.get_ticker ~symbol:asset_with_fees.symbol with
        | Some (bid, ask) ->
            current_price := Some ((bid +. ask) /. 2.0);
@@ -320,7 +313,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
       Logging.info_f ~section "Entering domain loop for %s. is_running=%B" key (Atomic.get state.is_running);
       
-      (* Get balances for asset and quote currency - once before loop *)
+      (* Parse base/quote currency pair from the symbol *)
       let (base_asset, quote_currency) =
         if String.contains asset_with_fees.symbol '/' then
           let parts = String.split_on_char '/' asset_with_fees.symbol in
@@ -329,7 +322,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (asset_with_fees.symbol, "USD")
       in
 
-      (* Cache for infrequent info logging *)
+      (* Cached values for periodic info-level log output *)
       let last_asset_balance = ref 0.0 in
       let last_quote_balance = ref 0.0 in
       let last_buy_count = ref 0 in
@@ -340,8 +333,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let { prof_ticker; prof_ob; prof_exec; prof_strategy; prof_cycle } =
         get_domain_profilers asset_with_fees.symbol in
 
-      (* Pre-resolve strategy states once to avoid re-acquiring strategy_states_mutex
-         on every hot-path call. The state reference is stable while is_running=true. *)
+      (* Cache strategy state references to avoid repeated mutex acquisition
+         on the hot path. References are stable while is_running is true. *)
       let cached_grid_state = match !grid_strategy_asset_ref with
         | Some _ -> Some (Dio_strategies.Suicide_grid.get_strategy_state asset_with_fees.symbol)
         | None -> None in
@@ -354,12 +347,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
-        (* Minimal logging in hot loop *)
+        (* Periodic debug logging gated by cycle_mod *)
         if !cycle_count mod config.cycle_mod = 0 then
           Logging.debug_f ~section "Asset [%s/%s] cycle #%d"
             asset_with_fees.exchange asset_with_fees.symbol !cycle_count;
         
-        (* Consume ticker events *)
+        (* Consume pending ticker events from the ring buffer *)
         let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
         if ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) then begin
           let start_ticker = Mtime_clock.now_ns () in
@@ -373,7 +366,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
         end;
         
-        (* Consume orderbook events *)
+        (* Consume pending orderbook events from the ring buffer *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
         if ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) then begin
           let start_ob = Mtime_clock.now_ns () in
@@ -393,9 +386,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
         end;
         
-        (* Consume ticker events *)
-        
-        (* Consume execution events *)
+        (* Consume pending execution events from the ring buffer *)
         let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
         if current_pos <> !exec_read_pos then begin
           let start_exec = Mtime_clock.now_ns () in
@@ -483,7 +474,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               | _ -> ()
           ) in
           if !event_count > 0 then begin
-            (* First exec event batch received - allow strategy to run now *)
+            (* First exec batch received: open the Hyperliquid startup gate *)
             if not !hl_exec_ready then begin
               hl_exec_ready := true;
               (match !grid_strategy_asset_ref with
@@ -499,20 +490,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let stop_exec = Mtime_clock.now_ns () in
           Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub stop_exec start_exec))
         end;
-        (* Fallback: if exec position hasn't changed since startup (no new events),
-           we still need to unblock the strategy after confirming the current position.
-           This covers Hyperliquid assets with no open orders - the absence of exec
-           events is valid data meaning there's nothing to reconcile.
-           Gate: wait until the open-order snapshot injection is complete so the strategy
-           starts with accurate state. The snapshot fires set_startup_snapshot_done()
-           (typically 200-500ms) which wakes us immediately via Exchange_wakeup. *)
+        (* Fallback gate for Hyperliquid domains with no open orders: if no
+           exec events arrived and the startup snapshot injection is complete,
+           open the gate so the strategy can place its initial order. *)
         if not !hl_exec_ready && not !hl_exec_checked && asset_with_fees.exchange = "hyperliquid"
            && Hyperliquid.Executions_feed.is_startup_snapshot_done () then begin
           let current_pos_now = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
           if current_pos_now = !exec_read_pos then begin
             hl_exec_checked := true;
             hl_exec_ready := true;
-            (* Mark startup replay complete so profit calculation is no longer gated *)
+            (* Mark startup replay complete to ungate profit calculation *)
             (match !grid_strategy_asset_ref with
              | Some _ ->
                  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
@@ -522,13 +509,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           end
         end;
 
-        (* Execute strategy based on type - only when triggered by events (event-driven) *)
+        (* Execute strategy if new events have been consumed (event-driven gate) *)
         let should_execute = !hl_exec_ready && !should_execute_strategy in
         if should_execute then begin
           let start_strat = Mtime_clock.now_ns () in
-          should_execute_strategy := false;  (* Reset flag *)
+          should_execute_strategy := false;  (* Clear event-driven trigger *)
 
-          (* Get open orders and compute counts in a single fold - no intermediate list allocations *)
+          (* Fold open orders into per-strategy counts and lists in a single pass *)
           let (all_open_orders, grid_open_buy_count, grid_open_sell_count, mm_open_buy_count, mm_open_sell_count, mm_open_orders) =
             Ex.fold_open_orders ~symbol:asset_with_fees.symbol
               ~init:([], 0, 0, 0, 0, [])
@@ -551,7 +538,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               )
           in
 
-          (* Lock-free balance queries *)
+          (* Query current balances for base and quote assets *)
           (match Ex.get_balance ~asset:base_asset with
            | bal -> last_asset_balance := bal
            | exception _ -> ());
@@ -565,7 +552,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           last_buy_count := grid_open_buy_count + mm_open_buy_count;
           last_sell_count := grid_open_sell_count + mm_open_sell_count;
 
-          (* Dynamic check for price movement to trigger F&G updates and adapt strategy *)
+          (* Trigger async Fear & Greed refresh on significant price movement *)
           (match !current_price with
            | Some cp ->
                (match !baseline_price with
@@ -580,7 +567,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                     end)
            | None -> ());
 
-          (* Apply updated F&G to strategy config dynamically *)
+          (* Apply updated Fear & Greed value to strategy config if changed *)
           let current_fng = match Fear_and_greed.get_cached () with Some v -> v | None -> 50.0 in
           if current_fng <> !last_known_fng then begin
             last_known_fng := current_fng;
@@ -589,7 +576,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             Logging.info_f ~section "[%s/%s] Fear & Greed updated to %.2f. Re-evaluated grid_interval to %.4f (range %.4f-%.4f)"
               asset_with_fees.exchange asset_with_fees.symbol current_fng new_interval lo hi;
             
-            (* Also update accumulation_buffer — Hyperliquid only *)
+            (* Update accumulation_buffer for Hyperliquid *)
             if asset_with_fees.exchange = "hyperliquid" then begin
               let (ab_lo, ab_hi) = asset_with_fees.accumulation_buffer in
               let new_ab = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:current_fng in
@@ -622,8 +609,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat))
         end;
         
-        (* Log cycle stats *)
-        (* Log cycle stats every 1M cycles *)
+        (* Periodic cycle statistics (gated by cycle_mod) *)
         if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
@@ -634,28 +620,27 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           | _ -> ());
         end;
         
-        (* Record cycle work time BEFORE blocking — we want to measure outliers
-           in active processing, not how long we slept waiting for the next frame. *)
+        (* Record cycle work time before blocking. Captures active processing
+           latency only, excluding sleep time in Exchange_wakeup.wait. *)
         let cycle_stop = Mtime_clock.now_ns () in
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
         Latency_profiler.record prof_cycle cycle_span;
 
-        (* Report latencies (Prints to background log files + resets internal memory!) *)
+        (* Flush latency reports when sample threshold is reached *)
         Latency_profiler.report ~sample_threshold:1000000 prof_ticker;
         Latency_profiler.report ~sample_threshold:1000000 prof_ob;
         Latency_profiler.report ~sample_threshold:100000 prof_exec;
         Latency_profiler.report ~sample_threshold:1000000 prof_strategy;
         Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
 
-        (* Yield to allow other threads (websockets) to run *)
-        (* Event-driven: block until the next WS frame signals new data. *)
+        (* Block until the next websocket frame signals new data *)
         if not !should_execute_strategy then
           Concurrency.Exchange_wakeup.wait ~symbol:asset_with_fees.symbol;
 
         ()
       done
 
-(** Register a domain for supervision *)
+(** Create a new domain_state and register it in the global domain_registry. *)
 let register_domain asset =
   let key = domain_key asset in
   let state = {
@@ -672,18 +657,20 @@ let register_domain asset =
   Logging.debug_f ~section "Registered domain for supervision: %s" key;
   state
 
-(** Condition variable signalled when a domain exits (crash or normal exit).
-    Allows supervisor_loop to react immediately instead of waiting the full 5s. *)
+(** Condition variable signalled on domain exit (crash or normal). Allows
+    supervisor_loop to react immediately rather than waiting the full 5s tick. *)
 let domain_died_mutex = Mutex.create ()
 let domain_died_cond = Condition.create ()
 
-(** Notify the supervisor that a domain has just died *)
+(** Signal domain_died_cond to wake the supervisor after a domain exits. *)
 let notify_domain_died () =
   Mutex.lock domain_died_mutex;
   Condition.signal domain_died_cond;
   Mutex.unlock domain_died_mutex
 
-(** Start a supervised domain *)
+(** Spawn a new OCaml domain for the given state, guarded by its mutex.
+    Joins any previous domain handle before spawning. Returns false if
+    the domain is already running. *)
 let start_domain config state fee_fetcher =
   let asset = state.asset in
   let key = domain_key asset in
@@ -698,7 +685,7 @@ let start_domain config state fee_fetcher =
     Atomic.set state.restart_count (Atomic.get state.restart_count + 1);
     Atomic.set state.is_running true;
 
-    (* Join old domain synchronously before starting new one *)
+    (* Join the previous domain handle synchronously before spawning *)
     (match Atomic.get state.domain_handle with
      | Some old_handle ->
          Logging.debug_f ~section "Joining old domain %s before restart" key;
@@ -711,7 +698,7 @@ let start_domain config state fee_fetcher =
       Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
         asset.exchange asset.symbol (Atomic.get state.restart_count);
 
-      (* Exception handling for robustness *)
+      (* Catch exceptions to prevent domain crash from propagating *)
       try
         asset_domain_worker config fee_fetcher asset;
         Logging.info_f ~section "Domain for %s/%s completed normally" asset.exchange asset.symbol
@@ -719,11 +706,10 @@ let start_domain config state fee_fetcher =
         Logging.critical_f ~section "Domain for %s/%s crashed (CAUGHT IN SPAWNER): %s"
           asset.exchange asset.symbol (Printexc.to_string exn);
 
-        (* Mark domain as stopped and allow restart *)
+        (* Mark domain as stopped; notify supervisor for potential restart.
+           domain_handle is preserved for join on next start_domain call. *)
         Atomic.set state.is_running false;
         notify_domain_died ();
-        (* Do NOT clear domain_handle here - we need it to join the domain later *)
-        (* Don't re-raise - domain should be restarted by supervisor *)
         ()
     ) in
 
@@ -733,13 +719,14 @@ let start_domain config state fee_fetcher =
     true
   )
 
-(** Stop a domain *)
+(** Stop a running domain: set is_running to false, clean up strategy state,
+    signal blocked workers via Exchange_wakeup, and join the domain handle. *)
 let stop_domain state =
   let key = domain_key state.asset in
   Mutex.lock state.mutex;
   Atomic.set state.is_running false;
 
-  (* Clean up strategy state when domain stops *)
+  (* Release strategy state for this symbol *)
   let symbol = state.asset.symbol in
   (match state.asset.strategy with
    | "Grid" | "suicide_grid" ->
@@ -751,15 +738,15 @@ let stop_domain state =
    | _ ->
        Logging.debug_f ~section "No cleanup needed for strategy %s" state.asset.strategy);
 
-  (* Unblock any domain worker blocked in Exchange_wakeup.wait so it can
-     see is_running=false and exit the while loop cleanly. *)
+  (* Unblock workers in Exchange_wakeup.wait so they observe is_running=false
+     and exit the main loop. *)
   Concurrency.Exchange_wakeup.signal_all ();
 
 
   (match Atomic.get state.domain_handle with
    | Some handle ->
        Logging.info_f ~section "Stopping domain %s..." key;
-       (* Join synchronously - domain will exit quickly when is_running=false *)
+       (* Join synchronously; domain exits promptly after is_running is cleared *)
        (try Domain.join handle
         with exn -> Logging.warn_f ~section "Exception joining domain %s: %s"
                       key (Printexc.to_string exn));
@@ -767,19 +754,17 @@ let stop_domain state =
    | None -> ());
   Mutex.unlock state.mutex
 
-(** Check if domain needs restart *)
+(** Returns true if the domain is stopped and no shutdown has been requested. *)
 let domain_needs_restart state =
   Mutex.lock state.mutex;
-  (* Don't restart if shutdown has been requested, even if domain is not running *)
+  (* Suppress restart when shutdown is in progress *)
   let needs_restart = not (Atomic.get state.is_running) && not (Atomic.get shutdown_requested) in
   Mutex.unlock state.mutex;
   needs_restart
 
-(** Single persistent waker: signals domain_died_cond every 5 seconds so
-    supervisor_loop's Condition.wait returns on a regular cadence without a
-    domain crashing.  Declared once here to replace the previous pattern of
-    spawning a new un-joined Thread.create on every loop iteration, which
-    leaked ~17 000 OS threads per day. *)
+(** Persistent waker thread: signals domain_died_cond every 5s so the
+    supervisor loop wakes on a regular cadence even when no domain crashes.
+    Allocated once at module load to avoid per-iteration thread leaks. *)
 let _supervisor_waker_thread : Thread.t =
   Thread.create (fun () ->
     while not (Atomic.get shutdown_requested) do
@@ -790,20 +775,21 @@ let _supervisor_waker_thread : Thread.t =
     done
   ) ()
 
-(** Domain supervisor monitoring loop *)
+(** Supervisor monitoring loop. Blocks on domain_died_cond, then iterates
+    the registry and restarts any stopped domains with exponential backoff. *)
 let supervisor_loop config fee_fetcher =
   let section = "domain_supervisor" in
   Logging.info ~section "Domain supervisor started";
 
   while not (Atomic.get shutdown_requested) do
     try
-      (* Wait up to 5s for a domain-died signal or the periodic tick from
-         _supervisor_waker_thread (started once at module load). *)
+      (* Block until domain_died_cond is signalled by a crashed domain or
+         the periodic 5s tick from _supervisor_waker_thread. *)
       Mutex.lock domain_died_mutex;
       Condition.wait domain_died_cond domain_died_mutex;
       Mutex.unlock domain_died_mutex;
 
-      (* Check for shutdown again after the delay *)
+      (* Re-check shutdown flag after waking *)
       if Atomic.get shutdown_requested then raise Exit;
 
       Mutex.lock registry_mutex;
@@ -811,7 +797,7 @@ let supervisor_loop config fee_fetcher =
       Mutex.unlock registry_mutex;
 
       List.iter (fun state ->
-        (* Check for shutdown during iteration to exit immediately *)
+        (* Early exit if shutdown was requested during iteration *)
         if Atomic.get shutdown_requested then raise Exit;
 
         if domain_needs_restart state then (
@@ -820,7 +806,7 @@ let supervisor_loop config fee_fetcher =
           let restart_count = Atomic.get state.restart_count in
           let time_since_restart = Unix.time () -. last_restart in
 
-          (* Implement exponential backoff: 1s, 2s, 4s, 8s, max 30s *)
+          (* Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 30s *)
           let backoff_delay = min 30.0 (2.0 ** float_of_int (restart_count - 1)) in
 
           if time_since_restart >= backoff_delay then (
@@ -833,24 +819,25 @@ let supervisor_loop config fee_fetcher =
 
     with exn ->
       match exn with
-      | Exit -> ()  (* Exit cleanly on shutdown *)
+      | Exit -> ()  (* Clean exit on shutdown *)
       | _ -> Logging.error_f ~section "Exception in domain supervisor: %s" (Printexc.to_string exn)
   done
 
-(** Spawn supervised domains for assets *)
+(** Initialize strategies, register all assets, start their domains, and
+    launch the supervisor thread. Returns the supervisor Thread.t handle. *)
 let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : Thread.t =
   Logging.debug_f ~section "Spawning supervised domains for %d assets..." (List.length assets);
 
-  (* Initialize strategy modules *)
+  (* Initialize strategy module state *)
   Dio_strategies.Suicide_grid.Strategy.init ();
   Dio_strategies.Market_maker.Strategy.init ();
 
-  (* Register all domains *)
+  (* Register each asset in the domain registry *)
   List.iter (fun asset ->
     ignore (register_domain asset)
   ) assets;
 
-  (* Start initial domains *)
+  (* Spawn the initial domain for each registered asset *)
   Mutex.lock registry_mutex;
   let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
   Mutex.unlock registry_mutex;
@@ -861,12 +848,12 @@ let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading
 
 
 
-  (* Start supervisor thread *)
+  (* Launch the supervisor monitoring thread *)
   let supervisor_thread = Thread.create (supervisor_loop config) fee_fetcher in
   Logging.info ~section "Domain supervisor thread started";
   supervisor_thread
 
-(** Get domain status for monitoring *)
+(** Return a snapshot of all domain states for external monitoring. *)
 let get_domain_status () =
   Mutex.lock registry_mutex;
   let status = Hashtbl.fold (fun key state acc ->
@@ -878,15 +865,15 @@ let get_domain_status () =
   Mutex.unlock registry_mutex;
   status
 
-(** Clear domain registry (for testing) *)
+(** Clear the domain registry. Intended for test teardown only. *)
 let clear_domain_registry () =
   Mutex.lock registry_mutex;
   Hashtbl.clear domain_registry;
   Mutex.unlock registry_mutex
 
-(** Get non-destructive latency profiler snapshots for all domains.
-    Returns (symbol, [(label, snapshot option)]) list.
-    Safe to call from the dashboard without resetting profiler data. *)
+(** Return non-destructive latency profiler snapshots for all domains.
+    Result type: (symbol, [(label, snapshot option)]) list.
+    Safe to call from the dashboard; does not reset profiler data. *)
 let get_domain_profiler_snapshots () =
   Mutex.lock profiler_cache_mutex;
   let result = Hashtbl.fold (fun symbol profs acc ->
@@ -902,10 +889,11 @@ let get_domain_profiler_snapshots () =
   Mutex.unlock profiler_cache_mutex;
   result
 
-(** Stop all domains gracefully *)
+(** Initiate graceful shutdown: signal supervisor, stop each domain,
+    and wait up to 10s for all domains to terminate. *)
 let stop_all_domains () =
   Logging.info ~section "Stopping all supervised domains...";
-  (* Signal supervisor to stop restarting domains *)
+  (* Set shutdown flag to prevent supervisor from restarting domains *)
   Atomic.set shutdown_requested true;
   Mutex.lock registry_mutex;
   let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
@@ -913,7 +901,7 @@ let stop_all_domains () =
 
   List.iter stop_domain all_states;
 
-  (* Wait for domains to stop *)
+  (* Poll until all domains have stopped or timeout expires *)
   let rec wait_for_stop max_wait =
     if max_wait <= 0.0 then
       Logging.warn ~section "Timeout waiting for domains to stop"
@@ -928,19 +916,20 @@ let stop_all_domains () =
   in
   wait_for_stop 10.0
 
-(** Legacy function for backward compatibility - returns empty list since domains are now supervised *)
+(** Deprecated compatibility wrapper. Delegates to spawn_supervised_domains_for_assets
+    and returns domain handles for callers that expect unit Domain.t list. *)
 let spawn_domains_for_assets (config : config) (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : unit Domain.t list =
   Logging.warn ~section "spawn_domains_for_assets is deprecated, use spawn_supervised_domains_for_assets instead";
   ignore (spawn_supervised_domains_for_assets config fee_fetcher assets);
 
-  (* Return the list of domain handles for compatibility *)
+  (* Collect current domain handles for the legacy return type *)
   Mutex.lock registry_mutex;
   let domains = Hashtbl.to_seq_values domain_registry |> List.of_seq
                 |> List.filter_map (fun state -> Atomic.get state.domain_handle) in
   Mutex.unlock registry_mutex;
   domains
 
-(* Entrypoint to spawn config domains; call in main program as appropriate *)
+(* Top-level entrypoint: reads config and spawns domains for all trading assets. *)
 let spawn_config_domains (fee_fetcher : trading_config -> trading_config) () : unit Domain.t list =
   let full_config = read_config () in
   let configs = full_config.trading in

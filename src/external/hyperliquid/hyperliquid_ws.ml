@@ -1,10 +1,13 @@
-(** Hyperliquid WebSocket client - market data subscription hub *)
+(** Hyperliquid WebSocket client.
+    Manages a single persistent connection for market data and user event
+    subscriptions. Incoming frames are demultiplexed to subscriber streams
+    and to a request/response table keyed by integer IDs. *)
 
 open Lwt.Infix
 
 let section = "hyperliquid_ws"
 
-(** Subscription handle returned to consumers *)
+(** Handle returned to consumers of [subscribe_market_data]. *)
 type subscription = {
   stream: Yojson.Safe.t Lwt_stream.t;
   close: unit -> unit;
@@ -13,14 +16,13 @@ type subscription = {
 let is_connected_ref = Atomic.make false
 let is_connected () = Atomic.get is_connected_ref
 
-(** Mvar filled each time a new connection is established.
-    Consumers take from it to wait without polling; the mvar is
-    refilled after each successful connect so it remains available
-    for the next caller (e.g. after reconnect). *)
+(** Mvar signaled each time a new connection is established.
+    Consumers call [wait_for_connected] to block on this rather than polling.
+    Refilled after each successful connect so subsequent callers also wake. *)
 let connected_wakeup : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
-(** Block until the WS is connected (or return immediately if already connected).
-    Uses connected_wakeup for zero-latency notification instead of sleep polling. *)
+(** Returns immediately if already connected, otherwise blocks until
+    [connected_wakeup] is signaled by a successful connection. *)
 let wait_for_connected () =
   if Atomic.get is_connected_ref then Lwt.return_unit
   else Lwt_mvar.take connected_wakeup
@@ -28,14 +30,13 @@ let wait_for_connected () =
 let active_connection = ref None
 let connection_mutex = Lwt_mutex.create ()
 
-(** Condition variable used to unblock domain workers waiting for Hyperliquid data.
-    Signaled on every incoming WS frame and on WS disconnect.
-    Delegates to Concurrency.Exchange_wakeup which is visible from all library layers. *)
+(** Broadcasts to [Concurrency.Exchange_wakeup] to unblock domain workers
+    waiting on Hyperliquid data. Called on every incoming frame and on disconnect. *)
 let signal_new_data () = Concurrency.Exchange_wakeup.signal_all ()
 
-(** Global subscriber list.
-    Each pusher is a function that accepts a Yojson.Safe.t option.
-    Bounded internally: returns true if the push succeeded, false if dropped. *)
+(** Global list of subscriber push functions.
+    Each entry accepts [Some json] to deliver a message or [None] to close
+    the stream. Returns [true] on success, [false] if the message was dropped. *)
 let pushers : (Yojson.Safe.t option -> bool) list ref = ref []
 let pushers_mutex = Mutex.create ()
 
@@ -48,22 +49,23 @@ end)
 let responses : (Yojson.Safe.t Lwt.u * float) Response_table.t = Response_table.create 32
 let responses_mutex = Lwt_mutex.create ()
 
-(** Consecutive ping failures tracked by supervisor *)
+(** Counter of consecutive ping failures, read by the supervisor. *)
 let ping_failures = Atomic.make 0
 let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
 
-(** Pong tracking for active ping/pong monitoring.
-    Hyperliquid pong responses are {"channel": "pong"} with NO id field,
-    so we cannot use the ID-matched send_request mechanism. Instead we
-    fire-and-forget the ping and wait on a dedicated condition variable. *)
+(** Pong tracking state.
+    Hyperliquid pong responses carry no id field, so the generic
+    [send_request] ID-matching mechanism cannot be used. Instead,
+    [send_ping] waits on [pong_condition], which is broadcast when
+    a frame with channel "pong" arrives. *)
 let last_pong_time = ref 0.0
 let pong_condition = Lwt_condition.create ()
 
-(** Fail all pending response waiters on disconnect — mirrors Kraken's
-    fail_all_pending / reset_state pattern. Without this, in-flight
-    send_request calls hang until their individual timeouts (up to 5s). *)
+(** Rejects all pending [send_request] waiters with a [Failure] exception.
+    Called on disconnect to prevent callers from blocking until their
+    individual timeouts expire. *)
 let fail_all_pending reason =
   Lwt.async (fun () ->
     Lwt_mutex.with_lock responses_mutex (fun () ->
@@ -81,8 +83,9 @@ let fail_all_pending reason =
     )
   )
 
-(** Clean up stale response table entries older than 30s — prevents memory leaks.
-    Mirrors Kraken's cleanup_stale_response_entries pattern. *)
+(** Removes response table entries older than 30 seconds.
+    Each stale waiter is rejected with a timeout [Failure].
+    Prevents unbounded growth of the response table. *)
 let cleanup_stale_responses () =
   Lwt_mutex.with_lock responses_mutex (fun () ->
     let now = Unix.time () in
@@ -102,9 +105,9 @@ let cleanup_stale_responses () =
     Lwt.return_unit
   )
 
-(** Close all subscriber streams — called on WS disconnect to unblock
-    Lwt_stream.iter in processor tasks and prevent orphaned push closures
-    from leaking memory. Pushing None terminates the Lwt_stream. *)
+(** Pushes [None] to every subscriber stream to signal termination, then
+    clears the pushers list. Called on disconnect to unblock consumers
+    waiting in [Lwt_stream.iter] and to release push closures. *)
 let close_all_subscribers () =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
@@ -118,10 +121,10 @@ let close_all_subscribers () =
     ) ps
   end
 
-(** Broadcast to all subscribers.
-    Push is non-blocking: if a consumer's bounded stream is full, the message
-    is silently dropped for that consumer. This prevents unbounded memory growth
-    from slow consumers accumulating Yojson.Safe.t trees. *)
+(** Delivers a JSON message to all registered subscribers.
+    Push is non-blocking: if a subscriber's bounded stream is full, the
+    message is silently dropped for that subscriber to prevent unbounded
+    memory growth from slow consumers. Dead pushers are evicted. *)
 let broadcast_message json =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
@@ -132,31 +135,27 @@ let broadcast_message json =
     try ignore (push (Some json))
     with _ -> dead := push :: !dead
   ) ps;
-  (* Evict any dead pushers *)
   if !dead <> [] then begin
     Mutex.lock pushers_mutex;
     pushers := List.filter (fun p -> not (List.memq p !dead)) !pushers;
     Mutex.unlock pushers_mutex
   end
 
-(** Subscribe to all incoming market data messages.
-    Uses a bounded stream (capacity 64) to prevent unbounded memory growth.
-    When the stream is full, new messages are silently dropped — consumers
-    will process the next available message when they catch up. *)
+(** Creates a bounded subscriber stream (capacity 16) for incoming messages.
+    Returns a [subscription] with the stream and a [close] function that
+    removes the subscriber from the global list. Messages are silently
+    dropped when the stream buffer is full. *)
 let subscribe_market_data () =
   let (stream, push_source) = Lwt_stream.create_bounded 16 in
-  (* Non-blocking push wrapper compatible with pushers list signature.
-     Returns true if pushed, false if dropped/closed. *)
+  (* Non-blocking push wrapper. Returns true on success, false if dropped. *)
   let push_fn item =
     match item with
     | None ->
-        (* Close signal — always deliver *)
         push_source#close;
         true
     | Some json ->
         let p = push_source#push json in
         if Lwt.is_sleeping p then begin
-          (* Stream is full — drop this message *)
           Lwt.cancel p;
           false
         end else
@@ -172,7 +171,8 @@ let subscribe_market_data () =
   in
   { stream; close }
 
-(** Send a subscription message to the active connection *)
+(** Sends a JSON message over the active WebSocket connection.
+    No-op with a warning if not currently connected. *)
 let subscribe json =
   Lwt_mutex.with_lock connection_mutex (fun () ->
     match !active_connection with
@@ -185,7 +185,12 @@ let subscribe json =
         Lwt.return_unit
   )
 
-(** Send initial subscriptions to Hyperliquid *)
+(** Sends subscription messages for all configured channels.
+    Subscribes to allMids unconditionally. If [wallet] is non-empty,
+    subscribes to user-specific channels: webData2, userEvents, spotState,
+    userFills, userFundings, userNonFundingLedgerUpdates, orderUpdates.
+    Subscribes to l2Book for each symbol, using the coin identifier
+    resolved via [Hyperliquid_instruments_feed]. *)
 let subscribe_to_feeds ~symbols ~wallet =
   let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "allMids")])]) in
   
@@ -202,13 +207,16 @@ let subscribe_to_feeds ~symbols ~wallet =
   in
   
   Lwt_list.iter_s (fun symbol ->
-    (* Use instruments feed to get correct coin identifier:
-       perps use base name (e.g. "HYPE"), spot pairs use "@N" format *)
+    (* Perps use the base name (e.g. "HYPE"); spot pairs use "@N" format. *)
     let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
     Logging.info_f ~section "Subscribing to l2Book for %s (coin=%s)" symbol coin;
     subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String coin)])])
   ) symbols
 
+(** Processes a single WebSocket frame.
+    Text frames are parsed as JSON, then either matched to a pending
+    request via the response table or broadcast to all subscribers.
+    Close frames trigger connection teardown and subscriber cleanup. *)
 let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
   | Websocket.Frame.Opcode.Text ->
@@ -221,14 +229,13 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
           try member "channel" json |> to_string with _ -> ""
         in
         
-        (* Detect pong responses for active ping monitoring *)
+        (* Update pong tracking on pong responses. *)
         if channel = "pong" then begin
           last_pong_time := Unix.gettimeofday ();
           (try Lwt_condition.broadcast pong_condition () with _ -> ())
         end;
 
-        (* post responses are logged in hyperliquid_module as "Hyperliquid order raw response" *)
-        (* pong is noisy, but we want to see post for now for debugging timeouts *)
+        (* Filter high-frequency channels from debug logging. *)
         let is_noisy = List.mem channel ["pong"] in
 
         if not is_noisy then begin
@@ -243,7 +250,8 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
             Logging.debug_f ~section "Raw WS message: %s" log_msg
         end;
         
-        (* Check if it's a response to a request *)
+        (* Attempt to extract an integer ID from the JSON payload.
+           Searches top-level, then inside "data" and "response" keys. *)
         let is_response = 
           let id_opt = 
             let rec find_id node =
@@ -255,7 +263,6 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
                    | Some (`String s) -> (try Some (int_of_string s) with _ -> None)
                    | Some (`Float f) -> Some (int_of_float f)
                    | _ -> 
-                       (* If not at this level, check inside "data" or "response" *)
                        (match List.assoc_opt "data" pairs with
                         | Some next_node -> find_id next_node
                         | None -> 
@@ -268,7 +275,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
           in
           match id_opt with
           | Some id ->
-              (* It's a response with an ID *)
+              (* Wake the corresponding [send_request] waiter. *)
               Lwt.async (fun () ->
                 Lwt_mutex.with_lock responses_mutex (fun () ->
                   try
@@ -289,8 +296,8 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
               false
         in
         
+        (* Messages without a matching request ID are broadcast to subscribers. *)
         if not is_response then begin
-          (* Debug log for data messages occasionally *)
           if not is_noisy then
             if channel = "webData2" then
               Logging.debug ~section "Broadcasting webData2 data message"
@@ -310,11 +317,15 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
       ) >>= fun () ->
       fail_all_pending "Connection closed by server";
       close_all_subscribers ();
-      signal_new_data ();  (* unblock waiting domain workers so they re-check is_running *)
+      signal_new_data ();
       Lwt.return_unit
   | _ -> Lwt.return_unit
 
-(** Connect to Hyperliquid WebSocket and broadcast messages to all subscribers. *)
+(** Establishes a TLS WebSocket connection to the Hyperliquid API.
+    Resolves the hostname, connects via TLS, then enters a read loop
+    that dispatches frames through [handle_frame]. On connection loss,
+    cleans up state, fails pending requests, closes subscribers, and
+    invokes [on_failure]. The supervisor is responsible for reconnection. *)
 let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
   let base_url = if testnet then "api.hyperliquid-testnet.xyz" else "api.hyperliquid.xyz" in
   let url = Printf.sprintf "wss://%s/ws" base_url in
@@ -335,9 +346,8 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     Lwt_mutex.with_lock connection_mutex (fun () ->
       active_connection := Some conn;
       Atomic.set is_connected_ref true;
-      (* Signal any waiters blocked in wait_for_connected().
-         is_empty guard ensures we don't queue a blocking Lwt continuation
-         when the mvar already holds a signal (rapid reconnect scenario). *)
+      (* Signal waiters blocked in [wait_for_connected].
+         Guard on [is_empty] to avoid queuing a second value on rapid reconnect. *)
       if Lwt_mvar.is_empty connected_wakeup then
         Lwt.async (fun () -> Lwt_mvar.put connected_wakeup ());
       Lwt.return_unit
@@ -345,8 +355,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     on_connected ();
     reset_ping_failures ();
     
-    (* No internal heartbeat loop — supervisor owns ping/pong monitoring,
-       matching the Kraken auth WS pattern for consistent supervision. *)
+    (* Ping/pong monitoring is owned by the supervisor, not this module. *)
 
     let done_p, done_u = Lwt.wait () in
     let rec loop () =
@@ -354,7 +363,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
         Websocket_lwt_unix.read conn >>= fun frame ->
         handle_frame ~on_heartbeat frame >>= fun () ->
         if Atomic.get is_connected_ref then begin
-          (* Spawn next iteration independently — breaks Forward chain *)
+          (* Spawn next iteration to avoid stack growth from chained binds. *)
           Lwt.async loop;
           Lwt.return_unit
         end else begin
@@ -389,8 +398,8 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
           close_all_subscribers ();
           Lwt.fail exn
     ) >>= fun () ->
-    (* Read loop exited normally (e.g. server Close frame).
-       Treat this as a connection failure so supervisor triggers restart. *)
+    (* Normal read loop exit (e.g. server-initiated close frame).
+       Treated as a failure so the supervisor triggers reconnection. *)
     Lwt_mutex.with_lock connection_mutex (fun () ->
       active_connection := None;
       Atomic.set is_connected_ref false;
@@ -409,11 +418,12 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     Lwt.return_unit
   )
 
-(** Send a request and wait for a response using the given req_id. *)
+(** Sends a JSON request over the WebSocket and blocks until a response
+    with the matching [req_id] arrives or [timeout_ms] elapses.
+    Logs a warning when the response table exceeds 10 pending entries. *)
 let send_request ~json ~req_id ~timeout_ms =
   let waiter, wakener = Lwt.wait () in
   Lwt_mutex.with_lock responses_mutex (fun () ->
-    (* Backpressure check: clean up stale entries if table is growing large *)
     let pending_count = Response_table.length responses in
     if pending_count > 10 then
       Logging.warn_f ~section "Response table size is high: %d pending requests" pending_count;
@@ -437,9 +447,11 @@ let send_request ~json ~req_id ~timeout_ms =
     )
   ]
 
-(** Send a ping and wait for pong — used by supervisor for active health monitoring.
-    Hyperliquid pong = {"channel":"pong"} with NO id field, so we use a
-    dedicated condition variable instead of the ID-matched send_request. *)
+(** Sends a ping and waits for a pong within [timeout_ms].
+    Returns [true] if a pong was received, [false] on timeout or send failure.
+    Uses [pong_condition] since Hyperliquid pong responses carry no id field.
+    Falls back to checking [last_pong_time] in case the condition signal
+    was delivered before this function began waiting. *)
 let send_ping ~req_id:_ ~timeout_ms =
   let ping_msg = `Assoc [("method", `String "ping")] in
   let send_time = Unix.gettimeofday () in
@@ -452,7 +464,7 @@ let send_ping ~req_id:_ ~timeout_ms =
        reset_ping_failures ();
        Lwt.return true);
       (Lwt_unix.sleep timeout >>= fun () ->
-       (* Check if pong arrived but we missed the condition signal *)
+       (* Check timestamp in case the condition was signaled before we waited. *)
        if !last_pong_time > send_time then begin
          reset_ping_failures ();
          Lwt.return true

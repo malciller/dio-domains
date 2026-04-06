@@ -1,4 +1,9 @@
-(** Kraken Orderbook Feed - WebSocket v2 depth subscription with ring buffer *)
+(**
+   Kraken V2 WebSocket orderbook feed.
+   Maintains per-symbol orderbook state via lock-free ring buffers.
+   Validates orderbook integrity using CRC32 checksums per Kraken specification.
+   Sequence tracking enforces strict ordering; gaps or rollbacks trigger resynchronization.
+*)
 
 open Lwt.Infix
 
@@ -9,10 +14,10 @@ let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 let orderbook_depth = Kraken_common_types.default_orderbook_depth
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_orderbook
 
-(** Global flag to track if cleanup handlers are running *)
+(** Atomic flag indicating whether cleanup handlers have been initialized. *)
 let cleanup_handlers_started = Atomic.make false
 
-(** Shared CRC32 implementation for checksum calculations *)
+(** CRC32 lookup table (IEEE 802.3 polynomial 0xEDB88320). *)
 let crc32_table =
   Array.init 256 (fun n ->
     let c = ref (Int32.of_int n) in
@@ -33,7 +38,7 @@ let crc32_zlib s =
   done;
   Int32.logxor !crc 0xFFFFFFFFl
 
-(** Shared helpers for checksum calculations *)
+(** Remove all decimal point characters from a numeric string. Used for CRC32 input normalization. *)
 let remove_decimal s =
   let b = Buffer.create (String.length s) in
   String.iter (fun c -> if c <> '.' then Buffer.add_char b c) s;
@@ -49,7 +54,7 @@ let remove_leading_zeros s =
   let trimmed = aux 0 in
   if trimmed = "" then "0" else trimmed
 
-(** Individual price level with both float and string representations *)
+(** Single price level. Stores both string and float representations to avoid repeated parsing. *)
 type level = {
   price: string;
   size: string;
@@ -62,11 +67,11 @@ type orderbook = {
   bids: level array;
   asks: level array;
   sequence: int64 option;
-  checksum: int32 option; (* Kraken CRC32 checksum *)
+  checksum: int32 option; (** CRC32 checksum received from Kraken for validation. *)
   timestamp: float;
 }
 
-(** Take first n elements from list, or all elements if fewer than n *)
+(** Return the first [n] elements of a list. Returns all elements if the list has fewer than [n]. *)
 let take n lst =
   let rec take_aux acc n = function
     | [] -> List.rev acc
@@ -75,8 +80,9 @@ let take n lst =
   in
   take_aux [] n lst
 
-(** Decimal-aware string comparator for sorting prices (avoids float precision issues).
-    Assumes format like "X.YYYY" or "0.YYYY"; compares numerically by aligning decimals. *)
+(** Decimal-aware string comparator for price ordering. Avoids float precision loss
+    by splitting on the decimal point and comparing integer/fractional parts independently.
+    Fractional parts are right-padded to 15 digits for uniform comparison. *)
 let decimal_compare s1 s2 =
   let normalize s =
     let parts = String.split_on_char '.' s in
@@ -89,12 +95,12 @@ let decimal_compare s1 s2 =
   let (w2, f2) = normalize s2 in
   let cmp_whole = compare (int_of_string w1) (int_of_string w2) in
   if cmp_whole <> 0 then cmp_whole else
-  let pad_frac f = f ^ String.make (max 0 (15 - String.length f)) '0' in  (* Pad to 15 decimals for compare *)
+  let pad_frac f = f ^ String.make (max 0 (15 - String.length f)) '0' in
   String.compare (pad_frac f1) (pad_frac f2)
 
 let to_decimal_str ?(trim_trailing=true) ?dec json =
   match json with
-  | `String s -> s  (* Rare, but handle if strings appear *)
+  | `String s -> s
   | `Float f ->
       let d = match dec with Some d -> d | None -> 12 in
       let s = Printf.sprintf "%.*f" d f in
@@ -104,7 +110,7 @@ let to_decimal_str ?(trim_trailing=true) ?dec json =
         (match parts with
          | [whole; frac] ->
              if trim_trailing then
-               (* Existing rtrim logic *)
+               (* Trim trailing zeros from fractional part. *)
                let len = String.length frac in
                let rec rtrim i =
                  if i <= 0 then ""
@@ -119,15 +125,15 @@ let to_decimal_str ?(trim_trailing=true) ?dec json =
   | `Intlit s -> s
   | _ -> "0"
 
-(** Extract raw price/qty strings from JSON for checksum calculation *)
+(** Parse price and quantity strings from JSON values for checksum input. *)
 let parse_checksum_level price_json qty_json =
   let price_str = to_decimal_str ~trim_trailing:true price_json in
   let qty_str   = to_decimal_str ~trim_trailing:true qty_json in
   (price_str, qty_str)
 
-(** Calculate CRC32 checksum per Kraken specification using top 10 levels *)
+(** Compute CRC32 checksum from raw JSON bid/ask arrays using the top 10 levels per side.
+    Operates directly on JSON to preserve original string precision. *)
 let calculate_checksum_from_json symbol bids_json asks_json : int32 =
-  (* Parse levels directly from JSON for checksum calculation *)
   let parse_checksum_levels json =
     match json with
     | `List entries ->
@@ -149,7 +155,7 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
   let bids_levels = parse_checksum_levels bids_json in
   let asks_levels = parse_checksum_levels asks_json in
 
-  (* Helper: check if size is effectively zero using string comparison *)
+  (* Check if quantity string represents zero by scanning for any non-zero, non-decimal digit. *)
   let is_effectively_zero qty_str =
     let rec has_non_zero s i =
       if i >= String.length s then false
@@ -159,11 +165,11 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
     not (has_non_zero qty_str 0)
   in
 
-  (* Filter out levels with zero quantities *)
+  (* Exclude levels with zero quantity. *)
   let valid_bids = List.filter (fun (_, qty_str) -> not (is_effectively_zero qty_str)) bids_levels in
   let valid_asks = List.filter (fun (_, qty_str) -> not (is_effectively_zero qty_str)) asks_levels in
 
-  (* Sort bids descending (high to low), asks ascending (low to high) *)
+  (* Sort bids descending by price, asks ascending by price. *)
   let sorted_bids = List.sort (fun (p1, _) (p2, _) ->
     let cmp = decimal_compare p2 p1 in
     cmp
@@ -174,7 +180,7 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
     cmp
   ) valid_asks in
 
-  (* Take top min(10, available) - NO PADDING per Kraken spec *)
+  (* Select up to 10 levels per side. No padding per Kraken specification. *)
   let top_bids = take (min 10 (List.length sorted_bids)) sorted_bids in
   let top_asks = take (min 10 (List.length sorted_asks)) sorted_asks in
 
@@ -191,13 +197,13 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
     price_clean ^ qty_clean
   in
 
-  (* Generate asks string (sorted low to high) *)
+  (* Concatenate normalized ask levels (ascending price order). *)
   let asks_string = String.concat "" (List.map format_price_level top_asks) in
 
-  (* Generate bids string (sorted high to low) *)
+  (* Concatenate normalized bid levels (descending price order). *)
   let bids_string = String.concat "" (List.map format_price_level top_bids) in
 
-  (* Concatenate asks + bids *)
+  (* Final checksum input: asks followed by bids. *)
   let combined_string = asks_string ^ bids_string in
 
   let result = crc32_zlib combined_string in
@@ -207,7 +213,7 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
 
   result
 
-(** Lock-free ring buffer for orderbook data - shared implementation *)
+(** Lock-free ring buffer for orderbook snapshots. Aliases the shared implementation. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
 module PriceMap = Map.Make (struct
@@ -215,48 +221,47 @@ module PriceMap = Map.Make (struct
   let compare = String.compare
 end)
 
-(** Per-symbol orderbook storage and readiness signalling *)
+(** Per-symbol mutable orderbook state, including bid/ask maps, ring buffer, and synchronization metadata. *)
 type store = {
   mutable buffer: orderbook RingBuffer.t;
   mutable bids: (string * string * float * float) PriceMap.t;
   mutable asks: (string * string * float * float) PriceMap.t;
   ready: bool Atomic.t;
-  has_snapshot: bool Atomic.t;  (** Track if we have received a snapshot for this symbol *)
-  last_sequence: int64 option Atomic.t;  (** Track the last sequence number for this symbol *)
-  mutable last_update: float;  (** Track when this store was last updated *)
+  has_snapshot: bool Atomic.t;  (** True after an initial snapshot has been received. Updates are rejected until set. *)
+  last_sequence: int64 option Atomic.t;  (** Last processed sequence number. Used for gap and rollback detection. *)
+  mutable last_update: float;  (** Unix timestamp of the most recent data write. Used for staleness pruning. *)
 }
 
-type decimals = int * int  (* pair_decimals, lot_decimals *)
+type decimals = int * int  (** (pair_decimals, lot_decimals) precision tuple from AssetPairs API. *)
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
 let ready_condition = Lwt_condition.create ()
 
-(** Get precision info from instruments feed cache *)
+(** Retrieve price and quantity precision from the instruments feed cache. Returns None on failure. *)
 let get_precision_from_instruments symbol =
   try
-    (* Use the exported function from instruments feed *)
+
     Kraken_instruments_feed.get_precision_info symbol
   with _ -> None
 
 let calculate_checksum symbol bids asks : int32 =
   let pd, ld =
-    (* First try to get precision from instruments feed *)
+    (* Prefer instruments feed precision; fall back to AssetPairs cache, then defaults. *)
     match get_precision_from_instruments symbol with
     | Some (price_prec, qty_prec) ->
         Logging.debug_f ~section "Using instruments feed precision for %s: price=%d qty=%d" symbol price_prec qty_prec;
         (price_prec, qty_prec)
     | None ->
-        (* Fall back to decimals_tbl from AssetPairs API *)
+
         try Hashtbl.find decimals_tbl symbol
         with Not_found ->
           Logging.debug_f ~section "No precision found for %s, using defaults" symbol;
-          (8, 8)  (* Fallback defaults *)
+          (8, 8)
   in
 
-  (* Helper: check if size is effectively zero using string comparison *)
+  (* Check if size string represents zero by scanning for any non-zero, non-decimal digit. *)
   let is_effectively_zero size =
-    (* Remove leading zeros and check if empty or all zeros *)
     let rec has_non_zero s i =
       if i >= String.length s then false
       else if s.[i] <> '0' && s.[i] <> '.' then true
@@ -265,11 +270,11 @@ let calculate_checksum symbol bids asks : int32 =
     not (has_non_zero size 0)
   in
 
-  (* Filter out levels with zero quantities *)
+  (* Exclude levels with zero quantity. *)
   let valid_bids = Array.to_list bids |> List.filter (fun level -> not (is_effectively_zero level.size)) in
   let valid_asks = Array.to_list asks |> List.filter (fun level -> not (is_effectively_zero level.size)) in
 
-  (* Sort bids descending (high to low), asks ascending (low to high) *)
+  (* Sort bids descending by price, asks ascending by price. *)
   let sorted_bids = List.sort (fun l1 l2 ->
     decimal_compare l2.price l1.price
   ) valid_bids in
@@ -278,7 +283,7 @@ let calculate_checksum symbol bids asks : int32 =
     decimal_compare l1.price l2.price
   ) valid_asks in
 
-  (* Take top min(10, available) - NO PADDING per Kraken spec *)
+  (* Select up to 10 levels per side. No padding per Kraken specification. *)
   let top_bids = take (min 10 (List.length sorted_bids)) sorted_bids in
   let top_asks = take (min 10 (List.length sorted_asks)) sorted_asks in
 
@@ -297,13 +302,13 @@ let calculate_checksum symbol bids asks : int32 =
     price_clean ^ qty_clean
   in
 
-  (* Generate asks string (sorted low to high) *)
+  (* Concatenate normalized ask levels (ascending price order). *)
   let asks_string = String.concat "" (List.map format_price_level top_asks) in
 
-  (* Generate bids string (sorted high to low) *)
+  (* Concatenate normalized bid levels (descending price order). *)
   let bids_string = String.concat "" (List.map format_price_level top_bids) in
 
-  (* Concatenate asks + bids *)
+  (* Final checksum input: asks followed by bids. *)
   let combined_string = asks_string ^ bids_string in
 
   let result = crc32_zlib combined_string in
@@ -343,7 +348,7 @@ let notify_ready ~symbol store =
   Concurrency.Exchange_wakeup.signal ~symbol
 
 let is_effectively_zero size =
-  (* Remove leading zeros and check if empty or all zeros *)
+  (* Returns true if the string contains no non-zero, non-decimal, non-sign digits. *)
   let rec has_non_zero s i =
     if i >= String.length s then false
     else if s.[i] <> '0' && s.[i] <> '.' && s.[i] <> '-' then true
@@ -382,22 +387,25 @@ let parse_level symbol price_json size_json =
   let qty_float = try float_of_string qty_str with _ -> 0.0 in
   Some (price_str, qty_str, price_float, qty_float)
 
+(** Parse a JSON array of price levels into (price_str, qty_str, price_float, qty_float) tuples.
+    Supports both object format ({price, qty}) and legacy array format ([price, qty]). *)
 let parse_levels symbol json =
   match json with
   | `List entries -> List.filter_map (fun entry ->
       match entry with
-      (* New format: objects with "price" and "qty" fields *)
+      (* Object format: {"price": ..., "qty": ...} *)
       | `Assoc fields ->
           (match List.assoc_opt "price" fields, List.assoc_opt "qty" fields with
            | Some price_json, Some qty_json -> parse_level symbol price_json qty_json
            | _ -> None)
-      (* Legacy format: arrays [price, qty] *)
+      (* Array format: [price, qty] or [price, qty, timestamp] *)
       | `List [price_json; size_json] -> parse_level symbol price_json size_json
       | `List [price_json; size_json; _] -> parse_level symbol price_json size_json
       | _ -> None
     ) entries
   | _ -> []
 
+(** Apply incremental level updates to a PriceMap. Zero-quantity levels are removed; non-zero levels are upserted. *)
 let apply_levels map levels =
   List.fold_left (fun acc (price_str, size_str, price_float, size_float) ->
     if is_effectively_zero size_str then
@@ -406,6 +414,8 @@ let apply_levels map levels =
       PriceMap.add price_str (price_str, size_str, price_float, size_float) acc
   ) map levels
 
+(** Convert a PriceMap to a sorted level array truncated to [depth] entries.
+    [sort_desc] controls descending (bids) vs ascending (asks) order. *)
 let levels_to_array ?(sort_desc = false) map depth =
   let levels_list = PriceMap.fold (fun _ (price_str, size_str, price_float, size_float) acc ->
     { price = price_str; size = size_str; price_float; size_float } :: acc
@@ -425,12 +435,14 @@ let levels_to_array ?(sort_desc = false) map depth =
 
   Array.of_list (take depth sorted_levels [])
 
+(** Rebuild a PriceMap containing only the top [max_levels] entries. Used to bound map size. *)
 let rebuild_map_from_top_levels map sort_desc max_levels =
   let levels_array = levels_to_array ~sort_desc map max_levels in
   Array.fold_left (fun acc level ->
     PriceMap.add level.price (level.price, level.size, level.price_float, level.size_float) acc
   ) PriceMap.empty levels_array
 
+(** Construct an [orderbook] record from the current store state and the raw JSON entry metadata. *)
 let build_orderbook store symbol entry =
   let open Yojson.Safe.Util in
   let sequence =
@@ -459,8 +471,9 @@ let build_orderbook store symbol entry =
     timestamp = Unix.time ();
   }
 
+(** Fetch price and lot decimal precision for the given symbols.
+    Skips the AssetPairs REST call if all symbols already have precision data from the instruments feed. *)
 let fetch_decimals symbols =
-  (* First check if we can get precision from instruments feed for all symbols *)
   let all_have_instruments_data =
     List.for_all (fun symbol ->
       match Kraken_instruments_feed.get_precision_info symbol with
@@ -503,11 +516,14 @@ let fetch_decimals symbols =
 
 let notified_symbols_reusable : (string, store) Hashtbl.t = Hashtbl.create 16
 
+(** Process a single orderbook WebSocket message. When [reset] is true, the message
+    is treated as a snapshot (full state replacement). Otherwise it is an incremental update.
+    Performs sequence validation, checksum verification, and ring buffer writes.
+    Returns [Some ()] on successful parse, [None] on failure. *)
 let process_orderbook_message ~reset json on_heartbeat =
   let open Yojson.Safe.Util in
   try
     let data = member "data" json |> to_list in
-    (* Track symbols that successfully wrote to buffer in this message *)
     Hashtbl.clear notified_symbols_reusable;
     let notified_symbols = notified_symbols_reusable in
     List.iter (fun entry ->
@@ -515,14 +531,13 @@ let process_orderbook_message ~reset json on_heartbeat =
         let symbol = member "symbol" entry |> to_string in
         let store = ensure_store symbol in
 
-        (* Handle snapshot vs update logic *)
         if reset then begin
-          (* Snapshot: reset state and mark as having snapshot *)
+          (* Snapshot: clear existing state and reinitialize from this message. *)
           store.bids <- PriceMap.empty;
           store.asks <- PriceMap.empty;
           Atomic.set store.has_snapshot true;
 
-          (* Extract sequence from snapshot entry *)
+
           let sequence =
             match int64_of_json (member "sequence" entry) with
             | Some seq -> Some seq
@@ -533,14 +548,14 @@ let process_orderbook_message ~reset json on_heartbeat =
             symbol (match sequence with Some s -> Int64.to_string s | None -> "none");
 
         end else begin
-          (* Update: only process if we have a snapshot *)
+          (* Incremental update: discard if no snapshot has been received yet. *)
           if not (Atomic.get store.has_snapshot) then begin
             Logging.debug_f ~section "Ignoring update for %s: waiting for snapshot after reconnect"
               symbol;
             raise Exit  (* Skip processing this entry *)
           end;
 
-          (* Validate sequence ordering for updates *)
+          (* Validate monotonic sequence ordering. Rollbacks and gaps trigger full resync. *)
           let current_sequence =
             match int64_of_json (member "sequence" entry) with
             | Some seq -> Some seq
@@ -567,7 +582,7 @@ let process_orderbook_message ~reset json on_heartbeat =
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
               raise Exit  (* Skip processing this entry *)
-          | _ -> ()  (* Sequence is valid or not present *)
+          | _ -> ()
         end;
         let bids_json = member "bids" entry in
         let asks_json = member "asks" entry in
@@ -576,43 +591,43 @@ let process_orderbook_message ~reset json on_heartbeat =
 
         store.bids <- apply_levels store.bids bids;
         store.asks <- apply_levels store.asks asks;
-        store.last_update <- Unix.time ();  (* Update timestamp on data change *)
+        store.last_update <- Unix.time ();
 
-        (* Truncate maps to top 25 levels to prevent bloat *)
+        (* Truncate maps to top 25 levels to bound memory usage. *)
         store.bids <- rebuild_map_from_top_levels store.bids true 25;
         store.asks <- rebuild_map_from_top_levels store.asks false 25;
 
-        (* Calculate checksum from current orderbook state (top 10 levels) *)
+        (* Compute CRC32 from current state using top 10 levels per side. *)
         let calculated_checksum = calculate_checksum symbol
           (levels_to_array ~sort_desc:true store.bids 10)
           (levels_to_array ~sort_desc:false store.asks 10) in
 
         let orderbook = build_orderbook store symbol entry in
 
-        (* Verify checksum - only proceed if valid *)
+        (* Verify computed checksum against received value. Mismatch triggers full resync. *)
         let checksum_valid =
           match orderbook.checksum with
           | Some received_checksum ->
               if Int32.compare calculated_checksum received_checksum <> 0 then begin
                 Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
                   symbol received_checksum received_checksum calculated_checksum calculated_checksum;
-                (* Mark symbol out-of-sync on checksum mismatch *)
+
                 store.bids <- PriceMap.empty;
                 store.asks <- PriceMap.empty;
                 store.buffer <- RingBuffer.create ring_buffer_size;
                 Atomic.set store.has_snapshot false;
                 Atomic.set store.last_sequence None;
-                false  (* Don't write to buffer *)
+                false
               end else
-                true   (* Write to buffer *)
-          | None -> true  (* No checksum to validate, proceed *)
+                true
+          | None -> true
         in
 
         if checksum_valid then begin
           RingBuffer.write store.buffer orderbook;
           Hashtbl.replace notified_symbols symbol store;
 
-          (* Update last sequence on successful write *)
+
           let current_sequence =
             match int64_of_json (member "sequence" entry) with
             | Some seq -> Some seq
@@ -621,16 +636,16 @@ let process_orderbook_message ~reset json on_heartbeat =
           Atomic.set store.last_sequence current_sequence;
         end;
 
-        (* Update connection heartbeat *)
+
         on_heartbeat ()
       with
-      | Exit -> ()  (* Exit is used for control flow to skip entries - don't log *)
+      | Exit -> ()  (* Control flow: entry skipped due to missing snapshot or sequence error. *)
       | exn ->
         Logging.warn_f ~section "Failed to process orderbook entry: %s"
           (Printexc.to_string exn)
     ) data;
 
-    (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
+    (* Broadcast readiness and signal exchange wakeup for each symbol that received a valid write. *)
     Hashtbl.iter (fun symbol store -> notify_ready ~symbol store) notified_symbols;
 
     Some ()
@@ -652,19 +667,20 @@ let[@inline always] get_best_bid_ask symbol =
       Some (bid.price, bid.size, ask.price, ask.size)
   | _ -> None
 
-(** Read orderbook events since last position - for domain consumers *)
+(** Read all orderbook snapshots written since [last_pos]. Returns an empty list if the symbol is unknown. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match store_opt symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 
-(** Zero-allocation iteration over orderbook events since last position *)
+(** Iterate over orderbook snapshots since [last_pos] without allocating an intermediate list.
+    Returns the new read position. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match store_opt symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
   | None -> last_pos
 
-(** Get current write position for tracking consumption *)
+(** Return the current ring buffer write position for the given symbol. Returns 0 if unknown. *)
 let[@inline always] get_current_position symbol =
   match store_opt symbol with
   | Some store -> RingBuffer.get_position store.buffer
@@ -685,13 +701,14 @@ let has_orderbook_data symbol =
   | Some store when Atomic.get store.ready -> Option.is_some (RingBuffer.read_latest store.buffer)
   | _ -> false
 
-(** Clear all orderbook stores - used when reconnecting to ensure clean state *)
+(** Reset all per-symbol stores: clear bid/ask maps, replace ring buffers, and unset readiness flags.
+    Called on reconnection to ensure no stale data persists. *)
 let clear_all_stores () =
   Hashtbl.iter (fun symbol store ->
     Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
     store.bids <- PriceMap.empty;
     store.asks <- PriceMap.empty;
-    (* Replace ring buffer with fresh empty one to clear any stale data *)
+
     store.buffer <- RingBuffer.create ring_buffer_size;
     Atomic.set store.ready false;
     Atomic.set store.has_snapshot false;
@@ -699,11 +716,12 @@ let clear_all_stores () =
     store.last_update <- Unix.time ()
   ) stores
 
-(** Prune inactive stores and stale price levels to prevent memory growth *)
+(** Remove stores inactive for over 30 minutes and trim oversized price maps to [max_price_levels].
+    Prevents unbounded memory growth from abandoned subscriptions or accumulated levels. *)
 let prune_stale_data () =
   let now = Unix.gettimeofday () in
-  let stale_threshold = 30.0 *. 60.0 in  (* 30 minutes *)
-  let max_price_levels = 100 in  (* Max levels to keep per side *)
+  let stale_threshold = 30.0 *. 60.0 in
+  let max_price_levels = 100 in
 
   let stores_to_remove = ref [] in
   let trimmed_stores = ref [] in
@@ -712,11 +730,11 @@ let prune_stale_data () =
   Hashtbl.iter (fun symbol store ->
     let age = now -. store.last_update in
 
-    (* Check if store is stale *)
+
     if age > stale_threshold then begin
       stores_to_remove := symbol :: !stores_to_remove
     end else begin
-      (* For active stores, check if price maps are too large *)
+
       let bids_count = PriceMap.cardinal store.bids in
       let asks_count = PriceMap.cardinal store.asks in
       let trimmed = ref false in
@@ -736,13 +754,13 @@ let prune_stale_data () =
     end
   ) stores;
 
-  (* Remove stale stores *)
+
   List.iter (fun symbol ->
     Hashtbl.remove stores symbol;
     Logging.debug_f ~section "Removed stale orderbook store for %s (age > 30min)" symbol
   ) !stores_to_remove;
 
-  (* Log trimming actions *)
+
   if !trimmed_stores <> [] then
     Logging.debug_f ~section "Trimmed price levels for %d active stores: %s"
       (List.length !trimmed_stores) (String.concat ", " !trimmed_stores);
@@ -755,7 +773,7 @@ let prune_stale_data () =
     Logging.info_f ~section "Orderbook cleanup: removed %d stale stores, trimmed %d active stores (%d -> %d total stores)"
       stores_removed stores_trimmed total_stores_before total_stores_after
 
-(** Event-driven trigger for orderbook cleanup *)
+(** Asynchronously trigger orderbook pruning. [reason] is logged for diagnostics. *)
 let trigger_orderbook_cleanup ~reason () =
   Lwt.async (fun () ->
     Logging.debug_f ~section "Triggering orderbook cleanup (reason=%s)" reason;
@@ -779,7 +797,7 @@ let handle_message message on_heartbeat =
       ignore (process_orderbook_message ~reset:true json on_heartbeat)
   | Some "book", Some "update", _ ->
       ignore (process_orderbook_message ~reset:false json on_heartbeat)
-    | Some "heartbeat", _, _ -> on_heartbeat () (* Update connection heartbeat *)
+    | Some "heartbeat", _, _ -> on_heartbeat ()
     | _, _, Some "subscribe" ->
         let result = member "result" json in
         let symbol = member "symbol" result |> to_string in
@@ -805,16 +823,16 @@ let wait_for_orderbook_data_lwt symbols timeout_seconds =
       else if !timeout_ref then
         Lwt.return_false
       else
-        (* Wait for condition signal, but handle potential cancellation issues *)
+        (* Block on condition broadcast; treat cancellation as timeout. *)
         Lwt.catch (fun () ->
           Lwt_condition.wait ready_condition >>= fun () -> wait_loop ()
         ) (fun _ ->
-          (* If condition wait fails (e.g., due to cancellation), treat as timeout *)
+
           timeout_ref := true;
           Lwt.return_false
         )
   in
-  (* Start a background timeout that sets the flag *)
+  (* Background timer enforces hard timeout via shared ref. *)
   Lwt.async (fun () ->
     Lwt_unix.sleep timeout_seconds >>= fun () ->
     timeout_ref := true;
@@ -825,7 +843,8 @@ let wait_for_orderbook_data_lwt symbols timeout_seconds =
 let wait_for_orderbook_data = wait_for_orderbook_data_lwt
 
 
-(** Message handling loop - runs in background *)
+(** Subscribe to orderbook channels and enter the asynchronous read loop.
+    Invokes [on_failure] on connection loss; resolves the returned promise when the loop terminates. *)
 let start_message_handler conn symbols on_failure on_heartbeat =
   let subscribe_msg = `Assoc [
     ("method", `String "subscribe");
@@ -882,7 +901,7 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
     Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
-    (* Call on_connected callback after successful connection and before starting message handler *)
+
     on_connected ();
     start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
     Logging.debug_f ~section "Orderbook WebSocket connection closed";

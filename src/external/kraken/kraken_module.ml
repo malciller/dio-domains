@@ -1,4 +1,15 @@
-(** Kraken Exchange Implementation *)
+(**
+   Kraken exchange adapter.
+
+   Implements [Exchange_intf.S] for the Kraken exchange. Converts between
+   Kraken-specific types and the unified Dio [Types] domain, delegates order
+   actions to [Kraken_actions], and reads market data from the per-symbol
+   WebSocket feed caches ([Kraken_ticker_feed], [Kraken_orderbook_feed],
+   [Kraken_executions_feed], [Kraken_balances_feed]).
+
+   Registered into [Exchange.Registry] at module load time via side-effecting
+   [let () = ...] at the bottom of this file.
+*)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -8,10 +19,11 @@ module Kraken_impl = struct
   let name = "kraken"
   let section = "kraken_module"
 
-  (* Internal cache for fees *)
+  (** In-memory cache mapping symbol to (maker_fee, taker_fee).
+      Populated once at startup by [initialize_fees]. *)
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 
-  (* Helpers for type conversion *)
+  (** Map unified [Types.order_type] to the Kraken API string representation. *)
   let string_of_order_type = function
     | Types.Limit -> "limit"
     | Types.Market -> "market"
@@ -22,15 +34,18 @@ module Kraken_impl = struct
     | Types.SettlPosition -> "settl-position"
     | Types.Other s -> s
 
+  (** Map unified [Types.side] to Kraken API side string. *)
   let string_of_side = function
     | Types.Buy -> "buy"
     | Types.Sell -> "sell"
 
+  (** Map unified [Types.time_in_force] to Kraken API TIF string. *)
   let string_of_time_in_force = function
     | Types.GTC -> "GTC"
     | Types.IOC -> "IOC"
     | Types.FOK -> "FOK"
 
+  (** Convert Kraken execution feed order status to unified [Types] status. *)
   let status_of_kraken_status = function
     | Kraken_executions_feed.PendingNewStatus -> Types.Pending
     | Kraken_executions_feed.NewStatus -> Types.New
@@ -41,10 +56,12 @@ module Kraken_impl = struct
     | Kraken_executions_feed.RejectedStatus -> Types.Rejected
     | Kraken_executions_feed.UnknownStatus s -> Types.Unknown s
   
+  (** Convert Kraken execution feed side to unified [Types.side]. *)
   let side_of_kraken_side = function
     | Kraken_executions_feed.Buy -> Types.Buy
     | Kraken_executions_feed.Sell -> Types.Sell
 
+  (** Convert optional unified retry config to [Kraken_actions.retry_config]. *)
   let convert_retry_config (config: Types.retry_config option) =
     match config with
     | Some c -> Some {
@@ -55,7 +72,9 @@ module Kraken_impl = struct
       }
     | None -> None
 
-  (** Place a new order *)
+  (** Submit a new order via [Kraken_actions.place_order].
+      Converts unified types to Kraken API strings, delegates the REST/WS call,
+      and maps the response back to [Types.place_order_result]. *)
   let place_order
       ~token
       ~order_type
@@ -103,7 +122,18 @@ module Kraken_impl = struct
         }
     | Error e -> Error e
 
-  (** Amend an existing order *)
+  (** Amend an existing order via [Kraken_actions.amend_order].
+
+      Requires the order to exist in the local execution feed cache before
+      dispatching. If absent (e.g. due to WS reconnect lag) returns [Error]
+      immediately so the strategy can recover via fresh placement.
+
+      When [qty] is not provided, the cached [order_qty] is used as the
+      effective quantity, matching the Hyperliquid adapter convention.
+
+      On success, proactively updates the cached limit price in
+      [Kraken_executions_feed] so that the order executor's duplicate-check
+      sees the new price before the async WS amended event arrives. *)
   let amend_order
       ~token
       ~order_id
@@ -117,10 +147,8 @@ module Kraken_impl = struct
       ?retry_config
       () =
 
-    (* Mirror Hyperliquid: require the order to be in the local WS cache before
-       firing. If absent (WS lag, reconnect churn, genuinely gone) return Error
-       immediately so handle_order_amendment_failed fires and the strategy
-       self-corrects via fresh placement instead of silently stalling. *)
+    (* Validate existence in local WS cache before dispatching the amend.
+       Returns Error if missing so the strategy can fall back to re-placement. *)
     let sym = Option.value symbol ~default:"" in
     match Kraken_executions_feed.find_order_everywhere order_id with
     | None ->
@@ -128,8 +156,7 @@ module Kraken_impl = struct
           order_id (if sym <> "" then Printf.sprintf " [%s]" sym else "");
         Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
     | Some existing ->
-        (* Inherit qty from cached order when not explicitly provided,
-           mirroring how hyperliquid_module uses existing.order_qty. *)
+        (* Default to the cached order_qty when caller omits qty. *)
         let effective_qty = match qty with Some q -> q | None -> existing.order_qty in
         let actual_retry_config = convert_retry_config retry_config in
 
@@ -147,9 +174,8 @@ module Kraken_impl = struct
           ()
         >|= function
         | Ok (res : Kraken_common_types.amend_order_result) ->
-            (* Proactively update the cached limit_price so the executor's
-               skip-check sees the new price immediately, without waiting for
-               the async exec_type=amended WS event to arrive. *)
+            (* Eagerly update cached limit_price so the executor sees the new
+               price before the async WS amended event arrives. *)
             (match limit_price with
              | Some new_price when sym <> "" ->
                  Kraken_executions_feed.update_open_order_price
@@ -163,7 +189,9 @@ module Kraken_impl = struct
             }
         | Error e -> Error e
 
-  (** Cancel orders *)
+  (** Cancel one or more orders via [Kraken_actions.cancel_orders].
+      Accepts any combination of order_ids, cl_ord_ids, or order_userrefs.
+      Returns a list of [Types.cancel_order_result] on success. *)
   let cancel_orders
       ~token
       ?order_ids
@@ -174,7 +202,7 @@ module Kraken_impl = struct
     
     let actual_retry_config = convert_retry_config retry_config in
     
-    (* Kraken_actions.cancel_orders takes lists directly *)
+    (* Delegate directly; Kraken_actions accepts optional list parameters. *)
     Kraken_actions.cancel_orders
       ~token
       ?order_ids
@@ -192,36 +220,34 @@ module Kraken_impl = struct
         Ok mapped
     | Error e -> Error e
 
-  (** Market Data Access *)
-  
+  (* -- Market data accessors ------------------------------------------- *)
+
+  (** Return the latest (bid, ask) from the ticker feed cache, or [None]. *)
+
   let get_ticker ~symbol =
     match Kraken_ticker_feed.get_latest_ticker symbol with
     | Some t -> Some (t.bid, t.ask)
     | None -> None
 
+  (** Request the ticker feed to begin tracking [symbol]. *)
   let subscribe_ticker ~symbol =
     Kraken_ticker_feed.subscribe_ticker symbol
 
+  (** Return best bid/ask as [(bid_price, bid_size, ask_price, ask_size)] floats.
+      [Kraken_orderbook_feed.get_best_bid_ask] returns string values;
+      each is parsed to float here, defaulting to [0.0] on parse failure. *)
   let get_top_of_book ~symbol =
     match Kraken_orderbook_feed.get_best_bid_ask symbol with
-    | Some (bp, bs, ap, as_val) -> 
-        (* Kraken_orderbook_feed returns (bid_price, bid_size, ask_price, ask_size) strings/floats? 
-           Checking `get_best_bid_ask`: returns `Some (bid.price, bid.size, ask.price, ask.size)` 
-           where price/size are strings in the `level` type but `price_float` exists.
-           Wait, `get_best_bid_ask` returns STRINGS!
-           I need to parse them to floats or use `get_latest_orderbook` directly.
-           Checking `kraken_orderbook_feed.ml`:
-             `Some (bid.price, bid.size, ask.price, ask.size)` -> Strings.
-           I should update `get_best_bid_ask` or parse here.
-           I'll parse here to be safe.
-        *)
+    | Some (bp, bs, ap, as_val) ->
         let safe_float s = try float_of_string s with _ -> 0.0 in
         Some (safe_float bp, safe_float bs, safe_float ap, safe_float as_val)
     | None -> None
 
+  (** Return the current balance for [asset] from the balances feed cache. *)
   let get_balance ~asset =
     Kraken_balances_feed.get_balance asset
 
+  (** Return all assets with a positive balance as [(asset, balance)] pairs. *)
   let get_all_balances () =
     let assets = Kraken_balances_feed.get_all_assets () in
     List.filter_map (fun asset ->
@@ -229,6 +255,8 @@ module Kraken_impl = struct
       if bal > 0.0 then Some (asset, bal) else None
     ) assets
 
+  (** Look up a single open order by symbol and order_id in the executions
+      feed cache. Returns a unified [Types.open_order option]. *)
   let get_open_order ~symbol ~order_id =
     match Kraken_executions_feed.get_open_order symbol order_id with
     | Some o -> Some {
@@ -245,6 +273,8 @@ module Kraken_impl = struct
       }
     | None -> None
 
+  (** Return all open orders for [symbol] from the executions feed cache,
+      mapped to unified [Types.open_order] records. *)
   let get_open_orders ~symbol =
     let orders = Kraken_executions_feed.get_open_orders symbol in
     List.map (fun (o : Kraken_executions_feed.open_order) ->
@@ -262,9 +292,14 @@ module Kraken_impl = struct
       }
     ) orders
 
+  (** Return the current ring-buffer position for execution events on [symbol]. *)
   let get_execution_feed_position ~symbol =
     Kraken_executions_feed.get_current_position symbol
 
+  (** Read execution events from [start_pos] onward for [symbol].
+      Derives [remaining_qty] from [order_qty - cum_qty] and coerces status
+      to [Filled] when remaining quantity reaches zero to handle cases where
+      the WS event status lags behind the cumulative fill quantity. *)
   let read_execution_events ~symbol ~start_pos =
     let events = Kraken_executions_feed.read_execution_events symbol start_pos in
     List.map (fun (e : Kraken_executions_feed.execution_event) ->
@@ -285,6 +320,9 @@ module Kraken_impl = struct
       }
     ) events
 
+  (** Iterate execution events from [start_pos] for [symbol], applying [f]
+      to each event after converting to unified [Types.execution_event].
+      Uses the same fill-derived status coercion as [read_execution_events]. *)
   let iter_execution_events ~symbol ~start_pos f =
     Kraken_executions_feed.iter_execution_events symbol start_pos (fun (e : Kraken_executions_feed.execution_event) ->
       let remaining_qty = e.order_qty -. e.cum_qty in
@@ -304,9 +342,12 @@ module Kraken_impl = struct
       }
     )
 
+  (** Return the current ring-buffer position for ticker events on [symbol]. *)
   let get_ticker_position ~symbol =
     Kraken_ticker_feed.get_current_position symbol
 
+  (** Read ticker events from [start_pos] onward for [symbol], mapped to
+      unified [Types.ticker_event] records containing bid, ask, timestamp. *)
   let read_ticker_events ~symbol ~start_pos =
     let events = Kraken_ticker_feed.read_ticker_events symbol start_pos in
     List.map (fun (t : Kraken_ticker_feed.ticker) ->
@@ -317,14 +358,19 @@ module Kraken_impl = struct
       }
     ) events
 
+  (** Iterate ticker events from [start_pos] for [symbol], applying [f]. *)
   let iter_ticker_events ~symbol ~start_pos f =
     Kraken_ticker_feed.iter_ticker_events symbol start_pos (fun (t : Kraken_ticker_feed.ticker) ->
       f { Types. bid = t.bid; ask = t.ask; timestamp = t.timestamp }
     )
 
+  (** Return the current ring-buffer position for orderbook events on [symbol]. *)
   let get_orderbook_position ~symbol =
     Kraken_orderbook_feed.get_current_position symbol
 
+  (** Read orderbook snapshots from [start_pos] for [symbol]. Each snapshot's
+      levels are converted from [Kraken_orderbook_feed.level] (with separate
+      string/float fields) to [(price, size)] float tuples in arrays. *)
   let read_orderbook_events ~symbol ~start_pos =
     let events = Kraken_orderbook_feed.read_orderbook_events symbol start_pos in
     List.map (fun (ob : Kraken_orderbook_feed.orderbook) ->
@@ -341,6 +387,8 @@ module Kraken_impl = struct
       }
     ) events
 
+  (** Iterate orderbook snapshots from [start_pos] for [symbol], applying [f]
+      to each snapshot after level conversion. *)
   let iter_orderbook_events ~symbol ~start_pos f =
     Kraken_orderbook_feed.iter_orderbook_events symbol start_pos (fun (ob : Kraken_orderbook_feed.orderbook) ->
       let map_levels levels =
@@ -352,6 +400,8 @@ module Kraken_impl = struct
       f { Types. bids = map_levels ob.bids; asks = map_levels ob.asks; timestamp = ob.timestamp }
     )
 
+  (** Fold over all open orders for [symbol] with accumulator [init] and
+      function [f], converting each order to unified [Types.open_order]. *)
   let fold_open_orders ~symbol ~init ~f =
     Kraken_executions_feed.fold_open_orders symbol ~init ~f:(fun acc (o : Kraken_executions_feed.open_order) ->
       f acc { Types.
@@ -368,28 +418,36 @@ module Kraken_impl = struct
       }
     )
 
-  (** Metadata Access *)
-  
+  (* -- Instrument metadata accessors ----------------------------------- *)
+
+
+  (** Return the minimum price tick size for [symbol], or [None] if unknown. *)
   let get_price_increment ~symbol =
     Kraken_instruments_feed.get_price_increment symbol
 
+  (** Return the minimum quantity step for [symbol], or [None] if unknown. *)
   let get_qty_increment ~symbol =
     Kraken_instruments_feed.get_qty_increment symbol
 
+  (** Return the minimum order quantity for [symbol], or [None] if unknown. *)
   let get_qty_min ~symbol =
     Kraken_instruments_feed.get_qty_min symbol
 
+  (** Round [price] to the nearest valid tick for [symbol].
+      Falls back to the original value if no price increment is known. *)
   let round_price ~symbol ~price =
     match Kraken_instruments_feed.get_price_increment symbol with
     | Some inc -> Float.round (price /. inc) *. inc
     | None -> price
 
+  (** Return [(maker_fee option, taker_fee option)] from the local fee cache. *)
   let get_fees ~symbol =
     match Hashtbl.find_opt fee_cache symbol with
     | Some f -> (Some (fst f), Some (snd f))
     | None -> (None, None)
 
-  (* Initialization helper - to be called by main app to populate fees etc *)
+  (** Fetch fee schedules for [symbols] via [Kraken_get_fee] and populate
+      [fee_cache]. Intended to be called once at application startup. *)
   let initialize_fees symbols =
     Lwt_list.iter_p (fun symbol ->
       Kraken_get_fee.get_fee_info symbol >|= function
@@ -401,6 +459,6 @@ module Kraken_impl = struct
     ) symbols
 end
 
-(* Register the module *)
+(* Register Kraken_impl into the global exchange registry at load time. *)
 let () =
   Exchange.Registry.register (module Kraken_impl)

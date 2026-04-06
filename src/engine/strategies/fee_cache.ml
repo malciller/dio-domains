@@ -1,49 +1,56 @@
 (**
-  Fee Cache - Caches maker fees per exchange/symbol with TTL and async refresh
+  Fee Cache
 
-  Provides dynamic fee data for strategies, falling back gracefully on cache misses.
-  Uses async refresh to avoid blocking strategy execution paths.
+  TTL-based in-memory cache for maker and taker fees, keyed by
+  (exchange, symbol). Supports LRU eviction at capacity, deduplication
+  of concurrent fetches via in-flight promise tracking, and exponential
+  backoff retry on transient errors. Cache misses return [None] without
+  blocking the caller; background refresh is scheduled asynchronously.
 *)
 
 open Lwt.Infix
 
-(** Access to Kraken modules *)
+(** Kraken exchange API bindings. *)
 open Kraken
 
 let section = "fee_cache"
 
-(** Cache entry with timestamp, TTL, and LRU tracking *)
+(** Per-symbol fee record with TTL expiry and LRU metadata. *)
 type cache_entry = {
   maker_fee: float;
   taker_fee: float;
-  timestamp: float;
-  ttl_seconds: float;
-  mutable last_access: float;  (* Track last access for LRU eviction *)
+  timestamp: float;            (** Unix epoch at insertion. *)
+  ttl_seconds: float;          (** Validity window in seconds. *)
+  mutable last_access: float;  (** Unix epoch of most recent read; used for LRU eviction. *)
 }
 
-(** Maximum cache size to prevent unbounded growth *)
+(** Upper bound on cache entries; triggers LRU eviction when reached. *)
 let max_cache_size = 100
 
-(** In-memory cache: (exchange, symbol) -> cache_entry *)
+(** Primary cache table keyed by [(exchange, symbol)]. *)
 let fee_cache : (string * string, cache_entry) Hashtbl.t = Hashtbl.create 32
+
+(** Guards all reads and writes to [fee_cache]. *)
 let cache_mutex = Mutex.create ()
 
-(** In-flight fetches: (exchange, symbol) -> unit promise *)
+(** Tracks pending fetch promises keyed by [(exchange, symbol)] to deduplicate concurrent requests. *)
 let in_flight : (string * string, unit Lwt.t) Hashtbl.t = Hashtbl.create 32
+
+(** Guards all reads and writes to [in_flight]. *)
 let in_flight_mutex = Mutex.create ()
 
-(** Default TTL for cache entries (10 minutes) *)
+(** Default entry TTL in seconds (600s = 10 minutes). *)
 let default_ttl = 600.0
 
-(** Check if cache entry is still valid *)
+(** Returns [true] if [entry] has not exceeded its TTL. *)
 let is_valid entry =
   let now = Unix.time () in
   now -. entry.timestamp < entry.ttl_seconds
 
-(** Evict least recently used entry if cache is at capacity *)
+(** Removes the least-recently-accessed entry when cache is at [max_cache_size].
+    Must be called while [cache_mutex] is held. *)
 let evict_lru_if_needed () =
   if Hashtbl.length fee_cache >= max_cache_size then (
-    (* Find LRU entry *)
     let oldest_key = ref None in
     let oldest_time = ref Float.max_float in
     Hashtbl.iter (fun key entry ->
@@ -59,15 +66,16 @@ let evict_lru_if_needed () =
     | None -> ()
   )
 
-(** Get cached maker fee for exchange/symbol pair *)
+(** Looks up the cached maker fee for [(exchange, symbol)].
+    Returns [Some fee] on a valid hit, [None] on miss or expiry.
+    Expired entries are removed eagerly. *)
 let get_maker_fee ~exchange ~symbol =
   Mutex.lock cache_mutex;
   let result = match Hashtbl.find_opt fee_cache (exchange, symbol) with
     | Some entry when is_valid entry ->
-        entry.last_access <- Unix.time ();  (* Update LRU timestamp *)
+        entry.last_access <- Unix.time ();
         Some entry.maker_fee
     | Some _ ->
-        (* Entry exists but expired - remove it *)
         Hashtbl.remove fee_cache (exchange, symbol);
         None
     | None -> None
@@ -75,15 +83,16 @@ let get_maker_fee ~exchange ~symbol =
   Mutex.unlock cache_mutex;
   result
 
-(** Get cached taker fee for exchange/symbol pair *)
+(** Looks up the cached taker fee for [(exchange, symbol)].
+    Returns [Some fee] on a valid hit, [None] on miss or expiry.
+    Expired entries are removed eagerly. *)
 let get_taker_fee ~exchange ~symbol =
   Mutex.lock cache_mutex;
   let result = match Hashtbl.find_opt fee_cache (exchange, symbol) with
     | Some entry when is_valid entry ->
-        entry.last_access <- Unix.time ();  (* Update LRU timestamp *)
+        entry.last_access <- Unix.time ();
         Some entry.taker_fee
     | Some _ ->
-        (* Entry exists but expired - remove it *)
         Hashtbl.remove fee_cache (exchange, symbol);
         None
     | None -> None
@@ -91,7 +100,8 @@ let get_taker_fee ~exchange ~symbol =
   Mutex.unlock cache_mutex;
   result
 
-(** Store fees in cache with timestamp *)
+(** Inserts or replaces the fee entry for [(exchange, symbol)].
+    Triggers LRU eviction if the cache is at capacity before insertion. *)
 let store_fees ~exchange ~symbol ~maker_fee ~taker_fee ~ttl_seconds =
   let now = Unix.time () in
   let entry = {
@@ -99,18 +109,20 @@ let store_fees ~exchange ~symbol ~maker_fee ~taker_fee ~ttl_seconds =
     taker_fee;
     timestamp = now;
     ttl_seconds;
-    last_access = now;  (* Initialize last_access *)
+    last_access = now;
   } in
   Mutex.lock cache_mutex;
-  evict_lru_if_needed ();  (* Evict before adding if at capacity *)
+  evict_lru_if_needed ();
   Hashtbl.replace fee_cache (exchange, symbol) entry;
   Mutex.unlock cache_mutex;
   Logging.debug_f ~section "Cached fees for %s/%s: maker=%.6f, taker=%.6f (TTL: %.0fs, cache size: %d/%d)" 
     exchange symbol maker_fee taker_fee ttl_seconds (Hashtbl.length fee_cache) max_cache_size
 
-(** Async refresh of fee for a symbol - with in-flight guard and retry logic *)
+(** Asynchronously refreshes the fee for [symbol] on Kraken.
+    No-op if a valid entry already exists. Deduplicates concurrent
+    calls via the [in_flight] table. Uses linear backoff (0.5s increments,
+    up to 3 attempts) on nonce errors. *)
 let refresh_async symbol =
-  (* Check if we have a valid cached entry first *)
   Mutex.lock cache_mutex;
   let has_valid_entry =
     match Hashtbl.find_opt fee_cache ("kraken", symbol) with
@@ -121,17 +133,15 @@ let refresh_async symbol =
 
   if has_valid_entry then begin
     Logging.debug_f ~section "Fee for %s already cached and valid, skipping fetch" symbol;
-    Lwt.return_unit  (* Already have valid cached fee *)
+    Lwt.return_unit
   end else begin
-    (* Check if fetch is already in-flight *)
     Mutex.lock in_flight_mutex;
     let existing_promise = Hashtbl.find_opt in_flight ("kraken", symbol) in
     let promise = match existing_promise with
       | Some p ->
           Logging.debug_f ~section "Fee fetch for %s already in-flight, reusing promise" symbol;
-          p  (* Reuse existing in-flight fetch *)
+          p
       | None ->
-          (* Start new fetch with retry logic *)
           let rec fetch_with_retry attempt =
             Lwt.catch (fun () ->
               Kraken_get_fee.get_fee_info symbol >>= fun fee_opt ->
@@ -141,7 +151,7 @@ let refresh_async symbol =
                    Logging.info_f ~section "Fetched and cached fees for %s: maker=%.6f, taker=%.6f (attempt %d)" symbol maker_fee taker_fee attempt;
                    Lwt.return_unit
                | Some { maker_fee = Some maker_fee; taker_fee = None; exchange; _ } ->
-                   (* Only maker fee available - use maker for both *)
+                   (* Taker fee unavailable; fall back to maker fee for both. *)
                    store_fees ~exchange ~symbol ~maker_fee ~taker_fee:maker_fee ~ttl_seconds:default_ttl;
                    Logging.info_f ~section "Fetched and cached maker fee for %s: %.6f (taker=default to maker) (attempt %d)" symbol maker_fee attempt;
                    Lwt.return_unit
@@ -154,10 +164,9 @@ let refresh_async symbol =
               )
             ) (fun exn ->
               let error_msg = Printexc.to_string exn in
-              (* Check if this is a nonce error that might benefit from retry *)
               let is_nonce_error = String.length error_msg >= 12 && String.sub error_msg 0 12 = "Invalid nonce" in
               if is_nonce_error && attempt < 3 then begin
-                let backoff = float_of_int attempt *. 0.5 in  (* 0.5s, 1.0s, 1.5s backoff *)
+                let backoff = float_of_int attempt *. 0.5 in
                 Logging.warn_f ~section "Nonce error fetching fee for %s (attempt %d), retrying in %.1fs: %s"
                   symbol attempt backoff error_msg;
                 Lwt_unix.sleep backoff >>= fun () ->
@@ -174,7 +183,7 @@ let refresh_async symbol =
     in
     Mutex.unlock in_flight_mutex;
 
-    (* Clean up in-flight table when promise completes *)
+    (* Remove entry from [in_flight] on resolution or rejection. *)
     Lwt.on_any promise
       (fun () ->
          Mutex.lock in_flight_mutex;
@@ -189,18 +198,19 @@ let refresh_async symbol =
   end
 
 
-(** Initialize cache - called once at startup *)
+(** Performs one-time startup initialization. Logs the configured TTL. *)
 let init () =
   Logging.debug_f ~section "Fee cache initialized with TTL %.0f seconds" default_ttl
 
-(** Clear cache - for testing *)
+(** Removes all entries from the cache. Intended for test teardown. *)
 let clear () =
   Mutex.lock cache_mutex;
   Hashtbl.clear fee_cache;
   Mutex.unlock cache_mutex
 
 
-(** Get cache statistics for monitoring *)
+(** Returns [(total_entries, valid_entries)] for monitoring.
+    Counts entries that have not yet exceeded their TTL as valid. *)
 let stats () =
   Mutex.lock cache_mutex;
   let count = Hashtbl.length fee_cache in

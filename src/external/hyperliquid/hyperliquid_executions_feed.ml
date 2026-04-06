@@ -1,4 +1,8 @@
-(** Hyperliquid Executions Feed *)
+(** Hyperliquid executions feed.
+    Provides real-time order and trade event tracking via WebSocket subscriptions.
+    Maintains per-symbol execution ring buffers, open order state, and trade
+    deduplication with bounded FIFO eviction. Thread-safe access is enforced
+    through per-resource mutexes and atomic flags. *)
 
 open Lwt.Infix
 
@@ -57,20 +61,20 @@ type execution_event = {
 
 
 
-(** Lock-free ring buffer for execution data *)
+(** Lock-free ring buffer used for execution event storage. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Maximum number of trade IDs retained per symbol for deduplication.
-    Oldest entries are evicted FIFO when the cap is reached. *)
+(** Maximum trade IDs retained per symbol for deduplication.
+    Eviction follows FIFO order when the cap is exceeded. *)
 let max_processed_tids = 256
 
-(** Per-symbol execution storage with readiness signalling *)
+(** Per-symbol execution state container with readiness signalling. *)
 type store = {
   events_buffer: execution_event RingBuffer.t;
   open_orders: (string, open_order) Hashtbl.t;
   ready: bool Atomic.t;
-  processed_tids: (int64, float) Hashtbl.t; (* trade_id -> arrival_time for deduplication *)
-  processed_tids_queue: int64 Queue.t; (* FIFO eviction order *)
+  processed_tids: (int64, float) Hashtbl.t; (** trade_id to arrival_time mapping for deduplication. *)
+  processed_tids_queue: int64 Queue.t; (** FIFO eviction queue for processed trade IDs. *)
   orders_mutex: Mutex.t;
   tids_mutex: Mutex.t;
 }
@@ -79,18 +83,19 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Global order_id -> symbol mapping with adaptive startup cap + FIFO eviction.
-    Must be accessed under initialization_mutex. *)
+(** Global order_id to symbol index with adaptive capacity and FIFO eviction.
+    All access requires holding initialization_mutex. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
-(** FIFO insertion queue for oldest-entry eviction *)
+(** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-(** Mutable cap: max_int during startup (uncapped), locked after first snapshot *)
+(** Adaptive capacity bound. Set to max_int (uncapped) during startup,
+    then locked to a bounded value after the initial snapshot completes. *)
 let order_to_symbol_cap : int ref = ref max_int
 let order_to_symbol_startup_done = Atomic.make false
 
-(** Set once after inject_open_orders completes — replaces the 2s wall-clock gate
-    in domain_spawner with a real event. Domains poll this flag in their cycle;
-    Exchange_wakeup.signal() is called so sleeping domains wake immediately. *)
+(** Atomic flag set once after inject_open_orders completes. Domains poll this
+    flag in their cycle loop. Exchange_wakeup.signal_all is invoked on transition
+    so sleeping domains wake immediately without requiring a wall-clock delay. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
 let set_startup_snapshot_done () =
   if not (Atomic.exchange _startup_snapshot_done true) then begin
@@ -99,18 +104,17 @@ let set_startup_snapshot_done () =
   end
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 
-(** Add order_id->symbol, evicting the oldest entry when over cap.
-    Ring-buffer semantics: newest always wins, oldest always goes.
-    Must be called while holding initialization_mutex. *)
+(** Insert an order_id to symbol mapping, evicting the oldest entry when
+    the adaptive cap is exceeded. Caller must hold initialization_mutex. *)
 let add_to_order_to_symbol order_id symbol =
   if not (Hashtbl.mem order_to_symbol order_id) then
     Queue.push order_id order_to_symbol_queue;
   Hashtbl.replace order_to_symbol order_id symbol;
-  (* Enforce cap only after startup snapshot is complete *)
+  (* Enforce capacity bound only after the startup snapshot has been consumed. *)
   if Atomic.get order_to_symbol_startup_done then
     while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
       if Queue.is_empty order_to_symbol_queue then
-        (* Queue and table drifted — just accept current length as new cap *)
+        (* Queue/table size diverged; accept current table size as the new cap. *)
         order_to_symbol_cap := Hashtbl.length order_to_symbol
       else begin
         let oldest = Queue.pop order_to_symbol_queue in
@@ -118,12 +122,12 @@ let add_to_order_to_symbol order_id symbol =
       end
     done
 
-(** Lock the adaptive cap after the startup snapshot is fully consumed.
-    Cap = observed size rounded up by 50%%, minimum 32.
-    Called exactly once; subsequent calls are no-ops. *)
+(** Lock the adaptive capacity after the startup snapshot is fully consumed.
+    Sets cap to max(32, observed * 1.5 + 1). Idempotent; only the first
+    invocation takes effect. *)
 let mark_startup_complete () =
   if not (Atomic.exchange order_to_symbol_startup_done true) then begin
-    (* initialization_mutex is already held by the caller (inject_open_orders) *)
+    (* Precondition: initialization_mutex is held by the caller (inject_open_orders). *)
     let observed = Hashtbl.length order_to_symbol in
     let cap = max 32 (observed + observed / 2 + 1) in
     order_to_symbol_cap := cap;
@@ -132,12 +136,13 @@ let mark_startup_complete () =
   end
 
 (** Blacklist of order IDs removed by cancel-replace amendments.
-    Prevents late WS orderUpdates 'open' events from re-adding
-    orders that were already superseded by a newer cancel-replace. *)
+    Prevents late WebSocket orderUpdates events from re-adding orders
+    that have already been superseded by a newer cancel-replace. *)
 let amended_blacklist : (string, float) Hashtbl.t = Hashtbl.create 16
 let amended_blacklist_mutex = Mutex.create ()
 
-(** Get or create store for a symbol - thread-safe initialization *)
+(** Retrieve or lazily create a per-symbol store. Uses double-checked
+    locking under initialization_mutex for thread-safe initialization. *)
 let get_symbol_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store
@@ -175,7 +180,7 @@ let[@inline always] get_open_order symbol order_id =
   order
 
 let find_order_everywhere order_id =
-  (* Use order_to_symbol index for O(1) lookup instead of iterating all stores *)
+  (* O(1) lookup via the global order_to_symbol index. *)
   Mutex.lock initialization_mutex;
   let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
   Mutex.unlock initialization_mutex;
@@ -195,7 +200,7 @@ let[@inline always] get_open_orders symbol =
   Mutex.unlock store.orders_mutex;
   orders
 
-(** Zero-allocation fold over open orders under the mutex *)
+(** Fold over open orders under the per-symbol mutex. Avoids intermediate list allocation. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
@@ -203,9 +208,9 @@ let[@inline always] fold_open_orders symbol ~init ~f =
   Mutex.unlock store.orders_mutex;
   result
 
-(** Remove a single open order by ID — used to clean up the old order entry
-    after a successful cancel-replace amendment so it doesn't appear as a
-    ghost duplicate in get_open_orders. *)
+(** Remove a single open order by ID. Called after a successful cancel-replace
+    amendment to prevent the superseded order from appearing as a duplicate
+    in get_open_orders. The order ID is added to the amendment blacklist. *)
 let remove_open_order ~symbol ~order_id =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
@@ -215,7 +220,7 @@ let remove_open_order ~symbol ~order_id =
     Mutex.lock initialization_mutex;
     Hashtbl.remove order_to_symbol order_id;
     Mutex.unlock initialization_mutex;
-    (* Blacklist this ID so late WS orderUpdates events don't re-add it *)
+    (* Blacklist this ID to suppress late WebSocket orderUpdates re-insertion. *)
     Mutex.lock amended_blacklist_mutex;
     Hashtbl.replace amended_blacklist order_id (Unix.gettimeofday ());
     Mutex.unlock amended_blacklist_mutex;
@@ -223,17 +228,19 @@ let remove_open_order ~symbol ~order_id =
   end;
   Mutex.unlock store.orders_mutex
 
-(** Get all symbols that have execution stores (initialized symbols) *)
+(** Return all symbols that have initialized execution stores. *)
 let get_all_symbols () =
   Mutex.lock initialization_mutex;
   let symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
   Mutex.unlock initialization_mutex;
   symbols
 
-(** Safety cleanup for stale orders - matches Kraken's cleanup_stale_orders pattern *)
+(** Periodic safety cleanup. Removes stale orders (>24h), expired amendment
+    blacklist entries (>30s), stale processed trade IDs (>10min), and orphaned
+    entries from the order_to_symbol eviction queue. *)
 let cleanup_stale_orders () =
   let now = Unix.gettimeofday () in
-  let stale_threshold = 24.0 *. 3600.0 in (* 24 hours *)
+  let stale_threshold = 24.0 *. 3600.0 in
   let stale_orders = ref [] in
   
   let all_symbols = get_all_symbols () in
@@ -265,7 +272,7 @@ let cleanup_stale_orders () =
     ) !stale_orders
   end;
 
-  (* Clean up stale amendment blacklist entries (>30s old) *)
+  (* Evict amendment blacklist entries older than 30 seconds. *)
   Mutex.lock amended_blacklist_mutex;
   let blacklist_to_remove = ref [] in
   Hashtbl.iter (fun order_id timestamp ->
@@ -278,7 +285,7 @@ let cleanup_stale_orders () =
   if bl_removed > 0 then
     Logging.debug_f ~section "Cleaned up %d stale amendment blacklist entries" bl_removed;
 
-  (* Clean up stale processed_tids (>10min old) across all stores *)
+  (* Evict processed trade IDs older than 10 minutes across all symbol stores. *)
   List.iter (fun symbol ->
     let store = get_symbol_store symbol in
     Mutex.lock store.tids_mutex;
@@ -294,13 +301,11 @@ let cleanup_stale_orders () =
   ) all_symbols;
 
   (* Purge orphaned entries from order_to_symbol_queue.
-     Terminal events (fill/cancel) remove order_ids from the Hashtbl via Hashtbl.remove
-     but do NOT remove them from the Queue (OCaml Queue has no O(1) remove by value).
-     Over time the queue accumulates one dead string entry per completed order — these
-     are never drained because the eviction while-loop only fires when the Hashtbl
-     exceeds its cap (which it doesn't, since terminals keep it small).
-     Fix: during each cleanup cycle, rebuild the queue keeping only entries still
-     present in the Hashtbl.  This is O(queue_length) but runs at most every 120s. *)
+     Terminal events (fill/cancel) remove order_ids from the Hashtbl but not
+     from the Queue (OCaml Queue lacks O(1) removal by value). The queue
+     accumulates dead entries over time since the eviction loop only fires
+     when the Hashtbl exceeds its cap. This rebuild pass retains only entries
+     still present in the Hashtbl. Runs at most once per cleanup cycle. *)
   Mutex.lock initialization_mutex;
   let original_queue_len = Queue.length order_to_symbol_queue in
   if original_queue_len > 0 then begin
@@ -319,8 +324,8 @@ let cleanup_stale_orders () =
   end;
   Mutex.unlock initialization_mutex
 
-(** Clear all open orders across all stores - used on WebSocket reconnection
-    to prevent stale phantom orders from blocking new order placement. *)
+(** Clear all open orders across all symbol stores. Called on WebSocket
+    reconnection to prevent stale phantom orders from blocking placement. *)
 let clear_all_open_orders () =
   let all_symbols = get_all_symbols () in
   let total_removed = ref 0 in
@@ -332,7 +337,7 @@ let clear_all_open_orders () =
     Hashtbl.clear store.open_orders;
     Mutex.unlock store.orders_mutex;
   ) all_symbols;
-  (* Clear global index and eviction queue *)
+  (* Reset the global order_to_symbol index and its eviction queue. *)
   Mutex.lock initialization_mutex;
   Hashtbl.clear order_to_symbol;
   Queue.clear order_to_symbol_queue;
@@ -357,7 +362,7 @@ let[@inline always] read_execution_events symbol last_pos =
   let store = get_symbol_store symbol in
   RingBuffer.read_since store.events_buffer last_pos
 
-(** Zero-allocation iteration over execution events since last position *)
+(** Iterate over execution events since last_pos without intermediate allocation. *)
 let[@inline always] iter_execution_events symbol last_pos f =
   let store = get_symbol_store symbol in
   RingBuffer.iter_since store.events_buffer last_pos f
@@ -385,7 +390,9 @@ let wait_for_execution_data symbols timeout_seconds =
   in
   loop ()
 
-(** Internal helper to update open orders and generate an event - adopts Kraken's "update_open_orders" pattern *)
+(** Core internal handler for order state transitions. Updates the open orders
+    table, writes the event to the ring buffer, and signals the relevant domain.
+    Handles terminal removal, amendment blacklist filtering, and userref recovery. *)
 let update_orders_internal ?user_ref store (event : execution_event) =
   let now = Unix.gettimeofday () in
   Mutex.lock store.orders_mutex;
@@ -398,9 +405,8 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   let existing_order = Hashtbl.find_opt store.open_orders event.order_id in
 
   (* Check if this non-terminal order was superseded by a cancel-replace amendment.
-     If so, skip re-adding it — a late WS orderUpdates event would create a
-     phantom duplicate that triggers the multi-buy cancel branch.
-     Terminal events always process (to clean up tracking). *)
+     If so, skip re-adding it to prevent phantom duplicates. Terminal events
+     always process to ensure proper tracking cleanup. *)
   let is_superseded = if is_terminal then false else begin
     Mutex.lock amended_blacklist_mutex;
     let result = Hashtbl.mem amended_blacklist event.order_id in
@@ -411,8 +417,7 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   if is_superseded then begin
     Mutex.unlock store.orders_mutex;
     Logging.debug_f ~section "Skipping late WS event for superseded order %s [%s]" event.order_id event.symbol;
-    (* Still write to ring buffer so exec event consumers see the event,
-       but do NOT add to open_orders hashtable *)
+    (* Write to ring buffer for event consumers but do not add to open_orders. *)
     RingBuffer.write store.events_buffer event;
     notify_ready store;
     Concurrency.Exchange_wakeup.signal ~symbol:event.symbol
@@ -420,16 +425,16 @@ let update_orders_internal ?user_ref store (event : execution_event) =
 
   if is_terminal then begin
     Hashtbl.remove store.open_orders event.order_id;
-    (* Remove from global index *)
+    (* Remove from global order_to_symbol index. *)
     Mutex.lock initialization_mutex;
     Hashtbl.remove order_to_symbol event.order_id;
     Mutex.unlock initialization_mutex;
   end else begin
-    (* UserRef Recovery Logic:
-       1. Use explicitly provided user_ref (from proactive inject_order)
-       2. Use existing tracked user_ref
-       3. Recover from cloid string (Hyperliquid encodes UserRef in cloid hex)
-    *)
+    (* UserRef recovery precedence:
+       1. Explicitly provided user_ref (from proactive inject_order).
+       2. Previously tracked user_ref on the existing open order.
+       3. Decoded from the cloid hex string (Hyperliquid encodes userref in the
+          trailing 16 hex digits of the client order ID). *)
     let recovered_user_ref = match user_ref with
       | Some _ -> user_ref
       | None -> 
@@ -472,7 +477,7 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     } in
     
     Hashtbl.replace store.open_orders event.order_id order;
-    (* Add to global index with FIFO eviction when over adaptive cap *)
+    (* Add to global order_to_symbol index with bounded FIFO eviction. *)
     Mutex.lock initialization_mutex;
     add_to_order_to_symbol event.order_id event.symbol;
     Mutex.unlock initialization_mutex;
@@ -530,9 +535,9 @@ let find_registered_symbol coin =
       Mutex.unlock initialization_mutex;
       !result
 
-(** Detect Hyperliquid-specific rejection status strings.
-    HL uses statuses like "badAloPxRejected", "insufficientSpotBalanceRejected",
-    "tickRejected", "perpMarginRejected", etc. instead of a generic "rejected". *)
+(** Detect Hyperliquid-specific rejection status strings. The exchange uses
+    descriptive suffixed variants (e.g. "badAloPxRejected", "tickRejected")
+    rather than a generic "rejected" status. *)
 let is_rejection_status s =
   let suffix = "Rejected" in
   let slen = String.length s and sfxlen = String.length suffix in
@@ -649,7 +654,7 @@ let process_order_updates data_json =
 
 let process_user_events data_json =
   let open Yojson.Safe.Util in
-  (* Handle fills *)
+  (* Process fill events from the userEvents/userFills payload. *)
   let fills = try member "fills" data_json |> to_list with _ -> [] in
   List.iter (fun fill ->
     let coin = member "coin" fill |> to_string in
@@ -673,17 +678,17 @@ let process_user_events data_json =
         let fee = try member "fee" fill |> to_string |> float_of_string with _ -> 0.0 in
         let store = get_symbol_store symbol in
         
-        (* Deduplicate trade fills *)
+        (* Deduplicate trade fills using bounded per-symbol trade ID tracking. *)
         let now = Unix.gettimeofday () in
         Mutex.lock store.tids_mutex;
         let already_processed = Hashtbl.mem store.processed_tids tid in
         if not already_processed then begin
           Hashtbl.replace store.processed_tids tid now;
           Queue.push tid store.processed_tids_queue;
-          (* FIFO eviction when over cap *)
+          (* FIFO eviction when exceeding max_processed_tids capacity. *)
           while Hashtbl.length store.processed_tids > max_processed_tids do
             if Queue.is_empty store.processed_tids_queue then
-              ignore (Hashtbl.length store.processed_tids) (* queue drifted, let timer cleanup handle *)
+              ignore (Hashtbl.length store.processed_tids) (* Queue/table diverged; deferred to periodic cleanup. *)
             else begin
               let oldest = Queue.pop store.processed_tids_queue in
               Hashtbl.remove store.processed_tids oldest
@@ -693,7 +698,7 @@ let process_user_events data_json =
         Mutex.unlock store.tids_mutex;
 
         if not already_processed then begin
-          (* Hold lock for entire read-compute-write cycle to prevent double-counted fills *)
+          (* Hold mutex for the full read-compute-write cycle to prevent double-counted fills. *)
           Mutex.lock store.orders_mutex;
           let (existing_order : open_order option) = Hashtbl.find_opt store.open_orders order_id in
           let cum_qty = match existing_order with Some o -> o.cum_qty +. size | None -> size in
@@ -727,7 +732,7 @@ let process_user_events data_json =
     | None -> ()
   ) fills;
 
-  (* Handle nonUserCancel *)
+  (* Process non-user cancellation events (exchange-initiated). *)
   let non_user_cancels = try member "nonUserCancel" data_json |> to_list with _ -> [] in
   List.iter (fun nuc ->
     let coin = member "coin" nuc |> to_string in
@@ -782,28 +787,25 @@ let process_market_data json =
         let data = member "data" json in
         process_user_events data
     | Some "webData2" ->
-        (* webData2 parsing for openOrders and fills removed.
-           We now rely entirely on targeted websocket feeds:
-           orderUpdates, userFills, userEvents for real-time pushing,
-           which replaces the need for this snapshot polling loop. *)
+        (* webData2 parsing for openOrders and fills has been removed.
+           All order and fill tracking now uses the targeted WebSocket feeds:
+           orderUpdates, userFills, and userEvents. *)
         ()
     | _ -> ()
   with exn -> 
     Logging.error_f ~section "Failed to process Hyperliquid executions data: %s" (Printexc.to_string exn)
 
-(** Event-driven cleanup bus — fires on-demand (reconnect, manual trigger) and
-    falls back to a 120s safety timer so stale data never accumulates indefinitely.
-    Uses an Lwt_mvar as a one-shot signal channel; request_cleanup is idempotent. *)
+(** Event-driven cleanup signal channel. Fires on-demand (reconnect, manual
+    trigger) and falls back to a 120s safety timer. Implemented as an Lwt_mvar
+    used as a one-shot signal; request_cleanup is idempotent. *)
 let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
-(** Signal the cleanup loop to run immediately (idempotent: skipped if already pending).
-    Uses is_empty guard so no Lwt continuation is ever queued: the put only happens
-    when the mvar is empty (previous signal consumed), making this truly O(1). *)
+(** Signal the cleanup loop to run immediately. Idempotent: skipped if a signal
+    is already pending. Uses an is_empty guard to avoid queuing Lwt continuations;
+    the put only occurs when the mvar is empty (previous signal consumed). *)
 let request_cleanup () =
-  (* is_empty is a pure synchronous check.  Only put when the mvar is empty so we
-     never queue a blocking continuation inside Lwt.async — the original bug that
-     caused one Lwt closure to pile up per trigger_stale_order_cleanup call while
-     the cleanup task was sleeping (up to 120 s between drains). *)
+  (* Synchronous is_empty check. Only puts when the mvar is empty to avoid
+     queuing blocking Lwt continuations during the cleanup sleep interval. *)
   if Lwt_mvar.is_empty cleanup_mvar then
     Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
 
@@ -812,7 +814,7 @@ let periodic_tasks_started = Atomic.make false
 let start_periodic_tasks () =
   if not (Atomic.exchange periodic_tasks_started true) then begin
     let rec run () =
-      (* Block until an explicit signal OR 120s safety timeout *)
+      (* Block until an explicit cleanup signal or the 120s safety timeout. *)
       Lwt.pick [
         (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
         (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
@@ -832,7 +834,7 @@ let _processor_task =
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid executions processor task";
       let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
-      (* Stream ended normally (disconnect pushed None) — re-subscribe *)
+      (* Stream ended normally (disconnect pushed None); re-subscribe. *)
       sub.close ();
       Logging.info ~section "Executions stream ended (disconnect), re-subscribing in 1s...";
       Lwt_unix.sleep 1.0 >>= fun () -> run ()
@@ -905,8 +907,8 @@ let inject_open_orders data_json =
       with exn -> Logging.warn_f ~section "Failed to parse open order entry: %s" (Printexc.to_string exn)
     ) orders;
     Logging.info_f ~section "Injected %d initial open orders from snapshot" !count;
-    (* Lock adaptive cap now that startup snapshot is fully consumed.
-       Subsequent inserts will evict oldest entries when over cap. *)
+    (* Lock the adaptive capacity now that the startup snapshot is fully consumed.
+       Subsequent inserts will evict the oldest entries when exceeding the cap. *)
     Mutex.lock initialization_mutex;
     mark_startup_complete ();
     Mutex.unlock initialization_mutex

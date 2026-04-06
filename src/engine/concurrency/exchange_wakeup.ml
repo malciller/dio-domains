@@ -1,26 +1,31 @@
 (** Exchange Wakeup
-    
-    Per-symbol Mutex + Condition variables that allow domain workers to block
-    efficiently waiting for new exchange data for THEIR symbol, rather than
-    waking on every event across all symbols (thundering herd).
 
-    Exchange-specific modules call [signal ~symbol] to wake only the domain
-    worker responsible for that symbol.  Domain workers call [wait ~symbol]
-    to block until data for their specific symbol arrives.
+    Per-symbol mutex and condition variable mechanism that allows domain workers
+    to block until exchange data arrives for their assigned symbol, avoiding
+    unnecessary wakeups across unrelated symbols.
 
-    A global [signal_all] is retained for cross-cutting events like shutdown
-    or startup snapshot completion.
+    Exchange-specific modules call [signal ~symbol] to wake the domain worker
+    responsible for that symbol. Domain workers call [wait ~symbol] to block
+    until data for their symbol is available.
+
+    [signal_all] broadcasts to all waiting workers for cross-cutting events
+    such as shutdown or snapshot completion.
 *)
 
+(** Global mutex protecting [conditions] and synchronizing all condition
+    variable operations in this module. *)
 let mutex = Mutex.create ()
 
-(** Per-symbol condition variables *)
+(** Hash table mapping symbol strings to their dedicated condition variables.
+    Entries are created lazily on first access per symbol. *)
 let conditions : (string, Condition.t) Hashtbl.t = Hashtbl.create 16
 
-(** Global condition for broadcast-to-all events (shutdown, etc.) *)
+(** Global condition variable used for broadcast events that must wake all
+    waiting workers regardless of symbol assignment. *)
 let global_condition = Condition.create ()
 
-(** Get or create a per-symbol condition variable. Must be called under [mutex]. *)
+(** Returns the condition variable for [symbol], creating one if it does not
+    exist. Caller must hold [mutex]. *)
 let[@inline] get_condition_locked symbol =
   match Hashtbl.find_opt conditions symbol with
   | Some c -> c
@@ -29,26 +34,28 @@ let[@inline] get_condition_locked symbol =
       Hashtbl.add conditions symbol c;
       c
 
-(** Signal the domain worker for a specific symbol. *)
+(** Signals the condition variable for [symbol], waking the domain worker
+    blocked on that symbol. Acquires and releases [mutex] internally. *)
 let[@warning "-32"] signal ~symbol =
   Mutex.lock mutex;
   let cond = get_condition_locked symbol in
   Condition.signal cond;
   Mutex.unlock mutex
 
-(** Signal ALL waiting domain workers (e.g. shutdown, snapshot done). *)
+(** Signals all per-symbol condition variables and broadcasts on the global
+    condition variable. Used for events that require waking every waiting
+    worker, such as shutdown or snapshot completion. *)
 let signal_all () =
   Mutex.lock mutex;
   Hashtbl.iter (fun _ cond -> Condition.signal cond) conditions;
   Condition.broadcast global_condition;
   Mutex.unlock mutex
 
-(** Block the calling thread until data for [symbol] arrives,
-    or a global broadcast fires. *)
+(** Blocks the calling domain worker until the condition variable for [symbol]
+    is signaled or a global broadcast occurs. Acquires [mutex], waits on the
+    per-symbol condition, then releases [mutex] on return. *)
 let wait ~symbol =
   Mutex.lock mutex;
   let cond = get_condition_locked symbol in
   Condition.wait cond mutex;
   Mutex.unlock mutex
-
-
