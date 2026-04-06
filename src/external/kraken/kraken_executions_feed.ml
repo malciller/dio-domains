@@ -160,6 +160,7 @@ type symbol_store = {
   orders_mutex: Mutex.t;  (* Per-symbol mutex for open_orders access. *)
   ready: bool Atomic.t;
   last_event_time: float Atomic.t;
+  snapshot: open_order list Atomic.t;  (* Lock-free snapshot for fold_open_orders readers. *)
 }
 
 (** Global symbol-to-store mapping. *)
@@ -225,6 +226,7 @@ let get_symbol_store symbol =
               orders_mutex = Mutex.create ();
               ready = Atomic.make false;
               last_event_time = Atomic.make 0.0;
+              snapshot = Atomic.make [];
             } in
             Hashtbl.add symbol_stores symbol s;
             Logging.debug_f ~section "Created execution store for %s" symbol;
@@ -280,13 +282,13 @@ let[@inline always] get_open_orders symbol =
   Mutex.unlock store.orders_mutex;
   orders
 
-(** Zero-allocation fold over open orders for a symbol. Holds per-symbol orders_mutex for the duration. *)
+(** Lock-free fold over the latest open orders snapshot for a symbol.
+    The snapshot is an immutable list published atomically by the writer
+    thread after every mutation. No mutex acquisition on the reader side. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let result = Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init in
-  Mutex.unlock store.orders_mutex;
-  result
+  let orders = Atomic.get store.snapshot in
+  List.fold_left (fun acc order -> f acc order) init orders
 
 (** Looks up a single open order by ID within a symbol store. *)
 let[@inline always] get_open_order symbol order_id =
@@ -331,6 +333,10 @@ let update_open_order_price ~symbol ~order_id ~new_price =
    | None ->
        Logging.debug_f ~section "update_open_order_price: order %s [%s] not in cache, skipping"
          order_id symbol);
+  (* Publish snapshot after mutation. Rebuilt from Hashtbl under mutex;
+     old snapshot becomes unreachable and is collected by minor GC. *)
+  let snap = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+  Atomic.set store.snapshot snap;
   Mutex.unlock store.orders_mutex
 
 (** Returns all symbols with initialized execution stores. *)
@@ -535,6 +541,11 @@ let update_open_orders store (event : execution_event) =
     end
   end;
   
+  (* Publish immutable snapshot for lock-free readers. The old snapshot
+     becomes unreachable once all concurrent fold_open_orders calls that
+     captured it via Atomic.get have returned. OCaml GC collects it. *)
+  let snap = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+  Atomic.set store.snapshot snap;
   Mutex.unlock store.orders_mutex
 
 (** Parses an optional float from JSON. Delegates to Kraken_common_types. *)
@@ -765,6 +776,9 @@ let handle_snapshot json on_heartbeat =
         
         if Hashtbl.mem store.open_orders order_id then begin
           Hashtbl.remove store.open_orders order_id;
+          (* Publish snapshot after reconciliation removal. *)
+          let snap = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+          Atomic.set store.snapshot snap;
           Mutex.lock global_orders_mutex;
           Hashtbl.remove order_to_symbol order_id;
           Mutex.unlock global_orders_mutex;

@@ -342,6 +342,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         | Some _ -> Some (Dio_strategies.Market_maker.get_strategy_state asset_with_fees.symbol)
         | None -> None in
 
+      (* Resolve balance store references once. Subsequent reads are a single
+         Atomic.get, bypassing Hashtbl.find_opt on every cycle. *)
+      let read_base_balance = Ex.resolve_balance ~asset:base_asset in
+      let read_quote_balance = Ex.resolve_balance ~asset:quote_currency in
+
       while Atomic.get state.is_running do
         let cycle_start = Mtime_clock.now_ns () in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
@@ -542,13 +547,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               )
           in
 
-          (* Query current balances for base and quote assets *)
-          (match Ex.get_balance ~asset:base_asset with
-           | bal -> last_asset_balance := bal
-           | exception _ -> ());
-          (match Ex.get_balance ~asset:quote_currency with
-           | bal -> last_quote_balance := bal
-           | exception _ -> ());
+          (* Read cached balance atomics; zero-allocation, no Hashtbl lookup. *)
+          last_asset_balance := read_base_balance ();
+          last_quote_balance := read_quote_balance ();
           
           let asset_balance = Some !last_asset_balance in
           let quote_balance = Some !last_quote_balance in
@@ -601,17 +602,22 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             end
           end;
 
+          (* Single wall-clock timestamp for the cycle. Computed once outside
+             the strategy timer to eliminate the gettimeofday(2) syscall from
+             the timed strategy block. *)
+          let cycle_wall_time = Unix.gettimeofday () in
+
           (* Strategy timing starts here: measures only execute_strategy computation,
              excludes exchange reads and FNG checks above. *)
           let start_strat = Mtime_clock.now_ns () in
 
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
-               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now:cycle_wall_time asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
-               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
+               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs ~now:cycle_wall_time asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
            | _ -> ());
           let stop_strat = Mtime_clock.now_ns () in
           Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat))
