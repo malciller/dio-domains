@@ -57,6 +57,50 @@ let contains_fragment s fragment =
   let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
   loop 0
 
+(** Exchange-specific behavioral configuration.
+    Encodes the 11 non-persistence branches that diverge between exchanges.
+    Persistence (Hyperliquid.State_persistence) is intentionally left as
+    explicit exchange_id checks until a third exchange requires abstraction. *)
+type exchange_config = {
+  time_in_force: string;                      (** TIF for limit orders: "Alo" (HL) vs "GTC" (Kraken) *)
+  track_pending_sells: bool;                  (** Whether to add sell orders to pending_orders tracking *)
+  use_accumulation_sells: bool;               (** Whether profit-gated accumulation sell path is active *)
+  sell_uses_mult: bool;                       (** true = sell qty is qty × sell_mult; false = 1:1 sells *)
+  sell_failure_sets_asset_low: bool;           (** Whether a sell "insufficient balance" rejection sets asset_low *)
+  use_reserved_base_guard: bool;              (** Whether to check reserved_base + locked_in_sells before selling *)
+  asset_low_requires_balance_change: bool;    (** true = clear asset_low only on balance increase; false = threshold only *)
+  merge_preserved_sells: bool;                (** Whether to merge recently_injected_sells into open_sell_orders *)
+  check_stale_balance: bool;                  (** Whether missing balance data blocks strategy execution *)
+}
+
+let kraken_config = {
+  time_in_force = "GTC";
+  track_pending_sells = true;
+  use_accumulation_sells = false;
+  sell_uses_mult = true;
+  sell_failure_sets_asset_low = false;
+  use_reserved_base_guard = false;
+  asset_low_requires_balance_change = true;
+  merge_preserved_sells = false;
+  check_stale_balance = true;
+}
+
+let hyperliquid_config = {
+  time_in_force = "Alo";
+  track_pending_sells = false;
+  use_accumulation_sells = true;
+  sell_uses_mult = false;
+  sell_failure_sets_asset_low = true;
+  use_reserved_base_guard = true;
+  asset_low_requires_balance_change = false;
+  merge_preserved_sells = true;
+  check_stale_balance = false;
+}
+
+let get_exchange_config exchange =
+  if exchange = "hyperliquid" then hyperliquid_config
+  else kraken_config
+
 (** Trading configuration type (local definition for strategies) *)
 type trading_config = {
   exchange: string;
@@ -313,7 +357,7 @@ let generate_side_duplicate_key asset_symbol side =
   Printf.sprintf "%s|%s|grid" asset_symbol (string_of_order_side side)
 
 let create_place_order asset_symbol side qty price post_only strategy exchange =
-  let tif = if exchange = "hyperliquid" then "Alo" else "GTC" in
+  let ecfg = get_exchange_config exchange in
   {
     operation = Place;
     order_id = None;
@@ -323,7 +367,7 @@ let create_place_order asset_symbol side qty price post_only strategy exchange =
     order_type = "limit";
     qty;
     price;
-    time_in_force = tif;
+    time_in_force = ecfg.time_in_force;
     post_only;
     userref = Some Strategy_common.strategy_userref_grid;  (* Tag order as Grid strategy *)
     strategy;
@@ -332,7 +376,7 @@ let create_place_order asset_symbol side qty price post_only strategy exchange =
 
 (** Create a strategy order for amending an existing order *)
 let create_amend_order order_id asset_symbol side qty price post_only strategy exchange =
-  let tif = if exchange = "hyperliquid" then "Alo" else "GTC" in
+  let ecfg = get_exchange_config exchange in
   {
     operation = Amend;
     order_id = Some order_id;
@@ -342,7 +386,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy e
     order_type = "limit";
     qty;
     price;
-    time_in_force = tif;
+    time_in_force = ecfg.time_in_force;
     post_only;
     userref = None;  (* Amends don't set userref *)
     strategy;
@@ -452,11 +496,11 @@ let push_order order =
             (* Handle different operations *)
             (match order.operation with
              | Place ->
-                 (* For Hyperliquid: skip pending tracking for sell orders entirely.
-                    Sells are fire-and-forget; tracking them creates ghost entries
-                    that cause re-placement loops during cancel-replace amendments.
-                    Kraken retains existing pending sell tracking behavior. *)
-                 let skip_pending = order.exchange = "hyperliquid" && order.side = Sell in
+                 (* Skip pending tracking for sell orders on exchanges that don't
+                    use it. Tracking creates ghost entries that cause re-placement
+                    loops during cancel-replace amendments. *)
+                 let order_ecfg = get_exchange_config order.exchange in
+                 let skip_pending = not order_ecfg.track_pending_sells && order.side = Sell in
                  if not skip_pending then begin
                    (* Track order as pending - generate temporary ID until we get the real one from exchange *)
                    let temp_order_id = Printf.sprintf "pending_%s_%.2f"
@@ -516,6 +560,7 @@ let execute_strategy
     (cycle : int) =
 
   let state = get_strategy_state asset.symbol in
+  let ecfg = get_exchange_config asset.exchange in
 
   (* Only proceed with main strategy if capital_low flag is clear.
      asset_low is checked below only for sell+buy placement — order sync,
@@ -539,25 +584,22 @@ let execute_strategy
 
    (* --- Asset-low check: clear flag when asset balance recovers --- *)
    (* Subtract reserved_base so accumulated base asset is protected from sells *)
-   (* For Kraken: only clear when balance has genuinely increased (fill, deposit).
-      Kraken's "Insufficient funds" on sells can mean USD collateral is too low,
-      not that asset balance is insufficient. The local balance check would
-      immediately clear the flag every cycle, causing a tight retry loop.
-      For Hyperliquid: clear whenever available balance passes the threshold
-      (existing behavior). *)
    (match asset_balance with
     | Some asset_bal ->
         let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
         let asset_needed_fast =
-          if asset.exchange = "hyperliquid" then qty_f  (* 1:1 sells need full qty *)
-          else let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
-               qty_f *. sell_mult_f
+          if ecfg.sell_uses_mult then
+            let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
+            qty_f *. sell_mult_f
+          else qty_f  (* 1:1 sells need full qty *)
         in
         let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit in
         let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
         let should_clear =
-          if asset.exchange = "hyperliquid" then available_asset >= asset_needed_fast
-          else available_asset >= asset_needed_fast && balance_actually_changed
+          if ecfg.asset_low_requires_balance_change then
+            available_asset >= asset_needed_fast && balance_actually_changed
+          else
+            available_asset >= asset_needed_fast
         in
         if state.asset_low && should_clear then begin
           state.asset_low <- false;
@@ -747,10 +789,10 @@ let execute_strategy
       (* Set sell orders *)
       state.open_sell_orders <- !sell_orders;
 
-      (* For Hyperliquid: merge any preserved sell orders that aren't in the
-         exchange-sourced list. This covers cancel-replace amendments where
-         the new order hasn't yet appeared in the order update stream. *)
-      if asset.exchange = "hyperliquid" then begin
+      (* Merge any preserved sell orders that aren't in the exchange-sourced list.
+         This covers cancel-replace amendments where the new order hasn't yet
+         appeared in the order update stream. *)
+      if ecfg.merge_preserved_sells then begin
         List.iter (fun (preserved_id, preserved_price, _) ->
           let already_present = List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders in
           if not already_present then
@@ -780,8 +822,8 @@ let execute_strategy
       (* Calculate required balances *)
       let quote_needed = ask_price *. qty in
       let asset_needed =
-        if asset.exchange = "hyperliquid" then qty  (* most sells are 1:1 on Hyperliquid *)
-        else qty *. sell_mult
+        if ecfg.sell_uses_mult then qty *. sell_mult
+        else qty  (* 1:1 sells *)
       in
 
   (* Log current balance status for debugging - throttled to every 10,000 cycles *)
@@ -794,7 +836,7 @@ let execute_strategy
 
   (* Check for missing balance data - stale but present balance data is OK *)
   (* Note: Supervisor monitors WebSocket health via heartbeats *)
-  let is_stale = asset.exchange = "kraken" && (
+  let is_stale = ecfg.check_stale_balance && (
     match asset_balance, quote_balance with
     | None, None ->
         (* No balance data at all - can't trade without balance info *)
@@ -886,7 +928,7 @@ let execute_strategy
         (match asset_balance with
          | Some asset_bal when not state.inflight_sell ->
              let (sell_qty, is_accumulation_sell) =
-               if asset.exchange = "hyperliquid" then begin
+               if ecfg.use_accumulation_sells then begin
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
                  let rounding_diff = qty -. rounded_sell in
                  let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
@@ -894,18 +936,19 @@ let execute_strategy
                    (rounded_sell, true)
                  else
                    (qty, false)  (* 1:1 sell until profit covers rounding cost *)
-               end else
+               end else if ecfg.sell_uses_mult then
                  (qty *. sell_mult, false)
+               else
+                 (qty, false)
              in
-             (* Proactive reserved_base guard (Hyperliquid only): ensure we never sell
+             (* Proactive reserved_base guard: ensure we never sell
                 accumulated base asset.  The available balance must exclude:
                 1. reserved_base — accumulated base that must never be sold
                 2. qty already locked in open sell orders on the exchange
                 Uses the open_orders parameter (authoritative exchange data) rather than
-                state.open_sell_orders which may be empty after startup/reconnection.
-                Kraken does not use reserved_base so the check is skipped. *)
+                state.open_sell_orders which may be empty after startup/reconnection. *)
              let balance_ok =
-               if asset.exchange = "hyperliquid" then
+               if ecfg.use_reserved_base_guard then
                  let locked_in_sells = List.fold_left (fun acc (_oid, _price, remaining_qty, side_str, _uref) ->
                    if side_str = "sell" then acc +. remaining_qty else acc
                  ) 0.0 open_orders in
@@ -1240,17 +1283,19 @@ let handle_order_failed asset_symbol side reason =
            Logging.warn_f ~section "Exchange rejected buy for %s with insufficient funds - setting capital_low flag"
              asset_symbol
          end
-     | Sell when is_insufficient_balance && state.exchange_id = "hyperliquid" ->
-          if not state.asset_low then begin
-            state.asset_low <- true;
-            Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance - setting asset_low flag"
-              asset_symbol
-          end
      | Sell when is_insufficient_balance ->
-          (* Kraken: sell failures are fire-and-forget. Don't set asset_low;
-             the sell simply fails and the strategy continues placing the buy. *)
-          Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance (ignored, Kraken sell is fire-and-forget)"
-            asset_symbol
+          let ecfg = get_exchange_config state.exchange_id in
+          if ecfg.sell_failure_sets_asset_low then begin
+            if not state.asset_low then begin
+              state.asset_low <- true;
+              Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance - setting asset_low flag"
+                asset_symbol
+            end
+          end else
+            (* Sell failures are fire-and-forget. Don't set asset_low;
+               the sell simply fails and the strategy continues placing the buy. *)
+            Logging.warn_f ~section "Exchange rejected sell for %s with insufficient balance (ignored, sell is fire-and-forget)"
+              asset_symbol
      | _ -> ());
 
     (* Apply timer cooldown only for buy-side rate limits; sell side uses asset_low flag *)
