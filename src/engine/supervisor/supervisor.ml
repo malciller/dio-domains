@@ -8,41 +8,10 @@ let section = "supervisor"
 (** Open Strategy_common for shared order types *)
 open Dio_strategies.Strategy_common
 
-(** Connection state *)
-type connection_state =
-  | Disconnected
-  | Connecting
-  | Connected
-  | Failed of string
 
-(** Circuit breaker state *)
-type circuit_breaker_state =
-  | Closed  (* Normal operation *)
-  | Open    (* Failing too much, temporarily disabled *)
-  | HalfOpen  (* Testing if service recovered *)
+(** Use canonical types and connection registry from Supervisor_types *)
+open Supervisor_types
 
-(** Supervised connection *)
-type supervised_connection = {
-  name: string;
-  mutable state: connection_state;
-  mutable last_connected: float option;
-  mutable last_disconnected: float option;
-  mutable last_connecting: float option;  (* Timestamp when entered Connecting state *)
-  mutable last_data_received: float option;  (* For heartbeat monitoring *)
-  mutable last_ping_sent: float option;  (* For ping/pong monitoring *)
-  ping_failures: int Atomic.t;  (* Consecutive ping failures *)
-  mutable reconnect_attempts: int;
-  mutable total_connections: int;
-  mutable circuit_breaker: circuit_breaker_state;
-  mutable circuit_breaker_failures: int;  (* Consecutive failures *)
-  mutable circuit_breaker_last_failure: float option;
-  mutable connect_fn: (unit -> unit Lwt.t) option;  (* Optional - None for monitoring-only connections *)
-  mutex: Mutex.t;
-}
-
-(** Registry of supervised connections *)
-let connections : (string, supervised_connection) Hashtbl.t = Hashtbl.create 16
-let registry_mutex = Mutex.create ()
 
 (** Shutdown flag for graceful termination *)
 let shutdown_requested = Atomic.make false
@@ -998,70 +967,71 @@ let order_processing_loop () =
                 (* Handle different operation types *)
                 (match order.operation with
                  | Place ->
-                     let order_request = {
-                       Dio_engine.Order_executor.order_type = order.order_type;
-                       side = (match order.side with Buy -> "buy" | Sell -> "sell");
-                       quantity = order.qty;
-                       symbol = order.symbol;
-                       limit_price = order.price;
-                       time_in_force = Some order.time_in_force;
-                       post_only = Some order.post_only;
-                       margin = None;
-                       reduce_only = None;
-                       order_userref = order.userref;
-                       cl_ord_id = None;
-                       trigger_price = None;
-                       trigger_price_type = None;
-                       display_qty = None;
-                       fee_preference = None;
-                       duplicate_key = order.duplicate_key;
-                       exchange = order.exchange;
-                     } in
-
-                     (* Fire-and-forget: just send the order, don't touch strategy tracking.
-                      The consumer thread handles all tracking via WS execution events. *)
-                     Lwt.async (fun () ->
-                       let%lwt () = Lwt.pause () in
-                       Lwt.catch (fun () ->
-                         Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
-                         | Ok result ->
-                             orders_placed := !orders_placed + 1;
-                             Logging.info_f ~section "✓ Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
-                               (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
-                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
-                               result.order_id;
-                              (* Immediately notify strategy so inflight flags + order tracking
-                                 are updated without waiting for the async execution feed *)
-                              (match order.price with
-                               | Some price ->
-                                   Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
-                                     order.symbol result.order_id order.side price
-                               | None -> ());
-                             Lwt.return_unit
-                         | Error err ->
-                             Logging.error_f ~section "✗ Order placement failed: %s %s %.8f @ %s - %s"
-                               (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
-                               (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
-                               err;
-                             (* Notify strategy so it cleans up pending/in-flight state *)
-                             Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side err;
-                             (match order.price with
-                              | Some price ->
-                                  Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                              | None -> ());
-                             Lwt.return_unit
-                       ) (fun exn ->
-                         Logging.error_f ~section "✗ Exception placing order %s %s: %s"
-                           (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                         (* Notify strategy so it cleans up pending/in-flight state *)
-                         Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
-                         (match order.price with
-                          | Some price ->
-                              Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
-                          | None -> ());
-                         Lwt.return_unit
-                       )
-                     )
+                      process_order_if_connected order (fun () ->
+                        let order_request = {
+                          Dio_engine.Order_executor.order_type = order.order_type;
+                          side = (match order.side with Buy -> "buy" | Sell -> "sell");
+                          quantity = order.qty;
+                          symbol = order.symbol;
+                          limit_price = order.price;
+                          time_in_force = Some order.time_in_force;
+                          post_only = Some order.post_only;
+                          margin = None;
+                          reduce_only = None;
+                          order_userref = order.userref;
+                          cl_ord_id = None;
+                          trigger_price = None;
+                          trigger_price_type = None;
+                          display_qty = None;
+                          fee_preference = None;
+                          duplicate_key = order.duplicate_key;
+                          exchange = order.exchange;
+                        } in
+                        Lwt.async (fun () ->
+                          let%lwt () = Lwt.pause () in
+                          Lwt.catch (fun () ->
+                            Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
+                            | Ok result ->
+                                orders_placed := !orders_placed + 1;
+                                Logging.info_f ~section "✓ Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
+                                  (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
+                                  (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                                  result.order_id;
+                                (match order.price with
+                                 | Some price ->
+                                     Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
+                                       order.symbol result.order_id order.side price
+                                 | None -> ());
+                                Lwt.return_unit
+                            | Error err ->
+                                Logging.error_f ~section "✗ Order placement failed: %s %s %.8f @ %s - %s"
+                                  (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
+                                  (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
+                                  err;
+                                Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side err;
+                                (match order.price with
+                                 | Some price ->
+                                     Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                                 | None -> ());
+                                Lwt.return_unit
+                          ) (fun exn ->
+                            Logging.error_f ~section "✗ Exception placing order %s %s: %s"
+                              (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
+                            Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
+                            (match order.price with
+                             | Some price ->
+                                 Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                             | None -> ());
+                            Lwt.return_unit
+                          )
+                        )
+                      ) (fun err ->
+                        Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side err;
+                        (match order.price with
+                         | Some price ->
+                             Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                         | None -> ())
+                      )
 
                  | Amend ->
                      process_order_if_connected order (fun () ->
@@ -1217,7 +1187,8 @@ let order_processing_loop () =
                 (* Handle different operation types *)
                 (match order.operation with
                  | Place ->
-                     let order_request = {
+                      process_order_if_connected order (fun () ->
+                      let order_request = {
                        Dio_engine.Order_executor.order_type = order.order_type;
                        side = (match order.side with Buy -> "buy" | Sell -> "sell");
                        quantity = order.qty;
@@ -1245,13 +1216,13 @@ let order_processing_loop () =
                          Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                          | Ok result ->
                              orders_placed := !orders_placed + 1;
-                             Logging.info_f ~section "✓ Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
+                             Logging.info_f ~section " Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                result.order_id;
                              Lwt.return_unit
                          | Error err ->
-                             Logging.error_f ~section "✗ Order placement failed: %s %s %.8f @ %s - %s"
+                             Logging.error_f ~section " Order placement failed: %s %s %.8f @ %s - %s"
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                err;
@@ -1263,7 +1234,7 @@ let order_processing_loop () =
                               | None -> ());
                              Lwt.return_unit
                        ) (fun exn ->
-                         Logging.error_f ~section "✗ Exception placing order %s %s: %s"
+                         Logging.error_f ~section " Exception placing order %s %s: %s"
                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
                          (* Notify strategy so it cleans up pending/in-flight state *)
                          Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
@@ -1274,6 +1245,13 @@ let order_processing_loop () =
                          Lwt.return_unit
                        )
                      )
+                     ) (fun err ->
+                        Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side err;
+                        (match order.price with
+                         | Some price ->
+                             Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
+                         | None -> ())
+                      )
 
                  | Amend ->
                      process_order_if_connected order (fun () ->

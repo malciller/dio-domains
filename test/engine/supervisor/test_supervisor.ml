@@ -1,4 +1,4 @@
-open Supervisor
+
 
 let test_connection_registration () =
   (* Test connection registration with connect function *)
@@ -11,7 +11,7 @@ let test_connection_registration () =
   (* Verify connection was registered *)
   Alcotest.(check string) "connection name" "test_conn" conn.name;
   Alcotest.(check bool) "has connect function" true (Option.is_some conn.connect_fn);
-  Alcotest.(check bool) "initial state disconnected" true (conn.state = Supervisor.Disconnected)
+  Alcotest.(check bool) "initial state disconnected" true (conn.state = Supervisor_types.Disconnected)
 
 let test_connection_registration_monitoring () =
   (* Test connection registration for monitoring only *)
@@ -19,27 +19,27 @@ let test_connection_registration_monitoring () =
   (* Verify monitoring connection was registered *)
   Alcotest.(check string) "monitoring connection name" "monitor_conn" conn.name;
   Alcotest.(check bool) "no connect function" true (Option.is_none conn.connect_fn);
-  Alcotest.(check bool) "monitoring state connected" true (conn.state = Supervisor.Connected)
+  Alcotest.(check bool) "monitoring state connected" true (conn.state = Supervisor_types.Connected)
 
 let test_state_management () =
   (* Test state transitions *)
   let conn = Supervisor.register_for_monitoring ~name:"state_test" in
   (* Test Connected -> Disconnected *)
-  Supervisor.set_state conn Supervisor.Disconnected;
-  Alcotest.(check bool) "disconnected state" true ((Supervisor.get_state conn) = Supervisor.Disconnected);
+  Supervisor.set_state conn Supervisor_types.Disconnected;
+  Alcotest.(check bool) "disconnected state" true ((Supervisor.get_state conn) = Supervisor_types.Disconnected);
   (* Test Disconnected -> Connected *)
-  Supervisor.set_state conn Supervisor.Connected;
-  Alcotest.(check bool) "connected state" true ((Supervisor.get_state conn) = Supervisor.Connected);
+  Supervisor.set_state conn Supervisor_types.Connected;
+  Alcotest.(check bool) "connected state" true ((Supervisor.get_state conn) = Supervisor_types.Connected);
   (* Test Connected -> Failed *)
-  Supervisor.set_state conn (Supervisor.Failed "test error");
+  Supervisor.set_state conn (Supervisor_types.Failed "test error");
   match Supervisor.get_state conn with
-  | Supervisor.Failed "test error" -> Alcotest.(check bool) "failed state" true true
+  | Supervisor_types.Failed "test error" -> Alcotest.(check bool) "failed state" true true
   | _ -> Alcotest.fail "wrong failed state"
 
 let test_circuit_breaker_initial () =
   (* Test circuit breaker initial state *)
   let conn = Supervisor.register_for_monitoring ~name:"cb_test" in
-  Alcotest.(check bool) "circuit breaker closed" true (conn.circuit_breaker = Supervisor.Closed);
+  Alcotest.(check bool) "circuit breaker closed" true (conn.circuit_breaker = Supervisor_types.Closed);
   Alcotest.(check int) "zero failures" 0 conn.circuit_breaker_failures
 
 let test_circuit_breaker_failure_counting () =
@@ -52,20 +52,20 @@ let test_circuit_breaker_failure_counting () =
   Supervisor.update_circuit_breaker conn false;  (* failure 4 *)
   Supervisor.update_circuit_breaker conn false;  (* failure 5 - should open *)
   Alcotest.(check int) "five failures" 5 conn.circuit_breaker_failures;
-  Alcotest.(check bool) "circuit breaker open" true (conn.circuit_breaker = Supervisor.Open)
+  Alcotest.(check bool) "circuit breaker open" true (conn.circuit_breaker = Supervisor_types.Open)
 
 let test_circuit_breaker_recovery () =
   (* Test circuit breaker recovery *)
   let conn = Supervisor.register_for_monitoring ~name:"cb_recover_test" in
   (* Set up opened circuit breaker *)
-  conn.circuit_breaker <- Supervisor.Open;
+  conn.circuit_breaker <- Supervisor_types.Open;
   conn.circuit_breaker_failures <- 5;
   conn.circuit_breaker_last_failure <- Some (Unix.time () -. 400.0);  (* 400 seconds ago *)
   (* Should allow connection attempt after timeout *)
   Alcotest.(check bool) "allows connection after timeout" true (Supervisor.circuit_breaker_allows_connection conn);
   (* Simulate successful connection *)
   Supervisor.update_circuit_breaker conn true;
-  Alcotest.(check bool) "circuit breaker closed after success" true (conn.circuit_breaker = Supervisor.Closed);
+  Alcotest.(check bool) "circuit breaker closed after success" true (conn.circuit_breaker = Supervisor_types.Closed);
   Alcotest.(check int) "zero failures after success" 0 conn.circuit_breaker_failures
 
 let test_token_store () =
@@ -94,7 +94,7 @@ let test_connection_queries () =
   let all_conns = Supervisor.get_all_connections () in
   Alcotest.(check bool) "at least 2 connections" true (List.length all_conns >= 2);
   (* Check that our connections are in the list *)
-  let names = List.map (fun (c : Supervisor.supervised_connection) -> c.name) all_conns in
+  let names = List.map (fun (c : Supervisor_types.supervised_connection) -> c.name) all_conns in
   Alcotest.(check bool) "contains query_test1" true (List.mem "query_test1" names);
   Alcotest.(check bool) "contains query_test2" true (List.mem "query_test2" names)
 
@@ -104,7 +104,7 @@ let test_connection_uptime () =
   (* No uptime initially (starts disconnected) *)
   Alcotest.(check bool) "no uptime when disconnected" true (Option.is_none (Supervisor.get_uptime conn));
   (* Set connected state *)
-  Supervisor.set_state conn Supervisor.Connected;
+  Supervisor.set_state conn Supervisor_types.Connected;
   (* Should have uptime now *)
   Alcotest.(check bool) "has uptime when connected" true (Option.is_some (Supervisor.get_uptime conn))
 
@@ -122,7 +122,7 @@ let test_connection_metrics () =
   let initial_attempts = conn.reconnect_attempts in
   let initial_total = conn.total_connections in
   (* Set connected state to trigger metrics updates *)
-  Supervisor.set_state conn Supervisor.Connected;
+  Supervisor.set_state conn Supervisor_types.Connected;
   Alcotest.(check int) "reconnect attempts unchanged" initial_attempts conn.reconnect_attempts;
   Alcotest.(check int) "total connections incremented" (initial_total + 1) conn.total_connections
 
