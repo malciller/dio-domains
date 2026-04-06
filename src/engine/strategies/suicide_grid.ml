@@ -44,10 +44,14 @@ let _round_price_fn_cache : (string, float -> float) Hashtbl.t =
   Hashtbl.create 8
 
 
-(** Utility function to take first n elements from a list *)
-let rec take n = function
-  | [] -> []
-  | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
+(** Utility function to take first n elements from a list (tail-recursive) *)
+let take n lst =
+  let rec aux acc n = function
+    | [] -> List.rev acc
+    | _ when n <= 0 -> List.rev acc
+    | x :: xs -> aux (x :: acc) (n - 1) xs
+  in
+  aux [] n lst
 
 (** Check if [s] contains [fragment] as a substring (case-sensitive).
     Extracted from handle_order_failed / handle_order_amendment_failed
@@ -672,42 +676,32 @@ let execute_strategy
         | _ -> (price, price)
       in
 
-      (* Efficient cleanup logic - run every cycle but use scan-and-remove to avoid allocation *)
-      (* This prevents accumulation while maintaining HFT responsiveness *)
-      
-      (* Clean up stale pending orders (older than 5 seconds) and enforce hard limit of 50 *)
-      let original_pending_count = List.length state.pending_orders in
-      state.pending_orders <- List.filter (fun (order_id, side, _, timestamp) ->
-        let age = now -. timestamp in
-        if age > 5.0 then begin  (* Reduced from 10 to 5 seconds *)
-          Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
-          
-          (* Clean up global trackers to allow immediate re-placement *)
-          if String.starts_with ~prefix:"pending_amend_" order_id then begin
-            let target_oid = String.sub order_id 14 (String.length order_id - 14) in
-            ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
-          end else begin
-            let duplicate_key = generate_side_duplicate_key asset.symbol side in
-            ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-            (* Fallback: clear inflight flags for stale placements *)
-            (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
-          end;
-          false
-        end else
-          true
-      ) state.pending_orders;
-
-      (* Enforce hard limit of 50 pending orders to prevent memory growth *)
-      if List.length state.pending_orders > 50 then begin
-        let excess = List.length state.pending_orders - 50 in
-        state.pending_orders <- take 50 state.pending_orders;  (* Keep most recent 50 *)
-        Logging.warn_f ~section "Truncated %d excess pending orders for %s (kept 50)" excess asset.symbol;
-      end;
-
-      (* Log cleanup summary occasionally *)
-      let cleaned_pending = original_pending_count - List.length state.pending_orders in
-      if cleaned_pending > 0 && cycle mod 100000 = 0 then
-        Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_pending asset.symbol;
+      (* Clean up stale pending orders and enforce hard limit in a single pass.
+         Combines the former List.length + List.filter + List.length + take into
+         one List.fold_left that counts kept/removed and truncates at 50. *)
+      let (kept_rev, kept_count, removed_count) =
+        List.fold_left (fun (acc, kept, removed) ((order_id, side, _, timestamp) as entry) ->
+          let age = now -. timestamp in
+          if age > 5.0 then begin
+            Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
+            if String.starts_with ~prefix:"pending_amend_" order_id then begin
+              let target_oid = String.sub order_id 14 (String.length order_id - 14) in
+              ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
+            end else begin
+              let duplicate_key = generate_side_duplicate_key asset.symbol side in
+              ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+              (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
+            end;
+            (acc, kept, removed + 1)
+          end else if kept >= 50 then
+            (acc, kept, removed + 1)  (* silently drop excess beyond hard limit *)
+          else
+            (entry :: acc, kept + 1, removed)
+        ) ([], 0, 0) state.pending_orders
+      in
+      state.pending_orders <- List.rev kept_rev;
+      if removed_count > 0 && cycle mod 100000 = 0 then
+        Logging.debug_f ~section "Cleaned up %d pending orders for %s (kept %d)" removed_count asset.symbol kept_count;
 
 
       (* Clean up expired amend cooldowns *)
@@ -720,6 +714,11 @@ let execute_strategy
       List.iter (fun order_id ->
         Hashtbl.remove state.amend_cooldowns order_id
       ) !to_remove_cooldowns;
+      (* Hard cap: if cooldowns accumulate faster than they expire, prevent unbounded growth *)
+      if Hashtbl.length state.amend_cooldowns > 100 then begin
+        Hashtbl.reset state.amend_cooldowns;
+        Logging.warn_f ~section "amend_cooldowns exceeded 100 entries for %s — reset" asset.symbol
+      end;
 
       (* Sync strategy state with actual open orders from exchange *)
       (* Preserve sell orders that were set by handle_order_amended
