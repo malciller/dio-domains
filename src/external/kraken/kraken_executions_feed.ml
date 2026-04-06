@@ -282,6 +282,14 @@ let[@inline always] get_open_orders symbol =
   Mutex.unlock global_orders_mutex;
   orders
 
+(** Zero-allocation fold over open orders under the mutex *)
+let[@inline always] fold_open_orders symbol ~init ~f =
+  let store = get_symbol_store symbol in
+  Mutex.lock global_orders_mutex;
+  let result = Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init in
+  Mutex.unlock global_orders_mutex;
+  result
+
 (** Get specific open order by ID *)
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
@@ -734,6 +742,7 @@ let handle_snapshot json on_heartbeat =
           update_open_orders store event;
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
+          Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
           
           (* Track this order ID as active *)
           Hashtbl.replace snapshot_order_ids event.order_id ();
@@ -811,6 +820,7 @@ let handle_update json on_heartbeat =
           update_open_orders store event;
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
+          Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
 
           (* Publish order update event to event bus *)
           OrderUpdateEventBus.publish order_update_event_bus event;
@@ -825,7 +835,6 @@ let handle_update json on_heartbeat =
 
 (** WebSocket message handler - accepts pre-parsed JSON to avoid re-serialization *)
 let handle_message_json json on_heartbeat =
-  Concurrency.Exchange_wakeup.signal ();  (* wake domain workers blocked in wait() *)
   try
     let open Yojson.Safe.Util in
     let channel = member "channel" json |> to_string_option in

@@ -150,6 +150,7 @@ let process_market_data json =
                 let store = ensure_store symbol in
                 RingBuffer.write store.buffer ticker;
                 notify_ready store;
+                Concurrency.Exchange_wakeup.signal ~symbol;
                 Logging.debug_f ~section "Ticker: %s mid=%.2f" symbol mid
               with exn ->
                 Logging.warn_f ~section "Failed to parse mid for %s: %s" coin (Printexc.to_string exn))
@@ -183,6 +184,7 @@ let process_market_data json =
               let store = ensure_store symbol in
               RingBuffer.write store.buffer ticker;
               notify_ready store;
+              Concurrency.Exchange_wakeup.signal ~symbol;
               Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f (from l2Book)" symbol bid_px ask_px
             end
           with exn ->

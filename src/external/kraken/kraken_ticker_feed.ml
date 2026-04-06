@@ -146,14 +146,16 @@ let parse_ticker json on_heartbeat =
       ) data;
 
       (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
-      Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+      Hashtbl.iter (fun symbol store ->
+        notify_ready store;
+        Concurrency.Exchange_wakeup.signal ~symbol
+      ) notified_symbols;
 
       Some ()
 
 (** WebSocket message handler *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
-  Concurrency.Exchange_wakeup.signal ();  (* wake domain workers blocked in wait() *)
   try
     let json = Yojson.Safe.from_string message in
     let open Yojson.Safe.Util in

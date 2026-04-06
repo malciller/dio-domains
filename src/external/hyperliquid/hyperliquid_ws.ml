@@ -31,8 +31,7 @@ let connection_mutex = Lwt_mutex.create ()
 (** Condition variable used to unblock domain workers waiting for Hyperliquid data.
     Signaled on every incoming WS frame and on WS disconnect.
     Delegates to Concurrency.Exchange_wakeup which is visible from all library layers. *)
-let signal_new_data () = Concurrency.Exchange_wakeup.signal ()
-let wait_for_data () = Concurrency.Exchange_wakeup.wait ()
+let signal_new_data () = Concurrency.Exchange_wakeup.signal_all ()
 
 (** Global subscriber list.
     Each pusher is a function that accepts a Yojson.Safe.t option.
@@ -138,8 +137,7 @@ let broadcast_message json =
     Mutex.lock pushers_mutex;
     pushers := List.filter (fun p -> not (List.memq p !dead)) !pushers;
     Mutex.unlock pushers_mutex
-  end;
-  signal_new_data ()  (* wake any domain workers blocked in wait_for_data *)
+  end
 
 (** Subscribe to all incoming market data messages.
     Uses a bounded stream (capacity 64) to prevent unbounded memory growth.

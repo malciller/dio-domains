@@ -269,13 +269,6 @@ module Kraken_impl = struct
     let events = Kraken_executions_feed.read_execution_events symbol start_pos in
     List.map (fun (e : Kraken_executions_feed.execution_event) ->
       let remaining_qty = e.order_qty -. e.cum_qty in
-      (* Kraken sends exec_type=trade with order_status=partially_filled even
-         when the order is fully filled (cum_qty = order_qty). The subsequent
-         exec_type=filled event is "minimal" (no symbol field) and gets silently
-         dropped because the symbol mapping was already cleaned up by the trade
-         event. Normalize: if remaining_qty <= 0, override status to Filled so
-         the domain spawner dispatches to handle_order_filled, not
-         handle_order_acknowledged. *)
       let effective_status =
         if remaining_qty <= 0.0 && e.order_qty > 0.0 then Types.Filled
         else status_of_kraken_status e.order_status
@@ -292,6 +285,25 @@ module Kraken_impl = struct
       }
     ) events
 
+  let iter_execution_events ~symbol ~start_pos f =
+    Kraken_executions_feed.iter_execution_events symbol start_pos (fun (e : Kraken_executions_feed.execution_event) ->
+      let remaining_qty = e.order_qty -. e.cum_qty in
+      let effective_status =
+        if remaining_qty <= 0.0 && e.order_qty > 0.0 then Types.Filled
+        else status_of_kraken_status e.order_status
+      in
+      f { Types.
+        order_id = e.order_id;
+        order_status = effective_status;
+        limit_price = e.limit_price;
+        side = side_of_kraken_side e.side;
+        remaining_qty;
+        filled_qty = e.cum_qty;
+        avg_price = e.avg_price;
+        timestamp = e.timestamp;
+      }
+    )
+
   let get_ticker_position ~symbol =
     Kraken_ticker_feed.get_current_position symbol
 
@@ -304,6 +316,11 @@ module Kraken_impl = struct
         timestamp = t.timestamp;
       }
     ) events
+
+  let iter_ticker_events ~symbol ~start_pos f =
+    Kraken_ticker_feed.iter_ticker_events symbol start_pos (fun (t : Kraken_ticker_feed.ticker) ->
+      f { Types. bid = t.bid; ask = t.ask; timestamp = t.timestamp }
+    )
 
   let get_orderbook_position ~symbol =
     Kraken_orderbook_feed.get_current_position symbol
@@ -323,6 +340,33 @@ module Kraken_impl = struct
         timestamp = ob.timestamp;
       }
     ) events
+
+  let iter_orderbook_events ~symbol ~start_pos f =
+    Kraken_orderbook_feed.iter_orderbook_events symbol start_pos (fun (ob : Kraken_orderbook_feed.orderbook) ->
+      let map_levels levels =
+        Array.map (fun (l : Kraken_orderbook_feed.level) ->
+          (try float_of_string l.price with _ -> 0.0),
+          (try float_of_string l.size with _ -> 0.0)
+        ) levels
+      in
+      f { Types. bids = map_levels ob.bids; asks = map_levels ob.asks; timestamp = ob.timestamp }
+    )
+
+  let fold_open_orders ~symbol ~init ~f =
+    Kraken_executions_feed.fold_open_orders symbol ~init ~f:(fun acc (o : Kraken_executions_feed.open_order) ->
+      f acc { Types.
+        order_id = o.order_id;
+        symbol = o.symbol;
+        side = side_of_kraken_side o.side;
+        qty = o.order_qty;
+        cum_qty = o.cum_qty;
+        remaining_qty = o.remaining_qty;
+        limit_price = o.limit_price;
+        status = status_of_kraken_status o.order_status;
+        user_ref = o.order_userref;
+        cl_ord_id = o.cl_ord_id;
+      }
+    )
 
   (** Metadata Access *)
   

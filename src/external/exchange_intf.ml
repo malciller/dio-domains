@@ -178,17 +178,29 @@ module type S = sig
   (** Read Ticker Events from specific position *)
   val read_ticker_events : symbol:string -> start_pos:int -> Types.ticker_event list
 
+  (** Zero-allocation iteration over ticker events. Returns new read position. *)
+  val iter_ticker_events : symbol:string -> start_pos:int -> (Types.ticker_event -> unit) -> int
+
   (** Get Position for Orderbook Feed *)
   val get_orderbook_position : symbol:string -> int
 
   (** Read Orderbook Events from specific position *)
   val read_orderbook_events : symbol:string -> start_pos:int -> Types.orderbook_event list
 
+  (** Zero-allocation iteration over orderbook events. Returns new read position. *)
+  val iter_orderbook_events : symbol:string -> start_pos:int -> (Types.orderbook_event -> unit) -> int
+
   (** Get position for consuming execution feed *)
   val get_execution_feed_position : symbol:string -> int
 
   (** Read Execution Events from specific position *)
   val read_execution_events : symbol:string -> start_pos:int -> Types.execution_event list
+
+  (** Zero-allocation iteration over execution events. Returns new read position. *)
+  val iter_execution_events : symbol:string -> start_pos:int -> (Types.execution_event -> unit) -> int
+
+  (** Fold over open orders for a symbol without allocating an intermediate list. *)
+  val fold_open_orders : symbol:string -> init:'a -> f:('a -> Types.open_order -> 'a) -> 'a
 
   (** Metadata Access *)
   

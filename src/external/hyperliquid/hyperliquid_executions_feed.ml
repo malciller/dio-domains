@@ -95,7 +95,7 @@ let _startup_snapshot_done : bool Atomic.t = Atomic.make false
 let set_startup_snapshot_done () =
   if not (Atomic.exchange _startup_snapshot_done true) then begin
     Logging.info ~section "HL open-order snapshot injected — domains may now activate";
-    Concurrency.Exchange_wakeup.signal ()
+    Concurrency.Exchange_wakeup.signal_all ()
   end
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 
@@ -194,6 +194,14 @@ let[@inline always] get_open_orders symbol =
   let orders = Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [] in
   Mutex.unlock store.orders_mutex;
   orders
+
+(** Zero-allocation fold over open orders under the mutex *)
+let[@inline always] fold_open_orders symbol ~init ~f =
+  let store = get_symbol_store symbol in
+  Mutex.lock store.orders_mutex;
+  let result = Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init in
+  Mutex.unlock store.orders_mutex;
+  result
 
 (** Remove a single open order by ID — used to clean up the old order entry
     after a successful cancel-replace amendment so it doesn't appear as a
@@ -406,7 +414,8 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     (* Still write to ring buffer so exec event consumers see the event,
        but do NOT add to open_orders hashtable *)
     RingBuffer.write store.events_buffer event;
-    notify_ready store
+    notify_ready store;
+    Concurrency.Exchange_wakeup.signal ~symbol:event.symbol
   end else begin
 
   if is_terminal then begin
@@ -471,7 +480,8 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   Mutex.unlock store.orders_mutex;
   
   RingBuffer.write store.events_buffer event;
-  notify_ready store
+  notify_ready store;
+  Concurrency.Exchange_wakeup.signal ~symbol:event.symbol
 
   end
 
