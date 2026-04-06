@@ -418,6 +418,29 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     Lwt.return_unit
   )
 
+(** Gracefully closes the Hyperliquid WebSocket connection.
+    Clears the active connection reference, marks the connection as
+    disconnected, fails all pending request waiters, closes all subscriber
+    streams, and tears down the underlying TLS transport. *)
+let close () : unit Lwt.t =
+  Lwt_mutex.with_lock connection_mutex (fun () ->
+    match !active_connection with
+    | None -> Lwt.return None
+    | Some conn ->
+        active_connection := None;
+        Atomic.set is_connected_ref false;
+        Lwt.return (Some conn)
+  ) >>= function
+  | None -> Lwt.return_unit
+  | Some conn ->
+      Logging.info ~section "Closing Hyperliquid WebSocket connection";
+      fail_all_pending "Client requested close";
+      close_all_subscribers ();
+      signal_new_data ();
+      Lwt.catch
+        (fun () -> Websocket_lwt_unix.close_transport conn)
+        (fun _ -> Lwt.return_unit)
+
 (** Sends a JSON request over the WebSocket and blocks until a response
     with the matching [req_id] arrives or [timeout_ms] elapses.
     Logs a warning when the response table exceeds 10 pending entries. *)
