@@ -1,15 +1,21 @@
 (executable
  (name bench)
- (libraries dio.strategies dio.engine dio.latency_profiling mtime mtime.clock.os unix))
+ (libraries
+  dio.strategies
+  dio.engine
+  dio.latency_profiling
+  mtime
+  mtime.clock.os
+  unix))
 
 (rule
  (alias runtest)
  (deps
   (universe)
   %{exe:bench.exe}
-  (alias ../../exchange/cmc/runtest)
-  (alias ../../exchange/hyperliquid/runtest)
-  (alias ../../exchange/kraken/runtest)
+  (alias ../../external/cmc/runtest)
+  (alias ../../external/hyperliquid/runtest)
+  (alias ../../external/kraken/runtest)
   (alias ../config/runtest)
   (alias ../order_executor/runtest)
   (alias ../order_executor/order_cache/runtest)
@@ -19,4 +25,5 @@
   (alias ../concurrency/runtest)
   (alias ../logging/runtest)
   (alias ../supervisor/runtest))
- (action (run %{exe:bench.exe})))
+ (action
+  (run %{exe:bench.exe})))
