@@ -146,20 +146,24 @@ let update_balance_timestamp asset =
   Hashtbl.replace last_balance_update asset (Unix.time ());
   Mutex.unlock balance_update_mutex
 
-(** Returns the balance store for [asset], creating one lazily if absent. *)
+(** Returns the balance store for [asset], creating one lazily if absent.
+    Double-checked lock: fast path is lock-free when the store already exists. *)
 let get_balance_store asset =
-  Mutex.lock balance_stores_mutex;
-  let store = match Hashtbl.find_opt balance_stores asset with
+  match Hashtbl.find_opt balance_stores asset with
   | Some store -> store
   | None ->
-      (* Lazy initialization fallback; stores should be pre-created via [initialize]. *)
-      let store = BalanceStore.create () in
-      Hashtbl.add balance_stores asset store;
-      Logging.debug_f ~section "Created balance store on-the-fly for %s (should be pre-initialized)" asset;
+      Mutex.lock balance_stores_mutex;
+      let store = match Hashtbl.find_opt balance_stores asset with
+      | Some store -> store
+      | None ->
+          (* Lazy initialization fallback; stores should be pre-created via [initialize]. *)
+          let store = BalanceStore.create () in
+          Hashtbl.add balance_stores asset store;
+          Logging.debug_f ~section "Created balance store on-the-fly for %s (should be pre-initialized)" asset;
+          store
+      in
+      Mutex.unlock balance_stores_mutex;
       store
-  in
-  Mutex.unlock balance_stores_mutex;
-  store
 
 (** Returns the aggregate balance for [asset]. Inlined for hot-path performance. *)
 let[@inline always] get_balance asset =
