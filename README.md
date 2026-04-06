@@ -45,13 +45,13 @@ CMC_API_KEY=your_cmc_api_key                               # Fear & Greed index 
 Edit `config.json` (example):
 ```json
 {
-  "logging_level": "info",            // Log verbosity: debug, info, warning, error
+  "logging_level": "info",            // Log verbosity: debug, info, warn, error, critical
   "logging_sections": "",             // Filter logs by section (optional, comma-separated)
   "cycle_mod": 10000,                 // Cycle interval for periodic checks and logs
   "gc": {                             // OCaml 5 Tuning for high-throughput websockets
     "minor_heap_size": 8388608,       // Words (64MB) to absorb JSON parsing bursts
     "space_overhead": 80,             // Moderate major heap spacing
-    "max_overhead": 150,              // Safe compaction threshold 
+    "max_overhead": 150,              // Safe compaction threshold
     "window_size": 10,                // Smooths major GC pacing
     "allocation_policy": 2,           // Best-fit policy (OCaml 5 default)
     "major_heap_increment": 100       // Double heap size on growth to prevent OS thrashing
@@ -84,13 +84,6 @@ Edit `config.json` (example):
       "testnet": true                 // Use testnet
     },
     {
-      "symbol": "HYPE/USDC",          // Pair to trade
-      "exchange": "hyperliquid",      // Exchange name: "kraken", "hyperliquid"
-      "qty": "1.0",                 // Trade size per market making quote
-      "strategy": "MM",               // Strategy name: "MM"
-      "testnet": false                // Use testnet
-    },
-    {
       "symbol": "HYPE/USDC",          // Pair to trade (spot)
       "exchange": "hyperliquid",      // Exchange name (must be "hyperliquid")
       "qty": "0.35",                  // Base asset quantity per order
@@ -99,7 +92,7 @@ Edit `config.json` (example):
       "accumulation_buffer": [0.5, 5.0], // Min/Max net quote profit buffer (USDC) for sell_mult accumulation; resolved dynamically from Fear & Greed
       "strategy": "Grid",             // Strategy name: "Grid"
       "testnet": false,               // Use testnet
-      "hedge": true                // Enable auto-hedge (Hyperliquid only)
+      "hedge": true                   // Enable auto-hedge (Hyperliquid only)
     }
   ]
 }
@@ -160,11 +153,13 @@ profit-guaranteeing quotes where fees apply.
 **Fear & Greed**: Both `grid_interval` and `accumulation_buffer` are
 resolved at domain startup using linear interpolation between their
 configured `[min, max]` ranges based on the CoinMarketCap Fear & Greed
-index (0–100). The index is dynamically re-evaluated at runtime whenever
-the underlying asset price moves by a significant threshold (e.g.,
-+/- 3.5%) from the baseline, ensuring both grid spacing and accumulation
-behavior adapt to changing market conditions. `accumulation_buffer`
-scaling is Hyperliquid-only. Provide `CMC_API_KEY` for live values.
+index (0 to 100). The index is dynamically re-evaluated at runtime
+whenever the underlying asset price moves by a significant threshold
+(e.g., +/- 3.5%) from the baseline, ensuring both grid spacing and
+accumulation behavior adapt to changing market conditions.
+`accumulation_buffer` scaling is Hyperliquid-only. Provide `CMC_API_KEY`
+for live values; the index defaults to 50.0 when the key is missing or
+the API is unreachable.
 
 **Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge
 on perps. Spot buy fills open a perp short; spot sell fills close it.
@@ -172,6 +167,48 @@ Enable with `"hedge": true`. Kraken is not supported.
 
 ---
 
+## Dashboard
+
+The engine includes a standalone TUI dashboard binary
+(`bin/dashboard.exe`) that connects to the running engine over a
+Unix domain socket using a length-prefixed JSON protocol.
+
+```bash
+# Auto-discovers the engine socket by scanning /tmp/dio-*.sock
+./_build/default/bin/dashboard.exe
+
+# Connect to a specific engine socket
+./_build/default/bin/dashboard.exe --socket /tmp/dio-<pid>.sock
+```
+
+The dashboard operates out-of-process for crash isolation and
+automatically reconnects when the engine restarts (new PID). It runs in
+watch mode, where the engine pushes state snapshots every 500ms.
+
+### Panels
+
+| Panel | Description |
+|-------|-------------|
+| **Header** | Uptime, Fear & Greed index, per-exchange connectivity status |
+| **Memory & GC** | Heap size, live/free KB, major/minor collections, compactions, fragments |
+| **Holdings & Strategy** | Per-strategy and non-strategy balances, mid-price, accumulated holdings, pending buy/sell distances, unrealized sell value, aggregated portfolio summary |
+| **Latency Profiling** | Per-domain percentile profiling (p50, p90, p99, p999) in microseconds |
+| **Domains** | Running/stopped status, restart count, last restart age |
+
+### Wire Protocol
+
+The dashboard server runs as an Lwt fiber within the engine process,
+listening on `/tmp/dio-<pid>.sock` with file permissions restricted to
+the current user (0600). Communication uses a 4-byte big-endian
+length-prefixed JSON frame format.
+
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `Q` | Client to Server | Close the connection |
+
+Maximum concurrent clients: 5.
+
+---
 
 ## Benchmarks
 
@@ -180,7 +217,7 @@ resolution. p50/p90/p99 values in microseconds.
 
 ```
 ------------------------------------------------------------------------------
-Benchmark                                       N  p50 (µs)  p90 (µs)  p99 (µs) total (ms)
+Benchmark                                       N  p50 (us)  p90 (us)  p99 (us) total (ms)
 ------------------------------------------------------------------------------
 ringbuffer_write_read                       10000       1.00       1.00       1.00       0.70
 inflight_orders_ops                         10000       1.00       1.00       1.00       2.31
@@ -218,6 +255,7 @@ generate_duplicate_key                      10000       1.00       1.00       1.
                |  - Lock-free tick bus & event registry      |
                |  - Histogram latency profiling (us)         |
                |  - Structured logging (level + section)     |
+               |  - Dashboard UDS server (JSON over socket)  |
                +---------------------------------------------+
                         |                        |
                         v                        v
@@ -234,6 +272,40 @@ generate_duplicate_key                      10000       1.00       1.00       1.
 
 ---
 
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `KRAKEN_API_KEY` | Conditional | Kraken API key. Required when trading on Kraken. |
+| `KRAKEN_API_SECRET` | Conditional | Kraken API secret. Required when trading on Kraken. |
+| `HYPERLIQUID_WALLET_ADDRESS` | Conditional | Public wallet address. Required for Hyperliquid. |
+| `HYPERLIQUID_AGENT_ADDRESS` | Conditional | Agent address for L1 auth. Required for Hyperliquid. |
+| `HYPERLIQUID_PRIVATE_KEY` | Conditional | Private key for L1 signature generation. Required for Hyperliquid. |
+| `CMC_API_KEY` | Optional | CoinMarketCap API key for Fear & Greed index. Falls back to 50.0 when absent. |
+| `DIO_BACKTRACE` | Optional | Set to any value to enable exception backtraces. Disabled by default to avoid allocation overhead. |
+
+---
+
+## Logging
+
+The engine uses a structured, domain-safe logging system with five
+severity levels: `DEBUG`, `INFO`, `WARN`, `ERROR`, and `CRITICAL`.
+
+Key properties:
+
+- **Per-section filtering**: Log output can be restricted to specific
+  sections via the `logging_sections` config field (comma-separated).
+- **Domain safety**: All log output is serialized through a shared mutex
+  to prevent interleaved lines from concurrent OCaml 5 domains.
+- **Zero-allocation fast path**: Disabled log levels skip string
+  formatting entirely using `Printf.ifprintf`.
+- **ANSI color output**: Enabled by default for terminal output; each
+  severity level uses a distinct color.
+- **Timestamped**: All entries include millisecond-precision wall-clock
+  timestamps with per-second caching to reduce `localtime` calls.
+
+---
+
 ## Development
 
 ```bash
@@ -246,17 +318,6 @@ dune test
 # Format / Docs
 dune fmt
 dune build @doc
-```
-
-```bash
-# Build the project
-dune build
-
-# Run the core engine
-./_build/default/bin/main.exe
-
-# Run the dashboard monitor
-./_build/default/bin/dashboard.exe
 ```
 
 ### Hyperliquid State Persistence
@@ -291,13 +352,18 @@ container rebuilds:
 docker run -v /path/on/host/data:/app/data --env-file .env dio
 ```
 
+The Docker image uses `jemalloc` (`LD_PRELOAD=libjemalloc.so.2`) to
+prevent glibc arena fragmentation, with tuning for fast dirty/muzzy
+page decay and limited arenas (`narenas:2`) suited to OCaml 5
+multicore workloads.
+
 #### OS-Specific Notes
 
-**macOS / Linux** -- No additional setup needed. The `data/` directory
+**macOS / Linux**: No additional setup needed. The `data/` directory
 is created automatically on first write.
 
-**Windows (WSL2 -- recommended)** -- Run inside WSL2 (Ubuntu 22.04+).
-The Unix build toolchain and `Sys.rename` atomicity work as-is:
+**Windows (WSL2, recommended)**: Run inside WSL2 (Ubuntu 22.04+).
+The Unix build toolchain and `Sys.rename` atomicity work as expected:
 
 ```bash
 # Inside WSL2
@@ -309,12 +375,12 @@ dune build
 > [!TIP]
 > Store the project and `data/` directory **inside the WSL filesystem** (e.g. `~/dio-domains/`), not on a `/mnt/c/` Windows mount. NTFS mounts have poor `inotify` support and `Sys.rename` across filesystem boundaries can fail silently.
 
-**Windows (native -- advanced)** -- Requires MSVC or MinGW OCaml. Key
+**Windows (native, advanced)**: Requires MSVC or MinGW OCaml. Key
 differences:
 
 1. **Atomic rename**: `Sys.rename` on Windows fails if the target file is open by another process (e.g. antivirus scanner). Exclude `data/` from real-time scanning.
 2. **Path separators**: `Filename.concat` handles `\` vs `/` correctly.
-3. **Docker path**: `/app` detection does not trigger on native Windows -- state always writes to `./data/`.
+3. **Docker path**: `/app` detection does not trigger on native Windows; state always writes to `./data/`.
 4. **libsecp256k1**: Must be compiled manually. See the [secp256k1 build docs](https://github.com/bitcoin-core/secp256k1#building-on-windows).
 
 > [!WARNING]
@@ -322,9 +388,18 @@ differences:
 
 ---
 
-## Logging
+## Graceful Shutdown
 
-- Debug, Info, Warning, Error, timestamped by component.
+The engine handles `SIGINT` and `SIGTERM` for orderly shutdown. A
+second `SIGINT` forces immediate exit. The shutdown sequence:
+
+1. Close all open Hyperliquid hedge positions (if any).
+2. Tear down exchange feeds and strategy domains.
+3. Clean up the dashboard UDS socket.
+4. Force-exit after a 3-second timeout if teardown stalls.
+
+Fatal signals (`SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGFPE`) are caught to
+emit diagnostic snapshots (GC stats, domain status) before termination.
 
 ---
 
@@ -338,6 +413,8 @@ differences:
      - Concurrency & Bus:        src/engine/concurrency/
      - Latency Profiling:        src/engine/latency_profiling/
      - Connection supervision:   src/engine/supervisor/
+     - Dashboard (engine):       src/engine/dashboard/
+     - Dashboard (TUI):          bin/dashboard.ml
      - WebSocket feeds (Kraken): src/external/kraken/
      - WebSocket feeds (HL):     src/external/hyperliquid/
      - Exchange interface:       src/external/exchange_intf.ml
@@ -346,7 +423,9 @@ differences:
 5. Open PR
 ```
 
-Guidelines: add tests, update docs, keep CI green.
+Guidelines: add tests, update docs, keep CI green. See
+`src/external/README.md` for the exchange integration guide when adding
+new exchange backends.
 
 ---
 
