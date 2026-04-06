@@ -499,12 +499,15 @@ let cancel_orders
             Lwt.return result
   )
 
-(** Closes the underlying trading client connection.
-    TODO: Currently closes only the Kraken client. Multi-exchange teardown
-    requires iterating registered modules or delegating to [Exchange.Registry]. *)
+(** Closes all underlying trading client connections (Kraken and Hyperliquid).
+    Invoked during graceful shutdown to tear down WebSocket transports,
+    fail pending request waiters, and release subscriber streams. *)
 let close () : unit Lwt.t =
   Logging.info ~section "Closing order executor";
-  Kraken.Kraken_trading_client.close ()
+  Lwt.join [
+    Kraken.Kraken_trading_client.close ();
+    Hyperliquid.Ws.close ();
+  ]
 
 (** No-op initialization. Reserved for future setup (e.g., exchange
     pre-connection, cache warming). *)
