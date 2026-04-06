@@ -330,8 +330,8 @@ module Kraken_impl = struct
     List.map (fun (ob : Kraken_orderbook_feed.orderbook) ->
       let map_levels levels =
         Array.map (fun (l : Kraken_orderbook_feed.level) ->
-          (try float_of_string l.price with _ -> 0.0),
-          (try float_of_string l.size with _ -> 0.0)
+          l.price_float,
+          l.size_float
         ) levels
       in
       { Types.
@@ -345,8 +345,8 @@ module Kraken_impl = struct
     Kraken_orderbook_feed.iter_orderbook_events symbol start_pos (fun (ob : Kraken_orderbook_feed.orderbook) ->
       let map_levels levels =
         Array.map (fun (l : Kraken_orderbook_feed.level) ->
-          (try float_of_string l.price with _ -> 0.0),
-          (try float_of_string l.size with _ -> 0.0)
+          l.price_float,
+          l.size_float
         ) levels
       in
       f { Types. bids = map_levels ob.bids; asks = map_levels ob.asks; timestamp = ob.timestamp }
