@@ -93,7 +93,7 @@ let build_and_push_hedge testnet hedge_symbol hedge_side filled_qty fill_price p
       time_in_force = "GTC";
       post_only = false;
       userref = Some 3;
-      strategy = "Hedger";
+      strategy = Hedger;
       duplicate_key = generate_duplicate_key hedge_symbol (string_of_order_side hedge_side) hedge_qty_final limit_price ^ "_" ^ string_of_float (Unix.gettimeofday ());
     } in
     

@@ -2,7 +2,7 @@
 let create_test_order ?(operation=Dio_strategies.Strategy_common.Place)
     ?(order_id=None) ?(symbol="BTC/USD") ?(side=Dio_strategies.Strategy_common.Buy)
     ?(order_type="limit") ?(qty=0.001) ?(price=Some 50000.0)
-    ?(time_in_force="GTC") ?(post_only=true) ?(userref=Some 2) ?(strategy="MM") 
+    ?(time_in_force="GTC") ?(post_only=true) ?(userref=Some 2) ?(strategy=Dio_strategies.Strategy_common.MM) 
     ?duplicate_key () =
   let duplicate_key = match duplicate_key with
     | Some k -> k
@@ -54,7 +54,7 @@ let test_strategy_order_creation () =
   Alcotest.(check string) "time in force" "GTC" order.time_in_force;
   Alcotest.(check bool) "post only" true order.post_only;
   Alcotest.(check (option int)) "userref" (Some 12345) order.userref;
-  Alcotest.(check string) "strategy" "MM" order.strategy
+  Alcotest.(check bool) "strategy" true (order.strategy = Dio_strategies.Strategy_common.MM)
 
 let test_strategy_order_variants () =
   (* Test different strategy order variants *)

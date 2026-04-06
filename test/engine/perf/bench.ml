@@ -39,7 +39,7 @@ let bench_ringbuffer () =
   let n    = 10_000 in
   let buf  = SC.OrderRingBuffer.create 16 in
   let order =
-    SG.create_place_order "BTC/USD" SC.Buy 0.001 (Some 50000.0) true "Grid" "kraken"
+    SG.create_place_order "BTC/USD" SC.Buy 0.001 (Some 50000.0) true SC.Grid "kraken"
   in
   let p = LP.create ~max_latency_us:100_000 name in
   let total_ms = wall_ms (fun () ->
@@ -120,7 +120,7 @@ let bench_order_creation_place () =
   let total_ms = wall_ms (fun () ->
     run_bench p n (fun () ->
       let _ =
-        SG.create_place_order "BTC/USD" SC.Buy 0.001 (Some 50000.0) true "Grid" "kraken"
+        SG.create_place_order "BTC/USD" SC.Buy 0.001 (Some 50000.0) true SC.Grid "kraken"
       in ()
     )
   ) in
@@ -138,7 +138,7 @@ let bench_order_creation_amend () =
     run_bench p n (fun () ->
       let _ =
         SG.create_amend_order
-          "order-xyz" "BTC/USD" SC.Sell 0.001 (Some 51000.0) true "Grid" "kraken"
+          "order-xyz" "BTC/USD" SC.Sell 0.001 (Some 51000.0) true SC.Grid "kraken"
       in ()
     )
   ) in

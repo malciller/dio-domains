@@ -7,7 +7,7 @@ let test_initialization () =
 
 let test_order_creation_place () =
   (* Test creating place orders *)
-  let order = Dio_strategies.Suicide_grid.create_place_order "BTC/USD" Dio_strategies.Strategy_common.Buy 0.001 (Some 50000.0) true "Grid" "kraken" in
+  let order = Dio_strategies.Suicide_grid.create_place_order "BTC/USD" Dio_strategies.Strategy_common.Buy 0.001 (Some 50000.0) true Dio_strategies.Strategy_common.Grid "kraken" in
 
   check bool "place order operation" true (order.operation = Dio_strategies.Strategy_common.Place);
   check string "place order symbol" "BTC/USD" order.symbol;
@@ -15,11 +15,11 @@ let test_order_creation_place () =
   check (float 0.) "place order qty" 0.001 order.qty;
   check (option (float 0.)) "place order price" (Some 50000.0) order.price;
   check bool "place order post_only" true order.post_only;
-  check string "place order strategy" "Grid" order.strategy
+  check bool "place order strategy" true (order.strategy = Dio_strategies.Strategy_common.Grid)
 
 let test_order_creation_amend () =
   (* Test creating amend orders *)
-  let order = Dio_strategies.Suicide_grid.create_amend_order "order123" "BTC/USD" Dio_strategies.Strategy_common.Sell 0.001 (Some 51000.0) true "Grid" "kraken" in
+  let order = Dio_strategies.Suicide_grid.create_amend_order "order123" "BTC/USD" Dio_strategies.Strategy_common.Sell 0.001 (Some 51000.0) true Dio_strategies.Strategy_common.Grid "kraken" in
 
   check bool "amend order operation" true (order.operation = Dio_strategies.Strategy_common.Amend);
   check (option string) "amend order id" (Some "order123") order.order_id;
@@ -28,16 +28,16 @@ let test_order_creation_amend () =
   check (float 0.) "amend order qty" 0.001 order.qty;
   check (option (float 0.)) "amend order price" (Some 51000.0) order.price;
   check bool "amend order post_only" true order.post_only;
-  check string "amend order strategy" "Grid" order.strategy
+  check bool "amend order strategy" true (order.strategy = Dio_strategies.Strategy_common.Grid)
 
 let test_order_creation_cancel () =
   (* Test creating cancel orders *)
-  let order = Dio_strategies.Suicide_grid.create_cancel_order "order456" "BTC/USD" "Grid" "kraken" in
+  let order = Dio_strategies.Suicide_grid.create_cancel_order "order456" "BTC/USD" Dio_strategies.Strategy_common.Grid "kraken" in
 
   check bool "cancel order operation" true (order.operation = Dio_strategies.Strategy_common.Cancel);
   check (option string) "cancel order id" (Some "order456") order.order_id;
   check string "cancel order symbol" "BTC/USD" order.symbol;
-  check string "cancel order strategy" "Grid" order.strategy;
+  check bool "cancel order strategy" true (order.strategy = Dio_strategies.Strategy_common.Grid);
   check (option (float 0.)) "cancel order price" None order.price;
   check (float 0.) "cancel order qty" 0.0 order.qty
 
@@ -56,9 +56,9 @@ let test_legacy_order_creation () =
 let test_duplicate_key_per_side () =
   (* Ensure duplicate key is per asset+side, not price/qty *)
   let open Dio_strategies in
-  let buy1 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Buy 0.001 (Some 50000.0) true "Grid" "kraken" in
-  let buy2 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Buy 0.002 (Some 51000.0) true "Grid" "kraken" in
-  let sell1 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Sell 0.003 (Some 52000.0) true "Grid" "kraken" in
+  let buy1 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Buy 0.001 (Some 50000.0) true Strategy_common.Grid "kraken" in
+  let buy2 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Buy 0.002 (Some 51000.0) true Strategy_common.Grid "kraken" in
+  let sell1 = Suicide_grid.create_place_order "BTC/USD" Strategy_common.Sell 0.003 (Some 52000.0) true Strategy_common.Grid "kraken" in
 
   check string "same key for buy side" buy1.duplicate_key buy2.duplicate_key;
   check bool "different key for opposite side" true (buy1.duplicate_key <> sell1.duplicate_key)
