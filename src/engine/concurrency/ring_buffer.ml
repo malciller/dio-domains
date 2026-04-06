@@ -51,6 +51,24 @@ module RingBuffer = struct
       in
       collect [] last_pos
 
+  (** Zero-allocation iteration from last known position.
+      Calls [f] on each event in order without building an intermediate list.
+      Returns the new read position so the caller can update its tracking. *)
+  let[@inline] iter_since buffer last_pos f =
+    let current_pos = Atomic.get buffer.write_pos in
+    if last_pos = current_pos then
+      current_pos
+    else begin
+      let pos = ref last_pos in
+      while !pos <> current_pos do
+        (match Atomic.get buffer.data.(!pos) with
+         | Some event -> f event
+         | None -> ());
+        pos := (!pos + 1) mod buffer.size
+      done;
+      current_pos
+    end
+
   (** Read all events currently in the buffer *)
   let read_all buffer =
     let rec collect_all acc i =

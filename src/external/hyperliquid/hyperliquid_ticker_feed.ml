@@ -70,6 +70,12 @@ let[@inline always] read_ticker_events symbol last_pos =
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 
+(** Zero-allocation iteration over ticker events since last position *)
+let[@inline always] iter_ticker_events symbol last_pos f =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> RingBuffer.iter_since store.buffer last_pos f
+  | None -> last_pos
+
 (** Get current write position *)
 let[@inline always] get_current_position symbol =
   match Hashtbl.find_opt stores symbol with

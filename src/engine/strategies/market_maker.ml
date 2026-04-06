@@ -251,7 +251,7 @@ let create_cancel_order order_id asset_symbol strategy exchange =
   }
 
 (** Push order to ringbuffer. Returns true if successfully pushed, false if duplicate or full. *)
-let push_order order =
+let push_order ?(now = Unix.time ()) order =
   let operation_str = match order.operation with
     | Place -> "place"
     | Amend -> "amend"
@@ -285,7 +285,7 @@ let push_order order =
 
 
                    (* Add to pending cancellations tracking *)
-                   Hashtbl.add state.pending_cancellations target_order_id (Unix.time ());
+                   Hashtbl.add state.pending_cancellations target_order_id now;
                    Logging.debug_f ~section "Cancelling order for %s (target: %s)"
                      order.symbol target_order_id;
                   true
@@ -347,7 +347,7 @@ let push_order order =
                     (string_of_order_side order.side)
                     (Option.value order.price ~default:0.0) in
                   let order_price = Option.value order.price ~default:0.0 in
-                  let timestamp = Unix.time () in
+                  let timestamp = now in
                   state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
                   Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
                     (string_of_order_side order.side) temp_order_id order_price order.symbol;
@@ -365,7 +365,7 @@ let push_order order =
                 let temp_order_id = Printf.sprintf "pending_amend_%s"
                   (Option.value order.order_id ~default:"unknown") in
                 let order_price = Option.value order.price ~default:0.0 in
-                let timestamp = Unix.time () in
+                let timestamp = now in
                 state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
                 Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
                   (string_of_order_side order.side) temp_order_id order_price order.symbol
@@ -406,6 +406,7 @@ let cancel_duplicate_orders asset_symbol target_price target_side open_orders st
 
 (** Main strategy execution function *)
 let execute_strategy
+    ?cached_state
     (asset : trading_config)
     (current_price : float option)
     (top_of_book : (float * float * float * float) option)
@@ -419,7 +420,7 @@ let execute_strategy
   (* Only log every x iterations to reduce log volume *)
   let should_log = cycle mod log_interval = 0 in
 
-  let state = get_strategy_state asset.symbol in
+  let state = match cached_state with Some s -> s | None -> get_strategy_state asset.symbol in
 
   (* --- Asset-low check: clear flag when asset balance recovers --- *)
   (* For Kraken: only clear when balance has genuinely increased (fill, deposit).
@@ -713,7 +714,7 @@ let execute_strategy
           
           List.iter (fun buy_id ->
              let cancel_order = create_cancel_order buy_id asset.symbol MM asset.exchange in
-             ignore (push_order cancel_order);
+             ignore (push_order ~now cancel_order);
              if should_log then Logging.debug_f ~section "Cancelling buy order due to pause: %s for %s" buy_id asset.symbol
           ) buys_to_cancel;
 
@@ -738,7 +739,7 @@ let execute_strategy
                 if meets_min_qty asset.symbol rounded_qty asset.exchange then begin
                    let sell_price = round_price ask asset.symbol asset.exchange in
                    let sell_order = create_place_order asset.symbol Sell rounded_qty (Some sell_price) true MM asset.exchange in
-                   ignore (push_order sell_order);
+                   ignore (push_order ~now sell_order);
                    if should_log then Logging.info_f ~section "Placed emergency sell order for free balance: %.8f @ %.2f for %s" rounded_qty sell_price asset.symbol
                 end
             | _ -> ()
@@ -810,7 +811,7 @@ let execute_strategy
             
             List.iter (fun (buy_id, _) ->
               let cancel_order = create_cancel_order buy_id asset.symbol MM asset.exchange in
-              ignore (push_order cancel_order)
+              ignore (push_order ~now cancel_order)
             ) !buy_orders;
             
             state.last_buy_order_price <- None;
@@ -858,7 +859,7 @@ let execute_strategy
                   (* Place SELL ORDER first*)
                   if can_place_sell then begin
                     let sell_order = create_place_order asset.symbol Sell qty (Some sell_price) true MM asset.exchange in
-                    ignore (push_order sell_order);
+                    ignore (push_order ~now sell_order);
                     if should_log then Logging.info_f ~section "Placed sell order for %s: %.8f @ %.2f"
                       asset.symbol qty sell_price;
                   end;
@@ -867,7 +868,7 @@ let execute_strategy
                   if can_place_buy then begin
                     let _ = cancel_duplicate_orders asset.symbol buy_price Buy open_orders MM asset.exchange in
                     let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true MM asset.exchange in
-                    if push_order buy_order then begin
+                    if push_order ~now buy_order then begin
                       state.last_buy_order_price <- Some buy_price;
                       if should_log then Logging.info_f ~section "Placed buy order for %s: %.8f @ %.2f (fee=%.6f)"
                         asset.symbol qty buy_price fee;
@@ -937,14 +938,14 @@ let execute_strategy
                   if profitability_ok && required_buy_price <= (bid +. 0.0000001) && amendment_balance_ok then begin
                     let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy open_orders MM asset.exchange in
                     let amend_order = create_amend_order buy_order_id asset.symbol Buy qty (Some required_buy_price) true MM asset.exchange in
-                    ignore (push_order amend_order);
+                    ignore (push_order ~now amend_order);
                     state.last_buy_order_price <- Some required_buy_price;
 
                     if should_log then Logging.info_f ~section "Amended buy order for %s: %.8f -> %.8f (reason=book shift)"
                       asset.symbol current_buy_price required_buy_price;
                   end else begin
                     let cancel_order = create_cancel_order buy_order_id asset.symbol MM asset.exchange in
-                    ignore (push_order cancel_order)
+                    ignore (push_order ~now cancel_order)
                   end
                 end else begin
                   (* Matched: No action needed *)

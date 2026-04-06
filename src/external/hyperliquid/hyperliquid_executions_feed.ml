@@ -349,6 +349,11 @@ let[@inline always] read_execution_events symbol last_pos =
   let store = get_symbol_store symbol in
   RingBuffer.read_since store.events_buffer last_pos
 
+(** Zero-allocation iteration over execution events since last position *)
+let[@inline always] iter_execution_events symbol last_pos f =
+  let store = get_symbol_store symbol in
+  RingBuffer.iter_since store.events_buffer last_pos f
+
 let[@inline always] has_execution_data symbol =
   let store = get_symbol_store symbol in
   Atomic.get store.ready
