@@ -63,7 +63,7 @@ let cache = {
 }
 
 let initialized = ref false
-let polling_loop_started = Atomic.make false
+
 
 (** Create connection snapshots by safely reading from supervisor *)
 let create_connection_snapshots () : connection_snapshot list =

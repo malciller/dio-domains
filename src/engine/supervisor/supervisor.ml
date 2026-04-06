@@ -21,7 +21,7 @@ let shutdown_cond = Condition.create ()
 (** Timestamp of the last Supervisor_cache.force_update() call.
     Used to rate-limit cache refreshes so that rapid reconnect bursts
     do not trigger dozens of snapshot allocations per second. *)
-let last_supervisor_cache_update : float Atomic.t = Atomic.make 0.0
+let last_supervisor_cache_update = ref 0.0
 
 (** Sleep for a specified duration, but wake up immediately if shutdown is requested *)
 let interruptible_sleep seconds =
@@ -164,9 +164,9 @@ let set_state conn new_state =
        The dashboard state_broadcaster picks up any interim delta at its next
        500ms tick regardless. *)
     let now = Unix.gettimeofday () in
-    let last = Atomic.get last_supervisor_cache_update in
+    let last = !last_supervisor_cache_update in
     if now -. last >= 1.0 then begin
-      Atomic.set last_supervisor_cache_update now;
+      last_supervisor_cache_update := now;
       Supervisor_cache.force_update ()
     end
   end
@@ -202,22 +202,25 @@ let update_data_heartbeat conn =
 
 
 
+(** Check if circuit breaker allows connection attempt (assumes lock is held) *)
+let circuit_breaker_allows_connection_unlocked conn =
+  let current_time = Unix.time () in
+  match conn.circuit_breaker with
+  | Closed -> true
+  | Open ->
+      begin match conn.circuit_breaker_last_failure with
+      | Some failure_time when current_time -. failure_time > 300.0 ->  (* 5 minutes timeout *)
+          conn.circuit_breaker <- HalfOpen;
+          Logging.info_f ~section "[%s] Circuit breaker HALF-OPEN (testing recovery)" conn.name;
+          true
+      | _ -> false
+      end
+  | HalfOpen -> true  (* Allow one attempt in half-open state *)
+
 (** Check if circuit breaker allows connection attempt *)
 let circuit_breaker_allows_connection conn =
   Mutex.lock conn.mutex;
-  let current_time = Unix.time () in
-  let allowed = match conn.circuit_breaker with
-    | Closed -> true
-    | Open ->
-        begin match conn.circuit_breaker_last_failure with
-        | Some failure_time when current_time -. failure_time > 300.0 ->  (* 5 minutes timeout *)
-            conn.circuit_breaker <- HalfOpen;
-            Logging.info_f ~section "[%s] Circuit breaker HALF-OPEN (testing recovery)" conn.name;
-            true
-        | _ -> false
-        end
-    | HalfOpen -> true  (* Allow one attempt in half-open state *)
-  in
+  let allowed = circuit_breaker_allows_connection_unlocked conn in
   Mutex.unlock conn.mutex;
   allowed
 
@@ -247,48 +250,67 @@ let start_async conn =
   | None ->
       Logging.warn_f ~section "[%s] Cannot start connection - no connect function provided (monitoring only)" conn.name
   | Some connect_fn ->
-      (* Check if connection is already attempting to connect *)
       Mutex.lock conn.mutex;
-      let current_state = conn.state in
-      Mutex.unlock conn.mutex;
+      let should_start = match conn.state with
+        | Connecting -> 
+            Mutex.unlock conn.mutex;
+            Logging.debug_f ~section "[%s] Connection already connecting, skipping duplicate start" conn.name;
+            false
+        | old_state ->
+            if not (circuit_breaker_allows_connection_unlocked conn) then begin
+              conn.state <- Failed "Circuit breaker open";
+              conn.last_disconnected <- Some (Unix.time ());
+              conn.last_connecting <- None;
+              conn.reconnect_attempts <- conn.reconnect_attempts + 1;
+              let attempt_num = conn.reconnect_attempts in
+              Mutex.unlock conn.mutex;
+              
+              Logging.warn_f ~section "[%s] Circuit breaker blocks connection attempt" conn.name;
+              Logging.error_f ~section "[%s] Connection failed: Circuit breaker open (attempt #%d)" conn.name attempt_num;
+              Logging.debug_f ~section "[%s] State transition: %s -> Failed" 
+                conn.name (match old_state with Disconnected -> "Disconnected" | Connected -> "Connected" | Failed _ -> "Failed" | Connecting -> "Connecting");
+              false
+            end else begin
+              conn.state <- Connecting;
+              conn.last_connecting <- Some (Unix.time ());
+              conn.reconnect_attempts <- conn.reconnect_attempts + 1;
+              let attempt_num = conn.reconnect_attempts in
+              Mutex.unlock conn.mutex;
+              
+              Logging.info_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num;
+              Logging.debug_f ~section "[%s] State transition: %s -> Connecting" 
+                conn.name (match old_state with Disconnected -> "Disconnected" | Connected -> "Connected" | Failed _ -> "Failed" | Connecting -> "Connecting");
+              
+              let now = Unix.gettimeofday () in
+              let last = !last_supervisor_cache_update in
+              if now -. last >= 1.0 then begin
+                last_supervisor_cache_update := now;
+                Supervisor_cache.force_update ()
+              end;
+              Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num;
+              true
+            end
+      in
 
-      if current_state = Connecting then begin
-        Logging.debug_f ~section "[%s] Connection already connecting, skipping duplicate start" conn.name;
-      end else begin
-        (* Check circuit breaker before attempting connection *)
-        if not (circuit_breaker_allows_connection conn) then begin
-          Logging.warn_f ~section "[%s] Circuit breaker blocks connection attempt" conn.name;
-          set_state conn (Failed "Circuit breaker open");
-        end else begin
-          (* Set to Connecting immediately to prevent duplicate restarts *)
-          set_state conn Connecting;
-          Mutex.lock conn.mutex;
-          conn.reconnect_attempts <- conn.reconnect_attempts + 1;
-          let attempt_num = conn.reconnect_attempts in
-          Mutex.unlock conn.mutex;
-
-          Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)"
-            conn.name attempt_num;
-
-          let open Lwt.Infix in
-          Lwt.async (fun () ->
-            (* The connection function now handles its own state management *)
-            (* Just start the connection and let it manage success/failure *)
-            Lwt.catch (fun () ->
-              connect_fn () >>= fun () ->
-              (* Connection function completed - this shouldn't happen for WebSocket connections *)
-              Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
-              set_state conn (Failed "connection completed unexpectedly");
-              Lwt.return_unit
-            ) (fun exn ->
-              let error_msg = Printexc.to_string exn in
-              Logging.error_f ~section "[%s] Unexpected error in connection function: %s" conn.name error_msg;
-              (* Ensure state is set to Failed on any exception during connection setup *)
-              set_state conn (Failed error_msg);
-              Lwt.return_unit
-            )
+      if should_start then begin
+        let open Lwt.Infix in
+        Lwt.async (fun () ->
+          (* The connection function now handles its own state management *)
+          (* Just start the connection and let it manage success/failure *)
+          Lwt.catch (fun () ->
+            connect_fn () >>= fun () ->
+            (* Connection function completed - this shouldn't happen for WebSocket connections *)
+            Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
+            set_state conn (Failed "connection completed unexpectedly");
+            Lwt.return_unit
+          ) (fun exn ->
+            let error_msg = Printexc.to_string exn in
+            Logging.error_f ~section "[%s] Unexpected error in connection function: %s" conn.name error_msg;
+            (* Ensure state is set to Failed on any exception during connection setup *)
+            set_state conn (Failed error_msg);
+            Lwt.return_unit
           )
-        end
+        )
       end
 
 (** Restart a connection *)
@@ -912,7 +934,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 let order_processing_loop () =
   let section = "order_processor" in
   let cycle_count = ref 0 in
-  let orders_placed = ref 0 in
+  let orders_placed = Atomic.make 0 in
   let order_mutex = Mutex.create () in
 
   let rec loop () =
@@ -992,7 +1014,7 @@ let order_processing_loop () =
                           Lwt.catch (fun () ->
                             Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                             | Ok result ->
-                                orders_placed := !orders_placed + 1;
+                                Atomic.incr orders_placed;
                                 Logging.info_f ~section "✓ Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
                                   (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                   (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
@@ -1069,7 +1091,7 @@ let order_processing_loop () =
                                          );
                                          Lwt.return_unit
                                      end else begin
-                                         orders_placed := !orders_placed + 1;
+                                         Atomic.incr orders_placed;
                                          Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order ID: %s"
                                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                            (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
@@ -1135,7 +1157,7 @@ let order_processing_loop () =
                                 Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                                 | Ok results ->
                                     let count = List.length results in
-                                    orders_placed := !orders_placed + count;
+                                    Atomic.set orders_placed (Atomic.get orders_placed + count);
                                     Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
                                     (match order.strategy with
                                      | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
@@ -1216,7 +1238,7 @@ let order_processing_loop () =
                        Lwt.catch (fun () ->
                          Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                          | Ok result ->
-                             orders_placed := !orders_placed + 1;
+                             Atomic.incr orders_placed;
                              Logging.info_f ~section " Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
@@ -1291,7 +1313,7 @@ let order_processing_loop () =
                                         );
                                         Lwt.return_unit
                                     end else begin
-                                        orders_placed := !orders_placed + 1;
+                                        Atomic.incr orders_placed;
                                         Logging.info_f ~section "✓ Order amended successfully: %s %s %.8f @ %s (Amend ID: %s) New Order: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") (match result.amend_id with Some id -> id | None -> "none") result.new_order_id;
                                         (match order.price with
                                          | Some price ->
@@ -1346,7 +1368,7 @@ let order_processing_loop () =
                                 Dio_engine.Order_executor.cancel_orders ~token:auth_token request >>= function
                                 | Ok results ->
                                     let count = List.length results in
-                                    orders_placed := !orders_placed + count;
+                                    Atomic.set orders_placed (Atomic.get orders_placed + count);
                                     Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
                                     (match order.strategy with
                                      | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
@@ -1422,7 +1444,7 @@ let order_processing_loop () =
                          Lwt.catch (fun () ->
                            Dio_engine.Order_executor.place_order ~token:auth_token ~check_duplicate:false order_request >>= function
                            | Ok result ->
-                               orders_placed := !orders_placed + 1;
+                               Atomic.incr orders_placed;
                                Logging.info_f ~section "✓ Hedger order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
                                  (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                  (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
@@ -1456,7 +1478,7 @@ let order_processing_loop () =
 
             if !cycle_count mod 100 = 0 then
               Logging.debug_f ~section "Order processing: %d orders placed, %d grid + %d mm + %d hedge pending in current batch"
-                !orders_placed (List.length pending_grid_orders) (List.length pending_mm_orders) (List.length pending_hedge_orders);
+                (Atomic.get orders_placed) (List.length pending_grid_orders) (List.length pending_mm_orders) (List.length pending_hedge_orders);
 
             (* Small pause to allow other tasks to run before checking again *)
             Lwt.pause () >>= loop
@@ -1556,12 +1578,16 @@ let start_order_executor () : unit Lwt.t =
 
   Dio_engine.Order_executor.init
 
-(** Get connection by name *)
-let get_connection name =
+(** Get connection by name (optional) *)
+let get_connection_opt name =
   Mutex.lock registry_mutex;
   let conn = Hashtbl.find_opt connections name in
   Mutex.unlock registry_mutex;
-  match conn with
+  conn
+
+(** Get connection by name (raises if not found) *)
+let get_connection name =
+  match get_connection_opt name with
   | Some c -> c
   | None -> failwith (Printf.sprintf "Connection '%s' not found" name)
 
