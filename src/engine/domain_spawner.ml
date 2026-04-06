@@ -621,6 +621,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let stop_strat = Mtime_clock.now_ns () in
           Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat))
         end;
+
+        (* Record cycle work time BEFORE telemetry logging and boundary blocking — we want to measure
+           active polling/strategy processing, not the cost of OS console flushes. *)
+        let cycle_stop = Mtime_clock.now_ns () in
+        let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
+        Latency_profiler.record prof_cycle cycle_span;
         
         (* Log cycle stats *)
         (* Log cycle stats every 1M cycles *)
@@ -633,19 +639,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
           | _ -> ());
         end;
-        
-        (* Record cycle work time BEFORE blocking — we want to measure outliers
-           in active processing, not how long we slept waiting for the next frame. *)
-        let cycle_stop = Mtime_clock.now_ns () in
-        let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
-        Latency_profiler.record prof_cycle cycle_span;
 
         (* Report latencies *)
         Latency_profiler.report ~sample_threshold:100 prof_ticker;
         Latency_profiler.report ~sample_threshold:100 prof_ob;
         Latency_profiler.report ~sample_threshold:1 prof_exec;
-        Latency_profiler.report ~sample_threshold:1000 prof_strategy;
-        Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
+        Latency_profiler.report ~sample_threshold:100 prof_strategy;
+        Latency_profiler.report ~sample_threshold:10000 prof_cycle;
 
         (* Yield to allow other threads (websockets) to run *)
         (* Event-driven: block until the next WS frame signals new data. *)
