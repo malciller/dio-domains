@@ -19,9 +19,10 @@ type supervised_connection = {
   mutable state: connection_state;
   mutable last_connected: float option;
   mutable last_disconnected: float option;
+  mutable last_connecting: float option;  (* Timestamp when entered Connecting state *)
   mutable last_data_received: float option;  (* For heartbeat monitoring *)
   mutable last_ping_sent: float option;  (* For ping/pong monitoring *)
-  mutable ping_failures: int;  (* Consecutive ping failures *)
+  ping_failures: int Atomic.t;  (* Consecutive ping failures *)
   mutable reconnect_attempts: int;
   mutable total_connections: int;
   mutable circuit_breaker: circuit_breaker_state;
