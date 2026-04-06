@@ -154,97 +154,114 @@ let strategy_states_mutex = Mutex.create ()
 
 (** Retrieves or lazily initializes the strategy state for [asset_symbol].
     On first access, loads persisted state (reserved_base, accumulated_profit,
-    last_fill_oid, fill prices) from Hyperliquid.State_persistence. *)
+    last_fill_oid, fill prices) from Hyperliquid.State_persistence.
+    Double-checked lock: fast path is lock-free when the state already exists. *)
 let get_strategy_state asset_symbol =
-  Mutex.lock strategy_states_mutex;
-  let state =
-    match Hashtbl.find_opt strategy_states asset_symbol with
-    | Some state -> state
-    | None ->
-        (* Load persisted state for this symbol (survives container restarts). *)
-        let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
-        let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
-        let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
-        let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
-        let persisted_last_sell_fill_price = Hyperliquid.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
-        let new_state = {
-          last_buy_order_price = None;
-          last_buy_order_id = None;
-          open_sell_orders = [];
-          recently_injected_sells = [];
-          pending_orders = [];
-          last_cycle = 0;
-          last_order_time = 0.0;
-          inflight_cancel_buy = false;
-          inflight_amend_buy = false;
-          amend_cooldowns = Hashtbl.create 16;
-          last_cleanup_time = 0.0;
-          inflight_buy = false;
-          inflight_sell = false;
-          asset_low = false;
-          capital_low = false;
-          capital_low_logged = false;
-          capital_low_at_balance = 0.0;
-          reserved_quote = 0.0;
-          accumulated_profit = persisted_accumulated_profit;
-          reserved_base = persisted_reserved_base;
-          last_buy_fill_price = persisted_last_buy_fill_price;
-          last_sell_fill_price = persisted_last_sell_fill_price;
-          grid_qty = 0.0;
-          maker_fee = 0.0;
-          exchange_id = "";
-          startup_replay = true;  (* gates profit calc until set_startup_replay_done *)
-          last_fill_oid = persisted_last_fill_oid;
-          highest_startup_oid = None;
-          anticipated_base_credit = 0.0;
-          last_seen_asset_balance = 0.0;
-          mutex = Mutex.create ();
-        } in
-        Hashtbl.replace strategy_states asset_symbol new_state;
-        new_state
-  in
-  Mutex.unlock strategy_states_mutex;
-  state
+  match Hashtbl.find_opt strategy_states asset_symbol with
+  | Some state -> state
+  | None ->
+      Mutex.lock strategy_states_mutex;
+      let state =
+        match Hashtbl.find_opt strategy_states asset_symbol with
+        | Some state -> state
+        | None ->
+            (* Load persisted state for this symbol (survives container restarts). *)
+            let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
+            let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
+            let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
+            let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
+            let persisted_last_sell_fill_price = Hyperliquid.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
+            let new_state = {
+              last_buy_order_price = None;
+              last_buy_order_id = None;
+              open_sell_orders = [];
+              recently_injected_sells = [];
+              pending_orders = [];
+              last_cycle = 0;
+              last_order_time = 0.0;
+              inflight_cancel_buy = false;
+              inflight_amend_buy = false;
+              amend_cooldowns = Hashtbl.create 16;
+              last_cleanup_time = 0.0;
+              inflight_buy = false;
+              inflight_sell = false;
+              asset_low = false;
+              capital_low = false;
+              capital_low_logged = false;
+              capital_low_at_balance = 0.0;
+              reserved_quote = 0.0;
+              accumulated_profit = persisted_accumulated_profit;
+              reserved_base = persisted_reserved_base;
+              last_buy_fill_price = persisted_last_buy_fill_price;
+              last_sell_fill_price = persisted_last_sell_fill_price;
+              grid_qty = 0.0;
+              maker_fee = 0.0;
+              exchange_id = "";
+              startup_replay = true;  (* gates profit calc until set_startup_replay_done *)
+              last_fill_oid = persisted_last_fill_oid;
+              highest_startup_oid = None;
+              anticipated_base_credit = 0.0;
+              last_seen_asset_balance = 0.0;
+              mutex = Mutex.create ();
+            } in
+            Hashtbl.replace strategy_states asset_symbol new_state;
+            new_state
+      in
+      Mutex.unlock strategy_states_mutex;
+      state
 
-(** Mutex protecting all reserved_quote reads and writes across domains.
-    Lock order: state.mutex -> reservation_mutex -> strategy_states_mutex.
-    reservation_mutex is never held while waiting for state.mutex. *)
+(** Per-exchange running totals for reserved_quote.
+    Maintained incrementally via set_asset_reserved_quote so the read path
+    is O(1) instead of O(n_symbols). Protected by reservation_mutex. *)
 let reservation_mutex = Mutex.create ()
+let exchange_reserved_totals : (string, float) Hashtbl.t = Hashtbl.create 4
 
-(** Sums reserved_quote for states matching [exchange]. Caller must hold reservation_mutex. *)
-let get_total_reserved_quote_locked ~exchange =
-  Mutex.lock strategy_states_mutex;
-  let total = Hashtbl.fold (fun _key state acc ->
-    if state.exchange_id = exchange then acc +. state.reserved_quote
-    else acc
-  ) strategy_states 0.0 in
-  Mutex.unlock strategy_states_mutex;
-  total
-
-(** Acquires reservation_mutex and returns total reserved_quote for [exchange].
-    Safe to call outside state.mutex. *)
+(** Returns the total reserved_quote for [exchange]. O(1) lookup. *)
 let get_total_reserved_quote ~exchange =
   Mutex.lock reservation_mutex;
-  let total = get_total_reserved_quote_locked ~exchange in
+  let total = match Hashtbl.find_opt exchange_reserved_totals exchange with
+    | Some v -> v
+    | None -> 0.0
+  in
   Mutex.unlock reservation_mutex;
   total
 
-(** Sets this asset's reserved_quote under reservation_mutex.
-    May be called from inside state.mutex (respects lock order). *)
+(** Sets this asset's reserved_quote and updates the per-exchange running total.
+    Computes delta from old value to avoid drift. *)
 let set_asset_reserved_quote state v =
   Mutex.lock reservation_mutex;
+  let old = state.reserved_quote in
   state.reserved_quote <- v;
+  if state.exchange_id <> "" then begin
+    let cur = match Hashtbl.find_opt exchange_reserved_totals state.exchange_id with
+      | Some t -> t
+      | None -> 0.0
+    in
+    Hashtbl.replace exchange_reserved_totals state.exchange_id (cur -. old +. v)
+  end;
   Mutex.unlock reservation_mutex
 
 (** Atomically checks available quote balance and reserves for a buy if sufficient.
     Returns (balance_ok, available_quote, total_reserved).
-    Must be called from inside state.mutex. On success, sets state.reserved_quote. *)
+    Must be called from inside state.mutex. On success, sets state.reserved_quote
+    and updates the per-exchange running total. *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
   Mutex.lock reservation_mutex;
-  let total_reserved = get_total_reserved_quote_locked ~exchange:state.exchange_id in
+  let total_reserved = match Hashtbl.find_opt exchange_reserved_totals state.exchange_id with
+    | Some v -> v
+    | None -> 0.0
+  in
   let available = quote_bal -. total_reserved in
   let ok = available >= quote_needed in
-  if ok then state.reserved_quote <- reserve_amount;
+  if ok then begin
+    let old = state.reserved_quote in
+    state.reserved_quote <- reserve_amount;
+    let cur = match Hashtbl.find_opt exchange_reserved_totals state.exchange_id with
+      | Some t -> t
+      | None -> 0.0
+    in
+    Hashtbl.replace exchange_reserved_totals state.exchange_id (cur -. old +. reserve_amount)
+  end;
   Mutex.unlock reservation_mutex;
   (ok, available, total_reserved)
 

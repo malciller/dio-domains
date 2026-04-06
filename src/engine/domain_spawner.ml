@@ -49,7 +49,7 @@ let get_domain_profilers symbol =
           prof_ticker   = Latency_profiler.create (symbol ^ ":ticker");
           prof_ob       = Latency_profiler.create (symbol ^ ":ob");
           prof_exec     = Latency_profiler.create (symbol ^ ":exec");
-          prof_strategy = Latency_profiler.create (symbol ^ ":strategy");
+          prof_strategy = Latency_profiler.create ~bucket_us:10 ~max_latency_us:100_000 (symbol ^ ":strategy");
           prof_cycle    = Latency_profiler.create ~bucket_us:10 ~max_latency_us:1_000_000 (symbol ^ ":cycle");
         } in
         Hashtbl.replace domain_profiler_cache symbol p;
