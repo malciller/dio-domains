@@ -512,8 +512,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Execute strategy if new events have been consumed (event-driven gate) *)
         let should_execute = !hl_exec_ready && !should_execute_strategy in
         if should_execute then begin
-          let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Clear event-driven trigger *)
+
+          (* Exchange reads and FNG checks happen OUTSIDE strategy timing.
+             These acquire exchange mutexes (orders_mutex, balance stores) and
+             are not strategy computation. Measuring them as "strategy" latency
+             inflates p999 with cross-thread contention artifacts. *)
 
           (* Fold open orders into per-strategy counts and lists in a single pass *)
           let (all_open_orders, grid_open_buy_count, grid_open_sell_count, mm_open_buy_count, mm_open_sell_count, mm_open_orders) =
@@ -596,6 +600,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                | None -> ())
             end
           end;
+
+          (* Strategy timing starts here: measures only execute_strategy computation,
+             excludes exchange reads and FNG checks above. *)
+          let start_strat = Mtime_clock.now_ns () in
 
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->

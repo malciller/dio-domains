@@ -966,7 +966,7 @@ let execute_strategy
                    state.accumulated_profit <- state.accumulated_profit -. required_profit;
                    let base_increment = qty -. rounded_sell in
                    state.reserved_base <- state.reserved_base +. base_increment;
-                   Hyperliquid.State_persistence.save ~symbol:asset.symbol
+                   Hyperliquid.State_persistence.save_async ~symbol:asset.symbol
                      ~reserved_base:state.reserved_base
                      ~accumulated_profit:state.accumulated_profit ();
                    Logging.info_f ~section
@@ -1397,7 +1397,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
          Without this, sell fills after restart have no buy_price reference
          and silently skip profit calculation. *)
       if state.exchange_id = "hyperliquid" then
-        Hyperliquid.State_persistence.save ~symbol:asset_symbol
+        Hyperliquid.State_persistence.save_async ~symbol:asset_symbol
           ~reserved_base:state.reserved_base
           ~accumulated_profit:state.accumulated_profit
           ~last_buy_fill_price:fill_price
@@ -1482,7 +1482,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
                    Also persist last_buy_fill_price so the next
                    sell after restart still has a buy reference. *)
                 if state.exchange_id = "hyperliquid" then
-                  Hyperliquid.State_persistence.save ~symbol:asset_symbol
+                  Hyperliquid.State_persistence.save_async ~symbol:asset_symbol
                     ~reserved_base:state.reserved_base
                     ~accumulated_profit:state.accumulated_profit
                     ~last_fill_oid:(Option.get state.last_fill_oid)

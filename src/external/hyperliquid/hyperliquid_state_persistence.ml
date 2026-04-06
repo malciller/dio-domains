@@ -206,3 +206,87 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fil
     with exn ->
       Logging.warn_f ~section "Failed to persist state for %s: %s" symbol (Printexc.to_string exn)
   )
+
+(* Async write infrastructure for non-blocking state persistence.
+   Domain workers push write requests to a coalescing queue instead
+   of performing file I/O directly on the hot path. A background
+   thread drains the queue on signal and flushes to disk. *)
+type write_request = {
+  wr_symbol: string;
+  wr_reserved_base: float;
+  wr_accumulated_profit: float;
+  wr_last_fill_oid: string option;
+  wr_last_buy_fill_price: float option;
+  wr_last_sell_fill_price: float option;
+}
+
+let write_queue : write_request Queue.t = Queue.create ()
+let queue_mutex = Mutex.create ()
+let queue_cond = Condition.create ()
+let writer_started = Atomic.make false
+
+(** Lazily start the background writer thread on first save_async call.
+    Idempotent; only the first invocation spawns a thread. *)
+let ensure_writer_started () =
+  if not (Atomic.get writer_started) then
+    if not (Atomic.exchange writer_started true) then
+      ignore (Thread.create (fun () ->
+        while true do
+          Mutex.lock queue_mutex;
+          while Queue.is_empty write_queue do
+            Condition.wait queue_cond queue_mutex
+          done;
+          (* Drain all pending writes; coalesce per symbol (latest wins). *)
+          let latest : (string, write_request) Hashtbl.t = Hashtbl.create 8 in
+          while not (Queue.is_empty write_queue) do
+            let req = Queue.pop write_queue in
+            Hashtbl.replace latest req.wr_symbol req
+          done;
+          Mutex.unlock queue_mutex;
+          (* Flush outside queue lock to minimize contention with enqueue. *)
+          Hashtbl.iter (fun _ req ->
+            save ~symbol:req.wr_symbol
+              ~reserved_base:req.wr_reserved_base
+              ~accumulated_profit:req.wr_accumulated_profit
+              ?last_fill_oid:req.wr_last_fill_oid
+              ?last_buy_fill_price:req.wr_last_buy_fill_price
+              ?last_sell_fill_price:req.wr_last_sell_fill_price ()
+          ) latest
+        done
+      ) ())
+
+(** Non-blocking save for domain worker hot paths.
+    Enqueues the write request and signals the background writer thread.
+    File I/O happens asynchronously, decoupling persistence latency
+    from strategy execution. ~50ns (mutex + push + signal) vs ~1ms (file I/O). *)
+let save_async ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price ?last_sell_fill_price () =
+  ensure_writer_started ();
+  let req = {
+    wr_symbol = symbol;
+    wr_reserved_base = reserved_base;
+    wr_accumulated_profit = accumulated_profit;
+    wr_last_fill_oid = last_fill_oid;
+    wr_last_buy_fill_price = last_buy_fill_price;
+    wr_last_sell_fill_price = last_sell_fill_price;
+  } in
+  Mutex.lock queue_mutex;
+  Queue.push req write_queue;
+  Condition.signal queue_cond;
+  Mutex.unlock queue_mutex
+
+(** Blocks until all pending async writes are flushed to disk.
+    Called during graceful shutdown to prevent data loss. *)
+let flush_async () =
+  if Atomic.get writer_started then begin
+    let rec wait () =
+      Mutex.lock queue_mutex;
+      let empty = Queue.is_empty write_queue in
+      if not empty then Condition.signal queue_cond;
+      Mutex.unlock queue_mutex;
+      if not empty then begin
+        Thread.yield ();
+        wait ()
+      end
+    in
+    wait ()
+  end

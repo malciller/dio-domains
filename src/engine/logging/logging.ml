@@ -24,6 +24,10 @@ type section = { name: string; mutable min_level: level }
 
 (* Global mutable configuration state. *)
 let global_min_level = ref INFO
+(* Atomic cache of level_to_int !global_min_level for lock-free hot-path guard.
+   Domain workers check this single atomic BEFORE the Hashtbl-based will_log,
+   eliminating hash computation when the message level is below global minimum. *)
+let global_min_level_int = Atomic.make (level_to_int INFO)
 let sections = Hashtbl.create 32
 let use_colors = ref true
 let output_channel = ref stderr
@@ -118,29 +122,30 @@ let log level section_name message =
   log_sync level section_name message;
   Lwt.return_unit
 
-(* Format-string log API. Zero-allocation when the level is disabled:
-   [Printf.ifprintf] consumes format arguments without allocating a string;
-   [Printf.ksprintf] allocates a buffer only when the message will be emitted. *)
+(* Format-string log API. Two-tier guard eliminates Hashtbl overhead on disabled levels:
+   Tier 1: Atomic.get global_min_level_int (~1ns, no hash, no allocation)
+   Tier 2: Full will_log (Hashtbl lookup + section filter) only when tier 1 passes.
+   Printf.ifprintf consumes format arguments without allocating a string. *)
 let debug_f ~section (fmt : ('a, unit, string, unit) format4) =
-  if will_log DEBUG section then
+  if Atomic.get global_min_level_int <= 0 && will_log DEBUG section then
     Printf.ksprintf (fun msg -> log_sync DEBUG section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let info_f ~section (fmt : ('a, unit, string, unit) format4) =
-  if will_log INFO section then
+  if Atomic.get global_min_level_int <= 1 && will_log INFO section then
     Printf.ksprintf (fun msg -> log_sync INFO section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let warn_f ~section (fmt : ('a, unit, string, unit) format4) =
-  if will_log WARN section then
+  if Atomic.get global_min_level_int <= 2 && will_log WARN section then
     Printf.ksprintf (fun msg -> log_sync WARN section msg) fmt
   else
     Printf.ifprintf () fmt
 
 let error_f ~section (fmt : ('a, unit, string, unit) format4) =
-  if will_log ERROR section then
+  if Atomic.get global_min_level_int <= 3 && will_log ERROR section then
     Printf.ksprintf (fun msg -> log_sync ERROR section msg) fmt
   else
     Printf.ifprintf () fmt
@@ -152,19 +157,19 @@ let critical_f ~section (fmt : ('a, unit, string, unit) format4) =
     Printf.ifprintf () fmt
 
 let debug ~section msg =
-  if will_log DEBUG section then log_sync DEBUG section msg
+  if Atomic.get global_min_level_int <= 0 && will_log DEBUG section then log_sync DEBUG section msg
 let info ~section msg =
-  if will_log INFO section then log_sync INFO section msg
+  if Atomic.get global_min_level_int <= 1 && will_log INFO section then log_sync INFO section msg
 let warn ~section msg =
-  if will_log WARN section then log_sync WARN section msg
+  if Atomic.get global_min_level_int <= 2 && will_log WARN section then log_sync WARN section msg
 let error ~section msg =
-  if will_log ERROR section then log_sync ERROR section msg
+  if Atomic.get global_min_level_int <= 3 && will_log ERROR section then log_sync ERROR section msg
 let critical ~section msg =
   if will_log CRITICAL section then log_sync CRITICAL section msg
 
 (* Global and per-section configuration accessors. *)
 let init () = ()
-let set_level level = global_min_level := level
+let set_level level = global_min_level := level; Atomic.set global_min_level_int (level_to_int level)
 let set_section_level name level = (get_section name).min_level <- level
 let set_colors enabled = use_colors := enabled
 let set_output channel = output_channel := channel
