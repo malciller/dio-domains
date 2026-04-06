@@ -32,6 +32,12 @@ let string_of_operation_type = function
   | Amend -> "amend"
   | Cancel -> "cancel"
 
+(** Strategy identifier — exhaustive set of strategies that produce orders *)
+type strategy_id = Grid | MM | Hedger
+
+let string_of_strategy_id = function
+  | Grid -> "Grid" | MM -> "MM" | Hedger -> "Hedger"
+
 (** Unified strategy order type used by all strategies *)
 type strategy_order = {
   operation: operation_type;  (* What to do with this order *)
@@ -44,7 +50,7 @@ type strategy_order = {
   time_in_force: string;  (* "GTC", "IOC", "FOK" *)
   post_only: bool;
   userref: int option;  (* Strategy identifier: 1=GRID, 2=MM, 3=ARB *)
-  strategy: string;     (* Strategy name for order processing *)
+  strategy: strategy_id; (* Strategy variant for type-safe dispatch *)
   exchange: string;     (* Exchange to execute order on *)
   duplicate_key: string; (* Unique key for duplicate detection *)
 }

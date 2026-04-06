@@ -417,7 +417,7 @@ let create_cancel_order order_id asset_symbol strategy exchange =
 
 (** Create a strategy order - backwards compatibility *)
 let create_order asset_symbol side qty price post_only exchange =
-  create_place_order asset_symbol side qty price post_only "Grid" exchange
+  create_place_order asset_symbol side qty price post_only Grid exchange
 
 (** Push order to ringbuffer. Returns true if successfully pushed, false if duplicate or full. *)
 let push_order order =
@@ -894,7 +894,7 @@ let execute_strategy
 
         (* Cancel all buy orders *)
         List.iter (fun (order_id, _) ->
-          let cancel_order = create_cancel_order order_id asset.symbol "Grid" asset.exchange in
+          let cancel_order = create_cancel_order order_id asset.symbol Grid asset.exchange in
           ignore (push_order cancel_order);
           Logging.info_f ~section "Cancelling excess buy order: %s for %s" order_id asset.symbol
         ) !buy_orders;
@@ -1107,7 +1107,7 @@ let execute_strategy
                        ~price_diff:price_diff_rounded ~min_move_threshold then begin
                     (match quote_balance with
                      | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                         let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
+                         let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                          ignore (push_order order);
                          state.last_buy_order_price <- Some target_buy_price;
                          let target_distance = sell_price -. target_buy_price in
@@ -1136,7 +1136,7 @@ let execute_strategy
                      ~price_diff:price_diff_rounded ~min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" asset.exchange in
+                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true Grid asset.exchange in
                        ignore (push_order order);
                        state.last_buy_order_price <- Some exact_target;
                        Logging.debug_f ~section "Amended buy %s for %s (enforcing 2x): sell@%.4f, buy@%.4f -> %.4f (dist: %.4f <= 2x: %.4f)"
@@ -1171,7 +1171,7 @@ let execute_strategy
                      ~price_diff:price_diff_rounded ~min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
-                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
+                       let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                        ignore (push_order order);
                        state.last_buy_order_price <- Some target_buy_price;
                        Logging.debug_f ~section "Trailing buy %s for %s: %.4f -> %.4f (no sell anchors)"
@@ -1709,7 +1709,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     
     if is_order_gone then begin
       (* Explicitly send a cancel order just in case it's wedged in the exchange's cache *)
-      let cancel_order = create_cancel_order order_id asset_symbol "Grid" state.exchange_id in
+      let cancel_order = create_cancel_order order_id asset_symbol Grid state.exchange_id in
       ignore (push_order cancel_order);
 
       (* Mark cancel in flight so the sync block doesn't reinstall this order *)

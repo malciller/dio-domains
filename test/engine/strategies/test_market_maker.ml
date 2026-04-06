@@ -21,7 +21,7 @@ let test_initialization () =
 
 let test_order_creation_place () =
   (* Test creating place orders *)
-  let order = Dio_strategies.Market_maker.create_place_order "BTC/USD" Dio_strategies.Strategy_common.Buy 0.001 (Some 50000.0) true "MM" "kraken" in
+  let order = Dio_strategies.Market_maker.create_place_order "BTC/USD" Dio_strategies.Strategy_common.Buy 0.001 (Some 50000.0) true Dio_strategies.Strategy_common.MM "kraken" in
 
   check bool "place order operation" true (order.operation = Dio_strategies.Strategy_common.Place);
   check string "place order symbol" "BTC/USD" order.symbol;
@@ -29,11 +29,11 @@ let test_order_creation_place () =
   check (float 0.) "place order qty" 0.001 order.qty;
   check (option (float 0.)) "place order price" (Some 50000.0) order.price;
   check bool "place order post_only" true order.post_only;
-  check string "place order strategy" "MM" order.strategy
+  check bool "place order strategy" true (order.strategy = Dio_strategies.Strategy_common.MM)
 
 let test_order_creation_amend () =
   (* Test creating amend orders *)
-  let order = Dio_strategies.Market_maker.create_amend_order "order123" "BTC/USD" Dio_strategies.Strategy_common.Sell 0.001 (Some 51000.0) true "MM" "kraken" in
+  let order = Dio_strategies.Market_maker.create_amend_order "order123" "BTC/USD" Dio_strategies.Strategy_common.Sell 0.001 (Some 51000.0) true Dio_strategies.Strategy_common.MM "kraken" in
 
   check bool "amend order operation" true (order.operation = Dio_strategies.Strategy_common.Amend);
   check (option string) "amend order id" (Some "order123") order.order_id;
@@ -42,16 +42,16 @@ let test_order_creation_amend () =
   check (float 0.) "amend order qty" 0.001 order.qty;
   check (option (float 0.)) "amend order price" (Some 51000.0) order.price;
   check bool "amend order post_only" true order.post_only;
-  check string "amend order strategy" "MM" order.strategy
+  check bool "amend order strategy" true (order.strategy = Dio_strategies.Strategy_common.MM)
 
 let test_order_creation_cancel () =
   (* Test creating cancel orders *)
-  let order = Dio_strategies.Market_maker.create_cancel_order "order456" "BTC/USD" "MM" "kraken" in
+  let order = Dio_strategies.Market_maker.create_cancel_order "order456" "BTC/USD" Dio_strategies.Strategy_common.MM "kraken" in
 
   check bool "cancel order operation" true (order.operation = Dio_strategies.Strategy_common.Cancel);
   check (option string) "cancel order id" (Some "order456") order.order_id;
   check string "cancel order symbol" "BTC/USD" order.symbol;
-  check string "cancel order strategy" "MM" order.strategy;
+  check bool "cancel order strategy" true (order.strategy = Dio_strategies.Strategy_common.MM);
   check (option (float 0.)) "cancel order price" None order.price;
   check (float 0.) "cancel order qty" 0.0 order.qty
 
@@ -174,7 +174,7 @@ let test_duplicate_cancellation () =
   state.cancelled_orders <- [("order1", Unix.time ())];  (* Mark order1 as cancelled *)
 
   (* Count duplicates cancelled *)
-  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders "MM" "kraken" in
+  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders Dio_strategies.Strategy_common.MM "kraken" in
 
   (* Should cancel 1 duplicate (order2), order1 is already cancelled *)
   check int "duplicate cancellation count" 1 cancelled_count
@@ -275,7 +275,7 @@ let test_post_only_checks () =
       check bool "pause sell operation" true (order.Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Place);
       check bool "pause sell side" true (order.side = Dio_strategies.Strategy_common.Sell);
       check (float 0.000001) "pause sell qty" 0.5 order.qty; (* Should sell full balance *)
-      check string "pause sell strategy" "MM" order.strategy
+      check bool "pause sell strategy" true (order.strategy = Dio_strategies.Strategy_common.MM)
   | None -> fail "No sell order placed during pause" *)
 
 let () =

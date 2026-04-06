@@ -1089,18 +1089,18 @@ let order_processing_loop () =
                                        (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                        err;
                                      (match order.strategy with
-                                      | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                                      | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                                      | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment failure: %s" order.strategy err
+                                      | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                      | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                      | Hedger -> ()
                                      );
                                      Lwt.return_unit
                                ) (fun exn ->
                                  Logging.error_f ~section "✗ Exception amending order %s %s: %s"
                                    (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
                                  (match order.strategy with
-                                  | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
-                                  | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
-                                  | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
+                                  | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                  | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                  | Hedger -> ()
                                  );
                                  Lwt.return_unit
                                )
@@ -1111,9 +1111,9 @@ let order_processing_loop () =
                         (match order.order_id with
                          | Some target_order_id ->
                              (match order.strategy with
-                              | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                              | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                              | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
+                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                              | Hedger -> ()
                              )
                          | None -> ());
                      )
@@ -1138,23 +1138,23 @@ let order_processing_loop () =
                                     orders_placed := !orders_placed + count;
                                     Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
                                     (match order.strategy with
-                                     | "Grid" -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | _ -> ());
+                                     | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | MM -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | Hedger -> ());
                                     Lwt.return_unit
                                 | Error err ->
                                     Logging.error_f ~section "✗ Order cancellation failed: %s - %s" target_order_id err;
                                     (match order.strategy with
-                                     | "Grid" -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | _ -> ());
+                                     | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | MM -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | Hedger -> ());
                                     Lwt.return_unit
                               ) (fun exn ->
                                 Logging.error_f ~section "✗ Exception cancelling order %s: %s" target_order_id (Printexc.to_string exn);
                                 (match order.strategy with
-                                 | "Grid" -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                 | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                 | _ -> ());
+                                 | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                 | MM -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                 | Hedger -> ());
                                 Lwt.return_unit
                               )
                             )
@@ -1171,7 +1171,8 @@ let order_processing_loop () =
                   (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_grid_orders;
 
-            (* Process market maker orders *)
+            (* Process market maker orders — skip if shutdown requested after grid batch *)
+            if not (Atomic.get shutdown_requested) then
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
               Mutex.lock order_mutex;
@@ -1282,9 +1283,9 @@ let order_processing_loop () =
                                         (match order.price with
                                          | Some price ->
                                              (match order.strategy with
-                                              | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
-                                              | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
-                                              | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment skipped acknowledgment: %s" order.strategy result.new_order_id
+                                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
+                                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
+                                              | Hedger -> ()
                                              )
                                          | None -> Logging.warn_f ~section "Amendment skipped but no price available for strategy update: %s" result.new_order_id
                                         );
@@ -1295,9 +1296,9 @@ let order_processing_loop () =
                                         (match order.price with
                                          | Some price ->
                                              (match order.strategy with
-                                              | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
-                                              | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
-                                              | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment acknowledgment: %s" order.strategy result.new_order_id
+                                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
+                                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
+                                              | Hedger -> ()
                                              )
                                          | None -> Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.new_order_id
                                         );
@@ -1306,17 +1307,17 @@ let order_processing_loop () =
                                 | Error err ->
                                     Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") err;
                                     (match order.strategy with
-                                     | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                                     | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                                     | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
+                                     | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                     | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                     | Hedger -> ()
                                     );
                                     Lwt.return_unit
                               ) (fun exn ->
                                 Logging.error_f ~section "✗ Exception amending order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
                                 (match order.strategy with
-                                 | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
-                                 | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
-                                 | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment exception: %s" order.strategy (Printexc.to_string exn)
+                                 | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                 | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                 | Hedger -> ()
                                 );
                                 Lwt.return_unit
                               )
@@ -1327,9 +1328,9 @@ let order_processing_loop () =
                         (match order.order_id with
                          | Some target_order_id ->
                              (match order.strategy with
-                              | "Grid" -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                              | "MM" -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                              | _ -> Logging.warn_f ~section "Unknown strategy '%s' for amendment rejection: %s" order.strategy err
+                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                              | Hedger -> ()
                              )
                          | None -> ());
                      )
@@ -1348,23 +1349,23 @@ let order_processing_loop () =
                                     orders_placed := !orders_placed + count;
                                     Logging.info_f ~section "✓ Cancelled %d order(s) successfully: %s" count target_order_id;
                                     (match order.strategy with
-                                     | "Grid" -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | _ -> ());
+                                     | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | MM -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | Hedger -> ());
                                     Lwt.return_unit
                                 | Error err ->
                                     Logging.error_f ~section "✗ Order cancellation failed: %s - %s" target_order_id err;
                                     (match order.strategy with
-                                     | "Grid" -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                     | _ -> ());
+                                     | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | MM -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                     | Hedger -> ());
                                     Lwt.return_unit
                               ) (fun exn ->
                                 Logging.error_f ~section "✗ Exception cancelling order %s: %s" target_order_id (Printexc.to_string exn);
                                 (match order.strategy with
-                                 | "Grid" -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                 | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
-                                 | _ -> ());
+                                 | Grid -> Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                 | MM -> Dio_strategies.Market_maker.Strategy.cleanup_pending_cancellation order.symbol target_order_id
+                                 | Hedger -> ());
                                 Lwt.return_unit
                               )
                             )
@@ -1380,7 +1381,8 @@ let order_processing_loop () =
                 Logging.error_f ~section "Error processing order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_mm_orders;
 
-            (* Process auto hedger orders *)
+            (* Process auto hedger orders — skip if shutdown requested after MM batch *)
+            if not (Atomic.get shutdown_requested) then
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
               Mutex.lock order_mutex;
