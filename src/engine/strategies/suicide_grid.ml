@@ -49,6 +49,14 @@ let rec take n = function
   | [] -> []
   | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
 
+(** Check if [s] contains [fragment] as a substring (case-sensitive).
+    Extracted from handle_order_failed / handle_order_amendment_failed
+    to eliminate duplication. *)
+let contains_fragment s fragment =
+  let sl = String.length s and fl = String.length fragment in
+  let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
+  loop 0
+
 (** Trading configuration type (local definition for strategies) *)
 type trading_config = {
   exchange: string;
@@ -271,6 +279,26 @@ let calculate_grid_price current_price grid_interval_pct is_above symbol exchang
   let raw_price = if is_above then current_price +. interval else current_price -. interval in
   round_price raw_price symbol exchange
 
+(** Check whether an amendment is allowed for [order_id].
+    Returns true when:
+    - no pending amend exists for this order in [state.pending_orders]
+    - the order is not in the global InFlightAmendments registry
+    - the order is not on a cooldown timer in [state.amend_cooldowns]
+    - [price_diff] exceeds [min_move_threshold]
+    - [target_price] differs from [current_price_rounded]
+    Consolidates the identical guard that was duplicated in 3 trailing branches. *)
+let amend_allowed ~state ~order_id ~target_price ~current_price_rounded
+    ~price_diff ~min_move_threshold =
+  let is_being_amended = List.exists (fun (id, _, _, _) ->
+    String.starts_with ~prefix:"pending_amend_" id &&
+    String.sub id 14 (String.length id - 14) = order_id
+  ) state.pending_orders in
+  let is_in_flight = InFlightAmendments.is_in_flight order_id in
+  let is_on_cooldown = Hashtbl.mem state.amend_cooldowns order_id in
+  not is_being_amended && not is_in_flight && not is_on_cooldown
+  && price_diff >= min_move_threshold
+  && target_price <> current_price_rounded
+
 (** Check if we can place a buy order based on quote balance *)
 let can_place_buy_order (_qty : float) quote_balance quote_needed =
   quote_balance >= quote_needed
@@ -489,6 +517,14 @@ let execute_strategy
 
   let state = get_strategy_state asset.symbol in
 
+  (* Only proceed with main strategy if capital_low flag is clear.
+     asset_low is checked below only for sell+buy placement — order sync,
+     cleanup, and cancellation detection must always run.
+     NOTE: All state mutations below run under state.mutex to prevent
+     races when concurrent callers target the same symbol. *)
+  Mutex.lock state.mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+
    (* --- Anticipated balance credit decay: clear when balance feed catches up --- *)
    (match asset_balance with
     | Some asset_bal ->
@@ -574,13 +610,7 @@ let execute_strategy
    | None -> () (* No balance data yet, fall through *)
   );
 
-  (* Only proceed with main strategy if capital_low flag is clear.
-     asset_low is checked below only for sell+buy placement — order sync,
-     cleanup, and cancellation detection must always run. *)
   if not state.capital_low then begin
-
-  Mutex.lock state.mutex;
-  Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
 
   (* Throttle order placement - wait at least 1 second between orders *)
   (* Keep order placement throttle, but allow logic to run every cycle *)
@@ -656,6 +686,9 @@ let execute_strategy
       state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
         now_time -. ts < 10.0
       ) state.recently_injected_sells;
+      (* cap to 20 entries to prevent O(n²) scans during sell storms *)
+      if List.length state.recently_injected_sells > 20 then
+        state.recently_injected_sells <- take 20 state.recently_injected_sells;
       let preserved_sells = state.recently_injected_sells in
       state.open_sell_orders <- [];
       (* Preserve buy tracking across sync for all exchanges.
@@ -852,28 +885,17 @@ let execute_strategy
            protecting the accumulated base asset. *)
         (match asset_balance with
          | Some asset_bal when not state.inflight_sell ->
-             let sell_qty =
+             let (sell_qty, is_accumulation_sell) =
                if asset.exchange = "hyperliquid" then begin
                  let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
                  let rounding_diff = qty -. rounded_sell in
                  let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
-                 if required_profit > 0.0 && state.accumulated_profit >= required_profit then begin
-                   (* Profit-gated: enough realized profit to cover the rounding cost *)
-                   state.accumulated_profit <- state.accumulated_profit -. required_profit;
-                   let base_increment = qty -. rounded_sell in
-                   state.reserved_base <- state.reserved_base +. base_increment;
-                   (* Persist both values so they survive Docker restarts *)
-                   Hyperliquid.State_persistence.save ~symbol:asset.symbol
-                     ~reserved_base:state.reserved_base
-                     ~accumulated_profit:state.accumulated_profit ();
-                   Logging.info_f ~section
-                     "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
-                     asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base;
-                   rounded_sell
-                 end else
-                   qty  (* 1:1 sell until profit covers rounding cost *)
+                 if required_profit > 0.0 && state.accumulated_profit >= required_profit then
+                   (rounded_sell, true)
+                 else
+                   (qty, false)  (* 1:1 sell until profit covers rounding cost *)
                end else
-                 qty *. sell_mult
+                 (qty *. sell_mult, false)
              in
              (* Proactive reserved_base guard (Hyperliquid only): ensure we never sell
                 accumulated base asset.  The available balance must exclude:
@@ -899,9 +921,25 @@ let execute_strategy
              in
              if balance_ok then begin
                let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-               if push_order sell_order then
+               if push_order sell_order then begin
+                 (* Commit accumulation state AFTER push_order succeeds (F-9 audit fix) *)
+                 if is_accumulation_sell then begin
+                   let rounded_sell = sell_qty in
+                   let rounding_diff = qty -. rounded_sell in
+                   let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
+                   state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                   let base_increment = qty -. rounded_sell in
+                   state.reserved_base <- state.reserved_base +. base_increment;
+                   Hyperliquid.State_persistence.save ~symbol:asset.symbol
+                     ~reserved_base:state.reserved_base
+                     ~accumulated_profit:state.accumulated_profit ();
+                   Logging.info_f ~section
+                     "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
+                     asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+                 end;
                  Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
                    asset.symbol sell_qty sell_price
+               end
              end
          | _ -> ()
         );
@@ -1021,17 +1059,10 @@ let execute_strategy
                   let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
                   let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                   let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
-                  
-                  (* Check if this order is already being amended *)
-                  let is_being_amended = List.exists (fun (id, _, _, _) ->
-                    String.starts_with ~prefix:"pending_amend_" id &&
-                    String.sub id 14 (String.length id - 14) = buy_order_id
-                  ) state.pending_orders in
-                  
-                  let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
-                  let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
 
-                  if not is_being_amended && not is_in_flight && not is_on_cooldown && price_diff_rounded >= min_move_threshold && target_buy_price <> current_buy_price_rounded then begin
+                  if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
+                       ~current_price_rounded:current_buy_price_rounded
+                       ~price_diff:price_diff_rounded ~min_move_threshold then begin
                     (match quote_balance with
                      | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                          let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
@@ -1058,16 +1089,9 @@ let execute_strategy
                 let price_diff_rounded = round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) asset.symbol asset.exchange in
                 let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
 
-                (* Check if this order is already being amended *)
-                let is_being_amended = List.exists (fun (id, _, _, _) ->
-                  String.starts_with ~prefix:"pending_amend_" id &&
-                  String.sub id 14 (String.length id - 14) = buy_order_id
-                ) state.pending_orders in
-
-                let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
-                let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
-
-                if not is_being_amended && not is_in_flight && not is_on_cooldown && price_diff_rounded >= min_move_threshold && exact_target_rounded <> current_buy_price_rounded then begin
+                if amend_allowed ~state ~order_id:buy_order_id ~target_price:exact_target_rounded
+                     ~current_price_rounded:current_buy_price_rounded
+                     ~price_diff:price_diff_rounded ~min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true "Grid" asset.exchange in
@@ -1100,16 +1124,9 @@ let execute_strategy
                  let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
                  let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
 
-                (* Check if this order is already being amended *)
-                let is_being_amended = List.exists (fun (id, _, _, _) ->
-                  String.starts_with ~prefix:"pending_amend_" id &&
-                  String.sub id 14 (String.length id - 14) = buy_order_id
-                ) state.pending_orders in
-
-                let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
-                let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
-
-                if not is_being_amended && not is_in_flight && not is_on_cooldown && price_diff_rounded >= min_move_threshold then begin
+                if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
+                     ~current_price_rounded:current_buy_price_rounded
+                     ~price_diff:price_diff_rounded ~min_move_threshold then begin
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true "Grid" asset.exchange in
@@ -1136,9 +1153,8 @@ let execute_strategy
         (* No action needed for other cases *)
         state.last_cycle <- cycle
       end
-  end);
-  ()
-end
+  end  (* end: is_stale else begin *)
+  end) (* end: if not capital_low then begin; close Fun.protect *)
 
 
 (** Handle order placement success - update pending order status *)
@@ -1207,11 +1223,7 @@ let handle_order_failed asset_symbol side reason =
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
     
     let lower_reason = String.lowercase_ascii reason in
-    let contains_fragment s fragment =
-      let sl = String.length s and fl = String.length fragment in
-      let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
-      loop 0
-    in
+
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
     let is_insufficient_balance = contains_fragment lower_reason "insufficient funds"
       || contains_fragment lower_reason "insufficient spot balance" in
@@ -1630,11 +1642,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
        was untouched on the book even if the amend request failed. We apply a cooldown
        instead of dropping tracking, which would induce a spamming duplicate placement loop. *)
     let lower_reason = String.lowercase_ascii reason in
-    let contains_fragment s fragment =
-      let sl = String.length s and fl = String.length fragment in
-      let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
-      loop 0
-    in
+
     
     let is_cache_miss = contains_fragment lower_reason "order not found" || contains_fragment lower_reason "not found for amendment" || contains_fragment lower_reason "unknown order" in
     let is_cannot_modify = contains_fragment lower_reason "cannot modify canceled or filled" in
