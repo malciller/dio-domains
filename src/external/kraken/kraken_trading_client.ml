@@ -498,33 +498,29 @@ let cleanup_stale_response_entries ~reason () =
       (fun () ->
         let now = Unix.time () in
         let stale_entries = ref [] in
-        (* Acquire mutex with a 100ms timeout guard to prevent indefinite blocking. *)
-        Lwt.pick [
-          (Lwt_mutex.with_lock state.mutex (fun () ->
-            if Atomic.get shutdown_requested then
-              Lwt.return_unit
-            else begin
-              Response_table.iter (fun req_id (wakener, expected_method, timestamp) ->
-                if now -. timestamp > 30.0 then
-                  stale_entries := (req_id, wakener, expected_method, timestamp) :: !stale_entries
-              ) state.responses;
-              List.iter (fun (req_id, wakener, expected_method, timestamp) ->
-                Response_table.remove state.responses req_id;
-                Logging.debug_f ~section "Cleaned up stale response entry for req_id=%d (age: %.1fs, method: %s, reason=%s)"
-                  req_id (now -. timestamp) expected_method reason;
-                (* Fail the stale promise to release associated memory. *)
-                try
-                  Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
-                with Invalid_argument _ ->
-                  Logging.debug_f ~section "Promise for stale req_id=%d was already resolved" req_id
-              ) !stale_entries;
-              if !stale_entries <> [] then
-                Logging.debug_f ~section "Cleaned up %d stale response table entries (reason=%s)" (List.length !stale_entries) reason;
-              Lwt.return_unit
-            end
-          ));
-          (Lwt_unix.sleep 0.1 >|= fun () -> ())  (* 100ms guard against mutex deadlock. *)
-        ]
+        Lwt_mutex.with_lock state.mutex (fun () ->
+          if Atomic.get shutdown_requested then
+            Lwt.return_unit
+          else begin
+            Response_table.iter (fun req_id (wakener, expected_method, timestamp) ->
+              if now -. timestamp > 30.0 then
+                stale_entries := (req_id, wakener, expected_method, timestamp) :: !stale_entries
+            ) state.responses;
+            List.iter (fun (req_id, wakener, expected_method, timestamp) ->
+              Response_table.remove state.responses req_id;
+              Logging.debug_f ~section "Cleaned up stale response entry for req_id=%d (age: %.1fs, method: %s, reason=%s)"
+                req_id (now -. timestamp) expected_method reason;
+              (* Fail the stale promise to release associated memory. *)
+              try
+                Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
+              with Invalid_argument _ ->
+                Logging.debug_f ~section "Promise for stale req_id=%d was already resolved" req_id
+            ) !stale_entries;
+            if !stale_entries <> [] then
+              Logging.debug_f ~section "Cleaned up %d stale response table entries (reason=%s)" (List.length !stale_entries) reason;
+            Lwt.return_unit
+          end
+        )
       )
       (fun exn ->
         if not (Atomic.get shutdown_requested) then
@@ -537,13 +533,9 @@ let periodic_tasks_started = Atomic.make false
 let start_periodic_tasks () =
   if not (Atomic.exchange periodic_tasks_started true) then begin
     let rec run () =
-      Lwt.pick [
-        (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
-        (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
-      ] >>= fun reason ->
-      Logging.debug_f ~section "Running Kraken response table cleanup (%s)"
-        (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
-      cleanup_stale_response_entries ~reason:(match reason with `Signal -> "backpressure" | `Timeout -> "periodic") () >>= fun () ->
+      Lwt_mvar.take cleanup_mvar >>= fun () ->
+      Logging.debug_f ~section "Running Kraken response table cleanup (requested)";
+      cleanup_stale_response_entries ~reason:"backpressure" () >>= fun () ->
       (* Spawn the next cleanup cycle asynchronously to break promise chain growth. *)
       Lwt.async run;
       Lwt.return_unit
@@ -639,24 +631,21 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
                 Lwt.cancel waiter;
                 Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
             | `Already_removed ->
-                (* Possible race: response arrived concurrently. Apply a 10ms grace period. *)
-                Logging.debug_f ~section "Request req_id=%d: possible race condition - waiting briefly for response" req_id;
-                Lwt.pick [
-                  waiter >|= (fun response -> `Response response);
-                  Lwt_unix.sleep 0.01 >|= (fun () -> `Still_timeout)
-                ] >>= function
-                | `Response response ->
-                    (* Response resolved within the grace period; treat as success. *)
-                    Logging.debug_f ~section "Request req_id=%d: response arrived just after timeout (within 10ms grace period)" req_id;
-       
-                    Logging.debug_f ~section "Request req_id=%d: response received successfully (timeout race resolved)" req_id;
-                    Lwt.return response
-                | `Still_timeout ->
-                    (* Grace period expired without resolution; report timeout. *)
-                    Logging.warn_f ~section "Request timeout (race condition): req_id=%d, timeout_ms=%d, sent %.3fs ago" req_id timeout_ms timeout;
-                    Logging.debug_f ~section "Request req_id=%d: waiter not resolved after race condition wait" req_id;
-                    (* Leave the waiter unresolved to avoid double-wakeup; fail this call. *)
-                    Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
+                (* Entry removed from table by resolve_response or reset_state.
+                   Yield to scheduler to let pending Lwt.wakeup_later execute. *)
+                Logging.debug_f ~section "Request req_id=%d: entry already removed, yielding to scheduler" req_id;
+                Lwt.pause () >>= fun () ->
+                if Lwt.is_sleeping waiter then begin
+                  (* Waiter still unresolved after yield; should not occur in normal operation. *)
+                  Logging.warn_f ~section "Request timeout (post-yield): req_id=%d, timeout_ms=%d, sent %.3fs ago" req_id timeout_ms timeout;
+                  Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
+                end else begin
+                  (* Waiter resolved or failed by resolve_response or reset_state. *)
+                  Logging.debug_f ~section "Request req_id=%d: response resolved after scheduler yield" req_id;
+                  waiter >|= fun response ->
+                  Logging.debug_f ~section "Request req_id=%d: response received successfully (timeout race resolved)" req_id;
+                  response
+                end
   end
 
 let get_connection () : Websocket_lwt_unix.conn Lwt.t =
