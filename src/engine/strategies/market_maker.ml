@@ -73,35 +73,39 @@ type strategy_state = {
 let strategy_states : (string, strategy_state) Hashtbl.t = Hashtbl.create 16
 let strategy_states_mutex = Mutex.create ()
 
-(** Returns existing state for [asset_symbol], or creates and registers a new default. *)
+(** Returns existing state for [asset_symbol], or creates and registers a new default.
+    Double-checked lock: fast path is lock-free when the state already exists. *)
 let get_strategy_state asset_symbol =
-  Mutex.lock strategy_states_mutex;
-  let state =
-    match Hashtbl.find_opt strategy_states asset_symbol with
-    | Some state -> state
-    | None ->
-        let new_state = {
-          last_buy_order_price = None;
-          last_buy_order_id = None;
-          open_sell_orders = [];
-          pending_orders = [];
-          last_cycle = 0;
-          cancelled_orders = [];
-          pending_cancellations = Hashtbl.create 16;
-          last_cleanup_time = 0.0;
-          inflight_buy = false;
-          inflight_sell = false;
-          capital_low = false;
-          asset_low = false;
-          capital_low_logged = false;
-          last_seen_asset_balance = 0.0;
-          mutex = Mutex.create ();
-        } in
-        Hashtbl.add strategy_states asset_symbol new_state;
-        new_state
-  in
-  Mutex.unlock strategy_states_mutex;
-  state
+  match Hashtbl.find_opt strategy_states asset_symbol with
+  | Some state -> state
+  | None ->
+      Mutex.lock strategy_states_mutex;
+      let state =
+        match Hashtbl.find_opt strategy_states asset_symbol with
+        | Some state -> state
+        | None ->
+            let new_state = {
+              last_buy_order_price = None;
+              last_buy_order_id = None;
+              open_sell_orders = [];
+              pending_orders = [];
+              last_cycle = 0;
+              cancelled_orders = [];
+              pending_cancellations = Hashtbl.create 16;
+              last_cleanup_time = 0.0;
+              inflight_buy = false;
+              inflight_sell = false;
+              capital_low = false;
+              asset_low = false;
+              capital_low_logged = false;
+              last_seen_asset_balance = 0.0;
+              mutex = Mutex.create ();
+            } in
+            Hashtbl.add strategy_states asset_symbol new_state;
+            new_state
+      in
+      Mutex.unlock strategy_states_mutex;
+      state
 
 (** Parses a string config value to float, logging and returning [default] on failure. *)
 let parse_config_float config value_name default exchange symbol =
