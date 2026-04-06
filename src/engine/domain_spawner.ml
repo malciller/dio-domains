@@ -190,7 +190,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       (* Tracks whether we've done at least one exec position check - used as fallback for
          Hyperliquid assets with no open orders that generate no exec events. *)
       let hl_exec_checked = ref false in
-      let last_balance_check = ref 0.0 in
 
       (* Initialize strategy for this asset based on strategy type *)
       let baseline_price = ref None in
@@ -523,17 +522,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           end
         end;
 
-        (* Mock balance check throttling *)
-        if !cycle_count mod config.cycle_mod = 0 then (
-          let now = Unix.time () in
-          if now -. !last_balance_check > 2.0 then begin
-            last_balance_check := now;
-          end
-        );
-
         (* Execute strategy based on type - only when triggered by events (event-driven) *)
-        (* Add fallback: execute every X cycles to prevent getting stuck *)
-        let should_execute = !hl_exec_ready && (!should_execute_strategy || (!cycle_count mod config.cycle_mod = 0)) in
+        let should_execute = !hl_exec_ready && !should_execute_strategy in
         if should_execute then begin
           let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Reset flag *)
