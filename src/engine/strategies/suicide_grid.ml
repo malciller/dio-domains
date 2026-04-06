@@ -212,57 +212,78 @@ let get_strategy_state asset_symbol =
 
 (** Per-exchange running totals for reserved_quote.
     Maintained incrementally via set_asset_reserved_quote so the read path
-    is O(1) instead of O(n_symbols). Protected by reservation_mutex. *)
-let reservation_mutex = Mutex.create ()
-let exchange_reserved_totals : (string, float) Hashtbl.t = Hashtbl.create 4
+    is O(1) instead of O(n_symbols). Lock-free via per-exchange float atomics
+    encoded as Int64 (bits_of_float). Init mutex used only for lazy creation. *)
+let exchange_reserved_atomics : (string, int64 Atomic.t) Hashtbl.t = Hashtbl.create 4
+let reservation_init_mutex = Mutex.create ()
 
-(** Returns the total reserved_quote for [exchange]. O(1) lookup. *)
-let get_total_reserved_quote ~exchange =
-  Mutex.lock reservation_mutex;
-  let total = match Hashtbl.find_opt exchange_reserved_totals exchange with
-    | Some v -> v
-    | None -> 0.0
-  in
-  Mutex.unlock reservation_mutex;
-  total
+(** Retrieve or lazily create the per-exchange atomic total.
+    After initial creation, this is a single Hashtbl.find_opt with no mutex. *)
+let[@inline] get_reserved_atomic exchange =
+  match Hashtbl.find_opt exchange_reserved_atomics exchange with
+  | Some a -> a
+  | None ->
+      Mutex.lock reservation_init_mutex;
+      let a = match Hashtbl.find_opt exchange_reserved_atomics exchange with
+        | Some a -> a
+        | None ->
+            let a = Atomic.make (Int64.bits_of_float 0.0) in
+            Hashtbl.replace exchange_reserved_atomics exchange a;
+            a
+      in
+      Mutex.unlock reservation_init_mutex;
+      a
+
+(** Returns the total reserved_quote for [exchange]. Lock-free O(1) read. *)
+let[@inline] get_total_reserved_quote ~exchange =
+  let a = get_reserved_atomic exchange in
+  Int64.float_of_bits (Atomic.get a)
+
+(** CAS loop to atomically add [delta] to the per-exchange reserved total.
+    Retries on contention. Typically completes on first attempt. *)
+let[@inline] cas_add_reserved exchange delta =
+  if delta = 0.0 then ()
+  else begin
+    let a = get_reserved_atomic exchange in
+    let rec loop () =
+      let old_bits = Atomic.get a in
+      let old_val = Int64.float_of_bits old_bits in
+      let new_bits = Int64.bits_of_float (old_val +. delta) in
+      if not (Atomic.compare_and_set a old_bits new_bits) then loop ()
+    in
+    loop ()
+  end
 
 (** Sets this asset's reserved_quote and updates the per-exchange running total.
-    Computes delta from old value to avoid drift. *)
+    Lock-free via CAS on the exchange atomic. *)
 let set_asset_reserved_quote state v =
-  Mutex.lock reservation_mutex;
   let old = state.reserved_quote in
   state.reserved_quote <- v;
-  if state.exchange_id <> "" then begin
-    let cur = match Hashtbl.find_opt exchange_reserved_totals state.exchange_id with
-      | Some t -> t
-      | None -> 0.0
-    in
-    Hashtbl.replace exchange_reserved_totals state.exchange_id (cur -. old +. v)
-  end;
-  Mutex.unlock reservation_mutex
+  if state.exchange_id <> "" then
+    cas_add_reserved state.exchange_id (v -. old)
 
 (** Atomically checks available quote balance and reserves for a buy if sufficient.
     Returns (balance_ok, available_quote, total_reserved).
     Must be called from inside state.mutex. On success, sets state.reserved_quote
-    and updates the per-exchange running total. *)
+    and updates the per-exchange running total via CAS. *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
-  Mutex.lock reservation_mutex;
-  let total_reserved = match Hashtbl.find_opt exchange_reserved_totals state.exchange_id with
-    | Some v -> v
-    | None -> 0.0
-  in
+  let a = get_reserved_atomic state.exchange_id in
+  let total_bits = Atomic.get a in
+  let total_reserved = Int64.float_of_bits total_bits in
   let available = quote_bal -. total_reserved in
   let ok = available >= quote_needed in
   if ok then begin
     let old = state.reserved_quote in
     state.reserved_quote <- reserve_amount;
-    let cur = match Hashtbl.find_opt exchange_reserved_totals state.exchange_id with
-      | Some t -> t
-      | None -> 0.0
-    in
-    Hashtbl.replace exchange_reserved_totals state.exchange_id (cur -. old +. reserve_amount)
+    let delta = reserve_amount -. old in
+    if delta <> 0.0 then begin
+      let new_bits = Int64.bits_of_float (total_reserved +. delta) in
+      (* Fast path: try CAS with the value we already read. If it fails,
+         fall back to the general CAS loop. *)
+      if not (Atomic.compare_and_set a total_bits new_bits) then
+        cas_add_reserved state.exchange_id delta
+    end
   end;
-  Mutex.unlock reservation_mutex;
   (ok, available, total_reserved)
 
 (** Parses a config string to float with fallback default and warning. *)
@@ -548,6 +569,8 @@ let push_order ~now order =
 let execute_strategy
     ?cached_state
     ~now
+    ~qty_f
+    ~sell_mult_f
     (asset : trading_config)
     (current_price : float option)
     (top_of_book : (float * float * float * float) option)
@@ -585,11 +608,8 @@ let execute_strategy
       Subtract reserved_base so accumulated base asset is protected from sells. *)
    (match asset_balance with
     | Some asset_bal ->
-        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
         let asset_needed_fast =
-          if ecfg.sell_uses_mult then
-            let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
-            qty_f *. sell_mult_f
+          if ecfg.sell_uses_mult then qty_f *. sell_mult_f
           else qty_f  (* 1:1 sells require full qty *)
         in
         let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit in
@@ -617,7 +637,6 @@ let execute_strategy
      short-circuits here. When balance recovers, the flag is cleared. *)
   (match quote_balance with
    | Some quote_bal ->
-       let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
        let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
        (* Available balance = total balance minus all domains' reserved quote. *)
        let total_reserved = get_total_reserved_quote ~exchange:state.exchange_id in
@@ -806,20 +825,23 @@ let execute_strategy
         (List.length open_orders) asset.symbol
         (List.length !buy_orders) (List.length !sell_orders);
 
-      (* Parse configuration values. *)
-      let qty = parse_config_float asset.qty "qty" 0.001 asset.exchange asset.symbol in
+      (* Use pre-parsed config values passed from domain_spawner. *)
+      let qty = qty_f in
       let grid_interval = asset.grid_interval in
-      let sell_mult = parse_config_float asset.sell_mult "sell_mult" 1.0 asset.exchange asset.symbol in
+      let sell_mult = sell_mult_f in
 
-      (* Cache config in state so handle_order_filled can compute real PnL. *)
-      state.grid_qty <- qty;
-      state.maker_fee <- (match asset.maker_fee with
-        | Some f -> f
-        | None ->
-            match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
-            | Some cached -> cached
-            | None -> 0.0);
-      state.exchange_id <- asset.exchange;
+      (* Cache config in state so handle_order_filled can compute real PnL.
+         Guard writes to avoid unnecessary stores on every cycle. *)
+      if state.grid_qty <> qty then state.grid_qty <- qty;
+      if state.exchange_id = "" then begin
+        state.exchange_id <- asset.exchange;
+        state.maker_fee <- (match asset.maker_fee with
+          | Some f -> f
+          | None ->
+              match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
+              | Some cached -> cached
+              | None -> 0.0)
+      end;
 
       (* Calculate required balances. *)
       let quote_needed = ask_price *. qty in
@@ -1058,22 +1080,26 @@ let execute_strategy
         state.last_cycle <- cycle
       end else if effective_buy_count > 0 then begin
         (* Case 2: open buy exists; check sell orders for spacing enforcement. *)
-        (* Combine active and pending sell orders for spacing calculation. *)
-        let all_sell_orders = state.open_sell_orders @ (
-          List.filter_map (fun (id, side, price, _) ->
-            if side = Sell then Some (id, price, 0.0) else None
-          ) state.pending_orders
-        ) in
-        
-        if all_sell_orders <> [] then begin
-          (* Find the closest sell order. *)
-          let closest_sell_order = List.fold_left (fun acc (order_id, sell_price, _) ->
+        (* Find the closest sell order across active and pending sells
+           without allocating an intermediate list. Two sequential folds. *)
+        let closest_sell_order =
+          let acc0 = List.fold_left (fun acc (order_id, sell_price, _) ->
             match acc with
             | None -> Some (order_id, sell_price)
             | Some (_, best_price) ->
                 if sell_price < best_price then Some (order_id, sell_price) else acc
-          ) None all_sell_orders in
+          ) None state.open_sell_orders in
+          List.fold_left (fun acc (id, side, price, _) ->
+            if side <> Sell then acc
+            else match acc with
+            | None -> Some (id, price)
+            | Some (_, best_price) ->
+                if price < best_price then Some (id, price) else acc
+          ) acc0 state.pending_orders
+        in
+        let has_sell_orders = closest_sell_order <> None in
 
+        if has_sell_orders then begin
           match closest_sell_order, state.last_buy_order_price, state.last_buy_order_id with
           | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
               (* Calculate distance from buy to sell as absolute dollar amount. *)

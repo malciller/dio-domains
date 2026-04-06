@@ -225,6 +225,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           })
         else ref None
       in
+      (* Pre-parse config floats once at domain init, not on every cycle. *)
+      let grid_qty_f = (try float_of_string asset_with_fees.qty with Failure _ -> 0.001) in
+      let grid_sell_mult_f = (try float_of_string asset_with_fees.sell_mult with Failure _ -> 1.0) in
       let mm_strategy_asset_ref =
         if asset_with_fees.strategy = "MM" then
           ref (Some {
@@ -248,7 +251,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
        | Some asset ->
            let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
            st.exchange_id <- asset.exchange;
-           st.grid_qty <- (try float_of_string asset.qty with Failure _ -> 0.001);
+           st.grid_qty <- grid_qty_f;
            st.maker_fee <- (match asset.maker_fee with
              | Some f -> f
              | None ->
@@ -613,7 +616,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
-               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now:cycle_wall_time asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now:cycle_wall_time ~qty_f:grid_qty_f ~sell_mult_f:grid_sell_mult_f asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
