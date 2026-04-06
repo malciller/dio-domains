@@ -1,11 +1,21 @@
 (subdir engine/concurrency)
+
 (subdir engine/logging)
+
 (subdir engine/order_executor)
+
 (subdir engine/strategies)
+
 (subdir engine/supervisor)
+
 (subdir engine/config)
+
 (subdir engine/domain_spawner)
-(subdir exchange/kraken)
-(subdir exchange/cmc)
+
+(subdir external/kraken)
+
+(subdir external/cmc)
+
 (subdir order_cache)
+
 (subdir engine/perf)
