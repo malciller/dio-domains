@@ -331,7 +331,7 @@ let ensure_store symbol =
 
 let store_opt symbol = Hashtbl.find_opt stores symbol
 
-let notify_ready store =
+let notify_ready ~symbol store =
   if not (Atomic.get store.ready) then begin
     Atomic.set store.ready true;
     (try
@@ -340,7 +340,7 @@ let notify_ready store =
       (* Ignore all exceptions during broadcast - waiters may have been cancelled *)
       ())
   end;
-  Concurrency.Exchange_wakeup.signal ()  (* wake domain workers blocked in wait() *)
+  Concurrency.Exchange_wakeup.signal ~symbol
 
 let is_effectively_zero size =
   (* Remove leading zeros and check if empty or all zeros *)
@@ -631,7 +631,7 @@ let process_orderbook_message ~reset json on_heartbeat =
     ) data;
 
     (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
-    Hashtbl.iter (fun _ store -> notify_ready store) notified_symbols;
+    Hashtbl.iter (fun symbol store -> notify_ready ~symbol store) notified_symbols;
 
     Some ()
   with exn ->

@@ -103,6 +103,7 @@ let process_market_data json =
             let store = ensure_store symbol in
             RingBuffer.write store.buffer ob;
             notify_ready store;
+            Concurrency.Exchange_wakeup.signal ~symbol;
             Logging.debug_f ~section "Orderbook update for %s: bids=%d asks=%d" 
               symbol (Array.length bids) (Array.length asks)
           with exn ->

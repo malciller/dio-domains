@@ -364,15 +364,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
         if ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) then begin
           let start_ticker = Mtime_clock.now_ns () in
-          let new_tickers = Ex.read_ticker_events ~symbol:asset_with_fees.symbol ~start_pos:!ticker_read_pos in
-          ticker_read_pos := ticker_pos;
-          
-          List.iter (fun (ticker : Types.ticker_event) ->
+          ticker_read_pos := Ex.iter_ticker_events ~symbol:asset_with_fees.symbol ~start_pos:!ticker_read_pos (fun (ticker : Types.ticker_event) ->
             current_price := Some ((ticker.bid +. ticker.ask) /. 2.0);
             should_execute_strategy := true;
             Logging.debug_f ~section "Asset [%s/%s]: Consumed ticker event - price=$%.2f"
               asset_with_fees.exchange asset_with_fees.symbol ((ticker.bid +. ticker.ask) /. 2.0)
-          ) new_tickers;
+          );
           let stop_ticker = Mtime_clock.now_ns () in
           Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
         end;
@@ -381,10 +378,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
         if ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) then begin
           let start_ob = Mtime_clock.now_ns () in
-          let new_orderbooks = Ex.read_orderbook_events ~symbol:asset_with_fees.symbol ~start_pos:!orderbook_read_pos in
-          orderbook_read_pos := ob_pos;
-          
-          List.iter (fun (ob : Types.orderbook_event) ->
+          orderbook_read_pos := Ex.iter_orderbook_events ~symbol:asset_with_fees.symbol ~start_pos:!orderbook_read_pos (fun (ob : Types.orderbook_event) ->
             if Array.length ob.bids > 0 && Array.length ob.asks > 0 then begin
               let (bid_price, bid_size) = ob.bids.(0) in
               let (ask_price, ask_size) = ob.asks.(0) in
@@ -395,7 +389,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 asset_with_fees.exchange asset_with_fees.symbol
                 bid_price bid_size ask_price ask_size
             end
-          ) new_orderbooks;
+          );
           let stop_ob = Mtime_clock.now_ns () in
           Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
         end;
@@ -406,12 +400,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
         if current_pos <> !exec_read_pos then begin
           let start_exec = Mtime_clock.now_ns () in
-          let new_events = Ex.read_execution_events ~symbol:asset_with_fees.symbol ~start_pos:!exec_read_pos in
-          let event_count = List.length new_events in
-          if event_count > 0 then begin
-            
-            List.iter (fun (event : Types.execution_event) ->
-              match event.order_status with
+          let event_count = ref 0 in
+          let new_pos = Ex.iter_execution_events ~symbol:asset_with_fees.symbol ~start_pos:!exec_read_pos (fun (event : Types.execution_event) ->
+            incr event_count;
+            match event.order_status with
               | Types.Canceled | Types.Rejected | Types.Expired ->
                   should_execute_strategy := true;
                   let status_desc = match event.order_status with
@@ -462,7 +454,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (* Trigger Auto-Hedging module *)
                   if asset_with_fees.hedge then begin
                     let hedge_symbol = String.split_on_char '/' asset_with_fees.symbol |> List.hd in
-                    (* Query the PERP orderbook (keyed by base asset e.g. "HYPE", not "HYPE/USDC") *)
                     let perp_tob = Ex.get_top_of_book ~symbol:hedge_symbol in
                     Dio_strategies.Auto_hedger.handle_order_filled
                       asset_with_fees.testnet asset_with_fees.exchange hedge_symbol side event.filled_qty event.avg_price perp_tob
@@ -491,20 +482,20 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                         | None -> ())
                    | None -> ())
               | _ -> ()
-            ) new_events
+          ) in
+          if !event_count > 0 then begin
+            (* First exec event batch received - allow strategy to run now *)
+            if not !hl_exec_ready then begin
+              hl_exec_ready := true;
+              (match !grid_strategy_asset_ref with
+               | Some _ ->
+                   Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
+               | None -> ());
+              Logging.info_f ~section "[%s/%s] First exec event batch received, strategy now active"
+                asset_with_fees.exchange asset_with_fees.symbol
+            end
           end;
-          (* First exec event batch received - allow strategy to run now *)
-          if not !hl_exec_ready then begin
-            hl_exec_ready := true;
-            (* Mark startup replay complete so profit calculation is no longer gated *)
-            (match !grid_strategy_asset_ref with
-             | Some _ ->
-                 Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
-             | None -> ());
-            Logging.info_f ~section "[%s/%s] First exec event batch received, strategy now active"
-              asset_with_fees.exchange asset_with_fees.symbol
-          end;
-          exec_read_pos := current_pos;
+          exec_read_pos := new_pos;
           hl_exec_checked := true;
           let stop_exec = Mtime_clock.now_ns () in
           Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub stop_exec start_exec))
@@ -547,59 +538,27 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Reset flag *)
 
-          (* Get open orders for strategy sync - only when executing strategy *)
-          let orders = Ex.get_open_orders ~symbol:asset_with_fees.symbol in
-          (* Map to internal format used by existing strategies:
-             (order_id, price, remaining_qty, side_str, order_userref) 
-          *)
-          let all_open_orders = List.filter_map (fun (order : Types.open_order) ->
-            match order.limit_price with
-            | Some price -> 
-                let side_str = match order.side with
-                  | Types.Buy -> "buy"
-                  | Types.Sell -> "sell"
-                in
-                Some (order.order_id, price, order.remaining_qty, side_str, order.user_ref)
-            | None -> None
-          ) orders in
-
-          (* Filter orders by strategy based on userref *)
-          let filter_orders_by_strategy _strategy_name strategy_userref =
-            List.filter (fun (_order_id, _, _, _, userref_opt) ->
-              match userref_opt with
-              | Some userref -> Dio_strategies.Strategy_common.is_strategy_order strategy_userref userref
-              | None -> false
-            ) all_open_orders
-          in
-
-          (* Get strategy-specific open orders *)
-          let mm_open_orders = filter_orders_by_strategy "MM" Dio_strategies.Strategy_common.strategy_userref_mm in
-
-          (* Calculate buy/sell counts from grid strategy orders *)
-          let (grid_open_buy_count, grid_open_sell_count) =
-            List.fold_left (fun (buys, sells) (_, _, _, side_str, userref_opt) ->
-              (* Only count orders that match the grid strategy userref.
-                 Hyperliquid orders have no userref, so fall back to exchange-based
-                 detection (same logic as filter_orders_by_strategy).
-                 Previously `None -> false` caused grid_open_buy_count=0 for all
-                 Hyperliquid orders, making effective_buy_count rely solely on
-                 the fragile has_tracked_buy flag and triggering buy order spam. *)
-              let is_grid_order = match userref_opt with
-                | Some userref -> userref <> Dio_strategies.Strategy_common.strategy_userref_mm
-                | None -> true
-              in
-              if is_grid_order then
-                (if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1))
-              else
-                (buys, sells)
-            ) (0, 0) all_open_orders
-          in
-
-          (* Calculate buy/sell counts from MM strategy orders *)
-          let (mm_open_buy_count, mm_open_sell_count) =
-            List.fold_left (fun (buys, sells) (_, _, _, side_str, _) ->
-              if side_str = "buy" then (buys + 1, sells) else (buys, sells + 1)
-            ) (0, 0) mm_open_orders
+          (* Get open orders and compute counts in a single fold - no intermediate list allocations *)
+          let (all_open_orders, grid_open_buy_count, grid_open_sell_count, mm_open_buy_count, mm_open_sell_count, mm_open_orders) =
+            Ex.fold_open_orders ~symbol:asset_with_fees.symbol
+              ~init:([], 0, 0, 0, 0, [])
+              ~f:(fun (all_acc, g_buys, g_sells, m_buys, m_sells, mm_acc) (order : Types.open_order) ->
+                match order.limit_price with
+                | None -> (all_acc, g_buys, g_sells, m_buys, m_sells, mm_acc)
+                | Some price ->
+                    let side_str = match order.side with Types.Buy -> "buy" | Types.Sell -> "sell" in
+                    let entry = (order.order_id, price, order.remaining_qty, side_str, order.user_ref) in
+                    let is_mm = match order.user_ref with
+                      | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm userref
+                      | None -> false
+                    in
+                    if is_mm then
+                      let (mb, ms) = if side_str = "buy" then (m_buys + 1, m_sells) else (m_buys, m_sells + 1) in
+                      (entry :: all_acc, g_buys, g_sells, mb, ms, entry :: mm_acc)
+                    else
+                      let (gb, gs) = if side_str = "buy" then (g_buys + 1, g_sells) else (g_buys, g_sells + 1) in
+                      (entry :: all_acc, gb, gs, m_buys, m_sells, mm_acc)
+              )
           in
 
           (* Lock-free balance queries *)
@@ -701,7 +660,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Yield to allow other threads (websockets) to run *)
         (* Event-driven: block until the next WS frame signals new data. *)
         if not !should_execute_strategy then
-          Concurrency.Exchange_wakeup.wait ();
+          Concurrency.Exchange_wakeup.wait ~symbol:asset_with_fees.symbol;
 
         ()
       done
@@ -804,7 +763,7 @@ let stop_domain state =
 
   (* Unblock any domain worker blocked in Exchange_wakeup.wait so it can
      see is_running=false and exit the while loop cleanly. *)
-  Concurrency.Exchange_wakeup.signal ();
+  Concurrency.Exchange_wakeup.signal_all ();
 
 
   (match Atomic.get state.domain_handle with

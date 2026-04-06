@@ -306,6 +306,22 @@ module Hyperliquid_impl = struct
       }
     ) orders
 
+  let fold_open_orders ~symbol ~init ~f =
+    Hyperliquid_executions_feed.fold_open_orders symbol ~init ~f:(fun acc (o : Hyperliquid_executions_feed.open_order) ->
+      f acc { Types.
+        order_id = o.order_id;
+        symbol = o.symbol;
+        side = side_of_hyperliquid_side o.side;
+        qty = o.order_qty;
+        cum_qty = o.cum_qty;
+        remaining_qty = o.remaining_qty;
+        limit_price = o.limit_price;
+        status = status_of_hyperliquid_status o.order_status;
+        user_ref = o.order_userref;
+        cl_ord_id = o.cl_ord_id;
+      }
+    )
+
   let get_execution_feed_position ~symbol =
     Hyperliquid_executions_feed.get_current_position symbol
 
@@ -324,6 +340,20 @@ module Hyperliquid_impl = struct
       }
     ) events
 
+  let iter_execution_events ~symbol ~start_pos f =
+    Hyperliquid_executions_feed.iter_execution_events symbol start_pos (fun (e : Hyperliquid_executions_feed.execution_event) ->
+      f { Types.
+        order_id = e.order_id;
+        order_status = status_of_hyperliquid_status e.order_status;
+        limit_price = e.limit_price;
+        side = side_of_hyperliquid_side e.side;
+        remaining_qty = max 0.0 (e.order_qty -. e.cum_qty);
+        filled_qty = e.cum_qty;
+        avg_price = e.avg_price;
+        timestamp = e.timestamp;
+      }
+    )
+
   let get_ticker_position ~symbol =
     Hyperliquid_ticker_feed.get_current_position symbol
 
@@ -336,6 +366,11 @@ module Hyperliquid_impl = struct
         timestamp = t.timestamp;
       }
     ) events
+
+  let iter_ticker_events ~symbol ~start_pos f =
+    Hyperliquid_ticker_feed.iter_ticker_events symbol start_pos (fun (t : Hyperliquid_ticker_feed.ticker) ->
+      f { Types. bid = t.bid; ask = t.ask; timestamp = t.timestamp }
+    )
 
   let get_orderbook_position ~symbol =
     Hyperliquid_orderbook_feed.get_current_position symbol
@@ -354,6 +389,16 @@ module Hyperliquid_impl = struct
         timestamp = ob.timestamp;
       }
     ) events
+
+  let iter_orderbook_events ~symbol ~start_pos f =
+    Hyperliquid_orderbook_feed.iter_orderbook_events symbol start_pos (fun (ob : Hyperliquid_orderbook_feed.orderbook) ->
+      let map_levels levels =
+        Array.map (fun (l : Hyperliquid_orderbook_feed.level) ->
+          l.price, l.size
+        ) levels
+      in
+      f { Types. bids = map_levels ob.bids; asks = map_levels ob.asks; timestamp = ob.timestamp }
+    )
 
   (** Metadata Access *)
   
