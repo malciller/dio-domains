@@ -191,59 +191,50 @@ end
 (** Lock-free ring buffer for strategy orders *)
 module OrderRingBuffer = struct
   type 'a t = {
-    data: 'a option Atomic.t array;
-    write_pos: int Atomic.t;
-    read_pos: int Atomic.t;
+    data: 'a option array;
+    mutable write_pos: int;
+    mutable read_pos: int;
     size: int;
   }
 
   let create size =
     {
-      data = Array.init size (fun _ -> Atomic.make None);
-      write_pos = Atomic.make 0;
-      read_pos = Atomic.make 0;
+      data = Array.make size None;
+      write_pos = 0;
+      read_pos = 0;
       size;
     }
 
-  (** Lock-free write - producer side *)
+  (** Write to buffer — caller must hold order_buffer_mutex *)
   let write buffer value =
-    let pos = Atomic.get buffer.write_pos in
-    let read_pos = Atomic.get buffer.read_pos in
+    let pos = buffer.write_pos in
     let next_pos = (pos + 1) mod buffer.size in
-
-    (* Check if buffer is full *)
-    if next_pos = read_pos then
+    if next_pos = buffer.read_pos then
       None  (* Buffer full, drop the order *)
     else begin
-      Atomic.set buffer.data.(pos) (Some value);
-      Atomic.set buffer.write_pos next_pos;
+      buffer.data.(pos) <- Some value;
+      buffer.write_pos <- next_pos;
       Some ()
     end
 
-  (** Lock-free read - consumer side *)
+  (** Read from buffer — caller must hold order_buffer_mutex *)
   let read buffer =
-    let read_pos = Atomic.get buffer.read_pos in
-    let write_pos = Atomic.get buffer.write_pos in
-
-    if read_pos = write_pos then
+    if buffer.read_pos = buffer.write_pos then
       None  (* Buffer empty *)
     else
-      match Atomic.get buffer.data.(read_pos) with
+      match buffer.data.(buffer.read_pos) with
       | Some value ->
-          Atomic.set buffer.data.(read_pos) None;
-          let next_read_pos = (read_pos + 1) mod buffer.size in
-          Atomic.set buffer.read_pos next_read_pos;
+          buffer.data.(buffer.read_pos) <- None;
+          buffer.read_pos <- (buffer.read_pos + 1) mod buffer.size;
           Some value
       | None -> None  (* Shouldn't happen in normal operation *)
 
   (** Get current buffer usage *)
   let size buffer =
-    let read_pos = Atomic.get buffer.read_pos in
-    let write_pos = Atomic.get buffer.write_pos in
-    if write_pos >= read_pos then
-      write_pos - read_pos
+    if buffer.write_pos >= buffer.read_pos then
+      buffer.write_pos - buffer.read_pos
     else
-      buffer.size - read_pos + write_pos
+      buffer.size - buffer.read_pos + buffer.write_pos
 
   (** Batch read multiple items *)
   let read_batch buffer max_items =
