@@ -547,6 +547,7 @@ let push_order ~now order =
 (** Main strategy execution loop. *)
 let execute_strategy
     ?cached_state
+    ~now
     (asset : trading_config)
     (current_price : float option)
     (top_of_book : (float * float * float * float) option)
@@ -653,9 +654,8 @@ let execute_strategy
 
   if not state.capital_low then begin
 
-  (* Single wall-clock timestamp for the entire cycle. Avoids redundant
-     gettimeofday(2) syscalls that accumulate 1-5us each. *)
-  let now = Unix.gettimeofday () in
+   (* Wall-clock timestamp passed in from domain_spawner. Avoids a redundant
+      gettimeofday(2) syscall inside the timed strategy block. *)
   
   match current_price, top_of_book with
   | None, _ -> ()  (* No price data available yet *)
@@ -670,6 +670,12 @@ let execute_strategy
         | Some (bid, _, ask, _) when bid > 0.0 && ask > 0.0 -> (bid, ask)
         | _ -> (price, price)
       in
+
+      (* Stale pending order and amend cooldown cleanup. Gated by cycle_mod
+         to avoid O(n) list scans and Hashtbl iterations on every tick.
+         Stale entries have 5s timeouts; checking every 1024 cycles is
+         more than sufficient. Pure event-driven, no timers. *)
+      if cycle mod 1024 = 0 then begin
 
       (* Clean up stale pending orders and enforce a hard limit in a single pass.
          Combines List.length + List.filter + List.length + take into one
@@ -715,16 +721,19 @@ let execute_strategy
         Logging.warn_f ~section "amend_cooldowns exceeded 100 entries for %s, reset" asset.symbol
       end;
 
-      (* Sync strategy state with actual open orders from exchange.
-         Preserve sell orders set by handle_order_amended or newly placed
-         execution events that may not yet appear in exchange data due to WS lag. *)
-      let now_time = now in
+      (* Evict expired recently_injected_sells entries. *)
       state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
-        now_time -. ts < 10.0
+        now -. ts < 10.0
       ) state.recently_injected_sells;
       (* Cap to 20 entries to prevent O(n^2) scans during sell storms. *)
       if List.length state.recently_injected_sells > 20 then
         state.recently_injected_sells <- take 20 state.recently_injected_sells;
+
+      end; (* end: cycle mod cleanup gate *)
+
+      (* Sync strategy state with actual open orders from exchange.
+         Preserve sell orders set by handle_order_amended or newly placed
+         execution events that may not yet appear in exchange data due to WS lag. *)
       let preserved_sells = state.recently_injected_sells in
       state.open_sell_orders <- [];
       (* Preserve buy tracking across sync for all exchanges.

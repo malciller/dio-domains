@@ -275,6 +275,12 @@ module Hyperliquid_impl = struct
   let get_balance ~asset =
     Hyperliquid_balances.get_balance asset
 
+  (** Resolve a cached balance reader. Captures the underlying atomic store
+      once; subsequent calls bypass the Hashtbl lookup in get_balance_store. *)
+  let resolve_balance ~asset =
+    let store = Hyperliquid_balances.get_balance_store asset in
+    fun () -> Hyperliquid_balances.BalanceStore.get_balance store
+
   let get_all_balances () =
     let assets = Hyperliquid_balances.get_all_assets () in
     List.filter_map (fun asset ->

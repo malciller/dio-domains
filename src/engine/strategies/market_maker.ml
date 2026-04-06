@@ -412,6 +412,7 @@ let cancel_duplicate_orders asset_symbol target_price target_side open_orders st
     places/amends/cancels buy and sell orders to maintain one active pair. *)
 let execute_strategy
     ?cached_state
+    ~now
     (asset : trading_config)
     (current_price : float option)
     (top_of_book : (float * float * float * float) option)
@@ -478,8 +479,13 @@ let execute_strategy
      cleanup, and cancellation detection always execute regardless. *)
   if not state.capital_low then begin
 
-  (* Single wall-clock timestamp for the entire cycle. *)
-  let now = Unix.gettimeofday () in
+   (* Wall-clock timestamp passed in from domain_spawner. Avoids a redundant
+      gettimeofday(2) syscall inside the timed strategy block. *)
+
+      (* Stale pending order, cancelled order, and pending cancellation cleanup.
+         Gated by cycle_mod to avoid O(n) list scans and Hashtbl iterations
+         on every tick. Pure event-driven, no timers. *)
+      if cycle mod 1024 = 0 then begin
 
       (* Evict stale pending orders (older than 5s) and cap list at 50 entries *)
   let original_count = List.length state.pending_orders in
@@ -544,6 +550,8 @@ let execute_strategy
   let cleaned_cancelled_count = original_cancelled_count - List.length state.cancelled_orders in
   if cleaned_cancelled_count > 0 && should_log then
     Logging.debug_f ~section "Cleaned up %d cancelled orders for %s" cleaned_cancelled_count asset.symbol;
+
+  end; (* end: cycle mod cleanup gate *)
 
 
   (* state.mutex is intentionally not locked in this function.
