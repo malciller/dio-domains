@@ -1,27 +1,26 @@
 (**
-  Single-Short-Per-Cycle Auto-Hedging Module
-  
-  Intercepts spot fills on Hyperliquid and manages a single perp short position
-  per grid cycle:
-  
-  - Spot Buy  → Open perp short ONLY if no hedge is currently open
-  - Spot Sell → Close the entire open hedge short
-  
-  During drawdowns the single short (opened at the first buy's price) rides the
-  full move, accumulating unrealized profit. Additional buys do NOT stack more
-  shorts. When the grid sells on recovery, the short is closed — realizing the
-  hedge profit — and the slot opens for the next cycle.
-  
-  Uses IOC limit orders priced at the perp top-of-book (best bid for sells,
-  best ask for buys) to minimise slippage and avoid taker spread. Falls back
-  to market orders when orderbook data is unavailable.
+   Single-short-per-cycle auto-hedging module.
+
+   Intercepts spot fills on Hyperliquid and manages one perp short per grid cycle:
+
+   - Spot buy -> open a perp short only if no hedge is currently open.
+   - Spot sell -> close the entire open hedge short.
+
+   During drawdowns the single short (opened at the first buy price) rides the
+   full move, accumulating unrealized profit. Additional buys do not stack more
+   shorts. On grid recovery sell, the short is closed, realizing the hedge
+   profit and freeing the slot for the next cycle.
+
+   Places IOC limit orders at perp top-of-book (best bid for sells, best ask
+   for buys) to minimize slippage. Falls back to market orders when orderbook
+   data is unavailable.
 *)
 
 open Strategy_common
 
 let section = "auto_hedger"
 
-(* Unique ring buffer for hedging orders *)
+(* Ring buffer dedicated to hedging orders. *)
 let order_buffer = OrderRingBuffer.create 2048
 let order_buffer_mutex = Mutex.create ()
 
@@ -40,9 +39,9 @@ let push_order order =
   | Some () -> ()
 
 (** Build a hedge order and push it to the ring buffer.
-    When perp_tob is available, places an IOC limit order at the best bid (sell)
-    or best ask (buy) to reduce slippage. Falls back to market order otherwise.
-    Returns the hedge quantity on success, 0.0 on skip. *)
+    When [perp_tob] is available, places an IOC limit at best bid (sell) or
+    best ask (buy) to reduce slippage. Falls back to market order otherwise.
+    Returns the hedge quantity on success, or 0.0 on skip. *)
 let build_and_push_hedge testnet hedge_symbol hedge_side filled_qty fill_price perp_tob =
   if fill_price <= 0.0 then begin
     Logging.warn_f ~section "Fill price is 0 for %s, skipping hedge" hedge_symbol;
@@ -63,17 +62,16 @@ let build_and_push_hedge testnet hedge_symbol hedge_side filled_qty fill_price p
         filled_qty
     in
     
-    (* Determine order type and price from perp top-of-book:
-       - Sell hedge: limit at best bid (cross the spread for immediate fill)
-       - Buy hedge:  limit at best ask (cross the spread for immediate fill)
-       Falls back to market order if no orderbook data available. *)
+    (* Determine order type and price from perp top-of-book.
+       Sell hedge: limit at best bid. Buy hedge: limit at best ask.
+       Falls back to market order when no orderbook data is available. *)
     let (order_type, limit_price) = match perp_tob with
       | Some (best_bid, _bid_sz, best_ask, _ask_sz) ->
           let px = match hedge_side with
             | Sell -> best_bid
             | Buy  -> best_ask
           in
-          Logging.info_f ~section "Using perp TOB for %s %s: bid=%.4f ask=%.4f → limit=%.4f"
+          Logging.info_f ~section "Using perp TOB for %s %s: bid=%.4f ask=%.4f -> limit=%.4f"
             (string_of_order_side hedge_side) hedge_symbol best_bid best_ask px;
           ("limit", Some px)
       | None ->
@@ -105,7 +103,7 @@ let build_and_push_hedge testnet hedge_symbol hedge_side filled_qty fill_price p
     hedge_qty_final
   end
 
-(* Single-short state: is a hedge currently open, and what qty? *)
+(* Mutable state tracking whether a hedge is open and its quantity. *)
 let hedge_open = ref false
 let hedge_qty = ref 0.0
 let hedge_mutex = Mutex.create ()
@@ -134,20 +132,20 @@ let clear_hedge () =
   hedge_qty := 0.0;
   Mutex.unlock hedge_mutex
 
-(** Handle a spot fill (single-short-per-cycle model):
-    - Spot Buy  → open perp short ONLY if no hedge is currently open (skip if riding)
-    - Spot Sell → close the full open hedge short
-    perp_tob: optional (bid_price, bid_size, ask_price, ask_size) from the perp orderbook *)
+(** Handle a spot fill under the single-short-per-cycle model.
+    Spot buy: open perp short only if no hedge is currently open.
+    Spot sell: close the full open hedge short.
+    [perp_tob]: optional (bid_price, bid_size, ask_price, ask_size) from the perp orderbook. *)
 let handle_order_filled testnet exchange hedge_symbol side filled_qty fill_price perp_tob =
   if exchange <> "hyperliquid" then ()
   else begin
     match side with
     | Buy ->
       if is_hedge_open () then
-        Logging.info_f ~section "Spot buy fill: %.8f %s @ %.4f → hedge already open (%.8f short), skipping"
+        Logging.info_f ~section "Spot buy fill: %.8f %s @ %.4f -> hedge already open (%.8f short), skipping"
           filled_qty hedge_symbol fill_price (get_hedge_qty ())
       else begin
-        Logging.info_f ~section "Spot buy fill: %.8f %s @ %.4f → opening hedge short"
+        Logging.info_f ~section "Spot buy fill: %.8f %s @ %.4f -> opening hedge short"
           filled_qty hedge_symbol fill_price;
         let qty = build_and_push_hedge testnet hedge_symbol Sell filled_qty fill_price perp_tob in
         if qty > 0.0 then begin
@@ -158,7 +156,7 @@ let handle_order_filled testnet exchange hedge_symbol side filled_qty fill_price
     | Sell ->
       if is_hedge_open () then begin
         let close_qty = get_hedge_qty () in
-        Logging.info_f ~section "Spot sell fill: %.8f %s @ %.4f → closing full hedge short (%.8f)"
+        Logging.info_f ~section "Spot sell fill: %.8f %s @ %.4f -> closing full hedge short (%.8f)"
           filled_qty hedge_symbol fill_price close_qty;
         let qty = build_and_push_hedge testnet hedge_symbol Buy close_qty fill_price perp_tob in
         if qty > 0.0 then begin
@@ -166,11 +164,11 @@ let handle_order_filled testnet exchange hedge_symbol side filled_qty fill_price
           Logging.info_f ~section "Hedge short closed: %.8f %s" qty hedge_symbol
         end
       end else
-        Logging.info_f ~section "Spot sell fill: %.8f %s @ %.4f → no hedge open, skipping"
+        Logging.info_f ~section "Spot sell fill: %.8f %s @ %.4f -> no hedge open, skipping"
           filled_qty hedge_symbol fill_price
   end
 
-(** Reset state — kept for test compatibility *)
+(** Reset hedge state. Retained for test compatibility. *)
 let reset_state () =
   Mutex.lock hedge_mutex;
   hedge_open := false;

@@ -1,4 +1,8 @@
-(** Hyperliquid Instruments Feed *)
+(** Hyperliquid instrument metadata feed.
+    Maintains a local cache of perpetual and spot instrument definitions
+    (symbol, size decimals, max leverage, asset index) derived from
+    WebSocket meta payloads. Provides lookup, rounding, and subscription
+    identifier resolution for downstream consumers. *)
 
 
 let section = "hyperliquid_instruments_feed"
@@ -6,8 +10,8 @@ let section = "hyperliquid_instruments_feed"
 type pair_info = {
   symbol: string;
   sz_decimals: int;
-  max_leverage: int option; (* optionally null for spot *)
-  asset_index: int; (* used for ordering *)
+  max_leverage: int option; (** [None] for spot instruments. *)
+  asset_index: int; (** Numeric index used for ordering and spot identifier encoding. *)
 }
 
 let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 128
@@ -24,7 +28,10 @@ let notify_ready () =
   Atomic.set is_ready true;
   Lwt_condition.broadcast ready_condition ()
 
-(** Process instrument metadata from JSON payloads (called by higher level component pushing WS data) *)
+(** Parses perpetual and spot instrument metadata from JSON payloads
+    received via WebSocket. Populates [pair_cache] and signals readiness
+    on completion. Spot instruments are keyed by both canonical symbol
+    and [@N] alias. *)
 let process_meta_response payload_perp payload_spot =
   Lwt.catch (fun () ->
     let open Yojson.Safe.Util in
@@ -44,7 +51,7 @@ let process_meta_response payload_perp payload_spot =
     ) tokens_spot;
     
     Mutex.lock cache_mutex;
-    (* Process Perpetuals *)
+    (* Iterate perpetual universe; asset_index matches list position. *)
     List.iteri (fun idx item ->
       try
         let symbol = member "name" item |> to_string in
@@ -56,7 +63,7 @@ let process_meta_response payload_perp payload_spot =
         Logging.warn_f ~section "Failed to parse perp item: %s" (Printexc.to_string exn)
     ) universe_perp;
     
-    (* Process Spot *)
+    (* Iterate spot universe; resolve base/quote from token index table. *)
     List.iter (fun item ->
       try
         let index = member "index" item |> to_int in
@@ -67,7 +74,7 @@ let process_meta_response payload_perp payload_spot =
         in
         let base_name, sz_decimals = Hashtbl.find spot_info_by_token_idx base_idx in
         let quote_name, _ = Hashtbl.find spot_info_by_token_idx quote_idx in
-        (* Map wrapper spot tokens to normal names (e.g. UBTC -> BTC) *)
+        (* Canonicalize wrapped token names (e.g. UBTC to BTC). *)
         let canon_base = match base_name with
           | "UBTC" -> "BTC"
           | "UETH" -> "ETH"
@@ -94,11 +101,13 @@ let process_meta_response payload_perp payload_spot =
     Lwt.return_unit
   )
 
-(** Mock initialization for testing - populates cache without network requests *)
+(** Populates the instrument cache with synthetic entries for testing.
+    Assigns default sz_decimals of 4. Determines instrument type
+    (spot vs perpetual) by the presence of a '/' separator in the symbol. *)
 let initialize symbols =
   Mutex.lock cache_mutex;
   List.iter (fun symbol ->
-    let sz_decimals = 4 in (* Default for testing *)
+    let sz_decimals = 4 in
     let max_leverage = if String.contains symbol '/' then None else Some 50 in
     let asset_index = if String.contains symbol '/' then 10000 else 0 in
     let info = { symbol; sz_decimals; max_leverage; asset_index } in
@@ -107,29 +116,33 @@ let initialize symbols =
   Mutex.unlock cache_mutex;
   Logging.info_f ~section "Initialized Hyperliquid instruments feed with %d mock symbols" (List.length symbols)
 
-(** Register a single instrument with a custom sz_decimals for testing *)
+(** Registers a single instrument entry with caller-specified sz_decimals.
+    Also inserts a base-asset alias for perpetual-style lookups.
+    Intended for test harnesses requiring fine-grained control over
+    instrument parameters. *)
 let register_test_instrument ~symbol ~sz_decimals =
   Mutex.lock cache_mutex;
   let max_leverage = if String.contains symbol '/' then None else Some 50 in
   let asset_index = if String.contains symbol '/' then 10000 else 0 in
   let info = { symbol; sz_decimals; max_leverage; asset_index } in
   Hashtbl.replace pair_cache symbol info;
-  (* Also register the base asset as a perp alias so lookup_info fallback works *)
+  (* Register base asset key as a perpetual alias for fallback lookups. *)
   (match String.split_on_char '/' symbol with
    | base :: _ when base <> symbol -> Hashtbl.replace pair_cache base info
    | _ -> ());
   Mutex.unlock cache_mutex
 
-(** Look up a symbol in the cache, with a fallback for perp pairs expressed as BASE/USDC.
-    Config uses "BTC/USDC" but perps are cached as just "BTC" (index 0..N-1).
-    Spot pairs are stored as "BASE/QUOTE" directly (index 10000+). *)
+(** Looks up instrument info by symbol. Falls back to stripping the
+    quote suffix (e.g. "BTC/USDC" to "BTC") to resolve perpetuals,
+    which are cached under their base name only. Spot pairs are stored
+    under their full "BASE/QUOTE" key (asset_index >= 10000). *)
 let lookup_info symbol =
   Mutex.lock cache_mutex;
   let direct = Hashtbl.find_opt pair_cache symbol in
   let result = match direct with
     | Some _ as r -> r
     | None ->
-        (* Try stripping the quote suffix to find a perp: "BTC/USDC" -> "BTC" *)
+        (* Strip quote suffix and retry as perpetual base name. *)
         (match String.split_on_char '/' symbol with
          | base :: _ -> Hashtbl.find_opt pair_cache base
          | [] -> None)
@@ -137,10 +150,11 @@ let lookup_info symbol =
   Mutex.unlock cache_mutex;
   result
 
-(** Get the tick size / price increment for a symbol *)
+(** Returns a fixed minimum price increment.
+    Hyperliquid enforces 5 significant figures with up to 6 decimal places;
+    this static accessor returns the smallest representable tick. *)
 let get_price_increment _symbol =
-  (* Hyperliquid uses 5 significant figures for price, up to 6 decimals.
-     For this static interface we return a fixed small minimum increment. *)
+
   Some 0.00001
 
 let get_qty_increment symbol =
@@ -165,26 +179,27 @@ let resolve_symbol coin =
   Mutex.unlock cache_mutex;
   res
 
-(** Get the correct coin identifier for WS subscriptions (l2Book, allMids matching).
-    Perps use the base coin name (e.g. "HYPE"), spot pairs use "@N" format. *)
+(** Returns the coin identifier expected by Hyperliquid WebSocket channels
+    (l2Book, allMids). Perpetuals use the base coin name; spot pairs use
+    the "@N" format derived from asset_index. *)
 let get_subscription_coin symbol =
   Mutex.lock cache_mutex;
   let res = match Hashtbl.find_opt pair_cache symbol with
     | Some info when info.asset_index >= 10000 ->
-        (* Spot pair - use @N format where N = asset_index - 10000 *)
+        (* Spot pair: encode as @N where N = asset_index - 10000. *)
         Printf.sprintf "@%d" (info.asset_index - 10000)
     | _ ->
-        (* Perp or not found - use base coin name *)
+        (* Perpetual or unknown: extract base coin name. *)
         if String.contains symbol '/' then String.split_on_char '/' symbol |> List.hd
         else symbol
   in
   Mutex.unlock cache_mutex;
   res
 
-(** Round price to Hyperliquid's precision rules for a specific symbol:
-    - 5 significant figures
-    - At most (MAX_DECIMALS - szDecimals) decimal places
-    - MAX_DECIMALS = 8 for spot, 6 for perp *)
+(** Rounds price according to Hyperliquid per-symbol precision rules.
+    Step 1: round to 5 significant figures.
+    Step 2: cap decimal places at (max_decimals - sz_decimals),
+    where max_decimals is 8 for spot and 6 for perpetual instruments. *)
 let round_price_to_tick_for_symbol symbol price =
   if price <= 0.0 then price
   else begin
@@ -195,18 +210,19 @@ let round_price_to_tick_for_symbol symbol price =
     let max_decimals = if is_spot then 8 else 6 in
     let allowed_decimals = max_decimals - sz_decimals in
 
-    (* Step 1: round to 5 significant figures *)
+    (* Round to 5 significant figures. *)
     let exp = floor (log10 price) in
     let shift = 4. -. exp in
     let sig_fig_multiplier = 10. ** shift in
     let rounded_5sf = floor (price *. sig_fig_multiplier +. 0.5) /. sig_fig_multiplier in
 
-    (* Step 2: cap at allowed_decimals decimal places *)
+    (* Cap at allowed_decimals decimal places. *)
     let dec_multiplier = 10. ** (float_of_int allowed_decimals) in
     floor (rounded_5sf *. dec_multiplier +. 0.5) /. dec_multiplier
   end
 
-(** Round price to tick using symbol-unaware fallback (5 sig figs, 6 decimal cap) *)
+(** Rounds price to tick without instrument context.
+    Applies 5 significant figures and a fixed 6 decimal place cap. *)
 let round_price_to_tick price =
   if price <= 0.0 then price
   else
@@ -218,13 +234,15 @@ let round_price_to_tick price =
     let dec_multiplier = 10. ** max_decimals in
     floor (rounded *. dec_multiplier +. 0.5) /. dec_multiplier
 
-(** Round quantity to the instrument's szDecimals (lot size) *)
+(** Rounds quantity down to the instrument's sz_decimals (lot size).
+    Uses floor to prevent over-allocation. Returns qty unmodified
+    if the instrument is not found in the cache. *)
 let round_qty_to_lot symbol qty =
   match lookup_info symbol with
   | Some info ->
       let multiplier = 10. ** (float_of_int info.sz_decimals) in
-      (* Use floor down to ensure we never over-allocate qty, which is typical for trading *)
+      (* Floor to avoid exceeding available balance. *)
       floor (qty *. multiplier) /. multiplier
   | None ->
-      (* Fallback: don't round if we don't know the asset *)
+      (* Unknown instrument: return qty unmodified. *)
       qty

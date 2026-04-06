@@ -1,10 +1,13 @@
-(** Hyperliquid Ticker Feed *)
+(** Hyperliquid ticker feed.
+    Consumes allMids and l2Book WebSocket channels, stores per-symbol
+    ticker snapshots in lock-free ring buffers, and exposes low-latency
+    read accessors for downstream pricing consumers. *)
 
 
 
 let section = "hyperliquid_ticker"
 
-(** Ticker data *)
+(** Canonical ticker record representing a single price snapshot for one symbol. *)
 type ticker = {
   symbol: string;
   bid: float;
@@ -14,10 +17,10 @@ type ticker = {
   timestamp: float;
 }
 
-(** Lock-free ring buffer for ticker data *)
+(** Lock-free ring buffer used for bounded, wait-free ticker storage. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol ticker storage with readiness signalling *)
+(** Per-symbol store pairing a ring buffer with an atomic readiness flag. *)
 type store = {
   buffer: ticker RingBuffer.t;
   ready: bool Atomic.t;
@@ -27,7 +30,8 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Get or create store for a symbol - thread-safe with double-checked locking *)
+(** Returns the store for [symbol], creating one if absent.
+    Uses double-checked locking via [initialization_mutex] for thread safety. *)
 let ensure_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store
@@ -52,31 +56,32 @@ let notify_ready store =
     (try Lwt_condition.broadcast ready_condition () with _ -> ())
   end
 
-(** Get latest ticker for a symbol *)
+(** Returns the most recent ticker snapshot for [symbol], or [None] if no data exists. *)
 let[@inline always] get_latest_ticker symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.read_latest store.buffer
   | None -> None
 
-(** Get latest price (midpoint of bid/ask) - hot path, inlined *)
+(** Returns the bid/ask midpoint for [symbol]. Inlined on the hot path. *)
 let[@inline always] get_latest_price symbol =
   match get_latest_ticker symbol with
   | None -> None
   | Some ticker -> Some ((ticker.bid +. ticker.ask) /. 2.0)
 
-(** Read ticker events since last position *)
+(** Returns all ticker events written after [last_pos] for [symbol]. *)
 let[@inline always] read_ticker_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 
-(** Zero-allocation iteration over ticker events since last position *)
+(** Iterates [f] over ticker events written after [last_pos] without allocation.
+    Returns the new read position. *)
 let[@inline always] iter_ticker_events symbol last_pos f =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
   | None -> last_pos
 
-(** Get current write position *)
+(** Returns the current write position for [symbol]'s ring buffer. *)
 let[@inline always] get_current_position symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.get_position store.buffer
@@ -108,10 +113,11 @@ let wait_for_price_data symbols timeout_seconds =
   loop ()
 
 let find_registered_symbol coin =
-  (* Use instruments feed to resolve coin to canonical symbol.
-     - Spot pairs: coin="@107" -> resolve -> "HYPE/USDC" -> found in stores ✓
-     - Perps:      coin="BTC"  -> resolve -> "BTC"        -> NOT in stores (keyed "BTC/USDC")
-                   so fall back to trying "BTC/USDC" to match config-style symbol. *)
+  (* Resolves a Hyperliquid coin identifier to a registered store symbol.
+     Spot tokens (e.g. "@107") resolve via the instruments feed to their
+     canonical pair (e.g. "HYPE/USDC"). Perp coins (e.g. "BTC") resolve to
+     the bare name; if that is not in stores, the "/USDC" suffix is appended
+     to match the config-style key (e.g. "BTC/USDC"). *)
   match Hyperliquid_instruments_feed.resolve_symbol coin with
   | Some symbol ->
       if Hashtbl.mem stores symbol then Some symbol
@@ -198,7 +204,7 @@ let _processor_task =
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid ticker processor task";
       let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
-      (* Stream ended normally (disconnect pushed None) — re-subscribe *)
+      (* Stream ended normally (disconnect pushed None); re-subscribe. *)
       sub.close ();
       Logging.info ~section "Ticker stream ended (disconnect), re-subscribing in 1s...";
       Lwt.bind (Lwt_unix.sleep 1.0) (fun () -> run ())

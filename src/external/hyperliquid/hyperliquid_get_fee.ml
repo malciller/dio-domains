@@ -1,3 +1,7 @@
+(* Hyperliquid_get_fee -- per-user fee rate retrieval for perpetual and spot markets.
+   Queries the Hyperliquid /info endpoint with the configured wallet address,
+   parses account-specific and schedule-level rates, and falls back to
+   hardcoded tier maximums when neither is available. *)
 
 let section = "hyperliquid_get_fee"
 
@@ -9,7 +13,8 @@ type fee_info = {
   spot_taker_fee: float option;
 }
 
-(** Load API credentials from .env file *)
+(** Reads the HYPERLIQUID_WALLET_ADDRESS environment variable.
+    Fails with an Lwt exception if the variable is unset. *)
 let get_wallet_address_from_env () : string Lwt.t =
   match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" with
   | Some v -> Lwt.return v 
@@ -19,14 +24,14 @@ let parse_fee_info body_str =
   let open Yojson.Safe.Util in
   try
     let json = Yojson.Safe.from_string body_str in
-    (* Hyperliquid returns rates like "0.0001" as strings *)
+    (* Perp fee rates. The API returns decimal string values (e.g. "0.0001"). *)
     let maker = member "userAddRate" json |> to_string_option |> Option.map float_of_string in
     let taker = member "userCrossRate" json |> to_string_option |> Option.map float_of_string in
     
-    (* Parse user-specific spot fees from the API response.
-       Primary: userSpotAddRate / userSpotCrossRate (include referral & staking discounts).
-       Fallback: feeSchedule.spotAdd / feeSchedule.spotCross (base schedule rates).
-       Last resort: 0.0004 maker / 0.0007 taker (highest Hyperliquid default spot rates). *)
+    (* Spot fee resolution order:
+       1. userSpotAddRate / userSpotCrossRate (account-specific, includes referral and staking discounts).
+       2. feeSchedule.spotAdd / feeSchedule.spotCross (base schedule rates).
+       3. Hardcoded defaults: 0.0004 maker, 0.0007 taker (highest Hyperliquid spot tier). *)
     let spot_maker =
       let user_rate = member "userSpotAddRate" json |> to_string_option |> Option.map float_of_string in
       match user_rate with
@@ -69,7 +74,9 @@ let parse_fee_info body_str =
     Logging.error_f ~section "Failed to parse Hyperliquid fee response: %s (JSON: %s)" (Printexc.to_string exn) body_str;
     None
 
-(** Get user fees from Hyperliquid info endpoint *)
+(** Fetches per-user fee rates from the Hyperliquid /info endpoint via POST.
+    Selects mainnet or testnet base URL based on [~testnet].
+    Applies a 5-second timeout. Returns [None] on HTTP error, timeout, or parse failure. *)
 let get_fee_info ~testnet () : fee_info option Lwt.t =
   let open Lwt.Infix in
   let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
@@ -81,7 +88,7 @@ let get_fee_info ~testnet () : fee_info option Lwt.t =
     
     Logging.info_f ~section "Fetching Hyperliquid fees for wallet %s..." wallet;
     
-    (* Using Lwt_unix.with_timeout to prevent hanging *)
+    (* 5-second timeout guard against unresponsive upstream *)
     Lwt_unix.with_timeout 5.0 (fun () ->
       Cohttp_lwt_unix.Client.post ~headers ~body url >>= fun (resp, resp_body) ->
       if Cohttp.Response.status resp |> Cohttp.Code.code_of_status |> fun c -> c >= 200 && c < 300 then

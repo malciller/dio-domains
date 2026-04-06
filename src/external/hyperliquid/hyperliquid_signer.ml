@@ -1,4 +1,6 @@
-(** Hyperliquid EIP-712 Signing utility *)
+(** EIP-712 structured data signing for the Hyperliquid L1 action protocol.
+    Implements domain separation, Agent struct hashing, and secp256k1 ECDSA
+    signature generation with recovery ID per the Ethereum signing convention. *)
 
 module Int64 = Stdlib.Int64
 
@@ -30,37 +32,37 @@ let hex_of_bytes s =
   done;
   Bytes.to_string b
 
-(** Convert an integer to an 8-byte big-endian string *)
+(** Encode a 64-bit integer as an 8-byte big-endian binary string. *)
 let encode_uint64_be n =
   let buf = Bytes.create 8 in
   Bytes.set_int64_be buf 0 n;
   Bytes.to_string buf
 
-(** Generate an action hash according to Hyperliquid's rules:
-    msgpack(action) + nonce + [vault] + [expires_after] 
-*)
+(** Compute the Keccak-256 action hash per the Hyperliquid signing spec.
+    Concatenates: msgpack(action) || nonce(u64) || vault_address? || expires_after?
+    The vault and expiration fields are optional; vault uses a 0x00/0x01 presence tag. *)
 let action_hash ~action_msgpack ~nonce ~vault_address ~expires_after =
   let buf = Buffer.create 128 in
   
-  (* 1. msgpack(action) *)
+  (* Append the msgpack-serialized action payload. *)
   Buffer.add_string buf action_msgpack;
   
-  (* 2. nonce (uint64, 8 bytes) *)
+  (* Append nonce as a big-endian uint64 (8 bytes). *)
   Buffer.add_string buf (encode_uint64_be nonce);
   
-  (* 3. vault_address *)
+  (* Append vault address with presence tag: 0x00 if absent, 0x01 + 20-byte address if present. *)
   (match vault_address with
   | None -> Buffer.add_char buf '\x00'
   | Some addr_raw -> 
       Buffer.add_char buf '\x01';
       let addr = String.lowercase_ascii addr_raw in
-      (* Convert 0x string to bytes *)
+      (* Strip optional "0x" prefix and decode hex to raw bytes. *)
       let clean_addr = if String.starts_with ~prefix:"0x" addr then String.sub addr 2 (String.length addr - 2) else addr in
       let addr_bytes = bytes_of_hex clean_addr in
       Buffer.add_string buf addr_bytes
   );
   
-  (* 4. expires_after *)
+  (* Append optional expiration: 0x00 tag followed by big-endian uint64 timestamp. *)
   (match expires_after with
   | None -> ()
   | Some expiration -> 
@@ -68,15 +70,16 @@ let action_hash ~action_msgpack ~nonce ~vault_address ~expires_after =
       Buffer.add_string buf (encode_uint64_be expiration)
   );
   
-  (* keccak256 *)
+  (* Compute Keccak-256 digest of the concatenated buffer. *)
   let digest = Digestif.KECCAK_256.digest_string (Buffer.contents buf) in
   Digestif.KECCAK_256.to_raw_string digest
 
-(** Helper: Keccak256 of string *)
+(** Compute Keccak-256 of a string, returning the raw 32-byte digest. *)
 let keccak256_str s =
   Digestif.KECCAK_256.to_raw_string (Digestif.KECCAK_256.digest_string s)
 
-(** Domain Hash precomputation *)
+(** Precomputed EIP-712 domain separator type hash and field hashes.
+    Domain: name="Exchange", version="1", verifyingContract=0x0. *)
 let domain_type_hash = keccak256_str "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
 let domain_name_hash = keccak256_str "Exchange"
 let domain_version_hash = keccak256_str "1"
@@ -96,7 +99,7 @@ let hash_domain ~chain_id =
   Buffer.add_string buf domain_contract;
   keccak256_str (Buffer.contents buf)
 
-(** Agent Struct Precomputation *)
+(** Precomputed EIP-712 type hash for the Agent struct: Agent(string source, bytes32 connectionId). *)
 let agent_type_hash = keccak256_str "Agent(string source,bytes32 connectionId)"
 
 let hash_agent ~source_str ~connection_id_raw =
@@ -106,9 +109,8 @@ let hash_agent ~source_str ~connection_id_raw =
   Buffer.add_string buf connection_id_raw;
   keccak256_str (Buffer.contents buf)
 
-(** EIP-712 encode
-    \x19\x01 || hashDomain || hashAgent 
-*)
+(** Produce the final EIP-712 signing digest: 0x1901 || domainSeparator || structHash.
+    Returns a 32-byte Keccak-256 hash suitable for ECDSA signing. *)
 let eip712_digest ~chain_id ~hash_struct =
   let buf = Buffer.create 66 in
   Buffer.add_string buf "\x19\x01";
@@ -116,7 +118,7 @@ let eip712_digest ~chain_id ~hash_struct =
   Buffer.add_string buf hash_struct;
   keccak256_str (Buffer.contents buf)
 
-(** Sign a payload with secp256k1 given raw bytes *)
+(** Secp256k1 ECDSA signing utilities using the libsecp256k1 C bindings. *)
 open Bigarray
 
 let bs_of_string s =
@@ -144,19 +146,20 @@ let sign_hash ~private_key_raw ~msg_hash_raw =
   let s = bs_sub_to_string block 32 32 in
   let hex_r = hex_of_bytes r in
   let hex_s = hex_of_bytes s in
-  (* Note: standard Ethereum mapping for v is +27. But in API some just expect 27/28 or 0/1, python returns `v=27 + recovery_id`. *)
+  (* Ethereum convention: v = recovery_id + 27, yielding 27 or 28. *)
   let v_eth = v + 27 in
   (hex_r, hex_s, v_eth)
 
-(** Derive Ethereum address (0x-prefixed hex) from private key hex.
-    Used to ensure HYPERLIQUID_PRIVATE_KEY matches HYPERLIQUID_WALLET_ADDRESS. *)
+(** Derive the Ethereum address (0x-prefixed, lowercase hex) from a private key.
+    Computes the uncompressed public key, hashes it with Keccak-256,
+    and extracts the last 20 bytes as the address. *)
 let address_of_private_key_hex ~private_key_hex =
   let pkey_clean = if String.starts_with ~prefix:"0x" private_key_hex then String.sub private_key_hex 2 (String.length private_key_hex - 2) else private_key_hex in
   let private_key_raw = bytes_of_hex pkey_clean in
   let ctx = Secp256k1.Context.create [Secp256k1.Context.Sign] in
   let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
   let pubkey = Secp256k1.Key.neuterize_exn ctx seckey in
-  (* Uncompressed public key (65 bytes: 04 || x || y), then keccak256, then last 20 bytes = address *)
+  (* Serialize uncompressed public key (65 bytes: 0x04 || x || y), hash with Keccak-256, take last 20 bytes. *)
   let pubkey_buf = Secp256k1.Key.to_bytes ~compress:false ctx pubkey in
   let pubkey_str = Array1.dim pubkey_buf |> fun n -> let s = Bytes.create n in for i = 0 to n - 1 do Bytes.set s i (Array1.get pubkey_buf i) done; Bytes.to_string s in
   let hash = Digestif.KECCAK_256.digest_string pubkey_str in
@@ -164,7 +167,9 @@ let address_of_private_key_hex ~private_key_hex =
   let addr_bytes = String.sub hash_raw 12 20 in
   "0x" ^ hex_of_bytes addr_bytes
 
-(** Final wrapper for Hyperliquid L1 Action *)
+(** Sign a Hyperliquid L1 action. Computes the action hash, constructs the EIP-712
+    Agent struct, produces the typed data digest, and signs with the given private key.
+    Returns (r, s, v) as hex strings and integer recovery value. *)
 let sign_l1_action ?expires_after ~private_key_hex ~action_msgpack ~nonce ~is_mainnet ~vault_address () =
   let pkey_clean = if String.starts_with ~prefix:"0x" private_key_hex then String.sub private_key_hex 2 (String.length private_key_hex - 2) else private_key_hex in
   let private_key_raw = bytes_of_hex pkey_clean in

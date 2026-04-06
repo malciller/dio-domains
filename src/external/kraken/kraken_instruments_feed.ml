@@ -1,9 +1,20 @@
-(** Kraken Instrument Data - WebSocket v2 subscription for pair status and parameters *)
+(**
+   Kraken instrument metadata feed.
+
+   Maintains a local cache of per-pair trading parameters (tick sizes, quantity
+   constraints, cost minimums, trading status) sourced from the Kraken REST
+   API ([/0/public/AssetPairs]).  A WebSocket-based feed path is stubbed but
+   not yet implemented; [initialize_symbols] populates the cache via REST.
+
+   Consumers (e.g. [Kraken_module]) query the cache synchronously through
+   [get_price_increment], [get_qty_increment], [get_qty_min], etc.
+*)
 
 open Lwt.Infix
 
 let section = "kraken_instrument"
 
+(** Trading status of a Kraken pair as reported by the API. *)
 type pair_status = 
   | Online
   | CancelOnly
@@ -15,40 +26,45 @@ type pair_status =
   | WorkInProgress
   | Unknown
 
+(** Parse a Kraken API status string into [pair_status]. *)
 let status_of_string = function
   | "online" -> Online | "cancel_only" -> CancelOnly | "delisted" -> Delisted
   | "limit_only" -> LimitOnly | "maintenance" -> Maintenance | "post_only" -> PostOnly
   | "reduce_only" -> ReduceOnly | "work_in_progress" -> WorkInProgress | _ -> Unknown
 
+(** Serialize [pair_status] to its Kraken API string form. *)
 let status_to_string = function
   | Online -> "online" | CancelOnly -> "cancel_only" | Delisted -> "delisted"
   | LimitOnly -> "limit_only" | Maintenance -> "maintenance" | PostOnly -> "post_only"
   | ReduceOnly -> "reduce_only" | WorkInProgress -> "work_in_progress" | Unknown -> "unknown"
 
+(** Returns [true] only when status is [Online]. *)
 let is_tradeable = function Online -> true | _ -> false
 
+(** Cached instrument metadata for a single trading pair. *)
 type pair_info = {
-  symbol: string;
-  base: string;
-  quote: string;
-  status: pair_status;
-  qty_precision: int;
-  qty_increment: float;
-  qty_min: float;
-  price_precision: int;
-  price_increment: float;
-  cost_precision: int;
-  cost_min: float;
-  marginable: bool;
-  has_index: bool;
-  last_updated: float;
+  symbol: string;           (** Canonical pair symbol (e.g. "BTC/USD"). *)
+  base: string;             (** Base asset identifier. *)
+  quote: string;            (** Quote asset identifier. *)
+  status: pair_status;      (** Current trading status. *)
+  qty_precision: int;       (** Decimal places for order quantities. *)
+  qty_increment: float;     (** Minimum quantity step size. *)
+  qty_min: float;           (** Minimum allowed order quantity. *)
+  price_precision: int;     (** Decimal places for prices. *)
+  price_increment: float;   (** Minimum price tick size. *)
+  cost_precision: int;      (** Decimal places for cost values. *)
+  cost_min: float;          (** Minimum notional order cost. *)
+  marginable: bool;         (** Whether margin trading is available. *)
+  has_index: bool;          (** Whether an index price exists. *)
+  last_updated: float;      (** Unix timestamp of last cache write. *)
 }
 
-(* In-memory cache of pair information *)
+(** In-memory symbol-to-[pair_info] cache. Protected by [cache_mutex]. *)
 let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 32
 let cache_mutex = Lwt_mutex.create ()
 
-(** Parse pair info from JSON *)
+(** Parse a single pair JSON object (WebSocket schema) into [pair_info].
+    Returns [None] if any required field is missing or malformed. *)
 let parse_pair_info json : pair_info option =
   try
     let open Yojson.Safe.Util in
@@ -68,7 +84,8 @@ let parse_pair_info json : pair_info option =
            last_updated = Unix.time () }
   with _ -> None
 
-(** Update cache with pair info *)
+(** Insert or replace [info] in [pair_cache] under [cache_mutex].
+    Logs a warning on status transitions and a debug line on first insertion. *)
 let update_pair_info info =
   Lwt_mutex.with_lock cache_mutex (fun () ->
     let prev_status = Hashtbl.find_opt pair_cache info.symbol |> Option.map (fun p -> p.status) in
@@ -82,15 +99,17 @@ let update_pair_info info =
     | _ -> ());
     Lwt.return_unit)
 
-(** Get pair info from cache *)
+(** Look up [symbol] in the pair cache. Acquires [cache_mutex]. *)
 let get_pair_info symbol : pair_info option Lwt.t =
   Lwt_mutex.with_lock cache_mutex (fun () -> Lwt.return (Hashtbl.find_opt pair_cache symbol))
 
-(** Check if a pair is currently tradeable *)
+(** Returns [true] if [symbol] exists in the cache with [Online] status. *)
 let is_pair_tradeable symbol : bool Lwt.t =
   get_pair_info symbol >|= function None -> false | Some info -> is_tradeable info.status
 
-(** Process instrument snapshot or update *)
+(** Process a full instrument data snapshot (WebSocket schema).
+    Extracts the ["pairs"] array from the ["data"] envelope and updates
+    the cache for each successfully parsed pair. *)
 let process_instrument_data json =
   try
     let open Yojson.Safe.Util in
@@ -106,12 +125,19 @@ let process_instrument_data json =
     Logging.error_f ~section "Failed to process instrument data: %s" (Printexc.to_string exn);
     Lwt.return_unit
 
-(** WebSocket connection management - to be implemented *)
+(** Placeholder for a future WebSocket-based instrument feed subscription.
+    Currently a no-op; the cache is populated via [fetch_from_rest] instead. *)
 let connect_and_subscribe () : unit Lwt.t =
   Logging.info ~section "WebSocket instrument stream not yet implemented; using REST API fallback";
   Lwt.return_unit
 
-(** Fetch instrument data from Kraken REST API *)
+(** Fetch pair metadata from [GET /0/public/AssetPairs] and populate the
+    cache for each symbol in [symbols].
+
+    Symbol matching accounts for Kraken naming conventions: the function
+    normalises the requested symbol to uppercase, strips slashes, and
+    compares against both the [wsname] and [altname] fields in the API
+    response, including legacy aliases (e.g. XBT/USD for BTC/USD). *)
 let fetch_from_rest symbols =
   Lwt.catch (fun () ->
     let open Cohttp_lwt_unix in
@@ -150,14 +176,15 @@ let fetch_from_rest symbols =
           let price_inc = safe_get (fun m -> to_string m |> float_of_string) 0.01 "tick_size" in
           let cost_min = safe_get (fun m -> to_string m |> float_of_string) 0.5 "costmin" in
 
-          (* Determine price precision without hardcoded symbol fallbacks *)
+          (* Derive price precision: prefer explicit JSON fields, fall back
+             to counting decimal digits in tick_size. *)
           let price_prec =
-            (* Prefer explicit precision fields when available *)
+
             (try member "pair_decimals" pair_json |> to_int with _ ->
             (try member "decimals" pair_json |> to_int with _ ->
-              (* Derive precision from tick_size if decimals are not provided *)
+              (* Infer precision from tick_size by counting decimal places. *)
               let rec count_decimals v count =
-                if count > 12 then count (* cap to avoid infinite loops due to float inaccuracy *)
+                if count > 12 then count  (* Cap at 12 to avoid float rounding drift. *)
                 else
                   let scaled = v *. 10.0 ** float_of_int count in
                   if Float.abs (scaled -. Float.round scaled) < 1e-9 then count
@@ -185,16 +212,19 @@ let fetch_from_rest symbols =
     Lwt.return_unit
   )
 
-(** Round a value to the nearest increment *)
+(** Round [value] to the nearest multiple of [increment]. *)
 let round_to_increment value increment = Float.round (value /. increment) *. increment
 
-(** Round quantity to valid increment *)
+(** Round [qty] to the nearest valid quantity step for [info]. *)
 let round_quantity info qty = round_to_increment qty info.qty_increment
 
-(** Round price to valid increment *)  
+(** Round [price] to the nearest valid tick for [info]. *)
 let round_price info price = round_to_increment price info.price_increment
 
-(** Validate if an order meets all requirements *)
+(** Validate [qty] and [price] against the constraints in [info].
+    Rounds both values to their respective increments, then checks
+    minimum quantity, minimum cost (qty * price), and tradeable status.
+    Returns [Ok (rounded_qty, rounded_price, cost)] or [Error msg]. *)
 let validate_order info ~qty ~price =
   let rqty = round_quantity info qty in
   let rprice = round_price info price in
@@ -204,38 +234,45 @@ let validate_order info ~qty ~price =
   else if not (is_tradeable info.status) then Error (Printf.sprintf "Pair %s not tradeable (status: %s)" info.symbol (status_to_string info.status))
   else Ok (rqty, rprice, cost)
 
-(** Initialize instrument data for a list of symbols using REST fallback *)
+(** Populate the instrument cache for [symbols] via the REST API.
+    Intended to be called once at application startup before trading begins. *)
 let initialize_symbols symbols : unit Lwt.t =
   Logging.debug_f ~section "Initializing instrument data for %d symbols" (List.length symbols);
   fetch_from_rest symbols
 
+(** Duplicate binding of [get_pair_info]; retained for link compatibility. *)
 let get_pair_info symbol : (pair_info option) Lwt.t =
   Lwt_mutex.with_lock cache_mutex (fun () -> Lwt.return (Hashtbl.find_opt pair_cache symbol))
 
-(** Get precision info for a symbol - synchronous version for internal use *)
+(** Return [(price_precision, qty_precision)] for [symbol], or [None].
+    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
 let get_precision_info symbol : (int * int) option =
   try
     Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> (info.price_precision, info.qty_precision))
   with _ -> None
 
-(** Get price increment for a symbol - synchronous version for internal use *)
+(** Return the minimum price tick size for [symbol], or [None].
+    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
 let get_price_increment symbol : float option =
   try
     Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.price_increment)
   with _ -> None
 
+(** Return price precision for [symbol]. Raises [Failure] if not cached. *)
 let get_price_precision_exn symbol : int =
   match get_precision_info symbol with
   | Some (price_prec, _) -> price_prec
   | None -> failwith (Printf.sprintf "No price precision found for symbol %s" symbol)
 
-(** Get minimum quantity for a symbol - synchronous version for internal use *)
+(** Return the minimum order quantity for [symbol], or [None].
+    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
 let get_qty_min symbol : float option =
   try
     Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_min)
   with _ -> None
 
-(** Get quantity increment for a symbol - synchronous version for internal use *)
+(** Return the minimum quantity step size for [symbol], or [None].
+    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
 let get_qty_increment symbol : float option =
   try
     Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_increment)

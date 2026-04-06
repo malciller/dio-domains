@@ -1,16 +1,16 @@
-(** Hyperliquid Balances Feed
-    
-    Uses:
-    - REST clearinghouseState for initial + periodic spot balance fetch
-    - WS webData2 for perp clearinghouse state (withdrawable/accountValue)
-    - WS spotState for streaming spot balance updates
-*)
+(** Hyperliquid balance tracking module.
+
+    Aggregates balance state from two WebSocket channels:
+    - [webData2]: perpetual clearinghouse state (withdrawable, accountValue).
+    - [spotState]: streaming spot token balance updates.
+
+    Exposes a thread-safe per-asset balance store with readiness signaling. *)
 
 open Lwt.Infix
 
 let section = "hyperliquid_balances"
 
-(** Balance data per asset - matches Kraken's design for downstream compatibility if needed *)
+(** Per-asset balance record. Fields mirror the exchange-agnostic balance representation. *)
 type balance_data = {
   asset: string;
   balance: float;
@@ -19,7 +19,7 @@ type balance_data = {
   last_updated: float;
 }
 
-(** Balance storage that aggregates across multiple wallets (e.g., spot vs perp) *)
+(** Per-asset balance store that aggregates across wallet types (spot, perp). *)
 module BalanceStore = struct
   type wallet_balance = {
     balance: float;
@@ -63,7 +63,7 @@ module BalanceStore = struct
   let get_balance store = Atomic.get store.total_balance
 end
 
-(* --- Internal state --- *)
+(* Global mutable state: per-asset balance stores and readiness flag. *)
 let balance_stores : (string, BalanceStore.t) Hashtbl.t = Hashtbl.create 16
 let balance_stores_mutex = Mutex.create ()
 let is_ready = Atomic.make false
@@ -81,7 +81,7 @@ let get_balance_store asset =
   Mutex.unlock balance_stores_mutex;
   store
 
-(* --- Public API --- *)
+(* Public query and readiness interface. *)
 
 let get_all_assets () =
   Mutex.lock balance_stores_mutex;
@@ -126,7 +126,7 @@ let wait_for_balance_data assets timeout_seconds =
   in
   loop ()
 
-(* --- JSON helpers --- *)
+(* JSON parsing utilities for numeric fields. *)
 
 let parse_json_float json =
   match json with
@@ -135,10 +135,9 @@ let parse_json_float json =
   | `Int i -> float_of_int i
   | _ -> 0.0
 
-(** Map Hyperliquid wrapped spot token names to canonical names.
-    The spot API returns e.g. "UBTC" for Bitcoin, but trading symbols
-    and balance queries use "BTC".  Must match the mapping in
-    hyperliquid_instruments_feed.ml process_meta_response. *)
+(** Maps wrapped spot token identifiers to canonical symbols.
+    The spot API returns prefixed names (e.g. "UBTC" for BTC).
+    This mapping must stay consistent with [hyperliquid_instruments_feed.ml]. *)
 let canonicalize_coin = function
   | "UBTC" -> "BTC"
   | "UETH" -> "ETH"
@@ -146,7 +145,7 @@ let canonicalize_coin = function
   | other -> other
 
 
-(* --- WS message handler --- *)
+(* WebSocket message dispatcher. Routes by channel to balance update handlers. *)
 
 let process_market_data json =
   let open Yojson.Safe.Util in
@@ -163,7 +162,7 @@ let process_market_data json =
         else `Null
       in
 
-      (* Parse perp USDC: use withdrawable (actual available) with accountValue fallback *)
+      (* Extract perp USDC balance. Prefer withdrawable; fall back to accountValue. *)
       let () = try
         if clearinghouse_data <> `Null then begin
           let withdrawable = parse_json_float (member "withdrawable" clearinghouse_data) in
@@ -184,7 +183,7 @@ let process_market_data json =
       notify_ready ()
 
   | Some "spotState" ->
-      (* Streaming spot balance updates from dedicated subscription *)
+      (* Process spot balance snapshot from the spotState subscription. *)
       let data = member "data" json in
       let () = try
         let balances = member "spotState" data |> member "balances" |> to_list in
@@ -208,7 +207,7 @@ let process_market_data json =
 
   | _ -> ()
 
-(* --- Initialization --- *)
+(* Background processor and module initialization. *)
 
 let _processor_task =
   let rec run () =
@@ -216,7 +215,7 @@ let _processor_task =
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid balances processor task";
       let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
-      (* Stream ended normally (disconnect pushed None) — re-subscribe *)
+      (* Stream closed (disconnect pushed None). Reconnect after backoff. *)
       sub.close ();
       Logging.info ~section "Balances stream ended (disconnect), re-subscribing in 1s...";
       Lwt_unix.sleep 1.0 >>= fun () -> run ()
@@ -232,7 +231,7 @@ let _processor_task =
 let initialize ~testnet assets =
   Logging.info_f ~section "Initializing Hyperliquid balances feed for %d assets (testnet=%b)" (List.length assets) testnet;
   
-  (* Pre-create stores for requested assets *)
+  (* Pre-allocate balance stores for each requested asset. *)
   List.iter (fun asset -> ignore (get_balance_store asset)) assets;
   
   Logging.info ~section "Hyperliquid balance stores initialized"

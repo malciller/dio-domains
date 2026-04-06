@@ -1,29 +1,32 @@
 
-(** Connection Supervisor - Monitors and manages WebSocket connections *)
+(** Connection supervisor. Monitors WebSocket connection lifecycle, performs
+    health checks via ping/pong and data heartbeats, and triggers automatic
+    reconnection with circuit breaker and backoff logic. Also owns the
+    centralized order processing loop that drains strategy ring buffers. *)
 
 open Lwt.Infix
 
 let section = "supervisor"
 
-(** Open Strategy_common for shared order types *)
+(* Shared order types (side, operation, strategy_order). *)
 open Dio_strategies.Strategy_common
 
 
-(** Use canonical types and connection registry from Supervisor_types *)
+(* Canonical connection types and global registry from Supervisor_types. *)
 open Supervisor_types
 
 
-(** Shutdown flag for graceful termination *)
+(* Atomic shutdown flag and condition variable for graceful termination. *)
 let shutdown_requested = Atomic.make false
 let shutdown_mutex = Mutex.create ()
 let shutdown_cond = Condition.create ()
 
-(** Timestamp of the last Supervisor_cache.force_update() call.
-    Used to rate-limit cache refreshes so that rapid reconnect bursts
-    do not trigger dozens of snapshot allocations per second. *)
+(* Timestamp of the last Supervisor_cache.force_update call.
+   Rate-limits cache refreshes to prevent allocation bursts during
+   rapid reconnect cycles. *)
 let last_supervisor_cache_update = ref 0.0
 
-(** Sleep for a specified duration, but wake up immediately if shutdown is requested *)
+(** Polls the shutdown flag in 100ms increments and returns early if set. *)
 let interruptible_sleep seconds =
   if Atomic.get shutdown_requested then ()
   else begin
@@ -44,9 +47,10 @@ let interruptible_sleep seconds =
     end
   end
 
-(** Global authentication token for reuse across modules *)
+(** Global authentication token store. Single-writer (supervisor init),
+    lock-free reads via Atomic snapshot. *)
 module Token_store = struct
-  (* Single writer (supervisor init) with atomic snapshots to avoid races *)
+  (* Atomic ref: single writer at init, concurrent lock-free readers. *)
   let token : string option Atomic.t = Atomic.make None
 
   let set value = Atomic.set token value
@@ -54,20 +58,23 @@ module Token_store = struct
   let get () = Atomic.get token
 end
 
-(** Generate unique ping request ID - start high to avoid conflicts with trading req_ids *)
+(** Generates monotonically increasing ping request IDs starting at 1000001
+    to avoid collisions with trading request IDs. *)
 let next_ping_req_id =
   let counter = ref 1000000 in
   fun () -> incr counter; !counter
 
 
-(** Register a new supervised connection with auto-restart capability *)
+(** Registers a new supervised connection in the global registry.
+    Initializes all state fields and stores the optional connect_fn
+    for automatic reconnection. *)
 let register ~name ~connect_fn =
   Mutex.lock registry_mutex;
   let conn = {
     name;
     state = Disconnected;
     last_connected = None;
-    last_disconnected = Some (Unix.time ());  (* Set to now to prevent immediate auto-restart *)
+    last_disconnected = Some (Unix.time ());  (* Seed with current time to suppress immediate auto-restart *)
     last_connecting = None;
     last_data_received = None;
     last_ping_sent = None;
@@ -85,16 +92,17 @@ let register ~name ~connect_fn =
   Logging.info_f ~section "Registered supervised connection: %s" name;
   conn
 
-(** Register an existing connection for monitoring only (no auto-restart) *)
+(** Registers an existing connection for health monitoring only.
+    No connect_fn is provided, so automatic reconnection is disabled. *)
 let register_for_monitoring ~name =
   Mutex.lock registry_mutex;
   let conn = {
     name;
-    state = Connected;  (* Assume it's connected since we're just monitoring *)
+    state = Connected;  (* Assumed already connected since this is monitor-only *)
     last_connected = Some (Unix.time ());
     last_disconnected = None;
     last_connecting = None;
-    last_data_received = Some (Unix.time ());  (* Assume data was recently received *)
+    last_data_received = Some (Unix.time ());  (* Seed heartbeat timestamp *)
     last_ping_sent = None;
     ping_failures = Atomic.make 0;
     reconnect_attempts = 0;
@@ -102,7 +110,7 @@ let register_for_monitoring ~name =
     circuit_breaker = Closed;
     circuit_breaker_failures = 0;
     circuit_breaker_last_failure = None;
-    connect_fn = None;  (* No restart capability for monitoring-only *)
+    connect_fn = None;  (* No connect_fn: reconnection disabled *)
     mutex = Mutex.create ();
   } in
   Hashtbl.replace connections name conn;
@@ -110,7 +118,9 @@ let register_for_monitoring ~name =
   Logging.info_f ~section "Registered connection for monitoring: %s" name;
   conn
 
-(** Update connection state *)
+(** Transitions connection to [new_state], updating timestamps and counters
+    under the per-connection mutex. Propagates changes to the supervisor
+    cache at most once per second. *)
 let set_state conn new_state =
   Mutex.lock conn.mutex;
   let old_state = conn.state in
@@ -119,32 +129,32 @@ let set_state conn new_state =
   (match new_state with
   | Connected ->
       conn.last_connected <- Some (Unix.time ());
-      conn.last_connecting <- None;  (* Clear connecting timestamp *)
-      conn.last_data_received <- Some (Unix.time ());  (* Reset data heartbeat on connect *)
-      conn.last_ping_sent <- None;  (* Reset ping tracking on connect *)
-      Atomic.set conn.ping_failures 0;  (* Reset ping failures on connect *)
+      conn.last_connecting <- None;
+      conn.last_data_received <- Some (Unix.time ());
+      conn.last_ping_sent <- None;
+      Atomic.set conn.ping_failures 0;
       conn.reconnect_attempts <- 0;
       conn.total_connections <- conn.total_connections + 1;
       Logging.info_f ~section "[%s] Connection established (total: %d)"
         conn.name conn.total_connections
   | Disconnected ->
       conn.last_disconnected <- Some (Unix.time ());
-      conn.last_connecting <- None;  (* Clear connecting timestamp *)
+      conn.last_connecting <- None;
       Logging.warn_f ~section "[%s] Connection lost" conn.name
   | Connecting ->
-      conn.last_connecting <- Some (Unix.time ());  (* Record when we started connecting *)
+      conn.last_connecting <- Some (Unix.time ());
       Logging.info_f ~section "[%s] Attempting connection (attempt #%d)"
         conn.name (conn.reconnect_attempts + 1)
   | Failed reason ->
       conn.last_disconnected <- Some (Unix.time ());
-      conn.last_connecting <- None;  (* Clear connecting timestamp *)
+      conn.last_connecting <- None;
       conn.reconnect_attempts <- conn.reconnect_attempts + 1;
       Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)"
         conn.name reason conn.reconnect_attempts);
   
   Mutex.unlock conn.mutex;
   
-  (* Log state transitions *)
+  (* Log state transitions and propagate to cache *)
   if old_state <> new_state then begin
     Logging.debug_f ~section "[%s] State transition: %s -> %s" 
       conn.name 
@@ -159,10 +169,9 @@ let set_state conn new_state =
        | Connected -> "Connected"
        | Failed _ -> "Failed");
        
-    (* Propagate changes to the supervisor cache, but rate-limit to at most once
-       per second to avoid allocation bursts during rapid reconnect cycles.
-       The dashboard state_broadcaster picks up any interim delta at its next
-       500ms tick regardless. *)
+    (* Rate-limit cache updates to at most once per second.
+       The dashboard state_broadcaster picks up interim deltas
+       at its next 500ms tick regardless. *)
     let now = Unix.gettimeofday () in
     let last = !last_supervisor_cache_update in
     if now -. last >= 1.0 then begin
@@ -171,14 +180,15 @@ let set_state conn new_state =
     end
   end
 
-(** Get connection state *)
+(** Returns the current connection state under mutex. *)
 let get_state conn =
   Mutex.lock conn.mutex;
   let state = conn.state in
   Mutex.unlock conn.mutex;
   state
 
-(** Get connection uptime in seconds *)
+(** Returns elapsed seconds since the connection entered Connected state,
+    or None if currently disconnected. *)
 let get_uptime conn =
   Mutex.lock conn.mutex;
   let uptime = match conn.last_connected, conn.state with
@@ -188,13 +198,13 @@ let get_uptime conn =
   Mutex.unlock conn.mutex;
   uptime
 
-(** Set connection function (for updating after registration) *)
+(** Replaces the stored connect_fn (used for deferred registration). *)
 let set_connect_fn conn connect_fn =
   Mutex.lock conn.mutex;
   conn.connect_fn <- connect_fn;
   Mutex.unlock conn.mutex
 
-(** Update last data received timestamp (for heartbeat monitoring) *)
+(** Records current time as the last data heartbeat for this connection. *)
 let update_data_heartbeat conn =
   Mutex.lock conn.mutex;
   conn.last_data_received <- Some (Unix.time ());
@@ -202,49 +212,55 @@ let update_data_heartbeat conn =
 
 
 
-(** Check if circuit breaker allows connection attempt (assumes lock is held) *)
+(** Checks whether the circuit breaker permits a connection attempt.
+    Caller must hold conn.mutex. Transitions Open to HalfOpen after
+    a 300s (5 min) cooldown. *)
 let circuit_breaker_allows_connection_unlocked conn =
   let current_time = Unix.time () in
   match conn.circuit_breaker with
   | Closed -> true
   | Open ->
       begin match conn.circuit_breaker_last_failure with
-      | Some failure_time when current_time -. failure_time > 300.0 ->  (* 5 minutes timeout *)
+      | Some failure_time when current_time -. failure_time > 300.0 ->  (* 5 min cooldown *)
           conn.circuit_breaker <- HalfOpen;
           Logging.info_f ~section "[%s] Circuit breaker HALF-OPEN (testing recovery)" conn.name;
           true
       | _ -> false
       end
-  | HalfOpen -> true  (* Allow one attempt in half-open state *)
+  | HalfOpen -> true  (* Permit one probe attempt *)
 
-(** Check if circuit breaker allows connection attempt *)
+(** Thread-safe wrapper around [circuit_breaker_allows_connection_unlocked]. *)
 let circuit_breaker_allows_connection conn =
   Mutex.lock conn.mutex;
   let allowed = circuit_breaker_allows_connection_unlocked conn in
   Mutex.unlock conn.mutex;
   allowed
 
-(** Update circuit breaker state based on connection result *)
+(** Updates circuit breaker state. On success, resets to Closed.
+    On failure, increments the counter and opens the circuit
+    after 5 consecutive failures. *)
 let update_circuit_breaker conn success =
   Mutex.lock conn.mutex;
   if success then begin
-    (* Success - reset circuit breaker *)
+    (* Reset circuit breaker on success *)
     conn.circuit_breaker <- Closed;
     conn.circuit_breaker_failures <- 0;
     conn.circuit_breaker_last_failure <- None;
   end else begin
-    (* Failure - increment counter and potentially open circuit *)
+    (* Increment failure counter; open circuit at threshold *)
     conn.circuit_breaker_failures <- conn.circuit_breaker_failures + 1;
     conn.circuit_breaker_last_failure <- Some (Unix.time ());
 
-    if conn.circuit_breaker_failures >= 5 then begin  (* Open after 5 consecutive failures *)
+    if conn.circuit_breaker_failures >= 5 then begin  (* Threshold: 5 consecutive failures *)
       conn.circuit_breaker <- Open;
       Logging.warn_f ~section "[%s] Circuit breaker OPEN after %d consecutive failures" conn.name conn.circuit_breaker_failures;
     end
   end;
   Mutex.unlock conn.mutex
 
-(** Start a supervised connection - schedules it in the Lwt event loop *)
+(** Schedules connect_fn in the Lwt event loop if the circuit breaker
+    permits and the connection is not already in Connecting state.
+    Transitions state to Connecting under mutex before launching. *)
 let start_async conn =
   match conn.connect_fn with
   | None ->
@@ -295,35 +311,41 @@ let start_async conn =
       if should_start then begin
         let open Lwt.Infix in
         Lwt.async (fun () ->
-          (* The connection function now handles its own state management *)
-          (* Just start the connection and let it manage success/failure *)
+          (* connect_fn manages its own Connected/Failed transitions *)
           Lwt.catch (fun () ->
             connect_fn () >>= fun () ->
-            (* Connection function completed - this shouldn't happen for WebSocket connections *)
+            (* WebSocket connect_fn should block indefinitely; early return is abnormal *)
             Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
             set_state conn (Failed "connection completed unexpectedly");
             Lwt.return_unit
           ) (fun exn ->
             let error_msg = Printexc.to_string exn in
             Logging.error_f ~section "[%s] Unexpected error in connection function: %s" conn.name error_msg;
-            (* Ensure state is set to Failed on any exception during connection setup *)
+            (* Transition to Failed on unhandled exception *)
             set_state conn (Failed error_msg);
             Lwt.return_unit
           )
         )
       end
 
-(** Restart a connection *)
+(** Forces a reconnect by resetting state to Disconnected and
+    clearing the reconnect counter before calling [start_async]. *)
 let restart conn =
   Logging.info_f ~section "[%s] Manually restarting connection" conn.name;
   set_state conn Disconnected;
-  (* Reset reconnect attempts for manual restart *)
+  (* Reset backoff counter for manual restart *)
   Mutex.lock conn.mutex;
   conn.reconnect_attempts <- 0;
   Mutex.unlock conn.mutex;
   start_async conn
 
-(** Monitor all connections and report status *)
+(** Tick-driven health monitor. Subscribes to the tick event bus and checks
+    all registered connections at most once per second. Implements:
+    - Linear backoff reconnection for Failed connections (2s..30s)
+    - Stale disconnect detection (60s idle in Disconnected state)
+    - Stuck-connecting timeout (120s)
+    - Active ping/pong liveness for authenticated WebSockets
+    - Passive data heartbeat timeout for market data feeds *)
 let monitor_loop () =
   let cycle_count = ref 0 in
   let subscription = Concurrency.Tick_event_bus.subscribe_ticks () in
@@ -336,7 +358,7 @@ let monitor_loop () =
       | Some () ->
           if Atomic.get shutdown_requested then Lwt.return_unit else begin
             let current_time = Unix.time () in
-            (* Throttle full connection checks to maximum once per second to avoid excessive CPU on high tick rates *)
+            (* Throttle checks to max once per second *)
             if current_time -. !last_check_time < 1.0 then loop ()
             else begin
               last_check_time := current_time;
@@ -347,10 +369,10 @@ let monitor_loop () =
                 let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
                 Mutex.unlock registry_mutex;
               
-                (* Check each connection and trigger auto-restart if needed *)
+                (* Iterate connections and apply health checks *)
                 List.iter (fun conn ->
                   if Atomic.get shutdown_requested then () else
-                  (* Get all state information atomically *)
+                  (* Snapshot state fields under mutex *)
                   Mutex.lock conn.mutex;
                   let state = conn.state in
                   let attempts = conn.reconnect_attempts in
@@ -359,19 +381,19 @@ let monitor_loop () =
                   let has_connect_fn = Option.is_some conn.connect_fn in
                   Mutex.unlock conn.mutex;
 
-                  (* Health monitoring and backup restart logic *)
+                  (* Health check and backup reconnection logic *)
                   match state, has_connect_fn with
                   | Failed reason, true ->
-                      (* Check current state atomically to avoid race conditions *)
+                      (* Re-read state under lock to prevent TOCTOU race *)
                       Mutex.lock conn.mutex;
                       let current_state = conn.state in
                       Mutex.unlock conn.mutex;
 
                       if current_state <> Connecting then begin
-                        (* Calculate backoff delay: 2s, 4s, 6s, ... max 30s *)
+                        (* Linear backoff: 2s, 4s, 6s, ... capped at 30s *)
                         let delay = min 30.0 (2.0 *. Float.of_int attempts) in
 
-                        (* Check if enough time has passed since last disconnect *)
+                        (* Only reconnect after backoff elapses *)
                         let should_reconnect =
                           match last_disconnected with
                           | Some t -> current_time -. t >= delay
@@ -384,8 +406,9 @@ let monitor_loop () =
                         end
                       end
                   | Disconnected, true ->
-                      (* Connection is disconnected but not failed - might be intentional shutdown *)
-                      (* Only restart if it's been disconnected for more than 60 seconds *)
+                      (* Disconnected without failure may be intentional.
+                         Only restart after 60s idle to avoid interfering with
+                         graceful shutdown or manual disconnect. *)
                       let should_reconnect =
                         match last_disconnected with
                         | Some t -> current_time -. t >= 60.0
@@ -397,14 +420,14 @@ let monitor_loop () =
                         start_async conn
                       end
                   | Connecting, _ ->
-                      (* Already connecting, check for stuck connections *)
+                      (* Detect stuck Connecting state *)
                       let stuck_time = match last_connecting with
                         | Some t -> current_time -. t
-                        | None -> 0.0  (* Shouldn't happen if state logic is correct, but defensive *)
+                        | None -> 0.0  (* Defensive fallback *)
                       in
-                      if stuck_time > 120.0 then begin  (* Stuck for more than 2 minutes *)
+                      if stuck_time > 120.0 then begin  (* 2 min timeout *)
                         Logging.error_f ~section "[%s] Connection stuck in 'Connecting' state for %.0fs, restarting..." conn.name stuck_time;
-                        (* Atomically set state and restart to avoid race conditions *)
+                        (* Re-check under mutex before forcing restart *)
                         Mutex.lock conn.mutex;
                         let current_state = conn.state in
                         Mutex.unlock conn.mutex;
@@ -415,16 +438,16 @@ let monitor_loop () =
                         end
                       end
                   | Connected, _ ->
-                      (* For authenticated connections, use active ping/pong monitoring *)
+                      (* Active ping/pong liveness for authenticated connections *)
                       if String.equal conn.name "kraken_auth_ws" || String.equal conn.name "hyperliquid_ws" then begin
                         let should_ping =
                           match conn.last_ping_sent with
-                          | None -> true  (* Never pinged before *)
-                          | Some last_ping -> current_time -. last_ping >= 15.0  (* Ping every 15 seconds to stay under 30s timeout *)
+                          | None -> true  (* First ping *)
+                          | Some last_ping -> current_time -. last_ping >= 15.0  (* 15s interval, under 30s server timeout *)
                         in
 
                         if should_ping then begin
-                          (* Send ping asynchronously *)
+                          (* Dispatch ping asynchronously *)
                           conn.last_ping_sent <- Some current_time;
                           Lwt.async (fun () ->
                             let req_id = next_ping_req_id () in
@@ -434,8 +457,8 @@ let monitor_loop () =
                                   Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
                                   if response.success then begin
                                     Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
-                                    Atomic.set conn.ping_failures 0;  (* Reset failure count on success *)
-                                    update_data_heartbeat conn;  (* Update heartbeat since we got a response *)
+                                    Atomic.set conn.ping_failures 0;
+                                    update_data_heartbeat conn;
                                     Lwt.return_unit
                                   end else begin
                                     Logging.warn_f ~section "[%s] Ping failed: %s" conn.name
@@ -472,7 +495,7 @@ let monitor_loop () =
                           )
                         end;
 
-                        (* Check for ping failures - done here to avoid mutex deadlock in async callback *)
+                        (* Check ping failures outside async to avoid mutex deadlock *)
                         let ping_failures = Atomic.get conn.ping_failures in
                         if ping_failures >= 3 then begin
                           Logging.error_f ~section "[%s] Ping failed %d times, marking connection as failed"
@@ -480,9 +503,9 @@ let monitor_loop () =
                           set_state conn (Failed "ping timeout");
                         end
                       end else begin
-                        (* For non-trading connections, monitor data heartbeat *)
+                        (* Passive heartbeat monitoring for market data feeds *)
                         match conn.last_data_received with
-                        | Some last_data when current_time -. last_data > 60.0 ->  (* No data for 60 seconds *)
+                        | Some last_data when current_time -. last_data > 60.0 ->  (* 60s data silence threshold *)
                             Logging.warn_f ~section "[%s] No data received for %.0fs, marking connection as failed"
                               conn.name (current_time -. last_data);
                             set_state conn (Failed "data timeout")
@@ -500,21 +523,27 @@ let monitor_loop () =
   in
   Lwt.async (fun () -> loop ())
 
-(** Initialize all websocket feeds and connections *)
+(** Performs the full WebSocket feed initialization sequence:
+    1. Reads trading configs and partitions symbols by exchange
+    2. Initializes ticker, instrument, orderbook, balance, and execution stores
+    3. Registers and starts supervised WebSocket connections
+    4. Waits for initial market data readiness with timeouts
+    5. Fetches and caches trading fees per symbol
+    Returns (configs_with_fees, auth_token). *)
 let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.t) =
   Logging.info ~section "Initializing websocket feeds...";
 
-  (* Get trading configurations *)
+  (* Load trading configurations *)
   let config = Dio_engine.Config.read_config () in
   let app_configs = config.trading in
   Logging.info_f ~section "Loaded %d trading configuration(s)" (List.length app_configs);
 
-  (* Extract Kraken symbols for websocket connections *)
+  (* Partition symbols by exchange *)
   let kraken_symbols = app_configs
                       |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken")
                       |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
 
-  (* Extract Hyperliquid symbols (including base asset for spot pairs to enable perp hedging prices) *)
+  (* Extract Hyperliquid symbols; include base asset of spot pairs for perp hedge pricing *)
   let hyperliquid_symbols = app_configs
                            |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid")
                            |> List.fold_left (fun acc cfg ->
@@ -533,7 +562,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     | Some cfg -> cfg.testnet
     | None -> false in
 
-  (* Configure the Hyperliquid module with the testnet flag from config *)
+  (* Apply testnet flag to Hyperliquid module *)
   if has_hyperliquid then
     Hyperliquid.Module.Hyperliquid_impl.set_testnet hyperliquid_testnet;
 
@@ -541,11 +570,11 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   if has_hyperliquid then
     Logging.info_f ~section "Connecting to %d Hyperliquid websockets..." (List.length hyperliquid_symbols);
 
-  (* Start initialization sequence as a promise chain *)
+  (* Begin sequential initialization steps *)
 
   let all_hyperliquid_symbols = hyperliquid_symbols |> List.sort_uniq String.compare in
 
-  (* Initialize data stores for websocket feeds *)
+  (* Step 1: Initialize ticker data stores *)
   Logging.info ~section "Step 1: Initializing ticker feed stores...";
   Kraken.Kraken_ticker_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Ticker_feed.initialize all_hyperliquid_symbols;
@@ -557,9 +586,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
        Lwt.catch (fun () ->
          let on_failure reason =
            set_state hl_ws_conn (Failed reason);
-           (* Immediately trigger reconnection attempt — mirrors Kraken auth WS pattern
-              to avoid waiting for monitor loop's backoff cycle (2s+). *)
-           Lwt.async (fun () ->
+            (* Immediately schedule reconnection; avoids waiting for
+               monitor loop backoff (mirrors Kraken auth WS pattern). *)           Lwt.async (fun () ->
              Lwt.catch (fun () ->
                Lwt.pause () >>= fun () ->
                start_async hl_ws_conn;
@@ -577,9 +605,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
            Lwt.async (fun () -> 
              Hyperliquid.Instruments_feed.wait_until_ready () >>= fun () ->
              Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet >>= fun () ->
-             (* Clear stale open orders and immediately re-fetch actual state
-                from exchange. Done sequentially to minimize the window where
-                the strategy could see 0 orders and spam new placements. *)
+             (* Clear stale open orders, then re-fetch from exchange.
+                Sequential execution prevents the strategy from seeing
+                zero orders and placing duplicates. *)
              Hyperliquid.Executions_feed.clear_all_open_orders ();
              Hyperliquid.Module.fetch_open_orders_ws ())
          in
@@ -615,18 +643,18 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   in
   Logging.info ~section "Authentication token obtained";
 
-  (* Store token globally for reuse by order executor *)
+  (* Store token globally for order executor reuse *)
   Token_store.set (Some auth_token);
 
   Logging.info ~section "Step 5: Initializing balances feed stores...";
-  (* Extract all unique assets from trading symbols *)
+  (* Derive unique base asset list from trading symbols *)
   let all_assets = app_configs
                   |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol)
                   |> List.map (fun symbol -> 
                       if String.contains symbol '/' then String.split_on_char '/' symbol |> List.hd
-                      else symbol (* For Hyperliquid which might not use / in config *))
+                      else symbol)
                   |> List.sort_uniq String.compare
-                  |> fun assets -> "USD" :: assets in  (* Add USD as quote currency *)
+                  |> fun assets -> "USD" :: assets in  (* Include USD as quote currency *)
   let all_assets = if has_hyperliquid then "USDC" :: all_assets else all_assets in
   let all_assets = List.sort_uniq String.compare all_assets in
   
@@ -645,26 +673,26 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Executions_feed.initialize hyperliquid_symbols;
 
-  (* Fetch existing open orders SYNCHRONOUSLY before domains start to prevent duplicates *)
+  (* Synchronously fetch open orders before domains start to prevent duplicate placements *)
   let%lwt () =
     if has_hyperliquid then Hyperliquid.Module.fetch_open_orders_ws ()
     else Lwt.return_unit
   in
 
-  (* Register and start remaining supervised websocket connections *)
+  (* Step 7: Register and start remaining supervised WebSocket connections *)
   Logging.info ~section "Step 7: Starting Kraken websocket connections...";
 
-  (* Ticker feed *)
+  (* Kraken ticker feed *)
   if has_kraken then begin
     let ticker_conn = register ~name:"kraken_ticker_ws" ~connect_fn:None in
     let ticker_connect_fn () =
-      (* Wrap the connection in try-catch for proper error handling *)
+      (* Exception boundary for connection establishment *)
       Lwt.catch (fun () ->
         let on_failure reason = set_state ticker_conn (Failed reason) in
         let on_heartbeat () = update_data_heartbeat ticker_conn in
         let on_connected () = set_state ticker_conn Connected in
         Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-        (* Connection function completed - this shouldn't happen for WebSocket connections *)
+        (* Unexpected early return from WebSocket connect_fn *)
         Lwt.return_unit
       ) (fun exn ->
         let error_msg = Printexc.to_string exn in
@@ -676,18 +704,18 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     set_connect_fn ticker_conn (Some ticker_connect_fn);
     start_async ticker_conn;
 
-    (* Orderbook feed *)
+    (* Kraken orderbook feed *)
     let orderbook_conn = register ~name:"kraken_orderbook_ws" ~connect_fn:None in
     let orderbook_connect_fn () =
-      (* Clear orderbook stores before reconnecting to ensure clean state *)
+      (* Reset orderbook stores to ensure clean snapshot state *)
       Kraken.Kraken_orderbook_feed.clear_all_stores ();
-      (* Wrap the connection in try-catch for proper error handling *)
+      (* Exception boundary for connection establishment *)
       Lwt.catch (fun () ->
         let on_failure reason = set_state orderbook_conn (Failed reason) in
         let on_heartbeat () = update_data_heartbeat orderbook_conn in
         let on_connected () = set_state orderbook_conn Connected in
         Kraken.Kraken_orderbook_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-        (* Connection function completed - this shouldn't happen for WebSocket connections *)
+        (* Unexpected early return from WebSocket connect_fn *)
         Lwt.return_unit
       ) (fun exn ->
         let error_msg = Printexc.to_string exn in
@@ -699,17 +727,17 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     set_connect_fn orderbook_conn (Some orderbook_connect_fn);
     start_async orderbook_conn;
 
-    (* Single unified authenticated WebSocket connection for trading, balances, and executions *)
+    (* Unified authenticated WebSocket for trading, balances, and executions *)
     let auth_ws_conn = register ~name:"kraken_auth_ws" ~connect_fn:None in
     let auth_ws_connect_fn () =
-      (* Wrap the connection in try-catch for proper error handling *)
+      (* Exception boundary for connection establishment *)
       Lwt.catch (fun () ->
         let on_failure reason =
           set_state auth_ws_conn (Failed reason);
-          (* Immediately trigger reconnection attempt to avoid waiting for monitor loop *)
+          (* Schedule immediate reconnection; bypass monitor loop backoff *)
           Lwt.async (fun () ->
             Lwt.catch (fun () ->
-              Lwt.pause () >>= fun () ->  (* Cooperative yield to avoid same-turn re-entry *)
+              Lwt.pause () >>= fun () ->  (* Cooperative yield to prevent same-turn re-entry *)
               start_async auth_ws_conn;
               Lwt.return_unit
             ) (fun exn ->
@@ -721,7 +749,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         let on_heartbeat () = update_data_heartbeat auth_ws_conn in
         let on_connected () =
           set_state auth_ws_conn Connected;
-          (* Trigger individual feed subscriptions on the unified connection *)
+          (* Subscribe balance and execution feeds on the unified connection *)
           Lwt.async (fun () ->
             Lwt.join [
               Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
@@ -730,7 +758,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           )
         in
         Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
-        (* Connection function completed - this shouldn't happen for WebSocket connections *)
+        (* Unexpected early return from WebSocket connect_fn *)
         Lwt.return_unit
       ) (fun exn ->
         let error_msg = Printexc.to_string exn in
@@ -743,8 +771,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     start_async auth_ws_conn;
   end;
 
-  (* Wait for trading client connection to be fully established before proceeding *)
-  (* This prevents a race condition where domains start trading before the WebSocket is ready *)
+  (* Block until trading client WebSocket is connected to prevent
+     strategies from issuing orders on a dead connection. *)
   let%lwt () = if has_kraken then begin
     Logging.info ~section "Waiting for trading client to be ready...";
     let%lwt trading_client_ready = 
@@ -767,7 +795,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     else
       Logging.info ~section "✓ Trading client connected and ready";
       
-    (* Wait for executions data FIRST to avoid race condition *)
+    (* Await executions feed before strategies start to avoid stale-state race *)
     Logging.info ~section "Waiting for executions feed to be ready...";
     let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
     if not executions_ready then
@@ -778,10 +806,10 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.return_unit
   end else Lwt.return_unit in
 
-  (* Wait for initial market data from all feeds *)
+  (* Await initial data from each market data feed *)
   Logging.info ~section "Waiting for initial market data from all feeds...";
 
-  (* Wait for ticker data *)
+  (* Ticker readiness gate *)
   let%lwt () = if has_kraken then begin
     let%lwt ticker_ready = Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0 in
     if not ticker_ready then
@@ -791,7 +819,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.return_unit
   end else Lwt.return_unit in
 
-  (* Wait for orderbook data *)
+  (* Orderbook readiness gate *)
   let%lwt () = if has_kraken then begin
     let%lwt orderbook_ready = Kraken.Kraken_orderbook_feed.wait_for_orderbook_data kraken_symbols 10.0 in
     if not orderbook_ready then
@@ -801,7 +829,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Lwt.return_unit
   end else Lwt.return_unit in
 
-  (* Wait for executions data again *)
+  (* Executions readiness gate (both exchanges) *)
   let%lwt hl_executions_ready = 
     if has_hyperliquid then Hyperliquid.Executions_feed.wait_for_execution_data all_hyperliquid_symbols 10.0
     else Lwt.return_true
@@ -815,7 +843,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   else
     Logging.info ~section "✓ Executions feed ready";
 
-  (* Wait for balance data *)
+  (* Balance readiness gate *)
   let%lwt balances_ready = 
     let%lwt kraken_ready = 
       if has_kraken then Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0
@@ -834,7 +862,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   Logging.info ~section "All feeds initialized with market data!";
 
-  (* Fetch fees for all assets *)
+  (* Step 8: Fetch and cache trading fees per symbol *)
   Logging.info ~section "Step 8: Fetching trading fees for all assets...";
 
   let%lwt global_hl_fees = 
@@ -849,7 +877,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     end else Lwt.return_none
   in
 
-  (* Convert fee fetching to promise-based operations *)
+  (* Sequentially fetch fees per config; results enrich trading_config with fee fields *)
   let%lwt configs_with_fees = Lwt_list.map_s (fun asset ->
     try
       if asset.Dio_engine.Config.exchange = "kraken" then begin
@@ -861,7 +889,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
               asset.Dio_engine.Config.symbol
               (Option.value fee_info.Kraken.Kraken_get_fee.maker_fee ~default:0. *. 100.)
               (Option.value fee_info.Kraken.Kraken_get_fee.taker_fee ~default:0. *. 100.);
-            (* Store fees in Fee_cache so UI can access them *)
+            (* Populate Fee_cache for dashboard access *)
             (match fee_info.Kraken.Kraken_get_fee.maker_fee, fee_info.Kraken.Kraken_get_fee.taker_fee with
              | Some maker, Some taker ->
                  Dio_strategies.Fee_cache.store_fees 
@@ -871,7 +899,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                    ~taker_fee:taker 
                    ~ttl_seconds:600.0
              | Some maker, None ->
-                 (* Use maker for both if taker not available *)
+                 (* Fallback: use maker fee as taker when taker is absent *)
                  Dio_strategies.Fee_cache.store_fees 
                    ~exchange:asset.Dio_engine.Config.exchange 
                    ~symbol:asset.Dio_engine.Config.symbol 
@@ -885,8 +913,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         | None ->
             Logging.error_f ~section "Fatal: Failed to fetch fees for %s. Exiting." asset.Dio_engine.Config.symbol;
             exit 1 in
-        (* No nonce sleep needed: requests are sequential (Lwt_list.map_s) and
-           each HTTP round-trip takes >10ms, guaranteeing unique timestamps. *)
+        (* Sequential Lwt_list.map_s guarantees >10ms between HTTP requests,
+           so nonce/timestamp collisions are not possible. *)
         Lwt.return result
       end else if asset.Dio_engine.Config.exchange = "hyperliquid" then begin
         let is_spot = String.contains asset.Dio_engine.Config.symbol '/' in
@@ -910,14 +938,14 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Lwt.return result
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
-        (* Store default fees in cache for unsupported exchanges *)
+        (* Cache default fees for unsupported exchanges *)
         Dio_strategies.Fee_cache.store_fees 
           ~exchange:asset.Dio_engine.Config.exchange 
           ~symbol:asset.Dio_engine.Config.symbol 
           ~maker_fee:0.0016 
           ~taker_fee:0.0026 
           ~ttl_seconds:600.0;
-        (* Provide default fee values for unsupported exchanges *)
+        (* Apply default fee values *)
         Lwt.return { asset with
           Dio_engine.Config.maker_fee = Some 0.0016;  (* 0.16% maker fee default *)
           Dio_engine.Config.taker_fee = Some 0.0026 } (* 0.26% taker fee default *)
@@ -930,7 +958,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   Lwt.return (configs_with_fees, auth_token)
 
-(** Order processing loop - consumes orders from strategy ring buffers *)
+(** Central order processing loop. Drains pending orders from all strategy
+    ring buffers (grid, market maker, hedger) and dispatches them to the
+    Order_executor via Lwt.async. Blocks on OrderSignal when idle. *)
 let order_processing_loop () =
   let section = "order_processor" in
   let cycle_count = ref 0 in
@@ -940,7 +970,7 @@ let order_processing_loop () =
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
     else begin
-      (* Determine exchange connection statuses *)
+      (* Check exchange connection liveness *)
       let kraken_connected = Kraken.Kraken_trading_client.is_connected () in
       
       let is_hyperliquid_connected =
@@ -950,13 +980,13 @@ let order_processing_loop () =
           with Not_found -> false
       in
 
-      (* Fetch pending orders regardless of connection status so we don't back up the ringbuffer *)
+      (* Drain ring buffers regardless of connection status to prevent backpressure *)
       let pending_grid_orders = Dio_strategies.Suicide_grid.Strategy.get_pending_orders 100 in
       let pending_mm_orders = Dio_strategies.Market_maker.Strategy.get_pending_orders 100 in
       let pending_hedge_orders = Dio_strategies.Auto_hedger.get_pending_orders 100 in
 
       if pending_grid_orders = [] && pending_mm_orders = [] && pending_hedge_orders = [] then
-        (* No orders to process, wait for a signal *)
+        (* No pending orders; block until signalled *)
         OrderSignal.wait () >>= loop
       else begin
         incr cycle_count;
@@ -973,12 +1003,12 @@ let order_processing_loop () =
           end
         in
         try
-            (* Process suicide grid orders *)
+            (* Process grid strategy orders *)
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
               Mutex.lock order_mutex;
               try
-                (* Get authentication token *)
+                (* Retrieve auth token *)
                 let auth_token = match Token_store.get () with
                   | Some token -> token
                   | None ->
@@ -986,7 +1016,7 @@ let order_processing_loop () =
                     raise (Failure "No auth token")
                 in
 
-                (* Handle different operation types *)
+                (* Dispatch by operation type *)
                 (match order.operation with
                  | Place ->
                       process_order_if_connected order (fun () ->
@@ -1074,8 +1104,8 @@ let order_processing_loop () =
                               exchange = order.exchange;
                             } in
   
-                            (* Fire-and-forget: just send the amendment, don't touch strategy tracking.
-                             The consumer thread handles all tracking via WS execution events. *)
+                            (* Async dispatch; strategy state is updated by WS execution events,
+                             not by the placement response. *)
                             Lwt.async (fun () ->
                                let%lwt () = Lwt.pause () in
                                Lwt.catch (fun () ->
@@ -1185,7 +1215,7 @@ let order_processing_loop () =
                      ) (fun _err -> ())
                 );
                 
-                (* Unlock order_mutex immediately after initiating Lwt.async requests so callbacks can run *)
+                (* Release mutex before Lwt.async callbacks execute *)
                 Mutex.unlock order_mutex
               with exn ->
                 Mutex.unlock order_mutex;
@@ -1193,13 +1223,13 @@ let order_processing_loop () =
                   (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_grid_orders;
 
-            (* Process market maker orders — skip if shutdown requested after grid batch *)
+            (* Process market maker orders; abort if shutdown raised after grid batch *)
             if not (Atomic.get shutdown_requested) then
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
               Mutex.lock order_mutex;
               try
-                (* Get authentication token *)
+                (* Retrieve auth token *)
                 let auth_token = match Token_store.get () with
                   | Some token -> token
                   | None ->
@@ -1207,7 +1237,7 @@ let order_processing_loop () =
                     raise (Failure "No auth token")
                 in
 
-                (* Handle different operation types *)
+                (* Dispatch by operation type *)
                 (match order.operation with
                  | Place ->
                       process_order_if_connected order (fun () ->
@@ -1231,8 +1261,8 @@ let order_processing_loop () =
                        exchange = order.exchange;
                      } in
 
-                     (* Fire-and-forget: just send the order, don't touch strategy tracking.
-                      The consumer thread handles all tracking via WS execution events. *)
+                     (* Async dispatch; strategy state is updated by WS execution events,
+                      not by the placement response. *)
                      Lwt.async (fun () ->
                        let%lwt () = Lwt.pause () in
                        Lwt.catch (fun () ->
@@ -1249,7 +1279,7 @@ let order_processing_loop () =
                                (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                err;
-                             (* Notify strategy so it cleans up pending/in-flight state *)
+                             (* Notify strategy to clean up pending/in-flight state *)
                              Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side err;
                              (match order.price with
                               | Some price ->
@@ -1259,7 +1289,7 @@ let order_processing_loop () =
                        ) (fun exn ->
                          Logging.error_f ~section " Exception placing order %s %s: %s"
                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                         (* Notify strategy so it cleans up pending/in-flight state *)
+                         (* Notify strategy to clean up pending/in-flight state *)
                          Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
                          (match order.price with
                           | Some price ->
@@ -1396,14 +1426,14 @@ let order_processing_loop () =
                      ) (fun _err -> ())
                 );
                 
-                (* Unlock order_mutex immediately after initiating Lwt.async requests so callbacks can run *)
+                (* Release mutex before Lwt.async callbacks execute *)
                 Mutex.unlock order_mutex
               with exn ->
                 Mutex.unlock order_mutex;
                 Logging.error_f ~section "Error processing order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_mm_orders;
 
-            (* Process auto hedger orders — skip if shutdown requested after MM batch *)
+            (* Process hedger orders; abort if shutdown raised after MM batch *)
             if not (Atomic.get shutdown_requested) then
             List.iter (fun order ->
               if Atomic.get shutdown_requested then () else
@@ -1480,7 +1510,7 @@ let order_processing_loop () =
               Logging.debug_f ~section "Order processing: %d orders placed, %d grid + %d mm + %d hedge pending in current batch"
                 (Atomic.get orders_placed) (List.length pending_grid_orders) (List.length pending_mm_orders) (List.length pending_hedge_orders);
 
-            (* Small pause to allow other tasks to run before checking again *)
+            (* Cooperative yield before next drain cycle *)
             Lwt.pause () >>= loop
 
           with exn ->
@@ -1491,12 +1521,14 @@ let order_processing_loop () =
   in
   Lwt.async loop
 
-(** Periodically check for non-active assets with balances and subscribe their tickers *)
+(** Periodically scans all exchanges for non-configured assets that have
+    a positive balance and subscribes their ticker feeds. Runs every 10s.
+    Enables portfolio valuation for assets that are held but not actively traded. *)
 let monitor_non_active_assets () =
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
     else
-      (* Yield and wait 10 seconds between checks *)
+      (* 10s polling interval *)
       Lwt_unix.sleep 10.0 >>= fun () ->
       if Atomic.get shutdown_requested then Lwt.return_unit else begin
         let config = Dio_engine.Config.read_config () in
@@ -1531,7 +1563,7 @@ let monitor_non_active_assets () =
                   if not is_configured && not is_fiat_or_stable then begin
                     match Ex.get_ticker ~symbol with
                     | None ->
-                        (* Ticker missing for non-active asset with balance > 0, subscribe! *)
+                        (* No ticker subscribed for asset with positive balance; subscribe *)
                         Logging.info_f ~section "Balance found for non-active %s on %s, subscribing to ticker" symbol exch_name;
                         Ex.subscribe_ticker ~symbol
                     | Some _ -> Lwt.return_unit
@@ -1544,29 +1576,31 @@ let monitor_non_active_assets () =
   in
   Lwt.async loop
 
-(** Start the supervisor monitoring thread and initialize all feeds *)
+(** Entry point: starts the monitor loop, non-active asset monitor, and
+    order processing loop, then runs [initialize_feeds] synchronously.
+    Returns enriched trading configs with fee data. *)
 let start_monitoring () =
   Logging.info ~section "Starting connection supervisor";
 
-  (* Start the monitoring thread first *)
+  (* Launch health monitor on tick event bus *)
   monitor_loop ();
 
-  (* Start the non-active assets monitor *)
+  (* Launch non-active asset ticker subscription loop *)
   monitor_non_active_assets ();
 
-  (* Start the order processing thread *)
+  (* Launch order processing loop *)
   order_processing_loop ();
 
-  (* Initialize all feeds and get configs with fees and token *)
-  (* Use Lwt_main.run here to handle the promise from initialize_feeds *)
+  (* Run feed initialization synchronously via Lwt_main.run *)
   let (configs_with_fees, _auth_token) = Lwt_main.run (initialize_feeds ()) in
 
   configs_with_fees
 
-(** Start the order executor with the authentication token *)
+(** Initializes the Order_executor module. Retrieves the stored auth
+    token or generates a fresh one if absent. *)
 let start_order_executor () : unit Lwt.t =
 
-  (* Get the token from the global storage *)
+  (* Retrieve or regenerate auth token *)
   let _auth_token = match Token_store.get () with
     | Some token -> token
     | None ->
@@ -1578,39 +1612,41 @@ let start_order_executor () : unit Lwt.t =
 
   Dio_engine.Order_executor.init
 
-(** Get connection by name (optional) *)
+(** Looks up a connection by name. Returns None if unregistered. *)
 let get_connection_opt name =
   Mutex.lock registry_mutex;
   let conn = Hashtbl.find_opt connections name in
   Mutex.unlock registry_mutex;
   conn
 
-(** Get connection by name (raises if not found) *)
+(** Looks up a connection by name. Raises [Failure] if unregistered. *)
 let get_connection name =
   match get_connection_opt name with
   | Some c -> c
   | None -> failwith (Printf.sprintf "Connection '%s' not found" name)
 
-(** Get all connections *)
+(** Returns a snapshot list of all registered connections. *)
 let get_all_connections () =
   Mutex.lock registry_mutex;
   let conns = Hashtbl.to_seq_values connections |> List.of_seq in
   Mutex.unlock registry_mutex;
   conns
 
-(** Stop order processing loop *)
+(** Sets the shutdown flag and broadcasts the condition variable
+    to interrupt any sleeping threads. *)
 let stop_order_processing () =
   Atomic.set shutdown_requested true;
-  (* Wake up any sleeping threads *)
+  (* Signal all waiters on the shutdown condition *)
   Mutex.lock shutdown_mutex;
   Condition.broadcast shutdown_cond;
   Mutex.unlock shutdown_mutex;
   Logging.info ~section "Order processing loop shutdown requested"
 
-(** Stop all connections *)
+(** Stops order processing and transitions all registered connections
+    to Disconnected. Includes a 500ms drain window for in-flight orders. *)
 let stop_all () =
   stop_order_processing ();
-  interruptible_sleep 0.5;  (* Give order processing thread time to finish current iteration *)
+  interruptible_sleep 0.5;  (* Drain window for in-flight order iterations *)
   Logging.warn ~section "Stopping all supervised connections";
   Mutex.lock registry_mutex;
   Hashtbl.iter (fun _name conn ->

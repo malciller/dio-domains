@@ -1,4 +1,4 @@
-(** Hyperliquid action packing and translation *)
+(** Action packing, signing, and submission for the Hyperliquid exchange API. *)
 
 open Hyperliquid_types
 module ExTypes = Dio_exchange.Exchange_intf.Types
@@ -6,31 +6,30 @@ open Lwt.Infix
 
 let section = "hyperliquid_actions"
 
-(** Convert Exchange standard order type to Hyperliquid order type (with TIF) *)
+(** Maps an Exchange_intf order type and optional time-in-force to an order_type_wire.
+    FOK is not natively supported by Hyperliquid; it is mapped to IOC as a best-effort fallback. *)
 let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force option) : order_type_wire =
   let tif = match tif_opt with
     | Some ExTypes.GTC -> Alo
     | Some ExTypes.IOC -> Ioc
-    | Some ExTypes.FOK -> Ioc (* HL doesn't support FOK natively in the same way, best effort IOC *)
+    | Some ExTypes.FOK -> Ioc (* FOK unsupported natively; mapped to IOC *)
     | None -> Alo
   in
   match ot with
   | ExTypes.Limit -> Limit { tif = Alo }
-  | ExTypes.Market -> Limit { tif = Ioc } (* Market orders are usually IOC limits in HL *)
+  | ExTypes.Market -> Limit { tif = Ioc } (* Market orders submitted as IOC limit orders *)
   | ExTypes.StopLoss -> Trigger { triggerPx = "0.0"; isMarket = true; tpsl = Sl }
   | ExTypes.TakeProfit -> Trigger { triggerPx = "0.0"; isMarket = true; tpsl = Tp }
   | ExTypes.StopLossLimit -> Trigger { triggerPx = "0.0"; isMarket = false; tpsl = Sl }
   | ExTypes.TakeProfitLimit -> Trigger { triggerPx = "0.0"; isMarket = false; tpsl = Tp }
-  | _ -> Limit { tif } (* Fallback *)
+  | _ -> Limit { tif } (* Default fallback for unmatched order types *)
 
-(** Format float as a string rounded to a precision suitable for Hyperliquid.
-    HL expects maximum 8 decimals, but crucially it must be normalized (no trailing zeros).
-    This matches Python's Decimal(rounded).normalize() representation. *)
+(** Formats a float as a fixed-point string with at most 8 decimal places.
+    Strips trailing zeros and the decimal point if unnecessary.
+    Hyperliquid requires normalized numeric strings without trailing zeros. *)
 let format_number f =
   let rounded = Printf.sprintf "%.8f" f in
-  (* Convert back to float and then to string to let OCaml handle trailing zeros,
-     but OCaml's string_of_float can use scientific notation for very small/large numbers.
-     Hyperliquid expects fixed-point strings. *)
+  (* Iteratively strip trailing '0' characters and a dangling decimal point. *)
   let rec strip_zeros s =
     if String.length s > 1 && s.[String.length s - 1] = '0' && String.contains s '.' then
       strip_zeros (String.sub s 0 (String.length s - 1))
@@ -41,7 +40,9 @@ let format_number f =
   let s = strip_zeros rounded in
   if s = "-0" then "0" else s
 
-(** Convert generic order parameters into Hyperliquid's order_wire format *)
+(** Constructs an order_wire record from generic order parameters.
+    Maps side to a boolean, formats price and size as normalized strings,
+    and defaults reduce_only to false when unspecified. *)
 let to_hl_order_wire ~qty ~symbol:_ ~asset_index ~ot ~side ~limit_price ~reduce_only ~cl_ord_id : order_wire =
   let b = match side with
     | ExTypes.Buy -> true
@@ -49,7 +50,7 @@ let to_hl_order_wire ~qty ~symbol:_ ~asset_index ~ot ~side ~limit_price ~reduce_
   in
   let p = match limit_price with
     | Some price -> format_number price
-    | None -> "0.0" (* Market orders or triggers where price is handled differently *)
+    | None -> "0.0" (* Placeholder for market or trigger orders *)
   in
   let s = format_number qty in
   let r = match reduce_only with
@@ -67,7 +68,7 @@ let to_int64_opt = function
   | `String s -> (try Some (Int64.of_string s) with _ -> None)
   | _ -> None
 
-(** --- REST API Actions --- *)
+(** REST API action types and credential management. *)
 
 type place_order_result = {
   order_id: int64;
@@ -89,6 +90,8 @@ let get_credentials () =
   in
   (pkey, wallet)
 
+(** Monotonically increasing nonce derived from wall-clock milliseconds.
+    Protected by a mutex to ensure uniqueness across concurrent callers. *)
 let last_nonce = ref 0L
 let nonce_mutex = Mutex.create ()
 
@@ -104,6 +107,10 @@ let get_next_nonce () =
   Mutex.unlock nonce_mutex;
   next_nonce
 
+(** Submits a signed action to the Hyperliquid REST /exchange endpoint.
+    Signs the msgpack-serialized action with the configured private key,
+    constructs the JSON request envelope, and performs an HTTP POST.
+    Returns Ok(json) on 2xx or Error(string) otherwise. *)
 let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
   let (pkey, _wallet) = get_credentials () in
   let nonce = get_next_nonce () in
@@ -140,7 +147,7 @@ let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
   else
     Lwt.return (Error (Printf.sprintf "HTTP Error %d: %s" status body_str))
 
-(** Helper function to check if string contains substring *)
+(** Returns true if [substr] occurs anywhere within [str]. Linear scan. *)
 let string_contains (str : string) (substr : string) : bool =
   let str_len = String.length str in
   let substr_len = String.length substr in
@@ -153,7 +160,7 @@ let string_contains (str : string) (substr : string) : bool =
     in
     loop 0
 
-(** Retry configuration - matches Kraken's pattern *)
+(** Configuration for exponential backoff retry logic. *)
 type retry_config = {
   max_attempts: int;
   base_delay_ms: float;
@@ -168,10 +175,11 @@ let default_retry_config = {
   backoff_factor = 2.0;
 }
 
-(** Sleep for the specified milliseconds *)
+(** Lwt sleep for the given duration in milliseconds. *)
 let sleep_ms ms = Lwt_unix.sleep (ms /. 1000.0)
 
-(** Retry a function with exponential backoff *)
+(** Retries [f] with exponential backoff according to [config].
+    Stops retrying when max_attempts is reached or [is_retriable] returns false. *)
 let retry_with_backoff ~config ~f ~is_retriable =
   let rec attempt attempt_num =
     if attempt_num > config.max_attempts then
@@ -193,26 +201,27 @@ let retry_with_backoff ~config ~f ~is_retriable =
   in
   attempt 1
 
-(** Check if an error is retriable (network issues, temporary server errors, rate limits) *)
+(** Classifies an error string as retriable by checking for indicators of
+    network failures, HTTP 5xx server errors, and rate-limit rejections. *)
 let is_retriable_error err =
   let err_lower = String.lowercase_ascii err in
-  (* Network and connectivity errors *)
+  (* Network and connectivity errors. *)
   string_contains err_lower "timeout" ||
   string_contains err_lower "connection" ||
   string_contains err_lower "network" ||
   string_contains err_lower "reset" ||
   string_contains err_lower "broken pipe" ||
-  (* Server errors that might be temporary *)
+  (* HTTP 5xx server errors, potentially transient. *)
   string_contains err_lower "500" ||
   string_contains err_lower "502" ||
   string_contains err_lower "503" ||
   string_contains err_lower "504" ||
-  (* Rate limiting - Hyperliquid specific *)
+  (* Hyperliquid rate-limit responses. *)
   string_contains err_lower "rate limit" ||
   string_contains err_lower "too many requests" ||
   string_contains err_lower "too many cumulative requests"
 
-(** --- WebSocket req_id counter --- *)
+(** Atomic counter for WebSocket request IDs. *)
 
 let ws_req_id_counter = Atomic.make 1
 
@@ -220,14 +229,11 @@ let next_ws_req_id () =
   let id = Atomic.fetch_and_add ws_req_id_counter 1 in
   id
 
-(** Send a signed action over the WebSocket `post` channel.
-    Fails with an error if the WebSocket is not connected - no REST fallback.
-
-    WS response shape:
-      { "id": N, "response": { "type": "action",
-          "payload": { "status": "ok", "response": { ... } } } }
-    We extract response.payload which is identical to the REST response shape,
-    so all downstream parsers work unchanged. *)
+(** Submits a signed action via the WebSocket "post" channel.
+    Returns Error immediately if the WebSocket is not connected.
+    The response payload is extracted from the nested WS frame structure
+    (data.response.payload) to match the REST response shape, allowing
+    shared downstream parsing logic. *)
 let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
   if not (Hyperliquid_ws.is_connected ()) then
     Lwt.return (Error "Hyperliquid WS not connected - order rejected")
@@ -263,11 +269,7 @@ let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
     Lwt.catch
       (fun () ->
         Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:10000 >>= fun resp ->
-        (* Full WS broadcast frame shape:
-             { "channel":"post", "data": { "id": N,
-                 "response": { "type":"action",
-                   "payload": { "status":"ok", "response": {...} } } } }
-           Extract data.response.payload → identical to REST response shape. *)
+        (* Extract data.response.payload from the WS broadcast frame. *)
         let open Yojson.Safe.Util in
         let payload =
           try resp |> member "data" |> member "response" |> member "payload"
@@ -283,7 +285,9 @@ let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
       )
   end
 
-(** Place order with retry logic *)
+(** Places a single order on Hyperliquid via WebSocket with exponential backoff retry.
+    Constructs both the JSON and msgpack representations, signs and submits them,
+    then parses the response for a resting or filled order ID. *)
 let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?cl_ord_id ?time_in_force ~testnet () =
   let place_order_once () =
     let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
@@ -368,7 +372,9 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?c
   in
   retry_with_backoff ~config:default_retry_config ~f:place_order_once ~is_retriable:is_retriable_error
 
-(** Amend order with retry logic *)
+(** Amends an existing order by order_id on Hyperliquid via WebSocket with retry.
+    Submits a "modify" action with updated price, size, and side.
+    Returns the original and potentially new order ID on success. *)
 let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
   let amend_order_once () =
     let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
@@ -448,7 +454,8 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
   in
   retry_with_backoff ~config:default_retry_config ~f:amend_order_once ~is_retriable:is_retriable_error
 
-(** Cancel order with retry logic *)
+(** Cancels one or more orders by their order IDs for a given symbol.
+    Constructs a batch cancel action and submits via WebSocket with retry. *)
 let cancel_orders ~symbol ~order_ids ~testnet =
   let cancel_orders_once () =
     let asset_index = match Hyperliquid_instruments_feed.get_asset_index symbol with
@@ -471,7 +478,8 @@ let cancel_orders ~symbol ~order_ids ~testnet =
   in
   retry_with_backoff ~config:default_retry_config ~f:cancel_orders_once ~is_retriable:is_retriable_error
 
-(** Transfer USDC between spot and perp wallets via usdClassTransfer *)
+(** Transfers USDC between spot and perpetual wallets via the usdClassTransfer action.
+    Uses the REST endpoint (not WebSocket) with exponential backoff retry. *)
 let usd_class_transfer ~amount ~to_perp ~testnet =
   let transfer_once () =
     let amount_str = format_number amount in

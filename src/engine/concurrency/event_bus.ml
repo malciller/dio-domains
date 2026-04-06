@@ -1,10 +1,11 @@
-(** Lightweight event bus for lock-free, snapshot-based fan-out.
+(** Lock-free, snapshot-based event bus with bounded fan-out.
 
-    Producers publish immutable payloads; subscribers receive a stream of
-    snapshots via `Lwt_stream`. Internally each topic maintains an
-    atomically-swapped snapshot (`Atomic.t`) and a list of Lwt push
-    functions. This keeps the hot path lock-free while delivering events to
-    cooperative consumers.
+    Producers publish immutable payloads to a named topic. Subscribers receive
+    copies via bounded [Lwt_stream] channels. Each topic maintains an atomic
+    subscriber list. The publish path is lock-free: it iterates the subscriber
+    list under a single [Atomic.get] and pushes non-blockingly. Slow subscribers
+    whose bounded streams are full are closed immediately to prevent backpressure
+    propagation. Periodic cleanup of closed subscribers runs every 100 publishes.
 *)
 
 open Lwt.Infix
@@ -13,15 +14,20 @@ module type PAYLOAD = sig
   type t
 end
 
-(** Global registry of all event buses for monitoring and cleanup *)
+(** Existential record exposing per-bus operations to the global registry.
+    [cleanup] triggers stale subscriber removal and returns the count removed.
+    [stats] returns (total, active, closed) subscriber counts. *)
 type bus_ops = {
   topic: string;
   cleanup: unit -> int option;
   stats: unit -> (int * int * int);
 }
 
+(** Global atomic list of all instantiated buses. Used for cross-bus
+    monitoring and coordinated cleanup from external callers. *)
 let registry : bus_ops list Atomic.t = Atomic.make []
 
+(** CAS-loop insertion into the global bus registry. *)
 let register ops =
   let rec loop () =
     let old = Atomic.get registry in
@@ -30,6 +36,7 @@ let register ops =
   in
   loop ()
 
+(** Iterate over all registered buses. Snapshot is taken once via [Atomic.get]. *)
 let iter_buses f =
   List.iter f (Atomic.get registry)
 
@@ -38,23 +45,27 @@ module Make (Payload : PAYLOAD) = struct
 
   type subscription = {
     stream: snapshot Lwt_stream.t;
-    close: unit -> unit;  (* Function to close this subscription's stream *)
+    close: unit -> unit;  (** Closes this subscription's bounded stream. *)
   }
 
   type subscriber = {
     push: snapshot -> unit Lwt.t;
-    close: unit -> unit;  (* Function to close this subscriber's stream *)
+    close: unit -> unit;  (** Closes the underlying [Lwt_stream.bounded_push]. *)
     mutable closed: bool;
-    persistent: bool;  (* Mark persistent subscribers that should not be force cleaned *)
+    persistent: bool;  (** Persistent subscribers are exempt from forced cleanup. *)
   }
 
   type t = {
     topic: string;
     subscribers: subscriber list Atomic.t;
-    mutable publish_count: int;  (* Counter for event-driven cleanup *)
+    mutable publish_count: int;  (** Monotonic counter driving periodic cleanup. *)
   }
 
-  (** Clean up closed subscribers — only checks the closed flag, no syscalls *)
+  (** Remove non-persistent subscribers whose [closed] flag is set. Uses a
+      CAS loop to atomically swap the filtered list. Returns [Some n] if
+      [n] subscribers were removed, [None] if none were stale. The
+      [max_age_seconds] and [max_unused_seconds] parameters are accepted
+      for interface compatibility but are currently unused. *)
   let cleanup_stale_subscribers bus ?(max_age_seconds=60.0) ?(max_unused_seconds=30.0) () =
     ignore max_age_seconds; ignore max_unused_seconds;
     let current = Atomic.get bus.subscribers in
@@ -80,10 +91,11 @@ module Make (Payload : PAYLOAD) = struct
       try_cleanup ()
     end
 
-  (** Force cleanup all closed subscribers (alias kept for API compatibility) **)
+  (** Alias for [cleanup_stale_subscribers] with default parameters.
+      Retained for backward API compatibility. *)
   let force_cleanup_stale_subscribers bus () = cleanup_stale_subscribers bus ()
 
-  (** Get subscriber statistics for monitoring *)
+  (** Returns [(total, active, closed)] subscriber counts for this bus. *)
   let get_subscriber_stats bus =
     let subs = Atomic.get bus.subscribers in
     let total = List.length subs in
@@ -91,13 +103,16 @@ module Make (Payload : PAYLOAD) = struct
     let closed = List.length (List.filter (fun sub -> sub.closed) subs) in
     (total, active, closed)
 
+  (** Allocate a new bus for the given [topic]. Registers the bus in the
+      global registry for external monitoring. The [?initial] parameter is
+      accepted but ignored; payloads are not retained in an [Atomic.t] to
+      avoid unbounded memory growth from large structures. *)
   let create ?initial:_ topic =
     let bus = {
       topic;
       subscribers = Atomic.make [];
       publish_count = 0;
     } in
-    (* Register with global registry *)
     register {
       topic;
       cleanup = (fun () -> cleanup_stale_subscribers bus ());
@@ -107,34 +122,36 @@ module Make (Payload : PAYLOAD) = struct
 
   let topic bus = bus.topic
 
+  (** Publish [payload] to all active subscribers. Each subscriber's push
+      is attempted non-blockingly. If the push promise is sleeping (i.e. the
+      bounded stream buffer is full), the subscriber is marked closed and its
+      stream is terminated to avoid backpressure. Cleanup of stale subscribers
+      is triggered every 100 publishes. No payload is retained after dispatch. *)
   let publish bus payload =
-    (* Do NOT store payload in latest — retaining large Yojson trees / records causes
-       unbounded memory growth when payloads are large (e.g. l2Book with full bid/ask
-       arrays, webData2 snapshots, execution_event records). *)
     let subs = Atomic.get bus.subscribers in
-    (* Filter out closed subscribers inline — avoids allocating a new list *)
     List.iter (fun sub ->
       if not sub.closed then begin
-        (* Try non-blocking push first to avoid Lwt.async/Lwt.pick/timer overhead *)
         let push_result = sub.push payload in
         if Lwt.is_sleeping push_result then begin
-          (* Stream is full — subscriber is too slow, close it immediately *)
+          (* Bounded stream is full; subscriber cannot keep up. *)
           Lwt.cancel push_result;
           sub.closed <- true;
           (try sub.close () with _ -> ())
         end
-        (* last_used tracking removed: Unix.time() syscall on every hot-path publish
-           was measured as significant overhead at high WS frame rates. *)
       end
     ) subs;
 
-    (* Event-driven cleanup: run cleanup every 100 publications *)
     bus.publish_count <- bus.publish_count + 1;
     if bus.publish_count mod 100 = 0 then
       ignore (cleanup_stale_subscribers bus ())
 
+  (** Create a new subscription backed by a bounded (capacity 4) [Lwt_stream].
+      The subscriber is atomically prepended to the bus's subscriber list via
+      a CAS loop. An [Lwt.finalize] handler on [Lwt_stream.closed] ensures
+      the subscriber is removed from the list when the stream is closed.
+      If [persistent] is [true], the subscriber is exempt from forced cleanup.
+      No initial snapshot is pushed; payloads are not retained by the bus. *)
   let subscribe ?(persistent=false) bus =
-    (* Use bounded stream to prevent unbounded memory growth *)
     let stream, push_source = Lwt_stream.create_bounded 4 in
     let subscriber = {
       push = (fun payload -> push_source#push payload);
@@ -142,19 +159,21 @@ module Make (Payload : PAYLOAD) = struct
       closed = false;
       persistent;
     } in
+    (* CAS loop: atomically prepend subscriber to the list. *)
     let rec try_add () =
       let current = Atomic.get bus.subscribers in
       if List.exists (fun s -> s == subscriber) current then ()
       else if Atomic.compare_and_set bus.subscribers current (subscriber :: current) then ()
       else try_add ()
     in
+    (* CAS loop: atomically remove subscriber from the list. *)
     let rec try_remove () =
       let current = Atomic.get bus.subscribers in
       let filtered = List.filter (fun s -> s != subscriber) current in
       if Atomic.compare_and_set bus.subscribers current filtered then () else try_remove ()
     in
     try_add ();
-    (* Use finalize pattern to guarantee cleanup when stream closes *)
+    (* Guarantee cleanup on stream closure via Lwt finalizer. *)
     Lwt.async (fun () ->
       Lwt.finalize
         (fun () -> Lwt_stream.closed stream)
@@ -164,10 +183,11 @@ module Make (Payload : PAYLOAD) = struct
           Lwt.return_unit
         )
     );
-    (* Snapshot-on-subscribe removed: we no longer retain latest payloads since
-       large Yojson trees / records would be held indefinitely in the Atomic. *)
     { stream; close = subscriber.close }
 
+  (** Subscribe, await a single event or timeout, then close. Returns
+      [Some payload] if an event arrived within [timeout] seconds,
+      [None] on timeout. The subscription is cleaned up in the finalizer. *)
   let await_next bus timeout =
     let subscription = subscribe bus in
     Lwt.finalize
@@ -178,5 +198,3 @@ module Make (Payload : PAYLOAD) = struct
         ])
       (fun () -> subscription.close (); Lwt.return_unit)
 end
-
-

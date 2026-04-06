@@ -1,3 +1,8 @@
+(* Fear_and_greed -- CoinMarketCap Fear and Greed Index client.
+   Fetches the latest index value via the CMC Pro API, caches it atomically
+   for process lifetime, and provides a linear interpolation utility for
+   mapping the index to configurable grid intervals. *)
+
 open Lwt.Infix
 open Cohttp_lwt_unix
 
@@ -5,7 +10,7 @@ let section = "fear_and_greed"
 let endpoint = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest"
 let api_key_env = "CMC_API_KEY"
 
-(* Cache the fetched value for the lifetime of the process *)
+(* Process-lifetime atomic cache for the most recently fetched index value. *)
 let cached_value : float option Atomic.t = Atomic.make None
 
 let clear_cache () = Atomic.set cached_value None
@@ -87,7 +92,7 @@ let force_fetch_async ?(fallback = 50.0) () =
       Logging.error_f ~section "Exception in async fetch fear-and-greed: %s" (Printexc.to_string exn)
   ) ())
 
-(* Get the grid value based on fear_and_greed using linear interpolation (0-100 range) *)
+(* Linearly interpolates a grid value within [min_val, max_val] based on fear_and_greed clamped to [0, 100]. *)
 let grid_value_for_fng ~grid_interval:(min_val, max_val) ~fear_and_greed =
   let fng = max 0.0 (min 100.0 fear_and_greed) in
   min_val +. (fng *. (max_val -. min_val) /. 100.0)

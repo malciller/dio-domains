@@ -1,10 +1,12 @@
-(** Bounded Ring Buffer - Generic lock-free ring buffer with FIFO eviction
+(** Bounded ring buffer with FIFO eviction semantics.
 
-    Used for market data feeds (ticker, orderbook, executions) to prevent 
-    unbounded memory growth. Supports thread-safe operations with atomic variables.
+    Provides a fixed-capacity circular buffer backed by atomic variables.
+    Designed for single-writer, multi-reader market data feeds (ticker,
+    orderbook, executions) where bounded memory usage is required.
+    Overwrites the oldest entry when the buffer is full.
 *)
 
-(** Generic bounded ring buffer with FIFO eviction *)
+(** Fixed-capacity circular buffer parameterized over element type. *)
 module RingBuffer = struct
   type 'a t = {
     data: 'a option Atomic.t array;
@@ -12,7 +14,8 @@ module RingBuffer = struct
     size: int;
   }
 
-  (** Create a new ring buffer with the specified capacity *)
+  (** [create size] allocates a ring buffer with [size] slots.
+      @raise Invalid_argument if [size <= 0]. *)
   let create size =
     if size <= 0 then
       invalid_arg "RingBuffer.create: size must be positive";
@@ -22,20 +25,25 @@ module RingBuffer = struct
       size;
     }
 
-  (** Lock-free write - single writer, overwrites oldest entry when full *)
+  (** [write buffer value] stores [value] at the current write position
+      and advances the index modulo capacity. Single-writer only;
+      concurrent writers require external synchronization. *)
   let write buffer value =
     let pos = Atomic.get buffer.write_pos in
     Atomic.set buffer.data.(pos) (Some value);
     let new_pos = (pos + 1) mod buffer.size in
     Atomic.set buffer.write_pos new_pos
 
-  (** Wait-free read - returns most recent entry *)
+  (** [read_latest buffer] returns the most recently written element,
+      or [None] if the buffer is empty. Wait-free for readers. *)
   let read_latest buffer =
     let pos = Atomic.get buffer.write_pos in
     let read_pos = if pos = 0 then buffer.size - 1 else pos - 1 in
     Atomic.get buffer.data.(read_pos)
 
-  (** Read events from last known position - for domain consumers *)
+  (** [read_since buffer last_pos] collects all elements written since
+      [last_pos] up to the current write position. Returns an empty list
+      if no new elements exist. Allocates an intermediate list. *)
   let read_since buffer last_pos =
     let current_pos = Atomic.get buffer.write_pos in
     if last_pos = current_pos then
@@ -51,9 +59,10 @@ module RingBuffer = struct
       in
       collect [] last_pos
 
-  (** Zero-allocation iteration from last known position.
-      Calls [f] on each event in order without building an intermediate list.
-      Returns the new read position so the caller can update its tracking. *)
+  (** [iter_since buffer last_pos f] applies [f] to each element from
+      [last_pos] to the current write position without allocating a list.
+      Returns the new position for the caller to track consumption.
+      Inlined to reduce closure overhead on the hot path. *)
   let[@inline] iter_since buffer last_pos f =
     let current_pos = Atomic.get buffer.write_pos in
     if last_pos = current_pos then
@@ -69,7 +78,8 @@ module RingBuffer = struct
       current_pos
     end
 
-  (** Read all events currently in the buffer *)
+  (** [read_all buffer] returns every non-empty slot as a list,
+      scanning indices 0 through [size - 1] in order. *)
   let read_all buffer =
     let rec collect_all acc i =
       if i >= buffer.size then
@@ -81,15 +91,18 @@ module RingBuffer = struct
     in
     collect_all [] 0
 
-  (** Get current write position for tracking consumption *)
+  (** [get_position buffer] returns the current write index.
+      Consumers use this value as the [last_pos] argument to
+      [read_since] or [iter_since]. *)
   let get_position buffer =
     Atomic.get buffer.write_pos
 
-  (** Clear all entries in the buffer *)
+  (** [clear buffer] resets all slots to [None] and the write
+      position to 0. Not safe to call concurrently with writers. *)
   let clear buffer =
     Array.iter (fun atomic -> Atomic.set atomic None) buffer.data;
     Atomic.set buffer.write_pos 0
 
-  (** Get capacity of the buffer *)
+  (** [capacity buffer] returns the fixed slot count of the buffer. *)
   let capacity buffer = buffer.size
 end

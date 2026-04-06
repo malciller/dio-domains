@@ -1,19 +1,36 @@
-(** Dio Trading Engine — Terminal Dashboard
-    
-    Connects to the engine via Unix domain socket and renders
-    a real-time TUI using Notty. Separate binary for crash isolation.
-    
+(** Terminal dashboard for the Dio trading engine.
+
+    Runs as an out-of-process binary for crash isolation. Connects to the
+    engine over a Unix domain socket using a length-prefixed JSON protocol
+    in watch mode, where the engine pushes snapshot frames on each tick.
+
+    Panels:
+    - Header:     uptime, fear-and-greed index, per-exchange connectivity
+    - Memory/GC:  heap size, live/free KB, major/minor collections, compactions
+    - Holdings:   per-strategy and non-strategy balances, mid-price, accumulated
+                  holdings, pending buy/sell distances, unrealized sell value,
+                  aggregated portfolio summary (cash, accum val, hold val, sell val)
+    - Latency:    per-domain percentile profiling (p50, p90, p99, p999)
+    - Domains:    running/stopped status, restart count, last restart age
+
+    Rendering uses atomic frame writes via a pipe-based buffer to avoid
+    EAGAIN partial-frame artifacts. Synchronized update ANSI sequences
+    (DEC mode 2026) bracket each frame to eliminate flicker.
+
+    The main loop manages raw terminal mode, alternate screen buffer, and
+    automatic reconnection with PID-based socket discovery on engine restart.
+
     Usage: ./dio-dashboard [--socket /tmp/dio-<pid>.sock]
 *)
 
 open Notty
 
-(* ── UDS Client ──────────────────────────────────────────────────── *)
+(* UDS Client *)
 
 let socket_path = ref ""
 
 (** Discover engine socket path by scanning /tmp/dio-*.sock.
-    Probes each candidate to discard stale sockets from crashed instances. *)
+    Probes each candidate and discards stale sockets. *)
 let discover_socket () =
   let entries = try Sys.readdir "/tmp" with _ -> [||] in
   let socks = Array.to_list entries
@@ -23,7 +40,7 @@ let discover_socket () =
       String.sub f (len - 5) 5 = ".sock")
     |> List.map (fun f -> "/tmp/" ^ f)
   in
-  (* Probe each candidate: discard sockets that refuse connection *)
+  (* Discard sockets that refuse connection *)
   let live = List.filter (fun path ->
     let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
     let ok = (try Unix.connect fd (Unix.ADDR_UNIX path); true
@@ -38,7 +55,7 @@ let discover_socket () =
   | s :: _ -> Some s
   | [] -> None
 
-(** Read exactly n bytes from fd *)
+(** Read exactly [len] bytes from [fd] into [buf] at offset [off]. *)
 let read_exact fd buf off len =
   let rec loop off remaining =
     if remaining = 0 then ()
@@ -49,7 +66,7 @@ let read_exact fd buf off len =
   in
   loop off len
 
-(** Read a length-prefixed JSON message from the socket *)
+(** Read a 4-byte big-endian length-prefixed JSON message from [fd]. *)
 let read_message fd =
   let header = Bytes.create 4 in
   read_exact fd header 0 4;
@@ -64,15 +81,15 @@ let read_message fd =
   read_exact fd payload 0 len;
   Bytes.to_string payload
 
-(** Connect to engine UDS and request watch mode *)
+(** Connect to the engine UDS at [path] and send the watch-mode command. *)
 let connect_and_watch path =
   let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   Unix.connect fd (Unix.ADDR_UNIX path);
-  (* Send 'W' for watch mode *)
+  (* Send watch-mode command *)
   let _ = Unix.write_substring fd "W" 0 1 in
   fd
 
-(* ── JSON helpers ────────────────────────────────────────────────── *)
+(* JSON helpers *)
 
 let ( |?> ) json key =
   match json with
@@ -85,7 +102,7 @@ let to_int_d d = function `Int i -> i | `Float f -> int_of_float f | _ -> d
 let to_bool_d d = function `Bool b -> b | _ -> d
 let to_list_d = function `List l -> l | _ -> []
 
-(* ── Formatting ──────────────────────────────────────────────────── *)
+(* Formatting *)
 
 let format_duration secs =
   let s = int_of_float secs in
@@ -116,7 +133,7 @@ let truncate_string n s =
   if String.length s <= n then s
   else String.sub s 0 (n - 1) ^ "."
 
-(* ── Color palette ───────────────────────────────────────────────── *)
+(* Color palette: RGB-888 constants for the TUI theme *)
 
 let c_bg         = A.rgb_888 ~r:10  ~g:13  ~b:20
 let c_panel      = A.rgb_888 ~r:18  ~g:22  ~b:32
@@ -132,7 +149,7 @@ let c_red        = A.rgb_888 ~r:248 ~g:81  ~b:73
 let c_yellow     = A.rgb_888 ~r:250 ~g:176 ~b:5
 let c_cyan       = A.rgb_888 ~r:34  ~g:211 ~b:238
 let c_dim        = A.rgb_888 ~r:55  ~g:63  ~b:78
-(* ── Attribute constructors ──────────────────────────────────────── *)
+(* Attribute constructors: foreground + background + optional style *)
 
 let a_label      = A.(fg c_label  ++ bg c_bg)
 let a_text       = A.(fg c_text   ++ bg c_bg)
@@ -145,10 +162,10 @@ let a_dim        = A.(fg c_dim    ++ bg c_bg)
 let a_border     = A.(fg c_border ++ bg c_bg)
 
 
-(* ── Drawing primitives ──────────────────────────────────────────── *)
+(* Drawing primitives *)
 
 let hline w =
-  (* Build a UTF-8 thin horizontal rule using U+2500 (─) *)
+  (* Render a horizontal rule of width [w] using U+2500 *)
   let buf = Buffer.create (w * 3) in
   for _ = 1 to w do Buffer.add_string buf "─" done;
   I.string a_border (Buffer.contents buf)
@@ -165,7 +182,7 @@ let format_pct f =
   else if abs_float f >= 10.0 then Printf.sprintf "%.1f%%" f
   else Printf.sprintf "%.2f%%" f
 
-(* ── Drawing helpers ──────────────────────────────────────── *)
+(* Drawing helpers *)
 
 let section_title w label =
   let lbl = "  " ^ label ^ "  " in
@@ -175,13 +192,13 @@ let section_title w label =
     I.string A.(bg c_section_bg) (String.make pad ' ');
   ]
 
-(* ── Panel: Header bar ───────────────────────────────────────────── *)
+(* Panel: Header bar *)
 
 let render_header w json =
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
   let fng    = json |?> "fear_and_greed" |> to_float_d 0.0 in
-  (* Derive per-exchange connectivity: green if any strategy on the exchange
-     has a live bid/ask feed, red otherwise. Deduplicated and stable-sorted. *)
+  (* Per-exchange connectivity: green if any strategy has a live bid/ask
+     feed on that exchange, red otherwise. Deduplicated and sorted. *)
   let exch_connected =
     let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
     let tbl = Hashtbl.create 4 in
@@ -237,7 +254,7 @@ let render_header w json =
     @ [ I.string A.(bg c_panel) (String.make (max 0 (w - base_w - conn_w)) ' ') ]
   )
 
-(* ── Panel: Holdings & Strategy ──────────────────────────────────── *)
+(* Panel: Holdings and Strategy *)
 
 let exch_tag_of = function
   | "kraken" -> "kr" | "hyperliquid" -> "hl"
@@ -246,7 +263,7 @@ let exch_tag_of = function
 let render_strategies w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
   let all_balances = json |?> "all_balances" |> to_list_d in
-  (* Header row *)
+  (* Column header row *)
   let header = I.hcat [
     I.string a_text " ";
     col 14 a_label "SYMBOL";
@@ -264,7 +281,7 @@ let render_strategies w json =
     col 12 a_label "SELL VAL";
   ] in
 
-  (* Render strategy rows *)
+  (* Build one row per strategy *)
   let strategy_rows = List.map (fun (symbol, data) ->
     let exchange = data |?> "exchange" |> to_string_d "?" in
     let strat = data |?> "strategy" in
@@ -273,7 +290,7 @@ let render_strategies w json =
     let cap_low = strat |?> "capital_low" |> to_bool_d false in
     let asset_low = strat |?> "asset_low" |> to_bool_d false in
 
-    (* Market data *)
+    (* Market data: compute mid-price from bid/ask *)
     let bid = market |?> "bid" |> to_float_d 0.0 in
     let ask = market |?> "ask" |> to_float_d 0.0 in
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0
@@ -281,12 +298,11 @@ let render_strategies w json =
     let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
     let hold_value = base_bal *. mid in
 
-    (* Strategy data *)
+    (* Strategy state: next buy price and completed sell count *)
     let buy_price = strat |?> "buy_price" |> to_float_d 0.0 in
     let sell_count = strat |?> "sell_count" |> to_int_d 0 in
 
-    (* Unrealized profit: sum of mark proceeds for all pending sells *)
-    (* Unrealized profit and accumulated holdings from pending sells *)
+    (* Sum mark-to-market proceeds and quantity across pending sell orders *)
     let sell_orders = strat |?> "sell_orders" |> to_list_d in
     let unrealized_profit, pending_sell_qty = List.fold_left (fun (up, qty_acc) s ->
       let sp = s |?> "price" |> to_float_d 0.0 in
@@ -298,14 +314,14 @@ let render_strategies w json =
     let accum_holding = max 0.0 (base_bal -. pending_sell_qty) in
     let accum_hold_value = accum_holding *. mid in
 
-    (* Distance to pending buy order — only when strategy is active (not paused) *)
+    (* Percentage distance from mid-price to pending buy, if active *)
     let buy_dist_pct =
       if (not cap_low) && buy_price > 0.0 && mid > 0.0 then
         Some (((buy_price -. mid) /. mid) *. 100.0)
       else None
     in
 
-    (* Distance to closest pending sell order *)
+    (* Percentage distance from mid-price to nearest pending sell *)
     let closest_sell_dist_pct =
       let sell_prices = List.filter_map (fun s ->
         let sp = s |?> "price" |> to_float_d 0.0 in
@@ -317,7 +333,7 @@ let render_strategies w json =
       | prices -> Some (List.fold_left (fun acc p -> if abs_float p < abs_float acc then p else acc) (List.hd prices) prices)
     in
 
-    (* Status indicator: ▶ active, ⏸ paused *)
+    (* Status indicator *)
     let status_str, status_attr =
       if cap_low || asset_low then "⏸", a_yellow
       else "▶", a_green
@@ -325,7 +341,7 @@ let render_strategies w json =
 
     let exch_tag = exch_tag_of exchange in
 
-    (* Buy distance formatting *)
+    (* Format buy distance with proximity-based color *)
     let buy_dist_str, buy_dist_attr = match buy_dist_pct with
       | None -> "--", a_dim
       | Some d ->
@@ -335,7 +351,7 @@ let render_strategies w json =
                      else a_dim in
           format_pct d, attr
     in
-    (* Sell distance formatting *)
+    (* Format sell distance with proximity-based color *)
     let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
       | None -> "--", a_dim
       | Some d ->
@@ -367,7 +383,7 @@ let render_strategies w json =
     ]
   ) strats in
 
-  (* Split strategy rows into active vs paused *)
+  (* Partition strategies into active and paused groups *)
   let active_rows, paused_rows = List.partition (fun (_symbol, data) ->
     let strat = data |?> "strategy" in
     let cap_low = strat |?> "capital_low" |> to_bool_d false in
@@ -381,7 +397,7 @@ let render_strategies w json =
     List.assoc sym (List.combine (List.map fst strats) strategy_rows)
   ) paused_rows in
 
-  (* Render non-strategy balance rows from all_balances — now enriched with market + order data *)
+  (* Build rows for non-strategy balances, enriched with market and order data *)
   let non_strategy_rows = List.filter_map (fun bal_json ->
     let exchange = bal_json |?> "exchange" |> to_string_d "?" in
     let asset = bal_json |?> "asset" |> to_string_d "?" in
@@ -391,18 +407,18 @@ let render_strategies w json =
     else begin
       let exch_tag = exch_tag_of exchange in
 
-      (* Market data from enriched snapshot *)
+      (* Market data from enriched balance snapshot *)
       let bid = bal_json |?> "bid" |> to_float_d 0.0 in
       let ask = bal_json |?> "ask" |> to_float_d 0.0 in
       let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0
                 else (max bid ask) in
       let hold_value = balance *. mid in
 
-      (* Open sell orders *)
+      (* Pending sell orders for this balance *)
       let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
       let sell_count = bal_json |?> "sell_count" |> to_int_d 0 in
 
-      (* Unrealized profit and accumulated holdings from pending sells *)
+      (* Unrealized proceeds and accumulated quantity from pending sells *)
       let unrealized_profit, pending_sell_qty = List.fold_left (fun (up, qty_acc) s ->
         let sp = s |?> "price" |> to_float_d 0.0 in
         let sq = s |?> "qty" |> to_float_d 0.0 in
@@ -415,7 +431,7 @@ let render_strategies w json =
       let accum_holding = if is_quote then 0.0 else max 0.0 (balance -. pending_sell_qty) in
       let accum_hold_value = accum_holding *. mid in
 
-      (* Distance to closest sell order *)
+      (* Percentage distance to nearest sell order *)
       let closest_sell_dist_pct =
         let sell_prices = List.filter_map (fun s ->
           let sp = s |?> "price" |> to_float_d 0.0 in
@@ -463,22 +479,22 @@ let render_strategies w json =
     end
   ) all_balances in
 
-  (* Split non-strategy rows: inactive assets vs quote currencies *)
+  (* Separate non-strategy rows into inactive assets and quote currencies *)
   let inactive_rows = List.filter_map (fun (is_q, img) -> if not is_q then Some img else None) non_strategy_rows in
   let quote_rows = List.filter_map (fun (is_q, img) -> if is_q then Some img else None) non_strategy_rows in
 
-  (* Compute total unrealized profit and hold value across strategies *)
+  (* Aggregate unrealized profit, hold value, and accum value across strategies *)
   let total_up_strats, total_hold_strats, total_accum_val_strats = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) (_symbol, data) ->
     let strat = data |?> "strategy" in
     let market = data |?> "market" in
     
-    (* Calc holding value *)
+    (* Compute holding value from mid-price *)
     let bid = market |?> "bid" |> to_float_d 0.0 in
     let ask = market |?> "ask" |> to_float_d 0.0 in
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else (max bid ask) in
     let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
     
-    (* Calc UP *)
+    (* Compute unrealized proceeds from pending sell orders *)
     let sell_orders = strat |?> "sell_orders" |> to_list_d in
     let strat_up, pending_sell_qty = List.fold_left (fun (a, q_acc) s ->
       let sp = s |?> "price" |> to_float_d 0.0 in
@@ -492,7 +508,7 @@ let render_strategies w json =
     (up_acc +. strat_up, hold_acc +. (base_bal *. mid), accum_val_acc +. accum_hold_value)
   ) (0.0, 0.0, 0.0) strats in
 
-  (* Add non-strategy unrealized profit and hold value *)
+  (* Aggregate unrealized profit, hold value, and accum value for non-strategy balances *)
   let total_up_bals, total_hold_bals, total_accum_val_bals = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) bal_json ->
     let balance = bal_json |?> "balance" |> to_float_d 0.0 in
     let asset = bal_json |?> "asset" |> to_string_d "?" in
@@ -520,7 +536,7 @@ let render_strategies w json =
   let total_hold_val = total_hold_strats +. total_hold_bals in
   let total_accum_val = total_accum_val_strats +. total_accum_val_bals in
 
-  (* Sum all quote-currency balances — these are always $1 by definition *)
+  (* Sum all quote-currency balances (pegged to $1) *)
   let total_quote_val = List.fold_left (fun acc bal_json ->
     let asset   = bal_json |?> "asset"   |> to_string_d "" in
     let balance = bal_json |?> "balance" |> to_float_d 0.0 in
@@ -529,13 +545,13 @@ let render_strategies w json =
     if is_quote && balance > 0.0 then acc +. balance else acc
   ) 0.0 all_balances in
 
-  (* Section title *)
+  (* Section header *)
   let title = section_title w "HOLDINGS & STRATEGY" in
 
-  (* Main table: active → paused → inactive → quotes *)
+  (* Compose table: active, paused, inactive, then quote rows *)
   let main_table = I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows) in
 
-  (* Summary footer rendered as a horizontal bar below the table, within w *)
+  (* Summary footer bar with aggregated portfolio metrics *)
   let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_bg ++ st bold)
                 else A.(fg c_red   ++ bg c_bg ++ st bold) in
   let pipe = I.string A.(fg c_border ++ bg c_bg) "  │  " in
@@ -561,7 +577,7 @@ let render_strategies w json =
 
   I.vcat [ main_table; summary_section ]
 
-(* ── Panel: Latencies ────────────────────────────────────────────── *)
+(* Panel: Latency Profiling *)
 
 let render_latencies w json =
   let lats = match json |?> "latencies" with `Assoc l -> l | _ -> [] in
@@ -615,7 +631,7 @@ let render_latencies w json =
   else
     I.vcat (title :: header :: rows)
 
-(* ── Panel: Memory / GC ─────────────────────────────────────────── *)
+(* Panel: Memory and GC statistics *)
 
 let render_memory w json =
   let mem = json |?> "memory" in
@@ -649,7 +665,7 @@ let render_memory w json =
   let grid = I.hcat [col1; col2; I.string a_text (String.make (max 0 (w - 44)) ' ')] in
   I.vcat [title; grid]
 
-(* ── Panel: Domains ──────────────────────────────────────────────── *)
+(* Panel: Domain status *)
 
 let render_domains w json =
   let now = Unix.gettimeofday () in
@@ -685,20 +701,18 @@ let render_domains w json =
   ) doms in
   I.vcat (title :: rows)
 
-(* ── Full render ─────────────────────────────────────────────────── *)
-
-(* ── Atomic frame rendering ──────────────────────────────────────── *)
-(* Each render call opens a fresh blocking pipe, writes the frame,    *)
-(* closes the write end (giving clean EOF), then drains fully before  *)
-(* a single write to stdout.  This eliminates the EAGAIN race that    *)
-(* caused partial frames / click-to-scroll with the old global pipe.  *)
+(* Atomic frame rendering.
+   Each render call opens a fresh pipe, writes the frame, closes the write
+   end (producing EOF), drains the read end into a buffer, then performs a
+   single write to stdout. This avoids EAGAIN races that caused partial
+   frames with the previous shared-pipe approach. *)
 
 let render_to_stdout (draw : out_channel -> unit) =
   let (pr, pw) = Unix.pipe () in
   let oc = Unix.out_channel_of_descr pw in
   draw oc;
   flush oc;
-  Unix.close pw;                    (* write-EOF lets drain loop finish cleanly *)
+  Unix.close pw;                    (* EOF signals the drain loop to terminate *)
   let buf = Buffer.create 65536 in
   let tmp = Bytes.create 8192 in
   (try
@@ -746,31 +760,31 @@ let render_frame w h json =
       sep;
       I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  Diophant Solutions");
     ]
-    |> I.hsnap ~align:`Left w   (* clamp width: prevents line-wrap / scroll *)
-    |> I.vsnap ~align:`Top  h   (* clamp height: prevents overflow below     *)
+    |> I.hsnap ~align:`Left w   (* clamp width to prevent line-wrap *)
+    |> I.vsnap ~align:`Top  h   (* clamp height to prevent overflow *)
   in
   render_to_stdout (fun oc ->
-    output_string oc "\027[?2026h";   (* begin synchronized update *)
-    output_string oc "\027[H";        (* cursor home               *)
+    output_string oc "\027[?2026h";   (* begin synchronized update  *)
+    output_string oc "\027[H";        (* cursor home                *)
     Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
-    output_string oc "\027[J";        (* clear to end of screen    *)
-    output_string oc "\027[?2026l")   (* end synchronized update   *)
+    output_string oc "\027[J";        (* clear to end of screen     *)
+    output_string oc "\027[?2026l")   (* end synchronized update    *)
 
-(* ── Main loop ───────────────────────────────────────────────────── *)
+(* Main loop *)
 
 let () =
-  (* Parse args *)
+  (* Parse command-line arguments *)
   let speclist = [
     "--socket", Arg.Set_string socket_path, " Path to engine UDS (auto-discovers if not set)";
   ] in
   Arg.parse speclist (fun _ -> ()) "dio-dashboard [--socket /tmp/dio-<pid>.sock]";
 
-  (* ── Manual terminal setup (bypass Notty Term to avoid reader thread) ── *)
+  (* Manual terminal setup: bypass Notty Term to avoid its reader thread *)
 
-  (* Save original terminal attributes for cleanup *)
+  (* Save original termios for restoration on exit *)
   let saved_termios = Unix.tcgetattr Unix.stdin in
 
-  (* Set stdin to raw mode: no echo, no canonical, no signals, immediate read *)
+  (* Raw mode: disable echo, canonical input, and signal generation *)
   let raw_termios = { saved_termios with
     Unix.c_icanon = false;
     Unix.c_echo = false;
@@ -780,12 +794,12 @@ let () =
   } in
   Unix.tcsetattr Unix.stdin Unix.TCSAFLUSH raw_termios;
 
-  (* Enter alternate screen buffer + hide cursor via ANSI escapes *)
+  (* Enter alternate screen buffer and hide cursor *)
   Printf.printf "\027[?1049h\027[?25l%!";
 
-  (* Register cleanup on exit (covers normal exit, signals, exceptions) *)
+  (* Register at_exit handler to restore terminal state *)
   at_exit (fun () ->
-    Printf.printf "\027[?25h\027[?1049l%!";  (* show cursor, leave alt screen *)
+    Printf.printf "\027[?25h\027[?1049l%!";  (* restore cursor, leave alt screen *)
     Unix.tcsetattr Unix.stdin Unix.TCSAFLUSH saved_termios
   );
 
@@ -793,17 +807,17 @@ let () =
   let quit = ref false in
   let input_buf = Bytes.create 64 in
 
-  (* ── Outer reconnect loop ────────────────────────────────────────── *)
-  (* On engine restart the socket path changes (new PID), so we
-     re-run discover_socket on each reconnect attempt.  A --socket
-     override is honoured only for the first connection; after a
-     disconnect we always auto-discover so we follow the new PID. *)
+  (* Outer reconnect loop.
+     On engine restart the socket path changes (new PID), so
+     discover_socket is re-invoked on each reconnect attempt.
+     The --socket override applies only to the first connection;
+     subsequent reconnects always auto-discover the new PID. *)
   let fd_ref : Unix.file_descr option ref = ref None in
 
   let try_connect () =
     let path_opt =
       if !socket_path <> "" && !fd_ref = None then
-        (* First connection: honour --socket override *)
+        (* First connection: use --socket override *)
         Some !socket_path
       else
         discover_socket ()
@@ -825,7 +839,7 @@ let () =
     (try Unix.close fd with _ -> ())
   in
 
-  (* Show wait screen until first connection *)
+  (* Display wait screen and poll for engine availability *)
   let rec wait_for_engine () =
     if !quit then ()
     else
@@ -835,7 +849,7 @@ let () =
           let (w, h) = match Notty_unix.winsize Unix.stdout with
             | Some (w, h) -> (w, h) | None -> (80, 24) in
           render_wait_screen w h "Waiting for engine...  (q to quit)";
-          (* Poll keyboard while waiting *)
+          (* Poll stdin for quit input *)
           let ready, _, _ =
             try Unix.select [Unix.stdin] [] [] 2.0
             with Unix.Unix_error _ -> ([], [], [])
@@ -851,16 +865,16 @@ let () =
           if not !quit then wait_for_engine ()
 
   and run_event_loop fd =
-    (* Inner loop: read + render until disconnect or quit *)
+    (* Inner loop: read from socket and render until disconnect or quit *)
     let lost_connection = ref false in
     while not !quit && not !lost_connection do
-      (* 1. Wait for socket data or keyboard input, 100ms timeout *)
+      (* 1. Select on socket and stdin with 100ms timeout *)
       let ready, _, _ =
         try Unix.select [fd; Unix.stdin] [] [] 0.1
         with Unix.Unix_error _ -> ([], [], [])
       in
 
-      (* 2. Check for keyboard input *)
+      (* 2. Process keyboard input *)
       if List.mem Unix.stdin ready then begin
         let n = try Unix.read Unix.stdin input_buf 0 64 with _ -> 0 in
         let rec check_bytes i =
@@ -869,7 +883,7 @@ let () =
             (match Bytes.get input_buf i with
              | 'q' | 'Q' -> quit := true
              | '\027' ->
-                 if i + 1 >= n then quit := true (* bare Esc *)
+                 if i + 1 >= n then quit := true (* bare Escape key *)
              | _ -> ());
             check_bytes (i + 1)
           end
@@ -877,7 +891,7 @@ let () =
         check_bytes 0
       end;
 
-      (* 3. Read socket data if available *)
+      (* 3. Read and parse socket data if available *)
       if List.mem fd ready && not !quit then begin
         (try
           let msg = read_message fd in
@@ -890,11 +904,11 @@ let () =
             disconnect fd;
             lost_connection := true
         | _ ->
-            (* Other parse errors: keep last known state *)
+            (* Parse error: retain last known state *)
             ())
       end;
 
-      (* 4. Render: render_to_stdout writes atomically inside render_frame *)
+      (* 4. Render frame atomically via render_to_stdout *)
       if not !quit && not !lost_connection then begin
         let (w, h) = match Notty_unix.winsize Unix.stdout with
           | Some (w, h) -> (w, h)
@@ -903,7 +917,7 @@ let () =
         render_frame w h !last_json
       end
     done;
-    (* If we lost the connection (not a deliberate quit), try to reconnect *)
+    (* On connection loss (not user quit), re-enter reconnect loop *)
     if not !quit then wait_for_engine ()
   in
 

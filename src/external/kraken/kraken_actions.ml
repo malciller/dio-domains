@@ -1,7 +1,11 @@
+(**
+   Kraken trading action utilities.
+   Provides helper functions for order parameter formatting, precision truncation, and payload construction.
+*)
 open Lwt.Infix
 open Yojson.Safe
 
-(** Helper function to add key-value pair to JSON association object *)
+(** Appends key value tuple to JSON association structure. *)
 let add_to_assoc (json : Yojson.Safe.t) (key_value_pair : string * Yojson.Safe.t) : Yojson.Safe.t =
   match json with
   | `Assoc assoc_list ->
@@ -11,15 +15,15 @@ let add_to_assoc (json : Yojson.Safe.t) (key_value_pair : string * Yojson.Safe.t
 
 let section = "kraken_actions"
 
-(** Truncate price to exact decimal precision and return as properly-rounded float *)
+(** Clamps float value to instrument decimal precision limitations. *)
 let truncate_price_to_precision price symbol =
   match Kraken_instruments_feed.get_precision_info symbol with
   | Some (price_precision, qty_precision) ->
       Logging.debug_f ~section "Truncating price %.8f for %s with precision %d (qty_precision: %d)" price symbol price_precision qty_precision;
-      (* Round mathematically to exact decimal precision to avoid floating-point truncations *)
+      (* Rounds to absolute precision preventing truncation. *)
       let multiplier = 10.0 ** float_of_int price_precision in
       let truncated_price = Float.round (price *. multiplier) /. multiplier in
-      (* Force re-parsing through string to eliminate FP artifacts *)
+      (* Reparses to eliminate floating point artifacts. *)
       let formatted_str = Printf.sprintf "%.*f" price_precision truncated_price in
       let clean_price = Float.of_string formatted_str in
       Logging.debug_f ~section "Rounded price %.8f -> %s -> %.8f for %s" price formatted_str clean_price symbol;
@@ -28,7 +32,7 @@ let truncate_price_to_precision price symbol =
       Logging.warn_f ~section "No price precision info for %s, using original price" symbol;
       price
 
-(** Helper function to check if string contains substring *)
+(** Evaluates string for substring presence. *)
 let string_contains (str : string) (substr : string) : bool =
   let str_len = String.length str in
   let substr_len = String.length substr in
@@ -41,19 +45,19 @@ let string_contains (str : string) (substr : string) : bool =
     in
     loop 0
 
-(** Custom JSON encoder that uses symbol-specific precision for floats based on field type *)
+(** Serializes JSON applying instrument specific float precision bounds. *)
 let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : string =
   match json with
   | `Null -> "null"
   | `Bool b -> if b then "true" else "false"
   | `Int i -> string_of_int i
   | `Float f ->
-      (* Use appropriate precision based on field name and symbol *)
+      (* Selects precision bounds using field context. *)
       let precision = match symbol with
         | Some sym ->
             (match Kraken_instruments_feed.get_precision_info sym with
              | Some (price_precision, qty_precision) ->
-                 (* Use price precision for price-related fields, qty precision for others *)
+                 (* Routes price limits to price parameters and quantity limits otherwise. *)
                  (match field_name with
                   | Some name when string_contains name "price" -> price_precision
                   | _ -> qty_precision)
@@ -62,7 +66,7 @@ let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : strin
       in
       Printf.sprintf "%.*f" precision f
   | `String s ->
-      (* Properly escape JSON strings *)
+      (* Escapes JSON string literal values. *)
       "\"" ^ (String.concat "" (List.map (function
         | '"' -> "\\\""
         | '\\' -> "\\\\"
@@ -83,19 +87,19 @@ let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : strin
   | `Tuple _ -> failwith "json_to_string_precise: Tuple not supported"
   | `Variant _ -> failwith "json_to_string_precise: Variant not supported"
 
-(** Generate unique request ID *)
+(** Generates sequential request identifier. *)
 let next_req_id =
   let counter = ref 0 in
-  let ping_start_id = 1000000 in  (* Ping IDs start at this value *)
+  let ping_start_id = 1000000 in  (* Denotes ping ID reserved boundary. *)
   fun () ->
     incr counter;
     let id = !counter in
-    (* Warn if approaching ping ID range to detect potential collisions *)
+    (* Logs threshold warning approaching ping ID collision boundary. *)
     if id >= ping_start_id - 1000 then
       Logging.warn_f ~section "Trading request ID %d approaching ping ID range (ping IDs start at %d) - potential collision risk" id ping_start_id;
     id
 
-(** Retry configuration *)
+(** Request retry configurations. *)
 type retry_config = {
   max_attempts: int;
   base_delay_ms: float;
@@ -110,10 +114,10 @@ let default_retry_config = {
   backoff_factor = 2.0;
 }
 
-(** Sleep for the specified milliseconds *)
+(** Halts execution thread for millisecond duration. *)
 let sleep_ms ms = Lwt_unix.sleep (ms /. 1000.0)
 
-(** Retry a function with exponential backoff *)
+(** Executes closure repeating upon failure with exponential backoff algorithm. *)
 let retry_with_backoff ~config ~f ~is_retriable =
   let rec attempt attempt_num =
     if attempt_num > config.max_attempts then
@@ -136,28 +140,28 @@ let retry_with_backoff ~config ~f ~is_retriable =
   attempt 1
 
 
-(** Check if an error is retriable (network issues, temporary server errors) *)
+(** Classifies error responses targeting transient network conditions. *)
 let is_retriable_error err =
   let err_lower = String.lowercase_ascii err in
-  (* Network and connectivity errors *)
+  (* Assesses connectivity socket failures. *)
   string_contains err_lower "timeout" ||
   string_contains err_lower "connection" ||
   string_contains err_lower "network" ||
   string_contains err_lower "reset" ||
   string_contains err_lower "broken pipe" ||
-  (* Server errors that might be temporary *)
+  (* Assesses transient server state errors. *)
   string_contains err_lower "500" ||
   string_contains err_lower "502" ||
   string_contains err_lower "503" ||
   string_contains err_lower "504" ||
-  (* WebSocket connection issues *)
+  (* Assesses websocket protocol failures. *)
   string_contains err_lower "websocket" ||
   string_contains err_lower "socket" ||
-  (* Rate limiting (though Kraken might use different codes) *)
+  (* Assesses API rate limit violations. *)
   string_contains err_lower "rate limit" ||
   string_contains err_lower "too many requests"
 
-(** Place a new order on Kraken with retry logic *)
+(** Transmits order placement payload utilizing retry handler. *)
 let place_order
     ~token
     ~order_type
@@ -182,10 +186,10 @@ let place_order
   let config = match retry_config with Some c -> c | None -> default_retry_config in
 
   let place_order_once () =
-    (* Use REST API instead of WebSocket to avoid concurrency issues *)
+    (* Submits via REST enforcing sequence isolation constraints. *)
     let req_id = next_req_id () in
 
-    (* Build order parameters *)
+    (* Appends core parameters. *)
     let params = `Assoc [
       ("order_type", `String order_type);
       ("side", `String side);
@@ -194,7 +198,7 @@ let place_order
       ("token", `String token);
     ] in
 
-    (* Add optional parameters *)
+    (* Appends optional parameters. *)
     let params = match limit_price with
       | Some price -> 
           let truncated_price = truncate_price_to_precision price symbol in
@@ -226,7 +230,7 @@ let place_order
       | None -> params
     in
 
-    (* Add trigger parameters for conditional orders *)
+    (* Appends conditional trigger parameters. *)
     let params = match trigger_price with
       | Some price ->
           let truncated_price = truncate_price_to_precision price symbol in
@@ -239,19 +243,19 @@ let place_order
       | None -> params
     in
 
-    (* Add display quantity for iceberg orders *)
+    (* Appends execution display limits. *)
     let params = match display_qty with
       | Some qty -> add_to_assoc params ("display_qty", `Float qty)
       | None -> params
     in
 
-    (* Add fee preference *)
+    (* Appends fee structure preference. *)
     let params = match fee_preference with
       | Some pref -> add_to_assoc params ("fee_preference", `String pref)
       | None -> params
     in
 
-    (* Add validate parameter for testing without execution *)
+    (* Appends execution validation flag. *)
     let params = match validate with
       | Some v -> add_to_assoc params ("validate", `Bool v)
       | None -> params
@@ -260,7 +264,7 @@ let place_order
     Logging.debug_f ~section "Placing %s order: %s %s %f @ %s" side symbol order_type order_qty
       (match limit_price with Some p -> Printf.sprintf "%.6f" (truncate_price_to_precision p symbol) | None -> "market");
 
-    (* Log the order parameters being sent *)
+    (* Logs serialized order payload. *)
     let json_str = json_to_string_precise (Some symbol) params in
     Logging.debug_f ~section "Order parameters: %s" json_str;
 
@@ -304,7 +308,7 @@ let place_order
 
   retry_with_backoff ~config ~f:place_order_once ~is_retriable:is_retriable_error
 
-(** Amend an existing order on Kraken with retry logic *)
+(** Transmits order modification payload utilizing retry handler. *)
 let amend_order
     ~token
     ~order_id
@@ -325,25 +329,25 @@ let amend_order
   let config = match retry_config with Some c -> c | None -> default_retry_config in
 
   let amend_order_once () =
-    (* Trading client should already be initialized by order executor *)
+    (* Assumes initialized singleton dependency. *)
     let req_id = next_req_id () in
 
     let symbol_str = Option.value symbol ~default:"" in
-    if symbol_str = "" then failwith "Symbol required for price precision in amend_order";  (* Enforce it *)
+    if symbol_str = "" then failwith "Symbol required for price precision in amend_order";  (* Validates symbol configuration. *)
 
-    (* Build amend parameters *)
+    (* Appends immutable parameters. *)
     let params = `Assoc [
       ("order_id", `String order_id);
       ("token", `String token);
     ] in
 
-    (* Add order_qty only if provided *)
+    (* Appends dynamic quantity parameter. *)
     let params = match order_qty with
       | Some qty -> add_to_assoc params ("order_qty", `Float qty)
       | None -> params
     in
 
-    (* Add optional parameters *)
+    (* Appends optional parameters. *)
     let params = match cl_ord_id with
       | Some id -> add_to_assoc params ("cl_ord_id", `String id)
       | None -> params
@@ -377,19 +381,19 @@ let amend_order
       | None -> params
     in
 
-    (* Add deadline parameter for latency-sensitive orders *)
+    (* Appends expiration deadline parameter. *)
     let params = match deadline with
       | Some deadline -> add_to_assoc params ("deadline", `String deadline)
       | None -> params
     in
 
-    (* Add validate parameter for testing without execution *)
+    (* Appends execution validation flag. *)
     let params = match validate with
       | Some v -> add_to_assoc params ("validate", `Bool v)
       | None -> params
     in
 
-    (* Add symbol parameter for non-crypto pairs *)
+    (* Appends asset symbol mapping. *)
     let params = match symbol with
       | Some s -> add_to_assoc params ("symbol", `String s)
       | None -> params
@@ -450,7 +454,7 @@ let amend_order
 
   retry_with_backoff ~config ~f:amend_order_once ~is_retriable:is_retriable_error
 
-(** Cancel orders on Kraken with retry logic *)
+(** Transmits order cancellation payload utilizing retry handler. *)
 let cancel_orders
     ~token
     ?order_ids
@@ -462,13 +466,13 @@ let cancel_orders
   let config = match retry_config with Some c -> c | None -> default_retry_config in
 
   let cancel_orders_once () =
-    (* Trading client should already be initialized by order executor *)
+    (* Assumes initialized singleton dependency. *)
     let req_id = next_req_id () in
 
-    (* Build cancel parameters *)
+    (* Initializes base cancel parameters. *)
     let params = `Assoc [("token", `String token)] in
 
-    (* Add order identifiers *)
+    (* Appends target reference identifiers. *)
     let params = match order_ids with
       | Some ids -> add_to_assoc params ("order_id", `List (List.map (fun id -> `String id) ids))
       | None -> params
@@ -494,9 +498,8 @@ let cancel_orders
       ~req_id
       ~timeout_ms:10000 >>= fun response ->
 
-    (* For cancel operations, Kraken returns individual responses for each cancelled order *)
-    (* The current response contains one result, but we need to handle the fact that
-       multiple cancel operations might be processed as separate responses *)
+    (* Processes individual sequential cancel responses. *)
+    (* Modifies multi order payload processing behavior routing sequence limits. *)
 
     if response.success then begin
       match response.result with
@@ -508,8 +511,7 @@ let cancel_orders
               Kraken_common_types.order_id;
               cl_ord_id;
             } in
-            (* For now, return a list with single result. In a more sophisticated implementation,
-               we might need to handle streaming responses differently *)
+            (* Yields singleton list bypassing streaming payload structures. *)
             Lwt.return (Ok [result])
           with exn ->
             let err = Printf.sprintf "Failed to parse cancel response: %s" (Printexc.to_string exn) in
@@ -517,7 +519,7 @@ let cancel_orders
             Lwt.return (Error err)
           end
       | None ->
-          (* This shouldn't happen for successful cancel responses *)
+          (* Validates successful response body allocation. *)
           let err = "No result in successful cancel response" in
           Logging.error ~section err;
           Lwt.return (Error err)

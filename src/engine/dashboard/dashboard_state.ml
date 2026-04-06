@@ -1,16 +1,16 @@
-(** Dashboard State Serialization
-    Reads engine state from various modules and serializes to JSON
-    for transmission over Unix domain socket to the TUI dashboard. *)
+(** Dashboard state serialization.
+    Aggregates engine state from multiple modules and serializes it
+    as JSON for transmission to the TUI dashboard via Unix domain socket. *)
 
 module Exchange = Dio_exchange.Exchange_intf
 module Fear_and_greed = Cmc.Fear_and_greed
 
-(** Cached engine start time — set once by the server at startup *)
+(** Cached engine start time. Set once by the server at startup. *)
 let engine_start_time = ref 0.0
 
 let set_start_time t = engine_start_time := t
 
-(** Trading config: cached after first read (static at runtime) *)
+(** Trading config ref. Cached on first read; immutable at runtime. *)
 let cached_config : Dio_engine.Config.config option ref = ref None
 
 let get_config () =
@@ -21,7 +21,7 @@ let get_config () =
       cached_config := Some c;
       c
 
-(* ── JSON helpers ────────────────────────────────────────────────── *)
+(* JSON helpers *)
 
 let json_of_float_opt = function
   | Some f -> `Float f
@@ -31,7 +31,7 @@ let json_of_string_opt = function
   | Some s -> `String s
   | None -> `Null
 
-(* ── Connection snapshots ────────────────────────────────────────── *)
+(* Connection snapshots *)
 
 let json_of_connection_snapshot (snap : Supervisor_cache.connection_snapshot) =
   let state_str = match snap.state with
@@ -56,7 +56,7 @@ let json_of_connection_snapshot (snap : Supervisor_cache.connection_snapshot) =
     "total_conns", `Int snap.total_connections;
   ]
 
-(* ── Domain state ────────────────────────────────────────────────── *)
+(* Domain state *)
 
 let json_of_domains () =
   let statuses = Dio_engine.Domain_spawner.get_domain_status () in
@@ -69,7 +69,7 @@ let json_of_domains () =
     ]
   ) statuses)
 
-(* ── Strategy state — Grid ───────────────────────────────────────── *)
+(* Strategy state: Grid *)
 
 let json_of_grid_strategy symbol =
   let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
@@ -95,7 +95,7 @@ let json_of_grid_strategy symbol =
     "maker_fee", `Float state.maker_fee;
   ]
 
-(* ── Strategy state — Market Maker ───────────────────────────────── *)
+(* Strategy state: Market Maker *)
 
 let json_of_mm_strategy symbol =
   let state = Dio_strategies.Market_maker.get_strategy_state symbol in
@@ -114,10 +114,10 @@ let json_of_mm_strategy symbol =
     "pending_count", `Int (List.length state.pending_orders);
   ]
 
-(* ── Market data per symbol ──────────────────────────────────────── *)
+(* Per-symbol market data *)
 
-(** Split a trading symbol into (base_asset, quote_currency).
-    Computed once and passed down to avoid repeated list allocations. *)
+(** Splits a trading symbol on '/' into (base_asset, quote_currency).
+    Defaults quote to "USD" when no delimiter is present. *)
 let split_symbol symbol =
   if String.contains symbol '/' then
     match String.split_on_char '/' symbol with
@@ -147,7 +147,7 @@ let json_of_market_data exchange symbol base_asset quote_currency =
         "quote_balance", `Float quote_balance;
       ]
 
-(* ── Latency profiler snapshots ──────────────────────────────────── *)
+(* Latency profiler snapshots *)
 
 let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
   `Assoc [
@@ -170,7 +170,7 @@ let json_of_domain_latencies () =
     ) snaps)
   ) profilers)
 
-(* ── Memory / GC stats ───────────────────────────────────────────── *)
+(* Memory and GC stats *)
 
 let json_of_memory () =
   let s = Gc.stat () in
@@ -188,23 +188,23 @@ let json_of_memory () =
     "heap_chunks", `Int s.heap_chunks;
   ]
 
-(* ── Full state snapshot ─────────────────────────────────────────── *)
+(* Full state snapshot *)
 
 let build_snapshot () =
   let now = Unix.gettimeofday () in
   let uptime = now -. !engine_start_time in
   let config = get_config () in
 
-  (* Connections *)
+  (* Supervisor connection snapshots *)
   let connections = Supervisor_cache.get_snapshots () in
 
-  (* Fear & Greed *)
+  (* Fear and Greed index value *)
   let fng = match Fear_and_greed.get_cached () with
     | Some v -> `Float v
     | None -> `Null
   in
 
-  (* Per-symbol strategy + market data *)
+  (* Per-symbol strategy state and market data *)
   let strategies = List.map (fun (tc : Dio_engine.Config.trading_config) ->
     let strategy_json = match tc.strategy with
       | "Grid" | "suicide_grid" -> json_of_grid_strategy tc.symbol
@@ -226,8 +226,8 @@ let build_snapshot () =
     ]
   ) config.trading in
 
-  (* Collect all non-zero balances from every registered exchange,
-     enriched with market data and open orders for full visibility *)
+  (* Aggregate balances from all registered exchanges,
+     enriched with ticker data and open sell orders *)
   let configured_symbols = List.map (fun (tc : Dio_engine.Config.trading_config) ->
     (tc.exchange, tc.symbol)
   ) config.trading in
@@ -238,13 +238,13 @@ let build_snapshot () =
     | None -> []
     | Some (module Ex) ->
         List.filter_map (fun (asset, bal) ->
-          (* Infer the likely trading pair for this asset; split once *)
+          (* Infer trading pair for this asset *)
           let quote = match exch_name with
             | "hyperliquid" -> "USDC"
             | _ -> "USD"
           in
           let symbol = asset ^ "/" ^ quote in
-          (* Skip if this symbol is already a configured strategy *)
+          (* Skip assets already covered by a configured strategy *)
           let is_configured = List.exists (fun (ex, sym) ->
             ex = exch_name && sym = symbol
           ) configured_symbols in
@@ -258,7 +258,7 @@ let build_snapshot () =
                   if is_quote then `Float 1.0, `Float 1.0
                   else `Null, `Null
             in
-            (* Get open orders for this symbol *)
+            (* Retrieve open sell orders for this symbol *)
             let open_orders = Ex.get_open_orders ~symbol in
             let sell_orders = List.filter (fun (o : Exchange.Types.open_order) ->
               o.side = Exchange.Types.Sell && o.remaining_qty > 0.0
@@ -297,7 +297,7 @@ let build_snapshot () =
     "latencies", json_of_domain_latencies ();
   ]
 
-(** Build a JSON snapshot and serialize to string *)
+(** Builds a full JSON snapshot and serializes it to a string. *)
 let snapshot_to_string () =
   let json = build_snapshot () in
   Yojson.Basic.to_string json

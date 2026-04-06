@@ -1,63 +1,59 @@
-(**
-  Common types shared between strategies (suicide_grid, market_maker, etc.)
-  
-  This module provides unified types for strategy orders to enable consistent
-  order processing in the supervisor regardless of which strategy generates them.
-*)
+(** Common types and infrastructure shared across all trading strategies.
+    Provides unified order representation, in-flight deduplication caches,
+    a ring buffer for order queuing, and the strategy module signature. *)
 
-(** Strategy userref values - simple integers to tag orders by strategy
-    These are non-unique identifiers that group all orders from a strategy together *)
-let strategy_userref_grid = 1  (* Grid strategy *)
-let strategy_userref_mm = 2    (* Market maker strategy *)
+(** Integer userref tags for per-strategy order grouping on the exchange. *)
+let strategy_userref_grid = 1  (* grid strategy *)
+let strategy_userref_mm = 2    (* market maker strategy *)
 
-(** Check if a userref matches a specific strategy *)
+(** Returns true if [order_userref] matches the given [strategy_userref]. *)
 let is_strategy_order strategy_userref order_userref =
   strategy_userref = order_userref
 
-(** Order side - buy or sell *)
+(** Order side: buy or sell. *)
 type order_side = Buy | Sell
 
 let string_of_order_side = function
   | Buy -> "buy"
   | Sell -> "sell"
 
-(** Operation type - what to do with an order *)
+(** Operation type for a strategy order. *)
 type operation_type =
-  | Place  (* Place a new order *)
-  | Amend  (* Amend an existing order *)
-  | Cancel (* Cancel an existing order *)
+  | Place  (* submit a new order *)
+  | Amend  (* modify an existing order *)
+  | Cancel (* cancel an existing order *)
 
 let string_of_operation_type = function
   | Place -> "place"
   | Amend -> "amend"
   | Cancel -> "cancel"
 
-(** Strategy identifier — exhaustive set of strategies that produce orders *)
+(** Discriminant for the strategy that produced an order. *)
 type strategy_id = Grid | MM | Hedger
 
 let string_of_strategy_id = function
   | Grid -> "Grid" | MM -> "MM" | Hedger -> "Hedger"
 
-(** Unified strategy order type used by all strategies *)
+(** Unified order record emitted by all strategies. *)
 type strategy_order = {
-  operation: operation_type;  (* What to do with this order *)
-  order_id: string option;    (* For amend/cancel operations - the target order ID *)
+  operation: operation_type;  (* place, amend, or cancel *)
+  order_id: string option;    (* target order ID for amend/cancel; None for place *)
   symbol: string;
   side: order_side;
-  order_type: string;  (* "limit", "market", etc. *)
+  order_type: string;  (* e.g. "limit", "market" *)
   qty: float;
   price: float option;
-  time_in_force: string;  (* "GTC", "IOC", "FOK" *)
+  time_in_force: string;  (* e.g. "GTC", "IOC", "FOK" *)
   post_only: bool;
-  userref: int option;  (* Strategy identifier: 1=GRID, 2=MM, 3=ARB *)
-  strategy: strategy_id; (* Strategy variant for type-safe dispatch *)
-  exchange: string;     (* Exchange to execute order on *)
-  duplicate_key: string; (* Unique key for duplicate detection *)
+  userref: int option;  (* exchange-level strategy tag *)
+  strategy: strategy_id; (* originating strategy variant *)
+  exchange: string;     (* target exchange *)
+  duplicate_key: string; (* composite key for deduplication *)
 }
 
-(** Generate a hash key for duplicate order detection.
-    Uses a single Buffer pass to avoid intermediate string allocations
-    from nested Printf.sprintf calls (was the hottest alloc in benchmarks). *)
+(** Build a composite deduplication key from order parameters.
+    Uses a single [Buffer] pass to avoid intermediate string allocations
+    that nested [Printf.sprintf] calls would incur. *)
 let generate_duplicate_key symbol side quantity limit_price =
   let buf = Buffer.create 48 in
   Buffer.add_string buf symbol;
@@ -71,25 +67,26 @@ let generate_duplicate_key symbol side quantity limit_price =
    | None   -> Buffer.add_string buf "market");
   Buffer.contents buf
 
-(** In-flight order cache to prevent duplicate orders *)
+(** In-flight order cache for deduplication of pending place/cancel requests. *)
 module InFlightOrders = struct
-  (* Map duplicate_key -> timestamp *)
+  (* duplicate_key -> insertion timestamp *)
   let registry : (string, float) Hashtbl.t = Hashtbl.create 16
   let mutex = Mutex.create ()
 
-  (** Check if an order is already in-flight and add it if not *)
+  (** Atomically insert [duplicate_key] if absent. Returns true on insertion,
+      false if the key was already present. *)
   let add_in_flight_order duplicate_key =
     Mutex.lock mutex;
     match Hashtbl.mem registry duplicate_key with
     | true ->
         Mutex.unlock mutex;
-        false (* Already existed *)
+        false (* already tracked *)
     | false ->
         Hashtbl.add registry duplicate_key (Unix.gettimeofday ());
         Mutex.unlock mutex;
-        true (* Added successfully *)
+        true (* newly inserted *)
 
-  (** Remove an order from the in-flight cache *)
+  (** Remove [duplicate_key] from the cache. Returns true if it was present. *)
   let remove_in_flight_order duplicate_key =
     Mutex.lock mutex;
     let existed = Hashtbl.mem registry duplicate_key in
@@ -97,64 +94,65 @@ module InFlightOrders = struct
     Mutex.unlock mutex;
     existed
 
-  (** Get the current size of the in-flight orders registry *)
+  (** Return the number of entries currently tracked. *)
   let get_registry_size () =
     Mutex.lock mutex;
     let size = Hashtbl.length registry in
     Mutex.unlock mutex;
     size
 
-  (** Cleanup stale entries *)
+  (** Evict entries older than [max_age] seconds. Returns [(0, removed_count)]. *)
   let cleanup ?(max_age=60.0) () =
     Mutex.lock mutex;
     let now = Unix.gettimeofday () in
     let removed = ref 0 in
 
-    (* Scan and remove stale entries directly - safe under mutex protection *)
+    (* In-place scan; safe under mutex *)
     Hashtbl.filter_map_inplace (fun _key timestamp ->
       if now -. timestamp > max_age then begin
         incr removed;
-        None  (* Remove this entry *)
+        None
       end else
-        Some timestamp  (* Keep this entry *)
+        Some timestamp
     ) registry;
 
     Mutex.unlock mutex;
-    (0, !removed) (* drift, trimmed *)
+    (0, !removed)
 
-  (** Return cleanup function for event registry integration *)
+  (** Return a closure compatible with the event registry cleanup interface. *)
   let get_cleanup_fn () =
     fun () ->
       let (drift, trimmed) = cleanup () in
       Some (Some drift, Some trimmed)
 end
 
-(** In-flight amendment cache to prevent duplicate amendments *)
+(** In-flight amendment cache for deduplication of pending amend requests. *)
 module InFlightAmendments = struct
-  (* Map order_id -> timestamp *)
+  (* order_id -> insertion timestamp *)
   let registry : (string, float) Hashtbl.t = Hashtbl.create 16
   let mutex = Mutex.create ()
 
-  (** Check if an amendment is already in-flight and add it if not *)
+  (** Atomically insert [order_id] if absent. Returns true on insertion,
+      false if already tracked. *)
   let add_in_flight_amendment order_id =
     Mutex.lock mutex;
     match Hashtbl.mem registry order_id with
     | true ->
         Mutex.unlock mutex;
-        false (* Already existed *)
+        false (* already tracked *)
     | false ->
         Hashtbl.add registry order_id (Unix.gettimeofday ());
         Mutex.unlock mutex;
-        true (* Added successfully *)
+        true (* newly inserted *)
 
-  (** Check if an amendment is currently in-flight *)
+  (** Returns true if [order_id] has a pending amendment. *)
   let is_in_flight order_id =
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry order_id in
     Mutex.unlock mutex;
     exists
 
-  (** Remove an amendment from the in-flight cache *)
+  (** Remove [order_id] from the cache. Returns true if it was present. *)
   let remove_in_flight_amendment order_id =
     Mutex.lock mutex;
     let existed = Hashtbl.mem registry order_id in
@@ -162,45 +160,46 @@ module InFlightAmendments = struct
     Mutex.unlock mutex;
     existed
 
-  (** Get the current size of the in-flight amendments registry *)
+  (** Return the number of entries currently tracked. *)
   let get_registry_size () =
     Mutex.lock mutex;
     let size = Hashtbl.length registry in
     Mutex.unlock mutex;
     size
 
-  (** Cleanup stale entries *)
+  (** Evict entries older than [max_age] seconds. Returns [(0, removed_count)]. *)
   let cleanup ?(max_age=60.0) () =
     Mutex.lock mutex;
     let now = Unix.gettimeofday () in
     let removed = ref 0 in
 
-    (* Scan and remove stale entries directly - safe under mutex protection *)
+    (* In-place scan; safe under mutex *)
     Hashtbl.filter_map_inplace (fun _key timestamp ->
       if now -. timestamp > max_age then begin
         incr removed;
-        None  (* Remove this entry *)
+        None
       end else
-        Some timestamp  (* Keep this entry *)
+        Some timestamp
     ) registry;
 
     Mutex.unlock mutex;
-    (0, !removed) (* drift, trimmed *)
+    (0, !removed)
 
-  (** Return cleanup function for event registry integration *)
+  (** Return a closure compatible with the event registry cleanup interface. *)
   let get_cleanup_fn () =
     fun () ->
       let (drift, trimmed) = cleanup () in
       Some (Some drift, Some trimmed)
 end
 
-(** Lock-free ring buffer for strategy orders *)
+(** Fixed-capacity ring buffer for queuing strategy orders.
+    Not thread-safe; callers must hold [order_buffer_mutex]. *)
 module OrderRingBuffer = struct
   type 'a t = {
     data: 'a option array;
-    mutable write_pos: int;
-    mutable read_pos: int;
-    size: int;
+    mutable write_pos: int;  (* next write index *)
+    mutable read_pos: int;   (* next read index *)
+    size: int;               (* capacity of the backing array *)
   }
 
   let create size =
@@ -211,38 +210,38 @@ module OrderRingBuffer = struct
       size;
     }
 
-  (** Write to buffer — caller must hold order_buffer_mutex *)
+  (** Enqueue [value]. Returns [Some ()] on success, [None] if the buffer is full. *)
   let write buffer value =
     let pos = buffer.write_pos in
     let next_pos = (pos + 1) mod buffer.size in
     if next_pos = buffer.read_pos then
-      None  (* Buffer full, drop the order *)
+      None  (* buffer full *)
     else begin
       buffer.data.(pos) <- Some value;
       buffer.write_pos <- next_pos;
       Some ()
     end
 
-  (** Read from buffer — caller must hold order_buffer_mutex *)
+  (** Dequeue the next item. Returns [None] if the buffer is empty. *)
   let read buffer =
     if buffer.read_pos = buffer.write_pos then
-      None  (* Buffer empty *)
+      None  (* empty *)
     else
       match buffer.data.(buffer.read_pos) with
       | Some value ->
           buffer.data.(buffer.read_pos) <- None;
           buffer.read_pos <- (buffer.read_pos + 1) mod buffer.size;
           Some value
-      | None -> None  (* Shouldn't happen in normal operation *)
+      | None -> None  (* invariant violation: slot should not be None *)
 
-  (** Get current buffer usage *)
+  (** Return the number of items currently queued. *)
   let size buffer =
     if buffer.write_pos >= buffer.read_pos then
       buffer.write_pos - buffer.read_pos
     else
       buffer.size - buffer.read_pos + buffer.write_pos
 
-  (** Batch read multiple items *)
+  (** Dequeue up to [max_items] entries, returned in FIFO order. *)
   let read_batch buffer max_items =
     let rec read_n acc n =
       if n >= max_items then List.rev acc
@@ -254,14 +253,14 @@ module OrderRingBuffer = struct
     read_n [] 0
 end
 
-(** Global order signal for event-driven order processing *)
+(** Lwt condition variable used to notify the supervisor of new queued orders. *)
 module OrderSignal = struct
   let condition = Lwt_condition.create ()
   let broadcast () = Lwt_condition.broadcast condition ()
   let wait () = Lwt_condition.wait condition
 end
 
-(** Strategy Implementation Interface *)
+(** Module signature that all strategy implementations must satisfy. *)
 module type S = sig
   type config
   val execute : 

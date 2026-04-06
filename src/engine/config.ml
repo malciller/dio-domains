@@ -1,9 +1,9 @@
-(** Trading configuration type *)
+(** Per-symbol trading parameters parsed from a single entry in the "trading" array of config.json. *)
 type trading_config = {
   exchange: string;
   symbol: string;
   qty: string;
-  grid_interval: float * float;  (** min, max grid interval percentages *)
+  grid_interval: float * float;  (** (min, max) grid interval percentages; resolved to equal bounds when a scalar is provided *)
   sell_mult: string;
   min_usd_balance: string option;
   max_exposure: string option;
@@ -12,7 +12,7 @@ type trading_config = {
   taker_fee: float option;
   testnet: bool;
   hedge: bool;
-  accumulation_buffer: float * float;  (** min, max quote profit buffer; resolved dynamically from Fear & Greed *)
+  accumulation_buffer: float * float;  (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
 }
 type logging_config = {
   level: Logging.level;
@@ -35,10 +35,10 @@ type config = {
   trading: trading_config list;
 }
 
-(** Internal section tag for logging *)
+(** Logging section identifier for this module. *)
 let section = "config"
 
-(** Known keys at each config level *)
+(** Permitted key sets used by [validate_keys] for strict schema enforcement at each nesting level. *)
 let known_top_level_keys =
   [ "logging_level"; "logging_sections"; "cycle_mod";
     "engine"; "trading"; "gc" ]
@@ -54,8 +54,8 @@ let known_trading_keys =
     "min_usd_balance"; "max_exposure"; "strategy"; "maker_fee";
     "taker_fee"; "testnet"; "hedge"; "accumulation_buffer" ]
 
-(** Validate that all keys in a JSON object are in the allowed set.
-    Logs critical for each unknown key and returns true if any were found. *)
+(** Validates that all keys in a JSON associative object belong to the [allowed] set.
+    Logs at CRITICAL level for each unknown key. Returns [true] if any unknown keys are present. *)
 let validate_keys ~context ~allowed json =
   let open Yojson.Basic.Util in
   let actual = json |> to_assoc |> List.map fst in
@@ -65,9 +65,9 @@ let validate_keys ~context ~allowed json =
   ) unknown;
   unknown <> []
 
-(** Parse grid_interval from JSON, accepting:
-    - list [min, max]
-    - single number/string -> treated as (v, v) for backward compatibility *)
+(** Parses the "grid_interval" field from a trading entry JSON object.
+    Accepts a two-element list [min; max] or a single numeric/string scalar
+    (promoted to equal bounds for backward compatibility). Defaults to (1.0, 1.0). *)
 let parse_grid_interval json exchange symbol =
   let open Yojson.Basic.Util in
   let default = (1.0, 1.0) in
@@ -101,9 +101,9 @@ let parse_grid_interval json exchange symbol =
           default)
   | _ -> default
 
-(** Parse accumulation_buffer from JSON, accepting:
-    - list [min, max]
-    - single number/string -> treated as (v, v) for backward compatibility *)
+(** Parses the "accumulation_buffer" field from a trading entry JSON object.
+    Accepts a two-element list [min; max] or a single numeric/string scalar
+    (promoted to equal bounds for backward compatibility). Defaults to (0.01, 0.01). *)
 let parse_accumulation_buffer json exchange symbol =
   let open Yojson.Basic.Util in
   let default = (0.01, 0.01) in
@@ -137,14 +137,17 @@ let parse_accumulation_buffer json exchange symbol =
           default)
   | _ -> default
 
-(** Parse a single trading config from JSON *)
+(** Parses a single trading entry from the JSON "trading" array into a [trading_config].
+    Validates keys, enforces exchange-specific constraints (e.g. testnet/hedge/accumulation_buffer
+    are restricted to Hyperliquid), and restricts grid_interval to the Grid strategy. Exits on
+    schema violations. *)
 let parse_config json =
   if validate_keys ~context:"trading entry" ~allowed:known_trading_keys json then
     exit 1;
   let open Yojson.Basic.Util in
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
-  (* testnet, hedge, accumulation_buffer are Hyperliquid-only keys *)
+  (* Enforce that testnet, hedge, and accumulation_buffer are only valid for Hyperliquid entries. *)
   if exchange <> "hyperliquid" then begin
     let hl_only = [ "testnet"; "hedge"; "accumulation_buffer" ] in
     let actual = json |> to_assoc |> List.map fst in
@@ -157,7 +160,7 @@ let parse_config json =
     end
   end;
   let strategy = json |> member "strategy" |> to_string in
-  (* grid_interval is only valid for Grid strategies *)
+  (* Reject grid_interval when strategy is not Grid. *)
   if strategy <> "Grid" then begin
     let actual = json |> to_assoc |> List.map fst in
     if List.mem "grid_interval" actual then begin
@@ -183,7 +186,8 @@ let parse_config json =
     accumulation_buffer = parse_accumulation_buffer json exchange symbol;
   }
 
-(** Parse logging configuration *)
+(** Parses top-level "logging_level" and "logging_sections" fields into a [logging_config].
+    Defaults to INFO level and no section filters when fields are absent or invalid. *)
 let parse_logging_config json : logging_config =
   let open Yojson.Basic.Util in
   let level_str = json |> member "logging_level" |> to_string_option |> Option.value ~default:"info" in
@@ -195,7 +199,8 @@ let parse_logging_config json : logging_config =
   let sections = sections_str |> String.split_on_char ',' |> List.map String.trim |> List.filter ((<>) "") in
   { level; sections }
 
-(** Parse GC configuration *)
+(** Parses the optional "gc" object into OCaml GC tuning parameters.
+    Returns [None] when the key is absent. Exits on unknown sub-keys. *)
 let parse_gc_config json : gc_config option =
   let open Yojson.Basic.Util in
   match json |> member "gc" with
@@ -218,15 +223,17 @@ let parse_gc_config json : gc_config option =
         major_heap_increment;
       }
 
-(** Read and parse engine configuration from config.json *)
+(** Reads config.json from the working directory and parses it into a [config] record.
+    Performs strict key validation at each nesting level, exiting on schema violations
+    or JSON parse errors. Falls back to defaults on filesystem errors. *)
 let read_config () : config =
   try
     let json = Yojson.Basic.from_file "config.json" in
     let open Yojson.Basic.Util in
-    (* Validate top-level keys *)
+    (* Reject unknown top-level keys. *)
     if validate_keys ~context:"top-level" ~allowed:known_top_level_keys json then
       exit 1;
-    (* Validate engine keys if present *)
+    (* Reject unknown keys in the optional "engine" sub-object. *)
     (match json |> member "engine" with
      | `Null -> ()
      | engine_json ->
@@ -242,6 +249,6 @@ let read_config () : config =
     Logging.critical_f ~section "Failed to parse config.json: %s" msg;
     exit 1
   | Sys_error msg ->
-    Logging.warn_f ~section "Cannot read config.json: %s — using defaults" msg;
+    Logging.warn_f ~section "Cannot read config.json: %s, using defaults" msg;
     { cycle_mod = 10000; logging = { level = Logging.INFO; sections = [] };
       gc = None; trading = [] }

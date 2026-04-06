@@ -1,22 +1,31 @@
+(** Histogram-based latency profiler.
+    Records latency samples into fixed-width buckets and computes
+    percentile distributions (p50, p90, p95, p99, p999).
+    All latency values are in microseconds. *)
+
 open Mtime
 
 let section = "latency_profiler"
 
-(* bucket resolution in microseconds *)
+(* Default bucket width in microseconds. *)
 let bucket_us = 1
 
-(* maximum latency tracked: 10ms *)
+(* Upper bound of tracked latency range in microseconds. *)
 let max_latency_us = 100_000
 
+(** Profiler state. Contains a fixed-size histogram array and
+    running counters for total samples and overflow events. *)
 type t = {
-  name : string;
-  buckets : int array;
-  bucket_us : int;
-  bucket_count : int;
-  mutable samples : int;
-  mutable overflow : int;
+  name : string;          (* Identifier for this profiler instance. *)
+  buckets : int array;    (* Histogram bin counts. *)
+  bucket_us : int;        (* Width of each bucket in microseconds. *)
+  bucket_count : int;     (* Total number of histogram buckets. *)
+  mutable samples : int;  (* Total recorded samples. *)
+  mutable overflow : int; (* Samples exceeding the histogram range. *)
 }
 
+(** [create ?bucket_us ?max_latency_us name] allocates a profiler with
+    [max_latency_us / bucket_us] histogram buckets, all initialized to zero. *)
 let create ?(bucket_us=1) ?(max_latency_us=10_000) name = 
   let count = max_latency_us / bucket_us in
   {
@@ -28,6 +37,10 @@ let create ?(bucket_us=1) ?(max_latency_us=10_000) name =
     overflow = 0;
   }
 
+(** [record t span] converts [span] from nanoseconds to microseconds,
+    maps it to the corresponding histogram bucket, and increments both
+    the bucket count and total sample count. Samples that exceed the
+    histogram range are clamped to the last bucket and counted as overflow. *)
 let record t span =
   let us = Int64.to_int (Int64.div (Span.to_uint64_ns span) 1000L) in
   let bucket_idx = us / t.bucket_us in
@@ -39,6 +52,9 @@ let record t span =
   end;
   t.samples <- t.samples + 1
 
+(** [percentile t p] computes the p-th percentile (0.0 to 1.0) from the
+    histogram by performing a cumulative scan over buckets. Returns the
+    bucket boundary in microseconds. Returns 0.0 when no samples exist. *)
 let percentile t p =
   if t.samples = 0 then 0.0
   else
@@ -54,11 +70,16 @@ let percentile t p =
 
     float (!result * t.bucket_us)
 
+(** [reset t] zeroes all histogram buckets and resets sample/overflow counters. *)
 let reset t =
   Array.fill t.buckets 0 t.bucket_count 0;
   t.samples <- 0;
   t.overflow <- 0
 
+(** [report ?sample_threshold t] logs the current percentile distribution
+    if at least [sample_threshold] samples have been collected. Includes
+    overflow count in the log output when overflow is nonzero. Resets the
+    profiler state after reporting. *)
 let report ?(sample_threshold=1) t =
   if t.samples >= sample_threshold then (
 
@@ -78,7 +99,8 @@ let report ?(sample_threshold=1) t =
     reset t
   )
 
-(* Helper for timing a function *)
+(** [time_it t f] measures the wall-clock execution time of [f ()],
+    records the resulting span in the profiler, and returns the result of [f]. *)
 let time_it t f =
   let start = Mtime_clock.now_ns () in
   let res = f () in
@@ -87,21 +109,22 @@ let time_it t f =
   record t span;
   res
 
-(** Non-destructive snapshot of current latency percentiles.
-    Safe to call from the dashboard without interfering with the
-    engine's periodic report-and-reset cycle. Returns None if
-    no samples have been recorded yet. *)
+(** Read-only snapshot of percentile data. Computed without mutating
+    the profiler state, so it does not interfere with the periodic
+    report-and-reset cycle. *)
 type snapshot = {
-  name: string;
-  p50: float;
-  p90: float;
-  p95: float;
-  p99: float;
-  p999: float;
-  samples: int;
-  overflow: int;
+  name: string;     (* Profiler instance name. *)
+  p50: float;       (* 50th percentile in microseconds. *)
+  p90: float;       (* 90th percentile in microseconds. *)
+  p95: float;       (* 95th percentile in microseconds. *)
+  p99: float;       (* 99th percentile in microseconds. *)
+  p999: float;      (* 99.9th percentile in microseconds. *)
+  samples: int;     (* Total samples at snapshot time. *)
+  overflow: int;    (* Overflow count at snapshot time. *)
 }
 
+(** [snapshot prof] returns [Some snapshot] with current percentile values,
+    or [None] if no samples have been recorded. Does not reset the profiler. *)
 let snapshot (prof : t) : snapshot option =
   if prof.samples = 0 then None
   else
@@ -113,6 +136,6 @@ let snapshot (prof : t) : snapshot option =
     Some { name = prof.name; p50; p90; p95; p99; p999;
            samples = prof.samples; overflow = prof.overflow }
 
-(** Get profiler name *)
+(** [name t] returns the profiler instance identifier. *)
 let name t = t.name
 

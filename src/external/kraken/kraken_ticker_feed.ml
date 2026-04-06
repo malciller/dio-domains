@@ -1,12 +1,19 @@
-(** Kraken Ticker Feed - WebSocket v2 ticker subscription with ring buffer *)
+(**
+   Kraken WebSocket v2 ticker feed.
+   Subscribes to real-time top-of-book bid/ask, last price, and rolling
+   24h volume for configured trading pairs. Ticker snapshots are written
+   to per-symbol lock-free ring buffers. Readiness is signalled via
+   [Lwt_condition] and per-symbol [Exchange_wakeup] events to notify
+   waiting domains without polling.
+*)
 open Lwt.Infix
 
 let section = "kraken_ticker"
 
-(** Safely force Conduit context with error handling *)
+(** Obtain a TLS-capable Conduit context, delegated to [Kraken_common_types]. *)
 let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 
-(** Ticker data *)
+(** Snapshot of ticker state for a single symbol at a point in time. *)
 type ticker = {
   symbol: string;
   bid: float;
@@ -16,10 +23,10 @@ type ticker = {
   timestamp: float;
 }
 
-(** Lock-free ring buffer for ticker data - shared implementation *)
+(** Lock-free ring buffer shared with other feeds via [Concurrency.Ring_buffer]. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol ticker storage with readiness signalling *)
+(** Per-symbol store pairing a ring buffer with an atomic readiness flag. *)
 type store = {
   buffer: ticker RingBuffer.t;
   ready: bool Atomic.t;
@@ -47,47 +54,47 @@ let notify_ready store =
     (try
       Lwt_condition.broadcast ready_condition ()
     with _ ->
-      (* Ignore all exceptions during broadcast - waiters may have been cancelled *)
+      (* Broadcast may raise if waiters were cancelled; suppress safely. *)
       ())
   end
 
-(** Get latest ticker for a symbol - hot path, inlined *)
+(** Return the most recent ticker snapshot for [symbol], or [None] if unavailable. Hot path; always inlined. *)
 let[@inline always] get_latest_ticker symbol =
   match store_opt symbol with
   | Some store -> RingBuffer.read_latest store.buffer
   | None -> None
 
-(** Get latest price (midpoint of bid/ask) - hot path, inlined *)
+(** Return the bid/ask midpoint for [symbol], or [None] if no ticker exists. Hot path; always inlined. *)
 let[@inline always] get_latest_price symbol =
   match get_latest_ticker symbol with
   | None -> None
   | Some ticker -> Some ((ticker.bid +. ticker.ask) /. 2.0)
 
-(** Read ticker events since last position - for domain consumers *)
+(** Return all ticker snapshots written after [last_pos]. Allocates a list; use [iter_ticker_events] on hot paths. *)
 let[@inline always] read_ticker_events symbol last_pos =
   match store_opt symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 
-(** Zero-allocation iteration over ticker events since last position *)
+(** Iterate [f] over ticker snapshots written after [last_pos] without allocating a list. Returns the new read position. *)
 let[@inline always] iter_ticker_events symbol last_pos f =
   match store_opt symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
   | None -> last_pos
 
-(** Get current write position for tracking consumption *)
+(** Return the current write position of the ring buffer for [symbol]. Used by consumers to initialize or checkpoint their read cursor. *)
 let[@inline always] get_current_position symbol =
   match store_opt symbol with
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 
-(** Check if we have price data for a symbol *)
+(** Return [true] if the store for [symbol] is marked ready and contains at least one ticker entry. *)
 let has_price_data symbol =
   match store_opt symbol with
   | Some store when Atomic.get store.ready -> Option.is_some (RingBuffer.read_latest store.buffer)
   | _ -> false
 
-(** Wait until price data is available for all symbols using event signalling *)
+(** Block until [has_price_data] returns [true] for every symbol in [symbols], or [timeout_seconds] elapses. Returns [true] if all symbols are ready, [false] on timeout. Uses [ready_condition] to avoid busy-waiting. *)
 let wait_for_price_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
@@ -109,7 +116,7 @@ let wait_for_price_data_lwt symbols timeout_seconds =
 
 let wait_for_price_data = wait_for_price_data_lwt
 
-(** Parse ticker from WebSocket message *)
+(** Parse a "ticker" channel message. Extracts each element of the [data] array, writes a [ticker] record to the corresponding symbol store, and signals readiness. Calls [on_heartbeat] per successfully parsed entry to keep the supervisor connection alive. *)
 let parse_ticker json on_heartbeat =
   let open Yojson.Safe.Util in
   match json |> member "data" |> to_list with
@@ -119,7 +126,7 @@ let parse_ticker json on_heartbeat =
       None
   | [] -> Some ()
   | data ->
-      (* Track symbols that successfully wrote to buffer in this message *)
+      (* Collect symbols that wrote successfully so readiness is signalled once per symbol per message. *)
       let notified_symbols = Hashtbl.create 16 in
       List.iter (fun ticker_data ->
         try
@@ -134,18 +141,18 @@ let parse_ticker json on_heartbeat =
           } in
           let store = ensure_store symbol in
           RingBuffer.write store.buffer ticker;
-          (* Record that this symbol should be notified (only once per message) *)
+          (* Deduplicate: replace ensures at most one notification per symbol. *)
           Hashtbl.replace notified_symbols symbol store;
           Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f last=%.2f"
             symbol ticker.bid ticker.ask ticker.last;
-          (* Update connection heartbeat *)
+          (* Propagate heartbeat to supervisor connection tracker. *)
           on_heartbeat ()
         with exn ->
           Logging.warn_f ~section "Failed to parse ticker data: %s"
             (Printexc.to_string exn)
       ) data;
 
-      (* Notify readiness for all symbols that successfully wrote to buffer (once per symbol per message) *)
+      (* Signal readiness and per-symbol Exchange_wakeup for each successfully updated store. *)
       Hashtbl.iter (fun symbol store ->
         notify_ready store;
         Concurrency.Exchange_wakeup.signal ~symbol
@@ -153,7 +160,7 @@ let parse_ticker json on_heartbeat =
 
       Some ()
 
-(** WebSocket message handler *)
+(** Top-level WebSocket frame dispatcher. Publishes a global tick event, then routes based on the [channel] or [method] field of the JSON payload. *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   try
@@ -163,7 +170,7 @@ let handle_message message on_heartbeat =
           member "method" json |> to_string_option with
     | Some "ticker", _ ->
         ignore (parse_ticker json on_heartbeat)
-    | Some "heartbeat", _ -> on_heartbeat () (* Update connection heartbeat *)
+    | Some "heartbeat", _ -> on_heartbeat () (* Propagate server heartbeat to supervisor. *)
     | _, Some "subscribe" ->
         let result = member "result" json in
         let symbol = member "symbol" result |> to_string in
@@ -176,10 +183,10 @@ let handle_message message on_heartbeat =
       (Printexc.to_string exn) message
 
 
-(** Active WebSocket connection *)
+(** Mutable reference to the current WebSocket connection, used for dynamic subscriptions. *)
 let active_conn = ref None
 
-(** Dynamically subscribe to a ticker feed for a symbol *)
+(** Send a subscribe request for [symbol] on the active WebSocket connection. Ensures the local store exists before subscribing. Logs a warning and returns [unit] if no connection is active. *)
 let subscribe_ticker symbol =
   match !active_conn with
   | Some conn ->
@@ -198,10 +205,10 @@ let subscribe_ticker symbol =
       Logging.warn_f ~section "Cannot dynamically subscribe to %s: ticker WS not connected" symbol;
       Lwt.return_unit
 
-(** Message handling loop - runs in background *)
+(** Subscribe to all [symbols] on [conn], then enter a background read loop. Resolves the returned promise when the connection is closed or an error occurs. Invokes [on_failure] with a reason string on abnormal termination. Uses [Lwt.async] per frame to avoid stack growth. *)
 let start_message_handler conn symbols on_failure on_heartbeat =
   active_conn := Some conn;
-  (* Subscribe to ticker for all symbols *)
+  (* Build and send a single batch subscribe message for all symbols. *)
   let subscribe_msg = `Assoc [
     ("method", `String "subscribe");
     ("params", `Assoc [
@@ -212,7 +219,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   let msg_str = Yojson.Safe.to_string subscribe_msg in
   Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ()) >>= fun () ->
 
-  (* Message loop — uses Lwt.async to break Forward chain *)
+  (* Recursive read loop. Each iteration dispatches via Lwt.async to avoid promise chain accumulation. *)
   let done_p, done_u = Lwt.wait () in
   let rec msg_loop () =
     Lwt.catch (fun () ->
@@ -245,12 +252,12 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   Lwt.async msg_loop;
   done_p
 
-(** WebSocket connection to Kraken - establishes connection and starts message handler *)
+(** Resolve the Kraken WebSocket host, establish a TLS connection, invoke [on_connected], then delegate to [start_message_handler]. Returns when the connection terminates. *)
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
 
   Logging.info_f ~section "Connecting to Kraken WebSocket...";
-  (* Resolve hostname to IP *)
+  (* DNS resolution: resolve ws.kraken.com to an IPv4 address for Conduit TLS. *)
   Lwt_unix.getaddrinfo "ws.kraken.com" "443" [Unix.AI_FAMILY Unix.PF_INET] >>= fun addresses ->
   let ip = match addresses with
     | {Unix.ai_addr = Unix.ADDR_INET (addr, _); _} :: _ ->
@@ -262,13 +269,13 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   Websocket_lwt_unix.connect ~ctx:_ctx client uri >>= fun conn ->
 
     Logging.info ~section "WebSocket established, subscribing to ticker feed";
-    (* Call on_connected callback after successful connection and before starting message handler *)
+    (* Notify supervisor of successful connection before entering the read loop. *)
     on_connected ();
     start_message_handler conn symbols on_failure on_heartbeat >>= fun () ->
     Logging.info ~section "Ticker WebSocket connection closed";
     Lwt.return_unit
 
-(** Initialize ticker feed data stores *)
+(** Pre-allocate ring buffer stores for all [symbols] so that writers never race with store creation during the first tick. *)
 let initialize symbols =
   Logging.info_f ~section "Initializing ticker feed for %d symbols" (List.length symbols);
   List.iter (fun symbol ->

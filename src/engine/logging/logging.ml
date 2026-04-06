@@ -1,4 +1,5 @@
-(** Advanced Logging System with Formatting, Styling and Granular Control *)
+(** Structured logging system with ANSI formatting, per-section level filtering,
+    and domain-safe synchronous output. *)
 
 type level = DEBUG | INFO | WARN | ERROR | CRITICAL
 
@@ -12,16 +13,16 @@ let level_of_string s = match String.lowercase_ascii s with
 
 let level_to_int = function DEBUG -> 0 | INFO -> 1 | WARN -> 2 | ERROR -> 3 | CRITICAL -> 4
 
-(* ANSI color codes *)
+(* ANSI escape sequences for terminal color output per log level. *)
 let reset = "\027[0m"
 let level_color = function
   | DEBUG -> "\027[2m\027[36m" | INFO -> "\027[32m" | WARN -> "\027[33m"
   | ERROR -> "\027[31m" | CRITICAL -> "\027[1m\027[41m\027[37m"
 
-(* Logging section management *)
+(* Per-section log level configuration. *)
 type section = { name: string; mutable min_level: level }
 
-(* Global configuration *)
+(* Global mutable configuration state. *)
 let global_min_level = ref INFO
 let sections = Hashtbl.create 32
 let use_colors = ref true
@@ -33,8 +34,8 @@ let set_enabled_sections secs = enabled_sections := secs
 let set_quiet_mode quiet = quiet_mode := quiet
 let set_log_callback callback = log_callback := callback
 
-(** Mutex protecting output_channel writes across OCaml 5.x domains.
-    Without this, concurrent domain workers interleave log lines. *)
+(** Mutex serializing output_channel writes across OCaml 5.x domains
+    to prevent interleaved log lines from concurrent workers. *)
 let output_mutex = Mutex.create ()
 
 let get_section name =
@@ -52,14 +53,16 @@ let get_section name =
       Mutex.unlock output_mutex;
       s
 
-(** Check if a log level will be enabled for a section (avoids allocation) *)
+(** Returns true if [level] passes both the section and global minimum
+    level filters. Used as a guard to skip allocation on disabled paths. *)
 let will_log level section_name =
   let section = get_section section_name in
   (!enabled_sections = [] || List.mem section_name !enabled_sections) &&
   level_to_int level >= level_to_int section.min_level &&
   level_to_int level >= level_to_int !global_min_level
 
-(* Format timestamp - performance optimized *)
+(* Formats the current wall-clock time as "YYYY-MM-DD HH:MM:SS.mmm".
+   Caches the date/time prefix per second to avoid repeated localtime calls. *)
 let format_timestamp =
   let last_sec = ref 0.0 in
   let last_ts = ref "" in
@@ -76,10 +79,9 @@ let format_timestamp =
     end;
     !last_ts ^ Printf.sprintf ".%03d" ms
 
-(* Core logging function — fully synchronous, domain-safe.
-   Uses a mutex to protect output_channel writes.
-   No Lwt involvement: domain workers don't have a Lwt scheduler,
-   so Lwt.async from domains leaked promises into the main scheduler. *)
+(* Core synchronous logging function. Domain-safe via [output_mutex].
+   Intentionally avoids Lwt: domain workers lack a Lwt scheduler,
+   and Lwt.async from domains would leak promises into the main scheduler. *)
 let log_sync level section_name message =
   let section = get_section section_name in
   if (!enabled_sections <> [] && not (List.mem section_name !enabled_sections)) ||
@@ -87,8 +89,8 @@ let log_sync level section_name message =
      level_to_int level < level_to_int !global_min_level then
     ()
   else if !quiet_mode then
-    (* In quiet mode, fire callback asynchronously only from the Lwt domain.
-       Domain workers skip the callback entirely to avoid Lwt thread-safety issues. *)
+    (* Quiet mode: suppress all console output. Callback dispatch, if needed,
+       is restricted to the Lwt domain to avoid thread-safety violations. *)
     ()
   else begin
     let timestamp = format_timestamp () in
@@ -111,14 +113,14 @@ let log_sync level section_name message =
        ignore exn)
   end
 
-(* Lwt-compatible wrapper for code that needs Lwt return type *)
+(* Lwt wrapper: delegates to [log_sync] then returns [Lwt.return_unit]. *)
 let log level section_name message =
   log_sync level section_name message;
   Lwt.return_unit
 
-(* Public API - zero-allocation when log level is disabled.
-   Printf.ifprintf consumes format arguments without allocating a string.
-   Printf.ksprintf allocates a Buffer + string, so we only call it when needed. *)
+(* Format-string log API. Zero-allocation when the level is disabled:
+   [Printf.ifprintf] consumes format arguments without allocating a string;
+   [Printf.ksprintf] allocates a buffer only when the message will be emitted. *)
 let debug_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log DEBUG section then
     Printf.ksprintf (fun msg -> log_sync DEBUG section msg) fmt
@@ -160,7 +162,7 @@ let error ~section msg =
 let critical ~section msg =
   if will_log CRITICAL section then log_sync CRITICAL section msg
 
-(* Configuration *)
+(* Global and per-section configuration accessors. *)
 let init () = ()
 let set_level level = global_min_level := level
 let set_section_level name level = (get_section name).min_level <- level
@@ -169,5 +171,5 @@ let set_output channel = output_channel := channel
 let get_level () = !global_min_level
 let get_section_level name = (get_section name).min_level
 
-(* Utility functions *)
+(* Re-exported utility. *)
 let level_to_string = level_to_string
