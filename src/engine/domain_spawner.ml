@@ -341,6 +341,15 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let { prof_ticker; prof_ob; prof_exec; prof_strategy; prof_cycle } =
         get_domain_profilers asset_with_fees.symbol in
 
+      (* Pre-resolve strategy states once to avoid re-acquiring strategy_states_mutex
+         on every hot-path call. The state reference is stable while is_running=true. *)
+      let cached_grid_state = match !grid_strategy_asset_ref with
+        | Some _ -> Some (Dio_strategies.Suicide_grid.get_strategy_state asset_with_fees.symbol)
+        | None -> None in
+      let cached_mm_state = match !mm_strategy_asset_ref with
+        | Some _ -> Some (Dio_strategies.Market_maker.get_strategy_state asset_with_fees.symbol)
+        | None -> None in
+
       while Atomic.get state.is_running do
         let cycle_start = Mtime_clock.now_ns () in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
@@ -652,14 +661,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             end
           end;
 
-          (match !grid_strategy_asset_ref with
-           | Some asset ->
-               Dio_strategies.Suicide_grid.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
-           | None -> ());
-          (match !mm_strategy_asset_ref with
-           | Some asset ->
-               Dio_strategies.Market_maker.Strategy.execute asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
-           | None -> ());
+          (match !grid_strategy_asset_ref, cached_grid_state with
+           | Some asset, Some cs ->
+               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+           | _ -> ());
+          (match !mm_strategy_asset_ref, cached_mm_state with
+           | Some asset, Some cs ->
+               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
+           | _ -> ());
           let stop_strat = Mtime_clock.now_ns () in
           Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat))
         end;

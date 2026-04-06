@@ -425,6 +425,11 @@ let[@inline always] read_execution_events symbol last_pos =
   let store = get_symbol_store symbol in
   RingBuffer.read_since store.events_buffer last_pos
 
+(** Zero-allocation iteration over execution events since last position *)
+let[@inline always] iter_execution_events symbol last_pos f =
+  let store = get_symbol_store symbol in
+  RingBuffer.iter_since store.events_buffer last_pos f
+
 (** Get current write position for tracking consumption *)
 let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
