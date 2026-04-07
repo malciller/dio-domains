@@ -1,13 +1,38 @@
-_opam
-__pyache__
+# Build artifacts (rebuilt inside Docker)
 _build
+_opam
+
+# Dev tooling / analytics (not needed for production)
 utils
 reference
+test
+
+# Python artifacts
+__pycache__
+*.py
+
+# Data & logs
+data
 *.log
-node_modules
+*.csv
+
+# Git / GitHub
 .git
 .gitignore
+.github
+
+# Credentials (mounted at runtime, never baked into image)
+.env
+
+# Editor / OS junk
 *.swp
 *.swo
-*.py
-*.csv
+.DS_Store
+
+# Node
+node_modules
+
+# Docker
+Dockerfile
+.dockerignore
+deploy.sh
