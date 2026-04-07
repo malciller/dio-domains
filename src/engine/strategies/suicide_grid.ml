@@ -145,6 +145,7 @@ type strategy_state = {
   mutable highest_startup_oid: string option; (* highest fill OID observed during startup; bootstraps new strategies *)
   mutable anticipated_base_credit: float;  (* base qty from buy fills not yet reflected in balance feed *)
   mutable last_seen_asset_balance: float;  (* previous asset_bal value; used to detect balance feed updates *)
+  recently_terminal_oids: (string, bool) Hashtbl.t;  (* order IDs from fills/cancels; prevents order sync from re-adding stale snapshot entries *)
   mutex: Mutex.t;  (* per-symbol mutex; prevents concurrent strategy execution *)
 }
 
@@ -202,6 +203,7 @@ let get_strategy_state asset_symbol =
               highest_startup_oid = None;
               anticipated_base_credit = 0.0;
               last_seen_asset_balance = 0.0;
+              recently_terminal_oids = Hashtbl.create 8;
               mutex = Mutex.create ();
             } in
             Hashtbl.replace strategy_states asset_symbol new_state;
@@ -748,6 +750,10 @@ let execute_strategy
       if List.length state.recently_injected_sells > 20 then
         state.recently_injected_sells <- take 20 state.recently_injected_sells;
 
+      (* Flush recently_terminal_oids. By the time cleanup runs (every 1024
+         cycles), the exchange snapshot has long since dropped the order. *)
+      Hashtbl.clear state.recently_terminal_oids;
+
       end; (* end: cycle mod cleanup gate *)
 
       (* Sync strategy state with actual open orders from exchange.
@@ -771,14 +777,14 @@ let execute_strategy
           | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
           | None -> true
         in
+        (* Skip orders that fill/cancel handlers already processed but the
+           exchange snapshot has not yet dropped (WS propagation lag). *)
+        let is_terminal = Hashtbl.mem state.recently_terminal_oids order_id in
         
-        if qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity. *)
-          (* Use actual order side from exchange, not price-based classification. *)
+        if qty > 0.0 && is_our_strategy && not is_terminal then
           if side_str = "buy" then
-            (* All buy orders are treated as grid buys to enforce single-buy-order policy. *)
             buy_orders := (order_id, order_price) :: !buy_orders
           else
-            (* Include all open sell orders regardless of tag. *)
             sell_orders := (order_id, order_price, qty) :: !sell_orders
       ) open_orders;
 
@@ -1409,6 +1415,8 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
     state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
+    (* Prevent order sync from re-adding this OID from a stale exchange snapshot. *)
+    Hashtbl.replace state.recently_terminal_oids order_id true;
 
     (* 4. Clear buy order tracking only on buy fills.
        A sell fill must not clear last_buy_order_id because the buy is still
@@ -1601,6 +1609,8 @@ let handle_order_cancelled asset_symbol order_id side =
       sell_id <> order_id
     ) state.open_sell_orders;
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
+    (* Prevent order sync from re-adding this OID from a stale exchange snapshot. *)
+    Hashtbl.replace state.recently_terminal_oids order_id true;
 
     (* Clear inflight flags and global placement trackers for immediate re-placement. *)
     (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
@@ -1646,18 +1656,24 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                 Logging.info_f ~section "Ignoring amendment for untracked buy order %s -> %s for %s"
                   old_order_id new_order_id asset_symbol)
      | Sell ->
-         let original_sell_count = List.length state.open_sell_orders in
-         let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
-           | Some (_, _, q) -> q | None -> state.grid_qty in
-         state.open_sell_orders <- (new_order_id, price, old_qty) :: 
-            List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
-         state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
-         if List.length state.open_sell_orders = original_sell_count then
-           Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
-             old_order_id new_order_id price asset_symbol
-         else
-           Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
-             new_order_id price asset_symbol);
+          let original_sell_count = List.length state.open_sell_orders in
+          let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
+            | Some (_, _, q) -> q | None -> state.grid_qty in
+          state.open_sell_orders <- (new_order_id, price, old_qty) :: 
+             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
+          (* Remove old entry from recently_injected_sells before adding new.
+             Without this, the merge step re-adds the old price as a ghost sell. *)
+          state.recently_injected_sells <- List.filter (fun (id, _, _) -> id <> old_order_id) state.recently_injected_sells;
+          state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
+          (* Mark old OID terminal so order sync skips it from stale snapshots. *)
+          if old_order_id <> new_order_id then
+            Hashtbl.replace state.recently_terminal_oids old_order_id true;
+          if List.length state.open_sell_orders = original_sell_count then
+            Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
+              old_order_id new_order_id price asset_symbol
+          else
+            Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
+              new_order_id price asset_symbol);
              
     (* Apply a short cooldown to prevent amending the newly amended order
        before the exchange's WebSocket open-orders cache catches up.
