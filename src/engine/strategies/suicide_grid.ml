@@ -800,8 +800,7 @@ let execute_strategy
            state.last_buy_order_id <- Some best_order_id;
            (* Sync per-asset reserved_quote from the actual open buy so the
               capital_low check uses the real exchange-reserved amount after restart. *)
-           let qty = (try float_of_string asset.qty with Failure _ -> 0.001) in
-           set_asset_reserved_quote state (best_price *. qty)
+           set_asset_reserved_quote state (best_price *. qty_f)
        | _ ->
            (* In-flight cancel or place: open_orders may be stale.
               Retain current state; order channel will resolve. *)
