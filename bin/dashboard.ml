@@ -602,26 +602,24 @@ let render_latencies w json =
       let p999    = data |?> "p999"    |> to_float_d 0.0 in
       let samples = data |?> "samples" |> to_int_d 0 in
       let empty   = samples = 0 in
-      let p99_attr =
-        if empty             then a_dim
-        else if p99 > 1000.0 then a_red
-        else if p99 >  500.0 then a_yellow
-        else a_text
+      let lat_attr f =
+        if empty          then a_dim
+        else if f > 500.0 then a_red
+        else if f > 250.0 then a_yellow
+        else a_green
       in
-      let lat_col attr f =
+      let lat_col f =
         if empty then col 10 a_dim "--"
-        else col 10 attr (format_latency_us f)
+        else col 10 (lat_attr f) (format_latency_us f)
       in
       I.hcat [
         I.string a_text "  ";
         col 14 (if empty then a_dim else a_bright) (truncate_string 13 symbol);
         col metric_w (if empty then a_dim else a_cyan) (truncate_string (metric_w - 1) label);
-        lat_col a_text p50;
-        lat_col a_text p90;
-        lat_col p99_attr p99;
-        lat_col (if p999 > 1000.0 && not empty then a_red
-                 else if p999 > 500.0 && not empty then a_yellow
-                 else a_text) p999;
+        lat_col p50;
+        lat_col p90;
+        lat_col p99;
+        lat_col p999;
         col 10 a_dim (if empty then "--" else string_of_int samples);
       ]
     ) mlist
