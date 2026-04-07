@@ -35,11 +35,20 @@ let send_response oc json_str =
   Lwt_io.write oc json_str >>= fun () ->
   Lwt_io.flush oc
 
-(** Atomic count of currently connected dashboard clients. *)
-let active_clients = Atomic.make 0
+(** Count of currently connected dashboard clients. *)
+let active_clients = ref 0
 
-(** Mutable list of output channels subscribed to watch mode broadcasts. *)
-let watch_clients : Lwt_io.output_channel list ref = ref []
+(** Each watch client tracks its output channel, the underlying fd
+    (for explicit close), and a cancel resolver to unblock the reader
+    when the broadcaster detects a dead write. *)
+type watch_entry = {
+  oc : Lwt_io.output_channel;
+  fd : Lwt_unix.file_descr;
+  cancel : unit Lwt.u;
+}
+
+(** Mutable list of watch-mode client entries. *)
+let watch_clients : watch_entry list ref = ref []
 
 (** Cached serialized snapshot string and its generation timestamp.
     Reused across 500 ms broadcast ticks to avoid repeated Yojson
@@ -49,9 +58,14 @@ let snapshot_cache_str = ref ""
 let snapshot_cache_time = ref 0.0
 let snapshot_cache_max_age = 0.9
 
+(** Close a client fd, ignoring errors if already closed. *)
+let close_fd fd =
+  Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
+
 (** Periodic broadcaster that pushes state to all watch-mode clients
     every 500 ms. Uses the snapshot cache when valid; rebuilds otherwise.
-    Clients that fail a write are removed from [watch_clients]. *)
+    When a write fails, the client's cancel resolver is woken to unblock
+    its reader, and its fd is closed. *)
 let rec state_broadcaster () =
   let%lwt () = Lwt_unix.sleep 0.5 in
   let current_clients = !watch_clients in
@@ -70,11 +84,16 @@ let rec state_broadcaster () =
             s
           end
         in
-        (* Broadcast sequentially; remove clients whose writes fail. *)
-        let%lwt surviving = Lwt_list.filter_map_s (fun oc ->
+        (* Broadcast sequentially; on write failure, signal cancel and close fd. *)
+        let%lwt surviving = Lwt_list.filter_map_s (fun entry ->
           Lwt.catch
-            (fun () -> send_response oc json_str >|= fun () -> Some oc)
-            (fun _ -> Lwt.return_none)
+            (fun () -> send_response entry.oc json_str >|= fun () -> Some entry)
+            (fun _ ->
+              (* Wake the blocked reader so handle_client returns and
+                 the finalize block decrements active_clients. *)
+              (try Lwt.wakeup entry.cancel () with Invalid_argument _ -> ());
+              let%lwt () = close_fd entry.fd in
+              Lwt.return_none)
         ) current_clients in
         watch_clients := surviving;
         Lwt.return_unit)
@@ -84,9 +103,11 @@ let rec state_broadcaster () =
   end else Lwt.return_unit)
   >>= fun () -> state_broadcaster ()
 
-(** Handles a single client connection over [ic]/[oc].
-    Reads 1-byte commands in a loop until disconnect or 'Q'. *)
-let handle_client (ic, oc) =
+(** Handles a single client connection over [ic]/[oc]/[fd].
+    Reads 1-byte commands in a loop until disconnect or 'Q'.
+    [cancel_promise] resolves when the broadcaster detects a dead write,
+    allowing blocked reads to be interrupted. *)
+let handle_client ~fd ~cancel_promise (ic, oc) =
   let buf = Bytes.create 1 in
   let rec loop () =
     Lwt.catch
@@ -102,9 +123,12 @@ let handle_client (ic, oc) =
               let%lwt () = send_response oc json_str in
               loop ()
           | 'W' ->
-              (* Register this channel for periodic broadcast. *)
-              watch_clients := oc :: !watch_clients;
-              (* Block until client sends 'Q' or disconnects. *)
+              (* Register this client for periodic broadcast. *)
+              let cancel_promise_inner, cancel_resolver = Lwt.wait () in
+              let entry = { oc; fd; cancel = cancel_resolver } in
+              watch_clients := entry :: !watch_clients;
+              (* Block until client sends 'Q', disconnects, or is cancelled
+                 by the broadcaster detecting a write failure. *)
               let rec wait_for_quit () =
                 Lwt.catch
                   (fun () ->
@@ -113,9 +137,9 @@ let handle_client (ic, oc) =
                     else wait_for_quit ())
                   (fun _exn -> Lwt.return_unit)
               in
-              let%lwt () = wait_for_quit () in
+              let%lwt () = Lwt.pick [wait_for_quit (); cancel_promise_inner; cancel_promise] in
               (* Unsubscribe from broadcast list. *)
-              watch_clients := List.filter (fun c -> c != oc) !watch_clients;
+              watch_clients := List.filter (fun e -> e.fd != fd) !watch_clients;
               Lwt.return_unit
           | 'Q' ->
               Lwt.return_unit  (* Graceful close *)
@@ -152,24 +176,25 @@ let start ~start_time =
 
   let rec accept_loop () =
     let%lwt (client_fd, _client_addr) = Lwt_unix.accept server_socket in
-    if Atomic.get active_clients >= 5 then begin
+    if !active_clients >= 5 then begin
       Logging.warn_f ~section "Dashboard client rejected: Max active clients (5) reached";
-      Lwt.catch (fun () -> Lwt_unix.close client_fd) (fun _ -> Lwt.return_unit) >>= fun () ->
+      close_fd client_fd >>= fun () ->
       accept_loop ()
     end else begin
-      let _count = Atomic.fetch_and_add active_clients 1 in
-      Logging.info_f ~section "Dashboard client connected (active: %d)" (Atomic.get active_clients);
+      active_clients := !active_clients + 1;
+      Logging.info_f ~section "Dashboard client connected (active: %d)" !active_clients;
     Lwt.async (fun () ->
-      let ic = Lwt_io.of_fd ~mode:Lwt_io.Input client_fd in
-      let oc = Lwt_io.of_fd ~mode:Lwt_io.Output client_fd in
+      let ic = Lwt_io.of_fd ~close:(fun () -> Lwt.return_unit) ~mode:Lwt_io.Input client_fd in
+      let oc = Lwt_io.of_fd ~close:(fun () -> Lwt.return_unit) ~mode:Lwt_io.Output client_fd in
+      let cancel_promise, _cancel_resolver = Lwt.wait () in
       Lwt.finalize
-        (fun () -> handle_client (ic, oc))
+        (fun () -> handle_client ~fd:client_fd ~cancel_promise (ic, oc))
         (fun () ->
-          ignore (Atomic.fetch_and_add active_clients (-1));
-          Logging.info_f ~section "Dashboard client disconnected (active: %d)" (Atomic.get active_clients);
-          Lwt.catch
-            (fun () -> Lwt_unix.close client_fd)
-            (fun _exn -> Lwt.return_unit)));
+          (* Remove from watch list in case handle_client didn't clean up. *)
+          watch_clients := List.filter (fun e -> e.fd != client_fd) !watch_clients;
+          active_clients := !active_clients - 1;
+          Logging.info_f ~section "Dashboard client disconnected (active: %d)" !active_clients;
+          close_fd client_fd));
       accept_loop ()
     end
   in
