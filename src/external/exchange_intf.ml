@@ -198,12 +198,6 @@ module type S = sig
   (** Return the current balance for [asset]. Returns [0.0] if unknown. *)
   val get_balance : asset:string -> float
 
-  (** Resolve a cached balance reader for [asset]. The returned closure
-      captures the underlying atomic store, bypassing Hashtbl lookups on
-      every call. Intended for hot-path consumers that read the same asset
-      balance on every cycle. *)
-  val resolve_balance : asset:string -> (unit -> float)
-
   (** Return all cached asset balances as [(asset_name, balance)] pairs. *)
   val get_all_balances : unit -> (string * float) list
 

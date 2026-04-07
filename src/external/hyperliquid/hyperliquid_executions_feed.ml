@@ -77,7 +77,6 @@ type store = {
   processed_tids_queue: int64 Queue.t; (** FIFO eviction queue for processed trade IDs. *)
   orders_mutex: Mutex.t;
   tids_mutex: Mutex.t;
-  snapshot: open_order list Atomic.t;  (* Lock-free snapshot for fold_open_orders readers. *)
 }
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
@@ -160,7 +159,6 @@ let get_symbol_store symbol =
               processed_tids_queue = Queue.create ();
               orders_mutex = Mutex.create ();
               tids_mutex = Mutex.create ();
-              snapshot = Atomic.make [];
             } in
             Hashtbl.add stores symbol store;
             store
@@ -202,13 +200,13 @@ let[@inline always] get_open_orders symbol =
   Mutex.unlock store.orders_mutex;
   orders
 
-(** Lock-free fold over the latest open orders snapshot for a symbol.
-    The snapshot is an immutable list published atomically by the writer
-    thread after every mutation. No mutex acquisition on the reader side. *)
+(** Fold over open orders under the per-symbol mutex. Avoids intermediate list allocation. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  let orders = Atomic.get store.snapshot in
-  List.fold_left (fun acc order -> f acc order) init orders
+  Mutex.lock store.orders_mutex;
+  let result = Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init in
+  Mutex.unlock store.orders_mutex;
+  result
 
 (** Remove a single open order by ID. Called after a successful cancel-replace
     amendment to prevent the superseded order from appearing as a duplicate
@@ -228,9 +226,6 @@ let remove_open_order ~symbol ~order_id =
     Mutex.unlock amended_blacklist_mutex;
     Logging.debug_f ~section "Removed old order %s [%s] after amendment (blacklisted)" order_id symbol
   end;
-  (* Publish snapshot after potential removal. *)
-  let snap = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Atomic.set store.snapshot snap;
   Mutex.unlock store.orders_mutex
 
 (** Return all symbols that have initialized execution stores. *)
@@ -268,9 +263,6 @@ let cleanup_stale_orders () =
       Mutex.lock store.orders_mutex;
       if Hashtbl.mem store.open_orders order_id then begin
         Hashtbl.remove store.open_orders order_id;
-        (* Publish snapshot after stale removal. *)
-        let snap = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-        Atomic.set store.snapshot snap;
         Mutex.lock initialization_mutex;
         Hashtbl.remove order_to_symbol order_id;
         Mutex.unlock initialization_mutex;
@@ -343,8 +335,6 @@ let clear_all_open_orders () =
     let count = Hashtbl.length store.open_orders in
     total_removed := !total_removed + count;
     Hashtbl.clear store.open_orders;
-    (* Publish empty snapshot after clear. *)
-    Atomic.set store.snapshot [];
     Mutex.unlock store.orders_mutex;
   ) all_symbols;
   (* Reset the global order_to_symbol index and its eviction queue. *)
@@ -492,11 +482,6 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     add_to_order_to_symbol event.order_id event.symbol;
     Mutex.unlock initialization_mutex;
   end;
-  (* Publish immutable snapshot for lock-free readers. The old snapshot
-     becomes unreachable once all concurrent fold_open_orders calls that
-     captured it via Atomic.get have returned. OCaml GC collects it. *)
-  let snap = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Atomic.set store.snapshot snap;
   Mutex.unlock store.orders_mutex;
   
   RingBuffer.write store.events_buffer event;

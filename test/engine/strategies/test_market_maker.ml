@@ -191,7 +191,7 @@ let test_sell_first_placement_logic () =
 
   (* This would trigger the sell-first logic, but testing it fully requires mocking the order ringbuffer *)
   (* For now, just ensure the function can be called without crashing *)
-  Dio_strategies.Market_maker.Strategy.execute ~now:(Unix.gettimeofday ()) asset current_price top_of_book asset_balance quote_balance 0 0 [] 1;
+  Dio_strategies.Market_maker.Strategy.execute asset current_price top_of_book asset_balance quote_balance 0 0 [] 1;
   check bool "execute function runs" true true
 
 let test_fee_cache_integration () =
@@ -247,10 +247,10 @@ let test_post_only_checks () =
   let asset = create_test_asset () in
 
   (* Test with prices where buy < bid (valid post-only) *)
-  Dio_strategies.Market_maker.Strategy.execute ~now:(Unix.gettimeofday ()) asset (Some 50000.0) (Some (49950.0, 1.0, 50050.0, 1.0)) (Some 0.1) (Some 1000.0) 0 0 [] 1;
+  Dio_strategies.Market_maker.Strategy.execute asset (Some 50000.0) (Some (49950.0, 1.0, 50050.0, 1.0)) (Some 0.1) (Some 1000.0) 0 0 [] 1;
 
   (* Test with prices where buy >= bid (invalid post-only - should be skipped) *)
-  Dio_strategies.Market_maker.Strategy.execute ~now:(Unix.gettimeofday ()) asset (Some 50000.0) (Some (50000.0, 1.0, 50050.0, 1.0)) (Some 0.1) (Some 1000.0) 0 0 [] 2;
+  Dio_strategies.Market_maker.Strategy.execute asset (Some 50000.0) (Some (50000.0, 1.0, 50050.0, 1.0)) (Some 0.1) (Some 1000.0) 0 0 [] 2;
 
   check bool "post-only checks handled" true true
 

@@ -49,7 +49,7 @@ let get_domain_profilers symbol =
           prof_ticker   = Latency_profiler.create (symbol ^ ":ticker");
           prof_ob       = Latency_profiler.create (symbol ^ ":ob");
           prof_exec     = Latency_profiler.create (symbol ^ ":exec");
-          prof_strategy = Latency_profiler.create ~bucket_us:10 ~max_latency_us:100_000 (symbol ^ ":strategy");
+          prof_strategy = Latency_profiler.create (symbol ^ ":strategy");
           prof_cycle    = Latency_profiler.create ~bucket_us:10 ~max_latency_us:1_000_000 (symbol ^ ":cycle");
         } in
         Hashtbl.replace domain_profiler_cache symbol p;
@@ -225,9 +225,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           })
         else ref None
       in
-      (* Pre-parse config floats once at domain init, not on every cycle. *)
-      let grid_qty_f = (try float_of_string asset_with_fees.qty with Failure _ -> 0.001) in
-      let grid_sell_mult_f = (try float_of_string asset_with_fees.sell_mult with Failure _ -> 1.0) in
       let mm_strategy_asset_ref =
         if asset_with_fees.strategy = "MM" then
           ref (Some {
@@ -251,7 +248,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
        | Some asset ->
            let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
            st.exchange_id <- asset.exchange;
-           st.grid_qty <- grid_qty_f;
+           st.grid_qty <- (try float_of_string asset.qty with Failure _ -> 0.001);
            st.maker_fee <- (match asset.maker_fee with
              | Some f -> f
              | None ->
@@ -344,11 +341,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let cached_mm_state = match !mm_strategy_asset_ref with
         | Some _ -> Some (Dio_strategies.Market_maker.get_strategy_state asset_with_fees.symbol)
         | None -> None in
-
-      (* Resolve balance store references once. Subsequent reads are a single
-         Atomic.get, bypassing Hashtbl.find_opt on every cycle. *)
-      let read_base_balance = Ex.resolve_balance ~asset:base_asset in
-      let read_quote_balance = Ex.resolve_balance ~asset:quote_currency in
 
       while Atomic.get state.is_running do
         let cycle_start = Mtime_clock.now_ns () in
@@ -520,12 +512,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Execute strategy if new events have been consumed (event-driven gate) *)
         let should_execute = !hl_exec_ready && !should_execute_strategy in
         if should_execute then begin
+          let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Clear event-driven trigger *)
-
-          (* Exchange reads and FNG checks happen OUTSIDE strategy timing.
-             These acquire exchange mutexes (orders_mutex, balance stores) and
-             are not strategy computation. Measuring them as "strategy" latency
-             inflates p999 with cross-thread contention artifacts. *)
 
           (* Fold open orders into per-strategy counts and lists in a single pass *)
           let (all_open_orders, grid_open_buy_count, grid_open_sell_count, mm_open_buy_count, mm_open_sell_count, mm_open_orders) =
@@ -550,9 +538,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               )
           in
 
-          (* Read cached balance atomics; zero-allocation, no Hashtbl lookup. *)
-          last_asset_balance := read_base_balance ();
-          last_quote_balance := read_quote_balance ();
+          (* Query current balances for base and quote assets *)
+          (match Ex.get_balance ~asset:base_asset with
+           | bal -> last_asset_balance := bal
+           | exception _ -> ());
+          (match Ex.get_balance ~asset:quote_currency with
+           | bal -> last_quote_balance := bal
+           | exception _ -> ());
           
           let asset_balance = Some !last_asset_balance in
           let quote_balance = Some !last_quote_balance in
@@ -605,22 +597,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             end
           end;
 
-          (* Single wall-clock timestamp for the cycle. Computed once outside
-             the strategy timer to eliminate the gettimeofday(2) syscall from
-             the timed strategy block. *)
-          let cycle_wall_time = Unix.gettimeofday () in
-
-          (* Strategy timing starts here: measures only execute_strategy computation,
-             excludes exchange reads and FNG checks above. *)
-          let start_strat = Mtime_clock.now_ns () in
-
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
-               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now:cycle_wall_time ~qty_f:grid_qty_f ~sell_mult_f:grid_sell_mult_f asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
-               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs ~now:cycle_wall_time asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
+               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
            | _ -> ());
           let stop_strat = Mtime_clock.now_ns () in
           Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat))
