@@ -97,19 +97,21 @@ let log_sync level section_name message =
        is restricted to the Lwt domain to avoid thread-safety violations. *)
     ()
   else begin
+    (* Format OUTSIDE the mutex to minimize hold time. *)
     let timestamp = format_timestamp () in
     let level_str = level_to_string level in
     let formatted =
       if !use_colors then
-        Printf.sprintf "%s %s%s%s [%s] %s"
+        Printf.sprintf "%s %s%s%s [%s] %s\n"
           timestamp (level_color level) level_str reset section_name message
       else
-        Printf.sprintf "%s %s [%s] %s" timestamp level_str section_name message
+        Printf.sprintf "%s %s [%s] %s\n" timestamp level_str section_name message
     in
+    (* Mutex only held for write+flush, not formatting. *)
     Mutex.lock output_mutex;
     (try
        output_string !output_channel formatted;
-       output_char !output_channel '\n';
+       flush !output_channel;
        Mutex.unlock output_mutex
      with exn ->
        Mutex.unlock output_mutex;
