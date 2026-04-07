@@ -44,7 +44,7 @@
       "exchange": "hyperliquid",
       "qty": "0.35",
       "grid_interval": [
-        0.5,
+        0.3,
         1.25
       ],
       "sell_mult": "0.999",

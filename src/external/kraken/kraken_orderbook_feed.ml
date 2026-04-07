@@ -223,7 +223,7 @@ end)
 
 (** Per-symbol mutable orderbook state, including bid/ask maps, ring buffer, and synchronization metadata. *)
 type store = {
-  mutable buffer: orderbook RingBuffer.t;
+  buffer: orderbook RingBuffer.t;
   mutable bids: (string * string * float * float) PriceMap.t;
   mutable asks: (string * string * float * float) PriceMap.t;
   ready: bool Atomic.t;
@@ -568,7 +568,7 @@ let process_orderbook_message ~reset json on_heartbeat =
                 symbol curr_seq last_seq;
               store.bids <- PriceMap.empty;
               store.asks <- PriceMap.empty;
-              store.buffer <- RingBuffer.create ring_buffer_size;
+              RingBuffer.clear store.buffer;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
               raise Exit  (* Skip processing this entry *)
@@ -578,7 +578,7 @@ let process_orderbook_message ~reset json on_heartbeat =
                 symbol curr_seq last_seq gap;
               store.bids <- PriceMap.empty;
               store.asks <- PriceMap.empty;
-              store.buffer <- RingBuffer.create ring_buffer_size;
+              RingBuffer.clear store.buffer;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
               raise Exit  (* Skip processing this entry *)
@@ -614,7 +614,7 @@ let process_orderbook_message ~reset json on_heartbeat =
 
                 store.bids <- PriceMap.empty;
                 store.asks <- PriceMap.empty;
-                store.buffer <- RingBuffer.create ring_buffer_size;
+                RingBuffer.clear store.buffer;
                 Atomic.set store.has_snapshot false;
                 Atomic.set store.last_sequence None;
                 false
@@ -709,7 +709,7 @@ let clear_all_stores () =
     store.bids <- PriceMap.empty;
     store.asks <- PriceMap.empty;
 
-    store.buffer <- RingBuffer.create ring_buffer_size;
+    RingBuffer.clear store.buffer;
     Atomic.set store.ready false;
     Atomic.set store.has_snapshot false;
     Atomic.set store.last_sequence None;
