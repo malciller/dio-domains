@@ -145,6 +145,7 @@ type strategy_state = {
   mutable highest_startup_oid: string option; (* highest fill OID observed during startup; bootstraps new strategies *)
   mutable anticipated_base_credit: float;  (* base qty from buy fills not yet reflected in balance feed *)
   mutable last_seen_asset_balance: float;  (* previous asset_bal value; used to detect balance feed updates *)
+  mutable persistence_dirty: bool;  (* true when accumulation state changed; flushed by caller outside hotloop *)
   mutex: Mutex.t;  (* per-symbol mutex; prevents concurrent strategy execution *)
 }
 
@@ -198,6 +199,7 @@ let get_strategy_state asset_symbol =
           highest_startup_oid = None;
           anticipated_base_credit = 0.0;
           last_seen_asset_balance = 0.0;
+          persistence_dirty = false;
           mutex = Mutex.create ();
         } in
         Hashtbl.replace strategy_states asset_symbol new_state;
@@ -940,21 +942,21 @@ let execute_strategy
              if balance_ok then begin
                let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
                if push_order ~now sell_order then begin
-                 (* Commit accumulation state after push_order succeeds. *)
-                 if is_accumulation_sell then begin
-                   let rounded_sell = sell_qty in
-                   let rounding_diff = qty -. rounded_sell in
-                   let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
-                   state.accumulated_profit <- state.accumulated_profit -. required_profit;
-                   let base_increment = qty -. rounded_sell in
-                   state.reserved_base <- state.reserved_base +. base_increment;
-                   Hyperliquid.State_persistence.save ~symbol:asset.symbol
-                     ~reserved_base:state.reserved_base
-                     ~accumulated_profit:state.accumulated_profit ();
-                   Logging.info_f ~section
-                     "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
-                     asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
-                 end;
+                  (* Commit accumulation state after push_order succeeds.
+                     Persistence is deferred: set dirty flag for the caller
+                     (domain_spawner) to flush outside the hotloop. *)
+                  if is_accumulation_sell then begin
+                    let rounded_sell = sell_qty in
+                    let rounding_diff = qty -. rounded_sell in
+                    let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
+                    state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                    let base_increment = qty -. rounded_sell in
+                    state.reserved_base <- state.reserved_base +. base_increment;
+                    state.persistence_dirty <- true;
+                    Logging.info_f ~section
+                      "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
+                      asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+                  end;
                  Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
                    asset.symbol sell_qty sell_price
                end
@@ -1173,7 +1175,26 @@ let execute_strategy
         state.last_cycle <- cycle
       end
   end  (* end: is_stale else begin *)
-  end) (* end: if not capital_low then begin; close Fun.protect *)
+   end) (* end: if not capital_low then begin; close Fun.protect *)
+
+
+(** Flushes deferred accumulation state to disk when the dirty flag is set.
+    Called by the domain_spawner after execute_strategy returns, keeping
+    blocking file I/O out of the strategy hotloop. Acquires state.mutex
+    to read and clear the flag atomically with the save. *)
+let flush_persistence asset_symbol =
+  let state = get_strategy_state asset_symbol in
+  (* Fast non-locking check to skip mutex acquisition on non-dirty cycles. *)
+  if state.persistence_dirty then begin
+    Mutex.lock state.mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+      if state.persistence_dirty then begin
+        state.persistence_dirty <- false;
+        Hyperliquid.State_persistence.save ~symbol:asset_symbol
+          ~reserved_base:state.reserved_base
+          ~accumulated_profit:state.accumulated_profit ()
+      end)
+  end
 
 
 (** Handles order placement acknowledgment. Updates pending and tracking state. *)
@@ -1774,6 +1795,7 @@ module Strategy = struct
     Mutex.unlock strategy_states_mutex
 
   let execute = execute_strategy
+  let flush_persistence = flush_persistence
   let get_pending_orders = get_pending_orders
   let handle_order_acknowledged = handle_order_acknowledged
   let handle_order_rejected = handle_order_rejected

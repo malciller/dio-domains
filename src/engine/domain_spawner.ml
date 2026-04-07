@@ -606,7 +606,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
            | _ -> ());
           let stop_strat = Mtime_clock.now_ns () in
-          Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat))
+          Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat));
+
+          (* Flush deferred accumulation persistence outside the strategy hotloop.
+             Only performs file I/O when the dirty flag was set during execute_strategy. *)
+          (match !grid_strategy_asset_ref with
+           | Some _ ->
+               Dio_strategies.Suicide_grid.Strategy.flush_persistence asset_with_fees.symbol
+           | None -> ())
         end;
         
         (* Periodic cycle statistics (gated by cycle_mod) *)
