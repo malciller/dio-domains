@@ -247,12 +247,6 @@ module Kraken_impl = struct
   let get_balance ~asset =
     Kraken_balances_feed.get_balance asset
 
-  (** Resolve a cached balance reader. Captures the underlying atomic store
-      once; subsequent calls bypass the Hashtbl lookup in get_balance_store. *)
-  let resolve_balance ~asset =
-    let store = Kraken_balances_feed.get_balance_store asset in
-    fun () -> Kraken_balances_feed.BalanceStore.get_balance store
-
   (** Return all assets with a positive balance as [(asset, balance)] pairs. *)
   let get_all_balances () =
     let assets = Kraken_balances_feed.get_all_assets () in

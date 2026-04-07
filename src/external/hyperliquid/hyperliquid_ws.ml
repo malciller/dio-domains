@@ -275,16 +275,20 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
           in
           match id_opt with
           | Some id ->
-              (* Synchronous wakeup. No yield points between find/remove/wakeup,
-                 so the Lwt_mutex is unnecessary. Avoids a scheduler round-trip
-                 on the order execution critical path. *)
-              (try
-                let (wakener, _) = Response_table.find responses id in
-                Response_table.remove responses id;
-                Lwt.wakeup_later wakener json
-              with Not_found ->
-                if channel = "post" then
-                  Logging.info_f ~section "Received 'post' response for unknown req_id %d: %s" id (Yojson.Safe.to_string json));
+              (* Wake the corresponding [send_request] waiter. *)
+              Lwt.async (fun () ->
+                Lwt_mutex.with_lock responses_mutex (fun () ->
+                  try
+                    let (wakener, _) = Response_table.find responses id in
+                    Response_table.remove responses id;
+                    Lwt.wakeup_later wakener json;
+                    Lwt.return_unit
+                  with Not_found -> 
+                    if channel = "post" then
+                      Logging.info_f ~section "Received 'post' response for unknown req_id %d: %s" id (Yojson.Safe.to_string json);
+                    Lwt.return_unit
+                )
+              );
               true
           | None -> 
               if channel = "post" then

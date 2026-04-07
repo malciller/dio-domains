@@ -126,15 +126,11 @@ module InFlightOrders = struct
       Some (Some drift, Some trimmed)
 end
 
-(** In-flight amendment cache for deduplication of pending amend requests.
-    Includes an atomic entry count for lock-free fast-path reads. *)
+(** In-flight amendment cache for deduplication of pending amend requests. *)
 module InFlightAmendments = struct
   (* order_id -> insertion timestamp *)
   let registry : (string, float) Hashtbl.t = Hashtbl.create 16
   let mutex = Mutex.create ()
-  (* Atomic count of entries. Allows is_in_flight to skip mutex acquisition
-     when the registry is empty (common case on the hot path). *)
-  let entry_count = Atomic.make 0
 
   (** Atomically insert [order_id] if absent. Returns true on insertion,
       false if already tracked. *)
@@ -146,29 +142,21 @@ module InFlightAmendments = struct
         false (* already tracked *)
     | false ->
         Hashtbl.add registry order_id (Unix.gettimeofday ());
-        Atomic.set entry_count (Hashtbl.length registry);
         Mutex.unlock mutex;
         true (* newly inserted *)
 
-  (** Returns true if [order_id] has a pending amendment.
-      Fast path: if entry_count is 0, return false without mutex. *)
-  let[@inline] is_in_flight order_id =
-    if Atomic.get entry_count = 0 then false
-    else begin
-      Mutex.lock mutex;
-      let exists = Hashtbl.mem registry order_id in
-      Mutex.unlock mutex;
-      exists
-    end
+  (** Returns true if [order_id] has a pending amendment. *)
+  let is_in_flight order_id =
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry order_id in
+    Mutex.unlock mutex;
+    exists
 
   (** Remove [order_id] from the cache. Returns true if it was present. *)
   let remove_in_flight_amendment order_id =
     Mutex.lock mutex;
     let existed = Hashtbl.mem registry order_id in
-    if existed then begin
-      Hashtbl.remove registry order_id;
-      Atomic.set entry_count (Hashtbl.length registry)
-    end;
+    if existed then Hashtbl.remove registry order_id;
     Mutex.unlock mutex;
     existed
 
@@ -194,7 +182,6 @@ module InFlightAmendments = struct
         Some timestamp
     ) registry;
 
-    Atomic.set entry_count (Hashtbl.length registry);
     Mutex.unlock mutex;
     (0, !removed)
 

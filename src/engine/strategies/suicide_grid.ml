@@ -145,7 +145,6 @@ type strategy_state = {
   mutable highest_startup_oid: string option; (* highest fill OID observed during startup; bootstraps new strategies *)
   mutable anticipated_base_credit: float;  (* base qty from buy fills not yet reflected in balance feed *)
   mutable last_seen_asset_balance: float;  (* previous asset_bal value; used to detect balance feed updates *)
-  recently_terminal_oids: (string, bool) Hashtbl.t;  (* order IDs from fills/cancels; prevents order sync from re-adding stale snapshot entries *)
   mutex: Mutex.t;  (* per-symbol mutex; prevents concurrent strategy execution *)
 }
 
@@ -155,137 +154,98 @@ let strategy_states_mutex = Mutex.create ()
 
 (** Retrieves or lazily initializes the strategy state for [asset_symbol].
     On first access, loads persisted state (reserved_base, accumulated_profit,
-    last_fill_oid, fill prices) from Hyperliquid.State_persistence.
-    Double-checked lock: fast path is lock-free when the state already exists. *)
+    last_fill_oid, fill prices) from Hyperliquid.State_persistence. *)
 let get_strategy_state asset_symbol =
-  match Hashtbl.find_opt strategy_states asset_symbol with
-  | Some state -> state
-  | None ->
-      Mutex.lock strategy_states_mutex;
-      let state =
-        match Hashtbl.find_opt strategy_states asset_symbol with
-        | Some state -> state
-        | None ->
-            (* Load persisted state for this symbol (survives container restarts). *)
-            let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
-            let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
-            let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
-            let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
-            let persisted_last_sell_fill_price = Hyperliquid.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
-            let new_state = {
-              last_buy_order_price = None;
-              last_buy_order_id = None;
-              open_sell_orders = [];
-              recently_injected_sells = [];
-              pending_orders = [];
-              last_cycle = 0;
-              last_order_time = 0.0;
-              inflight_cancel_buy = false;
-              inflight_amend_buy = false;
-              amend_cooldowns = Hashtbl.create 16;
-              last_cleanup_time = 0.0;
-              inflight_buy = false;
-              inflight_sell = false;
-              asset_low = false;
-              capital_low = false;
-              capital_low_logged = false;
-              capital_low_at_balance = 0.0;
-              reserved_quote = 0.0;
-              accumulated_profit = persisted_accumulated_profit;
-              reserved_base = persisted_reserved_base;
-              last_buy_fill_price = persisted_last_buy_fill_price;
-              last_sell_fill_price = persisted_last_sell_fill_price;
-              grid_qty = 0.0;
-              maker_fee = 0.0;
-              exchange_id = "";
-              startup_replay = true;  (* gates profit calc until set_startup_replay_done *)
-              last_fill_oid = persisted_last_fill_oid;
-              highest_startup_oid = None;
-              anticipated_base_credit = 0.0;
-              last_seen_asset_balance = 0.0;
-              recently_terminal_oids = Hashtbl.create 8;
-              mutex = Mutex.create ();
-            } in
-            Hashtbl.replace strategy_states asset_symbol new_state;
-            new_state
-      in
-      Mutex.unlock strategy_states_mutex;
-      state
+  Mutex.lock strategy_states_mutex;
+  let state =
+    match Hashtbl.find_opt strategy_states asset_symbol with
+    | Some state -> state
+    | None ->
+        (* Load persisted state for this symbol (survives container restarts). *)
+        let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
+        let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
+        let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
+        let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
+        let persisted_last_sell_fill_price = Hyperliquid.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
+        let new_state = {
+          last_buy_order_price = None;
+          last_buy_order_id = None;
+          open_sell_orders = [];
+          recently_injected_sells = [];
+          pending_orders = [];
+          last_cycle = 0;
+          last_order_time = 0.0;
+          inflight_cancel_buy = false;
+          inflight_amend_buy = false;
+          amend_cooldowns = Hashtbl.create 16;
+          last_cleanup_time = 0.0;
+          inflight_buy = false;
+          inflight_sell = false;
+          asset_low = false;
+          capital_low = false;
+          capital_low_logged = false;
+          capital_low_at_balance = 0.0;
+          reserved_quote = 0.0;
+          accumulated_profit = persisted_accumulated_profit;
+          reserved_base = persisted_reserved_base;
+          last_buy_fill_price = persisted_last_buy_fill_price;
+          last_sell_fill_price = persisted_last_sell_fill_price;
+          grid_qty = 0.0;
+          maker_fee = 0.0;
+          exchange_id = "";
+          startup_replay = true;  (* gates profit calc until set_startup_replay_done *)
+          last_fill_oid = persisted_last_fill_oid;
+          highest_startup_oid = None;
+          anticipated_base_credit = 0.0;
+          last_seen_asset_balance = 0.0;
+          mutex = Mutex.create ();
+        } in
+        Hashtbl.replace strategy_states asset_symbol new_state;
+        new_state
+  in
+  Mutex.unlock strategy_states_mutex;
+  state
 
-(** Per-exchange running totals for reserved_quote.
-    Maintained incrementally via set_asset_reserved_quote so the read path
-    is O(1) instead of O(n_symbols). Lock-free via per-exchange float atomics
-    encoded as Int64 (bits_of_float). Init mutex used only for lazy creation. *)
-let exchange_reserved_atomics : (string, int64 Atomic.t) Hashtbl.t = Hashtbl.create 4
-let reservation_init_mutex = Mutex.create ()
+(** Mutex protecting all reserved_quote reads and writes across domains.
+    Lock order: state.mutex -> reservation_mutex -> strategy_states_mutex.
+    reservation_mutex is never held while waiting for state.mutex. *)
+let reservation_mutex = Mutex.create ()
 
-(** Retrieve or lazily create the per-exchange atomic total.
-    After initial creation, this is a single Hashtbl.find_opt with no mutex. *)
-let[@inline] get_reserved_atomic exchange =
-  match Hashtbl.find_opt exchange_reserved_atomics exchange with
-  | Some a -> a
-  | None ->
-      Mutex.lock reservation_init_mutex;
-      let a = match Hashtbl.find_opt exchange_reserved_atomics exchange with
-        | Some a -> a
-        | None ->
-            let a = Atomic.make (Int64.bits_of_float 0.0) in
-            Hashtbl.replace exchange_reserved_atomics exchange a;
-            a
-      in
-      Mutex.unlock reservation_init_mutex;
-      a
+(** Sums reserved_quote for states matching [exchange]. Caller must hold reservation_mutex. *)
+let get_total_reserved_quote_locked ~exchange =
+  Mutex.lock strategy_states_mutex;
+  let total = Hashtbl.fold (fun _key state acc ->
+    if state.exchange_id = exchange then acc +. state.reserved_quote
+    else acc
+  ) strategy_states 0.0 in
+  Mutex.unlock strategy_states_mutex;
+  total
 
-(** Returns the total reserved_quote for [exchange]. Lock-free O(1) read. *)
-let[@inline] get_total_reserved_quote ~exchange =
-  let a = get_reserved_atomic exchange in
-  Int64.float_of_bits (Atomic.get a)
+(** Acquires reservation_mutex and returns total reserved_quote for [exchange].
+    Safe to call outside state.mutex. *)
+let get_total_reserved_quote ~exchange =
+  Mutex.lock reservation_mutex;
+  let total = get_total_reserved_quote_locked ~exchange in
+  Mutex.unlock reservation_mutex;
+  total
 
-(** CAS loop to atomically add [delta] to the per-exchange reserved total.
-    Retries on contention. Typically completes on first attempt. *)
-let[@inline] cas_add_reserved exchange delta =
-  if delta = 0.0 then ()
-  else begin
-    let a = get_reserved_atomic exchange in
-    let rec loop () =
-      let old_bits = Atomic.get a in
-      let old_val = Int64.float_of_bits old_bits in
-      let new_bits = Int64.bits_of_float (old_val +. delta) in
-      if not (Atomic.compare_and_set a old_bits new_bits) then loop ()
-    in
-    loop ()
-  end
-
-(** Sets this asset's reserved_quote and updates the per-exchange running total.
-    Lock-free via CAS on the exchange atomic. *)
+(** Sets this asset's reserved_quote under reservation_mutex.
+    May be called from inside state.mutex (respects lock order). *)
 let set_asset_reserved_quote state v =
-  let old = state.reserved_quote in
+  Mutex.lock reservation_mutex;
   state.reserved_quote <- v;
-  if state.exchange_id <> "" then
-    cas_add_reserved state.exchange_id (v -. old)
+  Mutex.unlock reservation_mutex
 
 (** Atomically checks available quote balance and reserves for a buy if sufficient.
     Returns (balance_ok, available_quote, total_reserved).
-    Must be called from inside state.mutex. On success, sets state.reserved_quote
-    and updates the per-exchange running total via CAS. *)
+    Must be called from inside state.mutex. On success, sets state.reserved_quote. *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
-  let a = get_reserved_atomic state.exchange_id in
-  let total_bits = Atomic.get a in
-  let total_reserved = Int64.float_of_bits total_bits in
+  Mutex.lock reservation_mutex;
+  let total_reserved = get_total_reserved_quote_locked ~exchange:state.exchange_id in
   let available = quote_bal -. total_reserved in
   let ok = available >= quote_needed in
-  if ok then begin
-    let old = state.reserved_quote in
-    state.reserved_quote <- reserve_amount;
-    let delta = reserve_amount -. old in
-    if delta <> 0.0 then begin
-      let new_bits = Int64.bits_of_float (total_reserved +. delta) in
-      (* Fast path: try CAS with the value we already read. If it fails,
-         fall back to the general CAS loop. *)
-      if not (Atomic.compare_and_set a total_bits new_bits) then
-        cas_add_reserved state.exchange_id delta
-    end
-  end;
+  if ok then state.reserved_quote <- reserve_amount;
+  Mutex.unlock reservation_mutex;
   (ok, available, total_reserved)
 
 (** Parses a config string to float with fallback default and warning. *)
@@ -570,9 +530,6 @@ let push_order ~now order =
 (** Main strategy execution loop. *)
 let execute_strategy
     ?cached_state
-    ~now
-    ~qty_f
-    ~sell_mult_f
     (asset : trading_config)
     (current_price : float option)
     (top_of_book : (float * float * float * float) option)
@@ -610,8 +567,11 @@ let execute_strategy
       Subtract reserved_base so accumulated base asset is protected from sells. *)
    (match asset_balance with
     | Some asset_bal ->
+        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
         let asset_needed_fast =
-          if ecfg.sell_uses_mult then qty_f *. sell_mult_f
+          if ecfg.sell_uses_mult then
+            let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
+            qty_f *. sell_mult_f
           else qty_f  (* 1:1 sells require full qty *)
         in
         let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit in
@@ -639,6 +599,7 @@ let execute_strategy
      short-circuits here. When balance recovers, the flag is cleared. *)
   (match quote_balance with
    | Some quote_bal ->
+       let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
        let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
        (* Available balance = total balance minus all domains' reserved quote. *)
        let total_reserved = get_total_reserved_quote ~exchange:state.exchange_id in
@@ -675,8 +636,8 @@ let execute_strategy
 
   if not state.capital_low then begin
 
-   (* Wall-clock timestamp passed in from domain_spawner. Avoids a redundant
-      gettimeofday(2) syscall inside the timed strategy block. *)
+  (* Order placement throttle: allow logic to run every cycle. *)
+  let now = Unix.time () in
   
   match current_price, top_of_book with
   | None, _ -> ()  (* No price data available yet *)
@@ -691,12 +652,6 @@ let execute_strategy
         | Some (bid, _, ask, _) when bid > 0.0 && ask > 0.0 -> (bid, ask)
         | _ -> (price, price)
       in
-
-      (* Stale pending order and amend cooldown cleanup. Gated by cycle_mod
-         to avoid O(n) list scans and Hashtbl iterations on every tick.
-         Stale entries have 5s timeouts; checking every 1024 cycles is
-         more than sufficient. Pure event-driven, no timers. *)
-      if cycle mod 1024 = 0 then begin
 
       (* Clean up stale pending orders and enforce a hard limit in a single pass.
          Combines List.length + List.filter + List.length + take into one
@@ -742,23 +697,16 @@ let execute_strategy
         Logging.warn_f ~section "amend_cooldowns exceeded 100 entries for %s, reset" asset.symbol
       end;
 
-      (* Evict expired recently_injected_sells entries. *)
+      (* Sync strategy state with actual open orders from exchange.
+         Preserve sell orders set by handle_order_amended or newly placed
+         execution events that may not yet appear in exchange data due to WS lag. *)
+      let now_time = Unix.gettimeofday () in
       state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
-        now -. ts < 10.0
+        now_time -. ts < 10.0
       ) state.recently_injected_sells;
       (* Cap to 20 entries to prevent O(n^2) scans during sell storms. *)
       if List.length state.recently_injected_sells > 20 then
         state.recently_injected_sells <- take 20 state.recently_injected_sells;
-
-      (* Flush recently_terminal_oids. By the time cleanup runs (every 1024
-         cycles), the exchange snapshot has long since dropped the order. *)
-      Hashtbl.clear state.recently_terminal_oids;
-
-      end; (* end: cycle mod cleanup gate *)
-
-      (* Sync strategy state with actual open orders from exchange.
-         Preserve sell orders set by handle_order_amended or newly placed
-         execution events that may not yet appear in exchange data due to WS lag. *)
       let preserved_sells = state.recently_injected_sells in
       state.open_sell_orders <- [];
       (* Preserve buy tracking across sync for all exchanges.
@@ -777,14 +725,14 @@ let execute_strategy
           | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
           | None -> true
         in
-        (* Skip orders that fill/cancel handlers already processed but the
-           exchange snapshot has not yet dropped (WS propagation lag). *)
-        let is_terminal = Hashtbl.mem state.recently_terminal_oids order_id in
         
-        if qty > 0.0 && is_our_strategy && not is_terminal then
+        if qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity. *)
+          (* Use actual order side from exchange, not price-based classification. *)
           if side_str = "buy" then
+            (* All buy orders are treated as grid buys to enforce single-buy-order policy. *)
             buy_orders := (order_id, order_price) :: !buy_orders
           else
+            (* Include all open sell orders regardless of tag. *)
             sell_orders := (order_id, order_price, qty) :: !sell_orders
       ) open_orders;
 
@@ -806,7 +754,8 @@ let execute_strategy
            state.last_buy_order_id <- Some best_order_id;
            (* Sync per-asset reserved_quote from the actual open buy so the
               capital_low check uses the real exchange-reserved amount after restart. *)
-           set_asset_reserved_quote state (best_price *. qty_f)
+           let qty = (try float_of_string asset.qty with Failure _ -> 0.001) in
+           set_asset_reserved_quote state (best_price *. qty)
        | _ ->
            (* In-flight cancel or place: open_orders may be stale.
               Retain current state; order channel will resolve. *)
@@ -830,23 +779,20 @@ let execute_strategy
         (List.length open_orders) asset.symbol
         (List.length !buy_orders) (List.length !sell_orders);
 
-      (* Use pre-parsed config values passed from domain_spawner. *)
-      let qty = qty_f in
+      (* Parse configuration values. *)
+      let qty = parse_config_float asset.qty "qty" 0.001 asset.exchange asset.symbol in
       let grid_interval = asset.grid_interval in
-      let sell_mult = sell_mult_f in
+      let sell_mult = parse_config_float asset.sell_mult "sell_mult" 1.0 asset.exchange asset.symbol in
 
-      (* Cache config in state so handle_order_filled can compute real PnL.
-         Guard writes to avoid unnecessary stores on every cycle. *)
-      if state.grid_qty <> qty then state.grid_qty <- qty;
-      if state.exchange_id = "" then begin
-        state.exchange_id <- asset.exchange;
-        state.maker_fee <- (match asset.maker_fee with
-          | Some f -> f
-          | None ->
-              match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
-              | Some cached -> cached
-              | None -> 0.0)
-      end;
+      (* Cache config in state so handle_order_filled can compute real PnL. *)
+      state.grid_qty <- qty;
+      state.maker_fee <- (match asset.maker_fee with
+        | Some f -> f
+        | None ->
+            match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
+            | Some cached -> cached
+            | None -> 0.0);
+      state.exchange_id <- asset.exchange;
 
       (* Calculate required balances. *)
       let quote_needed = ask_price *. qty in
@@ -1002,7 +948,7 @@ let execute_strategy
                    state.accumulated_profit <- state.accumulated_profit -. required_profit;
                    let base_increment = qty -. rounded_sell in
                    state.reserved_base <- state.reserved_base +. base_increment;
-                   Hyperliquid.State_persistence.save_async ~symbol:asset.symbol
+                   Hyperliquid.State_persistence.save ~symbol:asset.symbol
                      ~reserved_base:state.reserved_base
                      ~accumulated_profit:state.accumulated_profit ();
                    Logging.info_f ~section
@@ -1085,26 +1031,22 @@ let execute_strategy
         state.last_cycle <- cycle
       end else if effective_buy_count > 0 then begin
         (* Case 2: open buy exists; check sell orders for spacing enforcement. *)
-        (* Find the closest sell order across active and pending sells
-           without allocating an intermediate list. Two sequential folds. *)
-        let closest_sell_order =
-          let acc0 = List.fold_left (fun acc (order_id, sell_price, _) ->
+        (* Combine active and pending sell orders for spacing calculation. *)
+        let all_sell_orders = state.open_sell_orders @ (
+          List.filter_map (fun (id, side, price, _) ->
+            if side = Sell then Some (id, price, 0.0) else None
+          ) state.pending_orders
+        ) in
+        
+        if all_sell_orders <> [] then begin
+          (* Find the closest sell order. *)
+          let closest_sell_order = List.fold_left (fun acc (order_id, sell_price, _) ->
             match acc with
             | None -> Some (order_id, sell_price)
             | Some (_, best_price) ->
                 if sell_price < best_price then Some (order_id, sell_price) else acc
-          ) None state.open_sell_orders in
-          List.fold_left (fun acc (id, side, price, _) ->
-            if side <> Sell then acc
-            else match acc with
-            | None -> Some (id, price)
-            | Some (_, best_price) ->
-                if price < best_price then Some (id, price) else acc
-          ) acc0 state.pending_orders
-        in
-        let has_sell_orders = closest_sell_order <> None in
+          ) None all_sell_orders in
 
-        if has_sell_orders then begin
           match closest_sell_order, state.last_buy_order_price, state.last_buy_order_id with
           | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
               (* Calculate distance from buy to sell as absolute dollar amount. *)
@@ -1415,8 +1357,6 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
     state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
-    (* Prevent order sync from re-adding this OID from a stale exchange snapshot. *)
-    Hashtbl.replace state.recently_terminal_oids order_id true;
 
     (* 4. Clear buy order tracking only on buy fills.
        A sell fill must not clear last_buy_order_id because the buy is still
@@ -1439,7 +1379,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
          Without this, sell fills after restart have no buy_price reference
          and silently skip profit calculation. *)
       if state.exchange_id = "hyperliquid" then
-        Hyperliquid.State_persistence.save_async ~symbol:asset_symbol
+        Hyperliquid.State_persistence.save ~symbol:asset_symbol
           ~reserved_base:state.reserved_base
           ~accumulated_profit:state.accumulated_profit
           ~last_buy_fill_price:fill_price
@@ -1524,7 +1464,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
                    Also persist last_buy_fill_price so the next
                    sell after restart still has a buy reference. *)
                 if state.exchange_id = "hyperliquid" then
-                  Hyperliquid.State_persistence.save_async ~symbol:asset_symbol
+                  Hyperliquid.State_persistence.save ~symbol:asset_symbol
                     ~reserved_base:state.reserved_base
                     ~accumulated_profit:state.accumulated_profit
                     ~last_fill_oid:(Option.get state.last_fill_oid)
@@ -1609,8 +1549,6 @@ let handle_order_cancelled asset_symbol order_id side =
       sell_id <> order_id
     ) state.open_sell_orders;
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
-    (* Prevent order sync from re-adding this OID from a stale exchange snapshot. *)
-    Hashtbl.replace state.recently_terminal_oids order_id true;
 
     (* Clear inflight flags and global placement trackers for immediate re-placement. *)
     (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
@@ -1656,24 +1594,18 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                 Logging.info_f ~section "Ignoring amendment for untracked buy order %s -> %s for %s"
                   old_order_id new_order_id asset_symbol)
      | Sell ->
-          let original_sell_count = List.length state.open_sell_orders in
-          let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
-            | Some (_, _, q) -> q | None -> state.grid_qty in
-          state.open_sell_orders <- (new_order_id, price, old_qty) :: 
-             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
-          (* Remove old entry from recently_injected_sells before adding new.
-             Without this, the merge step re-adds the old price as a ghost sell. *)
-          state.recently_injected_sells <- List.filter (fun (id, _, _) -> id <> old_order_id) state.recently_injected_sells;
-          state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
-          (* Mark old OID terminal so order sync skips it from stale snapshots. *)
-          if old_order_id <> new_order_id then
-            Hashtbl.replace state.recently_terminal_oids old_order_id true;
-          if List.length state.open_sell_orders = original_sell_count then
-            Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
-              old_order_id new_order_id price asset_symbol
-          else
-            Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
-              new_order_id price asset_symbol);
+         let original_sell_count = List.length state.open_sell_orders in
+         let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
+           | Some (_, _, q) -> q | None -> state.grid_qty in
+         state.open_sell_orders <- (new_order_id, price, old_qty) :: 
+            List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
+         state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
+         if List.length state.open_sell_orders = original_sell_count then
+           Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
+             old_order_id new_order_id price asset_symbol
+         else
+           Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
+             new_order_id price asset_symbol);
              
     (* Apply a short cooldown to prevent amending the newly amended order
        before the exchange's WebSocket open-orders cache catches up.
