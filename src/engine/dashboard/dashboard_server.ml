@@ -16,10 +16,12 @@ open Lwt.Infix
 
 let section = "dashboard_server"
 
-(** Returns the UDS path for the current engine process, keyed by PID. *)
+(** Fixed UDS path for the dashboard socket.
+    Lives under /var/run/dio/ so it can be volume-mounted and accessed
+    from outside the engine container (e.g. via docker run --rm -it). *)
+let socket_dir = "/var/run/dio"
 let socket_path () =
-  let pid = Unix.getpid () in
-  Printf.sprintf "/tmp/dio-%d.sock" pid
+  Printf.sprintf "%s/dashboard.sock" socket_dir
 
 (** Writes a length-prefixed JSON frame to [oc].
     Encodes [json_str] length as a 4-byte big-endian header.
@@ -60,7 +62,8 @@ let watch_clients : watch_entry list ref = ref []
 let snapshot_cache_str = ref ""
 let snapshot_cache_time = ref 0.0
 let snapshot_cache_max_age = 0.9
-let heartbeat_timeout = 5.0  (* seconds without pong before pruning *)
+let heartbeat_timeout = 3.0  (* seconds without pong before pruning *)
+let idle_read_timeout = 10.0 (* seconds waiting for a command before dropping client *)
 
 (** Close a client fd, ignoring errors if already closed. *)
 let close_fd fd =
@@ -125,17 +128,27 @@ let rec state_broadcaster () =
   Lwt.async state_broadcaster;
   Lwt.return_unit
 
+(** Read with a timeout.  Returns 0 (simulating EOF) if [timeout_s]
+    elapses before any data arrives. *)
+let read_with_timeout ic buf off len timeout_s =
+  Lwt.pick [
+    Lwt_io.read_into ic buf off len;
+    (let%lwt () = Lwt_unix.sleep timeout_s in Lwt.return 0)
+  ]
+
 (** Handles a single client connection over [ic]/[oc]/[fd].
     Reads 1-byte commands in a loop until disconnect or 'Q'.
     [cancel_promise] resolves when the broadcaster detects a dead write,
-    allowing blocked reads to be interrupted. *)
+    allowing blocked reads to be interrupted.
+    The initial command read uses [idle_read_timeout] so zombie connections
+    that never send a command byte are cleaned up. *)
 let handle_client ~fd ~cancel_promise (ic, oc) =
   let buf = Bytes.create 1 in
   let rec loop () =
     Lwt.catch
       (fun () ->
-        let%lwt n = Lwt_io.read_into ic buf 0 1 in
-        if n = 0 then Lwt.return_unit  (* EOF: client disconnected *)
+        let%lwt n = read_with_timeout ic buf 0 1 idle_read_timeout in
+        if n = 0 then Lwt.return_unit  (* EOF or timeout: client disconnected *)
         else
           let cmd = Bytes.get buf 0 in
           match cmd with
@@ -182,12 +195,14 @@ let handle_client ~fd ~cancel_promise (ic, oc) =
   loop ()
 
 (** Starts the UDS server as an Lwt fiber.
-    Binds to the PID-keyed socket path, spawns the state broadcaster,
+    Binds to [/var/run/dio/dashboard.sock], spawns the state broadcaster,
     and enters an accept loop. Limits concurrent clients to 5.
     Call after engine initialization. *)
 let start ~start_time =
   Dashboard_state.set_start_time start_time;
   let path = socket_path () in
+  (* Ensure socket directory exists. *)
+  (try Unix.mkdir socket_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   (* Remove stale socket file from a previous run. *)
   (try Unix.unlink path with Unix.Unix_error _ -> ());
   let addr = Lwt_unix.ADDR_UNIX path in

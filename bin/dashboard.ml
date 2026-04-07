@@ -29,18 +29,25 @@ open Notty
 
 let socket_path = ref ""
 
-(** Discover candidate engine socket paths by scanning /tmp/dio-*.sock.
-    Returns paths sorted newest-first (highest PID first) without opening
-    any probe connections. *)
+(** Default socket path matching the engine's fixed location. *)
+let default_socket_path = "/var/run/dio/dashboard.sock"
+
+(** Discover candidate engine socket paths.
+    Checks the fixed path first, then falls back to scanning /tmp/dio-*.sock
+    for backward compatibility with older engine versions. *)
 let discover_socket_candidates () =
-  let entries = try Sys.readdir "/tmp" with _ -> [||] in
-  Array.to_list entries
-  |> List.filter (fun f ->
-    String.length f > 4 && String.sub f 0 4 = "dio-" &&
-    let len = String.length f in
-    String.sub f (len - 5) 5 = ".sock")
-  |> List.sort (fun a b -> String.compare b a)  (* newest PID first *)
-  |> List.map (fun f -> "/tmp/" ^ f)
+  let fixed = [default_socket_path] |> List.filter Sys.file_exists in
+  if fixed <> [] then fixed
+  else begin
+    let entries = try Sys.readdir "/tmp" with _ -> [||] in
+    Array.to_list entries
+    |> List.filter (fun f ->
+      String.length f > 4 && String.sub f 0 4 = "dio-" &&
+      let len = String.length f in
+      String.sub f (len - 5) 5 = ".sock")
+    |> List.sort (fun a b -> String.compare b a)
+    |> List.map (fun f -> "/tmp/" ^ f)
+  end
 
 (** Read exactly [len] bytes from [fd] into [buf] at offset [off]. *)
 let read_exact fd buf off len =
@@ -717,6 +724,33 @@ let render_to_stdout (draw : out_channel -> unit) =
   in
   go 0 len
 
+(** Check if stdout is still connected to a live TTY.
+    When SSH disconnects, the PTY dies and isatty returns false. *)
+let stdout_alive () =
+  try Unix.isatty Unix.stdout
+  with Unix.Unix_error _ -> false
+
+(** Exception raised by SIGALRM when a stdout write times out. *)
+exception Render_timeout
+
+(** Wrapper around [render_to_stdout] with an alarm-based timeout.
+    Returns [true] if the render completed, [false] if it timed out
+    (indicating the PTY/stdout is dead or blocked). *)
+let render_to_stdout_safe ~timeout_s draw =
+  let old_handler = Sys.signal Sys.sigalrm
+    (Sys.Signal_handle (fun _ -> raise Render_timeout)) in
+  let completed = ref false in
+  (try
+    ignore (Unix.alarm timeout_s);
+    render_to_stdout draw;
+    ignore (Unix.alarm 0);
+    completed := true
+  with
+  | Render_timeout -> ignore (Unix.alarm 0)
+  | exn -> ignore (Unix.alarm 0); raise exn);
+  Sys.set_signal Sys.sigalrm old_handler;
+  !completed
+
 let render_wait_screen w h msg =
   let img = I.string A.(fg c_yellow ++ bg c_bg) msg
             |> I.hsnap ~align:`Left w
@@ -729,31 +763,7 @@ let render_wait_screen w h msg =
     output_string oc "\027[J";
     output_string oc "\027[?2026l")
 
-let render_frame w h json =
-  let img =
-    let sep = hline w in
-    I.vcat [
-      render_header w json;
-      sep;
-      render_memory w json;
-      sep;
-      render_strategies w json;
-      sep;
-      render_latencies w json;
-      sep;
-      render_domains w json;
-      sep;
-      I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  Diophant Solutions");
-    ]
-    |> I.hsnap ~align:`Left w   (* clamp width to prevent line-wrap *)
-    |> I.vsnap ~align:`Top  h   (* clamp height to prevent overflow *)
-  in
-  render_to_stdout (fun oc ->
-    output_string oc "\027[?2026h";   (* begin synchronized update  *)
-    output_string oc "\027[H";        (* cursor home                *)
-    Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
-    output_string oc "\027[J";        (* clear to end of screen     *)
-    output_string oc "\027[?2026l")   (* end synchronized update    *)
+
 
 (* Main loop *)
 
@@ -791,6 +801,12 @@ let () =
   let last_json = ref (`Assoc []) in
   let quit = ref false in
   let input_buf = Bytes.create 64 in
+
+  (* SIGHUP handler: when the controlling terminal hangs up (SSH disconnect),
+     the kernel sends SIGHUP to the process group.  Set quit so the event
+     loop exits and goes through the disconnect path, sending 'Q' to the
+     server.  Re-enable c_isig temporarily so the signal is delivered. *)
+  Sys.set_signal Sys.sighup (Sys.Signal_handle (fun _ -> quit := true));
 
   (* Outer reconnect loop.
      On engine restart the socket path changes (new PID), so
@@ -906,19 +922,57 @@ let () =
             ())
       end;
 
-      (* 4. Render frame atomically via render_to_stdout, then pong the server *)
+      (* 4. Check PTY liveness, render frame, then pong the server *)
       if not !quit && not !lost_connection then begin
-        let (w, h) = match Notty_unix.winsize Unix.stdout with
-          | Some (w, h) -> (w, h)
-          | None -> (80, 24)
-        in
-        render_frame w h !last_json;
-        (* Heartbeat pong: confirms render succeeded and stdout is alive.
-           If stdout is blocked (dead PTY), we never reach this, and the
-           server prunes us after 5s without a pong. *)
-        (try let _ = Unix.write_substring fd "P" 0 1 in () with _ -> ())
+        (* Fast-path: if stdout is no longer a TTY, the PTY is dead. *)
+        if not (stdout_alive ()) then begin
+          disconnect fd;
+          quit := true
+        end else begin
+          let (w, h) = match Notty_unix.winsize Unix.stdout with
+            | Some (w, h) -> (w, h)
+            | None -> (80, 24)
+          in
+          let draw oc =
+            output_string oc "\027[?2026h";
+            output_string oc "\027[H";
+            let img =
+              let sep = hline w in
+              I.vcat [
+                render_header w !last_json;
+                sep;
+                render_memory w !last_json;
+                sep;
+                render_strategies w !last_json;
+                sep;
+                render_latencies w !last_json;
+                sep;
+                render_domains w !last_json;
+                sep;
+                I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  Diophant Solutions");
+              ]
+              |> I.hsnap ~align:`Left w
+              |> I.vsnap ~align:`Top  h
+            in
+            Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
+            output_string oc "\027[J";
+            output_string oc "\027[?2026l"
+          in
+          let rendered = render_to_stdout_safe ~timeout_s:2 draw in
+          if not rendered then begin
+            (* Stdout write timed out — PTY is dead. Clean up. *)
+            disconnect fd;
+            quit := true
+          end else
+            (* Heartbeat pong: confirms render succeeded and stdout is alive.
+               If stdout is blocked (dead PTY), we never reach this, and the
+               server prunes us after 3s without a pong. *)
+            (try let _ = Unix.write_substring fd "P" 0 1 in () with _ -> ())
+        end
       end
     done;
+    (* On quit, ensure we disconnect cleanly so the server decrements active_clients. *)
+    (match !fd_ref with Some fd -> disconnect fd | None -> ());
     (* On connection loss (not user quit), re-enter reconnect loop *)
     if not !quit then wait_for_engine ()
   in
