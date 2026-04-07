@@ -7,6 +7,7 @@
       Client to Server: 1-byte ASCII command
         'S' = request a single state snapshot
         'W' = enter watch mode (server pushes state every 500 ms)
+        'P' = heartbeat pong (client confirms it rendered a frame)
         'Q' = close the connection
       Server to Client: 4-byte big-endian length prefix followed by a JSON payload
 *)
@@ -39,12 +40,14 @@ let send_response oc json_str =
 let active_clients = ref 0
 
 (** Each watch client tracks its output channel, the underlying fd
-    (for explicit close), and a cancel resolver to unblock the reader
-    when the broadcaster detects a dead write. *)
+    (for explicit close), a cancel resolver to unblock the reader
+    when the broadcaster detects a dead write, and a heartbeat
+    timestamp updated by client pong messages. *)
 type watch_entry = {
   oc : Lwt_io.output_channel;
   fd : Lwt_unix.file_descr;
   cancel : unit Lwt.u;
+  last_pong : float ref;
 }
 
 (** Mutable list of watch-mode client entries. *)
@@ -57,6 +60,7 @@ let watch_clients : watch_entry list ref = ref []
 let snapshot_cache_str = ref ""
 let snapshot_cache_time = ref 0.0
 let snapshot_cache_max_age = 0.9
+let heartbeat_timeout = 5.0  (* seconds without pong before pruning *)
 
 (** Close a client fd, ignoring errors if already closed. *)
 let close_fd fd =
@@ -72,8 +76,20 @@ let rec state_broadcaster () =
   (if current_clients <> [] then begin
     Lwt.catch
       (fun () ->
-        (* Use cached snapshot if within max age; otherwise regenerate. *)
         let now = Unix.gettimeofday () in
+        (* Prune clients that have not sent a heartbeat pong within the timeout. *)
+        let%lwt live_clients = Lwt_list.filter_map_s (fun entry ->
+          let age = now -. !(entry.last_pong) in
+          if age > heartbeat_timeout then begin
+            Logging.info_f ~section "Pruning stale dashboard client (no pong for %.1fs)" age;
+            (try Lwt.wakeup entry.cancel () with Invalid_argument _ -> ());
+            let%lwt () = close_fd entry.fd in
+            Lwt.return_none
+          end else
+            Lwt.return (Some entry)
+        ) current_clients in
+        watch_clients := live_clients;
+        (* Use cached snapshot if within max age; otherwise regenerate. *)
         let json_str =
           if now -. !snapshot_cache_time < snapshot_cache_max_age && !snapshot_cache_str <> ""
           then !snapshot_cache_str
@@ -84,24 +100,30 @@ let rec state_broadcaster () =
             s
           end
         in
-        (* Broadcast sequentially; on write failure, signal cancel and close fd. *)
-        let%lwt surviving = Lwt_list.filter_map_s (fun entry ->
+        (* Broadcast in parallel; on write failure or timeout, signal cancel and close fd. *)
+        let%lwt surviving = Lwt_list.filter_map_p (fun entry ->
           Lwt.catch
-            (fun () -> send_response entry.oc json_str >|= fun () -> Some entry)
+            (fun () ->
+              Lwt.pick [
+                (send_response entry.oc json_str >|= fun () -> Some entry);
+                (let%lwt () = Lwt_unix.sleep 0.2 in Lwt.fail (Failure "write timeout"))
+              ]
+            )
             (fun _ ->
-              (* Wake the blocked reader so handle_client returns and
-                 the finalize block decrements active_clients. *)
               (try Lwt.wakeup entry.cancel () with Invalid_argument _ -> ());
               let%lwt () = close_fd entry.fd in
               Lwt.return_none)
-        ) current_clients in
+        ) live_clients in
         watch_clients := surviving;
         Lwt.return_unit)
       (fun exn ->
         Logging.error_f ~section "Error in state_broadcaster: %s" (Printexc.to_string exn);
         Lwt.return_unit)
   end else Lwt.return_unit)
-  >>= fun () -> state_broadcaster ()
+  >>= fun () ->
+  (* Sever promise chain to prevent Forward node accumulation. *)
+  Lwt.async state_broadcaster;
+  Lwt.return_unit
 
 (** Handles a single client connection over [ic]/[oc]/[fd].
     Reads 1-byte commands in a loop until disconnect or 'Q'.
@@ -125,16 +147,21 @@ let handle_client ~fd ~cancel_promise (ic, oc) =
           | 'W' ->
               (* Register this client for periodic broadcast. *)
               let cancel_promise_inner, cancel_resolver = Lwt.wait () in
-              let entry = { oc; fd; cancel = cancel_resolver } in
+              let pong_time = ref (Unix.gettimeofday ()) in
+              let entry = { oc; fd; cancel = cancel_resolver; last_pong = pong_time } in
               watch_clients := entry :: !watch_clients;
               (* Block until client sends 'Q', disconnects, or is cancelled
-                 by the broadcaster detecting a write failure. *)
+                 by the broadcaster detecting a write failure or heartbeat timeout. *)
               let rec wait_for_quit () =
                 Lwt.catch
                   (fun () ->
                     let%lwt n = Lwt_io.read_into ic buf 0 1 in
                     if n = 0 || Bytes.get buf 0 = 'Q' then Lwt.return_unit
-                    else wait_for_quit ())
+                    else begin
+                      if Bytes.get buf 0 = 'P' then
+                        pong_time := Unix.gettimeofday ();
+                      wait_for_quit ()
+                    end)
                   (fun _exn -> Lwt.return_unit)
               in
               let%lwt () = Lwt.pick [wait_for_quit (); cancel_promise_inner; cancel_promise] in

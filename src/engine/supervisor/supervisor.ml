@@ -513,11 +513,14 @@ let monitor_loop () =
                       end
                   | _ -> ()
                 ) conn_list;
-                loop ()
+                (* Spawn next iteration independently to sever Forward chain. *)
+                Lwt.async loop;
+                Lwt.return_unit
               with exn ->
                 Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);
                 Logging.error_f ~section "Monitor loop continuing after exception...";
-                loop ()
+                Lwt.async loop;
+                Lwt.return_unit
             end
           end
   in
@@ -986,8 +989,11 @@ let order_processing_loop () =
       let pending_hedge_orders = Dio_strategies.Auto_hedger.get_pending_orders 100 in
 
       if pending_grid_orders = [] && pending_mm_orders = [] && pending_hedge_orders = [] then
-        (* No pending orders; block until signalled *)
-        OrderSignal.wait () >>= loop
+        (* No pending orders; block until signalled.
+           Sever promise chain via Lwt.async to prevent Forward node accumulation. *)
+        OrderSignal.wait () >>= fun () ->
+        Lwt.async loop;
+        Lwt.return_unit
       else begin
         incr cycle_count;
         let process_order_if_connected order process_fn reject_fn =
@@ -1510,12 +1516,14 @@ let order_processing_loop () =
               Logging.debug_f ~section "Order processing: %d orders placed, %d grid + %d mm + %d hedge pending in current batch"
                 (Atomic.get orders_placed) (List.length pending_grid_orders) (List.length pending_mm_orders) (List.length pending_hedge_orders);
 
-            (* Cooperative yield before next drain cycle *)
-            Lwt.pause () >>= loop
+            (* Sever promise chain before next drain cycle. *)
+            Lwt.async loop;
+            Lwt.return_unit
 
           with exn ->
             Logging.error_f ~section "Exception in order processing loop: %s" (Printexc.to_string exn);
-            Lwt.pause () >>= loop
+            Lwt.async loop;
+            Lwt.return_unit
         end
       end
   in
@@ -1571,7 +1579,9 @@ let monitor_non_active_assets () =
                 end else Lwt.return_unit
               ) balances
         ) exchange_names >>= fun () ->
-        loop ()
+        (* Sever promise chain to prevent Forward node accumulation. *)
+        Lwt.async loop;
+        Lwt.return_unit
       end
   in
   Lwt.async loop
