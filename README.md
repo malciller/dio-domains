@@ -171,18 +171,37 @@ Enable with `"hedge": true`. Kraken is not supported.
 
 The engine includes a standalone TUI dashboard binary
 (`bin/dashboard.exe`) that connects to the running engine over a
-Unix domain socket using a length-prefixed JSON protocol.
+Unix domain socket at `/var/run/dio/dashboard.sock` using a
+length-prefixed JSON protocol.
 
+### Local
 ```bash
-# Auto-discovers the engine socket by scanning /tmp/dio-*.sock
+# Auto-discovers the engine socket
 ./_build/default/bin/dashboard.exe
 
 # Connect to a specific engine socket
-./_build/default/bin/dashboard.exe --socket /tmp/dio-<pid>.sock
+./_build/default/bin/dashboard.exe --socket /var/run/dio/dashboard.sock
 ```
 
+### Docker
+
+The engine exposes its dashboard socket via the `dio-sock` named
+volume. Run the dashboard in a **separate container** using
+`docker run --rm -it` — this ties the dashboard's lifetime to your
+SSH session so disconnecting SSH kills the dashboard and frees the
+server connection slot.
+
+```bash
+docker run --rm -it -v dio-sock:/var/run/dio dio dio-dashboard
+```
+
+> [!WARNING]
+> Do not use `docker exec -it` for the dashboard. Docker exec keeps
+> the container-side PTY alive after SSH disconnects, leaving zombie
+> connections that are never cleaned up.
+
 The dashboard operates out-of-process for crash isolation and
-automatically reconnects when the engine restarts (new PID). It runs in
+automatically reconnects when the engine restarts. It runs in
 watch mode, where the engine pushes state snapshots every 500ms.
 
 ### Panels
@@ -198,9 +217,9 @@ watch mode, where the engine pushes state snapshots every 500ms.
 ### Wire Protocol
 
 The dashboard server runs as an Lwt fiber within the engine process,
-listening on `/tmp/dio-<pid>.sock` with file permissions restricted to
-the current user (0600). Communication uses a 4-byte big-endian
-length-prefixed JSON frame format.
+listening on `/var/run/dio/dashboard.sock` with file permissions
+restricted to the current user (0600). Communication uses a 4-byte
+big-endian length-prefixed JSON frame format.
 
 | Command | Direction | Description |
 |---------|-----------|-------------|
@@ -208,29 +227,6 @@ length-prefixed JSON frame format.
 
 Maximum concurrent clients: 5.
 
----
-
-## Benchmarks
-
-All benchmarks run on hot-path components with sub-microsecond
-resolution. p50/p90/p99 values in microseconds.
-
-```
-------------------------------------------------------------------------------
-Benchmark                                       N  p50 (us)  p90 (us)  p99 (us) total (ms)
-------------------------------------------------------------------------------
-ringbuffer_write_read                       10000       1.00       1.00       1.00       0.70
-inflight_orders_ops                         10000       1.00       1.00       1.00       2.31
-inflight_amendments_ops                     10000       1.00       1.00       1.00       2.33
-fee_cache_store_get                          5000       1.00       1.00       1.00       1.97
-order_creation_place                         5000       1.00       1.00       1.00       0.71
-order_creation_amend                         5000       1.00       1.00       1.00       0.36
-config_parse_float                          10000       1.00       1.00       1.00       1.12
-price_calc_grid                             10000       1.00       1.00       1.00       2.58
-state_get_100_symbols                         100       4.00       4.00       6.00       0.36
-generate_duplicate_key                      10000       1.00       1.00       1.00       3.42
-------------------------------------------------------------------------------
-```
 
 ---
 
@@ -349,7 +345,7 @@ Mount a host volume for the `data/` directory so state survives
 container rebuilds:
 
 ```bash
-docker run -v /path/on/host/data:/app/data --env-file .env dio
+docker run -v /path/on/host/data:/app/data -v dio-sock:/var/run/dio --env-file .env dio
 ```
 
 The Docker image uses `jemalloc` (`LD_PRELOAD=libjemalloc.so.2`) to
