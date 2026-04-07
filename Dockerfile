@@ -1,14 +1,16 @@
 # ────────────────────────────────────────────────────────────────────────────────
-# Dio – Dockerfile
-# Ubuntu 22.04 base image + OCaml 5.2.0 + full native build
-# Fixes "unknown scheme" by shipping /etc/services (via netbase package)
+# Dio – Dockerfile (multi-stage)
+# Stage 1: build  – Ubuntu 22.04 + OCaml 5.2.0 + full native build
+# Stage 2: runtime – minimal Ubuntu with only shared libs + binaries
 # ────────────────────────────────────────────────────────────────────────────────
 
-# 1.  Base image
-FROM ubuntu:22.04
+# ==============================================================================
+# STAGE 1 — Builder
+# ==============================================================================
+FROM ubuntu:22.04 AS builder
 ENV QEMU_CPU=host
 
-# 2.  System dependencies
+# 1. System dependencies (build-time only)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     m4 \
@@ -19,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     libpq-dev \
     zlib1g-dev \
-    libjemalloc2 \
     make \
     g++ \
     git \
@@ -32,8 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libtool \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Compile libsecp256k1 from source (Ubuntu package lacks schnorrsig)
-RUN git clone https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1 \
+# 2. Compile libsecp256k1 from source (pinned to v0.7.1 for cache stability)
+RUN git clone --depth 1 --branch v0.7.1 \
+        https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1 \
     && cd /tmp/secp256k1 \
     && ./autogen.sh \
     && ./configure --enable-module-schnorrsig --enable-module-recovery \
@@ -43,44 +45,70 @@ RUN git clone https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1 \
     && ldconfig \
     && rm -rf /tmp/secp256k1
 
-# 4.  OPAM + OCaml switch (5.2.0)
+# 3. OPAM + OCaml switch (5.2.0)
 RUN opam init --disable-sandboxing --reinit -y \
     && opam switch create 5.2.0 ocaml-base-compiler.5.2.0 \
     && eval $(opam env --switch=5.2.0)
 
-# 5.  Workdir inside the container
+# 4. Workdir
 WORKDIR /app
 
-# 6.  Copy project descriptors first (layer-cache friendly)
+# 5. Copy project descriptors first (layer-cache friendly)
 COPY --chown=root:root dio.opam dune-project ./
 
-# 7.  Install OCaml dependencies
+# 6. Install OCaml dependencies (cached unless opam deps change)
 RUN eval $(opam env --switch=5.2.0) \
     && opam install -y . --deps-only --with-test --no-depexts
 
-# 8.  Copy the rest of the source tree
+# 7. Copy the rest of the source tree
 COPY --chown=root:root . .
 
-# 9.  Build native executables (engine + dashboard)
+# 8. Build native executables
 RUN eval $(opam env --switch=5.2.0) \
-    && dune build --profile=release bin/main.exe bin/dashboard.exe \
-    && cp _build/default/bin/main.exe /usr/local/bin/dio \
-    && cp _build/default/bin/dashboard.exe /usr/local/bin/dio-dashboard
+    && dune build --profile=release bin/main.exe bin/dashboard.exe
 
-# 10. Runtime PATH (opam binaries + app)
-ENV PATH="/usr/local/bin:/root/.opam/5.2.0/bin:${PATH}"
+# ==============================================================================
+# STAGE 2 — Runtime (minimal)
+# ==============================================================================
+FROM ubuntu:22.04 AS runtime
 
-# 11. Use jemalloc to prevent glibc arena fragmentation in OCaml 5
+# 9. Runtime shared libraries only (no compilers, no opam, no git)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libffi8 \
+    libgmp10 \
+    libpcre3 \
+    libssl3 \
+    libpq5 \
+    zlib1g \
+    libjemalloc2 \
+    ca-certificates \
+    netbase \
+    && rm -rf /var/lib/apt/lists/*
+
+# 10. Copy libsecp256k1 from builder
+COPY --from=builder /usr/local/lib/libsecp256k1* /usr/local/lib/
+RUN ldconfig
+
+# 11. Copy compiled binaries from builder
+COPY --from=builder /app/_build/default/bin/main.exe /usr/local/bin/dio
+COPY --from=builder /app/_build/default/bin/dashboard.exe /usr/local/bin/dio-dashboard
+
+# 12. Copy config files needed at runtime
+COPY --chown=root:root config.json /app/config.json
+
+WORKDIR /app
+
+# 13. Use jemalloc to prevent glibc arena fragmentation in OCaml 5
 ENV LD_PRELOAD=libjemalloc.so.2
 
-# 12. jemalloc tuning: fast dirty/muzzy page decay, limited arenas for OCaml 5
+# 14. jemalloc tuning: fast dirty/muzzy page decay, limited arenas for OCaml 5
 ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 
-# 13. OCaml runtime GC defaults (belt-and-suspenders; config.json Gc.set overrides)
+# 15. OCaml runtime GC defaults (belt-and-suspenders; config.json Gc.set overrides)
 ENV OCAMLRUNPARAM="s=2M,o=40,O=50,w=1"
 
-# 14. Expose metrics broadcast port
+# 16. Expose metrics broadcast port
 EXPOSE 8080
 
-# 15. Default command
+# 17. Default command
 CMD ["dio"]
