@@ -29,31 +29,18 @@ open Notty
 
 let socket_path = ref ""
 
-(** Discover engine socket path by scanning /tmp/dio-*.sock.
-    Probes each candidate and discards stale sockets. *)
-let discover_socket () =
+(** Discover candidate engine socket paths by scanning /tmp/dio-*.sock.
+    Returns paths sorted newest-first (highest PID first) without opening
+    any probe connections. *)
+let discover_socket_candidates () =
   let entries = try Sys.readdir "/tmp" with _ -> [||] in
-  let socks = Array.to_list entries
-    |> List.filter (fun f ->
-      String.length f > 4 && String.sub f 0 4 = "dio-" &&
-      let len = String.length f in
-      String.sub f (len - 5) 5 = ".sock")
-    |> List.map (fun f -> "/tmp/" ^ f)
-  in
-  (* Discard sockets that refuse connection *)
-  let live = List.filter (fun path ->
-    let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-    let ok = (try Unix.connect fd (Unix.ADDR_UNIX path); true
-               with Unix.Unix_error _ -> false) in
-    (try Unix.close fd with _ -> ());
-    ok
-  ) socks in
-  (match live with
-  | _ :: _ :: _ -> Printf.eprintf "Warning: multiple live engine sockets found, using first\n%!"
-  | _ -> ());
-  match live with
-  | s :: _ -> Some s
-  | [] -> None
+  Array.to_list entries
+  |> List.filter (fun f ->
+    String.length f > 4 && String.sub f 0 4 = "dio-" &&
+    let len = String.length f in
+    String.sub f (len - 5) 5 = ".sock")
+  |> List.sort (fun a b -> String.compare b a)  (* newest PID first *)
+  |> List.map (fun f -> "/tmp/" ^ f)
 
 (** Read exactly [len] bytes from [fd] into [buf] at offset [off]. *)
 let read_exact fd buf off len =
@@ -813,21 +800,28 @@ let () =
   let fd_ref : Unix.file_descr option ref = ref None in
 
   let try_connect () =
-    let path_opt =
+    let candidates =
       if !socket_path <> "" && !fd_ref = None then
         (* First connection: use --socket override *)
-        Some !socket_path
+        [!socket_path]
       else
-        discover_socket ()
+        discover_socket_candidates ()
     in
-    match path_opt with
-    | None -> None
-    | Some p ->
-        (try
-          let fd = connect_and_watch p in
-          fd_ref := Some fd;
-          Some fd
-        with Unix.Unix_error _ -> None)
+    let rec try_candidates = function
+      | [] -> None
+      | p :: rest ->
+          (try
+            let fd = connect_and_watch p in
+            fd_ref := Some fd;
+            Some fd
+          with Unix.Unix_error _ ->
+            (* Stale socket — clean up and try the next candidate *)
+            (try Unix.unlink p with _ -> ());
+            try_candidates rest)
+    in
+    if List.length candidates > 1 then
+      Printf.eprintf "Warning: multiple engine sockets found, trying newest first\n%!";
+    try_candidates candidates
   in
 
   let disconnect fd =
@@ -854,11 +848,14 @@ let () =
           in
           if List.mem Unix.stdin ready then begin
             let n = try Unix.read Unix.stdin input_buf 0 64 with _ -> 0 in
-            for i = 0 to n - 1 do
-              match Bytes.get input_buf i with
-              | 'q' | 'Q' | '\027' -> quit := true
-              | _ -> ()
-            done
+            if n = 0 then quit := true
+            else begin
+              for i = 0 to n - 1 do
+                match Bytes.get input_buf i with
+                | 'q' | 'Q' | '\027' -> quit := true
+                | _ -> ()
+              done
+            end
           end;
           if not !quit then wait_for_engine ()
 
@@ -875,18 +872,21 @@ let () =
       (* 2. Process keyboard input *)
       if List.mem Unix.stdin ready then begin
         let n = try Unix.read Unix.stdin input_buf 0 64 with _ -> 0 in
-        let rec check_bytes i =
-          if i >= n then ()
-          else begin
-            (match Bytes.get input_buf i with
-             | 'q' | 'Q' -> quit := true
-             | '\027' ->
-                 if i + 1 >= n then quit := true (* bare Escape key *)
-             | _ -> ());
-            check_bytes (i + 1)
-          end
-        in
-        check_bytes 0
+        if n = 0 then quit := true
+        else begin
+          let rec check_bytes i =
+            if i >= n then ()
+            else begin
+              (match Bytes.get input_buf i with
+               | 'q' | 'Q' -> quit := true
+               | '\027' ->
+                   if i + 1 >= n then quit := true (* bare Escape key *)
+               | _ -> ());
+              check_bytes (i + 1)
+            end
+          in
+          check_bytes 0
+        end
       end;
 
       (* 3. Read and parse socket data if available *)
@@ -906,13 +906,17 @@ let () =
             ())
       end;
 
-      (* 4. Render frame atomically via render_to_stdout *)
+      (* 4. Render frame atomically via render_to_stdout, then pong the server *)
       if not !quit && not !lost_connection then begin
         let (w, h) = match Notty_unix.winsize Unix.stdout with
           | Some (w, h) -> (w, h)
           | None -> (80, 24)
         in
-        render_frame w h !last_json
+        render_frame w h !last_json;
+        (* Heartbeat pong: confirms render succeeded and stdout is alive.
+           If stdout is blocked (dead PTY), we never reach this, and the
+           server prunes us after 5s without a pong. *)
+        (try let _ = Unix.write_substring fd "P" 0 1 in () with _ -> ())
       end
     done;
     (* On connection loss (not user quit), re-enter reconnect loop *)
