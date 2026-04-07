@@ -110,7 +110,6 @@ let log_sync level section_name message =
     (try
        output_string !output_channel formatted;
        output_char !output_channel '\n';
-       flush !output_channel;
        Mutex.unlock output_mutex
      with exn ->
        Mutex.unlock output_mutex;
