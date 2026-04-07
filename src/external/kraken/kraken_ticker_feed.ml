@@ -95,6 +95,11 @@ let has_price_data symbol =
   | _ -> false
 
 (** Block until [has_price_data] returns [true] for every symbol in [symbols], or [timeout_seconds] elapses. Returns [true] if all symbols are ready, [false] on timeout. Uses [ready_condition] to avoid busy-waiting. *)
+(** Reusable hashtable for deduplicating per-symbol readiness notifications
+    within a single parse_ticker call. Cleared on each invocation to avoid
+    allocating a fresh Hashtbl on every incoming WS message. *)
+let notified_symbols_reusable : (string, store) Hashtbl.t = Hashtbl.create 16
+
 let wait_for_price_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
@@ -127,7 +132,8 @@ let parse_ticker json on_heartbeat =
   | [] -> Some ()
   | data ->
       (* Collect symbols that wrote successfully so readiness is signalled once per symbol per message. *)
-      let notified_symbols = Hashtbl.create 16 in
+      Hashtbl.clear notified_symbols_reusable;
+      let notified_symbols = notified_symbols_reusable in
       List.iter (fun ticker_data ->
         try
           let symbol = ticker_data |> member "symbol" |> to_string in
