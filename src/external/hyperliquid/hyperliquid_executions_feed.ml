@@ -834,15 +834,18 @@ let _processor_task =
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid executions processor task";
       let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
-      (* Stream ended normally (disconnect pushed None); re-subscribe. *)
+      (* Stream ended (disconnect pushed None). Re-subscribe immediately;
+         consume_stream blocks event-driven on the new stream until the
+         WS reconnects and data flows. Sever Forward chain via Lwt.async. *)
       sub.close ();
-      Logging.info ~section "Executions stream ended (disconnect), re-subscribing in 1s...";
-      Lwt_unix.sleep 1.0 >>= fun () -> run ()
+      Logging.info ~section "Executions stream ended (disconnect), re-subscribing...";
+      Lwt.async run;
+      Lwt.return_unit
     ) (fun exn ->
       sub.close ();
-      Logging.error_f ~section "Hyperliquid executions processor task crashed: %s. Restarting in 5s..." (Printexc.to_string exn);
-      Lwt_unix.sleep 5.0 >>= fun () ->
-      run ()
+      Logging.error_f ~section "Hyperliquid executions processor task crashed: %s. Re-subscribing..." (Printexc.to_string exn);
+      Lwt.async run;
+      Lwt.return_unit
     )
   in
   Lwt.async run
