@@ -1192,7 +1192,10 @@ let flush_persistence asset_symbol =
         state.persistence_dirty <- false;
         Hyperliquid.State_persistence.save ~symbol:asset_symbol
           ~reserved_base:state.reserved_base
-          ~accumulated_profit:state.accumulated_profit ()
+          ~accumulated_profit:state.accumulated_profit
+          ?last_fill_oid:state.last_fill_oid
+          ?last_buy_fill_price:state.last_buy_fill_price
+          ?last_sell_fill_price:state.last_sell_fill_price ()
       end)
   end
 
@@ -1396,15 +1399,11 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
       state.last_sell_fill_price <- None;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
-      (* Persist buy fill price to survive container restarts.
+      (* Mark dirty so flush_persistence writes buy fill price to disk.
          Without this, sell fills after restart have no buy_price reference
          and silently skip profit calculation. *)
       if state.exchange_id = "hyperliquid" then
-        Hyperliquid.State_persistence.save ~symbol:asset_symbol
-          ~reserved_base:state.reserved_base
-          ~accumulated_profit:state.accumulated_profit
-          ~last_buy_fill_price:fill_price
-          ~last_sell_fill_price:0.0 ();
+        state.persistence_dirty <- true;
       (* Credit anticipated base so the sell guard sees incoming asset before
          the balance feed catches up (exec feed is faster than balance feed). *)
       if state.grid_qty > 0.0 then begin
@@ -1485,12 +1484,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
                    Also persist last_buy_fill_price so the next
                    sell after restart still has a buy reference. *)
                 if state.exchange_id = "hyperliquid" then
-                  Hyperliquid.State_persistence.save ~symbol:asset_symbol
-                    ~reserved_base:state.reserved_base
-                    ~accumulated_profit:state.accumulated_profit
-                    ~last_fill_oid:(Option.get state.last_fill_oid)
-                    ?last_buy_fill_price:state.last_buy_fill_price
-                    ~last_sell_fill_price:sell_fill_price ();
+                  state.persistence_dirty <- true;
                 Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
                   asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
               end;
