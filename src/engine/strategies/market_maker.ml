@@ -478,60 +478,63 @@ let execute_strategy
 
   let now = Unix.time () in
 
-  (* Clean up stale pending orders and enforce a hard limit in a single pass. *)
-  let (kept_pending_rev, kept_pending_count, removed_pending_count) =
-    List.fold_left (fun (acc, kept, removed) ((order_id, side, _, timestamp) as entry) ->
-      let age = now -. timestamp in
-      if age > 5.0 then begin
-        if should_log then Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
-        
-        (* Release global trackers to permit immediate re-placement *)
-        if String.starts_with ~prefix:"pending_amend_" order_id then begin
-          let target_oid = String.sub order_id 14 (String.length order_id - 14) in
-          ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
+  (* Clean up stale pending orders using identity-preserving zero-allocation filter. *)
+  let rec filter_pending kept removed lst =
+    match lst with
+    | [] -> if removed > 0 && should_log then Logging.debug_f ~section "Cleaned up %d pending orders for %s (kept %d)" removed asset.symbol kept; lst
+    | ((order_id, side, _, timestamp) as entry) :: tl ->
+        let age = now -. timestamp in
+        if age > 5.0 || kept >= 50 then begin
+          if age > 5.0 && should_log then Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
+          if age > 5.0 then begin
+            (* Release global trackers to permit immediate re-placement *)
+            if String.starts_with ~prefix:"pending_amend_" order_id then begin
+              let target_oid = String.sub order_id 14 (String.length order_id - 14) in
+              ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
+            end else begin
+              let duplicate_key = generate_side_duplicate_key asset.symbol side in
+              ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+              (* Clear inflight flags for stale placements *)
+              (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
+            end
+          end;
+          filter_pending kept (removed + 1) tl
         end else begin
-          let duplicate_key = generate_side_duplicate_key asset.symbol side in
-          ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-          (* Clear inflight flags for stale placements *)
-          (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
-        end;
-        (acc, kept, removed + 1)
-      end else if kept >= 50 then
-        (acc, kept, removed + 1)  (* silently drop excess beyond hard limit *)
-      else
-        (entry :: acc, kept + 1, removed)
-    ) ([], 0, 0) state.pending_orders
+          let new_tl = filter_pending (kept + 1) removed tl in
+          if tl == new_tl then lst else entry :: new_tl
+        end
   in
-  state.pending_orders <- List.rev kept_pending_rev;
-  if removed_pending_count > 0 && should_log then
-    Logging.debug_f ~section "Cleaned up %d pending orders for %s (kept %d)" removed_pending_count asset.symbol kept_pending_count;
+  state.pending_orders <- filter_pending 0 0 state.pending_orders;
 
   (* Evict cancelled order blacklist entries older than 15s; cap at 20 *)
-  let (kept_cancelled_rev, kept_cancelled_count, removed_cancelled_count) =
-    List.fold_left (fun (acc, kept, removed) ((_oid, timestamp) as entry) ->
-      if now -. timestamp > 15.0 then
-        (acc, kept, removed + 1)
-      else if kept >= 20 then
-        (acc, kept, removed + 1)
-      else
-        (entry :: acc, kept + 1, removed)
-    ) ([], 0, 0) state.cancelled_orders
+  let rec filter_cancelled kept removed lst =
+    match lst with
+    | [] -> if removed > 0 && should_log then Logging.debug_f ~section "Cleaned up %d cancelled orders for %s (kept %d)" removed asset.symbol kept; lst
+    | ((_oid, timestamp) as entry) :: tl ->
+        if now -. timestamp > 15.0 || kept >= 20 then
+          filter_cancelled kept (removed + 1) tl
+        else
+          let new_tl = filter_cancelled (kept + 1) removed tl in
+          if tl == new_tl then lst else entry :: new_tl
   in
-  state.cancelled_orders <- List.rev kept_cancelled_rev;
-  if removed_cancelled_count > 0 && should_log then
-    Logging.debug_f ~section "Cleaned up %d cancelled orders for %s (kept %d)" removed_cancelled_count asset.symbol kept_cancelled_count;
+  state.cancelled_orders <- filter_cancelled 0 0 state.cancelled_orders;
 
-  (* Evict stale pending cancellations (older than 30s) via scan-and-remove *)
-  let to_remove = ref [] in
-  Hashtbl.iter (fun order_id timestamp ->
-    if now -. timestamp > 30.0 then
-      to_remove := order_id :: !to_remove
-  ) state.pending_cancellations;
+  (* Evict stale pending cancellations (older than 30s). Throttled to 1s to prevent cycle allocations. *)
+  if now -. state.last_cleanup_time >= 1.0 then begin
+    state.last_cleanup_time <- now;
+    let to_remove = ref [] in
+    Hashtbl.iter (fun order_id timestamp ->
+      if now -. timestamp > 30.0 then
+        to_remove := order_id :: !to_remove
+    ) state.pending_cancellations;
 
-  List.iter (fun order_id ->
-    if should_log then Logging.debug_f ~section "Removing stale pending cancellation %s for %s" order_id asset.symbol;
-    Hashtbl.remove state.pending_cancellations order_id
-  ) !to_remove;
+    (match !to_remove with
+     | [] -> ()
+     | ids -> List.iter (fun order_id ->
+         if should_log then Logging.debug_f ~section "Removing stale pending cancellation %s for %s" order_id asset.symbol;
+         Hashtbl.remove state.pending_cancellations order_id
+       ) ids)
+  end;
 
 
   (* state.mutex is intentionally not locked in this function.
@@ -571,26 +574,30 @@ let execute_strategy
         let mid_price = (bid +. ask) /. 2.0 in
         let spread_pct = if mid_price > 0.0 then spread /. mid_price else 0.0 in
 
-        (* Compute available balances net of open order commitments *)
+        (* Single pass to compute available balances and counts net of open order commitments *)
+        let locked_in_sells = ref 0.0 in
+        let locked_in_buys = ref 0.0 in
+        let open_buy_count = ref 0 in
+        
+        iter_open_orders (fun order_id order_price remaining_qty side_str _uref ->
+          let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
+          if not is_cancelled && remaining_qty > 0.0 then begin
+            if side_str = "sell" then
+              locked_in_sells := !locked_in_sells +. remaining_qty
+            else if side_str = "buy" then begin
+              locked_in_buys := !locked_in_buys +. (order_price *. remaining_qty);
+              incr open_buy_count
+            end
+          end
+        );
+
         let available_asset_balance = match asset_balance with
-          | Some total_balance ->
-              (* Deduct qty locked in open sells *)
-              let locked_in_sells = ref 0.0 in
-              iter_open_orders (fun _oid _price remaining_qty side_str _uref ->
-                if side_str = "sell" then locked_in_sells := !locked_in_sells +. remaining_qty
-              );
-              Some (total_balance -. !locked_in_sells)
+          | Some total_balance -> Some (total_balance -. !locked_in_sells)
           | None -> None
         in
 
         let available_quote_balance = match quote_balance with
-          | Some total_balance ->
-              (* Deduct value locked in open buys *)
-              let locked_in_buys = ref 0.0 in
-              iter_open_orders (fun _oid order_price remaining_qty side_str _uref ->
-                if side_str = "buy" then locked_in_buys := !locked_in_buys +. (order_price *. remaining_qty)
-              );
-              Some (total_balance -. !locked_in_buys)
+          | Some total_balance -> Some (total_balance -. !locked_in_buys)
           | None -> None
         in
 
@@ -603,13 +610,6 @@ let execute_strategy
         if should_log then Logging.debug_f ~section "DEBUG Asset [%s/%s]: spread=%.8f, spread_pct=%.8f, fee=%.8f, exposure=%.2f"
           asset.exchange asset.symbol spread spread_pct fee exposure_value;
 
-        (* Count non-cancelled open buy orders for balance check *)
-        let open_buy_count = ref 0 in
-        iter_open_orders (fun order_id _price qty side_str _uref ->
-          let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-          if side_str = "buy" && not is_cancelled && qty > 0.0 then
-            incr open_buy_count
-        );
         let open_buy_count = !open_buy_count in
 
         (* Balance constraints: enforced only when config parameters are set *)
@@ -640,68 +640,34 @@ let execute_strategy
           if should_log then Logging.debug_f ~section "Balance/exposure limits exceeded for %s (exposure_ok=%B, usd_ok=%B), pausing strategy"
             asset.symbol exposure_ok usd_balance_ok;
 
-          (* Sync tracking with actual open orders from exchange *)
-          state.open_sell_orders <- [];
-          (* Hyperliquid: preserve buy tracking across sync. webData2 lags
-             execution events during cancel-replace amendments, so the exchange
-             may briefly report 0 buys while one exists internally.
-             effective_buy_count logic handles this when tracking is preserved.
-             Genuine cancellations clear tracking via handle_order_cancelled.
-             Kraken clears tracking since its data feed is authoritative. *)
+          (* Pending orders not cleared here; managed by order response handlers.
+             Hyperliquid: preserve buy tracking across sync. kraken clears. *)
           if asset.exchange <> "hyperliquid" then begin
             state.last_buy_order_price <- None;
             state.last_buy_order_id <- None
           end;
-          (* pending_orders not cleared here; managed by order response handlers *)
 
-          (* Rebuild tracking from exchange open orders, filtering blacklisted cancels *)
-          let buy_orders = ref [] in
-          let sell_orders = ref [] in
-
-          iter_open_orders (fun order_id order_price qty side_str userref_opt ->
-            (* Skip blacklisted (cancelled) orders *)
+          (* Cancel all active buy orders. Zero allocation iteration. *)
+          iter_open_orders (fun order_id _order_price qty side_str userref_opt ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            
             let is_our_strategy = match userref_opt with
               | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
               | None -> false
             in
-
-            if not is_cancelled && qty > 0.0 && is_our_strategy then
-              (* Classify by the exchange-reported side, not by price *)
-              if side_str = "buy" then
-                (* Enforce single-buy-order policy across all exchanges *)
-                buy_orders := (order_id, order_price) :: !buy_orders
-              else
-                (* Include all open sell orders regardless of tag *)
-                sell_orders := (order_id, order_price, qty) :: !sell_orders
+            if not is_cancelled && qty > 0.0 && is_our_strategy && side_str = "buy" then begin
+              let cancel_order = create_cancel_order order_id asset.symbol MM asset.exchange in
+              ignore (push_order ~now cancel_order);
+              if should_log then Logging.debug_f ~section "Cancelling buy order due to pause: %s for %s" order_id asset.symbol
+            end
           );
 
-          (* Track the highest-priced buy order *)
-          (match !buy_orders with
-           | [] -> ()
-           | orders ->
-               let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
-                 if price > acc_price then (order_id, price) else (acc_id, acc_price)
-               ) (List.hd orders) (List.tl orders) in
-               state.last_buy_order_price <- Some best_price;
-               state.last_buy_order_id <- Some best_order_id);
-
-          (* Update sell order tracking *)
-          state.open_sell_orders <- !sell_orders;
-
-          (* Cancel all open buy orders; deduplicate tracked and exchange-reported order IDs without @ concatenation *)
-          let buys_to_cancel = ref (List.map (fun (id, _) -> id) !buy_orders) in
+          (* Also cancel the actively tracked buy if it wasn't caught by iter_open_orders *)
           (match state.last_buy_order_id with
-           | Some id when not (List.mem id !buys_to_cancel) -> buys_to_cancel := id :: !buys_to_cancel
-           | _ -> ());
-          let buys_to_cancel = !buys_to_cancel in
-          
-          List.iter (fun buy_id ->
-             let cancel_order = create_cancel_order buy_id asset.symbol MM asset.exchange in
-             ignore (push_order ~now cancel_order);
-             if should_log then Logging.debug_f ~section "Cancelling buy order due to pause: %s for %s" buy_id asset.symbol
-          ) buys_to_cancel;
+           | Some tracked_id ->
+               let cancel_order = create_cancel_order tracked_id asset.symbol MM asset.exchange in
+               ignore (push_order ~now cancel_order);
+               if should_log then Logging.debug_f ~section "Cancelling tracked buy order due to pause: %s for %s" tracked_id asset.symbol
+           | None -> ());
 
           (* Clear buy tracking after cancellation *)
           state.last_buy_order_price <- None;
@@ -733,67 +699,69 @@ let execute_strategy
         end else begin
           (* Balance and exposure OK: proceed to buy order management *)
 
-          (* Rebuild tracking from exchange open orders.
-             Hyperliquid: preserve buy tracking because webData2 can lag. *)
-          state.open_sell_orders <- [];
-          if asset.exchange <> "hyperliquid" then begin
-            state.last_buy_order_price <- None;
-            state.last_buy_order_id <- None
-          end;
-
-          let buy_orders = ref [] in
-          let sell_orders = ref [] in
+          (* Use zero-allocation iteration to find the best active buy order *)
+          let best_buy_price = ref None in
+          let best_buy_id = ref None in
+          let sync_open_buy_count = ref 0 in
+          let sync_open_sell_count = ref 0 in
 
           iter_open_orders (fun order_id order_price qty side_str userref_opt ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            
             let is_our_strategy = match userref_opt with
               | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
               | None -> false
             in
-
-            if not is_cancelled && qty > 0.0 && is_our_strategy then
-              if side_str = "buy" then
-                buy_orders := (order_id, order_price) :: !buy_orders
-              else
-                sell_orders := (order_id, order_price, qty) :: !sell_orders
+            if not is_cancelled && qty > 0.0 && is_our_strategy then begin
+              if side_str = "buy" then begin
+                incr sync_open_buy_count;
+                let current_best_price = match !best_buy_price with Some p -> p | None -> -1.0 in
+                if order_price > current_best_price then begin
+                  best_buy_price := Some order_price;
+                  best_buy_id := Some order_id
+                end
+              end else begin
+                incr sync_open_sell_count
+              end
+            end
           );
 
-          (* Sync tracking from exchange-reported open orders *)
-          (match !buy_orders with
-           | [] -> ()
-           | orders ->
-               let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
-                 if price > acc_price then (order_id, price) else (acc_id, acc_price)
-               ) (List.hd orders) (List.tl orders) in
-               state.last_buy_order_price <- Some best_price;
-               state.last_buy_order_id <- Some best_order_id);
+          if asset.exchange <> "hyperliquid" then begin
+            state.last_buy_order_price <- !best_buy_price;
+            state.last_buy_order_id <- !best_buy_id
+          end else begin
+            (* Hyperliquid: trust our internal tracking if open_orders is empty but we have an active tracker. *)
+            if !sync_open_buy_count > 0 then begin
+              state.last_buy_order_price <- !best_buy_price;
+              state.last_buy_order_id <- !best_buy_id
+            end
+          end;
 
-          state.open_sell_orders <- !sell_orders;
-
-          (* Derive effective open buy count by merging internal tracking with exchange data *)
           let has_tracked_buy = state.last_buy_order_id <> None in
-          let sync_open_buy_count = List.length !buy_orders in
           
-          (* Hyperliquid: if tracking shows a buy but webData2 reports 0, trust tracking.
-             Genuine cancellations clear tracking via handle_order_cancelled. *)
           let actual_open_buy_count = 
-            if asset.exchange = "hyperliquid" && has_tracked_buy && sync_open_buy_count = 0 then 1
-            else sync_open_buy_count 
+            if asset.exchange = "hyperliquid" && has_tracked_buy && !sync_open_buy_count = 0 then 1
+            else !sync_open_buy_count 
           in
 
           if should_log then Logging.debug_f ~section "Order management for %s: open_buy_count=%d, open_sell_count=%d" 
-            asset.symbol actual_open_buy_count (List.length !sell_orders);
+            asset.symbol actual_open_buy_count !sync_open_sell_count;
 
           (* Buy order management: maintain exactly one active buy at a profitable level *)
           if actual_open_buy_count > 1 then begin
             (* Multiple open buys: cancel all; next trigger re-places a single order *)
             if should_log then Logging.debug_f ~section "Cancelling %d excess buy orders for %s" actual_open_buy_count asset.symbol;
             
-            List.iter (fun (buy_id, _) ->
-              let cancel_order = create_cancel_order buy_id asset.symbol MM asset.exchange in
-              ignore (push_order ~now cancel_order)
-            ) !buy_orders;
+            iter_open_orders (fun order_id _order_price qty side_str userref_opt ->
+              let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
+              let is_our_strategy = match userref_opt with
+                | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
+                | None -> false
+              in
+              if not is_cancelled && qty > 0.0 && is_our_strategy && side_str = "buy" then begin
+                let cancel_order = create_cancel_order order_id asset.symbol MM asset.exchange in
+                ignore (push_order ~now cancel_order)
+              end
+            );
             
             state.last_buy_order_price <- None;
             state.last_buy_order_id <- None;
