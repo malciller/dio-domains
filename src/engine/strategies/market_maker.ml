@@ -66,6 +66,7 @@ type strategy_state = {
   mutable asset_low: bool;            (** true when asset balance is insufficient; pauses sell placement *)
   mutable capital_low_logged: bool;   (** suppresses repeated capital_low warnings *)
   mutable last_seen_asset_balance: float;  (** last observed balance; used to detect genuine recovery *)
+  mutable startup_replay: bool;       (** true during startup; suppresses logging/metrics if needed *)
   mutex: Mutex.t;  (** guards concurrent access from callback handlers *)
 }
 
@@ -95,6 +96,7 @@ let get_strategy_state asset_symbol =
           asset_low = false;
           capital_low_logged = false;
           last_seen_asset_balance = 0.0;
+          startup_replay = true;
           mutex = Mutex.create ();
         } in
         Hashtbl.add strategy_states asset_symbol new_state;
@@ -1297,6 +1299,17 @@ let init () =
   Fee_cache.init ();
   Random.self_init ()
 
+(** Clears the startup_replay flag so telemetry profiling activates. 
+    Called by domain_spawner once the first exec event batch has been consumed. *)
+let set_startup_replay_done symbol =
+  let state = get_strategy_state symbol in
+  Mutex.lock state.mutex;
+  if state.startup_replay then begin
+    state.startup_replay <- false;
+    Logging.info_f ~section "Startup replay complete for market maker %s" symbol
+  end;
+  Mutex.unlock state.mutex
+
 (** Public strategy module interface. *)
 module Strategy = struct
   type config = trading_config
@@ -1323,5 +1336,6 @@ module Strategy = struct
   let handle_order_amendment_failed = handle_order_amendment_failed
   let cleanup_pending_cancellation = cleanup_pending_cancellation
   let cleanup_strategy_state = cleanup_strategy_state
+  let set_startup_replay_done = set_startup_replay_done
   let init = init
 end

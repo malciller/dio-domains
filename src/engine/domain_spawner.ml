@@ -190,6 +190,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       (* Set after the first exec position check. Acts as a fallback to open the
          hl_exec_ready gate for Hyperliquid assets with no open orders. *)
       let hl_exec_checked = ref false in
+      let latency_active = ref false in
 
       (* Initialize strategy configuration refs based on strategy type *)
       let baseline_price = ref None in
@@ -351,6 +352,18 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
+        if not !latency_active && asset_with_fees.exchange <> "hyperliquid" then begin
+          latency_active := true;
+          (match !grid_strategy_asset_ref with
+           | Some _ -> Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
+           | None -> ());
+          (match !mm_strategy_asset_ref with
+           | Some _ -> Dio_strategies.Market_maker.Strategy.set_startup_replay_done asset_with_fees.symbol
+           | None -> ());
+          Logging.info_f ~section "[%s/%s] First cycle complete; startup replay and latency ungated"
+            asset_with_fees.exchange asset_with_fees.symbol
+        end;
+        
         (* Periodic debug logging gated by cycle_mod *)
         if !cycle_count mod config.cycle_mod = 0 then
           Logging.debug_f ~section "Asset [%s/%s] cycle #%d"
@@ -367,7 +380,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               asset_with_fees.exchange asset_with_fees.symbol ((ticker.bid +. ticker.ask) /. 2.0)
           );
           let stop_ticker = Mtime_clock.now_ns () in
-          Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
+          if !latency_active then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
         end;
         
         (* Consume pending orderbook events from the ring buffer.
@@ -384,7 +397,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               bid_price bid_size ask_price ask_size
           );
           let stop_ob = Mtime_clock.now_ns () in
-          Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
+          if !latency_active then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
         end;
         
         (* Consume pending execution events from the ring buffer *)
@@ -478,9 +491,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             (* First exec batch received: open the Hyperliquid startup gate *)
             if not !hl_exec_ready then begin
               hl_exec_ready := true;
+              latency_active := true;
               (match !grid_strategy_asset_ref with
                | Some _ ->
                    Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
+               | None -> ());
+              (match !mm_strategy_asset_ref with
+               | Some _ ->
+                   Dio_strategies.Market_maker.Strategy.set_startup_replay_done asset_with_fees.symbol
                | None -> ());
               Logging.info_f ~section "[%s/%s] First exec event batch received, strategy now active"
                 asset_with_fees.exchange asset_with_fees.symbol
@@ -489,7 +507,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           exec_read_pos := new_pos;
           hl_exec_checked := true;
           let stop_exec = Mtime_clock.now_ns () in
-          Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub stop_exec start_exec))
+          if !latency_active then Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub stop_exec start_exec))
         end;
         (* Fallback gate for Hyperliquid domains with no open orders: if no
            exec events arrived and the startup snapshot injection is complete,
@@ -500,10 +518,15 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           if current_pos_now = !exec_read_pos then begin
             hl_exec_checked := true;
             hl_exec_ready := true;
+            latency_active := true;
             (* Mark startup replay complete to ungate profit calculation *)
             (match !grid_strategy_asset_ref with
              | Some _ ->
                  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
+             | None -> ());
+            (match !mm_strategy_asset_ref with
+             | Some _ ->
+                 Dio_strategies.Market_maker.Strategy.set_startup_replay_done asset_with_fees.symbol
              | None -> ());
             Logging.info_f ~section "[%s/%s] Snapshot done, no exec events - strategy now active (no open orders)"
               asset_with_fees.exchange asset_with_fees.symbol
@@ -611,7 +634,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance !mm_open_buy_count !mm_open_sell_count iter_orders !cycle_count
            | _ -> ());
           let stop_strat = Mtime_clock.now_ns () in
-          Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat));
+          if !latency_active then Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat));
 
           (* Flush deferred accumulation persistence outside the strategy hotloop.
              Only performs file I/O when the dirty flag was set during execute_strategy. *)
@@ -636,7 +659,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            latency only, excluding sleep time in Exchange_wakeup.wait. *)
         let cycle_stop = Mtime_clock.now_ns () in
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
-        Latency_profiler.record prof_cycle cycle_span;
+        if !latency_active then Latency_profiler.record prof_cycle cycle_span;
 
         (* Flush latency reports periodically, gated by cycle_mod to avoid
            5 threshold checks per cycle on the hot path. *)
