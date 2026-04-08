@@ -1206,7 +1206,7 @@ let flush_persistence asset_symbol =
     in
     match snapshot_to_save with
     | Some (reserved_base, accumulated_profit, last_fill_oid, last_buy_fill_price, last_sell_fill_price) ->
-        Hyperliquid.State_persistence.save ~symbol:asset_symbol
+        Hyperliquid.State_persistence.save_async ~symbol:asset_symbol
           ~reserved_base
           ~accumulated_profit
           ?last_fill_oid
