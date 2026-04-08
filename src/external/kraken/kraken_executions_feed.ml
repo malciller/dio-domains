@@ -159,6 +159,7 @@ type symbol_store = {
   open_orders: (string, open_order) Hashtbl.t;
   ready: bool Atomic.t;
   last_event_time: float Atomic.t;
+  orders_mutex: Mutex.t;
 }
 
 (** Global symbol-to-store mapping. *)
@@ -219,6 +220,7 @@ let get_symbol_store symbol =
               open_orders = Hashtbl.create 32;
               ready = Atomic.make false;
               last_event_time = Atomic.make 0.0;
+              orders_mutex = Mutex.create ();
             } in
             Hashtbl.add symbol_stores symbol s;
             Logging.debug_f ~section "Created execution store for %s" symbol;
@@ -266,36 +268,36 @@ let wait_for_execution_data_lwt symbols timeout_seconds =
 
 let wait_for_execution_data = wait_for_execution_data_lwt
 
-(** Returns the list of open orders for a symbol. Acquires global_orders_mutex. *)
+(** Returns the list of open orders for a symbol. Acquires store.orders_mutex. *)
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock global_orders_mutex;
+  Mutex.lock store.orders_mutex;
   let orders = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Mutex.unlock global_orders_mutex;
+  Mutex.unlock store.orders_mutex;
   orders
 
-(** Zero-allocation fold over open orders for a symbol. Holds global_orders_mutex for the duration. *)
+(** Zero-allocation fold over open orders for a symbol. Holds store.orders_mutex for the duration. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  Mutex.lock global_orders_mutex;
+  Mutex.lock store.orders_mutex;
   let result = Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init in
-  Mutex.unlock global_orders_mutex;
+  Mutex.unlock store.orders_mutex;
   result
 
 (** Looks up a single open order by ID within a symbol store. *)
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
-  Mutex.lock global_orders_mutex;
+  Mutex.lock store.orders_mutex;
   let order_opt = Hashtbl.find_opt store.open_orders order_id in
-  Mutex.unlock global_orders_mutex;
+  Mutex.unlock store.orders_mutex;
   order_opt
 
 (** Returns true if the given order ID exists in the symbol's open orders. *)
 let[@inline always] has_open_order symbol order_id =
   let store = get_symbol_store symbol in
-  Mutex.lock global_orders_mutex;
+  Mutex.lock store.orders_mutex;
   let exists = Hashtbl.mem store.open_orders order_id in
-  Mutex.unlock global_orders_mutex;
+  Mutex.unlock store.orders_mutex;
   exists
 
 (** Looks up an open order by ID across all symbols via the global order-to-symbol index. O(1) lookup; returns None if absent from cache. *)
@@ -307,15 +309,15 @@ let find_order_everywhere order_id =
   | None -> None
   | Some symbol ->
       let store = get_symbol_store symbol in
-      Mutex.lock global_orders_mutex;
+      Mutex.lock store.orders_mutex;
       let order = Hashtbl.find_opt store.open_orders order_id in
-      Mutex.unlock global_orders_mutex;
+      Mutex.unlock store.orders_mutex;
       order
 
 (** Eagerly updates the cached limit price of an open order after a successful amend response, closing the stale-price window before the execution update arrives. No-op if the order is not tracked. *)
 let update_open_order_price ~symbol ~order_id ~new_price =
   let store = get_symbol_store symbol in
-  Mutex.lock global_orders_mutex;
+  Mutex.lock store.orders_mutex;
   (match Hashtbl.find_opt store.open_orders order_id with
    | Some order ->
        let updated = { order with limit_price = Some new_price; last_updated = Unix.gettimeofday () } in
@@ -325,7 +327,7 @@ let update_open_order_price ~symbol ~order_id ~new_price =
    | None ->
        Logging.debug_f ~section "update_open_order_price: order %s [%s] not in cache, skipping"
          order_id symbol);
-  Mutex.unlock global_orders_mutex
+  Mutex.unlock store.orders_mutex
 
 (** Returns all symbols with initialized execution stores. *)
 let get_all_symbols () =
@@ -387,15 +389,15 @@ let trigger_stale_order_cleanup ~reason:_ () = request_cleanup ()
 (** Returns the total count of open orders for a symbol. *)
 let[@inline always] count_open_orders symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock global_orders_mutex;
+  Mutex.lock store.orders_mutex;
   let count = Hashtbl.length store.open_orders in
-  Mutex.unlock global_orders_mutex;
+  Mutex.unlock store.orders_mutex;
   count
 
 (** Returns (buy_count, sell_count) of open orders for a symbol. *)
 let[@inline always] count_open_orders_by_side symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock global_orders_mutex;
+  Mutex.lock store.orders_mutex;
   let buys = ref 0 in
   let sells = ref 0 in
   Hashtbl.iter (fun _id order ->
@@ -403,7 +405,7 @@ let[@inline always] count_open_orders_by_side symbol =
     | Buy -> incr buys
     | Sell -> incr sells
   ) store.open_orders;
-  Mutex.unlock global_orders_mutex;
+  Mutex.unlock store.orders_mutex;
   (!buys, !sells)
 
 (** Reads execution events for a symbol since the given ring buffer position. *)
@@ -428,9 +430,6 @@ let update_open_orders store (event : execution_event) =
   (* Deferred log signal: captures what to log after mutex release. *)
   let log_action = ref `None in
 
-  Mutex.lock global_orders_mutex;
-  
-  (* Determine terminal state primarily from order_status. *)
   let is_terminal_status = match event.order_status with
     | FilledStatus | CanceledStatus | ExpiredStatus | RejectedStatus -> true
     | PendingNewStatus | NewStatus | PartiallyFilledStatus | UnknownStatus _ -> false
@@ -445,18 +444,14 @@ let update_open_orders store (event : execution_event) =
     if abs_order_qty = 0.0 then 1e-12 else abs_order_qty *. 1e-6
   in
   let is_effectively_filled = remaining_qty <= epsilon in
-  
+
+  Mutex.lock store.orders_mutex;
+  let was_tracked = Hashtbl.mem store.open_orders event.order_id in
+  let needs_cleanup = ref false in
+
   if is_terminal_status || is_effectively_filled then begin
     (* Terminal: remove from open orders if present. *)
-    let was_tracked = Hashtbl.mem store.open_orders event.order_id in
-    if was_tracked then begin
-      Hashtbl.remove store.open_orders event.order_id;
-      if is_terminal_status then
-        Hashtbl.remove order_to_symbol event.order_id;
-      log_action := if is_terminal_status then `Removed_terminal else `Removed_zero_qty remaining_qty
-    end else begin
-      log_action := if is_terminal_status then `Terminal_untracked else `Filled_untracked
-    end
+    if was_tracked then Hashtbl.remove store.open_orders event.order_id
   end else begin
     (* Non-terminal: upsert into open orders. *)
     let order = {
@@ -474,18 +469,28 @@ let update_open_orders store (event : execution_event) =
       cl_ord_id = event.cl_ord_id;
       last_updated = event.timestamp;
     } in
-    
-    let was_present = Hashtbl.mem store.open_orders event.order_id in
     Hashtbl.replace store.open_orders event.order_id order;
-    
-    (* Update global order-to-symbol index with FIFO eviction if cap exceeded. *)
-    add_to_order_to_symbol event.order_id event.symbol;
-
-    let needs_cleanup = not was_present && Hashtbl.length store.open_orders > 1000 in
-    log_action := `Upserted (was_present, needs_cleanup, remaining_qty)
+    needs_cleanup := not was_tracked && Hashtbl.length store.open_orders > 1000;
   end;
-  
-  Mutex.unlock global_orders_mutex;
+  Mutex.unlock store.orders_mutex;
+
+  if is_terminal_status || is_effectively_filled then begin
+    if was_tracked then begin
+      if is_terminal_status then begin
+        Mutex.lock global_orders_mutex;
+        Hashtbl.remove order_to_symbol event.order_id;
+        Mutex.unlock global_orders_mutex;
+      end;
+      log_action := if is_terminal_status then `Removed_terminal else `Removed_zero_qty remaining_qty
+    end else begin
+      log_action := if is_terminal_status then `Terminal_untracked else `Filled_untracked
+    end
+  end else begin
+    Mutex.lock global_orders_mutex;
+    add_to_order_to_symbol event.order_id event.symbol;
+    Mutex.unlock global_orders_mutex;
+    log_action := `Upserted (was_tracked, !needs_cleanup, remaining_qty)
+  end;
 
   (* Deferred logging: outside the critical section. *)
   (match !log_action with
@@ -737,7 +742,7 @@ let handle_snapshot json on_heartbeat =
     let all_symbols = get_all_symbols () in
     List.iter (fun symbol ->
       let store = get_symbol_store symbol in
-      Mutex.lock global_orders_mutex;
+      Mutex.lock store.orders_mutex;
       
       (* Collect orders not present in the snapshot. *)
       Hashtbl.iter (fun order_id _ ->
@@ -745,7 +750,7 @@ let handle_snapshot json on_heartbeat =
           stale_orders := (symbol, order_id) :: !stale_orders
       ) store.open_orders;
       
-      Mutex.unlock global_orders_mutex;
+      Mutex.unlock store.orders_mutex;
     ) all_symbols;
     
     (* Remove identified stale orders. *)
@@ -755,15 +760,19 @@ let handle_snapshot json on_heartbeat =
       
       List.iter (fun (symbol, order_id) ->
         let store = get_symbol_store symbol in
-        Mutex.lock global_orders_mutex;
-        
-        if Hashtbl.mem store.open_orders order_id then begin
-          Hashtbl.remove store.open_orders order_id;
+        let was_present =
+          Mutex.lock store.orders_mutex;
+          let exists = Hashtbl.mem store.open_orders order_id in
+          if exists then Hashtbl.remove store.open_orders order_id;
+          Mutex.unlock store.orders_mutex;
+          exists
+        in
+        if was_present then begin
+          Mutex.lock global_orders_mutex;
           Hashtbl.remove order_to_symbol order_id;
+          Mutex.unlock global_orders_mutex;
           Logging.debug_f ~section "Removed stale order during reconciliation: %s [%s]" order_id symbol
-        end;
-        
-        Mutex.unlock global_orders_mutex;
+        end
       ) !stale_orders;
       
     end;
