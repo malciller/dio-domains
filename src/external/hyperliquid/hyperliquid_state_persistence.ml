@@ -206,3 +206,41 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fil
     with exn ->
       Logging.warn_f ~section "Failed to persist state for %s: %s" symbol (Printexc.to_string exn)
   )
+
+type save_request = {
+  symbol: string;
+  reserved_base: float;
+  accumulated_profit: float;
+  last_fill_oid: string option;
+  last_buy_fill_price: float option;
+  last_sell_fill_price: float option;
+}
+
+let save_queue : save_request Queue.t = Queue.create ()
+let save_queue_mutex = Mutex.create ()
+let save_cond = Condition.create ()
+
+let rec background_worker () =
+  Mutex.lock save_queue_mutex;
+  while Queue.is_empty save_queue do
+    Condition.wait save_cond save_queue_mutex
+  done;
+  let req = Queue.pop save_queue in
+  Mutex.unlock save_queue_mutex;
+
+  save ~symbol:req.symbol
+       ~reserved_base:req.reserved_base
+       ~accumulated_profit:req.accumulated_profit
+       ?last_fill_oid:req.last_fill_oid
+       ?last_buy_fill_price:req.last_buy_fill_price
+       ?last_sell_fill_price:req.last_sell_fill_price ();
+
+  background_worker ()
+
+let _worker_thread = Thread.create background_worker ()
+
+let save_async ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price ?last_sell_fill_price () =
+  Mutex.lock save_queue_mutex;
+  Queue.push { symbol; reserved_base; accumulated_profit; last_fill_oid; last_buy_fill_price; last_sell_fill_price } save_queue;
+  Condition.signal save_cond;
+  Mutex.unlock save_queue_mutex
