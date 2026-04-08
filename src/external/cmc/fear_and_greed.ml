@@ -87,7 +87,9 @@ let fetch_value ?(fallback = 50.0) () =
 let force_fetch_async ?(fallback = 50.0) () =
   ignore (Thread.create (fun () ->
     try
-      ignore (Lwt_main.run (fetch_value_lwt ~fallback ()))
+      Lwt_preemptive.run_in_main (fun () ->
+        fetch_value_lwt ~fallback () >>= fun _ -> Lwt.return_unit
+      )
     with exn ->
       Logging.error_f ~section "Exception in async fetch fear-and-greed: %s" (Printexc.to_string exn)
   ) ())
