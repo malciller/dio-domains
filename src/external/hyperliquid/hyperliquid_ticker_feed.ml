@@ -139,25 +139,29 @@ let process_market_data json =
       
       if mids <> [] then begin
         Logging.debug_f ~section "Received allMids with %d coins" (List.length mids);
+        let now_ts = Unix.gettimeofday () in
         
         List.iter (fun (coin, mid_json) ->
           match find_registered_symbol coin with
           | Some symbol ->
               (try
-                let mid = to_string mid_json |> float_of_string in
-                let ticker = {
-                  symbol;
-                  bid = mid;
-                  ask = mid;
-                  last = mid;
-                  volume = 0.0;
-                  timestamp = Unix.gettimeofday ();
-                } in
+                let mid_str = match mid_json with `String s -> s | _ -> to_string mid_json in
+                let mid = float_of_string mid_str in
                 let store = ensure_store symbol in
-                RingBuffer.write store.buffer ticker;
-                notify_ready store;
-                Concurrency.Exchange_wakeup.signal ~symbol;
-                Logging.debug_f ~section "Ticker: %s mid=%.2f" symbol mid
+                let changed = match RingBuffer.read_latest store.buffer with
+                  | Some t -> t.bid <> mid || t.ask <> mid
+                  | None -> true
+                in
+                if changed then begin
+                  let ticker = {
+                    symbol; bid = mid; ask = mid; last = mid;
+                    volume = 0.0; timestamp = now_ts;
+                  } in
+                  RingBuffer.write store.buffer ticker;
+                  notify_ready store;
+                  Concurrency.Exchange_wakeup.signal ~symbol;
+                  Logging.debug_f ~section "Ticker: %s mid=%.2f" symbol mid
+                end
               with exn ->
                 Logging.warn_f ~section "Failed to parse mid for %s: %s" coin (Printexc.to_string exn))
           | None -> ()
@@ -178,20 +182,22 @@ let process_market_data json =
               let ask_px = List.hd asks |> member "px" |> to_string |> float_of_string in
               let mid = (bid_px +. ask_px) /. 2.0 in
               
-              let ticker = {
-                symbol;
-                bid = bid_px;
-                ask = ask_px;
-                last = mid;
-                volume = 0.0;
-                timestamp = Unix.gettimeofday ();
-              } in
-              
               let store = ensure_store symbol in
-              RingBuffer.write store.buffer ticker;
-              notify_ready store;
-              Concurrency.Exchange_wakeup.signal ~symbol;
-              Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f (from l2Book)" symbol bid_px ask_px
+              let changed = match RingBuffer.read_latest store.buffer with
+                | Some t -> t.bid <> bid_px || t.ask <> ask_px
+                | None -> true
+              in
+              
+              if changed then begin
+                let ticker = {
+                  symbol; bid = bid_px; ask = ask_px; last = mid;
+                  volume = 0.0; timestamp = Unix.gettimeofday ();
+                } in
+                RingBuffer.write store.buffer ticker;
+                notify_ready store;
+                Concurrency.Exchange_wakeup.signal ~symbol;
+                Logging.debug_f ~section "Ticker: %s bid=%.2f ask=%.2f (from l2Book)" symbol bid_px ask_px
+              end
             end
           with exn ->
             Logging.warn_f ~section "Failed to parse l2Book for %s: %s" coin (Printexc.to_string exn))

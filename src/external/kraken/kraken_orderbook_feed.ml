@@ -664,7 +664,7 @@ let[@inline always] get_best_bid_ask symbol =
   | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
       let bid = bids.(0) in
       let ask = asks.(0) in
-      Some (bid.price, bid.size, ask.price, ask.size)
+      Some (bid.price_float, bid.size_float, ask.price_float, ask.size_float)
   | _ -> None
 
 (** Read all orderbook snapshots written since [last_pos]. Returns an empty list if the symbol is unknown. *)
