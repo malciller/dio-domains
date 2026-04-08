@@ -217,19 +217,18 @@ let get_strategy_state asset_symbol =
   state
 
 (** Mutex protecting all reserved_quote reads and writes across domains.
-    Lock order: state.mutex -> reservation_mutex -> strategy_states_mutex.
+    Lock order: state.mutex -> reservation_mutex.
     reservation_mutex is never held while waiting for state.mutex. *)
 let reservation_mutex = Mutex.create ()
 
-(** Sums reserved_quote for states matching [exchange]. Caller must hold reservation_mutex. *)
+(** Tracking total reserved quote per exchange to avoid O(N) strategy_states_mutex locking. *)
+let total_reserved_by_exchange : (string, float) Hashtbl.t = Hashtbl.create 4
+
+(** Gets the cached total reserved quote for [exchange]. Caller must hold reservation_mutex. *)
 let get_total_reserved_quote_locked ~exchange =
-  Mutex.lock strategy_states_mutex;
-  let total = Hashtbl.fold (fun _key state acc ->
-    if state.exchange_id = exchange then acc +. state.reserved_quote
-    else acc
-  ) strategy_states 0.0 in
-  Mutex.unlock strategy_states_mutex;
-  total
+  match Hashtbl.find_opt total_reserved_by_exchange exchange with
+  | Some total -> total
+  | None -> 0.0
 
 (** Acquires reservation_mutex and returns total reserved_quote for [exchange].
     Safe to call outside state.mutex. *)
@@ -243,7 +242,12 @@ let get_total_reserved_quote ~exchange =
     May be called from inside state.mutex (respects lock order). *)
 let set_asset_reserved_quote state v =
   Mutex.lock reservation_mutex;
+  let diff = v -. state.reserved_quote in
   state.reserved_quote <- v;
+  if state.exchange_id <> "" then begin
+    let current_total = get_total_reserved_quote_locked ~exchange:state.exchange_id in
+    Hashtbl.replace total_reserved_by_exchange state.exchange_id (current_total +. diff)
+  end;
   Mutex.unlock reservation_mutex
 
 (** Atomically checks available quote balance and reserves for a buy if sufficient.
@@ -254,7 +258,13 @@ let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
   let total_reserved = get_total_reserved_quote_locked ~exchange:state.exchange_id in
   let available = quote_bal -. total_reserved in
   let ok = available >= quote_needed in
-  if ok then state.reserved_quote <- reserve_amount;
+  if ok then begin
+    let diff = reserve_amount -. state.reserved_quote in
+    state.reserved_quote <- reserve_amount;
+    if state.exchange_id <> "" then begin
+      Hashtbl.replace total_reserved_by_exchange state.exchange_id (total_reserved +. diff)
+    end
+  end;
   Mutex.unlock reservation_mutex;
   (ok, available, total_reserved)
 
@@ -554,6 +564,7 @@ let execute_strategy
     (cycle : int) =
 
   let state = match cached_state with Some s -> s | None -> get_strategy_state asset.symbol in
+  if state.exchange_id = "" then state.exchange_id <- asset.exchange;
   let ecfg = state.cached_ecfg in
 
   (* Only proceed with main strategy if capital_low flag is clear.
@@ -1691,7 +1702,7 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                    as the tracked buy. Doing so resurrects ghost orders from stale
                    orderUpdate websocket events, causing duplicate/ghost order
                    detection when combined with fresh placements. *)
-                Logging.info_f ~section "Ignoring amendment for untracked buy order %s -> %s for %s"
+                Logging.debug_f ~section "Ignoring amendment for untracked buy order %s -> %s for %s"
                   old_order_id new_order_id asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
