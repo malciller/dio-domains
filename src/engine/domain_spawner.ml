@@ -348,7 +348,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let cached_fng_check_threshold = config.fng_check_threshold in
 
       while Atomic.get state.is_running do
-        let t0 = Mtime_clock.now_ns () in
+        (* Snapshot the gate at cycle start: all recording decisions within
+           this cycle use the snapshot so that a mid-cycle flip from false
+           to true never pairs a real timestamp against a stale 0L. *)
+        let latency_this_cycle = !latency_active in
+        let t0 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
@@ -383,8 +387,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  asset_with_fees.exchange asset_with_fees.symbol ((bid +. ask) /. 2.0)
            | None -> ());
         end;
-        let t1 = Mtime_clock.now_ns () in
-        if did_ticker && !latency_active then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub t1 t0));
+        let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
+        if did_ticker && latency_this_cycle then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub t1 t0));
         
         (* Consume pending orderbook events from the ring buffer by snapping to the latest. *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
@@ -400,8 +404,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  bid_price bid_size ask_price ask_size
            | None -> ());
         end;
-        let t2 = Mtime_clock.now_ns () in
-        if did_ob && !latency_active then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
+        let t2 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
+        if did_ob && latency_this_cycle then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
         
         (* Consume pending execution events from the ring buffer *)
         let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
@@ -510,8 +514,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           exec_read_pos := new_pos;
           hl_exec_checked := true;
         end;
-        let t3 = Mtime_clock.now_ns () in
-        if did_exec && !latency_active then Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub t3 t2));
+        let t3 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
+        if did_exec && latency_this_cycle then Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub t3 t2));
         (* Fallback gate for Hyperliquid domains with no open orders: if no
            exec events arrived and the startup snapshot injection is complete,
            open the gate so the strategy can place its initial order. *)
@@ -636,8 +640,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance !mm_open_buy_count !mm_open_sell_count iter_orders !cycle_count
            | _ -> ());
         end;
-        let t4 = Mtime_clock.now_ns () in
-        if should_execute && !latency_active then Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub t4 t3));
+        let t4 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
+        if should_execute && latency_this_cycle then Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub t4 t3));
 
         (* Flush deferred accumulation persistence outside the strategy hotloop.
            Only performs file I/O when the dirty flag was set during execute_strategy. *)
@@ -662,7 +666,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Record cycle work time before blocking. Captures active processing
            latency only, excluding sleep time in Exchange_wakeup.wait. *)
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t0) in
-        if !latency_active then Latency_profiler.record prof_cycle cycle_span;
+        if latency_this_cycle then Latency_profiler.record prof_cycle cycle_span;
 
         (* Flush latency reports periodically, gated by cycle_mod to avoid
            5 threshold checks per cycle on the hot path. *)
