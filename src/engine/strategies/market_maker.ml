@@ -478,52 +478,48 @@ let execute_strategy
 
   let now = Unix.time () in
 
-      (* Evict stale pending orders (older than 5s) and cap list at 50 entries *)
-  let original_count = List.length state.pending_orders in
-  state.pending_orders <- List.filter (fun (order_id, side, _, timestamp) ->
-    let age = now -. timestamp in
-    if age > 5.0 then begin
-      if should_log then Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
-      
-      (* Release global trackers to permit immediate re-placement *)
-      if String.starts_with ~prefix:"pending_amend_" order_id then begin
-        let target_oid = String.sub order_id 14 (String.length order_id - 14) in
-        ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
-      end else begin
-        let duplicate_key = generate_side_duplicate_key asset.symbol side in
-        ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-        (* Clear inflight flags for stale placements *)
-        (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
-      end;
-      false
-    end else
-      true
-  ) state.pending_orders;
-
-  (* Cap pending orders at 50 to bound memory usage *)
-  if List.length state.pending_orders > 50 then begin
-    let excess = List.length state.pending_orders - 50 in
-    state.pending_orders <- take 50 state.pending_orders;
-    if should_log then Logging.warn_f ~section "Truncated %d excess pending orders for %s (kept 50)" excess asset.symbol;
-  end;
-
-  (* Log if we cleaned up many orders *)
-  let cleaned_count = original_count - List.length state.pending_orders in
-  if cleaned_count > 0 && should_log then
-    Logging.debug_f ~section "Cleaned up %d pending orders for %s" cleaned_count asset.symbol;
+  (* Clean up stale pending orders and enforce a hard limit in a single pass. *)
+  let (kept_pending_rev, kept_pending_count, removed_pending_count) =
+    List.fold_left (fun (acc, kept, removed) ((order_id, side, _, timestamp) as entry) ->
+      let age = now -. timestamp in
+      if age > 5.0 then begin
+        if should_log then Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
+        
+        (* Release global trackers to permit immediate re-placement *)
+        if String.starts_with ~prefix:"pending_amend_" order_id then begin
+          let target_oid = String.sub order_id 14 (String.length order_id - 14) in
+          ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
+        end else begin
+          let duplicate_key = generate_side_duplicate_key asset.symbol side in
+          ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+          (* Clear inflight flags for stale placements *)
+          (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
+        end;
+        (acc, kept, removed + 1)
+      end else if kept >= 50 then
+        (acc, kept, removed + 1)  (* silently drop excess beyond hard limit *)
+      else
+        (entry :: acc, kept + 1, removed)
+    ) ([], 0, 0) state.pending_orders
+  in
+  state.pending_orders <- List.rev kept_pending_rev;
+  if removed_pending_count > 0 && should_log then
+    Logging.debug_f ~section "Cleaned up %d pending orders for %s (kept %d)" removed_pending_count asset.symbol kept_pending_count;
 
   (* Evict cancelled order blacklist entries older than 15s; cap at 20 *)
-  let original_cancelled_count = List.length state.cancelled_orders in
-  state.cancelled_orders <- List.filter (fun (_, timestamp) ->
-    now -. timestamp < 15.0
-  ) state.cancelled_orders;
-
-  (* Cap cancelled orders blacklist at 20 to bound memory usage *)
-  if List.length state.cancelled_orders > 20 then begin
-    let excess = List.length state.cancelled_orders - 20 in
-    state.cancelled_orders <- take 20 state.cancelled_orders;
-    if should_log then Logging.warn_f ~section "Truncated %d excess cancelled orders for %s (kept 20)" excess asset.symbol;
-  end;
+  let (kept_cancelled_rev, kept_cancelled_count, removed_cancelled_count) =
+    List.fold_left (fun (acc, kept, removed) ((_oid, timestamp) as entry) ->
+      if now -. timestamp > 15.0 then
+        (acc, kept, removed + 1)
+      else if kept >= 20 then
+        (acc, kept, removed + 1)
+      else
+        (entry :: acc, kept + 1, removed)
+    ) ([], 0, 0) state.cancelled_orders
+  in
+  state.cancelled_orders <- List.rev kept_cancelled_rev;
+  if removed_cancelled_count > 0 && should_log then
+    Logging.debug_f ~section "Cleaned up %d cancelled orders for %s (kept %d)" removed_cancelled_count asset.symbol kept_cancelled_count;
 
   (* Evict stale pending cancellations (older than 30s) via scan-and-remove *)
   let to_remove = ref [] in
@@ -536,11 +532,6 @@ let execute_strategy
     if should_log then Logging.debug_f ~section "Removing stale pending cancellation %s for %s" order_id asset.symbol;
     Hashtbl.remove state.pending_cancellations order_id
   ) !to_remove;
-
-  (* Log if we cleaned up many cancelled orders *)
-  let cleaned_cancelled_count = original_cancelled_count - List.length state.cancelled_orders in
-  if cleaned_cancelled_count > 0 && should_log then
-    Logging.debug_f ~section "Cleaned up %d cancelled orders for %s" cleaned_cancelled_count asset.symbol;
 
 
   (* state.mutex is intentionally not locked in this function.
@@ -699,12 +690,12 @@ let execute_strategy
           (* Update sell order tracking *)
           state.open_sell_orders <- !sell_orders;
 
-          (* Cancel all open buy orders; deduplicate tracked and exchange-reported order IDs *)
-          let buys_to_cancel = 
-            let tracked_id = match state.last_buy_order_id with Some id -> [id] | None -> [] in
-            let open_ids = List.map (fun (id, _) -> id) !buy_orders in
-            List.sort_uniq String.compare (tracked_id @ open_ids) 
-          in
+          (* Cancel all open buy orders; deduplicate tracked and exchange-reported order IDs without @ concatenation *)
+          let buys_to_cancel = ref (List.map (fun (id, _) -> id) !buy_orders) in
+          (match state.last_buy_order_id with
+           | Some id when not (List.mem id !buys_to_cancel) -> buys_to_cancel := id :: !buys_to_cancel
+           | _ -> ());
+          let buys_to_cancel = !buys_to_cancel in
           
           List.iter (fun buy_id ->
              let cancel_order = create_cancel_order buy_id asset.symbol MM asset.exchange in
