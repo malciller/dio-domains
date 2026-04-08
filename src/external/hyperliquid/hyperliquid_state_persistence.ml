@@ -237,7 +237,7 @@ let rec background_worker () =
 
   background_worker ()
 
-let _worker_thread = Thread.create background_worker ()
+let () = ignore (Domain.spawn background_worker)
 
 let save_async ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price ?last_sell_fill_price () =
   Mutex.lock save_queue_mutex;
