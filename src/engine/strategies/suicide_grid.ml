@@ -1053,22 +1053,22 @@ let execute_strategy
       end else if effective_buy_count > 0 then begin
         (* Case 2: open buy exists; check sell orders for spacing enforcement. *)
         (* Combine active and pending sell orders for spacing calculation. *)
-        let all_sell_orders = state.open_sell_orders @ (
-          List.filter_map (fun (id, side, price, _) ->
-            if side = Sell then Some (id, price, 0.0) else None
-          ) state.pending_orders
-        ) in
+        let closest_sell_order = ref None in
+        let update_closest oid price =
+          match !closest_sell_order with
+          | None -> closest_sell_order := Some (oid, price)
+          | Some (_, best_price) ->
+              if price < best_price then closest_sell_order := Some (oid, price)
+        in
         
-        if all_sell_orders <> [] then begin
-          (* Find the closest sell order. *)
-          let closest_sell_order = List.fold_left (fun acc (order_id, sell_price, _) ->
-            match acc with
-            | None -> Some (order_id, sell_price)
-            | Some (_, best_price) ->
-                if sell_price < best_price then Some (order_id, sell_price) else acc
-          ) None all_sell_orders in
-
-          match closest_sell_order, state.last_buy_order_price, state.last_buy_order_id with
+        List.iter (fun (oid, price, _) -> update_closest oid price) state.open_sell_orders;
+        List.iter (fun (oid, side, price, _) -> 
+          if side = Sell then update_closest oid price
+        ) state.pending_orders;
+        
+        let closest_sell_order_val = !closest_sell_order in
+        if closest_sell_order_val <> None then begin
+          match closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id with
           | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
               (* Calculate distance from buy to sell as absolute dollar amount. *)
               let distance = sell_price -. current_buy_price in
