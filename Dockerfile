@@ -104,8 +104,8 @@ ENV LD_PRELOAD=libjemalloc.so.2
 # 14. jemalloc tuning: fast dirty/muzzy page decay, limited arenas for OCaml 5
 ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 
-# 15. OCaml runtime GC defaults (belt-and-suspenders; config.json Gc.set overrides)
-ENV OCAMLRUNPARAM="s=2M,o=40,O=50,w=1"
+# 15. OCaml runtime GC defaults (Forces OCaml 5 minor_heap_size scaling per-domain natively)
+ENV OCAMLRUNPARAM="s=4194304,o=2000,O=8000,h=100,w=1"
 
 # 16. Expose metrics broadcast port
 EXPOSE 8080
