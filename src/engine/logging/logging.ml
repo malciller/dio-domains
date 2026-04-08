@@ -81,7 +81,12 @@ let format_timestamp =
 
 (* Core synchronous logging function. Domain-safe via [output_mutex].
    Intentionally avoids Lwt: domain workers lack a Lwt scheduler,
-   and Lwt.async from domains would leak promises into the main scheduler. *)
+   and Lwt.async from domains would leak promises into the main scheduler.
+
+   Performance: flush is deferred to the OS stdio buffer for DEBUG/INFO
+   levels. Only WARN and above trigger an explicit flush, ensuring error
+   messages are visible immediately after a crash while keeping the
+   output_mutex hold time minimal on the hot path. *)
 let log_sync level section_name message =
   let section = get_section section_name in
   if (!enabled_sections <> [] && not (List.mem section_name !enabled_sections)) ||
@@ -106,7 +111,10 @@ let log_sync level section_name message =
     (try
        output_string !output_channel formatted;
        output_char !output_channel '\n';
-       flush !output_channel;
+       (* Flush only on WARN+ to ensure error/crash messages are visible.
+          DEBUG/INFO rely on OS stdio buffering for throughput. *)
+       if level_to_int level >= level_to_int WARN then
+         flush !output_channel;
        Mutex.unlock output_mutex
      with exn ->
        Mutex.unlock output_mutex;

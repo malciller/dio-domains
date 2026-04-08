@@ -252,3 +252,27 @@ let read_config () : config =
     Logging.warn_f ~section "Cannot read config.json: %s, using defaults" msg;
     { cycle_mod = 10000; logging = { level = Logging.INFO; sections = [] };
       gc = None; trading = [] }
+
+(** Cached GC config, parsed once on first access. Thread-safe via Lazy. *)
+let cached_gc_config : gc_config option Lazy.t = lazy (
+  let config = read_config () in
+  config.gc
+)
+
+(** Apply GC tuning parameters from the cached config. Must be called
+    once per OCaml 5 domain (each domain has its own minor heap).
+    No-op if [gc] is absent from config.json. *)
+let apply_gc_config () =
+  match Lazy.force cached_gc_config with
+  | None -> ()
+  | Some gc ->
+      let ctrl = Gc.get () in
+      Gc.set { ctrl with
+        minor_heap_size = gc.minor_heap_size;
+        space_overhead = gc.space_overhead;
+        max_overhead = gc.max_overhead;
+        window_size = gc.window_size;
+        allocation_policy = gc.allocation_policy;
+        major_heap_increment = gc.major_heap_increment;
+      }
+

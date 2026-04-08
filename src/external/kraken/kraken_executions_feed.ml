@@ -421,8 +421,13 @@ let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
   RingBuffer.get_position store.events_buffer
 
-(** Reconciles the open orders table from an incoming execution event. *)
+(** Reconciles the open orders table from an incoming execution event.
+    Logging is deferred until after the mutex is released to avoid holding
+    global_orders_mutex while contending on the logging output_mutex. *)
 let update_open_orders store (event : execution_event) =
+  (* Deferred log signal: captures what to log after mutex release. *)
+  let log_action = ref `None in
+
   Mutex.lock global_orders_mutex;
   
   (* Determine terminal state primarily from order_status. *)
@@ -443,32 +448,14 @@ let update_open_orders store (event : execution_event) =
   
   if is_terminal_status || is_effectively_filled then begin
     (* Terminal: remove from open orders if present. *)
-    if Hashtbl.mem store.open_orders event.order_id then begin
+    let was_tracked = Hashtbl.mem store.open_orders event.order_id in
+    if was_tracked then begin
       Hashtbl.remove store.open_orders event.order_id;
-      
-      (* Remove global mapping only on explicit terminal status to avoid dropping late fill events that rely on the index for symbol resolution. *)
       if is_terminal_status then
         Hashtbl.remove order_to_symbol event.order_id;
-      
-      if is_terminal_status then
-        Logging.debug_f ~section "Removed order: %s [%s] status=%s exec_type=%s"
-          event.order_id event.symbol 
-          (string_of_order_status event.order_status)
-          (string_of_exec_type event.exec_type)
-      else
-        Logging.debug_f ~section "Removed order with zero remaining qty: %s [%s] status=%s exec_type=%s remaining=%.12f qty=%.12f"
-          event.order_id event.symbol
-          (string_of_order_status event.order_status)
-          (string_of_exec_type event.exec_type)
-          remaining_qty event.order_qty
+      log_action := if is_terminal_status then `Removed_terminal else `Removed_zero_qty remaining_qty
     end else begin
-      (* Terminal event for an untracked order (e.g., pre-startup cancellation). *)
-      if is_terminal_status then
-        Logging.debug_f ~section "Terminal event for untracked order: %s [%s] status=%s"
-          event.order_id event.symbol (string_of_order_status event.order_status)
-      else
-        Logging.debug_f ~section "Ignored effectively filled order for untracked id: %s [%s] status=%s"
-          event.order_id event.symbol (string_of_order_status event.order_status)
+      log_action := if is_terminal_status then `Terminal_untracked else `Filled_untracked
     end
   end else begin
     (* Non-terminal: upsert into open orders. *)
@@ -494,35 +481,55 @@ let update_open_orders store (event : execution_event) =
     (* Update global order-to-symbol index with FIFO eviction if cap exceeded. *)
     add_to_order_to_symbol event.order_id event.symbol;
 
-    if not was_present && Hashtbl.length store.open_orders > 1000 then
-      trigger_stale_order_cleanup ~reason:"open_orders_exceeds_1000" ();
-    
-    if was_present then begin
-      Logging.debug_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
-        event.order_id event.symbol remaining_qty 
-        (Option.value event.limit_price ~default:0.0) 
-        event.cum_qty event.order_qty
-        (string_of_order_status event.order_status)
-    end else begin
-      Logging.debug_f ~section "Added new open order: %s [%s] %s side %.8f@%.2f status=%s"
-        event.order_id event.symbol 
-        (string_of_side event.side)
-        event.order_qty
-        (Option.value event.limit_price ~default:0.0)
-        (string_of_order_status event.order_status)
-    end;
-    
-    (* Log trade fills at info level for real-time monitoring. *)
-    if event.exec_type = Trade then begin
-      Logging.info_f ~section "Trade fill: %s [%s] qty=%.8f price=%.2f (total filled: %.8f/%.8f)"
-        event.order_id event.symbol 
-        (Option.value event.last_qty ~default:0.0)
-        (Option.value event.last_price ~default:0.0)
-        event.cum_qty event.order_qty
-    end
+    let needs_cleanup = not was_present && Hashtbl.length store.open_orders > 1000 in
+    log_action := `Upserted (was_present, needs_cleanup, remaining_qty)
   end;
   
-  Mutex.unlock global_orders_mutex
+  Mutex.unlock global_orders_mutex;
+
+  (* Deferred logging: outside the critical section. *)
+  (match !log_action with
+   | `Removed_terminal ->
+       Logging.debug_f ~section "Removed order: %s [%s] status=%s exec_type=%s"
+         event.order_id event.symbol 
+         (string_of_order_status event.order_status)
+         (string_of_exec_type event.exec_type)
+   | `Removed_zero_qty rq ->
+       Logging.debug_f ~section "Removed order with zero remaining qty: %s [%s] status=%s exec_type=%s remaining=%.12f qty=%.12f"
+         event.order_id event.symbol
+         (string_of_order_status event.order_status)
+         (string_of_exec_type event.exec_type)
+         rq event.order_qty
+   | `Terminal_untracked ->
+       Logging.debug_f ~section "Terminal event for untracked order: %s [%s] status=%s"
+         event.order_id event.symbol (string_of_order_status event.order_status)
+   | `Filled_untracked ->
+       Logging.debug_f ~section "Ignored effectively filled order for untracked id: %s [%s] status=%s"
+         event.order_id event.symbol (string_of_order_status event.order_status)
+   | `Upserted (was_present, needs_cleanup, remaining_qty) ->
+       if needs_cleanup then
+         trigger_stale_order_cleanup ~reason:"open_orders_exceeds_1000" ();
+       if was_present then
+         Logging.debug_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
+           event.order_id event.symbol remaining_qty 
+           (Option.value event.limit_price ~default:0.0) 
+           event.cum_qty event.order_qty
+           (string_of_order_status event.order_status)
+       else
+         Logging.debug_f ~section "Added new open order: %s [%s] %s side %.8f@%.2f status=%s"
+           event.order_id event.symbol 
+           (string_of_side event.side)
+           event.order_qty
+           (Option.value event.limit_price ~default:0.0)
+           (string_of_order_status event.order_status);
+       (* Log trade fills at info level for real-time monitoring. *)
+       if event.exec_type = Trade then
+         Logging.info_f ~section "Trade fill: %s [%s] qty=%.8f price=%.2f (total filled: %.8f/%.8f)"
+           event.order_id event.symbol 
+           (Option.value event.last_qty ~default:0.0)
+           (Option.value event.last_price ~default:0.0)
+           event.cum_qty event.order_qty
+   | `None -> ())
 
 (** Parses an optional float from JSON. Delegates to Kraken_common_types. *)
 let parse_float_opt = Kraken_common_types.parse_float_opt

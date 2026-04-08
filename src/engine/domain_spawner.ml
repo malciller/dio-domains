@@ -945,6 +945,9 @@ let spawn_domains_for_assets (config : config) (fee_fetcher : trading_config -> 
 (* Top-level entrypoint: reads config and spawns domains for all trading assets. *)
 let spawn_config_domains (fee_fetcher : trading_config -> trading_config) () : unit Domain.t list =
   let full_config = read_config () in
+  (* Apply GC tuning on the main domain before spawning workers.
+     Runtime inherits these settings for all subsequently spawned domains. *)
+  apply_gc_config ();
   let configs = full_config.trading in
   Logging.debug_f ~section "Preparing to spawn domains for %d assets..." (List.length configs);
   spawn_domains_for_assets full_config fee_fetcher configs
