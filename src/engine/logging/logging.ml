@@ -53,12 +53,25 @@ let get_section name =
       Mutex.unlock output_mutex;
       s
 
+let dummy_section = { name = ""; min_level = CRITICAL }
+let tls_section_cache = Domain.DLS.new_key (fun () -> ("", dummy_section))
+
 (** Returns true if [level] passes both the section and global minimum
-    level filters. Used as a guard to skip allocation on disabled paths. *)
+    level filters. Used as a guard to skip allocation on disabled paths.
+    Uses Domain.DLS to aggressively cache the last localized section lookup,
+    eliminating Hashtbl lookup overhead on the hot path. *)
 let will_log level section_name =
-  let section = get_section section_name in
+  let (last_name, section) = Domain.DLS.get tls_section_cache in
+  let sec =
+    if section_name == last_name || String.equal section_name last_name then section
+    else begin
+      let s = get_section section_name in
+      Domain.DLS.set tls_section_cache (section_name, s);
+      s
+    end
+  in
   (!enabled_sections = [] || List.mem section_name !enabled_sections) &&
-  level_to_int level >= level_to_int section.min_level &&
+  level_to_int level >= level_to_int sec.min_level &&
   level_to_int level >= level_to_int !global_min_level
 
 (* Formats the current wall-clock time as "YYYY-MM-DD HH:MM:SS.mmm".
