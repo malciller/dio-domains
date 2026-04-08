@@ -369,33 +369,36 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           Logging.debug_f ~section "Asset [%s/%s] cycle #%d"
             asset_with_fees.exchange asset_with_fees.symbol !cycle_count;
         
-        (* Consume pending ticker events from the ring buffer *)
+        (* Consume pending ticker events from the ring buffer by snapping to the latest.
+           Skipping intermediate events eliminates useless allocations and GC pressure. *)
         let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
         if ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) then begin
           let start_ticker = Mtime_clock.now_ns () in
-          ticker_read_pos := Ex.iter_ticker_events ~symbol:asset_with_fees.symbol ~start_pos:!ticker_read_pos (fun (ticker : Types.ticker_event) ->
-            current_price := Some ((ticker.bid +. ticker.ask) /. 2.0);
-            should_execute_strategy := true;
-            Logging.debug_f ~section "Asset [%s/%s]: Consumed ticker event - price=$%.2f"
-              asset_with_fees.exchange asset_with_fees.symbol ((ticker.bid +. ticker.ask) /. 2.0)
-          );
+          ticker_read_pos := ticker_pos;  (* Fast-forward to latest *)
+          (match Ex.get_ticker ~symbol:asset_with_fees.symbol with
+           | Some (bid, ask) ->
+               current_price := Some ((bid +. ask) /. 2.0);
+               should_execute_strategy := true;
+               Logging.debug_f ~section "Asset [%s/%s]: Snapped to latest ticker - price=$%.2f"
+                 asset_with_fees.exchange asset_with_fees.symbol ((bid +. ask) /. 2.0)
+           | None -> ());
           let stop_ticker = Mtime_clock.now_ns () in
           if !latency_active then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
         end;
         
-        (* Consume pending orderbook events from the ring buffer.
-           Uses iter_top_of_book_events to avoid allocating converted
-           (float*float) arrays per event — the loop only needs BBO. *)
+        (* Consume pending orderbook events from the ring buffer by snapping to the latest. *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
         if ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) then begin
           let start_ob = Mtime_clock.now_ns () in
-          orderbook_read_pos := Ex.iter_top_of_book_events ~symbol:asset_with_fees.symbol ~start_pos:!orderbook_read_pos (fun bid_price bid_size ask_price ask_size ->
-            top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
-            should_execute_strategy := true;
-            Logging.debug_f ~section "Asset [%s/%s]: Consumed orderbook event - bid=$%.2f x %.4f, ask=$%.2f x %.4f"
-              asset_with_fees.exchange asset_with_fees.symbol
-              bid_price bid_size ask_price ask_size
-          );
+          orderbook_read_pos := ob_pos;  (* Fast-forward to latest *)
+          (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
+           | Some (bid_price, bid_size, ask_price, ask_size) ->
+               top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
+               should_execute_strategy := true;
+               Logging.debug_f ~section "Asset [%s/%s]: Snapped to latest orderbook - bid=$%.2f x %.4f, ask=$%.2f x %.4f"
+                 asset_with_fees.exchange asset_with_fees.symbol
+                 bid_price bid_size ask_price ask_size
+           | None -> ());
           let stop_ob = Mtime_clock.now_ns () in
           if !latency_active then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
         end;
