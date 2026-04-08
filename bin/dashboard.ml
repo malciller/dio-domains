@@ -607,27 +607,24 @@ let render_latencies w json =
       let samples = data |?> "samples" |> to_int_d 0 in
       let empty   = samples = 0 in
       let (warn, crit) = latency_thresholds label in
-      let lat_attr ~is_p999 f =
+      let lat_attr f =
         if empty then a_dim
-        else
-          (* p999 gets 2x slack — tail spikes are expected *)
-          let mult = if is_p999 then 2.0 else 1.0 in
-          if f > crit *. mult then a_red
-          else if f > warn *. mult then a_yellow
-          else a_green
+        else if f > crit then a_red
+        else if f > warn then a_yellow
+        else a_green
       in
-      let lat_col ~is_p999 f =
+      let lat_col f =
         if empty then col 10 a_dim "--"
-        else col 10 (lat_attr ~is_p999 f) (format_latency_us f)
+        else col 10 (lat_attr f) (format_latency_us f)
       in
       I.hcat [
         I.string a_text "  ";
         col 14 (if empty then a_dim else a_bright) (truncate_string 13 symbol);
         col metric_w (if empty then a_dim else a_cyan) (truncate_string (metric_w - 1) label);
-        lat_col ~is_p999:false p50;
-        lat_col ~is_p999:false p90;
-        lat_col ~is_p999:false p99;
-        lat_col ~is_p999:true  p999;
+        lat_col p50;
+        lat_col p90;
+        lat_col p99;
+        lat_col p999;
         col 10 a_dim (if empty then "--" else string_of_int samples);
       ]
     ) mlist
