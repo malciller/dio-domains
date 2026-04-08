@@ -234,13 +234,10 @@ module Kraken_impl = struct
     Kraken_ticker_feed.subscribe_ticker symbol
 
   (** Return best bid/ask as [(bid_price, bid_size, ask_price, ask_size)] floats.
-      [Kraken_orderbook_feed.get_best_bid_ask] returns string values;
-      each is parsed to float here, defaulting to [0.0] on parse failure. *)
+      Directly consumes float values provided by [Kraken_orderbook_feed.get_best_bid_ask]. *)
   let get_top_of_book ~symbol =
     match Kraken_orderbook_feed.get_best_bid_ask symbol with
-    | Some (bp, bs, ap, as_val) ->
-        let safe_float s = try float_of_string s with _ -> 0.0 in
-        Some (safe_float bp, safe_float bs, safe_float ap, safe_float as_val)
+    | Some (bp, bs, ap, as_val) -> Some (bp, bs, ap, as_val)
     | None -> None
 
   (** Return the current balance for [asset] from the balances feed cache. *)
