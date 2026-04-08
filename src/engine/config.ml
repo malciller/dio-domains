@@ -33,6 +33,7 @@ type config = {
   logging: logging_config;
   gc: gc_config option;
   trading: trading_config list;
+  fng_check_threshold: float;
 }
 
 (** Logging section identifier for this module. *)
@@ -41,7 +42,7 @@ let section = "config"
 (** Permitted key sets used by [validate_keys] for strict schema enforcement at each nesting level. *)
 let known_top_level_keys =
   [ "logging_level"; "logging_sections"; "cycle_mod";
-    "engine"; "trading"; "gc" ]
+    "engine"; "trading"; "gc"; "fng_check_threshold" ]
 
 let known_engine_keys = []
 
@@ -243,7 +244,8 @@ let read_config () : config =
     let logging = parse_logging_config json in
     let gc = parse_gc_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
-    { cycle_mod; logging; gc; trading }
+    let fng_check_threshold = json |> member "fng_check_threshold" |> to_float_option |> Option.value ~default:1.5 in
+    { cycle_mod; logging; gc; trading; fng_check_threshold }
   with
   | Yojson.Json_error msg ->
     Logging.critical_f ~section "Failed to parse config.json: %s" msg;
@@ -251,7 +253,7 @@ let read_config () : config =
   | Sys_error msg ->
     Logging.warn_f ~section "Cannot read config.json: %s, using defaults" msg;
     { cycle_mod = 10000; logging = { level = Logging.INFO; sections = [] };
-      gc = None; trading = [] }
+      gc = None; trading = []; fng_check_threshold = 1.5 }
 
 (** Cached GC config, parsed once on first access. Thread-safe via Lazy. *)
 let cached_gc_config : gc_config option Lazy.t = lazy (

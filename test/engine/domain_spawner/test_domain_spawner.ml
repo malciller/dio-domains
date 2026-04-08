@@ -42,6 +42,7 @@ let test_spawn_domains_basic () =
     logging = { level = Logging.INFO; sections = [] };
     gc = None;
     trading = assets;
+    fng_check_threshold = 1.5;
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher assets in
 
@@ -58,6 +59,7 @@ let test_spawn_domains_empty () =
     logging = { level = Logging.INFO; sections = [] };
     gc = None;
     trading = [];
+    fng_check_threshold = 1.5;
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [] in
 
@@ -119,6 +121,7 @@ let test_domain_error_handling () =
     logging = { level = Logging.INFO; sections = [] };
     gc = None;
     trading = [failing_asset];
+    fng_check_threshold = 1.5;
   } in
   let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [failing_asset] in
   (* Give domains a moment to potentially fail *)

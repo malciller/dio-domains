@@ -137,6 +137,7 @@ Strategies (e.g., `market_maker`, `suicide_grid`) operate generically over `Exch
 2. **Order Tracking**: Strategies track orders via `cl_ord_id` or `order_userref`. Implementations must store and return these identifiers in `add_order_result` and propagate them through execution events.
 3. **Balance Checks**: Strategies pause when `get_balance` returns insufficient funds. This value must stay current via WebSocket or periodic REST polling.
 4. **Zero-Allocation Iteration**: Hot-path strategies use `iter_ticker_events`, `iter_orderbook_events`, `iter_execution_events`, and `fold_open_orders` to avoid per-tick list allocations.
+5. **Dynamic Fear & Greed Re-evaluation**: Engine supervisors monitor price variations across ticker events. When price movement exceeds the dynamically configured `fng_check_threshold` (set in `config.json`), strategies trigger a Fear & Greed index recalculation. Timely ticker feeds are essential for accurate threshold adherence.
 
 ## Order Handling Specification
 

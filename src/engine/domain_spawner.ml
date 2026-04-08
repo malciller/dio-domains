@@ -344,6 +344,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         | Some _ -> Some (Dio_strategies.Market_maker.get_strategy_state asset_with_fees.symbol)
         | None -> None in
 
+      let cached_fng_check_threshold = config.fng_check_threshold in
+
       while Atomic.get state.is_running do
         let cycle_start = Mtime_clock.now_ns () in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
@@ -558,7 +560,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 | None -> baseline_price := Some cp
                 | Some base ->
                     let diff_pct = abs_float ((cp -. base) /. base) *. 100.0 in
-                    if diff_pct >= 1.5 then begin
+                    if diff_pct >= cached_fng_check_threshold then begin
                       Logging.info_f ~section "[%s/%s] Price moved by %.2f%% from baseline $%.2f to $%.2f. Triggering dynamic Fear & Greed check."
                         asset_with_fees.exchange asset_with_fees.symbol diff_pct base cp;
                       baseline_price := Some cp;
