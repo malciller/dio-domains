@@ -607,24 +607,33 @@ let render_latencies w json =
       let samples = data |?> "samples" |> to_int_d 0 in
       let empty   = samples = 0 in
       let (warn, crit) = latency_thresholds label in
-      let lat_attr f =
-        if empty then a_dim
-        else if f > crit then a_red
-        else if f > warn then a_yellow
-        else a_green
+      (* Severity: 0=green, 1=yellow, 2=red, 3=dim *)
+      let severity f =
+        if empty then 3
+        else if f > crit then 2
+        else if f > warn then 1
+        else 0
       in
-      let lat_col f =
+      let attr_of_sev = function
+        | 2 -> a_red | 1 -> a_yellow | 0 -> a_green | _ -> a_dim
+      in
+      (* Enforce monotonicity: each column at least as severe as its left neighbour *)
+      let s50  = severity p50 in
+      let s90  = max s50 (severity p90) in
+      let s99  = max s90 (severity p99) in
+      let s999 = max s99 (severity p999) in
+      let lat_col sev f =
         if empty then col 10 a_dim "--"
-        else col 10 (lat_attr f) (format_latency_us f)
+        else col 10 (attr_of_sev sev) (format_latency_us f)
       in
       I.hcat [
         I.string a_text "  ";
         col 14 (if empty then a_dim else a_bright) (truncate_string 13 symbol);
         col metric_w (if empty then a_dim else a_cyan) (truncate_string (metric_w - 1) label);
-        lat_col p50;
-        lat_col p90;
-        lat_col p99;
-        lat_col p999;
+        lat_col s50  p50;
+        lat_col s90  p90;
+        lat_col s99  p99;
+        lat_col s999 p999;
         col 10 a_dim (if empty then "--" else string_of_int samples);
       ]
     ) mlist
