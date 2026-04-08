@@ -256,6 +256,10 @@ module type S = sig
       list. Applies [f] to each open order, threading the accumulator. *)
   val fold_open_orders : symbol:string -> init:'a -> f:('a -> Types.open_order -> 'a) -> 'a
 
+  (** Fast path iterator that avoids creating Types.open_order intermediate records.
+      Yields primitive order values to the provided closure callback directly. *)
+  val iter_open_orders_fast : symbol:string -> (string -> float -> float -> string -> int option -> unit) -> unit
+
   (* ---- Instrument metadata ---- *)
 
   (** Return the minimum price increment (tick size) for [symbol],

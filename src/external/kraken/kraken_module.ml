@@ -429,6 +429,13 @@ module Kraken_impl = struct
       }
     )
 
+  let iter_open_orders_fast ~symbol f =
+    Kraken_executions_feed.fold_open_orders symbol ~init:() ~f:(fun () (o : Kraken_executions_feed.open_order) ->
+      let limit_price = match o.limit_price with Some p -> p | None -> 0.0 in
+      let side_str = match o.side with Kraken_executions_feed.Buy -> "buy" | Sell -> "sell" in
+      f o.order_id limit_price o.remaining_qty side_str o.order_userref
+    )
+
   (* -- Instrument metadata accessors ----------------------------------- *)
 
 
