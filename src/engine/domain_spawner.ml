@@ -736,6 +736,7 @@ let start_domain config state fee_fetcher =
      | None -> ());
 
     let domain_handle = Domain.spawn (fun () ->
+      Config.apply_gc_config ();
       Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
         asset.exchange asset.symbol (Atomic.get state.restart_count);
 
