@@ -148,6 +148,8 @@ type strategy_state = {
   mutable anticipated_base_credit: float;  (* base qty from buy fills not yet reflected in balance feed *)
   mutable last_seen_asset_balance: float;  (* previous asset_bal value; used to detect balance feed updates *)
   mutable persistence_dirty: bool;  (* true when accumulation state changed; flushed by caller outside hotloop *)
+  mutable last_cycle_orders_hash: int;  (* tracks exchange state for 0-alloc diffing *)
+  mutable last_cycle_buy_count: int;
   mutex: Mutex.t;  (* per-symbol mutex; prevents concurrent strategy execution *)
 }
 
@@ -204,6 +206,8 @@ let get_strategy_state asset_symbol =
           anticipated_base_credit = 0.0;
           last_seen_asset_balance = 0.0;
           persistence_dirty = false;
+          last_cycle_orders_hash = 0;
+          last_cycle_buy_count = 0;
           mutex = Mutex.create ();
         } in
         Hashtbl.replace strategy_states asset_symbol new_state;
@@ -663,57 +667,80 @@ let execute_strategy
       (* Clean up stale pending orders and enforce a hard limit in a single pass.
          Combines List.length + List.filter + List.length + take into one
          List.fold_left that counts kept/removed and truncates at 50. *)
-      let (kept_rev, kept_count, removed_count) =
-        List.fold_left (fun (acc, kept, removed) ((order_id, side, _, timestamp) as entry) ->
-          let age = now -. timestamp in
-          if age > 5.0 then begin
-            Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
-            if String.starts_with ~prefix:"pending_amend_" order_id then begin
-              let target_oid = String.sub order_id 14 (String.length order_id - 14) in
-              ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
-            end else begin
-              let duplicate_key = generate_side_duplicate_key asset.symbol side in
-              ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-              (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
-            end;
-            (acc, kept, removed + 1)
-          end else if kept >= 50 then
-            (acc, kept, removed + 1)  (* silently drop excess beyond hard limit *)
-          else
-            (entry :: acc, kept + 1, removed)
-        ) ([], 0, 0) state.pending_orders
+      let needs_pending_cleanup =
+        let rec check_stale count = function
+          | [] -> count > 50
+          | (_, _, _, ts) :: rest ->
+              if now -. ts > 5.0 then true else check_stale (count + 1) rest
+        in check_stale 0 state.pending_orders
       in
-      state.pending_orders <- List.rev kept_rev;
-      if removed_count > 0 && cycle mod 100000 = 0 then
-        Logging.debug_f ~section "Cleaned up %d pending orders for %s (kept %d)" removed_count asset.symbol kept_count;
+      if needs_pending_cleanup then begin
+        let (kept_rev, kept_count, removed_count) =
+          List.fold_left (fun (acc, kept, removed) ((order_id, side, _, timestamp) as entry) ->
+            let age = now -. timestamp in
+            if age > 5.0 then begin
+              Logging.warn_f ~section "Removing stale pending order %s for %s (age: %.1fs)" order_id asset.symbol age;
+              if String.starts_with ~prefix:"pending_amend_" order_id then begin
+                let target_oid = String.sub order_id 14 (String.length order_id - 14) in
+                ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
+              end else begin
+                let duplicate_key = generate_side_duplicate_key asset.symbol side in
+                ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+                (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
+              end;
+              (acc, kept, removed + 1)
+            end else if kept >= 50 then
+              (acc, kept, removed + 1)  (* silently drop excess beyond hard limit *)
+            else
+              (entry :: acc, kept + 1, removed)
+          ) ([], 0, 0) state.pending_orders
+        in
+        state.pending_orders <- List.rev kept_rev;
+        if removed_count > 0 && cycle mod 100000 = 0 then
+          Logging.debug_f ~section "Cleaned up %d pending orders for %s (kept %d)" removed_count asset.symbol kept_count;
+      end;
 
 
       (* Clean up expired amend cooldowns. *)
-      let to_remove_cooldowns = ref [] in
-      Hashtbl.iter (fun order_id expiry_time ->
-        if now > expiry_time then
-          to_remove_cooldowns := order_id :: !to_remove_cooldowns
-      ) state.amend_cooldowns;
-
-      List.iter (fun order_id ->
-        Hashtbl.remove state.amend_cooldowns order_id
-      ) !to_remove_cooldowns;
-      (* Hard cap: prevent unbounded growth if cooldowns accumulate faster than they expire. *)
-      if Hashtbl.length state.amend_cooldowns > 100 then begin
-        Hashtbl.reset state.amend_cooldowns;
-        Logging.warn_f ~section "amend_cooldowns exceeded 100 entries for %s, reset" asset.symbol
+      if Hashtbl.length state.amend_cooldowns > 0 then begin
+        let has_expired = ref false in
+        Hashtbl.iter (fun _ expiry_time -> if now > expiry_time then has_expired := true) state.amend_cooldowns;
+        if !has_expired then begin
+          let to_remove_cooldowns = ref [] in
+          Hashtbl.iter (fun order_id expiry_time ->
+            if now > expiry_time then
+              to_remove_cooldowns := order_id :: !to_remove_cooldowns
+          ) state.amend_cooldowns;
+          List.iter (fun order_id ->
+            Hashtbl.remove state.amend_cooldowns order_id
+          ) !to_remove_cooldowns;
+        end;
+        (* Hard cap: prevent unbounded growth if cooldowns accumulate faster than they expire. *)
+        if Hashtbl.length state.amend_cooldowns > 100 then begin
+          Hashtbl.reset state.amend_cooldowns;
+          Logging.warn_f ~section "amend_cooldowns exceeded 100 entries for %s, reset" asset.symbol
+        end
       end;
 
       (* Sync strategy state with actual open orders from exchange.
          Preserve sell orders set by handle_order_amended or newly placed
          execution events that may not yet appear in exchange data due to WS lag. *)
       let now_time = now in
-      state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
-        now_time -. ts < 10.0
-      ) state.recently_injected_sells;
-      (* Cap to 20 entries to prevent O(n^2) scans during sell storms. *)
-      if List.length state.recently_injected_sells > 20 then
-        state.recently_injected_sells <- take 20 state.recently_injected_sells;
+      let needs_sells_cleanup =
+        let rec check_injected count = function
+          | [] -> count > 20
+          | (_, _, ts) :: rest -> 
+              if now_time -. ts >= 10.0 then true else check_injected (count + 1) rest
+        in check_injected 0 state.recently_injected_sells
+      in
+      if needs_sells_cleanup then begin
+        state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
+          now_time -. ts < 10.0
+        ) state.recently_injected_sells;
+        (* Cap to 20 entries to prevent O(n^2) scans during sell storms. *)
+        if List.length state.recently_injected_sells > 20 then
+          state.recently_injected_sells <- take 20 state.recently_injected_sells
+      end;
       let preserved_sells = state.recently_injected_sells in
       state.open_sell_orders <- [];
       (* Preserve buy tracking across sync for all exchanges.
@@ -724,24 +751,51 @@ let execute_strategy
       (* pending_orders are managed by order placement responses; not cleared here. *)
 
       (* Rebuild buy and sell lists from exchange open_orders data. *)
-          let buy_orders = ref [] in
-          let sell_orders = ref [] in
-
+          let new_orders_hash = ref 0 in
+          let open_buy_count_local = ref 0 in
+          let open_sell_count_local = ref 0 in
+          
           iter_open_orders (fun order_id order_price qty side_str userref_opt ->
             let is_our_strategy = match userref_opt with
               | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
               | None -> true
             in
-
-            if qty > 0.0 && is_our_strategy then
-              (* Classify by the exchange-reported side, not by price *)
-              if side_str = "buy" then
-                (* Enforce single-buy-order policy across all exchanges *)
-                buy_orders := (order_id, order_price) :: !buy_orders
-              else
-                (* Include all open sell orders regardless of tag *)
-                sell_orders := (order_id, order_price, qty) :: !sell_orders
+            if qty > 0.0 && is_our_strategy then begin
+              let hash_id = if String.length order_id > 0 then Char.code order_id.[0] + String.length order_id else 0 in
+              new_orders_hash := !new_orders_hash + hash_id + int_of_float (order_price *. 100.0) + int_of_float (qty *. 100.0);
+              if side_str = "buy" then incr open_buy_count_local else incr open_sell_count_local
+            end
           );
+          
+          let state_changed = (!new_orders_hash <> state.last_cycle_orders_hash) || 
+                              (!open_buy_count_local <> state.last_cycle_buy_count) ||
+                              (!open_sell_count_local <> List.length state.open_sell_orders) in
+                              
+          let buy_orders = ref [] in
+          let sell_orders = ref [] in
+          
+          if state_changed then begin
+            state.last_cycle_orders_hash <- !new_orders_hash;
+            state.last_cycle_buy_count <- !open_buy_count_local;
+            
+            iter_open_orders (fun order_id order_price qty side_str userref_opt ->
+              let is_our_strategy = match userref_opt with
+                | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
+                | None -> true
+              in
+              if qty > 0.0 && is_our_strategy then
+                if side_str = "buy" then
+                  buy_orders := (order_id, order_price) :: !buy_orders
+                else
+                  sell_orders := (order_id, order_price, qty) :: !sell_orders
+            );
+          end else begin
+            (* Fully 0-alloc state preservation. Rebuild lightweight buy state from existing if needed. *)
+            (match state.last_buy_order_id, state.last_buy_order_price with
+            | Some id, Some price when !open_buy_count_local = 1 -> buy_orders := [(id, price)]
+            | _ -> ());
+            sell_orders := state.open_sell_orders;
+          end;
 
       (* Set buy order price and ID (select highest buy if multiple exist).
          Gate: if a cancel is in flight, the open_orders snapshot is not trusted
