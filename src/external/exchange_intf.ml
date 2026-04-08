@@ -234,6 +234,12 @@ module type S = sig
       an intermediate list. Returns the new read position. *)
   val iter_orderbook_events : symbol:string -> start_pos:int -> (Types.orderbook_event -> unit) -> int
 
+  (** Iterate over orderbook events from [start_pos], extracting only
+      top-of-book (best bid, best ask) without allocating converted arrays.
+      Callback receives [(bid_price, bid_size, ask_price, ask_size)].
+      Returns the new read position. *)
+  val iter_top_of_book_events : symbol:string -> start_pos:int -> (float -> float -> float -> float -> unit) -> int
+
   (** Return the current write position of the execution feed ring buffer
       for [symbol]. Used as the starting cursor for [read_execution_events]. *)
   val get_execution_feed_position : symbol:string -> int

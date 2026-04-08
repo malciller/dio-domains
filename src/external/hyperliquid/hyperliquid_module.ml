@@ -409,6 +409,17 @@ module Hyperliquid_impl = struct
       f { Types. bids = map_levels ob.bids; asks = map_levels ob.asks; timestamp = ob.timestamp }
     )
 
+  (** Zero-allocation top-of-book iterator. Reads price/size directly
+      from Hyperliquid level records without building converted arrays. *)
+  let iter_top_of_book_events ~symbol ~start_pos f =
+    Hyperliquid_orderbook_feed.iter_orderbook_events symbol start_pos (fun (ob : Hyperliquid_orderbook_feed.orderbook) ->
+      if Array.length ob.bids > 0 && Array.length ob.asks > 0 then begin
+        let bid = ob.bids.(0) in
+        let ask = ob.asks.(0) in
+        f bid.price bid.size ask.price ask.size
+      end
+    )
+
   (** Instrument metadata and fee accessors *)
   
   let get_price_increment ~symbol = Hyperliquid_instruments_feed.get_price_increment symbol

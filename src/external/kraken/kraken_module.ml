@@ -400,6 +400,17 @@ module Kraken_impl = struct
       f { Types. bids = map_levels ob.bids; asks = map_levels ob.asks; timestamp = ob.timestamp }
     )
 
+  (** Zero-allocation top-of-book iterator. Reads price_float/size_float
+      directly from Kraken level records without building converted arrays. *)
+  let iter_top_of_book_events ~symbol ~start_pos f =
+    Kraken_orderbook_feed.iter_orderbook_events symbol start_pos (fun (ob : Kraken_orderbook_feed.orderbook) ->
+      if Array.length ob.bids > 0 && Array.length ob.asks > 0 then begin
+        let bid = ob.bids.(0) in
+        let ask = ob.asks.(0) in
+        f bid.price_float bid.size_float ask.price_float ask.size_float
+      end
+    )
+
   (** Fold over all open orders for [symbol] with accumulator [init] and
       function [f], converting each order to unified [Types.open_order]. *)
   let fold_open_orders ~symbol ~init ~f =
