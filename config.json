@@ -13,57 +13,12 @@
   },
   "trading": [
     {
-      "symbol": "BTC/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.00025",
+      "symbol": "QQQ",
+      "exchange": "ibkr",
+      "qty": "1",
       "grid_interval": [
-        0.25,
-        0.25
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        0.75,
-        2.0
-      ],
-      "strategy": "Grid",
-      "testnet": false,
-      "hedge": false
-    },
-    {
-      "symbol": "SOL/USD",
-      "exchange": "kraken",
-      "qty": "0.14",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
-    },
-    {
-      "symbol": "HYPE/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.35",
-      "grid_interval": [
-        0.3,
-        1.0
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
         0.5,
-        5.0
-      ],
-      "strategy": "Grid",
-      "testnet": false,
-      "hedge": false
-    },
-    {
-      "symbol": "ADA/USD",
-      "exchange": "kraken",
-      "qty": "50.0",
-      "grid_interval": [
-        2.5,
-        5.0
+        1.5
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"
