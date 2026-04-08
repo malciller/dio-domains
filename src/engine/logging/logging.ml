@@ -62,22 +62,25 @@ let will_log level section_name =
   level_to_int level >= level_to_int !global_min_level
 
 (* Formats the current wall-clock time as "YYYY-MM-DD HH:MM:SS.mmm".
-   Caches the date/time prefix per second to avoid repeated localtime calls. *)
-let format_timestamp =
-  let last_sec = ref 0.0 in
-  let last_ts = ref "" in
-  fun () ->
-    let time = Unix.gettimeofday () in
-    let sec = floor time in
-    let ms = int_of_float ((time -. sec) *. 1000.) in
-    if sec <> !last_sec then begin
+   Caches the date/time prefix per second using Atomic for lock-free thread safety. *)
+let timestamp_cache = Atomic.make (0.0, "")
+
+let format_timestamp () =
+  let time = Unix.gettimeofday () in
+  let sec = floor time in
+  let ms = int_of_float ((time -. sec) *. 1000.) in
+  let (last_sec, ts) = Atomic.get timestamp_cache in
+  let ts_prefix =
+    if sec <> last_sec then begin
       let tm = Unix.localtime time in
-      last_ts := Printf.sprintf "%04d-%02d-%02d %02d:%02d:%02d"
+      let new_ts = Printf.sprintf "%04d-%02d-%02d %02d:%02d:%02d"
         (tm.Unix.tm_year + 1900) (tm.Unix.tm_mon + 1) tm.Unix.tm_mday
-        tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec;
-      last_sec := sec
-    end;
-    !last_ts ^ Printf.sprintf ".%03d" ms
+        tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec in
+      ignore (Atomic.compare_and_set timestamp_cache (last_sec, ts) (sec, new_ts));
+      new_ts
+    end else ts
+  in
+  ts_prefix ^ Printf.sprintf ".%03d" ms
 
 (* ---- Async log drain for DEBUG/INFO ----
    Hot path: format the message, push onto async_queue under async_mutex.
