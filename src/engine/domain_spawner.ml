@@ -348,7 +348,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let cached_fng_check_threshold = config.fng_check_threshold in
 
       while Atomic.get state.is_running do
-        let cycle_start = Mtime_clock.now_ns () in
+        let t0 = Mtime_clock.now_ns () in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
@@ -372,8 +372,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Consume pending ticker events from the ring buffer by snapping to the latest.
            Skipping intermediate events eliminates useless allocations and GC pressure. *)
         let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
-        if ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) then begin
-          let start_ticker = Mtime_clock.now_ns () in
+        let did_ticker = ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) in
+        if did_ticker then begin
           ticker_read_pos := ticker_pos;  (* Fast-forward to latest *)
           (match Ex.get_ticker ~symbol:asset_with_fees.symbol with
            | Some (bid, ask) ->
@@ -382,14 +382,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                Logging.debug_f ~section "Asset [%s/%s]: Snapped to latest ticker - price=$%.2f"
                  asset_with_fees.exchange asset_with_fees.symbol ((bid +. ask) /. 2.0)
            | None -> ());
-          let stop_ticker = Mtime_clock.now_ns () in
-          if !latency_active then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
         end;
+        let t1 = Mtime_clock.now_ns () in
+        if did_ticker && !latency_active then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub t1 t0));
         
         (* Consume pending orderbook events from the ring buffer by snapping to the latest. *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
-        if ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) then begin
-          let start_ob = Mtime_clock.now_ns () in
+        let did_ob = ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) in
+        if did_ob then begin
           orderbook_read_pos := ob_pos;  (* Fast-forward to latest *)
           (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
            | Some (bid_price, bid_size, ask_price, ask_size) ->
@@ -399,14 +399,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  asset_with_fees.exchange asset_with_fees.symbol
                  bid_price bid_size ask_price ask_size
            | None -> ());
-          let stop_ob = Mtime_clock.now_ns () in
-          if !latency_active then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
         end;
+        let t2 = Mtime_clock.now_ns () in
+        if did_ob && !latency_active then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
         
         (* Consume pending execution events from the ring buffer *)
         let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
-        if current_pos <> !exec_read_pos then begin
-          let start_exec = Mtime_clock.now_ns () in
+        let did_exec = current_pos <> !exec_read_pos in
+        if did_exec then begin
           let event_count = ref 0 in
           let new_pos = Ex.iter_execution_events ~symbol:asset_with_fees.symbol ~start_pos:!exec_read_pos (fun (event : Types.execution_event) ->
             incr event_count;
@@ -509,9 +509,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           end;
           exec_read_pos := new_pos;
           hl_exec_checked := true;
-          let stop_exec = Mtime_clock.now_ns () in
-          if !latency_active then Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub stop_exec start_exec))
         end;
+        let t3 = Mtime_clock.now_ns () in
+        if did_exec && !latency_active then Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub t3 t2));
         (* Fallback gate for Hyperliquid domains with no open orders: if no
            exec events arrived and the startup snapshot injection is complete,
            open the gate so the strategy can place its initial order. *)
@@ -539,7 +539,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Execute strategy if new events have been consumed (event-driven gate) *)
         let should_execute = !hl_exec_ready && !should_execute_strategy in
         if should_execute then begin
-          let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Clear event-driven trigger *)
 
           (* Compute open counts without allocating intermediate lists *)
@@ -636,11 +635,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            | Some asset, Some cs ->
                Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance !mm_open_buy_count !mm_open_sell_count iter_orders !cycle_count
            | _ -> ());
-          let stop_strat = Mtime_clock.now_ns () in
-          if !latency_active then Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat));
+        end;
+        let t4 = Mtime_clock.now_ns () in
+        if should_execute && !latency_active then Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub t4 t3));
 
-          (* Flush deferred accumulation persistence outside the strategy hotloop.
-             Only performs file I/O when the dirty flag was set during execute_strategy. *)
+        (* Flush deferred accumulation persistence outside the strategy hotloop.
+           Only performs file I/O when the dirty flag was set during execute_strategy. *)
+        if should_execute then begin
           (match !grid_strategy_asset_ref with
            | Some _ ->
                Dio_strategies.Suicide_grid.Strategy.flush_persistence asset_with_fees.symbol
@@ -660,8 +661,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         
         (* Record cycle work time before blocking. Captures active processing
            latency only, excluding sleep time in Exchange_wakeup.wait. *)
-        let cycle_stop = Mtime_clock.now_ns () in
-        let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
+        let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t0) in
         if !latency_active then Latency_profiler.record prof_cycle cycle_span;
 
         (* Flush latency reports periodically, gated by cycle_mod to avoid

@@ -37,12 +37,14 @@ let create ?(bucket_us=1) ?(max_latency_us=10_000) name =
     overflow = 0;
   }
 
+let one_k_l = 1000L
+
 (** [record t span] converts [span] from nanoseconds to microseconds,
     maps it to the corresponding histogram bucket, and increments both
     the bucket count and total sample count. Samples that exceed the
     histogram range are clamped to the last bucket and counted as overflow. *)
-let record t span =
-  let us = Int64.to_int (Int64.div (Span.to_uint64_ns span) 1000L) in
+let[@inline] record t span =
+  let us = Int64.to_int (Int64.div (Span.to_uint64_ns span) one_k_l) in
   let bucket_idx = us / t.bucket_us in
   if bucket_idx >= t.bucket_count then begin
     t.buckets.(t.bucket_count - 1) <- t.buckets.(t.bucket_count - 1) + 1;
