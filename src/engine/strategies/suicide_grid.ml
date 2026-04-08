@@ -87,8 +87,21 @@ let hyperliquid_config = {
   check_stale_balance = false;
 }
 
+let ibkr_config = {
+  time_in_force = "DAY";
+  track_pending_sells = true;
+  use_accumulation_sells = false;
+  sell_uses_mult = false;             (* 1:1 sells for equity *)
+  sell_failure_sets_asset_low = true;  (* Can't short sell ETFs — exchange rejection sets flag *)
+  use_reserved_base_guard = false;    (* Let the exchange be the arbiter *)
+  asset_low_requires_balance_change = false;
+  merge_preserved_sells = false;
+  check_stale_balance = true;
+}
+
 let get_exchange_config exchange =
   if exchange = "hyperliquid" then hyperliquid_config
+  else if exchange = "ibkr" then ibkr_config
   else kraken_config
 
 (** Per-asset trading configuration. *)

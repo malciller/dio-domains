@@ -5,6 +5,7 @@
  (modes exe)
  (libraries
   dio.kraken
+  dio.ibkr
   dio.cmc
   dio.strategies
   dio.dashboard
