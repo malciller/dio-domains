@@ -249,14 +249,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
            st.exchange_id <- asset.exchange;
            st.grid_qty <- (try float_of_string asset.qty with Failure _ -> 0.001);
+           st.cached_sell_mult <- (try float_of_string asset.Dio_strategies.Suicide_grid.sell_mult with Failure _ -> 1.0);
+           st.cached_ecfg <- Dio_strategies.Suicide_grid.get_exchange_config asset.exchange;
            st.maker_fee <- (match asset.maker_fee with
              | Some f -> f
              | None ->
                  match Dio_strategies.Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
                  | Some cached -> cached
                  | None -> 0.0);
-           Logging.debug_f ~section "Early-init strategy state for %s: exchange_id=%s, grid_qty=%.8f, maker_fee=%.6f"
-             asset.symbol asset.exchange st.grid_qty st.maker_fee
+           Logging.debug_f ~section "Early-init strategy state for %s: exchange_id=%s, grid_qty=%.8f, sell_mult=%.4f, maker_fee=%.6f"
+             asset.symbol asset.exchange st.grid_qty st.cached_sell_mult st.maker_fee
        | None -> ());
 
       (* Initialize exec read position. Non-Hyperliquid: set to current write
@@ -366,21 +368,18 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub stop_ticker start_ticker))
         end;
         
-        (* Consume pending orderbook events from the ring buffer *)
+        (* Consume pending orderbook events from the ring buffer.
+           Uses iter_top_of_book_events to avoid allocating converted
+           (float*float) arrays per event — the loop only needs BBO. *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
         if ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) then begin
           let start_ob = Mtime_clock.now_ns () in
-          orderbook_read_pos := Ex.iter_orderbook_events ~symbol:asset_with_fees.symbol ~start_pos:!orderbook_read_pos (fun (ob : Types.orderbook_event) ->
-            if Array.length ob.bids > 0 && Array.length ob.asks > 0 then begin
-              let (bid_price, bid_size) = ob.bids.(0) in
-              let (ask_price, ask_size) = ob.asks.(0) in
-              
-              top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
-              should_execute_strategy := true;
-              Logging.debug_f ~section "Asset [%s/%s]: Consumed orderbook event - bid=$%.2f x %.4f, ask=$%.2f x %.4f"
-                asset_with_fees.exchange asset_with_fees.symbol
-                bid_price bid_size ask_price ask_size
-            end
+          orderbook_read_pos := Ex.iter_top_of_book_events ~symbol:asset_with_fees.symbol ~start_pos:!orderbook_read_pos (fun bid_price bid_size ask_price ask_size ->
+            top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
+            should_execute_strategy := true;
+            Logging.debug_f ~section "Asset [%s/%s]: Consumed orderbook event - bid=$%.2f x %.4f, ask=$%.2f x %.4f"
+              asset_with_fees.exchange asset_with_fees.symbol
+              bid_price bid_size ask_price ask_size
           );
           let stop_ob = Mtime_clock.now_ns () in
           Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub stop_ob start_ob))
@@ -559,7 +558,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 | None -> baseline_price := Some cp
                 | Some base ->
                     let diff_pct = abs_float ((cp -. base) /. base) *. 100.0 in
-                    if diff_pct >= 3.5 then begin
+                    if diff_pct >= 1.5 then begin
                       Logging.info_f ~section "[%s/%s] Price moved by %.2f%% from baseline $%.2f to $%.2f. Triggering dynamic Fear & Greed check."
                         asset_with_fees.exchange asset_with_fees.symbol diff_pct base cp;
                       baseline_price := Some cp;
@@ -597,9 +596,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             end
           end;
 
+          (* Compute wall-clock timestamp once per cycle for strategy use,
+             eliminating Unix.time/gettimeofday syscalls inside the strategy. *)
+          let now = Unix.gettimeofday () in
+
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
-               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
@@ -633,12 +636,15 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub cycle_stop cycle_start) in
         Latency_profiler.record prof_cycle cycle_span;
 
-        (* Flush latency reports when sample threshold is reached *)
-        Latency_profiler.report ~sample_threshold:1000000 prof_ticker;
-        Latency_profiler.report ~sample_threshold:1000000 prof_ob;
-        Latency_profiler.report ~sample_threshold:100000 prof_exec;
-        Latency_profiler.report ~sample_threshold:1000000 prof_strategy;
-        Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
+        (* Flush latency reports periodically, gated by cycle_mod to avoid
+           5 threshold checks per cycle on the hot path. *)
+        if !cycle_count mod config.cycle_mod = 0 then begin
+          Latency_profiler.report ~sample_threshold:1000000 prof_ticker;
+          Latency_profiler.report ~sample_threshold:1000000 prof_ob;
+          Latency_profiler.report ~sample_threshold:100000 prof_exec;
+          Latency_profiler.report ~sample_threshold:1000000 prof_strategy;
+          Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
+        end;
 
         (* Block until the next websocket frame signals new data *)
         if not !should_execute_strategy then

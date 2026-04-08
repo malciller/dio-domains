@@ -138,6 +138,8 @@ type strategy_state = {
   mutable last_buy_fill_price: float option; (* fill price of most recent buy; cost basis for sell profit calc *)
   mutable last_sell_fill_price: float option; (* fill price of most recent sell; cost basis for consecutive sells *)
   mutable grid_qty: float;              (* cached config qty; used by fill handler for profit calc *)
+  mutable cached_sell_mult: float;      (* cached parsed sell_mult; avoids float_of_string per cycle *)
+  mutable cached_ecfg: exchange_config; (* cached exchange_config; avoids string comparison per cycle *)
   mutable maker_fee: float;             (* cached maker fee rate; used by fill handler for profit calc *)
   mutable exchange_id: string;          (* cached exchange name; used for persistence routing *)
   mutable startup_replay: bool;  (* true during startup fill replay; suppresses profit calculation *)
@@ -192,6 +194,8 @@ let get_strategy_state asset_symbol =
           last_buy_fill_price = persisted_last_buy_fill_price;
           last_sell_fill_price = persisted_last_sell_fill_price;
           grid_qty = 0.0;
+          cached_sell_mult = 1.0;
+          cached_ecfg = kraken_config;
           maker_fee = 0.0;
           exchange_id = "";
           startup_replay = true;  (* gates profit calc until set_startup_replay_done *)
@@ -529,9 +533,12 @@ let push_order ~now order =
            false
        end)
 
-(** Main strategy execution loop. *)
+(** Main strategy execution loop.
+    [~now] is a pre-computed [Unix.gettimeofday ()] timestamp passed by the
+    caller to avoid redundant syscalls on every cycle. *)
 let execute_strategy
     ?cached_state
+    ~now
     (asset : trading_config)
     (current_price : float option)
     (top_of_book : (float * float * float * float) option)
@@ -543,7 +550,7 @@ let execute_strategy
     (cycle : int) =
 
   let state = match cached_state with Some s -> s | None -> get_strategy_state asset.symbol in
-  let ecfg = get_exchange_config asset.exchange in
+  let ecfg = state.cached_ecfg in
 
   (* Only proceed with main strategy if capital_low flag is clear.
      asset_low is checked below only for sell+buy placement; order sync,
@@ -569,11 +576,10 @@ let execute_strategy
       Subtract reserved_base so accumulated base asset is protected from sells. *)
    (match asset_balance with
     | Some asset_bal ->
-        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
+        let qty_f = state.grid_qty in
         let asset_needed_fast =
           if ecfg.sell_uses_mult then
-            let sell_mult_f = (try float_of_string asset.sell_mult with Failure _ -> 1.0) in
-            qty_f *. sell_mult_f
+            qty_f *. state.cached_sell_mult
           else qty_f  (* 1:1 sells require full qty *)
         in
         let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit in
@@ -601,7 +607,7 @@ let execute_strategy
      short-circuits here. When balance recovers, the flag is cleared. *)
   (match quote_balance with
    | Some quote_bal ->
-       let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
+       let qty_f = state.grid_qty in
        let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
        (* Available balance = total balance minus all domains' reserved quote. *)
        let total_reserved = get_total_reserved_quote ~exchange:state.exchange_id in
@@ -638,8 +644,7 @@ let execute_strategy
 
   if not state.capital_low then begin
 
-  (* Order placement throttle: allow logic to run every cycle. *)
-  let now = Unix.time () in
+  (* [now] is provided by the caller to avoid per-cycle syscalls. *)
   
   match current_price, top_of_book with
   | None, _ -> ()  (* No price data available yet *)
@@ -702,7 +707,7 @@ let execute_strategy
       (* Sync strategy state with actual open orders from exchange.
          Preserve sell orders set by handle_order_amended or newly placed
          execution events that may not yet appear in exchange data due to WS lag. *)
-      let now_time = Unix.gettimeofday () in
+      let now_time = now in
       state.recently_injected_sells <- List.filter (fun (_, _, ts) -> 
         now_time -. ts < 10.0
       ) state.recently_injected_sells;
@@ -756,7 +761,7 @@ let execute_strategy
            state.last_buy_order_id <- Some best_order_id;
            (* Sync per-asset reserved_quote from the actual open buy so the
               capital_low check uses the real exchange-reserved amount after restart. *)
-           let qty = (try float_of_string asset.qty with Failure _ -> 0.001) in
+           let qty = state.grid_qty in
            set_asset_reserved_quote state (best_price *. qty)
        | _ ->
            (* In-flight cancel or place: open_orders may be stale.
@@ -781,20 +786,19 @@ let execute_strategy
         (List.length open_orders) asset.symbol
         (List.length !buy_orders) (List.length !sell_orders);
 
-      (* Parse configuration values. *)
-      let qty = parse_config_float asset.qty "qty" 0.001 asset.exchange asset.symbol in
+      (* Use cached parsed config values; updated once at domain startup
+         and whenever the config ref changes (Fear & Greed re-evaluation). *)
+      let qty = state.grid_qty in
       let grid_interval = asset.grid_interval in
-      let sell_mult = parse_config_float asset.sell_mult "sell_mult" 1.0 asset.exchange asset.symbol in
+      let sell_mult = state.cached_sell_mult in
 
-      (* Cache config in state so handle_order_filled can compute real PnL. *)
-      state.grid_qty <- qty;
+      (* Refresh maker_fee from live cache (exchange may push updated fees). *)
       state.maker_fee <- (match asset.maker_fee with
         | Some f -> f
         | None ->
             match Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
             | Some cached -> cached
             | None -> 0.0);
-      state.exchange_id <- asset.exchange;
 
       (* Calculate required balances. *)
       let quote_needed = ask_price *. qty in
