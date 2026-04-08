@@ -79,14 +79,71 @@ let format_timestamp =
     end;
     !last_ts ^ Printf.sprintf ".%03d" ms
 
-(* Core synchronous logging function. Domain-safe via [output_mutex].
-   Intentionally avoids Lwt: domain workers lack a Lwt scheduler,
-   and Lwt.async from domains would leak promises into the main scheduler.
+(* ---- Async log drain for DEBUG/INFO ----
+   Hot path: format the message, push onto async_queue under async_mutex.
+   Cost: ~50ns (mutex + Queue.push). Zero I/O, zero output_mutex contention.
 
-   Performance: flush is deferred to the OS stdio buffer for DEBUG/INFO
-   levels. Only WARN and above trigger an explicit flush, ensuring error
-   messages are visible immediately after a crash while keeping the
-   output_mutex hold time minimal on the hot path. *)
+   Background drain thread: wakes every 50ms, takes all queued messages,
+   writes each with per-message flush to output_channel. Logs appear
+   promptly (~50ms latency) without blocking trading domains.
+
+   WARN+: drains the async queue first (preserving order), then writes
+   synchronously with flush for immediate visibility. *)
+
+let async_queue : string Queue.t = Queue.create ()
+let async_mutex = Mutex.create ()
+let async_drain_started = Atomic.make false
+
+(** Push a pre-formatted log line onto the async queue. No I/O. *)
+let[@inline always] log_async formatted =
+  Mutex.lock async_mutex;
+  Queue.push formatted async_queue;
+  Mutex.unlock async_mutex
+
+(** Drain all pending async messages to output_channel.
+    Caller must NOT hold output_mutex. *)
+let drain_async_queue () =
+  Mutex.lock async_mutex;
+  if Queue.is_empty async_queue then
+    Mutex.unlock async_mutex
+  else begin
+    (* Transfer pending messages out of the async queue in O(1).
+       This minimizes async_mutex hold time — producers can push
+       immediately after we unlock. *)
+    let batch = Queue.create () in
+    Queue.transfer async_queue batch;
+    Mutex.unlock async_mutex;
+    (* Write the batch under output_mutex with per-message flush
+       so each log line appears promptly in the terminal. *)
+    Mutex.lock output_mutex;
+    (try
+       Queue.iter (fun msg ->
+         output_string !output_channel msg;
+         output_char !output_channel '\n';
+         flush !output_channel
+       ) batch;
+       Mutex.unlock output_mutex
+     with exn ->
+       Mutex.unlock output_mutex;
+       ignore exn)
+  end
+
+(** Start the background drain thread. Called once; idempotent.
+    Uses Thread.create (not Domain.spawn) to avoid consuming a core. *)
+let start_async_drain () =
+  if Atomic.compare_and_set async_drain_started false true then begin
+    let _drain_thread = Thread.create (fun () ->
+      while true do
+        Thread.delay 0.05;  (* 50ms drain interval *)
+        drain_async_queue ()
+      done
+    ) () in
+    ()
+  end
+
+(* Core logging function. Domain-safe.
+   - DEBUG/INFO: pushed to async queue (no I/O on caller).
+   - WARN+: drains async queue first, then writes synchronously with flush. *)
 let log_sync level section_name message =
   let section = get_section section_name in
   if (!enabled_sections <> [] && not (List.mem section_name !enabled_sections)) ||
@@ -94,8 +151,6 @@ let log_sync level section_name message =
      level_to_int level < level_to_int !global_min_level then
     ()
   else if !quiet_mode then
-    (* Quiet mode: suppress all console output. Callback dispatch, if needed,
-       is restricted to the Lwt domain to avoid thread-safety violations. *)
     ()
   else begin
     let timestamp = format_timestamp () in
@@ -107,18 +162,25 @@ let log_sync level section_name message =
       else
         Printf.sprintf "%s %s [%s] %s" timestamp level_str section_name message
     in
-    Mutex.lock output_mutex;
-    (try
-       output_string !output_channel formatted;
-       output_char !output_channel '\n';
-       (* Flush only on WARN+ to ensure error/crash messages are visible.
-          DEBUG/INFO rely on OS stdio buffering for throughput. *)
-       if level_to_int level >= level_to_int WARN then
+    if level_to_int level >= level_to_int WARN then begin
+      (* Synchronous path: drain async queue first to preserve ordering,
+         then write this message with immediate flush. *)
+      drain_async_queue ();
+      Mutex.lock output_mutex;
+      (try
+         output_string !output_channel formatted;
+         output_char !output_channel '\n';
          flush !output_channel;
-       Mutex.unlock output_mutex
-     with exn ->
-       Mutex.unlock output_mutex;
-       ignore exn)
+         Mutex.unlock output_mutex
+       with exn ->
+         Mutex.unlock output_mutex;
+         ignore exn)
+    end else begin
+      (* Async path: just buffer the formatted line. The drain thread
+         will write + flush it within ~50ms. *)
+      start_async_drain ();
+      log_async formatted
+    end
   end
 
 (* Lwt wrapper: delegates to [log_sync] then returns [Lwt.return_unit]. *)
