@@ -1190,17 +1190,29 @@ let flush_persistence asset_symbol =
   let state = get_strategy_state asset_symbol in
   (* Fast non-locking check to skip mutex acquisition on non-dirty cycles. *)
   if state.persistence_dirty then begin
-    Mutex.lock state.mutex;
-    Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-      if state.persistence_dirty then begin
-        state.persistence_dirty <- false;
+    let snapshot_to_save =
+      Mutex.lock state.mutex;
+      Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+        if state.persistence_dirty then begin
+          state.persistence_dirty <- false;
+          Some (
+            state.reserved_base,
+            state.accumulated_profit,
+            state.last_fill_oid,
+            state.last_buy_fill_price,
+            state.last_sell_fill_price
+          )
+        end else None)
+    in
+    match snapshot_to_save with
+    | Some (reserved_base, accumulated_profit, last_fill_oid, last_buy_fill_price, last_sell_fill_price) ->
         Hyperliquid.State_persistence.save ~symbol:asset_symbol
-          ~reserved_base:state.reserved_base
-          ~accumulated_profit:state.accumulated_profit
-          ?last_fill_oid:state.last_fill_oid
-          ?last_buy_fill_price:state.last_buy_fill_price
-          ?last_sell_fill_price:state.last_sell_fill_price ()
-      end)
+          ~reserved_base
+          ~accumulated_profit
+          ?last_fill_oid
+          ?last_buy_fill_price
+          ?last_sell_fill_price ()
+    | None -> ()
   end
 
 

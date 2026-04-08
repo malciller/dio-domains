@@ -51,6 +51,7 @@ Edit `config.json` (example):
   "logging_level": "info",            // Log verbosity: debug, info, warn, error, critical
   "logging_sections": "",             // Filter logs by section (optional, comma-separated)
   "cycle_mod": 10000,                 // Cycle interval for periodic checks and logs
+  "fng_check_threshold": 1.5,         // Minimum price change (%) to trigger a Fear & Greed check
   "gc": {                             // OCaml 5 Tuning for high-throughput websockets
     "minor_heap_size": 8388608,       // Words (64MB) to absorb JSON parsing bursts
     "space_overhead": 80,             // Moderate major heap spacing
