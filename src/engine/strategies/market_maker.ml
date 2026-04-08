@@ -385,23 +385,25 @@ let push_order ?(now = Unix.time ()) order =
        end)
 
 (** Cancels all open orders at [target_price] for [target_side]. Returns count cancelled. *)
-let cancel_duplicate_orders asset_symbol target_price target_side open_orders strategy exchange =
-  let duplicates = List.filter (fun (order_id, order_price, qty, side_str, _) ->
+let cancel_duplicate_orders asset_symbol target_price target_side iter_open_orders strategy exchange =
+  let duplicates = ref [] in
+  iter_open_orders (fun order_id order_price qty side_str _ ->
     let is_cancelled = List.exists (fun (cancelled_id, _) ->
       cancelled_id = order_id) (get_strategy_state asset_symbol).cancelled_orders in
-    not is_cancelled && qty > 0.0 &&
-    side_str = (if target_side = Buy then "buy" else "sell") &&
-    abs_float (order_price -. target_price) < 0.000001  (* price match within float epsilon *)
-  ) open_orders in
+    if not is_cancelled && qty > 0.0 &&
+       side_str = (if target_side = Buy then "buy" else "sell") &&
+       abs_float (order_price -. target_price) < 0.000001 then
+      duplicates := order_id :: !duplicates
+  );
 
-  List.iter (fun (order_id, _, _, _, _) ->
+  List.iter (fun order_id ->
     let cancel_order = create_cancel_order order_id asset_symbol strategy exchange in
     ignore (push_order cancel_order);
     Logging.debug_f ~section "Cancelling duplicate order %s for %s at price %.8f"
       order_id asset_symbol target_price
-  ) duplicates;
+  ) !duplicates;
 
-  List.length duplicates
+  List.length !duplicates
 
 (** Core strategy tick. Synchronizes state with exchange open orders, performs
     pending/cancelled order cleanup, enforces balance and exposure limits, and
@@ -415,7 +417,7 @@ let execute_strategy
     (quote_balance : float option)
     (_open_buy_count : int)
     (_open_sell_count : int)
-    (open_orders : (string * float * float * string * int option) list)  (* (order_id, price, remaining_qty, side, userref) *)
+    (iter_open_orders : ((string -> float -> float -> string -> int option -> unit) -> unit))
     (cycle : int) =
 
   (* Throttle logging to every log_interval cycles *)
@@ -582,20 +584,22 @@ let execute_strategy
         let available_asset_balance = match asset_balance with
           | Some total_balance ->
               (* Deduct qty locked in open sells *)
-              let locked_in_sells = List.fold_left (fun acc (_, _, remaining_qty, side_str, _) ->
-                if side_str = "sell" then acc +. remaining_qty else acc
-              ) 0.0 open_orders in
-              Some (total_balance -. locked_in_sells)
+              let locked_in_sells = ref 0.0 in
+              iter_open_orders (fun _oid _price remaining_qty side_str _uref ->
+                if side_str = "sell" then locked_in_sells := !locked_in_sells +. remaining_qty
+              );
+              Some (total_balance -. !locked_in_sells)
           | None -> None
         in
 
         let available_quote_balance = match quote_balance with
           | Some total_balance ->
               (* Deduct value locked in open buys *)
-              let locked_in_buys = List.fold_left (fun acc (_, order_price, remaining_qty, side_str, _) ->
-                if side_str = "buy" then acc +. (order_price *. remaining_qty) else acc
-              ) 0.0 open_orders in
-              Some (total_balance -. locked_in_buys)
+              let locked_in_buys = ref 0.0 in
+              iter_open_orders (fun _oid order_price remaining_qty side_str _uref ->
+                if side_str = "buy" then locked_in_buys := !locked_in_buys +. (order_price *. remaining_qty)
+              );
+              Some (total_balance -. !locked_in_buys)
           | None -> None
         in
 
@@ -609,12 +613,13 @@ let execute_strategy
           asset.exchange asset.symbol spread spread_pct fee exposure_value;
 
         (* Count non-cancelled open buy orders for balance check *)
-        let open_buy_orders = List.filter (fun (order_id, _, qty, side_str, _) ->
+        let open_buy_count = ref 0 in
+        iter_open_orders (fun order_id _price qty side_str _uref ->
           let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-          side_str = "buy" && not is_cancelled && qty > 0.0
-        ) open_orders in
-
-        let open_buy_count = List.length open_buy_orders in
+          if side_str = "buy" && not is_cancelled && qty > 0.0 then
+            incr open_buy_count
+        );
+        let open_buy_count = !open_buy_count in
 
         (* Balance constraints: enforced only when config parameters are set *)
         let usd_balance_ok = match min_usd_balance_opt, available_quote_balance with
@@ -662,7 +667,7 @@ let execute_strategy
           let buy_orders = ref [] in
           let sell_orders = ref [] in
 
-          List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
+          iter_open_orders (fun order_id order_price qty side_str userref_opt ->
             (* Skip blacklisted (cancelled) orders *)
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
             
@@ -679,7 +684,7 @@ let execute_strategy
               else
                 (* Include all open sell orders regardless of tag *)
                 sell_orders := (order_id, order_price, qty) :: !sell_orders
-          ) open_orders;
+          );
 
           (* Track the highest-priced buy order *)
           (match !buy_orders with
@@ -748,7 +753,7 @@ let execute_strategy
           let buy_orders = ref [] in
           let sell_orders = ref [] in
 
-          List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
+          iter_open_orders (fun order_id order_price qty side_str userref_opt ->
             let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
             
             let is_our_strategy = match userref_opt with
@@ -761,7 +766,7 @@ let execute_strategy
                 buy_orders := (order_id, order_price) :: !buy_orders
               else
                 sell_orders := (order_id, order_price, qty) :: !sell_orders
-          ) open_orders;
+          );
 
           (* Sync tracking from exchange-reported open orders *)
           (match !buy_orders with
@@ -849,7 +854,7 @@ let execute_strategy
 
                   (* Then place buy *)
                   if can_place_buy then begin
-                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy open_orders MM asset.exchange in
+                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy iter_open_orders MM asset.exchange in
                     let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true MM asset.exchange in
                     if push_order ~now buy_order then begin
                       state.last_buy_order_price <- Some buy_price;
@@ -918,7 +923,7 @@ let execute_strategy
 
                   (* Proceed only if profitable, post-only safe, and balance is sufficient *)
                   if profitability_ok && required_buy_price <= (bid +. 0.0000001) && amendment_balance_ok then begin
-                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy open_orders MM asset.exchange in
+                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy iter_open_orders MM asset.exchange in
                     let amend_order = create_amend_order buy_order_id asset.symbol Buy qty (Some required_buy_price) true MM asset.exchange in
                     ignore (push_order ~now amend_order);
                     state.last_buy_order_price <- Some required_buy_price;

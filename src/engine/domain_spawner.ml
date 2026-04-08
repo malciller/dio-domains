@@ -516,28 +516,28 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let start_strat = Mtime_clock.now_ns () in
           should_execute_strategy := false;  (* Clear event-driven trigger *)
 
-          (* Fold open orders into per-strategy counts and lists in a single pass *)
-          let (all_open_orders, grid_open_buy_count, grid_open_sell_count, mm_open_buy_count, mm_open_sell_count, mm_open_orders) =
-            Ex.fold_open_orders ~symbol:asset_with_fees.symbol
-              ~init:([], 0, 0, 0, 0, [])
-              ~f:(fun (all_acc, g_buys, g_sells, m_buys, m_sells, mm_acc) (order : Types.open_order) ->
-                match order.limit_price with
-                | None -> (all_acc, g_buys, g_sells, m_buys, m_sells, mm_acc)
-                | Some price ->
-                    let side_str = match order.side with Types.Buy -> "buy" | Types.Sell -> "sell" in
-                    let entry = (order.order_id, price, order.remaining_qty, side_str, order.user_ref) in
-                    let is_mm = match order.user_ref with
-                      | Some userref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm userref
-                      | None -> false
-                    in
-                    if is_mm then
-                      let (mb, ms) = if side_str = "buy" then (m_buys + 1, m_sells) else (m_buys, m_sells + 1) in
-                      (entry :: all_acc, g_buys, g_sells, mb, ms, entry :: mm_acc)
-                    else
-                      let (gb, gs) = if side_str = "buy" then (g_buys + 1, g_sells) else (g_buys, g_sells + 1) in
-                      (entry :: all_acc, gb, gs, m_buys, m_sells, mm_acc)
-              )
+          (* Compute open counts without allocating intermediate lists *)
+          let grid_open_buy_count = ref 0 in
+          let grid_open_sell_count = ref 0 in
+          let mm_open_buy_count = ref 0 in
+          let mm_open_sell_count = ref 0 in
+
+          let iter_orders f =
+            Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol f
           in
+
+          iter_orders (fun _oid _price qty side_str userref_opt ->
+             if qty > 0.0 then begin
+               let is_mm = match userref_opt with
+                 | Some uref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm uref
+                 | None -> false
+               in
+               if is_mm then
+                 if side_str = "buy" then incr mm_open_buy_count else incr mm_open_sell_count
+               else
+                 if side_str = "buy" then incr grid_open_buy_count else incr grid_open_sell_count
+             end
+          );
 
           (* Query current balances for base and quote assets *)
           (match Ex.get_balance ~asset:base_asset with
@@ -550,8 +550,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let asset_balance = Some !last_asset_balance in
           let quote_balance = Some !last_quote_balance in
           
-          last_buy_count := grid_open_buy_count + mm_open_buy_count;
-          last_sell_count := grid_open_sell_count + mm_open_sell_count;
+          last_buy_count := !grid_open_buy_count + !mm_open_buy_count;
+          last_sell_count := !grid_open_sell_count + !mm_open_sell_count;
 
           (* Trigger async Fear & Greed refresh on significant price movement *)
           (match !current_price with
@@ -604,11 +604,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
-               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now asset !current_price !top_of_book asset_balance quote_balance grid_open_buy_count grid_open_sell_count all_open_orders !cycle_count
+               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now asset !current_price !top_of_book asset_balance quote_balance !grid_open_buy_count !grid_open_sell_count iter_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
-               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance mm_open_buy_count mm_open_sell_count mm_open_orders !cycle_count
+               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance !mm_open_buy_count !mm_open_sell_count iter_orders !cycle_count
            | _ -> ());
           let stop_strat = Mtime_clock.now_ns () in
           Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub stop_strat start_strat));

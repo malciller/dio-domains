@@ -331,6 +331,13 @@ module Hyperliquid_impl = struct
       }
     )
 
+  let iter_open_orders_fast ~symbol f =
+    Hyperliquid_executions_feed.fold_open_orders symbol ~init:() ~f:(fun () (o : Hyperliquid_executions_feed.open_order) ->
+      let limit_price = match o.limit_price with Some p -> p | None -> 0.0 in
+      let side_str = match o.side with Hyperliquid_executions_feed.Buy -> "buy" | Sell -> "sell" in
+      f o.order_id limit_price o.remaining_qty side_str o.order_userref
+    )
+
   let get_execution_feed_position ~symbol =
     Hyperliquid_executions_feed.get_current_position symbol
 

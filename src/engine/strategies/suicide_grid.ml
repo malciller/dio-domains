@@ -544,9 +544,9 @@ let execute_strategy
     (top_of_book : (float * float * float * float) option)
     (asset_balance : float option)
     (quote_balance : float option)
-    (open_buy_count : int)
+    (_open_buy_count : int)
     (_open_sell_count : int)
-    (open_orders : (string * float * float * string * int option) list)  (* (order_id, price, remaining_qty, side, userref) *)
+    (iter_open_orders : ((string -> float -> float -> string -> int option -> unit) -> unit))
     (cycle : int) =
 
   let state = match cached_state with Some s -> s | None -> get_strategy_state asset.symbol in
@@ -724,24 +724,24 @@ let execute_strategy
       (* pending_orders are managed by order placement responses; not cleared here. *)
 
       (* Rebuild buy and sell lists from exchange open_orders data. *)
-      let buy_orders = ref [] in
-      let sell_orders = ref [] in
+          let buy_orders = ref [] in
+          let sell_orders = ref [] in
 
-      List.iter (fun (order_id, order_price, qty, side_str, userref_opt) ->
-        let is_our_strategy = match userref_opt with
-          | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
-          | None -> true
-        in
-        
-        if qty > 0.0 && is_our_strategy then (* Only count orders with remaining quantity. *)
-          (* Use actual order side from exchange, not price-based classification. *)
-          if side_str = "buy" then
-            (* All buy orders are treated as grid buys to enforce single-buy-order policy. *)
-            buy_orders := (order_id, order_price) :: !buy_orders
-          else
-            (* Include all open sell orders regardless of tag. *)
-            sell_orders := (order_id, order_price, qty) :: !sell_orders
-      ) open_orders;
+          iter_open_orders (fun order_id order_price qty side_str userref_opt ->
+            let is_our_strategy = match userref_opt with
+              | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
+              | None -> true
+            in
+
+            if qty > 0.0 && is_our_strategy then
+              (* Classify by the exchange-reported side, not by price *)
+              if side_str = "buy" then
+                (* Enforce single-buy-order policy across all exchanges *)
+                buy_orders := (order_id, order_price) :: !buy_orders
+              else
+                (* Include all open sell orders regardless of tag *)
+                sell_orders := (order_id, order_price, qty) :: !sell_orders
+          );
 
       (* Set buy order price and ID (select highest buy if multiple exist).
          Gate: if a cancel is in flight, the open_orders snapshot is not trusted
@@ -782,9 +782,8 @@ let execute_strategy
         ) preserved_sells
       end;
 
-      Logging.debug_f ~section "Synced %d open orders for %s: %d buys, %d sells"
-        (List.length open_orders) asset.symbol
-        (List.length !buy_orders) (List.length !sell_orders);
+      Logging.debug_f ~section "Synced open orders for %s: %d buys, %d sells"
+        asset.symbol (List.length !buy_orders) (List.length !sell_orders);
 
       (* Use cached parsed config values; updated once at domain startup
          and whenever the config ref changes (Fear & Greed re-evaluation). *)
@@ -848,8 +847,8 @@ let execute_strategy
     (* Core strategy logic based on open orders and balances.
        Log state periodically for race condition debugging. *)
     if state.last_cycle <> cycle && cycle mod 100000 = 0 then begin
-      Logging.debug_f ~section "Strategy state for %s: open_buy_count=%d, pending_orders=%d, buy_price=%s, sell_count=%d"
-        asset.symbol open_buy_count (List.length state.pending_orders)
+      Logging.debug_f ~section "Strategy state for %s: pending_orders=%d, buy_price=%s, sell_count=%d"
+        asset.symbol (List.length state.pending_orders)
         (match state.last_buy_order_price with Some p -> Printf.sprintf "%.2f" p | None -> "none")
         (List.length state.open_sell_orders)
     end;
@@ -859,8 +858,18 @@ let execute_strategy
        webData2 snapshots can be stale during cancel-replace amendments.
        last_buy_order_id is set immediately by orderUpdates events. *)
     let has_tracked_buy = state.last_buy_order_id <> None in
-    let tracked_buy_count = List.length !buy_orders in
-    let effective_buy_count = if has_tracked_buy && tracked_buy_count = 0 then 1 else tracked_buy_count in
+    (* Count non-cancelled open buy orders for balance check *)
+    let open_buy_count = ref 0 in
+    iter_open_orders (fun _order_id _price qty side_str userref_opt ->
+      let is_our_strategy = match userref_opt with
+        | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
+        | None -> true
+      in
+      if side_str = "buy" && qty > 0.0 && is_our_strategy then
+        incr open_buy_count
+    );
+    let open_buy_count = !open_buy_count in
+    let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
 
     if buy_order_pending then begin
         (* Log every 100,000 iterations to avoid spam. *)
@@ -925,20 +934,19 @@ let execute_strategy
              (* Proactive reserved_base guard: prevent selling accumulated base.
                 Available balance must exclude:
                 1. reserved_base: accumulated base that must not be sold.
-                2. qty locked in open sell orders on the exchange.
-                Uses open_orders parameter (authoritative exchange data) rather than
-                state.open_sell_orders which may be empty after startup/reconnection. *)
+                2. qty locked in open sell orders on the exchange. *)
              let balance_ok =
                if ecfg.use_reserved_base_guard then
-                 let locked_in_sells = List.fold_left (fun acc (_oid, _price, remaining_qty, side_str, _uref) ->
-                   if side_str = "sell" then acc +. remaining_qty else acc
-                 ) 0.0 open_orders in
-                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells in
+                 let locked_in_sells = ref 0.0 in
+                 iter_open_orders (fun _oid _price remaining_qty side_str _uref ->
+                   if side_str = "sell" then locked_in_sells := !locked_in_sells +. remaining_qty
+                 );
+                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. !locked_in_sells in
                  if available >= sell_qty then true
                  else begin
                    Logging.warn_f ~section
                      "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells sell_qty;
+                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base !locked_in_sells sell_qty;
                    false
                  end
                else true
@@ -974,18 +982,28 @@ let execute_strategy
              Logging.debug_f ~section "Skipping buy order placement for %s due to rate limit cooldown" asset.symbol
          | Some _ when state.inflight_buy ->
              Logging.debug_f ~section "Skipping buy order placement for %s: inflight buy=%B" asset.symbol state.inflight_buy
-         | Some quote_bal ->
-             (* Atomically check balance and reserve. Prevents TOCTOU race where
-                two domains both read sufficient balance and both place buys. *)
-             let (balance_ok, available_quote, total_reserved) =
-               atomic_check_and_reserve state quote_bal quote_needed (buy_price *. qty)
+         | Some _quote_bal ->
+             (* Compute available balances net of open order commitments *)
+             let available_quote_balance = match quote_balance with
+               | Some total_balance ->
+                   (* Deduct value locked in open buys *)
+                   let locked_in_buys = ref 0.0 in
+                   iter_open_orders (fun _oid order_price remaining_qty side_str _uref ->
+                     if side_str = "buy" then locked_in_buys := !locked_in_buys +. (order_price *. remaining_qty)
+                   );
+                   Some (total_balance -. !locked_in_buys)
+               | None -> None
+             in
+             let balance_ok = match available_quote_balance with
+               | Some avail -> avail >= (buy_price *. qty)
+               | None -> true
              in
              if balance_ok then begin
                let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
                if push_order ~now order then begin
                  state.last_buy_order_price <- Some buy_price;
-                 Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f (available %.2f, reserved %.2f)"
-                   asset.symbol qty buy_price available_quote state.reserved_quote;
+                 Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
+                   asset.symbol qty buy_price;
 
                  (* Enforce exactly 2x grid_interval spacing. *)
                  let all_sells = (("new_sell", sell_price, 0.0) :: state.open_sell_orders) in
@@ -1005,9 +1023,6 @@ let execute_strategy
                         Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
                           asset.symbol buy_price target_buy cs_price
                   | None -> ())
-               end else begin
-                 (* push_order failed (buffer full); release the reservation. *)
-                 set_asset_reserved_quote state 0.0
                end
              end else begin
                 (* Local balance appears insufficient but still attempt the buy,
@@ -1021,8 +1036,8 @@ let execute_strategy
                    ack or rejection. *)
                 let cooldown_key = "place_Buy" in
                 if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
-                  Logging.warn_f ~section "Local balance low for %s buy (need %.2f, available %.2f, total %.2f, total_reserved %.2f) - attempting anyway, exchange will reject if truly insufficient"
-                    asset.symbol quote_needed available_quote quote_bal total_reserved;
+                  Logging.warn_f ~section "Local balance low for %s buy (need %.2f, available %.2f) - attempting anyway, exchange will reject if truly insufficient"
+                    asset.symbol quote_needed (Option.value available_quote_balance ~default:0.0);
                   Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
                   (* Attempt without a reservation; exchange is the final gatekeeper. *)
                   let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
