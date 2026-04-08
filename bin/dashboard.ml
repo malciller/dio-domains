@@ -587,6 +587,16 @@ let render_latencies w json =
     col 10 a_label "p999";
     col 10 a_label "SAMPLES";
   ] in
+  (* Per-metric latency thresholds: (yellow_us, red_us) *)
+  let latency_thresholds label =
+    match label with
+    | "ticker"    -> (10.0,  50.0)
+    | "orderbook" -> (20.0,  75.0)
+    | "strategy"  -> (100.0, 250.0)
+    | "execution" -> (300.0, 750.0)
+    | "cycle"     -> (150.0, 400.0)
+    | _           -> (250.0, 500.0)
+  in
   let rows = List.concat_map (fun (symbol, metrics) ->
     let mlist = match metrics with `Assoc l -> l | _ -> [] in
     List.map (fun (label, data) ->
@@ -596,24 +606,28 @@ let render_latencies w json =
       let p999    = data |?> "p999"    |> to_float_d 0.0 in
       let samples = data |?> "samples" |> to_int_d 0 in
       let empty   = samples = 0 in
-      let lat_attr f =
-        if empty          then a_dim
-        else if f > 500.0 then a_red
-        else if f > 250.0 then a_yellow
-        else a_green
+      let (warn, crit) = latency_thresholds label in
+      let lat_attr ~is_p999 f =
+        if empty then a_dim
+        else
+          (* p999 gets 2x slack — tail spikes are expected *)
+          let mult = if is_p999 then 2.0 else 1.0 in
+          if f > crit *. mult then a_red
+          else if f > warn *. mult then a_yellow
+          else a_green
       in
-      let lat_col f =
+      let lat_col ~is_p999 f =
         if empty then col 10 a_dim "--"
-        else col 10 (lat_attr f) (format_latency_us f)
+        else col 10 (lat_attr ~is_p999 f) (format_latency_us f)
       in
       I.hcat [
         I.string a_text "  ";
         col 14 (if empty then a_dim else a_bright) (truncate_string 13 symbol);
         col metric_w (if empty then a_dim else a_cyan) (truncate_string (metric_w - 1) label);
-        lat_col p50;
-        lat_col p90;
-        lat_col p99;
-        lat_col p999;
+        lat_col ~is_p999:false p50;
+        lat_col ~is_p999:false p90;
+        lat_col ~is_p999:false p99;
+        lat_col ~is_p999:true  p999;
         col 10 a_dim (if empty then "--" else string_of_int samples);
       ]
     ) mlist
