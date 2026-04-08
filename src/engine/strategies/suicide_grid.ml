@@ -761,10 +761,10 @@ let execute_strategy
       
       (* pending_orders are managed by order placement responses; not cleared here. *)
 
-      (* Rebuild buy and sell lists from exchange open_orders data. *)
-          let new_orders_hash = ref 0 in
+      (* Rebuild buy and sell lists from exchange open_orders data in a single pass. *)
           let open_buy_count_local = ref 0 in
-          let open_sell_count_local = ref 0 in
+          let buy_orders = ref [] in
+          let sell_orders = ref [] in
           
           iter_open_orders (fun order_id order_price qty side_str userref_opt ->
             let is_our_strategy = match userref_opt with
@@ -772,41 +772,14 @@ let execute_strategy
               | None -> true
             in
             if qty > 0.0 && is_our_strategy then begin
-              let hash_id = if String.length order_id > 0 then Char.code order_id.[0] + String.length order_id else 0 in
-              new_orders_hash := !new_orders_hash + hash_id + int_of_float (order_price *. 100.0) + int_of_float (qty *. 100.0);
-              if side_str = "buy" then incr open_buy_count_local else incr open_sell_count_local
+              if side_str = "buy" then begin
+                incr open_buy_count_local;
+                buy_orders := (order_id, order_price) :: !buy_orders
+              end else begin
+                sell_orders := (order_id, order_price, qty) :: !sell_orders
+              end
             end
           );
-          
-          let state_changed = (!new_orders_hash <> state.last_cycle_orders_hash) || 
-                              (!open_buy_count_local <> state.last_cycle_buy_count) ||
-                              (!open_sell_count_local <> List.length state.open_sell_orders) in
-                              
-          let buy_orders = ref [] in
-          let sell_orders = ref [] in
-          
-          if state_changed then begin
-            state.last_cycle_orders_hash <- !new_orders_hash;
-            state.last_cycle_buy_count <- !open_buy_count_local;
-            
-            iter_open_orders (fun order_id order_price qty side_str userref_opt ->
-              let is_our_strategy = match userref_opt with
-                | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
-                | None -> true
-              in
-              if qty > 0.0 && is_our_strategy then
-                if side_str = "buy" then
-                  buy_orders := (order_id, order_price) :: !buy_orders
-                else
-                  sell_orders := (order_id, order_price, qty) :: !sell_orders
-            );
-          end else begin
-            (* Fully 0-alloc state preservation. Rebuild lightweight buy state from existing if needed. *)
-            (match state.last_buy_order_id, state.last_buy_order_price with
-            | Some id, Some price when !open_buy_count_local = 1 -> buy_orders := [(id, price)]
-            | _ -> ());
-            sell_orders := state.open_sell_orders;
-          end;
 
       (* Set buy order price and ID (select highest buy if multiple exist).
          Gate: if a cancel is in flight, the open_orders snapshot is not trusted
@@ -924,16 +897,7 @@ let execute_strategy
        last_buy_order_id is set immediately by orderUpdates events. *)
     let has_tracked_buy = state.last_buy_order_id <> None in
     (* Count non-cancelled open buy orders for balance check *)
-    let open_buy_count = ref 0 in
-    iter_open_orders (fun _order_id _price qty side_str userref_opt ->
-      let is_our_strategy = match userref_opt with
-        | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
-        | None -> true
-      in
-      if side_str = "buy" && qty > 0.0 && is_our_strategy then
-        incr open_buy_count
-    );
-    let open_buy_count = !open_buy_count in
+    let open_buy_count = _open_buy_count in
     let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
 
     if buy_order_pending then begin
@@ -1002,16 +966,13 @@ let execute_strategy
                 2. qty locked in open sell orders on the exchange. *)
              let balance_ok =
                if ecfg.use_reserved_base_guard then
-                 let locked_in_sells = ref 0.0 in
-                 iter_open_orders (fun _oid _price remaining_qty side_str _uref ->
-                   if side_str = "sell" then locked_in_sells := !locked_in_sells +. remaining_qty
-                 );
-                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. !locked_in_sells in
+                 let locked_in_sells = List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 !sell_orders in
+                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells in
                  if available >= sell_qty then true
                  else begin
                    Logging.warn_f ~section
                      "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base !locked_in_sells sell_qty;
+                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells sell_qty;
                    false
                  end
                else true
@@ -1052,11 +1013,8 @@ let execute_strategy
              let available_quote_balance = match quote_balance with
                | Some total_balance ->
                    (* Deduct value locked in open buys *)
-                   let locked_in_buys = ref 0.0 in
-                   iter_open_orders (fun _oid order_price remaining_qty side_str _uref ->
-                     if side_str = "buy" then locked_in_buys := !locked_in_buys +. (order_price *. remaining_qty)
-                   );
-                   Some (total_balance -. !locked_in_buys)
+                   let locked_in_buys = List.fold_left (fun acc (_, price) -> acc +. (price *. state.grid_qty)) 0.0 !buy_orders in
+                   Some (total_balance -. locked_in_buys)
                | None -> None
              in
              let balance_ok = match available_quote_balance with
