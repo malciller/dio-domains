@@ -173,13 +173,11 @@ let test_duplicate_cancellation () =
   let state = Dio_strategies.Market_maker.get_strategy_state "TEST/USD" in
   state.cancelled_orders <- [("order1", Unix.time ())];  (* Mark order1 as cancelled *)
 
-  (* Provide iterator wrapper for the mocked list *)
-  let iter_orders f =
-    List.iter (fun (oid, price, qty, side_str, uref) -> f oid price qty side_str uref) open_orders
-  in
+  (* Re-map the mocked list into the shape the new duplicate function expects *)
+  let open_orders_list = List.map (fun (oid, price, qty, _, _) -> (oid, price, qty)) open_orders in
 
   (* Count duplicates cancelled *)
-  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy iter_orders Dio_strategies.Strategy_common.MM "kraken" in
+  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders_list Dio_strategies.Strategy_common.MM "kraken" in
 
   (* Should cancel 1 duplicate (order2), order1 is already cancelled *)
   check int "duplicate cancellation count" 1 cancelled_count

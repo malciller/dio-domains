@@ -387,16 +387,17 @@ let push_order ?(now = Unix.time ()) order =
        end)
 
 (** Cancels all open orders at [target_price] for [target_side]. Returns count cancelled. *)
-let cancel_duplicate_orders asset_symbol target_price target_side iter_open_orders strategy exchange =
+let cancel_duplicate_orders asset_symbol target_price _target_side (open_orders_list : (string * float * float) list) strategy exchange =
+  let count = ref 0 in
   let duplicates = ref [] in
-  iter_open_orders (fun order_id order_price qty side_str _ ->
-    let is_cancelled = List.exists (fun (cancelled_id, _) ->
-      cancelled_id = order_id) (get_strategy_state asset_symbol).cancelled_orders in
-    if not is_cancelled && qty > 0.0 &&
-       side_str = (if target_side = Buy then "buy" else "sell") &&
-       abs_float (order_price -. target_price) < 0.000001 then
-      duplicates := order_id :: !duplicates
-  );
+
+  List.iter (fun (order_id, order_price, _) ->
+    if abs_float (order_price -. target_price) < 0.00001 then begin
+      incr count;
+      if !count > 1 then
+        duplicates := order_id :: !duplicates
+    end
+  ) open_orders_list;
 
   List.iter (fun order_id ->
     let cancel_order = create_cancel_order order_id asset_symbol strategy exchange in
@@ -576,19 +577,40 @@ let execute_strategy
         let mid_price = (bid +. ask) /. 2.0 in
         let spread_pct = if mid_price > 0.0 then spread /. mid_price else 0.0 in
 
-        (* Single pass to compute available balances and counts net of open order commitments *)
+        (* Single pass to compute available balances, counts, and active orders net of cancellations *)
         let locked_in_sells = ref 0.0 in
         let locked_in_buys = ref 0.0 in
-        let open_buy_count = ref 0 in
-        
-        iter_open_orders (fun order_id order_price remaining_qty side_str _uref ->
+        let sync_open_buy_count = ref 0 in
+        let sync_open_sell_count = ref 0 in
+        let best_buy_price = ref None in
+        let best_buy_id = ref None in
+        let mm_open_orders = ref [] in
+
+        iter_open_orders (fun order_id order_price remaining_qty side_str userref_opt ->
           let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
           if not is_cancelled && remaining_qty > 0.0 then begin
             if side_str = "sell" then
               locked_in_sells := !locked_in_sells +. remaining_qty
             else if side_str = "buy" then begin
               locked_in_buys := !locked_in_buys +. (order_price *. remaining_qty);
-              incr open_buy_count
+            end;
+            
+            let is_our_strategy = match userref_opt with
+              | Some ref_val -> Strategy_common.is_strategy_order Strategy_common.strategy_userref_mm ref_val
+              | None -> false
+            in
+            if is_our_strategy then begin
+              mm_open_orders := (order_id, order_price, remaining_qty, side_str) :: !mm_open_orders;
+              if side_str = "buy" then begin
+                incr sync_open_buy_count;
+                let current_best = match !best_buy_price with Some p -> p | None -> -1.0 in
+                if order_price > current_best then begin
+                  best_buy_price := Some order_price;
+                  best_buy_id := Some order_id
+                end
+              end else begin
+                incr sync_open_sell_count
+              end
             end
           end
         );
@@ -612,13 +634,11 @@ let execute_strategy
         if should_log then Logging.debug_f ~section "DEBUG Asset [%s/%s]: spread=%.8f, spread_pct=%.8f, fee=%.8f, exposure=%.2f"
           asset.exchange asset.symbol spread spread_pct fee exposure_value;
 
-        let open_buy_count = !open_buy_count in
-
         (* Balance constraints: enforced only when config parameters are set *)
         let usd_balance_ok = match min_usd_balance_opt, available_quote_balance with
           | Some min_balance, Some qb ->
               (* Exclude existing open buy cost to avoid double-counting *)
-              let buy_cost = if open_buy_count > 0 then 0.0 else bid *. qty in
+              let buy_cost = if !sync_open_buy_count > 0 then 0.0 else bid *. qty in
               qb -. buy_cost >= min_balance
           | Some _, None -> false  (* no quote balance data; fail-safe *)
           | None, _ -> true        (* no min_balance constraint configured *)
@@ -632,9 +652,8 @@ let execute_strategy
           | None, _ -> true        (* no max_exposure constraint *)
         in
 
-
         if should_log then Logging.info_f ~section "Strategy check for %s: open_buy_count=%d, bid=%.8f, ask=%.8f, exposure_ok=%B, usd_ok=%B"
-          asset.symbol open_buy_count bid ask exposure_ok usd_balance_ok;
+          asset.symbol !sync_open_buy_count bid ask exposure_ok usd_balance_ok;
 
         (* Exposure or balance limit breach: cancel buys, place emergency sell for free balance *)
         if not exposure_ok || not usd_balance_ok then begin
@@ -649,19 +668,14 @@ let execute_strategy
             state.last_buy_order_id <- None
           end;
 
-          (* Cancel all active buy orders. Zero allocation iteration. *)
-          iter_open_orders (fun order_id _order_price qty side_str userref_opt ->
-            let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            let is_our_strategy = match userref_opt with
-              | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
-              | None -> false
-            in
-            if not is_cancelled && qty > 0.0 && is_our_strategy && side_str = "buy" then begin
+          (* Cancel all active buy orders mapped locally *)
+          List.iter (fun (order_id, _order_price, _qty, side_str) ->
+            if side_str = "buy" then begin
               let cancel_order = create_cancel_order order_id asset.symbol MM asset.exchange in
               ignore (push_order ~now cancel_order);
               if should_log then Logging.debug_f ~section "Cancelling buy order due to pause: %s for %s" order_id asset.symbol
             end
-          );
+          ) !mm_open_orders;
 
           (* Also cancel the actively tracked buy if it wasn't caught by iter_open_orders *)
           (match state.last_buy_order_id with
@@ -701,32 +715,8 @@ let execute_strategy
         end else begin
           (* Balance and exposure OK: proceed to buy order management *)
 
-          (* Use zero-allocation iteration to find the best active buy order *)
-          let best_buy_price = ref None in
-          let best_buy_id = ref None in
-          let sync_open_buy_count = ref 0 in
-          let sync_open_sell_count = ref 0 in
-
-          iter_open_orders (fun order_id order_price qty side_str userref_opt ->
-            let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-            let is_our_strategy = match userref_opt with
-              | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
-              | None -> false
-            in
-            if not is_cancelled && qty > 0.0 && is_our_strategy then begin
-              if side_str = "buy" then begin
-                incr sync_open_buy_count;
-                let current_best_price = match !best_buy_price with Some p -> p | None -> -1.0 in
-                if order_price > current_best_price then begin
-                  best_buy_price := Some order_price;
-                  best_buy_id := Some order_id
-                end
-              end else begin
-                incr sync_open_sell_count
-              end
-            end
-          );
-
+          (* Use localized counts instead of duplicate scanning *)
+          
           if asset.exchange <> "hyperliquid" then begin
             state.last_buy_order_price <- !best_buy_price;
             state.last_buy_order_id <- !best_buy_id
@@ -753,17 +743,12 @@ let execute_strategy
             (* Multiple open buys: cancel all; next trigger re-places a single order *)
             if should_log then Logging.debug_f ~section "Cancelling %d excess buy orders for %s" actual_open_buy_count asset.symbol;
             
-            iter_open_orders (fun order_id _order_price qty side_str userref_opt ->
-              let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-              let is_our_strategy = match userref_opt with
-                | Some ref_val -> ref_val = Strategy_common.strategy_userref_mm
-                | None -> false
-              in
-              if not is_cancelled && qty > 0.0 && is_our_strategy && side_str = "buy" then begin
+            List.iter (fun (order_id, _order_price, _qty, side_str) ->
+              if side_str = "buy" then begin
                 let cancel_order = create_cancel_order order_id asset.symbol MM asset.exchange in
                 ignore (push_order ~now cancel_order)
               end
-            );
+            ) !mm_open_orders;
             
             state.last_buy_order_price <- None;
             state.last_buy_order_id <- None;
@@ -815,7 +800,8 @@ let execute_strategy
 
                   (* Then place buy *)
                   if can_place_buy then begin
-                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy iter_open_orders MM asset.exchange in
+                    let synthetic_list = [(buy_price |> string_of_float, buy_price, qty)] in
+                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy synthetic_list MM asset.exchange in
                     let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true MM asset.exchange in
                     if push_order ~now buy_order then begin
                       state.last_buy_order_price <- Some buy_price;
@@ -884,7 +870,8 @@ let execute_strategy
 
                   (* Proceed only if profitable, post-only safe, and balance is sufficient *)
                   if profitability_ok && required_buy_price <= (bid +. 0.0000001) && amendment_balance_ok then begin
-                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy iter_open_orders MM asset.exchange in
+                    let synthetic_list = [(buy_order_id, required_buy_price, qty)] in
+                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy synthetic_list MM asset.exchange in
                     let amend_order = create_amend_order buy_order_id asset.symbol Buy qty (Some required_buy_price) true MM asset.exchange in
                     ignore (push_order ~now amend_order);
                     state.last_buy_order_price <- Some required_buy_price;
