@@ -320,13 +320,16 @@ let update_open_order_price ~symbol ~order_id ~new_price =
   Mutex.lock store.orders_mutex;
   (match Hashtbl.find_opt store.open_orders order_id with
    | Some order ->
+       let old_price = order.limit_price in
        let updated = { order with limit_price = Some new_price; last_updated = Unix.gettimeofday () } in
        Hashtbl.replace store.open_orders order_id updated;
-       Logging.debug_f ~section "Proactively updated cached limit_price for %s [%s] -> %.8f"
-         order_id symbol new_price
+       Logging.info_f ~section "EAGER_PRICE_UPDATE %s [%s]: %s -> %.8f (qty=%.8f remaining=%.8f)"
+         order_id symbol
+         (match old_price with Some p -> Printf.sprintf "%.8f" p | None -> "None")
+         new_price order.order_qty order.remaining_qty
    | None ->
-       Logging.debug_f ~section "update_open_order_price: order %s [%s] not in cache, skipping"
-         order_id symbol);
+       Logging.info_f ~section "EAGER_PRICE_UPDATE %s [%s] not in cache, skipping (new_price=%.8f)"
+         order_id symbol new_price);
   Mutex.unlock store.orders_mutex
 
 (** Returns all symbols with initialized execution stores. *)
@@ -443,27 +446,66 @@ let update_open_orders store (event : execution_event) =
     let abs_order_qty = abs_float event.order_qty in
     if abs_order_qty = 0.0 then 1e-12 else abs_order_qty *. 1e-6
   in
-  let is_effectively_filled = remaining_qty <= epsilon in
+  (* Guard: when order_qty is 0.0 (fallback default from a minimal WS event
+     with missing quantity fields) and the status is non-terminal, this is NOT
+     a real fill. Treating it as effectively filled removes valid orders from
+     the open_orders table, breaking strategy reference price tracking. *)
+  let is_effectively_filled =
+    if event.order_qty = 0.0 && not is_terminal_status then false
+    else remaining_qty <= epsilon
+  in
 
   Mutex.lock store.orders_mutex;
   let was_tracked = Hashtbl.mem store.open_orders event.order_id in
   let needs_cleanup = ref false in
+  (* Capture previous values for change detection logging. *)
+  let prev_price_qty = if was_tracked then
+    match Hashtbl.find_opt store.open_orders event.order_id with
+    | Some prev -> Some (prev.limit_price, prev.order_qty, prev.remaining_qty)
+    | None -> None
+  else None in
 
   if is_terminal_status || is_effectively_filled then begin
     (* Terminal: remove from open orders if present. *)
     if was_tracked then Hashtbl.remove store.open_orders event.order_id
   end else begin
-    (* Non-terminal: upsert into open orders. *)
+    (* Non-terminal: upsert into open orders.
+       CRITICAL: Kraken's execution feed snapshot replays all open orders as
+       exec_type=new/status=new but with MINIMAL data — limit_price is often
+       absent (None) and qty fields may be zero. When we already have a cached
+       entry with valid data, we must PRESERVE those fields rather than
+       blindly overwriting them with empty/zero values. *)
+    let merged_limit_price, merged_order_qty, merged_remaining_qty, merged_avg_price, merged_cum_cost =
+      match Hashtbl.find_opt store.open_orders event.order_id with
+      | Some prev ->
+          (* Preserve cached price if incoming is None or zero —
+             Kraken snapshot events arrive with limit_price = Some 0.0 *)
+          let lp = match event.limit_price with
+            | Some p when p > 1e-12 -> event.limit_price
+            | _ -> prev.limit_price in
+          (* Preserve cached order_qty if incoming is zero *)
+          let oq = if event.order_qty > 1e-12 then event.order_qty else prev.order_qty in
+          (* Preserve cached remaining_qty if incoming is zero but previous wasn't *)
+          let rq = if remaining_qty > 1e-12 then remaining_qty
+                   else if prev.remaining_qty > 1e-12 then prev.remaining_qty
+                   else remaining_qty in
+          (* Preserve avg_price and cum_cost similarly *)
+          let ap = if event.avg_price > 1e-12 then event.avg_price else prev.avg_price in
+          let cc = if event.cum_cost > 1e-12 then event.cum_cost else prev.cum_cost in
+          (lp, oq, rq, ap, cc)
+      | None ->
+          (event.limit_price, event.order_qty, remaining_qty, event.avg_price, event.cum_cost)
+    in
     let order = {
       order_id = event.order_id;
       symbol = event.symbol;
       side = event.side;
-      order_qty = event.order_qty;
+      order_qty = merged_order_qty;
       cum_qty = event.cum_qty;
-      remaining_qty;
-      limit_price = event.limit_price;
-      avg_price = event.avg_price;
-      cum_cost = event.cum_cost;
+      remaining_qty = merged_remaining_qty;
+      limit_price = merged_limit_price;
+      avg_price = merged_avg_price;
+      cum_cost = merged_cum_cost;
       order_status = event.order_status;
       order_userref = event.order_userref;
       cl_ord_id = event.cl_ord_id;
@@ -473,6 +515,38 @@ let update_open_orders store (event : execution_event) =
     needs_cleanup := not was_tracked && Hashtbl.length store.open_orders > 1000;
   end;
   Mutex.unlock store.orders_mutex;
+
+  (* Detect and log price/qty overwrites on existing orders. *)
+  (match prev_price_qty with
+   | Some (prev_lp, prev_oq, prev_rq) when not is_terminal_status && not is_effectively_filled ->
+       (* Compare against the MERGED values that were actually stored,
+          not the raw event values which may have been discarded by the merge. *)
+       let stored_lp = match Hashtbl.find_opt store.open_orders event.order_id with
+         | Some o -> o.limit_price | None -> event.limit_price in
+       let stored_oq = match Hashtbl.find_opt store.open_orders event.order_id with
+         | Some o -> o.order_qty | None -> event.order_qty in
+       let stored_rq = match Hashtbl.find_opt store.open_orders event.order_id with
+         | Some o -> o.remaining_qty | None -> remaining_qty in
+       let price_changed = prev_lp <> stored_lp in
+       let qty_changed = abs_float (prev_oq -. stored_oq) > 1e-12 in
+       let rq_changed = abs_float (prev_rq -. stored_rq) > 1e-12 in
+       if price_changed || qty_changed || rq_changed then
+         Logging.info_f ~section
+           "CACHE_OVERWRITE %s [%s] exec_type=%s status=%s: price %s->%s | qty %.8f->%.8f | remaining %.8f->%.8f"
+           event.order_id event.symbol
+           (string_of_exec_type event.exec_type)
+           (string_of_order_status event.order_status)
+           (match prev_lp with Some p -> Printf.sprintf "%.2f" p | None -> "None")
+           (match stored_lp with Some p -> Printf.sprintf "%.2f" p | None -> "None")
+           prev_oq stored_oq
+           prev_rq stored_rq
+       else
+         (* Merge preserved existing data — snapshot replay was harmless *)
+         Logging.debug_f ~section
+           "CACHE_MERGE_NOOP %s [%s] exec_type=%s (snapshot replay, cached data preserved)"
+           event.order_id event.symbol
+           (string_of_exec_type event.exec_type)
+   | _ -> ());
 
   if is_terminal_status || is_effectively_filled then begin
     if was_tracked then begin
@@ -577,9 +651,9 @@ let parse_execution_event json =
     | Some sym ->
         (* Fetch existing order to fill in missing fields from minimal events. *)
         let store = get_symbol_store sym in
-        Mutex.lock global_orders_mutex;
+        Mutex.lock store.orders_mutex;
         let existing_order = Hashtbl.find_opt store.open_orders order_id in
-        Mutex.unlock global_orders_mutex;
+        Mutex.unlock store.orders_mutex;
 
         (* Extract fields from JSON with fallback to existing order data. *)
         let side_str =
@@ -595,9 +669,19 @@ let parse_execution_event json =
           match parse_float_opt json "order_qty" with
           | Some q -> q
           | None ->
-              (match existing_order with
-               | Some order -> order.order_qty
-               | None -> 0.0)
+              match parse_float_opt json "qty" with
+              | Some q -> q
+              | None ->
+                  match parse_float_opt json "quantity" with
+                  | Some q -> q
+                  | None ->
+                      (match existing_order with
+                       | Some order -> order.order_qty
+                       | None ->
+                           Logging.info_f ~section
+                             "FIELD FALLBACK order_qty=0.0 for %s [%s] exec_type=%s status=%s (no cached order)"
+                             order_id (Option.value symbol_opt ~default:"?") exec_type_str order_status_str;
+                           0.0)
         in
 
         let cum_qty =
@@ -631,9 +715,16 @@ let parse_execution_event json =
           match parse_float_opt json "limit_price" with
           | Some _ as p -> p
           | None ->
-              (match existing_order with
-               | Some order -> order.limit_price
-               | None -> None)
+              match parse_float_opt json "price" with
+              | Some _ as p -> p
+              | None ->
+                  (match existing_order with
+                   | Some order -> order.limit_price
+                   | None ->
+                       Logging.info_f ~section
+                         "FIELD FALLBACK limit_price=None for %s [%s] exec_type=%s status=%s (no cached order)"
+                         order_id (Option.value symbol_opt ~default:"?") exec_type_str order_status_str;
+                       None)
         in
 
         let last_qty = parse_float_opt json "last_qty" in

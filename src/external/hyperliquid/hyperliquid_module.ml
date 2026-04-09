@@ -357,6 +357,7 @@ module Hyperliquid_impl = struct
         filled_qty = e.cum_qty;
         avg_price = e.avg_price;
         timestamp = e.timestamp;
+        is_amended = false;
       }
     ) events
 
@@ -371,6 +372,7 @@ module Hyperliquid_impl = struct
         filled_qty = e.cum_qty;
         avg_price = e.avg_price;
         timestamp = e.timestamp;
+        is_amended = false;
       }
     )
 

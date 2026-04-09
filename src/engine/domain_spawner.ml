@@ -462,8 +462,19 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   end
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
+                  (* Guard: skip handle_order_acknowledged for in-place amendment
+                     confirmations (Kraken exec_type=amended with status=new).
+                     The amendment lifecycle is handled by the supervisor's
+                     handle_order_amended callback on the REST response path.
+                     Routing these through handle_order_acknowledged causes a
+                     dual-update race that corrupts open_sell_orders tracking. *)
+                  if event.is_amended then
+                    Logging.info_f ~section "AMENDED_SKIP %s [%s] status=%s (handled by amendment lifecycle)"
+                      event.order_id asset_with_fees.symbol
+                      (match event.order_status with Types.New -> "New" | Types.PartiallyFilled -> "PartiallyFilled" | _ -> "Other")
+                  else
                   (match event.limit_price with
-                   | Some price ->
+                   | Some price when price > 0.0 ->
                        let side = match event.side with
                          | Types.Buy -> Dio_strategies.Strategy_common.Buy
                          | Types.Sell -> Dio_strategies.Strategy_common.Sell
@@ -482,6 +493,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                             Logging.debug_f ~section "Notified MM strategy about acknowledged order %s for %s"
                               event.order_id asset_with_fees.symbol
                         | None -> ())
+                   | Some price ->
+                       Logging.debug_f ~section "ZERO_PRICE_SKIP %s [%s] price=%.8f (snapshot replay, not a real ack)"
+                         event.order_id asset_with_fees.symbol price
                    | None -> ())
               | _ -> ()
           ) in
