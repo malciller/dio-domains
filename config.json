@@ -78,21 +78,6 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"
-    },
-    {
-      "symbol": "TQQQ",
-      "exchange": "ibkr",
-      "qty": "1.0",
-      "grid_interval": [
-        0.5,
-        1.0
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        25.0,
-        50.0
-      ],
-      "strategy": "Grid"
     }
   ]
 }
