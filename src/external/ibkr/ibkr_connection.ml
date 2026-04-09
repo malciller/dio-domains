@@ -61,28 +61,42 @@ let get_server_version t = t.server_version
 
 (* ---- Low-level IO ---- *)
 
-(** Read exactly [n] bytes from the input channel. *)
-let read_bytes ic n =
-  let buf = Bytes.create n in
-  Lwt_io.read_into_exactly ic buf 0 n >|= fun () ->
-  buf
+(** Pre-allocated 4-byte buffer for reading length prefixes.
+    Eliminates a Bytes.create(4) per inbound message.
+    Safe: single-reader architecture guarantees sequential access. *)
+let length_buf = Bytes.create 4
 
-(** Read a 4-byte big-endian length prefix. *)
+(** Growable reusable buffer for reading message payloads.
+    Avoids allocating a fresh Bytes.t per inbound message. Only
+    reallocates when a message exceeds the current capacity.
+    Safe: decode_fields copies data into new strings before we reuse. *)
+let msg_buf = ref (Bytes.create 4096)
+
+(** Read exactly [n] bytes from the input channel into a provided buffer. *)
+let read_bytes_into ic buf n =
+  Lwt_io.read_into_exactly ic buf 0 n
+
+(** Read a 4-byte big-endian length prefix using the pre-allocated buffer. *)
 let read_length ic =
-  read_bytes ic 4 >|= fun buf ->
-  (Bytes.get_uint8 buf 0 lsl 24) lor
-  (Bytes.get_uint8 buf 1 lsl 16) lor
-  (Bytes.get_uint8 buf 2 lsl 8) lor
-  (Bytes.get_uint8 buf 3)
+  read_bytes_into ic length_buf 4 >|= fun () ->
+  (Bytes.get_uint8 length_buf 0 lsl 24) lor
+  (Bytes.get_uint8 length_buf 1 lsl 16) lor
+  (Bytes.get_uint8 length_buf 2 lsl 8) lor
+  (Bytes.get_uint8 length_buf 3)
 
-(** Read a single length-prefixed message and decode its fields. *)
+(** Read a single length-prefixed message and decode its fields.
+    Uses a growable reusable buffer to minimize allocations. *)
 let read_message ic =
   read_length ic >>= fun len ->
   if len <= 0 || len > 1_000_000 then
     Lwt.fail_with (Printf.sprintf "Invalid message length: %d" len)
-  else
-    read_bytes ic len >|= fun buf ->
-    Ibkr_codec.decode_fields (Bytes.to_string buf)
+  else begin
+    (* Grow the reusable buffer if needed *)
+    if Bytes.length !msg_buf < len then
+      msg_buf := Bytes.create (len * 2);
+    read_bytes_into ic !msg_buf len >|= fun () ->
+    Ibkr_codec.decode_fields (Bytes.sub_string !msg_buf 0 len)
+  end
 
 (** Write raw bytes to the output channel under the write mutex. *)
 let write_raw t bytes =

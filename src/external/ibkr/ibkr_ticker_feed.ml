@@ -39,6 +39,11 @@ let ready_condition = Lwt_condition.create ()
 let req_id_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 32
 let next_req_id = Atomic.make 1000
 
+(** Clear stale reqId→symbol mappings. Called before reconnection to
+    prevent orphaned entries from prior connections accumulating. *)
+let clear_req_ids () =
+  Hashtbl.clear req_id_to_symbol
+
 let ensure_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store

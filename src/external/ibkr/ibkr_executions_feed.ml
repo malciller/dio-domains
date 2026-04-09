@@ -93,6 +93,13 @@ let resolve_symbol order_id =
   Mutex.unlock global_mutex;
   r
 
+(** Remove an order_id from the global order→symbol index.
+    Called when an order reaches terminal status. *)
+let unregister_order ~order_id =
+  Mutex.lock global_mutex;
+  Hashtbl.remove order_to_symbol order_id;
+  Mutex.unlock global_mutex
+
 (** Update open orders table from an execution event. *)
 let update_open_orders symbol (event : execution_event) =
   let store = get_symbol_store symbol in
@@ -101,9 +108,13 @@ let update_open_orders symbol (event : execution_event) =
     | _ -> false
   in
   Mutex.lock store.orders_mutex;
-  if is_terminal || event.remaining_qty <= 0.0 then
-    Hashtbl.remove store.open_orders event.order_id
-  else begin
+  if is_terminal || event.remaining_qty <= 0.0 then begin
+    Hashtbl.remove store.open_orders event.order_id;
+    (* Clean up global order→symbol index for completed orders
+       to prevent unbounded growth of the hashtable. *)
+    (try unregister_order ~order_id:(int_of_string event.order_id)
+     with _ -> ())
+  end else begin
     let limit_price = match Hashtbl.find_opt store.open_orders event.order_id with
       | Some existing -> existing.oo_limit_price
       | None -> None
