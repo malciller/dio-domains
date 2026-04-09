@@ -159,7 +159,15 @@ let get_balance ~asset =
   | "SETTLED" -> get_settled_cash ()
   | "NET_LIQ" -> get_net_liquidation ()
   | "BUYING_POWER" -> get_buying_power ()
-  | other -> get_account_value other
+  | symbol ->
+      (* For equity symbols, check position data from updatePortfolio.
+         Falls back to account_values for misc TWS account keys. *)
+      (Mutex.lock positions_mutex;
+       let r = Hashtbl.find_opt positions symbol in
+       Mutex.unlock positions_mutex;
+       match r with
+       | Some (qty, _, _, _) -> qty
+       | None -> get_account_value symbol)
 
 (** Get all balances in a form compatible with the supervisor's
     non-active asset monitor. IBKR account values are internal TWS keys

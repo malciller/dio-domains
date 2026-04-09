@@ -13,14 +13,85 @@
   },
   "trading": [
     {
-      "symbol": "QQQ",
-      "exchange": "ibkr",
-      "qty": "1",
+      "symbol": "BTC/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.00025",
       "grid_interval": [
-        0.5,
-        1.5
+        0.25,
+        0.25
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.75,
+        2.0
+      ],
+      "strategy": "Grid",
+      "testnet": false,
+      "hedge": false
+    },
+    {
+      "symbol": "ETH/USD",
+      "exchange": "kraken",
+      "qty": "0.006",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "SOL/USD",
+      "exchange": "kraken",
+      "qty": "0.14",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "HYPE/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.35",
+      "grid_interval": [
+        0.3,
+        1.0
+      ],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.5,
+        5.0
+      ],
+      "strategy": "Grid",
+      "testnet": false,
+      "hedge": false
+    },
+    {
+      "symbol": "ADA/USD",
+      "exchange": "kraken",
+      "qty": "50.0",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
+    },
+    {
+      "symbol": "TQQQ",
+      "exchange": "ibkr",
+      "qty": "1.0",
+      "grid_interval": [
+        0.5,
+        1.0
+      ],
+      "sell_mult": "1.0",
+      "accumulation_buffer": [
+        25.0,
+        50.0
+      ],
       "strategy": "Grid"
     }
   ]

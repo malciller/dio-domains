@@ -148,9 +148,21 @@ let parse_config json =
   let open Yojson.Basic.Util in
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
-  (* Enforce that testnet, hedge, and accumulation_buffer are only valid for Hyperliquid entries. *)
+  (* Enforce that testnet and hedge are only valid for Hyperliquid entries.
+     accumulation_buffer is also valid for ibkr (whole-share accumulation). *)
+  if exchange <> "hyperliquid" && exchange <> "ibkr" then begin
+    let restricted = [ "testnet"; "hedge"; "accumulation_buffer" ] in
+    let actual = json |> to_assoc |> List.map fst in
+    let bad = List.filter (fun k -> List.mem k restricted) actual in
+    if bad <> [] then begin
+      List.iter (fun k ->
+        Logging.critical_f ~section "Key '%s' is not valid for exchange '%s' (found in %s/%s)" k exchange exchange symbol
+      ) bad;
+      exit 1
+    end
+  end;
   if exchange <> "hyperliquid" then begin
-    let hl_only = [ "testnet"; "hedge"; "accumulation_buffer" ] in
+    let hl_only = [ "testnet"; "hedge" ] in
     let actual = json |> to_assoc |> List.map fst in
     let bad = List.filter (fun k -> List.mem k hl_only) actual in
     if bad <> [] then begin
