@@ -789,7 +789,9 @@ let execute_strategy
                 incr open_buy_count_local;
                 buy_orders := (order_id, order_price) :: !buy_orders
               end else begin
-                sell_orders := (order_id, order_price, qty) :: !sell_orders
+                sell_orders := (order_id, order_price, qty) :: !sell_orders;
+                Logging.debug_f ~section "SELL_REBUILD [%s] from exchange cache: %s @ %.2f qty=%.8f"
+                  asset.symbol order_id order_price qty
               end
             end
           );
@@ -823,6 +825,9 @@ let execute_strategy
               Retain current state; order channel will resolve. *)
            ());
 
+      (* Log sell order changes: compare new exchange-sourced list with prior state. *)
+      let prev_sells = state.open_sell_orders in
+
       (* Apply exchange sell orders. *)
       state.open_sell_orders <- !sell_orders;
 
@@ -832,13 +837,26 @@ let execute_strategy
       if ecfg.merge_preserved_sells then begin
         List.iter (fun (preserved_id, preserved_price, _) ->
           let already_present = List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders in
-          if not already_present then
-            state.open_sell_orders <- (preserved_id, preserved_price, state.grid_qty) :: state.open_sell_orders
+          if not already_present then begin
+            state.open_sell_orders <- (preserved_id, preserved_price, state.grid_qty) :: state.open_sell_orders;
+            Logging.debug_f ~section "SELL_MERGE [%s] injected preserved sell: %s @ %.2f"
+              asset.symbol preserved_id preserved_price
+          end
         ) preserved_sells
       end;
 
-      Logging.debug_f ~section "Synced open orders for %s: %d buys, %d sells"
-        asset.symbol (List.length !buy_orders) (List.length !sell_orders);
+      (* Detect sell order mutations from prior cycle. *)
+      List.iter (fun (id, new_price, new_qty) ->
+        match List.find_opt (fun (pid, _, _) -> pid = id) prev_sells with
+        | Some (_, prev_price, prev_qty) ->
+            if abs_float (new_price -. prev_price) > 0.01 || abs_float (new_qty -. prev_qty) > 1e-8 then
+              Logging.debug_f ~section "SELL_CHANGED [%s] %s: price %.2f->%.2f qty %.8f->%.8f"
+                asset.symbol id prev_price new_price prev_qty new_qty
+        | None -> ()
+      ) state.open_sell_orders;
+
+      Logging.debug_f ~section "SELL_SYNC [%s] buys=%d sells=%d (prev_sells=%d)"
+        asset.symbol (List.length !buy_orders) (List.length !sell_orders) (List.length prev_sells);
 
       (* Use cached parsed config values; updated once at domain startup
          and whenever the config ref changes (Fear & Greed re-evaluation). *)
@@ -1325,7 +1343,9 @@ let handle_order_acknowledged asset_symbol order_id side price =
     Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
    | Sell ->
     state.inflight_sell <- false;
-    state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells);
+    state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
+    Logging.info_f ~section "SELL_ACK [%s] injected into recently_injected_sells: %s @ %.2f"
+      asset_symbol order_id price);
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     order_id (string_of_order_side side) price asset_symbol
@@ -1694,17 +1714,18 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                   old_order_id new_order_id asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
-         let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
+         let old_entry = List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders in
+         let old_qty = match old_entry with
            | Some (_, _, q) -> q | None -> state.grid_qty in
-         state.open_sell_orders <- (new_order_id, price, old_qty) :: 
+         Logging.info_f ~section "SELL_AMEND [%s] %s -> %s @ %.2f: old_entry=%s old_qty=%.8f sells_before=%d"
+           asset_symbol old_order_id new_order_id price
+           (match old_entry with Some (_, p, q) -> Printf.sprintf "%.2f/%.8f" p q | None -> "NOT_FOUND")
+           old_qty original_sell_count;
+         state.open_sell_orders <- (new_order_id, price, old_qty) ::
             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
          state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
-         if List.length state.open_sell_orders = original_sell_count then
-           Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
-             old_order_id new_order_id price asset_symbol
-         else
-           Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
-             new_order_id price asset_symbol);
+         Logging.info_f ~section "SELL_AMEND [%s] result: sells_after=%d"
+           asset_symbol (List.length state.open_sell_orders));
              
     (* Apply a short cooldown to prevent amending the newly amended order
        before the exchange's WebSocket open-orders cache catches up.

@@ -105,6 +105,10 @@ module Types = struct
     filled_qty: float;             (** Cumulative filled quantity. *)
     avg_price: float;              (** Volume-weighted average fill price. *)
     timestamp: float;              (** Unix timestamp of the execution report. *)
+    is_amended: bool;              (** True when this event is an in-place amendment
+                                       confirmation (Kraken exec_type=amended), not a
+                                       genuine new-order acknowledgment. Domain workers
+                                       must skip handle_order_acknowledged for these. *)
   }
 
   (** Parameters controlling exponential backoff retry behavior. *)

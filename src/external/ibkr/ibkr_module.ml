@@ -354,6 +354,7 @@ module Ibkr_impl = struct
         filled_qty = e.filled_qty;
         avg_price = e.avg_fill_price;
         timestamp = e.timestamp;
+        is_amended = false;
       }
     ) (Ibkr_executions_feed.read_execution_events symbol start_pos)
 
@@ -367,6 +368,7 @@ module Ibkr_impl = struct
           filled_qty = e.filled_qty;
           avg_price = e.avg_fill_price;
           timestamp = e.timestamp;
+          is_amended = false;
         }
     )
 
