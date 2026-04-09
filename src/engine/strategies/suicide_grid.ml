@@ -784,7 +784,7 @@ let execute_strategy
               | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
               | None -> true
             in
-            if qty > 0.0 && order_price > 0.0 && is_our_strategy then begin
+            if qty > 0.0 && is_our_strategy then begin
               if side_str = "buy" then begin
                 incr open_buy_count_local;
                 buy_orders := (order_id, order_price) :: !buy_orders
@@ -805,15 +805,19 @@ let execute_strategy
            set_asset_reserved_quote state 0.0
        | orders when not state.inflight_cancel_buy && not state.inflight_buy ->
            (* Safe to sync: no in-flight operation. *)
-           let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
-             if price > acc_price then (order_id, price) else (acc_id, acc_price)
-           ) (List.hd orders) (List.tl orders) in
-           state.last_buy_order_price <- Some best_price;
-           state.last_buy_order_id <- Some best_order_id;
-           (* Sync per-asset reserved_quote from the actual open buy so the
-              capital_low check uses the real exchange-reserved amount after restart. *)
-           let qty = state.grid_qty in
-           set_asset_reserved_quote state (best_price *. qty)
+           let valid_orders = List.filter (fun (_, p) -> p > 0.0) orders in
+           (match valid_orders with
+            | [] -> () (* Maintain prior state if price is temporarily unavailable *)
+            | hd :: tl ->
+               let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
+                 if price > acc_price then (order_id, price) else (acc_id, acc_price)
+               ) hd tl in
+               state.last_buy_order_price <- Some best_price;
+               state.last_buy_order_id <- Some best_order_id;
+               (* Sync per-asset reserved_quote from the actual open buy so the
+                  capital_low check uses the real exchange-reserved amount after restart. *)
+               let qty = state.grid_qty in
+               set_asset_reserved_quote state (best_price *. qty))
        | _ ->
            (* In-flight cancel or place: open_orders may be stale.
               Retain current state; order channel will resolve. *)
@@ -1102,10 +1106,12 @@ let execute_strategy
         (* Combine active and pending sell orders for spacing calculation. *)
         let closest_sell_order = ref None in
         let update_closest oid price =
-          match !closest_sell_order with
-          | None -> closest_sell_order := Some (oid, price)
-          | Some (_, best_price) ->
-              if price < best_price then closest_sell_order := Some (oid, price)
+          if price > 0.0 then begin
+            match !closest_sell_order with
+            | None -> closest_sell_order := Some (oid, price)
+            | Some (_, best_price) ->
+                if price < best_price then closest_sell_order := Some (oid, price)
+          end
         in
         
         List.iter (fun (oid, price, _) -> update_closest oid price) state.open_sell_orders;
