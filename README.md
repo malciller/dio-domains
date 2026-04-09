@@ -200,9 +200,15 @@ services:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: always
     environment:
+      # Live Credentials
       TWS_USERID: ${TWS_USERID}
       TWS_PASSWORD: ${TWS_PASSWORD}
-      TRADING_MODE: paper
+      
+      # Paper Credentials (required when mode is 'both')
+      TWS_USERID_PAPER: ${TWS_USERID_PAPER}
+      TWS_PASSWORD_PAPER: ${TWS_PASSWORD_PAPER}
+      
+      TRADING_MODE: both
       READ_ONLY_API: "no"
       TWS_ACCEPT_INCOMING: accept
       EXISTING_SESSION_DETECTED_ACTION: primary
@@ -213,8 +219,9 @@ services:
       ALLOW_BLIND_TRADING: "no"
       VNC_SERVER_PASSWORD: "ibkr"
     ports:
-      - "127.0.0.1:4002:4004"   # Paper: container 4004 → host 4002
-      - "127.0.0.1:5900:5900"   # VNC (optional)
+      - "127.0.0.1:4001:4003"   # Live API
+      - "127.0.0.1:4002:4004"   # Paper API
+      - "127.0.0.1:5900:5900"   # VNC (Usually points to live)
     volumes:
       - ibkr-settings:/home/ibgateway/Jts
 
