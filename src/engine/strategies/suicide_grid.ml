@@ -172,7 +172,7 @@ let strategy_states_mutex = Mutex.create ()
 
 (** Retrieves or lazily initializes the strategy state for [asset_symbol].
     On first access, loads persisted state (reserved_base, accumulated_profit,
-    last_fill_oid, fill prices) from Hyperliquid.State_persistence. *)
+    last_fill_oid, fill prices) from Dio_persistence.State_persistence. *)
 let get_strategy_state asset_symbol =
   Mutex.lock strategy_states_mutex;
   let state =
@@ -180,11 +180,11 @@ let get_strategy_state asset_symbol =
     | Some state -> state
     | None ->
         (* Load persisted state for this symbol (survives container restarts). *)
-        let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
-        let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
-        let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
-        let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
-        let persisted_last_sell_fill_price = Hyperliquid.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
+        let persisted_reserved_base = Dio_persistence.State_persistence.load_reserved_base ~symbol:asset_symbol in
+        let persisted_accumulated_profit = Dio_persistence.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
+        let persisted_last_fill_oid = Dio_persistence.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
+        let persisted_last_buy_fill_price = Dio_persistence.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
+        let persisted_last_sell_fill_price = Dio_persistence.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
@@ -1268,7 +1268,7 @@ let flush_persistence asset_symbol =
     in
     match snapshot_to_save with
     | Some (reserved_base, accumulated_profit, last_fill_oid, last_buy_fill_price, last_sell_fill_price) ->
-        Hyperliquid.State_persistence.save_async ~symbol:asset_symbol
+        Dio_persistence.State_persistence.save_async ~symbol:asset_symbol
           ~reserved_base
           ~accumulated_profit
           ?last_fill_oid
@@ -1898,9 +1898,9 @@ module Strategy = struct
          the next restart can resume from a known position. *)
       if state.last_fill_oid = None
          && state.highest_startup_oid <> None
-         && state.exchange_id = "hyperliquid" then begin
+         && (state.exchange_id = "hyperliquid" || state.exchange_id = "ibkr") then begin
         state.last_fill_oid <- state.highest_startup_oid;
-        Hyperliquid.State_persistence.save ~symbol
+        Dio_persistence.State_persistence.save ~symbol
           ~reserved_base:state.reserved_base
           ~accumulated_profit:state.accumulated_profit
           ~last_fill_oid:(Option.get state.highest_startup_oid) ();
