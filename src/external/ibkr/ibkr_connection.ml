@@ -192,7 +192,12 @@ let disconnect t =
 
 (** Start the background reader loop. Reads messages from the socket and
     dispatches each to [on_message ~msg_id ~fields]. The loop exits on
-    socket EOF or error, invoking [on_disconnect] with a reason string. *)
+    socket EOF or error, invoking [on_disconnect] with a reason string.
+
+    Uses [Lwt.async] to spawn each iteration independently, severing
+    the Lwt [Forward] chain per the pattern in [Lwt_util.consume_stream].
+    Without this, each [>>=] chains the current promise to its successor,
+    accumulating one [Forward] node per inbound message indefinitely. *)
 let start_reader t ~on_message ~on_disconnect =
   let rec loop ic =
     Lwt.catch (fun () ->
@@ -200,7 +205,9 @@ let start_reader t ~on_message ~on_disconnect =
       match fields with
       | [] ->
           Logging.warn ~section "Received empty message, skipping";
-          loop ic
+          (* Sever Forward chain: spawn next iteration independently. *)
+          Lwt.async (fun () -> loop ic);
+          Lwt.return_unit
       | msg_id_str :: rest ->
           let msg_id = try int_of_string msg_id_str with _ -> -1 in
           (Lwt.catch
@@ -210,7 +217,9 @@ let start_reader t ~on_message ~on_disconnect =
                 msg_id (Printexc.to_string exn);
               Lwt.return_unit)
           ) >>= fun () ->
-          loop ic
+          (* Sever Forward chain: spawn next iteration independently. *)
+          Lwt.async (fun () -> loop ic);
+          Lwt.return_unit
     ) (function
       | End_of_file ->
           Logging.warn ~section "Connection closed by gateway (EOF)";
