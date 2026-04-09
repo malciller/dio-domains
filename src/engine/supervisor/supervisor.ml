@@ -570,10 +570,18 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                      |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "ibkr")
                      |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
   let has_ibkr = List.length ibkr_symbols > 0 in
+  let ibkr_testnet =
+    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> cfg.exchange = "ibkr") with
+    | Some cfg -> cfg.testnet
+    | None -> true in
 
   (* Apply testnet flag to Hyperliquid module *)
   if has_hyperliquid then
     Hyperliquid.Module.Hyperliquid_impl.set_testnet hyperliquid_testnet;
+
+  (* Apply testnet flag to IBKR module — must happen before gateway connection *)
+  if has_ibkr then
+    Ibkr.Module.Config.set_testnet ibkr_testnet;
 
   Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
   if has_hyperliquid then
@@ -793,7 +801,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.catch (fun () ->
         let conn = Ibkr.Connection.create
           ~host:Ibkr.Module.Config.gateway_host
-          ~port:Ibkr.Module.Config.gateway_port
+          ~port:!(Ibkr.Module.Config.gateway_port)
           ~client_id:Ibkr.Module.Config.client_id
         in
         Ibkr.Module.connection := Some conn;
@@ -828,7 +836,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         (* Request open orders snapshot *)
         Ibkr.Executions_feed.request_open_orders conn >>= fun () ->
         (* Set market data type: delayed (3) for paper, live (1) for live *)
-        let mkt_data_type = if Ibkr.Module.Config.trading_mode = "paper" then "3" else "1" in
+        let mkt_data_type = if !(Ibkr.Module.Config.trading_mode) = "paper" then "3" else "1" in
         Logging.info_f ~section "Setting IBKR market data type to %s (%s)"
           mkt_data_type (if mkt_data_type = "3" then "delayed" else "live");
         Ibkr.Connection.send conn [
