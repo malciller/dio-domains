@@ -82,9 +82,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       None
   in
 
-  (* Resolve accumulation_buffer once via Fear & Greed. Hyperliquid only. *)
+  (* Resolve accumulation_buffer once via Fear & Greed. Hyperliquid and IBKR. *)
   let resolved_accumulation_buffer =
-    if asset_with_fees.exchange = "hyperliquid"
+    if (asset_with_fees.exchange = "hyperliquid" || asset_with_fees.exchange = "ibkr")
        && (asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid") then
       let fallback = let (lo, hi) = asset_with_fees.accumulation_buffer in (lo +. hi) /. 2.0 in
       let fng = Fear_and_greed.fetch_value ~fallback () in
@@ -606,8 +606,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             Logging.info_f ~section "[%s/%s] Fear & Greed updated to %.2f. Re-evaluated grid_interval to %.4f (range %.4f-%.4f)"
               asset_with_fees.exchange asset_with_fees.symbol current_fng new_interval lo hi;
             
-            (* Update accumulation_buffer for Hyperliquid *)
-            if asset_with_fees.exchange = "hyperliquid" then begin
+            (* Update accumulation_buffer for exchanges that use it *)
+            if asset_with_fees.exchange = "hyperliquid" || asset_with_fees.exchange = "ibkr" then begin
               let (ab_lo, ab_hi) = asset_with_fees.accumulation_buffer in
               let new_ab = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:current_fng in
               Logging.info_f ~section "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"

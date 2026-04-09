@@ -88,12 +88,12 @@ let hyperliquid_config = {
 }
 
 let ibkr_config = {
-  time_in_force = "DAY";
+  time_in_force = "GTC";
   track_pending_sells = true;
-  use_accumulation_sells = false;
+  use_accumulation_sells = true;     (* accumulate whole shares via profit *)
   sell_uses_mult = false;             (* 1:1 sells for equity *)
-  sell_failure_sets_asset_low = true;  (* Can't short sell ETFs — exchange rejection sets flag *)
-  use_reserved_base_guard = false;    (* Let the exchange be the arbiter *)
+  sell_failure_sets_asset_low = true;  (* Exchange rejection as safety net *)
+  use_reserved_base_guard = true;     (* Pre-check position before selling — prevents short-selling on margin *)
   asset_low_requires_balance_change = false;
   merge_preserved_sells = false;
   check_stale_balance = true;
@@ -990,28 +990,39 @@ let execute_strategy
                  end
                else true
              in
-             if balance_ok then begin
-               let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-               if push_order ~now sell_order then begin
-                  (* Commit accumulation state after push_order succeeds.
-                     Persistence is deferred: set dirty flag for the caller
-                     (domain_spawner) to flush outside the hotloop. *)
-                  if is_accumulation_sell then begin
-                    let rounded_sell = sell_qty in
-                    let rounding_diff = qty -. rounded_sell in
-                    let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
-                    state.accumulated_profit <- state.accumulated_profit -. required_profit;
-                    let base_increment = qty -. rounded_sell in
-                    state.reserved_base <- state.reserved_base +. base_increment;
-                    state.persistence_dirty <- true;
-                    Logging.info_f ~section
-                      "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
-                      asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
-                  end;
-                 Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                   asset.symbol sell_qty sell_price
-               end
-             end
+             if sell_qty = 0.0 && is_accumulation_sell then begin
+                (* Whole-share retention: profit covers the cost of a full share.
+                   Skip the sell order and retain the share as reserved_base.
+                   The reserved_base guard will prevent this share from being sold. *)
+                let required_profit = qty *. sell_price +. asset.accumulation_buffer in
+                state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                state.reserved_base <- state.reserved_base +. qty;
+                state.persistence_dirty <- true;
+                Logging.info_f ~section
+                  "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
+                  asset.symbol (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+              end else if balance_ok then begin
+                let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+                if push_order ~now sell_order then begin
+                   (* Commit accumulation state after push_order succeeds.
+                      Persistence is deferred: set dirty flag for the caller
+                      (domain_spawner) to flush outside the hotloop. *)
+                   if is_accumulation_sell then begin
+                     let rounded_sell = sell_qty in
+                     let rounding_diff = qty -. rounded_sell in
+                     let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
+                     state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                     let base_increment = qty -. rounded_sell in
+                     state.reserved_base <- state.reserved_base +. base_increment;
+                     state.persistence_dirty <- true;
+                     Logging.info_f ~section
+                       "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
+                       asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+                   end;
+                  Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+                    asset.symbol sell_qty sell_price
+                end
+              end
          | _ -> ()
         );
 

@@ -372,7 +372,7 @@ module Ibkr_impl = struct
     | Some c when c.Ibkr_types.min_tick > 0.0 -> Some c.min_tick
     | _ -> None
 
-  let get_qty_increment ~symbol:_ = Some 1.0  (* TWS API: whole shares only *)
+  let get_qty_increment ~symbol:_ = Some 1.0  (* TWS API: whole shares only — fractional not supported via API *)
 
   let get_qty_min ~symbol:_ = Some 1.0  (* TWS API: whole shares only *)
 
