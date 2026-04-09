@@ -174,9 +174,10 @@ engine spawns an isolated domain per entry.
 
 ## IBKR Gateway Setup
 
-The engine connects to Interactive Brokers via the TWS API through
-[IB Gateway](https://github.com/gnzsnz/ib-gateway-docker), a headless
-Docker container that handles authentication and session management.
+The engine connects to Interactive Brokers via the TWS API. For headless
+deployment, this project relies on [ib-gateway-docker](https://github.com/gnzsnz/ib-gateway-docker),
+an excellent Docker image created by [@gnzsnz](https://github.com/gnzsnz) that handles
+headless authentication and session management.
 
 ### 1. Create gateway directory and credentials
 
