@@ -1,12 +1,12 @@
 [![OCaml](https://img.shields.io/badge/Language-OCaml-blue.svg)](https://ocaml.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-High-performance OCaml 5.2 trading engine for Kraken and Hyperliquid
-featuring domain-based parallel strategy execution. Each trading asset
-runs in its own isolated domain with lock-free communication,
-tick-driven event architecture, and real-time latency profiling.
-Built for high-frequency trading with WebSocket data feeds and
-asynchronous order execution.
+High-performance OCaml 5.2 trading engine for Kraken, Hyperliquid,
+and Interactive Brokers (IBKR) featuring domain-based parallel
+strategy execution. Each trading asset runs in its own isolated
+domain with lock-free communication, tick-driven event architecture,
+and real-time latency profiling. Built for high-frequency trading
+with WebSocket data feeds and asynchronous order execution.
 
 > [!NOTE]
 > **Full technical write-up**: [Diogrid v2.0.0](https://diophantsolutions.com/diogrid-wp)
@@ -16,17 +16,34 @@ asynchronous order execution.
 
 ---
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [IBKR Gateway Setup](#ibkr-gateway-setup)
+- [Strategies](#strategies)
+- [Architecture](#architecture)
+- [Dashboard](#dashboard)
+- [Deployment](#deployment)
+- [Development](#development)
+- [Contributing](#contributing)
+
+---
+
 ## Requirements
 
 - OCaml 5.2.0 (opam)
-- Kraken API key/secret and/or Hyperliquid wallet/key
 - macOS / Linux / WSL
+- At least one exchange configured:
+  - **Kraken**: API key and secret
+  - **Hyperliquid**: Wallet address, agent address, and private key
+  - **IBKR**: IB Gateway (Docker) with TWS credentials
 
 ---
 
 ## Quick Start
 
-### Install
 ```bash
 git clone https://github.com/malciller/dio-domains.git
 cd dio-domains
@@ -34,203 +51,250 @@ opam install . --deps-only
 dune build
 ```
 
-### Configure
-Create `.env`:
 ```bash
-KRAKEN_API_KEY=your_kraken_api_key
-KRAKEN_API_SECRET=your_kraken_api_secret
-HYPERLIQUID_WALLET_ADDRESS=your_hyperliquid_wallet_address  # public wallet address
-HYPERLIQUID_AGENT_ADDRESS=your_hyperliquid_agent_address    # For L1 auth
-HYPERLIQUID_PRIVATE_KEY=your_hyperliquid_private_key        # For L1 signature generation
-CMC_API_KEY=your_cmc_api_key                               # Fear & Greed index (optional fallback to default)
+# Start the engine
+./_build/default/bin/main.exe
+
+# In a separate terminal, start the dashboard
+./_build/default/bin/dashboard.exe
 ```
 
-Edit `config.json` (example):
+---
+
+## Configuration
+
+### Environment Variables
+
+Create a `.env` file in the project root with credentials for your
+exchanges. Only include variables for exchanges you are using.
+
+```bash
+# ── Kraken ──
+KRAKEN_API_KEY=your_kraken_api_key
+KRAKEN_API_SECRET=your_kraken_api_secret
+
+# ── Hyperliquid ──
+HYPERLIQUID_WALLET_ADDRESS=your_wallet_address
+HYPERLIQUID_AGENT_ADDRESS=your_agent_address
+HYPERLIQUID_PRIVATE_KEY=your_private_key
+
+# ── IBKR ──
+IBKR_GATEWAY_HOST=127.0.0.1    # Default: 127.0.0.1
+IBKR_GATEWAY_PORT=4002          # Default: 4002
+IBKR_TRADING_MODE=paper         # "paper" or "live" (default: paper)
+IBKR_CLIENT_ID=0                # Default: 0
+IBKR_ACCOUNT_ID=                # Auto-detected from gateway if omitted
+
+# ── Optional ──
+CMC_API_KEY=your_cmc_api_key    # Fear & Greed index (defaults to 50.0 if absent)
+DIO_BACKTRACE=                  # Set any value to enable exception backtraces
+```
+
+### Trading Config (`config.json`)
+
+Each entry in the `trading` array defines one asset to trade. The
+engine spawns an isolated domain per entry.
+
 ```json
 {
-  "logging_level": "info",            // Log verbosity: debug, info, warn, error, critical
-  "logging_sections": "",             // Filter logs by section (optional, comma-separated)
-  "cycle_mod": 10000,                 // Cycle interval for periodic checks and logs
-  "fng_check_threshold": 1.5,         // Minimum price change (%) to trigger a Fear & Greed check
-  "gc": {                             // OCaml 5 Tuning for high-throughput websockets
-    "minor_heap_size": 8388608,       // Words (64MB) to absorb JSON parsing bursts
-    "space_overhead": 80,             // Moderate major heap spacing
-    "max_overhead": 150,              // Safe compaction threshold
-    "window_size": 10,                // Smooths major GC pacing
-    "allocation_policy": 2,           // Best-fit policy (OCaml 5 default)
-    "major_heap_increment": 100       // Double heap size on growth to prevent OS thrashing
+  "logging_level": "info",
+  "logging_sections": "",
+  "cycle_mod": 10000,
+  "fng_check_threshold": 1.5,
+  "gc": {
+    "minor_heap_size": 8388608,
+    "space_overhead": 80,
+    "max_overhead": 150,
+    "window_size": 10,
+    "allocation_policy": 2,
+    "major_heap_increment": 100
   },
   "trading": [
     {
-      "symbol": "BTC/USD",            // Pair to trade
-      "exchange": "kraken",           // Exchange name: "kraken", "hyperliquid"
-      "qty": "0.0002",                // Base asset quantity per order
-      "grid_interval": [0.25, 1.25],  // Min/Max grid spacing (%); resolved dynamically from Fear & Greed
-      "sell_mult": "0.999",           // Sell amount multiplier (qty * sell_mult = sell order size)
-      "strategy": "Grid"              // Strategy name: "Grid"
+      "symbol": "BTC/USD",
+      "exchange": "kraken",
+      "qty": "0.0002",
+      "grid_interval": [0.25, 1.25],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
     },
     {
-      "symbol": "USDG/USD",           // Pair to trade
-      "exchange": "kraken",           // Exchange name: "kraken", "hyperliquid"
-      "qty": "100.0",                 // Trade size per market making quote
-      "min_usd_balance": "500.0",     // Minimum USD balance required to run this strategy
-      "max_exposure": "500.0",        // Maximum asset balance allowed before pausing strategy
-      "strategy": "MM"                // Strategy name: "MM"
+      "symbol": "HYPE/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.35",
+      "grid_interval": [0.25, 0.5],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [0.5, 5.0],
+      "strategy": "Grid",
+      "testnet": false,
+      "hedge": true
     },
     {
-      "symbol": "BTC/USDC",            // Pair to trade
-      "exchange": "hyperliquid",      // Exchange name: "kraken", "hyperliquid"
-      "qty": "0.001",                 // Base asset quantity per order
-      "grid_interval": [0.1, 0.5],    // Min/Max grid spacing (%)
-      "accumulation_buffer": [0.75, 3.0], // Min/Max net quote profit buffer (USDC) for sell_mult accumulation; resolved dynamically from Fear & Greed
-      "sell_mult": "1.0",             // Sell amount multiplier
-      "strategy": "Grid",             // Strategy name: "Grid"
-      "testnet": true                 // Use testnet
-    },
-    {
-      "symbol": "HYPE/USDC",          // Pair to trade (spot)
-      "exchange": "hyperliquid",      // Exchange name (must be "hyperliquid")
-      "qty": "0.35",                  // Base asset quantity per order
-      "grid_interval": [0.25, 0.5],   // Min/Max grid spacing (%)
-      "sell_mult": "0.999",           // Sell amount multiplier (triggers discrete accumulation on Hyperliquid)
-      "accumulation_buffer": [0.5, 5.0], // Min/Max net quote profit buffer (USDC) for sell_mult accumulation; resolved dynamically from Fear & Greed
-      "strategy": "Grid",             // Strategy name: "Grid"
-      "testnet": false,               // Use testnet
-      "hedge": true                   // Enable auto-hedge (Hyperliquid only)
+      "symbol": "TQQQ",
+      "exchange": "ibkr",
+      "qty": "1.0",
+      "grid_interval": [0.5, 1.0],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [25.0, 50.0],
+      "strategy": "Grid"
     }
   ]
 }
 ```
 
-### Run
-```bash
-# Start the core trading engine
-./_build/default/bin/main.exe
+#### Config Reference
 
-# In a separate terminal, run the state monitoring dashboard
-./_build/default/bin/dashboard.exe
+| Field | Type | Description |
+|-------|------|-------------|
+| `symbol` | string | Trading pair (e.g. `"BTC/USD"`) or ticker (e.g. `"TQQQ"`) |
+| `exchange` | string | `"kraken"`, `"hyperliquid"`, or `"ibkr"` |
+| `qty` | string | Order quantity per grid level |
+| `grid_interval` | [min, max] | Grid spacing as `%` of price, resolved via Fear & Greed |
+| `sell_mult` | string | Sell quantity multiplier (`qty × sell_mult`). Values < 1.0 trigger accumulation |
+| `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, IBKR) |
+| `strategy` | string | `"Grid"` or `"MM"` |
+| `min_usd_balance` | string | Minimum USD balance to run (MM only) |
+| `max_exposure` | string | Maximum asset exposure before pausing (MM only) |
+| `testnet` | bool | Use testnet (Hyperliquid only) |
+| `hedge` | bool | Enable auto-hedge (Hyperliquid only) |
+| `maker_fee` / `taker_fee` | float | Override exchange fee rates |
+
+#### GC Tuning
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `minor_heap_size` | 8388608 | Words (64MB) — absorbs JSON parsing bursts |
+| `space_overhead` | 80 | Major heap spacing |
+| `max_overhead` | 150 | Compaction threshold |
+| `window_size` | 10 | Smooths major GC pacing |
+| `allocation_policy` | 2 | Best-fit (OCaml 5 default) |
+| `major_heap_increment` | 100 | Heap growth factor to prevent OS thrashing |
+
+---
+
+## IBKR Gateway Setup
+
+The engine connects to Interactive Brokers via the TWS API through
+[IB Gateway](https://github.com/gnzsnz/ib-gateway-docker), a headless
+Docker container that handles authentication and session management.
+
+### 1. Create gateway directory and credentials
+
+```bash
+mkdir -p ~/ibkr && cd ~/ibkr
+
+cat > .env << 'EOF'
+TWS_USERID=your_ibkr_username
+TWS_PASSWORD=your_ibkr_password
+EOF
 ```
+
+### 2. Create `docker-compose.yml`
+
+```yaml
+name: ibkr-gateway
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: always
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: paper
+      READ_ONLY_API: "no"
+      TWS_ACCEPT_INCOMING: accept
+      EXISTING_SESSION_DETECTED_ACTION: primary
+      TWOFA_TIMEOUT_ACTION: restart
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      AUTO_RESTART_TIME: "11:59 PM"
+      TIME_ZONE: America/New_York
+      ALLOW_BLIND_TRADING: "no"
+      VNC_SERVER_PASSWORD: "ibkr"
+    ports:
+      - "127.0.0.1:4002:4004"   # Paper: container 4004 → host 4002
+      - "127.0.0.1:5900:5900"   # VNC (optional)
+    volumes:
+      - ibkr-settings:/home/ibgateway/Jts
+
+volumes:
+  ibkr-settings:
+```
+
+> [!IMPORTANT]
+> Port `4002:4004` maps the container's paper port to the host. For
+> live trading, change `TRADING_MODE` to `live` and map `4001:4001`.
+
+### 3. Start and verify
+
+```bash
+cd ~/ibkr
+docker compose up -d
+docker compose logs -f   # Look for "Market data farm connection is OK"
+```
+
+### 4. VNC access (optional)
+
+Connect to `localhost:5900` (password: `ibkr`) via any VNC client to
+see the IB Gateway GUI for debugging login or order issues.
+
+> [!NOTE]
+> The gateway handles automatic reconnection, daily restarts, and 2FA
+> timeouts. Paper accounts receive delayed (15-min) market data; the
+> engine sets data type to delayed automatically.
 
 ---
 
 ## Strategies
 
-**Grid**: Maintains buy/sell ladders around price with configurable spacing
-and size. Acts as a market maker with optional DCA accumulation via
-`sell_mult`. On Kraken, sells use `qty * sell_mult` directly.
+### Grid
 
-Hyperliquid enforces discrete order sizes via `szDecimals` (e.g. HYPE
-uses 2 decimal places, so the lot increment is 0.01). When
-`sell_mult < 1.0`, the desired sell quantity often falls between valid
-lot boundaries and must be floored, creating rounding loss that exceeds
-the intended skim. For example, `0.35 * 0.999 = 0.34965` floors to
-`0.34`, losing 0.01 HYPE per cycle (~2.86%) instead of the intended
-~0.1%.
+Maintains buy/sell limit orders at grid intervals around the current
+price. Acts as a market maker with configurable spacing and optional
+DCA accumulation via `sell_mult`.
 
-To handle this, the Grid strategy uses profit-gated accumulation. Most
-cycles sell the full `qty` (1:1), growing quote balance through grid
-spread profits. Once realized net profit (accounting for quantity and
-maker fees on both legs) exceeds the rounding cost plus
-`accumulation_buffer`, a single `sell_mult` sell is triggered to
-accumulate base asset. The effective threshold is
-`rounding_cost + accumulation_buffer`, where
-`rounding_cost = rounding_diff x sell_price` (the USDC value of the
-base being accumulated).
+#### Accumulation (Hyperliquid)
 
-`accumulation_buffer` is configured as a `[min, max]` range and resolved
-via linear interpolation against the Fear & Greed index, just like
-`grid_interval`. Low F&G (fear) resolves closer to `min`, triggering
-accumulation sooner (accumulate more aggressively in fearful markets).
-High F&G (greed) resolves closer to `max`, requiring more profit before
-accumulating (more conservative in greedy markets). For example, with
-`qty=0.35`, `sell_mult=0.999`, `accumulation_buffer=[0.5, 5.0]`,
-and HYPE at $39.55: the rounding cost is `0.01 x 39.55 = 0.40 USDC`;
-at F&G=25 the resolved buffer is ~1.63 USDC (threshold ~2.03), while at
-F&G=75 it is ~3.88 USDC (threshold ~4.28). This is adaptive: fearful
-markets accumulate faster, greedy markets wait longer. Kraken is
-unaffected.
+Hyperliquid enforces discrete order sizes via `szDecimals`. When
+`sell_mult < 1.0`, the sell quantity is floored to the nearest valid
+lot, creating a rounding difference (e.g. `0.35 × 0.999 = 0.34965`
+floors to `0.34`). The strategy sells 1:1 most cycles, accumulating
+profit from the grid spread. When `accumulated_profit` exceeds
+`rounding_cost + accumulation_buffer`, a reduced sell is triggered
+and the difference is retained as `reserved_base`.
 
-**MM (Adaptive Market Maker)**: Dynamically adapts quoting style based
-on market fees. Uses greedy quoting for no-fee markets and conservative
-profit-guaranteeing quotes where fees apply.
+#### Accumulation (IBKR)
 
-**Fear & Greed**: Both `grid_interval` and `accumulation_buffer` are
-resolved at domain startup using linear interpolation between their
-configured `[min, max]` ranges based on the CoinMarketCap Fear & Greed
-index (0 to 100). The index is dynamically re-evaluated at runtime
-whenever the underlying asset price moves by a significant threshold
-(e.g., +/- 3.5%) from the baseline, ensuring both grid spacing and
-accumulation behavior adapt to changing market conditions.
-`accumulation_buffer` scaling is Hyperliquid-only. Provide `CMC_API_KEY`
-for live values; the index defaults to 50.0 when the key is missing or
-the API is unreachable.
+IBKR's TWS API does not support fractional shares. The same mechanism
+adapts for whole shares: any `sell_mult < 1.0` (e.g. `"0.999"`) floors
+to 0 shares with the whole-share increment. The strategy trades 1:1,
+accumulating USD profit. When `accumulated_profit` exceeds
+`share_price + accumulation_buffer`, the sell is skipped entirely and
+the share is retained as `reserved_base`. The `reserved_base` guard
+prevents retained shares from being sold.
 
-**Auto-Hedge** (Hyperliquid only): Single-short-per-cycle delta hedge
-on perps. Spot buy fills open a perp short; spot sell fills close it.
-Enable with `"hedge": true`. Kraken is not supported.
+- **No fee erosion**: IBKR commissions are in USD, not shares
+- **Position-gated sells**: Pre-checked via `updatePortfolio` to prevent short-selling
+- **GTC orders**: All IBKR orders use Good-Til-Cancelled time-in-force
 
----
+#### `accumulation_buffer` and Fear & Greed
 
-## Dashboard
+`accumulation_buffer` is resolved via linear interpolation against the
+CoinMarketCap Fear & Greed index (0–100): fear resolves closer to
+`min` (accumulate faster), greed resolves closer to `max` (wait
+longer). Re-evaluated dynamically when price moves ≥3.5% from
+baseline. Applies to Hyperliquid and IBKR.
 
-The engine includes a standalone TUI dashboard binary
-(`bin/dashboard.exe`) that connects to the running engine over a
-Unix domain socket at `/var/run/dio/dashboard.sock` using a
-length-prefixed JSON protocol.
+### MM (Adaptive Market Maker)
 
-### Local
-```bash
-# Auto-discovers the engine socket
-./_build/default/bin/dashboard.exe
+Dynamically adapts quoting style based on market fees. Uses greedy
+quoting for no-fee markets and conservative profit-guaranteeing
+quotes where fees apply.
 
-# Connect to a specific engine socket
-./_build/default/bin/dashboard.exe --socket /var/run/dio/dashboard.sock
-```
+### Auto-Hedge (Hyperliquid only)
 
-### Docker
-
-The engine exposes its dashboard socket via the `dio-sock` named
-volume. Run the dashboard in a **separate container** using
-`docker run --rm -it` — this ties the dashboard's lifetime to your
-SSH session so disconnecting SSH kills the dashboard and frees the
-server connection slot.
-
-```bash
-docker run --rm -it -v dio-sock:/var/run/dio dio dio-dashboard
-```
-
-> [!WARNING]
-> Do not use `docker exec -it` for the dashboard. Docker exec keeps
-> the container-side PTY alive after SSH disconnects, leaving zombie
-> connections that are never cleaned up.
-
-The dashboard operates out-of-process for crash isolation and
-automatically reconnects when the engine restarts. It runs in
-watch mode, where the engine pushes state snapshots every 500ms.
-
-### Panels
-
-| Panel | Description |
-|-------|-------------|
-| **Header** | Uptime, Fear & Greed index, per-exchange connectivity status |
-| **Memory & GC** | Heap size, live/free KB, major/minor collections, compactions, fragments |
-| **Holdings & Strategy** | Per-strategy and non-strategy balances, mid-price, accumulated holdings, pending buy/sell distances, unrealized sell value, aggregated portfolio summary |
-| **Latency Profiling** | Per-domain percentile profiling (p50, p90, p99, p999) in microseconds |
-| **Domains** | Running/stopped status, restart count, last restart age |
-
-### Wire Protocol
-
-The dashboard server runs as an Lwt fiber within the engine process,
-listening on `/var/run/dio/dashboard.sock` with file permissions
-restricted to the current user (0600). Communication uses a 4-byte
-big-endian length-prefixed JSON frame format.
-
-| Command | Direction | Description |
-|---------|-----------|-------------|
-| `Q` | Client to Server | Close the connection |
-
-Maximum concurrent clients: 5.
-
+Single-short-per-cycle delta hedge on perps. Spot buy fills open a
+perp short; spot sell fills close it. Enable with `"hedge": true`.
 
 ---
 
@@ -253,100 +317,60 @@ Maximum concurrent clients: 5.
                +---------------------------------------------+
                |           Engine Core                       |
                |  - Lock-free tick bus & event registry      |
-               |  - Histogram latency profiling (us)         |
+               |  - Histogram latency profiling (μs)        |
                |  - Structured logging (level + section)     |
                |  - Dashboard UDS server (JSON over socket)  |
                +---------------------------------------------+
-                        |                        |
-                        v                        v
-          +-----------------------+   +-----------------------+
-          |  Kraken Integration   |   | Hyperliquid Integration|
-          | - WS: ticker, book,  |   | - WS: allMids, L2,    |
-          |   balance, exec      |   |   webData2, spotState  |
-          | - Trading client     |   | - REST: L1 sigs,       |
-          |   (auth, heartbeat)  |   |   retry + backoff      |
-          | - Ring buffer store  |   | - Global order index,  |
-          +-----------------------+   |   double-check locking |
-                                      +-----------------------+
+                |                   |                   |
+                v                   v                   v
+   +------------------+  +------------------+  +------------------+
+   | Kraken           |  | Hyperliquid      |  | IBKR             |
+   | WS: ticker,      |  | WS: allMids, L2, |  | TWS API: ticker, |
+   | book, balance,   |  | webData2, spot   |  | orderbook, exec  |
+   | exec             |  | REST: L1 sigs    |  | portfolio, acct  |
+   | Ring buffer store|  | Global order idx |  | Contract cache   |
+   +------------------+  +------------------+  +------------------+
 ```
 
 ---
 
-## Environment Variables
+## Dashboard
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `KRAKEN_API_KEY` | Conditional | Kraken API key. Required when trading on Kraken. |
-| `KRAKEN_API_SECRET` | Conditional | Kraken API secret. Required when trading on Kraken. |
-| `HYPERLIQUID_WALLET_ADDRESS` | Conditional | Public wallet address. Required for Hyperliquid. |
-| `HYPERLIQUID_AGENT_ADDRESS` | Conditional | Agent address for L1 auth. Required for Hyperliquid. |
-| `HYPERLIQUID_PRIVATE_KEY` | Conditional | Private key for L1 signature generation. Required for Hyperliquid. |
-| `CMC_API_KEY` | Optional | CoinMarketCap API key for Fear & Greed index. Falls back to 50.0 when absent. |
-| `DIO_BACKTRACE` | Optional | Set to any value to enable exception backtraces. Disabled by default to avoid allocation overhead. |
+Standalone TUI dashboard (`bin/dashboard.exe`) connecting to the
+engine via Unix domain socket at `/var/run/dio/dashboard.sock`.
 
----
-
-## Logging
-
-The engine uses a structured, domain-safe logging system with five
-severity levels: `DEBUG`, `INFO`, `WARN`, `ERROR`, and `CRITICAL`.
-
-Key properties:
-
-- **Per-section filtering**: Log output can be restricted to specific
-  sections via the `logging_sections` config field (comma-separated).
-- **Domain safety**: All log output is serialized through a shared mutex
-  to prevent interleaved lines from concurrent OCaml 5 domains.
-- **Zero-allocation fast path**: Disabled log levels skip string
-  formatting entirely using `Printf.ifprintf`.
-- **ANSI color output**: Enabled by default for terminal output; each
-  severity level uses a distinct color.
-- **Timestamped**: All entries include millisecond-precision wall-clock
-  timestamps with per-second caching to reduce `localtime` calls.
-
----
-
-## Development
+### Usage
 
 ```bash
-# Build
-dune build
+# Local
+./_build/default/bin/dashboard.exe
 
-# Tests
-dune test
-
-# Format / Docs
-dune fmt
-dune build @doc
+# Docker (ties lifetime to SSH session)
+docker run --rm -it -v dio-sock:/var/run/dio dio dio-dashboard
 ```
 
-### Hyperliquid State Persistence
+> [!WARNING]
+> Do not use `docker exec -it` for the dashboard — it keeps the PTY
+> alive after SSH disconnects, leaving zombie connections.
 
-The Grid strategy persists accumulation state to disk so
-`reserved_base`, `accumulated_profit`, and `last_fill_oid` survive
-restarts.
+### Panels
 
-**State file**: `data/accumulated_state.json` (local dev) or
-`/app/data/accumulated_state.json` (Docker).
+| Panel | Description |
+|-------|-------------|
+| **Header** | Uptime, Fear & Greed index, per-exchange connectivity |
+| **Memory & GC** | Heap size, live/free KB, major/minor collections |
+| **Holdings & Strategy** | Balances, mid-price, accumulated holdings, pending orders, portfolio summary |
+| **Latency Profiling** | Per-domain p50/p90/p99/p999 in microseconds |
+| **Domains** | Running/stopped status, restart count, last restart age |
 
-```json
-{
-  "HYPE/USDC": {
-    "reserved_base": 0.15,
-    "accumulated_profit": 0.482716,
-    "last_fill_oid": "355883830672"
-  }
-}
-```
+Wire protocol: 4-byte big-endian length-prefixed JSON frames. Max 5
+concurrent clients. Send `Q` to close a connection.
 
-State is written atomically (temp file + rename) with a mutex for
-multi-domain safety. On startup the strategy loads persisted values;
-missing fields default to `0.0` / `None`.
+---
 
-#### Docker
+## Deployment
 
-Mount a host volume for the `data/` directory so state survives
-container rebuilds:
+### Docker
 
 ```bash
 docker run -v /path/on/host/data:/app/data -v dio-sock:/var/run/dio --env-file .env dio
@@ -357,38 +381,34 @@ prevent glibc arena fragmentation, with tuning for fast dirty/muzzy
 page decay and limited arenas (`narenas:2`) suited to OCaml 5
 multicore workloads.
 
-#### OS-Specific Notes
+### State Persistence
 
-**macOS / Linux**: No additional setup needed. The `data/` directory
-is created automatically on first write.
+The Grid strategy persists accumulation state to disk so
+`reserved_base`, `accumulated_profit`, and `last_fill_oid` survive
+restarts. Used by Hyperliquid and IBKR.
 
-**Windows (WSL2, recommended)**: Run inside WSL2 (Ubuntu 22.04+).
-The Unix build toolchain and `Sys.rename` atomicity work as expected:
+**State file**: `data/accumulated_state.json` (local) or
+`/app/data/accumulated_state.json` (Docker).
 
-```bash
-# Inside WSL2
-opam install . --deps-only
-dune build
-./_build/default/bin/main.exe
+```json
+{
+  "HYPE/USDC": {
+    "reserved_base": 0.15,
+    "accumulated_profit": 0.482716,
+    "last_fill_oid": "355883830672"
+  },
+  "TQQQ": {
+    "reserved_base": 3.0,
+    "accumulated_profit": 12.45,
+    "last_fill_oid": "42"
+  }
+}
 ```
 
-> [!TIP]
-> Store the project and `data/` directory **inside the WSL filesystem** (e.g. `~/dio-domains/`), not on a `/mnt/c/` Windows mount. NTFS mounts have poor `inotify` support and `Sys.rename` across filesystem boundaries can fail silently.
+Written atomically (temp file + rename) with a mutex for multi-domain
+safety. Missing fields default to `0.0` / `None` on startup.
 
-**Windows (native, advanced)**: Requires MSVC or MinGW OCaml. Key
-differences:
-
-1. **Atomic rename**: `Sys.rename` on Windows fails if the target file is open by another process (e.g. antivirus scanner). Exclude `data/` from real-time scanning.
-2. **Path separators**: `Filename.concat` handles `\` vs `/` correctly.
-3. **Docker path**: `/app` detection does not trigger on native Windows; state always writes to `./data/`.
-4. **libsecp256k1**: Must be compiled manually. See the [secp256k1 build docs](https://github.com/bitcoin-core/secp256k1#building-on-windows).
-
-> [!WARNING]
-> Native Windows is not actively tested. WSL2 or Docker is strongly recommended.
-
----
-
-## Graceful Shutdown
+### Graceful Shutdown
 
 The engine handles `SIGINT` and `SIGTERM` for orderly shutdown. A
 second `SIGINT` forces immediate exit. The shutdown sequence:
@@ -398,8 +418,41 @@ second `SIGINT` forces immediate exit. The shutdown sequence:
 3. Clean up the dashboard UDS socket.
 4. Force-exit after a 3-second timeout if teardown stalls.
 
-Fatal signals (`SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGFPE`) are caught to
-emit diagnostic snapshots (GC stats, domain status) before termination.
+Fatal signals (`SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGFPE`) emit
+diagnostic snapshots (GC stats, domain status) before termination.
+
+---
+
+## Development
+
+```bash
+dune build        # Build
+dune test         # Tests
+dune fmt          # Format
+dune build @doc   # Docs
+```
+
+### Logging
+
+Structured, domain-safe logging with five severity levels: `DEBUG`,
+`INFO`, `WARN`, `ERROR`, `CRITICAL`.
+
+- **Per-section filtering** via `logging_sections` (comma-separated)
+- **Domain safety** — serialized through a shared mutex
+- **Zero-allocation fast path** — disabled levels skip formatting entirely
+- **ANSI color output** — distinct color per severity
+- **Millisecond timestamps** with per-second caching
+
+### Platform Notes
+
+**macOS / Linux**: No additional setup needed.
+
+**Windows (WSL2)**: Run inside WSL2 (Ubuntu 22.04+). Store project
+inside the WSL filesystem, not on `/mnt/c/`.
+
+> [!WARNING]
+> Native Windows is not actively tested. WSL2 or Docker is strongly
+> recommended.
 
 ---
 
@@ -408,24 +461,23 @@ emit diagnostic snapshots (GC stats, domain status) before termination.
 ```
 1. Fork
 2. Create branch  -->  git checkout -b feature/xyz
-     - Trading strategies:       src/engine/strategies/
-     - Domain management:        src/engine/domain_spawner.ml
-     - Concurrency & Bus:        src/engine/concurrency/
-     - Latency Profiling:        src/engine/latency_profiling/
-     - Connection supervision:   src/engine/supervisor/
-     - Dashboard (engine):       src/engine/dashboard/
-     - Dashboard (TUI):          bin/dashboard.ml
-     - WebSocket feeds (Kraken): src/external/kraken/
-     - WebSocket feeds (HL):     src/external/hyperliquid/
-     - Exchange interface:       src/external/exchange_intf.ml
+     - Strategies:       src/engine/strategies/
+     - Domain management: src/engine/domain_spawner.ml
+     - Concurrency:      src/engine/concurrency/
+     - Latency:          src/engine/latency_profiling/
+     - Supervisor:       src/engine/supervisor/
+     - Dashboard:        src/engine/dashboard/ + bin/dashboard.ml
+     - Kraken feeds:     src/external/kraken/
+     - Hyperliquid feeds: src/external/hyperliquid/
+     - IBKR feeds:       src/external/ibkr/
+     - Exchange interface: src/external/exchange_intf.ml
 3. Commit  -->  git commit -m "..."
 4. Push    -->  git push origin feature/xyz
 5. Open PR
 ```
 
-Guidelines: add tests, update docs, keep CI green. See
-`src/external/README.md` for the exchange integration guide when adding
-new exchange backends.
+Add tests, update docs, keep CI green. See `src/external/README.md`
+for the exchange integration guide.
 
 ---
 
