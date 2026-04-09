@@ -155,7 +155,7 @@ engine spawns an isolated domain per entry.
 | `strategy` | string | `"Grid"` or `"MM"` |
 | `min_usd_balance` | string | Minimum USD balance to run (MM only) |
 | `max_exposure` | string | Maximum asset exposure before pausing (MM only) |
-| `testnet` | bool | Use testnet (Hyperliquid only) |
+| `testnet` | bool | Use testnet (Hyperliquid, IBKR only) |
 | `hedge` | bool | Enable auto-hedge (Hyperliquid only) |
 | `maker_fee` / `taker_fee` | float | Override exchange fee rates |
 
