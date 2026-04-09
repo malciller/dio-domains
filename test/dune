@@ -14,6 +14,8 @@
 
 (subdir external/kraken)
 
+(subdir external/ibkr)
+
 (subdir external/cmc)
 
 (subdir order_cache)
