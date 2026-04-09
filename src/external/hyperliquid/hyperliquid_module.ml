@@ -341,6 +341,10 @@ module Hyperliquid_impl = struct
   let get_execution_feed_position ~symbol =
     Hyperliquid_executions_feed.get_current_position symbol
 
+  (** Return [true] once the initial execution snapshot has been ingested for [symbol]. *)
+  let has_execution_data ~symbol =
+    Hyperliquid_executions_feed.has_execution_data symbol
+
   let read_execution_events ~symbol ~start_pos =
     let events = Hyperliquid_executions_feed.read_execution_events symbol start_pos in
     List.map (fun (e : Hyperliquid_executions_feed.execution_event) ->

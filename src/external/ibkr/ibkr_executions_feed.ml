@@ -368,6 +368,10 @@ let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
   RingBuffer.get_position store.events_buffer
 
+let[@inline always] has_execution_data symbol =
+  let store = get_symbol_store symbol in
+  Atomic.get store.ready
+
 (** Pre-allocate stores and register handlers. *)
 let initialize symbols =
   Logging.info_f ~section "Initializing executions feed for %d symbols" (List.length symbols);

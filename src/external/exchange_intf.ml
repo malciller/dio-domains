@@ -244,6 +244,11 @@ module type S = sig
       for [symbol]. Used as the starting cursor for [read_execution_events]. *)
   val get_execution_feed_position : symbol:string -> int
 
+  (** Return [true] if the execution feed has received its initial data
+      snapshot for [symbol]. Used by domain workers to gate strategy
+      execution until open order state is populated. *)
+  val has_execution_data : symbol:string -> bool
+
   (** Read execution events from [start_pos] up to the current write
       position. Returns a newly allocated list of events. *)
   val read_execution_events : symbol:string -> start_pos:int -> Types.execution_event list

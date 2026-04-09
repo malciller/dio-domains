@@ -340,6 +340,10 @@ module Ibkr_impl = struct
   let get_execution_feed_position ~symbol =
     Ibkr_executions_feed.get_current_position symbol
 
+  (** Return [true] once execution data has been received for [symbol]. *)
+  let has_execution_data ~symbol =
+    Ibkr_executions_feed.has_execution_data symbol
+
   let read_execution_events ~symbol ~start_pos =
     List.map (fun (e : Ibkr_executions_feed.execution_event) ->
       { Types.order_id = e.order_id;
