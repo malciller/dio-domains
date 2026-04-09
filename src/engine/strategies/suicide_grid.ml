@@ -71,7 +71,7 @@ let kraken_config = {
   sell_failure_sets_asset_low = false;
   use_reserved_base_guard = false;
   asset_low_requires_balance_change = true;
-  merge_preserved_sells = false;
+  merge_preserved_sells = true;
   check_stale_balance = true;
 }
 
@@ -95,7 +95,7 @@ let ibkr_config = {
   sell_failure_sets_asset_low = true;  (* Exchange rejection as safety net *)
   use_reserved_base_guard = true;     (* Pre-check position before selling — prevents short-selling on margin *)
   asset_low_requires_balance_change = false;
-  merge_preserved_sells = false;
+  merge_preserved_sells = true;
   check_stale_balance = true;
 }
 
