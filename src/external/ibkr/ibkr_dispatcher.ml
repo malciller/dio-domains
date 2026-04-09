@@ -46,6 +46,14 @@ let register_req_handler ~req_id ~on_data ~on_end =
 let remove_req_handler ~req_id =
   Hashtbl.remove req_handlers req_id
 
+(** Reset all dispatcher state. Called before reconnection to prevent
+    stale handler entries and leaked closures from accumulating. *)
+let reset () =
+  Hashtbl.clear handlers;
+  Hashtbl.clear req_handlers;
+  connection := None;
+  Logging.info ~section "Dispatcher state reset (handlers cleared)"
+
 (** Set the active connection reference. *)
 let set_connection conn =
   connection := Some conn

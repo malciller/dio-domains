@@ -799,6 +799,17 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     let ibkr_conn_sup = register ~name:"ibkr_gateway" ~connect_fn:None in
     let ibkr_connect_fn () =
       Lwt.catch (fun () ->
+        (* Clean up previous connection state to prevent leaks on reconnection.
+           Old req_id mappings, handler closures, and IO channels would otherwise
+           accumulate across reconnect cycles. *)
+        (match !(Ibkr.Module.connection) with
+         | Some old_conn ->
+             Logging.info ~section "[ibkr_gateway] Disconnecting old connection before reconnect";
+             Lwt.async (fun () -> Ibkr.Connection.disconnect old_conn)
+         | None -> ());
+        Ibkr.Dispatcher.reset ();
+        Ibkr.Ticker_feed.clear_req_ids ();
+        Ibkr.Orderbook_feed.clear_req_ids ();
         let conn = Ibkr.Connection.create
           ~host:Ibkr.Module.Config.gateway_host
           ~port:!(Ibkr.Module.Config.gateway_port)
