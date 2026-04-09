@@ -1344,7 +1344,7 @@ let handle_order_acknowledged asset_symbol order_id side price =
    | Sell ->
     state.inflight_sell <- false;
     state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
-    Logging.info_f ~section "SELL_ACK [%s] injected into recently_injected_sells: %s @ %.2f"
+    Logging.debug_f ~section "SELL_ACK [%s] injected into recently_injected_sells: %s @ %.2f"
       asset_symbol order_id price);
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
