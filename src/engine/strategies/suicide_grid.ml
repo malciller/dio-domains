@@ -784,7 +784,7 @@ let execute_strategy
               | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
               | None -> true
             in
-            if qty > 0.0 && is_our_strategy then begin
+            if qty > 0.0 && order_price > 0.0 && is_our_strategy then begin
               if side_str = "buy" then begin
                 incr open_buy_count_local;
                 buy_orders := (order_id, order_price) :: !buy_orders

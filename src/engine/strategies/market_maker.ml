@@ -588,7 +588,7 @@ let execute_strategy
 
         iter_open_orders (fun order_id order_price remaining_qty side_str userref_opt ->
           let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
-          if not is_cancelled && remaining_qty > 0.0 then begin
+          if not is_cancelled && remaining_qty > 0.0 && order_price > 0.0 then begin
             if side_str = "sell" then
               locked_in_sells := !locked_in_sells +. remaining_qty
             else if side_str = "buy" then begin
