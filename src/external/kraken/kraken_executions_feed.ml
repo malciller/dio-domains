@@ -678,7 +678,7 @@ let parse_execution_event json =
                       (match existing_order with
                        | Some order -> order.order_qty
                        | None ->
-                           Logging.info_f ~section
+                           Logging.debug_f ~section
                              "FIELD FALLBACK order_qty=0.0 for %s [%s] exec_type=%s status=%s (no cached order)"
                              order_id (Option.value symbol_opt ~default:"?") exec_type_str order_status_str;
                            0.0)
@@ -721,7 +721,7 @@ let parse_execution_event json =
                   (match existing_order with
                    | Some order -> order.limit_price
                    | None ->
-                       Logging.info_f ~section
+                       Logging.debug_f ~section
                          "FIELD FALLBACK limit_price=None for %s [%s] exec_type=%s status=%s (no cached order)"
                          order_id (Option.value symbol_opt ~default:"?") exec_type_str order_status_str;
                        None)
