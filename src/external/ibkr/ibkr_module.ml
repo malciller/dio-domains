@@ -19,7 +19,12 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
-(** Configuration loaded from environment. *)
+(** Configuration loaded from environment, with runtime override via [set_testnet].
+
+    Environment variables set the initial defaults.  The per-symbol [testnet]
+    flag in config.json is applied later by the supervisor before the gateway
+    connection is established, overriding [trading_mode], [is_paper], and
+    [gateway_port]. *)
 module Config = struct
   let section = "ibkr_config"
 
@@ -27,32 +32,49 @@ module Config = struct
     try Sys.getenv "IBKR_GATEWAY_HOST"
     with Not_found -> "127.0.0.1"
 
-  let gateway_port =
+  (* Mutable so set_testnet can override after config is parsed *)
+  let gateway_port = ref (
     try int_of_string (Sys.getenv "IBKR_GATEWAY_PORT")
     with _ -> 4002
+  )
 
   let account_id =
     try Some (Sys.getenv "IBKR_ACCOUNT_ID")
     with Not_found -> None
 
-  let trading_mode =
+  let trading_mode = ref (
     try
       let mode = Sys.getenv "IBKR_TRADING_MODE" in
       match String.lowercase_ascii mode with
       | "live" -> "live"
       | "paper" | _ -> "paper"
     with Not_found -> "paper"
+  )
 
   let client_id =
     try int_of_string (Sys.getenv "IBKR_CLIENT_ID")
     with _ -> Ibkr_types.default_client_id
 
-  let is_paper = trading_mode = "paper"
+  let is_paper = ref (!trading_mode = "paper")
+
+  (** Override trading mode from the config.json [testnet] flag.
+      [testnet = true] → paper trading (port 4002).
+      [testnet = false] → live trading (port 4001).
+      Only overrides the port when no explicit IBKR_GATEWAY_PORT env var is set. *)
+  let set_testnet testnet =
+    let mode = if testnet then "paper" else "live" in
+    trading_mode := mode;
+    is_paper := testnet;
+    (* Only override port if the user didn't set it explicitly via env *)
+    if Sys.getenv_opt "IBKR_GATEWAY_PORT" = None then
+      gateway_port := (if testnet then 4002 else 4001);
+    Logging.info_f ~section "IBKR trading mode set to %s (testnet=%b, port=%d)"
+      mode testnet !gateway_port
 
   let () =
     Logging.info_f ~section "IBKR config: host=%s port=%d mode=%s clientId=%d"
-      gateway_host gateway_port trading_mode client_id;
-    if is_paper then
+      gateway_host !gateway_port !trading_mode client_id;
+    if !is_paper then
       Logging.info ~section "Running in PAPER trading mode"
     else
       Logging.warn ~section "Running in LIVE trading mode — real money at risk"

@@ -162,13 +162,21 @@ let parse_config json =
     end
   end;
   if exchange <> "hyperliquid" then begin
-    let hl_only = [ "testnet"; "hedge" ] in
+    let hl_only = [ "hedge" ] in
     let actual = json |> to_assoc |> List.map fst in
     let bad = List.filter (fun k -> List.mem k hl_only) actual in
     if bad <> [] then begin
       List.iter (fun k ->
         Logging.critical_f ~section "Key '%s' is only valid for hyperliquid (found in %s/%s)" k exchange symbol
       ) bad;
+      exit 1
+    end
+  end;
+  (* testnet is valid for hyperliquid and ibkr only *)
+  if exchange <> "hyperliquid" && exchange <> "ibkr" then begin
+    let actual = json |> to_assoc |> List.map fst in
+    if List.mem "testnet" actual then begin
+      Logging.critical_f ~section "Key 'testnet' is only valid for hyperliquid and ibkr (found in %s/%s)" exchange symbol;
       exit 1
     end
   end;
