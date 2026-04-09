@@ -731,12 +731,15 @@ let start_domain config state fee_fetcher =
      | None -> ());
 
     let domain_handle = Domain.spawn (fun () ->
-      Config.apply_gc_config ();
-      Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
-        asset.exchange asset.symbol (Atomic.get state.restart_count);
-
-      (* Catch exceptions to prevent domain crash from propagating *)
+      (* Catch ALL exceptions including those from apply_gc_config.
+         Previously apply_gc_config was outside the try/with, so a
+         CamlinternalLazy.Undefined from concurrent Lazy.force on the
+         shared cached_gc_config would silently kill the domain. *)
       try
+        Config.apply_gc_config ();
+        Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
+          asset.exchange asset.symbol (Atomic.get state.restart_count);
+
         asset_domain_worker config fee_fetcher asset;
         Logging.info_f ~section "Domain for %s/%s completed normally" asset.exchange asset.symbol
       with exn ->
@@ -874,6 +877,14 @@ let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading
     ignore (register_domain asset)
   ) assets;
 
+  (* Pre-force the shared cached_gc_config Lazy before spawning domains.
+     OCaml 5 domains that concurrently Lazy.force the same value race:
+     the first domain computes while others block, but if the computing
+     domain fails, blocked domains get CamlinternalLazy.Undefined.
+     Forcing here in the main domain eliminates the race entirely.
+     (Same pattern as the Conduit context pre-force in main.ml.) *)
+  Config.apply_gc_config ();
+
   (* Spawn the initial domain for each registered asset *)
   Mutex.lock registry_mutex;
   let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
@@ -882,9 +893,6 @@ let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading
   List.iter (fun state ->
     ignore (start_domain config state fee_fetcher)
   ) all_states;
-
-
-
   (* Launch the supervisor monitoring thread *)
   let supervisor_thread = Thread.create (supervisor_loop config) fee_fetcher in
   Logging.info ~section "Domain supervisor thread started";
