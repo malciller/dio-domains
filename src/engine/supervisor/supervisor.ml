@@ -804,6 +804,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Ibkr.Ticker_feed.register_handlers;
       Ibkr.Orderbook_feed.register_handlers;
       Ibkr.Executions_feed.register_handlers;
+      Ibkr.Balances.register_handlers;
     ];
     let ibkr_connect_fn () =
       Lwt.catch (fun () ->
