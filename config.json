@@ -30,6 +30,21 @@
       "hedge": false
     },
     {
+      "symbol": "ETH/USDC",
+      "exchange": "lighter",
+      "qty": "0.006",
+      "grid_interval": [
+        1.0,
+        2.5
+      ],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.75,
+        2.0
+      ],
+      "strategy": "Grid"
+    },
+    {
       "symbol": "SOL/USD",
       "exchange": "kraken",
       "qty": "0.14",

@@ -93,6 +93,9 @@ RUN ldconfig
 COPY --from=builder /app/_build/default/bin/main.exe /usr/local/bin/dio
 COPY --from=builder /app/_build/default/bin/dashboard.exe /usr/local/bin/dio-dashboard
 
+# 11a. Copy Lighter signer shared library (Go-compiled .so for linux/amd64)
+COPY --from=builder /app/lighter-signer-linux-amd64.so /app/lighter-signer-linux-amd64.so
+
 # 12. Copy config files needed at runtime
 COPY --chown=root:root config.json /app/config.json
 
@@ -106,6 +109,9 @@ ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 
 # 15. OCaml runtime GC defaults (Forces OCaml 5 minor_heap_size scaling per-domain natively)
 ENV OCAMLRUNPARAM="s=4194304,o=2000,O=8000,h=100,w=1"
+
+# 15a. Lighter signer library path (linux/amd64 .so in /app)
+ENV LIGHTER_SIGNER_LIB_PATH=./lighter-signer-linux-amd64
 
 # 16. Expose metrics broadcast port
 EXPOSE 8080

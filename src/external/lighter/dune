@@ -1,0 +1,21 @@
+(library
+ (name lighter)
+ (public_name dio.lighter)
+ (libraries
+  yojson
+  lwt
+  lwt.unix
+  dotenv
+  logging
+  cohttp-lwt-unix
+  uri
+  threads
+  websocket-lwt-unix
+  conduit-lwt-unix
+  ipaddr.unix
+  ctypes
+  ctypes-foreign
+  concurrency
+  dio.exchange)
+ (preprocess
+  (pps lwt_ppx)))

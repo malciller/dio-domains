@@ -119,7 +119,7 @@ let test_order_cancellation () =
   state.open_sell_orders <- [("sell456", 51000.0, 1.0)];
 
   (* Cancel the buy order *)
-  Dio_strategies.Market_maker.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy;
+  Dio_strategies.Market_maker.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy None;
 
   (* Should clear buy order tracking *)
   check (option string) "buy order id cleared" None state.last_buy_order_id;

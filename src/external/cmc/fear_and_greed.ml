@@ -50,20 +50,28 @@ let fetch_value_lwt ?(fallback = 50.0) () =
       Lwt.return (set_cached fallback)
   | Some api_key ->
       let headers = Cohttp.Header.of_list [ ("X-CMC_PRO_API_KEY", api_key) ] in
-      Client.get ~headers (Uri.of_string endpoint) >>= fun (resp, body) ->
-      Cohttp_lwt.Body.to_string body >>= fun body_str ->
-      let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-      if status <> 200 then (
-        Logging.error_f ~section "CMC fear-and-greed HTTP %d: %s" status body_str;
+      let timeout =
+        Lwt_unix.sleep 5.0 >>= fun () ->
+        Logging.warn_f ~section "CMC fear-and-greed request timed out after 5s";
         Lwt.return (set_cached fallback)
-      ) else
-        match parse_value body_str with
-        | Some value ->
-            Logging.info_f ~section "Fetched fear & greed index: %.2f" value;
-            Lwt.return (set_cached value)
-        | None ->
-            Logging.error_f ~section "Failed to parse fear-and-greed response: %s" body_str;
-            Lwt.return (set_cached fallback)
+      in
+      let fetch =
+        Client.get ~headers (Uri.of_string endpoint) >>= fun (resp, body) ->
+        Cohttp_lwt.Body.to_string body >>= fun body_str ->
+        let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+        if status <> 200 then (
+          Logging.error_f ~section "CMC fear-and-greed HTTP %d: %s" status body_str;
+          Lwt.return (set_cached fallback)
+        ) else
+          match parse_value body_str with
+          | Some value ->
+              Logging.info_f ~section "Fetched fear & greed index: %.2f" value;
+              Lwt.return (set_cached value)
+          | None ->
+              Logging.error_f ~section "Failed to parse fear-and-greed response: %s" body_str;
+              Lwt.return (set_cached fallback)
+      in
+      Lwt.pick [fetch; timeout]
 
 let fetch_and_cache_sync ?(fallback = 50.0) () =
   match Atomic.get cached_value with
