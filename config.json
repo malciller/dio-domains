@@ -34,8 +34,8 @@
       "exchange": "lighter",
       "qty": "0.006",
       "grid_interval": [
-        1.0,
-        2.5
+        0.1,
+        1.0
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
