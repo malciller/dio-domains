@@ -319,6 +319,7 @@ module Kraken_impl = struct
         avg_price = e.avg_price;
         timestamp = e.timestamp;
         is_amended = (e.exec_type = Kraken_executions_feed.Amended);
+        cl_ord_id = e.cl_ord_id;
       }
     ) events
 
@@ -342,6 +343,7 @@ module Kraken_impl = struct
         avg_price = e.avg_price;
         timestamp = e.timestamp;
         is_amended = (e.exec_type = Kraken_executions_feed.Amended);
+        cl_ord_id = e.cl_ord_id;
       }
     )
 

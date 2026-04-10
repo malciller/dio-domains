@@ -2,11 +2,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 High-performance OCaml 5.2 trading engine for Kraken, Hyperliquid,
-and Interactive Brokers (IBKR) featuring domain-based parallel
-strategy execution. Each trading asset runs in its own isolated
-domain with lock-free communication, tick-driven event architecture,
-and real-time latency profiling. Built for high-frequency trading
-with WebSocket data feeds and asynchronous order execution.
+Lighter, and Interactive Brokers (IBKR) featuring domain-based
+parallel strategy execution. Each trading asset runs in its own
+isolated domain with lock-free communication, tick-driven event
+architecture, and real-time latency profiling. Built for
+high-frequency trading with WebSocket data feeds and asynchronous
+order execution.
 
 > [!NOTE]
 > **Full technical write-up**: [Diogrid v2.0.0](https://diophantsolutions.com/diogrid-wp)
@@ -38,6 +39,7 @@ with WebSocket data feeds and asynchronous order execution.
 - At least one exchange configured:
   - **Kraken**: API key and secret
   - **Hyperliquid**: Wallet address, agent address, and private key
+  - **Lighter**: API private key, account index, and signer shared library
   - **IBKR**: IB Gateway (Docker) with TWS credentials
 
 ---
@@ -85,6 +87,13 @@ IBKR_TRADING_MODE=paper         # "paper" or "live" (default: paper)
 IBKR_CLIENT_ID=0                # Default: 0
 IBKR_ACCOUNT_ID=                # Auto-detected from gateway if omitted
 
+# ── Lighter ──
+LIGHTER_API_PRIVATE_KEY=your_lighter_private_key
+LIGHTER_API_KEY_INDEX=4                            # API key index from Lighter dashboard
+LIGHTER_ACCOUNT_INDEX=123456                       # Account index from Lighter dashboard
+LIGHTER_SIGNER_LIB_PATH=./lighter-signer-darwin-arm64  # Path to signer lib (without extension)
+LIGHTER_PROXY_URL=https://your-proxy.workers.dev       # Optional: Cloudflare proxy URL
+
 # ── Optional ──
 CMC_API_KEY=your_cmc_api_key    # Fear & Greed index (defaults to 50.0 if absent)
 DIO_BACKTRACE=                  # Set any value to enable exception backtraces
@@ -130,6 +139,15 @@ engine spawns an isolated domain per entry.
       "hedge": true
     },
     {
+      "symbol": "ETH/USDC",
+      "exchange": "lighter",
+      "qty": "0.01",
+      "grid_interval": [0.25, 0.75],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [0.5, 5.0],
+      "strategy": "Grid"
+    },
+    {
       "symbol": "TQQQ",
       "exchange": "ibkr",
       "qty": "1.0",
@@ -147,11 +165,11 @@ engine spawns an isolated domain per entry.
 | Field | Type | Description |
 |-------|------|-------------|
 | `symbol` | string | Trading pair (e.g. `"BTC/USD"`) or ticker (e.g. `"TQQQ"`) |
-| `exchange` | string | `"kraken"`, `"hyperliquid"`, or `"ibkr"` |
+| `exchange` | string | `"kraken"`, `"hyperliquid"`, `"lighter"`, or `"ibkr"` |
 | `qty` | string | Order quantity per grid level |
 | `grid_interval` | [min, max] | Grid spacing as `%` of price, resolved via Fear & Greed |
 | `sell_mult` | string | Sell quantity multiplier (`qty × sell_mult`). Values < 1.0 trigger accumulation |
-| `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, IBKR) |
+| `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, Lighter, IBKR) |
 | `strategy` | string | `"Grid"` or `"MM"` |
 | `min_usd_balance` | string | Minimum USD balance to run (MM only) |
 | `max_exposure` | string | Maximum asset exposure before pausing (MM only) |
@@ -281,6 +299,19 @@ profit from the grid spread. When `accumulated_profit` exceeds
 `rounding_cost + accumulation_buffer`, a reduced sell is triggered
 and the difference is retained as `reserved_base`.
 
+#### Accumulation (Lighter)
+
+Lighter uses the same discrete-size model as Hyperliquid — each
+market defines `supported_size_decimals` which determines the minimum
+lot step. Quantities are floored to valid precision via the
+instruments feed metadata fetched at startup. The accumulation logic
+is identical: 1:1 sells most cycles, with reduced sells triggered
+when `accumulated_profit` exceeds `rounding_cost + accumulation_buffer`.
+
+- **EdDSA signing**: Orders are signed via a precompiled Go shared library (`lighter-signer`) using BabyJubJub/Poseidon cryptography
+- **Instrument metadata**: Price/quantity precision resolved from `GET /api/v1/orderBookDetails` at startup
+- **GTC orders**: All Lighter orders use Good-Til-Cancelled time-in-force
+
 #### Accumulation (IBKR)
 
 IBKR's TWS API does not support fractional shares. The same mechanism
@@ -301,7 +332,7 @@ prevents retained shares from being sold.
 CoinMarketCap Fear & Greed index (0–100): fear resolves closer to
 `min` (accumulate faster), greed resolves closer to `max` (wait
 longer). Re-evaluated dynamically when price moves ≥3.5% from
-baseline. Applies to Hyperliquid and IBKR.
+baseline. Applies to Hyperliquid, Lighter, and IBKR.
 
 ### MM (Adaptive Market Maker)
 
@@ -341,13 +372,13 @@ perp short; spot sell fills close it. Enable with `"hedge": true`.
                +---------------------------------------------+
                 |                   |                   |
                 v                   v                   v
-   +------------------+  +------------------+  +------------------+
-   | Kraken           |  | Hyperliquid      |  | IBKR             |
-   | WS: ticker,      |  | WS: allMids, L2, |  | TWS API: ticker, |
-   | book, balance,   |  | webData2, spot   |  | orderbook, exec  |
-   | exec             |  | REST: L1 sigs    |  | portfolio, acct  |
-   | Ring buffer store|  | Global order idx |  | Contract cache   |
-   +------------------+  +------------------+  +------------------+
+   +------------------+  +------------------+  +------------------+  +------------------+
+   | Kraken           |  | Hyperliquid      |  | Lighter          |  | IBKR             |
+   | WS: ticker,      |  | WS: allMids, L2, |  | WS: ticker, L2,  |  | TWS API: ticker, |
+   | book, balance,   |  | webData2, spot   |  | exec, balances   |  | orderbook, exec  |
+   | exec             |  | REST: L1 sigs    |  | FFI: EdDSA signer|  | portfolio, acct  |
+   | Ring buffer store|  | Global order idx |  | REST: instruments|  | Contract cache   |
+   +------------------+  +------------------+  +------------------+  +------------------+
 ```
 
 ---
@@ -399,11 +430,154 @@ prevent glibc arena fragmentation, with tuning for fast dirty/muzzy
 page decay and limited arenas (`narenas:2`) suited to OCaml 5
 multicore workloads.
 
+### Lighter Signer Library
+
+Lighter requires a precompiled Go shared library for EdDSA transaction
+signing. The library is loaded via FFI at runtime.
+
+| Platform | File | Source |
+|----------|------|--------|
+| macOS ARM64 (dev) | `lighter-signer-darwin-arm64.dylib` | [lighter-go releases](https://github.com/elliottech/lighter-go/releases) |
+| Linux x86_64 (Docker) | `lighter-signer-linux-amd64.so` | [lighter-go releases](https://github.com/elliottech/lighter-go/releases) |
+
+Place both files in the project root. The engine auto-detects the
+correct binary based on OS and architecture. Override with
+`LIGHTER_SIGNER_LIB_PATH` (without file extension).
+
+To build from source:
+
+```bash
+git clone https://github.com/elliottech/lighter-go.git /tmp/lighter-go
+cd /tmp/lighter-go && go mod vendor
+
+# Linux amd64 (via Docker)
+docker run --rm --platform linux/amd64 -v ${PWD}:/go/src/sdk -w /go/src/sdk \
+  golang:1.23.2-bullseye /bin/sh -c \
+  "CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -trimpath \
+   -o ./build/lighter-signer-linux-amd64.so ./sharedlib"
+
+# macOS ARM64 (native)
+go build -buildmode=c-shared -trimpath \
+  -o ./build/lighter-signer-darwin-arm64.dylib ./sharedlib/main.go
+```
+
+### Lighter Proxy (Cloudflare Worker)
+
+Some exchange APIs serve traffic through CDNs that enforce regional
+access policies. The included Cloudflare Worker proxy
+(`proxy/cloudflare/`) provides a lightweight forwarding layer that
+routes all Lighter HTTP and WebSocket traffic through a Cloudflare
+point of presence in a region of your choosing. This can be useful
+if your infrastructure is deployed in a region where direct
+connectivity to an exchange's upstream CDN is unreliable or
+unavailable — a simple configuration change lets you route through
+any jurisdiction Cloudflare operates in.
+
+The proxy is a generic forwarder: it does not modify, inspect, or
+cache request/response payloads. It simply relocates the network
+egress point.
+
+#### Prerequisites
+
+- A [Cloudflare account](https://dash.cloudflare.com/sign-up) (free
+  tier is sufficient)
+- [Node.js](https://nodejs.org/) 18+ and npm
+- Wrangler CLI (`npm install -g wrangler` or use `npx`)
+
+#### 1. Authenticate with Cloudflare
+
+```bash
+npx wrangler login
+```
+
+This opens a browser window to authorize Wrangler against your
+Cloudflare account.
+
+#### 2. Configure the region
+
+Edit `proxy/cloudflare/wrangler.toml` to set the Durable Object
+location hint and Worker placement region. The defaults route traffic
+through Western Europe:
+
+```toml
+# wrangler.toml (excerpt)
+
+# Durable Object location — where upstream connections originate from.
+# Options: "wnam", "enam", "weur", "eeur", "apac", "oc", "afr", "me"
+# See: https://developers.cloudflare.com/durable-objects/reference/data-location/
+[[durable_objects.bindings]]
+name = "LIGHTER_PROXY"
+class_name = "LighterProxy"
+
+# Worker placement — colocate the Worker near a specific cloud region.
+# Choose a region geographically close to your Durable Object hint.
+[placement]
+mode = "targeted"
+region = "gcp:europe-west1"    # or "gcp:asia-east1", "gcp:us-east1", etc.
+```
+
+> [!TIP]
+> The `locationHint` in `src/index.ts` (default: `"weur"`) controls
+> where the Durable Object instance is created. The `[placement]`
+> region in `wrangler.toml` controls where the Worker itself runs.
+> For lowest latency, set both to the same geographic area. If you
+> need traffic to exit from a specific jurisdiction, set the location
+> hint to the corresponding region code.
+
+#### 3. Deploy
+
+```bash
+cd proxy/cloudflare
+npm install
+npx wrangler deploy
+```
+
+Wrangler will output your proxy URL:
+
+```
+Published lighter-proxy (x.xx sec)
+  https://lighter-proxy.<your-subdomain>.workers.dev
+```
+
+#### 4. Configure the engine
+
+Add the proxy URL to your `.env`:
+
+```bash
+LIGHTER_PROXY_URL=https://lighter-proxy.<your-subdomain>.workers.dev
+```
+
+When set, **all** Lighter HTTP and WebSocket traffic is routed through
+the proxy. When unset, the engine connects directly to Lighter's
+origin.
+
+
+#### Architecture
+
+The proxy uses a Cloudflare Durable Object to maintain a persistent
+egress point:
+
+- **HTTP requests**: Forwarded to the DO, which fetches from Lighter's
+  origin (`mainnet.zklighter.elliot.ai`) using its regional IP
+- **WebSocket connections**: The Worker creates a client-facing
+  WebSocket pair, then instructs the DO to establish the upstream
+  connection and relay messages bidirectionally
+- **Observability**: Request/response logging is enabled by default
+  via Cloudflare's `[observability]` config — view logs in the
+  Cloudflare dashboard under Workers → Logs
+
+> [!NOTE]
+> The proxy adds minimal latency (~10–30ms) since Cloudflare's
+> network is anycast. The Durable Object is pinned to a single
+> region, so all upstream connections consistently originate from
+> the same jurisdiction regardless of where your client connects
+> from.
+
 ### State Persistence
 
 The Grid strategy persists accumulation state to disk so
 `reserved_base`, `accumulated_profit`, and `last_fill_oid` survive
-restarts. Used by Hyperliquid and IBKR.
+restarts. Used by Hyperliquid, Lighter, and IBKR.
 
 **State file**: `data/accumulated_state.json` (local) or
 `/app/data/accumulated_state.json` (Docker).
@@ -414,6 +588,11 @@ restarts. Used by Hyperliquid and IBKR.
     "reserved_base": 0.15,
     "accumulated_profit": 0.482716,
     "last_fill_oid": "355883830672"
+  },
+  "ETH": {
+    "reserved_base": 0.02,
+    "accumulated_profit": 1.237,
+    "last_fill_oid": "18442"
   },
   "TQQQ": {
     "reserved_base": 3.0,
@@ -466,7 +645,7 @@ Structured, domain-safe logging with five severity levels: `DEBUG`,
 **macOS / Linux**: No additional setup needed.
 
 **Windows (WSL2)**: Run inside WSL2 (Ubuntu 22.04+). Store project
-inside the WSL filesystem, not on `/mnt/c/`.
+inside the WSL filesystem, not on `/mnt/c/`. You will have to compile your own lighter-signer-windows-amd64.dll.
 
 > [!WARNING]
 > Native Windows is not actively tested. WSL2 or Docker is strongly
@@ -487,7 +666,9 @@ inside the WSL filesystem, not on `/mnt/c/`.
      - Dashboard:        src/engine/dashboard/ + bin/dashboard.ml
      - Kraken feeds:     src/external/kraken/
      - Hyperliquid feeds: src/external/hyperliquid/
+     - Lighter feeds:    src/external/lighter/
      - IBKR feeds:       src/external/ibkr/
+     - Lighter proxy:    proxy/cloudflare/
      - Exchange interface: src/external/exchange_intf.ml
 3. Commit  -->  git commit -m "..."
 4. Push    -->  git push origin feature/xyz

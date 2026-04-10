@@ -1032,7 +1032,11 @@ let handle_order_rejected asset_symbol side price =
 
 (** Handles a full order fill. Clears all tracking (pending amends, sell orders,
     buy order state) and releases in-flight guards. *)
-let handle_order_filled asset_symbol order_id side ~fill_price:_ =
+let order_or_client_matches tracked order_id cl_ord_id =
+  tracked = order_id
+  || match cl_ord_id with Some c -> tracked = c | None -> false
+
+let handle_order_filled asset_symbol order_id side ~fill_price:_ cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1050,7 +1054,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price:_ =
 
     (* Clear buy order tracking if this was the tracked buy *)
     let was_tracked_buy = match state.last_buy_order_id with
-      | Some id when id = order_id -> true
+      | Some id when order_or_client_matches id order_id cl_ord_id -> true
       | _ -> false
     in
     if was_tracked_buy then begin
@@ -1068,7 +1072,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price:_ =
 
 (** Handles an order cancellation. Distinguishes cancel-replace (amendment)
     from genuine cancellation. Applies cleanup accordingly. *)
-let handle_order_cancelled asset_symbol order_id side =
+let handle_order_cancelled asset_symbol order_id side cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1098,14 +1102,20 @@ let handle_order_cancelled asset_symbol order_id side =
     (* Genuine cancellation: full cleanup *)
     (* Blacklist order ID to prevent re-addition during sync *)
     let now = Unix.time () in
-    state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
+    state.cancelled_orders <-
+      (order_id, now)
+      :: (match cl_ord_id with
+          | Some c when c <> order_id -> (c, now) :: state.cancelled_orders
+          | _ -> state.cancelled_orders);
     
     let cancelled_side = side in
 
     (* Remove from pending orders by order_id or by side for ghost placements *)
     let original_pending_count = List.length state.pending_orders in
     state.pending_orders <- List.filter (fun (pending_id, s, _, _) ->
-      let matches_id = pending_id = order_id in
+      let matches_id = pending_id = order_id
+        || match cl_ord_id with Some c -> pending_id = c | None -> false
+      in
       let is_ghost_placement = (s = cancelled_side) && 
                               (String.starts_with ~prefix:"pending_buy_" pending_id || 
                                String.starts_with ~prefix:"pending_sell_" pending_id) in
@@ -1115,7 +1125,7 @@ let handle_order_cancelled asset_symbol order_id side =
     
     (* Clear buy tracking if this was the tracked buy order *)
     let was_tracked_buy = match state.last_buy_order_id with
-      | Some id when id = order_id -> true
+      | Some id when order_or_client_matches id order_id cl_ord_id -> true
       | _ -> false
     in
     
@@ -1129,6 +1139,7 @@ let handle_order_cancelled asset_symbol order_id side =
     let original_sell_count = List.length state.open_sell_orders in
     state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
+      && match cl_ord_id with Some c -> sell_id <> c | None -> true
     ) state.open_sell_orders;
     let removed_sell = original_sell_count - List.length state.open_sell_orders in
 

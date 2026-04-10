@@ -125,6 +125,8 @@ let set_state conn new_state =
   Mutex.lock conn.mutex;
   let old_state = conn.state in
   conn.state <- new_state;
+  (* Lighter WS reconnects frequently by design; demote its state logs to debug *)
+  let is_quiet = String.equal conn.name "lighter_ws" in
   
   (match new_state with
   | Connected ->
@@ -135,22 +137,37 @@ let set_state conn new_state =
       Atomic.set conn.ping_failures 0;
       conn.reconnect_attempts <- 0;
       conn.total_connections <- conn.total_connections + 1;
-      Logging.info_f ~section "[%s] Connection established (total: %d)"
-        conn.name conn.total_connections
+      if is_quiet then
+        Logging.debug_f ~section "[%s] Connection established (total: %d)"
+          conn.name conn.total_connections
+      else
+        Logging.info_f ~section "[%s] Connection established (total: %d)"
+          conn.name conn.total_connections
   | Disconnected ->
       conn.last_disconnected <- Some (Unix.time ());
       conn.last_connecting <- None;
-      Logging.warn_f ~section "[%s] Connection lost" conn.name
+      if is_quiet then
+        Logging.debug_f ~section "[%s] Connection lost" conn.name
+      else
+        Logging.warn_f ~section "[%s] Connection lost" conn.name
   | Connecting ->
       conn.last_connecting <- Some (Unix.time ());
-      Logging.info_f ~section "[%s] Attempting connection (attempt #%d)"
-        conn.name (conn.reconnect_attempts + 1)
+      if is_quiet then
+        Logging.debug_f ~section "[%s] Attempting connection (attempt #%d)"
+          conn.name (conn.reconnect_attempts + 1)
+      else
+        Logging.info_f ~section "[%s] Attempting connection (attempt #%d)"
+          conn.name (conn.reconnect_attempts + 1)
   | Failed reason ->
       conn.last_disconnected <- Some (Unix.time ());
       conn.last_connecting <- None;
       conn.reconnect_attempts <- conn.reconnect_attempts + 1;
-      Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)"
-        conn.name reason conn.reconnect_attempts);
+      if is_quiet then
+        Logging.debug_f ~section "[%s] Connection failed: %s (attempt #%d)"
+          conn.name reason conn.reconnect_attempts
+      else
+        Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)"
+          conn.name reason conn.reconnect_attempts);
   
   Mutex.unlock conn.mutex;
   
@@ -293,7 +310,11 @@ let start_async conn =
               let attempt_num = conn.reconnect_attempts in
               Mutex.unlock conn.mutex;
               
-              Logging.info_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num;
+              let is_quiet = String.equal conn.name "lighter_ws" in
+              (if is_quiet then
+                Logging.debug_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num
+              else
+                Logging.info_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num);
               Logging.debug_f ~section "[%s] State transition: %s -> Connecting" 
                 conn.name (match old_state with Disconnected -> "Disconnected" | Connected -> "Connected" | Failed _ -> "Failed" | Connecting -> "Connecting");
               
@@ -303,7 +324,10 @@ let start_async conn =
                 last_supervisor_cache_update := now;
                 Supervisor_cache.force_update ()
               end;
-              Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num;
+              (if is_quiet then
+                Logging.debug_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num
+              else
+                Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num);
               true
             end
       in
@@ -315,7 +339,10 @@ let start_async conn =
           Lwt.catch (fun () ->
             connect_fn () >>= fun () ->
             (* WebSocket connect_fn should block indefinitely; early return is abnormal *)
-            Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
+            (if String.equal conn.name "lighter_ws" then
+              Logging.debug_f ~section "[%s] Connection function completed unexpectedly" conn.name
+            else
+              Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name);
             set_state conn (Failed "connection completed unexpectedly");
             Lwt.return_unit
           ) (fun exn ->
@@ -472,7 +499,7 @@ let monitor_loop () =
                                   Atomic.incr conn.ping_failures;
                                   Lwt.return_unit
                                 )
-                            else (* hyperliquid_ws *)
+                            else if String.equal conn.name "hyperliquid_ws" then
                               Lwt.catch
                                 (fun () ->
                                   Hyperliquid.Ws.send_ping ~req_id ~timeout_ms:5000 >>= fun success ->
@@ -492,6 +519,27 @@ let monitor_loop () =
                                   Atomic.incr conn.ping_failures;
                                   Lwt.return_unit
                                 )
+                            else if String.equal conn.name "lighter_ws" then
+                              Lwt.catch
+                                (fun () ->
+                                  Lighter.Ws.send_ping ~req_id ~timeout_ms:5000 >>= fun success ->
+                                  if success then begin
+                                    Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
+                                    Atomic.set conn.ping_failures 0;
+                                    update_data_heartbeat conn;
+                                    Lwt.return_unit
+                                  end else begin
+                                    Logging.warn_f ~section "[%s] Ping failed (req_id: %d)" conn.name req_id;
+                                    Atomic.incr conn.ping_failures;
+                                    Lwt.return_unit
+                                  end
+                                )
+                                (fun exn ->
+                                  Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit
+                                )
+                            else Lwt.return_unit
                           )
                         end;
 
@@ -575,6 +623,12 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     | Some cfg -> cfg.testnet
     | None -> true in
 
+  (* Extract Lighter symbols *)
+  let lighter_symbols = app_configs
+                        |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "lighter")
+                        |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
+  let has_lighter = List.length lighter_symbols > 0 in
+
   (* Apply testnet flag to Hyperliquid module *)
   if has_hyperliquid then
     Hyperliquid.Module.Hyperliquid_impl.set_testnet hyperliquid_testnet;
@@ -588,6 +642,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Logging.info_f ~section "Connecting to %d Hyperliquid websockets..." (List.length hyperliquid_symbols);
   if has_ibkr then
     Logging.info_f ~section "Connecting to IBKR gateway for %d symbols..." (List.length ibkr_symbols);
+  if has_lighter then
+    Logging.info_f ~section "Connecting to Lighter L2 for %d symbols..." (List.length lighter_symbols);
 
   (* Begin sequential initialization steps *)
 
@@ -598,6 +654,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Kraken.Kraken_ticker_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Ticker_feed.initialize all_hyperliquid_symbols;
   if has_ibkr then Ibkr.Ticker_feed.initialize ibkr_symbols;
+  if has_lighter then Lighter.Ticker_feed.initialize lighter_symbols;
 
   Logging.info ~section "Step 1.5: Starting Hyperliquid websocket connection early...";
   if has_hyperliquid then begin
@@ -645,10 +702,64 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
      start_async hl_ws_conn;
   end;
 
+  (* Start Lighter WS connection and signer initialization *)
+  let%lwt () = (if has_lighter then begin
+    Logging.info ~section "Initializing Lighter signer and WebSocket...";
+    let%lwt () = Lighter.Module.initialize_signer () in
+    let lt_ws_conn = register ~name:"lighter_ws" ~connect_fn:None in
+    let lt_ws_connect_fn () =
+      Lwt.catch (fun () ->
+        let on_failure reason =
+          set_state lt_ws_conn (Failed reason);
+          Lwt.async (fun () ->
+            Lwt.catch (fun () ->
+              (* Delay before reconnecting to avoid 429 rate-limits
+                 from the Lighter upstream WS endpoint *)
+              Lwt_unix.sleep 2.0 >>= fun () ->
+              start_async lt_ws_conn;
+              Lwt.return_unit
+            ) (fun exn ->
+              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" lt_ws_conn.name (Printexc.to_string exn);
+              Lwt.return_unit
+            )
+          )
+        in
+        let on_heartbeat () = update_data_heartbeat lt_ws_conn in
+        let on_connected () =
+          set_state lt_ws_conn Connected;
+          let account_index = match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
+            | Some s -> (try int_of_string s with _ -> 0)
+            | None -> 0
+          in
+          let auth_token = Lighter.Signer.get_auth_token () in
+          Lwt.async (fun () ->
+            Lighter.Instruments_feed.wait_until_ready () >>= fun () ->
+            Lighter.Ws.subscribe_to_feeds ~symbols:lighter_symbols ~account_index ~auth_token >>= fun () ->
+            Lighter.Executions_feed.clear_all_open_orders ();
+            Lighter.Module.fetch_open_orders ())
+        in
+        Lighter.Ws.connect_and_monitor
+          ~on_failure ~on_connected ~on_heartbeat
+      ) (fun exn ->
+        let error_msg = Printexc.to_string exn in
+        Logging.error_f ~section "[%s] Connection failed: %s" lt_ws_conn.name error_msg;
+        set_state lt_ws_conn (Failed error_msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn lt_ws_conn (Some lt_ws_connect_fn);
+    start_async lt_ws_conn;
+    Lwt.return_unit
+  end else Lwt.return_unit) in
+
   Logging.info ~section "Step 2: Initializing instruments feed stores...";
   let%lwt () = Kraken.Kraken_instruments_feed.initialize_symbols kraken_symbols in
   let%lwt () = 
     if has_hyperliquid then Hyperliquid.Module.initialize_instruments_ws ()
+    else Lwt.return_unit
+  in
+  let%lwt () =
+    if has_lighter then Lighter.Module.initialize_instruments ~symbols:lighter_symbols
     else Lwt.return_unit
   in
 
@@ -656,6 +767,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
   if has_hyperliquid then Hyperliquid.Orderbook_feed.initialize all_hyperliquid_symbols;
   if has_ibkr then Ibkr.Orderbook_feed.initialize ibkr_symbols;
+  if has_lighter then Lighter.Orderbook_feed.initialize lighter_symbols;
 
   Logging.info ~section "Step 4: Getting authentication token...";
   let%lwt auth_token = 
@@ -677,6 +789,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                   |> List.sort_uniq String.compare
                   |> fun assets -> "USD" :: assets in  (* Include USD as quote currency *)
   let all_assets = if has_hyperliquid then "USDC" :: all_assets else all_assets in
+  let all_assets = if has_lighter then "USDC" :: all_assets else all_assets in
   let all_assets = List.sort_uniq String.compare all_assets in
   
   let () = try
@@ -686,6 +799,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.async (fun () -> Hyperliquid.Module.fetch_spot_balances_ws ())
     end;
     if has_ibkr then Ibkr.Balances.initialize ();
+    if has_lighter then Lighter.Balances.initialize ["USDC"; "ETH"];
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
@@ -695,6 +809,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Executions_feed.initialize hyperliquid_symbols;
   if has_ibkr then Ibkr.Executions_feed.initialize ibkr_symbols;
+  if has_lighter then Lighter.Executions_feed.initialize lighter_symbols;
 
   (* Synchronously fetch open orders before domains start to prevent duplicate placements *)
   let%lwt () =
@@ -997,7 +1112,11 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       if has_hyperliquid then Hyperliquid.Balances.wait_until_ready ()
       else Lwt.return_true
     in
-    Lwt.return (kraken_ready && hl_ready)
+    let%lwt lighter_ready =
+      if has_lighter then Lighter.Balances.wait_for_balance_data ["USDC"; "ETH"] 10.0
+      else Lwt.return_true
+    in
+    Lwt.return (kraken_ready && hl_ready && lighter_ready)
   in
   if not balances_ready then
     Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
@@ -1096,6 +1215,23 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Lwt.return { asset with
           Dio_engine.Config.maker_fee = Some maker;
           Dio_engine.Config.taker_fee = Some taker }
+      end else if asset.Dio_engine.Config.exchange = "lighter" then begin
+        (* Lighter fees are embedded in orderBookDetails and already cached
+           in the instruments feed — no separate fee endpoint needed. *)
+        let fees = Lighter.Instruments_feed.lookup_info asset.Dio_engine.Config.symbol in
+        let maker = match fees with Some i -> i.Lighter.Types.maker_fee | None -> 0.0 in
+        let taker = match fees with Some i -> i.Lighter.Types.taker_fee | None -> 0.0 in
+        Logging.debug_f ~section "Lighter fees for %s from instruments feed: maker=%.4f%% taker=%.4f%%"
+          asset.Dio_engine.Config.symbol (maker *. 100.) (taker *. 100.);
+        Dio_strategies.Fee_cache.store_fees
+          ~exchange:"lighter"
+          ~symbol:asset.Dio_engine.Config.symbol
+          ~maker_fee:maker
+          ~taker_fee:taker
+          ~ttl_seconds:86400.0;
+        Lwt.return { asset with
+          Dio_engine.Config.maker_fee = Some maker;
+          Dio_engine.Config.taker_fee = Some taker }
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
         (* Cache default fees for unsupported exchanges *)
@@ -1147,6 +1283,13 @@ let order_processing_loop () =
           with Not_found -> false
       in
 
+      let is_lighter_connected =
+          try
+            let lt_conn = Hashtbl.find connections "lighter_ws" in
+            get_state lt_conn = Connected
+          with Not_found -> false
+      in
+
       (* Drain ring buffers regardless of connection status to prevent backpressure *)
       let pending_grid_orders = Dio_strategies.Suicide_grid.Strategy.get_pending_orders 100 in
       let pending_mm_orders = Dio_strategies.Market_maker.Strategy.get_pending_orders 100 in
@@ -1165,6 +1308,7 @@ let order_processing_loop () =
             if order.Dio_strategies.Strategy_common.exchange = "kraken" then kraken_connected
             else if order.Dio_strategies.Strategy_common.exchange = "hyperliquid" then is_hyperliquid_connected
             else if order.Dio_strategies.Strategy_common.exchange = "ibkr" then is_ibkr_connected
+            else if order.Dio_strategies.Strategy_common.exchange = "lighter" then is_lighter_connected
             else true
           in
           if connected then process_fn ()
@@ -1221,9 +1365,10 @@ let order_processing_loop () =
                                   (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                   result.order_id;
                                 (match order.price with
-                                 | Some price ->
+                                 | Some price when order.exchange <> "lighter" ->
                                      Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
                                        order.symbol result.order_id order.side price
+                                 | Some _ -> ()
                                  | None -> ());
                                 Lwt.return_unit
                             | Error err ->
@@ -1720,7 +1865,7 @@ let monitor_non_active_assets () =
               Lwt_list.iter_s (fun (asset, bal) ->
                 if bal > 0.0 then begin
                   let quote = match exch_name with
-                    | "hyperliquid" -> "USDC"
+                    | "hyperliquid" | "lighter" -> "USDC"
                     | _ -> "USD"
                   in
                   let symbol = asset ^ "/" ^ quote in
@@ -1730,7 +1875,9 @@ let monitor_non_active_assets () =
                   
                   let is_fiat_or_stable = 
                     (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || 
-                    (asset = "USDT") || (asset = quote) || (asset = "USDe")
+                    (asset = "USDT") || (asset = quote) || (asset = "USDe") ||
+                    (* Skip raw numeric asset IDs from Lighter balance feed *)
+                    (try ignore (int_of_string asset); true with _ -> false)
                   in
                   
                   if not is_configured && not is_fiat_or_stable then begin

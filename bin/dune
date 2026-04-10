@@ -6,6 +6,7 @@
  (libraries
   dio.kraken
   dio.ibkr
+  dio.lighter
   dio.cmc
   dio.strategies
   dio.dashboard
