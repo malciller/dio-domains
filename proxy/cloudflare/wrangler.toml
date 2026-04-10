@@ -28,6 +28,7 @@ enabled = false
 persist = true
 head_sampling_rate = 1
 
+# Pin worker entrypoint to Asia-East (matches DO locationHint "apac")
 [placement]
 mode = "targeted"
 region = "gcp:asia-east1"
