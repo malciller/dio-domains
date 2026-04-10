@@ -241,6 +241,16 @@ docker compose up -d
 docker compose logs -f   # Look for "Market data farm connection is OK"
 ```
 
+> [!CAUTION]
+> **First-time connection requires 2FA.** When IB Gateway starts for
+> the first time (or after credential changes), IBKR will send a 2FA
+> challenge to your IBKR mobile app or security device. You must
+> approve it within the timeout window or the gateway will fail to
+> authenticate. Connect via VNC (see below) to monitor the login
+> process. Subsequent reconnections and daily restarts are handled
+> automatically by the `TWOFA_TIMEOUT_ACTION: restart` and
+> `RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"` settings.
+
 ### 4. VNC access (optional)
 
 Connect to `localhost:5900` (password: `ibkr`) via any VNC client to
