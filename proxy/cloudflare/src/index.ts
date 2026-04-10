@@ -1,18 +1,21 @@
 /**
  * Lighter API Proxy — Cloudflare Worker + Durable Object
  *
- * Routes all Lighter traffic through a Durable Object pinned to Western Europe
- * (locationHint: "weur") to bypass CloudFront US geo-restrictions.
+ * Routes all Lighter traffic through a Durable Object pinned to Asia-East
+ * (locationHint: "apac") to bypass CloudFront geo-restrictions.
  *
- * HTTP requests are forwarded to the DO which fetches from Lighter with an EU IP.
+ * HTTP requests are forwarded to the DO which fetches from Lighter with an
+ * appropriate regional IP.
  * WebSocket requests are handled at the entrypoint (where CF recognises the
- * upgrade) and the DO establishes the upstream connection from EU.
+ * upgrade) and the DO establishes the upstream connection and manages
+ * keepalive + transparent reconnection.
  *
  * Deploy:  cd proxy/cloudflare && npx wrangler deploy
  * Usage:   export LIGHTER_PROXY_URL=https://lighter-proxy.malciller.workers.dev
  */
 
 const LIGHTER_ORIGIN = "https://mainnet.zklighter.elliot.ai";
+const LOCATION_HINT = "apac";
 
 // ─── Env type ────────────────────────────────────────────────────────────────
 
@@ -33,9 +36,9 @@ export default {
       return handleWebSocket(url, env);
     }
 
-    // HTTP: forward to DO pinned in Western Europe
-    const id = env.LIGHTER_PROXY.idFromName("lighter-eu");
-    const stub = env.LIGHTER_PROXY.get(id, { locationHint: "weur" });
+    // HTTP: forward to DO pinned in Asia-East
+    const id = env.LIGHTER_PROXY.idFromName("lighter-apac");
+    const stub = env.LIGHTER_PROXY.get(id, { locationHint: LOCATION_HINT });
     return stub.fetch(request);
   },
 };
@@ -43,16 +46,17 @@ export default {
 // ─── WebSocket handling ──────────────────────────────────────────────────────
 // WebSocket upgrade must be returned from the entrypoint (where CF recognises
 // the client upgrade). We create the client-facing pair here, then ask the DO
-// (running in EU) to establish the upstream connection and relay messages back
-// through a simple message-passing protocol over an internal DO WebSocket.
+// (running in Asia-East) to establish the upstream connection and relay
+// messages back through a simple message-passing protocol over an internal DO
+// WebSocket.
 
 async function handleWebSocket(url: URL, env: Env): Promise<Response> {
   const [client, server] = Object.values(new WebSocketPair());
   server.accept();
 
   // Ask the DO to connect upstream and relay via an internal WebSocket
-  const id = env.LIGHTER_PROXY.idFromName("lighter-eu");
-  const stub = env.LIGHTER_PROXY.get(id, { locationHint: "weur" });
+  const id = env.LIGHTER_PROXY.idFromName("lighter-apac");
+  const stub = env.LIGHTER_PROXY.get(id, { locationHint: LOCATION_HINT });
 
   // Use a special internal endpoint to establish the upstream connection
   const internalUrl = new URL(url.toString());
@@ -142,9 +146,15 @@ async function handleWebSocket(url: URL, env: Env): Promise<Response> {
   return new Response(null, { status: 101, webSocket: client });
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ─── Durable Object: LighterProxy ───────────────────────────────────────────
-// Runs in Western Europe. All outbound fetch() and WebSocket connections
-// exit from a European Cloudflare PoP → CloudFront sees EU IP → 200 OK.
+// Runs in Asia-East. All outbound fetch() and WebSocket connections
+// exit from an appropriate Cloudflare PoP → CloudFront sees allowed IP → 200.
 
 export class LighterProxy implements DurableObject {
   private state: DurableObjectState;
@@ -191,7 +201,7 @@ export class LighterProxy implements DurableObject {
 
       const respHeaders = new Headers(resp.headers);
       respHeaders.set("access-control-allow-origin", "*");
-      respHeaders.set("x-proxy-region", "weur");
+      respHeaders.set("x-proxy-region", LOCATION_HINT);
 
       return new Response(resp.body, {
         status: resp.status,
@@ -208,85 +218,97 @@ export class LighterProxy implements DurableObject {
 
   // ── Upstream WebSocket relay ─────────────────────────────────────────────
   // Called internally by the worker entrypoint. Establishes the upstream
-  // WebSocket to Lighter from this EU DO, and relays messages over an
-  // internal WebSocket pair back to the entrypoint.
+  // WebSocket to Lighter from this DO, relays messages over an internal
+  // WebSocket pair back to the entrypoint. Manages upstream keepalive and
+  // transparent reconnection so the client never sees upstream drops.
 
   private async handleUpstreamRelay(url: URL): Promise<Response> {
     // Create the internal WebSocket pair (between entrypoint and this DO)
     const [client, server] = Object.values(new WebSocketPair());
 
-    // Connect upstream to Lighter from this EU Durable Object
-    // CF Workers fetch() requires https:// (not wss://) for WebSocket upgrades
-    const upstreamUrl = `${LIGHTER_ORIGIN}/stream${url.search}`;
+    // ── State for this relay session ──
+    let upstream: WebSocket | null = null;
+    let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+    let clientClosed = false;
+    let reconnecting = false;
+    const subscriptions = new Set<string>();
 
-    try {
-      // Let CF Workers handle WebSocket negotiation headers automatically.
-      // Do NOT set Sec-WebSocket-Version manually — it conflicts with the
-      // runtime's auto-negotiation and can cause upstream rejection.
-      const upstreamResp = await fetch(upstreamUrl, {
-        headers: {
-          Upgrade: "websocket",
-        },
-      });
+    // Diagnostic counters (cumulative across reconnects)
+    let internalToUpstreamCount = 0;
+    let upstreamToInternalCount = 0;
+    let upstreamConnectCount = 0;
 
-      const upstream = upstreamResp.webSocket;
-      if (!upstream) {
-        console.error(
-          `Upstream WS upgrade failed: status=${upstreamResp.status} ${upstreamResp.statusText}`
-        );
-        const body = await upstreamResp.text().catch(() => "");
-        console.error(`Upstream response body: ${body.slice(0, 500)}`);
-        return new Response(
-          `Failed to connect upstream WebSocket (${upstreamResp.status})`,
-          { status: 502 }
-        );
+    // ── Connect to Lighter upstream ──
+    const connectUpstream = async (): Promise<WebSocket | null> => {
+      const upstreamUrl = `${LIGHTER_ORIGIN}/stream${url.search}`;
+      try {
+        const upstreamResp = await fetch(upstreamUrl, {
+          headers: { Upgrade: "websocket" },
+        });
+
+        const ws = upstreamResp.webSocket;
+        if (!ws) {
+          console.error(
+            `Upstream WS upgrade failed: status=${upstreamResp.status} ${upstreamResp.statusText}`
+          );
+          return null;
+        }
+
+        ws.accept();
+        upstreamConnectCount++;
+        console.log(`[DO] Upstream connected (#${upstreamConnectCount})`);
+        return ws;
+      } catch (err) {
+        console.error(`[DO] Upstream connect error: ${err}`);
+        return null;
       }
+    };
 
-      // Accept both sides
-      upstream.accept();
-      server.accept();
-
-      // Diagnostic counters
-      let internalToUpstreamCount = 0;
-      let upstreamToInternalCount = 0;
-
-      // Relay: internal (from entrypoint) → upstream (to Lighter)
-      server.addEventListener("message", (event) => {
+    // ── Start keepalive interval ──
+    const startKeepalive = () => {
+      stopKeepalive();
+      keepaliveInterval = setInterval(() => {
         try {
-          if (upstream.readyState === WebSocket.READY_STATE_OPEN) {
-            internalToUpstreamCount++;
-            if (internalToUpstreamCount <= 10) {
-              console.log(`[DO] internal→upstream #${internalToUpstreamCount}: ${String(event.data).slice(0, 200)}`);
-            }
-            upstream.send(event.data);
-          } else {
-            console.warn(`[DO] upstream not open (state=${upstream.readyState}), dropped msg #${internalToUpstreamCount + 1}`);
+          if (upstream && upstream.readyState === WebSocket.READY_STATE_OPEN) {
+            upstream.send(JSON.stringify({ type: "ping" }));
           }
         } catch {
-          // upstream already closed
+          // Upstream gone, will be caught by close handler
         }
-      });
+      }, 30_000);
+    };
 
-      server.addEventListener("close", (event) => {
-        console.log(`[DO] Internal relay closed: code=${event.code}`);
+    // ── Stop keepalive interval ──
+    const stopKeepalive = () => {
+      if (keepaliveInterval !== null) {
+        clearInterval(keepaliveInterval);
+        keepaliveInterval = null;
+      }
+    };
+
+    // ── Replay subscriptions to a new upstream ──
+    const replaySubscriptions = (ws: WebSocket) => {
+      if (subscriptions.size === 0) return;
+      console.log(`[DO] Replaying ${subscriptions.size} subscriptions to new upstream`);
+      for (const sub of subscriptions) {
         try {
-          upstream.close(event.code, event.reason);
+          if (ws.readyState === WebSocket.READY_STATE_OPEN) {
+            ws.send(sub);
+          }
         } catch {
-          // already closed
+          console.warn("[DO] Failed to replay subscription during reconnect");
         }
-      });
+      }
+    };
 
-      server.addEventListener("error", (event) => {
-        console.error("Internal relay server-side error:", event);
-        try { upstream.close(1011, "relay error"); } catch {}
-      });
-
-      // Relay: upstream (from Lighter) → internal (to entrypoint)
-      upstream.addEventListener("message", (event) => {
+    // ── Wire event handlers for an upstream WebSocket ──
+    const wireUpstream = (ws: WebSocket) => {
+      // Relay: upstream (from Lighter) → internal (to entrypoint → client)
+      ws.addEventListener("message", (event) => {
         try {
           if (server.readyState === WebSocket.READY_STATE_OPEN) {
             upstreamToInternalCount++;
-            if (upstreamToInternalCount <= 3 || upstreamToInternalCount % 500 === 0) {
+            if (upstreamToInternalCount <= 3 || upstreamToInternalCount % 1000 === 0) {
               console.log(`[DO] upstream→internal #${upstreamToInternalCount}: ${String(event.data).slice(0, 120)}`);
             }
             server.send(event.data);
@@ -298,27 +320,155 @@ export class LighterProxy implements DurableObject {
         }
       });
 
-      upstream.addEventListener("close", (event) => {
-        console.log(`[DO] Upstream WS closed: code=${event.code} reason="${event.reason}", relayed ${upstreamToInternalCount} msgs`);
-        try {
-          server.close(event.code, event.reason);
-        } catch {
-          // already closed
+      // Upstream close: attempt transparent reconnect
+      ws.addEventListener("close", (event) => {
+        console.log(`[DO] Upstream closed: code=${event.code} reason="${event.reason}" (relayed ${upstreamToInternalCount} msgs total)`);
+        stopKeepalive();
+
+        // If client already disconnected, nothing to reconnect for
+        if (clientClosed) {
+          console.log("[DO] Client already closed, not reconnecting upstream");
+          return;
         }
+
+        // If already reconnecting (from a previous close), skip
+        if (reconnecting) {
+          console.log("[DO] Already reconnecting, skipping duplicate");
+          return;
+        }
+
+        // Attempt transparent reconnect
+        reconnecting = true;
+        (async () => {
+          const maxAttempts = 5;
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            if (clientClosed) {
+              console.log("[DO] Client closed during reconnect, aborting");
+              return;
+            }
+
+            const delay = Math.min(1000 * Math.pow(2, attempt), 16_000);
+            console.log(`[DO] Upstream reconnect attempt ${attempt + 1}/${maxAttempts} in ${delay}ms`);
+            await sleep(delay);
+
+            if (clientClosed) {
+              console.log("[DO] Client closed during reconnect backoff, aborting");
+              return;
+            }
+
+            const newWs = await connectUpstream();
+            if (newWs) {
+              upstream = newWs;
+              wireUpstream(newWs);
+              replaySubscriptions(newWs);
+              startKeepalive();
+              reconnecting = false;
+              console.log(`[DO] Upstream reconnected successfully (attempt ${attempt + 1})`);
+              return;
+            }
+          }
+
+          // All attempts exhausted
+          reconnecting = false;
+          console.error(`[DO] Upstream reconnect failed after ${maxAttempts} attempts, closing client`);
+          try {
+            server.close(1011, "upstream reconnect failed");
+          } catch {}
+        })();
       });
 
-      upstream.addEventListener("error", (event) => {
-        console.error("Upstream WebSocket error:", event);
-        try { server.close(1011, "upstream error"); } catch {}
+      ws.addEventListener("error", (event) => {
+        console.error("[DO] Upstream WebSocket error:", event);
+        // The close event will follow and trigger reconnect
       });
+    };
 
-      return new Response(null, { status: 101, webSocket: client });
-    } catch (err) {
-      console.error("Upstream WebSocket connection failed:", err);
+    // ── Initial upstream connection ──
+    upstream = await connectUpstream();
+    if (!upstream) {
       return new Response(
-        JSON.stringify({ error: String(err) }),
+        JSON.stringify({ error: "Failed to connect upstream WebSocket" }),
         { status: 502, headers: { "content-type": "application/json" } },
       );
     }
+
+    // Accept internal server side
+    server.accept();
+
+    // Wire upstream event handlers
+    wireUpstream(upstream);
+
+    // Start keepalive
+    startKeepalive();
+
+    // Relay: internal (from entrypoint/client) → upstream (to Lighter)
+    server.addEventListener("message", (event) => {
+      try {
+        const data = String(event.data);
+
+        // Track subscription messages for replay on reconnect
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.type === "subscribe") {
+            subscriptions.add(data);
+          } else if (parsed.type === "unsubscribe") {
+            // Remove matching subscription if client unsubscribes
+            // Match by channel since the rest of the payload should be identical
+            for (const sub of subscriptions) {
+              try {
+                const s = JSON.parse(sub);
+                if (s.channel === parsed.channel) {
+                  subscriptions.delete(sub);
+                  break;
+                }
+              } catch {}
+            }
+          }
+        } catch {
+          // Not JSON, just relay
+        }
+
+        if (upstream && upstream.readyState === WebSocket.READY_STATE_OPEN) {
+          internalToUpstreamCount++;
+          if (internalToUpstreamCount <= 10) {
+            console.log(`[DO] internal→upstream #${internalToUpstreamCount}: ${data.slice(0, 200)}`);
+          }
+          upstream.send(event.data);
+        } else if (reconnecting) {
+          // Upstream is reconnecting — drop the message but don't error.
+          // Pings and subscription messages will be lost during reconnect,
+          // but subscriptions will be replayed and pings will resume.
+          console.warn(`[DO] Upstream reconnecting, dropped client msg #${internalToUpstreamCount + 1}`);
+        } else {
+          console.warn(`[DO] upstream not open (state=${upstream?.readyState}), dropped msg #${internalToUpstreamCount + 1}`);
+        }
+      } catch {
+        // upstream already closed
+      }
+    });
+
+    server.addEventListener("close", (event) => {
+      console.log(`[DO] Internal relay closed: code=${event.code}`);
+      clientClosed = true;
+      stopKeepalive();
+      try {
+        if (upstream && upstream.readyState === WebSocket.READY_STATE_OPEN) {
+          upstream.close(event.code, event.reason);
+        }
+      } catch {
+        // already closed
+      }
+    });
+
+    server.addEventListener("error", (event) => {
+      console.error("[DO] Internal relay server-side error:", event);
+      clientClosed = true;
+      stopKeepalive();
+      try {
+        if (upstream) upstream.close(1011, "relay error");
+      } catch {}
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 }
