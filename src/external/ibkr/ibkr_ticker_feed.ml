@@ -69,11 +69,18 @@ let notify_ready store =
 (** Write a ticker snapshot to the ring buffer. Called when any
     price/size field updates. *)
 let flush_ticker symbol store =
-  if store.bid > 0.0 && store.ask > 0.0 then begin
+  (* Prefer real bid/ask when available (market hours).
+     Fall back to last price as synthetic bid/ask when bid/ask are absent
+     (off-hours frozen data only delivers a closing price, no quotes). *)
+  let bid = if store.bid > 0.0 then store.bid
+            else if store.last > 0.0 then store.last else 0.0 in
+  let ask = if store.ask > 0.0 then store.ask
+            else if store.last > 0.0 then store.last else 0.0 in
+  if bid > 0.0 && ask > 0.0 then begin
     let ticker = {
       symbol;
-      bid = store.bid;
-      ask = store.ask;
+      bid;
+      ask;
       last = store.last;
       bid_size = store.bid_size;
       ask_size = store.ask_size;
@@ -94,8 +101,11 @@ let handle_tick_price fields =
   let _size, fields = Ibkr_codec.read_int fields in  (* deprecated size field *)
   let _attribs, _fields = Ibkr_codec.read_int fields in
   match Hashtbl.find_opt req_id_to_symbol req_id with
-  | None -> ()
+  | None ->
+      Logging.debug_f ~section "tickPrice: reqId=%d tick_type=%d price=%.4f — NO SYMBOL MAPPING"
+        req_id tick_type price
   | Some symbol ->
+      Logging.debug_f ~section "tickPrice: %s reqId=%d tick_type=%d price=%.4f" symbol req_id tick_type price;
       let store = ensure_store symbol in
       if tick_type = Ibkr_types.tick_bid || tick_type = Ibkr_types.tick_delayed_bid then begin
         store.bid <- price;
@@ -106,7 +116,8 @@ let handle_tick_price fields =
       end else if tick_type = Ibkr_types.tick_last || tick_type = Ibkr_types.tick_delayed_last then begin
         store.last <- price;
         flush_ticker symbol store
-      end
+      end else
+        Logging.debug_f ~section "tickPrice: %s unhandled tick_type=%d" symbol tick_type
 
 (** Handle tickSize message from the dispatcher. *)
 let handle_tick_size fields =
@@ -126,7 +137,7 @@ let handle_tick_size fields =
         store.volume <- size
       end
 
-(** Subscribe to market data for [symbol]. Requires a resolved contract. *)
+(** Subscribe to streaming market data for [symbol]. Requires a resolved contract. *)
 let subscribe conn ~contract =
   let symbol = contract.Ibkr_types.symbol in
   let req_id = Atomic.fetch_and_add next_req_id 1 in
@@ -145,7 +156,36 @@ let subscribe conn ~contract =
     @ [
       "0";    (* deltaNeutralContract = false *)
       "";     (* genericTickList *)
-      "0";    (* snapshot *)
+      "0";    (* snapshot = false — streaming *)
+      "0";    (* regulatorySnapshot *)
+      "";     (* mktDataOptions *)
+    ]
+  in
+  Ibkr_connection.send conn msg_fields
+
+(** One-shot snapshot reqId counter (separate range to avoid collision
+    with streaming subscriptions). *)
+let next_snapshot_req_id = Atomic.make 3000
+
+(** Request a one-shot frozen snapshot for [symbol]. Used at startup to
+    seed an initial price before the streaming delayed/live feed kicks in.
+    IB auto-cancels the request after delivering the snapshot data. *)
+let request_snapshot conn ~contract =
+  let symbol = contract.Ibkr_types.symbol in
+  let req_id = Atomic.fetch_and_add next_snapshot_req_id 1 in
+  let _ = ensure_store symbol in
+  Hashtbl.replace req_id_to_symbol req_id symbol;
+  Logging.info_f ~section "Requesting frozen snapshot for %s (reqId=%d)" symbol req_id;
+
+  let msg_fields =
+    [string_of_int Ibkr_types.msg_req_mkt_data;
+     "11";  (* version *)
+     string_of_int req_id]
+    @ Ibkr_codec.encode_contract_short contract
+    @ [
+      "0";    (* deltaNeutralContract = false *)
+      "";     (* genericTickList *)
+      "1";    (* snapshot = true — one-shot *)
       "0";    (* regulatorySnapshot *)
       "";     (* mktDataOptions *)
     ]
