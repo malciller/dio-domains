@@ -188,9 +188,9 @@ let round_qty_for_symbol symbol qty =
 (** Initialize with mock data for non-live scenarios. *)
 let initialize symbols =
   Mutex.lock cache_mutex;
-  List.iter (fun symbol ->
+  List.iteri (fun idx symbol ->
     let info : Lighter_types.market_info = {
-      market_index = 0;
+      market_index = idx;
       symbol;
       supported_size_decimals = 4;
       supported_price_decimals = 2;
@@ -199,7 +199,8 @@ let initialize symbols =
       taker_fee = 0.0;
       maker_fee = 0.0;
     } in
-    Hashtbl.replace pair_cache symbol info
+    Hashtbl.replace pair_cache symbol info;
+    Hashtbl.replace index_to_symbol idx symbol
   ) symbols;
   Mutex.unlock cache_mutex;
   Logging.info_f ~section "Initialized Lighter instruments feed with %d mock symbols" (List.length symbols)

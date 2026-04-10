@@ -1,0 +1,31 @@
+(test
+ (name test_lighter_types)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_ws)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_ticker_feed)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_orderbook_feed)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_executions_feed)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_instruments_feed)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_balances)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_module)
+ (libraries dio.lighter dio.exchange alcotest))
