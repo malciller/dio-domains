@@ -44,7 +44,7 @@ let[@inline] get_sync symbol =
 
 (** Signals the condition variable for [symbol], waking the domain worker
     blocked on that symbol. Acquires and releases ONLY the per-symbol mutex. *)
-let[@warning "-32"] signal ~symbol =
+let signal ~symbol =
   let sync = get_sync symbol in
   Mutex.lock sync.mutex;
   Condition.signal sync.condition;

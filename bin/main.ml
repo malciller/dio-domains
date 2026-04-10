@@ -300,6 +300,7 @@ let usage_msg = "Dio Trading Engine\n\nUsage: " ^ Sys.argv.(0) ^ "\n\nStarts the
 (** Synchronous trading engine initialization: fetches market sentiment, starts supervisor monitoring, and spawns per-asset domains. *)
 let init_trading_engine_sync (config : Dio_engine.Config.config) =
   (* Pre-fetch Fear & Greed index before websocket connections are established. *)
+  Logging.info ~section:"main" "Step 0: Fetching Fear & Greed index...";
   let () =
     try
       let value = Fear_and_greed.fetch_and_cache_sync ~fallback:50.0 () in
@@ -310,6 +311,7 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
   in
 
   (* Start supervisor monitoring; returns trading configs augmented with fee schedules. *)
+  Logging.info ~section:"main" "Starting supervisor and initializing feeds...";
   let configs_with_fees = Supervisor.start_monitoring () in
 
   (* Spawn one supervised domain per asset to consume market data and execute strategies. *)

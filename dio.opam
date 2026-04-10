@@ -29,6 +29,8 @@ depends: [
   "mtime"
   "secp256k1"
   "msgpck"
+  "ctypes"
+  "ctypes-foreign"
   "notty"
   "odoc" {with-doc}
 ]

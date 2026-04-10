@@ -39,6 +39,8 @@
   mtime
   secp256k1
   msgpck
+  ctypes
+  ctypes-foreign
   notty)
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
