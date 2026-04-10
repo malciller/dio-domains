@@ -2,6 +2,8 @@
     Provides unified order representation, in-flight deduplication caches,
     a ring buffer for order queuing, and the strategy module signature. *)
 
+open Lwt.Infix
+
 (** Integer userref tags for per-strategy order grouping on the exchange. *)
 let strategy_userref_grid = 1  (* grid strategy *)
 let strategy_userref_mm = 2    (* market maker strategy *)
@@ -253,11 +255,50 @@ module OrderRingBuffer = struct
     read_n [] 0
 end
 
-(** Lwt condition variable used to notify the supervisor of new queued orders. *)
+(** Domain-safe order signal channel.
+    Domain workers call [broadcast ()] to notify the supervisor's Lwt event loop
+    that new orders are available. Implemented via a Unix self-pipe so that a
+    single-byte write from any domain wakes the Lwt scheduler without touching
+    Lwt internals (Lwt_condition is NOT safe from non-Lwt domains).
+
+    The [pending] atomic flag coalesces multiple rapid broadcasts into a single
+    pipe write to avoid saturating the pipe buffer under high order throughput. *)
 module OrderSignal = struct
-  let condition = Lwt_condition.create ()
-  let broadcast () = Lwt_condition.broadcast condition ()
-  let wait () = Lwt_condition.wait condition
+  let read_fd, write_fd =
+    let (r, w) = Unix.pipe ~cloexec:true () in
+    Unix.set_nonblock r;
+    Unix.set_nonblock w;
+    (r, w)
+
+  (** Lwt wrapper for the read end of the self-pipe. Created once at module
+      init to avoid per-wait allocation. *)
+  let lwt_read_fd = Lwt_unix.of_unix_file_descr ~blocking:false ~set_flags:false read_fd
+
+  (** Atomic flag to coalesce multiple broadcasts into one pipe write. *)
+  let pending = Atomic.make false
+
+  (** Signal from any domain that new orders are available.
+      Safe to call from OCaml 5 domain workers — no Lwt internals are touched. *)
+  let broadcast () =
+    if not (Atomic.exchange pending true) then
+      (* First signaller since last drain; write a single byte to wake Lwt. *)
+      (try ignore (Unix.write write_fd (Bytes.make 1 '\x00') 0 1) with
+       | Unix.Unix_error (Unix.EAGAIN, _, _) -> ()  (* pipe buffer full; Lwt side will drain *)
+       | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) -> ()
+       | _ -> ())
+
+  (** Block in the Lwt event loop until the pipe becomes readable (a broadcast
+      arrived). Drains the pipe and clears the pending flag before returning. *)
+  let wait () =
+    Lwt_unix.wait_read lwt_read_fd >>= fun () ->
+    (* Drain all accumulated bytes from the pipe. *)
+    let buf = Bytes.create 64 in
+    (try while true do
+       let n = Unix.read read_fd buf 0 64 in
+       if n = 0 then raise Exit
+     done with _ -> ());
+    Atomic.set pending false;
+    Lwt.return_unit
 end
 
 (** Module signature that all strategy implementations must satisfy. *)

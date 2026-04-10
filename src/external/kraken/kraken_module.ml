@@ -293,6 +293,10 @@ module Kraken_impl = struct
   let get_execution_feed_position ~symbol =
     Kraken_executions_feed.get_current_position symbol
 
+  (** Return [true] once the initial execution snapshot has been ingested for [symbol]. *)
+  let has_execution_data ~symbol =
+    Kraken_executions_feed.has_execution_data symbol
+
   (** Read execution events from [start_pos] onward for [symbol].
       Derives [remaining_qty] from [order_qty - cum_qty] and coerces status
       to [Filled] when remaining quantity reaches zero to handle cases where
@@ -314,6 +318,7 @@ module Kraken_impl = struct
         filled_qty = e.cum_qty;
         avg_price = e.avg_price;
         timestamp = e.timestamp;
+        is_amended = (e.exec_type = Kraken_executions_feed.Amended);
       }
     ) events
 
@@ -336,6 +341,7 @@ module Kraken_impl = struct
         filled_qty = e.cum_qty;
         avg_price = e.avg_price;
         timestamp = e.timestamp;
+        is_amended = (e.exec_type = Kraken_executions_feed.Amended);
       }
     )
 

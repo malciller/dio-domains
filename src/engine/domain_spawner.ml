@@ -82,9 +82,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       None
   in
 
-  (* Resolve accumulation_buffer once via Fear & Greed. Hyperliquid only. *)
+  (* Resolve accumulation_buffer once via Fear & Greed. Hyperliquid and IBKR. *)
   let resolved_accumulation_buffer =
-    if asset_with_fees.exchange = "hyperliquid"
+    if (asset_with_fees.exchange = "hyperliquid" || asset_with_fees.exchange = "ibkr")
        && (asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid") then
       let fallback = let (lo, hi) = asset_with_fees.accumulation_buffer in (lo +. hi) /. 2.0 in
       let fng = Fear_and_greed.fetch_value ~fallback () in
@@ -182,14 +182,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
       (* Event-driven flag: true when new data warrants a strategy execution *)
       let should_execute_strategy = ref true in
-      (* Hyperliquid startup gate: blocks strategy execution until exec events
-         from the webData2 snapshot have been consumed, ensuring
-         handle_order_acknowledged restores state before any new orders.
-         Non-Hyperliquid domains start with the gate open (true). *)
-      let hl_exec_ready = ref (asset_with_fees.exchange <> "hyperliquid") in
+      (* Startup gate: blocks strategy execution until execution events from
+         the initial snapshot have been consumed via the ring buffer, ensuring
+         handle_order_acknowledged restores order state (last_buy_order_id, etc.)
+         before any new orders are placed. Applies to ALL exchanges. *)
+      let exec_ready = ref false in
       (* Set after the first exec position check. Acts as a fallback to open the
-         hl_exec_ready gate for Hyperliquid assets with no open orders. *)
-      let hl_exec_checked = ref false in
+         exec_ready gate for assets with no open orders (empty snapshot). *)
+      let exec_checked = ref false in
       let latency_active = ref false in
 
       (* Initialize strategy configuration refs based on strategy type *)
@@ -262,30 +262,33 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
              asset.symbol asset.exchange st.grid_qty st.cached_sell_mult st.maker_fee
        | None -> ());
 
-      (* Initialize exec read position. Non-Hyperliquid: set to current write
-         position to skip pre-existing snapshot events. Hyperliquid: start from
-         0 to replay webData2-generated NewStatus events, which call
-         handle_order_acknowledged and restore last_buy_order_id for any
-         pre-existing orders, preventing duplicate buys on startup. *)
+      (* Initialize exec read position: ALL exchanges start from position 0
+         to replay snapshot events through handle_order_acknowledged, restoring
+         last_buy_order_id and open sell tracking. This unifies the startup
+         path across Kraken, Hyperliquid, and IBKR — previously only
+         Hyperliquid replayed from 0, causing a race condition where Kraken
+         domains could execute their first strategy cycle before the snapshot
+         populated the open_orders Hashtbl. *)
       Logging.info_f ~section "About to get execution feed position for %s" asset_with_fees.symbol;
-      begin try
-        if asset_with_fees.exchange = "hyperliquid" then begin
-          (* Hyperliquid: replay from position 0 to process webData2 snapshot
-             events and restore order state via handle_order_acknowledged. *)
-          exec_read_pos := 0;
-          Logging.info_f ~section "Hyperliquid domain for %s starting from exec position 0 (full replay)" asset_with_fees.symbol
-        end else begin
-          exec_read_pos := Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol;
-          Logging.info_f ~section "Got execution feed position %d" !exec_read_pos;
-          Logging.debug_f ~section "Domain for %s/%s starting consumption from exec position %d"
-            asset_with_fees.exchange asset_with_fees.symbol !exec_read_pos
-        end
-      with exn ->
-        Logging.info_f ~section "Caught exception in get_execution_feed_position: %s" (Printexc.to_string exn);
-        Logging.error_f ~section "Failed to get execution position for %s/%s: %s (starting from 0)"
-          asset_with_fees.exchange asset_with_fees.symbol (Printexc.to_string exn);
-        exec_read_pos := 0
-      end;
+      exec_read_pos := 0;
+
+      (* Wait for execution snapshot to be ingested before entering the loop.
+         Without this, the first cycle may see zero open orders and place
+         duplicates. Timeout after 15s to avoid blocking indefinitely. *)
+      let deadline = Unix.gettimeofday () +. 15.0 in
+      while not (Ex.has_execution_data ~symbol:asset_with_fees.symbol)
+            && Unix.gettimeofday () < deadline do
+        Thread.delay 0.05
+      done;
+      if not (Ex.has_execution_data ~symbol:asset_with_fees.symbol) then
+        Logging.warn_f ~section "Execution data not ready for %s/%s after 15s, proceeding anyway"
+          asset_with_fees.exchange asset_with_fees.symbol
+      else
+        Logging.info_f ~section "Execution data confirmed ready for %s/%s"
+          asset_with_fees.exchange asset_with_fees.symbol;
+
+      Logging.info_f ~section "Domain for %s/%s starting consumption from exec position 0 (full replay)"
+        asset_with_fees.exchange asset_with_fees.symbol;
       
       (* Set ticker and orderbook positions to current write position, skipping
          stale ring buffer data. Starting at 0 would replay up to 128 historical
@@ -355,18 +358,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         let t0 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
-        
-        if not !latency_active && asset_with_fees.exchange <> "hyperliquid" then begin
-          latency_active := true;
-          (match !grid_strategy_asset_ref with
-           | Some _ -> Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
-           | None -> ());
-          (match !mm_strategy_asset_ref with
-           | Some _ -> Dio_strategies.Market_maker.Strategy.set_startup_replay_done asset_with_fees.symbol
-           | None -> ());
-          Logging.info_f ~section "[%s/%s] First cycle complete; startup replay and latency ungated"
-            asset_with_fees.exchange asset_with_fees.symbol
-        end;
         
         (* Periodic debug logging gated by cycle_mod *)
         if !cycle_count mod config.cycle_mod = 0 then
@@ -471,8 +462,19 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   end
               | Types.New | Types.PartiallyFilled ->
                   should_execute_strategy := true;
+                  (* Guard: skip handle_order_acknowledged for in-place amendment
+                     confirmations (Kraken exec_type=amended with status=new).
+                     The amendment lifecycle is handled by the supervisor's
+                     handle_order_amended callback on the REST response path.
+                     Routing these through handle_order_acknowledged causes a
+                     dual-update race that corrupts open_sell_orders tracking. *)
+                  if event.is_amended then
+                    Logging.info_f ~section "AMENDED_SKIP %s [%s] status=%s (handled by amendment lifecycle)"
+                      event.order_id asset_with_fees.symbol
+                      (match event.order_status with Types.New -> "New" | Types.PartiallyFilled -> "PartiallyFilled" | _ -> "Other")
+                  else
                   (match event.limit_price with
-                   | Some price ->
+                   | Some price when price > 0.0 ->
                        let side = match event.side with
                          | Types.Buy -> Dio_strategies.Strategy_common.Buy
                          | Types.Sell -> Dio_strategies.Strategy_common.Sell
@@ -491,13 +493,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                             Logging.debug_f ~section "Notified MM strategy about acknowledged order %s for %s"
                               event.order_id asset_with_fees.symbol
                         | None -> ())
+                   | Some price ->
+                       Logging.debug_f ~section "ZERO_PRICE_SKIP %s [%s] price=%.8f (snapshot replay, not a real ack)"
+                         event.order_id asset_with_fees.symbol price
                    | None -> ())
               | _ -> ()
           ) in
           if !event_count > 0 then begin
-            (* First exec batch received: open the Hyperliquid startup gate *)
-            if not !hl_exec_ready then begin
-              hl_exec_ready := true;
+            (* First exec batch received: open the startup gate for ALL exchanges *)
+            if not !exec_ready then begin
+              exec_ready := true;
               latency_active := true;
               (match !grid_strategy_asset_ref with
                | Some _ ->
@@ -512,19 +517,19 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             end
           end;
           exec_read_pos := new_pos;
-          hl_exec_checked := true;
+          exec_checked := true;
         end;
         let t3 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         if did_exec && latency_this_cycle then Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub t3 t2));
-        (* Fallback gate for Hyperliquid domains with no open orders: if no
-           exec events arrived and the startup snapshot injection is complete,
-           open the gate so the strategy can place its initial order. *)
-        if not !hl_exec_ready && not !hl_exec_checked && asset_with_fees.exchange = "hyperliquid"
-           && Hyperliquid.Executions_feed.is_startup_snapshot_done () then begin
+        (* Fallback gate for domains with no open orders: if no exec events
+           arrived and the execution data is ready (snapshot ingested), open
+           the gate so the strategy can place its initial order. *)
+        if not !exec_ready && not !exec_checked
+           && Ex.has_execution_data ~symbol:asset_with_fees.symbol then begin
           let current_pos_now = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
           if current_pos_now = !exec_read_pos then begin
-            hl_exec_checked := true;
-            hl_exec_ready := true;
+            exec_checked := true;
+            exec_ready := true;
             latency_active := true;
             (* Mark startup replay complete to ungate profit calculation *)
             (match !grid_strategy_asset_ref with
@@ -541,7 +546,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         end;
 
         (* Execute strategy if new events have been consumed (event-driven gate) *)
-        let should_execute = !hl_exec_ready && !should_execute_strategy in
+        let should_execute = !exec_ready && !should_execute_strategy in
         if should_execute then begin
           should_execute_strategy := false;  (* Clear event-driven trigger *)
 
@@ -606,8 +611,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             Logging.info_f ~section "[%s/%s] Fear & Greed updated to %.2f. Re-evaluated grid_interval to %.4f (range %.4f-%.4f)"
               asset_with_fees.exchange asset_with_fees.symbol current_fng new_interval lo hi;
             
-            (* Update accumulation_buffer for Hyperliquid *)
-            if asset_with_fees.exchange = "hyperliquid" then begin
+            (* Update accumulation_buffer for exchanges that use it *)
+            if asset_with_fees.exchange = "hyperliquid" || asset_with_fees.exchange = "ibkr" then begin
               let (ab_lo, ab_hi) = asset_with_fees.accumulation_buffer in
               let new_ab = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:current_fng in
               Logging.info_f ~section "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"
@@ -740,12 +745,15 @@ let start_domain config state fee_fetcher =
      | None -> ());
 
     let domain_handle = Domain.spawn (fun () ->
-      Config.apply_gc_config ();
-      Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
-        asset.exchange asset.symbol (Atomic.get state.restart_count);
-
-      (* Catch exceptions to prevent domain crash from propagating *)
+      (* Catch ALL exceptions including those from apply_gc_config.
+         Previously apply_gc_config was outside the try/with, so a
+         CamlinternalLazy.Undefined from concurrent Lazy.force on the
+         shared cached_gc_config would silently kill the domain. *)
       try
+        Config.apply_gc_config ();
+        Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
+          asset.exchange asset.symbol (Atomic.get state.restart_count);
+
         asset_domain_worker config fee_fetcher asset;
         Logging.info_f ~section "Domain for %s/%s completed normally" asset.exchange asset.symbol
       with exn ->
@@ -883,6 +891,14 @@ let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading
     ignore (register_domain asset)
   ) assets;
 
+  (* Pre-force the shared cached_gc_config Lazy before spawning domains.
+     OCaml 5 domains that concurrently Lazy.force the same value race:
+     the first domain computes while others block, but if the computing
+     domain fails, blocked domains get CamlinternalLazy.Undefined.
+     Forcing here in the main domain eliminates the race entirely.
+     (Same pattern as the Conduit context pre-force in main.ml.) *)
+  Config.apply_gc_config ();
+
   (* Spawn the initial domain for each registered asset *)
   Mutex.lock registry_mutex;
   let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
@@ -891,9 +907,6 @@ let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading
   List.iter (fun state ->
     ignore (start_domain config state fee_fetcher)
   ) all_states;
-
-
-
   (* Launch the supervisor monitoring thread *)
   let supervisor_thread = Thread.create (supervisor_loop config) fee_fetcher in
   Logging.info ~section "Domain supervisor thread started";

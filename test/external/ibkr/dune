@@ -1,0 +1,35 @@
+(test
+ (name test_ibkr_types)
+ (libraries dio.ibkr dio.exchange alcotest))
+
+(test
+ (name test_ibkr_codec)
+ (libraries dio.ibkr alcotest))
+
+(test
+ (name test_ibkr_connection)
+ (libraries dio.ibkr alcotest))
+
+(test
+ (name test_ibkr_dispatcher)
+ (libraries dio.ibkr alcotest))
+
+(test
+ (name test_ibkr_contracts)
+ (libraries dio.ibkr alcotest))
+
+(test
+ (name test_ibkr_ticker_feed)
+ (libraries dio.ibkr alcotest threads))
+
+(test
+ (name test_ibkr_orderbook_feed)
+ (libraries dio.ibkr alcotest))
+
+(test
+ (name test_ibkr_executions_feed)
+ (libraries dio.ibkr alcotest))
+
+(test
+ (name test_ibkr_balances)
+ (libraries dio.ibkr alcotest))

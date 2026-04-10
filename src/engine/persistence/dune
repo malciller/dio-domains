@@ -1,0 +1,5 @@
+(library
+ (name dio_persistence)
+ (public_name dio.persistence)
+ (libraries yojson logging threads)
+ (modules State_persistence))

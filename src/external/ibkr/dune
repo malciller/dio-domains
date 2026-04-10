@@ -1,0 +1,13 @@
+(library
+ (name ibkr)
+ (public_name dio.ibkr)
+ (libraries
+  lwt
+  lwt.unix
+  dotenv
+  logging
+  threads
+  dio.concurrency
+  dio.exchange)
+ (preprocess
+  (pps lwt_ppx)))

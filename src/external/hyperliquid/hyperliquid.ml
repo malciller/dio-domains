@@ -36,5 +36,5 @@ module Module = Hyperliquid_module
 (** Shared type definitions for Hyperliquid domain objects. *)
 module Types = Hyperliquid_types
 
-(** Persistent state serialization and recovery for open orders and positions. *)
-module State_persistence = Hyperliquid_state_persistence
+(** Persistent state — delegated to engine-level module. *)
+module State_persistence = Dio_persistence.State_persistence

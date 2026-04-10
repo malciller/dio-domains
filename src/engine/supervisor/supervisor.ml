@@ -565,13 +565,29 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     | Some cfg -> cfg.testnet
     | None -> false in
 
+  (* Extract IBKR symbols *)
+  let ibkr_symbols = app_configs
+                     |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "ibkr")
+                     |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
+  let has_ibkr = List.length ibkr_symbols > 0 in
+  let ibkr_testnet =
+    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> cfg.exchange = "ibkr") with
+    | Some cfg -> cfg.testnet
+    | None -> true in
+
   (* Apply testnet flag to Hyperliquid module *)
   if has_hyperliquid then
     Hyperliquid.Module.Hyperliquid_impl.set_testnet hyperliquid_testnet;
 
+  (* Apply testnet flag to IBKR module — must happen before gateway connection *)
+  if has_ibkr then
+    Ibkr.Module.Config.set_testnet ibkr_testnet;
+
   Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
   if has_hyperliquid then
     Logging.info_f ~section "Connecting to %d Hyperliquid websockets..." (List.length hyperliquid_symbols);
+  if has_ibkr then
+    Logging.info_f ~section "Connecting to IBKR gateway for %d symbols..." (List.length ibkr_symbols);
 
   (* Begin sequential initialization steps *)
 
@@ -581,6 +597,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Logging.info ~section "Step 1: Initializing ticker feed stores...";
   Kraken.Kraken_ticker_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Ticker_feed.initialize all_hyperliquid_symbols;
+  if has_ibkr then Ibkr.Ticker_feed.initialize ibkr_symbols;
 
   Logging.info ~section "Step 1.5: Starting Hyperliquid websocket connection early...";
   if has_hyperliquid then begin
@@ -638,6 +655,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Logging.info ~section "Step 3: Initializing orderbook feed stores...";
   let%lwt () = Kraken.Kraken_orderbook_feed.initialize kraken_symbols in
   if has_hyperliquid then Hyperliquid.Orderbook_feed.initialize all_hyperliquid_symbols;
+  if has_ibkr then Ibkr.Orderbook_feed.initialize ibkr_symbols;
 
   Logging.info ~section "Step 4: Getting authentication token...";
   let%lwt auth_token = 
@@ -667,6 +685,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Hyperliquid.Balances.initialize ~testnet:hyperliquid_testnet all_assets;
       Lwt.async (fun () -> Hyperliquid.Module.fetch_spot_balances_ws ())
     end;
+    if has_ibkr then Ibkr.Balances.initialize ();
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
@@ -675,6 +694,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   Logging.info ~section "Step 6: Initializing executions feed stores...";
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
   if has_hyperliquid then Hyperliquid.Executions_feed.initialize hyperliquid_symbols;
+  if has_ibkr then Ibkr.Executions_feed.initialize ibkr_symbols;
 
   (* Synchronously fetch open orders before domains start to prevent duplicate placements *)
   let%lwt () =
@@ -772,6 +792,127 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     in
     set_connect_fn auth_ws_conn (Some auth_ws_connect_fn);
     start_async auth_ws_conn;
+  end;
+
+  (* IBKR Gateway TCP connection *)
+  if has_ibkr then begin
+    let ibkr_conn_sup = register ~name:"ibkr_gateway" ~connect_fn:None in
+    (* Register feed handler hooks so they survive dispatcher reset() on
+       every connect/reconnect. These closures are called from
+       Ibkr.Dispatcher.initialize after core handlers are registered. *)
+    Ibkr.Dispatcher.on_initialize_hooks := [
+      Ibkr.Ticker_feed.register_handlers;
+      Ibkr.Orderbook_feed.register_handlers;
+      Ibkr.Executions_feed.register_handlers;
+      Ibkr.Balances.register_handlers;
+    ];
+    let ibkr_connect_fn () =
+      Lwt.catch (fun () ->
+        (* Clean up previous connection state to prevent leaks on reconnection.
+           Old req_id mappings, handler closures, and IO channels would otherwise
+           accumulate across reconnect cycles. *)
+        (match !(Ibkr.Module.connection) with
+         | Some old_conn ->
+             Logging.info ~section "[ibkr_gateway] Disconnecting old connection before reconnect";
+             Lwt.async (fun () -> Ibkr.Connection.disconnect old_conn)
+         | None -> ());
+        Ibkr.Dispatcher.reset ();
+        Ibkr.Ticker_feed.clear_req_ids ();
+        Ibkr.Orderbook_feed.clear_req_ids ();
+        let conn = Ibkr.Connection.create
+          ~host:Ibkr.Module.Config.gateway_host
+          ~port:!(Ibkr.Module.Config.gateway_port)
+          ~client_id:Ibkr.Module.Config.client_id
+        in
+        Ibkr.Module.connection := Some conn;
+        Ibkr.Connection.connect_with_retry conn ~max_attempts:10 >>= fun () ->
+        Ibkr.Dispatcher.initialize conn;
+        (* Register callback so openOrderEnd marks execution stores as ready.
+           Must be set after initialize (which clears state) and before
+           request_open_orders fires — avoids dependency cycle in the lib. *)
+        Ibkr.Dispatcher.on_open_orders_end := Some Ibkr.Executions_feed.mark_ready_all;
+        Ibkr.Connection.start_reader conn
+          ~on_message:Ibkr.Dispatcher.dispatch
+          ~on_disconnect:(fun reason ->
+            set_state ibkr_conn_sup (Failed reason);
+            Lwt.async (fun () ->
+              Lwt.catch (fun () ->
+                Lwt.pause () >>= fun () ->
+                start_async ibkr_conn_sup;
+                Lwt.return_unit
+              ) (fun exn ->
+                Logging.warn_f ~section "[ibkr_gateway] Reconnect exception: %s" (Printexc.to_string exn);
+                Lwt.return_unit
+              )
+            )
+          );
+        set_state ibkr_conn_sup Connected;
+        update_data_heartbeat ibkr_conn_sup;
+        Logging.info ~section "✓ IBKR Gateway connected";
+        (* Wait for nextValidId before subscribing *)
+        Lwt_unix.sleep 1.0 >>= fun () ->
+        (* Subscribe to account updates *)
+        let account_id = match Ibkr.Module.Config.account_id with
+          | Some id -> id
+          | None -> Ibkr.Connection.get_account_id conn
+        in
+        Ibkr.Balances.subscribe conn ~account_id >>= fun () ->
+        (* Request open orders snapshot *)
+        Ibkr.Executions_feed.request_open_orders conn >>= fun () ->
+
+        let is_paper = !(Ibkr.Module.Config.trading_mode) = "paper" in
+
+        (* Phase 1: Snapshot — seed an initial price immediately.
+           Paper: type 4 (delayed-frozen) — free, no live subscription needed.
+           Live:  type 2 (frozen) — last close from live subscription. *)
+        let snapshot_type = if is_paper then "4" else "2" in
+        Logging.info_f ~section "IBKR Phase 1: Requesting %s snapshot for initial price seed"
+          (if is_paper then "delayed-frozen" else "frozen");
+        Ibkr.Connection.send conn [
+          string_of_int Ibkr.Types.msg_req_market_data_type;
+          "1";    (* version *)
+          snapshot_type;
+        ] >>= fun () ->
+        (* Resolve contracts once; reuse for both snapshot and streaming. *)
+        let%lwt contracts = Lwt_list.map_s (fun symbol ->
+          Ibkr.Contracts.resolve conn ~symbol >>= fun contract ->
+          Lwt.return (symbol, contract)
+        ) ibkr_symbols in
+        let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
+          Ibkr.Ticker_feed.request_snapshot conn ~contract
+        ) contracts in
+        (* Brief pause to let the gateway deliver snapshot ticks *)
+        Lwt_unix.sleep 2.0 >>= fun () ->
+
+        (* Phase 2: Streaming — ongoing market data.
+           Paper: type 4 (delayed-frozen) — 15-min delayed during hours,
+                  last known quote when closed. Never touches live data.
+           Live:  type 1 (live) — real-time streaming. *)
+        let stream_type = if is_paper then "4" else "1" in
+        Logging.info_f ~section "IBKR Phase 2: Switching to %s streaming"
+          (if is_paper then "delayed-frozen" else "live");
+        Ibkr.Connection.send conn [
+          string_of_int Ibkr.Types.msg_req_market_data_type;
+          "1";    (* version *)
+          stream_type;
+        ] >>= fun () ->
+        let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
+          Ibkr.Ticker_feed.subscribe conn ~contract >>= fun () ->
+          Ibkr.Orderbook_feed.subscribe conn ~contract
+        ) contracts in
+        Logging.info_f ~section "IBKR subscribed to %d symbols (snapshot + streaming)" (List.length ibkr_symbols);
+        (* Block forever — reader loop runs in background *)
+        let wait_p, _wait_u = Lwt.wait () in
+        wait_p
+      ) (fun exn ->
+        let error_msg = Printexc.to_string exn in
+        Logging.error_f ~section "[ibkr_gateway] Connection failed: %s" error_msg;
+        set_state ibkr_conn_sup (Failed error_msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn ibkr_conn_sup (Some ibkr_connect_fn);
+    start_async ibkr_conn_sup;
   end;
 
   (* Block until trading client WebSocket is connected to prevent
@@ -939,6 +1080,22 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             exit 1
         in
         Lwt.return result
+      end else if asset.Dio_engine.Config.exchange = "ibkr" then begin
+        (* IBKR uses fixed per-share commissions, not maker/taker %.
+           US equities Fixed plan: $0.005/share all-in is a conservative estimate.
+           Express as fraction of trade value for Fee_cache compatibility. *)
+        let maker = 0.0005 in  (* 0.05% — conservative estimate for ETFs *)
+        let taker = 0.0005 in
+        Logging.debug_f ~section "Applying IBKR fixed rate fees for %s: %.4f%%" asset.Dio_engine.Config.symbol (maker *. 100.);
+        Dio_strategies.Fee_cache.store_fees
+          ~exchange:"ibkr"
+          ~symbol:asset.Dio_engine.Config.symbol
+          ~maker_fee:maker
+          ~taker_fee:taker
+          ~ttl_seconds:86400.0;  (* Fees don't change often for IBKR *)
+        Lwt.return { asset with
+          Dio_engine.Config.maker_fee = Some maker;
+          Dio_engine.Config.taker_fee = Some taker }
       end else begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
         (* Cache default fees for unsupported exchanges *)
@@ -983,6 +1140,13 @@ let order_processing_loop () =
           with Not_found -> false
       in
 
+      let is_ibkr_connected =
+          try
+            let ibkr_conn = Hashtbl.find connections "ibkr_gateway" in
+            get_state ibkr_conn = Connected
+          with Not_found -> false
+      in
+
       (* Drain ring buffers regardless of connection status to prevent backpressure *)
       let pending_grid_orders = Dio_strategies.Suicide_grid.Strategy.get_pending_orders 100 in
       let pending_mm_orders = Dio_strategies.Market_maker.Strategy.get_pending_orders 100 in
@@ -1000,6 +1164,7 @@ let order_processing_loop () =
           let connected =
             if order.Dio_strategies.Strategy_common.exchange = "kraken" then kraken_connected
             else if order.Dio_strategies.Strategy_common.exchange = "hyperliquid" then is_hyperliquid_connected
+            else if order.Dio_strategies.Strategy_common.exchange = "ibkr" then is_ibkr_connected
             else true
           in
           if connected then process_fn ()
