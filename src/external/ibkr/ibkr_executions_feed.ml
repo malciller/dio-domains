@@ -372,6 +372,19 @@ let[@inline always] has_execution_data symbol =
   let store = get_symbol_store symbol in
   Atomic.get store.ready
 
+(** Mark all initialized symbol stores as ready.
+    Called when the gateway sends openOrderEnd, indicating the initial
+    open-orders snapshot is complete. Without this, symbols with no
+    open orders never have their ready flag set, causing domain_spawner
+    to wait 15s for execution data that will never arrive. *)
+let mark_ready_all () =
+  Hashtbl.iter (fun symbol store ->
+    if not (Atomic.get store.ready) then begin
+      Logging.debug_f ~section "Marking executions feed ready for %s (snapshot complete)" symbol;
+      notify_ready store
+    end
+  ) symbol_stores
+
 (** Pre-allocate stores and register handlers. *)
 let initialize symbols =
   Logging.info_f ~section "Initializing executions feed for %d symbols" (List.length symbols);

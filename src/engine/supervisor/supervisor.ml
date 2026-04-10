@@ -797,6 +797,14 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   (* IBKR Gateway TCP connection *)
   if has_ibkr then begin
     let ibkr_conn_sup = register ~name:"ibkr_gateway" ~connect_fn:None in
+    (* Register feed handler hooks so they survive dispatcher reset() on
+       every connect/reconnect. These closures are called from
+       Ibkr.Dispatcher.initialize after core handlers are registered. *)
+    Ibkr.Dispatcher.on_initialize_hooks := [
+      Ibkr.Ticker_feed.register_handlers;
+      Ibkr.Orderbook_feed.register_handlers;
+      Ibkr.Executions_feed.register_handlers;
+    ];
     let ibkr_connect_fn () =
       Lwt.catch (fun () ->
         (* Clean up previous connection state to prevent leaks on reconnection.
@@ -818,6 +826,10 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Ibkr.Module.connection := Some conn;
         Ibkr.Connection.connect_with_retry conn ~max_attempts:10 >>= fun () ->
         Ibkr.Dispatcher.initialize conn;
+        (* Register callback so openOrderEnd marks execution stores as ready.
+           Must be set after initialize (which clears state) and before
+           request_open_orders fires — avoids dependency cycle in the lib. *)
+        Ibkr.Dispatcher.on_open_orders_end := Some Ibkr.Executions_feed.mark_ready_all;
         Ibkr.Connection.start_reader conn
           ~on_message:Ibkr.Dispatcher.dispatch
           ~on_disconnect:(fun reason ->
@@ -846,22 +858,48 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Ibkr.Balances.subscribe conn ~account_id >>= fun () ->
         (* Request open orders snapshot *)
         Ibkr.Executions_feed.request_open_orders conn >>= fun () ->
-        (* Set market data type: delayed (3) for paper, live (1) for live *)
-        let mkt_data_type = if !(Ibkr.Module.Config.trading_mode) = "paper" then "3" else "1" in
-        Logging.info_f ~section "Setting IBKR market data type to %s (%s)"
-          mkt_data_type (if mkt_data_type = "3" then "delayed" else "live");
+
+        let is_paper = !(Ibkr.Module.Config.trading_mode) = "paper" in
+
+        (* Phase 1: Snapshot — seed an initial price immediately.
+           Paper: type 4 (delayed-frozen) — free, no live subscription needed.
+           Live:  type 2 (frozen) — last close from live subscription. *)
+        let snapshot_type = if is_paper then "4" else "2" in
+        Logging.info_f ~section "IBKR Phase 1: Requesting %s snapshot for initial price seed"
+          (if is_paper then "delayed-frozen" else "frozen");
         Ibkr.Connection.send conn [
           string_of_int Ibkr.Types.msg_req_market_data_type;
           "1";    (* version *)
-          mkt_data_type;
+          snapshot_type;
         ] >>= fun () ->
-        (* Resolve contracts and subscribe to market data *)
-        Lwt_list.iter_s (fun symbol ->
+        (* Resolve contracts once; reuse for both snapshot and streaming. *)
+        let%lwt contracts = Lwt_list.map_s (fun symbol ->
           Ibkr.Contracts.resolve conn ~symbol >>= fun contract ->
+          Lwt.return (symbol, contract)
+        ) ibkr_symbols in
+        let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
+          Ibkr.Ticker_feed.request_snapshot conn ~contract
+        ) contracts in
+        (* Brief pause to let the gateway deliver snapshot ticks *)
+        Lwt_unix.sleep 2.0 >>= fun () ->
+
+        (* Phase 2: Streaming — ongoing market data.
+           Paper: type 4 (delayed-frozen) — 15-min delayed during hours,
+                  last known quote when closed. Never touches live data.
+           Live:  type 1 (live) — real-time streaming. *)
+        let stream_type = if is_paper then "4" else "1" in
+        Logging.info_f ~section "IBKR Phase 2: Switching to %s streaming"
+          (if is_paper then "delayed-frozen" else "live");
+        Ibkr.Connection.send conn [
+          string_of_int Ibkr.Types.msg_req_market_data_type;
+          "1";    (* version *)
+          stream_type;
+        ] >>= fun () ->
+        let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
           Ibkr.Ticker_feed.subscribe conn ~contract >>= fun () ->
           Ibkr.Orderbook_feed.subscribe conn ~contract
-        ) ibkr_symbols >>= fun () ->
-        Logging.info_f ~section "IBKR subscribed to %d symbols" (List.length ibkr_symbols);
+        ) contracts in
+        Logging.info_f ~section "IBKR subscribed to %d symbols (snapshot + streaming)" (List.length ibkr_symbols);
         (* Block forever — reader loop runs in background *)
         let wait_p, _wait_u = Lwt.wait () in
         wait_p

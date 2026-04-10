@@ -46,12 +46,18 @@ let register_req_handler ~req_id ~on_data ~on_end =
 let remove_req_handler ~req_id =
   Hashtbl.remove req_handlers req_id
 
+(** Callback invoked when the gateway sends openOrderEnd, indicating the
+    initial open-orders snapshot is complete. Set externally (e.g., by the
+    supervisor) to avoid a dependency cycle with ibkr_executions_feed. *)
+let on_open_orders_end : (unit -> unit) option ref = ref None
+
 (** Reset all dispatcher state. Called before reconnection to prevent
     stale handler entries and leaked closures from accumulating. *)
 let reset () =
   Hashtbl.clear handlers;
   Hashtbl.clear req_handlers;
   connection := None;
+  on_open_orders_end := None;
   Logging.info ~section "Dispatcher state reset (handlers cleared)"
 
 (** Set the active connection reference. *)
@@ -128,6 +134,10 @@ let handle_error fields =
   else if code >= 2100 && code <= 2110 then
     (* Connectivity status messages — informational *)
     Logging.info_f ~section "Gateway status [%d] id=%d: %s" code id message
+  else if code = 10089 || code = 10167 || code = 10168 then
+    (* Market data subscription/mode notifications — expected during
+       paper trading when live data is not subscribed. *)
+    Logging.info_f ~section "Market data info [%d] id=%d: %s" code id message
   else begin
     (* Log the error *)
     if code = 200 then
@@ -203,7 +213,14 @@ let register_core_handlers () =
   register_handler
     ~msg_id:Ibkr_types.msg_in_open_order_end
     ~handler:(fun _fields ->
-      Logging.debug ~section "Open orders end");
+      Logging.debug ~section "Open orders end";
+      (* Invoke the on_open_orders_end callback if registered.
+         Used by supervisor to mark execution stores as ready
+         after the initial snapshot completes. Callback ref avoids
+         a direct dependency on ibkr_executions_feed. *)
+      (match !on_open_orders_end with
+       | Some f -> f ()
+       | None -> ()));
 
   register_handler
     ~msg_id:Ibkr_types.msg_in_execution_data_end
@@ -221,8 +238,16 @@ let register_core_handlers () =
     ~handler:(fun _fields ->
       Logging.debug ~section "Position data end")
 
-(** Initialize the dispatcher with a connection and register core handlers. *)
+(** Callbacks to re-register feed handlers after reset().
+    Set externally by the supervisor to avoid dependency cycles. *)
+let on_initialize_hooks : (unit -> unit) list ref = ref []
+
+(** Initialize the dispatcher with a connection and register core handlers.
+    Also invokes on_initialize_hooks to re-register feed handlers that
+    get wiped by reset() on every connect/reconnect. *)
 let initialize conn =
   set_connection conn;
   register_core_handlers ();
+  (* Re-register feed handlers via hooks — avoids dependency cycles *)
+  List.iter (fun f -> f ()) !on_initialize_hooks;
   Logging.info ~section "Dispatcher initialized with core handlers"
