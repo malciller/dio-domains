@@ -99,10 +99,41 @@ let ibkr_config = {
   check_stale_balance = true;
 }
 
+let lighter_config = {
+  time_in_force = "GTC";
+  track_pending_sells = false;
+  use_accumulation_sells = true;
+  sell_uses_mult = false;             (* 1:1 sells; accumulation path handles rounding *)
+  sell_failure_sets_asset_low = true;
+  use_reserved_base_guard = true;     (* Prevent selling accumulated base *)
+  asset_low_requires_balance_change = false;
+  merge_preserved_sells = true;
+  check_stale_balance = false;        (* Balance feed may lag; don't block strategy *)
+}
+
 let get_exchange_config exchange =
   if exchange = "hyperliquid" then hyperliquid_config
+  else if exchange = "lighter" then lighter_config
   else if exchange = "ibkr" then ibkr_config
   else kraken_config
+
+(** Exchanges that persist accumulation (buy fill price, profit, last_fill_oid) on fills.
+    IBKR was missing from this path and never set [persistence_dirty] on buy/sell fills. *)
+let[@inline always] persistence_accumulation_exchange id =
+  id = "hyperliquid" || id = "lighter" || id = "ibkr"
+
+(** Spot venues: sell-leg maker fee only in realized PnL (not IBKR equities). *)
+let[@inline always] hl_like_spot_fee_exchange id =
+  id = "hyperliquid" || id = "lighter"
+
+(** IBKR Pro Tiered commission: $0.0035/share, min $0.35/order, max 1% of trade value.
+    Returns the USD commission for a single order leg. *)
+let ibkr_commission ~qty ~price =
+  let per_share_rate = 0.0035 in
+  let raw = qty *. per_share_rate in
+  let min_fee = 0.35 in
+  let max_fee = 0.01 *. qty *. price in
+  Float.max min_fee (Float.min raw max_fee)
 
 (** Per-asset trading configuration. *)
 type trading_config = {
@@ -327,6 +358,37 @@ let round_qty qty symbol exchange =
   let increment = get_qty_increment_val symbol exchange in
   let inv = 1.0 /. increment in
   floor (qty *. inv) /. inv
+
+(** Quantity used for grid orders, balance checks, reserved quote, accumulation,
+    and PnL on venues with strict lot rules. IBKR: whole shares (at least
+    [get_qty_min] when config qty is positive but rounds to zero). Lighter:
+    instrument [supported_size_decimals] via the instruments feed. Other
+    exchanges: config [grid_qty] unchanged. *)
+let venue_lot_qty grid_qty symbol exchange =
+  match exchange with
+  | "ibkr" ->
+      if grid_qty <= 0.0 then 0.0
+      else
+        (match get_exchange_module exchange with
+         | Some (module Ex : Exchange.S) ->
+             let q = round_qty grid_qty symbol exchange in
+             if q > 0.0 then q
+             else Option.value (Ex.get_qty_min ~symbol) ~default:1.0
+         | None ->
+             (* Unit tests or stripped link: whole-share floor, min one share. *)
+             let q = floor grid_qty in
+             if q > 0.0 then q else 1.0)
+  | "lighter" ->
+      if grid_qty <= 0.0 then 0.0
+      else
+        let q = round_qty grid_qty symbol exchange in
+        if q > 0.0 then q
+        else
+          (match get_exchange_module exchange with
+           | Some (module Ex : Exchange.S) ->
+               Option.value (Ex.get_qty_min ~symbol) ~default:q
+           | None -> q)
+  | _ -> grid_qty
 
 (** Returns the minimum price delta required to trigger an amendment.
     max(10 * tick_size, 5% of one grid interval). Prevents amendment spam. *)
@@ -587,6 +649,7 @@ let execute_strategy
      races when concurrent callers target the same symbol. *)
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+   let lot_qty = venue_lot_qty state.grid_qty asset.symbol asset.exchange in
 
    (* Anticipated balance credit decay: clear when balance feed catches up. *)
    (match asset_balance with
@@ -604,7 +667,7 @@ let execute_strategy
       Subtract reserved_base so accumulated base asset is protected from sells. *)
    (match asset_balance with
     | Some asset_bal ->
-        let qty_f = state.grid_qty in
+        let qty_f = lot_qty in
         let asset_needed_fast =
           if ecfg.sell_uses_mult then
             qty_f *. state.cached_sell_mult
@@ -635,7 +698,7 @@ let execute_strategy
      short-circuits here. When balance recovers, the flag is cleared. *)
   (match quote_balance with
    | Some quote_bal ->
-       let qty_f = state.grid_qty in
+       let qty_f = lot_qty in
        let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
        (* Available balance = total balance minus all domains' reserved quote. *)
        let total_reserved = get_total_reserved_quote ~exchange:state.exchange_id in
@@ -675,7 +738,10 @@ let execute_strategy
   (* [now] is provided by the caller to avoid per-cycle syscalls. *)
   
   match current_price, top_of_book with
-  | None, _ -> ()  (* No price data available yet *)
+  | None, _ ->
+      if state.last_cycle <> cycle then
+        Logging.info_f ~section "Waiting for price data for %s (no ticker received yet)" asset.symbol
+      (* No price data available yet *)
   | Some price, top_opt ->
       (* Use l2Book top-of-book bid/ask instead of allMids mid price.
          l2Book updates per-block and tracks actual market state, while
@@ -818,8 +884,7 @@ let execute_strategy
                state.last_buy_order_id <- Some best_order_id;
                (* Sync per-asset reserved_quote from the actual open buy so the
                   capital_low check uses the real exchange-reserved amount after restart. *)
-               let qty = state.grid_qty in
-               set_asset_reserved_quote state (best_price *. qty))
+               set_asset_reserved_quote state (best_price *. lot_qty))
        | _ ->
            (* In-flight cancel or place: open_orders may be stale.
               Retain current state; order channel will resolve. *)
@@ -838,7 +903,7 @@ let execute_strategy
         List.iter (fun (preserved_id, preserved_price, _) ->
           let already_present = List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders in
           if not already_present then begin
-            state.open_sell_orders <- (preserved_id, preserved_price, state.grid_qty) :: state.open_sell_orders;
+            state.open_sell_orders <- (preserved_id, preserved_price, lot_qty) :: state.open_sell_orders;
             Logging.debug_f ~section "SELL_MERGE [%s] injected preserved sell: %s @ %.2f"
               asset.symbol preserved_id preserved_price
           end
@@ -860,7 +925,7 @@ let execute_strategy
 
       (* Use cached parsed config values; updated once at domain startup
          and whenever the config ref changes (Fear & Greed re-evaluation). *)
-      let qty = state.grid_qty in
+      let qty = lot_qty in
       let grid_interval = asset.grid_interval in
       let sell_mult = state.cached_sell_mult in
 
@@ -1059,7 +1124,7 @@ let execute_strategy
              let available_quote_balance = match quote_balance with
                | Some total_balance ->
                    (* Deduct value locked in open buys *)
-                   let locked_in_buys = List.fold_left (fun acc (_, price) -> acc +. (price *. state.grid_qty)) 0.0 !buy_orders in
+                   let locked_in_buys = List.fold_left (fun acc (_, price) -> acc +. (price *. lot_qty)) 0.0 !buy_orders in
                    Some (total_balance -. locked_in_buys)
                | None -> None
              in
@@ -1460,11 +1525,18 @@ let handle_order_rejected asset_symbol side price =
 
   (* Buy rejection signals no buy order exists; strategy re-evaluates on next cycle. *)
 
+(** True when [tracked] is the strategy's buy id and the execution report matches
+    either the exchange [order_id] or an optional client id (Lighter/Hyperliquid). *)
+let buy_tracking_matches_exchange_event tracked order_id cl_ord_id =
+  tracked = order_id
+  || match cl_ord_id with Some c -> tracked = c | None -> false
+
 (** Handles order fill. Fully clears tracking, pending amends, and computes profit. *)
-let handle_order_filled asset_symbol order_id side ~fill_price =
+let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+    let acc_qty = venue_lot_qty state.grid_qty asset_symbol state.exchange_id in
     (* 1. Remove any pending amend matching this order ID. *)
     state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
       not (String.starts_with ~prefix:"pending_amend_" pending_id &&
@@ -1493,7 +1565,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
        buy tracking, setting effective_buy_count=0 on the next cycle and
        triggering a redundant buy placement alongside the still-open original. *)
     let was_tracked_buy = match side, state.last_buy_order_id with
-      | Buy, Some id when id = order_id -> true
+      | Buy, Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
       | _ -> false
     in
     if was_tracked_buy then begin
@@ -1506,14 +1578,14 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
       (* Mark dirty so flush_persistence writes buy fill price to disk.
          Without this, sell fills after restart have no buy_price reference
          and silently skip profit calculation. *)
-      if state.exchange_id = "hyperliquid" then
+      if persistence_accumulation_exchange state.exchange_id then
         state.persistence_dirty <- true;
       (* Credit anticipated base so the sell guard sees incoming asset before
          the balance feed catches up (exec feed is faster than balance feed). *)
-      if state.grid_qty > 0.0 then begin
-        state.anticipated_base_credit <- state.anticipated_base_credit +. state.grid_qty;
+      if acc_qty > 0.0 then begin
+        state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
         Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
-          asset_symbol state.grid_qty state.anticipated_base_credit order_id
+          asset_symbol acc_qty state.anticipated_base_credit order_id
       end;
       Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
     end;
@@ -1538,7 +1610,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
       state.startup_replay &&
       (match state.last_fill_oid with
        | Some persisted_oid ->
-           (* OIDs are monotonically increasing integers on Hyperliquid. *)
+           (* OIDs are monotonically increasing on Hyperliquid and Lighter. *)
            (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
             with _ -> false)
        | None -> true  (* New strategy: no persisted OID; skip all fills during startup replay. *))
@@ -1557,14 +1629,17 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
           in
           (match cost_basis with
            | Some base_price when sell_fill_price > base_price ->
-              let qty = state.grid_qty in
+              let qty = acc_qty in
               let gross = (sell_fill_price -. base_price) *. qty in
-              (* Hyperliquid spot: buy fee is deducted from received base asset
-                 (no quote impact); sell fee is deducted from received quote.
-                 Only the sell-side fee affects USDC balance growth.
-                 Kraken: both fees are deducted from quote currency. *)
+              (* Hyperliquid / Lighter spot: buy fee from base; sell fee from quote.
+                 Only the sell-side fee affects quote (e.g. USDC) balance growth.
+                 Kraken: both legs charged against quote. *)
               let fees =
-                if state.exchange_id = "hyperliquid" then
+                if state.exchange_id = "ibkr" then
+                  (* IBKR Pro Tiered: per-share with min/max, charged per leg *)
+                  ibkr_commission ~qty ~price:base_price
+                  +. ibkr_commission ~qty ~price:sell_fill_price
+                else if hl_like_spot_fee_exchange state.exchange_id then
                   sell_fill_price *. qty *. state.maker_fee
                 else
                   (sell_fill_price *. qty *. state.maker_fee)
@@ -1587,7 +1662,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
                 (* Persist so profit survives container restarts.
                    Also persist last_buy_fill_price so the next
                    sell after restart still has a buy reference. *)
-                if state.exchange_id = "hyperliquid" then
+                if persistence_accumulation_exchange state.exchange_id then
                   state.persistence_dirty <- true;
                 Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
                   asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
@@ -1618,7 +1693,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price =
   )
 
 (** Handles order cancellation. Removes from pending and tracked orders. *)
-let handle_order_cancelled asset_symbol order_id side =
+let handle_order_cancelled asset_symbol order_id side cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1643,7 +1718,7 @@ let handle_order_cancelled asset_symbol order_id side =
     let cancelled_side = side in
     
     let was_tracked_buy = match state.last_buy_order_id with
-      | Some id when id = order_id -> true
+      | Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
       | _ -> false
     in
     
@@ -1716,7 +1791,8 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
          let original_sell_count = List.length state.open_sell_orders in
          let old_entry = List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders in
          let old_qty = match old_entry with
-           | Some (_, _, q) -> q | None -> state.grid_qty in
+           | Some (_, _, q) -> q
+           | None -> venue_lot_qty state.grid_qty asset_symbol state.exchange_id in
          Logging.info_f ~section "SELL_AMEND [%s] %s -> %s @ %.2f: old_entry=%s old_qty=%.8f sells_before=%d"
            asset_symbol old_order_id new_order_id price
            (match old_entry with Some (_, p, q) -> Printf.sprintf "%.2f/%.8f" p q | None -> "NOT_FOUND")
@@ -1919,13 +1995,13 @@ module Strategy = struct
         symbol
         (Option.value state.last_fill_oid ~default:"none")
         state.accumulated_profit;
-      (* Bootstrap persistent state for new Hyperliquid suicide_grid strategies.
-         If state has never been persisted for this symbol (last_fill_oid=None)
-         but fill events were seen during startup, establish an anchor point so
-         the next restart can resume from a known position. *)
+      (* Bootstrap persistent state for new suicide_grid strategies on venues that
+         persist fill OIDs (Hyperliquid, Lighter, IBKR). If state has never been
+         persisted (last_fill_oid=None) but fill events were seen during startup,
+         establish an anchor so the next restart can resume from a known position. *)
       if state.last_fill_oid = None
          && state.highest_startup_oid <> None
-         && (state.exchange_id = "hyperliquid" || state.exchange_id = "ibkr") then begin
+         && persistence_accumulation_exchange state.exchange_id then begin
         state.last_fill_oid <- state.highest_startup_oid;
         Dio_persistence.State_persistence.save ~symbol
           ~reserved_base:state.reserved_base

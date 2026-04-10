@@ -143,11 +143,22 @@ let test_order_cancellation () =
   state.open_sell_orders <- [("sell456", 51000.0, 1.0); ("sell789", 52000.0, 1.0)];
 
   (* Cancel the buy order *)
-  Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy;
+  Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy None;
 
   (* Should clear buy order tracking *)
   check (option string) "buy order id cleared" None state.last_buy_order_id;
   check (option (float 0.)) "buy order price cleared" None state.last_buy_order_price
+
+let test_order_cancellation_matches_client_order_id () =
+  (* Lighter (and similar): strategy may still track client index while the
+     execution feed reports exchange order_index on cancel. *)
+  let state = Dio_strategies.Suicide_grid.get_strategy_state "TEST_CLID/USD" in
+  state.last_buy_order_id <- Some "1";
+  state.last_buy_order_price <- Some 2200.0;
+  Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled "TEST_CLID/USD"
+    "577023702126926647" Dio_strategies.Strategy_common.Buy (Some "1");
+  check (option string) "buy cleared via cl_ord_id alias" None state.last_buy_order_id;
+  check (option (float 0.)) "buy price cleared" None state.last_buy_order_price
 
 let test_order_rejection () =
   (* Test order rejection handling *)
@@ -181,14 +192,14 @@ let test_accumulation_profit_tracking () =
   (* Simulate buy fill: sets last_buy_fill_price *)
   state.last_buy_order_id <- Some "buy001";
   state.last_buy_order_price <- Some 39.50;
-  Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol "buy001" Dio_strategies.Strategy_common.Buy ~fill_price:39.50;
+  Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol "buy001" Dio_strategies.Strategy_common.Buy ~fill_price:39.50 None;
 
   (* Verify buy fill recorded the price for later profit calc *)
   check (option (float 0.01)) "buy fill price recorded" (Some 39.50) state.last_buy_fill_price;
 
   (* Simulate sell fill at a higher price *)
   state.open_sell_orders <- [("sell001", 39.90, 1.0)];
-  Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol "sell001" Dio_strategies.Strategy_common.Sell ~fill_price:39.90;
+  Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol "sell001" Dio_strategies.Strategy_common.Sell ~fill_price:39.90 None;
 
   (* Verify profit was accumulated *)
   let expected_gross = (39.90 -. 39.50) *. 0.35 in
@@ -318,10 +329,10 @@ let test_accumulation_full_lifecycle () =
 
     state.last_buy_order_id <- Some buy_id;
     state.last_buy_order_price <- Some buy_price;
-    Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol buy_id Dio_strategies.Strategy_common.Buy ~fill_price:buy_price;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol buy_id Dio_strategies.Strategy_common.Buy ~fill_price:buy_price None;
 
     state.open_sell_orders <- [(sell_id, sell_price, 1.0)];
-    Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol sell_id Dio_strategies.Strategy_common.Sell ~fill_price:sell_price;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled symbol sell_id Dio_strategies.Strategy_common.Sell ~fill_price:sell_price None;
   done;
 
   (* After 5 cycles: ~5 * 0.128884 ≈ 0.644 USDC accumulated *)
@@ -410,9 +421,9 @@ let test_accumulation_multi_strategy_isolation () =
     let sell_id = Printf.sprintf "btc_sell_%d" i in
     btc.last_buy_order_id <- Some buy_id;
     btc.last_buy_order_price <- Some 84000.0;
-    Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym buy_id Dio_strategies.Strategy_common.Buy ~fill_price:84000.0;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym buy_id Dio_strategies.Strategy_common.Buy ~fill_price:84000.0 None;
     btc.open_sell_orders <- [(sell_id, 84336.0, 1.0)];
-    Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym sell_id Dio_strategies.Strategy_common.Sell ~fill_price:84336.0;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled btc_sym sell_id Dio_strategies.Strategy_common.Sell ~fill_price:84336.0 None;
   done;
 
   let btc_profit = btc.accumulated_profit in
@@ -426,9 +437,9 @@ let test_accumulation_multi_strategy_isolation () =
     let sell_id = Printf.sprintf "hype_sell_%d" i in
     hype.last_buy_order_id <- Some buy_id;
     hype.last_buy_order_price <- Some 39.50;
-    Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym buy_id Dio_strategies.Strategy_common.Buy ~fill_price:39.50;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym buy_id Dio_strategies.Strategy_common.Buy ~fill_price:39.50 None;
     hype.open_sell_orders <- [(sell_id, 39.90, 1.0)];
-    Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym sell_id Dio_strategies.Strategy_common.Sell ~fill_price:39.90;
+    Dio_strategies.Suicide_grid.Strategy.handle_order_filled hype_sym sell_id Dio_strategies.Strategy_common.Sell ~fill_price:39.90 None;
   done;
 
   let hype_profit = hype.accumulated_profit in
@@ -494,6 +505,7 @@ let () =
     "events", [
       test_case "order acknowledgment" `Quick test_order_acknowledgment;
       test_case "order cancellation" `Quick test_order_cancellation;
+      test_case "order cancellation matches client order id" `Quick test_order_cancellation_matches_client_order_id;
       test_case "order rejection" `Quick test_order_rejection;
     ];
     "accumulation", [

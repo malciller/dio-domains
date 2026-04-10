@@ -109,6 +109,8 @@ module Types = struct
                                        confirmation (Kraken exec_type=amended), not a
                                        genuine new-order acknowledgment. Domain workers
                                        must skip handle_order_acknowledged for these. *)
+    cl_ord_id: string option;     (** Client order id when the venue provides one
+                                       (Hyperliquid cloid, Lighter client_order_id). *)
   }
 
   (** Parameters controlling exponential backoff retry behavior. *)
