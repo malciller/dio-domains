@@ -17,6 +17,7 @@
   conduit-lwt-unix
   ipaddr.unix
   concurrency
+  dio.persistence
   dio.exchange)
  (preprocess
   (pps lwt_ppx)))

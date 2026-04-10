@@ -19,7 +19,12 @@ let section = "dashboard_server"
 (** Fixed UDS path for the dashboard socket.
     Lives under /var/run/dio/ so it can be volume-mounted and accessed
     from outside the engine container (e.g. via docker run --rm -it). *)
-let socket_dir = "/var/run/dio"
+let socket_dir =
+  let preferred = "/var/run/dio" in
+  try Unix.mkdir preferred 0o755; preferred
+  with Unix.Unix_error (Unix.EEXIST, _, _) -> preferred
+     | Unix.Unix_error _ -> "/tmp/dio"
+
 let socket_path () =
   Printf.sprintf "%s/dashboard.sock" socket_dir
 
@@ -213,7 +218,7 @@ let start ~start_time =
   Dashboard_state.set_start_time start_time;
   let path = socket_path () in
   (* Ensure socket directory exists. *)
-  (try Unix.mkdir socket_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  (try Unix.mkdir socket_dir 0o755 with Unix.Unix_error _ -> ());
   (* Remove stale socket file from a previous run. *)
   (try Unix.unlink path with Unix.Unix_error _ -> ());
   let addr = Lwt_unix.ADDR_UNIX path in

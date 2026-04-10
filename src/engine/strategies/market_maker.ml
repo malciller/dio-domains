@@ -604,7 +604,7 @@ let execute_strategy
               if side_str = "buy" then begin
                 incr sync_open_buy_count;
                 let current_best = match !best_buy_price with Some p -> p | None -> -1.0 in
-                if order_price > current_best then begin
+                if order_price > current_best && order_price > 0.0 then begin
                   best_buy_price := Some order_price;
                   best_buy_id := Some order_id
                 end

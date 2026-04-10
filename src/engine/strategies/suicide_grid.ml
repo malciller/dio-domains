@@ -71,7 +71,7 @@ let kraken_config = {
   sell_failure_sets_asset_low = false;
   use_reserved_base_guard = false;
   asset_low_requires_balance_change = true;
-  merge_preserved_sells = false;
+  merge_preserved_sells = true;
   check_stale_balance = true;
 }
 
@@ -87,8 +87,21 @@ let hyperliquid_config = {
   check_stale_balance = false;
 }
 
+let ibkr_config = {
+  time_in_force = "GTC";
+  track_pending_sells = true;
+  use_accumulation_sells = true;     (* accumulate whole shares via profit *)
+  sell_uses_mult = false;             (* 1:1 sells for equity *)
+  sell_failure_sets_asset_low = true;  (* Exchange rejection as safety net *)
+  use_reserved_base_guard = true;     (* Pre-check position before selling — prevents short-selling on margin *)
+  asset_low_requires_balance_change = false;
+  merge_preserved_sells = true;
+  check_stale_balance = true;
+}
+
 let get_exchange_config exchange =
   if exchange = "hyperliquid" then hyperliquid_config
+  else if exchange = "ibkr" then ibkr_config
   else kraken_config
 
 (** Per-asset trading configuration. *)
@@ -159,7 +172,7 @@ let strategy_states_mutex = Mutex.create ()
 
 (** Retrieves or lazily initializes the strategy state for [asset_symbol].
     On first access, loads persisted state (reserved_base, accumulated_profit,
-    last_fill_oid, fill prices) from Hyperliquid.State_persistence. *)
+    last_fill_oid, fill prices) from Dio_persistence.State_persistence. *)
 let get_strategy_state asset_symbol =
   Mutex.lock strategy_states_mutex;
   let state =
@@ -167,11 +180,11 @@ let get_strategy_state asset_symbol =
     | Some state -> state
     | None ->
         (* Load persisted state for this symbol (survives container restarts). *)
-        let persisted_reserved_base = Hyperliquid.State_persistence.load_reserved_base ~symbol:asset_symbol in
-        let persisted_accumulated_profit = Hyperliquid.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
-        let persisted_last_fill_oid = Hyperliquid.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
-        let persisted_last_buy_fill_price = Hyperliquid.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
-        let persisted_last_sell_fill_price = Hyperliquid.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
+        let persisted_reserved_base = Dio_persistence.State_persistence.load_reserved_base ~symbol:asset_symbol in
+        let persisted_accumulated_profit = Dio_persistence.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
+        let persisted_last_fill_oid = Dio_persistence.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
+        let persisted_last_buy_fill_price = Dio_persistence.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
+        let persisted_last_sell_fill_price = Dio_persistence.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
         let new_state = {
           last_buy_order_price = None;
           last_buy_order_id = None;
@@ -776,7 +789,9 @@ let execute_strategy
                 incr open_buy_count_local;
                 buy_orders := (order_id, order_price) :: !buy_orders
               end else begin
-                sell_orders := (order_id, order_price, qty) :: !sell_orders
+                sell_orders := (order_id, order_price, qty) :: !sell_orders;
+                Logging.debug_f ~section "SELL_REBUILD [%s] from exchange cache: %s @ %.2f qty=%.8f"
+                  asset.symbol order_id order_price qty
               end
             end
           );
@@ -792,19 +807,26 @@ let execute_strategy
            set_asset_reserved_quote state 0.0
        | orders when not state.inflight_cancel_buy && not state.inflight_buy ->
            (* Safe to sync: no in-flight operation. *)
-           let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
-             if price > acc_price then (order_id, price) else (acc_id, acc_price)
-           ) (List.hd orders) (List.tl orders) in
-           state.last_buy_order_price <- Some best_price;
-           state.last_buy_order_id <- Some best_order_id;
-           (* Sync per-asset reserved_quote from the actual open buy so the
-              capital_low check uses the real exchange-reserved amount after restart. *)
-           let qty = state.grid_qty in
-           set_asset_reserved_quote state (best_price *. qty)
+           let valid_orders = List.filter (fun (_, p) -> p > 0.0) orders in
+           (match valid_orders with
+            | [] -> () (* Maintain prior state if price is temporarily unavailable *)
+            | hd :: tl ->
+               let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
+                 if price > acc_price then (order_id, price) else (acc_id, acc_price)
+               ) hd tl in
+               state.last_buy_order_price <- Some best_price;
+               state.last_buy_order_id <- Some best_order_id;
+               (* Sync per-asset reserved_quote from the actual open buy so the
+                  capital_low check uses the real exchange-reserved amount after restart. *)
+               let qty = state.grid_qty in
+               set_asset_reserved_quote state (best_price *. qty))
        | _ ->
            (* In-flight cancel or place: open_orders may be stale.
               Retain current state; order channel will resolve. *)
            ());
+
+      (* Log sell order changes: compare new exchange-sourced list with prior state. *)
+      let prev_sells = state.open_sell_orders in
 
       (* Apply exchange sell orders. *)
       state.open_sell_orders <- !sell_orders;
@@ -815,13 +837,26 @@ let execute_strategy
       if ecfg.merge_preserved_sells then begin
         List.iter (fun (preserved_id, preserved_price, _) ->
           let already_present = List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders in
-          if not already_present then
-            state.open_sell_orders <- (preserved_id, preserved_price, state.grid_qty) :: state.open_sell_orders
+          if not already_present then begin
+            state.open_sell_orders <- (preserved_id, preserved_price, state.grid_qty) :: state.open_sell_orders;
+            Logging.debug_f ~section "SELL_MERGE [%s] injected preserved sell: %s @ %.2f"
+              asset.symbol preserved_id preserved_price
+          end
         ) preserved_sells
       end;
 
-      Logging.debug_f ~section "Synced open orders for %s: %d buys, %d sells"
-        asset.symbol (List.length !buy_orders) (List.length !sell_orders);
+      (* Detect sell order mutations from prior cycle. *)
+      List.iter (fun (id, new_price, new_qty) ->
+        match List.find_opt (fun (pid, _, _) -> pid = id) prev_sells with
+        | Some (_, prev_price, prev_qty) ->
+            if abs_float (new_price -. prev_price) > 0.01 || abs_float (new_qty -. prev_qty) > 1e-8 then
+              Logging.debug_f ~section "SELL_CHANGED [%s] %s: price %.2f->%.2f qty %.8f->%.8f"
+                asset.symbol id prev_price new_price prev_qty new_qty
+        | None -> ()
+      ) state.open_sell_orders;
+
+      Logging.debug_f ~section "SELL_SYNC [%s] buys=%d sells=%d (prev_sells=%d)"
+        asset.symbol (List.length !buy_orders) (List.length !sell_orders) (List.length prev_sells);
 
       (* Use cached parsed config values; updated once at domain startup
          and whenever the config ref changes (Fear & Greed re-evaluation). *)
@@ -977,28 +1012,39 @@ let execute_strategy
                  end
                else true
              in
-             if balance_ok then begin
-               let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-               if push_order ~now sell_order then begin
-                  (* Commit accumulation state after push_order succeeds.
-                     Persistence is deferred: set dirty flag for the caller
-                     (domain_spawner) to flush outside the hotloop. *)
-                  if is_accumulation_sell then begin
-                    let rounded_sell = sell_qty in
-                    let rounding_diff = qty -. rounded_sell in
-                    let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
-                    state.accumulated_profit <- state.accumulated_profit -. required_profit;
-                    let base_increment = qty -. rounded_sell in
-                    state.reserved_base <- state.reserved_base +. base_increment;
-                    state.persistence_dirty <- true;
-                    Logging.info_f ~section
-                      "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
-                      asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
-                  end;
-                 Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                   asset.symbol sell_qty sell_price
-               end
-             end
+             if sell_qty = 0.0 && is_accumulation_sell then begin
+                (* Whole-share retention: profit covers the cost of a full share.
+                   Skip the sell order and retain the share as reserved_base.
+                   The reserved_base guard will prevent this share from being sold. *)
+                let required_profit = qty *. sell_price +. asset.accumulation_buffer in
+                state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                state.reserved_base <- state.reserved_base +. qty;
+                state.persistence_dirty <- true;
+                Logging.info_f ~section
+                  "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
+                  asset.symbol (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+              end else if balance_ok then begin
+                let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+                if push_order ~now sell_order then begin
+                   (* Commit accumulation state after push_order succeeds.
+                      Persistence is deferred: set dirty flag for the caller
+                      (domain_spawner) to flush outside the hotloop. *)
+                   if is_accumulation_sell then begin
+                     let rounded_sell = sell_qty in
+                     let rounding_diff = qty -. rounded_sell in
+                     let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
+                     state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                     let base_increment = qty -. rounded_sell in
+                     state.reserved_base <- state.reserved_base +. base_increment;
+                     state.persistence_dirty <- true;
+                     Logging.info_f ~section
+                       "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
+                       asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+                   end;
+                  Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+                    asset.symbol sell_qty sell_price
+                end
+              end
          | _ -> ()
         );
 
@@ -1078,10 +1124,12 @@ let execute_strategy
         (* Combine active and pending sell orders for spacing calculation. *)
         let closest_sell_order = ref None in
         let update_closest oid price =
-          match !closest_sell_order with
-          | None -> closest_sell_order := Some (oid, price)
-          | Some (_, best_price) ->
-              if price < best_price then closest_sell_order := Some (oid, price)
+          if price > 0.0 then begin
+            match !closest_sell_order with
+            | None -> closest_sell_order := Some (oid, price)
+            | Some (_, best_price) ->
+                if price < best_price then closest_sell_order := Some (oid, price)
+          end
         in
         
         List.iter (fun (oid, price, _) -> update_closest oid price) state.open_sell_orders;
@@ -1244,7 +1292,7 @@ let flush_persistence asset_symbol =
     in
     match snapshot_to_save with
     | Some (reserved_base, accumulated_profit, last_fill_oid, last_buy_fill_price, last_sell_fill_price) ->
-        Hyperliquid.State_persistence.save_async ~symbol:asset_symbol
+        Dio_persistence.State_persistence.save_async ~symbol:asset_symbol
           ~reserved_base
           ~accumulated_profit
           ?last_fill_oid
@@ -1295,7 +1343,9 @@ let handle_order_acknowledged asset_symbol order_id side price =
     Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
    | Sell ->
     state.inflight_sell <- false;
-    state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells);
+    state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
+    Logging.debug_f ~section "SELL_ACK [%s] injected into recently_injected_sells: %s @ %.2f"
+      asset_symbol order_id price);
 
   Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
     order_id (string_of_order_side side) price asset_symbol
@@ -1664,17 +1714,18 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                   old_order_id new_order_id asset_symbol)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
-         let old_qty = match List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders with
+         let old_entry = List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders in
+         let old_qty = match old_entry with
            | Some (_, _, q) -> q | None -> state.grid_qty in
-         state.open_sell_orders <- (new_order_id, price, old_qty) :: 
+         Logging.info_f ~section "SELL_AMEND [%s] %s -> %s @ %.2f: old_entry=%s old_qty=%.8f sells_before=%d"
+           asset_symbol old_order_id new_order_id price
+           (match old_entry with Some (_, p, q) -> Printf.sprintf "%.2f/%.8f" p q | None -> "NOT_FOUND")
+           old_qty original_sell_count;
+         state.open_sell_orders <- (new_order_id, price, old_qty) ::
             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
          state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
-         if List.length state.open_sell_orders = original_sell_count then
-           Logging.info_f ~section "Amended sell order ID in tracking: %s -> %s @ %.2f for %s" 
-             old_order_id new_order_id price asset_symbol
-         else
-           Logging.debug_f ~section "Set sell order ID via amend: %s @ %.2f for %s" 
-             new_order_id price asset_symbol);
+         Logging.info_f ~section "SELL_AMEND [%s] result: sells_after=%d"
+           asset_symbol (List.length state.open_sell_orders));
              
     (* Apply a short cooldown to prevent amending the newly amended order
        before the exchange's WebSocket open-orders cache catches up.
@@ -1874,9 +1925,9 @@ module Strategy = struct
          the next restart can resume from a known position. *)
       if state.last_fill_oid = None
          && state.highest_startup_oid <> None
-         && state.exchange_id = "hyperliquid" then begin
+         && (state.exchange_id = "hyperliquid" || state.exchange_id = "ibkr") then begin
         state.last_fill_oid <- state.highest_startup_oid;
-        Hyperliquid.State_persistence.save ~symbol
+        Dio_persistence.State_persistence.save ~symbol
           ~reserved_base:state.reserved_base
           ~accumulated_profit:state.accumulated_profit
           ~last_fill_oid:(Option.get state.highest_startup_oid) ();

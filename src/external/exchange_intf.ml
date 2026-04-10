@@ -105,6 +105,10 @@ module Types = struct
     filled_qty: float;             (** Cumulative filled quantity. *)
     avg_price: float;              (** Volume-weighted average fill price. *)
     timestamp: float;              (** Unix timestamp of the execution report. *)
+    is_amended: bool;              (** True when this event is an in-place amendment
+                                       confirmation (Kraken exec_type=amended), not a
+                                       genuine new-order acknowledgment. Domain workers
+                                       must skip handle_order_acknowledged for these. *)
   }
 
   (** Parameters controlling exponential backoff retry behavior. *)
@@ -243,6 +247,11 @@ module type S = sig
   (** Return the current write position of the execution feed ring buffer
       for [symbol]. Used as the starting cursor for [read_execution_events]. *)
   val get_execution_feed_position : symbol:string -> int
+
+  (** Return [true] if the execution feed has received its initial data
+      snapshot for [symbol]. Used by domain workers to gate strategy
+      execution until open order state is populated. *)
+  val has_execution_data : symbol:string -> bool
 
   (** Read execution events from [start_pos] up to the current write
       position. Returns a newly allocated list of events. *)
