@@ -39,6 +39,14 @@ let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
 
+(** Pong tracking state.
+    Lighter pong responses are app-level messages with type "pong".
+    [send_ping] waits on [pong_condition], which is broadcast when
+    a "pong" message arrives in [handle_frame]. Falls back to
+    checking [last_pong_time] in case the signal arrived before waiting. *)
+let last_pong_time = ref 0.0
+let pong_condition = Lwt_condition.create ()
+
 (** Diagnostic counters for message types flowing through the WS. *)
 let msg_counter_ticker = Atomic.make 0
 let msg_counter_orderbook = Atomic.make 0
@@ -251,9 +259,11 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
              (* Routed to Lighter_balances._processor_task via broadcast_message below. *)
              Atomic.incr msg_counter_account
          | "pong" ->
-             (* Application-level pong response to our keepalive ping *)
-             reset_ping_failures ();
-             on_heartbeat ()
+              (* Application-level pong response to our keepalive ping *)
+              last_pong_time := Unix.gettimeofday ();
+              (try Lwt_condition.broadcast pong_condition () with _ -> ());
+              reset_ping_failures ();
+              on_heartbeat ()
          | t ->
              Atomic.incr msg_counter_other;
              (* Log first few unmatched types to diagnose relay issues *)
@@ -375,7 +385,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
     Lwt.fail_with "WebSocket closed by server"
   ) (fun exn ->
     let error_msg = Printexc.to_string exn in
-    Logging.debug_f ~section "WebSocket connection error: %s" error_msg;
+    Logging.error_f ~section "WebSocket connection error: %s" error_msg;
     Atomic.set is_connected_ref false;
     close_all_subscribers ();
     on_failure error_msg;
@@ -401,26 +411,33 @@ let close () : unit Lwt.t =
         (fun () -> Websocket_lwt_unix.close_transport conn)
         (fun _ -> Lwt.return_unit)
 
-(** Sends a ping and waits for a pong within [timeout_ms]. *)
+(** Sends an application-level ping and waits for a pong within [timeout_ms].
+    Returns [true] if a pong was received, [false] on timeout or send failure.
+    Uses [pong_condition] since Lighter pong responses are matched by message
+    type, not request ID. Falls back to [last_pong_time] in case the condition
+    was broadcast before this function began waiting. *)
 let send_ping ~req_id:_ ~timeout_ms =
+  let ping_msg = `Assoc [("type", `String "ping")] in
+  let send_time = Unix.gettimeofday () in
   Lwt.catch (fun () ->
-    Lwt_mutex.with_lock connection_mutex (fun () ->
-      match !active_connection with
-      | Some conn ->
-          Websocket_lwt_unix.write conn
-            (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ~content:"" ())
-      | None -> Lwt.return_unit
-    ) >>= fun () ->
+    send_json ping_msg >>= fun () ->
     let timeout = float_of_int timeout_ms /. 1000.0 in
-    Lwt_unix.sleep timeout >>= fun () ->
-    (* Check if we got a pong in that window *)
-    if Atomic.get is_connected_ref then begin
-      reset_ping_failures ();
-      Lwt.return true
-    end else begin
-      incr_ping_failures ();
-      Lwt.return false
-    end
+    Lwt.pick [
+      (Lwt_condition.wait pong_condition >>= fun () ->
+       Logging.debug ~section "Pong received";
+       reset_ping_failures ();
+       Lwt.return true);
+      (Lwt_unix.sleep timeout >>= fun () ->
+       (* Check timestamp in case the condition was signaled before we waited. *)
+       if !last_pong_time > send_time then begin
+         reset_ping_failures ();
+         Lwt.return true
+       end else begin
+         Logging.warn ~section "Ping timed out (no pong received)";
+         incr_ping_failures ();
+         Lwt.return false
+       end)
+    ]
   ) (fun exn ->
     Logging.warn_f ~section "Ping send failed: %s" (Printexc.to_string exn);
     incr_ping_failures ();

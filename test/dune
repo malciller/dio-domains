@@ -18,6 +18,8 @@
 
 (subdir external/cmc)
 
+(subdir external/lighter)
+
 (subdir order_cache)
 
 (subdir engine/perf)
