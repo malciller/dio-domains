@@ -257,10 +257,10 @@ let start_async conn =
       Logging.warn_f ~section "[%s] Cannot start connection - no connect function provided (monitoring only)" conn.name
   | Some connect_fn ->
       Mutex.lock conn.mutex;
-      let should_start = match conn.state with
+      let should_start, attempt_num_opt = match conn.state with
         | Connecting -> 
             Mutex.unlock conn.mutex;
-            false
+            false, None
         | _ ->
             if not (circuit_breaker_allows_connection_unlocked conn) then begin
               conn.state <- Failed "Circuit breaker open";
@@ -273,7 +273,7 @@ let start_async conn =
               Logging.warn_f ~section "[%s] Circuit breaker blocks connection attempt" conn.name;
               Logging.error_f ~section "[%s] Connection failed: Circuit breaker open (attempt #%d)" conn.name attempt_num;
 
-              false
+              false, None
             end else begin
               conn.state <- Connecting;
               conn.last_connecting <- Some (Unix.time ());
@@ -292,11 +292,12 @@ let start_async conn =
                 Supervisor_cache.force_update ()
               end;
               Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num;
-              true
+              true, Some attempt_num
             end
       in
 
       if should_start then begin
+        let attempt_num = Option.get attempt_num_opt in
         let open Lwt.Infix in
         Lwt.async (fun () ->
           (* connect_fn manages its own Connected/Failed transitions *)
