@@ -4,6 +4,8 @@
     buffers, open order state, and event deduplication. Thread-safe access is
     enforced through per-resource mutexes and atomic flags. *)
 
+open Lwt.Infix
+
 let section = "lighter_executions_feed"
 
 type side = Buy | Sell
@@ -62,14 +64,32 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Global order_id to symbol index for O(1) lookups. *)
+(** Global order_id to symbol index with adaptive capacity and FIFO eviction.
+    All access requires holding initialization_mutex. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 64
+(** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-let order_to_symbol_cap = ref 256
+(** Adaptive capacity bound. Set to max_int (uncapped) during startup,
+    then locked to a bounded value after the initial snapshot completes. *)
+let order_to_symbol_cap : int ref = ref max_int
+let order_to_symbol_startup_done = Atomic.make false
 
 
 (** Atomic flag set once after initial open orders snapshot completes. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
+(** Lock the adaptive capacity after the startup snapshot is fully consumed.
+    Sets cap to max(32, observed * 1.5 + 1). Idempotent; only the first
+    invocation takes effect. *)
+let mark_startup_complete () =
+  if not (Atomic.exchange order_to_symbol_startup_done true) then begin
+    (* Precondition: initialization_mutex is held by the caller. *)
+    let observed = Hashtbl.length order_to_symbol in
+    let cap = max 32 (observed + observed / 2 + 1) in
+    order_to_symbol_cap := cap;
+    Logging.info_f ~section
+      "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)" cap observed
+  end
+
 let set_startup_snapshot_done () =
   if not (Atomic.exchange _startup_snapshot_done true) then begin
     (* Mark all initialized per-symbol stores as ready so has_execution_data
@@ -79,21 +99,30 @@ let set_startup_snapshot_done () =
       if not (Atomic.get store.ready) then
         Atomic.set store.ready true
     ) stores;
+    mark_startup_complete ();
     Mutex.unlock initialization_mutex;
     Logging.info ~section "Lighter open-order snapshot injected — domains may now activate";
     Concurrency.Exchange_wakeup.signal_all ()
   end
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 
-(** Insert an order_id to symbol mapping with bounded FIFO eviction. *)
+(** Insert an order_id to symbol mapping, evicting the oldest entry when
+    the adaptive cap is exceeded. Caller must hold initialization_mutex. *)
 let add_to_order_to_symbol order_id symbol =
   if not (Hashtbl.mem order_to_symbol order_id) then
     Queue.push order_id order_to_symbol_queue;
   Hashtbl.replace order_to_symbol order_id symbol;
-  while Queue.length order_to_symbol_queue > !order_to_symbol_cap do
-    let oldest = Queue.pop order_to_symbol_queue in
-    Hashtbl.remove order_to_symbol oldest
-  done
+  (* Enforce capacity bound only after the startup snapshot has been consumed. *)
+  if Atomic.get order_to_symbol_startup_done then
+    while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
+      if Queue.is_empty order_to_symbol_queue then
+        (* Queue/table size diverged; accept current table size as the new cap. *)
+        order_to_symbol_cap := Hashtbl.length order_to_symbol
+      else begin
+        let oldest = Queue.pop order_to_symbol_queue in
+        Hashtbl.remove order_to_symbol oldest
+      end
+    done
 
 (** Retrieve or lazily create a per-symbol store. Uses double-checked
     locking under initialization_mutex for thread-safe initialization. *)
@@ -511,7 +540,8 @@ let process_account_orders_update json =
      waiting in has_execution_data. *)
   set_startup_snapshot_done ()
 
-(** Periodic cleanup of stale orders (>24h). *)
+(** Periodic safety cleanup. Removes stale orders (>24h) and orphaned
+    entries from the order_to_symbol eviction queue. *)
 let cleanup_stale_orders () =
   let now = Unix.gettimeofday () in
   let stale_threshold = 24.0 *. 3600.0 in
@@ -535,7 +565,61 @@ let cleanup_stale_orders () =
     Mutex.unlock store.orders_mutex;
     if !stale <> [] then
       Logging.info_f ~section "Cleaned %d stale orders for %s" (List.length !stale) symbol
-  ) all_symbols
+  ) all_symbols;
+
+  (* Purge orphaned entries from order_to_symbol_queue.
+     Terminal events (fill/cancel) remove order_ids from the Hashtbl but not
+     from the Queue (OCaml Queue lacks O(1) removal by value). The queue
+     accumulates dead entries over time since the eviction loop only fires
+     when the Hashtbl exceeds its cap. This rebuild pass retains only entries
+     still present in the Hashtbl. Runs at most once per cleanup cycle. *)
+  Mutex.lock initialization_mutex;
+  let original_queue_len = Queue.length order_to_symbol_queue in
+  if original_queue_len > 0 then begin
+    let temp = Queue.create () in
+    Queue.iter (fun order_id ->
+      if Hashtbl.mem order_to_symbol order_id then
+        Queue.push order_id temp
+    ) order_to_symbol_queue;
+    Queue.clear order_to_symbol_queue;
+    Queue.transfer temp order_to_symbol_queue;
+    let removed = original_queue_len - Queue.length order_to_symbol_queue in
+    if removed > 0 then
+      Logging.debug_f ~section
+        "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
+        removed original_queue_len (Queue.length order_to_symbol_queue)
+  end;
+  Mutex.unlock initialization_mutex
+
+(** Event-driven cleanup signal channel. Fires on-demand (reconnect, manual
+    trigger) and falls back to a 120s safety timer. Implemented as an Lwt_mvar
+    used as a one-shot signal; request_cleanup is idempotent. *)
+let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
+
+(** Signal the cleanup loop to run immediately. Idempotent: skipped if a signal
+    is already pending. *)
+let request_cleanup () =
+  if Lwt_mvar.is_empty cleanup_mvar then
+    Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
+
+let periodic_tasks_started = Atomic.make false
+
+let start_periodic_tasks () =
+  if not (Atomic.exchange periodic_tasks_started true) then begin
+    let rec run () =
+      (* Block until an explicit cleanup signal or the 120s safety timeout. *)
+      Lwt.pick [
+        (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
+        (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
+      ] >>= fun reason ->
+      Logging.debug_f ~section "Running Lighter executions cleanup (%s)"
+        (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
+      cleanup_stale_orders ();
+      Lwt.async run;
+      Lwt.return_unit
+    in
+    Lwt.async run
+  end
 
 (** Return all open orders with expiry data across all symbol stores.
     Used by the TIF renewal process to find orders approaching expiry. *)
@@ -555,6 +639,7 @@ let get_all_open_orders_with_expiry () =
   !result
 
 let initialize symbols =
+  start_periodic_tasks ();
   Logging.info_f ~section "Initializing Lighter executions feed for %d symbols" (List.length symbols);
   List.iter (fun symbol ->
     let _ = get_symbol_store symbol in

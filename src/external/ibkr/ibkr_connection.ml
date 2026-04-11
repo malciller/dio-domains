@@ -180,15 +180,25 @@ let connect t =
 (** Close the TCP connection cleanly. *)
 let disconnect t =
   t.connected <- false;
+  let close_ic = match t.ic with
+    | Some ic ->
+        t.ic <- None;
+        Lwt.catch (fun () -> Lwt_io.close ic) (fun _ -> Lwt.return_unit)
+    | None -> Lwt.return_unit
+  in
+  let close_oc = match t.oc with
+    | Some oc ->
+        t.oc <- None;
+        Lwt.catch (fun () -> Lwt_io.close oc) (fun _ -> Lwt.return_unit)
+    | None -> Lwt.return_unit
+  in
   let close_fd = match t.socket with
     | Some fd ->
         t.socket <- None;
-        t.ic <- None;
-        t.oc <- None;
         Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
     | None -> Lwt.return_unit
   in
-  close_fd
+  Lwt.join [close_ic; close_oc; close_fd]
 
 (** Start the background reader loop. Reads messages from the socket and
     dispatches each to [on_message ~msg_id ~fields]. The loop exits on
@@ -203,10 +213,14 @@ let start_reader t ~on_message ~on_disconnect =
   | None -> Logging.error ~section "Cannot start reader: not connected"
   | Some ic ->
       let stream = Lwt_stream.from (fun () ->
+        if not t.connected then Lwt.return_none
+        else
         Lwt.catch (fun () ->
           read_message ic >>= fun fields -> Lwt.return_some fields
         ) (function
           | End_of_file -> Lwt.return_none
+          | Unix.Unix_error(Unix.EBADF, _, _) -> Lwt.return_none
+          | Lwt_io.Channel_closed _ -> Lwt.return_none
           | exn -> Lwt.fail exn)
       ) in
       let process_fields fields =
