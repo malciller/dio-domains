@@ -23,6 +23,21 @@ interface Env {
   LIGHTER_PROXY: DurableObjectNamespace;
 }
 
+interface UpstreamSession {
+  id: string;
+  upstream: WebSocket | null;
+  client: WebSocket | null;
+  buffer: string[];
+  keepaliveInterval: ReturnType<typeof setInterval> | null;
+  expiryTimer: ReturnType<typeof setTimeout> | null;
+  subscriptions: Set<string>;
+  clientClosed: boolean;
+  reconnecting: boolean;
+  internalToUpstreamCount: number;
+  upstreamToInternalCount: number;
+  upstreamConnectCount: number;
+}
+
 // ─── Worker entrypoint ───────────────────────────────────────────────────────
 
 export default {
@@ -201,6 +216,7 @@ function sleep(ms: number): Promise<void> {
 
 export class LighterProxy implements DurableObject {
   private state: DurableObjectState;
+  private sessions = new Map<string, UpstreamSession>();
 
   constructor(state: DurableObjectState, _env: Env) {
     this.state = state;
@@ -266,241 +282,256 @@ export class LighterProxy implements DurableObject {
   // transparent reconnection so the client never sees upstream drops.
 
   private async handleUpstreamRelay(url: URL): Promise<Response> {
+    const sessionId = url.searchParams.get("sessionId") || "default-" + Math.random().toString(36).slice(2);
+    
     // Create the internal WebSocket pair (between entrypoint and this DO)
     const [client, server] = Object.values(new WebSocketPair());
 
-    // ── State for this relay session ──
-    let upstream: WebSocket | null = null;
-    let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
-    let clientClosed = false;
-    let reconnecting = false;
-    const subscriptions = new Set<string>();
+    let session = this.sessions.get(sessionId);
 
-    // Diagnostic counters (cumulative across reconnects)
-    let internalToUpstreamCount = 0;
-    let upstreamToInternalCount = 0;
-    let upstreamConnectCount = 0;
-
-    // ── Connect to Lighter upstream ──
-    const connectUpstream = async (): Promise<WebSocket | null> => {
-      const upstreamUrl = `${LIGHTER_ORIGIN}/stream${url.search}`;
-      try {
-        const upstreamResp = await fetch(upstreamUrl, {
-          headers: { Upgrade: "websocket" },
-        });
-
-        const ws = upstreamResp.webSocket;
-        if (!ws) {
-          console.error(
-            `Upstream WS upgrade failed: status=${upstreamResp.status} ${upstreamResp.statusText}`
-          );
-          return null;
-        }
-
-        ws.accept();
-        upstreamConnectCount++;
-        console.log(`[DO] Upstream connected (#${upstreamConnectCount})`);
-        return ws;
-      } catch (err) {
-        console.error(`[DO] Upstream connect error: ${err}`);
-        return null;
+    if (session) {
+      console.log(`[DO] Resuming session ${sessionId}, flushing buffer (${session.buffer.length} msgs)`);
+      if (session.expiryTimer) {
+        clearTimeout(session.expiryTimer);
+        session.expiryTimer = null;
       }
-    };
+      
+      session.client = server;
+      session.clientClosed = false;
 
-    // ── Start keepalive interval ──
-    const startKeepalive = () => {
-      stopKeepalive();
-      keepaliveInterval = setInterval(() => {
+      server.accept();
+
+      let flushCount = 0;
+      for (const msg of session.buffer) {
         try {
-          if (upstream && upstream.readyState === WebSocket.READY_STATE_OPEN) {
-            upstream.send(JSON.stringify({ type: "ping" }));
-          }
+           server.send(msg);
+           flushCount++;
         } catch {
-          // Upstream gone, will be caught by close handler
-        }
-      }, 30_000);
-    };
-
-    // ── Stop keepalive interval ──
-    const stopKeepalive = () => {
-      if (keepaliveInterval !== null) {
-        clearInterval(keepaliveInterval);
-        keepaliveInterval = null;
-      }
-    };
-
-    // ── Replay subscriptions to a new upstream ──
-    const replaySubscriptions = (ws: WebSocket) => {
-      if (subscriptions.size === 0) return;
-      console.log(`[DO] Replaying ${subscriptions.size} subscriptions to new upstream`);
-      for (const sub of subscriptions) {
-        try {
-          if (ws.readyState === WebSocket.READY_STATE_OPEN) {
-            ws.send(sub);
-          }
-        } catch {
-          console.warn("[DO] Failed to replay subscription during reconnect");
+           break;
         }
       }
+      session.buffer = [];
+      console.log(`[DO] Session ${sessionId} flushed ${flushCount} msgs`);
+      
+      this.wireSessionInternal(session);
+
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // ── Create New Session ──
+    session = {
+      id: sessionId,
+      upstream: null,
+      client: server,
+      buffer: [],
+      keepaliveInterval: null,
+      expiryTimer: null,
+      subscriptions: new Set<string>(),
+      clientClosed: false,
+      reconnecting: false,
+      internalToUpstreamCount: 0,
+      upstreamToInternalCount: 0,
+      upstreamConnectCount: 0,
     };
+    this.sessions.set(sessionId, session);
 
-    // ── Wire event handlers for an upstream WebSocket ──
-    const wireUpstream = (ws: WebSocket) => {
-      // Relay: upstream (from Lighter) → internal (to entrypoint → client)
-      ws.addEventListener("message", (event) => {
-        try {
-          if (server.readyState === WebSocket.READY_STATE_OPEN) {
-            upstreamToInternalCount++;
-            if (upstreamToInternalCount <= 3 || upstreamToInternalCount % 1000 === 0) {
-              console.log(`[DO] upstream→internal #${upstreamToInternalCount}: ${String(event.data).slice(0, 120)}`);
-            }
-            server.send(event.data);
-          } else {
-            console.warn(`[DO] internal not open (state=${server.readyState}), dropped msg #${upstreamToInternalCount + 1}`);
-          }
-        } catch {
-          // server side already closed
-        }
-      });
-
-      // Upstream close: attempt transparent reconnect
-      ws.addEventListener("close", (event) => {
-        console.log(`[DO] Upstream closed: code=${event.code} reason="${event.reason}" (relayed ${upstreamToInternalCount} msgs total)`);
-        stopKeepalive();
-
-        // If client already disconnected, nothing to reconnect for
-        if (clientClosed) {
-          console.log("[DO] Client already closed, not reconnecting upstream");
-          return;
-        }
-
-        // If already reconnecting (from a previous close), skip
-        if (reconnecting) {
-          console.log("[DO] Already reconnecting, skipping duplicate");
-          return;
-        }
-
-        // Attempt transparent reconnect
-        reconnecting = true;
-        (async () => {
-          if (clientClosed) {
-            console.log("[DO] Client closed during reconnect, aborting");
-            return;
-          }
-
-          console.log(`[DO] Upstream reconnecting immediately (1 attempt)`);
-          const newWs = await connectUpstream();
-          if (newWs) {
-            upstream = newWs;
-            wireUpstream(newWs);
-            replaySubscriptions(newWs);
-            startKeepalive();
-            reconnecting = false;
-            console.log(`[DO] Upstream reconnected successfully`);
-            return;
-          }
-
-          // All attempts exhausted
-          reconnecting = false;
-          console.error(`[DO] Upstream reconnect failed, closing client`);
-          try {
-            server.close(1011, "upstream reconnect failed");
-          } catch {}
-        })();
-      });
-
-      ws.addEventListener("error", (event) => {
-        console.error("[DO] Upstream WebSocket error:", event);
-        // The close event will follow and trigger reconnect
-      });
-    };
-
-    // ── Initial upstream connection ──
-    upstream = await connectUpstream();
+    // ── Wire up the new session ──
+    const upstream = await this.connectUpstream(url, session);
     if (!upstream) {
+      this.cleanupSession(session);
       return new Response(
         JSON.stringify({ error: "Failed to connect upstream WebSocket" }),
         { status: 502, headers: { "content-type": "application/json" } },
       );
     }
+    session.upstream = upstream;
 
-    // Accept internal server side
     server.accept();
 
-    // Wire upstream event handlers
-    wireUpstream(upstream);
+    this.wireUpstream(upstream, session, url);
+    this.startKeepalive(session);
+    this.wireSessionInternal(session);
 
-    // Start keepalive
-    startKeepalive();
+    return new Response(null, { status: 101, webSocket: client });
+  }
 
-    // Relay: internal (from entrypoint/client) → upstream (to Lighter)
+  // ── Session Helpers ──────────────────────────────────────────────────────
+
+  private async connectUpstream(url: URL, session: UpstreamSession): Promise<WebSocket | null> {
+    const upstreamUrl = `${LIGHTER_ORIGIN}/stream${url.search}`;
+    try {
+      const upstreamResp = await fetch(upstreamUrl, {
+        headers: { Upgrade: "websocket" },
+      });
+
+      const ws = upstreamResp.webSocket;
+      if (!ws) {
+        console.error(`Upstream WS err: status=${upstreamResp.status}`);
+        return null;
+      }
+
+      ws.accept();
+      session.upstreamConnectCount++;
+      console.log(`[DO] Upstream connected (#${session.upstreamConnectCount}) for session ${session.id}`);
+      return ws;
+    } catch (err) {
+      console.error(`[DO] Upstream connect error: ${err}`);
+      return null;
+    }
+  }
+
+  private startKeepalive(session: UpstreamSession) {
+    this.stopKeepalive(session);
+    session.keepaliveInterval = setInterval(() => {
+      try {
+        if (session.upstream && session.upstream.readyState === WebSocket.READY_STATE_OPEN) {
+          session.upstream.send(JSON.stringify({ type: "ping" }));
+        }
+      } catch {}
+    }, 30_000);
+  }
+
+  private stopKeepalive(session: UpstreamSession) {
+    if (session.keepaliveInterval !== null) {
+      clearInterval(session.keepaliveInterval);
+      session.keepaliveInterval = null;
+    }
+  }
+
+  private replaySubscriptions(ws: WebSocket, session: UpstreamSession) {
+    if (session.subscriptions.size === 0) return;
+    console.log(`[DO] Replaying ${session.subscriptions.size} subscriptions`);
+    for (const sub of session.subscriptions) {
+      try {
+        if (ws.readyState === WebSocket.READY_STATE_OPEN) {
+          ws.send(sub);
+        }
+      } catch {}
+    }
+  }
+
+  private wireUpstream(ws: WebSocket, session: UpstreamSession, url: URL) {
+    ws.addEventListener("message", (event) => {
+      try {
+        if (session.client && session.client.readyState === WebSocket.READY_STATE_OPEN && !session.clientClosed) {
+          session.upstreamToInternalCount++;
+          if (session.upstreamToInternalCount <= 3 || session.upstreamToInternalCount % 1000 === 0) {
+            console.log(`[DO] upstream→internal #${session.upstreamToInternalCount}: ${String(event.data).slice(0, 120)}`);
+          }
+          session.client.send(event.data);
+        } else {
+          // Client is disconnected. Buffer the message!
+          session.buffer.push(String(event.data));
+          if (session.buffer.length > 5000) {
+            session.buffer.shift(); // Drop oldest to avoid OOM
+          }
+        }
+      } catch {}
+    });
+
+    ws.addEventListener("close", (event) => {
+      console.log(`[DO] Upstream closed: code=${event.code} reason="${event.reason}"`);
+      
+      // If we are already terminating the session, or reconnecting
+      if (session.expiryTimer === null && session.clientClosed) {
+        return; // normal disconnect after expiry
+      }
+      
+      if (session.reconnecting) return;
+      session.reconnecting = true;
+
+      (async () => {
+        console.log(`[DO] Upstream reconnecting for session ${session.id}`);
+        const newWs = await this.connectUpstream(url, session);
+        if (newWs) {
+          session.upstream = newWs;
+          this.wireUpstream(newWs, session, url);
+          this.replaySubscriptions(newWs, session);
+          session.reconnecting = false;
+          console.log(`[DO] Upstream reconnected`);
+          return;
+        }
+
+        // Reconnet failed
+        session.reconnecting = false;
+        console.error(`[DO] Upstream reconnect failed for ${session.id}`);
+        try {
+          if (session.client && !session.clientClosed) {
+             session.client.close(1011, "upstream reconnect failed");
+          }
+        } catch {}
+      })();
+    });
+
+    ws.addEventListener("error", (event) => {
+      console.error("[DO] Upstream WebSocket error:", event);
+    });
+  }
+
+  private wireSessionInternal(session: UpstreamSession) {
+    if (!session.client) return;
+    const server = session.client;
+
     server.addEventListener("message", (event) => {
       try {
         const data = String(event.data);
 
-        // Track subscription messages for replay on reconnect
         try {
           const parsed = JSON.parse(data);
           if (parsed.type === "subscribe") {
-            subscriptions.add(data);
+            session.subscriptions.add(data);
           } else if (parsed.type === "unsubscribe") {
-            // Remove matching subscription if client unsubscribes
-            // Match by channel since the rest of the payload should be identical
-            for (const sub of subscriptions) {
+            for (const sub of session.subscriptions) {
               try {
                 const s = JSON.parse(sub);
                 if (s.channel === parsed.channel) {
-                  subscriptions.delete(sub);
+                  session.subscriptions.delete(sub);
                   break;
                 }
               } catch {}
             }
           }
-        } catch {
-          // Not JSON, just relay
-        }
+        } catch {}
 
-        if (upstream && upstream.readyState === WebSocket.READY_STATE_OPEN) {
-          internalToUpstreamCount++;
-          if (internalToUpstreamCount <= 10) {
-            console.log(`[DO] internal→upstream #${internalToUpstreamCount}: ${data.slice(0, 200)}`);
+        if (session.upstream && session.upstream.readyState === WebSocket.READY_STATE_OPEN) {
+          session.internalToUpstreamCount++;
+          if (session.internalToUpstreamCount <= 10) {
+             console.log(`[DO] internal→upstream #${session.internalToUpstreamCount}: ${data.slice(0, 200)}`);
           }
-          upstream.send(event.data);
-        } else if (reconnecting) {
-          // Upstream is reconnecting — drop the message but don't error.
-          // Pings and subscription messages will be lost during reconnect,
-          // but subscriptions will be replayed and pings will resume.
-          console.warn(`[DO] Upstream reconnecting, dropped client msg #${internalToUpstreamCount + 1}`);
-        } else {
-          console.warn(`[DO] upstream not open (state=${upstream?.readyState}), dropped msg #${internalToUpstreamCount + 1}`);
+          session.upstream.send(event.data);
+        } else if (session.reconnecting) {
+          console.warn(`[DO] Upstream reconnecting, dropped client msg`);
         }
-      } catch {
-        // upstream already closed
-      }
-    });
-
-    server.addEventListener("close", (event) => {
-      console.log(`[DO] Internal relay closed: code=${event.code}`);
-      clientClosed = true;
-      stopKeepalive();
-      try {
-        if (upstream && upstream.readyState === WebSocket.READY_STATE_OPEN) {
-          upstream.close(event.code, event.reason);
-        }
-      } catch {
-        // already closed
-      }
-    });
-
-    server.addEventListener("error", (event) => {
-      console.error("[DO] Internal relay server-side error:", event);
-      clientClosed = true;
-      stopKeepalive();
-      try {
-        if (upstream) upstream.close(1011, "relay error");
       } catch {}
     });
 
-    return new Response(null, { status: 101, webSocket: client });
+    server.addEventListener("close", (event) => {
+      console.log(`[DO] Client disconnected from session ${session.id}: code=${event.code}`);
+      session.clientClosed = true;
+      session.client = null;
+      
+      // Start buffering grace period (60s)
+      session.expiryTimer = setTimeout(() => {
+        console.log(`[DO] Session ${session.id} expired. Cleaning up.`);
+        this.cleanupSession(session);
+      }, 60_000);
+    });
+
+    server.addEventListener("error", (event) => {
+      console.error(`[DO] internal server error for ${session.id}:`, event);
+      try {
+         server.close(1011, "relay error");
+      } catch {} // triggers close event
+    });
+  }
+
+  private cleanupSession(session: UpstreamSession) {
+    this.sessions.delete(session.id);
+    this.stopKeepalive(session);
+    try {
+      if (session.upstream && session.upstream.readyState === WebSocket.READY_STATE_OPEN) {
+        session.upstream.close(1000, "session expired");
+      }
+    } catch {}
   }
 }
