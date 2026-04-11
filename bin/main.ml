@@ -326,6 +326,10 @@ let init_order_executor_async () =
   Logging.info ~section:"main" "Initializing order executor...";
   Supervisor.start_order_executor ()
 
+(** Start the Discord fill notifier as a background Lwt fiber. *)
+let init_discord_notifier () =
+  Discord.Notifier.start ()
+
 let () =
   (* Parse CLI arguments. *)
   Arg.parse speclist (fun _ -> ()) usage_msg;
@@ -421,6 +425,9 @@ let () =
 
     (* Start order executor as a background fiber. *)
     let _order_executor_promise = init_order_executor_async () in
+
+    (* Start Discord fill notifier as a background fiber. *)
+    init_discord_notifier ();
 
     Logging.info ~section:"main" "Trading engine ready, waiting for shutdown signal...";
 

@@ -1,0 +1,12 @@
+(library
+ (name discord)
+ (public_name dio.discord)
+ (libraries
+  yojson
+  lwt
+  lwt.unix
+  cohttp-lwt-unix
+  logging
+  concurrency)
+ (preprocess
+  (pps lwt_ppx)))

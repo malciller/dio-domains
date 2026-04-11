@@ -26,7 +26,7 @@ let next_client_order_index () =
       tx_type=<int>, tx_info=<json-string> *)
 let send_tx ~tx_type ~tx_info =
   let url = Lighter_proxy.api_base_url () ^ "/api/v1/sendTx" in
-  Logging.info_f ~section "Sending tx via REST (type=%d, tx_info=%s)" tx_type tx_info;
+  Logging.debug_f ~section "Sending tx via REST (type=%d, tx_info=%s)" tx_type tx_info;
   Lwt.catch (fun () ->
     let uri = Uri.of_string url in
     (* Build multipart/form-data body manually *)
@@ -147,7 +147,7 @@ let cancel_order ~symbol ~order_id =
       send_tx ~tx_type:Lighter_types.tx_type_cancel_order ~tx_info >>= fun result ->
       (match result with
        | Ok _ ->
-           Logging.info_f ~section "Cancel sent: %s [%s]" order_id symbol;
+           Logging.debug_f ~section "Cancel sent: %s [%s]" order_id symbol;
            Lwt.return (Ok { Lighter_types.Types.order_id; cl_ord_id = None })
        | Error msg ->
            Logging.error_f ~section "Cancel failed: %s [%s]: %s" order_id symbol msg;
@@ -173,7 +173,7 @@ let modify_order ~symbol ~order_id ~new_qty ~new_price =
           send_tx ~tx_type:Lighter_types.tx_type_modify_order ~tx_info >>= fun result ->
           (match result with
            | Ok _ ->
-               Logging.info_f ~section "Modify sent: %s [%s] qty=%.8f price=%.2f" order_id symbol new_qty new_price;
+               Logging.debug_f ~section "Modify sent: %s [%s] qty=%.8f price=%.2f" order_id symbol new_qty new_price;
                Lwt.return (Ok {
                  Lighter_types.Types.original_order_id = order_id;
                  new_order_id = order_id;
@@ -194,7 +194,7 @@ let cancel_all_orders ~symbol =
       send_tx ~tx_type:Lighter_types.tx_type_cancel_all_orders ~tx_info >>= fun result ->
       (match result with
        | Ok _ ->
-           Logging.info_f ~section "Cancel all sent for %s (market=%d)" symbol market_index;
+           Logging.debug_f ~section "Cancel all sent for %s (market=%d)" symbol market_index;
            Lwt.return (Ok ())
        | Error msg ->
            Logging.error_f ~section "Cancel all failed for %s: %s" symbol msg;

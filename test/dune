@@ -23,3 +23,5 @@
 (subdir order_cache)
 
 (subdir engine/perf)
+
+(subdir external/discord)

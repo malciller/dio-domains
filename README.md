@@ -96,6 +96,7 @@ LIGHTER_PROXY_URL=https://your-proxy.workers.dev       # Optional: Cloudflare pr
 
 # ── Optional ──
 CMC_API_KEY=your_cmc_api_key    # Fear & Greed index (defaults to 50.0 if absent)
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... # Order fill webhook
 DIO_BACKTRACE=                  # Set any value to enable exception backtraces
 ```
 
@@ -414,6 +415,16 @@ docker run --rm -it -v dio-sock:/var/run/dio dio dio-dashboard
 
 Wire protocol: 4-byte big-endian length-prefixed JSON frames. Max 5
 concurrent clients. Send `Q` to close a connection.
+
+---
+
+## Discord Notifications
+
+The engine supports cross-venue real-time order fill notifications delivered to a Discord webhook. 
+
+To enable notifications, provide your webhook URL via the `DISCORD_WEBHOOK_URL` environment variable. The engine operates a background token-bucket rate limiter (2.5 req/sec) to strictly adhere to Discord's `5 requests / 2 seconds` rate limits. 
+
+During bursty periods (e.g. cascading grid fills), the notification module natively batches up to 10 fills into a single Discord embed message to preserve rate limits seamlessly. Fills include precise estimated `maker_fee` deductions for net-value visibility.
 
 ---
 
