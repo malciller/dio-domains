@@ -180,7 +180,29 @@ let handle_order_status fields =
       update_open_orders symbol event;
 
       Logging.info_f ~section "Order %d [%s]: %s filled=%.2f remaining=%.2f avgPrice=%.4f"
-        order_id symbol status_str filled remaining avg_fill_price
+        order_id symbol status_str filled remaining avg_fill_price;
+
+      (* Publish to centralized fill event bus for Discord notifications *)
+      (if status = Ibkr_types.Filled then begin
+        let fill_value = filled *. avg_fill_price in
+        let maker_fee_rate =
+          match Dio_exchange.Exchange_intf.Registry.get "ibkr" with
+          | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+              (match Ex.get_fees ~symbol with (Some f, _) -> f | _ -> 0.0)
+          | None -> 0.0
+        in
+        let fee = fill_value *. maker_fee_rate in
+        Concurrency.Fill_event_bus.publish_fill {
+          venue = "ibkr";
+          symbol;
+          side = (if side = "BUY" then "buy" else "sell");
+          amount = filled;
+          fill_price = avg_fill_price;
+          value = fill_value;
+          fee;
+          timestamp = Unix.gettimeofday ();
+        }
+      end)
   | None ->
       Logging.debug_f ~section "orderStatus for unknown order %d (status=%s)" order_id status_str
 
