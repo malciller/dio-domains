@@ -199,43 +199,44 @@ let disconnect t =
     Without this, each [>>=] chains the current promise to its successor,
     accumulating one [Forward] node per inbound message indefinitely. *)
 let start_reader t ~on_message ~on_disconnect =
-  let rec loop ic =
-    Lwt.catch (fun () ->
-      read_message ic >>= fun fields ->
-      match fields with
-      | [] ->
-          Logging.warn ~section "Received empty message, skipping";
-          (* Sever Forward chain: spawn next iteration independently. *)
-          Lwt.async (fun () -> loop ic);
-          Lwt.return_unit
-      | msg_id_str :: rest ->
-          let msg_id = try int_of_string msg_id_str with _ -> -1 in
-          (Lwt.catch
-            (fun () -> on_message ~msg_id ~fields:rest; Lwt.return_unit)
-            (fun exn ->
-              Logging.error_f ~section "Handler error for msg_id=%d: %s"
-                msg_id (Printexc.to_string exn);
-              Lwt.return_unit)
-          ) >>= fun () ->
-          (* Sever Forward chain: spawn next iteration independently. *)
-          Lwt.async (fun () -> loop ic);
-          Lwt.return_unit
-    ) (function
-      | End_of_file ->
+  match t.ic with
+  | None -> Logging.error ~section "Cannot start reader: not connected"
+  | Some ic ->
+      let stream = Lwt_stream.from (fun () ->
+        Lwt.catch (fun () ->
+          read_message ic >>= fun fields -> Lwt.return_some fields
+        ) (function
+          | End_of_file -> Lwt.return_none
+          | exn -> Lwt.fail exn)
+      ) in
+      let process_fields fields =
+        match fields with
+        | [] -> Logging.warn ~section "Received empty message, skipping"
+        | msg_id_str :: rest ->
+            let msg_id = try int_of_string msg_id_str with _ -> -1 in
+            Lwt.async (fun () ->
+              Lwt.catch
+                (fun () -> on_message ~msg_id ~fields:rest; Lwt.return_unit)
+                (fun exn ->
+                  Logging.error_f ~section "Handler error for msg_id=%d: %s"
+                    msg_id (Printexc.to_string exn);
+                  Lwt.return_unit)
+            )
+      in
+      Lwt.async (fun () ->
+        Lwt.catch (fun () ->
+          Concurrency.Lwt_util.consume_stream process_fields stream >>= fun () ->
           Logging.warn ~section "Connection closed by gateway (EOF)";
           t.connected <- false;
           on_disconnect "Connection closed by gateway (EOF)";
           Lwt.return_unit
-      | exn ->
+        ) (fun exn ->
           Logging.error_f ~section "Reader error: %s" (Printexc.to_string exn);
           t.connected <- false;
           on_disconnect (Printf.sprintf "Reader error: %s" (Printexc.to_string exn));
           Lwt.return_unit
-    )
-  in
-  match t.ic with
-  | Some ic -> Lwt.async (fun () -> loop ic)
-  | None -> Logging.error ~section "Cannot start reader: not connected"
+        )
+      )
 
 (** Connect with exponential backoff retry. Attempts up to [max_attempts]
     times before giving up. *)

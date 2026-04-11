@@ -7,6 +7,10 @@ let section = "lighter_orderbook"
 
 let ring_buffer_size = 16
 
+(** Maximum number of price levels retained per side.
+    Bounds memory and matches downstream consumers (top-of-book only). *)
+let max_depth = 50
+
 type level = {
   price: float;
   size: float;
@@ -84,10 +88,29 @@ let apply_delta levels price size ~is_bid =
       else
         List.sort (fun (a, _) (b, _) -> compare a b) with_new (* Ascending *)
 
-(** Write current local state to ring buffer as snapshot. *)
+(** Truncate a level list to [max_depth] entries.
+    Lists are pre-sorted (bids descending, asks ascending) so a simple
+    take-first-N retains the best levels and drops the tail. *)
+let truncate_to_depth levels =
+  let rec take n acc = function
+    | _ when n <= 0 -> List.rev acc
+    | [] -> List.rev acc
+    | x :: xs -> take (n - 1) (x :: acc) xs
+  in
+  if List.length levels <= max_depth then levels
+  else take max_depth [] levels
+
+(** Write current local state to ring buffer as snapshot.
+    Uses Array.init with List.nth to avoid intermediate List.map allocation. *)
 let flush_to_ring store symbol =
-  let bids = List.map (fun (p, s) -> { price = p; size = s }) store.local_bids |> Array.of_list in
-  let asks = List.map (fun (p, s) -> { price = p; size = s }) store.local_asks |> Array.of_list in
+  let nb = min (List.length store.local_bids) max_depth in
+  let na = min (List.length store.local_asks) max_depth in
+  let bids = Array.init nb (fun i ->
+    let (p, s) = List.nth store.local_bids i in
+    { price = p; size = s }) in
+  let asks = Array.init na (fun i ->
+    let (p, s) = List.nth store.local_asks i in
+    { price = p; size = s }) in
   let ob = { symbol; bids; asks; timestamp = Unix.gettimeofday () } in
   RingBuffer.write store.buffer ob;
   notify_ready store;
@@ -144,8 +167,8 @@ let process_orderbook_snapshot ~market_index json =
 
       let store = ensure_store symbol in
       Mutex.lock store.ob_mutex;
-      store.local_bids <- List.sort (fun (a, _) (b, _) -> compare b a) bids;
-      store.local_asks <- List.sort (fun (a, _) (b, _) -> compare a b) asks;
+      store.local_bids <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare b a) bids);
+      store.local_asks <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare a b) asks);
       flush_to_ring store symbol;
       Mutex.unlock store.ob_mutex;
 
@@ -178,12 +201,14 @@ let process_orderbook_update ~market_index json =
         let size = Lighter_types.parse_json_float (member "size" level) in
         store.local_bids <- apply_delta store.local_bids price size ~is_bid:true
       ) bids_json;
+      store.local_bids <- truncate_to_depth store.local_bids;
 
       List.iter (fun level ->
         let price = Lighter_types.parse_json_float (member "price" level) in
         let size = Lighter_types.parse_json_float (member "size" level) in
         store.local_asks <- apply_delta store.local_asks price size ~is_bid:false
       ) asks_json;
+      store.local_asks <- truncate_to_depth store.local_asks;
 
       flush_to_ring store symbol;
       Mutex.unlock store.ob_mutex;

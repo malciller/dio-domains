@@ -357,25 +357,29 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
     
     (* Ping/pong monitoring is owned by the supervisor, not this module. *)
 
-    let done_p, done_u = Lwt.wait () in
-    let rec loop () =
-      Lwt.catch (fun () ->
+    let stream = Lwt_stream.from (fun () ->
+      if not (Atomic.get is_connected_ref) then Lwt.return_none
+      else Lwt.catch (fun () ->
         Websocket_lwt_unix.read conn >>= fun frame ->
-        handle_frame ~on_heartbeat frame >>= fun () ->
-        if Atomic.get is_connected_ref then begin
-          (* Spawn next iteration to avoid stack growth from chained binds. *)
-          Lwt.async loop;
-          Lwt.return_unit
-        end else begin
-          Lwt.wakeup_later done_u ();
-          Lwt.return_unit
-        end
-      ) (fun exn ->
-        Lwt.wakeup_later_exn done_u exn;
-        Lwt.return_unit
+        Lwt.return_some frame
+      ) (function
+        | End_of_file -> Lwt.return_none
+        | exn -> Lwt.fail exn)
+    ) in
+
+    let process_frame frame =
+      Lwt.async (fun () ->
+        Lwt.catch
+          (fun () -> handle_frame ~on_heartbeat frame)
+          (fun exn -> Logging.error_f ~section "Error handling Hyperliquid frame: %s" (Printexc.to_string exn); Lwt.return_unit)
       )
     in
-    Lwt.async loop;
+
+    let done_p =
+      Lwt.catch
+        (fun () -> Concurrency.Lwt_util.consume_stream process_frame stream)
+        (fun _exn -> Lwt.return_unit)
+    in
     Lwt.catch (fun () -> done_p) (function
       | End_of_file ->
           Logging.warn ~section "WebSocket connection closed unexpectedly (End_of_file)";

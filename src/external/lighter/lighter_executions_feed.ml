@@ -90,13 +90,9 @@ let add_to_order_to_symbol order_id symbol =
   if not (Hashtbl.mem order_to_symbol order_id) then
     Queue.push order_id order_to_symbol_queue;
   Hashtbl.replace order_to_symbol order_id symbol;
-  while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
-    if Queue.is_empty order_to_symbol_queue then
-      order_to_symbol_cap := Hashtbl.length order_to_symbol
-    else begin
-      let oldest = Queue.pop order_to_symbol_queue in
-      Hashtbl.remove order_to_symbol oldest
-    end
+  while Queue.length order_to_symbol_queue > !order_to_symbol_cap do
+    let oldest = Queue.pop order_to_symbol_queue in
+    Hashtbl.remove order_to_symbol oldest
   done
 
 (** Retrieve or lazily create a per-symbol store. Uses double-checked
@@ -287,9 +283,11 @@ let process_account_orders_update json =
   try
     let msg_type = (try member "type" json |> to_string with _ -> "unknown") in
     (* Log all account order messages to diagnose tracking issues *)
-    let json_str = Yojson.Safe.to_string json in
-    let truncated = if String.length json_str > 1500 then String.sub json_str 0 1500 ^ "..." else json_str in
-    Logging.debug_f ~section "Account orders message (type=%s): %s" msg_type truncated;
+    if Logging.will_log Logging.DEBUG section then begin
+      let json_str = Yojson.Safe.to_string json in
+      let truncated = if String.length json_str > 1500 then String.sub json_str 0 1500 ^ "..." else json_str in
+      Logging.debug_f ~section "Account orders message (type=%s): %s" msg_type truncated
+    end;
 
     (* Lighter uses channel-specific data keys; try the most likely ones *)
     let orders_json =
