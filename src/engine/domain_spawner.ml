@@ -351,48 +351,39 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let cached_fng_check_threshold = config.fng_check_threshold in
 
       while Atomic.get state.is_running do
-        (* Snapshot the gate at cycle start: all recording decisions within
-           this cycle use the snapshot so that a mid-cycle flip from false
-           to true never pairs a real timestamp against a stale 0L. *)
         let latency_this_cycle = !latency_active in
-        let t0 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
-        (* Periodic debug logging gated by cycle_mod *)
+        (* Periodic debug logging gated by cycle_mod — kept off the hot path *)
         if !cycle_count mod config.cycle_mod = 0 then
           Logging.debug_f ~section "Asset [%s/%s] cycle #%d"
             asset_with_fees.exchange asset_with_fees.symbol !cycle_count;
         
-        (* Consume pending ticker events from the ring buffer by snapping to the latest.
-           Skipping intermediate events eliminates useless allocations and GC pressure. *)
+        (* === TICKER HOT PATH START === *)
+        let t0 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
         let did_ticker = ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) in
         if did_ticker then begin
-          ticker_read_pos := ticker_pos;  (* Fast-forward to latest *)
+          ticker_read_pos := ticker_pos;
           (match Ex.get_ticker ~symbol:asset_with_fees.symbol with
            | Some (bid, ask) ->
                current_price := Some ((bid +. ask) /. 2.0);
-               should_execute_strategy := true;
-               Logging.debug_f ~section "Asset [%s/%s]: Snapped to latest ticker - price=$%.2f"
-                 asset_with_fees.exchange asset_with_fees.symbol ((bid +. ask) /. 2.0)
+               should_execute_strategy := true
            | None -> ());
         end;
         let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         if did_ticker && latency_this_cycle then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub t1 t0));
         
-        (* Consume pending orderbook events from the ring buffer by snapping to the latest. *)
+        (* === ORDERBOOK HOT PATH === *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
         let did_ob = ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) in
         if did_ob then begin
-          orderbook_read_pos := ob_pos;  (* Fast-forward to latest *)
+          orderbook_read_pos := ob_pos;
           (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
            | Some (bid_price, bid_size, ask_price, ask_size) ->
                top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
-               should_execute_strategy := true;
-               Logging.debug_f ~section "Asset [%s/%s]: Snapped to latest orderbook - bid=$%.2f x %.4f, ask=$%.2f x %.4f"
-                 asset_with_fees.exchange asset_with_fees.symbol
-                 bid_price bid_size ask_price ask_size
+               should_execute_strategy := true
            | None -> ());
         end;
         let t2 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
