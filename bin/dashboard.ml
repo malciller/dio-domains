@@ -697,15 +697,22 @@ let render_latencies _w json =
   ) lats in
   if active_lats = [] then I.empty
   else
-    (* Per-metric latency thresholds: (yellow_us, red_us) *)
+    (* Per-metric latency thresholds: (yellow_us, red_us).
+       These measure INTERNAL processing latency only — the code we control.
+       Network round-trip to exchanges is excluded (not colocated).
+       Thresholds are calibrated against achievable performance for each stage:
+       - ticker/ob:  in-memory struct update from ring buffer; should be <5us
+       - strategy:   grid logic + mutex + order push; target <25us p50
+       - execution:  ringbuffer write + signal broadcast; short path
+       - cycle:      full wakeup-to-sleep; sum of all stages *)
     let latency_thresholds label =
       match label with
-      | "ticker"    -> (10.0,  50.0)
-      | "orderbook" -> (20.0,  75.0)
-      | "strategy"  -> (100.0, 250.0)
-      | "execution" -> (300.0, 750.0)
-      | "cycle"     -> (150.0, 400.0)
-      | _           -> (250.0, 500.0)
+      | "ticker"    -> (5.0,   15.0)
+      | "orderbook" -> (10.0,  30.0)
+      | "strategy"  -> (30.0,  75.0)
+      | "execution" -> (50.0,  150.0)
+      | "cycle"     -> (50.0,  100.0)
+      | _           -> (50.0,  100.0)
     in
     let severity label f samples =
       if samples = 0 then 3  (* dim *)
