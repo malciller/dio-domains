@@ -491,8 +491,10 @@ let create_order asset_symbol side qty price post_only exchange =
   create_place_order asset_symbol side qty price post_only Grid exchange
 
 (** Pushes an order to the ringbuffer. Returns true on success, false on duplicate or full buffer.
-    [now] is a pre-computed Unix.time() timestamp to avoid redundant syscalls. *)
-let push_order ~now order =
+    [now] is a pre-computed Unix.time() timestamp to avoid redundant syscalls.
+    [?state] allows callers that already hold the strategy state to pass it
+    directly, avoiding a redundant [get_strategy_state] mutex acquisition. *)
+let push_order ~now ?state order =
   let operation_str = match order.operation with
     | Place -> "place"
     | Amend -> "amend"
@@ -502,7 +504,7 @@ let push_order ~now order =
   (* For Cancel operations, set inflight_cancel_buy when cancelling a buy *)
   (match order.operation with
    | Cancel ->
-       let state = get_strategy_state order.symbol in
+       let state = match state with Some s -> s | None -> get_strategy_state order.symbol in
        (match order.order_id with
         | Some target_order_id ->
             Mutex.lock order_buffer_mutex;
@@ -560,7 +562,7 @@ let push_order ~now order =
              (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
 
            (* Update strategy state. *)
-           let state = get_strategy_state order.symbol in
+           let state = match state with Some s -> s | None -> get_strategy_state order.symbol in
            state.last_order_time <- now;
 
             (* Set inflight flags for Place operations. *)
@@ -1015,7 +1017,7 @@ let execute_strategy
         (* Cancel all buy orders. *)
         List.iter (fun (order_id, _) ->
           let cancel_order = create_cancel_order order_id asset.symbol Grid asset.exchange in
-          ignore (push_order ~now cancel_order);
+          ignore (push_order ~now ~state cancel_order);
           Logging.info_f ~section "Cancelling excess buy order: %s for %s" order_id asset.symbol
         ) !buy_orders;
 
@@ -1090,7 +1092,7 @@ let execute_strategy
                   asset.symbol (state.accumulated_profit +. required_profit) required_profit state.reserved_base
               end else if balance_ok then begin
                 let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-                if push_order ~now sell_order then begin
+                if push_order ~now ~state sell_order then begin
                    (* Commit accumulation state after push_order succeeds.
                       Persistence is deferred: set dirty flag for the caller
                       (domain_spawner) to flush outside the hotloop. *)
@@ -1134,7 +1136,7 @@ let execute_strategy
              in
              if balance_ok then begin
                let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
-               if push_order ~now order then begin
+               if push_order ~now ~state order then begin
                  state.last_buy_order_price <- Some buy_price;
                  Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
                    asset.symbol qty buy_price;
@@ -1175,7 +1177,7 @@ let execute_strategy
                   Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
                   (* Attempt without a reservation; exchange is the final gatekeeper. *)
                   let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
-                  if push_order ~now order then
+                  if push_order ~now ~state order then
                     state.last_buy_order_price <- Some buy_price
                 end
              end
@@ -1242,7 +1244,7 @@ let execute_strategy
                     (match quote_balance with
                      | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                          let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
-                         ignore (push_order ~now order);
+                         ignore (push_order ~now ~state order);
                          state.last_buy_order_price <- Some target_buy_price;
                          let target_distance = sell_price -. target_buy_price in
                          Logging.debug_f ~section "Amended buy %s for %s (trailing upward): sell@%.4f, buy@%.4f -> %.4f (dist: %.4f -> %.4f, 2x: %.4f)"
@@ -1271,7 +1273,7 @@ let execute_strategy
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true Grid asset.exchange in
-                       ignore (push_order ~now order);
+                       ignore (push_order ~now ~state order);
                        state.last_buy_order_price <- Some exact_target;
                        Logging.debug_f ~section "Amended buy %s for %s (enforcing 2x): sell@%.4f, buy@%.4f -> %.4f (dist: %.4f <= 2x: %.4f)"
                          buy_order_id asset.symbol sell_price current_buy_price exact_target distance double_grid_interval
@@ -1306,7 +1308,7 @@ let execute_strategy
                   (match quote_balance with
                    | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
-                       ignore (push_order ~now order);
+                       ignore (push_order ~now ~state order);
                        state.last_buy_order_price <- Some target_buy_price;
                        Logging.debug_f ~section "Trailing buy %s for %s: %.4f -> %.4f (no sell anchors)"
                          buy_order_id asset.symbol current_buy_price target_buy_price
@@ -1882,7 +1884,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     if is_order_gone then begin
       (* Send explicit cancel in case the order is wedged in the exchange's cache. *)
       let cancel_order = create_cancel_order order_id asset_symbol Grid state.exchange_id in
-      ignore (push_order ~now:(Unix.time ()) cancel_order);
+      ignore (push_order ~now:(Unix.time ()) ~state cancel_order);
 
       (* Mark cancel in flight so the sync block does not reinstall this order. *)
       if side = Buy then

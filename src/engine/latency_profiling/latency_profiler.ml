@@ -56,21 +56,21 @@ let[@inline] record t span =
 
 (** [percentile t p] computes the p-th percentile (0.0 to 1.0) from the
     histogram by performing a cumulative scan over buckets. Returns the
-    bucket boundary in microseconds. Returns 0.0 when no samples exist. *)
+    bucket boundary in microseconds. Returns 0.0 when no samples exist.
+    Uses early exit to avoid scanning the full bucket array once the
+    target cumulative count is reached — critical for large histograms
+    (e.g. the cycle profiler with 100,000 buckets). *)
 let percentile t p =
   if t.samples = 0 then 0.0
   else
     let target = int_of_float (ceil (float t.samples *. p)) in
     let cumulative = ref 0 in
-    let result = ref 0 in
-
-    for i = 0 to t.bucket_count - 1 do
-      cumulative := !cumulative + t.buckets.(i);
-      if !cumulative >= target && !result = 0 then
-        result := i
+    let i = ref 0 in
+    while !i < t.bucket_count && !cumulative < target do
+      cumulative := !cumulative + t.buckets.(!i);
+      if !cumulative < target then incr i
     done;
-
-    float (!result * t.bucket_us)
+    float (!i * t.bucket_us)
 
 (** [reset t] zeroes all histogram buckets and resets sample/overflow counters. *)
 let reset t =
