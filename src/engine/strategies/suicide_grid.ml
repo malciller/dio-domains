@@ -1000,7 +1000,12 @@ let execute_strategy
          | Some asset_bal when not state.inflight_sell ->
              let (sell_qty, is_accumulation_sell) =
                if ecfg.use_accumulation_sells then begin
-                 let rounded_sell = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
+                 let rounded_sell =
+                   if asset.exchange = "ibkr" then
+                     max 0.0 (qty -. 1.0)
+                   else
+                     round_qty (qty *. sell_mult) asset.symbol asset.exchange
+                 in
                  let rounding_diff = qty -. rounded_sell in
                  let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
                  if required_profit > 0.0 && state.accumulated_profit >= required_profit then
