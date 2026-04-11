@@ -503,7 +503,17 @@ let fetch_decimals symbols =
             let pd = to_int (member "pair_decimals" pair_json) in
             let ld = to_int (member "lot_decimals" pair_json) in
             List.iter (fun sym ->
-              if altname = Some sym || wsname = Some sym then
+              let norm = sym in
+              let no_slash = String.concat "" (String.split_on_char '/' sym) in
+              let is_ws_match = match wsname with
+                | Some n -> n = norm || (n = "XBT/USD" && norm = "BTC/USD") || (n = "XETH/USD" && norm = "ETH/USD") || (n = "XXBTZUSD" && norm = "BTC/USD")
+                | None -> false
+              in
+              let is_alt_match = match altname with
+                | Some n -> n = no_slash || (n = "XBTUSD" && no_slash = "BTCUSD") || (n = "XETHUSD" && no_slash = "ETHUSD") || (n = "XXBTZUSD" && no_slash = "BTCUSD")
+                | None -> false
+              in
+              if is_ws_match || is_alt_match then
                 Hashtbl.add decimals_tbl sym (pd, ld)
             ) symbols
           ) pairs;
@@ -893,7 +903,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
              on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
              Lwt.return_unit)
   in
-  let final_done_p =
+let final_done_p =
     done_p >>= fun () ->
     (* Only handle EOF case if stream completes without error *)
     Logging.warn ~section "Orderbook WebSocket connection closed unexpectedly (End_of_file)";
@@ -901,6 +911,31 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     Lwt.return_unit
   in
   final_done_p
+
+let active_conn = ref None
+
+let subscribe_symbols symbols =
+  fetch_decimals symbols >>= fun () ->
+  List.iter (fun symbol ->
+    let _ = ensure_store symbol in
+    ()
+  ) symbols;
+  match !active_conn with
+  | Some conn ->
+      let subscribe_msg = `Assoc [
+        ("method", `String "subscribe");
+        ("params", `Assoc [
+          ("channel", `String "book");
+          ("symbol", `List (List.map (fun s -> `String s) symbols));
+          ("depth", `Int orderbook_depth)
+        ])
+      ] in
+      let msg_str = Yojson.Safe.to_string subscribe_msg in
+      Logging.debug_f ~section "Sending dynamic orderbook subscription for %d symbols" (List.length symbols);
+      Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
+  | None ->
+      Logging.warn_f ~section "Cannot dynamically subscribe symbols, orderbook WS not connected";
+      Lwt.return_unit
 
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
@@ -916,6 +951,7 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let ctx = get_conduit_ctx () in
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
+    active_conn := Some conn;
     Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
 
     on_connected ();

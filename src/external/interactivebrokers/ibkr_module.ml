@@ -239,6 +239,13 @@ module Ibkr_impl = struct
 
 
 
+  let subscribe_orderbook ~symbols =
+    let conn = get_conn () in
+    Lwt_list.iter_s (fun symbol ->
+      Ibkr_contracts.resolve conn ~symbol >>= fun contract ->
+      Ibkr_orderbook_feed.subscribe conn ~contract
+    ) symbols
+
   let get_top_of_book ~symbol =
     match Ibkr_orderbook_feed.store_opt symbol with
     | Some store ->

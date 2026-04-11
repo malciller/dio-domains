@@ -201,6 +201,12 @@ module type S = sig
   (** Return all open orders for [symbol]. *)
   val get_open_orders : symbol:string -> Types.open_order list
 
+  (* ---- Dynamic Subscription ---- *)
+
+  (** Dynamically subscribe additional symbols to the real-time orderbook feed.
+      Used to pipe top-of-book data into the central feed for non-active balance assets. *)
+  val subscribe_orderbook : symbols:string list -> unit Lwt.t
+
   (* ---- Ring buffer event feed consumption ---- *)
 
   (** Return the current write position of the orderbook ring buffer for

@@ -149,11 +149,9 @@ let send_json_on state json label =
 let send_public_json = send_json_on public_state
 let send_private_json = send_json_on private_state
 
-(** Subscribe to feeds routed properly between public and private dual connections. *)
-let subscribe_to_feeds ~symbols ~account_index ~auth_token =
-  (* Subscribe to ticker and orderbook for each symbol on the public connection *)
+let subscribe_public_orderbook ~symbols =
   let public_stream = Lwt_stream.of_list symbols in
-  let%lwt () = Concurrency.Lwt_util.consume_stream_s (fun symbol ->
+  Concurrency.Lwt_util.consume_stream_s (fun symbol ->
     match Lighter_instruments_feed.get_market_index ~symbol with
     | Some market_index ->
         let mi_str = string_of_int market_index in
@@ -166,7 +164,13 @@ let subscribe_to_feeds ~symbols ~account_index ~auth_token =
     | None ->
         Logging.error_f ~section "Cannot subscribe: no market_index for symbol %s" symbol;
         Lwt.return_unit
-  ) public_stream in
+  ) public_stream
+
+
+(** Subscribe to feeds routed properly between public and private dual connections. *)
+let subscribe_to_feeds ~symbols ~account_index ~auth_token =
+  (* Subscribe to ticker and orderbook for each symbol on the public connection *)
+  let%lwt () = subscribe_public_orderbook ~symbols in
 
   (* Subscribe to authenticated account channels on the private connection *)
   let acct_str = string_of_int account_index in
