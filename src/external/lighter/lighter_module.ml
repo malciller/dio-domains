@@ -416,7 +416,7 @@ let fetch_open_orders () =
         Lwt.return_unit
       end else begin
         let json = Yojson.Safe.from_string trimmed in
-        Lighter_executions_feed.process_account_orders_update json;
+        Lighter_executions_feed.handle_snapshot json;
         Lighter_executions_feed.set_startup_snapshot_done ();
         Logging.debug_f ~section "Fetched and injected open orders";
         Lwt.return_unit

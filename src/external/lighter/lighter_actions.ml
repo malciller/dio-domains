@@ -66,11 +66,14 @@ let send_tx ~tx_type ~tx_info =
         if find_sub lower "invalid nonce" 0 then begin
           Logging.warn_f ~section "Nonce desync detected — re-fetching correct nonce from exchange";
           let base_url = Lighter_proxy.api_base_url () in
-          Lwt.async (fun () ->
-            Lighter_signer.initialize_nonce
-              ~base_url
-              ~api_key_index:(Lighter_signer.get_api_key_index ())
-              ~account_index:(Lighter_signer.get_account_index ()))
+          Lwt.dont_wait
+            (fun () ->
+               Lighter_signer.initialize_nonce
+                 ~base_url
+                 ~api_key_index:(Lighter_signer.get_api_key_index ())
+                 ~account_index:(Lighter_signer.get_account_index ()))
+            (fun exn ->
+               Logging.error_f ~section "Failed to initialize nonce: %s" (Printexc.to_string exn))
         end
       end;
       Lwt.return (Error resp_str)

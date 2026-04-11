@@ -355,7 +355,7 @@ let () =
        }
    | None -> ());
 
-  (* Periodic memory reporter using an Lwt timer (600s interval).
+  (* Periodic memory reporter using an Lwt timer (60s interval).
      Replaces the prior Gc.create_alarm approach which had two issues:
      1. GC alarm callbacks run in GC signal context; calling Mutex.lock from
         within is unsafe on OCaml 5.x if the alarmed domain already holds
@@ -368,7 +368,7 @@ let () =
   let _memory_reporter =
     Lwt.async (fun () ->
       let rec loop () =
-        Lwt_unix.sleep 600.0 >>= fun () ->
+        Lwt_unix.sleep 60.0 >>= fun () ->
         if Atomic.get shutdown_requested then Lwt.return_unit
         else begin
           let now = Unix.gettimeofday () in

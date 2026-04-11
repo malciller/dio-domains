@@ -4,12 +4,12 @@
   "cycle_mod": 10000,
   "fng_check_threshold": 1.5,
   "gc": {
-    "minor_heap_size": 33554432,
-    "space_overhead": 120,
-    "max_overhead": 500,
-    "window_size": 10,
-    "allocation_policy": 2,
-    "major_heap_increment": 100
+    "minor_heap_size": 262144,
+    "space_overhead": 40,
+    "max_overhead": 50,
+    "window_size": 5,
+    "allocation_policy": 1,
+    "major_heap_increment": 524288
   },
   "trading": [
     {

@@ -28,25 +28,8 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Returns the store for [symbol], creating one if absent.
-    Uses double-checked locking via [initialization_mutex] for thread safety. *)
-let ensure_store symbol =
-  match Hashtbl.find_opt stores symbol with
-  | Some store -> store
-  | None ->
-      Mutex.lock initialization_mutex;
-      let store = match Hashtbl.find_opt stores symbol with
-        | Some store -> store
-        | None ->
-            let store = {
-              buffer = RingBuffer.create 100;
-              ready = Atomic.make false;
-            } in
-            Hashtbl.add stores symbol store;
-            store
-      in
-      Mutex.unlock initialization_mutex;
-      store
+let get_store symbol =
+  Hashtbl.find_opt stores symbol
 
 let notify_ready store =
   if not (Atomic.get store.ready) then begin
@@ -116,26 +99,28 @@ let process_ticker_update ~market_index json =
       let ask_price = Lighter_types.parse_json_float (member "price" ask_obj) in
       let ask_size = Lighter_types.parse_json_float (member "size" ask_obj) in
 
-      let store = ensure_store symbol in
-      let changed = match RingBuffer.read_latest store.buffer with
-        | Some t -> t.bid <> bid_price || t.ask <> ask_price || t.bid_size <> bid_size || t.ask_size <> ask_size
-        | None -> true
-      in
-      if changed then begin
-        let ticker = {
-          symbol;
-          bid = bid_price;
-          bid_size;
-          ask = ask_price;
-          ask_size;
-          timestamp = Unix.gettimeofday ();
-        } in
-        RingBuffer.write store.buffer ticker;
-        notify_ready store;
-        Concurrency.Exchange_wakeup.signal ~symbol;
-        Logging.debug_f ~section "Ticker: %s bid=%.2f(%s) ask=%.2f(%s)"
-          symbol bid_price (string_of_float bid_size) ask_price (string_of_float ask_size)
-      end
+      match get_store symbol with
+      | None -> ()
+      | Some store ->
+          let changed = match RingBuffer.read_latest store.buffer with
+            | Some t -> t.bid <> bid_price || t.ask <> ask_price || t.bid_size <> bid_size || t.ask_size <> ask_size
+            | None -> true
+          in
+          if changed then begin
+            let ticker = {
+              symbol;
+              bid = bid_price;
+              bid_size;
+              ask = ask_price;
+              ask_size;
+              timestamp = Unix.gettimeofday ();
+            } in
+            RingBuffer.write store.buffer ticker;
+            notify_ready store;
+            Concurrency.Exchange_wakeup.signal ~symbol;
+            Logging.debug_f ~section "Ticker: %s bid=%.2f(%s) ask=%.2f(%s)"
+              symbol bid_price (string_of_float bid_size) ask_price (string_of_float ask_size)
+          end
     end
   with exn ->
     Logging.warn_f ~section "Failed to parse ticker update for market %d: %s (json=%s)"
@@ -146,6 +131,14 @@ let process_ticker_update ~market_index json =
 let initialize symbols =
   Logging.info_f ~section "Initializing Lighter ticker feed for %d symbols" (List.length symbols);
   List.iter (fun symbol ->
-    let _ = ensure_store symbol in
+    Mutex.lock initialization_mutex;
+    if not (Hashtbl.mem stores symbol) then begin
+      let store = {
+        buffer = RingBuffer.create 100;
+        ready = Atomic.make false;
+      } in
+      Hashtbl.add stores symbol store;
+    end;
+    Mutex.unlock initialization_mutex;
     Logging.debug_f ~section "Created Lighter ticker buffer for %s" symbol
   ) symbols

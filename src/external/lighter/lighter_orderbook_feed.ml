@@ -40,28 +40,8 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Returns the store for [symbol], creating one if absent. Uses double-checked
-    locking via [initialization_mutex] for thread safety. *)
-let ensure_store symbol =
-  match Hashtbl.find_opt stores symbol with
-  | Some store -> store
-  | None ->
-      Mutex.lock initialization_mutex;
-      let store = match Hashtbl.find_opt stores symbol with
-        | Some store -> store
-        | None ->
-            let store = {
-              buffer = RingBuffer.create ring_buffer_size;
-              ready = Atomic.make false;
-              local_bids = [];
-              local_asks = [];
-              ob_mutex = Mutex.create ();
-            } in
-            Hashtbl.add stores symbol store;
-            store
-      in
-      Mutex.unlock initialization_mutex;
-      store
+let get_store symbol =
+  Hashtbl.find_opt stores symbol
 
 let notify_ready store =
   if not (Atomic.get store.ready) then begin
@@ -178,15 +158,18 @@ let process_orderbook_snapshot ~market_index json =
       let bids = parse_levels bids_json in
       let asks = parse_levels asks_json in
 
-      let store = ensure_store symbol in
-      Mutex.lock store.ob_mutex;
-      store.local_bids <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare b a) bids);
-      store.local_asks <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare a b) asks);
-      flush_to_ring store symbol;
-      Mutex.unlock store.ob_mutex;
+      match get_store symbol with
+      | None ->
+          Logging.warn_f ~section "Orderbook snapshot for uninitialized symbol: %s" symbol
+      | Some store ->
+          Mutex.lock store.ob_mutex;
+          store.local_bids <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare b a) bids);
+          store.local_asks <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare a b) asks);
+          flush_to_ring store symbol;
+          Mutex.unlock store.ob_mutex;
 
-      Logging.debug_f ~section "Orderbook snapshot for %s: bids=%d asks=%d"
-        symbol (List.length bids) (List.length asks)
+          Logging.debug_f ~section "Orderbook snapshot for %s: bids=%d asks=%d"
+            symbol (List.length bids) (List.length asks)
     end
   with exn ->
     Logging.warn_f ~section "Failed to parse orderbook snapshot for market %d: %s"
@@ -206,28 +189,42 @@ let process_orderbook_update ~market_index json =
       let bids_json = get_list_field ob_data "b" "bids" in
       let asks_json = get_list_field ob_data "a" "asks" in
 
-      let store = ensure_store symbol in
-      Mutex.lock store.ob_mutex;
+      match get_store symbol with
+      | None -> ()
+      | Some store ->
+          Mutex.lock store.ob_mutex;
 
-      List.iter (fun level ->
-        let price = Lighter_types.parse_json_float (member "price" level) in
-        let size = Lighter_types.parse_json_float (member "size" level) in
-        store.local_bids <- apply_delta store.local_bids price size ~is_bid:true
-      ) bids_json;
-      store.local_bids <- truncate_to_depth store.local_bids;
+          let b_len = ref (List.length store.local_bids) in
+          List.iter (fun level ->
+            let price = Lighter_types.parse_json_float (member "price" level) in
+            let size = Lighter_types.parse_json_float (member "size" level) in
+            store.local_bids <- apply_delta store.local_bids price size ~is_bid:true;
+            incr b_len;
+            if !b_len >= max_depth * 2 then begin
+              store.local_bids <- truncate_to_depth store.local_bids;
+              b_len := max_depth
+            end
+          ) bids_json;
+          store.local_bids <- truncate_to_depth store.local_bids;
 
-      List.iter (fun level ->
-        let price = Lighter_types.parse_json_float (member "price" level) in
-        let size = Lighter_types.parse_json_float (member "size" level) in
-        store.local_asks <- apply_delta store.local_asks price size ~is_bid:false
-      ) asks_json;
-      store.local_asks <- truncate_to_depth store.local_asks;
+          let a_len = ref (List.length store.local_asks) in
+          List.iter (fun level ->
+            let price = Lighter_types.parse_json_float (member "price" level) in
+            let size = Lighter_types.parse_json_float (member "size" level) in
+            store.local_asks <- apply_delta store.local_asks price size ~is_bid:false;
+            incr a_len;
+            if !a_len >= max_depth * 2 then begin
+              store.local_asks <- truncate_to_depth store.local_asks;
+              a_len := max_depth
+            end
+          ) asks_json;
+          store.local_asks <- truncate_to_depth store.local_asks;
 
-      flush_to_ring store symbol;
-      Mutex.unlock store.ob_mutex;
+          flush_to_ring store symbol;
+          Mutex.unlock store.ob_mutex;
 
-      Logging.debug_f ~section "Orderbook delta for %s: %d bid updates, %d ask updates"
-        symbol (List.length bids_json) (List.length asks_json)
+          Logging.debug_f ~section "Orderbook delta for %s: %d bid updates, %d ask updates"
+            symbol (List.length bids_json) (List.length asks_json)
     end
   with exn ->
     Logging.warn_f ~section "Failed to parse orderbook update for market %d: %s"
@@ -270,9 +267,26 @@ let has_orderbook_data symbol =
   | Some store -> Atomic.get store.ready
   | None -> false
 
+let wait_for_orderbook_data symbols timeout_seconds =
+  Concurrency.Lwt_util.poll_until
+    ~timeout:timeout_seconds
+    ~wait_signal:(fun () -> Lwt_condition.wait ready_condition)
+    ~check:(fun () -> List.for_all has_orderbook_data symbols)
+
 let initialize symbols =
   Logging.info_f ~section "Initializing Lighter orderbook feed for %d symbols" (List.length symbols);
   List.iter (fun symbol ->
-    let _ = ensure_store symbol in
+    Mutex.lock initialization_mutex;
+    if not (Hashtbl.mem stores symbol) then begin
+      let store = {
+        buffer = RingBuffer.create ring_buffer_size;
+        ready = Atomic.make false;
+        local_bids = [];
+        local_asks = [];
+        ob_mutex = Mutex.create ();
+      } in
+      Hashtbl.add stores symbol store;
+    end;
+    Mutex.unlock initialization_mutex;
     Logging.debug_f ~section "Created Lighter orderbook buffer for %s" symbol
   ) symbols

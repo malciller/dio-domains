@@ -4,7 +4,7 @@
     buffers, open order state, and event deduplication. Thread-safe access is
     enforced through per-resource mutexes and atomic flags. *)
 
-open Lwt.Infix
+
 
 let section = "lighter_executions_feed"
 
@@ -95,12 +95,13 @@ let set_startup_snapshot_done () =
     (* Mark all initialized per-symbol stores as ready so has_execution_data
        returns true even for symbols with zero open orders. *)
     Mutex.lock initialization_mutex;
-    Hashtbl.iter (fun _symbol store ->
-      if not (Atomic.get store.ready) then
-        Atomic.set store.ready true
-    ) stores;
-    mark_startup_complete ();
-    Mutex.unlock initialization_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+      Hashtbl.iter (fun _symbol store ->
+        if not (Atomic.get store.ready) then
+          Atomic.set store.ready true
+      ) stores;
+      mark_startup_complete ()
+    );
     Logging.info ~section "Lighter open-order snapshot injected — domains may now activate";
     Concurrency.Exchange_wakeup.signal_all ()
   end
@@ -113,7 +114,7 @@ let add_to_order_to_symbol order_id symbol =
     Queue.push order_id order_to_symbol_queue;
   Hashtbl.replace order_to_symbol order_id symbol;
   (* Enforce capacity bound only after the startup snapshot has been consumed. *)
-  if Atomic.get order_to_symbol_startup_done then
+  if Atomic.get order_to_symbol_startup_done then begin
     while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
       if Queue.is_empty order_to_symbol_queue then
         (* Queue/table size diverged; accept current table size as the new cap. *)
@@ -122,7 +123,15 @@ let add_to_order_to_symbol order_id symbol =
         let oldest = Queue.pop order_to_symbol_queue in
         Hashtbl.remove order_to_symbol oldest
       end
+    done;
+    (* Add hardcap to Queue because Hashtbl.length may stay small due to proactive removals *)
+    while Queue.length order_to_symbol_queue > !order_to_symbol_cap * 2 do
+      if not (Queue.is_empty order_to_symbol_queue) then begin
+        let oldest = Queue.pop order_to_symbol_queue in
+        Hashtbl.remove order_to_symbol oldest
+      end
     done
+  end
 
 (** Retrieve or lazily create a per-symbol store. Uses double-checked
     locking under initialization_mutex for thread-safe initialization. *)
@@ -131,7 +140,8 @@ let get_symbol_store symbol =
   | Some store -> store
   | None ->
       Mutex.lock initialization_mutex;
-      let store = match Hashtbl.find_opt stores symbol with
+      Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+        match Hashtbl.find_opt stores symbol with
         | Some store -> store
         | None ->
             let store = {
@@ -142,68 +152,67 @@ let get_symbol_store symbol =
             } in
             Hashtbl.add stores symbol store;
             store
-      in
-      Mutex.unlock initialization_mutex;
-      store
+      )
 
 let notify_ready store =
-  if not (Atomic.get store.ready) then begin
-    Atomic.set store.ready true;
-    (try Lwt_condition.broadcast ready_condition () with _ -> ())
-  end
+  if not (Atomic.get store.ready) then Atomic.set store.ready true;
+  (try Lwt_condition.broadcast ready_condition () with _ -> ())
 
 (** Core internal handler for order state transitions. *)
 let update_orders_internal store (event : execution_event) =
   let now = Unix.gettimeofday () in
   Mutex.lock store.orders_mutex;
 
-  let existing_opt = Hashtbl.find_opt store.open_orders event.order_id in
-  let resolved_cl_ord_id =
-    match event.cl_ord_id with
-    | Some _ as c -> c
-    | None ->
-        (match existing_opt with
-         | Some o -> o.cl_ord_id
-         | None -> None)
-  in
-
-  let is_terminal = match event.order_status with
-    | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
-    | _ -> false
-  in
-
-  if is_terminal then begin
-    Hashtbl.remove store.open_orders event.order_id;
-    Mutex.lock initialization_mutex;
-    Hashtbl.remove order_to_symbol event.order_id;
-    Mutex.unlock initialization_mutex;
-  end else begin
-    (* Preserve existing order_expiry if present; event updates don't carry expiry. *)
-    let preserved_expiry = match existing_opt with
-      | Some o -> o.order_expiry
-      | None -> None
+  Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+    let existing_opt = Hashtbl.find_opt store.open_orders event.order_id in
+    let resolved_cl_ord_id =
+      match event.cl_ord_id with
+      | Some _ as c -> c
+      | None ->
+          (match existing_opt with
+           | Some o -> o.cl_ord_id
+           | None -> None)
     in
-    let order : open_order = {
-      order_id = event.order_id;
-      symbol = event.symbol;
-      side = event.side;
-      order_qty = event.order_qty;
-      cum_qty = event.cum_qty;
-      remaining_qty = event.order_qty -. event.cum_qty;
-      limit_price = event.limit_price;
-      avg_price = event.avg_price;
-      order_status = event.order_status;
-      order_userref = None;
-      cl_ord_id = resolved_cl_ord_id;
-      last_updated = now;
-      order_expiry = preserved_expiry;
-    } in
-    Hashtbl.replace store.open_orders event.order_id order;
-    Mutex.lock initialization_mutex;
-    add_to_order_to_symbol event.order_id event.symbol;
-    Mutex.unlock initialization_mutex;
-  end;
-  Mutex.unlock store.orders_mutex;
+
+    let is_terminal = match event.order_status with
+      | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
+      | _ -> false
+    in
+
+    if is_terminal then begin
+      Hashtbl.remove store.open_orders event.order_id;
+      Mutex.lock initialization_mutex;
+      Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+        Hashtbl.remove order_to_symbol event.order_id
+      )
+    end else begin
+      (* Preserve existing order_expiry if present; event updates don't carry expiry. *)
+      let preserved_expiry = match existing_opt with
+        | Some o -> o.order_expiry
+        | None -> None
+      in
+      let order : open_order = {
+        order_id = event.order_id;
+        symbol = event.symbol;
+        side = event.side;
+        order_qty = event.order_qty;
+        cum_qty = event.cum_qty;
+        remaining_qty = event.order_qty -. event.cum_qty;
+        limit_price = event.limit_price;
+        avg_price = event.avg_price;
+        order_status = event.order_status;
+        order_userref = None;
+        cl_ord_id = resolved_cl_ord_id;
+        last_updated = now;
+        order_expiry = preserved_expiry;
+      } in
+      Hashtbl.replace store.open_orders event.order_id order;
+      Mutex.lock initialization_mutex;
+      Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+        add_to_order_to_symbol event.order_id event.symbol
+      )
+    end
+  );
 
   RingBuffer.write store.events_buffer event;
   notify_ready store;
@@ -214,23 +223,23 @@ let update_orders_internal store (event : execution_event) =
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
-  let order = Hashtbl.find_opt store.open_orders order_id in
-  Mutex.unlock store.orders_mutex;
-  order
+  Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+    Hashtbl.find_opt store.open_orders order_id
+  )
 
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
-  let orders = Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [] in
-  Mutex.unlock store.orders_mutex;
-  orders
+  Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+    Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders []
+  )
 
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
-  let result = Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init in
-  Mutex.unlock store.orders_mutex;
-  result
+  Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+    Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init
+  )
 
 let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
@@ -251,36 +260,40 @@ let[@inline always] has_execution_data symbol =
 (** Find an order across all symbol stores using the global index. *)
 let find_order_everywhere order_id =
   Mutex.lock initialization_mutex;
-  let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
-  Mutex.unlock initialization_mutex;
+  let symbol_opt = Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+    Hashtbl.find_opt order_to_symbol order_id
+  ) in
   match symbol_opt with
   | Some symbol ->
       let store = get_symbol_store symbol in
       Mutex.lock store.orders_mutex;
-      let order = Hashtbl.find_opt store.open_orders order_id in
-      Mutex.unlock store.orders_mutex;
-      order
+      Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+        Hashtbl.find_opt store.open_orders order_id
+      )
   | None -> None
 
 (** Clear all open orders across all symbol stores. Called on reconnection. *)
 let clear_all_open_orders () =
   Mutex.lock initialization_mutex;
-  let all_symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
-  Mutex.unlock initialization_mutex;
+  let all_symbols = Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+    Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores []
+  ) in
   let total_removed = ref 0 in
   List.iter (fun symbol ->
     let store = get_symbol_store symbol in
     Mutex.lock store.orders_mutex;
-    let count = Hashtbl.length store.open_orders in
-    total_removed := !total_removed + count;
-    Hashtbl.clear store.open_orders;
-    Atomic.set store.ready false;
-    Mutex.unlock store.orders_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+      let count = Hashtbl.length store.open_orders in
+      total_removed := !total_removed + count;
+      Hashtbl.clear store.open_orders;
+      Atomic.set store.ready false
+    )
   ) all_symbols;
   Mutex.lock initialization_mutex;
-  Hashtbl.clear order_to_symbol;
-  Queue.clear order_to_symbol_queue;
-  Mutex.unlock initialization_mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+    Hashtbl.clear order_to_symbol;
+    Queue.clear order_to_symbol_queue
+  );
   Atomic.set _startup_snapshot_done false;
   if !total_removed > 0 then
     Logging.debug_f ~section "Cleared %d stale open orders on reconnection" !total_removed
@@ -542,6 +555,81 @@ let process_account_orders_update json =
      waiting in has_execution_data. *)
   set_startup_snapshot_done ()
 
+(** Processes an execution snapshot: ingests events and reconciles stale open orders. *)
+let handle_snapshot json =
+  Logging.debug_f ~section "Processing Lighter execution snapshot...";
+  process_account_orders_update json;
+
+  let open Yojson.Safe.Util in
+  let snapshot_order_ids = Hashtbl.create 32 in
+  (try
+    let orders_json =
+      let try_key key = let v = member key json in if v <> `Null then Some v else None in
+      match try_key "account_all_orders" with
+      | Some v -> v
+      | None -> match try_key "orders" with
+        | Some v -> v
+        | None -> match try_key "data" with Some v -> v | None -> `Null
+    in
+    let orders = match orders_json with
+      | `Assoc pairs -> List.concat_map (fun (_,v) -> match v with `Assoc _ -> [v] | `List items -> items | _ -> []) pairs
+      | `List items -> items
+      | _ -> []
+    in
+    List.iter (fun order_json ->
+      try
+        match order_json with
+        | `Assoc _ ->
+            let order_index = member "order_index" order_json in
+            let order_id = match order_index with
+              | `String s -> s
+              | `Int i -> string_of_int i
+              | _ -> Lighter_types.parse_json_int64 order_index |> Int64.to_string
+            in
+            Hashtbl.replace snapshot_order_ids order_id ()
+        | _ -> ()
+      with _ -> ()
+    ) orders
+  with exn -> Logging.warn_f ~section "Failed to extract IDs for reconcile: %s" (Printexc.to_string exn));
+
+  (* Reconcile: remove locally cached orders absent from the snapshot by emitting CanceledStatus events *)
+  let stale_orders = ref [] in
+  Mutex.lock initialization_mutex;
+  let all_symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
+  Mutex.unlock initialization_mutex;
+
+  List.iter (fun symbol ->
+    let store = get_symbol_store symbol in
+    Mutex.lock store.orders_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+      Hashtbl.iter (fun order_id (cached_order: open_order) ->
+        if not (Hashtbl.mem snapshot_order_ids order_id) then
+          stale_orders := (symbol, store, cached_order) :: !stale_orders
+      ) store.open_orders
+    )
+  ) all_symbols;
+
+  List.iter (fun (symbol, store, (cached_order: open_order)) ->
+    let event : execution_event = {
+      order_id = cached_order.order_id;
+      symbol;
+      order_status = CanceledStatus;
+      limit_price = cached_order.limit_price;
+      side = cached_order.side;
+      order_qty = cached_order.order_qty;
+      cum_qty = cached_order.cum_qty;
+      avg_price = cached_order.avg_price;
+      timestamp = Unix.gettimeofday ();
+      is_amended = false;
+      cl_ord_id = cached_order.cl_ord_id;
+    } in
+    update_orders_internal store event;
+    Logging.info_f ~section "Reconciled stale order: emitted CanceledStatus for %s [%s]" cached_order.order_id symbol
+  ) !stale_orders;
+
+  if !stale_orders <> [] then
+    Logging.info_f ~section "Reconciled open orders: removed %d stale orders not present in snapshot" (List.length !stale_orders)
+
 (** Periodic safety cleanup. Removes stale orders (>24h) and orphaned
     entries from the order_to_symbol eviction queue. *)
 let cleanup_stale_orders () =
@@ -554,17 +642,19 @@ let cleanup_stale_orders () =
     let store = get_symbol_store symbol in
     let stale = ref [] in
     Mutex.lock store.orders_mutex;
-    Hashtbl.iter (fun order_id (order : open_order) ->
-      if now -. order.last_updated > stale_threshold then
-        stale := order_id :: !stale
-    ) store.open_orders;
-    List.iter (fun oid ->
-      Hashtbl.remove store.open_orders oid;
-      Mutex.lock initialization_mutex;
-      Hashtbl.remove order_to_symbol oid;
-      Mutex.unlock initialization_mutex;
-    ) !stale;
-    Mutex.unlock store.orders_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+      Hashtbl.iter (fun order_id (order : open_order) ->
+        if now -. order.last_updated > stale_threshold then
+          stale := order_id :: !stale
+      ) store.open_orders;
+      List.iter (fun oid ->
+        Hashtbl.remove store.open_orders oid;
+        Mutex.lock initialization_mutex;
+        Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+          Hashtbl.remove order_to_symbol oid
+        )
+      ) !stale
+    );
     if !stale <> [] then
       Logging.info_f ~section "Cleaned %d stale orders for %s" (List.length !stale) symbol
   ) all_symbols;
@@ -576,67 +666,70 @@ let cleanup_stale_orders () =
      when the Hashtbl exceeds its cap. This rebuild pass retains only entries
      still present in the Hashtbl. Runs at most once per cleanup cycle. *)
   Mutex.lock initialization_mutex;
-  let original_queue_len = Queue.length order_to_symbol_queue in
-  if original_queue_len > 0 then begin
-    let temp = Queue.create () in
-    Queue.iter (fun order_id ->
-      if Hashtbl.mem order_to_symbol order_id then
-        Queue.push order_id temp
-    ) order_to_symbol_queue;
-    Queue.clear order_to_symbol_queue;
-    Queue.transfer temp order_to_symbol_queue;
-    let removed = original_queue_len - Queue.length order_to_symbol_queue in
-    if removed > 0 then
-      Logging.debug_f ~section
-        "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
-        removed original_queue_len (Queue.length order_to_symbol_queue)
-  end;
-  Mutex.unlock initialization_mutex
+  Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+    let original_queue_len = Queue.length order_to_symbol_queue in
+    if original_queue_len > 0 then begin
+      let temp = Queue.create () in
+      Queue.iter (fun order_id ->
+        if Hashtbl.mem order_to_symbol order_id then
+          Queue.push order_id temp
+      ) order_to_symbol_queue;
+      Queue.clear order_to_symbol_queue;
+      Queue.transfer temp order_to_symbol_queue;
+      let removed = original_queue_len - Queue.length order_to_symbol_queue in
+      if removed > 0 then
+        Logging.debug_f ~section
+          "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
+          removed original_queue_len (Queue.length order_to_symbol_queue)
+    end
+  )
 
-(** Event-driven cleanup signal channel. Fires on-demand (reconnect, manual
-    trigger) and falls back to a 120s safety timer. Implemented as an Lwt_mvar
-    used as a one-shot signal; request_cleanup is idempotent. *)
-let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
-
-(** Signal the cleanup loop to run immediately. Idempotent: skipped if a signal
-    is already pending. *)
 let request_cleanup () =
-  if Lwt_mvar.is_empty cleanup_mvar then
-    Lwt.async (fun () -> Lwt_mvar.put cleanup_mvar ())
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () ->
+        Logging.debug_f ~section "Running Lighter executions cleanup (requested)";
+        cleanup_stale_orders ();
+        Lwt.return_unit)
+      (fun exn ->
+        Logging.error_f ~section "Failed immediate cleanup task: %s" (Printexc.to_string exn);
+        Lwt.return_unit))
 
 let periodic_tasks_started = Atomic.make false
 
 let start_periodic_tasks () =
   if not (Atomic.exchange periodic_tasks_started true) then begin
-    let rec run () =
-      (* Block until an explicit cleanup signal or the 120s safety timeout. *)
-      Lwt.pick [
-        (Lwt_mvar.take cleanup_mvar >|= fun () -> `Signal);
-        (Lwt_unix.sleep 120.0 >|= fun () -> `Timeout);
-      ] >>= fun reason ->
-      Logging.debug_f ~section "Running Lighter executions cleanup (%s)"
-        (match reason with `Signal -> "requested" | `Timeout -> "120s fallback");
-      cleanup_stale_orders ();
-      Lwt.async run;
-      Lwt.return_unit
-    in
-    Lwt.async run
+    ignore (Concurrency.Lwt_util.run_periodic
+      ~interval:120.0
+      ~stop:(fun () -> false)
+      (fun () ->
+        Lwt.catch (fun () ->
+          Logging.debug_f ~section "Running Lighter executions cleanup (120s fallback)";
+          cleanup_stale_orders ();
+          Lwt.return_unit
+        ) (fun exn ->
+          Logging.error_f ~section "Lighter executions cleanup task crashed: %s" (Printexc.to_string exn);
+          Lwt.return_unit
+        )
+      ))
   end
 
 (** Return all open orders with expiry data across all symbol stores.
     Used by the TIF renewal process to find orders approaching expiry. *)
 let get_all_open_orders_with_expiry () =
   Mutex.lock initialization_mutex;
-  let all_symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
-  Mutex.unlock initialization_mutex;
+  let all_symbols = Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+    Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores []
+  ) in
   let result = ref [] in
   List.iter (fun symbol ->
     let store = get_symbol_store symbol in
     Mutex.lock store.orders_mutex;
-    Hashtbl.iter (fun _order_id (order : open_order) ->
-      result := order :: !result
-    ) store.open_orders;
-    Mutex.unlock store.orders_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+      Hashtbl.iter (fun _order_id (order : open_order) ->
+        result := order :: !result
+      ) store.open_orders
+    )
   ) all_symbols;
   !result
 

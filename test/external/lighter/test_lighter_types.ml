@@ -37,7 +37,7 @@ let test_status_of_lighter_int_expired () =
 let test_status_of_lighter_int_unknown () =
   match Lighter.Types.status_of_lighter_int 99 with
   | Types.Unknown s ->
-      Alcotest.(check bool) "contains 99" true (String.length s > 0)
+      Alcotest.(check string) "static variant" "lighter_unknown_status" s
   | _ -> Alcotest.fail "Expected Unknown"
 
 (* --- status_of_lighter_string --- *)
@@ -64,7 +64,7 @@ let test_status_of_lighter_string_expired () =
 
 let test_status_of_lighter_string_unknown () =
   match Lighter.Types.status_of_lighter_string "SomethingElse" with
-  | Types.Unknown s -> Alcotest.(check string) "passthrough" "SomethingElse" s
+  | Types.Unknown s -> Alcotest.(check string) "static variant" "lighter_unknown_status" s
   | _ -> Alcotest.fail "Expected Unknown"
 
 (* --- order type mapping --- *)

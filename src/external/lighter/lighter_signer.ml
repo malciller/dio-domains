@@ -62,28 +62,60 @@ open Foreign
 (** StrOrErr { str *char; err *char } — returned by CreateAuthToken *)
 type str_or_err
 let str_or_err : str_or_err structure typ = structure "StrOrErr"
-let str_or_err_str = field str_or_err "str" string_opt
-let str_or_err_err = field str_or_err "err" string_opt
+let str_or_err_str = field str_or_err "str" (ptr_opt char)
+let str_or_err_err = field str_or_err "err" (ptr_opt char)
 let () = seal str_or_err
 
 (** SignedTxResponse { txType uint8; txInfo *char; txHash *char; messageToSign *char; err *char } *)
 type signed_tx_response
 let signed_tx_response : signed_tx_response structure typ = structure "SignedTxResponse"
 let _stx_tx_type = field signed_tx_response "txType" uint8_t
-let stx_tx_info  = field signed_tx_response "txInfo" string_opt
-let _stx_tx_hash = field signed_tx_response "txHash" string_opt
-let _stx_message = field signed_tx_response "messageToSign" string_opt
-let stx_err      = field signed_tx_response "err" string_opt
+let stx_tx_info  = field signed_tx_response "txInfo" (ptr_opt char)
+let _stx_tx_hash = field signed_tx_response "txHash" (ptr_opt char)
+let _stx_message = field signed_tx_response "messageToSign" (ptr_opt char)
+let stx_err      = field signed_tx_response "err" (ptr_opt char)
 let () = seal signed_tx_response
 
-(** Helper: extract the txInfo string from a SignedTxResponse, or raise on error. *)
+(* --- Memory management for C strings --- *)
+let go_free_ffi = lazy (
+  foreign "Free" ~from:(get_lib ()) (ptr void @-> returning void)
+)
+
+let safe_free p_opt =
+  match p_opt with
+  | None -> ()
+  | Some p -> (Lazy.force go_free_ffi) (to_voidp p)
+
+let read_c_string_and_free p_opt =
+  match p_opt with
+  | None -> ""
+  | Some p ->
+      let rec loop i =
+        let c = !@(p +@ i) in
+        if c = '\000' then i
+        else loop (i + 1)
+      in
+      let len = loop 0 in
+      let bytes = Bytes.create len in
+      for i = 0 to len - 1 do
+        Bytes.set bytes i !@(p +@ i)
+      done;
+      let s = Bytes.to_string bytes in
+      safe_free p_opt;
+      s
+
+(** Helper: extract the txInfo string from a SignedTxResponse, freeing all fields. *)
 let extract_signed_tx (resp : signed_tx_response structure) : string =
-  match getf resp stx_err with
-  | Some err when err <> "" -> failwith (Printf.sprintf "Signer FFI error: %s" err)
-  | _ ->
-      match getf resp stx_tx_info with
-      | Some info -> info
-      | None -> ""
+  let err_ptr = getf resp stx_err in
+  let info_ptr = getf resp stx_tx_info in
+  let hash_ptr = getf resp _stx_tx_hash in
+  let msg_ptr = getf resp _stx_message in
+  let err_str = read_c_string_and_free err_ptr in
+  let info_str = read_c_string_and_free info_ptr in
+  safe_free hash_ptr;
+  safe_free msg_ptr;
+  if err_str <> "" then failwith (Printf.sprintf "Signer FFI error: %s" err_str)
+  else info_str
 
 (* Lighter mainnet chain ID.
    Python SDK: chain_id = 304 if ("mainnet" in url or "api" in url) else 300
@@ -95,10 +127,10 @@ let chain_id = ref 304
 let create_client =
   lazy (
     let ffi_fn = foreign "CreateClient" ~from:(get_lib ())
-      (string @-> string @-> int @-> int @-> int64_t @-> returning string_opt) in
+      (string @-> string @-> int @-> int @-> int64_t @-> returning (ptr_opt char)) in
     fun url private_key ~chain_id:cid ~api_key_index ~account_index ->
-      match ffi_fn url private_key cid api_key_index (Int64.of_int account_index) with
-      | Some s -> s | None -> ""
+      let err_ptr = ffi_fn url private_key cid api_key_index (Int64.of_int account_index) in
+      read_c_string_and_free err_ptr
   )
 
 (** CheckClient(apiKeyIndex, accountIndex) -> error *char
@@ -106,10 +138,10 @@ let create_client =
 let check_client =
   lazy (
     let ffi_fn = foreign "CheckClient" ~from:(get_lib ())
-      (int @-> int64_t @-> returning string_opt) in
+      (int @-> int64_t @-> returning (ptr_opt char)) in
     fun api_key_index account_index ->
-      match ffi_fn api_key_index (Int64.of_int account_index) with
-      | Some s -> s | None -> ""
+      let err_ptr = ffi_fn api_key_index (Int64.of_int account_index) in
+      read_c_string_and_free err_ptr
   )
 
 (** CreateAuthToken(deadline, apiKeyIndex, accountIndex) -> StrOrErr
@@ -120,12 +152,10 @@ let create_auth_token_ffi =
       (int64_t @-> int @-> int64_t @-> returning str_or_err) in
     fun deadline api_key_index account_index ->
       let resp = ffi_fn deadline api_key_index (Int64.of_int account_index) in
-      match getf resp str_or_err_err with
-      | Some err when err <> "" -> failwith (Printf.sprintf "CreateAuthToken error: %s" err)
-      | _ ->
-          match getf resp str_or_err_str with
-          | Some s -> s
-          | None -> ""
+      let err_str = read_c_string_and_free (getf resp str_or_err_err) in
+      let str_str = read_c_string_and_free (getf resp str_or_err_str) in
+      if err_str <> "" then failwith (Printf.sprintf "CreateAuthToken error: %s" err_str)
+      else str_str
   )
 
 (** SignCreateOrder — full Go signature with all 17 parameters.
