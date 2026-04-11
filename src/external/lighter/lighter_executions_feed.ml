@@ -274,12 +274,14 @@ let clear_all_open_orders () =
     let count = Hashtbl.length store.open_orders in
     total_removed := !total_removed + count;
     Hashtbl.clear store.open_orders;
+    Atomic.set store.ready false;
     Mutex.unlock store.orders_mutex;
   ) all_symbols;
   Mutex.lock initialization_mutex;
   Hashtbl.clear order_to_symbol;
   Queue.clear order_to_symbol_queue;
   Mutex.unlock initialization_mutex;
+  Atomic.set _startup_snapshot_done false;
   if !total_removed > 0 then
     Logging.debug_f ~section "Cleared %d stale open orders on reconnection" !total_removed
 

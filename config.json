@@ -5,9 +5,9 @@
   "fng_check_threshold": 1.5,
   "gc": {
     "minor_heap_size": 33554432,
-    "space_overhead": 2000,
-    "max_overhead": 8000,
-    "window_size": 1,
+    "space_overhead": 120,
+    "max_overhead": 500,
+    "window_size": 10,
     "allocation_policy": 2,
     "major_heap_increment": 100
   },
@@ -52,7 +52,7 @@
       "qty": "0.006",
       "grid_interval": [
         0.1,
-        1.5
+        1.0
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [

@@ -214,6 +214,7 @@ module Ibkr_impl = struct
       ?order_ids
       ?cl_ord_ids:_
       ?order_userrefs:_
+      ?symbol:_
       ?retry_config:_
       () =
     let conn = get_conn () in

@@ -197,6 +197,7 @@ module Kraken_impl = struct
       ?order_ids
       ?cl_ord_ids
       ?order_userrefs
+      ?symbol:_
       ?retry_config
       () =
     

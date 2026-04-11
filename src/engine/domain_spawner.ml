@@ -458,8 +458,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           end
         end;
 
-        (* Execute strategy if new events have been consumed (event-driven gate) *)
-        let should_execute = !exec_ready && !should_execute_strategy in
+        (* Execute strategy if new events have been consumed and feed is ready (event-driven gate) *)
+        let should_execute = !exec_ready && !should_execute_strategy && 
+                             Ex.has_execution_data ~symbol:asset_with_fees.symbol in
         if should_execute then begin
           should_execute_strategy := false;  (* Clear event-driven trigger *)
 
@@ -605,8 +606,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
         end;
 
-        (* Block until the next websocket frame signals new data *)
-        if not !should_execute_strategy then
+        (* Block until the next websocket frame signals new data or until data is ready *)
+        if not !should_execute_strategy || not (Ex.has_execution_data ~symbol:asset_with_fees.symbol) then
           Concurrency.Exchange_wakeup.wait ~symbol:asset_with_fees.symbol;
 
         ()

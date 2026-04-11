@@ -119,6 +119,27 @@ let test_execution_events_ring_buffer () =
   let first = List.hd events in
   Alcotest.(check string) "event order_id" "ring_1" first.order_id
 
+let test_clear_all_open_orders_resets_reconnect_state () =
+  Lighter.Executions_feed.initialize ["EXRESET"];
+  Lighter.Executions_feed.inject_order
+    ~symbol:"EXRESET" ~order_id:"reset_1" ~side:Lighter.Executions_feed.Buy
+    ~qty:1.0 ~price:100.0 ();
+  Lighter.Executions_feed.set_startup_snapshot_done ();
+
+  Alcotest.(check bool) "ready before clear" true
+    (Lighter.Executions_feed.has_execution_data "EXRESET");
+  Alcotest.(check bool) "snapshot done before clear" true
+    (Lighter.Executions_feed.is_startup_snapshot_done ());
+
+  Lighter.Executions_feed.clear_all_open_orders ();
+
+  Alcotest.(check bool) "order removed after clear" true
+    (Option.is_none (Lighter.Executions_feed.get_open_order "EXRESET" "reset_1"));
+  Alcotest.(check bool) "ready reset after clear" false
+    (Lighter.Executions_feed.has_execution_data "EXRESET");
+  Alcotest.(check bool) "startup snapshot reset after clear" false
+    (Lighter.Executions_feed.is_startup_snapshot_done ())
+
 let () =
   Alcotest.run "Lighter Executions Feed" [
     "orders", [
@@ -126,6 +147,7 @@ let () =
       Alcotest.test_case "get_open_orders" `Quick test_get_open_orders;
       Alcotest.test_case "find_order_everywhere" `Quick test_find_order_everywhere;
       Alcotest.test_case "terminal status removes order" `Quick test_terminal_status_removes_order;
+      Alcotest.test_case "clear resets reconnect state" `Quick test_clear_all_open_orders_resets_reconnect_state;
     ];
     "state", [
       Alcotest.test_case "startup_snapshot_done" `Quick test_startup_snapshot_done;

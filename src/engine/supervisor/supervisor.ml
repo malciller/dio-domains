@@ -697,8 +697,16 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           let auth_token = Lighter.Signer.get_auth_token () in
           Lwt.async (fun () ->
             Lighter.Instruments_feed.wait_until_ready () >>= fun () ->
-            Logging.info_f ~section "Lighter WS reconnected — resubscribing (order state preserved)";
-            Lighter.Ws.subscribe_to_feeds ~symbols:lighter_symbols ~account_index ~auth_token)
+            Logging.info_f ~section "Lighter WS reconnected — resubscribing and rebuilding open-order state";
+            Lighter.Ws.subscribe_to_feeds ~symbols:lighter_symbols ~account_index ~auth_token >>= fun () ->
+            (* Do not preserve Lighter order state across reconnects.
+               This venue is flapping frequently, and stale local orders plus
+               client_order_id/order_id remaps can accumulate across sessions.
+               Mirror the Hyperliquid strategy: clear first, then rebuild from
+               the exchange snapshot so retained ghost orders do not survive
+               repeated reconnects. *)
+            Lighter.Executions_feed.clear_all_open_orders ();
+            Lighter.Module.fetch_open_orders ())
         in
         Lighter.Ws.connect_and_monitor
           ~on_failure ~on_connected ~on_heartbeat
@@ -1993,5 +2001,4 @@ let stop_all () =
     set_state conn Disconnected
   ) connections;
   Mutex.unlock registry_mutex
-
 

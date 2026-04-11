@@ -489,6 +489,7 @@ let cancel_orders
               ?order_ids:request.order_ids
               ?cl_ord_ids:request.cl_ord_ids
               ?order_userrefs:request.order_userrefs
+              ?symbol:request.symbol
               ?retry_config:ex_retry_config
               ()
             >>= fun result ->

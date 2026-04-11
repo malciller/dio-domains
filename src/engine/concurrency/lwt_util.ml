@@ -33,6 +33,28 @@ let consume_stream f stream =
   Lwt.async loop;
   done_p
 
+(** Sequentially applies async [f] to each element of [stream] without
+    accumulating [Forward] nodes. Unlike [consume_stream], this awaits [f x]
+    before scheduling the next iteration, which provides backpressure for
+    hot paths such as WebSocket frame processing. *)
+let consume_stream_s f stream =
+  let done_p, done_u = Lwt.wait () in
+  let rec loop () =
+    Lwt_stream.get stream >>= function
+    | None ->
+        Lwt.wakeup_later done_u ();
+        Lwt.return_unit
+    | Some x ->
+        Lwt.catch
+          (fun () -> f x)
+          (fun _exn -> Lwt.return_unit)
+        >>= fun () ->
+        Lwt.async loop;
+        Lwt.return_unit
+  in
+  Lwt.async loop;
+  done_p
+
 (** Runs [f ()] every [interval] seconds until [stop ()] returns [true].
     Each iteration is spawned via [Lwt.async] to sever the promise chain,
     identical to the pattern used in [consume_stream].
