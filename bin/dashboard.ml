@@ -143,6 +143,12 @@ let c_red        = A.rgb_888 ~r:248 ~g:81  ~b:73
 let c_yellow     = A.rgb_888 ~r:250 ~g:176 ~b:5
 let c_cyan       = A.rgb_888 ~r:34  ~g:211 ~b:238
 let c_dim        = A.rgb_888 ~r:55  ~g:63  ~b:78
+let c_near_fill  = A.rgb_888 ~r:40  ~g:55  ~b:35
+(* Per-exchange brand colors *)
+let c_exch_hl    = A.rgb_888 ~r:74  ~g:222 ~b:128  (* hyperliquid: green *)
+let c_exch_kr    = A.rgb_888 ~r:160 ~g:120 ~b:240  (* kraken: purple *)
+let c_exch_li    = A.rgb_888 ~r:88  ~g:166 ~b:255  (* lighter: blue *)
+let c_exch_ib    = A.rgb_888 ~r:232 ~g:160 ~b:72   (* ibkr: orange *)
 (* Attribute constructors: foreground + background + optional style *)
 
 let a_label      = A.(fg c_label  ++ bg c_bg)
@@ -154,6 +160,21 @@ let a_yellow     = A.(fg c_yellow ++ bg c_bg)
 let a_cyan       = A.(fg c_cyan   ++ bg c_bg)
 let a_dim        = A.(fg c_dim    ++ bg c_bg)
 let a_border     = A.(fg c_border ++ bg c_bg)
+(* Near-fill highlight: subtle green-tinted background for rows close to buy fill *)
+let a_near_fill  = A.(fg c_bright ++ bg c_near_fill ++ st bold)
+let a_near_fill_green = A.(fg c_green ++ bg c_near_fill ++ st bold)
+
+(** Exchange-specific color for the SYMBOL column. Bold for active strategies. *)
+let exch_sym_attr ?(dim=false) exchange =
+  let c = match exchange with
+    | "hyperliquid" -> c_exch_hl
+    | "kraken"      -> c_exch_kr
+    | "lighter"     -> c_exch_li
+    | "ibkr"        -> c_exch_ib
+    | _             -> c_bright
+  in
+  if dim then A.(fg c ++ bg c_bg)
+  else A.(fg c ++ bg c_bg ++ st bold)
 
 
 (* Drawing primitives *)
@@ -175,6 +196,13 @@ let format_pct f =
   if abs_float f < 0.01 then "<0.01%"
   else if abs_float f >= 10.0 then Printf.sprintf "%.1f%%" f
   else Printf.sprintf "%.2f%%" f
+
+let format_spread_bps bid ask =
+  if bid > 0.0 && ask > 0.0 then
+    let spread_bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
+    if spread_bps >= 100.0 then Printf.sprintf "%.0fbp" spread_bps
+    else Printf.sprintf "%.1fbp" spread_bps
+  else "--"
 
 (* Drawing helpers *)
 
@@ -261,10 +289,11 @@ let render_strategies w json =
   (* Column header row *)
   let header = I.hcat [
     I.string a_text " ";
-    col 14 a_label "SYMBOL";
+    col 16 a_label "SYMBOL";
     col 5 a_label "STGY";
     col 3 a_label "ST";
     col 12 a_label "PRICE";
+    col 8 a_label "SPREAD";
     col 12 a_label "HOLDING";
     col 10 a_label "HOLD VAL";
     col 12 a_label "ACCUM QTY";
@@ -335,6 +364,16 @@ let render_strategies w json =
     in
 
     let exch_tag = exch_tag_of exchange in
+    let spread_str = format_spread_bps bid ask in
+    let spread_attr =
+      if bid <= 0.0 || ask <= 0.0 then a_dim
+      else
+        let bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
+        if bps < 5.0 then a_green
+        else if bps < 20.0 then a_cyan
+        else if bps < 50.0 then a_yellow
+        else a_red
+    in
 
     (* Format buy distance with proximity-based color *)
     let buy_dist_str, buy_dist_attr = match buy_dist_pct with
@@ -357,17 +396,27 @@ let render_strategies w json =
           format_pct d, attr
     in
 
+    (* Near-fill row highlighting: use tinted background when buy is <0.5% away *)
+    let near_fill = match buy_dist_pct with
+      | Some d when abs_float d < 0.5 -> true
+      | _ -> false
+    in
+    let row_text  = if near_fill then a_near_fill else a_text in
+    let sym_attr = if near_fill then a_near_fill else exch_sym_attr exchange in
+
     I.hcat [
-      I.string a_text " ";
-      col 14 a_bright (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
+      I.string row_text " ";
+      col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
       col 5 a_cyan (truncate_string 4 stype);
       I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
-      col 12 a_text (if mid > 0.0 then format_price mid else "--");
-      col 12 a_text (if base_bal > 0.0 then format_qty base_bal else "0");
-      col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
-      col 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
-      col 10 a_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
-      col 12 (if buy_price > 0.0 then a_green else a_dim)
+      col 12 row_text (if mid > 0.0 then format_price mid else "--");
+      col 8 spread_attr spread_str;
+      col 12 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
+      col 10 row_text (if hold_value > 0.01 then format_price hold_value else "--");
+      col 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+      col 10 row_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
+      col 12 (if near_fill then a_near_fill_green
+              else if buy_price > 0.0 then a_green else a_dim)
         (if buy_price > 0.0 then format_price buy_price else "--");
       col 8 buy_dist_attr buy_dist_str;
       col 6 (if sell_count > 0 then a_yellow else a_dim)
@@ -451,12 +500,14 @@ let render_strategies w json =
         if is_quote then "$", a_green
         else "⏹", a_red
       in
+      let spread_str = format_spread_bps bid ask in
       let img = I.hcat [
         I.string a_text " ";
-        col 14 a_dim (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
+        col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
         col 5 a_dim "--";
         I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
         col 12 a_text (if mid > 0.0 then format_price mid else "--");
+        col 8 a_dim spread_str;
         col 12 a_text (format_qty balance);
         col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
         col 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
@@ -543,8 +594,44 @@ let render_strategies w json =
   (* Section header *)
   let title = section_title w "HOLDINGS & STRATEGY" in
 
-  (* Compose table: active, paused, inactive, then quote rows *)
-  let main_table = I.vcat (title :: header :: active_images @ paused_images @ inactive_rows @ quote_rows) in
+  (* Visual separator between strategy rows and non-strategy rows *)
+  let thin_sep label =
+    let lbl = "  ── " ^ label ^ " " in
+    let pad_count = max 0 (w - String.length lbl) in
+    let pad_buf = Buffer.create (pad_count * 3) in
+    for _ = 1 to pad_count do Buffer.add_string pad_buf "─" done;
+    I.hcat [
+      I.string A.(fg c_border ++ bg c_bg) lbl;
+      I.string A.(fg c_border ++ bg c_bg) (Buffer.contents pad_buf);
+    ]
+  in
+  let has_inactive = inactive_rows <> [] in
+  let has_quote = quote_rows <> [] in
+
+  (* Compose table: active, paused, separator, inactive, separator, quote rows *)
+  let rows = [title; header]
+    @ active_images
+    @ paused_images
+    @ (if has_inactive then [thin_sep "balances"] @ inactive_rows else [])
+    @ (if has_quote then [thin_sep "cash"] @ quote_rows else [])
+  in
+  let main_table = I.vcat rows in
+
+  (* Per-exchange cash breakdown *)
+  let per_exch_cash = Hashtbl.create 8 in
+  List.iter (fun bal_json ->
+    let asset   = bal_json |?> "asset"   |> to_string_d "" in
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+    let exch    = bal_json |?> "exchange" |> to_string_d "" in
+    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT"
+                || asset = "ZUSD" || asset = "USDe" in
+    if is_quote && balance > 0.0 && exch <> "" then begin
+      let cur = try Hashtbl.find per_exch_cash exch with Not_found -> 0.0 in
+      Hashtbl.replace per_exch_cash exch (cur +. balance)
+    end
+  ) all_balances;
+  let per_exch_pairs = Hashtbl.fold (fun k v acc -> (k, v) :: acc) per_exch_cash [] in
+  let per_exch_sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) per_exch_pairs in
 
   (* Summary footer bar with aggregated portfolio metrics *)
   let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_bg ++ st bold)
@@ -565,84 +652,132 @@ let render_strategies w json =
     pipe;
     kv "Sell Val"  (format_pnl   total_up)        up_attr;
   ] in
-  let summary_section = I.vcat [
+  (* Per-exchange cash breakdown line *)
+  let cash_breakdown =
+    if per_exch_sorted = [] then I.empty
+    else
+      let parts = List.map (fun (exch, bal) ->
+        I.hcat [
+          I.string A.(fg c_dim ++ bg c_bg) ("  " ^ exch_tag_of exch ^ ": ");
+          I.string A.(fg c_text ++ bg c_bg) (format_price bal);
+        ]
+      ) per_exch_sorted in
+      I.hcat (I.string A.(fg c_label ++ bg c_bg) "  cash" :: parts)
+  in
+  let summary_section = I.vcat (List.filter (fun img -> I.height img > 0) [
     I.string A.(fg c_title ++ bg c_section_bg ++ st bold) (pad_right w "  SUMMARY");
     summary_bar;
-  ] in
+    cash_breakdown;
+  ]) in
 
   I.vcat [ main_table; summary_section ]
 
-(* Panel: Latency Profiling *)
+(* Panel: Latency Profiling — compact one-row-per-domain *)
 
-let render_latencies w json =
+let render_latencies _w json =
   let lats = match json |?> "latencies" with `Assoc l -> l | _ -> [] in
-  let title = section_title w "LATENCY PROFILING" in
-  let metric_w = if w >= 100 then 14 else 8 in
-  let header = I.hcat [
-    I.string a_text "  ";
-    col 14 a_label "DOMAIN";
-    col metric_w a_label "METRIC";
-    col 10 a_label "p50";
-    col 10 a_label "p90";
-    col 10 a_label "p99";
-    col 10 a_label "p999";
-    col 10 a_label "SAMPLES";
-  ] in
-  (* Per-metric latency thresholds: (yellow_us, red_us) *)
-  let latency_thresholds label =
-    match label with
-    | "ticker"    -> (10.0,  50.0)
-    | "orderbook" -> (20.0,  75.0)
-    | "strategy"  -> (100.0, 250.0)
-    | "execution" -> (300.0, 750.0)
-    | "cycle"     -> (150.0, 400.0)
-    | _           -> (250.0, 500.0)
+  (* Build symbol -> exchange lookup from strategies *)
+  let sym_to_exch = match json |?> "strategies" with
+    | `Assoc l -> List.map (fun (sym, data) ->
+        (sym, data |?> "exchange" |> to_string_d "")
+      ) l
+    | _ -> []
   in
-  let rows = List.concat_map (fun (symbol, metrics) ->
+  let exch_of_symbol sym =
+    match List.assoc_opt sym sym_to_exch with
+    | Some e when e <> "" -> e
+    | _ -> ""
+  in
+  (* Filter to domains that have at least one metric with samples *)
+  let active_lats = List.filter (fun (_symbol, metrics) ->
     let mlist = match metrics with `Assoc l -> l | _ -> [] in
-    List.map (fun (label, data) ->
-      let p50     = data |?> "p50"     |> to_float_d 0.0 in
-      let p90     = data |?> "p90"     |> to_float_d 0.0 in
-      let p99     = data |?> "p99"     |> to_float_d 0.0 in
-      let p999    = data |?> "p999"    |> to_float_d 0.0 in
-      let samples = data |?> "samples" |> to_int_d 0 in
-      let empty   = samples = 0 in
-      let (warn, crit) = latency_thresholds label in
-      (* Severity: 0=green, 1=yellow, 2=red, 3=dim *)
-      let severity f =
-        if empty then 3
-        else if f > crit then 2
-        else if f > warn then 1
-        else 0
-      in
-      let attr_of_sev = function
-        | 2 -> a_red | 1 -> a_yellow | 0 -> a_green | _ -> a_dim
-      in
-      (* Enforce monotonicity: each column at least as severe as its left neighbour *)
-      let s50  = severity p50 in
-      let s90  = max s50 (severity p90) in
-      let s99  = max s90 (severity p99) in
-      let s999 = max s99 (severity p999) in
-      let lat_col sev f =
-        if empty then col 10 a_dim "--"
-        else col 10 (attr_of_sev sev) (format_latency_us f)
-      in
-      I.hcat [
-        I.string a_text "  ";
-        col 14 (if empty then a_dim else a_bright) (truncate_string 13 symbol);
-        col metric_w (if empty then a_dim else a_cyan) (truncate_string (metric_w - 1) label);
-        lat_col s50  p50;
-        lat_col s90  p90;
-        lat_col s99  p99;
-        lat_col s999 p999;
-        col 10 a_dim (if empty then "--" else string_of_int samples);
-      ]
+    List.exists (fun (_label, data) ->
+      data |?> "samples" |> to_int_d 0 > 0
     ) mlist
   ) lats in
-  if rows = [] then
-    I.vcat [title; header; I.string a_dim "  -- no latency data --"]
+  if active_lats = [] then I.empty
   else
-    I.vcat (title :: header :: rows)
+    (* Per-metric latency thresholds: (yellow_us, red_us) *)
+    let latency_thresholds label =
+      match label with
+      | "ticker"    -> (10.0,  50.0)
+      | "orderbook" -> (20.0,  75.0)
+      | "strategy"  -> (100.0, 250.0)
+      | "execution" -> (300.0, 750.0)
+      | "cycle"     -> (150.0, 400.0)
+      | _           -> (250.0, 500.0)
+    in
+    let severity label f samples =
+      if samples = 0 then 3  (* dim *)
+      else
+        let (warn, crit) = latency_thresholds label in
+        if f > crit then 2    (* red *)
+        else if f > warn then 1  (* yellow *)
+        else 0                 (* green *)
+    in
+    let attr_of_sev = function
+      | 2 -> a_red | 1 -> a_yellow | 0 -> a_green | _ -> a_dim
+    in
+    (* Metric display order *)
+    let metric_order = ["cycle"; "ticker"; "orderbook"; "strategy"; "execution"] in
+    let metric_labels = ["CYCLE"; "TICK"; "OB"; "STRAT"; "EXEC"] in
+    (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
+    let header_row1 = I.hcat (
+      [ I.string a_text "  ";
+        col 16 a_label "" ]
+      @ List.map (fun lbl ->
+          col 18 a_label (Printf.sprintf "  %-16s" lbl)
+        ) metric_labels
+    ) in
+    let header_row2 = I.hcat (
+      [ I.string a_text "  ";
+        col 16 a_label "DOMAIN" ]
+      @ List.concat_map (fun _lbl ->
+          [ col 9 a_dim "p50"; col 9 a_dim "p99" ]
+        ) metric_labels
+    ) in
+    let header = I.vcat [header_row1; header_row2] in
+    let rows = List.map (fun (symbol, metrics) ->
+      let mlist = match metrics with `Assoc l -> l | _ -> [] in
+      let find_metric label =
+        match List.assoc_opt label mlist with
+        | Some data ->
+            let p50 = data |?> "p50" |> to_float_d 0.0 in
+            let p99 = data |?> "p99" |> to_float_d 0.0 in
+            let samples = data |?> "samples" |> to_int_d 0 in
+            (p50, p99, samples)
+        | None -> (0.0, 0.0, 0)
+      in
+      (* Compute worst severity across all metrics for the health dot *)
+      let worst_sev = List.fold_left (fun worst label ->
+        let (p99, _, samples) = let (_, p99, s) = find_metric label in (p99, 0.0, s) in
+        if samples = 0 then worst
+        else max worst (severity label p99 samples)
+      ) 0 metric_order in
+      let dot_attr = attr_of_sev worst_sev in
+      let metric_cells = List.map (fun label ->
+        let (p50, p99, samples) = find_metric label in
+        if samples = 0 then
+          I.hcat [col 9 a_dim "--"; col 9 a_dim "--"]
+        else
+          let s50 = severity label p50 samples in
+          let s99 = max s50 (severity label p99 samples) in
+          I.hcat [
+            col 9 (attr_of_sev s50) (format_latency_us p50);
+            col 9 (attr_of_sev s99) (format_latency_us p99);
+          ]
+      ) metric_order in
+      let exch = exch_of_symbol symbol in
+      let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
+      I.hcat (
+        [ I.string a_text "  ";
+          I.string dot_attr "●";
+          I.string a_text " ";
+          col 14 sym_attr (truncate_string 13 symbol) ]
+        @ metric_cells
+      )
+    ) active_lats in
+    I.vcat (header :: rows)
 
 (* Panel: Memory and GC statistics *)
 
@@ -701,11 +836,21 @@ let render_domains w json =
       else if recent  then a_red
       else a_yellow
     in
+    (* Extract exchange name from domain key (format: "exchange/symbol") *)
+    let exch = match String.split_on_char '/' key with
+      | e :: _ -> e
+      | _ -> ""
+    in
+    let key_attr =
+      if not running then a_dim
+      else if exch <> "" then exch_sym_attr exch
+      else a_text
+    in
     I.hcat [
       I.string a_text "  ";
       I.string (if running then a_green else a_red) (if running then "\xe2\x96\xb6" else "\xe2\x96\xa0");
       I.string a_text "  ";
-      col 30 (if running then a_text else a_dim) (truncate_string 29 key);
+      col 30 key_attr (truncate_string 29 key);
       I.string a_label "restarts: ";
       col 3 (if restarts > 0 then a_yellow else a_dim) (string_of_int restarts);
       I.string a_dim "  last: ";
