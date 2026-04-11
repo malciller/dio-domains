@@ -240,7 +240,7 @@ let build_snapshot () =
         List.filter_map (fun (asset, bal) ->
           (* Infer trading pair for this asset *)
           let quote = match exch_name with
-            | "hyperliquid" -> "USDC"
+            | "hyperliquid" | "lighter" -> "USDC"
             | _ -> "USD"
           in
           let symbol = asset ^ "/" ^ quote in
