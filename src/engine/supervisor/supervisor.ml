@@ -303,8 +303,13 @@ let start_async conn =
           Lwt.catch (fun () ->
             connect_fn () >>= fun () ->
             (* WebSocket connect_fn should block indefinitely; early return is abnormal *)
-            Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
-            set_state conn (Failed "connection completed unexpectedly");
+            Mutex.lock conn.mutex;
+            let already_failed = match conn.state with Failed _ -> true | _ -> false in
+            Mutex.unlock conn.mutex;
+            if not already_failed then begin
+              Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
+              set_state conn (Failed "connection completed unexpectedly")
+            end;
             Lwt.return_unit
           ) (fun exn ->
             let error_msg = Printexc.to_string exn in
@@ -378,12 +383,15 @@ let monitor_loop () =
                            && not (Ibkr.Market_hours.is_market_open ()) then
                           ()  (* Market closed — suppress reconnection *)
                         else begin
-                          (* Exponential backoff: 2s, 4s, 8s, ... capped at 30s (300s for IBKR and Lighter) *)
+                          (* Exponential backoff: 0s, 2s, 4s, 8s, ... capped at 30s (300s for IBKR and Lighter) *)
                           let max_delay = 
                             if String.equal conn.name "ibkr_gateway" || String.equal conn.name "lighter_ws" then 300.0 
                             else 30.0 
                           in
-                          let delay = min max_delay (2.0 ** Float.of_int attempts) in
+                          let delay = 
+                            if attempts <= 1 then 0.0
+                            else min max_delay (2.0 ** Float.of_int (attempts - 1))
+                          in
 
                           (* Only reconnect after backoff elapses *)
                           let should_reconnect =
@@ -671,7 +679,18 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     let lt_ws_connect_fn () =
       Lwt.catch (fun () ->
         let on_failure reason =
-          set_state lt_ws_conn (Failed reason)
+          set_state lt_ws_conn (Failed reason);
+          (* Schedule immediate reconnection; bypass monitor loop backoff *)
+          Lwt.async (fun () ->
+            Lwt.catch (fun () ->
+              Lwt.pause () >>= fun () ->
+              start_async lt_ws_conn;
+              Lwt.return_unit
+            ) (fun exn ->
+              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" lt_ws_conn.name (Printexc.to_string exn);
+              Lwt.return_unit
+            )
+          )
         in
         let on_heartbeat () = update_data_heartbeat lt_ws_conn in
         let on_connected () =
