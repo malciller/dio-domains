@@ -85,24 +85,11 @@ let[@inline always] has_price_data symbol =
   | None -> false
 
 let wait_for_price_data symbols timeout_seconds =
-  let open Lwt.Infix in
-  let deadline = Unix.gettimeofday () +. timeout_seconds in
-  let rec loop () =
-    if List.for_all has_price_data symbols then
-      Lwt.return_true
-    else
-      let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0.0 then
-        Lwt.return_false
-      else
-        Lwt.pick [
-          (Lwt_condition.wait ready_condition >|= fun () -> `Again);
-          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-        ] >>= function
-        | `Again -> loop ()
-        | `Timeout -> Lwt.return (List.for_all has_price_data symbols)
-  in
-  loop ()
+  Concurrency.Lwt_util.poll_until
+    ~timeout:timeout_seconds
+    ~wait_signal:(fun () -> Lwt_condition.wait ready_condition)
+    ~check:(fun () -> List.for_all has_price_data symbols)
+
 
 (** Process a ticker update message from the Lighter WebSocket.
     Actual format: { "channel": "ticker:0", "ticker": { "s": "ETH", "b": { "price": "...", "size": "..." }, "a": { ... } } } *)

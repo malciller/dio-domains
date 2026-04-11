@@ -9,7 +9,7 @@
 
     Follows the same background-processor-task pattern as hyperliquid_balances.ml. *)
 
-open Lwt.Infix
+
 
 let section = "lighter_balances"
 
@@ -136,23 +136,11 @@ let notify_ready () =
   end
 
 let wait_for_balance_data_lwt assets timeout_seconds =
-  let deadline = Unix.gettimeofday () +. timeout_seconds in
-  let rec loop () =
-    if List.for_all has_balance_data assets then
-      Lwt.return_true
-    else
-      let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0.0 then
-        Lwt.return_false
-      else
-        Lwt.pick [
-          (Lwt_condition.wait ready_condition >|= fun () -> `Again);
-          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-        ] >>= function
-        | `Again -> loop ()
-        | `Timeout -> Lwt.return (List.for_all has_balance_data assets)
-  in
-  loop ()
+  Concurrency.Lwt_util.poll_until
+    ~timeout:timeout_seconds
+    ~wait_signal:(fun () -> Lwt_condition.wait ready_condition)
+    ~check:(fun () -> List.for_all has_balance_data assets)
+
 
 let wait_for_balance_data = wait_for_balance_data_lwt
 
