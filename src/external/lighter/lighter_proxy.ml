@@ -18,6 +18,8 @@
 
 let section = "lighter_proxy"
 
+let consecutive_proxy_failures = Atomic.make 0
+
 (** Read a value from the .env file if it exists. *)
 let read_dotenv key =
   try
@@ -81,7 +83,16 @@ let rotate_proxy () =
     let next = (current + 1) mod len in
     Atomic.set current_proxy_index next;
     Logging.info_f ~section "Rotating to fallback Lighter proxy: %s" (List.nth proxy_urls next)
-  end
+  end;
+  Atomic.incr consecutive_proxy_failures
+
+let reset_proxy_failures () =
+  Atomic.set consecutive_proxy_failures 0
+
+let has_more_proxies () =
+  let len = List.length proxy_urls in
+  if len <= 1 then false
+  else Atomic.get consecutive_proxy_failures < len - 1
 
 (** Returns the currently active proxy URL (if any). *)
 let proxy_url () =

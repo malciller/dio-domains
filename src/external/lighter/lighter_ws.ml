@@ -271,7 +271,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
       Lwt.return_unit
   | _ -> Lwt.return_unit
 
-let connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_heartbeat ~label =
+let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_heartbeat ~label =
   let (connect_host, connect_port) = connect_target () in
   let url = ws_url () in
   Logging.debug_f ~section "Connecting to [%s] Lighter WebSocket: %s (host=%s:%d)" label url connect_host connect_port;
@@ -355,11 +355,23 @@ let connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_hea
       in
       contains_5xx 0
     in
-    if label = "Private" && is_server_error then Lighter_proxy.rotate_proxy ();
-    Atomic.set state.is_connected_ref false;
-    close_all_subscribers ();
-    on_failure error_msg;
-    Lwt.return_unit
+    if label = "Private" && is_server_error then begin
+      Lighter_proxy.rotate_proxy ();
+      if Lighter_proxy.has_more_proxies () then begin
+        Atomic.set state.is_connected_ref false;
+        connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_heartbeat ~label
+      end else begin
+        Atomic.set state.is_connected_ref false;
+        close_all_subscribers ();
+        on_failure error_msg;
+        Lwt.return_unit
+      end
+    end else begin
+      Atomic.set state.is_connected_ref false;
+      close_all_subscribers ();
+      on_failure error_msg;
+      Lwt.return_unit
+    end
   )
 
 let close () : unit Lwt.t =
@@ -392,6 +404,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
   let check_ready () =
     if !pub_ready && !priv_ready then begin
       reset_ping_failures ();
+      Lighter_proxy.reset_proxy_failures ();
       on_connected ()
     end
   in
