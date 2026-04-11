@@ -32,3 +32,74 @@ let consume_stream f stream =
   in
   Lwt.async loop;
   done_p
+
+(** Runs [f ()] every [interval] seconds until [stop ()] returns [true].
+    Each iteration is spawned via [Lwt.async] to sever the promise chain,
+    identical to the pattern used in [consume_stream].
+
+    If [initial_delay] is provided, waits that many seconds before the
+    first iteration.
+
+    Returns a promise that resolves when the loop exits (i.e. [stop ()]
+    returns [true]). *)
+let run_periodic ?(initial_delay=0.0) ~interval ~stop f =
+  let done_p, done_u = Lwt.wait () in
+  let rec loop () =
+    if stop () then begin
+      Lwt.wakeup_later done_u ();
+      Lwt.return_unit
+    end else
+      Lwt.catch
+        (fun () -> f ())
+        (fun _exn -> Lwt.return_unit)
+      >>= fun () ->
+      Lwt_unix.sleep interval >>= fun () ->
+      if stop () then begin
+        Lwt.wakeup_later done_u ();
+        Lwt.return_unit
+      end else begin
+        Lwt.async loop;
+        Lwt.return_unit
+      end
+  in
+  if initial_delay > 0.0 then
+    Lwt.async (fun () -> Lwt_unix.sleep initial_delay >>= fun () ->
+      Lwt.async loop; Lwt.return_unit)
+  else
+    Lwt.async loop;
+  done_p
+
+(** Polls [check ()] on each wakeup until it returns [true] or the
+    [timeout] expires.  [wait_signal] should return a promise that
+    resolves whenever downstream data may have changed (e.g. an
+    [Lwt_condition.wait]).
+
+    Unlike a raw [>>= fun () -> loop ()], each iteration is spawned via
+    [Lwt.async] so the forward chain is severed.  Returns a promise that
+    resolves to [true] if [check ()] passed, [false] on timeout. *)
+let poll_until ~timeout ~wait_signal ~check =
+  let done_p, done_u = Lwt.wait () in
+  let deadline = Unix.gettimeofday () +. timeout in
+  let rec loop () =
+    if check () then begin
+      Lwt.wakeup_later done_u true;
+      Lwt.return_unit
+    end else
+      let remaining = deadline -. Unix.gettimeofday () in
+      if remaining <= 0.0 then begin
+        Lwt.wakeup_later done_u (check ());
+        Lwt.return_unit
+      end else
+        Lwt.pick [
+          (wait_signal () >|= fun () -> `Again);
+          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
+        ] >>= function
+        | `Again ->
+            Lwt.async loop;
+            Lwt.return_unit
+        | `Timeout ->
+            Lwt.wakeup_later done_u (check ());
+            Lwt.return_unit
+  in
+  Lwt.async loop;
+  done_p

@@ -253,6 +253,11 @@ let initialize_nonce ~base_url ~api_key_index ~account_index =
 let api_key_index = ref 0
 let account_index = ref 0
 
+(** Read accessors for nonce recovery. Used by lighter_actions to call
+    initialize_nonce when the exchange returns "invalid nonce". *)
+let get_api_key_index () = !api_key_index
+let get_account_index () = !account_index
+
 (** Initialize the signer client. Must be called before any signing operations. *)
 let initialize ~base_url ~private_key ~key_index ~acct_index =
   api_key_index := key_index;

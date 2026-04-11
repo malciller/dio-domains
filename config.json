@@ -30,6 +30,23 @@
       "hedge": false
     },
     {
+      "symbol": "HYPE/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.35",
+      "grid_interval": [
+        0.3,
+        1.0
+      ],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.5,
+        5.0
+      ],
+      "strategy": "Grid",
+      "testnet": false,
+      "hedge": false
+    },
+    {
       "symbol": "ETH/USDC",
       "exchange": "lighter",
       "qty": "0.006",
@@ -54,23 +71,6 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"
-    },
-    {
-      "symbol": "HYPE/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.35",
-      "grid_interval": [
-        0.3,
-        1.0
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        0.5,
-        5.0
-      ],
-      "strategy": "Grid",
-      "testnet": false,
-      "hedge": false
     },
     {
       "symbol": "ADA/USD",

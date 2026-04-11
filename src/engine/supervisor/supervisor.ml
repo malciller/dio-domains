@@ -734,9 +734,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           let auth_token = Lighter.Signer.get_auth_token () in
           Lwt.async (fun () ->
             Lighter.Instruments_feed.wait_until_ready () >>= fun () ->
-            Lighter.Ws.subscribe_to_feeds ~symbols:lighter_symbols ~account_index ~auth_token >>= fun () ->
-            Lighter.Executions_feed.clear_all_open_orders ();
-            Lighter.Module.fetch_open_orders ())
+            Logging.info_f ~section "Lighter WS reconnected — resubscribing (order state preserved)";
+            Lighter.Ws.subscribe_to_feeds ~symbols:lighter_symbols ~account_index ~auth_token)
         in
         Lighter.Ws.connect_and_monitor
           ~on_failure ~on_connected ~on_heartbeat

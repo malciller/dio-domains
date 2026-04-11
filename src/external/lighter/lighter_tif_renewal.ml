@@ -141,27 +141,14 @@ let start ~symbols:_ =
   Logging.info_f ~section "Starting TIF renewal monitor (check_interval=%.0fs, threshold=%.0f days)"
     check_interval_seconds (renewal_threshold_seconds /. 86400.0);
 
-  (* Run the first cycle immediately on startup, then loop hourly. *)
-  let rec loop () =
-    if !shutdown_requested then begin
-      Logging.info_f ~section "TIF renewal monitor shutting down";
-      Lwt.return_unit
-    end else begin
+  Concurrency.Lwt_util.run_periodic
+    ~initial_delay:5.0
+    ~interval:check_interval_seconds
+    ~stop:(fun () -> !shutdown_requested)
+    (fun () ->
       Lwt.catch
         (fun () -> run_renewal_cycle ())
         (fun exn ->
           Logging.error_f ~section "TIF renewal cycle failed: %s" (Printexc.to_string exn);
-          Lwt.return_unit)
-      >>= fun () ->
-      Lwt_unix.sleep check_interval_seconds >>= fun () ->
-      if !shutdown_requested then Lwt.return_unit
-      else begin
-        (* Spawn next iteration independently to break the Lwt chain. *)
-        Lwt.async loop;
-        Lwt.return_unit
-      end
-    end
-  in
-  (* Brief delay to let open orders finish loading from REST snapshot. *)
-  Lwt_unix.sleep 5.0 >>= fun () ->
-  loop ()
+          Lwt.return_unit))
+

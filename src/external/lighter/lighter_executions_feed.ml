@@ -67,6 +67,7 @@ let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 64
 let order_to_symbol_queue : string Queue.t = Queue.create ()
 let order_to_symbol_cap = ref 256
 
+
 (** Atomic flag set once after initial open orders snapshot completes. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
 let set_startup_snapshot_done () =
@@ -503,7 +504,14 @@ let process_account_orders_update json =
     ) orders
     end
   with exn ->
-    Logging.error_f ~section "Failed to process account orders update: %s" (Printexc.to_string exn)
+    Logging.error_f ~section "Failed to process account orders update: %s" (Printexc.to_string exn);
+  (* Trigger startup gate after processing a snapshot or subscribed message.
+     Previously only called from REST fetch_open_orders. Now that WS is the
+     single source of truth, we must ungate domains from the WS path too.
+     On reconnect _startup_snapshot_done is already true (Atomic.exchange
+     returns true → no-op). On first startup this unblocks domain workers
+     waiting in has_execution_data. *)
+  set_startup_snapshot_done ()
 
 (** Periodic cleanup of stale orders (>24h). *)
 let cleanup_stale_orders () =

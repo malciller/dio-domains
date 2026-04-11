@@ -111,10 +111,6 @@ module Lighter_impl = struct
       Lwt.return (Error "Cannot amend: symbol unknown and order not found")
     else
       let existing = Lighter_executions_feed.find_order_everywhere order_id in
-      (* Backup safety net: if the order is not in local state even though
-         symbol was provided, reject early. Primary defense is in
-         lighter_actions.ml modify_order, but this avoids computing
-         rounding and signing for a doomed order. *)
       if Option.is_some symbol && Option.is_none existing then begin
         Logging.warn_f ~section "Amend rejected at module level: order %s [%s] not in local state" order_id sym;
         Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))

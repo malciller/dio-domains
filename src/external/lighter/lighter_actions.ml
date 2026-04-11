@@ -52,6 +52,27 @@ let send_tx ~tx_type ~tx_info =
     end else begin
       Logging.error_f ~section "REST sendTx failed (status=%s): %s"
         (Cohttp.Code.string_of_status status) resp_str;
+      (* Auto-recover from nonce desync. Ghost modifies during WS disconnect
+         consume nonces locally but may fail on-chain, causing the local
+         counter to diverge. Re-fetch the correct nonce from the exchange
+         so subsequent operations don't get stuck in an "invalid nonce" loop. *)
+      let lower = String.lowercase_ascii resp_str in
+      if String.length lower > 0 then begin
+        let rec find_sub s sub i =
+          if i + String.length sub > String.length s then false
+          else if String.sub s i (String.length sub) = sub then true
+          else find_sub s sub (i + 1)
+        in
+        if find_sub lower "invalid nonce" 0 then begin
+          Logging.warn_f ~section "Nonce desync detected — re-fetching correct nonce from exchange";
+          let base_url = Lighter_proxy.api_base_url () in
+          Lwt.async (fun () ->
+            Lighter_signer.initialize_nonce
+              ~base_url
+              ~api_key_index:(Lighter_signer.get_api_key_index ())
+              ~account_index:(Lighter_signer.get_account_index ()))
+        end
+      end;
       Lwt.return (Error resp_str)
     end
   ) (fun exn ->
