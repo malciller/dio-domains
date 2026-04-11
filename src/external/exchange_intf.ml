@@ -184,6 +184,7 @@ module type S = sig
     ?order_ids:string list ->
     ?cl_ord_ids:string list ->
     ?order_userrefs:int list ->
+    ?symbol:string ->
     ?retry_config:Types.retry_config ->
     unit ->
     (Types.cancel_order_result list, string) result Lwt.t

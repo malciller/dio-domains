@@ -100,21 +100,23 @@ module Lighter_impl = struct
       ?retry_config:_
       () =
 
+    let existing = Lighter_executions_feed.find_order_everywhere order_id in
     let sym = match symbol with
       | Some s -> s
       | None ->
-          match Lighter_executions_feed.find_order_everywhere order_id with
+          match existing with
           | Some o -> o.symbol
           | None -> ""
     in
     if sym = "" then
       Lwt.return (Error "Cannot amend: symbol unknown and order not found")
+    else if Option.is_none existing then
+      (* Match Hyperliquid's guard: do not enqueue in-place modifies when the
+         live open-order cache lost the order during a WS flap. Returning an
+         error routes through the existing amend failure cooldown instead of
+         blindly spamming L2 modify requests against a ghost order. *)
+      Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
     else
-      let existing = Lighter_executions_feed.find_order_everywhere order_id in
-      if Option.is_some symbol && Option.is_none existing then begin
-        Logging.warn_f ~section "Amend rejected at module level: order %s [%s] not in local state" order_id sym;
-        Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
-      end else
       let new_qty = match qty with
         | Some q -> Lighter_instruments_feed.round_qty_for_symbol sym q
         | None -> (match existing with Some o -> o.order_qty | None -> 0.0)
@@ -136,6 +138,7 @@ module Lighter_impl = struct
       ?order_ids
       ?cl_ord_ids:_
       ?order_userrefs:_
+      ?symbol
       ?retry_config:_
       () =
 
@@ -144,15 +147,18 @@ module Lighter_impl = struct
       Lwt.return (Error "No order IDs to cancel")
     else
       let results = Lwt_list.map_s (fun order_id ->
-        (* Resolve symbol from the executions feed *)
-        let symbol = match Lighter_executions_feed.find_order_everywhere order_id with
-          | Some o -> o.symbol
-          | None -> ""
+        (* Resolve symbol from request or the executions feed *)
+        let sym = match symbol with
+          | Some s -> s
+          | None ->
+              match Lighter_executions_feed.find_order_everywhere order_id with
+              | Some o -> o.symbol
+              | None -> ""
         in
-        if symbol = "" then
+        if sym = "" then
           Lwt.return (Error (Printf.sprintf "Cannot cancel %s: symbol unknown" order_id))
         else
-          Lighter_actions.cancel_order ~symbol ~order_id
+          Lighter_actions.cancel_order ~symbol:sym ~order_id
       ) ids in
       results >|= fun res_list ->
       let successes = List.filter_map (function Ok r -> Some r | Error _ -> None) res_list in

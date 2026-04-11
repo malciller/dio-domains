@@ -55,6 +55,26 @@ let test_get_fees_with_instruments () =
   Alcotest.(check bool) "maker None" true (Option.is_none mk_miss);
   Alcotest.(check bool) "taker None" true (Option.is_none tk_miss)
 
+let test_amend_requires_tracked_order () =
+  Lighter.Instruments_feed.initialize ["ETH/USDC"];
+  let result =
+    Lwt_main.run
+      (Lighter.Module.Lighter_impl.amend_order
+         ~token:""
+         ~order_id:"missing_order"
+         ~symbol:"ETH/USDC"
+         ~qty:0.006
+         ~limit_price:2222.0
+         ())
+  in
+  match result with
+  | Ok _ -> Alcotest.fail "expected missing-order amend to be rejected"
+  | Error msg ->
+      Alcotest.(check string)
+        "missing order guard"
+        "Order not found for amendment: missing_order"
+        msg
+
 let () =
   Alcotest.run "Lighter Module" [
     "basics", [
@@ -67,5 +87,6 @@ let () =
     "data_access", [
       Alcotest.test_case "empty data accessors" `Quick test_data_accessors_empty;
       Alcotest.test_case "get_fees with instruments" `Quick test_get_fees_with_instruments;
+      Alcotest.test_case "amend requires tracked order" `Quick test_amend_requires_tracked_order;
     ]
   ]

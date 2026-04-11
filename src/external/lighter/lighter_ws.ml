@@ -73,29 +73,41 @@ let broadcast_message json =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
   Mutex.unlock pushers_mutex;
-  let dead = ref [] in
+  let alive = ref [] in
   List.iter (fun push ->
-    try ignore (push (Some json))
-    with _ -> dead := push :: !dead
+    try
+      if push (Some json) then alive := push :: !alive
+    with _ -> ()
   ) ps;
-  if !dead <> [] then begin
+  if List.length !alive <> List.length ps then begin
     Mutex.lock pushers_mutex;
-    pushers := List.filter (fun p -> not (List.memq p !dead)) !pushers;
+    pushers := List.rev !alive;
     Mutex.unlock pushers_mutex
   end
 
 (** Creates a bounded subscriber stream for incoming messages. *)
 let subscribe_market_data () =
   let (stream, push_source) = Lwt_stream.create_bounded 16 in
+  let closed = Atomic.make false in
+  let close_internal () =
+    if not (Atomic.exchange closed true) then begin
+      push_source#close;
+      true
+    end else
+      false
+  in
   let push_fn item =
+    if Atomic.get closed then
+      false
+    else
     match item with
     | None ->
-        push_source#close;
-        true
+        close_internal ()
     | Some json ->
         let p = push_source#push json in
         if Lwt.is_sleeping p then begin
           Lwt.cancel p;
+          ignore (close_internal ());
           false
         end else
           true
@@ -106,7 +118,8 @@ let subscribe_market_data () =
   let close () =
     Mutex.lock pushers_mutex;
     pushers := List.filter (fun p -> p != push_fn) !pushers;
-    Mutex.unlock pushers_mutex
+    Mutex.unlock pushers_mutex;
+    ignore (close_internal ())
   in
   { stream; close }
 
@@ -346,18 +359,15 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
         | exn -> Lwt.fail exn)
     ) in
 
-    let process_frame frame =
-      Lwt.async (fun () ->
-        Lwt.catch
-          (fun () -> handle_frame ~on_heartbeat frame)
-          (fun exn -> Logging.error_f ~section "Error handling frame: %s" (Printexc.to_string exn); Lwt.return_unit)
-      )
-    in
-
     let done_p =
-      Lwt.catch
-        (fun () -> Concurrency.Lwt_util.consume_stream process_frame stream)
-        (fun _exn -> Lwt.return_unit)
+      Concurrency.Lwt_util.consume_stream_s
+        (fun frame ->
+          Lwt.catch
+            (fun () -> handle_frame ~on_heartbeat frame)
+            (fun exn ->
+              Logging.error_f ~section "Error handling frame: %s" (Printexc.to_string exn);
+              Lwt.return_unit))
+        stream
     in
 
     Lwt.catch (fun () -> done_p) (function

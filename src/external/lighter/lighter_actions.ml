@@ -135,14 +135,6 @@ let place_order ~symbol ~is_buy ~qty ~price
 
 (** Cancel an order on Lighter. *)
 let cancel_order ~symbol ~order_id =
-  (* Pre-flight: skip cancel if order is already gone from local state.
-     Saves a nonce and avoids sending a doomed L2 transaction. *)
-  let order_exists = match Lighter_executions_feed.find_order_everywhere order_id with
-    | Some _ -> true | None -> false in
-  if not order_exists then begin
-    Logging.debug_f ~section "Cancel skipped: order %s [%s] not in local state (already gone)" order_id symbol;
-    Lwt.return (Ok { Lighter_types.Types.order_id; cl_ord_id = None })
-  end else
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None ->
       Lwt.return (Error (Printf.sprintf "Unknown symbol: %s" symbol))
@@ -160,17 +152,6 @@ let cancel_order ~symbol ~order_id =
 
 (** Modify an existing order on Lighter. *)
 let modify_order ~symbol ~order_id ~new_qty ~new_price =
-  (* Pre-flight: verify order exists in local open-orders state before
-     sending an async REST modify. Lighter's sendTx returns HTTP 200 even
-     for non-existent orders because it queues an L2 transaction.
-     Without this check, WS disconnects cause the strategy to loop
-     amending ghost orders indefinitely. *)
-  let order_exists = match Lighter_executions_feed.find_order_everywhere order_id with
-    | Some _ -> true | None -> false in
-  if not order_exists then begin
-    Logging.warn_f ~section "Modify rejected: order %s [%s] not found in open orders (likely cancelled during WS disconnect)" order_id symbol;
-    Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
-  end else
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None ->
       Lwt.return (Error (Printf.sprintf "Unknown symbol: %s" symbol))
