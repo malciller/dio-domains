@@ -325,48 +325,57 @@ let handle_frame frame ~expected_generation =
     promise chain accumulation. Signals [reader_done] on termination. *)
 let start_reader conn generation =
 
-  let done_p, done_u = Lwt.wait () in
-  let rec loop () =
-    if Atomic.get shutdown_requested then begin
-      Logging.info_f ~section "Reader loop shutting down (generation %d)" generation;
-      Lwt.wakeup_later done_u ();
-      Lwt.return_unit
-    end else if state.connection_generation <> generation then begin
+  let stream = Lwt_stream.from (fun () ->
+    if Atomic.get shutdown_requested then Lwt.return_none
+    else if state.connection_generation <> generation then Lwt.return_none
+    else Lwt.catch (fun () ->
+      Websocket_lwt_unix.read conn >>= fun frame ->
+      Lwt.return_some frame
+    ) (function
+      | End_of_file -> Lwt.return_none
+      | exn -> Lwt.fail exn)
+  ) in
 
-      Lwt.wakeup_later done_u ();
-      Lwt.return_unit
-    end else
-    Lwt.catch
-      (fun () ->
-        Websocket_lwt_unix.read conn >>= function
-        | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
-            Logging.warn_f ~section "Trading WebSocket closed by server (generation %d)" generation;
-            Lwt.wakeup_later done_u ();
-            reset_state conn ~notify_failure:true "Connection closed by server"
-        | frame ->
-            handle_frame frame ~expected_generation:generation >>= fun () ->
-            (* Spawn next iteration independently to break promise chain growth. *)
-            Lwt.async loop;
-            Lwt.return_unit
-      )
-      (function
-        | End_of_file ->
-            Logging.warn_f ~section "Trading WebSocket connection closed unexpectedly (End_of_file, generation %d)" generation;
-            Lwt.wakeup_later done_u ();
-            reset_state conn ~notify_failure:true "Connection closed unexpectedly (End_of_file)"
-        | exn ->
-            let reason = Printf.sprintf "WebSocket read error (generation %d): %s" generation (Printexc.to_string exn) in
-            Logging.error ~section reason;
-            Lwt.wakeup_later done_u ();
-            reset_state conn ~notify_failure:true reason
-      )
+  let process_frame = function
+    | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
+        Logging.warn_f ~section "Trading WebSocket closed by server (generation %d)" generation;
+        Lwt.fail (Failure "Connection closed by server")
+    | frame ->
+        Lwt.catch
+          (fun () -> handle_frame frame ~expected_generation:generation)
+          (fun exn ->
+             Logging.error_f ~section "Error handling Kraken trading frame: %s" (Printexc.to_string exn);
+             Lwt.return_unit)
   in
-  Lwt.async loop;
-  (* On reader loop completion, broadcast reader_done so ensure_connection unblocks. *)
+
+  let done_p =
+    Lwt.catch
+      (fun () -> Concurrency.Lwt_util.consume_stream (fun frame -> Lwt.async (fun () -> process_frame frame)) stream)
+      (fun exn ->
+         match exn with
+         | Failure msg when msg = "Connection closed by server" ->
+             reset_state conn ~notify_failure:true "Connection closed by server"
+         | _ ->
+             let reason = Printf.sprintf "WebSocket read error (generation %d): %s" generation (Printexc.to_string exn) in
+             Logging.error ~section reason;
+             reset_state conn ~notify_failure:true reason)
+  in
+
   Lwt.async (fun () ->
     done_p >>= fun () ->
-    Lwt_condition.broadcast reader_done ();
-    Lwt.return_unit
+    if Atomic.get shutdown_requested then begin
+      Logging.info_f ~section "Reader loop shutting down (generation %d)" generation;
+      Lwt_condition.broadcast reader_done ();
+      Lwt.return_unit
+    end else if state.connection_generation <> generation then begin
+      Lwt_condition.broadcast reader_done ();
+      Lwt.return_unit
+    end else begin
+      Logging.warn_f ~section "Trading WebSocket connection closed unexpectedly (End_of_file, generation %d)" generation;
+      reset_state conn ~notify_failure:true "Connection closed unexpectedly (End_of_file)" >>= fun () ->
+      Lwt_condition.broadcast reader_done ();
+      Lwt.return_unit
+    end
   );
   ()
 

@@ -257,7 +257,8 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
          | "subscribed/account_all_assets"
          | "update/user_stats" | "subscribed/user_stats" ->
              (* Routed to Lighter_balances._processor_task via broadcast_message below. *)
-             Atomic.incr msg_counter_account
+             Atomic.incr msg_counter_account;
+             broadcast_message json
          | "pong" ->
               (* Application-level pong response to our keepalive ping *)
               last_pong_time := Unix.gettimeofday ();
@@ -270,9 +271,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
              if Atomic.get msg_counter_other <= 5 then
                Logging.debug_f ~section "Unmatched WS message type: '%s' channel='%s' (len=%d)" t channel
                  (String.length frame.Websocket.Frame.content));
-        Atomic.incr msg_counter_total;
-
-        broadcast_message json
+        Atomic.incr msg_counter_total
       with exn ->
         Logging.warn_f ~section "Failed to parse WS message: %s (content_prefix=%s)"
           (Printexc.to_string exn)
@@ -326,9 +325,9 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
     (* Frame counter for first-frame diagnostics *)
     let frame_count = Atomic.make 0 in
 
-    let done_p, done_u = Lwt.wait () in
-    let rec loop () =
-      Lwt.catch (fun () ->
+    let stream = Lwt_stream.from (fun () ->
+      if not (Atomic.get is_connected_ref) then Lwt.return_none
+      else Lwt.catch (fun () ->
         Websocket_lwt_unix.read conn >>= fun frame ->
         let n = Atomic.fetch_and_add frame_count 1 in
         if n = 0 then
@@ -341,20 +340,25 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
              | Websocket.Frame.Opcode.Close -> "close"
              | _ -> "other")
             (String.length frame.Websocket.Frame.content);
-        handle_frame ~on_heartbeat frame >>= fun () ->
-        if Atomic.get is_connected_ref then begin
-          Lwt.async loop;
-          Lwt.return_unit
-        end else begin
-          Lwt.wakeup_later done_u ();
-          Lwt.return_unit
-        end
-      ) (fun exn ->
-        Lwt.wakeup_later_exn done_u exn;
-        Lwt.return_unit
+        Lwt.return_some frame
+      ) (function
+        | End_of_file -> Lwt.return_none
+        | exn -> Lwt.fail exn)
+    ) in
+
+    let process_frame frame =
+      Lwt.async (fun () ->
+        Lwt.catch
+          (fun () -> handle_frame ~on_heartbeat frame)
+          (fun exn -> Logging.error_f ~section "Error handling frame: %s" (Printexc.to_string exn); Lwt.return_unit)
       )
     in
-    Lwt.async loop;
+
+    let done_p =
+      Lwt.catch
+        (fun () -> Concurrency.Lwt_util.consume_stream process_frame stream)
+        (fun _exn -> Lwt.return_unit)
+    in
 
     Lwt.catch (fun () -> done_p) (function
       | End_of_file ->

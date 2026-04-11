@@ -857,34 +857,50 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   let msg_str = Yojson.Safe.to_string subscribe_msg in
   Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ()) >>= fun () ->
 
-  let done_p, done_u = Lwt.wait () in
-  let rec msg_loop () =
+  let stream = Lwt_stream.from (fun () ->
     Lwt.catch (fun () ->
-      Websocket_lwt_unix.read conn >>= function
-      | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
-          Logging.warn ~section "Orderbook WebSocket closed by server";
-          on_failure "Connection closed by server";
-          Lwt.wakeup_later done_u ();
-          Lwt.return_unit
-      | frame ->
-          handle_message frame.Websocket.Frame.content on_heartbeat;
-          Lwt.async msg_loop;
-          Lwt.return_unit
+      Websocket_lwt_unix.read conn >>= fun frame ->
+      Lwt.return_some frame
     ) (function
-      | End_of_file ->
-          Logging.warn ~section "Orderbook WebSocket connection closed unexpectedly (End_of_file)";
-          on_failure "Connection closed unexpectedly (End_of_file)";
-          Lwt.wakeup_later done_u ();
-          Lwt.return_unit
-      | exn ->
-          Logging.error_f ~section "Orderbook WebSocket error during read: %s" (Printexc.to_string exn);
-          on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
-          Lwt.wakeup_later done_u ();
-          Lwt.return_unit
-    )
+      | End_of_file -> Lwt.return_none
+      | exn -> Lwt.fail exn)
+  ) in
+
+  let process_frame = function
+    | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
+        Logging.warn ~section "Orderbook WebSocket closed by server";
+        on_failure "Connection closed by server";
+        Lwt.fail (Failure "Connection closed by server")
+    | frame ->
+        Lwt.catch
+          (fun () ->
+             handle_message frame.Websocket.Frame.content on_heartbeat;
+             Lwt.return_unit)
+          (fun exn ->
+             Logging.error_f ~section "Error handling Kraken orderbook frame: %s" (Printexc.to_string exn);
+             Lwt.return_unit)
   in
-  Lwt.async msg_loop;
-  done_p
+
+  let done_p =
+    Lwt.catch
+      (fun () -> Concurrency.Lwt_util.consume_stream (fun frame -> Lwt.async (fun () -> process_frame frame)) stream)
+      (fun exn ->
+         match exn with
+         | Failure msg when msg = "Connection closed by server" ->
+             Lwt.return_unit
+         | _ ->
+             Logging.error_f ~section "Orderbook WebSocket error during read: %s" (Printexc.to_string exn);
+             on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
+             Lwt.return_unit)
+  in
+  let final_done_p =
+    done_p >>= fun () ->
+    (* Only handle EOF case if stream completes without error *)
+    Logging.warn ~section "Orderbook WebSocket connection closed unexpectedly (End_of_file)";
+    on_failure "Connection closed unexpectedly (End_of_file)";
+    Lwt.return_unit
+  in
+  final_done_p
 
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in

@@ -170,29 +170,28 @@ let handle_client ~fd ~cancel_promise (ic, oc) =
               watch_clients := entry :: !watch_clients;
               (* Block until client sends 'Q', disconnects, or is cancelled
                  by the broadcaster detecting a write failure or heartbeat timeout. *)
-              let wait_for_quit () =
-                let quit_p, quit_u = Lwt.wait () in
-                let rec read_loop () =
-                  Lwt.catch
-                    (fun () ->
-                      let%lwt n = Lwt_io.read_into ic buf 0 1 in
-                      if n = 0 || Bytes.get buf 0 = 'Q' then begin
-                        (try Lwt.wakeup_later quit_u () with Invalid_argument _ -> ());
-                        Lwt.return_unit
-                      end else begin
-                        if Bytes.get buf 0 = 'P' then
-                          pong_time := Unix.gettimeofday ();
-                        (* Sever Forward chain: spawn next read independently. *)
-                        Lwt.async read_loop;
-                        Lwt.return_unit
-                      end)
-                    (fun _exn ->
-                      (try Lwt.wakeup_later quit_u () with Invalid_argument _ -> ());
-                      Lwt.return_unit)
+                let wait_for_quit () =
+                  let quit_p, quit_u = Lwt.wait () in
+                  let stream = Lwt_stream.from (fun () ->
+                    Lwt.catch (fun () ->
+                      Lwt_io.read_into ic buf 0 1 >>= fun n ->
+                      if n = 0 then Lwt.return_none
+                      else Lwt.return_some (Bytes.get buf 0)
+                    ) (fun _ -> Lwt.return_none)
+                  ) in
+                  let process_char c =
+                    if c = 'Q' then
+                      (try Lwt.wakeup_later quit_u () with Invalid_argument _ -> ())
+                    else if c = 'P' then
+                      pong_time := Unix.gettimeofday ()
+                  in
+                  Lwt.async (fun () ->
+                    Concurrency.Lwt_util.consume_stream process_char stream >>= fun () ->
+                    (try Lwt.wakeup_later quit_u () with Invalid_argument _ -> ());
+                    Lwt.return_unit
+                  );
+                  quit_p
                 in
-                Lwt.async read_loop;
-                quit_p
-              in
               let%lwt () = Lwt.pick [wait_for_quit (); cancel_promise_inner; cancel_promise] in
               (* Unsubscribe from broadcast list. *)
               watch_clients := List.filter (fun e -> e.fd != fd) !watch_clients;
