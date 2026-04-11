@@ -444,7 +444,21 @@ let process_account_orders_update json =
               | s -> UnknownStatus s
         in
 
-        let is_ask = (try member "is_ask" order_json |> to_bool with _ -> false) in
+        let is_ask =
+          let is_ask_val =
+            try let v = member "is_ask" order_json in if v <> `Null then v else member "isAsk" order_json
+            with _ -> `Null
+          in
+          match is_ask_val with
+          | `Bool b -> b
+          | `Int i -> i <> 0
+          | `String s -> String.lowercase_ascii s = "true" || s = "1"
+          | _ ->
+              (try
+                let side_str = member "side" order_json |> to_string |> String.lowercase_ascii in
+                side_str = "sell" || side_str = "ask"
+               with _ -> false)
+        in
         let side = if is_ask then Sell else Buy in
         let price = (try Lighter_types.parse_json_float (member "price" order_json) with _ -> 0.0) in
         let base_amount = (try Lighter_types.parse_json_float (member "initial_base_amount" order_json) with _ ->
