@@ -84,20 +84,6 @@ let reset t =
     profiler state after reporting. *)
 let report ?(sample_threshold=1) t =
   if t.samples >= sample_threshold then (
-
-    let p50 = percentile t 0.50 in
-    let p90 = percentile t 0.90 in
-    let p95 = percentile t 0.95 in
-    let p99 = percentile t 0.99 in
-    let p999 = percentile t 0.999 in
-
-    if t.overflow > 0 then
-      Logging.debug_f ~section "[%s] latency (us): p50=%.2f p90=%.2f p95=%.2f p99=%.2f p999=%.2f samples=%d overflow=%d"
-        t.name p50 p90 p95 p99 p999 t.samples t.overflow
-    else
-      Logging.debug_f ~section "[%s] latency (us): p50=%.2f p90=%.2f p95=%.2f p99=%.2f p999=%.2f samples=%d"
-        t.name p50 p90 p95 p99 p999 t.samples;
-
     reset t
   )
 

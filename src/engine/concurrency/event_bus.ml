@@ -82,7 +82,6 @@ module Make (Payload : PAYLOAD) = struct
             sub.closed <- true;
             (try sub.close () with _ -> ())
           ) to_remove;
-          Logging.debug_f ~section:"event_bus" "Cleaned up %d closed subscribers for topic %s (kept %d)" removed_count bus.topic (List.length to_keep);
           if Atomic.compare_and_set bus.subscribers current to_keep then
             Some removed_count
           else try_cleanup ()

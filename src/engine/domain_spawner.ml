@@ -98,78 +98,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
   in
   
 
-  let format_distance_info asset_symbol current_price strategy_type =
-    match strategy_type with
-    | "MM" ->
-        let state = Dio_strategies.Market_maker.get_strategy_state asset_symbol in
-        (match current_price with
-         | None -> " | Strategy: no price data"
-         | Some _ ->
-             let buy_info = match state.last_buy_order_price with
-               | Some buy_price -> Printf.sprintf "Buy@%.2f" buy_price
-               | None -> "Buy:none"
-             in
-             let sell_info =
-               if state.open_sell_orders = [] then
-                 "Sell:none"
-               else
-                 let best_price = match current_price with
-                   | Some price ->
-                       List.fold_left (fun acc (_, sell_price, _) ->
-                         match acc with
-                         | None -> Some sell_price
-                         | Some best -> if abs_float (sell_price -. price) < abs_float (best -. price) then Some sell_price else Some best
-                       ) None state.open_sell_orders
-                   | None -> 
-                       match state.open_sell_orders with (_, p, _)::_ -> Some p | [] -> None
-                 in
-                 match best_price with
-                 | Some p -> Printf.sprintf "Sell@%.2f" p
-                 | None -> "Sell:none"
-             in
-             Printf.sprintf " | Strategy: %s %s" buy_info sell_info)
-    | _ ->
-        (* Grid strategy distance info (default branch) *)
-        let state = Dio_strategies.Suicide_grid.get_strategy_state asset_symbol in
-        match current_price with
-        | None -> " | Strategy: no price data"
-        | Some price ->
-            let buy_info =
-              match state.last_buy_order_price with
-              | Some buy_price ->
-                  let buy_distance_pct = ((buy_price -. price) /. price) *. 100.0 in
-                  Printf.sprintf "Buy@%.2f(%.2f%c)" buy_price buy_distance_pct '%'
-              | None -> "Buy:none"
-            in
-            let sell_info =
-              if state.open_sell_orders = [] then
-                "Sell:none"
-              else
-                let closest_sell = List.fold_left (fun acc (_, sell_price, _) ->
-                  match acc with
-                  | None -> Some sell_price
-                  | Some current_closest ->
-                      if abs_float (sell_price -. price) < abs_float (current_closest -. price)
-                      then Some sell_price
-                      else Some current_closest
-                ) None state.open_sell_orders in
-                match closest_sell with
-                | Some sell_price ->
-                    let sell_distance_pct = ((sell_price -. price) /. price) *. 100.0 in
-                    Printf.sprintf "Sell@%.2f(%.2f%c,%d)" sell_price sell_distance_pct '%' (List.length state.open_sell_orders)
-                | None -> "Sell:none"
-            in
-            Printf.sprintf " | Strategy: %s %s" buy_info sell_info
-  in
+
 
   (* Resolve exchange module from the registry *)
-  Logging.debug_f ~section "Looking up exchange %s" asset_with_fees.exchange;
+
   match Exchange.Registry.get asset_with_fees.exchange with
   | None ->
       Logging.error_f ~section "Unknown exchange '%s' for asset %s, aborting domain"
         asset_with_fees.exchange asset_with_fees.symbol
   | Some (module Ex) ->
-      Logging.debug_f ~section "Found exchange module for %s" asset_with_fees.exchange;
+
 
       (* Ring buffer read positions for this domain *)
       let exec_read_pos = ref 0 in
@@ -258,8 +196,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                  match Dio_strategies.Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol with
                  | Some cached -> cached
                  | None -> 0.0);
-           Logging.debug_f ~section "Early-init strategy state for %s: exchange_id=%s, grid_qty=%.8f, sell_mult=%.4f, maker_fee=%.6f"
-             asset.symbol asset.exchange st.grid_qty st.cached_sell_mult st.maker_fee
+            ()
        | None -> ());
 
       (* Initialize exec read position: ALL exchanges start from position 0
@@ -355,11 +292,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
-        (* Periodic debug logging gated by cycle_mod — kept off the hot path *)
-        if !cycle_count mod config.cycle_mod = 0 then
-          Logging.debug_f ~section "Asset [%s/%s] cycle #%d"
-            asset_with_fees.exchange asset_with_fees.symbol !cycle_count;
-        
         (* === TICKER HOT PATH START === *)
         let t0 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
@@ -399,12 +331,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             match event.order_status with
               | Types.Canceled | Types.Rejected | Types.Expired ->
                   should_execute_strategy := true;
-                  let status_desc = match event.order_status with
-                    | Types.Canceled -> "cancelled"
-                    | Types.Rejected -> "rejected"
-                    | Types.Expired -> "expired"
-                    | _ -> "terminated"
-                  in
+
                   let side = match event.side with
                     | Types.Buy -> Dio_strategies.Strategy_common.Buy
                     | Types.Sell -> Dio_strategies.Strategy_common.Sell
@@ -413,15 +340,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled
                          asset_with_fees.symbol event.order_id side event.cl_ord_id;
-                       Logging.debug_f ~section "Notified Grid strategy about %s order %s for %s"
-                         status_desc event.order_id asset_with_fees.symbol
+                       ()
                    | None -> ());
                   (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_cancelled
                          asset_with_fees.symbol event.order_id side event.cl_ord_id;
-                       Logging.debug_f ~section "Notified MM strategy about %s order %s for %s"
-                         status_desc event.order_id asset_with_fees.symbol
+                       ()
                    | None -> ())
               | Types.Filled ->
                   should_execute_strategy := true;
@@ -434,16 +359,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                        Dio_strategies.Suicide_grid.Strategy.handle_order_filled
                          asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price
                          event.cl_ord_id;
-                       Logging.debug_f ~section "Notified Grid strategy about filled order %s for %s"
-                         event.order_id asset_with_fees.symbol
+                       ()
                    | None -> ());
                   (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_filled
                          asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price
                          event.cl_ord_id;
-                       Logging.debug_f ~section "Notified MM strategy about filled order %s for %s"
-                         event.order_id asset_with_fees.symbol
+                       ()
                    | None -> ());
                   
                   (* Trigger Auto-Hedging module *)
@@ -476,19 +399,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                         | Some _ ->
                             Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
                               asset_with_fees.symbol event.order_id side price;
-                            Logging.debug_f ~section "Notified Grid strategy about acknowledged order %s for %s"
-                              event.order_id asset_with_fees.symbol
+                            ()
                         | None -> ());
                        (match !mm_strategy_asset_ref with
                         | Some _ ->
                             Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
                               asset_with_fees.symbol event.order_id side price;
-                            Logging.debug_f ~section "Notified MM strategy about acknowledged order %s for %s"
-                              event.order_id asset_with_fees.symbol
+                            ()
                         | None -> ())
-                   | Some price ->
-                       Logging.debug_f ~section "ZERO_PRICE_SKIP %s [%s] price=%.8f (snapshot replay, not a real ack)"
-                         event.order_id asset_with_fees.symbol price
+                   | Some _ ->
+                       ()
                    | None -> ())
               | _ -> ()
           ) in
@@ -666,20 +586,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Periodic cycle statistics (gated by cycle_mod) *)
         if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
-          | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
-              (* Gate format_distance_info behind will_log: the function
-                 acquires strategy_states_mutex, allocates multiple strings via
-                 Printf.sprintf, and List.fold_lefts over open_sell_orders.
-                 All of that work is discarded when log level is INFO or above. *)
-              let dist_info =
-                if Logging.will_log Logging.DEBUG section then
-                  format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy
-                else ""
-              in
-              Logging.debug_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
-                asset_with_fees.exchange asset_with_fees.symbol !cycle_count price
-                bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
-                !last_buy_count !last_sell_count dist_info
+          | Some _, Some _ -> ()
           | _ -> ());
         end;
         
@@ -719,7 +626,7 @@ let register_domain asset =
   Mutex.lock registry_mutex;
   Hashtbl.replace domain_registry key state;
   Mutex.unlock registry_mutex;
-  Logging.debug_f ~section "Registered domain for supervision: %s" key;
+
   state
 
 (** Condition variable signalled on domain exit (crash or normal). Allows
@@ -753,7 +660,7 @@ let start_domain config state fee_fetcher =
     (* Join the previous domain handle synchronously before spawning *)
     (match Atomic.get state.domain_handle with
      | Some old_handle ->
-         Logging.debug_f ~section "Joining old domain %s before restart" key;
+
          (try Domain.join old_handle
           with exn -> Logging.warn_f ~section "Exception joining old domain %s: %s" 
                         key (Printexc.to_string exn))
@@ -799,13 +706,10 @@ let stop_domain state =
   let symbol = state.asset.symbol in
   (match state.asset.strategy with
    | "Grid" | "suicide_grid" ->
-       Dio_strategies.Suicide_grid.Strategy.cleanup_strategy_state symbol;
-       Logging.debug_f ~section "Cleaned up Grid strategy state for %s" symbol
+       Dio_strategies.Suicide_grid.Strategy.cleanup_strategy_state symbol
    | "MM" ->
-       Dio_strategies.Market_maker.Strategy.cleanup_strategy_state symbol;
-       Logging.debug_f ~section "Cleaned up MM strategy state for %s" symbol
-   | _ ->
-       Logging.debug_f ~section "No cleanup needed for strategy %s" state.asset.strategy);
+       Dio_strategies.Market_maker.Strategy.cleanup_strategy_state symbol
+   | _ -> ());
 
   (* Unblock workers in Exchange_wakeup.wait so they observe is_running=false
      and exit the main loop. *)
@@ -895,7 +799,7 @@ let supervisor_loop config fee_fetcher =
 (** Initialize strategies, register all assets, start their domains, and
     launch the supervisor thread. Returns the supervisor Thread.t handle. *)
 let spawn_supervised_domains_for_assets (config : config) (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : Thread.t =
-  Logging.debug_f ~section "Spawning supervised domains for %d assets..." (List.length assets);
+
 
   (* Initialize strategy module state *)
   Dio_strategies.Suicide_grid.Strategy.init ();
@@ -1022,5 +926,5 @@ let spawn_config_domains (fee_fetcher : trading_config -> trading_config) () : u
      Runtime inherits these settings for all subsequently spawned domains. *)
   apply_gc_config ();
   let configs = full_config.trading in
-  Logging.debug_f ~section "Preparing to spawn domains for %d assets..." (List.length configs);
+
   spawn_domains_for_assets full_config fee_fetcher configs
