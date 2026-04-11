@@ -118,8 +118,10 @@ let run_renewal_cycle () =
   ) all_orders;
 
   (* Process expiring orders sequentially with a delay between each
-     to avoid nonce conflicts with the Lighter signer. *)
-  Lwt_list.iter_s (fun (order : Lighter_executions_feed.open_order) ->
+     to avoid nonce conflicts with the Lighter signer.
+     Use consume_stream_s to prevent Forward promise accumulation. *)
+  let expiring_stream = Lwt_stream.of_list expiring in
+  Concurrency.Lwt_util.consume_stream_s (fun (order : Lighter_executions_feed.open_order) ->
     if !shutdown_requested then Lwt.return_unit
     else begin
       let expiry = Option.get order.order_expiry in
@@ -133,7 +135,7 @@ let run_renewal_cycle () =
       (* Rate-limit: 200ms between operations to be safe with nonces *)
       Lwt_unix.sleep 0.2
     end
-  ) expiring
+  ) expiring_stream
 
 (** Start the TIF renewal background loop. Runs every [check_interval_seconds]
     and scans open orders for those approaching expiry. *)

@@ -384,11 +384,30 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                      handle_order_amended callback on the REST response path.
                      Routing these through handle_order_acknowledged causes a
                      dual-update race that corrupts open_sell_orders tracking. *)
-                  if event.is_amended then
-                    Logging.info_f ~section "AMENDED_SKIP %s [%s] status=%s (handled by amendment lifecycle)"
+                  if event.is_amended then begin
+                    Logging.info_f ~section "AMENDED_WS_EVENT %s [%s] status=%s (updating strategy tracker)"
                       event.order_id asset_with_fees.symbol
-                      (match event.order_status with Types.New -> "New" | Types.PartiallyFilled -> "PartiallyFilled" | _ -> "Other")
-                  else
+                      (match event.order_status with Types.New -> "New" | Types.PartiallyFilled -> "PartiallyFilled" | _ -> "Other");
+                    (match event.limit_price with
+                     | Some price when price > 0.0 ->
+                         let side = match event.side with
+                           | Types.Buy -> Dio_strategies.Strategy_common.Buy
+                           | Types.Sell -> Dio_strategies.Strategy_common.Sell
+                         in
+                         (match !grid_strategy_asset_ref with
+                          | Some _ ->
+                              Dio_strategies.Suicide_grid.Strategy.handle_order_amended
+                                asset_with_fees.symbol event.order_id event.order_id side price;
+                              ()
+                          | None -> ());
+                         (match !mm_strategy_asset_ref with
+                          | Some _ ->
+                              Dio_strategies.Market_maker.Strategy.handle_order_amended
+                                asset_with_fees.symbol event.order_id event.order_id side price;
+                              ()
+                          | None -> ())
+                     | _ -> ())
+                  end else
                   (match event.limit_price with
                    | Some price when price > 0.0 ->
                        let side = match event.side with

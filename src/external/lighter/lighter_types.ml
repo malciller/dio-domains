@@ -28,7 +28,7 @@ let status_of_lighter_int = function
   | 5 -> Types.Canceled        (* CanceledByEngine *)
   | 6 -> Types.Canceled        (* CanceledByProtocol *)
   | 7 -> Types.Expired         (* Expired *)
-  | n -> Types.Unknown (Printf.sprintf "lighter_status_%d" n)
+  | _n -> Types.Unknown "lighter_unknown_status"
 
 let status_of_lighter_string = function
   | "InProgress" -> Types.Pending
@@ -37,7 +37,7 @@ let status_of_lighter_string = function
   | "Filled" -> Types.Filled
   | "CanceledByOwner" | "CanceledByEngine" | "CanceledByProtocol" -> Types.Canceled
   | "Expired" -> Types.Expired
-  | s -> Types.Unknown s
+  | _s -> Types.Unknown "lighter_unknown_status"
 
 (** Map [Types.order_type] to Lighter's integer codes.
     0=Limit, 1=Market, 2=StopLoss, 3=TakeProfit *)

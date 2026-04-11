@@ -16,7 +16,7 @@ type connection_state = {
   active_connection : Websocket_lwt_unix.conn option ref;
   connection_mutex : Lwt_mutex.t;
   is_connected_ref : bool Atomic.t;
-  connected_wakeup : unit Lwt_mvar.t;
+  connected_wakeup : unit Lwt_condition.t;
   last_pong_time : float ref;
   pong_condition : unit Lwt_condition.t;
 }
@@ -25,7 +25,7 @@ let create_connection_state () = {
   active_connection = ref None;
   connection_mutex = Lwt_mutex.create ();
   is_connected_ref = Atomic.make false;
-  connected_wakeup = Lwt_mvar.create_empty ();
+  connected_wakeup = Lwt_condition.create ();
   last_pong_time = ref 0.0;
   pong_condition = Lwt_condition.create ();
 }
@@ -40,7 +40,7 @@ let is_connected () = public_connected () && private_connected ()
 let wait_for_connected () =
   let wait_one state =
     if Atomic.get state.is_connected_ref then Lwt.return_unit
-    else Lwt_mvar.take state.connected_wakeup
+    else Lwt_condition.wait state.connected_wakeup
   in
   Lwt.join [wait_one public_state; wait_one private_state]
 
@@ -89,8 +89,9 @@ let broadcast_message json =
     with _ -> ()
   ) ps;
   if List.length !alive <> List.length ps then begin
+    let dead = List.filter (fun p -> not (List.memq p !alive)) ps in
     Mutex.lock pushers_mutex;
-    pushers := List.rev !alive;
+    pushers := List.filter (fun p -> not (List.memq p dead)) !pushers;
     Mutex.unlock pushers_mutex
   end
 
@@ -115,7 +116,6 @@ let subscribe_market_data () =
     | Some json ->
         let p = push_source#push json in
         if Lwt.is_sleeping p then begin
-          Lwt.cancel p;
           ignore (close_internal ());
           false
         end else
@@ -152,7 +152,8 @@ let send_private_json = send_json_on private_state
 (** Subscribe to feeds routed properly between public and private dual connections. *)
 let subscribe_to_feeds ~symbols ~account_index ~auth_token =
   (* Subscribe to ticker and orderbook for each symbol on the public connection *)
-  let%lwt () = Lwt_list.iter_s (fun symbol ->
+  let public_stream = Lwt_stream.of_list symbols in
+  let%lwt () = Concurrency.Lwt_util.consume_stream_s (fun symbol ->
     match Lighter_instruments_feed.get_market_index ~symbol with
     | Some market_index ->
         let mi_str = string_of_int market_index in
@@ -169,30 +170,21 @@ let subscribe_to_feeds ~symbols ~account_index ~auth_token =
     | None ->
         Logging.error_f ~section "Cannot subscribe: no market_index for symbol %s" symbol;
         Lwt.return_unit
-  ) symbols in
+  ) public_stream in
 
   (* Subscribe to authenticated account channels on the private connection *)
   let acct_str = string_of_int account_index in
-  let%lwt () = send_private_json (`Assoc [
-    ("type", `String "subscribe");
-    ("channel", `String ("account_all_orders/" ^ acct_str));
-    ("auth", `String auth_token)
-  ]) "Private" in
-  let%lwt () = send_private_json (`Assoc [
-    ("type", `String "subscribe");
-    ("channel", `String ("account_all/" ^ acct_str));
-    ("auth", `String auth_token)
-  ]) "Private" in
-  let%lwt () = send_private_json (`Assoc [
-    ("type", `String "subscribe");
-    ("channel", `String ("account_all_assets/" ^ acct_str));
-    ("auth", `String auth_token)
-  ]) "Private" in
-  let%lwt () = send_private_json (`Assoc [
-    ("type", `String "subscribe");
-    ("channel", `String ("user_stats/" ^ acct_str));
-    ("auth", `String auth_token)
-  ]) "Private" in
+  let private_commands = [
+    `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_orders/" ^ acct_str)); ("auth", `String auth_token)];
+    `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all/" ^ acct_str)); ("auth", `String auth_token)];
+    `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_assets/" ^ acct_str)); ("auth", `String auth_token)];
+    `Assoc [("type", `String "subscribe"); ("channel", `String ("user_stats/" ^ acct_str)); ("auth", `String auth_token)]
+  ] in
+  let private_stream = Lwt_stream.of_list private_commands in
+  let%lwt () = Concurrency.Lwt_util.consume_stream_s (fun cmd ->
+    send_private_json cmd "Private"
+  ) private_stream in
+  
   Logging.debug_f ~section "Subscribed to private channels for %s" acct_str;
   Lwt.return_unit
 
@@ -305,8 +297,7 @@ let connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_hea
     Lwt_mutex.with_lock state.connection_mutex (fun () ->
       state.active_connection := Some conn;
       Atomic.set state.is_connected_ref true;
-      if Lwt_mvar.is_empty state.connected_wakeup then
-        Lwt.async (fun () -> Lwt_mvar.put state.connected_wakeup ());
+      Lwt_condition.broadcast state.connected_wakeup ();
       Lwt.return_unit
     ) >>= fun () ->
     on_connected ();
@@ -343,7 +334,7 @@ let connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_hea
           close_all_subscribers ();
           Lwt.fail_with ("[" ^ label ^ "] Connection closed unexpectedly (End_of_file)")
       | exn ->
-          Logging.error_f ~section "[%s] WebSocket read error: %s" label (Printexc.to_string exn);
+          Logging.debug_f ~section "[%s] WebSocket read error: %s" label (Printexc.to_string exn);
           Lwt_mutex.with_lock state.connection_mutex (fun () ->
             state.active_connection := None;
             Atomic.set state.is_connected_ref false;
@@ -361,8 +352,18 @@ let connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_hea
     Lwt.fail_with ("[" ^ label ^ "] WebSocket closed by server")
   ) (fun exn ->
     let error_msg = Printexc.to_string exn in
-    Logging.error_f ~section "[%s] WebSocket connection error: %s" label error_msg;
-    if label = "Private" then Lighter_proxy.rotate_proxy ();
+    Logging.debug_f ~section "[%s] WebSocket connection error: %s" label error_msg;
+    let is_server_error =
+      let rec contains_5xx i =
+        if i > String.length error_msg - 3 then false
+        else
+          let sub = String.sub error_msg i 3 in
+          if sub = "500" || sub = "502" || sub = "503" || sub = "504" then true
+          else contains_5xx (i + 1)
+      in
+      contains_5xx 0
+    in
+    if label = "Private" && is_server_error then Lighter_proxy.rotate_proxy ();
     Atomic.set state.is_connected_ref false;
     close_all_subscribers ();
     on_failure error_msg;

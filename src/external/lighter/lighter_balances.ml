@@ -56,12 +56,13 @@ module BalanceStore = struct
     } in
 
     Mutex.lock store.mutex;
-    Hashtbl.replace store.wallets wallet_key wallet_data;
+    Fun.protect ~finally:(fun () -> Mutex.unlock store.mutex) (fun () ->
+      Hashtbl.replace store.wallets wallet_key wallet_data;
 
-    let total = Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0 in
-    Atomic.set store.total_balance total;
-    Atomic.set store.last_updated now;
-    Mutex.unlock store.mutex
+      let total = Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0 in
+      Atomic.set store.total_balance total;
+      Atomic.set store.last_updated now
+    )
 
   let get_balance store = Atomic.get store.total_balance
 
@@ -88,15 +89,14 @@ let ready_condition = Lwt_condition.create ()
 
 let get_balance_store asset =
   Mutex.lock balance_stores_mutex;
-  let store = match Hashtbl.find_opt balance_stores asset with
+  Fun.protect ~finally:(fun () -> Mutex.unlock balance_stores_mutex) (fun () ->
+    match Hashtbl.find_opt balance_stores asset with
     | Some store -> store
     | None ->
         let store = BalanceStore.create () in
         Hashtbl.add balance_stores asset store;
         store
-  in
-  Mutex.unlock balance_stores_mutex;
-  store
+  )
 
 let get_balance asset =
   let store = get_balance_store asset in
@@ -104,11 +104,11 @@ let get_balance asset =
 
 let get_all_balances () =
   Mutex.lock balance_stores_mutex;
-  let balances = Hashtbl.fold (fun asset store acc ->
-    (asset, BalanceStore.get_balance store) :: acc
-  ) balance_stores [] in
-  Mutex.unlock balance_stores_mutex;
-  balances
+  Fun.protect ~finally:(fun () -> Mutex.unlock balance_stores_mutex) (fun () ->
+    Hashtbl.fold (fun asset store acc ->
+      (asset, BalanceStore.get_balance store) :: acc
+    ) balance_stores []
+  )
 
 let get_balance_data asset =
   let store = get_balance_store asset in
@@ -124,16 +124,15 @@ let has_balance_data asset =
 
 let get_all_assets () =
   Mutex.lock balance_stores_mutex;
-  let assets = ref [] in
-  Hashtbl.iter (fun asset _store -> assets := asset :: !assets) balance_stores;
-  Mutex.unlock balance_stores_mutex;
-  !assets
+  Fun.protect ~finally:(fun () -> Mutex.unlock balance_stores_mutex) (fun () ->
+    let assets = ref [] in
+    Hashtbl.iter (fun asset _store -> assets := asset :: !assets) balance_stores;
+    !assets
+  )
 
 let notify_ready () =
-  if not (Atomic.get is_ready) then begin
-    Atomic.set is_ready true;
-    (try Lwt_condition.broadcast ready_condition () with _ -> ())
-  end
+  (* Broadcast on every update since wait_for_balance_data polls multiple assets *)
+  (try Lwt_condition.broadcast ready_condition () with _ -> ())
 
 let wait_for_balance_data_lwt assets timeout_seconds =
   Concurrency.Lwt_util.poll_until
@@ -262,23 +261,23 @@ let process_market_data json =
 (** Background processor task. Subscribes to the Lighter WS broadcast stream
     and dispatches messages to balance handlers. Mirrors hyperliquid_balances.ml. *)
 let _processor_task =
-  let rec run () =
-    let sub = Lighter_ws.subscribe_market_data () in
+  let open Lwt.Infix in
+  let rec loop () =
     Lwt.catch (fun () ->
+      let sub = Lighter_ws.subscribe_market_data () in
       Logging.debug ~section "Starting Lighter balances processor task";
       let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
       sub.close ();
       Logging.debug ~section "Balances stream ended (disconnect), re-subscribing...";
-      Lwt.async run;
       Lwt.return_unit
     ) (fun exn ->
-      sub.close ();
       Logging.debug_f ~section "Lighter balances processor task crashed: %s. Re-subscribing..." (Printexc.to_string exn);
-      Lwt.async run;
-      Lwt.return_unit
-    )
+      Lwt_unix.sleep 1.0
+    ) >>= fun () ->
+    Lwt.async loop;
+    Lwt.return_unit
   in
-  Lwt.async run
+  Lwt.async loop
 
 let initialize assets =
   Logging.info_f ~section "Initializing Lighter balances feed for %d assets" (List.length assets);
