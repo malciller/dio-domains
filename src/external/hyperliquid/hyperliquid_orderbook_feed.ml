@@ -76,6 +76,9 @@ let find_registered_symbol coin =
 let process_market_data json =
   let open Yojson.Safe.Util in
   let channel = member "channel" json |> to_string_option in
+  (* Hoist timestamp before the match: avoids a gettimeofday syscall
+     inside the per-symbol branch on every l2Book update. *)
+  let now_ts = Unix.gettimeofday () in
   match channel with
   | Some "l2Book" ->
       let data = member "data" json in
@@ -87,19 +90,25 @@ let process_market_data json =
             let raw_bids = List.nth levels 0 |> to_list in
             let raw_asks = List.nth levels 1 |> to_list in
             
-            let parse_level l = {
-              price = member "px" l |> to_string |> float_of_string;
-              size = member "sz" l |> to_string |> float_of_string;
-            } in
-            
-            let bids = List.map parse_level raw_bids |> Array.of_list in
-            let asks = List.map parse_level raw_asks |> Array.of_list in
+            (* Build level arrays: convert JSON list to array first (O(N)),
+               then map in-place. Avoids both the intermediate List.map cons-cell
+               allocation and the O(N²) penalty of List.nth inside Array.init. *)
+            let raw_bids_arr = Array.of_list raw_bids in
+            let raw_asks_arr = Array.of_list raw_asks in
+            let bids = Array.map (fun l ->
+              { price = member "px" l |> to_string |> float_of_string;
+                size = member "sz" l |> to_string |> float_of_string }
+            ) raw_bids_arr in
+            let asks = Array.map (fun l ->
+              { price = member "px" l |> to_string |> float_of_string;
+                size = member "sz" l |> to_string |> float_of_string }
+            ) raw_asks_arr in
             
             let ob = {
               symbol;
               bids;
               asks;
-              timestamp = Unix.gettimeofday ();
+              timestamp = now_ts;
             } in
             
             let store = ensure_store symbol in

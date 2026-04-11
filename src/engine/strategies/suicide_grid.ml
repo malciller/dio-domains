@@ -629,6 +629,7 @@ let push_order ~now ?state order =
     caller to avoid redundant syscalls on every cycle. *)
 let execute_strategy
     ?cached_state
+    ?precounted_orders
     ~now
     (asset : trading_config)
     (current_price : float option)
@@ -793,20 +794,11 @@ let execute_strategy
       end;
 
 
-      (* Clean up expired amend cooldowns. *)
+      (* Clean up expired amend cooldowns in a single pass. *)
       if Hashtbl.length state.amend_cooldowns > 0 then begin
-        let has_expired = ref false in
-        Hashtbl.iter (fun _ expiry_time -> if now > expiry_time then has_expired := true) state.amend_cooldowns;
-        if !has_expired then begin
-          let to_remove_cooldowns = ref [] in
-          Hashtbl.iter (fun order_id expiry_time ->
-            if now > expiry_time then
-              to_remove_cooldowns := order_id :: !to_remove_cooldowns
-          ) state.amend_cooldowns;
-          List.iter (fun order_id ->
-            Hashtbl.remove state.amend_cooldowns order_id
-          ) !to_remove_cooldowns;
-        end;
+        let to_remove = ref [] in
+        Hashtbl.iter (fun k v -> if now > v then to_remove := k :: !to_remove) state.amend_cooldowns;
+        List.iter (Hashtbl.remove state.amend_cooldowns) !to_remove;
         (* Hard cap: prevent unbounded growth if cooldowns accumulate faster than they expire. *)
         if Hashtbl.length state.amend_cooldowns > 100 then begin
           Hashtbl.reset state.amend_cooldowns;
@@ -842,27 +834,36 @@ let execute_strategy
       
       (* pending_orders are managed by order placement responses; not cleared here. *)
 
-      (* Rebuild buy and sell lists from exchange open_orders data in a single pass. *)
-          let open_buy_count_local = ref 0 in
-          let buy_orders = ref [] in
-          let sell_orders = ref [] in
-          
-          iter_open_orders (fun order_id order_price qty side_str userref_opt ->
-            let is_our_strategy = match userref_opt with
-              | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
-              | None -> true
-            in
-            if qty > 0.0 && is_our_strategy then begin
-              if side_str = "buy" then begin
-                incr open_buy_count_local;
-                buy_orders := (order_id, order_price) :: !buy_orders
-              end else begin
-                sell_orders := (order_id, order_price, qty) :: !sell_orders;
-                Logging.debug_f ~section "SELL_REBUILD [%s] from exchange cache: %s @ %.2f qty=%.8f"
-                  asset.symbol order_id order_price qty
-              end
-            end
-          );
+      (* Rebuild buy and sell lists from pre-computed data or exchange scan.
+         When precounted_orders is provided by the caller, skip the redundant
+         iter_open_orders call that would re-acquire orders_mutex and re-iterate
+         the same hashtable the caller already scanned. *)
+          let (buy_orders, sell_orders, open_buy_count_from_scan) =
+            match precounted_orders with
+            | Some (buys, sells, bc) ->
+                (ref buys, ref sells, bc)
+            | None ->
+                let obc = ref 0 in
+                let buys = ref [] in
+                let sells = ref [] in
+                iter_open_orders (fun order_id order_price qty side_str userref_opt ->
+                  let is_our_strategy = match userref_opt with
+                    | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
+                    | None -> true
+                  in
+                  if qty > 0.0 && is_our_strategy then begin
+                    if side_str = "buy" then begin
+                      incr obc;
+                      buys := (order_id, order_price) :: !buys
+                    end else begin
+                      sells := (order_id, order_price, qty) :: !sells;
+                      Logging.debug_f ~section "SELL_REBUILD [%s] from exchange cache: %s @ %.2f qty=%.8f"
+                        asset.symbol order_id order_price qty
+                    end
+                  end
+                );
+                (buys, sells, !obc)
+          in
 
       (* Set buy order price and ID (select highest buy if multiple exist).
          Gate: if a cancel is in flight, the open_orders snapshot is not trusted
@@ -998,8 +999,9 @@ let execute_strategy
        webData2 snapshots can be stale during cancel-replace amendments.
        last_buy_order_id is set immediately by orderUpdates events. *)
     let has_tracked_buy = state.last_buy_order_id <> None in
-    (* Count non-cancelled open buy orders for balance check *)
-    let open_buy_count = _open_buy_count in
+    (* Use the count from our own scan (precounted or internal), not the
+       external parameter which may include orders from other strategies. *)
+    let open_buy_count = open_buy_count_from_scan in
     let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
 
     if buy_order_pending then begin
