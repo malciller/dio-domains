@@ -125,8 +125,7 @@ let set_state conn new_state =
   Mutex.lock conn.mutex;
   let old_state = conn.state in
   conn.state <- new_state;
-  (* Lighter WS reconnects frequently by design; demote its state logs to debug *)
-  let is_quiet = String.equal conn.name "lighter_ws" in
+
   
   (match new_state with
   | Connected ->
@@ -137,54 +136,28 @@ let set_state conn new_state =
       Atomic.set conn.ping_failures 0;
       conn.reconnect_attempts <- 0;
       conn.total_connections <- conn.total_connections + 1;
-      if is_quiet then
-        Logging.debug_f ~section "[%s] Connection established (total: %d)"
-          conn.name conn.total_connections
-      else
-        Logging.info_f ~section "[%s] Connection established (total: %d)"
+      Logging.info_f ~section "[%s] Connection established (total: %d)"
           conn.name conn.total_connections
   | Disconnected ->
       conn.last_disconnected <- Some (Unix.time ());
       conn.last_connecting <- None;
-      if is_quiet then
-        Logging.debug_f ~section "[%s] Connection lost" conn.name
-      else
-        Logging.warn_f ~section "[%s] Connection lost" conn.name
+      Logging.warn_f ~section "[%s] Connection lost" conn.name
   | Connecting ->
       conn.last_connecting <- Some (Unix.time ());
-      if is_quiet then
-        Logging.debug_f ~section "[%s] Attempting connection (attempt #%d)"
-          conn.name (conn.reconnect_attempts + 1)
-      else
-        Logging.info_f ~section "[%s] Attempting connection (attempt #%d)"
+      Logging.info_f ~section "[%s] Attempting connection (attempt #%d)"
           conn.name (conn.reconnect_attempts + 1)
   | Failed reason ->
       conn.last_disconnected <- Some (Unix.time ());
       conn.last_connecting <- None;
       conn.reconnect_attempts <- conn.reconnect_attempts + 1;
-      if is_quiet then
-        Logging.debug_f ~section "[%s] Connection failed: %s (attempt #%d)"
-          conn.name reason conn.reconnect_attempts
-      else
-        Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)"
+      Logging.error_f ~section "[%s] Connection failed: %s (attempt #%d)"
           conn.name reason conn.reconnect_attempts);
   
   Mutex.unlock conn.mutex;
   
   (* Log state transitions and propagate to cache *)
   if old_state <> new_state then begin
-    Logging.debug_f ~section "[%s] State transition: %s -> %s" 
-      conn.name 
-      (match old_state with
-       | Disconnected -> "Disconnected"
-       | Connecting -> "Connecting"
-       | Connected -> "Connected"
-       | Failed _ -> "Failed")
-      (match new_state with
-       | Disconnected -> "Disconnected"
-       | Connecting -> "Connecting"
-       | Connected -> "Connected"
-       | Failed _ -> "Failed");
+
        
     (* Rate-limit cache updates to at most once per second.
        The dashboard state_broadcaster picks up interim deltas
@@ -287,9 +260,8 @@ let start_async conn =
       let should_start = match conn.state with
         | Connecting -> 
             Mutex.unlock conn.mutex;
-            Logging.debug_f ~section "[%s] Connection already connecting, skipping duplicate start" conn.name;
             false
-        | old_state ->
+        | _ ->
             if not (circuit_breaker_allows_connection_unlocked conn) then begin
               conn.state <- Failed "Circuit breaker open";
               conn.last_disconnected <- Some (Unix.time ());
@@ -300,8 +272,7 @@ let start_async conn =
               
               Logging.warn_f ~section "[%s] Circuit breaker blocks connection attempt" conn.name;
               Logging.error_f ~section "[%s] Connection failed: Circuit breaker open (attempt #%d)" conn.name attempt_num;
-              Logging.debug_f ~section "[%s] State transition: %s -> Failed" 
-                conn.name (match old_state with Disconnected -> "Disconnected" | Connected -> "Connected" | Failed _ -> "Failed" | Connecting -> "Connecting");
+
               false
             end else begin
               conn.state <- Connecting;
@@ -310,13 +281,9 @@ let start_async conn =
               let attempt_num = conn.reconnect_attempts in
               Mutex.unlock conn.mutex;
               
-              let is_quiet = String.equal conn.name "lighter_ws" in
-              (if is_quiet then
-                Logging.debug_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num
-              else
-                Logging.info_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num);
-              Logging.debug_f ~section "[%s] State transition: %s -> Connecting" 
-                conn.name (match old_state with Disconnected -> "Disconnected" | Connected -> "Connected" | Failed _ -> "Failed" | Connecting -> "Connecting");
+
+              Logging.info_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num;
+
               
               let now = Unix.gettimeofday () in
               let last = !last_supervisor_cache_update in
@@ -324,10 +291,7 @@ let start_async conn =
                 last_supervisor_cache_update := now;
                 Supervisor_cache.force_update ()
               end;
-              (if is_quiet then
-                Logging.debug_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num
-              else
-                Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num);
+              Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num;
               true
             end
       in
@@ -339,10 +303,7 @@ let start_async conn =
           Lwt.catch (fun () ->
             connect_fn () >>= fun () ->
             (* WebSocket connect_fn should block indefinitely; early return is abnormal *)
-            (if String.equal conn.name "lighter_ws" then
-              Logging.debug_f ~section "[%s] Connection function completed unexpectedly" conn.name
-            else
-              Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name);
+            Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
             set_state conn (Failed "connection completed unexpectedly");
             Lwt.return_unit
           ) (fun exn ->
@@ -483,7 +444,7 @@ let monitor_loop () =
                                 (fun () ->
                                   Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
                                   if response.success then begin
-                                    Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
+
                                     Atomic.set conn.ping_failures 0;
                                     update_data_heartbeat conn;
                                     Lwt.return_unit
@@ -504,7 +465,7 @@ let monitor_loop () =
                                 (fun () ->
                                   Hyperliquid.Ws.send_ping ~req_id ~timeout_ms:5000 >>= fun success ->
                                   if success then begin
-                                    Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
+
                                     Atomic.set conn.ping_failures 0;
                                     update_data_heartbeat conn;
                                     Lwt.return_unit
@@ -524,7 +485,7 @@ let monitor_loop () =
                                 (fun () ->
                                   Lighter.Ws.send_ping ~req_id ~timeout_ms:5000 >>= fun success ->
                                   if success then begin
-                                    Logging.debug_f ~section "[%s] Ping successful (req_id: %d)" conn.name req_id;
+
                                     Atomic.set conn.ping_failures 0;
                                     update_data_heartbeat conn;
                                     Lwt.return_unit
@@ -1057,7 +1018,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Logging.info ~section "Waiting for executions feed to be ready...";
     let%lwt executions_ready = Kraken.Kraken_executions_feed.wait_for_execution_data kraken_symbols 10.0 in
     if not executions_ready then
-      Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
+      Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
     else
       Logging.info ~section "✓ Executions feed ready";
       
@@ -1097,7 +1058,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     else Lwt.return_true
   in
   if not (executions_ready && hl_executions_ready) then
-    Logging.debug ~section "Timeout waiting for executions data, continuing anyway..."
+    Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
   else
     Logging.info ~section "✓ Executions feed ready";
 
@@ -1149,14 +1110,11 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let%lwt configs_with_fees = Lwt_list.map_s (fun asset ->
     try
       if asset.Dio_engine.Config.exchange = "kraken" then begin
-        Logging.debug_f ~section "Fetching fees for %s..." asset.Dio_engine.Config.symbol;
+
         let%lwt fee_info_opt = Kraken.Kraken_get_fee.get_fee_info asset.Dio_engine.Config.symbol in
         let%lwt result = match fee_info_opt with
         | Some fee_info ->
-            Logging.debug_f ~section "Retrieved fees for %s: maker=%.4f%% taker=%.4f%%"
-              asset.Dio_engine.Config.symbol
-              (Option.value fee_info.Kraken.Kraken_get_fee.maker_fee ~default:0. *. 100.)
-              (Option.value fee_info.Kraken.Kraken_get_fee.taker_fee ~default:0. *. 100.);
+
             (* Populate Fee_cache for dashboard access *)
             (match fee_info.Kraken.Kraken_get_fee.maker_fee, fee_info.Kraken.Kraken_get_fee.taker_fee with
              | Some maker, Some taker ->
@@ -1196,7 +1154,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
               if is_spot then Option.value fee_info.spot_taker_fee ~default:0.001
               else Option.value fee_info.taker_fee ~default:0.0005 
             in
-            Logging.debug_f ~section "Applying fees for Hyperliquid %s (spot=%b): maker=%.4f%% taker=%.4f%%" asset.Dio_engine.Config.symbol is_spot (maker *. 100.) (taker *. 100.);
+
             Dio_strategies.Fee_cache.store_fees ~exchange:"hyperliquid" ~symbol:asset.Dio_engine.Config.symbol ~maker_fee:maker ~taker_fee:taker ~ttl_seconds:600.0;
             Lwt.return { asset with Dio_engine.Config.maker_fee = Some maker; Dio_engine.Config.taker_fee = Some taker }
         | None ->
@@ -1210,7 +1168,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
            Express as fraction of trade value for Fee_cache compatibility. *)
         let maker = 0.0005 in  (* 0.05% — conservative estimate for ETFs *)
         let taker = 0.0005 in
-        Logging.debug_f ~section "Applying IBKR fixed rate fees for %s: %.4f%%" asset.Dio_engine.Config.symbol (maker *. 100.);
+
         Dio_strategies.Fee_cache.store_fees
           ~exchange:"ibkr"
           ~symbol:asset.Dio_engine.Config.symbol
@@ -1226,8 +1184,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         let fees = Lighter.Instruments_feed.lookup_info asset.Dio_engine.Config.symbol in
         let maker = match fees with Some i -> i.Lighter.Types.maker_fee | None -> 0.0 in
         let taker = match fees with Some i -> i.Lighter.Types.taker_fee | None -> 0.0 in
-        Logging.debug_f ~section "Lighter fees for %s from instruments feed: maker=%.4f%% taker=%.4f%%"
-          asset.Dio_engine.Config.symbol (maker *. 100.) (taker *. 100.);
+
         Dio_strategies.Fee_cache.store_fees
           ~exchange:"lighter"
           ~symbol:asset.Dio_engine.Config.symbol
@@ -1433,7 +1390,7 @@ let order_processing_loop () =
                                  Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                                  | Ok result ->
                                      if result.Dio_exchange.Exchange_intf.Types.amend_id = Some "skipped_no_change" then begin
-                                         Logging.debug_f ~section "Amendment skipped for %s %s %.8f @ %s (no price change)" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+
                                          (match order.price with
                                           | Some price ->
                                               Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped
@@ -1652,7 +1609,7 @@ let order_processing_loop () =
                                 Dio_engine.Order_executor.amend_order ~token:auth_token amend_request >>= function
                                 | Ok result ->
                                     if result.amend_id = Some "skipped_no_change" then begin
-                                        Logging.debug_f ~section "Amendment skipped for %s %s %.8f @ %s (no price change)" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+
                                         (match order.price with
                                          | Some price ->
                                              (match order.strategy with
@@ -1827,9 +1784,6 @@ let order_processing_loop () =
                   (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn)
             ) pending_hedge_orders;
 
-            if !cycle_count mod 100 = 0 then
-              Logging.debug_f ~section "Order processing: %d orders placed, %d grid + %d mm + %d hedge pending in current batch"
-                (Atomic.get orders_placed) (List.length pending_grid_orders) (List.length pending_mm_orders) (List.length pending_hedge_orders);
 
             (* Sever promise chain before next drain cycle. *)
             Lwt.async loop;

@@ -198,11 +198,7 @@ let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fil
         output_string oc (Yojson.Basic.pretty_to_string final);
         output_char oc '\n'
       );
-      Sys.rename tmp path;
-      Logging.debug_f ~section "Persisted state for %s: reserved_base=%.8f, accumulated_profit=%.6f, last_fill_oid=%s, last_buy_fill_price=%s"
-        symbol reserved_base accumulated_profit
-        (match last_fill_oid with Some o -> o | None -> "(unchanged)")
-        (match last_buy_fill_price with Some p -> Printf.sprintf "%.8f" p | None -> "(unchanged)")
+      Sys.rename tmp path
     with exn ->
       Logging.warn_f ~section "Failed to persist state for %s: %s" symbol (Printexc.to_string exn)
   )
