@@ -367,7 +367,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                      Routing these through handle_order_acknowledged causes a
                      dual-update race that corrupts open_sell_orders tracking. *)
                   if event.is_amended then begin
-                    Logging.info_f ~section "AMENDED_WS_EVENT %s [%s] status=%s (updating strategy tracker)"
+                    Logging.debug_f ~section "AMENDED_WS_EVENT %s [%s] status=%s (updating strategy tracker)"
                       event.order_id asset_with_fees.symbol
                       (match event.order_status with Types.New -> "New" | Types.PartiallyFilled -> "PartiallyFilled" | _ -> "Other");
                     (match event.limit_price with

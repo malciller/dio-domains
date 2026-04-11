@@ -1594,22 +1594,6 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
               let net_profit = gross -. fees in
               if net_profit > 0.0 then begin
                 state.accumulated_profit <- state.accumulated_profit +. net_profit;
-                (* Only advance last_fill_oid forward; never regress to a lower OID.
-                   Old sells (low OIDs placed earlier) can fill after newer sells;
-                   regressing would cause double-counting on restart replay. *)
-                let should_update_oid = match state.last_fill_oid with
-                  | Some prev_oid ->
-                      (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
-                       with _ -> true)
-                  | None -> true
-                in
-                if should_update_oid then
-                  state.last_fill_oid <- Some order_id;
-                (* Persist so profit survives container restarts.
-                   Also persist last_buy_fill_price so the next
-                   sell after restart still has a buy reference. *)
-                if persistence_accumulation_exchange state.exchange_id then
-                  state.persistence_dirty <- true;
                 Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
                   asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
               end;
@@ -1619,6 +1603,24 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
               (* Sell at or below cost basis; still record for consecutive sell tracking. *)
               state.last_sell_fill_price <- Some sell_fill_price)
      | Buy -> ());
+
+    (* 5b. Advance last_fill_oid on EVERY fill (buy or sell, profitable or not).
+       This ensures startup replay always has a valid watermark to resume from.
+       Without this, symbols that never had a profitable sell would have
+       last_fill_oid=None, causing all fills to be skipped on every restart
+       and preventing profit accumulation permanently. *)
+    let should_update_oid = match state.last_fill_oid with
+      | Some prev_oid ->
+          (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
+           with _ -> true)
+      | None -> true
+    in
+    if should_update_oid then
+      state.last_fill_oid <- Some order_id;
+    (* Persist state on every fill so last_fill_oid, fill prices, and profit
+       all survive container restarts. *)
+    if persistence_accumulation_exchange state.exchange_id then
+      state.persistence_dirty <- true;
 
     (* 6. Clear inflight flags, reservation, and global placement trackers for immediate re-placement. *)
     (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
