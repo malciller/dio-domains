@@ -141,6 +141,6 @@ let private_ws_url () =
   | Some url ->
       let uri = Uri.of_string url in
       let host = Uri.host uri |> Option.value ~default:direct_hostname in
-      Printf.sprintf "wss://%s/stream" host
+      Printf.sprintf "wss://%s/stream?sessionId=dio-private" host
   | None ->
       Printf.sprintf "wss://%s/stream" direct_hostname
