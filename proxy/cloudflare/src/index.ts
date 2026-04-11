@@ -383,37 +383,26 @@ export class LighterProxy implements DurableObject {
         // Attempt transparent reconnect
         reconnecting = true;
         (async () => {
-          const maxAttempts = 5;
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            if (clientClosed) {
-              console.log("[DO] Client closed during reconnect, aborting");
-              return;
-            }
+          if (clientClosed) {
+            console.log("[DO] Client closed during reconnect, aborting");
+            return;
+          }
 
-            const delay = Math.min(1000 * Math.pow(2, attempt), 16_000);
-            console.log(`[DO] Upstream reconnect attempt ${attempt + 1}/${maxAttempts} in ${delay}ms`);
-            await sleep(delay);
-
-            if (clientClosed) {
-              console.log("[DO] Client closed during reconnect backoff, aborting");
-              return;
-            }
-
-            const newWs = await connectUpstream();
-            if (newWs) {
-              upstream = newWs;
-              wireUpstream(newWs);
-              replaySubscriptions(newWs);
-              startKeepalive();
-              reconnecting = false;
-              console.log(`[DO] Upstream reconnected successfully (attempt ${attempt + 1})`);
-              return;
-            }
+          console.log(`[DO] Upstream reconnecting immediately (1 attempt)`);
+          const newWs = await connectUpstream();
+          if (newWs) {
+            upstream = newWs;
+            wireUpstream(newWs);
+            replaySubscriptions(newWs);
+            startKeepalive();
+            reconnecting = false;
+            console.log(`[DO] Upstream reconnected successfully`);
+            return;
           }
 
           // All attempts exhausted
           reconnecting = false;
-          console.error(`[DO] Upstream reconnect failed after ${maxAttempts} attempts, closing client`);
+          console.error(`[DO] Upstream reconnect failed, closing client`);
           try {
             server.close(1011, "upstream reconnect failed");
           } catch {}
