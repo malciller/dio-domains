@@ -169,19 +169,17 @@ let parse_ws_response json : Kraken_common_types.ws_response =
   end
 
 let resolve_response req_id (response : Kraken_common_types.ws_response) =
-  Logging.debug_f ~section "resolve_response called for req_id=%d (method=%s, success=%b)"
-    req_id response.method_ response.success;
+
   (* Acquire mutex only for the table lookup and removal. *)
   Lwt_mutex.with_lock state.mutex (fun () ->
-    let pending_count = Response_table.length state.responses in
+
     try
       let wakener, expected_method, _timestamp = Response_table.find state.responses req_id in
       Response_table.remove state.responses req_id;
-      Logging.debug_f ~section "Found waiter for req_id=%d (expected_method=%s, remaining pending: %d)"
-        req_id expected_method (pending_count - 1);
+
       Lwt.return (Some (wakener, expected_method))
     with Not_found -> begin
-      Logging.debug_f ~section "No waiter found for req_id=%d (total pending: %d)" req_id pending_count;
+
       Lwt.return None
     end
   ) >>= function
@@ -198,10 +196,7 @@ let resolve_response req_id (response : Kraken_common_types.ws_response) =
       end else begin
         (* Resolve the promise outside the mutex to reduce contention. *)
         (try
-          Logging.debug_f ~section "Waking up waiter for req_id=%d" req_id;
-          Lwt.wakeup_later wakener response;
-          Logging.debug_f ~section "Successfully matched response for req_id=%d (method=%s, success=%b)"
-            req_id response.method_ response.success
+          Lwt.wakeup_later wakener response
         with Invalid_argument _ ->
           (* Promise already resolved, typically by a preceding timeout. *)
           Logging.debug_f ~section "Promise for req_id=%d was already resolved (likely timeout), response discarded" req_id);
@@ -234,12 +229,9 @@ let reset_state conn ~notify_failure reason =
     | Some current when current.conn == conn ->
         let old_generation = state.connection_generation in
         let new_generation = old_generation + 1 in
-        Logging.debug_f ~section "Resetting state: incrementing generation from %d to %d (reason: %s)"
-          old_generation new_generation reason;
         let wakers = Response_table.fold (fun _ (wak, _, _) acc -> wak :: acc) state.responses [] in
         let pending_count = Response_table.length state.responses in
-        if pending_count > 0 then
-          Logging.debug_f ~section "Resetting state: failing %d pending requests" pending_count;
+        ignore pending_count;
         Response_table.clear state.responses;
         state.conn <- None;
         state.connecting <- false;
@@ -250,7 +242,7 @@ let reset_state conn ~notify_failure reason =
         let failure_cb = if notify_failure then state.on_failure else None in
         Lwt.return (wakers, true, failure_cb, pending_count)
     | _ ->
-        Logging.debug_f ~section "Resetting state: connection mismatch, not resetting (reason: %s)" reason;
+
         state.connecting <- false;
         Lwt_condition.broadcast state.connection_ready ();
         Lwt.return ([], false, None, 0)
@@ -264,15 +256,15 @@ let reset_state conn ~notify_failure reason =
     Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
 
     (* Fail all pending request promises with the reset reason. *)
-    Logging.debug_f ~section "Resetting state: waking up %d pending waiters" (List.length wakers);
+
     List.iter (fun wak ->
       try
         Lwt.wakeup_later_exn wak (Failure reason)
       with Invalid_argument _ ->
-        Logging.debug ~section "Attempted to wake already-resolved promise during reset_state"
+        ()
     ) wakers;
 
-    Logging.debug_f ~section "Resetting state: sending disconnected notification (reason: %s)" reason;
+
     notify_connection (`Disconnected reason);
     (match failure_cb with Some f -> f reason | None -> ());
     Lwt.return_unit
@@ -290,7 +282,7 @@ let handle_frame frame ~expected_generation =
      let open Yojson.Safe.Util in
      let method_opt = member "method" json |> to_string_option in
      match method_opt with
-     | Some method_name ->
+     | Some _ ->
          let response = parse_ws_response json in
          (match response.req_id with
           | Some req_id ->
@@ -301,25 +293,18 @@ let handle_frame frame ~expected_generation =
                 (* Process if current generation matches or req_id is still pending (delayed response). *)
                 let should_process = expected_generation = current_gen || req_id_exists in
                 Lwt.return (should_process, req_id_exists, current_gen)
-              ) >>= fun (should_process, req_id_exists, current_gen) ->
+              ) >>= fun (should_process, _, _) ->
               if not should_process then begin
-                Logging.debug_f ~section "Ignoring frame from old connection (expected_gen=%d, current_gen=%d, req_id=%d, req_id_in_table=%b)"
-                  expected_generation current_gen req_id req_id_exists;
                 Lwt.return_unit
               end else begin
-                if expected_generation <> current_gen && req_id_exists then begin
-                  Logging.debug_f ~section "Processing delayed response from old connection (expected_gen=%d, current_gen=%d, req_id=%d still pending)"
-                    expected_generation current_gen req_id;
-                end;
-                Logging.debug_f ~section "Processing frame: req_id=%d, method=%s"
-                  req_id method_name;
+
+
                 (* Resolve synchronously to prevent a timeout race. *)
                 resolve_response req_id response >>= fun () ->
                 Lwt.return_unit
               end
           | None ->
-             Logging.debug ~section
-               (Printf.sprintf "Unhandled trading response without req_id (method=%s)" method_name);
+
              Lwt.return_unit)
      | None ->
          (match member "channel" json |> to_string_option with
@@ -339,7 +324,7 @@ let handle_frame frame ~expected_generation =
     Each frame read spawns the next iteration via [Lwt.async] to prevent
     promise chain accumulation. Signals [reader_done] on termination. *)
 let start_reader conn generation =
-  Logging.debug_f ~section "Starting WebSocket reader loop (generation %d)" generation;
+
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
     if Atomic.get shutdown_requested then begin
@@ -347,7 +332,7 @@ let start_reader conn generation =
       Lwt.wakeup_later done_u ();
       Lwt.return_unit
     end else if state.connection_generation <> generation then begin
-      Logging.debug_f ~section "Reader loop exiting: generation mismatch (expected %d, current %d)" generation state.connection_generation;
+
       Lwt.wakeup_later done_u ();
       Lwt.return_unit
     end else
@@ -383,7 +368,7 @@ let start_reader conn generation =
     Lwt_condition.broadcast reader_done ();
     Lwt.return_unit
   );
-  Logging.debug_f ~section "Reader task started asynchronously (generation %d)" generation
+  ()
 
 let connect _token : Websocket_lwt_unix.conn Lwt.t =
   let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
@@ -401,17 +386,16 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
   Lwt.return conn
 
 let ensure_connection ?on_failure ?on_connected token =
-  Logging.debug_f ~section "ensure_connection called (connected: %b, connecting: %b)"
-    (Atomic.get state.connected) state.connecting;
+
   Lwt_mutex.with_lock state.mutex (fun () ->
     (match on_failure with Some f -> state.on_failure <- Some f | None -> ());
     if state.conn <> None then begin
       (* Reuse existing connection; invoke on_connected callback if registered. *)
-      Logging.debug ~section "Connection already exists, reusing";
+
       (match on_connected with Some f -> f () | None -> ());
       Lwt.return `Already
     end else if state.connecting then begin
-      Logging.debug ~section "Connection in progress, waiting";
+
       Lwt.return `Wait
     end else begin
       Logging.info ~section "Starting new connection";
@@ -462,22 +446,22 @@ let ensure_connection ?on_failure ?on_connected token =
       | Some (conn, generation) ->
           Logging.info_f ~section "Connection established successfully (generation %d)" generation;
           start_reader conn generation;
-          Logging.debug_f ~section "Reader task started (generation %d)" generation;
+
           notify_connection `Connected;
-          Logging.debug_f ~section "Connection `Connected notification sent (generation %d)" generation;
+
           (* Replay all registered subscriptions on the new connection. *)
           Lwt_mutex.with_lock state.mutex (fun () ->
             Lwt.return state.subscriptions
           ) >>= fun subs ->
           Lwt_list.iter_s (fun sub ->
             let content = Yojson.Safe.to_string sub in
-            Logging.debug_f ~section "Re-subscribing on unified authenticated connection: %s" content;
+
             Websocket_lwt_unix.write conn (Websocket.Frame.create ~content ())
           ) (List.rev subs) >>= fun () ->
 
           (* Invoke on_connected callback after subscription replay. *)
           (match on_connected with Some f -> f () | None -> ());
-          Logging.debug_f ~section "on_connected callback called (generation %d)" generation;
+
           (* Block on reader_done to keep this promise alive for the supervisor.
              Lwt_condition.wait creates a fresh promise each invocation,
              avoiding forwarding chain accumulation. *)
@@ -506,18 +490,16 @@ let cleanup_stale_response_entries ~reason () =
               if now -. timestamp > 30.0 then
                 stale_entries := (req_id, wakener, expected_method, timestamp) :: !stale_entries
             ) state.responses;
-            List.iter (fun (req_id, wakener, expected_method, timestamp) ->
+            List.iter (fun (req_id, wakener, _, timestamp) ->
               Response_table.remove state.responses req_id;
-              Logging.debug_f ~section "Cleaned up stale response entry for req_id=%d (age: %.1fs, method: %s, reason=%s)"
-                req_id (now -. timestamp) expected_method reason;
+
               (* Fail the stale promise to release associated memory. *)
               try
                 Lwt.wakeup_later_exn wakener (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
               with Invalid_argument _ ->
-                Logging.debug_f ~section "Promise for stale req_id=%d was already resolved" req_id
+                ()
             ) !stale_entries;
-            if !stale_entries <> [] then
-              Logging.debug_f ~section "Cleaned up %d stale response table entries (reason=%s)" (List.length !stale_entries) reason;
+
             Lwt.return_unit
           end
         )
@@ -534,7 +516,7 @@ let start_periodic_tasks () =
   if not (Atomic.exchange periodic_tasks_started true) then begin
     let rec run () =
       Lwt_mvar.take cleanup_mvar >>= fun () ->
-      Logging.debug_f ~section "Running Kraken response table cleanup (requested)";
+
       cleanup_stale_response_entries ~reason:"backpressure" () >>= fun () ->
       (* Spawn the next cleanup cycle asynchronously to break promise chain growth. *)
       Lwt.async run;
@@ -546,10 +528,10 @@ let start_periodic_tasks () =
 let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
   (* Reject requests if a shutdown is in progress. *)
   if Atomic.get shutdown_requested then begin
-    Logging.debug_f ~section "Request req_id=%d cancelled due to shutdown" req_id;
+
     Lwt.fail_with (Printf.sprintf "Request req_id %d cancelled due to shutdown" req_id)
   end else begin
-    Logging.debug_f ~section "Sending request: req_id=%d, method=%s, timeout_ms=%d" req_id expected_method timeout_ms;
+
     Lwt_mutex.with_lock state.mutex (fun () ->
       match state.conn with
       | None -> begin
@@ -557,7 +539,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
           Lwt.return (Error (Failure "Trading WebSocket not connected"))
         end
       | Some conn_with_gen -> begin
-          Logging.debug_f ~section "Request req_id=%d: connection generation=%d" req_id conn_with_gen.generation;
+
           (* Guard against req_id collision before registering the wakener. *)
           if Response_table.mem state.responses req_id then begin
             Logging.error_f ~section "Request ID collision detected: req_id %d already in use" req_id;
@@ -566,8 +548,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             let waiter, wakener = Lwt.wait () in
             Response_table.add state.responses req_id (wakener, expected_method, Unix.time ());
             let pending_count = Response_table.length state.responses in
-            Logging.debug_f ~section "Request req_id=%d registered in response table (pending requests: %d)"
-              req_id pending_count;
+
             (* Trigger cleanup if the pending request count exceeds the threshold. *)
             if pending_count > 10 then begin
               Logging.warn_f ~section "Response table size is high: %d pending requests" pending_count;
@@ -575,9 +556,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             end;
             Lwt.catch
               (fun () ->
-                 Logging.debug_f ~section "Request req_id=%d: writing to WebSocket" req_id;
                  Websocket_lwt_unix.write conn_with_gen.conn (Websocket.Frame.create ~content:message_str ()) >|= fun () ->
-                 Logging.debug_f ~section "Request req_id=%d: successfully sent to WebSocket" req_id;
                  Ok waiter)
               (fun exn ->
                  Logging.error_f ~section "Request req_id=%d: failed to write to WebSocket: %s" req_id (Printexc.to_string exn);
@@ -594,7 +573,6 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             Lwt_mutex.with_lock state.mutex (fun () ->
               if Response_table.mem state.responses req_id then begin
                 Response_table.remove state.responses req_id;
-                Logging.debug_f ~section "Request req_id=%d cancelled, removed from response table" req_id;
                 Lwt.return_unit
               end else Lwt.return_unit
             )
@@ -602,13 +580,13 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
         );
 
         let timeout = float_of_int timeout_ms /. 1000.0 in
-        Logging.debug_f ~section "Request req_id=%d: waiting for response (timeout: %.3fs)" req_id timeout;
+
         Lwt.pick [
           (waiter >|= fun response -> `Response response);
           (Lwt_unix.sleep timeout >|= fun () -> `Timeout)
         ] >>= function
         | `Response response ->
-            Logging.debug_f ~section "Request req_id=%d: response received successfully" req_id;
+
             Lwt.return response
         | `Timeout ->
             (* Atomically check pending status before evicting the timed-out entry. *)
@@ -616,10 +594,10 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
               let still_pending = Response_table.mem state.responses req_id in
               if still_pending then begin
                 Response_table.remove state.responses req_id;
-                Logging.debug_f ~section "Request req_id=%d: removed from response table due to timeout" req_id;
+
                 Lwt.return `Was_pending
               end else begin
-                Logging.debug_f ~section "Request req_id=%d: already removed from response table - response may have arrived" req_id;
+
                 Lwt.return `Already_removed
               end) >>= fun removal_status ->
 
@@ -627,13 +605,13 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             | `Was_pending ->
                 (* Genuine timeout: request was still in the response table. *)
                 Logging.warn_f ~section "Request timeout: req_id=%d, timeout_ms=%d, sent %.3fs ago" req_id timeout_ms timeout;
-                Logging.debug_f ~section "Request req_id=%d: cancelling waiter promise due to actual timeout" req_id;
+
                 Lwt.cancel waiter;
                 Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
             | `Already_removed ->
                 (* Entry removed from table by resolve_response or reset_state.
                    Yield to scheduler to let pending Lwt.wakeup_later execute. *)
-                Logging.debug_f ~section "Request req_id=%d: entry already removed, yielding to scheduler" req_id;
+
                 Lwt.pause () >>= fun () ->
                 if Lwt.is_sleeping waiter then begin
                   (* Waiter still unresolved after yield; should not occur in normal operation. *)
@@ -641,9 +619,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
                   Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
                 end else begin
                   (* Waiter resolved or failed by resolve_response or reset_state. *)
-                  Logging.debug_f ~section "Request req_id=%d: response resolved after scheduler yield" req_id;
                   waiter >|= fun response ->
-                  Logging.debug_f ~section "Request req_id=%d: response received successfully (timeout race resolved)" req_id;
                   response
                 end
   end
@@ -670,7 +646,7 @@ let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms : Kraken_common_ty
       ("req_id", `Int req_id)
     ] in
   let message_str = json_to_string_precise symbol message in
-  Logging.debug ~section (Printf.sprintf "Sending WebSocket message: %s" message_str);
+
   send_message ~message_str ~req_id ~expected_method:method_ ~timeout_ms >>= fun response ->
   Lwt.return response
 
@@ -700,7 +676,7 @@ let subscribe message =
     match state.conn with
     | Some conn_with_gen ->
         let content = Yojson.Safe.to_string message in
-        Logging.debug_f ~section "Sending subscription on unified authenticated connection: %s" content;
+
         Websocket_lwt_unix.write conn_with_gen.conn (Websocket.Frame.create ~content ())
     | None ->
         Logging.info_f ~section "Subscription registered, will be sent when connected: %s" (Yojson.Safe.to_string message);
