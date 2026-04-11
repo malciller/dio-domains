@@ -225,6 +225,9 @@ module Kraken_impl = struct
 
   (** Return best bid/ask as [(bid_price, bid_size, ask_price, ask_size)] floats.
       Directly consumes float values provided by [Kraken_orderbook_feed.get_best_bid_ask]. *)
+  let subscribe_orderbook ~symbols =
+    Kraken_orderbook_feed.subscribe_symbols symbols
+
   let get_top_of_book ~symbol =
     match Kraken_orderbook_feed.get_best_bid_ask symbol with
     | Some (bp, bs, ap, as_val) -> Some (bp, bs, ap, as_val)

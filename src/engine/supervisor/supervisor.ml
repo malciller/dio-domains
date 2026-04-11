@@ -1848,9 +1848,10 @@ let order_processing_loop () =
   Lwt.async loop
 
 (** Periodically scans all exchanges for non-configured assets that have
-    a positive balance and subscribes their ticker feeds. Runs every 10s.
+    a positive balance and subscribes their orderbook feeds. Runs every 10s.
     Enables portfolio valuation for assets that are held but not actively traded. *)
 let monitor_non_active_assets () =
+  let subscribed_symbols = Hashtbl.create 16 in
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
     else
@@ -1859,7 +1860,10 @@ let monitor_non_active_assets () =
       if Atomic.get shutdown_requested then Lwt.return_unit else begin
         let config = Dio_engine.Config.read_config () in
 
-        
+        let configured_symbols = List.map (fun tc -> 
+          (tc.Dio_engine.Config.exchange, tc.symbol)
+        ) config.trading in
+
         let exchange_names = List.sort_uniq String.compare
           (List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading) in
           
@@ -1868,9 +1872,32 @@ let monitor_non_active_assets () =
           | None -> Lwt.return_unit
           | Some (module Ex) ->
               let balances = Ex.get_all_balances () in
-              Lwt_list.iter_s (fun (_asset, _bal) ->
-                 Lwt.return_unit
-              ) balances
+              let symbols_to_subscribe = ref [] in
+              List.iter (fun (asset, _bal) ->
+                let quote = match exch_name with
+                  | "hyperliquid" | "lighter" -> "USDC"
+                  | _ -> "USD"
+                in
+                let symbol = asset ^ "/" ^ quote in
+                let is_configured = List.exists (fun (ex, sym) ->
+                  ex = exch_name && sym = symbol
+                ) configured_symbols in
+                let is_quote = (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || (asset = "USDT") || (asset = quote) || (asset = "USDe") in
+                
+                if not is_configured && not is_quote then begin
+                  let target_key = exch_name ^ ":" ^ symbol in
+                  if not (Hashtbl.mem subscribed_symbols target_key) then begin
+                    Hashtbl.add subscribed_symbols target_key true;
+                    symbols_to_subscribe := symbol :: !symbols_to_subscribe
+                  end
+                end
+              ) balances;
+              if !symbols_to_subscribe <> [] then begin
+                Logging.info_f ~section "Dynamically subscribing non-active assets on %s: %s" 
+                  exch_name (String.concat ", " !symbols_to_subscribe);
+                Ex.subscribe_orderbook ~symbols:!symbols_to_subscribe
+              end else
+                Lwt.return_unit
         ) exchange_names >>= fun () ->
         (* Sever promise chain to prevent Forward node accumulation. *)
         Lwt.async loop;

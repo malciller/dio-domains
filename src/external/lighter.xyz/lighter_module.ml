@@ -168,6 +168,9 @@ module Lighter_impl = struct
 
   (* ---- Market data accessors ---- *)
 
+  let subscribe_orderbook ~symbols =
+    Lighter_ws.subscribe_public_orderbook ~symbols
+
   let get_top_of_book ~symbol =
     Lighter_orderbook_feed.get_best_bid_ask symbol
 

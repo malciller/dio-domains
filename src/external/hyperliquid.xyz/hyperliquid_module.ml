@@ -260,6 +260,11 @@ module Hyperliquid_impl = struct
   
 
 
+  let subscribe_orderbook ~symbols =
+    Lwt_list.iter_s (fun coin ->
+      Hyperliquid_ws.subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String coin)])])
+    ) symbols
+
   let get_top_of_book ~symbol =
     match Hyperliquid_orderbook_feed.get_best_bid_ask symbol with
     | Some (bp, bs, ap, as_val) -> Some (bp, bs, ap, as_val)
