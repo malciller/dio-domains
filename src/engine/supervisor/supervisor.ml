@@ -305,17 +305,25 @@ let start_async conn =
             (* WebSocket connect_fn should block indefinitely; early return is abnormal *)
             Mutex.lock conn.mutex;
             let already_failed = match conn.state with Failed _ -> true | _ -> false in
+            let latest_attempt = conn.reconnect_attempts in
             Mutex.unlock conn.mutex;
-            if not already_failed then begin
+            if not already_failed && latest_attempt = attempt_num then begin
               Logging.warn_f ~section "[%s] Connection function completed unexpectedly" conn.name;
               set_state conn (Failed "connection completed unexpectedly")
             end;
             Lwt.return_unit
           ) (fun exn ->
             let error_msg = Printexc.to_string exn in
-            Logging.error_f ~section "[%s] Unexpected error in connection function: %s" conn.name error_msg;
-            (* Transition to Failed on unhandled exception *)
-            set_state conn (Failed error_msg);
+            Mutex.lock conn.mutex;
+            let latest_attempt = conn.reconnect_attempts in
+            Mutex.unlock conn.mutex;
+            if latest_attempt = attempt_num then begin
+              Logging.error_f ~section "[%s] Unexpected error in connection function: %s" conn.name error_msg;
+              (* Transition to Failed on unhandled exception *)
+              set_state conn (Failed error_msg)
+            end else begin
+              Logging.debug_f ~section "[%s] Muting error from superseded connection attempt: %s" conn.name error_msg
+            end;
             Lwt.return_unit
           )
         )
