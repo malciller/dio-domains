@@ -19,16 +19,21 @@ open Lwt.Infix
 let consume_stream f stream =
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
-    Lwt_stream.get stream >>= function
-    | None ->
-        Lwt.wakeup_later done_u ();
-        Lwt.return_unit
-    | Some x ->
-        f x;
-        (* Spawn next iteration independently to sever the Forward chain.
-           The current promise resolves immediately with unit. *)
-        Lwt.async loop;
-        Lwt.return_unit
+    Lwt.catch
+      (fun () ->
+        Lwt_stream.get stream >>= function
+        | None ->
+            Lwt.wakeup_later done_u ();
+            Lwt.return_unit
+        | Some x ->
+            f x;
+            (* Spawn next iteration independently to sever the Forward chain.
+               The current promise resolves immediately with unit. *)
+            Lwt.async loop;
+            Lwt.return_unit)
+      (fun exn ->
+        Lwt.wakeup_later_exn done_u exn;
+        Lwt.return_unit)
   in
   Lwt.async loop;
   done_p
@@ -40,17 +45,22 @@ let consume_stream f stream =
 let consume_stream_s f stream =
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
-    Lwt_stream.get stream >>= function
-    | None ->
-        Lwt.wakeup_later done_u ();
-        Lwt.return_unit
-    | Some x ->
-        Lwt.catch
-          (fun () -> f x)
-          (fun _exn -> Lwt.return_unit)
-        >>= fun () ->
-        Lwt.async loop;
-        Lwt.return_unit
+    Lwt.catch
+      (fun () ->
+        Lwt_stream.get stream >>= function
+        | None ->
+            Lwt.wakeup_later done_u ();
+            Lwt.return_unit
+        | Some x ->
+            Lwt.catch
+              (fun () -> f x)
+              (fun _exn -> Lwt.return_unit)
+            >>= fun () ->
+            Lwt.async loop;
+            Lwt.return_unit)
+      (fun exn ->
+        Lwt.wakeup_later_exn done_u exn;
+        Lwt.return_unit)
   in
   Lwt.async loop;
   done_p

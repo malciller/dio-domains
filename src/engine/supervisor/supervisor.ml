@@ -378,9 +378,12 @@ let monitor_loop () =
                            && not (Ibkr.Market_hours.is_market_open ()) then
                           ()  (* Market closed — suppress reconnection *)
                         else begin
-                          (* Linear backoff: 2s, 4s, 6s, ... capped at 30s (300s for IBKR) *)
-                          let max_delay = if String.equal conn.name "ibkr_gateway" then 300.0 else 30.0 in
-                          let delay = min max_delay (2.0 *. Float.of_int attempts) in
+                          (* Exponential backoff: 2s, 4s, 8s, ... capped at 30s (300s for IBKR and Lighter) *)
+                          let max_delay = 
+                            if String.equal conn.name "ibkr_gateway" || String.equal conn.name "lighter_ws" then 300.0 
+                            else 30.0 
+                          in
+                          let delay = min max_delay (2.0 ** Float.of_int attempts) in
 
                           (* Only reconnect after backoff elapses *)
                           let should_reconnect =
@@ -673,19 +676,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     let lt_ws_connect_fn () =
       Lwt.catch (fun () ->
         let on_failure reason =
-          set_state lt_ws_conn (Failed reason);
-          Lwt.async (fun () ->
-            Lwt.catch (fun () ->
-              (* Delay before reconnecting to avoid 429 rate-limits
-                 from the Lighter upstream WS endpoint *)
-              Lwt_unix.sleep 2.0 >>= fun () ->
-              start_async lt_ws_conn;
-              Lwt.return_unit
-            ) (fun exn ->
-              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" lt_ws_conn.name (Printexc.to_string exn);
-              Lwt.return_unit
-            )
-          )
+          set_state lt_ws_conn (Failed reason)
         in
         let on_heartbeat () = update_data_heartbeat lt_ws_conn in
         let on_connected () =

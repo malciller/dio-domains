@@ -541,16 +541,22 @@ Published lighter-proxy (x.xx sec)
 
 #### 4. Configure the engine
 
-Add the proxy URL to your `.env`:
+Add the proxy URL(s) to your `.env`:
 
 ```bash
 LIGHTER_PROXY_URL=https://lighter-proxy.<your-subdomain>.workers.dev
 ```
 
-When set, **all** Lighter HTTP and WebSocket traffic is routed through
-the proxy. When unset, the engine connects directly to Lighter's
-origin.
+**Free Tier Proxy Pooling (Failover)**: To prevent strict daily Cloudflare Durable Object limits (100k requests/day) from pausing your engine, you can deploy the proxy worker from multiple free Cloudflare accounts. Set `LIGHTER_PROXY_URL` to a comma-separated list of your proxy URLs:
 
+```bash
+LIGHTER_PROXY_URL=https://proxy1.workers.dev,https://proxy2.workers.dev,https://proxy3.workers.dev
+```
+
+When configured with a pool, `dio-domains` will seamlessly rotate through the provided proxies if it encounters an upstream HTTP failure (such as an exhausted quota `500 Internal Server Error`).
+
+> [!TIP]
+> **Performance Edge Split**: To aggressively conserve Durable Object quotas, the engine splits your streams. High-frequency public feeds (orderbook/ticker) securely bypass the proxy directly to the origin. Only authenticated private streams and API calls utilize the proxy quota pool.
 
 #### Architecture
 

@@ -405,6 +405,7 @@ let fetch_open_orders () =
     if status < 200 || status >= 300 then begin
       Logging.error_f ~section "openOrders request failed: HTTP %d (body=%s)" status
         (if String.length body_str > 200 then String.sub body_str 0 200 ^ "..." else body_str);
+      if status >= 500 then Lighter_proxy.rotate_proxy ();
       Lighter_executions_feed.set_startup_snapshot_done ();
       Lwt.return_unit
     end else begin
