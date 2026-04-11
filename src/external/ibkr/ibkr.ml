@@ -14,3 +14,4 @@ module Executions_feed = Ibkr_executions_feed
 module Balances = Ibkr_balances
 module Actions = Ibkr_actions
 module Module = Ibkr_module
+module Market_hours = Ibkr_market_hours

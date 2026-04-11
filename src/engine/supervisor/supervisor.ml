@@ -336,22 +336,14 @@ let restart conn =
     - Passive data heartbeat timeout for market data feeds *)
 let monitor_loop () =
   let cycle_count = ref 0 in
-  let subscription = Concurrency.Tick_event_bus.subscribe_ticks () in
-  let last_check_time = ref 0.0 in
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
-    else
-      Lwt_stream.get subscription.Concurrency.Tick_event_bus.stream >>= function
-      | None -> Lwt.return_unit
-      | Some () ->
-          if Atomic.get shutdown_requested then Lwt.return_unit else begin
-            let current_time = Unix.time () in
-            (* Throttle checks to max once per second *)
-            if current_time -. !last_check_time < 1.0 then loop ()
-            else begin
-              last_check_time := current_time;
-              try
-                incr cycle_count;
+    else begin
+      let%lwt () = Lwt_unix.sleep 1.0 in
+      if Atomic.get shutdown_requested then Lwt.return_unit else begin
+        let current_time = Unix.time () in
+        try
+          incr cycle_count;
 
                 Mutex.lock registry_mutex;
                 let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
@@ -378,19 +370,29 @@ let monitor_loop () =
                       Mutex.unlock conn.mutex;
 
                       if current_state <> Connecting then begin
-                        (* Linear backoff: 2s, 4s, 6s, ... capped at 30s *)
-                        let delay = min 30.0 (2.0 *. Float.of_int attempts) in
+                        (* IBKR market hours gate: skip reconnection attempts
+                           outside US equity extended hours (4 AM – 8 PM ET).
+                           The connect_fn itself will sleep until the next
+                           open window, so there's nothing for the monitor to do. *)
+                        if String.equal conn.name "ibkr_gateway"
+                           && not (Ibkr.Market_hours.is_market_open ()) then
+                          ()  (* Market closed — suppress reconnection *)
+                        else begin
+                          (* Linear backoff: 2s, 4s, 6s, ... capped at 30s (300s for IBKR) *)
+                          let max_delay = if String.equal conn.name "ibkr_gateway" then 300.0 else 30.0 in
+                          let delay = min max_delay (2.0 *. Float.of_int attempts) in
 
-                        (* Only reconnect after backoff elapses *)
-                        let should_reconnect =
-                          match last_disconnected with
-                          | Some t -> current_time -. t >= delay
-                          | None -> true
-                        in
+                          (* Only reconnect after backoff elapses *)
+                          let should_reconnect =
+                            match last_disconnected with
+                            | Some t -> current_time -. t >= delay
+                            | None -> true
+                          in
 
-                        if should_reconnect then begin
-                          Logging.info_f ~section "[%s] Backup auto-reconnecting after %.1fs backoff (reason: %s)..." conn.name delay reason;
-                          start_async conn
+                          if should_reconnect then begin
+                            Logging.info_f ~section "[%s] Backup auto-reconnecting after %.1fs backoff (reason: %s)..." conn.name delay reason;
+                            start_async conn
+                          end
                         end
                       end
                   | Disconnected, true ->
@@ -523,17 +525,17 @@ let monitor_loop () =
                   | _ -> ()
                 ) conn_list;
                 (* Spawn next iteration independently to sever Forward chain. *)
-                Lwt.async loop;
-                Lwt.return_unit
-              with exn ->
-                Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);
-                Logging.error_f ~section "Monitor loop continuing after exception...";
-                Lwt.async loop;
-                Lwt.return_unit
-            end
-          end
+          Lwt.async loop;
+          Lwt.return_unit
+        with exn ->
+          Logging.error_f ~section "Exception in monitor loop: %s" (Printexc.to_string exn);
+          Logging.error_f ~section "Monitor loop continuing after exception...";
+          Lwt.async loop;
+          Lwt.return_unit
+      end
+    end
   in
-  Lwt.async (fun () -> loop ())
+  Lwt.async loop
 
 (** Performs the full WebSocket feed initialization sequence:
     1. Reads trading configs and partitions symbols by exchange
@@ -883,14 +885,29 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     ];
     let ibkr_connect_fn () =
       Lwt.catch (fun () ->
+        (* Gate on US equity market hours: if the market is closed,
+           sleep until the next extended-hours open instead of burning
+           reconnect attempts against a gateway that will reject
+           contract resolution. *)
+        let%lwt () =
+          if not (Ibkr.Market_hours.is_market_open ()) then begin
+            let sleep_secs = Ibkr.Market_hours.seconds_until_next_open () in
+            Ibkr.Market_hours.log_market_status ();
+            Logging.info_f ~section "[ibkr_gateway] Sleeping %.0fs (%.1f hours) until market opens"
+              sleep_secs (sleep_secs /. 3600.0);
+            set_state ibkr_conn_sup (Failed "Market closed");
+            Lwt_unix.sleep sleep_secs
+          end else
+            Lwt.return_unit
+        in
         (* Clean up previous connection state to prevent leaks on reconnection.
            Old req_id mappings, handler closures, and IO channels would otherwise
            accumulate across reconnect cycles. *)
-        (match !(Ibkr.Module.connection) with
+        let%lwt () = (match !(Ibkr.Module.connection) with
          | Some old_conn ->
              Logging.info ~section "[ibkr_gateway] Disconnecting old connection before reconnect";
-             Lwt.async (fun () -> Ibkr.Connection.disconnect old_conn)
-         | None -> ());
+             Ibkr.Connection.disconnect old_conn
+         | None -> Lwt.return_unit) in
         Ibkr.Dispatcher.reset ();
         Ibkr.Ticker_feed.clear_req_ids ();
         Ibkr.Orderbook_feed.clear_req_ids ();
@@ -910,6 +927,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           ~on_message:Ibkr.Dispatcher.dispatch
           ~on_disconnect:(fun reason ->
             set_state ibkr_conn_sup (Failed reason);
+            update_circuit_breaker ibkr_conn_sup false;
             Lwt.async (fun () ->
               Lwt.catch (fun () ->
                 Lwt.pause () >>= fun () ->
@@ -921,9 +939,11 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
               )
             )
           );
-        set_state ibkr_conn_sup Connected;
+        (* Do NOT set Connected yet — defer until contract resolution succeeds.
+           Setting Connected here would reset reconnect_attempts to 0, defeating
+           the backoff and circuit breaker when contract resolution keeps failing. *)
+        Logging.info ~section "IBKR Gateway TCP connected, resolving contracts...";
         update_data_heartbeat ibkr_conn_sup;
-        Logging.info ~section "✓ IBKR Gateway connected";
         (* Wait for nextValidId before subscribing *)
         Lwt_unix.sleep 1.0 >>= fun () ->
         (* Subscribe to account updates *)
@@ -948,42 +968,81 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           "1";    (* version *)
           snapshot_type;
         ] >>= fun () ->
-        (* Resolve contracts once; reuse for both snapshot and streaming. *)
-        let%lwt contracts = Lwt_list.map_s (fun symbol ->
-          Ibkr.Contracts.resolve conn ~symbol >>= fun contract ->
-          Lwt.return (symbol, contract)
-        ) ibkr_symbols in
-        let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
-          Ibkr.Ticker_feed.request_snapshot conn ~contract
-        ) contracts in
-        (* Brief pause to let the gateway deliver snapshot ticks *)
-        Lwt_unix.sleep 2.0 >>= fun () ->
+        (* Resolve contracts once; reuse for both snapshot and streaming.
+           Catch contract resolution failures gracefully — IB Gateway may
+           reject symbol lookups when the market data farm is disconnected.
+           Return normally with Failed state instead of re-raising to avoid
+           resetting backoff and circuit breaker. *)
+        Lwt.catch (fun () ->
+          let%lwt contracts = Lwt_list.map_s (fun symbol ->
+            Ibkr.Contracts.resolve conn ~symbol >>= fun contract ->
+            Lwt.return (symbol, contract)
+          ) ibkr_symbols in
+          let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
+            Ibkr.Ticker_feed.request_snapshot conn ~contract
+          ) contracts in
+          (* Brief pause to let the gateway deliver snapshot ticks *)
+          Lwt_unix.sleep 2.0 >>= fun () ->
 
-        (* Phase 2: Streaming — ongoing market data.
-           Paper: type 4 (delayed-frozen) — 15-min delayed during hours,
-                  last known quote when closed. Never touches live data.
-           Live:  type 1 (live) — real-time streaming. *)
-        let stream_type = if is_paper then "4" else "1" in
-        Logging.info_f ~section "IBKR Phase 2: Switching to %s streaming"
-          (if is_paper then "delayed-frozen" else "live");
-        Ibkr.Connection.send conn [
-          string_of_int Ibkr.Types.msg_req_market_data_type;
-          "1";    (* version *)
-          stream_type;
-        ] >>= fun () ->
-        let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
-          Ibkr.Ticker_feed.subscribe conn ~contract >>= fun () ->
-          Ibkr.Orderbook_feed.subscribe conn ~contract
-        ) contracts in
-        Logging.info_f ~section "IBKR subscribed to %d symbols (snapshot + streaming)" (List.length ibkr_symbols);
-        (* Block forever — reader loop runs in background *)
-        let wait_p, _wait_u = Lwt.wait () in
-        wait_p
+          (* Phase 2: Streaming — ongoing market data.
+             Paper: type 4 (delayed-frozen) — 15-min delayed during hours,
+                    last known quote when closed. Never touches live data.
+             Live:  type 1 (live) — real-time streaming. *)
+          let stream_type = if is_paper then "4" else "1" in
+          Logging.info_f ~section "IBKR Phase 2: Switching to %s streaming"
+            (if is_paper then "delayed-frozen" else "live");
+          Ibkr.Connection.send conn [
+            string_of_int Ibkr.Types.msg_req_market_data_type;
+            "1";    (* version *)
+            stream_type;
+          ] >>= fun () ->
+          let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
+            Ibkr.Ticker_feed.subscribe conn ~contract >>= fun () ->
+            Ibkr.Orderbook_feed.subscribe conn ~contract
+          ) contracts in
+          Logging.info_f ~section "IBKR subscribed to %d symbols (snapshot + streaming)" (List.length ibkr_symbols);
+          (* Contract resolution succeeded — NOW mark as Connected.
+             This is the correct place: reconnect_attempts resets to 0,
+             circuit breaker resets, and backoff is cleared. *)
+          set_state ibkr_conn_sup Connected;
+          update_circuit_breaker ibkr_conn_sup true;
+          Logging.info ~section "✓ IBKR Gateway fully connected";
+          (* Block forever — reader loop runs in background *)
+          let wait_p, _wait_u = Lwt.wait () in
+          wait_p
+        ) (fun exn ->
+          (* Contract resolution failed (e.g., error 200: no security definition).
+             This typically means the IB market data farm is down or the market
+             is closed. Disconnect cleanly and handle based on market hours. *)
+          let error_msg = Printexc.to_string exn in
+          let%lwt () = Ibkr.Connection.disconnect conn in
+          Ibkr.Module.connection := None;
+          if not (Ibkr.Market_hours.is_market_open ()) then begin
+            (* Market is closed — don't escalate the circuit breaker.
+               Schedule a deferred reconnect at the next market open. *)
+            let sleep_secs = Ibkr.Market_hours.seconds_until_next_open () in
+            Logging.info_f ~section "[ibkr_gateway] Contract resolution failed (market closed): %s" error_msg;
+            Logging.info_f ~section "[ibkr_gateway] Sleeping %.0fs (%.1f hours) until market opens"
+              sleep_secs (sleep_secs /. 3600.0);
+            set_state ibkr_conn_sup (Failed "Market closed");
+            (* Sleep until market open, then let the connect_fn return normally
+               so start_async is triggered by the supervisor's on_disconnect handler. *)
+            let%lwt () = Lwt_unix.sleep sleep_secs in
+            Lwt.return_unit
+          end else begin
+            (* Market is open but contract resolution still failed — genuine error.
+               Escalate via circuit breaker as before. *)
+            Logging.error_f ~section "[ibkr_gateway] Contract resolution failed: %s" error_msg;
+            update_circuit_breaker ibkr_conn_sup false;
+            set_state ibkr_conn_sup (Failed error_msg);
+            Lwt.return_unit
+          end
+        )
       ) (fun exn ->
         let error_msg = Printexc.to_string exn in
         Logging.error_f ~section "[ibkr_gateway] Connection failed: %s" error_msg;
-        set_state ibkr_conn_sup (Failed error_msg);
-        Lwt.return_unit
+        update_circuit_breaker ibkr_conn_sup false;
+        Lwt.fail exn
       )
     in
     set_connect_fn ibkr_conn_sup (Some ibkr_connect_fn);

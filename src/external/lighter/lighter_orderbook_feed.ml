@@ -70,23 +70,36 @@ let notify_ready store =
   end
 
 (** Apply an incremental update to a sorted price level list.
-    size=0 means delete that price level, otherwise upsert. *)
+    size=0 means delete that price level, otherwise upsert.
+    Single-pass: the input list is pre-sorted (bids descending, asks
+    ascending). On update-in-place the prefix up to the match is rebuilt
+    but the tail is shared. On insertion, the new entry is spliced into
+    sorted position with one linear scan and no subsequent sort. *)
 let apply_delta levels price size ~is_bid =
   if size = 0.0 then
     List.filter (fun (p, _) -> p <> price) levels
   else
-    let updated = ref false in
-    let result = List.map (fun (p, s) ->
-      if p = price then begin updated := true; (p, size) end
-      else (p, s)
-    ) levels in
-    if !updated then result
-    else
-      let with_new = (price, size) :: result in
-      if is_bid then
-        List.sort (fun (a, _) (b, _) -> compare b a) with_new (* Descending *)
-      else
-        List.sort (fun (a, _) (b, _) -> compare a b) with_new (* Ascending *)
+    (* Single-pass upsert-or-insert over sorted list.
+       [cmp] encodes sort direction: bids descending, asks ascending. *)
+    let cmp = if is_bid
+      then (fun a b -> compare b a)  (* descending *)
+      else (fun a b -> compare a b)  (* ascending  *)
+    in
+    let rec go acc = function
+      | [] ->
+          (* Price not found; append at end (worst level). *)
+          List.rev_append acc [(price, size)]
+      | (p, _) :: tl when p = price ->
+          (* Update existing level, share the tail. *)
+          List.rev_append acc ((p, size) :: tl)
+      | ((p, _) as hd) :: tl ->
+          if cmp price p < 0 then
+            (* Insert before this element (better level). *)
+            List.rev_append acc ((price, size) :: hd :: tl)
+          else
+            go (hd :: acc) tl
+    in
+    go [] levels
 
 (** Truncate a level list to [max_depth] entries.
     Lists are pre-sorted (bids descending, asks ascending) so a simple
