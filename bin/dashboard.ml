@@ -251,8 +251,9 @@ let render_header w json =
 (* Panel: Holdings and Strategy *)
 
 let exch_tag_of = function
-  | "kraken" -> "kr" | "hyperliquid" -> "hl"
-  | e -> String.sub e 0 (min 2 (String.length e))
+  | "kraken" -> "krkn" | "hyperliquid" -> "hypr"
+  | "lighter" -> "ltr" | "ibkr" -> "ibkr"
+  | e -> String.sub e 0 (min 3 (String.length e))
 
 let render_strategies w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
