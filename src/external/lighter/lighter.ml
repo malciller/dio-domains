@@ -31,3 +31,6 @@ module Module = Lighter_module
 
 (** Shared type definitions for Lighter domain objects. *)
 module Types = Lighter_types
+
+(** Order TIF renewal background process (simulated GTC). *)
+module Tif_renewal = Lighter_tif_renewal

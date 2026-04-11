@@ -30,6 +30,7 @@ type open_order = {
   order_userref: int option;
   cl_ord_id: string option;
   last_updated: float;
+  order_expiry: float option;
 }
 
 type execution_event = {
@@ -151,6 +152,11 @@ let update_orders_internal store (event : execution_event) =
     Hashtbl.remove order_to_symbol event.order_id;
     Mutex.unlock initialization_mutex;
   end else begin
+    (* Preserve existing order_expiry if present; event updates don't carry expiry. *)
+    let preserved_expiry = match existing_opt with
+      | Some o -> o.order_expiry
+      | None -> None
+    in
     let order : open_order = {
       order_id = event.order_id;
       symbol = event.symbol;
@@ -164,6 +170,7 @@ let update_orders_internal store (event : execution_event) =
       order_userref = None;
       cl_ord_id = resolved_cl_ord_id;
       last_updated = now;
+      order_expiry = preserved_expiry;
     } in
     Hashtbl.replace store.open_orders event.order_id order;
     Mutex.lock initialization_mutex;
@@ -403,6 +410,29 @@ let process_account_orders_update json =
         let remaining = base_amount -. filled_base_amount in
         let avg_price = (try Lighter_types.parse_json_float (member "avg_fill_price" order_json) with _ -> price) in
 
+        (* Parse order expiry from the API. Lighter uses "e" in the Go struct,
+           but the REST/WS API may use "expiry" or "order_expiry". Try all.
+           Lighter returns expiry as epoch milliseconds; convert to seconds
+           to match Unix.gettimeofday(). *)
+        let order_expiry =
+          let try_field key =
+            try
+              let v = member key order_json in
+              if v <> `Null then
+                let raw = Lighter_types.parse_json_float v in
+                (* Values > 1e12 are milliseconds; convert to seconds *)
+                if raw > 1e12 then Some (raw /. 1000.0)
+                else Some raw
+              else None
+            with _ -> None
+          in
+          match try_field "e" with
+          | Some _ as v -> v
+          | None -> match try_field "expiry" with
+            | Some _ as v -> v
+            | None -> try_field "order_expiry"
+        in
+
         let store = get_symbol_store symbol in
         let is_amended = (try member "is_amended" order_json |> to_bool with _ -> false) in
         let now = Unix.gettimeofday () in
@@ -439,6 +469,23 @@ let process_account_orders_update json =
           cl_ord_id;
         } in
         update_orders_internal store event;
+
+        (* Set order_expiry on the open order entry if we parsed one.
+           update_orders_internal won't have it because execution_event
+           doesn't carry expiry — we set it directly on the stored order. *)
+        let is_terminal_status = match order_status with
+          | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
+          | _ -> false
+        in
+        (match order_expiry with
+         | Some exp when not is_terminal_status ->
+             Mutex.lock store.orders_mutex;
+             (match Hashtbl.find_opt store.open_orders event.order_id with
+              | Some o ->
+                  Hashtbl.replace store.open_orders event.order_id { o with order_expiry = Some exp }
+              | None -> ());
+             Mutex.unlock store.orders_mutex
+         | _ -> ());
 
         (match order_status with
          | FilledStatus ->
@@ -483,6 +530,23 @@ let cleanup_stale_orders () =
     if !stale <> [] then
       Logging.info_f ~section "Cleaned %d stale orders for %s" (List.length !stale) symbol
   ) all_symbols
+
+(** Return all open orders with expiry data across all symbol stores.
+    Used by the TIF renewal process to find orders approaching expiry. *)
+let get_all_open_orders_with_expiry () =
+  Mutex.lock initialization_mutex;
+  let all_symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
+  Mutex.unlock initialization_mutex;
+  let result = ref [] in
+  List.iter (fun symbol ->
+    let store = get_symbol_store symbol in
+    Mutex.lock store.orders_mutex;
+    Hashtbl.iter (fun _order_id (order : open_order) ->
+      result := order :: !result
+    ) store.open_orders;
+    Mutex.unlock store.orders_mutex;
+  ) all_symbols;
+  !result
 
 let initialize symbols =
   Logging.info_f ~section "Initializing Lighter executions feed for %d symbols" (List.length symbols);
