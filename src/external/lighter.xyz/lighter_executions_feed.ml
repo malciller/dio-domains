@@ -546,7 +546,26 @@ let process_account_orders_update json =
 
         (match order_status with
          | FilledStatus ->
-             Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f" order_id symbol base_amount price
+             Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f" order_id symbol base_amount price;
+             (* Publish to centralized fill event bus for Discord notifications *)
+             let fill_value = filled_base_amount *. avg_price in
+             let maker_fee_rate =
+               match Dio_exchange.Exchange_intf.Registry.get "lighter" with
+               | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+                   (match Ex.get_fees ~symbol with (Some f, _) -> f | _ -> 0.0)
+               | None -> 0.0
+             in
+             let fee = fill_value *. maker_fee_rate in
+             Concurrency.Fill_event_bus.publish_fill {
+               venue = "lighter";
+               symbol;
+               side = (if is_ask then "sell" else "buy");
+               amount = filled_base_amount;
+               fill_price = avg_price;
+               value = fill_value;
+               fee;
+               timestamp = Unix.gettimeofday ();
+             }
          | CanceledStatus ->
              Logging.info_f ~section "Order CANCELED: %s [%s] %.8f @ %.2f" order_id symbol base_amount price
          | NewStatus ->

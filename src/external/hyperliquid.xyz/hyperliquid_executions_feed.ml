@@ -724,9 +724,28 @@ let process_user_events data_json =
           
           update_orders_internal store event;
           
-          if is_filled then
-            Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid
-          else
+          if is_filled then begin
+            Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid;
+            (* Publish to centralized fill event bus for Discord notifications *)
+            let fill_value = cum_qty *. avg_price in
+            let maker_fee_rate =
+              match Dio_exchange.Exchange_intf.Registry.get "hyperliquid" with
+              | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+                  (match Ex.get_fees ~symbol with (Some f, _) -> f | _ -> 0.0)
+              | None -> 0.0
+            in
+            let estimated_fee = fill_value *. maker_fee_rate in
+            Concurrency.Fill_event_bus.publish_fill {
+              venue = "hyperliquid";
+              symbol;
+              side = (if side = Buy then "buy" else "sell");
+              amount = cum_qty;
+              fill_price = avg_price;
+              value = fill_value;
+              fee = estimated_fee;
+              timestamp = now;
+            }
+          end else
             Logging.info_f ~section "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty
         end
     | None -> ()

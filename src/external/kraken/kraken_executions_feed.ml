@@ -900,6 +900,28 @@ let handle_update json on_heartbeat =
           (* Publish to order update event bus *)
           OrderUpdateEventBus.publish order_update_event_bus event;
 
+          (* Publish complete fills to centralized fill event bus for Discord notifications *)
+          (if event.order_status = FilledStatus then begin
+            let fill_value = event.cum_qty *. event.avg_price in
+            let maker_fee_rate =
+              match Dio_exchange.Exchange_intf.Registry.get "kraken" with
+              | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+                  (match Ex.get_fees ~symbol:event.symbol with (Some f, _) -> f | _ -> 0.0)
+              | None -> 0.0
+            in
+            let fee = fill_value *. maker_fee_rate in
+            Concurrency.Fill_event_bus.publish_fill {
+              venue = "kraken";
+              symbol = event.symbol;
+              side = (string_of_side event.side);
+              amount = event.cum_qty;
+              fill_price = event.avg_price;
+              value = fill_value;
+              fee;
+              timestamp = event.timestamp;
+            }
+          end);
+
           (* Update heartbeat *)
           on_heartbeat ()
       | None -> ()
