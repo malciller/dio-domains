@@ -17,7 +17,7 @@ Both exchange modules follow the same concurrency and safety patterns:
 
 | Pattern | Description |
 |---------|-------------|
-| **Ring Buffers** | Lock-free `Concurrency.Ring_buffer.RingBuffer` for all feed data (tickers, executions, orderbook) |
+| **Ring Buffers** | Lock-free `Concurrency.Ring_buffer.RingBuffer` for all feed data (orderbook, executions) |
 | **Global Order Index** | `order_to_symbol` Hashtbl for O(1) order lookups across symbols |
 | **Double-Checked Locking** | Mutex-protected store initialization to prevent TOCTOU races |
 | **Atomic Flags** | `Atomic.t` for all shared boolean/float state (readiness, timestamps, config) |
@@ -41,7 +41,6 @@ The `Types` submodule defines all records and variants shared across exchange im
 | `amend_order_result` | Acknowledgment after amendment (original_order_id, new_order_id, amend_id, cl_ord_id) |
 | `cancel_order_result` | Acknowledgment after cancellation (order_id, cl_ord_id) |
 | `open_order` | Snapshot of a live order including fill progress and optional client identifiers |
-| `ticker_event` | Top-of-book snapshot: best bid, best ask, timestamp |
 | `orderbook_event` | Depth snapshot: arrays of (price, size) bid/ask levels, timestamp |
 | `execution_event` | Order state change report: status, fills, remaining qty, avg price |
 | `retry_config` | Exponential backoff parameters: max_attempts, base_delay_ms, max_delay_ms, backoff_factor |
@@ -66,9 +65,7 @@ Your module must provide all values specified in module type `S`. The interface 
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `get_ticker` | `symbol -> (float * float) option` | Return current (best_bid, best_ask), or None if unavailable. |
-| `subscribe_ticker` | `symbol -> unit Lwt.t` | Dynamically subscribe to the ticker feed for a symbol. |
-| `get_top_of_book` | `symbol -> (float * float * float * float) option` | Return (bid_price, bid_size, ask_price, ask_size), or None. |
+| `get_top_of_book` | `symbol -> (float * float * float * float) option` | Return (bid_price, bid_size, ask_price, ask_size) derived from the orderbook, or None if unavailable. |
 | `get_balance` | `asset -> float` | Return the current balance for an asset. Returns 0.0 if unknown. |
 | `get_all_balances` | `unit -> (string * float) list` | Return all cached (asset_name, balance) pairs. |
 | `get_open_order` | `symbol -> order_id -> open_order option` | Look up a specific open order by symbol and order_id. |
@@ -76,20 +73,20 @@ Your module must provide all values specified in module type `S`. The interface 
 
 #### Ring Buffer Event Feed Consumption
 
-Each feed type (ticker, orderbook, execution) exposes three functions: a position query, a list-returning reader, and a zero-allocation iterator.
+Each feed type (orderbook, execution) exposes three functions: a position query, a list-returning reader, and a zero-allocation iterator.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `get_ticker_position` | `symbol -> int` | Current write position of the ticker ring buffer. |
-| `read_ticker_events` | `symbol -> start_pos -> ticker_event list` | Read ticker events from start_pos to the current position. Allocates a list. |
-| `iter_ticker_events` | `symbol -> start_pos -> (ticker_event -> unit) -> int` | Iterate over ticker events without allocation. Returns new read position. |
 | `get_orderbook_position` | `symbol -> int` | Current write position of the orderbook ring buffer. |
-| `read_orderbook_events` | `symbol -> start_pos -> orderbook_event list` | Read orderbook events from start_pos. Allocates a list. |
+| `read_orderbook_events` | `symbol -> start_pos -> orderbook_event list` | Read orderbook events from start_pos to the current position. Allocates a list. |
 | `iter_orderbook_events` | `symbol -> start_pos -> (orderbook_event -> unit) -> int` | Iterate over orderbook events without allocation. Returns new read position. |
+| `iter_top_of_book_events` | `symbol -> start_pos -> (float -> float -> float -> float -> unit) -> int` | Iterate over orderbook events extracting only top-of-book (bid_price, bid_size, ask_price, ask_size) without allocating converted arrays. Returns new read position. |
 | `get_execution_feed_position` | `symbol -> int` | Current write position of the execution ring buffer. |
+| `has_execution_data` | `symbol -> bool` | Return true if the execution feed has received its initial data snapshot for the symbol. Used to gate strategy execution until open order state is populated. |
 | `read_execution_events` | `symbol -> start_pos -> execution_event list` | Read execution events from start_pos. Allocates a list. |
 | `iter_execution_events` | `symbol -> start_pos -> (execution_event -> unit) -> int` | Iterate over execution events without allocation. Returns new read position. |
 | `fold_open_orders` | `symbol -> init -> f -> 'a` | Fold over open orders without allocating an intermediate list. |
+| `iter_open_orders_fast` | `symbol -> (string -> float -> float -> string -> int option -> unit) -> unit` | Fast path iterator that avoids creating `Types.open_order` intermediate records. Yields primitive order values directly to the callback. |
 
 #### Instrument Metadata
 
@@ -136,8 +133,8 @@ Strategies (e.g., `market_maker`, `suicide_grid`) operate generically over `Exch
 1. **Precision Handling**: Strategies call `get_price_increment`, `get_qty_increment`, and `round_price` to format prices and quantities before submitting orders. Inaccurate metadata causes `INVALID_ARGS` rejections.
 2. **Order Tracking**: Strategies track orders via `cl_ord_id` or `order_userref`. Implementations must store and return these identifiers in `add_order_result` and propagate them through execution events.
 3. **Balance Checks**: Strategies pause when `get_balance` returns insufficient funds. This value must stay current via WebSocket or periodic REST polling.
-4. **Zero-Allocation Iteration**: Hot-path strategies use `iter_ticker_events`, `iter_orderbook_events`, `iter_execution_events`, and `fold_open_orders` to avoid per-tick list allocations.
-5. **Dynamic Fear & Greed Re-evaluation**: Engine supervisors monitor price variations across ticker events. When price movement exceeds the dynamically configured `fng_check_threshold` (set in `config.json`), strategies trigger a Fear & Greed index recalculation. Timely ticker feeds are essential for accurate threshold adherence.
+4. **Zero-Allocation Iteration**: Hot-path strategies use `iter_orderbook_events`, `iter_top_of_book_events`, `iter_execution_events`, `fold_open_orders`, and `iter_open_orders_fast` to avoid per-tick list allocations.
+5. **Dynamic Fear & Greed Re-evaluation**: Engine supervisors monitor price variations derived from orderbook top-of-book data. When price movement exceeds the dynamically configured `fng_check_threshold` (set in `config.json`), strategies trigger a Fear & Greed index recalculation. Timely orderbook feeds are essential for accurate threshold adherence.
 
 ## Order Handling Specification
 
@@ -171,8 +168,8 @@ Strategies (e.g., `market_maker`, `suicide_grid`) operate generically over `Exch
 - [ ] Create `src/external/<name>/` directory
 - [ ] Create `<name>_actions.ml` implementing REST/WS calls with retry logic
 - [ ] Create `<name>_module.ml` implementing the `Exchange_intf.S` module type
-- [ ] Create feed modules (`_ticker_feed.ml`, `_executions_feed.ml`, `_orderbook_feed.ml`) with ring buffers, double-checked locking, and crash recovery
-- [ ] Implement all `iter_*` and `fold_open_orders` functions for zero-allocation hot paths
+- [ ] Create feed modules (`_executions_feed.ml`, `_orderbook_feed.ml`) with ring buffers, double-checked locking, and crash recovery
+- [ ] Implement `iter_orderbook_events`, `iter_top_of_book_events`, `iter_execution_events`, `fold_open_orders`, and `iter_open_orders_fast` for zero-allocation hot paths
 - [ ] Implement `round_price` with exchange-specific precision rules
 - [ ] Ensure `amend_order` respects precision rules for the target API
 - [ ] Use `Atomic.t` for shared flags, `Mutex.t` for shared data structures
