@@ -506,7 +506,7 @@ let push_order ~now ?state order =
    | Cancel ->
        let state = match state with Some s -> s | None -> get_strategy_state order.symbol in
        (match order.order_id with
-        | Some target_order_id ->
+        | Some _ ->
             Mutex.lock order_buffer_mutex;
             let write_result = OrderRingBuffer.write order_buffer order in
             Mutex.unlock order_buffer_mutex;
@@ -514,18 +514,12 @@ let push_order ~now ?state order =
             (match write_result with
             | Some () ->
                 Strategy_common.OrderSignal.broadcast ();
-                Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
-                  operation_str
-                  (string_of_order_side order.side)
-                  order.symbol
-                  order.qty
-                  (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+
                 state.last_order_time <- now;
                 (* Gate open_orders sync until order channel confirms the cancel. *)
                 if order.side = Buy then
                   state.inflight_cancel_buy <- true;
-                Logging.debug_f ~section "Cancelling order for %s (target: %s)"
-                  order.symbol target_order_id;
+
                 true
             | None ->
                 Logging.warn_f ~section "Order ringbuffer full, dropped %s %s order for %s"
@@ -543,7 +537,7 @@ let push_order ~now ?state order =
        in
 
        if is_duplicate then begin
-         Logging.debug_f ~section "Duplicate %s detected (strategy): %s" operation_str order.symbol;
+
          false
        end else begin
          (* Write Place or Amend to ringbuffer. *)
@@ -554,12 +548,7 @@ let push_order ~now ?state order =
        match write_result with
        | Some () ->
            Strategy_common.OrderSignal.broadcast ();
-           Logging.debug_f ~section "Pushed %s %s order: %s %.8f @ %s"
-             operation_str
-             (string_of_order_side order.side)
-             order.symbol
-             order.qty
-             (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market");
+
 
            (* Update strategy state. *)
            let state = match state with Some s -> s | None -> get_strategy_state order.symbol in
@@ -586,14 +575,13 @@ let push_order ~now ?state order =
                    let order_price = Option.value order.price ~default:0.0 in
                    let timestamp = now in
                    state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
-                   Logging.debug_f ~section "Added pending order: %s %s @ %.2f for %s"
-                     (string_of_order_side order.side) temp_order_id order_price order.symbol;
+
 
                    (* Track sell orders in state for grid spacing logic. *)
                    (match order.side, order.price with
                     | Sell, Some price ->
                         state.open_sell_orders <- (temp_order_id, price, order.qty) :: state.open_sell_orders;
-                        Logging.debug_f ~section "Tracking sell order %s @ %.2f for %s" temp_order_id price order.symbol
+                        ()
                     | _ -> ())
                  end
             | Amend ->
@@ -603,9 +591,7 @@ let push_order ~now ?state order =
                 let order_price = Option.value order.price ~default:0.0 in
                 let timestamp = now in
                 state.pending_orders <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
-                Logging.debug_f ~section "Added pending amend: %s %s @ %.2f for %s (target: %s)"
-                  (string_of_order_side order.side) temp_order_id order_price order.symbol
-                  (Option.value order.order_id ~default:"unknown");
+
                 (* Gate duplicate-buy cancel for the inject->remove window. *)
                 if order.side = Buy then
                   state.inflight_amend_buy <- true
@@ -658,8 +644,7 @@ let execute_strategy
    (match asset_balance with
     | Some asset_bal ->
         if asset_bal > state.last_seen_asset_balance && state.anticipated_base_credit > 0.0 then begin
-          Logging.debug_f ~section "Balance feed caught up for %s: %.8f -> %.8f, clearing anticipated credit %.8f"
-            asset.symbol state.last_seen_asset_balance asset_bal state.anticipated_base_credit;
+
           state.anticipated_base_credit <- 0.0
         end;
         state.last_seen_asset_balance <- asset_bal
@@ -768,7 +753,7 @@ let execute_strategy
         in check_stale 0 state.pending_orders
       in
       if needs_pending_cleanup then begin
-        let (kept_rev, kept_count, removed_count) =
+        let (kept_rev, _, _) =
           List.fold_left (fun (acc, kept, removed) ((order_id, side, _, timestamp) as entry) ->
             let age = now -. timestamp in
             if age > 5.0 then begin
@@ -789,8 +774,7 @@ let execute_strategy
           ) ([], 0, 0) state.pending_orders
         in
         state.pending_orders <- List.rev kept_rev;
-        if removed_count > 0 && cycle mod 100000 = 0 then
-          Logging.debug_f ~section "Cleaned up %d pending orders for %s (kept %d)" removed_count asset.symbol kept_count;
+
       end;
 
 
@@ -857,8 +841,7 @@ let execute_strategy
                       buys := (order_id, order_price) :: !buys
                     end else begin
                       sells := (order_id, order_price, qty) :: !sells;
-                      Logging.debug_f ~section "SELL_REBUILD [%s] from exchange cache: %s @ %.2f qty=%.8f"
-                        asset.symbol order_id order_price qty
+                      ()
                     end
                   end
                 );
@@ -893,8 +876,6 @@ let execute_strategy
               Retain current state; order channel will resolve. *)
            ());
 
-      (* Log sell order changes: compare new exchange-sourced list with prior state. *)
-      let prev_sells = state.open_sell_orders in
 
       (* Apply exchange sell orders. *)
       state.open_sell_orders <- !sell_orders;
@@ -907,24 +888,14 @@ let execute_strategy
           let already_present = List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders in
           if not already_present then begin
             state.open_sell_orders <- (preserved_id, preserved_price, lot_qty) :: state.open_sell_orders;
-            Logging.debug_f ~section "SELL_MERGE [%s] injected preserved sell: %s @ %.2f"
-              asset.symbol preserved_id preserved_price
+            ()
           end
         ) preserved_sells
       end;
 
-      (* Detect sell order mutations from prior cycle. *)
-      List.iter (fun (id, new_price, new_qty) ->
-        match List.find_opt (fun (pid, _, _) -> pid = id) prev_sells with
-        | Some (_, prev_price, prev_qty) ->
-            if abs_float (new_price -. prev_price) > 0.01 || abs_float (new_qty -. prev_qty) > 1e-8 then
-              Logging.debug_f ~section "SELL_CHANGED [%s] %s: price %.2f->%.2f qty %.8f->%.8f"
-                asset.symbol id prev_price new_price prev_qty new_qty
-        | None -> ()
-      ) state.open_sell_orders;
 
-      Logging.debug_f ~section "SELL_SYNC [%s] buys=%d sells=%d (prev_sells=%d)"
-        asset.symbol (List.length !buy_orders) (List.length !sell_orders) (List.length prev_sells);
+
+
 
       (* Use cached parsed config values; updated once at domain startup
          and whenever the config ref changes (Fear & Greed re-evaluation). *)
@@ -940,20 +911,7 @@ let execute_strategy
             | Some cached -> cached
             | None -> 0.0);
 
-      (* Calculate required balances. *)
       let quote_needed = ask_price *. qty in
-      let asset_needed =
-        if ecfg.sell_uses_mult then qty *. sell_mult
-        else qty  (* 1:1 sells *)
-      in
-
-  (* Log current balance status; throttled to every 10,000 cycles. *)
-  if cycle mod 10000 = 0 then
-    Logging.debug_f ~section "Balance check for %s: asset_balance=%.8f, quote_balance=%.2f, needed asset=%.8f, needed quote=%.2f"
-      asset.symbol
-      (Option.value asset_balance ~default:0.0)
-      (Option.value quote_balance ~default:0.0)
-      asset_needed quote_needed;
 
   (* Check for missing balance data. Stale but present balance data is acceptable.
      Supervisor monitors WebSocket health via heartbeats. *)
@@ -961,20 +919,17 @@ let execute_strategy
     match asset_balance, quote_balance with
     | None, None ->
         (* No balance data at all; cannot trade without balance info. *)
-        if state.last_cycle <> cycle then
-          Logging.debug_f ~section "No balance data available for %s - waiting for balance feed" asset.symbol;
+
         true
     | Some _, None | None, Some _ ->
         (* Partial balance data; may indicate feed issue. *)
-        if state.last_cycle <> cycle then
-          Logging.debug_f ~section "Partial balance data for %s - waiting for complete data" asset.symbol;
+
         true
     | Some ab, Some qb ->
         (* Have balance data; check if balances are sufficient. *)
         if ab = 0.0 && qb < 10.0 then begin
           (* Very low balances; may not be able to trade. *)
-          if state.last_cycle <> cycle then
-            Logging.debug_f ~section "Very low balances for %s - asset: %.8f, quote: %.2f" asset.symbol ab qb;
+
           false
         end else
           false
@@ -987,12 +942,6 @@ let execute_strategy
   end else begin
     (* Core strategy logic based on open orders and balances.
        Log state periodically for race condition debugging. *)
-    if state.last_cycle <> cycle && cycle mod 100000 = 0 then begin
-      Logging.debug_f ~section "Strategy state for %s: pending_orders=%d, buy_price=%s, sell_count=%d"
-        asset.symbol (List.length state.pending_orders)
-        (match state.last_buy_order_price with Some p -> Printf.sprintf "%.2f" p | None -> "none")
-        (List.length state.open_sell_orders)
-    end;
 
     let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
     (* Effective buy count: use max of raw count and our own tracking.
@@ -1006,8 +955,7 @@ let execute_strategy
 
     if buy_order_pending then begin
         (* Log every 100,000 iterations to avoid spam. *)
-        if cycle mod 100000 = 0 then
-            Logging.debug_f ~section "Waiting for pending buy order to complete for %s" asset.symbol;
+        ();
     end else if effective_buy_count > 1 && not state.inflight_cancel_buy && not state.inflight_amend_buy then begin
         (* Case 0: Multiple buy orders exist. Cancel all to enforce single buy
            order policy. Fires at startup reconciliation when last_buy_order_id=None
@@ -1120,9 +1068,9 @@ let execute_strategy
         (* Place buy order if quote balance is available. *)
         (match quote_balance with
          | Some _ when is_buy_on_cooldown ->
-             Logging.debug_f ~section "Skipping buy order placement for %s due to rate limit cooldown" asset.symbol
+             ()
          | Some _ when state.inflight_buy ->
-             Logging.debug_f ~section "Skipping buy order placement for %s: inflight buy=%B" asset.symbol state.inflight_buy
+             ()
          | Some _quote_bal ->
              (* Compute available balances net of open order commitments *)
              let available_quote_balance = match quote_balance with
@@ -1248,9 +1196,7 @@ let execute_strategy
                          let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                          ignore (push_order ~now ~state order);
                          state.last_buy_order_price <- Some target_buy_price;
-                         let target_distance = sell_price -. target_buy_price in
-                         Logging.debug_f ~section "Amended buy %s for %s (trailing upward): sell@%.4f, buy@%.4f -> %.4f (dist: %.4f -> %.4f, 2x: %.4f)"
-                           buy_order_id asset.symbol sell_price current_buy_price target_buy_price distance target_distance double_grid_interval
+                         ()
                      | Some quote_bal ->
                          Logging.warn_f ~section "Insufficient quote balance to trail %s: need %.2f, have %.2f"
                            asset.symbol quote_needed quote_bal
@@ -1259,8 +1205,7 @@ let execute_strategy
                   end
                 end else begin
                   (* Price has fallen; hold buy order steady, do not trail down. *)
-                  Logging.debug_f ~section "Holding buy %s for %s @ %.2f (price fell, not trailing down)"
-                    buy_order_id asset.symbol current_buy_price
+                   ()
                 end
               end else begin
                 (* Distance <= 2x: enforce exact 2x spacing. *)
@@ -1277,20 +1222,18 @@ let execute_strategy
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true Grid asset.exchange in
                        ignore (push_order ~now ~state order);
                        state.last_buy_order_price <- Some exact_target;
-                       Logging.debug_f ~section "Amended buy %s for %s (enforcing 2x): sell@%.4f, buy@%.4f -> %.4f (dist: %.4f <= 2x: %.4f)"
-                         buy_order_id asset.symbol sell_price current_buy_price exact_target distance double_grid_interval
+                       ()
                    | Some quote_bal ->
                        Logging.warn_f ~section "Insufficient quote balance for %s: need %.2f, have %.2f"
                          asset.symbol quote_needed quote_bal
                    | None ->
                        Logging.warn_f ~section "No quote balance for %s" asset.symbol)
                 end else begin
-                  Logging.debug_f ~section "Buy %s for %s already at 2x: buy@%.4f, sell@%.4f"
-                    buy_order_id asset.symbol current_buy_price sell_price
+                  ()
                 end
               end
           | _ ->
-              Logging.debug_f ~section "Buy order tracking lost for %s, will re-place on next cycle" asset.symbol
+              ()
         end else begin
           (* No sell orders exist but buy is active.
              Trail buy without sell anchors; sells are only placed
@@ -1312,8 +1255,7 @@ let execute_strategy
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                        ignore (push_order ~now ~state order);
                        state.last_buy_order_price <- Some target_buy_price;
-                       Logging.debug_f ~section "Trailing buy %s for %s: %.4f -> %.4f (no sell anchors)"
-                         buy_order_id asset.symbol current_buy_price target_buy_price
+                       ()
                    | Some quote_bal ->
                        Logging.warn_f ~section "Insufficient quote balance to trail buy: need %.2f, have %.2f"
                          quote_needed quote_bal
@@ -1321,11 +1263,10 @@ let execute_strategy
                        Logging.warn_f ~section "No quote balance for buy trailing")
                 end
               end else begin
-                Logging.debug_f ~section "Holding buy for %s @ %.2f (price retraced or target unchanged)"
-                  asset.symbol current_buy_price
+                ()
               end
           | _ ->
-              Logging.debug_f ~section "Buy order tracking lost for %s, will re-place on next cycle" asset.symbol
+              ()
         end;
         (* Update cycle counter. *)
         state.last_cycle <- cycle
@@ -1409,15 +1350,13 @@ let handle_order_acknowledged asset_symbol order_id side price =
     state.inflight_buy <- false;
     (* Amendment window is over; exchange has acknowledged the new order. *)
     state.inflight_amend_buy <- false;
-    Logging.debug_f ~section "Updated buy order ID and price tracking: %s @ %.2f for %s" order_id price asset_symbol
+    ()
    | Sell ->
     state.inflight_sell <- false;
     state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
-    Logging.debug_f ~section "SELL_ACK [%s] injected into recently_injected_sells: %s @ %.2f"
-      asset_symbol order_id price);
+    ());
 
-  Logging.debug_f ~section "Order acknowledged and removed from pending: %s %s @ %.2f for %s"
-    order_id (string_of_order_side side) price asset_symbol
+  ()
   )
 
 (** Handles order placement failure. Clears in-flight trackers so strategy can retry. *)
@@ -1523,8 +1462,7 @@ let handle_order_rejected asset_symbol side price =
          Hashtbl.replace state.amend_cooldowns "place_Buy" new_expiry
    | Sell -> ());
 
-  Logging.debug_f ~section "Order rejected and removed from pending/trackers: %s @ %.2f for %s"
-    (string_of_order_side side) price asset_symbol
+  ()
   )
 
   (* Buy rejection signals no buy order exists; strategy re-evaluates on next cycle. *)
@@ -1591,7 +1529,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
         Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
           asset_symbol acc_qty state.anticipated_base_credit order_id
       end;
-      Logging.debug_f ~section "Filled buy order %s removed from tracking for %s" order_id asset_symbol
+      ()
     end;
 
     (* 5. Compute realized net profit on sell fills (discrete sizing accumulator).
@@ -1620,8 +1558,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
        | None -> true  (* New strategy: no persisted OID; skip all fills during startup replay. *))
     in
     if skip_profit_calc then
-      Logging.debug_f ~section "Skipping startup replay fill %s for %s (already persisted, last_fill_oid=%s)"
-        order_id asset_symbol (Option.value state.last_fill_oid ~default:"none")
+      ()
     else
     (match side with
      | Sell ->
@@ -1692,8 +1629,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
       state.inflight_sell <- false
     end;
 
-    Logging.debug_f ~section "Order FILLED and cleaned up explicitly: %s for %s"
-      order_id asset_symbol
+    ()
   )
 
 (** Handles order cancellation. Removes from pending and tracked orders. *)
@@ -1703,7 +1639,7 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
     (* Order channel confirmed cancellation (authoritative source of truth).
        1. Remove any pending operations for this order. *)
-    let original_pending_count = List.length state.pending_orders in
+
     state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
       (* Match pending_id equal to order_id, or pending_amend_ entries targeting order_id. *)
       let matches = pending_id = order_id || 
@@ -1712,7 +1648,7 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
                     String.sub pending_id 14 (String.length pending_id - 14) = order_id) in
       not matches
     ) state.pending_orders;
-    let removed_pending = original_pending_count - List.length state.pending_orders in
+
 
     (* Clear amend cooldowns if any exist. *)
     Hashtbl.remove state.amend_cooldowns order_id;
@@ -1729,7 +1665,7 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
     if was_tracked_buy then begin
          state.last_buy_order_id <- None;
          state.last_buy_order_price <- None;
-         Logging.debug_f ~section "Cancelled buy order %s removed from tracking for %s" order_id asset_symbol
+         ()
     end;
 
     (* Clear inflight_cancel_buy now that the order channel has confirmed; unblocks sync. *)
@@ -1742,18 +1678,17 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
     end;
     
     (* Remove from sell orders list. *)
-    let original_sell_count = List.length state.open_sell_orders in
+
     state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
       sell_id <> order_id
     ) state.open_sell_orders;
-    let removed_sell = original_sell_count - List.length state.open_sell_orders in
+
 
     (* Clear inflight flags and global placement trackers for immediate re-placement. *)
     (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol cancelled_side));
     
-    Logging.debug_f ~section "Order cancelled and cleaned up: %s for %s (removed %d pending, %d sell)"
-      order_id asset_symbol removed_pending removed_sell
+    ()
   )
 
 (** Handles cancel-replace order amendment. Swaps old ID for new ID in tracking. *)
@@ -1778,8 +1713,7 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                state.last_buy_order_price <- Some price;
                if old_order_id = new_order_id then
                  (* In-place amendment (Kraken): same order ID, price updated only. *)
-                 Logging.debug_f ~section "Updated buy price in tracking: %s @ %.2f for %s"
-                   old_order_id price asset_symbol
+                 ()
                else
                  (* Cancel-replace amendment (Hyperliquid): new order ID assigned. *)
                  Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s"
@@ -1789,8 +1723,7 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
                    as the tracked buy. Doing so resurrects ghost orders from stale
                    orderUpdate websocket events, causing duplicate/ghost order
                    detection when combined with fresh placements. *)
-                Logging.debug_f ~section "Ignoring amendment for untracked buy order %s -> %s for %s"
-                  old_order_id new_order_id asset_symbol)
+                ())
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
          let old_entry = List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders in
@@ -1824,12 +1757,11 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
     if side = Buy then
       state.inflight_amend_buy <- false;
 
-    Logging.debug_f ~section "Order amended and tracking updated: %s %s -> %s @ %.2f for %s"
-      (string_of_order_side side) old_order_id new_order_id price asset_symbol
+    ()
   )
 
 (** Handles skipped order amendment. Clears pending lock without swapping IDs. *)
-let handle_order_amendment_skipped asset_symbol order_id side price =
+let handle_order_amendment_skipped asset_symbol order_id _ _ =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1840,8 +1772,7 @@ let handle_order_amendment_skipped asset_symbol order_id side price =
       not matches_amend
     ) state.pending_orders;
     
-    Logging.debug_f ~section "Order amendment skipped for identical price, removed tracking guard: %s %s @ %.2f for %s"
-      (string_of_order_side side) order_id price asset_symbol
+    ()
   )
 
 (** Handles order amendment failure. Clears tracking so replacement can be placed. *)
@@ -1905,7 +1836,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
                 (* Order ID does not match tracking; already cleared by a previous call.
                    Clear cooldowns to unblock placement. *)
                 Hashtbl.remove state.amend_cooldowns "place_Buy";
-                Logging.debug_f ~section "Amendment failed for untracked buy order %s: %s. Cleared place_Buy cooldown." order_id reason)
+                ())
        | Sell ->
            let original_sell_count = List.length state.open_sell_orders in
            state.open_sell_orders <- List.filter (fun (sell_id, _, _) -> sell_id <> order_id) state.open_sell_orders;
@@ -1956,7 +1887,7 @@ let get_pending_orders max_orders =
 
 (** Initializes the strategy module. *)
 let init () =
-  Logging.debug_f ~section "Suicide Grid strategy initialized with order buffer size 4096";
+
   Random.self_init ()
 
 (** Strategy module interface. *)
@@ -1969,7 +1900,7 @@ module Strategy = struct
     (match Hashtbl.find_opt strategy_states symbol with
      | Some _ ->
          Hashtbl.remove strategy_states symbol;
-         Logging.debug_f ~section "Removed strategy state for %s" symbol
+         ()
      | None -> ());
     Mutex.unlock strategy_states_mutex
 
