@@ -652,7 +652,11 @@ let execute_strategy
    );
 
    (* Asset-low check: clear flag when asset balance recovers.
-      Subtract reserved_base so accumulated base asset is protected from sells. *)
+      Subtract reserved_base and locked_in_sells so the clearing condition
+      matches the blocking guard in the sell-placement path.  Without
+      subtracting locked_in_sells here, `available_asset` appears large
+      enough to clear asset_low, but the sell path immediately re-sets it,
+      causing a hot loop (~50 ms). *)
    (match asset_balance with
     | Some asset_bal ->
         let qty_f = lot_qty in
@@ -661,7 +665,12 @@ let execute_strategy
             qty_f *. state.cached_sell_mult
           else qty_f  (* 1:1 sells require full qty *)
         in
-        let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit in
+        let locked_in_sells =
+          if ecfg.use_reserved_base_guard then
+            List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
+          else 0.0
+        in
+        let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit -. locked_in_sells in
         let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
         let should_clear =
           if ecfg.asset_low_requires_balance_change then
@@ -673,8 +682,8 @@ let execute_strategy
           state.asset_low <- false;
           state.inflight_sell <- false;
           ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
-          Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
-            asset.symbol asset_bal state.reserved_base state.anticipated_base_credit available_asset asset_needed_fast
+          Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
+            asset.symbol asset_bal state.reserved_base state.anticipated_base_credit locked_in_sells available_asset asset_needed_fast
         end
     | None -> ()
    );
@@ -855,8 +864,19 @@ let execute_strategy
          (handle_order_cancelled) clears inflight_cancel_buy. *)
       (match !buy_orders with
        | [] when not state.inflight_cancel_buy && not state.inflight_buy ->
-           (* No open buy and no in-flight op; clear reservation. *)
-           set_asset_reserved_quote state 0.0
+           (* No open buy and no in-flight op; clear reservation and buy tracking.
+              This handles orders cancelled by the exchange during a WS disconnect
+              where the cancellation event was never received (ghost orders).
+              Without this, last_buy_order_id would persist indefinitely,
+              effective_buy_count would stay at 1, and no new buy could be placed. *)
+           set_asset_reserved_quote state 0.0;
+           (match state.last_buy_order_id with
+            | Some ghost_id ->
+                Logging.info_f ~section "Clearing ghost buy order %s for %s (exchange reports 0 open buys)"
+                  ghost_id asset.symbol;
+                state.last_buy_order_id <- None;
+                state.last_buy_order_price <- None
+            | None -> ())
        | orders when not state.inflight_cancel_buy && not state.inflight_buy ->
            (* Safe to sync: no in-flight operation. *)
            let valid_orders = List.filter (fun (_, p) -> p > 0.0) orders in
@@ -997,7 +1017,7 @@ let execute_strategy
            is set and will not clear until (asset_bal - reserved_base) >= needed,
            protecting accumulated base asset. *)
         (match asset_balance with
-         | Some asset_bal when not state.inflight_sell ->
+         | Some asset_bal when not state.inflight_sell && not state.asset_low ->
              let (sell_qty, is_accumulation_sell) =
                if ecfg.use_accumulation_sells then begin
                  let rounded_sell =
@@ -1030,6 +1050,14 @@ let execute_strategy
                    Logging.warn_f ~section
                      "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
                      asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells sell_qty;
+                   (* Set asset_low to prevent tight-looping on every cycle.
+                      Clears event-driven when balance recovers. Without this,
+                      the strategy re-enters the effective_buy_count=0 branch,
+                      retries the sell, and spams this warning every ~50ms. *)
+                   if not state.asset_low then begin
+                     state.asset_low <- true;
+                     Logging.info_f ~section "Setting asset_low for %s (sell blocked by reserved_base guard)" asset.symbol
+                   end;
                    false
                  end
                else true
