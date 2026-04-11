@@ -934,10 +934,24 @@ let clear_domain_registry () =
 
 (** Return non-destructive latency profiler snapshots for all domains.
     Result type: (symbol, [(label, snapshot option)]) list.
-    Safe to call from the dashboard; does not reset profiler data. *)
+    Safe to call from the dashboard; does not reset profiler data.
+
+    Implementation: snapshots profiler references under profiler_cache_mutex
+    in O(N) then computes percentiles outside the lock. This prevents the
+    dashboard from blocking domain workers (which acquire the same mutex
+    in get_domain_profilers) during the O(bucket_count) percentile scans. *)
 let get_domain_profiler_snapshots () =
+  (* Phase 1: snapshot profiler references under mutex (fast, O(N) pointer copies). *)
   Mutex.lock profiler_cache_mutex;
-  let result = Hashtbl.fold (fun symbol profs acc ->
+  let profiler_refs = Hashtbl.fold (fun symbol profs acc ->
+    (symbol, profs) :: acc
+  ) domain_profiler_cache [] in
+  Mutex.unlock profiler_cache_mutex;
+  (* Phase 2: compute percentiles outside mutex (slow, O(bucket_count) per percentile).
+     Profiler.snapshot reads only immutable-ish fields (samples, buckets array)
+     that are monotonically updated by a single domain writer. Reading stale
+     counts is harmless — the next snapshot will pick up the latest values. *)
+  List.map (fun (symbol, profs) ->
     let snaps = [
       "ticker",   Latency_profiler.snapshot profs.prof_ticker;
       "orderbook", Latency_profiler.snapshot profs.prof_ob;
@@ -945,10 +959,8 @@ let get_domain_profiler_snapshots () =
       "strategy",  Latency_profiler.snapshot profs.prof_strategy;
       "cycle",     Latency_profiler.snapshot profs.prof_cycle;
     ] in
-    (symbol, snaps) :: acc
-  ) domain_profiler_cache [] in
-  Mutex.unlock profiler_cache_mutex;
-  result
+    (symbol, snaps)
+  ) profiler_refs
 
 (** Initiate graceful shutdown: signal supervisor, stop each domain,
     and wait up to 10s for all domains to terminate. *)

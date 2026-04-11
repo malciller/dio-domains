@@ -173,7 +173,14 @@ let json_of_domain_latencies () =
 (* Memory and GC stats *)
 
 let json_of_memory () =
-  let s = Gc.stat () in
+  (* quick_stat reads cached GC counters in O(1) without walking the heap.
+     Gc.stat() performs a full heap traversal that blocks all domains —
+     unacceptable on the dashboard hot path (called every ~1s).
+     The only difference is live_words: quick_stat reports the value from
+     the last major GC rather than a fresh scan. This is accurate enough
+     for dashboard display; exact live_words are still logged by the
+     600s memory reporter in main.ml which calls Gc.full_major() first. *)
+  let s = Gc.quick_stat () in
   let heap_mb = s.heap_words * (Sys.word_size / 8) / 1048576 in
   let live_kb = s.live_words * (Sys.word_size / 8) / 1024 in
   let free_kb = (s.heap_words - s.live_words) * (Sys.word_size / 8) / 1024 in
