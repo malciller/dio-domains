@@ -50,36 +50,61 @@ let direct_hostname = "mainnet.zklighter.elliot.ai"
 (** The real Lighter API base URL for REST calls. *)
 let direct_base_url = "https://mainnet.zklighter.elliot.ai"
 
-(** Parsed proxy URL from LIGHTER_PROXY_URL (env var or .env file). *)
-let proxy_url : string option =
+(** Parsed proxy URLs from LIGHTER_PROXY_URL (comma-separated list). *)
+let proxy_urls : string list =
   match env_or_dotenv "LIGHTER_PROXY_URL" with
   | Some s when s <> "" ->
-      (* Strip trailing slash *)
-      let url = if String.length s > 0 && s.[String.length s - 1] = '/'
-        then String.sub s 0 (String.length s - 1)
-        else s in
-      Logging.info_f ~section "Lighter proxy configured: %s" url;
-      Some url
+      String.split_on_char ',' s
+      |> List.map String.trim
+      |> List.filter (fun url -> url <> "")
+      |> List.map (fun s ->
+           if String.length s > 0 && s.[String.length s - 1] = '/'
+           then String.sub s 0 (String.length s - 1)
+           else s)
+      |> fun urls ->
+          if List.length urls > 0 then
+            Logging.info_f ~section "Lighter proxy configured with %d pool(s): %s"
+              (List.length urls) (String.concat ", " urls);
+          urls
   | _ ->
       Logging.info_f ~section "No LIGHTER_PROXY_URL configured, connecting directly (readonly mode)";
-      None
+      []
+
+let current_proxy_index = Atomic.make 0
+
+(** Rotates the active proxy to the next instance in the comma-separated list.
+    Called automatically on connection failure to support multi-account failover. *)
+let rotate_proxy () =
+  let len = List.length proxy_urls in
+  if len > 1 then begin
+    let current = Atomic.get current_proxy_index in
+    let next = (current + 1) mod len in
+    Atomic.set current_proxy_index next;
+    Logging.info_f ~section "Rotating to fallback Lighter proxy: %s" (List.nth proxy_urls next)
+  end
+
+(** Returns the currently active proxy URL (if any). *)
+let proxy_url () =
+  let len = List.length proxy_urls in
+  if len = 0 then None
+  else Some (List.nth proxy_urls (Atomic.get current_proxy_index))
 
 (** Whether a proxy is configured. *)
-let is_proxied () = Option.is_some proxy_url
+let is_proxied () = List.length proxy_urls > 0
 
 (** Returns the base URL for REST API calls.
     Proxied: https://your-proxy.deno.dev
     Direct:  https://mainnet.zklighter.elliot.ai *)
 let api_base_url () =
-  match proxy_url with
+  match proxy_url () with
   | Some url -> url
   | None -> direct_base_url
 
-(** Returns the hostname and port to connect to for WebSocket.
-    Proxied: (your-proxy.deno.dev, 443)
+(** Returns the hostname and port to connect to for the private WebSocket.
+    Proxied: (your-proxy.workers.dev, 443)
     Direct:  (mainnet.zklighter.elliot.ai, 443) *)
-let ws_connect_target () =
-  match proxy_url with
+let private_ws_connect_target () =
+  match proxy_url () with
   | Some url ->
       let uri = Uri.of_string url in
       let host = Uri.host uri |> Option.value ~default:direct_hostname in
@@ -87,14 +112,24 @@ let ws_connect_target () =
       (host, port)
   | None -> (direct_hostname, 443)
 
-(** Returns the full WebSocket URL.
-    Proxied: wss://your-proxy.deno.dev/stream (full read/write)
-    Direct:  wss://mainnet.zklighter.elliot.ai/stream?readonly=true *)
-let ws_url () =
-  match proxy_url with
+(** Returns the hostname and port for the public WebSocket.
+    Always direct: (mainnet.zklighter.elliot.ai, 443) *)
+let public_ws_connect_target () =
+  (direct_hostname, 443)
+
+(** Returns the full WebSocket URL for public data.
+    Always direct to Lighter: wss://mainnet.zklighter.elliot.ai/stream?readonly=true *)
+let public_ws_url () =
+  Printf.sprintf "wss://%s/stream?readonly=true" direct_hostname
+
+(** Returns the full WebSocket URL for private data.
+    Proxied: wss://your-proxy.workers.dev/stream
+    Direct:  wss://mainnet.zklighter.elliot.ai/stream *)
+let private_ws_url () =
+  match proxy_url () with
   | Some url ->
       let uri = Uri.of_string url in
       let host = Uri.host uri |> Option.value ~default:direct_hostname in
       Printf.sprintf "wss://%s/stream" host
   | None ->
-      Printf.sprintf "wss://%s/stream?readonly=true" direct_hostname
+      Printf.sprintf "wss://%s/stream" direct_hostname

@@ -36,7 +36,50 @@ export default {
       return handleWebSocket(url, env);
     }
 
-    // HTTP: forward to DO pinned in Asia-East
+    // HTTP: Route non-authenticated directly from edge to bypass DO billing
+    const isAuth =
+      url.searchParams.has("auth") ||
+      url.searchParams.has("signature") ||
+      request.headers.has("authorization");
+
+    if (!isAuth) {
+      const targetUrl = new URL(request.url);
+      targetUrl.hostname = "mainnet.zklighter.elliot.ai";
+      targetUrl.protocol = "https:";
+      targetUrl.port = "443";
+      
+      const reqHeaders = new Headers(request.headers);
+      reqHeaders.set("host", "mainnet.zklighter.elliot.ai");
+      reqHeaders.delete("cf-connecting-ip");
+      reqHeaders.delete("cf-ipcountry");
+      reqHeaders.delete("cf-ray");
+      reqHeaders.delete("cf-visitor");
+      reqHeaders.delete("cf-worker");
+
+      try {
+        const resp = await fetch(targetUrl.toString(), {
+          method: request.method,
+          headers: reqHeaders,
+          body: request.method !== "GET" && request.method !== "HEAD" ? request.body : undefined,
+        });
+        const respHeaders = new Headers(resp.headers);
+        respHeaders.set("access-control-allow-origin", "*");
+        respHeaders.set("x-proxy-region", "edge");
+
+        return new Response(resp.body, {
+          status: resp.status,
+          statusText: resp.statusText,
+          headers: respHeaders,
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        });
+      }
+    }
+
+    // HTTP Auth: forward to DO pinned in Asia-East
     const id = env.LIGHTER_PROXY.idFromName("lighter-apac");
     const stub = env.LIGHTER_PROXY.get(id, { locationHint: LOCATION_HINT });
     return stub.fetch(request);
