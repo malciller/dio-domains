@@ -70,33 +70,70 @@ let fetch_and_initialize ~base_url ~required_symbols =
             Logging.warn_f ~section "Failed to parse market entry: %s" (Printexc.to_string exn)
         ) markets
       );
-      (* Spot markets are not listed in orderBookDetails but use indices >= 2048.
-         Register known spot markets explicitly. Use perp market's precision as baseline. *)
-      let spot_markets = [
-        ("ETH/USDC", 2048, "ETH");  (* spot ETH-USDC *)
-      ] in
-      List.iter (fun (spot_symbol, spot_index, perp_symbol) ->
-        let perp_info = Hashtbl.find_opt pair_cache perp_symbol in
-        let (size_dec, price_dec, min_base, min_quote) = match perp_info with
-          | Some pi -> (pi.supported_size_decimals, pi.supported_price_decimals,
-                        pi.min_base_amount, pi.min_quote_amount)
-          | None -> (4, 2, 0.005, 10.0)  (* fallback defaults *)
+      (* Discover spot markets dynamically from explorer API.
+         Spot markets are not listed in orderBookDetails (perps only) but
+         appear in the explorer's /api/markets endpoint with indices >= 2048.
+         Register any market not already in pair_cache, copying precision
+         from the corresponding perp (e.g. ETH/USDC -> ETH, LIT/USDC -> LIT). *)
+      let%lwt () = Lwt.catch (fun () ->
+        let markets_url = "https://explorer.elliot.ai/api/markets" in
+        Logging.info_f ~section "Fetching spot market indices from %s" markets_url;
+        let%lwt (_resp, body) = Cohttp_lwt_unix.Client.get (Uri.of_string markets_url) in
+        let%lwt body_str = Cohttp_lwt.Body.to_string body in
+        let markets_json = Yojson.Safe.from_string body_str in
+        let all_markets = match markets_json with
+          | `List items -> items
+          | _ -> []
         in
-        let info : Lighter_types.market_info = {
-          market_index = spot_index;
-          symbol = spot_symbol;
-          supported_size_decimals = size_dec;
-          supported_price_decimals = price_dec;
-          min_base_amount = min_base;
-          min_quote_amount = min_quote;
-          taker_fee = 0.0;
-          maker_fee = 0.0;
-        } in
-        Hashtbl.replace pair_cache spot_symbol info;
-        Hashtbl.replace index_to_symbol spot_index spot_symbol;
-        Logging.info_f ~section "Registered spot market: %s (index=%d, copied precision from %s perp)"
-          spot_symbol spot_index perp_symbol
-      ) spot_markets;
+        Mutex.lock cache_mutex;
+        Fun.protect ~finally:(fun () -> Mutex.unlock cache_mutex) (fun () ->
+          List.iter (fun entry ->
+            try
+              let sym = member "symbol" entry |> to_string in
+              let mi = member "market_index" entry |> to_int in
+              (* Only register markets not already in pair_cache (i.e. spot markets). *)
+              if not (Hashtbl.mem pair_cache sym) then begin
+                (* Derive perp symbol: "ETH/USDC" -> "ETH", "LIT/USDC" -> "LIT" *)
+                let perp_symbol = match String.split_on_char '/' sym with
+                  | base :: _ -> base
+                  | _ -> sym
+                in
+                let perp_info = Hashtbl.find_opt pair_cache perp_symbol in
+                let (size_dec, price_dec, min_base, min_quote) = match perp_info with
+                  | Some pi -> (pi.supported_size_decimals, pi.supported_price_decimals,
+                                pi.min_base_amount, pi.min_quote_amount)
+                  | None -> (4, 2, 0.005, 10.0)
+                in
+                let info : Lighter_types.market_info = {
+                  market_index = mi;
+                  symbol = sym;
+                  supported_size_decimals = size_dec;
+                  supported_price_decimals = price_dec;
+                  min_base_amount = min_base;
+                  min_quote_amount = min_quote;
+                  taker_fee = 0.0;
+                  maker_fee = 0.0;
+                } in
+                Hashtbl.replace pair_cache sym info;
+                Hashtbl.replace index_to_symbol mi sym;
+                Logging.info_f ~section "Registered spot market: %s (index=%d, precision from %s perp)"
+                  sym mi perp_symbol
+              end else begin
+                (* Ensure index_to_symbol is populated for already-known markets too *)
+                if not (Hashtbl.mem index_to_symbol mi) then
+                  Hashtbl.replace index_to_symbol mi sym
+              end
+            with _ -> ()
+          ) all_markets
+        );
+        Logging.info_f ~section "Spot market discovery complete: %d total markets in /api/markets"
+          (List.length all_markets);
+        Lwt.return_unit
+      ) (fun exn ->
+        Logging.warn_f ~section "Failed to fetch spot markets from explorer: %s (spot symbols may be unavailable)"
+          (Printexc.to_string exn);
+        Lwt.return_unit
+      ) in
 
       (* Validate all required symbols exist *)
       let missing = List.filter (fun sym ->
