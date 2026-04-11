@@ -197,44 +197,49 @@ let send_with_retry ~webhook_url payload =
 let consumer_loop ~webhook_url () =
   let read_pos = ref (Concurrency.Fill_event_bus.get_position ()) in
   let rec loop () =
-    (* Wait for new fill events *)
-    Concurrency.Fill_event_bus.wait_for_fill () >>= fun () ->
-    (* Drain all pending fills *)
-    let fills = ref [] in
-    let new_pos = Concurrency.Fill_event_bus.iter_since !read_pos (fun fill ->
-      fills := fill :: !fills
-    ) in
-    read_pos := new_pos;
-    let fills = List.rev !fills in
-    if fills <> [] then begin
-      Logging.debug_f ~section "Processing %d fill event(s) for Discord" (List.length fills);
-      (* Split into batches of max_fills_per_message *)
-      let rec send_batches remaining =
-        match remaining with
-        | [] -> Lwt.return_unit
-        | _ ->
-            let batch, rest =
-              let rec take n acc = function
-                | [] -> (List.rev acc, [])
-                | _ when n = 0 -> (List.rev acc, remaining)
-                | x :: xs -> take (n - 1) (x :: acc) xs
+    if !read_pos = Concurrency.Fill_event_bus.get_position () then
+      (* No new fills, wait for the condition variable to be signaled *)
+      Concurrency.Fill_event_bus.wait_for_fill () >>= fun () ->
+      loop ()
+    else begin
+      (* New fills available, drain them all *)
+      let fills = ref [] in
+      let new_pos = Concurrency.Fill_event_bus.iter_since !read_pos (fun fill ->
+        fills := fill :: !fills
+      ) in
+      read_pos := new_pos;
+      let fills = List.rev !fills in
+      
+      if fills <> [] then begin
+        Logging.debug_f ~section "Processing %d fill event(s) for Discord" (List.length fills);
+        (* Split into batches of max_fills_per_message *)
+        let rec send_batches remaining =
+          match remaining with
+          | [] -> Lwt.return_unit
+          | _ ->
+              let batch, rest =
+                let rec take n acc = function
+                  | [] -> (List.rev acc, [])
+                  | _ when n = 0 -> (List.rev acc, remaining)
+                  | x :: xs -> take (n - 1) (x :: acc) xs
+                in
+                take max_fills_per_message [] remaining
               in
-              take max_fills_per_message [] remaining
-            in
-            (match build_webhook_payload batch with
-             | Some payload ->
-                 send_with_retry ~webhook_url payload >>= fun () ->
-                 send_batches rest
-             | None ->
-                 send_batches rest)
-      in
-      send_batches fills
-    end else
-      Lwt.return_unit
-    >>= fun () ->
-    (* Sever Lwt Forward chain *)
-    Lwt.async loop;
-    Lwt.return_unit
+              (match build_webhook_payload batch with
+               | Some payload ->
+                   send_with_retry ~webhook_url payload >>= fun () ->
+                   send_batches rest
+               | None ->
+                   send_batches rest)
+        in
+        send_batches fills >>= fun () ->
+        Lwt.async loop;
+        Lwt.return_unit
+      end else begin
+        Lwt.async loop;
+        Lwt.return_unit
+      end
+    end
   in
   loop ()
 
