@@ -31,10 +31,6 @@
  (libraries dio.hyperliquid alcotest))
 
 (test
- (name test_hyperliquid_ticker_feed)
- (libraries dio.hyperliquid alcotest))
-
-(test
  (name test_hyperliquid_module)
  (libraries dio.hyperliquid alcotest))
 

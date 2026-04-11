@@ -31,7 +31,6 @@ let shutdown_requested = Atomic.make false
     profiler objects (each ~800KB) are allocated once per symbol rather than
     on every asset_domain_worker invocation. *)
 type domain_profilers = {
-  prof_ticker:   Latency_profiler.t;
   prof_ob:       Latency_profiler.t;
   prof_exec:     Latency_profiler.t;
   prof_strategy: Latency_profiler.t;
@@ -46,7 +45,6 @@ let get_domain_profilers symbol =
     | Some p -> p
     | None ->
         let p = {
-          prof_ticker   = Latency_profiler.create (symbol ^ ":ticker");
           prof_ob       = Latency_profiler.create (symbol ^ ":ob");
           prof_exec     = Latency_profiler.create (symbol ^ ":exec");
           prof_strategy = Latency_profiler.create (symbol ^ ":strategy");
@@ -111,7 +109,6 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
       (* Ring buffer read positions for this domain *)
       let exec_read_pos = ref 0 in
-      let ticker_read_pos = ref 0 in
       let orderbook_read_pos = ref 0 in
 
       (* Latest market data derived from consumed ring buffer events *)
@@ -227,24 +224,20 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       Logging.info_f ~section "Domain for %s/%s starting consumption from exec position 0 (full replay)"
         asset_with_fees.exchange asset_with_fees.symbol;
       
-      (* Set ticker and orderbook positions to current write position, skipping
+      (* Set orderbook positions to current write position, skipping
          stale ring buffer data. Starting at 0 would replay up to 128 historical
          entries per symbol on every restart, causing excessive allocations. *)
-      ticker_read_pos := Ex.get_ticker_position ~symbol:asset_with_fees.symbol;
       orderbook_read_pos := Ex.get_orderbook_position ~symbol:asset_with_fees.symbol;
 
       (* Seed current_price and top_of_book from the exchange live cache so
          the first cycle can execute immediately rather than waiting for the
-         next incoming tick event. Without this, both fields start as None
-         and strategy execution is deferred until the next ticker arrives. *)
-      (match Ex.get_ticker ~symbol:asset_with_fees.symbol with
-       | Some (bid, ask) ->
-           current_price := Some ((bid +. ask) /. 2.0);
-           Logging.info_f ~section "Seeded initial price for %s from cache: %.4f"
-             asset_with_fees.symbol (Option.get !current_price)
-       | None -> ());
+         next incoming update. *)
       (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
-       | Some _ as tob -> top_of_book := tob
+       | Some (bid_price, _, ask_price, _) as tob ->
+           top_of_book := tob;
+           current_price := Some ((bid_price +. ask_price) /. 2.0);
+           Logging.info_f ~section "Seeded initial intial price for %s from cache: %.4f"
+             asset_with_fees.symbol (Option.get !current_price)
        | None -> ());
       
       Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
@@ -273,7 +266,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
       let cycle_count = ref 0 in
 
-      let { prof_ticker; prof_ob; prof_exec; prof_strategy; prof_cycle } =
+      let { prof_ob; prof_exec; prof_strategy; prof_cycle } =
         get_domain_profilers asset_with_fees.symbol in
 
       (* Cache strategy state references to avoid repeated mutex acquisition
@@ -292,21 +285,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
-        (* === TICKER HOT PATH START === *)
-        let t0 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-        let ticker_pos = Ex.get_ticker_position ~symbol:asset_with_fees.symbol in
-        let did_ticker = ticker_pos <> !ticker_read_pos || (!ticker_read_pos = 0 && ticker_pos > 0) in
-        if did_ticker then begin
-          ticker_read_pos := ticker_pos;
-          (match Ex.get_ticker ~symbol:asset_with_fees.symbol with
-           | Some (bid, ask) ->
-               current_price := Some ((bid +. ask) /. 2.0);
-               should_execute_strategy := true
-           | None -> ());
-        end;
-        let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-        if did_ticker && latency_this_cycle then Latency_profiler.record prof_ticker (Mtime.Span.of_uint64_ns (Int64.sub t1 t0));
+
         
+        let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         (* === ORDERBOOK HOT PATH === *)
         let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
         let did_ob = ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) in
@@ -315,6 +296,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
            | Some (bid_price, bid_size, ask_price, ask_size) ->
                top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
+               current_price := Some ((bid_price +. ask_price) /. 2.0);
                should_execute_strategy := true
            | None -> ());
         end;
@@ -612,13 +594,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         
         (* Record cycle work time before blocking. Captures active processing
            latency only, excluding sleep time in Exchange_wakeup.wait. *)
-        let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t0) in
+        let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
         if latency_this_cycle then Latency_profiler.record prof_cycle cycle_span;
 
         (* Flush latency reports periodically, gated by cycle_mod to avoid
            5 threshold checks per cycle on the hot path. *)
         if !cycle_count mod config.cycle_mod = 0 then begin
-          Latency_profiler.report ~sample_threshold:1000000 prof_ticker;
+
           Latency_profiler.report ~sample_threshold:1000000 prof_ob;
           Latency_profiler.report ~sample_threshold:100000 prof_exec;
           Latency_profiler.report ~sample_threshold:1000000 prof_strategy;
@@ -890,7 +872,7 @@ let get_domain_profiler_snapshots () =
      counts is harmless — the next snapshot will pick up the latest values. *)
   List.map (fun (symbol, profs) ->
     let snaps = [
-      "ticker",   Latency_profiler.snapshot profs.prof_ticker;
+
       "orderbook", Latency_profiler.snapshot profs.prof_ob;
       "execution", Latency_profiler.snapshot profs.prof_exec;
       "strategy",  Latency_profiler.snapshot profs.prof_strategy;

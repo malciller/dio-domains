@@ -81,13 +81,6 @@ module Types = struct
     cl_ord_id: string option;  (** Client order identifier, if provided. *)
   }
 
-  (** Top-of-book ticker snapshot (best bid, best ask, timestamp). *)
-  type ticker_event = {
-    bid: float;       (** Best bid price. *)
-    ask: float;       (** Best ask price. *)
-    timestamp: float; (** Unix timestamp of the snapshot. *)
-  }
-
   (** Orderbook depth snapshot with arrays of (price, size) levels. *)
   type orderbook_event = {
     bids: (float * float) array; (** Bid levels: (price, size). *)
@@ -191,13 +184,6 @@ module type S = sig
 
   (* ---- Market data accessors ---- *)
 
-  (** Return the current best bid and best ask for [symbol], or [None]
-      if no ticker data is available. *)
-  val get_ticker : symbol:string -> (float * float) option
-
-  (** Dynamically subscribe to the ticker feed for [symbol]. *)
-  val subscribe_ticker : symbol:string -> unit Lwt.t
-
   (** Return top-of-book as [(bid_price, bid_size, ask_price, ask_size)],
       or [None] if orderbook data is unavailable. *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
@@ -216,18 +202,6 @@ module type S = sig
   val get_open_orders : symbol:string -> Types.open_order list
 
   (* ---- Ring buffer event feed consumption ---- *)
-
-  (** Return the current write position of the ticker ring buffer for
-      [symbol]. Used as the starting cursor for [read_ticker_events]. *)
-  val get_ticker_position : symbol:string -> int
-
-  (** Read ticker events from [start_pos] up to the current write position.
-      Returns a newly allocated list of events. *)
-  val read_ticker_events : symbol:string -> start_pos:int -> Types.ticker_event list
-
-  (** Iterate over ticker events from [start_pos] without allocating an
-      intermediate list. Returns the new read position. *)
-  val iter_ticker_events : symbol:string -> start_pos:int -> (Types.ticker_event -> unit) -> int
 
   (** Return the current write position of the orderbook ring buffer for
       [symbol]. Used as the starting cursor for [read_orderbook_events]. *)

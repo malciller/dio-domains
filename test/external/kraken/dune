@@ -31,9 +31,5 @@
  (libraries dio.kraken alcotest))
 
 (test
- (name test_kraken_ticker_feed)
- (libraries dio.kraken alcotest))
-
-(test
  (name test_kraken_trading_client)
  (libraries dio.kraken alcotest))

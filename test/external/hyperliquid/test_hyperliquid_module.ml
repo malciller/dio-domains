@@ -50,8 +50,7 @@ let test_side_conversions () =
   Alcotest.(check bool) "Sell -> Sell" true (sell = Types.Sell)
 
 let test_data_accessors_empty () =
-  let ticker = Hyperliquid.Module.Hyperliquid_impl.get_ticker ~symbol:"NODATA_TICKER" in
-  Alcotest.(check bool) "no ticker" true (Option.is_none ticker);
+
   let tob = Hyperliquid.Module.Hyperliquid_impl.get_top_of_book ~symbol:"NODATA_TOB" in
   Alcotest.(check bool) "no top of book" true (Option.is_none tob);
   let bal = Hyperliquid.Module.Hyperliquid_impl.get_balance ~asset:"NODATA_ASSET" in

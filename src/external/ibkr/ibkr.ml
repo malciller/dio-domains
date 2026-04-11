@@ -8,7 +8,7 @@ module Codec = Ibkr_codec
 module Connection = Ibkr_connection
 module Dispatcher = Ibkr_dispatcher
 module Contracts = Ibkr_contracts
-module Ticker_feed = Ibkr_ticker_feed
+
 module Orderbook_feed = Ibkr_orderbook_feed
 module Executions_feed = Ibkr_executions_feed
 module Balances = Ibkr_balances

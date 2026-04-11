@@ -55,12 +55,12 @@ module Lighter_impl = struct
           match order_type with
           | Types.Market ->
               (* Emulate market order with slippage from BBO *)
-              (match Lighter_ticker_feed.get_latest_ticker symbol with
-               | Some t ->
-                   if is_buy then t.ask *. 1.05
-                   else t.bid *. 0.95
+              (match Lighter_orderbook_feed.get_best_bid_ask symbol with
+               | Some (bid, _, ask, _) ->
+                   if is_buy then ask *. 1.05
+                   else bid *. 0.95
                | None ->
-                   Logging.warn_f ~section "No ticker for market order on %s" symbol;
+                   Logging.warn_f ~section "No orderbook data for market order on %s" symbol;
                    0.0)
           | _ -> 0.0
     in
@@ -168,15 +168,6 @@ module Lighter_impl = struct
 
   (* ---- Market data accessors ---- *)
 
-  let get_ticker ~symbol =
-    match Lighter_ticker_feed.get_latest_ticker symbol with
-    | Some t -> Some (t.bid, t.ask)
-    | None -> None
-
-  let subscribe_ticker ~symbol =
-    let _ = Lighter_ticker_feed.get_latest_ticker symbol in
-    Lwt.return_unit
-
   let get_top_of_book ~symbol =
     Lighter_orderbook_feed.get_best_bid_ask symbol
 
@@ -280,20 +271,6 @@ module Lighter_impl = struct
         is_amended = e.is_amended;
         cl_ord_id = e.cl_ord_id;
       }
-    )
-
-  let get_ticker_position ~symbol =
-    Lighter_ticker_feed.get_current_position symbol
-
-  let read_ticker_events ~symbol ~start_pos =
-    let events = Lighter_ticker_feed.read_ticker_events symbol start_pos in
-    List.map (fun (t : Lighter_ticker_feed.ticker) ->
-      { Types. bid = t.bid; ask = t.ask; timestamp = t.timestamp }
-    ) events
-
-  let iter_ticker_events ~symbol ~start_pos f =
-    Lighter_ticker_feed.iter_ticker_events symbol start_pos (fun (t : Lighter_ticker_feed.ticker) ->
-      f { Types. bid = t.bid; ask = t.ask; timestamp = t.timestamp }
     )
 
   let get_orderbook_position ~symbol =

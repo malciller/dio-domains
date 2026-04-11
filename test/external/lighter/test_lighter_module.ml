@@ -37,8 +37,7 @@ let test_side_conversions () =
   Alcotest.(check bool) "Sell -> Sell" true (sell = Types.Sell)
 
 let test_data_accessors_empty () =
-  let ticker = Lighter.Module.Lighter_impl.get_ticker ~symbol:"NODATA_L_TICKER" in
-  Alcotest.(check bool) "no ticker" true (Option.is_none ticker);
+
   let tob = Lighter.Module.Lighter_impl.get_top_of_book ~symbol:"NODATA_L_TOB" in
   Alcotest.(check bool) "no top of book" true (Option.is_none tob);
   let bal = Lighter.Module.Lighter_impl.get_balance ~asset:"NODATA_L_ASSET" in
