@@ -9,8 +9,12 @@ open Lwt.Infix
 
 let section = "lighter_actions"
 
-(** Atomic counter for generating unique client_order_index values. *)
-let client_order_counter = Atomic.make 1
+(** Atomic counter for generating unique client_order_index values.
+    Initialized from current epoch milliseconds to avoid collisions with
+    indexes used by previous engine runs. Lighter requires client_order_index
+    to be globally unique across all markets. *)
+let client_order_counter =
+  Atomic.make (int_of_float (Unix.gettimeofday () *. 1000.0))
 
 let next_client_order_index () =
   Int64.of_int (Atomic.fetch_and_add client_order_counter 1)

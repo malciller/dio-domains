@@ -1125,6 +1125,12 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   Logging.info ~section "All feeds initialized with market data!";
 
+  (* Start Lighter TIF renewal background monitor to keep GTT orders alive *)
+  if has_lighter then begin
+    Logging.info ~section "Starting Lighter TIF renewal monitor...";
+    Lwt.async (fun () -> Lighter.Tif_renewal.start ~symbols:lighter_symbols)
+  end;
+
   (* Step 8: Fetch and cache trading fees per symbol *)
   Logging.info ~section "Step 8: Fetching trading fees for all assets...";
 
