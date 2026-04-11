@@ -552,26 +552,37 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if should_execute then begin
           should_execute_strategy := false;  (* Clear event-driven trigger *)
 
-          (* Compute open counts without allocating intermediate lists *)
+          (* Single-pass open order scan: count by strategy AND collect
+             grid buy/sell order lists. Eliminates a second iter_open_orders
+             + orders_mutex acquisition inside the grid strategy. *)
           let grid_open_buy_count = ref 0 in
           let grid_open_sell_count = ref 0 in
           let mm_open_buy_count = ref 0 in
           let mm_open_sell_count = ref 0 in
+          let grid_buy_orders = ref [] in
+          let grid_sell_orders = ref [] in
 
           let iter_orders f =
             Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol f
           in
 
-          iter_orders (fun _oid _price qty side_str userref_opt ->
+          iter_orders (fun oid price qty side_str userref_opt ->
              if qty > 0.0 then begin
                let is_mm = match userref_opt with
                  | Some uref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm uref
                  | None -> false
                in
-               if is_mm then
+               if is_mm then begin
                  if side_str = "buy" then incr mm_open_buy_count else incr mm_open_sell_count
-               else
-                 if side_str = "buy" then incr grid_open_buy_count else incr grid_open_sell_count
+               end else begin
+                 if side_str = "buy" then begin
+                   incr grid_open_buy_count;
+                   grid_buy_orders := (oid, price) :: !grid_buy_orders
+                 end else begin
+                   incr grid_open_sell_count;
+                   grid_sell_orders := (oid, price, qty) :: !grid_sell_orders
+                 end
+               end
              end
           );
 
@@ -640,7 +651,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
-               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now asset !current_price !top_of_book asset_balance quote_balance !grid_open_buy_count !grid_open_sell_count iter_orders !cycle_count
+               Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now
+                 ~precounted_orders:(!grid_buy_orders, !grid_sell_orders, !grid_open_buy_count)
+                 asset !current_price !top_of_book asset_balance quote_balance !grid_open_buy_count !grid_open_sell_count iter_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
@@ -663,10 +676,19 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count mod config.cycle_mod = 0 then begin
           (match !current_price, !top_of_book with
           | Some price, Some (bid_price, _bid_size, ask_price, _ask_size) ->
+              (* Gate format_distance_info behind will_log: the function
+                 acquires strategy_states_mutex, allocates multiple strings via
+                 Printf.sprintf, and List.fold_lefts over open_sell_orders.
+                 All of that work is discarded when log level is INFO or above. *)
+              let dist_info =
+                if Logging.will_log Logging.DEBUG section then
+                  format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy
+                else ""
+              in
               Logging.debug_f ~section "[%s/%s] C#%d - $%.2f | bid=$%.8f | ask=$%.8f | %s: %.8f | %s: %.2f | %d buy / %d sell%s"
                 asset_with_fees.exchange asset_with_fees.symbol !cycle_count price
                 bid_price ask_price base_asset !last_asset_balance quote_currency !last_quote_balance
-                !last_buy_count !last_sell_count (format_distance_info asset_with_fees.symbol !current_price asset_with_fees.strategy)
+                !last_buy_count !last_sell_count dist_info
           | _ -> ());
         end;
         
