@@ -19,10 +19,6 @@
  (libraries dio.ibkr alcotest))
 
 (test
- (name test_ibkr_ticker_feed)
- (libraries dio.ibkr alcotest threads))
-
-(test
  (name test_ibkr_orderbook_feed)
  (libraries dio.ibkr alcotest))
 

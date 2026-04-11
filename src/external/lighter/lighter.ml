@@ -14,8 +14,7 @@ module Actions = Lighter_actions
 (** Account balance tracking. *)
 module Balances = Lighter_balances
 
-(** Real-time BBO ticker feed. *)
-module Ticker_feed = Lighter_ticker_feed
+
 
 (** L2 orderbook snapshot and delta feed. *)
 module Orderbook_feed = Lighter_orderbook_feed

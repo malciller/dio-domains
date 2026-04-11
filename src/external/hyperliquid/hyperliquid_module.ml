@@ -75,12 +75,12 @@ module Hyperliquid_impl = struct
           | Types.Market ->
               (* Hyperliquid has no native market order type.
                  Emulate via IOC limit order with 5% slippage from current BBO. *)
-              (match Hyperliquid_ticker_feed.get_latest_ticker symbol with
-              | Some t ->
-                  if side_bool then t.ask *. 1.05 (* Buy: 5% above ask *)
-                  else t.bid *. 0.95 (* Sell: 5% below bid *)
+              (match Hyperliquid_orderbook_feed.get_best_bid_ask symbol with
+              | Some (bid, _, ask, _) ->
+                  if side_bool then ask *. 1.05 (* Buy: 5% above ask *)
+                  else bid *. 0.95 (* Sell: 5% below bid *)
               | None ->
-                  Logging.warn_f ~section "No ticker available for market order on %s, using 0.0" symbol;
+                  Logging.warn_f ~section "No orderbook data available for market order on %s, using 0.0" symbol;
                   0.0)
           | _ -> 0.0
     in
@@ -258,15 +258,7 @@ module Hyperliquid_impl = struct
 
   (** Market data accessors. Delegate to the corresponding feed modules. *)
   
-  let get_ticker ~symbol =
-    match Hyperliquid_ticker_feed.get_latest_ticker symbol with
-    | Some t -> Some (t.bid, t.ask)
-    | None -> None
 
-  let subscribe_ticker ~symbol =
-    let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-    Logging.info_f ~section "Dynamically subscribing to l2Book for %s (coin=%s)" symbol coin;
-    Hyperliquid_ws.subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String coin)])])
 
   let get_top_of_book ~symbol =
     match Hyperliquid_orderbook_feed.get_best_bid_ask symbol with
@@ -379,23 +371,7 @@ module Hyperliquid_impl = struct
       }
     )
 
-  let get_ticker_position ~symbol =
-    Hyperliquid_ticker_feed.get_current_position symbol
 
-  let read_ticker_events ~symbol ~start_pos =
-    let events = Hyperliquid_ticker_feed.read_ticker_events symbol start_pos in
-    List.map (fun (t : Hyperliquid_ticker_feed.ticker) ->
-      { Types.
-        bid = t.bid;
-        ask = t.ask;
-        timestamp = t.timestamp;
-      }
-    ) events
-
-  let iter_ticker_events ~symbol ~start_pos f =
-    Hyperliquid_ticker_feed.iter_ticker_events symbol start_pos (fun (t : Hyperliquid_ticker_feed.ticker) ->
-      f { Types. bid = t.bid; ask = t.ask; timestamp = t.timestamp }
-    )
 
   let get_orderbook_position ~symbol =
     Hyperliquid_orderbook_feed.get_current_position symbol

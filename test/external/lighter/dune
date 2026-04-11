@@ -7,10 +7,6 @@
  (libraries dio.lighter alcotest))
 
 (test
- (name test_lighter_ticker_feed)
- (libraries dio.lighter alcotest))
-
-(test
  (name test_lighter_orderbook_feed)
  (libraries dio.lighter alcotest))
 

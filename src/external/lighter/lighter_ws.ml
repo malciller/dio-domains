@@ -57,7 +57,7 @@ let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
 
 (** Diagnostic counters for message types flowing through the WS. *)
-let msg_counter_ticker = Atomic.make 0
+
 let msg_counter_orderbook = Atomic.make 0
 let msg_counter_account = Atomic.make 0
 let msg_counter_other = Atomic.make 0
@@ -159,13 +159,9 @@ let subscribe_to_feeds ~symbols ~account_index ~auth_token =
         let mi_str = string_of_int market_index in
         let%lwt () = send_public_json (`Assoc [
           ("type", `String "subscribe");
-          ("channel", `String ("ticker/" ^ mi_str))
-        ]) "Public" in
-        let%lwt () = send_public_json (`Assoc [
-          ("type", `String "subscribe");
           ("channel", `String ("order_book/" ^ mi_str))
         ]) "Public" in
-        Logging.debug_f ~section "Subscribed to ticker/%s and order_book/%s for %s" mi_str mi_str symbol;
+        Logging.debug_f ~section "Subscribed to order_book/%s for %s" mi_str symbol;
         Lwt.return_unit
     | None ->
         Logging.error_f ~section "Cannot subscribe: no market_index for symbol %s" symbol;
@@ -227,11 +223,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
         in
 
         (match msg_type with
-         | "update/ticker" | "snapshot/ticker" | "subscribed/ticker" ->
-             Atomic.incr msg_counter_ticker;
-             let mi = market_index_from_channel channel in
-             if mi >= 0 then Lighter_ticker_feed.process_ticker_update ~market_index:mi json
-             else Logging.warn_f ~section "Ticker message with invalid market_index: channel=%s" channel
+
          | "snapshot/order_book" | "subscribed/order_book" ->
              Atomic.incr msg_counter_orderbook;
              let mi = market_index_from_channel channel in

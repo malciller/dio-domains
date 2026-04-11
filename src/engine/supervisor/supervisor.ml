@@ -615,12 +615,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   let all_hyperliquid_symbols = hyperliquid_symbols |> List.sort_uniq String.compare in
 
-  (* Step 1: Initialize ticker data stores *)
-  Logging.info ~section "Step 1: Initializing ticker feed stores...";
-  Kraken.Kraken_ticker_feed.initialize kraken_symbols;
-  if has_hyperliquid then Hyperliquid.Ticker_feed.initialize all_hyperliquid_symbols;
-  if has_ibkr then Ibkr.Ticker_feed.initialize ibkr_symbols;
-  if has_lighter then Lighter.Ticker_feed.initialize lighter_symbols;
+
 
   Logging.info ~section "Step 1.5: Starting Hyperliquid websocket connection early...";
   if has_hyperliquid then begin
@@ -781,29 +776,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   (* Step 7: Register and start remaining supervised WebSocket connections *)
   Logging.info ~section "Step 7: Starting Kraken websocket connections...";
 
-  (* Kraken ticker feed *)
+  (* Kraken orderbook feed *)
   if has_kraken then begin
-    let ticker_conn = register ~name:"kraken_ticker_ws" ~connect_fn:None in
-    let ticker_connect_fn () =
-      (* Exception boundary for connection establishment *)
-      Lwt.catch (fun () ->
-        let on_failure reason = set_state ticker_conn (Failed reason) in
-        let on_heartbeat () = update_data_heartbeat ticker_conn in
-        let on_connected () = set_state ticker_conn Connected in
-        Kraken.Kraken_ticker_feed.connect_and_subscribe kraken_symbols ~on_failure ~on_heartbeat ~on_connected >>= fun () ->
-        (* Unexpected early return from WebSocket connect_fn *)
-        Lwt.return_unit
-      ) (fun exn ->
-        let error_msg = Printexc.to_string exn in
-        Logging.error_f ~section "[%s] Connection failed during establishment: %s" ticker_conn.name error_msg;
-        set_state ticker_conn (Failed error_msg);
-        Lwt.return_unit
-      )
-    in
-    set_connect_fn ticker_conn (Some ticker_connect_fn);
-    start_async ticker_conn;
-
-    (* Kraken orderbook feed *)
     let orderbook_conn = register ~name:"kraken_orderbook_ws" ~connect_fn:None in
     let orderbook_connect_fn () =
       (* Reset orderbook stores to ensure clean snapshot state *)
@@ -877,7 +851,6 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
        every connect/reconnect. These closures are called from
        Ibkr.Dispatcher.initialize after core handlers are registered. *)
     Ibkr.Dispatcher.on_initialize_hooks := [
-      Ibkr.Ticker_feed.register_handlers;
       Ibkr.Orderbook_feed.register_handlers;
       Ibkr.Executions_feed.register_handlers;
       Ibkr.Balances.register_handlers;
@@ -908,7 +881,6 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
              Ibkr.Connection.disconnect old_conn
          | None -> Lwt.return_unit) in
         Ibkr.Dispatcher.reset ();
-        Ibkr.Ticker_feed.clear_req_ids ();
         Ibkr.Orderbook_feed.clear_req_ids ();
         let conn = Ibkr.Connection.create
           ~host:Ibkr.Module.Config.gateway_host
@@ -977,8 +949,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             Ibkr.Contracts.resolve conn ~symbol >>= fun contract ->
             Lwt.return (symbol, contract)
           ) ibkr_symbols in
-          let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
-            Ibkr.Ticker_feed.request_snapshot conn ~contract
+          let%lwt () = Lwt_list.iter_s (fun (_symbol, _contract) ->
+            Lwt.return_unit
           ) contracts in
           (* Brief pause to let the gateway deliver snapshot ticks *)
           Lwt_unix.sleep 2.0 >>= fun () ->
@@ -996,7 +968,6 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             stream_type;
           ] >>= fun () ->
           let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
-            Ibkr.Ticker_feed.subscribe conn ~contract >>= fun () ->
             Ibkr.Orderbook_feed.subscribe conn ~contract
           ) contracts in
           Logging.info_f ~section "IBKR subscribed to %d symbols (snapshot + streaming)" (List.length ibkr_symbols);
@@ -1086,15 +1057,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   (* Await initial data from each market data feed *)
   Logging.info ~section "Waiting for initial market data from all feeds...";
 
-  (* Ticker readiness gate *)
-  let%lwt () = if has_kraken then begin
-    let%lwt ticker_ready = Kraken.Kraken_ticker_feed.wait_for_price_data kraken_symbols 10.0 in
-    if not ticker_ready then
-      Logging.warn ~section "Timeout waiting for ticker data, continuing anyway..."
-    else
-      Logging.info ~section "✓ Ticker feed ready";
-    Lwt.return_unit
-  end else Lwt.return_unit in
+
 
   (* Orderbook readiness gate *)
   let%lwt () = if has_kraken then begin
@@ -1867,9 +1830,7 @@ let monitor_non_active_assets () =
       Lwt_unix.sleep 10.0 >>= fun () ->
       if Atomic.get shutdown_requested then Lwt.return_unit else begin
         let config = Dio_engine.Config.read_config () in
-        let configured_symbols = List.map (fun (tc : Dio_engine.Config.trading_config) ->
-          (tc.exchange, tc.symbol)
-        ) config.trading in
+
         
         let exchange_names = List.sort_uniq String.compare
           (List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading) in
@@ -1879,33 +1840,8 @@ let monitor_non_active_assets () =
           | None -> Lwt.return_unit
           | Some (module Ex) ->
               let balances = Ex.get_all_balances () in
-              Lwt_list.iter_s (fun (asset, bal) ->
-                if bal > 0.0 then begin
-                  let quote = match exch_name with
-                    | "hyperliquid" | "lighter" -> "USDC"
-                    | _ -> "USD"
-                  in
-                  let symbol = asset ^ "/" ^ quote in
-                  let is_configured = List.exists (fun (ex, sym) ->
-                    ex = exch_name && sym = symbol
-                  ) configured_symbols in
-                  
-                  let is_fiat_or_stable = 
-                    (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || 
-                    (asset = "USDT") || (asset = quote) || (asset = "USDe") ||
-                    (* Skip raw numeric asset IDs from Lighter balance feed *)
-                    (try ignore (int_of_string asset); true with _ -> false)
-                  in
-                  
-                  if not is_configured && not is_fiat_or_stable then begin
-                    match Ex.get_ticker ~symbol with
-                    | None ->
-                        (* No ticker subscribed for asset with positive balance; subscribe *)
-                        Logging.info_f ~section "Balance found for non-active %s on %s, subscribing to ticker" symbol exch_name;
-                        Ex.subscribe_ticker ~symbol
-                    | Some _ -> Lwt.return_unit
-                  end else Lwt.return_unit
-                end else Lwt.return_unit
+              Lwt_list.iter_s (fun (_asset, _bal) ->
+                 Lwt.return_unit
               ) balances
         ) exchange_names >>= fun () ->
         (* Sever promise chain to prevent Forward node accumulation. *)

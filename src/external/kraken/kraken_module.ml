@@ -4,7 +4,7 @@
    Implements [Exchange_intf.S] for the Kraken exchange. Converts between
    Kraken-specific types and the unified Dio [Types] domain, delegates order
    actions to [Kraken_actions], and reads market data from the per-symbol
-   WebSocket feed caches ([Kraken_ticker_feed], [Kraken_orderbook_feed],
+   WebSocket feed caches ([Kraken_orderbook_feed],
    [Kraken_executions_feed], [Kraken_balances_feed]).
 
    Registered into [Exchange.Registry] at module load time via side-effecting
@@ -223,17 +223,6 @@ module Kraken_impl = struct
 
   (* -- Market data accessors ------------------------------------------- *)
 
-  (** Return the latest (bid, ask) from the ticker feed cache, or [None]. *)
-
-  let get_ticker ~symbol =
-    match Kraken_ticker_feed.get_latest_ticker symbol with
-    | Some t -> Some (t.bid, t.ask)
-    | None -> None
-
-  (** Request the ticker feed to begin tracking [symbol]. *)
-  let subscribe_ticker ~symbol =
-    Kraken_ticker_feed.subscribe_ticker symbol
-
   (** Return best bid/ask as [(bid_price, bid_size, ask_price, ask_size)] floats.
       Directly consumes float values provided by [Kraken_orderbook_feed.get_best_bid_ask]. *)
   let get_top_of_book ~symbol =
@@ -346,28 +335,6 @@ module Kraken_impl = struct
         is_amended = (e.exec_type = Kraken_executions_feed.Amended);
         cl_ord_id = e.cl_ord_id;
       }
-    )
-
-  (** Return the current ring-buffer position for ticker events on [symbol]. *)
-  let get_ticker_position ~symbol =
-    Kraken_ticker_feed.get_current_position symbol
-
-  (** Read ticker events from [start_pos] onward for [symbol], mapped to
-      unified [Types.ticker_event] records containing bid, ask, timestamp. *)
-  let read_ticker_events ~symbol ~start_pos =
-    let events = Kraken_ticker_feed.read_ticker_events symbol start_pos in
-    List.map (fun (t : Kraken_ticker_feed.ticker) ->
-      { Types.
-        bid = t.bid;
-        ask = t.ask;
-        timestamp = t.timestamp;
-      }
-    ) events
-
-  (** Iterate ticker events from [start_pos] for [symbol], applying [f]. *)
-  let iter_ticker_events ~symbol ~start_pos f =
-    Kraken_ticker_feed.iter_ticker_events symbol start_pos (fun (t : Kraken_ticker_feed.ticker) ->
-      f { Types. bid = t.bid; ask = t.ask; timestamp = t.timestamp }
     )
 
   (** Return the current ring-buffer position for orderbook events on [symbol]. *)

@@ -237,15 +237,7 @@ module Ibkr_impl = struct
 
   (* ---- Market data accessors ---- *)
 
-  let get_ticker ~symbol =
-    match Ibkr_ticker_feed.get_latest_ticker symbol with
-    | Some t -> Some (t.Ibkr_ticker_feed.bid, t.Ibkr_ticker_feed.ask)
-    | None -> None
 
-  let subscribe_ticker ~symbol =
-    let conn = get_conn () in
-    Ibkr_contracts.resolve conn ~symbol >>= fun contract ->
-    Ibkr_ticker_feed.subscribe conn ~contract
 
   let get_top_of_book ~symbol =
     match Ibkr_orderbook_feed.store_opt symbol with
@@ -297,18 +289,7 @@ module Ibkr_impl = struct
 
   (* ---- Ring buffer event feeds ---- *)
 
-  let get_ticker_position ~symbol =
-    Ibkr_ticker_feed.get_current_position symbol
 
-  let read_ticker_events ~symbol ~start_pos =
-    List.map (fun (t : Ibkr_ticker_feed.ticker) ->
-      { Types.bid = t.bid; ask = t.ask; timestamp = t.timestamp }
-    ) (Ibkr_ticker_feed.read_ticker_events symbol start_pos)
-
-  let iter_ticker_events ~symbol ~start_pos f =
-    Ibkr_ticker_feed.iter_ticker_events symbol start_pos (fun (t : Ibkr_ticker_feed.ticker) ->
-      f { Types.bid = t.bid; ask = t.ask; timestamp = t.timestamp }
-    )
 
   let get_orderbook_position ~symbol =
     Ibkr_orderbook_feed.get_current_position symbol

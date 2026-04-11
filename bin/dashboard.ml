@@ -707,7 +707,6 @@ let render_latencies _w json =
        - cycle:      full wakeup-to-sleep; sum of all stages *)
     let latency_thresholds label =
       match label with
-      | "ticker"    -> (5.0,   15.0)
       | "orderbook" -> (10.0,  30.0)
       | "strategy"  -> (30.0,  75.0)
       | "execution" -> (50.0,  150.0)
@@ -726,21 +725,26 @@ let render_latencies _w json =
       | 2 -> a_red | 1 -> a_yellow | 0 -> a_green | _ -> a_dim
     in
     (* Metric display order *)
-    let metric_order = ["cycle"; "ticker"; "orderbook"; "strategy"; "execution"] in
-    let metric_labels = ["CYCLE"; "TICK"; "OB"; "STRAT"; "EXEC"] in
+    let metric_order = ["cycle"; "orderbook"; "strategy"; "execution"] in
+    let metric_labels = ["CYCLE"; "OB"; "STRAT"; "EXEC"] in
     (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
     let header_row1 = I.hcat (
       [ I.string a_text "  ";
         col 16 a_label "" ]
-      @ List.map (fun lbl ->
-          col 18 a_label (Printf.sprintf "  %-16s" lbl)
+      @ List.mapi (fun i lbl ->
+          let len = String.length lbl in
+          let pad = (27 - len) / 2 in
+          let s = String.make pad ' ' ^ lbl in
+          let img = col 27 a_label s in
+          if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
     ) in
     let header_row2 = I.hcat (
       [ I.string a_text "  ";
         col 16 a_label "DOMAIN" ]
-      @ List.concat_map (fun _lbl ->
-          [ col 9 a_dim "p50"; col 9 a_dim "p99" ]
+      @ List.mapi (fun i _lbl ->
+          let img = I.hcat [ col 9 a_dim "p50"; col 9 a_dim "p99"; col 9 a_dim "p999" ] in
+          if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
     ) in
     let header = I.vcat [header_row1; header_row2] in
@@ -751,28 +755,33 @@ let render_latencies _w json =
         | Some data ->
             let p50 = data |?> "p50" |> to_float_d 0.0 in
             let p99 = data |?> "p99" |> to_float_d 0.0 in
+            let p999 = data |?> "p999" |> to_float_d 0.0 in
             let samples = data |?> "samples" |> to_int_d 0 in
-            (p50, p99, samples)
-        | None -> (0.0, 0.0, 0)
+            (p50, p99, p999, samples)
+        | None -> (0.0, 0.0, 0.0, 0)
       in
       (* Compute worst severity across all metrics for the health dot *)
       let worst_sev = List.fold_left (fun worst label ->
-        let (p99, _, samples) = let (_, p99, s) = find_metric label in (p99, 0.0, s) in
+        let (_, p99, _, samples) = find_metric label in
         if samples = 0 then worst
         else max worst (severity label p99 samples)
       ) 0 metric_order in
       let dot_attr = attr_of_sev worst_sev in
-      let metric_cells = List.map (fun label ->
-        let (p50, p99, samples) = find_metric label in
-        if samples = 0 then
-          I.hcat [col 9 a_dim "--"; col 9 a_dim "--"]
+      let metric_cells = List.mapi (fun i label ->
+        let (p50, p99, p999, samples) = find_metric label in
+        let img = if samples = 0 then
+          I.hcat [col 9 a_dim "--"; col 9 a_dim "--"; col 9 a_dim "--"]
         else
           let s50 = severity label p50 samples in
           let s99 = max s50 (severity label p99 samples) in
+          let s999 = max s99 (severity label p999 samples) in
           I.hcat [
             col 9 (attr_of_sev s50) (format_latency_us p50);
             col 9 (attr_of_sev s99) (format_latency_us p99);
+            col 9 (attr_of_sev s999) (format_latency_us p999);
           ]
+        in
+        if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
       ) metric_order in
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in

@@ -130,13 +130,12 @@ let json_of_market_data exchange symbol base_asset quote_currency =
   match Exchange.Registry.get exchange with
   | None -> `Null
   | Some (module Ex) ->
-      let ticker = Ex.get_ticker ~symbol in
       let tob = Ex.get_top_of_book ~symbol in
       let base_balance = (try Ex.get_balance ~asset:base_asset with _ -> 0.0) in
       let quote_balance = (try Ex.get_balance ~asset:quote_currency with _ -> 0.0) in
       `Assoc [
-        "bid", (match ticker with Some (b, _) -> `Float b | None -> `Null);
-        "ask", (match ticker with Some (_, a) -> `Float a | None -> `Null);
+        "bid", (match tob with Some (b, _, _, _) -> `Float b | None -> `Null);
+        "ask", (match tob with Some (_, _, a, _) -> `Float a | None -> `Null);
         "tob_bid", (match tob with Some (b, _, _, _) -> `Float b | None -> `Null);
         "tob_bid_size", (match tob with Some (_, bs, _, _) -> `Float bs | None -> `Null);
         "tob_ask", (match tob with Some (_, _, a, _) -> `Float a | None -> `Null);
@@ -258,9 +257,9 @@ let build_snapshot () =
           if is_configured then None
           else begin
             let is_quote = (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || (asset = "USDT") || (asset = quote) || (asset = "USDe") in
-            let ticker = Ex.get_ticker ~symbol in
-            let bid_json, ask_json = match ticker with
-              | Some (b, a) -> `Float b, `Float a
+            let tob = Ex.get_top_of_book ~symbol in
+            let bid_json, ask_json = match tob with
+              | Some (b, _, a, _) -> `Float b, `Float a
               | None ->
                   if is_quote then `Float 1.0, `Float 1.0
                   else `Null, `Null

@@ -15,8 +15,7 @@ module Actions = Hyperliquid_actions
 (** Balance and margin state queries. *)
 module Balances = Hyperliquid_balances
 
-(** Real-time ticker (mid-price, mark, funding) feed. *)
-module Ticker_feed = Hyperliquid_ticker_feed
+
 
 (** L2 orderbook snapshot and incremental update feed. *)
 module Orderbook_feed = Hyperliquid_orderbook_feed
