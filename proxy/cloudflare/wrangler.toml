@@ -28,6 +28,11 @@ enabled = false
 persist = true
 head_sampling_rate = 1
 
+# Increase Durable Object CPU budget from default 30s to 300s (free plan max).
+# This extends WS relay session lifetime before CF terminates the DO.
+[limits]
+cpu_ms = 300000
+
 # Pin worker entrypoint to Asia-East (matches DO locationHint "apac")
 [placement]
 mode = "targeted"

@@ -222,22 +222,38 @@ let process_asset_balances json =
 
 (** Handle user_stats messages: extract USDC total from stats.collateral.
     This is the authoritative source for USDC — collateral includes all
-    deposited USDC regardless of how much is locked in open orders. *)
+    deposited USDC regardless of how much is locked in open orders.
+    Handles multiple message formats: data may be at top level, under
+    'user_stats', or under 'data' depending on the message type. *)
 let process_user_stats json =
   let open Yojson.Safe.Util in
-  let stats = member "stats" json in
+  (* Try to find stats in multiple locations *)
+  let stats =
+    let s = member "stats" json in
+    if s <> `Null then s
+    else
+      (* Some message types wrap under 'user_stats' or 'data' *)
+      let us = member "user_stats" json in
+      if us <> `Null then member "stats" us
+      else
+        let d = member "data" json in
+        if d <> `Null then member "stats" d
+        else `Null
+  in
   if stats = `Null then
-    Logging.debug_f ~section "user_stats message has no stats field (type=%s)"
+    Logging.info_f ~section "user_stats message has no stats field (type=%s, keys=%s)"
       (try member "type" json |> to_string with _ -> "unknown")
+      (try keys json |> String.concat "," with _ -> "?")
   else begin
     let collateral_v = member "collateral" stats in
     if collateral_v <> `Null then begin
       let collateral = (try Lighter_types.parse_json_float collateral_v with _ -> 0.0) in
       publish_balance_update "USDC" collateral;
-      Logging.debug_f ~section "Balance update: USDC = %.8f (via user_stats collateral)" collateral;
+      Logging.info_f ~section "Balance update: USDC = %.8f (via user_stats collateral)" collateral;
       notify_ready ()
     end else
-      Logging.debug_f ~section "user_stats stats.collateral is null"
+      Logging.info_f ~section "user_stats stats.collateral is null (stats_keys=%s)"
+        (try keys stats |> String.concat "," with _ -> "?")
   end
 
 (** WebSocket message dispatcher. Routes by message type to the appropriate handler. *)
@@ -252,7 +268,7 @@ let process_market_data json =
       (try process_asset_balances json
        with exn ->
          Logging.error_f ~section "Failed to process asset balance update: %s" (Printexc.to_string exn))
-  | "update/user_stats" | "subscribed/user_stats" ->
+  | "update/user_stats" | "snapshot/user_stats" | "subscribed/user_stats" ->
       (try process_user_stats json
        with exn ->
          Logging.error_f ~section "Failed to process user_stats update: %s" (Printexc.to_string exn))

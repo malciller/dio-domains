@@ -689,17 +689,11 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.catch (fun () ->
         let on_failure reason =
           set_state lt_ws_conn (Failed reason);
-          (* Schedule immediate reconnection; bypass monitor loop backoff *)
-          Lwt.async (fun () ->
-            Lwt.catch (fun () ->
-              Lwt.pause () >>= fun () ->
-              start_async lt_ws_conn;
-              Lwt.return_unit
-            ) (fun exn ->
-              Logging.warn_f ~section "[%s] Exception during emergency reconnection: %s" lt_ws_conn.name (Printexc.to_string exn);
-              Lwt.return_unit
-            )
-          )
+          (* Do NOT call start_async here — connect_and_monitor has
+             self-healing reconnect loops that never exit. The failure
+             callback is only invoked when both sides are simultaneously
+             down; the internal loops will recover automatically.
+             Calling start_async would spawn a duplicate instance. *)
         in
         let on_heartbeat () = update_data_heartbeat lt_ws_conn in
         let on_connected () =
@@ -713,12 +707,9 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             Lighter.Instruments_feed.wait_until_ready () >>= fun () ->
             Logging.info_f ~section "Lighter WS reconnected — resubscribing and rebuilding open-order state";
             Lighter.Ws.subscribe_to_feeds ~symbols:lighter_symbols ~account_index ~auth_token >>= fun () ->
-            (* Do not preserve Lighter order state across reconnects.
-               This venue is flapping frequently, and stale local orders plus
-               client_order_id/order_id remaps can accumulate across sessions.
-               Mirror the Hyperliquid strategy: clear first, then rebuild from
-               the exchange snapshot so retained ghost orders do not survive
-               repeated reconnects. *)
+            (* Rebuild order state when both sides come up together.
+               Individual side reconnects handle their own resubscription
+               internally via the per-side reconnect callbacks. *)
             Lighter.Executions_feed.clear_all_open_orders ();
             Lighter.Module.fetch_open_orders ())
         in

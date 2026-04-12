@@ -1,10 +1,22 @@
 (** Lighter WebSocket client.
     Manages dual persistent connections (public and private) to access 
-    market data and authenticated endpoints while avoiding Durable Object message limits. *)
+    market data and authenticated endpoints while avoiding Durable Object message limits.
+    
+    Public and private connections have independent lifecycles — a failure
+    on one side reconnects only that side, without tearing down the other.
+    This avoids the full reconnect+resubscribe+order-rebuild churn that
+    previously occurred ~30 times/hour when either side flapped. *)
 
 open Lwt.Infix
 
 let section = "lighter_ws"
+
+(** Remembered subscription parameters for autonomous reconnect loops.
+    Set once by [subscribe_to_feeds], used by per-side reconnect callbacks
+    so they can resubscribe without supervisor involvement. *)
+let subscribed_symbols : string list ref = ref []
+let subscribed_account_index : int ref = ref 0
+let subscribed_auth_token : string ref = ref ""
 
 (** Handle returned to consumers of [subscribe_market_data]. *)
 type subscription = {
@@ -167,8 +179,15 @@ let subscribe_public_orderbook ~symbols =
   ) public_stream
 
 
-(** Subscribe to feeds routed properly between public and private dual connections. *)
+(** Subscribe to feeds routed properly between public and private dual connections.
+    Also remembers subscription parameters so per-side reconnect loops can
+    resubscribe autonomously without supervisor involvement. *)
 let subscribe_to_feeds ~symbols ~account_index ~auth_token =
+  (* Remember subscription parameters for autonomous reconnects *)
+  subscribed_symbols := symbols;
+  subscribed_account_index := account_index;
+  subscribed_auth_token := auth_token;
+
   (* Subscribe to ticker and orderbook for each symbol on the public connection *)
   let%lwt () = subscribe_public_orderbook ~symbols in
 
@@ -241,7 +260,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
              Lighter_executions_feed.process_account_orders_update json
          | "update/account_all" | "snapshot/account_all" | "subscribed/account_all"
          | "update/account_all_assets" | "snapshot/account_all_assets" | "subscribed/account_all_assets"
-         | "update/user_stats" | "subscribed/user_stats" ->
+         | "update/user_stats" | "snapshot/user_stats" | "subscribed/user_stats" ->
              Atomic.incr msg_counter_account;
              broadcast_message json
          | "pong" ->
@@ -270,11 +289,17 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
         Atomic.set state.is_connected_ref false;
         Lwt.return_unit
       ) >>= fun () ->
-      close_all_subscribers ();
+      (* Don't close_all_subscribers here — a single-side disconnect
+         should not destroy consumer streams. The per-side reconnect
+         loop will re-establish the connection. *)
       signal_new_data ();
       Lwt.return_unit
   | _ -> Lwt.return_unit
 
+(** Establishes a single WebSocket connection and blocks while reading frames.
+    Returns unit when the connection closes (for any reason).
+    Does NOT call close_all_subscribers — single-side disconnects are handled
+    by the per-side reconnect loop in [connect_and_monitor]. *)
 let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_heartbeat ~label =
   let (connect_host, connect_port) = connect_target () in
   let url = ws_url () in
@@ -327,7 +352,6 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
             Atomic.set state.is_connected_ref false;
             Lwt.return_unit
           ) >>= fun () ->
-          close_all_subscribers ();
           Lwt.fail_with ("[" ^ label ^ "] Connection closed unexpectedly (End_of_file)")
       | exn ->
           Logging.debug_f ~section "[%s] WebSocket read error: %s" label (Printexc.to_string exn);
@@ -336,7 +360,6 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
             Atomic.set state.is_connected_ref false;
             Lwt.return_unit
           ) >>= fun () ->
-          close_all_subscribers ();
           Lwt.fail exn
     ) >>= fun () ->
     Lwt_mutex.with_lock state.connection_mutex (fun () ->
@@ -344,7 +367,6 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
       Atomic.set state.is_connected_ref false;
       Lwt.return_unit
     ) >>= fun () ->
-    close_all_subscribers ();
     Lwt.fail_with ("[" ^ label ^ "] WebSocket closed by server")
   ) (fun exn ->
     let error_msg = Printexc.to_string exn in
@@ -366,13 +388,11 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
         connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_heartbeat ~label
       end else begin
         Atomic.set state.is_connected_ref false;
-        close_all_subscribers ();
         on_failure error_msg;
         Lwt.return_unit
       end
     end else begin
       Atomic.set state.is_connected_ref false;
-      close_all_subscribers ();
       on_failure error_msg;
       Lwt.return_unit
     end
@@ -402,39 +422,147 @@ let close () : unit Lwt.t =
     close_one private_state "Private";
   ]
 
-let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
-  let pub_ready = ref false in
-  let priv_ready = ref false in
-  let check_ready () =
-    if !pub_ready && !priv_ready then begin
-      reset_ping_failures ();
-      Lighter_proxy.reset_proxy_failures ();
-      on_connected ()
+(** Close only the public WebSocket connection. *)
+let close_public () : unit Lwt.t =
+  Lwt_mutex.with_lock public_state.connection_mutex (fun () ->
+    match !(public_state.active_connection) with
+    | None -> Lwt.return None
+    | Some conn ->
+        public_state.active_connection := None;
+        Atomic.set public_state.is_connected_ref false;
+        Lwt.return (Some conn)
+  ) >>= function
+  | None -> Lwt.return_unit
+  | Some conn ->
+      Logging.info ~section "Closing Public Lighter WebSocket connection";
+      Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit)
+
+(** Close only the private WebSocket connection. *)
+let close_private () : unit Lwt.t =
+  Lwt_mutex.with_lock private_state.connection_mutex (fun () ->
+    match !(private_state.active_connection) with
+    | None -> Lwt.return None
+    | Some conn ->
+        private_state.active_connection := None;
+        Atomic.set private_state.is_connected_ref false;
+        Lwt.return (Some conn)
+  ) >>= function
+  | None -> Lwt.return_unit
+  | Some conn ->
+      Logging.info ~section "Closing Private Lighter WebSocket connection";
+      Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit)
+
+let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
+  let pub_ready = Atomic.make false in
+  let priv_ready = Atomic.make false in
+  let both_ready_fired = Atomic.make false in
+
+  (* Fire on_connected when both sides are up. Idempotent within a session — 
+     only fires once when transitioning from "not both ready" to "both ready". *)
+  let check_both_ready () =
+    if Atomic.get pub_ready && Atomic.get priv_ready then begin
+      if not (Atomic.exchange both_ready_fired true) then begin
+        reset_ping_failures ();
+        Lighter_proxy.reset_proxy_failures ();
+        on_connected ()
+      end
     end
   in
-  let failure_reported = ref false in
-  let safe_on_failure msg =
-    if not !failure_reported then begin
-      failure_reported := true;
-      on_failure msg;
-      Lwt.async (fun () -> close ())
-    end
+
+  (* Self-healing reconnect loop for one side.
+     Reconnects indefinitely on disconnect. Single-side flaps are handled
+     internally without escalating to the supervisor. The supervisor's
+     passive heartbeat monitoring catches genuine prolonged outages. *)
+  let rec reconnect_loop ~state ~connect_target ~ws_url ~label
+      ~ready_flag ~other_ready_flag ~on_side_reconnected =
+    let side_on_failure msg =
+      Atomic.set ready_flag false;
+      Atomic.set both_ready_fired false;
+      Logging.warn_f ~section "[%s] Disconnected: %s (reconnecting independently)" label msg;
+      (* Don't escalate to supervisor's on_failure — the self-healing
+         reconnect loop will recover. The supervisor's passive heartbeat
+         monitoring (60s data silence → Failed) catches genuine outages.
+         Reporting here would race with internal recovery and could cause
+         the monitor loop to spawn duplicate instances via start_async. *)
+      if not (Atomic.get other_ready_flag) then begin
+        Logging.error_f ~section "[lighter_ws] Both sides down — internal loops will recover";
+        close_all_subscribers ()
+      end
+    in
+    let side_on_connected () =
+      Atomic.set ready_flag true;
+      Lwt.async (fun () ->
+        Lwt.catch
+          (fun () -> on_side_reconnected ())
+          (fun exn ->
+            Logging.error_f ~section "[%s] Error in reconnect callback: %s" label (Printexc.to_string exn);
+            Lwt.return_unit)
+      );
+      check_both_ready ()
+    in
+    Lwt.catch (fun () ->
+      connect_one ~state ~connect_target ~ws_url
+        ~on_failure:side_on_failure
+        ~on_connected:side_on_connected
+        ~on_heartbeat ~label
+    ) (fun exn ->
+      Logging.debug_f ~section "[%s] connect_one raised: %s" label (Printexc.to_string exn);
+      Lwt.return_unit
+    ) >>= fun () ->
+    (* Connection ended — brief pause then reconnect *)
+    Atomic.set ready_flag false;
+    Atomic.set both_ready_fired false;
+    Logging.info_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
+    Lwt_unix.sleep 0.5 >>= fun () ->
+    reconnect_loop ~state ~connect_target ~ws_url ~label
+      ~ready_flag ~other_ready_flag ~on_side_reconnected
   in
+
   Lwt.join [
-    connect_one ~state:public_state
+    reconnect_loop
+      ~state:public_state
       ~connect_target:Lighter_proxy.public_ws_connect_target
       ~ws_url:Lighter_proxy.public_ws_url
-      ~on_failure:(fun msg -> safe_on_failure ("Public: " ^ msg))
-      ~on_connected:(fun () -> pub_ready := true; check_ready ())
-      ~on_heartbeat
-      ~label:"Public";
-    connect_one ~state:private_state
+      ~label:"Public"
+      ~ready_flag:pub_ready
+      ~other_ready_flag:priv_ready
+      ~on_side_reconnected:(fun () ->
+        (* Lightweight: just resubscribe orderbooks for remembered symbols *)
+        let symbols = !subscribed_symbols in
+        if List.length symbols > 0 then begin
+          Logging.info_f ~section "Public WS reconnected — resubscribing %d orderbook channels" (List.length symbols);
+          subscribe_public_orderbook ~symbols
+        end else
+          Lwt.return_unit
+      );
+    reconnect_loop
+      ~state:private_state
       ~connect_target:Lighter_proxy.private_ws_connect_target
       ~ws_url:Lighter_proxy.private_ws_url
-      ~on_failure:(fun msg -> safe_on_failure ("Private: " ^ msg))
-      ~on_connected:(fun () -> priv_ready := true; check_ready ())
-      ~on_heartbeat
       ~label:"Private"
+      ~ready_flag:priv_ready
+      ~other_ready_flag:pub_ready
+      ~on_side_reconnected:(fun () ->
+        (* Heavier: resubscribe private channels *)
+        let symbols = !subscribed_symbols in
+        let account_index = !subscribed_account_index in
+        let auth_token = !subscribed_auth_token in
+        if List.length symbols > 0 then begin
+          Logging.info_f ~section "Private WS reconnected — resubscribing private channels";
+          let acct_str = string_of_int account_index in
+          let private_commands = [
+            `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_orders/" ^ acct_str)); ("auth", `String auth_token)];
+            `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all/" ^ acct_str)); ("auth", `String auth_token)];
+            `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_assets/" ^ acct_str)); ("auth", `String auth_token)];
+            `Assoc [("type", `String "subscribe"); ("channel", `String ("user_stats/" ^ acct_str)); ("auth", `String auth_token)]
+          ] in
+          let private_stream = Lwt_stream.of_list private_commands in
+          Concurrency.Lwt_util.consume_stream_s (fun cmd ->
+            send_private_json cmd "Private"
+          ) private_stream
+        end else
+          Lwt.return_unit
+      );
   ]
 
 let send_ping ~req_id:_ ~timeout_ms =
