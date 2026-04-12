@@ -979,9 +979,13 @@ let render_memory w json =
 let render_to_stdout (draw : out_channel -> unit) =
   let (pr, pw) = Unix.pipe () in
   let oc = Unix.out_channel_of_descr pw in
-  draw oc;
-  flush oc;
-  Unix.close pw;                    (* EOF signals the drain loop to terminate *)
+  (try
+     draw oc;
+     close_out oc
+   with exn ->
+     close_out_noerr oc;
+     Unix.close pr;
+     raise exn);
   let buf = Buffer.create 65536 in
   let tmp = Bytes.create 8192 in
   (try
