@@ -283,7 +283,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
       on_heartbeat ();
       Lwt.return_unit
   | Websocket.Frame.Opcode.Close ->
-      Logging.info ~section "WebSocket connection closed by server";
+      Logging.debug_f ~section "WebSocket connection closed by server";
       Lwt_mutex.with_lock state.connection_mutex (fun () ->
         state.active_connection := None;
         Atomic.set state.is_connected_ref false;
@@ -318,6 +318,10 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
     Lwt_mutex.with_lock state.connection_mutex (fun () ->
       state.active_connection := Some conn;
       Atomic.set state.is_connected_ref true;
+      (* Seed pong time to now so early pings during DO cold-start
+         don't immediately fail (the proxy needs time to establish
+         its upstream WS before it can relay pongs). *)
+      state.last_pong_time := Unix.gettimeofday ();
       Lwt_condition.broadcast state.connected_wakeup ();
       Lwt.return_unit
     ) >>= fun () ->
@@ -512,7 +516,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
     (* Connection ended — brief pause then reconnect *)
     Atomic.set ready_flag false;
     Atomic.set both_ready_fired false;
-    Logging.info_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
+    Logging.debug_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
     Lwt_unix.sleep 0.5 >>= fun () ->
     reconnect_loop ~state ~connect_target ~ws_url ~label
       ~ready_flag ~other_ready_flag ~on_side_reconnected
@@ -530,7 +534,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
         (* Lightweight: just resubscribe orderbooks for remembered symbols *)
         let symbols = !subscribed_symbols in
         if List.length symbols > 0 then begin
-          Logging.info_f ~section "Public WS reconnected — resubscribing %d orderbook channels" (List.length symbols);
+          Logging.debug_f ~section "Public WS reconnected — resubscribing %d orderbook channels" (List.length symbols);
           subscribe_public_orderbook ~symbols
         end else
           Lwt.return_unit

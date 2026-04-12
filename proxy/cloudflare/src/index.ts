@@ -499,8 +499,19 @@ export class LighterProxy implements DurableObject {
              console.log(`[DO] internal→upstream #${session.internalToUpstreamCount}: ${data.slice(0, 200)}`);
           }
           session.upstream.send(event.data);
-        } else if (session.reconnecting) {
-          console.warn(`[DO] Upstream reconnecting, dropped client msg`);
+        } else {
+          // Upstream unavailable (reconnecting, cold-starting, or null).
+          // Always respond to pings so the client doesn't mark the proxied
+          // connection as dead while the DO manages upstream recovery.
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping" && server.readyState === WebSocket.READY_STATE_OPEN) {
+              server.send(JSON.stringify({ type: "pong" }));
+            }
+          } catch {}
+          if (session.reconnecting) {
+            console.warn(`[DO] Upstream reconnecting, dropped client msg`);
+          }
         }
       } catch {}
     });

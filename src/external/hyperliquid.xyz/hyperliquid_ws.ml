@@ -309,7 +309,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
         Logging.warn_f ~section "Failed to parse WS message: %s" (Printexc.to_string exn));
       Lwt.return_unit
   | Websocket.Frame.Opcode.Close ->
-      Logging.info ~section "WebSocket connection closed by server";
+      Logging.debug_f ~section "WebSocket connection closed by server";
       Lwt_mutex.with_lock connection_mutex (fun () ->
         active_connection := None;
         Atomic.set is_connected_ref false;
