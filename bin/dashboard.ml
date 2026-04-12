@@ -164,6 +164,10 @@ let a_border     = A.(fg c_border ++ bg c_bg)
 let a_near_fill  = A.(fg c_bright ++ bg c_near_fill ++ st bold)
 let a_near_fill_green = A.(fg c_green ++ bg c_near_fill ++ st bold)
 
+let c_near_sell  = A.rgb_888 ~r:65  ~g:30  ~b:30
+let a_near_sell  = A.(fg c_bright ++ bg c_near_sell ++ st bold)
+let a_near_sell_red = A.(fg c_red ++ bg c_near_sell ++ st bold)
+
 (** Exchange-specific color for the SYMBOL column. Bold for active strategies. *)
 let exch_sym_attr ?(dim=false) exchange =
   let c = match exchange with
@@ -179,11 +183,7 @@ let exch_sym_attr ?(dim=false) exchange =
 
 (* Drawing primitives *)
 
-let hline w =
-  (* Render a horizontal rule of width [w] using U+2500 *)
-  let buf = Buffer.create (w * 3) in
-  for _ = 1 to w do Buffer.add_string buf "─" done;
-  I.string a_border (Buffer.contents buf)
+
 
 let pad_right w s =
   let len = String.length s in
@@ -207,11 +207,13 @@ let format_spread_bps bid ask =
 (* Drawing helpers *)
 
 let section_title w label =
-  let lbl = "  " ^ label ^ "  " in
-  let pad = max 0 (w - String.length lbl) in
+  let lbl = " ╭── " ^ label ^ " " in
+  let pad_count = max 0 (w - String.length lbl) in
+  let pad_buf = Buffer.create (pad_count * 3) in
+  for _ = 1 to pad_count do Buffer.add_string pad_buf "─" done;
   I.hcat [
-    I.string A.(fg c_title ++ bg c_section_bg ++ st bold) lbl;
-    I.string A.(bg c_section_bg) (String.make pad ' ');
+    I.string A.(fg c_title ++ bg c_bg ++ st bold) lbl;
+    I.string A.(fg c_border ++ bg c_bg) (Buffer.contents pad_buf);
   ]
 
 (* Panel: Header bar *)
@@ -288,7 +290,7 @@ let render_strategies w json =
   let all_balances = json |?> "all_balances" |> to_list_d in
   (* Column header row *)
   let header = I.hcat [
-    I.string a_text " ";
+    I.string a_border " │  ";
     col 16 a_label "SYMBOL";
     col 5 a_label "STGY";
     col 3 a_label "ST";
@@ -303,6 +305,7 @@ let render_strategies w json =
     col 6 a_label "SELLS";
     col 8 a_label "Δ SELL";
     col 12 a_label "SELL VAL";
+    col 19 a_label "";
   ] in
 
   (* Build one row per strategy *)
@@ -357,6 +360,41 @@ let render_strategies w json =
       | prices -> Some (List.fold_left (fun acc p -> if abs_float p < abs_float acc then p else acc) (List.hd prices) prices)
     in
 
+    let grid_interval_lo = data |?> "grid_interval_lo" |> to_float_d 1.0 in
+    let grid_interval = if grid_interval_lo > 0.0 then grid_interval_lo else 1.0 in
+    let close_thresh = 0.5 *. grid_interval in
+    let far_thresh = 2.0 *. grid_interval in
+
+    let render_gauge b_pct s_pct =
+      let half = 7 in
+      let pos d =
+        if d < 0.0 then half
+        else if d < 0.25 *. grid_interval then 0
+        else if d < 0.75 *. grid_interval then 1
+        else if d < 1.5 *. grid_interval  then 2
+        else if d < 3.0 *. grid_interval  then 3
+        else if d < 6.0 *. grid_interval  then 4
+        else if d < 12.0 *. grid_interval then 5
+        else 6
+      in
+      let b_pos = match b_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+      let s_pos = match s_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+      let left_side = List.init half (fun i ->
+        if half - 1 - i = b_pos then "B" else "─"
+      ) |> String.concat "" in
+      let right_side = List.init half (fun i ->
+        if i = s_pos then "S" else "─"
+      ) |> String.concat "" in
+      I.hcat [
+        I.string a_border "  [";
+        I.string (if b_pos <= 1 then a_green else a_dim) left_side;
+        I.string a_border "┼";
+        I.string (if s_pos <= 1 then a_yellow else a_dim) right_side;
+        I.string a_border "]";
+      ]
+    in
+    let gauge_img = render_gauge buy_dist_pct closest_sell_dist_pct in
+
     (* Status indicator *)
     let status_str, status_attr =
       if cap_low then "⏸", a_yellow
@@ -380,8 +418,8 @@ let render_strategies w json =
       | None -> "--", a_dim
       | Some d ->
           let abs_d = abs_float d in
-          let attr = if abs_d < 0.5 then a_green
-                     else if abs_d < 2.0 then a_cyan
+          let attr = if abs_d < close_thresh then a_green
+                     else if abs_d < far_thresh then a_cyan
                      else a_dim in
           format_pct d, attr
     in
@@ -390,22 +428,55 @@ let render_strategies w json =
       | None -> "--", a_dim
       | Some d ->
           let abs_d = abs_float d in
-          let attr = if abs_d < 0.5 then a_yellow
-                     else if abs_d < 2.0 then a_cyan
+          let attr = if abs_d < close_thresh then a_yellow
+                     else if abs_d < far_thresh then a_cyan
                      else a_dim in
           format_pct d, attr
     in
 
-    (* Near-fill row highlighting: use tinted background when buy is <0.5% away *)
-    let near_fill = match buy_dist_pct with
-      | Some d when abs_float d < 0.5 -> true
-      | _ -> false
+    (* execution proximity: 0 = buy order, 100 = sell order *)
+    let near_buy, near_sell =
+      let sell_prices = List.filter_map (fun s ->
+        let sp = s |?> "price" |> to_float_d 0.0 in
+        if sp > 0.0 then Some sp else None
+      ) sell_orders in
+      let execution_proximity =
+        match sell_prices with
+        | [] -> None
+        | prices ->
+            let sell_price = List.fold_left min (List.hd prices) prices in
+            if (not cap_low) && buy_price > 0.0 && mid > 0.0 && sell_price > buy_price then
+              let range = sell_price -. buy_price in
+              Some (((mid -. buy_price) /. range) *. 100.0)
+            else None
+      in
+      match execution_proximity with
+      | Some pos -> (pos < 25.0, pos > 75.0)
+      | None ->
+          let is_near_buy = match buy_dist_pct with
+            | Some d -> abs_float d < close_thresh
+            | None -> false
+          in
+          (is_near_buy, false)
     in
-    let row_text  = if near_fill then a_near_fill else a_text in
-    let sym_attr = if near_fill then a_near_fill else exch_sym_attr exchange in
 
+    let row_text =
+      if near_buy then a_near_fill
+      else if near_sell then a_near_sell
+      else a_text
+    in
+    let sym_attr =
+      if near_buy then a_near_fill
+      else if near_sell then a_near_sell
+      else exch_sym_attr exchange
+    in
+
+    let border_attr =
+      let bg_color = if near_buy then c_near_fill else if near_sell then c_near_sell else c_bg in
+      A.(fg c_border ++ bg bg_color)
+    in
     I.hcat [
-      I.string row_text " ";
+      I.string border_attr " │  ";
       col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
       col 5 a_cyan (truncate_string 4 stype);
       I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
@@ -415,7 +486,8 @@ let render_strategies w json =
       col 10 row_text (if hold_value > 0.01 then format_price hold_value else "--");
       col 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
       col 10 row_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
-      col 12 (if near_fill then a_near_fill_green
+      col 12 (if near_buy then a_near_fill_green
+              else if near_sell then a_near_sell_red
               else if buy_price > 0.0 then a_green else a_dim)
         (if buy_price > 0.0 then format_price buy_price else "--");
       col 8 buy_dist_attr buy_dist_str;
@@ -424,6 +496,7 @@ let render_strategies w json =
       col 8 sell_dist_attr sell_dist_str;
       col 12 (if unrealized_profit >= 0.0 then a_green else a_red)
         (format_pnl unrealized_profit);
+      gauge_img;
     ]
   ) strats in
 
@@ -495,13 +568,43 @@ let render_strategies w json =
             format_pct d, attr
       in
 
+      let render_gauge b_pct s_pct =
+        let half = 7 in
+        let pos d =
+          if d < 0.0 then half
+          else if d < 0.25 then 0
+          else if d < 0.75 then 1
+          else if d < 1.5  then 2
+          else if d < 3.0  then 3
+          else if d < 6.0  then 4
+          else if d < 12.0 then 5
+          else 6
+        in
+        let b_pos = match b_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+        let s_pos = match s_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+        let left_side = List.init half (fun i ->
+          if half - 1 - i = b_pos then "B" else "─"
+        ) |> String.concat "" in
+        let right_side = List.init half (fun i ->
+          if i = s_pos then "S" else "─"
+        ) |> String.concat "" in
+        I.hcat [
+          I.string a_border "  [";
+          I.string (if b_pos <= 1 then a_green else a_dim) left_side;
+          I.string a_border "┼";
+          I.string (if s_pos <= 1 then a_yellow else a_dim) right_side;
+          I.string a_border "]";
+        ]
+      in
+      let gauge_img = render_gauge None closest_sell_dist_pct in
+
       let status_str, status_attr =
         if is_quote then "$", a_green
         else "⏹", a_red
       in
       let spread_str = format_spread_bps bid ask in
       let img = I.hcat [
-        I.string a_text " ";
+        I.string a_border " │  ";
         col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
         col 5 a_dim "--";
         I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
@@ -519,6 +622,7 @@ let render_strategies w json =
         col 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green
                 else if unrealized_profit > 0.0 then a_dim else a_dim)
           (if sell_count > 0 then format_pnl unrealized_profit else "--");
+        gauge_img;
       ] in
       Some (is_quote, img)
     end
@@ -728,7 +832,7 @@ let render_latencies _w json =
     let metric_labels = ["CYCLE"; "OB"; "STRAT"; "EXEC"] in
     (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
     let header_row1 = I.hcat (
-      [ I.string a_text "  ";
+      [ I.string a_border " │  ";
         col 16 a_label "" ]
       @ List.mapi (fun i lbl ->
           let len = String.length lbl in
@@ -739,7 +843,7 @@ let render_latencies _w json =
         ) metric_labels
     ) in
     let header_row2 = I.hcat (
-      [ I.string a_text "  ";
+      [ I.string a_border " │  ";
         col 16 a_label "DOMAIN" ]
       @ List.mapi (fun i _lbl ->
           let img = I.hcat [ col 9 a_dim "p50"; col 9 a_dim "p99"; col 9 a_dim "p999" ] in
@@ -785,7 +889,7 @@ let render_latencies _w json =
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
       I.hcat (
-        [ I.string a_text "  ";
+        [ I.string a_border " │  ";
           I.string dot_attr "●";
           I.string a_text " ";
           col 14 sym_attr (truncate_string 13 symbol) ]
@@ -806,73 +910,41 @@ let render_memory w json =
   let minor   = mem |?> "gc_minor"    |> to_int_d 0 in
   let compact = mem |?> "compactions" |> to_int_d 0 in
   let frags   = mem |?> "fragments"   |> to_int_d 0 in
-  let chunks  = mem |?> "heap_chunks" |> to_int_d 0 in
+
+  let total_kb = float_of_int (live + free) in
+  let live_ratio = if total_kb > 0.0 then (float_of_int live) /. total_kb else 0.0 in
+  let bar_len = 20 in
+  let filled_len = int_of_float (live_ratio *. float_of_int bar_len) in
+  let filled = String.make filled_len ' ' in
+  let empty = String.make (max 0 (bar_len - filled_len)) ' ' in
+  let bar = I.hcat [
+    I.string A.(fg c_border ++ bg c_bg) "┣";
+    I.string A.(bg c_accent) filled;
+    I.string A.(bg c_border) empty;
+    I.string A.(fg c_border ++ bg c_bg) "┫";
+  ] in
+
   let kv lbl v =
     I.hcat [
-      I.string A.(fg c_label  ++ bg c_bg) (Printf.sprintf "  %-9s" lbl);
-      I.string A.(fg c_bright ++ bg c_bg) (Printf.sprintf "%-12s" v);
+      I.string a_dim ("  " ^ lbl ^ " ");
+      I.string a_text (Printf.sprintf "%-8s" v);
     ]
   in
-  let col1 = I.vcat [
-    kv "heap"    (Printf.sprintf "%dMB" heap);
-    kv "live"    (Printf.sprintf "%dKB" live);
-    kv "free"    (Printf.sprintf "%dKB" free);
-    kv "frag"    (string_of_int frags);
+  let row1 = I.hcat [
+    I.string a_border " │";
+    kv "HEAP" (Printf.sprintf "%dMB" heap);
+    kv "LIVE" (Printf.sprintf "%dKB" live);
+    kv "FREE" (Printf.sprintf "%dKB" free);
+    I.string a_dim "  PRESSURE "; bar;
   ] in
-  let col2 = I.vcat [
-    kv "major"   (string_of_int major);
-    kv "minor"   (string_of_int minor);
-    kv "compact" (string_of_int compact);
-    kv "chunks"  (string_of_int chunks);
+  let row2 = I.hcat [
+    I.string a_border " │";
+    kv "MAJOR" (string_of_int major);
+    kv "MINOR" (string_of_int minor);
+    kv "COMPACT" (string_of_int compact);
+    kv "FRAGS" (string_of_int frags);
   ] in
-  let grid = I.hcat [col1; col2; I.string a_text (String.make (max 0 (w - 44)) ' ')] in
-  I.vcat [title; grid]
-
-(* Panel: Domain status *)
-
-let render_domains w json =
-  let now = Unix.gettimeofday () in
-  let doms = json |?> "domains" |> to_list_d in
-  let title = section_title w "DOMAINS" in
-  let rows = List.map (fun d ->
-    let key          = d |?> "key"           |> to_string_d "?" in
-    let running      = d |?> "running"        |> to_bool_d false in
-    let restarts     = d |?> "restart_count"  |> to_int_d 0 in
-    let last_restart = d |?> "last_restart"   |> to_float_d 0.0 in
-    let ago_secs     = if last_restart > 0.0 then now -. last_restart else -1.0 in
-    let ago_str =
-      if ago_secs < 0.0      then "--"
-      else if ago_secs < 5.0 then "just now"
-      else format_duration ago_secs ^ " ago"
-    in
-    let recent = ago_secs >= 0.0 && ago_secs < 30.0 in
-    let restart_attr =
-      if restarts = 0 then a_dim
-      else if recent  then a_red
-      else a_yellow
-    in
-    (* Extract exchange name from domain key (format: "exchange/symbol") *)
-    let exch = match String.split_on_char '/' key with
-      | e :: _ -> e
-      | _ -> ""
-    in
-    let key_attr =
-      if not running then a_dim
-      else if exch <> "" then exch_sym_attr exch
-      else a_text
-    in
-    I.hcat [
-      I.string a_text "  ";
-      I.string (if running then a_green else a_red) (if running then "\xe2\x96\xb6" else "\xe2\x96\xa0");
-      I.string a_text "  ";
-      col 30 key_attr (truncate_string 29 key);
-      I.string a_label "restarts: ";
-      col 3 (if restarts > 0 then a_yellow else a_dim) (string_of_int restarts);
-      I.string a_dim "  last: ";
-      col (max 0 (w - 60)) restart_attr ago_str;
-    ]
-  ) doms in
-  I.vcat (title :: rows)
+  I.vcat [title; I.string a_text " "; row1; row2; I.string a_text " "]
 
 (* Atomic frame rendering.
    Each render call opens a fresh pipe, writes the frame, closes the write
@@ -1118,19 +1190,17 @@ let () =
             output_string oc "\027[?2026h";
             output_string oc "\027[H";
             let img =
-              let sep = hline w in
+              let sep = I.string a_text " " in
               I.vcat [
                 render_header w !last_json;
                 sep;
                 render_memory w !last_json;
-                sep;
                 render_strategies w !last_json;
                 sep;
                 render_latencies w !last_json;
                 sep;
-                render_domains w !last_json;
-                sep;
-                I.string A.(fg c_dim ++ bg c_section_bg) (pad_right w "  q: quit  │  Diophant Solutions");
+                I.string A.(fg c_border ++ bg c_bg) " ╰──────────────────────────────────────────────────────────────────";
+                I.string A.(fg c_dim ++ bg c_bg) (pad_right w "  q: quit  │  Diophant Solutions");
               ]
               |> I.hsnap ~align:`Left w
               |> I.vsnap ~align:`Top  h

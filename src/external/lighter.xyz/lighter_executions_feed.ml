@@ -164,7 +164,7 @@ let get_symbol_store symbol =
             let store = {
               events_buffer = RingBuffer.create 128;
               open_orders = Hashtbl.create 32;
-              ready = Atomic.make false;
+              ready = Atomic.make (Atomic.get _startup_snapshot_done);
               orders_mutex = Mutex.create ();
             } in
             Hashtbl.add stores symbol store;
