@@ -279,6 +279,8 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
            if String.length c > 100 then String.sub c 0 100 ^ "..." else c));
       Lwt.return_unit
   | Websocket.Frame.Opcode.Pong ->
+      state.last_pong_time := Unix.gettimeofday ();
+      (try Lwt_condition.broadcast state.pong_condition () with _ -> ());
       on_heartbeat ();
       Lwt.return_unit
   | Websocket.Frame.Opcode.Close ->
@@ -562,13 +564,18 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
   ]
 
 let send_ping ~req_id:_ ~timeout_ms =
-  let ping_msg = `Assoc [("type", `String "ping")] in
   let timeout = float_of_int timeout_ms /. 1000.0 in
   
-  let ping_one state label =
+  let ping_one state _label =
     let send_time = Unix.gettimeofday () in
     Lwt.catch (fun () ->
-      send_json_on state ping_msg label >>= fun () ->
+      Lwt_mutex.with_lock state.connection_mutex (fun () ->
+        match !(state.active_connection) with
+        | Some conn ->
+            Websocket_lwt_unix.write conn (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ())
+        | None ->
+            Lwt.return_unit
+      ) >>= fun () ->
       Lwt.pick [
         (Lwt_condition.wait state.pong_condition >>= fun () -> Lwt.return true);
         (Lwt_unix.sleep timeout >>= fun () ->
