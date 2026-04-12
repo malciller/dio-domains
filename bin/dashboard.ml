@@ -129,26 +129,26 @@ let truncate_string n s =
 
 (* Color palette: RGB-888 constants for the TUI theme *)
 
-let c_bg         = A.rgb_888 ~r:10  ~g:13  ~b:20
-let c_panel      = A.rgb_888 ~r:18  ~g:22  ~b:32
-let c_section_bg = A.rgb_888 ~r:24  ~g:30  ~b:44
-let c_border     = A.rgb_888 ~r:38  ~g:46  ~b:62
-let c_title      = A.rgb_888 ~r:99  ~g:179 ~b:255
-let c_accent     = A.rgb_888 ~r:139 ~g:92  ~b:246
-let c_label      = A.rgb_888 ~r:110 ~g:120 ~b:138
-let c_text       = A.rgb_888 ~r:195 ~g:204 ~b:218
-let c_bright     = A.rgb_888 ~r:240 ~g:246 ~b:252
-let c_green      = A.rgb_888 ~r:74  ~g:222 ~b:128
-let c_red        = A.rgb_888 ~r:248 ~g:81  ~b:73
-let c_yellow     = A.rgb_888 ~r:250 ~g:176 ~b:5
+let c_bg         = A.rgb_888 ~r:14  ~g:14  ~b:18
+let c_panel      = A.rgb_888 ~r:24  ~g:24  ~b:32
+let c_section_bg = A.rgb_888 ~r:30  ~g:30  ~b:40
+let c_border     = A.rgb_888 ~r:60  ~g:60  ~b:75
+let c_title      = A.rgb_888 ~r:255 ~g:255 ~b:255
+let c_accent     = A.rgb_888 ~r:167 ~g:139 ~b:250
+let c_label      = A.rgb_888 ~r:150 ~g:150 ~b:165
+let c_text       = A.rgb_888 ~r:230 ~g:230 ~b:240
+let c_bright     = A.rgb_888 ~r:255 ~g:255 ~b:255
+let c_green      = A.rgb_888 ~r:52  ~g:211 ~b:153
+let c_red        = A.rgb_888 ~r:248 ~g:113 ~b:113
+let c_yellow     = A.rgb_888 ~r:251 ~g:191 ~b:36
 let c_cyan       = A.rgb_888 ~r:34  ~g:211 ~b:238
-let c_dim        = A.rgb_888 ~r:55  ~g:63  ~b:78
-let c_near_fill  = A.rgb_888 ~r:40  ~g:55  ~b:35
+let c_dim        = A.rgb_888 ~r:100 ~g:100 ~b:120
+let c_near_fill  = A.rgb_888 ~r:25  ~g:45  ~b:35
 (* Per-exchange brand colors *)
-let c_exch_hl    = A.rgb_888 ~r:74  ~g:222 ~b:128  (* hyperliquid: green *)
-let c_exch_kr    = A.rgb_888 ~r:160 ~g:120 ~b:240  (* kraken: purple *)
-let c_exch_li    = A.rgb_888 ~r:88  ~g:166 ~b:255  (* lighter: blue *)
-let c_exch_ib    = A.rgb_888 ~r:232 ~g:160 ~b:72   (* ibkr: orange *)
+let c_exch_hl    = A.rgb_888 ~r:52  ~g:211 ~b:153  (* hyperliquid: vivid green *)
+let c_exch_kr    = A.rgb_888 ~r:192 ~g:132 ~b:252  (* kraken: vivid purple *)
+let c_exch_li    = A.rgb_888 ~r:96  ~g:165 ~b:250  (* lighter: bright blue *)
+let c_exch_ib    = A.rgb_888 ~r:251 ~g:146 ~b:60   (* ibkr: bright orange *)
 (* Attribute constructors: foreground + background + optional style *)
 
 let a_label      = A.(fg c_label  ++ bg c_bg)
@@ -164,7 +164,7 @@ let a_border     = A.(fg c_border ++ bg c_bg)
 let a_near_fill  = A.(fg c_bright ++ bg c_near_fill ++ st bold)
 let a_near_fill_green = A.(fg c_green ++ bg c_near_fill ++ st bold)
 
-let c_near_sell  = A.rgb_888 ~r:65  ~g:30  ~b:30
+let c_near_sell  = A.rgb_888 ~r:75  ~g:35  ~b:35
 let a_near_sell  = A.(fg c_bright ++ bg c_near_sell ++ st bold)
 let a_near_sell_red = A.(fg c_red ++ bg c_near_sell ++ st bold)
 
@@ -296,15 +296,19 @@ let render_strategies w json =
     col 3 a_label "ST";
     col 12 a_label "PRICE";
     col 8 a_label "SPREAD";
+    I.string a_border " │ ";
     col 12 a_label "HOLDING";
     col 10 a_label "HOLD VAL";
     col 12 a_label "ACCUM QTY";
     col 10 a_label "ACCUM VAL";
+    I.string a_border " │ ";
     col 12 a_label "BUY @";
-    col 8 a_label "Δ BUY";
+    I.string a_label "Δ BUY   ";
+    I.string a_border " │ ";
     col 6 a_label "SELLS";
-    col 8 a_label "Δ SELL";
+    I.string a_label "Δ SELL  ";
     col 12 a_label "SELL VAL";
+    I.string a_border " │ ";
     col 19 a_label "";
   ] in
 
@@ -482,20 +486,24 @@ let render_strategies w json =
       I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
       col 12 row_text (if mid > 0.0 then format_price mid else "--");
       col 8 spread_attr spread_str;
+      I.string a_border " │ ";
       col 12 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
       col 10 row_text (if hold_value > 0.01 then format_price hold_value else "--");
       col 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
       col 10 row_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
+      I.string a_border " │ ";
       col 12 (if near_buy then a_near_fill_green
               else if near_sell then a_near_sell_red
               else if buy_price > 0.0 then a_green else a_dim)
         (if buy_price > 0.0 then format_price buy_price else "--");
       col 8 buy_dist_attr buy_dist_str;
+      I.string a_border " │ ";
       col 6 (if sell_count > 0 then a_yellow else a_dim)
         (string_of_int sell_count);
       col 8 sell_dist_attr sell_dist_str;
       col 12 (if unrealized_profit >= 0.0 then a_green else a_red)
         (format_pnl unrealized_profit);
+      I.string a_border " │ ";
       gauge_img;
     ]
   ) strats in
@@ -610,18 +618,22 @@ let render_strategies w json =
         I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
         col 12 a_text (if mid > 0.0 then format_price mid else "--");
         col 8 a_dim spread_str;
+        I.string a_border " │ ";
         col 12 a_text (format_qty balance);
         col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
         col 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
         col 10 a_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
+        I.string a_border " │ ";
         col 12 a_dim "--";
         col 8 a_dim "--";
+        I.string a_border " │ ";
         col 6 (if sell_count > 0 then a_yellow else a_dim)
           (string_of_int sell_count);
         col 8 sell_dist_attr sell_dist_str;
         col 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green
                 else if unrealized_profit > 0.0 then a_dim else a_dim)
           (if sell_count > 0 then format_pnl unrealized_profit else "--");
+        I.string a_border " │ ";
         gauge_img;
       ] in
       Some (is_quote, img)
@@ -720,22 +732,6 @@ let render_strategies w json =
   in
   let main_table = I.vcat rows in
 
-  (* Per-exchange cash breakdown *)
-  let per_exch_cash = Hashtbl.create 8 in
-  List.iter (fun bal_json ->
-    let asset   = bal_json |?> "asset"   |> to_string_d "" in
-    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-    let exch    = bal_json |?> "exchange" |> to_string_d "" in
-    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT"
-                || asset = "ZUSD" || asset = "USDe" in
-    if is_quote && balance > 0.0 && exch <> "" then begin
-      let cur = try Hashtbl.find per_exch_cash exch with Not_found -> 0.0 in
-      Hashtbl.replace per_exch_cash exch (cur +. balance)
-    end
-  ) all_balances;
-  let per_exch_pairs = Hashtbl.fold (fun k v acc -> (k, v) :: acc) per_exch_cash [] in
-  let per_exch_sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) per_exch_pairs in
-
   (* Summary footer bar with aggregated portfolio metrics *)
   let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_bg ++ st bold)
                 else A.(fg c_red   ++ bg c_bg ++ st bold) in
@@ -755,22 +751,9 @@ let render_strategies w json =
     pipe;
     kv "Sell Val"  (format_pnl   total_up)        up_attr;
   ] in
-  (* Per-exchange cash breakdown line *)
-  let cash_breakdown =
-    if per_exch_sorted = [] then I.empty
-    else
-      let parts = List.map (fun (exch, bal) ->
-        I.hcat [
-          I.string A.(fg c_dim ++ bg c_bg) ("  " ^ exch_tag_of exch ^ ": ");
-          I.string A.(fg c_text ++ bg c_bg) (format_price bal);
-        ]
-      ) per_exch_sorted in
-      I.hcat (I.string A.(fg c_label ++ bg c_bg) "  cash" :: parts)
-  in
   let summary_section = I.vcat (List.filter (fun img -> I.height img > 0) [
     I.string A.(fg c_title ++ bg c_section_bg ++ st bold) (pad_right w "  SUMMARY");
     summary_bar;
-    cash_breakdown;
   ]) in
 
   I.vcat [ main_table; summary_section ]
