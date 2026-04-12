@@ -766,6 +766,14 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let all_assets = if has_lighter then "USDC" :: all_assets else all_assets in
   let all_assets = List.sort_uniq String.compare all_assets in
   
+  let lighter_assets = lighter_symbols
+                      |> List.map (fun symbol -> 
+                          if String.contains symbol '/' then String.split_on_char '/' symbol |> List.hd
+                          else symbol)
+                      |> List.sort_uniq String.compare
+                      |> fun assets -> "USDC" :: assets in
+  let lighter_assets = List.sort_uniq String.compare lighter_assets in
+  
   let () = try
     Kraken.Kraken_balances_feed.initialize all_assets;
     if has_hyperliquid then begin
@@ -773,7 +781,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.async (fun () -> Hyperliquid.Module.fetch_spot_balances_ws ())
     end;
     if has_ibkr then Ibkr.Balances.initialize ();
-    if has_lighter then Lighter.Balances.initialize all_assets;
+    if has_lighter then Lighter.Balances.initialize lighter_assets;
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
@@ -1863,6 +1871,7 @@ let monitor_non_active_assets () =
           (List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading) in
           
         Lwt_list.iter_s (fun exch_name ->
+          if exch_name = "lighter" then Lwt.return_unit else
           match Dio_exchange.Exchange_intf.Registry.get exch_name with
           | None -> Lwt.return_unit
           | Some (module Ex) ->
