@@ -323,12 +323,12 @@ let update_open_order_price ~symbol ~order_id ~new_price =
        let old_price = order.limit_price in
        let updated = { order with limit_price = Some new_price; last_updated = Unix.gettimeofday () } in
        Hashtbl.replace store.open_orders order_id updated;
-       Logging.info_f ~section "EAGER_PRICE_UPDATE %s [%s]: %s -> %.8f (qty=%.8f remaining=%.8f)"
+       Logging.debug_f ~section "EAGER_PRICE_UPDATE %s [%s]: %s -> %.8f (qty=%.8f remaining=%.8f)"
          order_id symbol
          (match old_price with Some p -> Printf.sprintf "%.8f" p | None -> "None")
          new_price order.order_qty order.remaining_qty
    | None ->
-       Logging.info_f ~section "EAGER_PRICE_UPDATE %s [%s] not in cache, skipping (new_price=%.8f)"
+       Logging.debug_f ~section "EAGER_PRICE_UPDATE %s [%s] not in cache, skipping (new_price=%.8f)"
          order_id symbol new_price);
   Mutex.unlock store.orders_mutex
 
@@ -531,7 +531,7 @@ let update_open_orders store (event : execution_event) =
        let qty_changed = abs_float (prev_oq -. stored_oq) > 1e-12 in
        let rq_changed = abs_float (prev_rq -. stored_rq) > 1e-12 in
        if price_changed || qty_changed || rq_changed then
-         Logging.info_f ~section
+         Logging.debug_f ~section
            "CACHE_OVERWRITE %s [%s] exec_type=%s status=%s: price %s->%s | qty %.8f->%.8f | remaining %.8f->%.8f"
            event.order_id event.symbol
            (string_of_exec_type event.exec_type)

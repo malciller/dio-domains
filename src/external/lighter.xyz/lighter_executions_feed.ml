@@ -102,7 +102,7 @@ let set_startup_snapshot_done () =
       ) stores;
       mark_startup_complete ()
     );
-    Logging.info ~section "Lighter open-order snapshot injected — domains may now activate";
+    Logging.debug_f ~section "Lighter open-order snapshot injected — domains may now activate";
     Concurrency.Exchange_wakeup.signal_all ()
   end
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
