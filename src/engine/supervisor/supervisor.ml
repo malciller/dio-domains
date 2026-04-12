@@ -1102,20 +1102,25 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   else
     Logging.info ~section "✓ Executions feed ready";
 
-  (* Balance readiness gate *)
+  (* Balance readiness gate — run all exchanges in parallel since
+     subscriptions are already in-flight. Sequential waits would
+     accumulate timeouts and delay Lighter by 10-20s unnecessarily. *)
   let%lwt balances_ready = 
-    let%lwt kraken_ready = 
+    let kraken_p = 
       if has_kraken then Kraken.Kraken_balances_feed.wait_for_balance_data all_assets 10.0
       else Lwt.return_true
     in
-    let%lwt hl_ready = 
+    let hl_p = 
       if has_hyperliquid then Hyperliquid.Balances.wait_until_ready ()
       else Lwt.return_true
     in
-    let%lwt lighter_ready =
-      if has_lighter then Lighter.Balances.wait_for_balance_data ["USDC"; "ETH"] 10.0
+    let lighter_p =
+      if has_lighter then Lighter.Balances.wait_for_balance_data ["USDC"; "ETH"] 60.0
       else Lwt.return_true
     in
+    let%lwt kraken_ready = kraken_p
+    and hl_ready = hl_p
+    and lighter_ready = lighter_p in
     Lwt.return (kraken_ready && hl_ready && lighter_ready)
   in
   if not balances_ready then
