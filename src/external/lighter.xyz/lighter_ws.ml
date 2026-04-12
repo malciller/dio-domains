@@ -68,6 +68,10 @@ let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
 
+(** Guards pinging the private side until we've received real data
+    confirming the DO proxy's upstream relay is working. *)
+let private_stream_confirmed = Atomic.make false
+
 (** Diagnostic counters for message types flowing through the WS. *)
 
 let msg_counter_orderbook = Atomic.make 0
@@ -224,6 +228,9 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   | Websocket.Frame.Opcode.Text ->
       Concurrency.Tick_event_bus.publish_tick ();
       on_heartbeat ();
+      (* Mark private stream as confirmed on first real data *)
+      if state == private_state && not (Atomic.get private_stream_confirmed) then
+        Atomic.set private_stream_confirmed true;
       (try
         let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
         let msg_type =
@@ -318,10 +325,10 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
     Lwt_mutex.with_lock state.connection_mutex (fun () ->
       state.active_connection := Some conn;
       Atomic.set state.is_connected_ref true;
-      (* Seed pong time to now so early pings during DO cold-start
-         don't immediately fail (the proxy needs time to establish
-         its upstream WS before it can relay pongs). *)
-      state.last_pong_time := Unix.gettimeofday ();
+      (* Reset private stream confirmation — pings are suppressed
+         until we receive real data confirming the relay is alive. *)
+      if state == private_state then
+        Atomic.set private_stream_confirmed false;
       Lwt_condition.broadcast state.connected_wakeup ();
       Lwt.return_unit
     ) >>= fun () ->
@@ -586,7 +593,14 @@ let send_ping ~req_id:_ ~timeout_ms =
     ) (fun _ -> Lwt.return false)
   in
   
-  Lwt.both (ping_one public_state "Public") (ping_one private_state "Private") >>= fun (pub_ok, priv_ok) ->
+  (* Don't ping the private side until the stream is confirmed alive.
+     The DO proxy needs time to establish its upstream relay; pinging
+     before any data arrives is meaningless and causes false failures. *)
+  let priv_p =
+    if not (Atomic.get private_stream_confirmed) then Lwt.return true
+    else ping_one private_state "Private"
+  in
+  Lwt.both (ping_one public_state "Public") priv_p >>= fun (pub_ok, priv_ok) ->
   if pub_ok && priv_ok then begin
     reset_ping_failures ();
     Lwt.return true
