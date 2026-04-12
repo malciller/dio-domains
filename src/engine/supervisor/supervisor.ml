@@ -449,7 +449,7 @@ let monitor_loop () =
                       end
                   | Connected, _ ->
                       (* Active ping/pong liveness for authenticated connections *)
-                      if String.equal conn.name "kraken_auth_ws" || String.equal conn.name "hyperliquid_ws" then begin
+                      if String.equal conn.name "kraken_auth_ws" || String.equal conn.name "hyperliquid_ws" || String.equal conn.name "lighter_ws" then begin
                         let should_ping =
                           match conn.last_ping_sent with
                           | None -> true  (* First ping *)
