@@ -73,6 +73,7 @@ let json_of_domains () =
 
 let json_of_grid_strategy symbol =
   let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  let market_is_closed = state.exchange_id = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
   `Assoc [
     "type", `String "Grid";
     "buy_price", json_of_float_opt state.last_buy_order_price;
@@ -84,7 +85,7 @@ let json_of_grid_strategy symbol =
     "accumulated_profit", `Float state.accumulated_profit;
     "reserved_base", `Float state.reserved_base;
     "reserved_quote", `Float state.reserved_quote;
-    "capital_low", `Bool state.capital_low;
+    "capital_low", `Bool (state.capital_low || market_is_closed);
     "asset_low", `Bool state.asset_low;
     "inflight_buy", `Bool state.inflight_buy;
     "inflight_sell", `Bool state.inflight_sell;
@@ -99,6 +100,7 @@ let json_of_grid_strategy symbol =
 
 let json_of_mm_strategy symbol =
   let state = Dio_strategies.Market_maker.get_strategy_state symbol in
+  let market_is_closed = state.exchange_id = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
   `Assoc [
     "type", `String "MM";
     "buy_price", json_of_float_opt state.last_buy_order_price;
@@ -107,7 +109,7 @@ let json_of_mm_strategy symbol =
       `Assoc ["id", `String oid; "price", `Float price; "qty", `Float qty]
     ) state.open_sell_orders);
     "sell_count", `Int (List.length state.open_sell_orders);
-    "capital_low", `Bool state.capital_low;
+    "capital_low", `Bool (state.capital_low || market_is_closed);
     "asset_low", `Bool state.asset_low;
     "inflight_buy", `Bool state.inflight_buy;
     "inflight_sell", `Bool state.inflight_sell;
