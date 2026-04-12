@@ -902,10 +902,14 @@ let render_memory w json =
 
   let total_kb = float_of_int (live + free) in
   let live_ratio = if total_kb > 0.0 then (float_of_int live) /. total_kb else 0.0 in
+  
+  let space_overhead = mem |?> "space_overhead" |> to_int_d 80 in
+  let expected_live_ratio = 100.0 /. (100.0 +. float_of_int space_overhead) in
+  let normalized_pressure = if expected_live_ratio > 0.0 then live_ratio /. expected_live_ratio else 0.0 in
 
   let now = Unix.gettimeofday () in
   if now -. !pressure_last_time >= 1.0 then begin
-    pressure_hist.(!pressure_hist_idx) <- live_ratio;
+    pressure_hist.(!pressure_hist_idx) <- normalized_pressure;
     pressure_hist_idx := (!pressure_hist_idx + 1) mod pressure_max_len;
     pressure_last_time := now;
   end;
@@ -921,7 +925,7 @@ let render_memory w json =
     let offset = if offset < 0 then offset + pressure_max_len else offset in
     let ratio = pressure_hist.(offset) in
     
-    let v = int_of_float (ratio *. 16.0) in
+    let v = int_of_float (ratio *. 8.0) in
     let v = max 0 (min 16 v) in
     let t_idx, b_idx = if v <= 8 then (0, v) else (v - 8, 8) in
 
@@ -929,8 +933,8 @@ let render_memory w json =
     let s_bot = pressure_blocks.(b_idx) in
 
     let attr = 
-      if ratio < 0.5 then A.(fg c_green ++ bg c_bg)
-      else if ratio < 0.85 then A.(fg c_yellow ++ bg c_bg)
+      if ratio <= 1.05 then A.(fg c_green ++ bg c_bg)
+      else if ratio <= 1.35 then A.(fg c_yellow ++ bg c_bg)
       else A.(fg c_red ++ bg c_bg)
     in
     
