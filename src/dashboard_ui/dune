@@ -1,0 +1,4 @@
+(library
+ (name dashboard_ui)
+ (public_name dio.dashboard_ui)
+ (libraries notty notty.unix yojson unix))
