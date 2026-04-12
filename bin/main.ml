@@ -380,6 +380,16 @@ let () =
           (* Run a full major GC so live_words reflects current allocation. *)
           Gc.full_major ();
           let s = Gc.stat () in
+          
+          (* Conditionally compact if free space exceeds 1.5x live space
+             to suppress unbounded heap metric growth from fragmentation. *)
+          let s =
+            if (s.heap_words - s.live_words) > (s.live_words * 3 / 2) then begin
+              Gc.compact ();
+              Gc.stat ()
+            end else s
+          in
+          
           let heap_mb = s.heap_words * (Sys.word_size / 8) / 1048576 in
           let live_kb = s.live_words * (Sys.word_size / 8) / 1024 in
           let free_kb = (s.heap_words - s.live_words) * (Sys.word_size / 8) / 1024 in
