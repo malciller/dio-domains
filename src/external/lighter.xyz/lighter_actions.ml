@@ -1,29 +1,20 @@
-(** Lighter order actions.
-    WebSocket-first order dispatch with REST fallback.
-    Signs transactions via [lighter_signer.ml] FFI, then sends via WS
-    [jsonapi/sendtx] when connected, falling back to REST [POST /api/v1/sendTx]
-    when WebSocket is unavailable. REST fallback routes through the proxy
-    when LIGHTER_PROXY is configured. *)
+(** Lighter order actions and dispatch mechanisms.
+    This module implements the primary interface for order execution on the Lighter exchange, utilizing a dual transport strategy. It prioritizes WebSocket based order dispatch via the [jsonapi/sendtx] message type when the connection is active. In scenarios where the WebSocket connection is degraded or unavailable, it automatically falls back to utilizing the REST interface at [POST /api/v1/sendTx]. Transaction signing is handled securely through the [lighter_signer.ml] Foreign Function Interface. All REST fallback requests are automatically routed through the configured LIGHTER_PROXY address to maintain architectural consistency. *)
 
 open Lwt.Infix
 
 let section = "lighter_actions"
 
-(** Atomic counter for generating unique client_order_index values.
-    Initialized from current epoch milliseconds to avoid collisions with
-    indexes used by previous engine runs. Lighter requires client_order_index
-    to be globally unique across all markets. *)
+(** Atomic counter mechanism for generating unique client order identifiers.
+    This counter is required to produce a globally unique client order index for every order placement across all markets as mandated by the Lighter protocol. To prevent indexing collisions across process restarts and concurrent instance executions, the counter is securely initialized using the current system epoch time in milliseconds. *)
 let client_order_counter =
   Atomic.make (int_of_float (Unix.gettimeofday () *. 1000.0))
 
 let next_client_order_index () =
   Int64.of_int (Atomic.fetch_and_add client_order_counter 1)
 
-(** Send a signed transaction via REST.
-    The Python SDK passes the raw Go signer tx_info output unchanged to the
-    REST endpoint (confirmed from signer_client.py create_order → send_tx).
-    Lighter expects multipart/form-data with fields:
-      tx_type=<int>, tx_info=<json-string> *)
+(** Dispatches a signed transaction array over the REST protocol fallback.
+    This function construct a multipart form data payload that adheres to the Lighter API specification. It accepts the raw transaction information produced by the Go signer, similar to the behavior observed in the Python SDK implementation. The required form data fields are the transaction type represented as an integer and the transaction info represented as a JSON string. *)
 let send_tx ~tx_type ~tx_info =
   let url = Lighter_proxy.api_base_url () ^ "/api/v1/sendTx" in
   Logging.debug_f ~section "Sending tx via REST (type=%d, tx_info=%s)" tx_type tx_info;
@@ -52,10 +43,7 @@ let send_tx ~tx_type ~tx_info =
     end else begin
       Logging.error_f ~section "REST sendTx failed (status=%s): %s"
         (Cohttp.Code.string_of_status status) resp_str;
-      (* Auto-recover from nonce desync. Ghost modifies during WS disconnect
-         consume nonces locally but may fail on-chain, causing the local
-         counter to diverge. Re-fetch the correct nonce from the exchange
-         so subsequent operations don't get stuck in an "invalid nonce" loop. *)
+      (* Implement non-blocking auto recovery sequence for cryptographic nonce desynchronization. Ghost modifications executed during periods of WebSocket disconnection will consume nonce values locally but may fail to confirm on the blockchain. This behavior causes the local counter state to diverge from the exchange state. By re-fetching the correct nonce directly from the exchange, subsequent order operations are protected from entering an invalid nonce recursive failure loop. *)
       let lower = String.lowercase_ascii resp_str in
       if String.length lower > 0 then begin
         let rec find_sub s sub i =
@@ -64,7 +52,7 @@ let send_tx ~tx_type ~tx_info =
           else find_sub s sub (i + 1)
         in
         if find_sub lower "invalid nonce" 0 then begin
-          Logging.warn_f ~section "Nonce desync detected — re-fetching correct nonce from exchange";
+          Logging.warn_f ~section "Nonce desync detected. Re-fetching correct nonce from exchange.";
           let base_url = Lighter_proxy.api_base_url () in
           Lwt.dont_wait
             (fun () ->
@@ -84,7 +72,8 @@ let send_tx ~tx_type ~tx_info =
     Lwt.return (Error err)
   )
 
-(** Place a new order on Lighter. *)
+(** Executes a new order placement on the Lighter exchange.
+    This function converts standard system order parameters into the specific numerical formats required by the Lighter protocol and initiates the transaction signing process. It proactively injects the order into the local execution feed using the client order index as the temporary order identifier until the exchange confirms the formal order index. *)
 let place_order ~symbol ~is_buy ~qty ~price
     ?(order_type=Lighter_types.Types.Limit)
     ?(tif=Lighter_types.Types.GTC)
@@ -107,9 +96,7 @@ let place_order ~symbol ~is_buy ~qty ~price
             ~decimals:info.supported_price_decimals price in
           let lighter_ot = Lighter_types.lighter_order_type_int order_type in
           let lighter_tif = Lighter_types.lighter_tif_int ~post_only tif in
-          (* Lighter requires GTT (Good Till Time) — no GTC support.
-             Pass -1 to let the Go signer compute the default expiry
-             (Python SDK: DEFAULT_28_DAY_ORDER_EXPIRY = -1). *)
+          (* Note that the Lighter protocol necessitates the use of Good Till Time semantics, as Good Till Cancelled logic is not natively supported. A constant value of negative one is passed to instruct the Go signer tool to automatically calculate and apply the default standard order expiration period, mirroring the implementation found in the Python SDK. *)
           let expiry = Int64.of_int (-1) in
 
           let tx_info = Lighter_signer.sign_create_order
@@ -123,7 +110,7 @@ let place_order ~symbol ~is_buy ~qty ~price
                let order_id = Int64.to_string client_order_index in
                Logging.info_f ~section "Order placed: %s [%s] %s %.8f @ %.2f (market=%d)"
                  order_id symbol (if is_buy then "BUY" else "SELL") qty price market_index;
-               (* Proactively inject into open orders (client index = cl_ord_id until WS assigns order_index). *)
+               (* Proactively inject the new order record into the open orders state tracking container. The client index value is utilized as the temporary client order identifier until the WebSocket feed formally assigns and confirms the final sequence order index. *)
                let side = if is_buy then Lighter_executions_feed.Buy else Lighter_executions_feed.Sell in
                Lighter_executions_feed.inject_order ~symbol ~order_id ~side ~qty ~price ~cl_ord_id:order_id ();
                Lwt.return (Ok {
@@ -136,7 +123,8 @@ let place_order ~symbol ~is_buy ~qty ~price
                  symbol (if is_buy then "BUY" else "SELL") qty price msg;
                Lwt.return (Error msg))
 
-(** Cancel an order on Lighter. *)
+(** Initiates the cancellation of a previously placed order on the Lighter exchange.
+    This function derives the required market index and specific order index, generates the requisite cryptographic signature for the cancellation request, and transmits the signed payload via the appropriate transaction channels. *)
 let cancel_order ~symbol ~order_id =
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None ->
@@ -153,7 +141,8 @@ let cancel_order ~symbol ~order_id =
            Logging.error_f ~section "Cancel failed: %s [%s]: %s" order_id symbol msg;
            Lwt.return (Error msg))
 
-(** Modify an existing order on Lighter. *)
+(** Submits a modification request for an active order on the Lighter exchange.
+    This process recalculates the internal Lighter integer representations for both base amount and price, processes the transaction signature for the modification, and transmits the new parameters while preserving the original order identity. *)
 let modify_order ~symbol ~order_id ~new_qty ~new_price =
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None ->
@@ -184,7 +173,8 @@ let modify_order ~symbol ~order_id ~new_qty ~new_price =
                Logging.error_f ~section "Modify failed: %s [%s]: %s" order_id symbol msg;
                Lwt.return (Error msg))
 
-(** Cancel all orders for a market on Lighter. *)
+(** Triggers a mass cancellation sequence for all active orders associated with a specific market on the Lighter exchange.
+    The function identifies the target market index and constructs a specialized comprehensive cancellation transaction, thereby clearing the entire order book state for the specified symbol. *)
 let cancel_all_orders ~symbol =
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None ->

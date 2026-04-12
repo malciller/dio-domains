@@ -1,20 +1,22 @@
-(** US equity market hours logic for IBKR.
+(** Provides the core US equity market hours evaluation logic for the Interactive Brokers connection manager.
 
-    Determines whether US equity markets are currently within the
-    extended trading window (pre-market through after-hours) so the
-    supervisor can avoid futile reconnection attempts outside market
-    hours when IB Gateway rejects contract resolution requests.
+    This module evaluates whether US equity markets are currently operating within the
+    extended trading session, spanning from pre-market open through after-hours close. This state
+    evaluation is critical for the supervisor component, which utilizes this status to suspend
+    connection and contract resolution attempts during market closures, thereby preventing
+    unnecessary overhead and gateway rejection cycles.
 
-    Extended hours: 4:00 AM – 8:00 PM ET, Monday–Friday.
-    Holidays are NOT tracked — the gateway will reject once and the
-    supervisor will sleep until the next day's window. *)
+    The defined extended trading window is from 4:00 AM to 8:00 PM Eastern Time, Monday through Friday.
+    Note that specific exchange holidays are not independently tracked. In the event of a holiday closure,
+    the gateway will issue a single rejection, prompting the supervisor to automatically defer operations
+    until the subsequent valid trading window. *)
 
 let section = "ibkr_market_hours"
 
-(** US Eastern Time UTC offset, accounting for DST.
-    DST (EDT, UTC-4): second Sunday in March 2:00 AM to
-    first Sunday in November 2:00 AM.
-    Standard (EST, UTC-5): rest of the year. *)
+(** Computes the current UTC offset for US Eastern Time, dynamically adjusting for Daylight Saving Time.
+    The Daylight Saving Time configuration (EDT, UTC-4) applies from 2:00 AM on the second Sunday in March
+    until 2:00 AM on the first Sunday in November. For all other periods, the standard time configuration 
+    (EST, UTC-5) is returned. *)
 let us_eastern_offset_hours () =
   let t = Unix.gettimeofday () in
   let tm = Unix.gmtime t in
@@ -46,7 +48,7 @@ let us_eastern_offset_hours () =
   ignore year;
   if t >= dst_start && t < dst_end then -4 else -5
 
-(** Convert current UTC time to US Eastern hour and minute. *)
+(** Calculates the current day of the week, hour, and minute localized to US Eastern Time based on the current UTC timestamp and daylight saving adjustments. *)
 let current_eastern_time () =
   let t = Unix.gettimeofday () in
   let offset = us_eastern_offset_hours () in
@@ -54,14 +56,15 @@ let current_eastern_time () =
   let tm = Unix.gmtime eastern_t in
   (tm.Unix.tm_wday, tm.Unix.tm_hour, tm.Unix.tm_min)
 
-(** Extended trading window: 4:00 AM – 8:00 PM ET, Monday–Friday. *)
+(** Defines the operational hour and minute boundaries for the extended US equity trading session, spanning from 4:00 AM to 8:00 PM Eastern Time. *)
 let extended_open_hour = 4
 let extended_open_min = 0
 let extended_close_hour = 20
 let extended_close_min = 0
 
-(** [is_market_open ()] returns [true] if the current time falls within
-    the extended US equity trading window (4:00 AM – 8:00 PM ET, Mon–Fri). *)
+(** Evaluates the current system time against the predefined US equity extended trading schedule.
+    Returns [true] if the current time resides within the 4:00 AM to 8:00 PM Eastern Time window on a weekday,
+    indicating that the Interactive Brokers gateway is expected to accept connection and routing requests. *)
 let is_market_open () =
   let (wday, hour, min) = current_eastern_time () in
   (* Monday=1 through Friday=5; Saturday=6, Sunday=0 *)
@@ -73,8 +76,9 @@ let is_market_open () =
     let close_mins = extended_close_hour * 60 + extended_close_min in
     time_mins >= open_mins && time_mins < close_mins
 
-(** [seconds_until_next_open ()] returns the number of seconds until the
-    next extended-hours market open. Returns 0.0 if already within the window. *)
+(** Calculates the precise duration in seconds until the commencement of the next valid extended trading session.
+    If the market is currently evaluated as open, this function returns 0.0. The calculation comprehensively accounts
+    for weekend rollovers and time zone offsets to accurately target the next 4:00 AM Eastern Time opening sequence. *)
 let seconds_until_next_open () =
   if is_market_open () then 0.0
   else begin
@@ -111,7 +115,9 @@ let seconds_until_next_open () =
     Float.max delta 1.0
   end
 
-(** Human-readable market status for logging. *)
+(** Generates an exact, human-readable string representation of the current US equity market session status.
+    This output is utilized by the telemetry and logging systems to provide clear operational context regarding
+    pre-market, regular, after-hours, or closed states. *)
 let market_status_string () =
   let (wday, hour, min) = current_eastern_time () in
   let is_weekday = wday >= 1 && wday <= 5 in
@@ -132,7 +138,9 @@ let market_status_string () =
       "open (regular hours)"
   end
 
-(** Log the current market status once at startup or reconnection. *)
+(** Dispatches an informational log entry detailing the current market session status and the calculated time
+    until the next trading window. This operation is typically invoked during system initialization and upon successful
+    reconnection cycles to establish the operational baseline. *)
 let log_market_status () =
   let status = market_status_string () in
   let secs = seconds_until_next_open () in

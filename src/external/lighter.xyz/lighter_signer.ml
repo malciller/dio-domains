@@ -1,21 +1,19 @@
-(** Lighter signer FFI binding.
-    Binds to the precompiled lighter_signer shared library (.dylib/.so)
-    using OCaml ctypes for native-speed EdDSA/BabyJubJub/Poseidon signing.
-    Thread safety: all FFI calls are serialized through [signer_mutex]
-    since the Go shared library's internal state is not thread-safe. *)
+(** Provides Foreign Function Interface bindings to the precompiled Lighter signer shared library.
+    Integrates OCaml with the underlying native library using ctypes to enable highly performant EdDSA, BabyJubJub, and Poseidon cryptographic signing operations.
+    Concurrency considerations dictate that all Foreign Function Interface calls must be strictly serialized utilizing the internal Mutex, as the underlying Go shared library does not guarantee thread safety for its internal state structures. *)
 
 let section = "lighter_signer"
 
 open Lwt.Infix
 
-(* --- Dynamic library loading (deferred until first use) --- *)
+(* Dynamic Library Initialization Module *)
 
 let lib_path =
   match Sys.getenv_opt "LIGHTER_SIGNER_LIB_PATH" with
   | Some p -> p
   | None ->
-      (* Auto-detect platform-appropriate default.
-         Sys.os_type is "Unix" on both macOS and Linux; distinguish via /proc. *)
+      (* Implement platform detection logic to identify the operating system executing the process.
+         The system architecture returns Unix for both macOS and Linux environments, necessitating a filesystem check against the proc directory to disambiguate the platform. *)
       let os =
         if Sys.file_exists "/proc" then "linux"
         else "darwin"
@@ -52,21 +50,21 @@ let lib = lazy (
 
 let get_lib () = Lazy.force lib
 
-(* --- FFI function bindings (deferred) --- *)
+(* Foreign Function Interface Bindings Declaration *)
 
 open Ctypes
 open Foreign
 
-(* --- C struct types matching the Go shared library --- *)
+(* Foreign Function Interface Structure Definitions corresponding to the underlying Go library types *)
 
-(** StrOrErr { str *char; err *char } — returned by CreateAuthToken *)
+(** Structure representing either a string pointer or an error pointer returned by the authentication token creation process. *)
 type str_or_err
 let str_or_err : str_or_err structure typ = structure "StrOrErr"
 let str_or_err_str = field str_or_err "str" (ptr_opt char)
 let str_or_err_err = field str_or_err "err" (ptr_opt char)
 let () = seal str_or_err
 
-(** SignedTxResponse { txType uint8; txInfo *char; txHash *char; messageToSign *char; err *char } *)
+(** Structure representing the signed transaction response containing transaction type, transaction information payload, transaction hash, the raw message designated for signing, and an optional error pointer. *)
 type signed_tx_response
 let signed_tx_response : signed_tx_response structure typ = structure "SignedTxResponse"
 let _stx_tx_type = field signed_tx_response "txType" uint8_t
@@ -76,7 +74,7 @@ let _stx_message = field signed_tx_response "messageToSign" (ptr_opt char)
 let stx_err      = field signed_tx_response "err" (ptr_opt char)
 let () = seal signed_tx_response
 
-(* --- Memory management for C strings --- *)
+(* Memory Allocation and Cleanup Management for Foreign Function Interface Strings *)
 let go_free_ffi = lazy (
   foreign "Free" ~from:(get_lib ()) (ptr void @-> returning void)
 )
@@ -104,7 +102,7 @@ let read_c_string_and_free p_opt =
       safe_free p_opt;
       s
 
-(** Helper: extract the txInfo string from a SignedTxResponse, freeing all fields. *)
+(** Extracts the transaction information string payload from a signed transaction response structure and subsequently deallocates all associated unmanaged memory pointers to prevent memory leaks. *)
 let extract_signed_tx (resp : signed_tx_response structure) : string =
   let err_ptr = getf resp stx_err in
   let info_ptr = getf resp stx_tx_info in
@@ -117,13 +115,11 @@ let extract_signed_tx (resp : signed_tx_response structure) : string =
   if err_str <> "" then failwith (Printf.sprintf "Signer FFI error: %s" err_str)
   else info_str
 
-(* Lighter mainnet chain ID.
-   Python SDK: chain_id = 304 if ("mainnet" in url or "api" in url) else 300
-   Our proxy forwards to mainnet.zklighter.elliot.ai, so chain_id = 304. *)
+(* Defines the cryptographic chain identifier for the Lighter mainnet environment.
+   The integration logic routes traffic through a specific proxy directed to the mainnet endpoint, thereby setting the chain identifier deterministically to 304 for all corresponding operations. *)
 let chain_id = ref 304
 
-(** CreateClient(url, privateKey, chainId, apiKeyIndex, accountIndex) -> error *char
-    Note: accountIndex is C.longlong (int64) in Go. *)
+(** Initializes a new client instance within the Foreign Function Interface utilizing the provided connection uniform resource locator, private cryptographic key, chain identifier, application programming interface key index, and account index. The account index is represented as a 64 bit integer corresponding to the underlying Go long long type. Returns an optional error string pointer. *)
 let create_client =
   lazy (
     let ffi_fn = foreign "CreateClient" ~from:(get_lib ())
@@ -133,8 +129,7 @@ let create_client =
       read_c_string_and_free err_ptr
   )
 
-(** CheckClient(apiKeyIndex, accountIndex) -> error *char
-    accountIndex is C.longlong (int64) in Go. *)
+(** Validates the operational status of an existing client instance within the Foreign Function Interface utilizing the application programming interface key index and the 64 bit integer account index. Returns an optional error string pointer indicating the status of the client initialization. *)
 let check_client =
   lazy (
     let ffi_fn = foreign "CheckClient" ~from:(get_lib ())
@@ -144,8 +139,7 @@ let check_client =
       read_c_string_and_free err_ptr
   )
 
-(** CreateAuthToken(deadline, apiKeyIndex, accountIndex) -> StrOrErr
-    accountIndex is C.longlong (int64) in Go. *)
+(** Generates a cryptographic authentication token via the Foreign Function Interface bound by the specified deadline timestamp, using the application programming interface key index and the 64 bit integer account index. Returns a structure encapsulating either the generated token string pointer or an error string pointer. *)
 let create_auth_token_ffi =
   lazy (
     let ffi_fn = foreign "CreateAuthToken" ~from:(get_lib ())
@@ -158,8 +152,7 @@ let create_auth_token_ffi =
       else str_str
   )
 
-(** SignCreateOrder — full Go signature with all 17 parameters.
-    We pass 0 for integrator fields and skipNonce=0 since we manage nonces ourselves. *)
+(** Computes the digital signature for an order creation request utilizing the exhaustive set of 17 parameters mandated by the underlying Go library implementation. Integrator specific fields and the skip nonce parameter are configured to deterministic null values, delegating the responsibility of continuous nonce synchronization to the internal OCaml state management. *)
 let sign_create_order_ffi =
   lazy (
     let ffi_fn = foreign "SignCreateOrder" ~from:(get_lib ())
@@ -180,7 +173,7 @@ let sign_create_order_ffi =
       extract_signed_tx resp
   )
 
-(** SignCancelOrder(marketIndex, orderIndex, skipNonce, nonce, apiKeyIndex, accountIndex) *)
+(** Computes the digital signature for an order cancellation request bounded by the target market index, specific order identifier, cryptographic nonce value, application programming interface key index, and account identifier within the Foreign Function Interface. *)
 let sign_cancel_order_ffi =
   lazy (
     let ffi_fn = foreign "SignCancelOrder" ~from:(get_lib ())
@@ -195,9 +188,7 @@ let sign_cancel_order_ffi =
       extract_signed_tx resp
   )
 
-(** SignModifyOrder(marketIndex, orderIndex, baseAmount, price, triggerPrice,
-    integratorAccountIndex, integratorTakerFee, integratorMakerFee,
-    skipNonce, nonce, apiKeyIndex, accountIndex) *)
+(** Computes the digital signature for an order modification transaction, authorizing adjustments to the base fractional amount and price parameters for a specific order identifier within the targeted market index. Handles parameter serialization required for the Foreign Function Interface invocation, including default assignments for integrator specific variables and manual nonce provisioning. *)
 let sign_modify_order_ffi =
   lazy (
     let ffi_fn = foreign "SignModifyOrder" ~from:(get_lib ())
@@ -216,7 +207,7 @@ let sign_modify_order_ffi =
       extract_signed_tx resp
   )
 
-(** SignCancelAllOrders(timeInForce, time, skipNonce, nonce, apiKeyIndex, accountIndex) *)
+(** Computes the digital signature for a comprehensive cancellation command targeting all active orders within a specific market, utilizing the current system timestamp and local cryptographic nonce to satisfy the signing requirements of the Foreign Function Interface. *)
 let sign_cancel_all_orders_ffi =
   lazy (
     let ffi_fn = foreign "SignCancelAllOrders" ~from:(get_lib ())
@@ -231,7 +222,7 @@ let sign_cancel_all_orders_ffi =
       extract_signed_tx resp
   )
 
-(* --- Thread safety --- *)
+(* Concurrency Management and Mutual Exclusion Controls *)
 
 let signer_mutex = Mutex.create ()
 
@@ -241,7 +232,7 @@ let with_signer_lock f =
   Mutex.unlock signer_mutex;
   result
 
-(* --- Nonce management --- *)
+(* Cryptographic Nonce Synchronization and Trajectory Management *)
 
 let nonce_counter = Atomic.make 0
 
@@ -251,7 +242,7 @@ let get_and_increment_nonce () =
 let set_nonce n =
   Atomic.set nonce_counter n
 
-(** Fetch the next nonce from the REST API and initialize the counter. *)
+(** Establishes synchrony with the remote state by fetching the requisite cryptographic nonce via a representational state transfer request and subsequently updating the local atomic counter to mirror the server expectations. *)
 let initialize_nonce ~base_url ~api_key_index ~account_index =
   let url = Printf.sprintf "%s/api/v1/nextNonce?account_index=%d&api_key_index=%d"
     base_url account_index api_key_index in
@@ -278,17 +269,16 @@ let initialize_nonce ~base_url ~api_key_index ~account_index =
   in
   Lwt.pick [fetch; timeout]
 
-(* --- Configuration --- *)
+(* Local Operational State and Configuration Management *)
 
 let api_key_index = ref 0
 let account_index = ref 0
 
-(** Read accessors for nonce recovery. Used by lighter_actions to call
-    initialize_nonce when the exchange returns "invalid nonce". *)
+(** Provides read access to the locally cached application programming interface key and account identifiers. Facilitates external recovery procedures allowing upstream action modules to trigger resynchronization workflows when remote endpoints indicate state divergence regarding the expected sequence nonce. *)
 let get_api_key_index () = !api_key_index
 let get_account_index () = !account_index
 
-(** Initialize the signer client. Must be called before any signing operations. *)
+(** Orchestrates the initialization sequence for the underlying cryptographic signing client instance. Establish operational parameters including endpoint destinations, private keys, and deterministic indices before allowing any cryptographic signing operations to traverse the Foreign Function Interface boundaries. *)
 let initialize ~base_url ~private_key ~key_index ~acct_index =
   api_key_index := key_index;
   account_index := acct_index;
@@ -316,13 +306,12 @@ let initialize ~base_url ~private_key ~key_index ~acct_index =
       Ok ()
   end
 
-(* --- Auth token management --- *)
+(* Authentication Token Lifecycle and Expiration Management *)
 
 let cached_auth_token : string option ref = ref None
 let auth_token_expiry = ref 0.0
 
-(** Generate a fresh auth token valid for ~7 hours.
-    CreateAuthToken now returns the token string directly (not JSON). *)
+(** Provisions a new cryptographic authentication token configured with an extended validity threshold. Invokes the native Foreign Function Interface to construct the underlying token material and asserts the successful retrieval of a raw token string payload absent any serialized data structure encapsulation requirements. *)
 let refresh_auth_token () =
   let deadline = Int64.of_float (Unix.gettimeofday () +. (7.0 *. 3600.0)) in
   try
@@ -347,7 +336,7 @@ let get_auth_token () =
   | Some token when Unix.gettimeofday () < !auth_token_expiry -> token
   | _ -> refresh_auth_token ()
 
-(* --- Signing operations --- *)
+(* Cryptographic Transaction Signing Operational Implementations *)
 
 let sign_create_order
     ~market_index ~client_order_index ~base_amount ~price

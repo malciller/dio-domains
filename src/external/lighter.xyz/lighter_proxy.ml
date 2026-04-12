@@ -1,26 +1,28 @@
-(** Lighter proxy configuration.
-    Routes Lighter traffic through a Cloudflare Worker + Durable Object
-    reverse proxy to bypass CloudFront geo-restrictions.
+(** Modular networking component managing proxy routing for the Lighter exchange integration.
+    Handles the redirection of API requests and WebSocket streams through a distributed
+    edge network architecture to circumvent geographic access controls applied at the ingress layer.
     
-    Setup:
-      1. Deploy the proxy (from repo root):
+    Deployment Protocol:
+      1. Initialize the edge infrastructure routing namespace from the repository root:
            cd proxy/cloudflare && npx wrangler deploy
       
-      2. Set the environment variable:
+      2. Inject the routing pool definitions into the runtime environment:
            export LIGHTER_PROXY_URL=https://lighter-proxy.<subdomain>.workers.dev
     
-    When LIGHTER_PROXY_URL is set, all Lighter traffic (HTTP and WebSocket)
-    is routed through the proxy. The proxy runs on Cloudflare's edge
-    pinned to Western Europe, making requests appear to originate from there.
+    If the LIGHTER_PROXY_URL parameter is populated, the routing engine enforces 
+    proxy utilization for all bidirectional traffic channels. The target infrastructure 
+    operates on localized persistent execution environments bound to valid jurisdictions.
     
-    When LIGHTER_PROXY_URL is unset, connections go directly to Lighter.
-    WebSocket uses readonly=true to bypass geo-restriction for read-only data. *)
+    If left undefined, the module defaults to standard direct connectivity mechanisms.
+    In direct mode, WebSocket connections are synthesized with explicit read-only 
+    flags modifying the query parameters to bypass geographic ingress blocks. *)
 
 let section = "lighter_proxy"
 
 let consecutive_proxy_failures = Atomic.make 0
 
-(** Read a value from the .env file if it exists. *)
+(** Synchronous operating system read sequence parsing key-value pairs from localized
+    environment definition files, circumventing the primary process configuration. *)
 let read_dotenv key =
   try
     let ic = open_in ".env" in
@@ -40,19 +42,21 @@ let read_dotenv key =
     !result
   with Sys_error _ -> None
 
-(** Resolve an env variable: check process environment first, then .env file. *)
+(** Resolves targeted execution parameters by sequentially interrogating the
+    process environment space before falling back to localized file parsing logic. *)
 let env_or_dotenv key =
   match Sys.getenv_opt key |> Option.map String.trim with
   | Some s when s <> "" -> Some s
   | _ -> read_dotenv key
 
-(** The real Lighter API hostname. *)
+(** Primary destination hostname mapped to the exchange's core execution network. *)
 let direct_hostname = "mainnet.zklighter.elliot.ai"
 
-(** The real Lighter API base URL for REST calls. *)
+(** Primary REST interface URL mapped to the exchange's core execution network. *)
 let direct_base_url = "https://mainnet.zklighter.elliot.ai"
 
-(** Parsed proxy URLs from LIGHTER_PROXY_URL (comma-separated list). *)
+(** Instantiated pool of proxy endpoints extracted from the targeted environment
+    variable and tokenized utilizing delimiter processing logic. *)
 let proxy_urls : string list =
   match env_or_dotenv "LIGHTER_PROXY_URL" with
   | Some s when s <> "" ->
@@ -74,8 +78,9 @@ let proxy_urls : string list =
 
 let current_proxy_index = Atomic.make 0
 
-(** Rotates the active proxy to the next instance in the comma-separated list.
-    Called automatically on connection failure to support multi-account failover. *)
+(** Executes a circular state progression against the instantiated proxy pool index.
+    Triggered automatically by the connection manager upon intercepting localized
+    network failures to guarantee multi-account operational continuity sequences. *)
 let rotate_proxy () =
   let len = List.length proxy_urls in
   if len > 1 then begin
@@ -94,26 +99,28 @@ let has_more_proxies () =
   if len <= 1 then false
   else Atomic.get consecutive_proxy_failures < len - 1
 
-(** Returns the currently active proxy URL (if any). *)
+(** Resolves the current target connection URI mapped to the active execution state
+    of the proxy index sequence. Yields no value during direct connectivity modes. *)
 let proxy_url () =
   let len = List.length proxy_urls in
   if len = 0 then None
   else Some (List.nth proxy_urls (Atomic.get current_proxy_index))
 
-(** Whether a proxy is configured. *)
+(** Evaluates the initialization state of the proxy configuration pool to determine
+    if localized routing overrides are active within the current execution environment. *)
 let is_proxied () = List.length proxy_urls > 0
 
-(** Returns the base URL for REST API calls.
-    Proxied: https://your-proxy.deno.dev
-    Direct:  https://mainnet.zklighter.elliot.ai *)
+(** Computes the definitive REST API endpoint resolution sequence.
+    Proxied paths dynamically map to specified edge environments.
+    Direct paths default to the core deterministic exchange endpoint. *)
 let api_base_url () =
   match proxy_url () with
   | Some url -> url
   | None -> direct_base_url
 
-(** Returns the hostname and port to connect to for the private WebSocket.
-    Proxied: (your-proxy.workers.dev, 443)
-    Direct:  (mainnet.zklighter.elliot.ai, 443) *)
+(** Computes the localized socket resolution parameters for authenticated streams.
+    Extracts explicit hostname patterns and standard encrypted port mappings from the
+    active proxy configuration or defaults to the primary exchange coordinates. *)
 let private_ws_connect_target () =
   match proxy_url () with
   | Some url ->
@@ -123,19 +130,20 @@ let private_ws_connect_target () =
       (host, port)
   | None -> (direct_hostname, 443)
 
-(** Returns the hostname and port for the public WebSocket.
-    Always direct: (mainnet.zklighter.elliot.ai, 443) *)
+(** Computes the localized socket resolution parameters for unauthenticated pipelines.
+    Always maintains a direct routing topology bypassing the proxy architecture. *)
 let public_ws_connect_target () =
   (direct_hostname, 443)
 
-(** Returns the full WebSocket URL for public data.
-    Always direct to Lighter: wss://mainnet.zklighter.elliot.ai/stream?readonly=true *)
+(** Synthesizes the finalized WebSocket pipeline URI for aggregated market data.
+    Enforces direct connectivity using specialized read-only query parameters
+    to ensure geographic routing restrictions are correctly averted. *)
 let public_ws_url () =
   Printf.sprintf "wss://%s/stream?readonly=true" direct_hostname
 
-(** Returns the full WebSocket URL for private data.
-    Proxied: wss://your-proxy.workers.dev/stream
-    Direct:  wss://mainnet.zklighter.elliot.ai/stream *)
+(** Synthesizes the finalized WebSocket pipeline URI for authenticated session states.
+    Automatically transitions between direct and proxied routing topologies based
+    on the initialized configuration parameters extracted at runtime. *)
 let private_ws_url () =
   match proxy_url () with
   | Some url ->

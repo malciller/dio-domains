@@ -1,8 +1,9 @@
-(** Lighter executions feed.
-    Provides real-time order and trade event tracking via WebSocket subscriptions
-    to [account_all_orders/{ACCOUNT_ID}]. Maintains per-symbol execution ring
-    buffers, open order state, and event deduplication. Thread-safe access is
-    enforced through per-resource mutexes and atomic flags. *)
+(** Modular engine component for processing Lighter execution events.
+    Handles the ingestion and real-time synchronization of order updates
+    and trade data by consuming the account WebSocket subscriptions.
+    Each supported asset symbol is backed by an isolated locking scheme
+    that guards a dedicated ring buffer and hash table to process inbound
+    events with strict serialization and linearizability properties. *)
 
 
 
@@ -49,10 +50,14 @@ type execution_event = {
   cl_ord_id: string option;
 }
 
-(** Lock-free ring buffer used for execution event storage. *)
+(** Dedicated lock-free ring buffer structure allocated per trading pair
+    for ordered storage of real-time execution events. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol execution state container with readiness signalling. *)
+(** Isolated state container for a specific trading pair. Maintains
+    localized execution events, active order tracking structures, and
+    an atomic readiness flag to block downstream components until
+    market cache bootstrap is complete. Guarded by a dedicated mutex. *)
 type store = {
   events_buffer: execution_event RingBuffer.t;
   open_orders: (string, open_order) Hashtbl.t;
@@ -64,22 +69,28 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Global order_id to symbol index with adaptive capacity and FIFO eviction.
-    All access requires holding initialization_mutex. *)
+(** Global indexing structure mapping unique order identifiers to their
+    respective asset symbols. Incorporates dynamic capacity management
+    and chronological eviction policies. Operations modifying this index
+    must acquire the initialization lock. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 64
-(** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
+(** Chronological tracking structure enforcing first-in-first-out eviction
+    policies for the order-to-symbol global index. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-(** Adaptive capacity bound. Set to max_int (uncapped) during startup,
-    then locked to a bounded value after the initial snapshot completes. *)
+(** Threshold capacity variable governing the maximum index size. Initially
+    uncapped to allow complete ingestion of startup payloads, subsequently
+    constrained based on observed baseline system volume. *)
 let order_to_symbol_cap : int ref = ref max_int
 let order_to_symbol_startup_done = Atomic.make false
 
 
-(** Atomic flag set once after initial open orders snapshot completes. *)
+(** Synchronization primitive indicating successful completion of the
+    initial active orders ingestion sequence. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
-(** Lock the adaptive capacity after the startup snapshot is fully consumed.
-    Sets cap to max(32, observed * 1.5 + 1). Idempotent; only the first
-    invocation takes effect. *)
+(** Freezes the adaptive capacity threshold following the completion of
+    the initial execution snapshot. Computes a localized limit based on
+    startup volume to constrain index memory allocation. Re-invocation
+    is safely ignored. *)
 let mark_startup_complete () =
   if not (Atomic.exchange order_to_symbol_startup_done true) then begin
     (* Precondition: initialization_mutex is held by the caller. *)
@@ -92,8 +103,9 @@ let mark_startup_complete () =
 
 let set_startup_snapshot_done () =
   if not (Atomic.exchange _startup_snapshot_done true) then begin
-    (* Mark all initialized per-symbol stores as ready so has_execution_data
-       returns true even for symbols with zero open orders. *)
+    (* Broadcast initialization completion to all active localized stores.
+       Ensures downstream querying logic reports accurate readiness state
+       irrespective of initial open order volume. *)
     Mutex.lock initialization_mutex;
     Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
       Hashtbl.iter (fun _symbol store ->
@@ -102,29 +114,33 @@ let set_startup_snapshot_done () =
       ) stores;
       mark_startup_complete ()
     );
-    Logging.debug_f ~section "Lighter open-order snapshot injected — domains may now activate";
+    Logging.debug_f ~section "Lighter open-order snapshot injected. Core execution domains may now activate";
     Concurrency.Exchange_wakeup.signal_all ()
   end
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 
-(** Insert an order_id to symbol mapping, evicting the oldest entry when
-    the adaptive cap is exceeded. Caller must hold initialization_mutex. *)
+(** Injects an order identifier and its corresponding asset symbol into
+    the global index. Executes eviction routines if the adaptive capacity
+    threshold is eclipsed. Requires the caller to hold the initialization lock. *)
 let add_to_order_to_symbol order_id symbol =
   if not (Hashtbl.mem order_to_symbol order_id) then
     Queue.push order_id order_to_symbol_queue;
   Hashtbl.replace order_to_symbol order_id symbol;
-  (* Enforce capacity bound only after the startup snapshot has been consumed. *)
+  (* Execute chronological eviction processing only after the primary
+     startup sequence has finalized its operational capacity sizing. *)
   if Atomic.get order_to_symbol_startup_done then begin
     while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
       if Queue.is_empty order_to_symbol_queue then
-        (* Queue/table size diverged; accept current table size as the new cap. *)
+        (* Synchronize internal thresholds to the current state if
+           length invariants have diverged from queue metrics. *)
         order_to_symbol_cap := Hashtbl.length order_to_symbol
       else begin
         let oldest = Queue.pop order_to_symbol_queue in
         Hashtbl.remove order_to_symbol oldest
       end
     done;
-    (* Add hardcap to Queue because Hashtbl.length may stay small due to proactive removals *)
+    (* Reconcile capacity boundaries against the queue to eliminate
+       stale entries left by out-of-band removal requests. *)
     while Queue.length order_to_symbol_queue > !order_to_symbol_cap * 2 do
       if not (Queue.is_empty order_to_symbol_queue) then begin
         let oldest = Queue.pop order_to_symbol_queue in
@@ -133,8 +149,9 @@ let add_to_order_to_symbol order_id symbol =
     done
   end
 
-(** Retrieve or lazily create a per-symbol store. Uses double-checked
-    locking under initialization_mutex for thread-safe initialization. *)
+(** Resolves the specific state container assigned to the provided symbol.
+    Implements double-checked locking protocols to prevent data races
+    during lazy cache allocation operations. *)
 let get_symbol_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store
@@ -158,7 +175,8 @@ let notify_ready store =
   if not (Atomic.get store.ready) then Atomic.set store.ready true;
   (try Lwt_condition.broadcast ready_condition () with _ -> ())
 
-(** Core internal handler for order state transitions. *)
+(** Core deterministic transformation layer managing the lifecycle
+    transitions of tracked orders within local storage partitions. *)
 let update_orders_internal store (event : execution_event) =
   let now = Unix.gettimeofday () in
   Mutex.lock store.orders_mutex;
@@ -186,7 +204,8 @@ let update_orders_internal store (event : execution_event) =
         Hashtbl.remove order_to_symbol event.order_id
       )
     end else begin
-      (* Preserve existing order_expiry if present; event updates don't carry expiry. *)
+      (* Extract the expiration variable from historical tracking data
+         as differential event payloads lack termination scheduling fields. *)
       let preserved_expiry = match existing_opt with
         | Some o -> o.order_expiry
         | None -> None
@@ -257,7 +276,8 @@ let[@inline always] has_execution_data symbol =
   let store = get_symbol_store symbol in
   Atomic.get store.ready
 
-(** Find an order across all symbol stores using the global index. *)
+(** Executes a secondary lookup targeting active index entities across
+    all parallel stores by resolving the base symbol dependency first. *)
 let find_order_everywhere order_id =
   Mutex.lock initialization_mutex;
   let symbol_opt = Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
@@ -272,7 +292,9 @@ let find_order_everywhere order_id =
       )
   | None -> None
 
-(** Clear all open orders across all symbol stores. Called on reconnection. *)
+(** Triggers a destructive reset operation affecting all parallel
+    execution stores, erasing localized order tracking variables
+    during catastrophic connectivity events. *)
 let clear_all_open_orders () =
   Mutex.lock initialization_mutex;
   let all_symbols = Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
@@ -298,8 +320,9 @@ let clear_all_open_orders () =
   if !total_removed > 0 then
     Logging.debug_f ~section "Cleared %d stale open orders on reconnection" !total_removed
 
-(** Proactively inject an order into the open-orders table.
-    Used after place/amend to ensure immediate visibility. *)
+(** Proactively injects deterministic order parameters into the local
+    tracking state prior to receiving corresponding exchange validation.
+    Mitigates latency impacts associated with synchronous verification. *)
 let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id () =
   let store = get_symbol_store symbol in
   let now = Unix.gettimeofday () in
@@ -320,20 +343,22 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id () =
     order_id symbol (if side = Buy then "buy" else "sell") qty price
     (match cl_ord_id with Some c -> c | None -> "none")
 
-(** Process order updates from Lighter WebSocket account stream.
-    Lighter nests orders data under channel-specific keys, not "data". *)
+(** Primary ingest controller for discrete order updates dispatched by
+    the exchange via standard asynchronous broadcast mechanisms. *)
 let process_account_orders_update json =
   let open Yojson.Safe.Util in
   try
     let msg_type = (try member "type" json |> to_string with _ -> "unknown") in
-    (* Log all account order messages to diagnose tracking issues *)
+    (* Output serialized account message payloads directly for robust
+       protocol debugging and anomaly detection tasks. *)
     if Logging.will_log Logging.DEBUG section then begin
       let json_str = Yojson.Safe.to_string json in
       let truncated = if String.length json_str > 1500 then String.sub json_str 0 1500 ^ "..." else json_str in
       Logging.debug_f ~section "Account orders message (type=%s): %s" msg_type truncated
     end;
 
-    (* Lighter uses channel-specific data keys; try the most likely ones *)
+    (* Interrogate the unstructured payload against known deterministic
+       identifier keys implemented within the exchange serialization layer. *)
     let orders_json =
       let try_key key =
         let v = member key json in
@@ -353,15 +378,15 @@ let process_account_orders_update json =
         (try match json with `Assoc pairs -> String.concat ", " (List.map fst pairs) | _ -> "non-object" with _ -> "?");
       ()
     end else begin
-      (* Orders can be an array or an object (keyed by order_id).
-         Values in assoc may themselves be arrays of order objects. *)
+      (* Resolve unstructured arrays or nested key-value parameters into
+         standardized extraction primitives for uniform processing logic. *)
       let orders = match orders_json with
         | `Assoc pairs ->
             List.concat_map (fun (_key, v) ->
               match v with
-              | `Assoc _ -> [v]          (* single order object *)
-              | `List items -> items     (* array of orders under one key *)
-              | _ -> []                  (* skip non-object/non-array *)
+              | `Assoc _ -> [v]          (* Parse isolated object graph *)
+              | `List items -> items     (* Parse standardized sequential array *)
+              | _ -> []                  (* Prune unmatched unstructured variables *)
             ) pairs
         | `List items -> items
         | _ ->
@@ -386,10 +411,10 @@ let process_account_orders_update json =
           | None -> string_of_int market_index
         in
 
-        (* Lighter sends status as int codes or as strings (e.g. "canceled").
-           Do not use [parse_json_int] on string values: it maps bogus strings to 0,
-           which is the "InProgress" code — so "canceled" was misread as Pending and
-           the domain never ran [handle_order_cancelled]. *)
+        (* Convert serialized identification codes to standard internal types.
+           Prevents parsing layers from mapping unidentified alphanumeric
+           strings to default zero integers which could incorrectly trigger
+           pending status assignments and suppress execution workflows. *)
         let status_json = member "status" order_json in
         let map_int status_int =
           match Lighter_types.status_of_lighter_int status_int with
@@ -467,10 +492,10 @@ let process_account_orders_update json =
         let remaining = base_amount -. filled_base_amount in
         let avg_price = (try Lighter_types.parse_json_float (member "avg_fill_price" order_json) with _ -> price) in
 
-        (* Parse order expiry from the API. Lighter uses "e" in the Go struct,
-           but the REST/WS API may use "expiry" or "order_expiry". Try all.
-           Lighter returns expiry as epoch milliseconds; convert to seconds
-           to match Unix.gettimeofday(). *)
+        (* Extract defined numerical expiration constants from the exchange.
+           Supports multiple parameter names for backwards compatibility.
+           Translates native millisecond definitions into standardized
+           epoch variables aligned with internal state tracking logic. *)
         let order_expiry =
           let try_field key =
             try
@@ -494,10 +519,10 @@ let process_account_orders_update json =
         let is_amended = (try member "is_amended" order_json |> to_bool with _ -> false) in
         let now = Unix.gettimeofday () in
 
-        (* When the exchange confirms an order, it assigns a real order_id
-           (e.g., "577023702126945789") different from the client_order_index
-           (e.g., "1") we used locally. Remove the stale local entry to
-           prevent duplicates that confuse the strategy. *)
+        (* Execute deterministic substitution workflows upon detecting an
+           assigned exchange identifier differing from local index keys.
+           Prevents the execution system from diverging tracking variables
+           and emitting redundant downstream reconciliation payloads. *)
         let client_order_id = (try member "client_order_id" order_json |> to_string with _ -> "") in
         let cl_ord_id = if client_order_id <> "" then Some client_order_id else None in
         if client_order_id <> "" && client_order_id <> order_id then begin
@@ -527,9 +552,9 @@ let process_account_orders_update json =
         } in
         update_orders_internal store event;
 
-        (* Set order_expiry on the open order entry if we parsed one.
-           update_orders_internal won't have it because execution_event
-           doesn't carry expiry — we set it directly on the stored order. *)
+        (* Interject the explicit expiration target onto the underlying
+           recorded entity structure since standardized propagation events
+           omit expiration state from dynamic differential updates. *)
         let is_terminal_status = match order_status with
           | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
           | _ -> false
@@ -547,7 +572,7 @@ let process_account_orders_update json =
         (match order_status with
          | FilledStatus ->
              Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f" order_id symbol base_amount price;
-             (* Publish to centralized fill event bus for Discord notifications *)
+             (* Broadcast the reconciled execution parameters to the root event bus. *)
              let fill_value = filled_base_amount *. avg_price in
              let maker_fee_rate =
                match Dio_exchange.Exchange_intf.Registry.get "lighter" with
@@ -566,7 +591,7 @@ let process_account_orders_update json =
                fee;
                timestamp = Unix.gettimeofday ();
                order_id;
-               trade_id = order_id;  (* Lighter has no separate trade_id; use order_id *)
+               trade_id = order_id;  (* Fallback resolution utilizing the base order key. *)
              }
          | CanceledStatus ->
              Logging.info_f ~section "Order CANCELED: %s [%s] %.8f @ %.2f" order_id symbol base_amount price
@@ -575,22 +600,22 @@ let process_account_orders_update json =
          | PartiallyFilledStatus ->
              Logging.info_f ~section "Order PARTIAL: %s [%s] filled=%.8f/%.8f" order_id symbol filled_base_amount base_amount
          | _ -> ())
-        | _ -> ()  (* skip non-object order entries *)
+        | _ -> ()  (* Iterate past invalid unmapped elements. *)
       with exn ->
         Logging.warn_f ~section "Failed to parse order entry: %s" (Printexc.to_string exn)
     ) orders
     end
   with exn ->
     Logging.error_f ~section "Failed to process account orders update: %s" (Printexc.to_string exn);
-  (* Trigger startup gate after processing a snapshot or subscribed message.
-     Previously only called from REST fetch_open_orders. Now that WS is the
-     single source of truth, we must ungate domains from the WS path too.
-     On reconnect _startup_snapshot_done is already true (Atomic.exchange
-     returns true → no-op). On first startup this unblocks domain workers
-     waiting in has_execution_data. *)
+  (* Trigger the internal availability sequence upon interpreting specific
+     state variables from dynamic execution channels. Resolves previous
+     synchronization issues where internal modules encountered arbitrary
+     delays while evaluating initialization primitives. Setting the toggle
+     signals readiness across unblocked processing boundaries. *)
   set_startup_snapshot_done ()
 
-(** Processes an execution snapshot: ingests events and reconciles stale open orders. *)
+(** Primary processing loop for executing state normalization against
+    periodic synchronization payload data containing unified local mappings. *)
 let handle_snapshot json =
   Logging.debug_f ~section "Processing Lighter execution snapshot...";
   process_account_orders_update json;
@@ -627,7 +652,8 @@ let handle_snapshot json =
     ) orders
   with exn -> Logging.warn_f ~section "Failed to extract IDs for reconcile: %s" (Printexc.to_string exn));
 
-  (* Reconcile: remove locally cached orders absent from the snapshot by emitting CanceledStatus events *)
+  (* Transmit cancellation payloads downstream by evaluating the delta
+     between the provided execution data array and the internal cache. *)
   let stale_orders = ref [] in
   Mutex.lock initialization_mutex;
   let all_symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
@@ -665,8 +691,9 @@ let handle_snapshot json =
   if !stale_orders <> [] then
     Logging.info_f ~section "Reconciled open orders: removed %d stale orders not present in snapshot" (List.length !stale_orders)
 
-(** Periodic safety cleanup. Removes stale orders (>24h) and orphaned
-    entries from the order_to_symbol eviction queue. *)
+(** Asynchronous daemon executing cyclical cache reduction protocols.
+    Eliminates tracking components assigned to orders experiencing extreme
+    duration limits and terminates stale global mappings. *)
 let cleanup_stale_orders () =
   let now = Unix.gettimeofday () in
   let stale_threshold = 24.0 *. 3600.0 in
@@ -694,12 +721,11 @@ let cleanup_stale_orders () =
       Logging.info_f ~section "Cleaned %d stale orders for %s" (List.length !stale) symbol
   ) all_symbols;
 
-  (* Purge orphaned entries from order_to_symbol_queue.
-     Terminal events (fill/cancel) remove order_ids from the Hashtbl but not
-     from the Queue (OCaml Queue lacks O(1) removal by value). The queue
-     accumulates dead entries over time since the eviction loop only fires
-     when the Hashtbl exceeds its cap. This rebuild pass retains only entries
-     still present in the Hashtbl. Runs at most once per cleanup cycle. *)
+  (* Eliminate non-functional identifiers inhabiting the global eviction queue.
+     Queue operations implement constant-time algorithms which do not allow
+     rapid unmapping functions when variables undergo cancellation events.
+     Executing this deterministic purge logic synchronizes the chronological
+     queue array with the true operational properties of the hash mappings. *)
   Mutex.lock initialization_mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
     let original_queue_len = Queue.length order_to_symbol_queue in
@@ -749,8 +775,9 @@ let start_periodic_tasks () =
       ))
   end
 
-(** Return all open orders with expiry data across all symbol stores.
-    Used by the TIF renewal process to find orders approaching expiry. *)
+(** Computes a unified collection of valid operational instances joined
+    with explicit chronological constraints. Utilized by tracking daemons
+    to process cancellation logic over impending constraints. *)
 let get_all_open_orders_with_expiry () =
   Mutex.lock initialization_mutex;
   let all_symbols = Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
