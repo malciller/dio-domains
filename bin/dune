@@ -26,4 +26,5 @@
   notty
   notty.unix
   yojson
-  unix))
+  unix
+  dio.dashboard_ui))

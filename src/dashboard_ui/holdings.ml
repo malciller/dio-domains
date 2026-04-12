@@ -1,0 +1,497 @@
+open Notty
+open Theme
+
+let render_strategies w json =
+  let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
+  let all_balances = json |?> "all_balances" |> to_list_d in
+  (* Column header row *)
+  let header = I.hcat [
+    I.string a_border " │  ";
+    col 16 a_label "SYMBOL";
+    col 5 a_label "STGY";
+    col 3 a_label "ST";
+    col 12 a_label "PRICE";
+    col 8 a_label "SPREAD";
+    I.string a_border " │ ";
+    col 12 a_label "HOLDING";
+    col 10 a_label "HOLD VAL";
+    col 12 a_label "ACCUM QTY";
+    col 10 a_label "ACCUM VAL";
+    I.string a_border " │ ";
+    col 12 a_label "BUY @";
+    col_right 8 a_label "Δ BUY";
+    col 17 a_label "";
+    col 8 a_label "Δ SELL";
+    col 12 a_label "SELL @";
+    col 6 a_label "SELLS";
+    col 12 a_label "SELL VAL";
+  ] in
+
+  (* Build one row per strategy *)
+  let strategy_rows = List.map (fun (symbol, data) ->
+    let exchange = data |?> "exchange" |> to_string_d "?" in
+    let strat = data |?> "strategy" in
+    let market = data |?> "market" in
+    let stype = strat |?> "type" |> to_string_d "?" in
+    let cap_low = strat |?> "capital_low" |> to_bool_d false in
+
+    (* Market data: compute mid-price from bid/ask *)
+    let bid = market |?> "bid" |> to_float_d 0.0 in
+    let ask = market |?> "ask" |> to_float_d 0.0 in
+    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0
+              else (max bid ask) in
+    let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
+    let hold_value = base_bal *. mid in
+
+    (* Strategy state: next buy price and completed sell count *)
+    let buy_price = strat |?> "buy_price" |> to_float_d 0.0 in
+    let sell_count = strat |?> "sell_count" |> to_int_d 0 in
+
+    (* Sum mark-to-market proceeds and quantity across pending sell orders *)
+    let sell_orders = strat |?> "sell_orders" |> to_list_d in
+    let unrealized_profit, pending_sell_qty = List.fold_left (fun (up, qty_acc) s ->
+      let sp = s |?> "price" |> to_float_d 0.0 in
+      let sq = s |?> "qty" |> to_float_d 0.0 in
+      if sp > 0.0 && sq > 0.0 then (up +. (sp *. sq), qty_acc +. sq)
+      else (up, qty_acc)
+    ) (0.0, 0.0) sell_orders in
+    
+    let accum_holding = max 0.0 (base_bal -. pending_sell_qty) in
+    let accum_hold_value = accum_holding *. mid in
+
+    (* Percentage distance from mid-price to pending buy, if active *)
+    let buy_dist_pct =
+      if (not cap_low) && buy_price > 0.0 && mid > 0.0 then
+        Some (((buy_price -. mid) /. mid) *. 100.0)
+      else None
+    in
+
+    (* Percentage distance from mid-price to nearest pending sell *)
+    let closest_sell_dist_pct =
+      let sell_prices = List.filter_map (fun s ->
+        let sp = s |?> "price" |> to_float_d 0.0 in
+        if sp > 0.0 && mid > 0.0 then Some (((sp -. mid) /. mid) *. 100.0)
+        else None
+      ) sell_orders in
+      match sell_prices with
+      | [] -> None
+      | prices -> Some (List.fold_left (fun acc p -> if abs_float p < abs_float acc then p else acc) (List.hd prices) prices)
+    in
+
+    let grid_interval_lo = data |?> "grid_interval_lo" |> to_float_d 1.0 in
+    let grid_interval = if grid_interval_lo > 0.0 then grid_interval_lo else 1.0 in
+    let close_thresh = 0.5 *. grid_interval in
+    let far_thresh = 2.0 *. grid_interval in
+
+    let render_gauge b_pct s_pct =
+      let half = 7 in
+      let pos d =
+        if d < 0.0 then half
+        else if d < 0.25 *. grid_interval then 0
+        else if d < 0.75 *. grid_interval then 1
+        else if d < 1.5 *. grid_interval  then 2
+        else if d < 3.0 *. grid_interval  then 3
+        else if d < 6.0 *. grid_interval  then 4
+        else if d < 12.0 *. grid_interval then 5
+        else 6
+      in
+      let b_pos = match b_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+      let s_pos = match s_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+      let left_side = List.init half (fun i ->
+        if half - 1 - i = b_pos then "B" else "─"
+      ) |> String.concat "" in
+      let right_side = List.init half (fun i ->
+        if i = s_pos then "S" else "─"
+      ) |> String.concat "" in
+      I.hcat [
+        I.string a_border "[";
+        I.string (if b_pos <= 1 then a_green else a_dim) left_side;
+        I.string a_border "┼";
+        I.string (if s_pos <= 1 then a_yellow else a_dim) right_side;
+        I.string a_border "]";
+      ]
+    in
+    let gauge_img = render_gauge buy_dist_pct closest_sell_dist_pct in
+
+    (* Status indicator *)
+    let status_str, status_attr =
+      if cap_low then "⏸", a_yellow
+      else "▶", a_green
+    in
+
+    let exch_tag = exch_tag_of exchange in
+    let spread_str = format_spread_bps bid ask in
+    let spread_attr =
+      if bid <= 0.0 || ask <= 0.0 then a_dim
+      else
+        let bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
+        if bps < 5.0 then a_green
+        else if bps < 20.0 then a_cyan
+        else if bps < 50.0 then a_yellow
+        else a_red
+    in
+
+    (* Format buy distance with proximity-based color *)
+    let buy_dist_str, buy_dist_attr = match buy_dist_pct with
+      | None -> "--", a_dim
+      | Some d ->
+          let abs_d = abs_float d in
+          let attr = if abs_d < close_thresh then a_green
+                     else if abs_d < far_thresh then a_cyan
+                     else a_dim in
+          format_pct d, attr
+    in
+    (* Format sell distance with proximity-based color *)
+    let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
+      | None -> "--", a_dim
+      | Some d ->
+          let abs_d = abs_float d in
+          let attr = if abs_d < close_thresh then a_yellow
+                     else if abs_d < far_thresh then a_cyan
+                     else a_dim in
+          format_pct d, attr
+    in
+
+    let closest_sell_price_opt =
+      let sell_prices = List.filter_map (fun s ->
+        let sp = s |?> "price" |> to_float_d 0.0 in
+        if sp > 0.0 then Some sp else None
+      ) sell_orders in
+      match sell_prices with
+      | [] -> None
+      | prices -> Some (List.fold_left min (List.hd prices) prices)
+    in
+
+    (* execution proximity: 0 = buy order, 100 = sell order *)
+    let near_buy, near_sell =
+      let execution_proximity =
+        match closest_sell_price_opt with
+        | None -> None
+        | Some sell_price ->
+            if (not cap_low) && buy_price > 0.0 && mid > 0.0 && sell_price > buy_price then
+              let range = sell_price -. buy_price in
+              Some (((mid -. buy_price) /. range) *. 100.0)
+            else None
+      in
+      match execution_proximity with
+      | Some pos -> (pos < 25.0, pos > 75.0)
+      | None ->
+          let is_near_buy = match buy_dist_pct with
+            | Some d -> abs_float d < close_thresh
+            | None -> false
+          in
+          (is_near_buy, false)
+    in
+
+    let sell_price_str, sell_price_attr =
+      match closest_sell_price_opt with
+      | Some sp -> format_price sp, (if near_sell then a_near_sell_red else a_yellow)
+      | None -> "--", a_dim
+    in
+
+    let row_text =
+      if near_buy then a_near_fill
+      else if near_sell then a_near_sell
+      else a_text
+    in
+    let sym_attr =
+      if near_buy then a_near_fill
+      else if near_sell then a_near_sell
+      else exch_sym_attr exchange
+    in
+
+    let border_attr =
+      let bg_color = if near_buy then c_near_fill else if near_sell then c_near_sell else c_bg in
+      A.(fg c_border ++ bg bg_color)
+    in
+    I.hcat [
+      I.string border_attr " │  ";
+      col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
+      col 5 a_cyan (truncate_string 4 stype);
+      I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+      col 12 row_text (if mid > 0.0 then format_price mid else "--");
+      col 8 spread_attr spread_str;
+      I.string a_border " │ ";
+      col 12 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
+      col 10 row_text (if hold_value > 0.01 then format_price hold_value else "--");
+      col 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+      col 10 row_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
+      I.string a_border " │ ";
+      col 12 (if near_buy then a_near_fill_green
+              else if near_sell then a_near_sell_red
+              else if buy_price > 0.0 then a_green else a_dim)
+        (if buy_price > 0.0 then format_price buy_price else "--");
+      col_right 8 buy_dist_attr buy_dist_str;
+      gauge_img;
+      col 8 sell_dist_attr sell_dist_str;
+      col 12 sell_price_attr sell_price_str;
+      col 6 (if sell_count > 0 then a_yellow else a_dim)
+        (string_of_int sell_count);
+      col 12 (if unrealized_profit >= 0.0 then a_green else a_red)
+        (format_pnl unrealized_profit);
+    ]
+  ) strats in
+
+  (* Partition strategies into active and paused groups *)
+  let active_rows, paused_rows = List.partition (fun (_symbol, data) ->
+    let strat = data |?> "strategy" in
+    let cap_low = strat |?> "capital_low" |> to_bool_d false in
+    not cap_low
+  ) strats in
+  let active_images = List.map (fun (sym, _) ->
+    List.assoc sym (List.combine (List.map fst strats) strategy_rows)
+  ) active_rows in
+  let paused_images = List.map (fun (sym, _) ->
+    List.assoc sym (List.combine (List.map fst strats) strategy_rows)
+  ) paused_rows in
+
+  (* Build rows for non-strategy balances, enriched with market and order data *)
+  let non_strategy_rows = List.filter_map (fun bal_json ->
+    let exchange = bal_json |?> "exchange" |> to_string_d "?" in
+    let asset = bal_json |?> "asset" |> to_string_d "?" in
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+
+    if balance <= 0.0 then None
+    else begin
+      let exch_tag = exch_tag_of exchange in
+
+      (* Market data from enriched balance snapshot *)
+      let bid = bal_json |?> "bid" |> to_float_d 0.0 in
+      let ask = bal_json |?> "ask" |> to_float_d 0.0 in
+      let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0
+                else (max bid ask) in
+      let hold_value = balance *. mid in
+
+      (* Pending sell orders for this balance *)
+      let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
+      let sell_count = bal_json |?> "sell_count" |> to_int_d 0 in
+
+      (* Unrealized proceeds and accumulated quantity from pending sells *)
+      let unrealized_profit, pending_sell_qty = List.fold_left (fun (up, qty_acc) s ->
+        let sp = s |?> "price" |> to_float_d 0.0 in
+        let sq = s |?> "qty" |> to_float_d 0.0 in
+        if sp > 0.0 && sq > 0.0 then (up +. (sp *. sq), qty_acc +. sq)
+        else (up, qty_acc)
+      ) (0.0, 0.0) sell_orders in
+      
+      let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
+      
+      let accum_holding = if is_quote then 0.0 else max 0.0 (balance -. pending_sell_qty) in
+      let accum_hold_value = accum_holding *. mid in
+
+      (* Percentage distance to nearest sell order *)
+      let closest_sell_dist_pct =
+        let sell_prices = List.filter_map (fun s ->
+          let sp = s |?> "price" |> to_float_d 0.0 in
+          if sp > 0.0 && mid > 0.0 then Some (((sp -. mid) /. mid) *. 100.0)
+          else None
+        ) sell_orders in
+        match sell_prices with
+        | [] -> None
+        | prices -> Some (List.fold_left (fun acc p -> if abs_float p < abs_float acc then p else acc) (List.hd prices) prices)
+      in
+      let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
+        | None -> "--", a_dim
+        | Some d ->
+            let abs_d = abs_float d in
+            let attr = if abs_d < 0.5 then a_yellow
+                       else if abs_d < 2.0 then a_cyan
+                       else a_dim in
+            format_pct d, attr
+      in
+
+      let closest_sell_price_opt =
+        let sell_prices = List.filter_map (fun s ->
+          let sp = s |?> "price" |> to_float_d 0.0 in
+          if sp > 0.0 then Some sp else None
+        ) sell_orders in
+        match sell_prices with
+        | [] -> None
+        | prices -> Some (List.fold_left min (List.hd prices) prices)
+      in
+      let sell_price_str, sell_price_attr =
+        match closest_sell_price_opt with
+        | Some sp -> format_price sp, a_yellow
+        | None -> "--", a_dim
+      in
+
+      let render_gauge b_pct s_pct =
+        let half = 7 in
+        let pos d =
+          if d < 0.0 then half
+          else if d < 0.25 then 0
+          else if d < 0.75 then 1
+          else if d < 1.5  then 2
+          else if d < 3.0  then 3
+          else if d < 6.0  then 4
+          else if d < 12.0 then 5
+          else 6
+        in
+        let b_pos = match b_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+        let s_pos = match s_pct with Some d -> pos (abs_float d) | None -> half + 1 in
+        let left_side = List.init half (fun i ->
+          if half - 1 - i = b_pos then "B" else "─"
+        ) |> String.concat "" in
+        let right_side = List.init half (fun i ->
+          if i = s_pos then "S" else "─"
+        ) |> String.concat "" in
+        I.hcat [
+          I.string a_border "[";
+          I.string (if b_pos <= 1 then a_green else a_dim) left_side;
+          I.string a_border "┼";
+          I.string (if s_pos <= 1 then a_yellow else a_dim) right_side;
+          I.string a_border "]";
+        ]
+      in
+      let gauge_img = render_gauge None closest_sell_dist_pct in
+
+      let status_str, status_attr =
+        if is_quote then "$", a_green
+        else "⏹", a_red
+      in
+      let spread_str = format_spread_bps bid ask in
+      let img = I.hcat [
+        I.string a_border " │  ";
+        col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
+        col 5 a_dim "--";
+        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+        col 12 a_text (if mid > 0.0 then format_price mid else "--");
+        col 8 a_dim spread_str;
+        I.string a_border " │ ";
+        col 12 a_text (format_qty balance);
+        col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
+        col 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+        col 10 a_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
+        I.string a_border " │ ";
+        col 12 a_dim "--";
+        col_right 8 a_dim "--";
+        gauge_img;
+        col 8 sell_dist_attr sell_dist_str;
+        col 12 sell_price_attr sell_price_str;
+        col 6 (if sell_count > 0 then a_yellow else a_dim)
+          (string_of_int sell_count);
+        col 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green
+                else if unrealized_profit > 0.0 then a_dim else a_dim)
+          (if sell_count > 0 then format_pnl unrealized_profit else "--");
+      ] in
+      Some (is_quote, img)
+    end
+  ) all_balances in
+
+  (* Separate non-strategy rows into inactive assets and quote currencies *)
+  let inactive_rows = List.filter_map (fun (is_q, img) -> if not is_q then Some img else None) non_strategy_rows in
+  let quote_rows = List.filter_map (fun (is_q, img) -> if is_q then Some img else None) non_strategy_rows in
+
+  (* Aggregate unrealized profit, hold value, and accum value across strategies *)
+  let total_up_strats, total_hold_strats, total_accum_val_strats = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) (_symbol, data) ->
+    let strat = data |?> "strategy" in
+    let market = data |?> "market" in
+    
+    (* Compute holding value from mid-price *)
+    let bid = market |?> "bid" |> to_float_d 0.0 in
+    let ask = market |?> "ask" |> to_float_d 0.0 in
+    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else (max bid ask) in
+    let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
+    
+    (* Compute unrealized proceeds from pending sell orders *)
+    let sell_orders = strat |?> "sell_orders" |> to_list_d in
+    let strat_up, pending_sell_qty = List.fold_left (fun (a, q_acc) s ->
+      let sp = s |?> "price" |> to_float_d 0.0 in
+      let sq = s |?> "qty" |> to_float_d 0.0 in
+      if sp > 0.0 && sq > 0.0 then (a +. (sp *. sq), q_acc +. sq) else (a, q_acc)
+    ) (0.0, 0.0) sell_orders in
+    
+    let accum_holding = max 0.0 (base_bal -. pending_sell_qty) in
+    let accum_hold_value = accum_holding *. mid in
+    
+    (up_acc +. strat_up, hold_acc +. (base_bal *. mid), accum_val_acc +. accum_hold_value)
+  ) (0.0, 0.0, 0.0) strats in
+
+  (* Aggregate unrealized profit, hold value, and accum value for non-strategy balances *)
+  let total_up_bals, total_hold_bals, total_accum_val_bals = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) bal_json ->
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+    let asset = bal_json |?> "asset" |> to_string_d "?" in
+    if balance <= 0.0 then (up_acc, hold_acc, accum_val_acc) else
+    let bid = bal_json |?> "bid" |> to_float_d 0.0 in
+    let ask = bal_json |?> "ask" |> to_float_d 0.0 in
+    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else (max bid ask) in
+    
+    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
+    
+    let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
+    let bal_up, pending_sell_qty = List.fold_left (fun (a, q_acc) s ->
+      let sp = s |?> "price" |> to_float_d 0.0 in
+      let sq = s |?> "qty" |> to_float_d 0.0 in
+      if sp > 0.0 && sq > 0.0 then (a +. (sp *. sq), q_acc +. sq) else (a, q_acc)
+    ) (0.0, 0.0) sell_orders in
+    
+    let accum_holding = if is_quote then 0.0 else max 0.0 (balance -. pending_sell_qty) in
+    let accum_hold_value = accum_holding *. mid in
+    
+    (up_acc +. bal_up, hold_acc +. (balance *. mid), accum_val_acc +. accum_hold_value)
+  ) (0.0, 0.0, 0.0) all_balances in
+  
+  let total_up = total_up_strats +. total_up_bals in
+  let total_hold_val = total_hold_strats +. total_hold_bals in
+  let total_accum_val = total_accum_val_strats +. total_accum_val_bals in
+
+  (* Sum all quote-currency balances (pegged to $1) *)
+  let total_quote_val = List.fold_left (fun acc bal_json ->
+    let asset   = bal_json |?> "asset"   |> to_string_d "" in
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT"
+                || asset = "ZUSD" || asset = "USDe" in
+    if is_quote && balance > 0.0 then acc +. balance else acc
+  ) 0.0 all_balances in
+
+  (* Section header *)
+  let title = section_title w "HOLDINGS & STRATEGY" in
+
+  (* Visual separator between strategy rows and non-strategy rows *)
+  let thin_sep label =
+    let lbl = "  ── " ^ label ^ " " in
+    let pad_count = max 0 (w - String.length lbl) in
+    let pad_buf = Buffer.create (pad_count * 3) in
+    for _ = 1 to pad_count do Buffer.add_string pad_buf "─" done;
+    I.hcat [
+      I.string A.(fg c_border ++ bg c_bg) lbl;
+      I.string A.(fg c_border ++ bg c_bg) (Buffer.contents pad_buf);
+    ]
+  in
+  let has_inactive = inactive_rows <> [] in
+  let has_quote = quote_rows <> [] in
+
+  (* Compose table: active, paused, separator, inactive, separator, quote rows *)
+  let rows = [title; header]
+    @ active_images
+    @ paused_images
+    @ (if has_inactive then [thin_sep "balances"] @ inactive_rows else [])
+    @ (if has_quote then [thin_sep "cash"] @ quote_rows else [])
+  in
+  let main_table = I.vcat rows in
+
+  (* Summary footer bar with aggregated portfolio metrics *)
+  let up_attr = if total_up >= 0.0 then A.(fg c_green ++ bg c_bg ++ st bold)
+                else A.(fg c_red   ++ bg c_bg ++ st bold) in
+  let pipe = I.string A.(fg c_border ++ bg c_bg) "  │  " in
+  let kv lbl value_s vattr =
+    I.hcat [
+      I.string A.(fg c_label ++ bg c_bg) ("  " ^ lbl ^ ": ");
+      I.string vattr value_s;
+    ]
+  in
+  let summary_bar = I.hcat [
+    kv "Cash"      (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
+    pipe;
+    kv "Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
+    pipe;
+    kv "Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
+    pipe;
+    kv "Sell Val"  (format_pnl   total_up)        up_attr;
+  ] in
+  let summary_section = I.vcat (List.filter (fun img -> I.height img > 0) [
+    I.string A.(fg c_title ++ bg c_section_bg ++ st bold) (pad_right w "  SUMMARY");
+    summary_bar;
+  ]) in
+
+  I.vcat [ main_table; summary_section ]
