@@ -1,19 +1,18 @@
-(** Lighter balance tracking module.
-    Aggregates balance state from two WebSocket channels:
-    - [account_all_assets/{ACCOUNT_ID}]: spot base asset balances (ETH, etc.).
-    - [user_stats/{ACCOUNT_ID}]: USDC collateral (the quote/settlement currency).
+(** Provides the centralized subsystem for tracking real-time asset balances originating from the Lighter exchange.
+    This module synthesizes financial state by multiplexing over two disparate WebSocket streams:
+    1. The [account_all_assets/{ACCOUNT_ID}] channel, utilized exclusively for granular spot base asset tracking (e.g., parsing varying structures containing free, available, or balance fields).
+    2. The [user_stats/{ACCOUNT_ID}] channel, leveraged securely for retrieving the aggregate USDC collateral metrics.
 
-    USDC is intentionally NOT read from account_all_assets because Lighter reports
-    USDC balance=0 there whenever capital is committed to open buy orders — only
-    user_stats.stats.collateral reflects the correct total.
+    Note carefully that USDC valuation is deliberately omitted from the [account_all_assets] data pipeline. The Lighter matching engine zeros out the primary balance field in [account_all_assets] whenever quote collateral is encumbered by active buy limit orders. The definitive value of total committed and uncommitted capital is only reliably extrapolated from the [user_stats.stats.collateral] payload.
 
-    Follows the same background-processor-task pattern as hyperliquid_balances.ml. *)
+    Concurrency is orchestrated utilizing a localized Lwt background task that dispatches updates to an event bus topology, mirroring the asynchronous design constructs implemented in hyperliquid_balances.ml. *)
 
 
 
 let section = "lighter_balances"
 
-(** Per-asset balance record. *)
+(** Implements an atomic representation of the balance metrics mapped to a specific digital asset. 
+    Maintains localized timestamps to ensure data freshness constraints can be evaluated by external system invariants. *)
 type balance_data = {
   asset: string;
   balance: float;
@@ -22,7 +21,8 @@ type balance_data = {
   last_updated: float;
 }
 
-(** Thread-safe per-asset balance store supporting multiple wallet entries. *)
+(** Constructs an isolated, thread-safe memory partition for caching asset balances spanning disparate sub-accounts or wallet architectures.
+    Leverages OCaml mutex primitives alongside atomic variables for non-blocking read access to the aggregated balance figures. *)
 module BalanceStore = struct
   type wallet_balance = {
     balance: float;
@@ -155,7 +155,7 @@ let subscribe_balance_updates () =
   let subscription = BalanceUpdateEventBus.subscribe balance_update_event_bus in
   (subscription.stream, subscription.close)
 
-(* ---- Internal balance update helpers ---- *)
+(* Execution handlers for propagating balance mutations across the internal concurrent stores and outward to the subscription event bus. *)
 
 let publish_balance_update storage_key balance =
   let store = get_balance_store storage_key in
@@ -169,11 +169,9 @@ let publish_balance_update storage_key balance =
     last_updated = event_data.last_updated;
   }
 
-(** Handle account_all_assets / account_all messages: update base asset balances.
-    USDC is intentionally skipped here — its correct total is only available
-    via user_stats.collateral (see below). When a buy order is open, Lighter
-    reports USDC balance=0 in account_all_assets with the locked amount in
-    locked_balance, which would clobber the real value. *)
+(** Evaluates and maps incoming JSON payloads routed from the [account_all] or [account_all_assets] channels.
+    This function traverses dynamic JSON schema structures to extract base asset allocations safely.
+    The USDC asset ticker is decisively filtered out during the traversal sequence. As noted in the module documentation, modifying USDC balances via this feed introduces severe logical desynchronization when capital is bound in active operations, due to the system reporting standard balance values as zero. *)
 let process_asset_balances json =
   let open Yojson.Safe.Util in
   let account_data =
@@ -197,7 +195,7 @@ let process_asset_balances json =
               else asset_id
           | _ -> asset_id
         in
-        (* Skip USDC — owned exclusively by process_user_stats below. *)
+        (* Bypassing USDC derivation here. Authority over quote asset settlement data is reserved for the process_user_stats execution boundary. *)
         if storage_key = "USDC" || storage_key = "usdc" then ()
         else begin
           let balance = match balance_json with
@@ -228,19 +226,16 @@ let process_asset_balances json =
     notify_ready ()
   end
 
-(** Handle user_stats messages: extract USDC total from stats.collateral.
-    This is the authoritative source for USDC — collateral includes all
-    deposited USDC regardless of how much is locked in open orders.
-    Handles multiple message formats: data may be at top level, under
-    'user_stats', or under 'data' depending on the message type. *)
+(** Interprets the JSON telemetry specific to the [user_stats] event schema to isolate and persist the true collateral value.
+    This serves as the single source of truth for the quote currency metric. The deserialization logic supports deeply nested or variant encapsulation formats natively, probing for the [stats.collateral] node across different protocol wrapper formats, such as direct root, 'user_stats' wrapper, or a generic 'data' envelope. *)
 let process_user_stats json =
   let open Yojson.Safe.Util in
-  (* Try to find stats in multiple locations *)
+  (* Systematically unwrap the JSON hierarchy, probing distinct known schema permutations to locate the core statistics payload. *)
   let stats =
     let s = member "stats" json in
     if s <> `Null then s
     else
-      (* Some message types wrap under 'user_stats' or 'data' *)
+      (* Fallback traversal paths evaluating encapsulated envelopes instantiated by specific server-side broadcasting topologies. *)
       let us = member "user_stats" json in
       if us <> `Null then member "stats" us
       else
@@ -264,7 +259,7 @@ let process_user_stats json =
         (try keys stats |> String.concat "," with _ -> "?")
   end
 
-(** WebSocket message dispatcher. Routes by message type to the appropriate handler. *)
+(** Multiplexes demarshaled JSON frames from the WebSocket fabric into specialized processing functions based on the deterministic message type property. *)
 let process_market_data json =
   let open Yojson.Safe.Util in
   let msg_type =
@@ -282,8 +277,8 @@ let process_market_data json =
          Logging.error_f ~section "Failed to process user_stats update: %s" (Printexc.to_string exn))
   | _ -> ()
 
-(** Background processor task. Subscribes to the Lighter WS broadcast stream
-    and dispatches messages to balance handlers. Mirrors hyperliquid_balances.ml. *)
+(** Instantiates the primary, fault-tolerant Lwt execution loop responsible for sustaining the market data subscription.
+    This task seamlessly reconnects and reinjects incoming payloads into the synchronous processing dispatcher, ensuring continuous synchronization with the external exchange interface structure. *)
 let _processor_task =
   let open Lwt.Infix in
   let rec loop () =

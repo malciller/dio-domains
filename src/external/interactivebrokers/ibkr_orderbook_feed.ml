@@ -1,17 +1,18 @@
-(** L2 order book feed via reqMktDepth → ring buffers.
+(** Level 2 order book feed implementation routing reqMktDepth responses into ring buffers.
 
-    Maintains sorted bid/ask arrays per symbol, writes orderbook
-    snapshots to ring buffers on each update. *)
+    This module maintains sorted bid and ask array structures per symbol in memory.
+    It synchronously processes operations (insert, update, delete) on price levels
+    and writes point in time orderbook snapshots to lock free ring buffers. *)
 
 let section = "ibkr_orderbook"
 
-(** Single price level in the order book. *)
+(** Represents a consolidated price level within the order book containing the quote price and available liquidity size. *)
 type level = {
   price: float;
   size: float;
 }
 
-(** Orderbook snapshot. *)
+(** Complete point in time snapshot of the order book containing bidirectional depth and a timestamp for reconciliation. *)
 type orderbook = {
   bids: level array;
   asks: level array;
@@ -20,7 +21,7 @@ type orderbook = {
 
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol order book state. *)
+(** In-memory state structure maintaining the active ring buffer, thread-safe readiness flags, and mutable level arrays for a specific symbol. *)
 type store = {
   buffer: orderbook RingBuffer.t;
   ready: bool Atomic.t;
@@ -32,12 +33,11 @@ type store = {
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 
-(** reqId → symbol mapping. *)
+(** Global mapping linking Interactive Brokers request IDs to their corresponding instrument symbols for response routing. *)
 let req_id_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 32
 let next_req_id = Atomic.make 2000
 
-(** Clear stale reqId→symbol mappings. Called before reconnection to
-    prevent orphaned entries from prior connections accumulating. *)
+(** Clears stale request ID to symbol mappings. This function is invoked prior to socket reconnection to prevent orphaned state entries from accumulating across connection cycles. *)
 let clear_req_ids () =
   Hashtbl.clear req_id_to_symbol
 
@@ -65,7 +65,7 @@ let notify_ready store =
      with _ -> ())
   end
 
-(** Flush the current bid/ask arrays to the ring buffer. *)
+(** Materializes the current bid and ask arrays into an immutable snapshot and flushes it to the designated ring buffer. Triggers internal readiness conditions and broadcasts to exchange sleepers. *)
 let flush_orderbook symbol store =
   let ob = {
     bids = Array.copy store.bids;
@@ -76,8 +76,8 @@ let flush_orderbook symbol store =
   notify_ready store;
   Concurrency.Exchange_wakeup.signal ~symbol
 
-(** Handle updateMktDepth message.
-    Fields: version, reqId, position, operation, side, price, size *)
+(** Processes incoming updateMktDepth gateway messages.
+    Parses the binary string fields including version, request ID, absolute position, operation type, side, price, and size. Mutates the store arrays synchronously and triggers a ring buffer flush. *)
 let handle_market_depth fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let req_id, fields = Ibkr_codec.read_int fields in
@@ -101,16 +101,15 @@ let handle_market_depth fields =
         flush_orderbook symbol store
       end
 
-(** Subscribe to L2 order book for [symbol].
-    For STK/ETF on SMART, deep market data is not supported —
-    in that case we skip the subscription and mark ready immediately.
-    The grid strategy only needs bid/ask from the ticker feed. *)
+(** Initiates a Level 2 order book subscription for the given symbol.
+    For standard equity assets (STK/ETF) routed through SMART, deep market data is unsupported.
+    In these unsupported cases, the module skips dispatching the gateway request and immediately marks the store as ready, as subsequent pipeline stages safely fall back to top of book ticker data. *)
 let subscribe conn ~contract =
   let symbol = contract.Ibkr_types.symbol in
   let store = ensure_store symbol in
   if contract.sec_type = "STK" then begin
-    (* STK/ETF on SMART doesn't support L2 depth — skip *)
-    Logging.info_f ~section "Skipping L2 orderbook for %s (STK on %s — not supported)"
+    (* STK/ETF on SMART doesn't support L2 depth: skip *)
+    Logging.info_f ~section "Skipping L2 orderbook for %s (STK on %s not supported)"
       symbol contract.exchange;
     notify_ready store;
     Lwt.return_unit
@@ -134,7 +133,7 @@ let subscribe conn ~contract =
     Ibkr_connection.send conn msg_fields
   end
 
-(** Register handlers with the dispatcher. *)
+(** Registers the incoming market depth message translation callbacks with the global socket dispatcher mapping. *)
 let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_market_depth
@@ -160,7 +159,7 @@ let[@inline always] get_current_position symbol =
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 
-(** Pre-allocate stores and register handlers. *)
+(** Pre-allocates memory footprint for orderbook stores across all requested symbols and primes the dispatcher message callbacks. *)
 let initialize symbols =
   Logging.info_f ~section "Initializing orderbook feed for %d symbols" (List.length symbols);
   List.iter (fun symbol ->

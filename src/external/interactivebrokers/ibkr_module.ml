@@ -1,30 +1,35 @@
-(** IBKR exchange adapter.
+(** Interactive Brokers Exchange Integration Adapter.
 
-    Implements [Exchange_intf.S] for Interactive Brokers via the TWS API.
-    Converts between TWS-specific types and the unified Dio [Types] domain.
-    Delegates order actions to [Ibkr_actions] and reads market data from
-    per-symbol feed caches.
+    Provides the implementation of the abstract [Exchange_intf.S] interface tailored specifically
+    for the Interactive Brokers Trader Workstation Application Programming Interface.
+    This module performs the critical function of translating between the vendor-specific data structures
+    utilized by Trader Workstation and the unified canonical data types established within the Dio framework.
+    Order state transitions and routing mechanisms are delegated to the [Ibkr_actions] module, whereas
+    market data retrieval and low-latency access patterns are serviced via localized, symbol-specific
+    in-memory feed caches to maximize throughput.
 
-    Configuration via environment variables:
-    - IBKR_GATEWAY_HOST:  IB Gateway host (default: 127.0.0.1)
-    - IBKR_GATEWAY_PORT:  IB Gateway port (default: 4002)
-    - IBKR_ACCOUNT_ID:    Trading account ID (default: auto-detected)
-    - IBKR_TRADING_MODE:  "paper" or "live" (default: paper)
-    - IBKR_CLIENT_ID:     API client ID (default: 0)
+    Environment-based Operational Configuration:
+    - IBKR_GATEWAY_HOST: Specifies the network host address for the Interactive Brokers Gateway daemon. Default is 127.0.0.1.
+    - IBKR_GATEWAY_PORT: Specifies the Transmission Control Protocol port for the gateway connection. Default is 4002.
+    - IBKR_ACCOUNT_ID: Defines the specific trading account identifier to be utilized. The default behavior is auto-detection.
+    - IBKR_TRADING_MODE: Defines the execution environment context, accepting either "paper" or "live". Default is paper.
+    - IBKR_CLIENT_ID: Specifies the integer client identifier for the Application Programming Interface session. Default is 0.
 
-    Registered into [Exchange.Registry] at module load time. *)
+    Upon module initialization, this implementation automatically registers itself into the singleton [Exchange.Registry]. *)
 
 open Lwt.Infix
 
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
-(** Configuration loaded from environment, with runtime override via [set_testnet].
+(** Operational Configuration Parameters Context.
 
-    Environment variables set the initial defaults.  The per-symbol [testnet]
-    flag in config.json is applied later by the supervisor before the gateway
-    connection is established, overriding [trading_mode], [is_paper], and
-    [gateway_port]. *)
+    This module manages the instantiation of runtime parameters derived from the environment variables.
+    The variables define the baseline defaults at startup. Subsequently, the [testnet] boolean flag,
+    which is declared symmetrically per symbol within the configuration manifest, is applied during the
+    initialization lifecycle by the supervisor module prior to socket connection establishment. This pipeline
+    guarantees that the [trading_mode], [is_paper] state, and the [gateway_port] explicitly resolve to their
+    correct hierarchical values overriding baseline defaults if necessary. *)
 module Config = struct
   let section = "ibkr_config"
 
@@ -32,7 +37,7 @@ module Config = struct
     try Sys.getenv "IBKR_GATEWAY_HOST"
     with Not_found -> "127.0.0.1"
 
-  (* Mutable so set_testnet can override after config is parsed *)
+  (* Declared as a mutable reference to permit the [set_testnet] function to dynamically mutate the port binding after the initial configuration parsing phase is complete. *)
   let gateway_port = ref (
     try int_of_string (Sys.getenv "IBKR_GATEWAY_PORT")
     with _ -> 4002
@@ -57,15 +62,15 @@ module Config = struct
 
   let is_paper = ref (!trading_mode = "paper")
 
-  (** Override trading mode from the config.json [testnet] flag.
-      [testnet = true] → paper trading (port 4002).
-      [testnet = false] → live trading (port 4001).
-      Only overrides the port when no explicit IBKR_GATEWAY_PORT env var is set. *)
+  (** Dynamically resolves the execution trading mode based upon the serialized [testnet] parameter.
+      When [testnet] evaluates to true, the system is forced into paper trading simulation over port 4002.
+      When [testnet] evaluates to false, the system is forced into live execution over port 4001.
+      The runtime parameter mutation is strictly constrained to only override the transmission port in the event that no explicit environment variable binding for IBKR_GATEWAY_PORT was supplied at the process execution level. *)
   let set_testnet testnet =
     let mode = if testnet then "paper" else "live" in
     trading_mode := mode;
     is_paper := testnet;
-    (* Only override port if the user didn't set it explicitly via env *)
+    (* Conditionally apply the port override logic to preserve explicitly declared environment definitions. *)
     if Sys.getenv_opt "IBKR_GATEWAY_PORT" = None then
       gateway_port := (if testnet then 4002 else 4001);
     Logging.info_f ~section "IBKR trading mode set to %s (testnet=%b, port=%d)"
@@ -77,10 +82,10 @@ module Config = struct
     if !is_paper then
       Logging.info ~section "Running in PAPER trading mode"
     else
-      Logging.warn ~section "Running in LIVE trading mode — real money at risk"
+      Logging.warn ~section "Running in LIVE trading mode. Real money at risk."
 end
 
-(** Shared connection handle. *)
+(** Global thread-safe reference cell holding the active socket connection handle to the Interactive Brokers gateway daemon. *)
 let connection = ref None
 
 let get_conn () =
@@ -92,7 +97,9 @@ module Ibkr_impl = struct
   let name = "ibkr"
   let section = "ibkr_module"
 
-  (* ---- Type conversions ---- *)
+  (* ========================================== *)
+  (* Type Mapping and Value Conversion Routines *)
+  (* ========================================== *)
 
   let string_of_order_type = function
     | Types.Limit -> "LMT"
@@ -118,7 +125,9 @@ module Ibkr_impl = struct
     | "SELL" | "SLD" -> Types.Sell
     | _ -> Types.Buy
 
-  (* ---- Order lifecycle ---- *)
+  (* ========================================================= *)
+  (* Order Lifecycle Management and State Transition Functions *)
+  (* ========================================================= *)
 
   let place_order
       ~token:_
@@ -176,7 +185,7 @@ module Ibkr_impl = struct
     if sym = "" then
       Lwt.return (Error "Symbol required for IBKR order amendment")
     else
-      (* Look up existing order to fill in missing fields *)
+      (* Retrieve the existing open order parameterization from the in-memory state tracking to synthesize any omitted payload fields. *)
       let existing = Ibkr_executions_feed.get_open_order sym order_id in
       let action = match existing with
         | Some oo -> oo.Ibkr_executions_feed.oo_side
@@ -201,7 +210,7 @@ module Ibkr_impl = struct
         >|= fun () ->
         Ok {
           Types.original_order_id = order_id;
-          new_order_id = order_id;  (* TWS modifies in-place *)
+          new_order_id = order_id;  (* The Trader Workstation Application Programming Interface natively mutates existing orders in-place without generating substitute identifiers. *)
           amend_id = None;
           cl_ord_id = None;
         }
@@ -235,7 +244,9 @@ module Ibkr_impl = struct
     else
       Ok successes
 
-  (* ---- Market data accessors ---- *)
+  (* ======================================================== *)
+  (* Market Data Read Accessors and In-Memory Cache Retrieval *)
+  (* ======================================================== *)
 
 
 
@@ -294,7 +305,9 @@ module Ibkr_impl = struct
       }
     ) (Ibkr_executions_feed.get_open_orders symbol)
 
-  (* ---- Ring buffer event feeds ---- *)
+  (* ============================================================== *)
+  (* Linear Ring Buffer Traversal and Event Feed Subsystem Routines *)
+  (* ============================================================== *)
 
 
 
@@ -329,7 +342,7 @@ module Ibkr_impl = struct
   let get_execution_feed_position ~symbol =
     Ibkr_executions_feed.get_current_position symbol
 
-  (** Return [true] once execution data has been received for [symbol]. *)
+  (** Evaluates the propagation state of the execution feed and returns [true] strictly after the initial execution synchronization payload has been populated into the local cache for the specified [symbol]. *)
   let has_execution_data ~symbol =
     Ibkr_executions_feed.has_execution_data symbol
 
@@ -384,28 +397,30 @@ module Ibkr_impl = struct
       f oo.oo_order_id limit_price oo.oo_remaining_qty (String.lowercase_ascii oo.oo_side) None
     )
 
-  (* ---- Instrument metadata ---- *)
+  (* =========================================================== *)
+  (* Instrument Precision Metadata and Tick Specification Access *)
+  (* =========================================================== *)
 
   let get_price_increment ~symbol =
     match Ibkr_contracts.get_cached ~symbol with
     | Some c when c.Ibkr_types.min_tick > 0.0 -> Some c.min_tick
     | _ -> None
 
-  let get_qty_increment ~symbol:_ = Some 1.0  (* TWS API: whole shares only — fractional not supported via API *)
+  let get_qty_increment ~symbol:_ = Some 1.0  (* The current implementation natively limits precision to whole integers as fractional shares are unsupported for order routing in the standard Trader Workstation Application Programming Interface endpoints. *)
 
-  let get_qty_min ~symbol:_ = Some 1.0  (* TWS API: whole shares only *)
+  let get_qty_min ~symbol:_ = Some 1.0  (* The minimum permissible quantity floor limit is strictly bound to one whole share unit. *)
 
   let round_price ~symbol ~price =
     match get_price_increment ~symbol with
     | Some inc -> Float.round (price /. inc) *. inc
-    | None -> Float.round (price *. 100.0) /. 100.0  (* Default to 2 decimals *)
+    | None -> Float.round (price *. 100.0) /. 100.0  (* Applies a default structural formatting truncation of two decimal points for quote scaling in the absence of absolute specification. *)
 
   let get_fees ~symbol:_ =
-    (* IBKR uses a tiered/fixed commission structure, not per-pair fees.
-       Return None to indicate fees are not available per-symbol. *)
+    (* The parent venue employs a tiered commission framework disconnected from strict per-instrument asset basis.
+       Yielding a null variant effectively signals to the upstream risk models that commission estimation is completely structurally distinct from this module. *)
     (None, None)
 end
 
-(* Register into the global exchange registry at load time. *)
+(* Finalizes module execution by injecting the configured adapter logic into the global operational registry footprint mapping. *)
 let () =
   Exchange.Registry.register (module Ibkr_impl)

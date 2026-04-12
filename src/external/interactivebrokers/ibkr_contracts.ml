@@ -1,25 +1,21 @@
-(** Symbol → contract resolution via reqContractDetails.
+(** Implements financial instrument symbol to complete trading contract resolution utilizing the reqContractDetails message vector.
 
-    Caches resolved contracts so repeated lookups for the same symbol
-    are O(1). ETFs use [secType = "STK"], [exchange = "SMART"],
-    [currency = "USD"]. *)
+    Maintains a thread safe cache of resolved Interactive Brokers contracts ensuring that subsequent identical symbol queries execute with O(1) time complexity. Exchange traded funds are specifically modeled utilizing security type STK, the SMART routing exchange, and USD currency settings. *)
 
 open Lwt.Infix
 
 let section = "ibkr_contracts"
 
-(** Resolved contract cache: symbol → full contract. *)
+(** Hash map storing resolved symbol strings mapped to their comprehensive Ibkr_types.contract structures. *)
 let cache : (string, Ibkr_types.contract) Hashtbl.t = Hashtbl.create 32
 let cache_mutex = Mutex.create ()
 
-(** Next request ID for contract lookups. *)
+(** Atomic integer utilized for generating unique request identifiers during reqContractDetails network dispatches. *)
 let next_req_id = Atomic.make 9000
 
-(** [resolve conn symbol] sends reqContractDetails for [symbol] and
-    waits for the response. Caches the result for future calls.
-    Returns the full contract with conId, minTick, etc. *)
+(** Transmits a reqContractDetails invocation for the specified symbol across the given active connection and blocks asynchronously pending the server response. The resultant contract structure is persisted into memory cache for expediting future identical requests. Provides the fully initialized contract payload inclusive of conId and trading attributes such as minTick. *)
 let resolve conn ~symbol =
-  (* Check cache first *)
+  (* Inspect memory cache prior to network transmission *)
   Mutex.lock cache_mutex;
   let cached = Hashtbl.find_opt cache symbol in
   Mutex.unlock cache_mutex;
@@ -31,17 +27,15 @@ let resolve conn ~symbol =
       let req_id = Atomic.fetch_and_add next_req_id 1 in
       Logging.info_f ~section "Resolving contract for %s (reqId=%d)" symbol req_id;
 
-      (* Accumulator for contract data *)
+      (* Mutable reference accumulating inbound parsed contract metadata *)
       let result = ref None in
 
-      (* Register reqId-correlated handler *)
+      (* Establish a callback router index correlated to the generated request identifier *)
       let condition = Ibkr_dispatcher.register_req_handler
         ~req_id
         ~on_data:(fun fields ->
-          (* For serverVersion >= 164 (ours is 176), no version field.
-             Fields: [reqId, symbol, secType, lastTradeDate, strike, right,
-                      exchange, currency, localSymbol, marketName,
-                      tradingClass, conId, minTick, multiplier, ...] *)
+          (* Parsing logic predicated on server version 176 and greater omitting the initial version specifier.
+             Sequential field decoding maps to reqId, symbol, secType, lastTradeDate, strike, right, exchange, currency, localSymbol, marketName, tradingClass, conId, minTick, multiplier respectively. *)
           let _req_id, fields = Ibkr_codec.read_int fields in
           let symbol_resp, fields = Ibkr_codec.read_string fields in
           let sec_type, fields = Ibkr_codec.read_string fields in
@@ -77,22 +71,21 @@ let resolve conn ~symbol =
         )
       in
 
-      (* Send reqContractDetails
-         Wire format: [msgId=9, version=8, reqId, contract..., includeExpired,
-                       secIdType, secId, issuerId(v176+)] *)
+      (* Formulate and stream out the reqContractDetails wire format array.
+         Protocol message sequence corresponds to msgId 9, version 8, reqId, trailing contract definition, includeExpired, secIdType, secId, concluding with issuerId mandated for protocol versions 176 and above. *)
       let lookup_contract = Ibkr_types.make_stk_contract ~symbol in
       let msg_fields =
         [string_of_int Ibkr_types.msg_req_contract_details;
-         "8";    (* version *)
+         "8";    (* Hardcoded protocol payload version *)
          string_of_int req_id]
         @ Ibkr_codec.encode_contract lookup_contract
-        @ ["";     (* secIdType *)
-           "";     (* secId *)
-           ""]     (* issuerId - required for serverVersion >= 176 *)
+        @ ["";     (* Blank secIdType specification *)
+           "";     (* Blank secId attribute *)
+           ""]     (* Blank issuerId attribute strictly required for server version 176 and higher *)
       in
       Ibkr_connection.send conn msg_fields >>= fun () ->
 
-      (* Wait for response with timeout *)
+      (* Asynchronously yield execution context awaiting server callback activation paired with an absolute duration timeout *)
       Lwt.pick [
         (Lwt_condition.wait condition >|= fun () -> `Done);
         (Lwt_unix.sleep 10.0 >|= fun () -> `Timeout);
@@ -111,15 +104,14 @@ let resolve conn ~symbol =
           Logging.error_f ~section "No contract data received for %s" symbol;
           failwith (Printf.sprintf "No contract data received: %s" symbol)
 
-(** [get_cached symbol] returns the cached contract, or None. *)
+(** Synchronously retrieves an associated contract from the memory cache mapping substituting None if unpopulated. *)
 let get_cached ~symbol =
   Mutex.lock cache_mutex;
   let r = Hashtbl.find_opt cache symbol in
   Mutex.unlock cache_mutex;
   r
 
-(** Return (price_decimals, qty_decimals) from cached contract.
-    Price decimals derived from min_tick. *)
+(** Computes and extracts a tuple encapsulating the price and quantity decimal point precision requirements sourced directly from the resolved cached contract. The price precision bounds are mathematically extrapolated utilizing the contract min_tick attribute. *)
 let get_precision ~symbol =
   match get_cached ~symbol with
   | Some c ->
@@ -130,5 +122,5 @@ let get_precision ~symbol =
         else if c.min_tick >= 0.001 then 3
         else 4
       in
-      Some (price_dec, 0)  (* ETFs trade in whole shares *)
+      Some (price_dec, 0)  (* Zero decimal precision constraint bounded by fractional share inability for configured ETF processing *)
   | None -> None
