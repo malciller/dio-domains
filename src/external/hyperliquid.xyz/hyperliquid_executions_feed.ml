@@ -129,7 +129,7 @@ let mark_startup_complete () =
   if not (Atomic.exchange order_to_symbol_startup_done true) then begin
     (* Precondition: initialization_mutex is held by the caller (inject_open_orders). *)
     let observed = Hashtbl.length order_to_symbol in
-    let cap = max 32 (observed + observed / 2 + 1) in
+    let cap = max 1024 (observed + observed / 2 + 1) in
     order_to_symbol_cap := cap;
     Logging.info_f ~section
       "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)" cap observed

@@ -785,10 +785,18 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   if has_ibkr then Ibkr.Executions_feed.initialize ibkr_symbols;
   if has_lighter then Lighter.Executions_feed.initialize lighter_symbols;
 
-  (* Synchronously fetch open orders before domains start to prevent duplicate placements *)
+  (* Synchronously wait for open orders snapshot to finish (triggered by on_connected) *)
   let%lwt () =
-    if has_hyperliquid then Hyperliquid.Module.fetch_open_orders_ws ()
-    else Lwt.return_unit
+    if has_hyperliquid then begin
+      let rec wait_for_snapshot () =
+        if Hyperliquid.Executions_feed.is_startup_snapshot_done () then Lwt.return_unit
+        else Lwt_unix.sleep 0.1 >>= wait_for_snapshot
+      in
+      Lwt.pick [
+        wait_for_snapshot ();
+        Lwt_unix.sleep 10.0;
+      ]
+    end else Lwt.return_unit
   in
 
   (* Step 7: Register and start remaining supervised WebSocket connections *)
