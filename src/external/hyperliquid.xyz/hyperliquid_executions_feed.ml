@@ -97,11 +97,6 @@ let order_to_symbol_startup_done = Atomic.make false
     flag in their cycle loop. Exchange_wakeup.signal_all is invoked on transition
     so sleeping domains wake immediately without requiring a wall-clock delay. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
-let set_startup_snapshot_done () =
-  if not (Atomic.exchange _startup_snapshot_done true) then begin
-    Logging.info ~section "HL open-order snapshot injected — domains may now activate";
-    Concurrency.Exchange_wakeup.signal_all ()
-  end
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 
 (** Insert an order_id to symbol mapping, evicting the oldest entry when
@@ -170,6 +165,15 @@ let notify_ready store =
   if not (Atomic.get store.ready) then begin
     Atomic.set store.ready true;
     (try Lwt_condition.broadcast ready_condition () with _ -> ())
+  end
+
+let set_startup_snapshot_done () =
+  if not (Atomic.exchange _startup_snapshot_done true) then begin
+    Logging.info ~section "HL open-order snapshot injected — domains may now activate";
+    Hashtbl.iter (fun _symbol store ->
+      notify_ready store
+    ) stores;
+    Concurrency.Exchange_wakeup.signal_all ()
   end
 
 let[@inline always] get_open_order symbol order_id =

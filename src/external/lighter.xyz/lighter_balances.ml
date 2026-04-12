@@ -131,8 +131,10 @@ let get_all_assets () =
   )
 
 let notify_ready () =
-  (* Broadcast on every update since wait_for_balance_data polls multiple assets *)
-  (try Lwt_condition.broadcast ready_condition () with _ -> ())
+  if not (Atomic.get is_ready) then begin
+    Atomic.set is_ready true;
+    (try Lwt_condition.broadcast ready_condition () with _ -> ())
+  end
 
 let wait_for_balance_data_lwt assets timeout_seconds =
   Concurrency.Lwt_util.poll_until
@@ -140,6 +142,12 @@ let wait_for_balance_data_lwt assets timeout_seconds =
     ~wait_signal:(fun () -> Lwt_condition.wait ready_condition)
     ~check:(fun () -> List.for_all has_balance_data assets)
 
+let wait_until_ready () =
+  if Atomic.get is_ready then Lwt.return_true
+  else
+    let open Lwt.Infix in
+    Lwt_condition.wait ready_condition >>= fun () ->
+    Lwt.return_true
 
 let wait_for_balance_data = wait_for_balance_data_lwt
 

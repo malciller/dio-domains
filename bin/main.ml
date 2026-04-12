@@ -419,6 +419,9 @@ let () =
   Logging.info ~section:"main" "Starting Dio Trading Engine...";
 
   try
+    let start_time = Unix.gettimeofday () in
+    Lwt.async (fun () -> Dio_dashboard.Dashboard_server.start ~start_time);
+
     (* Synchronous engine init: supervisor, domains, websocket feeds. *)
     Logging.info ~section:"main" "Initializing trading engine...";
     let _configs = init_trading_engine_sync config in
@@ -434,9 +437,6 @@ let () =
     (* Enter main Lwt loop: run dashboard UDS server and block on shutdown condition. *)
     (try
       Lwt_main.run (
-        (* Launch dashboard Unix domain socket server as a background fiber. *)
-        let start_time = Unix.gettimeofday () in
-        Lwt.async (fun () -> Dio_dashboard.Dashboard_server.start ~start_time);
         Lwt_condition.wait shutdown_condition
       )
     with e ->
