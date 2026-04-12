@@ -6,7 +6,7 @@ module Fill_event_bus = Concurrency.Fill_event_bus
 
 (** Helper to create dummy fill events. *)
 let create_fill_event ?(venue="test_venue") ?(symbol="BTC/USD") ?(side="buy")
-    ?(amount=1.5) ?(fill_price=50000.0) ?(fee=0.1) timestamp =
+    ?(amount=1.5) ?(fill_price=50000.0) ?(fee=0.1) ?(order_id="test_oid") ?(trade_id="test_tid") timestamp =
   {
     Fill_event_bus.venue;
     symbol;
@@ -16,6 +16,8 @@ let create_fill_event ?(venue="test_venue") ?(symbol="BTC/USD") ?(side="buy")
     value = amount *. fill_price;
     fee;
     timestamp;
+    order_id;
+    trade_id;
   }
 
 (** Test that formatting a single fill event produces the correct single embed structure. *)

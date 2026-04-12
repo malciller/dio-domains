@@ -1414,7 +1414,8 @@ let handle_order_failed asset_symbol side reason =
 
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
     let is_insufficient_balance = contains_fragment lower_reason "insufficient funds"
-      || contains_fragment lower_reason "insufficient spot balance" in
+      || contains_fragment lower_reason "insufficient spot balance"
+      || contains_fragment lower_reason "not enough asset balance" in
     let cooldown = if is_rate_limit then 10.0 else 2.0 in
 
     (* Set balance flags when exchange reports insufficient balance.

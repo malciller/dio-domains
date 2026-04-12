@@ -26,6 +26,8 @@ type fill_event = {
   value: float;        (** Gross value: amount * fill_price. *)
   fee: float;          (** Estimated fee: value * maker_fee. *)
   timestamp: float;    (** Unix timestamp of the fill. *)
+  order_id: string;    (** Exchange order ID for deduplication. *)
+  trade_id: string;    (** Exchange trade/execution ID for deduplication. *)
 }
 
 (** Global fill event ring buffer. Capacity 256 provides ample headroom
@@ -38,16 +40,41 @@ let write_mutex = Mutex.create ()
 (** Lwt condition signaled after each write to wake the consumer fiber. *)
 let fill_condition : unit Lwt_condition.t = Lwt_condition.create ()
 
+(** Bounded deduplication set for published fills.
+    Prevents WebSocket reconnect replays from re-publishing fills that
+    were already sent to Discord. Key: (order_id, trade_id). *)
+let dedup_cap = 512
+let dedup_set : (string * string, unit) Hashtbl.t = Hashtbl.create dedup_cap
+let dedup_queue : (string * string) Queue.t = Queue.create ()
+
 (** Publish a fill event to the centralized buffer.
     Thread-safe: acquires [write_mutex] for the ring buffer write,
-    then broadcasts [fill_condition] to wake Lwt consumers. *)
+    then broadcasts [fill_condition] to wake Lwt consumers.
+    Silently drops duplicate fills based on (order_id, trade_id). *)
 let publish_fill (event : fill_event) =
+  let key = (event.order_id, event.trade_id) in
   Mutex.lock write_mutex;
-  RingBuffer.write buffer event;
-  Mutex.unlock write_mutex;
-  (* Broadcast is safe to call from any thread — Lwt_condition internally
-     handles cross-domain signaling via the Lwt scheduler. *)
-  (try Lwt_condition.broadcast fill_condition () with _ -> ())
+  if Hashtbl.mem dedup_set key then begin
+    Mutex.unlock write_mutex;
+    (* Duplicate fill — already published, skip silently *)
+  end else begin
+    Hashtbl.replace dedup_set key ();
+    Queue.push key dedup_queue;
+    (* Evict oldest entries when cap is exceeded *)
+    while Hashtbl.length dedup_set > dedup_cap do
+      if Queue.is_empty dedup_queue then
+        ignore (Hashtbl.length dedup_set)
+      else begin
+        let oldest = Queue.pop dedup_queue in
+        Hashtbl.remove dedup_set oldest
+      end
+    done;
+    RingBuffer.write buffer event;
+    Mutex.unlock write_mutex;
+    (* Broadcast is safe to call from any thread — Lwt_condition internally
+       handles cross-domain signaling via the Lwt scheduler. *)
+    (try Lwt_condition.broadcast fill_condition () with _ -> ())
+  end
 
 (** Return the current write position. Consumers use this as their
     starting cursor for [iter_since]. *)

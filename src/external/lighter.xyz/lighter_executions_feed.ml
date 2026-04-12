@@ -565,6 +565,8 @@ let process_account_orders_update json =
                value = fill_value;
                fee;
                timestamp = Unix.gettimeofday ();
+               order_id;
+               trade_id = order_id;  (* Lighter has no separate trade_id; use order_id *)
              }
          | CanceledStatus ->
              Logging.info_f ~section "Order CANCELED: %s [%s] %.8f @ %.2f" order_id symbol base_amount price

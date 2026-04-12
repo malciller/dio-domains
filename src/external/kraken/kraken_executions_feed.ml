@@ -919,6 +919,8 @@ let handle_update json on_heartbeat =
               value = fill_value;
               fee;
               timestamp = event.timestamp;
+              order_id = event.order_id;
+              trade_id = (match event.trade_id with Some tid -> Int64.to_string tid | None -> "");
             }
           end);
 
