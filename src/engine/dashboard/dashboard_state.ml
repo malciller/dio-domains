@@ -71,9 +71,9 @@ let json_of_domains () =
 
 (* Strategy state: Grid *)
 
-let json_of_grid_strategy symbol =
+let json_of_grid_strategy exchange symbol =
   let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
-  let market_is_closed = state.exchange_id = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
+  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
   `Assoc [
     "type", `String "Grid";
     "buy_price", json_of_float_opt state.last_buy_order_price;
@@ -98,9 +98,9 @@ let json_of_grid_strategy symbol =
 
 (* Strategy state: Market Maker *)
 
-let json_of_mm_strategy symbol =
+let json_of_mm_strategy exchange symbol =
   let state = Dio_strategies.Market_maker.get_strategy_state symbol in
-  let market_is_closed = state.exchange_id = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
+  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
   `Assoc [
     "type", `String "MM";
     "buy_price", json_of_float_opt state.last_buy_order_price;
@@ -215,8 +215,8 @@ let build_snapshot () =
   (* Per-symbol strategy state and market data *)
   let strategies = List.map (fun (tc : Dio_engine.Config.trading_config) ->
     let strategy_json = match tc.strategy with
-      | "Grid" | "suicide_grid" -> json_of_grid_strategy tc.symbol
-      | "MM" -> json_of_mm_strategy tc.symbol
+      | "Grid" | "suicide_grid" -> json_of_grid_strategy tc.exchange tc.symbol
+      | "MM" -> json_of_mm_strategy tc.exchange tc.symbol
       | other -> `Assoc ["type", `String other]
     in
     let (base_asset, quote_currency) = split_symbol tc.symbol in
