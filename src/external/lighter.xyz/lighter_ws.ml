@@ -363,6 +363,7 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
             Atomic.set state.is_connected_ref false;
             Lwt.return_unit
           ) >>= fun () ->
+          Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
           Lwt.fail_with ("[" ^ label ^ "] Connection closed unexpectedly (End_of_file)")
       | exn ->
           Logging.debug_f ~section "[%s] WebSocket read error: %s" label (Printexc.to_string exn);
@@ -371,6 +372,7 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
             Atomic.set state.is_connected_ref false;
             Lwt.return_unit
           ) >>= fun () ->
+          Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
           Lwt.fail exn
     ) >>= fun () ->
     Lwt_mutex.with_lock state.connection_mutex (fun () ->
@@ -378,6 +380,7 @@ let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on
       Atomic.set state.is_connected_ref false;
       Lwt.return_unit
     ) >>= fun () ->
+    Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
     Lwt.fail_with ("[" ^ label ^ "] WebSocket closed by server")
   ) (fun exn ->
     let error_msg = Printexc.to_string exn in
@@ -607,5 +610,7 @@ let send_ping ~req_id:_ ~timeout_ms =
   end else begin
     Logging.warn_f ~section "Ping failed (pub=%b, priv=%b)" pub_ok priv_ok;
     incr_ping_failures ();
+    let%lwt () = if not pub_ok then close_public () else Lwt.return_unit in
+    let%lwt () = if not priv_ok then close_private () else Lwt.return_unit in
     Lwt.return false
   end

@@ -312,7 +312,7 @@ let render_strategies w json =
     let market = data |?> "market" in
     let stype = strat |?> "type" |> to_string_d "?" in
     let cap_low = strat |?> "capital_low" |> to_bool_d false in
-    let asset_low = strat |?> "asset_low" |> to_bool_d false in
+    let _asset_low = strat |?> "asset_low" |> to_bool_d false in
 
     (* Market data: compute mid-price from bid/ask *)
     let bid = market |?> "bid" |> to_float_d 0.0 in
@@ -359,7 +359,7 @@ let render_strategies w json =
 
     (* Status indicator *)
     let status_str, status_attr =
-      if cap_low || asset_low then "⏸", a_yellow
+      if cap_low then "⏸", a_yellow
       else "▶", a_green
     in
 
@@ -431,8 +431,7 @@ let render_strategies w json =
   let active_rows, paused_rows = List.partition (fun (_symbol, data) ->
     let strat = data |?> "strategy" in
     let cap_low = strat |?> "capital_low" |> to_bool_d false in
-    let asset_low = strat |?> "asset_low" |> to_bool_d false in
-    not (cap_low || asset_low)
+    not cap_low
   ) strats in
   let active_images = List.map (fun (sym, _) ->
     List.assoc sym (List.combine (List.map fst strats) strategy_rows)

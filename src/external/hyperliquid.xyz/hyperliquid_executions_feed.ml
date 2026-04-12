@@ -676,6 +676,13 @@ let process_user_events data_json =
         let side = if member "side" fill |> to_string = "B" then Buy else Sell in
         let tid = (match member "tid" fill with `Int i -> Int64.of_int i | `String s -> Int64.of_string s | _ -> 0L) in
         let fee = try member "fee" fill |> to_string |> float_of_string with _ -> 0.0 in
+        let action_time =
+          match member "time" fill with
+          | `Int i -> float_of_int i /. 1000.0
+          | `Float f -> f /. 1000.0
+          | `String s -> (try float_of_string s /. 1000.0 with _ -> Unix.gettimeofday ())
+          | _ -> Unix.gettimeofday ()
+        in
         let store = get_symbol_store symbol in
         
         (* Deduplicate trade fills using bounded per-symbol trade ID tracking. *)
@@ -718,7 +725,7 @@ let process_user_events data_json =
             limit_price; side;
             order_qty; cum_qty; 
             cum_cost; avg_price;
-            timestamp = now; trade_id = Some tid;
+            timestamp = action_time; trade_id = Some tid;
             last_qty = Some size; last_price = Some price; fee = Some fee; cl_ord_id;
           } in
           
@@ -743,7 +750,9 @@ let process_user_events data_json =
               fill_price = avg_price;
               value = fill_value;
               fee = estimated_fee;
-              timestamp = now;
+              timestamp = action_time;
+              order_id;
+              trade_id = Int64.to_string tid;
             }
           end else
             Logging.info_f ~section "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty

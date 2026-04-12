@@ -722,8 +722,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Lwt.return_unit
       )
     in
-    set_connect_fn lt_ws_conn (Some lt_ws_connect_fn);
-    start_async lt_ws_conn;
+    Lwt.async lt_ws_connect_fn;
     Lwt.return_unit
   end else Lwt.return_unit) in
 

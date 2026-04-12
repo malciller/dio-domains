@@ -937,7 +937,8 @@ let handle_order_failed asset_symbol side reason =
       loop 0
     in
     let is_insufficient_balance = contains_fragment lower_reason "insufficient funds"
-      || contains_fragment lower_reason "insufficient spot balance" in
+      || contains_fragment lower_reason "insufficient spot balance"
+      || contains_fragment lower_reason "not enough asset balance" in
 
     (* Set balance flags on insufficient funds.
        capital_low (buy) and asset_low (sell) halt further placement

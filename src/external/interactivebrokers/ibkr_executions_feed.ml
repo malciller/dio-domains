@@ -201,6 +201,8 @@ let handle_order_status fields =
           value = fill_value;
           fee;
           timestamp = Unix.gettimeofday ();
+          order_id = string_of_int order_id;
+          trade_id = string_of_int order_id;  (* IBKR has no separate trade_id; use order_id *)
         }
       end)
   | None ->

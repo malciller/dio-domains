@@ -158,8 +158,10 @@ let send_webhook ~webhook_url payload =
         | Some s -> (try float_of_string s with _ -> 2.0)
         | None -> 2.0
       in
-      Logging.warn_f ~section "Discord webhook rate limited (429), sleeping %.1fs" retry_after;
-      Lwt_unix.sleep retry_after >>= fun () ->
+      (* Cap retry_after to prevent extreme sleeps from Discord abuse penalties *)
+      let capped = min retry_after 60.0 in
+      Logging.warn_f ~section "Discord webhook rate limited (429), sleeping %.1fs (raw retry-after: %.1fs)" capped retry_after;
+      Lwt_unix.sleep capped >>= fun () ->
       Lwt.return (Error "rate_limited")
     end else begin
       Logging.warn_f ~section "Discord webhook returned HTTP %d" code;
@@ -208,7 +210,18 @@ let consumer_loop ~webhook_url () =
         fills := fill :: !fills
       ) in
       read_pos := new_pos;
-      let fills = List.rev !fills in
+      (* Drop stale fills (>5min old) to skip replayed historical fills on reconnect *)
+      let now = Unix.gettimeofday () in
+      let max_age = 300.0 in
+      let fills = List.rev !fills
+        |> List.filter (fun (f : Concurrency.Fill_event_bus.fill_event) ->
+          let age = now -. f.timestamp in
+          if age > max_age then begin
+            Logging.debug_f ~section "Dropping stale fill for %s/%s (age=%.0fs)" f.venue f.symbol age;
+            false
+          end else true
+        )
+      in
       
       if fills <> [] then begin
         Logging.debug_f ~section "Processing %d fill event(s) for Discord" (List.length fills);
