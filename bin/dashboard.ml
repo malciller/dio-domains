@@ -883,6 +883,12 @@ let render_latencies _w json =
 
 (* Panel: Memory and GC statistics *)
 
+let pressure_max_len = 240
+let pressure_hist = Array.make pressure_max_len 0.0
+let pressure_hist_idx = ref 0
+let pressure_last_time = ref 0.0
+let pressure_blocks = [| " "; " "; "▂"; "▃"; "▄"; "▅"; "▆"; "▇"; "█" |]
+
 let render_memory w json =
   let mem = json |?> "memory" in
   let title = section_title w "MEMORY & GC" in
@@ -896,16 +902,48 @@ let render_memory w json =
 
   let total_kb = float_of_int (live + free) in
   let live_ratio = if total_kb > 0.0 then (float_of_int live) /. total_kb else 0.0 in
-  let bar_len = 20 in
-  let filled_len = int_of_float (live_ratio *. float_of_int bar_len) in
-  let filled = String.make filled_len ' ' in
-  let empty = String.make (max 0 (bar_len - filled_len)) ' ' in
-  let bar = I.hcat [
-    I.string A.(fg c_border ++ bg c_bg) "┣";
-    I.string A.(bg c_accent) filled;
-    I.string A.(bg c_border) empty;
-    I.string A.(fg c_border ++ bg c_bg) "┫";
-  ] in
+
+  let now = Unix.gettimeofday () in
+  if now -. !pressure_last_time >= 1.0 then begin
+    pressure_hist.(!pressure_hist_idx) <- live_ratio;
+    pressure_hist_idx := (!pressure_hist_idx + 1) mod pressure_max_len;
+    pressure_last_time := now;
+  end;
+
+  let used_width = 20 in
+  let bar_len = max 10 (min pressure_max_len (w - used_width)) in
+
+  let spark_imgs_top = ref [] in
+  let spark_imgs_bot = ref [] in
+
+  for i = bar_len - 1 downto 0 do
+    let offset = !pressure_hist_idx - bar_len + i in
+    let offset = if offset < 0 then offset + pressure_max_len else offset in
+    let ratio = pressure_hist.(offset) in
+    
+    let v = int_of_float (ratio *. 16.0) in
+    let v = max 0 (min 16 v) in
+    let t_idx, b_idx = if v <= 8 then (0, v) else (v - 8, 8) in
+
+    let s_top = pressure_blocks.(t_idx) in
+    let s_bot = pressure_blocks.(b_idx) in
+
+    let attr = 
+      if ratio < 0.5 then A.(fg c_green ++ bg c_bg)
+      else if ratio < 0.85 then A.(fg c_yellow ++ bg c_bg)
+      else A.(fg c_red ++ bg c_bg)
+    in
+    
+    spark_imgs_top := I.string attr s_top :: !spark_imgs_top;
+    spark_imgs_bot := I.string attr s_bot :: !spark_imgs_bot;
+  done;
+
+  let row3 = I.hcat (
+    [ I.string a_border " │"; I.string a_dim "  PRESSURE "; I.string a_border "╭" ] @ !spark_imgs_top @ [ I.string a_border "╮" ]
+  ) in
+  let row4 = I.hcat (
+    [ I.string a_border " │"; I.string a_dim "           "; I.string a_border "╰" ] @ !spark_imgs_bot @ [ I.string a_border "╯" ]
+  ) in
 
   let kv lbl v =
     I.hcat [
@@ -918,7 +956,6 @@ let render_memory w json =
     kv "HEAP" (Printf.sprintf "%dMB" heap);
     kv "LIVE" (Printf.sprintf "%dKB" live);
     kv "FREE" (Printf.sprintf "%dKB" free);
-    I.string a_dim "  PRESSURE "; bar;
   ] in
   let row2 = I.hcat [
     I.string a_border " │";
@@ -927,7 +964,7 @@ let render_memory w json =
     kv "COMPACT" (string_of_int compact);
     kv "FRAGS" (string_of_int frags);
   ] in
-  I.vcat [title; I.string a_text " "; row1; row2; I.string a_text " "]
+  I.vcat [title; I.string a_text " "; row1; row2; I.string a_text " "; row3; row4; I.string a_text " "]
 
 (* Atomic frame rendering.
    Each render call opens a fresh pipe, writes the frame, closes the write
