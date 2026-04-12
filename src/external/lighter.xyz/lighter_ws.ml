@@ -487,7 +487,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
      Reconnects indefinitely on disconnect. Single-side flaps are handled
      internally without escalating to the supervisor. The supervisor's
      passive heartbeat monitoring catches genuine prolonged outages. *)
-  let rec reconnect_loop ~state ~connect_target ~ws_url ~label
+  let reconnect_loop ~state ~connect_target ~ws_url ~label
       ~ready_flag ~other_ready_flag ~on_side_reconnected =
     let side_on_failure msg =
       Atomic.set ready_flag false;
@@ -514,22 +514,22 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
       );
       check_both_ready ()
     in
-    Lwt.catch (fun () ->
-      connect_one ~state ~connect_target ~ws_url
-        ~on_failure:side_on_failure
-        ~on_connected:side_on_connected
-        ~on_heartbeat ~label
-    ) (fun exn ->
-      Logging.debug_f ~section "[%s] connect_one raised: %s" label (Printexc.to_string exn);
+    Concurrency.Lwt_util.run_periodic ~interval:0.5 ~stop:(fun () -> false) (fun () ->
+      Lwt.catch (fun () ->
+        connect_one ~state ~connect_target ~ws_url
+          ~on_failure:side_on_failure
+          ~on_connected:side_on_connected
+          ~on_heartbeat ~label
+      ) (fun exn ->
+        Logging.debug_f ~section "[%s] connect_one raised: %s" label (Printexc.to_string exn);
+        Lwt.return_unit
+      ) >>= fun () ->
+      (* Connection ended — brief pause then reconnect *)
+      Atomic.set ready_flag false;
+      Atomic.set both_ready_fired false;
+      Logging.debug_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
       Lwt.return_unit
-    ) >>= fun () ->
-    (* Connection ended — brief pause then reconnect *)
-    Atomic.set ready_flag false;
-    Atomic.set both_ready_fired false;
-    Logging.debug_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
-    Lwt_unix.sleep 0.5 >>= fun () ->
-    reconnect_loop ~state ~connect_target ~ws_url ~label
-      ~ready_flag ~other_ready_flag ~on_side_reconnected
+    )
   in
 
   Lwt.join [
