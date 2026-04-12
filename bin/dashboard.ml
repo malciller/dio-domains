@@ -78,10 +78,14 @@ let read_message fd =
 (** Connect to the engine UDS at [path] and send the watch-mode command. *)
 let connect_and_watch path =
   let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-  Unix.connect fd (Unix.ADDR_UNIX path);
-  (* Send watch-mode command *)
-  let _ = Unix.write_substring fd "W" 0 1 in
-  fd
+  try
+    Unix.connect fd (Unix.ADDR_UNIX path);
+    (* Send watch-mode command *)
+    let _ = Unix.write_substring fd "W" 0 1 in
+    fd
+  with exn ->
+    (try Unix.close fd with _ -> ());
+    raise exn
 
 (* JSON helpers *)
 

@@ -251,6 +251,8 @@ let start ~start_time =
           watch_clients := List.filter (fun e -> e.fd != client_fd) !watch_clients;
           active_clients := !active_clients - 1;
           Logging.info_f ~section "Dashboard client disconnected (active: %d)" !active_clients;
+          let%lwt () = Lwt_io.abort ic in
+          let%lwt () = Lwt_io.abort oc in
           close_fd client_fd));
       accept_loop ()
     end
