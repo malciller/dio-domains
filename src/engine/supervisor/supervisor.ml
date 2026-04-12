@@ -773,7 +773,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.async (fun () -> Hyperliquid.Module.fetch_spot_balances_ws ())
     end;
     if has_ibkr then Ibkr.Balances.initialize ();
-    if has_lighter then Lighter.Balances.initialize ["USDC"; "ETH"];
+    if has_lighter then Lighter.Balances.initialize all_assets;
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
@@ -781,22 +781,14 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   Logging.info ~section "Step 6: Initializing executions feed stores...";
   Kraken.Kraken_executions_feed.initialize kraken_symbols;
-  if has_hyperliquid then Hyperliquid.Executions_feed.initialize hyperliquid_symbols;
+  if has_hyperliquid then Hyperliquid.Executions_feed.initialize all_hyperliquid_symbols;
   if has_ibkr then Ibkr.Executions_feed.initialize ibkr_symbols;
   if has_lighter then Lighter.Executions_feed.initialize lighter_symbols;
 
-  (* Synchronously wait for open orders snapshot to finish (triggered by on_connected) *)
+  (* Synchronously fetch open orders before domains start to prevent duplicate placements *)
   let%lwt () =
-    if has_hyperliquid then begin
-      let rec wait_for_snapshot () =
-        if Hyperliquid.Executions_feed.is_startup_snapshot_done () then Lwt.return_unit
-        else Lwt_unix.sleep 0.1 >>= wait_for_snapshot
-      in
-      Lwt.pick [
-        wait_for_snapshot ();
-        Lwt_unix.sleep 10.0;
-      ]
-    end else Lwt.return_unit
+    if has_hyperliquid then Hyperliquid.Module.fetch_open_orders_ws ()
+    else Lwt.return_unit
   in
 
   (* Step 7: Register and start remaining supervised WebSocket connections *)
@@ -1122,7 +1114,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       else Lwt.return_true
     in
     let lighter_p =
-      if has_lighter then Lighter.Balances.wait_for_balance_data ["USDC"; "ETH"] 60.0
+      if has_lighter then Lighter.Balances.wait_until_ready ()
       else Lwt.return_true
     in
     let%lwt kraken_ready = kraken_p
