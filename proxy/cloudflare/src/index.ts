@@ -11,7 +11,6 @@
  * keepalive + transparent reconnection.
  *
  * Deploy:  cd proxy/cloudflare && npx wrangler deploy
- * Usage:   export LIGHTER_PROXY_URL=https://lighter-proxy.malciller.workers.dev
  */
 
 const LIGHTER_ORIGIN = "https://mainnet.zklighter.elliot.ai";
