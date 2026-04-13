@@ -38,21 +38,28 @@ let crc32_zlib s =
   done;
   Int32.logxor !crc 0xFFFFFFFFl
 
-(** Remove all decimal point characters from a numeric string. Used for CRC32 input normalization. *)
-let remove_decimal s =
-  let b = Buffer.create (String.length s) in
-  String.iter (fun c -> if c <> '.' then Buffer.add_char b c) s;
-  Buffer.contents b
+let update_crc crc char =
+  let byte = Char.code char in
+  let idx = Int32.to_int (Int32.logand (Int32.logxor crc (Int32.of_int byte)) 0xFFl) in
+  Int32.logxor crc32_table.(idx) (Int32.shift_right_logical crc 8)
 
-let remove_leading_zeros s =
+let add_normalized_to_crc crc s =
   let len = String.length s in
-  let rec aux i =
-    if i >= len then ""
-    else if s.[i] = '0' then aux (i + 1)
-    else String.sub s i (len - i)
+  let rec find_first i =
+    if i >= len then crc
+    else
+      let c = s.[i] in
+      if c = '0' || c = '.' then find_first (i + 1)
+      else
+        let rec feed c_state j =
+          if j >= len then c_state
+          else
+            let c2 = s.[j] in
+            if c2 = '.' then feed c_state (j + 1)
+            else feed (update_crc c_state c2) (j + 1)
+        in feed crc i
   in
-  let trimmed = aux 0 in
-  if trimmed = "" then "0" else trimmed
+  find_first 0
 
 (** Single price level. Stores both string and float representations to avoid repeated parsing. *)
 type level = {
@@ -79,24 +86,6 @@ let take n lst =
     | _ -> List.rev acc
   in
   take_aux [] n lst
-
-(** Decimal-aware string comparator for price ordering. Avoids float precision loss
-    by splitting on the decimal point and comparing integer/fractional parts independently.
-    Fractional parts are right-padded to 15 digits for uniform comparison. *)
-let decimal_compare s1 s2 =
-  let normalize s =
-    let parts = String.split_on_char '.' s in
-    match parts with
-    | [whole] -> (whole, "0")
-    | [whole; frac] -> (whole, frac)
-    | _ -> ("0", "0")
-  in
-  let (w1, f1) = normalize s1 in
-  let (w2, f2) = normalize s2 in
-  let cmp_whole = compare (int_of_string w1) (int_of_string w2) in
-  if cmp_whole <> 0 then cmp_whole else
-  let pad_frac f = f ^ String.make (max 0 (15 - String.length f)) '0' in
-  String.compare (pad_frac f1) (pad_frac f2)
 
 let to_decimal_str ?(trim_trailing=true) ?dec json =
   match json with
@@ -171,13 +160,11 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
 
   (* Sort bids descending by price, asks ascending by price. *)
   let sorted_bids = List.sort (fun (p1, _) (p2, _) ->
-    let cmp = decimal_compare p2 p1 in
-    cmp
+    Float.compare (float_of_string p2) (float_of_string p1)
   ) valid_bids in
 
   let sorted_asks = List.sort (fun (p1, _) (p2, _) ->
-    let cmp = decimal_compare p1 p2 in
-    cmp
+    Float.compare (float_of_string p1) (float_of_string p2)
   ) valid_asks in
 
   (* Select up to 10 levels per side. No padding per Kraken specification. *)
@@ -187,29 +174,20 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
   Logging.debug_f ~section "Checksum input: symbol=%s bids=%d asks=%d" symbol (List.length bids_levels) (List.length asks_levels);
   Logging.debug_f ~section "Checksum levels used: bids=%d asks=%d" (List.length top_bids) (List.length top_asks);
 
-  let format_price_level (price_str, qty_str) : string =
-    let price_norm = remove_decimal price_str in
-    let qty_norm = remove_decimal qty_str in
+  let crc = ref 0xFFFFFFFFl in
+  List.iter (fun (price_str, qty_str) ->
+    crc := add_normalized_to_crc !crc price_str;
+    crc := add_normalized_to_crc !crc qty_str
+  ) top_asks;
+  List.iter (fun (price_str, qty_str) ->
+    crc := add_normalized_to_crc !crc price_str;
+    crc := add_normalized_to_crc !crc qty_str
+  ) top_bids;
+  
+  let result = Int32.logxor !crc 0xFFFFFFFFl in
 
-    let price_clean = remove_leading_zeros price_norm in
-    let qty_clean = remove_leading_zeros qty_norm in
-
-    price_clean ^ qty_clean
-  in
-
-  (* Concatenate normalized ask levels (ascending price order). *)
-  let asks_string = String.concat "" (List.map format_price_level top_asks) in
-
-  (* Concatenate normalized bid levels (descending price order). *)
-  let bids_string = String.concat "" (List.map format_price_level top_bids) in
-
-  (* Final checksum input: asks followed by bids. *)
-  let combined_string = asks_string ^ bids_string in
-
-  let result = crc32_zlib combined_string in
-
-  Logging.debug_f ~section "Checksum CRC32: input_len=%d result=%ld (0x%08lx)"
-    (String.length combined_string) result result;
+  Logging.debug_f ~section "Checksum CRC32: result=%ld (0x%08lx)"
+    result result;
 
   result
 
@@ -276,11 +254,11 @@ let calculate_checksum symbol bids asks : int32 =
 
   (* Sort bids descending by price, asks ascending by price. *)
   let sorted_bids = List.sort (fun l1 l2 ->
-    decimal_compare l2.price l1.price
+    Float.compare l2.price_float l1.price_float
   ) valid_bids in
 
   let sorted_asks = List.sort (fun l1 l2 ->
-    decimal_compare l1.price l2.price
+    Float.compare l1.price_float l2.price_float
   ) valid_asks in
 
   (* Select up to 10 levels per side. No padding per Kraken specification. *)
@@ -290,31 +268,24 @@ let calculate_checksum symbol bids asks : int32 =
   Logging.debug_f ~section "Checksum input: symbol=%s bids=%d asks=%d" symbol (Array.length bids) (Array.length asks);
   Logging.debug_f ~section "Checksum levels used: bids=%d asks=%d" (List.length top_bids) (List.length top_asks);
 
-  let format_price_level (level: level) : string =
+  let crc = ref 0xFFFFFFFFl in
+  List.iter (fun (level: level) ->
     let full_price_str = Printf.sprintf "%.*f" pd level.price_float in
     let full_qty_str = Printf.sprintf "%.*f" ld level.size_float in
-    let price_norm = remove_decimal full_price_str in
-    let qty_norm = remove_decimal full_qty_str in
+    crc := add_normalized_to_crc !crc full_price_str;
+    crc := add_normalized_to_crc !crc full_qty_str
+  ) top_asks;
+  List.iter (fun (level: level) ->
+    let full_price_str = Printf.sprintf "%.*f" pd level.price_float in
+    let full_qty_str = Printf.sprintf "%.*f" ld level.size_float in
+    crc := add_normalized_to_crc !crc full_price_str;
+    crc := add_normalized_to_crc !crc full_qty_str
+  ) top_bids;
 
-    let price_clean = remove_leading_zeros price_norm in
-    let qty_clean = remove_leading_zeros qty_norm in
+  let result = Int32.logxor !crc 0xFFFFFFFFl in
 
-    price_clean ^ qty_clean
-  in
-
-  (* Concatenate normalized ask levels (ascending price order). *)
-  let asks_string = String.concat "" (List.map format_price_level top_asks) in
-
-  (* Concatenate normalized bid levels (descending price order). *)
-  let bids_string = String.concat "" (List.map format_price_level top_bids) in
-
-  (* Final checksum input: asks followed by bids. *)
-  let combined_string = asks_string ^ bids_string in
-
-  let result = crc32_zlib combined_string in
-
-  Logging.debug_f ~section "Checksum CRC32: input_len=%d result=%ld (0x%08lx)"
-    (String.length combined_string) result result;
+  Logging.debug_f ~section "Checksum CRC32: result=%ld (0x%08lx)"
+    result result;
 
   result
 
@@ -422,8 +393,7 @@ let levels_to_array ?(sort_desc = false) map depth =
   ) map [] in
 
   let sorted_levels = List.sort (fun l1 l2 ->
-    let cmp = if sort_desc then decimal_compare l2.price l1.price else decimal_compare l1.price l2.price in
-    cmp
+    if sort_desc then Float.compare l2.price_float l1.price_float else Float.compare l1.price_float l2.price_float
   ) levels_list in
 
   let rec take n lst acc =

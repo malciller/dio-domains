@@ -12,25 +12,7 @@ let test_take_function () =
   Alcotest.(check (list int)) "take 0 from [1;2;3;4;5]" [] take_0;
   Alcotest.(check (list int)) "take 5 from empty list" [] take_empty
 
-let test_decimal_compare () =
-  (* Test decimal string comparison *)
-  let check_comparison s1 s2 expected_desc expected_cmp =
-    let result = Kraken.Kraken_orderbook_feed.decimal_compare s1 s2 in
-    let passed = match expected_cmp with
-      | 1 -> result > 0
-      | -1 -> result < 0
-      | 0 -> result = 0
-      | _ -> false
-    in
-    Alcotest.(check bool) expected_desc true passed
-  in
 
-  check_comparison "1.5" "1.4" "1.5 > 1.4" 1;
-  check_comparison "1.4" "1.5" "1.4 < 1.5" (-1);
-  check_comparison "2.0" "2.0" "2.0 = 2.0" 0;
-  check_comparison "1.10" "1.1" "1.10 = 1.1" 0;
-  check_comparison "0.001" "0.002" "0.001 < 0.002" (-1);
-  check_comparison "100" "50" "100 > 50" 1
 
 let test_to_decimal_str () =
   (* Test decimal string conversion *)
@@ -128,7 +110,6 @@ let () =
   Alcotest.run "Kraken Orderbook Feed" [
     "utility functions", [
       Alcotest.test_case "take_function" `Quick test_take_function;
-      Alcotest.test_case "decimal_compare" `Quick test_decimal_compare;
       Alcotest.test_case "to_decimal_str" `Quick test_to_decimal_str;
       Alcotest.test_case "to_decimal_str_with_precision" `Quick test_to_decimal_str_with_precision;
       Alcotest.test_case "is_effectively_zero" `Quick test_is_effectively_zero;
