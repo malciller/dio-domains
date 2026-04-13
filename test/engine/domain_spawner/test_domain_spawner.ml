@@ -44,10 +44,11 @@ let test_spawn_domains_basic () =
     trading = assets;
     fng_check_threshold = 1.5;
   } in
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher assets in
+  let _supervisor_thread = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets config mock_fee_fetcher assets in
+  let status = Dio_engine.Domain_spawner.get_domain_status () in
 
   (* Verify correct number of domains created *)
-  Alcotest.(check int) "correct number of domains" (List.length assets) (List.length domains)
+  Alcotest.(check int) "correct number of domains" (List.length assets) (List.length status)
 
 let test_spawn_domains_empty () =
   (* Test spawning domains with empty asset list *)
@@ -61,9 +62,10 @@ let test_spawn_domains_empty () =
     trading = [];
     fng_check_threshold = 1.5;
   } in
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [] in
+  let _supervisor_thread = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets config mock_fee_fetcher [] in
+  let status = Dio_engine.Domain_spawner.get_domain_status () in
 
-  Alcotest.(check int) "empty domains list length" 0 (List.length domains)
+  Alcotest.(check int) "empty domains list length" 0 (List.length status)
 
 let test_fee_fetcher_integration () =
   (* Test that fee fetcher is called and integrated properly *)
@@ -123,11 +125,12 @@ let test_domain_error_handling () =
     trading = [failing_asset];
     fng_check_threshold = 1.5;
   } in
-  let domains = Dio_engine.Domain_spawner.spawn_domains_for_assets config mock_fee_fetcher [failing_asset] in
+  let _supervisor_thread = Dio_engine.Domain_spawner.spawn_supervised_domains_for_assets config mock_fee_fetcher [failing_asset] in
   (* Give domains a moment to potentially fail *)
   Unix.sleepf 0.1;
+  let status = Dio_engine.Domain_spawner.get_domain_status () in
   (* If we get here, domains were created successfully (even if they fail internally) *)
-  Alcotest.(check int) "domain created for failing asset" 1 (List.length domains)
+  Alcotest.(check int) "domain created for failing asset" 1 (List.length status)
 
 let () =
   Alcotest.run "Domain Spawner" [

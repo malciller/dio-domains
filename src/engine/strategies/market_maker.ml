@@ -26,10 +26,7 @@ module Exchange = Dio_exchange.Exchange_intf
 
 
 
-(** Returns the first [n] elements of [list]. *)
-let rec take n = function
-  | [] -> []
-  | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs
+
 
 (** Per-asset trading configuration parsed from config.json. *)
 type trading_config = {

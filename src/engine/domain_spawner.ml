@@ -998,25 +998,4 @@ let stop_all_domains () =
   in
   wait_for_stop 10.0
 
-(** Deprecated compatibility wrapper. Delegates to spawn_supervised_domains_for_assets
-    and returns domain handles for callers that expect unit Domain.t list. *)
-let spawn_domains_for_assets (config : config) (fee_fetcher : trading_config -> trading_config) (assets : trading_config list) : unit Domain.t list =
-  Logging.warn ~section "spawn_domains_for_assets is deprecated, use spawn_supervised_domains_for_assets instead";
-  ignore (spawn_supervised_domains_for_assets config fee_fetcher assets);
 
-  (* Collect current domain handles for the legacy return type *)
-  Mutex.lock registry_mutex;
-  let domains = Hashtbl.to_seq_values domain_registry |> List.of_seq
-                |> List.filter_map (fun state -> Atomic.get state.domain_handle) in
-  Mutex.unlock registry_mutex;
-  domains
-
-(* Top-level entrypoint: reads config and spawns domains for all trading assets. *)
-let spawn_config_domains (fee_fetcher : trading_config -> trading_config) () : unit Domain.t list =
-  let full_config = read_config () in
-  (* Apply GC tuning on the main domain before spawning workers.
-     Runtime inherits these settings for all subsequently spawned domains. *)
-  apply_gc_config ();
-  let configs = full_config.trading in
-
-  spawn_domains_for_assets full_config fee_fetcher configs
