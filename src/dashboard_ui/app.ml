@@ -58,27 +58,20 @@ let connect_and_watch path =
     raise exn
 
 let render_to_stdout (draw : out_channel -> unit) =
-  let (pr, pw) = Unix.pipe () in
-  let oc = Unix.out_channel_of_descr pw in
+  let tmp_path = Filename.temp_file "dio_dash_" ".ansi" in
+  let oc = open_out_bin tmp_path in
   (try
      draw oc;
      close_out oc
    with exn ->
      close_out_noerr oc;
-     Unix.close pr;
+     Sys.remove tmp_path;
      raise exn);
-  let buf = Buffer.create 65536 in
-  let tmp = Bytes.create 8192 in
-  (try
-    while true do
-      let n = Unix.read pr tmp 0 8192 in
-      if n = 0 then raise Exit;
-      Buffer.add_subbytes buf tmp 0 n
-    done
-  with _ -> ());
-  Unix.close pr;
-  let frame = Buffer.contents buf in
-  let len   = String.length frame in
+  let ic = open_in_bin tmp_path in
+  let len = in_channel_length ic in
+  let frame = really_input_string ic len in
+  close_in ic;
+  Sys.remove tmp_path;
   let rec go off rem =
     if rem > 0 then
       let n = Unix.write_substring Unix.stdout frame off rem in
@@ -264,22 +257,29 @@ let run () =
             let draw oc =
               output_string oc "\027[?2026h";
               output_string oc "\027[H";
-              let img =
-                let sep = I.string a_text " " in
+              let content_img =
                   I.vcat [
                     Ticker_feed.render_ticker w !last_json;
-                    sep;
                     Memory.render_memory w !last_json;
                     Holdings.render_strategies w !last_json;
-                    sep;
                     Latencies.render_latencies w !last_json;
-                    sep;
-                    I.string A.(fg c_border ++ bg c_bg) " ╰──────────────────────────────────────────────────────────────────";
+                    (let pad_count = max 0 (w - 5) in
+                     let line = List.init pad_count (fun _ -> "─") |> String.concat "" in
+                     I.string A.(fg c_border ++ bg c_bg) (" ╰──" ^ line ^ "╯"));
                     Header.render_header w !last_json;
                   ]
-                |> I.hsnap ~align:`Left w
-                |> I.vsnap ~align:`Top  h
               in
+              let c_h = I.height content_img in
+              let c_w = I.width content_img in
+              let content_img = 
+                if c_h < h then I.vsnap ~align:`Middle h content_img
+                else I.vsnap ~align:`Top h content_img
+              in
+              let content_img = 
+                if c_w < w then I.hsnap ~align:`Middle w content_img
+                else I.hsnap ~align:`Left w content_img
+              in
+              let img = I.(content_img </> I.char A.(bg c_bg) ' ' w h) in
               Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
               output_string oc "\027[J";
               output_string oc "\027[?2026l"
