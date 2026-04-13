@@ -673,10 +673,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
            Lwt.async (fun () -> 
              Hyperliquid.Instruments_feed.wait_until_ready () >>= fun () ->
              Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet >>= fun () ->
-             (* Clear stale open orders, then re-fetch from exchange.
-                Sequential execution prevents the strategy from seeing
-                zero orders and placing duplicates. *)
-             Hyperliquid.Executions_feed.clear_all_open_orders ();
+             (* Clear out logic replaced by reconciliation in inject_open_orders to emit proper status events *)
              Hyperliquid.Module.fetch_open_orders_ws ())
          in
          Hyperliquid.Ws.connect_and_monitor 
@@ -722,8 +719,10 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             Lighter.Ws.subscribe_to_feeds ~symbols:lighter_symbols ~account_index ~auth_token >>= fun () ->
             (* Rebuild order state when both sides come up together.
                Individual side reconnects handle their own resubscription
-               internally via the per-side reconnect callbacks. *)
-            Lighter.Executions_feed.clear_all_open_orders ();
+               internally via the per-side reconnect callbacks.
+               We explicitly do NOT call clear_all_open_orders() here so that
+               Lighter.Module.fetch_open_orders() can perform reconciliation
+               and emit terminal events for missing orders. *)
             Lighter.Module.fetch_open_orders ())
         in
         Lighter.Ws.connect_and_monitor
