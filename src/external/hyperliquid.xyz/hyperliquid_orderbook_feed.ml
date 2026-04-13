@@ -97,6 +97,27 @@ let get_coin msg =
         else search (idx + 1)
   in search 0
 
+let parse_float_fast str start_idx end_idx =
+  let len = end_idx - start_idx in
+  if len = 0 then 0.0
+  else
+    let sign, start_idx = 
+      if String.unsafe_get str start_idx = '-' then (-1.0, start_idx + 1)
+      else (1.0, start_idx)
+    in
+    let rec loop idx acc dec frac_div =
+      if idx = end_idx then acc /. frac_div
+      else
+        let c = String.unsafe_get str idx in
+        if c = '.' then loop (idx + 1) acc true 1.0
+        else if c >= '0' && c <= '9' then
+          let d = float_of_int (Char.code c - 48) in
+          if dec then loop (idx + 1) ((acc *. 10.0) +. d) true (frac_div *. 10.0)
+          else loop (idx + 1) ((acc *. 10.0) +. d) false frac_div
+        else loop (idx + 1) acc dec frac_div
+    in
+    sign *. loop start_idx 0.0 false 1.0
+
 let rec parse_levels msg pos end_pos count acc =
   if count >= 1 || pos >= end_pos then List.rev acc
   else
@@ -114,17 +135,17 @@ let rec parse_levels msg pos end_pos count acc =
                 if string_match msg p key then
                   let val_start = p + String.length key in
                   match String.index_from_opt msg val_start '"' with
-                  | Some val_end -> Some (String.sub msg val_start (val_end - val_start), val_end + 1)
+                  | Some val_end -> Some (val_start, val_end)
                   | None -> None
                 else find_key key (p + 1)
           in
           match find_key px_key brace_idx with
-          | Some (px_str, next_pos) ->
-              (match find_key sz_key next_pos with
-               | Some (sz_str, after_sz) ->
-                    let px = float_of_string px_str in
-                    let sz = float_of_string sz_str in
-                    parse_levels msg after_sz end_pos (count + 1) ({price=px; size=sz} :: acc)
+          | Some (px_start, px_end) ->
+              (match find_key sz_key (px_end + 1) with
+               | Some (sz_start, sz_end) ->
+                    let px = parse_float_fast msg px_start px_end in
+                    let sz = parse_float_fast msg sz_start sz_end in
+                    parse_levels msg (sz_end + 1) end_pos (count + 1) ({price=px; size=sz} :: acc)
                | None -> List.rev acc)
           | None -> List.rev acc
 

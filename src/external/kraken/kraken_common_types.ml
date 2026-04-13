@@ -12,7 +12,7 @@ let nonce_ms_multiplier = 1000.0
 (* Feed configuration defaults *)
 
 (** Number of price levels maintained per side (bid/ask) in the orderbook. *)
-let default_orderbook_depth = 25
+let default_orderbook_depth = 1
 
 (** Ring buffer capacity (slot count) for the orderbook feed channel. *)
 let default_ring_buffer_size_orderbook = 16
