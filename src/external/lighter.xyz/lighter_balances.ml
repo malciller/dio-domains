@@ -196,35 +196,37 @@ let process_asset_balances json =
               else asset_id
           | _ -> asset_id
         in
-        let normalized_key = if storage_key = "usdc" then "USDC" else storage_key in
+        let normalized_key = if String.uppercase_ascii storage_key = "USDC" then "USDC" else storage_key in
         
-        let balance = match balance_json with
-          | `Assoc _ ->
-              let try_field key =
-                let v = member key balance_json in
-                if v <> `Null then Some (Lighter_types.parse_json_float v) else None
-              in
-              (match try_field "collateral" with
-               | Some b -> b
-               | None ->
-                   (match try_field "margin_balance" with
-                    | Some b -> b
-                    | None ->
-                        (match try_field "balance" with
-                         | Some b -> b
-                         | None ->
-                             (match try_field "available" with
-                              | Some b -> b
-                              | None -> (match try_field "free" with
+        if normalized_key <> "USDC" then begin
+          let balance = match balance_json with
+            | `Assoc _ ->
+                let try_field key =
+                  let v = member key balance_json in
+                  if v <> `Null then Some (Lighter_types.parse_json_float v) else None
+                in
+                (match try_field "collateral" with
+                 | Some b -> b
+                 | None ->
+                     (match try_field "margin_balance" with
+                      | Some b -> b
+                      | None ->
+                          (match try_field "balance" with
+                           | Some b -> b
+                           | None ->
+                               (match try_field "available" with
                                 | Some b -> b
-                                | None ->
-                                    Logging.warn_f ~section "Balance object for %s has unknown structure: %s"
-                                      normalized_key (Yojson.Safe.to_string balance_json);
-                                    0.0)))))
-          | _ -> Lighter_types.parse_json_float balance_json
-        in
-        publish_balance_update normalized_key balance;
-        Logging.warn_f ~section "Balance update: %s = %.8f" normalized_key balance
+                                | None -> (match try_field "free" with
+                                  | Some b -> b
+                                  | None ->
+                                      Logging.warn_f ~section "Balance object for %s has unknown structure: %s"
+                                        normalized_key (Yojson.Safe.to_string balance_json);
+                                      0.0)))))
+            | _ -> Lighter_types.parse_json_float balance_json
+          in
+          publish_balance_update normalized_key balance;
+          Logging.warn_f ~section "Balance update: %s = %.8f" normalized_key balance
+        end
       with exn ->
         Logging.warn_f ~section "Failed to parse balance for %s: %s" asset_id (Printexc.to_string exn)
     ) assets;
