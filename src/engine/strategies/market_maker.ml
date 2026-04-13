@@ -385,6 +385,7 @@ let cancel_duplicate_orders ~state asset_symbol target_price _target_side (open_
     places/amends/cancels buy and sell orders to maintain one active pair. *)
 let execute_strategy
     ?cached_state
+    ?precounted_orders
     (asset : trading_config)
     (current_price : float option)
     (top_of_book : (float * float * float * float) option)
@@ -554,7 +555,7 @@ let execute_strategy
         let best_buy_id = ref None in
         let mm_open_orders = ref [] in
 
-        iter_open_orders (fun order_id order_price remaining_qty side_str userref_opt ->
+        let process_order order_id order_price remaining_qty side_str userref_opt =
           let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = order_id) state.cancelled_orders in
           if not is_cancelled && remaining_qty > 0.0 then begin
             if side_str = "sell" then
@@ -581,6 +582,35 @@ let execute_strategy
               end
             end
           end
+        in
+
+        (match precounted_orders with
+         | Some (mm_orders_list, raw_global_locked_buys, raw_global_locked_sells) ->
+             locked_in_buys := raw_global_locked_buys;
+             locked_in_sells := raw_global_locked_sells;
+             List.iter (fun (oid, price, qty, side_str) ->
+               let is_cancelled = List.exists (fun (cancelled_id, _) -> cancelled_id = oid) state.cancelled_orders in
+               if is_cancelled then begin
+                 if side_str = "buy" then locked_in_buys := !locked_in_buys -. (price *. qty)
+                 else if side_str = "sell" then locked_in_sells := !locked_in_sells -. qty
+               end else begin
+                 if side_str = "buy" then begin
+                   incr sync_open_buy_count;
+                   let current_best = match !best_buy_price with Some p -> p | None -> -1.0 in
+                   if price > current_best && price > 0.0 then begin
+                     best_buy_price := Some price;
+                     best_buy_id := Some oid
+                   end
+                 end else begin
+                   incr sync_open_sell_count
+                 end;
+                 mm_open_orders := (oid, price, qty, side_str) :: !mm_open_orders
+               end
+             ) mm_orders_list
+         | None ->
+             iter_open_orders (fun order_id order_price remaining_qty side_str userref_opt ->
+               process_order order_id order_price remaining_qty side_str userref_opt
+             )
         );
 
         let available_asset_balance = match asset_balance with
