@@ -88,8 +88,8 @@
       "exchange": "ibkr",
       "qty": "1.0",
       "grid_interval": [
-        0.5,
-        1.0
+        0.25,
+        0.5
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
