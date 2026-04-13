@@ -25,8 +25,8 @@ let test_process_asset_balances () =
   let wbtc_bal = Lighter.Balances.get_balance "WBTC" in
   Alcotest.(check (float 0.000001)) "WBTC balance" 0.1 wbtc_bal
 
-let test_usdc_processed_in_asset_balances () =
-  (* USDC in account_all_assets is processed for unified accounts natively without skipping *)
+let test_usdc_skipped_in_asset_balances () =
+  (* USDC in account_all_assets is explicitly skipped to avoid zeroing out encumbered collateral *)
   let json = `Assoc [
     ("type", `String "update/account_all_assets");
     ("account_all", `Assoc [
@@ -38,7 +38,7 @@ let test_usdc_processed_in_asset_balances () =
 
   Lighter.Balances.process_market_data json;
   let usdc_after = Lighter.Balances.get_balance "USDC" in
-  Alcotest.(check (float 0.000001)) "USDC updated" 9999.0 usdc_after
+  Alcotest.(check (float 0.000001)) "USDC ignored" 0.0 usdc_after
 
 let test_process_user_stats_usdc () =
   let json = `Assoc [
@@ -77,7 +77,7 @@ let () =
     ];
     "processing", [
       Alcotest.test_case "process_asset_balances" `Quick test_process_asset_balances;
-      Alcotest.test_case "USDC processed in asset_balances" `Quick test_usdc_processed_in_asset_balances;
+      Alcotest.test_case "USDC skipped in asset_balances" `Quick test_usdc_skipped_in_asset_balances;
       Alcotest.test_case "process_user_stats USDC" `Quick test_process_user_stats_usdc;
       Alcotest.test_case "user_stats null stats" `Quick test_user_stats_null_stats;
     ];
