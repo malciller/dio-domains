@@ -129,6 +129,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
          exec_ready gate for assets with no open orders (empty snapshot). *)
       let exec_checked = ref false in
       let latency_active = ref false in
+      
+      let open_orders_dirty = ref true in
+      let cached_grid_buy_orders = ref [] in
+      let cached_grid_sell_orders = ref [] in
+      let cached_grid_open_buy_count = ref 0 in
+      let cached_grid_open_sell_count = ref 0 in
+      let cached_mm_open_buy_count = ref 0 in
+      let cached_mm_open_sell_count = ref 0 in
 
       (* Initialize strategy configuration refs based on strategy type *)
       let baseline_price = ref None in
@@ -319,7 +327,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
         let did_exec = current_pos <> !exec_read_pos in
         if did_exec then begin
+          open_orders_dirty := true;
           let event_count = ref 0 in
+          let now_exec = Unix.gettimeofday () in
           let new_pos = Ex.iter_execution_events ~symbol:asset_with_fees.symbol ~start_pos:!exec_read_pos (fun (event : Types.execution_event) ->
             incr event_count;
             match event.order_status with
@@ -333,13 +343,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (match !grid_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_cancelled
-                         asset_with_fees.symbol event.order_id side event.cl_ord_id;
+                         ~now:now_exec asset_with_fees.symbol event.order_id side event.cl_ord_id;
                        ()
                    | None -> ());
                   (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_cancelled
-                         asset_with_fees.symbol event.order_id side event.cl_ord_id;
+                         ~now:now_exec asset_with_fees.symbol event.order_id side event.cl_ord_id;
                        ()
                    | None -> ())
               | Types.Filled ->
@@ -351,14 +361,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (match !grid_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_filled
-                         asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price
+                         ~now:now_exec asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price
                          event.cl_ord_id;
                        ()
                    | None -> ());
                   (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_filled
-                         asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price
+                         ~now:now_exec asset_with_fees.symbol event.order_id side ~fill_price:event.avg_price
                          event.cl_ord_id;
                        ()
                    | None -> ());
@@ -391,13 +401,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                          (match !grid_strategy_asset_ref with
                           | Some _ ->
                               Dio_strategies.Suicide_grid.Strategy.handle_order_amended
-                                asset_with_fees.symbol event.order_id event.order_id side price;
+                                ~now:now_exec asset_with_fees.symbol event.order_id event.order_id side price;
                               ()
                           | None -> ());
                          (match !mm_strategy_asset_ref with
                           | Some _ ->
                               Dio_strategies.Market_maker.Strategy.handle_order_amended
-                                asset_with_fees.symbol event.order_id event.order_id side price;
+                                ~now:now_exec asset_with_fees.symbol event.order_id event.order_id side price;
                               ()
                           | None -> ())
                      | _ -> ())
@@ -411,13 +421,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                        (match !grid_strategy_asset_ref with
                         | Some _ ->
                             Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
-                              asset_with_fees.symbol event.order_id side price;
+                              ~now:now_exec asset_with_fees.symbol event.order_id side price;
                             ()
                         | None -> ());
                        (match !mm_strategy_asset_ref with
                         | Some _ ->
                             Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
-                              asset_with_fees.symbol event.order_id side price;
+                              ~now:now_exec asset_with_fees.symbol event.order_id side price;
                             ()
                         | None -> ())
                    | Some _ ->
@@ -467,14 +477,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
-                         asset_with_fees.symbol oid order_side price;
+                         ~now:(Unix.gettimeofday ()) asset_with_fees.symbol oid order_side price;
                        ()
                    | None -> ())
                 end else begin
                   (match !grid_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
-                         asset_with_fees.symbol oid order_side price;
+                         ~now:(Unix.gettimeofday ()) asset_with_fees.symbol oid order_side price;
                        ()
                    | None -> ())
                 end
@@ -504,36 +514,54 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (* Single-pass open order scan: count by strategy AND collect
              grid buy/sell order lists. Eliminates a second iter_open_orders
              + orders_mutex acquisition inside the grid strategy. *)
-          let grid_open_buy_count = ref 0 in
-          let grid_open_sell_count = ref 0 in
-          let mm_open_buy_count = ref 0 in
-          let mm_open_sell_count = ref 0 in
-          let grid_buy_orders = ref [] in
-          let grid_sell_orders = ref [] in
+
 
           let iter_orders f =
             Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol f
           in
 
-          iter_orders (fun oid price qty side_str userref_opt ->
-             if qty > 0.0 then begin
-               let is_mm = match userref_opt with
-                 | Some uref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm uref
-                 | None -> false
-               in
-               if is_mm then begin
-                 if side_str = "buy" then incr mm_open_buy_count else incr mm_open_sell_count
-               end else begin
-                 if side_str = "buy" then begin
-                   incr grid_open_buy_count;
-                   grid_buy_orders := (oid, price) :: !grid_buy_orders
+          if !open_orders_dirty then begin
+            open_orders_dirty := false;
+            let current_grid_buy_orders = ref [] in
+            let current_grid_sell_orders = ref [] in
+            let current_grid_open_buy_count = ref 0 in
+            let current_grid_open_sell_count = ref 0 in
+            let current_mm_open_buy_count = ref 0 in
+            let current_mm_open_sell_count = ref 0 in
+
+            iter_orders (fun oid price qty side_str userref_opt ->
+               if qty > 0.0 then begin
+                 let is_mm = match userref_opt with
+                   | Some uref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm uref
+                   | None -> false
+                 in
+                 if is_mm then begin
+                   if side_str = "buy" then incr current_mm_open_buy_count else incr current_mm_open_sell_count
                  end else begin
-                   incr grid_open_sell_count;
-                   grid_sell_orders := (oid, price, qty) :: !grid_sell_orders
+                   if side_str = "buy" then begin
+                     incr current_grid_open_buy_count;
+                     current_grid_buy_orders := (oid, price) :: !current_grid_buy_orders
+                   end else begin
+                     incr current_grid_open_sell_count;
+                     current_grid_sell_orders := (oid, price, qty) :: !current_grid_sell_orders
+                   end
                  end
                end
-             end
-          );
+            );
+            cached_grid_buy_orders := !current_grid_buy_orders;
+            cached_grid_sell_orders := !current_grid_sell_orders;
+            cached_grid_open_buy_count := !current_grid_open_buy_count;
+            cached_grid_open_sell_count := !current_grid_open_sell_count;
+            cached_mm_open_buy_count := !current_mm_open_buy_count;
+            cached_mm_open_sell_count := !current_mm_open_sell_count;
+          end;
+
+          let grid_buy_orders = !cached_grid_buy_orders in
+          let grid_sell_orders = !cached_grid_sell_orders in
+          let grid_open_buy_count = ref !cached_grid_open_buy_count in
+          let grid_open_sell_count = ref !cached_grid_open_sell_count in
+          let mm_open_buy_count = ref !cached_mm_open_buy_count in
+          let mm_open_sell_count = ref !cached_mm_open_sell_count in
 
           (* Fast-path tick perfect balance access without hashtable locks *)
           let asset_bal_val = 
@@ -602,7 +630,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
                Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now
-                 ~precounted_orders:(!grid_buy_orders, !grid_sell_orders, !grid_open_buy_count)
+                 ~precounted_orders:(grid_buy_orders, grid_sell_orders, !grid_open_buy_count)
                  asset !current_price !tob_bid !tob_ask asset_bal_val quote_bal_val !grid_open_buy_count !grid_open_sell_count iter_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with

@@ -103,7 +103,7 @@ let test_order_acknowledgment () =
   initial_state.pending_orders <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ()) :: initial_state.pending_orders;
 
   (* Handle acknowledgment *)
-  Dio_strategies.Market_maker.Strategy.handle_order_acknowledged "TEST/USD" "order456" Dio_strategies.Strategy_common.Buy 50000.0;
+  Dio_strategies.Market_maker.Strategy.handle_order_acknowledged ~now:0.0 "TEST/USD" "order456" Dio_strategies.Strategy_common.Buy 50000.0;
 
   (* Should update tracking but not remove pending orders since IDs don't match exactly *)
   (* This is a bit tricky to test precisely without more complex mocking *)
@@ -119,7 +119,7 @@ let test_order_cancellation () =
   state.open_sell_orders <- [("sell456", 51000.0, 1.0)];
 
   (* Cancel the buy order *)
-  Dio_strategies.Market_maker.Strategy.handle_order_cancelled "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy None;
+  Dio_strategies.Market_maker.Strategy.handle_order_cancelled ~now:0.0 "TEST2/USD" "buy123" Dio_strategies.Strategy_common.Buy None;
 
   (* Should clear buy order tracking *)
   check (option string) "buy order id cleared" None state.last_buy_order_id;
