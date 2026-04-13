@@ -77,15 +77,18 @@ module InFlightOrders = struct
 
   (** Atomically insert [duplicate_key] if absent. Returns true on insertion,
       false if the key was already present. *)
-  let rec add_in_flight_order duplicate_key =
-    let map = Atomic.get registry in
-    if StringMap.mem duplicate_key map then
-      false
-    else
-      let new_map = StringMap.add duplicate_key (Unix.gettimeofday ()) map in
-      if Atomic.compare_and_set registry map new_map then
-        true
-      else add_in_flight_order duplicate_key
+  let add_in_flight_order duplicate_key =
+    let now = Unix.gettimeofday () in
+    let rec loop () =
+      let map = Atomic.get registry in
+      if StringMap.mem duplicate_key map then
+        false
+      else
+        let new_map = StringMap.add duplicate_key now map in
+        if Atomic.compare_and_set registry map new_map then
+          true
+        else loop ()
+    in loop ()
 
   (** Remove [duplicate_key] from the cache. Returns true if it was present. *)
   let rec remove_in_flight_order duplicate_key =
@@ -135,15 +138,18 @@ module InFlightAmendments = struct
 
   (** Atomically insert [order_id] if absent. Returns true on insertion,
       false if already tracked. *)
-  let rec add_in_flight_amendment order_id =
-    let map = Atomic.get registry in
-    if StringMap.mem order_id map then
-      false
-    else
-      let new_map = StringMap.add order_id (Unix.gettimeofday ()) map in
-      if Atomic.compare_and_set registry map new_map then
-        true
-      else add_in_flight_amendment order_id
+  let add_in_flight_amendment order_id =
+    let now = Unix.gettimeofday () in
+    let rec loop () =
+      let map = Atomic.get registry in
+      if StringMap.mem order_id map then
+        false
+      else
+        let new_map = StringMap.add order_id now map in
+        if Atomic.compare_and_set registry map new_map then
+          true
+        else loop ()
+    in loop ()
 
   (** Returns true if [order_id] has a pending amendment. *)
   let is_in_flight order_id =

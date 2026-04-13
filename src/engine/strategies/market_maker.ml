@@ -249,7 +249,7 @@ let create_cancel_order order_id asset_symbol strategy exchange =
 (** Writes an order to the ring buffer after deduplication.
     Returns true on success, false if duplicate or buffer full.
     Updates in-flight flags, pending order tracking, and broadcasts OrderSignal. *)
-let push_order ?(now = Unix.time ()) order =
+let push_order ~state ?(now = Unix.time ()) order =
   let operation_str = match order.operation with
     | Place -> "place"
     | Amend -> "amend"
@@ -259,7 +259,6 @@ let push_order ?(now = Unix.time ()) order =
   (* Reject duplicate cancellations using pending_cancellations table *)
   (match order.operation with
    | Cancel ->
-       let state = get_strategy_state order.symbol in
        (match order.order_id with
         | Some target_order_id ->
             if Hashtbl.mem state.pending_cancellations target_order_id then begin
@@ -306,7 +305,6 @@ let push_order ?(now = Unix.time ()) order =
 
 
             (* Update per-symbol strategy state *)
-            let state = get_strategy_state order.symbol in
 
             (* Set inflight flags for Place operations *)
             (match order.operation, order.side with
@@ -363,7 +361,7 @@ let push_order ?(now = Unix.time ()) order =
        end)
 
 (** Cancels all open orders at [target_price] for [target_side]. Returns count cancelled. *)
-let cancel_duplicate_orders asset_symbol target_price _target_side (open_orders_list : (string * float * float) list) strategy exchange =
+let cancel_duplicate_orders ~state asset_symbol target_price _target_side (open_orders_list : (string * float * float) list) strategy exchange =
   let count = ref 0 in
   let duplicates = ref [] in
 
@@ -377,7 +375,7 @@ let cancel_duplicate_orders asset_symbol target_price _target_side (open_orders_
 
   List.iter (fun order_id ->
     let cancel_order = create_cancel_order order_id asset_symbol strategy exchange in
-    ignore (push_order cancel_order)
+    ignore (push_order ~state cancel_order)
   ) !duplicates;
 
   List.length !duplicates
@@ -635,7 +633,7 @@ let execute_strategy
           List.iter (fun (order_id, _order_price, _qty, side_str) ->
             if side_str = "buy" then begin
               let cancel_order = create_cancel_order order_id asset.symbol MM asset.exchange in
-              ignore (push_order ~now cancel_order);
+              ignore (push_order ~state ~now cancel_order);
               ()
             end
           ) !mm_open_orders;
@@ -644,7 +642,7 @@ let execute_strategy
           (match state.last_buy_order_id with
            | Some tracked_id ->
                let cancel_order = create_cancel_order tracked_id asset.symbol MM asset.exchange in
-               ignore (push_order ~now cancel_order);
+               ignore (push_order ~state ~now cancel_order);
                ()
            | None -> ());
 
@@ -666,7 +664,7 @@ let execute_strategy
                 if meets_min_qty asset.symbol rounded_qty asset.exchange then begin
                    let sell_price = round_price ask asset.symbol asset.exchange in
                    let sell_order = create_place_order asset.symbol Sell rounded_qty (Some sell_price) true MM asset.exchange in
-                   ignore (push_order ~now sell_order);
+                   ignore (push_order ~state ~now sell_order);
                    if should_log then Logging.info_f ~section "Placed emergency sell order for free balance: %.8f @ %.2f for %s" rounded_qty sell_price asset.symbol
                 end
             | _ -> ()
@@ -708,7 +706,7 @@ let execute_strategy
             List.iter (fun (order_id, _order_price, _qty, side_str) ->
               if side_str = "buy" then begin
                 let cancel_order = create_cancel_order order_id asset.symbol MM asset.exchange in
-                ignore (push_order ~now cancel_order)
+                ignore (push_order ~state ~now cancel_order)
               end
             ) !mm_open_orders;
             
@@ -755,7 +753,7 @@ let execute_strategy
                   (* Place sell first *)
                   if can_place_sell then begin
                     let sell_order = create_place_order asset.symbol Sell qty (Some sell_price) true MM asset.exchange in
-                    ignore (push_order ~now sell_order);
+                    ignore (push_order ~state ~now sell_order);
                     if should_log then Logging.info_f ~section "Placed sell order for %s: %.8f @ %.2f"
                       asset.symbol qty sell_price;
                   end;
@@ -763,9 +761,9 @@ let execute_strategy
                   (* Then place buy *)
                   if can_place_buy then begin
                     let synthetic_list = [(buy_price |> string_of_float, buy_price, qty)] in
-                    let _ = cancel_duplicate_orders asset.symbol buy_price Buy synthetic_list MM asset.exchange in
+                    let _ = cancel_duplicate_orders ~state asset.symbol buy_price Buy synthetic_list MM asset.exchange in
                     let buy_order = create_place_order asset.symbol Buy qty (Some buy_price) true MM asset.exchange in
-                    if push_order ~now buy_order then begin
+                    if push_order ~state ~now buy_order then begin
                       state.last_buy_order_price <- Some buy_price;
                       if should_log then Logging.info_f ~section "Placed buy order for %s: %.8f @ %.2f (fee=%.6f)"
                         asset.symbol qty buy_price fee;
@@ -833,16 +831,16 @@ let execute_strategy
                   (* Proceed only if profitable, post-only safe, and balance is sufficient *)
                   if profitability_ok && required_buy_price <= (bid +. 0.0000001) && amendment_balance_ok then begin
                     let synthetic_list = [(buy_order_id, required_buy_price, qty)] in
-                    let _ = cancel_duplicate_orders asset.symbol required_buy_price Buy synthetic_list MM asset.exchange in
+                    let _ = cancel_duplicate_orders ~state asset.symbol required_buy_price Buy synthetic_list MM asset.exchange in
                     let amend_order = create_amend_order buy_order_id asset.symbol Buy qty (Some required_buy_price) true MM asset.exchange in
-                    ignore (push_order ~now amend_order);
+                    ignore (push_order ~state ~now amend_order);
                     state.last_buy_order_price <- Some required_buy_price;
 
                     if should_log then Logging.info_f ~section "Amended buy order for %s: %.8f -> %.8f (reason=book shift)"
                       asset.symbol current_buy_price required_buy_price;
                   end else begin
                     let cancel_order = create_cancel_order buy_order_id asset.symbol MM asset.exchange in
-                    ignore (push_order ~now cancel_order)
+                    ignore (push_order ~state ~now cancel_order)
                   end
                 end else begin
                   (* Price already correct: no action required *)
