@@ -874,13 +874,24 @@ let execute_strategy
                    state.last_buy_order_price <- None
                | None -> ())
             end
-       end else if not state.inflight_cancel_buy && not state.inflight_buy then begin
+       end else if not state.inflight_cancel_buy && not state.inflight_buy && not state.inflight_amend_buy then begin
             (match !best_buy_id with
              | Some best_order_id ->
                  let best_price = !best_buy_price in
-                 state.last_buy_order_price <- Some best_price;
-                 state.last_buy_order_id <- Some best_order_id;
-                 set_asset_reserved_quote state (best_price *. lot_qty)
+                 
+                 (* If we amended very recently, the WS snapshot might be stale.
+                    Do not overwrite our local target price with the lagging WS price
+                    during the catch-up window, to prevent stuttering/receding amends. *)
+                 let recent_amend = match Hashtbl.find_opt state.amend_cooldowns best_order_id with
+                   | Some expiry -> (now -. expiry) < 5.0 (* up to 5 seconds after cooldown ends *)
+                   | None -> false
+                 in
+                 
+                 if not recent_amend then begin
+                   state.last_buy_order_price <- Some best_price;
+                   state.last_buy_order_id <- Some best_order_id;
+                   set_asset_reserved_quote state (best_price *. lot_qty)
+                 end
              | None -> ())
        end;
 
@@ -1744,13 +1755,15 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
                else
                  (* Cancel-replace amendment (Hyperliquid): new order ID assigned. *)
                  Logging.info_f ~section "Amended buy order ID in tracking: %s -> %s @ %.2f for %s"
-                   old_order_id new_order_id price asset_symbol
+                   old_order_id new_order_id price asset_symbol;
+               
+               state.inflight_amend_buy <- false
              | _ -> 
                 (* If the old order was not tracked, do not install the new order
                    as the tracked buy. Doing so resurrects ghost orders from stale
                    orderUpdate websocket events, causing duplicate/ghost order
                    detection when combined with fresh placements. *)
-                ())
+                state.inflight_amend_buy <- false)
      | Sell ->
          let original_sell_count = List.length state.open_sell_orders in
          let old_entry = List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders in
