@@ -5,6 +5,7 @@ let pressure_max_len = 240
 let pressure_hist = Array.make pressure_max_len 0.0
 let pressure_hist_idx = ref 0
 let pressure_last_time = ref 0.0
+let max_seen_heap_ref = ref 0
 let pressure_blocks = [| "⠀"; "⡀"; "⣀"; "⣄"; "⣤"; "⣦"; "⣶"; "⣷"; "⣿" |]
 
 let render_memory w json =
@@ -43,7 +44,12 @@ let render_memory w json =
     let offset = if offset < 0 then offset + pressure_max_len else offset in
     let ratio = pressure_hist.(offset) in
     
-    let v = int_of_float (ratio *. 8.0) in
+    let v = 
+      if ratio <= 1.05 then
+        int_of_float ((ratio /. 1.05) *. 8.0)
+      else
+        8 + int_of_float (((ratio -. 1.05) /. 0.3) *. 8.0)
+    in
     let v = max 0 (min 16 v) in
     let t_idx, b_idx = if v <= 8 then (0, v) else (v - 8, 8) in
 
@@ -81,9 +87,13 @@ let render_memory w json =
       render_progress_bar 15 ratio p_attr;
     ]
   in
+  let max_seen_heap = max !max_seen_heap_ref heap in
+  max_seen_heap_ref := max_seen_heap;
+  let heap_ratio = if max_seen_heap > 0 then float_of_int heap /. float_of_int max_seen_heap else 0.0 in
+
   let row1 = I.hcat [
     I.string a_border " │";
-    kv_bar "HEAP" (Printf.sprintf "%dMB" heap) (min 1.0 (float_of_int heap /. 500.0)) a_yellow;
+    kv_bar "HEAP" (Printf.sprintf "%dMB" heap) heap_ratio a_yellow;
     kv_bar "LIVE" (Printf.sprintf "%dKB" live) live_ratio a_green;
     kv "FREE" (Printf.sprintf "%dKB" free);
   ] in
