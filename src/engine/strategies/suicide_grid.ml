@@ -171,6 +171,7 @@ type strategy_state = {
   mutable last_cleanup_time: float;
   mutable inflight_buy: bool;   (* true while buy Place is pending ack or reject *)
   mutable inflight_sell: bool;  (* true while sell Place is pending ack or reject *)
+  mutable evicted_orders: (string, float) Hashtbl.t; (* order_id -> expiry_ts; blocks rebuilt orders *)
   mutable asset_low: bool;      (* set when asset balance is insufficient for next sell; pauses sell and buy *)
   mutable capital_low: bool;    (* set when quote balance is insufficient for next buy; pauses strategy *)
   mutable capital_low_logged: bool; (* suppresses repeated capital-low log warnings *)
@@ -234,6 +235,7 @@ let rec get_strategy_state asset_symbol =
         last_cleanup_time = 0.0;
         inflight_buy = false;
         inflight_sell = false;
+        evicted_orders = Hashtbl.create 16;
         asset_low = false;
         capital_low = false;
         capital_low_logged = false;
@@ -845,7 +847,7 @@ let execute_strategy
               | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
               | None -> true
             in
-            if qty > 0.0 && is_our_strategy then begin
+            if qty > 0.0 && is_our_strategy && not (Hashtbl.mem state.evicted_orders oid) then begin
               if side_str = "buy" then begin
                 incr open_buy_count_from_scan;
                 locked_in_buys := !locked_in_buys +. (price *. qty);
@@ -909,12 +911,10 @@ let execute_strategy
             ()
           end
         ) preserved_sells
-      end;
-
-      (* Stale sell reconciliation: detect sell orders priced at or below the
+      end;      (* Stale sell reconciliation: detect sell orders priced at or below the
          current bid. These should have filled but we may have missed the WS
-         notification during a connection drop. For Lighter, also trigger a
-         balance refresh since fill proceeds may not have been reflected. *)
+         notification during a connection drop. Evict them from memory so they
+         don't continuously log and block the grid's tracking state. *)
       if bid_price > 0.0 then begin
         let stale_sells = List.filter (fun (_oid, price, _qty) ->
           price <= bid_price
@@ -923,9 +923,15 @@ let execute_strategy
           List.iter (fun (oid, price, qty) ->
             Logging.warn_f ~section
               "STALE_SELL_DETECTED [%s] order %s @ %.2f <= bid %.2f (qty=%.8f). \
-               Likely filled during WS outage."
-              asset.symbol oid price bid_price qty
+               Likely filled during WS outage. Evicting from tracking memory."
+              asset.symbol oid price bid_price qty;
+            Hashtbl.replace state.evicted_orders oid (now +. 86400.0)
           ) stale_sells;
+          
+          state.open_sell_orders <- List.filter (fun (oid, _, _) ->
+            not (Hashtbl.mem state.evicted_orders oid)
+          ) state.open_sell_orders;
+
           (* Trigger a balance refresh for Lighter to pick up fill proceeds *)
           if asset.exchange = "lighter" then
             Lighter.Balances.request_balance_refresh ()
