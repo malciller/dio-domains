@@ -183,7 +183,7 @@ let process_asset_balances json =
   in
   let assets = (try member "assets" account_data |> to_assoc with _ -> []) in
   if assets = [] then
-    Logging.warn_f ~section "Balance update has no assets field (type=%s, content=%s)"
+    Logging.debug_f ~section "Balance update has no assets field (type=%s, content=%s)"
       (try member "type" json |> to_string with _ -> "unknown")
       (Yojson.Safe.to_string account_data)
   else begin
@@ -255,14 +255,24 @@ let process_user_stats json =
       (try member "type" json |> to_string with _ -> "unknown")
       (try keys json |> String.concat "," with _ -> "?")
   else begin
-    let collateral_v = member "collateral" stats in
-    if collateral_v <> `Null then begin
-      let collateral = (try Lighter_types.parse_json_float collateral_v with _ -> 0.0) in
-      publish_balance_update "USDC" collateral;
-      Logging.info_f ~section "Balance update: USDC = %.8f (via user_stats collateral)" collateral;
+    let extract_float key =
+      let v = member key stats in
+      if v <> `Null then (try Lighter_types.parse_json_float v with _ -> 0.0) else 0.0
+    in
+    let collateral = extract_float "collateral" in
+    let margin_balance = extract_float "margin_balance" in
+    let wallet_balance = extract_float "wallet_balance" in
+    let account_value = extract_float "account_value" in
+    
+    let true_balance = max (max collateral margin_balance) (max wallet_balance account_value) in
+    
+    if true_balance > 0.0 || (collateral = 0.0 && margin_balance = 0.0) then begin
+      publish_balance_update "USDC" true_balance;
+      Logging.debug_f ~section "Balance update: USDC = %.8f (via user_stats. max of col:%.2f mb:%.2f wb:%.2f av:%.2f)" 
+        true_balance collateral margin_balance wallet_balance account_value;
       notify_ready ()
     end else
-      Logging.info_f ~section "user_stats stats.collateral is null (stats_keys=%s)"
+      Logging.info_f ~section "user_stats received but all metrics are zero (stats_keys=%s)"
         (try keys stats |> String.concat "," with _ -> "?")
   end
 
@@ -270,7 +280,14 @@ let process_user_stats json =
 let process_market_data json =
   let open Yojson.Safe.Util in
   let msg_type =
-    try member "type" json |> to_string with _ -> ""
+    let raw_type = try member "type" json |> to_string with _ -> "" in
+    let channel = try member "channel" json |> to_string with _ -> "" in
+    if channel <> "" then
+      let ch_prefix = try String.sub channel 0 (String.index channel '/') with Not_found -> channel in
+      if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed" then
+        raw_type ^ "/" ^ ch_prefix
+      else raw_type
+    else raw_type
   in
   match msg_type with
   | "update/account_all" | "snapshot/account_all" | "subscribed/account_all"
