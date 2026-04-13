@@ -613,7 +613,6 @@ let push_order ~now ?state order =
     caller to avoid redundant syscalls on every cycle. *)
 let execute_strategy
     ?cached_state
-    ?precounted_orders
     ~now
     (asset : trading_config)
     (current_price : float)
@@ -832,83 +831,66 @@ let execute_strategy
          When precounted_orders is provided by the caller, skip the redundant
          iter_open_orders call that would re-acquire orders_mutex and re-iterate
          the same hashtable the caller already scanned. *)
-          let (buy_orders, sell_orders, open_buy_count_from_scan) =
-            match precounted_orders with
-            | Some (buys, sells, bc) ->
-                (ref buys, ref sells, bc)
-            | None ->
-                let obc = ref 0 in
-                let buys = ref [] in
-                let sells = ref [] in
-                iter_open_orders (fun order_id order_price qty side_str userref_opt ->
-                  let is_our_strategy = match userref_opt with
-                    | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
-                    | None -> true
-                  in
-                  if qty > 0.0 && is_our_strategy then begin
-                    if side_str = "buy" then begin
-                      incr obc;
-                      buys := (order_id, order_price) :: !buys
-                    end else begin
-                      sells := (order_id, order_price, qty) :: !sells;
-                      ()
-                    end
-                  end
-                );
-                (buys, sells, !obc)
-          in
 
-      (* Set buy order price and ID (select highest buy if multiple exist).
-         Gate: if a cancel is in flight, the open_orders snapshot is not trusted
-         because the order channel has not yet confirmed the cancel, so open_orders
-         may still report the order as open. Only the order channel
-         (handle_order_cancelled) clears inflight_cancel_buy. *)
-      (match !buy_orders with
-       | [] when not state.inflight_cancel_buy && not state.inflight_buy ->
-           (* No open buy and no in-flight op; clear reservation and buy tracking.
-              This handles orders cancelled by the exchange during a WS disconnect
-              where the cancellation event was never received (ghost orders).
-              Without this, last_buy_order_id would persist indefinitely,
-              effective_buy_count would stay at 1, and no new buy could be placed. *)
-           set_asset_reserved_quote state 0.0;
-           (match state.last_buy_order_id with
-            | Some ghost_id ->
-                Logging.info_f ~section "Clearing ghost buy order %s for %s (exchange reports 0 open buys)"
-                  ghost_id asset.symbol;
-                state.last_buy_order_id <- None;
-                state.last_buy_order_price <- None
-            | None -> ())
-       | orders when not state.inflight_cancel_buy && not state.inflight_buy ->
-           (* Safe to sync: no in-flight operation. *)
-           let valid_orders = List.filter (fun (_, p) -> p > 0.0) orders in
-           (match valid_orders with
-            | [] -> () (* Maintain prior state if price is temporarily unavailable *)
-            | hd :: tl ->
-               let (best_order_id, best_price) = List.fold_left (fun (acc_id, acc_price) (order_id, price) ->
-                 if price > acc_price then (order_id, price) else (acc_id, acc_price)
-               ) hd tl in
-               state.last_buy_order_price <- Some best_price;
-               state.last_buy_order_id <- Some best_order_id;
-               (* Sync per-asset reserved_quote from the actual open buy so the
-                  capital_low check uses the real exchange-reserved amount after restart. *)
-               set_asset_reserved_quote state (best_price *. lot_qty))
-       | _ ->
-           (* In-flight cancel or place: open_orders may be stale.
-              Retain current state; order channel will resolve. *)
-           ());
+          let best_buy_price = ref 0.0 in
+          let best_buy_id = ref None in
+          let open_buy_count_from_scan = ref 0 in
+          let locked_in_buys = ref 0.0 in
+          let locked_in_sells = ref 0.0 in
+          let closest_sell_order = ref None in
+          state.open_sell_orders <- [];
 
+          iter_open_orders (fun oid price qty side_str userref_opt ->
+            let is_our_strategy = match userref_opt with
+              | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
+              | None -> true
+            in
+            if qty > 0.0 && is_our_strategy then begin
+              if side_str = "buy" then begin
+                incr open_buy_count_from_scan;
+                locked_in_buys := !locked_in_buys +. (price *. qty);
+                if price > !best_buy_price && price > 0.0 then begin
+                  best_buy_price := price;
+                  best_buy_id := Some oid
+                end
+              end else if side_str = "sell" then begin
+                state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
+                locked_in_sells := !locked_in_sells +. qty;
+                match !closest_sell_order with
+                | None -> closest_sell_order := Some (oid, price)
+                | Some (_, best_p) -> if price < best_p then closest_sell_order := Some (oid, price)
+              end
+            end
+          );
+
+       if !open_buy_count_from_scan = 0 && not state.inflight_cancel_buy && not state.inflight_buy then begin
+            set_asset_reserved_quote state 0.0;
+            (match state.last_buy_order_id with
+             | Some _ghost_id ->
+                 state.last_buy_order_id <- None;
+                 state.last_buy_order_price <- None
+             | None -> ())
+       end else if not state.inflight_cancel_buy && not state.inflight_buy then begin
+            (match !best_buy_id with
+             | Some best_order_id ->
+                 let best_price = !best_buy_price in
+                 state.last_buy_order_price <- Some best_price;
+                 state.last_buy_order_id <- Some best_order_id;
+                 set_asset_reserved_quote state (best_price *. lot_qty)
+             | None -> ())
+       end;
 
       (* Apply exchange sell orders. *)
-      state.open_sell_orders <- !sell_orders;
+      
 
       (* Merge any preserved sell orders that aren't in the exchange-sourced list.
          This covers cancel-replace amendments where the new order hasn't yet
          appeared in the order update stream. *)
       if ecfg.merge_preserved_sells then begin
-        List.iter (fun (preserved_id, preserved_price, _) ->
+        List.iter (fun (preserved_id, _preserved_price, _) ->
           let already_present = List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders in
           if not already_present then begin
-            state.open_sell_orders <- (preserved_id, preserved_price, lot_qty) :: state.open_sell_orders;
+            
             ()
           end
         ) preserved_sells
@@ -953,7 +935,7 @@ let execute_strategy
     let has_tracked_buy = state.last_buy_order_id <> None in
     (* Use the count from our own scan (precounted or internal), not the
        external parameter which may include orders from other strategies. *)
-    let open_buy_count = open_buy_count_from_scan in
+    let open_buy_count = !open_buy_count_from_scan in
     let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
 
     if buy_order_pending then begin
@@ -967,12 +949,17 @@ let execute_strategy
         Logging.info_f ~section "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order policy"
           effective_buy_count asset.symbol;
 
-        (* Cancel all buy orders. *)
-        List.iter (fun (order_id, _) ->
-          let cancel_order = create_cancel_order order_id asset.symbol Grid asset.exchange in
-          ignore (push_order ~now ~state cancel_order);
-          Logging.info_f ~section "Cancelling excess buy order: %s for %s" order_id asset.symbol
-        ) !buy_orders;
+        iter_open_orders (fun order_id _ _ side_str userref_opt ->
+          let is_our_strategy = match userref_opt with
+            | Some ref_val -> ref_val <> Strategy_common.strategy_userref_mm
+            | None -> true
+          in
+          if is_our_strategy && side_str = "buy" then begin
+            let cancel_order = create_cancel_order order_id asset.symbol Grid asset.exchange in
+            ignore (push_order ~now ~state cancel_order);
+            Logging.info_f ~section "Cancelling excess buy order: %s for %s" order_id asset.symbol
+          end
+        );
 
         (* Clear buy order tracking; all buys are being cancelled. *)
         state.last_buy_order_id <- None;
@@ -1026,13 +1013,13 @@ let execute_strategy
                 2. qty locked in open sell orders on the exchange. *)
              let balance_ok =
                if ecfg.use_reserved_base_guard then
-                 let locked_in_sells = List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 !sell_orders in
-                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells in
+                 let locked_in_sells_local = !locked_in_sells in
+                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells_local in
                  if available >= sell_qty then true
                  else begin
                    Logging.warn_f ~section
                      "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells sell_qty;
+                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
                    (* Set asset_low to prevent tight-looping on every cycle.
                       Clears event-driven when balance recovers. Without this,
                       the strategy re-enters the effective_buy_count=0 branch,
@@ -1086,8 +1073,8 @@ let execute_strategy
          else begin
              let quote_bal = quote_balance in
              (* Compute available balances net of open order commitments *)
-             let locked_in_buys = List.fold_left (fun acc (_, price) -> acc +. (price *. lot_qty)) 0.0 !buy_orders in
-             let available_quote_balance = quote_bal -. locked_in_buys in
+             
+             let available_quote_balance = quote_bal -. !locked_in_buys in
              let balance_ok = available_quote_balance >= (buy_price *. qty) in
              if balance_ok then begin
                let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
@@ -1145,19 +1132,13 @@ let execute_strategy
       end else if effective_buy_count > 0 then begin
         (* Case 2: open buy exists; check sell orders for spacing enforcement. *)
         (* Combine active and pending sell orders for spacing calculation. *)
-        let closest_sell_order = ref None in
-        let update_closest oid price =
-          if price > 0.0 then begin
-            match !closest_sell_order with
-            | None -> closest_sell_order := Some (oid, price)
-            | Some (_, best_price) ->
-                if price < best_price then closest_sell_order := Some (oid, price)
-          end
+        let update_closest_pending oid price =
+          match !closest_sell_order with
+          | None -> closest_sell_order := Some (oid, price)
+          | Some (_, best_p) -> if price < best_p then closest_sell_order := Some (oid, price)
         in
-        
-        List.iter (fun (oid, price, _) -> update_closest oid price) state.open_sell_orders;
         List.iter (fun (oid, side, price, _) -> 
-          if side = Sell then update_closest oid price
+          if side = Sell then update_closest_pending oid price
         ) state.pending_orders;
         
         let closest_sell_order_val = !closest_sell_order in

@@ -132,15 +132,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let exec_ready_cycle = ref 0 in
       
       let open_orders_dirty = ref true in
-      let cached_grid_buy_orders = ref [] in
-      let cached_grid_sell_orders = ref [] in
-      let cached_grid_open_buy_count = ref 0 in
-      let cached_grid_open_sell_count = ref 0 in
-      let cached_mm_open_buy_count = ref 0 in
-      let cached_mm_open_sell_count = ref 0 in
-      let cached_mm_open_orders = ref [] in
-      let cached_global_locked_buys = ref 0.0 in
-      let cached_global_locked_sells = ref 0.0 in
+
 
       (* Initialize strategy configuration refs based on strategy type *)
       let baseline_price = ref None in
@@ -283,8 +275,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let get_exec_pos_fn = Ex.get_execution_feed_position_fast ~symbol:asset_with_fees.symbol in
       let has_exec_fn = Ex.has_execution_data_fast ~symbol:asset_with_fees.symbol in
       
-      let last_buy_count = ref 0 in
-      let last_sell_count = ref 0 in
+
 
       let cycle_count = ref 0 in
 
@@ -530,61 +521,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol f
           in
 
-          if !open_orders_dirty then begin
-            open_orders_dirty := false;
-            let current_grid_buy_orders = ref [] in
-            let current_grid_sell_orders = ref [] in
-            let current_grid_open_buy_count = ref 0 in
-            let current_grid_open_sell_count = ref 0 in
-            let current_mm_open_buy_count = ref 0 in
-            let current_mm_open_sell_count = ref 0 in
-            let current_mm_open_orders = ref [] in
-            let current_global_locked_buys = ref 0.0 in
-            let current_global_locked_sells = ref 0.0 in
+          
+          (* Pass iter_orders closure directly down. This removes the 2-3ms STW GC pause 
+             caused by allocating intermediate Order tracking lists exactly on the event hotpath. *)
 
-            iter_orders (fun oid price qty side_str userref_opt ->
-               if qty > 0.0 then begin
-                 if side_str = "buy" then current_global_locked_buys := !current_global_locked_buys +. (price *. qty)
-                 else if side_str = "sell" then current_global_locked_sells := !current_global_locked_sells +. qty;
-                 
-                 let is_mm = match userref_opt with
-                   | Some uref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm uref
-                   | None -> false
-                 in
-                 if is_mm then begin
-                   current_mm_open_orders := (oid, price, qty, side_str) :: !current_mm_open_orders;
-                   if side_str = "buy" then incr current_mm_open_buy_count else incr current_mm_open_sell_count
-                 end else begin
-                   if side_str = "buy" then begin
-                     incr current_grid_open_buy_count;
-                     current_grid_buy_orders := (oid, price) :: !current_grid_buy_orders
-                   end else begin
-                     incr current_grid_open_sell_count;
-                     current_grid_sell_orders := (oid, price, qty) :: !current_grid_sell_orders
-                   end
-                 end
-               end
-            );
-            cached_grid_buy_orders := !current_grid_buy_orders;
-            cached_grid_sell_orders := !current_grid_sell_orders;
-            cached_grid_open_buy_count := !current_grid_open_buy_count;
-            cached_grid_open_sell_count := !current_grid_open_sell_count;
-            cached_mm_open_buy_count := !current_mm_open_buy_count;
-            cached_mm_open_sell_count := !current_mm_open_sell_count;
-            cached_mm_open_orders := !current_mm_open_orders;
-            cached_global_locked_buys := !current_global_locked_buys;
-            cached_global_locked_sells := !current_global_locked_sells;
-          end;
-
-          let grid_buy_orders = !cached_grid_buy_orders in
-          let grid_sell_orders = !cached_grid_sell_orders in
-          let grid_open_buy_count = ref !cached_grid_open_buy_count in
-          let grid_open_sell_count = ref !cached_grid_open_sell_count in
-          let mm_open_buy_count = ref !cached_mm_open_buy_count in
-          let mm_open_sell_count = ref !cached_mm_open_sell_count in
-          let mm_open_orders = !cached_mm_open_orders in
-          let global_locked_buys = !cached_global_locked_buys in
-          let global_locked_sells = !cached_global_locked_sells in
 
           (* Fast-path tick perfect balance access without hashtable locks *)
           let asset_bal_val = 
@@ -598,8 +538,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             | exception _ -> nan
           in
           
-          last_buy_count := !grid_open_buy_count + !mm_open_buy_count;
-          last_sell_count := !grid_open_sell_count + !mm_open_sell_count;
+
 
           (* Trigger async Fear & Greed refresh on significant price movement *)
           if not (Float.is_nan !current_price) then begin
@@ -653,8 +592,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (match !grid_strategy_asset_ref, cached_grid_state with
            | Some asset, Some cs ->
                Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now
-                 ~precounted_orders:(grid_buy_orders, grid_sell_orders, !grid_open_buy_count)
-                 asset !current_price !tob_bid !tob_ask asset_bal_val quote_bal_val !grid_open_buy_count !grid_open_sell_count iter_orders !cycle_count
+                 
+                 asset !current_price !tob_bid !tob_ask asset_bal_val quote_bal_val 0 0 iter_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
@@ -662,7 +601,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                let mm_tob = if Float.is_nan !tob_bid then None else Some (!tob_bid, !tob_bsize, !tob_ask, !tob_asize) in
                let mm_abal = if Float.is_nan asset_bal_val then None else Some asset_bal_val in
                let mm_qbal = if Float.is_nan quote_bal_val then None else Some quote_bal_val in
-               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs ~precounted_orders:(mm_open_orders, global_locked_buys, global_locked_sells) asset mm_cp mm_tob mm_abal mm_qbal !mm_open_buy_count !mm_open_sell_count iter_orders !cycle_count
+               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset mm_cp mm_tob mm_abal mm_qbal 0 0 iter_orders !cycle_count
            | _ -> ());
         end;
         let t4 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
