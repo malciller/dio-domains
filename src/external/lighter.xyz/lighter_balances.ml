@@ -1,11 +1,12 @@
 (** Provides the centralized subsystem for tracking real-time asset balances originating from the Lighter exchange.
-    This module synthesizes financial state by multiplexing over two disparate WebSocket streams:
-    1. The [account_all_assets/{ACCOUNT_ID}] channel, utilized exclusively for granular spot base asset tracking (e.g., parsing varying structures containing free, available, or balance fields).
-    2. The [user_stats/{ACCOUNT_ID}] channel, leveraged securely for retrieving the aggregate USDC collateral metrics.
+    Base asset balances (ETH, etc.) are sourced from the [account_all_assets/{ACCOUNT_ID}] WS channel.
+    USDC balance handling depends on the account mode:
+    - Split accounts: USDC appears in the assets array of [account_all_assets] directly.
+    - Unified accounts: USDC is account-level collateral, sourced from [user_stats] WS channel
+      and seeded at startup via the REST /api/v1/account endpoint.
 
-    Note carefully that USDC valuation is deliberately omitted from the [account_all_assets] data pipeline. The Lighter matching engine zeros out the primary balance field in [account_all_assets] whenever quote collateral is encumbered by active buy limit orders. The definitive value of total committed and uncommitted capital is only reliably extrapolated from the [user_stats.stats.collateral] payload.
-
-    Concurrency is orchestrated utilizing a localized Lwt background task that dispatches updates to an event bus topology, mirroring the asynchronous design constructs implemented in hyperliquid_balances.ml. *)
+    Balance messages are dispatched synchronously from the WS frame handler in [lighter_ws.ml],
+    ensuring no messages are lost to bounded-stream backpressure. *)
 
 
 
@@ -170,8 +171,8 @@ let publish_balance_update storage_key balance =
   }
 
 (** Evaluates and maps incoming JSON payloads routed from the [account_all] or [account_all_assets] channels.
-    This function traverses dynamic JSON schema structures to extract base asset allocations safely.
-    The USDC asset ticker is decisively filtered out during the traversal sequence. As noted in the module documentation, modifying USDC balances via this feed introduces severe logical desynchronization when capital is bound in active operations, due to the system reporting standard balance values as zero. *)
+    This function traverses dynamic JSON schema structures to extract all asset allocations,
+    including USDC which reports balance directly in coin terms via the account_all_assets channel. *)
 let process_asset_balances json =
   let open Yojson.Safe.Util in
   let account_data =
@@ -197,52 +198,49 @@ let process_asset_balances json =
           | _ -> asset_id
         in
         let normalized_key = if String.uppercase_ascii storage_key = "USDC" then "USDC" else storage_key in
-        
-        if normalized_key <> "USDC" then begin
-          let balance = match balance_json with
-            | `Assoc _ ->
-                let try_field key =
-                  let v = member key balance_json in
-                  if v <> `Null then Some (Lighter_types.parse_json_float v) else None
-                in
-                (match try_field "collateral" with
-                 | Some b -> b
-                 | None ->
-                     (match try_field "margin_balance" with
-                      | Some b -> b
-                      | None ->
-                          (match try_field "balance" with
-                           | Some b -> b
-                           | None ->
-                               (match try_field "available" with
+        let balance = match balance_json with
+          | `Assoc _ ->
+              let try_field key =
+                let v = member key balance_json in
+                if v <> `Null then Some (Lighter_types.parse_json_float v) else None
+              in
+              (match try_field "balance" with
+               | Some b -> b
+               | None ->
+                   (match try_field "collateral" with
+                    | Some b -> b
+                    | None ->
+                        (match try_field "margin_balance" with
+                         | Some b -> b
+                         | None ->
+                             (match try_field "available" with
+                              | Some b -> b
+                              | None -> (match try_field "free" with
                                 | Some b -> b
-                                | None -> (match try_field "free" with
-                                  | Some b -> b
-                                  | None ->
-                                      Logging.warn_f ~section "Balance object for %s has unknown structure: %s"
-                                        normalized_key (Yojson.Safe.to_string balance_json);
-                                      0.0)))))
-            | _ -> Lighter_types.parse_json_float balance_json
-          in
-          publish_balance_update normalized_key balance;
-          Logging.warn_f ~section "Balance update: %s = %.8f" normalized_key balance
-        end
+                                | None ->
+                                    Logging.warn_f ~section "Balance object for %s has unknown structure: %s"
+                                      normalized_key (Yojson.Safe.to_string balance_json);
+                                    0.0)))))
+          | _ -> Lighter_types.parse_json_float balance_json
+        in
+        publish_balance_update normalized_key balance;
+        Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance
       with exn ->
         Logging.warn_f ~section "Failed to parse balance for %s: %s" asset_id (Printexc.to_string exn)
     ) assets;
     notify_ready ()
   end
 
-(** Interprets the JSON telemetry specific to the [user_stats] event schema to isolate and persist the true collateral value.
-    This serves as the single source of truth for the quote currency metric. The deserialization logic supports deeply nested or variant encapsulation formats natively, probing for the [stats.collateral] node across different protocol wrapper formats, such as direct root, 'user_stats' wrapper, or a generic 'data' envelope. *)
+(** Processes user_stats to maintain USDC balance for unified accounts.
+    In unified/cross-margin mode, USDC collateral lives at the account level
+    (reported via user_stats), not in the assets array (account_all_assets).
+    This handler writes collateral to the USDC balance store to keep it current. *)
 let process_user_stats json =
   let open Yojson.Safe.Util in
-  (* Systematically unwrap the JSON hierarchy, probing distinct known schema permutations to locate the core statistics payload. *)
   let stats =
     let s = member "stats" json in
     if s <> `Null then s
     else
-      (* Fallback traversal paths evaluating encapsulated envelopes instantiated by specific server-side broadcasting topologies. *)
       let us = member "user_stats" json in
       if us <> `Null then member "stats" us
       else
@@ -250,55 +248,32 @@ let process_user_stats json =
         if d <> `Null then member "stats" d
         else `Null
   in
-  if stats = `Null then
-    Logging.info_f ~section "user_stats message has no stats field (type=%s, keys=%s)"
-      (try member "type" json |> to_string with _ -> "unknown")
-      (try keys json |> String.concat "," with _ -> "?")
-  else begin
+  if stats <> `Null then begin
     let extract_float_opt key =
       let v = member key stats in
       if v <> `Null then (try Some (Lighter_types.parse_json_float v) with _ -> None) else None
     in
-    let collateral = extract_float_opt "collateral" in
-    let margin_balance = extract_float_opt "margin_balance" in
-    let wallet_balance = extract_float_opt "wallet_balance" in
-    let account_value = extract_float_opt "account_value" in
-
-    let has_any = Option.is_some collateral || Option.is_some margin_balance || Option.is_some wallet_balance || Option.is_some account_value in
-
-    if has_any then begin
-      let val_of = Option.value ~default:0.0 in
-      let c = val_of collateral in
-      let m = val_of margin_balance in
-      let w = val_of wallet_balance in
-      let a = val_of account_value in
-
-      let true_balance = max (max c m) (max w a) in
-
-      if true_balance > 0.0 then begin
-        publish_balance_update "USDC" true_balance;
-        Logging.debug_f ~section "Balance update: USDC = %.8f (via user_stats. max of col:%.2f mb:%.2f wb:%.2f av:%.2f)" 
-          true_balance c m w a;
+    let val_of o = Option.value o ~default:0.0 in
+    let c = val_of (extract_float_opt "collateral") in
+    let m = val_of (extract_float_opt "margin_balance") in
+    let w = val_of (extract_float_opt "wallet_balance") in
+    let a = val_of (extract_float_opt "account_value") in
+    let usdc_balance = max (max c m) (max w a) in
+    if usdc_balance > 0.0 then begin
+      publish_balance_update "USDC" usdc_balance;
+      Logging.debug_f ~section "USDC updated from user_stats: %.6f (col:%.2f mb:%.2f wb:%.2f av:%.2f)"
+        usdc_balance c m w a;
+      notify_ready ()
+    end else begin
+      (* Don't overwrite a known positive balance with zero *)
+      let existing = get_balance "USDC" in
+      if existing <= 0.0 then begin
+        publish_balance_update "USDC" 0.0;
         notify_ready ()
-      end else begin
-        (* Never overwrite a positive USDC balance with zero — transient
-           user_stats snapshots can report all-zero metrics during exchange
-           maintenance windows or WebSocket reconnections. Preserve the
-           last known positive balance to keep the dashboard accurate. *)
-        let existing = get_balance "USDC" in
-        if existing <= 0.0 then begin
-          (* No previous balance — publish zero and mark ready so the
-             readiness gate does not block indefinitely. *)
-          publish_balance_update "USDC" 0.0;
-          notify_ready ()
-        end;
-        Logging.info_f ~section "user_stats received with zero balance (existing=%.2f, col:%.2f mb:%.2f wb:%.2f av:%.2f, stats_keys=%s)"
-          existing c m w a
-          (try keys stats |> String.concat "," with _ -> "?")
-      end
-    end else
-      Logging.info_f ~section "user_stats received but expected structural metrics are absent (stats_keys=%s)"
-        (try keys stats |> String.concat "," with _ -> "?")
+      end;
+      Logging.debug_f ~section "user_stats zero balance (existing=%.2f, col:%.2f mb:%.2f wb:%.2f av:%.2f)"
+        existing c m w a
+    end
   end
 
 (** Multiplexes demarshaled JSON frames from the WebSocket fabric into specialized processing functions based on the deterministic message type property. *)
@@ -308,7 +283,7 @@ let process_market_data json =
     let raw_type = try member "type" json |> to_string with _ -> "" in
     let channel = try member "channel" json |> to_string with _ -> "" in
     if channel <> "" then
-      let ch_prefix = try String.sub channel 0 (String.index channel '/') with Not_found -> channel in
+      let ch_prefix = try String.sub channel 0 (min (try String.index channel '/' with Not_found -> String.length channel) (try String.index channel ':' with Not_found -> String.length channel)) with _ -> channel in
       if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed" then
         raw_type ^ "/" ^ ch_prefix
       else raw_type
@@ -326,26 +301,8 @@ let process_market_data json =
          Logging.error_f ~section "Failed to process user_stats update: %s" (Printexc.to_string exn))
   | _ -> ()
 
-(** Instantiates the primary, fault-tolerant Lwt execution loop responsible for sustaining the market data subscription.
-    This task seamlessly reconnects and reinjects incoming payloads into the synchronous processing dispatcher, ensuring continuous synchronization with the external exchange interface structure. *)
-let _processor_task =
-  let open Lwt.Infix in
-  let rec loop () =
-    Lwt.catch (fun () ->
-      let sub = Lighter_ws.subscribe_market_data () in
-      Logging.debug ~section "Starting Lighter balances processor task";
-      let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
-      sub.close ();
-      Logging.debug ~section "Balances stream ended (disconnect), re-subscribing...";
-      Lwt.return_unit
-    ) (fun exn ->
-      Logging.debug_f ~section "Lighter balances processor task crashed: %s. Re-subscribing..." (Printexc.to_string exn);
-      Lwt_unix.sleep 1.0
-    ) >>= fun () ->
-    Lwt.async loop;
-    Lwt.return_unit
-  in
-  Lwt.async loop
+
+
 
 let initialize assets =
   Logging.info_f ~section "Initializing Lighter balances feed for %d assets" (List.length assets);
