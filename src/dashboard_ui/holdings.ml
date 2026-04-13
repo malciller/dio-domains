@@ -2,6 +2,8 @@ open Notty
 open Theme
 
 let render_strategies w json =
+  let now = Unix.gettimeofday () in
+  let flash_on = fst (modf (now *. 1.5)) < 0.5 in
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
   let all_balances = json |?> "all_balances" |> to_list_d in
   (* Column header row *)
@@ -183,25 +185,28 @@ let render_strategies w json =
           (is_near_buy, false)
     in
 
+    let flash_buy = near_buy && flash_on in
+    let flash_sell = near_sell && flash_on in
+
     let sell_price_str, sell_price_attr =
       match closest_sell_price_opt with
-      | Some sp -> format_price sp, (if near_sell then a_near_sell_red else a_yellow)
+      | Some sp -> format_price sp, (if flash_sell then a_near_sell_red else a_yellow)
       | None -> "--", a_dim
     in
 
     let row_text =
-      if near_buy then a_near_fill
-      else if near_sell then a_near_sell
+      if flash_buy then a_near_fill
+      else if flash_sell then a_near_sell
       else a_text
     in
     let sym_attr =
-      if near_buy then a_near_fill
-      else if near_sell then a_near_sell
+      if flash_buy then a_near_fill
+      else if flash_sell then a_near_sell
       else exch_sym_attr exchange
     in
 
     let border_attr =
-      let bg_color = if near_buy then c_near_fill else if near_sell then c_near_sell else c_bg in
+      let bg_color = if flash_buy then c_near_fill else if flash_sell then c_near_sell else c_bg in
       A.(fg c_border ++ bg bg_color)
     in
     close_row w (I.hcat [
@@ -217,8 +222,8 @@ let render_strategies w json =
       col_right 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
       col_right 10 row_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
       I.string a_border " │ ";
-      col_right 12 (if near_buy then a_near_fill_green
-              else if near_sell then a_near_sell_red
+      col_right 12 (if flash_buy then a_near_fill_green
+              else if flash_sell then a_near_sell_red
               else if buy_price > 0.0 then a_green else a_dim)
         (if buy_price > 0.0 then format_price buy_price else "--");
       col_right 8 buy_dist_attr buy_dist_str;

@@ -98,7 +98,7 @@ let get_coin msg =
   in search 0
 
 let rec parse_levels msg pos end_pos count acc =
-  if count >= 25 || pos >= end_pos then List.rev acc
+  if count >= 1 || pos >= end_pos then List.rev acc
   else
     match String.index_from_opt msg pos '{' with
     | None -> List.rev acc

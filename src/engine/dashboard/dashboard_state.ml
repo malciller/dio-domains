@@ -73,7 +73,7 @@ let json_of_domains () =
 
 let json_of_grid_strategy exchange symbol =
   let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
-  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
+  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_regular_market_open ()) in
   `Assoc [
     "type", `String "Grid";
     "buy_price", json_of_float_opt state.last_buy_order_price;
@@ -100,7 +100,7 @@ let json_of_grid_strategy exchange symbol =
 
 let json_of_mm_strategy exchange symbol =
   let state = Dio_strategies.Market_maker.get_strategy_state symbol in
-  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_market_open ()) in
+  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_regular_market_open ()) in
   `Assoc [
     "type", `String "MM";
     "buy_price", json_of_float_opt state.last_buy_order_price;

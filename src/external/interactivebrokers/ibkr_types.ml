@@ -19,7 +19,7 @@ let default_ring_buffer_size_executions = 32
 let default_stale_order_threshold_s = 86400.0    (* 24 hours *)
 
 (** Default magnitude of granular price levels to maintain symmetrically for order book state construction. *)
-let default_orderbook_depth = 5
+let default_orderbook_depth = 1
 
 (** Base temporal delay in milliseconds applied prior to initiating a subsequent TCP socket reconnection attempt. *)
 let default_reconnect_base_delay_ms = 1000.0
