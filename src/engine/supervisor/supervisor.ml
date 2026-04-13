@@ -1118,11 +1118,19 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       else Lwt.return_true
     in
     let hl_p = 
-      if has_hyperliquid then Hyperliquid.Balances.wait_until_ready ()
+      if has_hyperliquid then
+        Lwt.pick [
+          Hyperliquid.Balances.wait_until_ready ();
+          (Lwt_unix.sleep 10.0 >|= fun () -> false)
+        ]
       else Lwt.return_true
     in
     let lighter_p =
-      if has_lighter then Lighter.Balances.wait_until_ready ()
+      if has_lighter then
+        Lwt.pick [
+          Lighter.Balances.wait_until_ready ();
+          (Lwt_unix.sleep 10.0 >|= fun () -> false)
+        ]
       else Lwt.return_true
     in
     let%lwt kraken_ready = kraken_p

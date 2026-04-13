@@ -196,6 +196,11 @@ type strategy_state = {
   mutable last_cycle_buy_count: int;
   mutable duplicate_key_buy: string;
   mutable duplicate_key_sell: string;
+  mutable cached_round_price: float -> float;
+  mutable cached_price_increment: float;
+  mutable cached_qty_increment: float;
+  mutable cached_qty_min: float;
+  mutable exchange_reserved_atomic: float Atomic.t option;
   mutex: Mutex.t;  (* per-symbol mutex; prevents concurrent strategy execution *)
 }
 
@@ -256,6 +261,11 @@ let get_strategy_state asset_symbol =
           last_cycle_buy_count = 0;
           duplicate_key_buy = Printf.sprintf "%s|buy|grid" asset_symbol;
           duplicate_key_sell = Printf.sprintf "%s|sell|grid" asset_symbol;
+          cached_round_price = Float.round;
+          cached_price_increment = 0.01;
+          cached_qty_increment = 0.01;
+          cached_qty_min = 1.0;
+          exchange_reserved_atomic = None;
           mutex = Mutex.create ();
         } in
         Hashtbl.replace strategy_states asset_symbol new_state;
@@ -289,10 +299,11 @@ let get_exchange_reserved_atomic exchange =
       Mutex.unlock reservation_mutex;
       a
 
-(** Fast lock-free read of total reserved.
-    Safe to call outside state.mutex. *)
-let get_total_reserved_quote ~exchange =
-  let a = get_exchange_reserved_atomic exchange in
+let get_total_reserved_quote state =
+  let a = match state.exchange_reserved_atomic with
+    | Some a -> a
+    | None -> let atm = get_exchange_reserved_atomic state.exchange_id in state.exchange_reserved_atomic <- Some atm; atm
+  in
   Atomic.get a
 
 (** Sets this asset's reserved_quote under reservation_mutex.
@@ -302,7 +313,10 @@ let set_asset_reserved_quote state v =
   let diff = v -. state.reserved_quote in
   state.reserved_quote <- v;
   if state.exchange_id <> "" then begin
-    let a = get_exchange_reserved_atomic state.exchange_id in
+    let a = match state.exchange_reserved_atomic with
+      | Some a -> a
+      | None -> let atm = get_exchange_reserved_atomic state.exchange_id in state.exchange_reserved_atomic <- Some atm; atm
+    in
     Atomic.set a ((Atomic.get a) +. diff)
   end;
   Mutex.unlock reservation_mutex
@@ -312,7 +326,10 @@ let set_asset_reserved_quote state v =
     Must be called from inside state.mutex. On success, sets state.reserved_quote. *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
   Mutex.lock reservation_mutex;
-  let a = get_exchange_reserved_atomic state.exchange_id in
+  let a = match state.exchange_reserved_atomic with
+    | Some a -> a
+    | None -> let atm = get_exchange_reserved_atomic state.exchange_id in state.exchange_reserved_atomic <- Some atm; atm
+  in
   let total_reserved = Atomic.get a in
   let available = quote_bal -. total_reserved in
   let ok = available >= quote_needed in
@@ -336,22 +353,17 @@ let parse_config_float config value_name default exchange symbol =
 
 (** Rounds price to exchange-mandated precision for the given symbol.
     Uses a per-(symbol,exchange) closure cache to skip module dispatch. *)
-let round_price price symbol exchange =
+let get_round_price_fn symbol exchange =
   let key = symbol ^ "|" ^ exchange in
-  let fn =
-    match Hashtbl.find_opt _round_price_fn_cache key with
-    | Some f -> f
-    | None ->
-        let f = match get_exchange_module exchange with
-          | Some (module Ex : Exchange.S) -> (fun p -> Ex.round_price ~symbol ~price:p)
-          | None ->
-              Logging.warn_f ~section "No exchange found for %s/%s, using default rounding" exchange symbol;
-              Float.round
-        in
-        Hashtbl.replace _round_price_fn_cache key f;
-        f
-  in
-  fn price
+  match Hashtbl.find_opt _round_price_fn_cache key with
+  | Some f -> f
+  | None ->
+      let f = match get_exchange_module exchange with
+        | Some (module Ex : Exchange.S) -> (fun p -> Ex.round_price ~symbol ~price:p)
+        | None -> Float.round
+      in
+      Hashtbl.replace _round_price_fn_cache key f;
+      f
 
 (** Returns the minimum price increment (tick size) for the symbol. *)
 let get_price_increment symbol exchange =
@@ -373,50 +385,32 @@ let round_qty qty symbol exchange =
   let inv = 1.0 /. increment in
   floor (qty *. inv) /. inv
 
-(** Quantity used for grid orders, balance checks, reserved quote, accumulation,
-    and PnL on venues with strict lot rules. IBKR: whole shares (at least
-    [get_qty_min] when config qty is positive but rounds to zero). Lighter:
-    instrument [supported_size_decimals] via the instruments feed. Other
-    exchanges: config [grid_qty] unchanged. *)
-let venue_lot_qty grid_qty symbol exchange =
+let venue_lot_qty grid_qty exchange state =
   match exchange with
   | "ibkr" ->
       if grid_qty <= 0.0 then 0.0
       else
-        (match get_exchange_module exchange with
-         | Some (module Ex : Exchange.S) ->
-             let q = round_qty grid_qty symbol exchange in
-             if q > 0.0 then q
-             else Option.value (Ex.get_qty_min ~symbol) ~default:1.0
-         | None ->
-             (* Unit tests or stripped link: whole-share floor, min one share. *)
-             let q = floor grid_qty in
-             if q > 0.0 then q else 1.0)
+        let q = let inv = 1.0 /. state.cached_qty_increment in floor (grid_qty *. inv) /. inv in
+        if q > 0.0 then q else state.cached_qty_min
   | "lighter" ->
       if grid_qty <= 0.0 then 0.0
       else
-        let q = round_qty grid_qty symbol exchange in
-        if q > 0.0 then q
-        else
-          (match get_exchange_module exchange with
-           | Some (module Ex : Exchange.S) ->
-               Option.value (Ex.get_qty_min ~symbol) ~default:q
-           | None -> q)
+        let q = let inv = 1.0 /. state.cached_qty_increment in floor (grid_qty *. inv) /. inv in
+        if q > 0.0 then q else state.cached_qty_min
   | _ -> grid_qty
 
 (** Returns the minimum price delta required to trigger an amendment.
     max(10 * tick_size, 5% of one grid interval). Prevents amendment spam. *)
-let get_min_move_threshold price grid_interval_pct symbol exchange =
-  let base_increment = get_price_increment symbol exchange in
-  (* Require at least 5% of one grid interval or 10x base increment. *)
+let get_min_move_threshold price grid_interval_pct state =
+  let base_increment = state.cached_price_increment in
   let pct_based = price *. (grid_interval_pct *. 0.05 /. 100.0) in
   max (base_increment *. 10.0) pct_based
 
 (** Computes a grid price one interval above or below [current_price]. *)
-let calculate_grid_price current_price grid_interval_pct is_above symbol exchange =
+let calculate_grid_price current_price grid_interval_pct is_above state =
   let interval = current_price *. (grid_interval_pct /. 100.0) in
   let raw_price = if is_above then current_price +. interval else current_price -. interval in
-  round_price raw_price symbol exchange
+  state.cached_round_price raw_price
 
 (** Returns true if an amendment is permitted for [order_id].
     Checks: no pending amend, not in InFlightAmendments, no active cooldown,
@@ -629,17 +623,28 @@ let execute_strategy
     ?precounted_orders
     ~now
     (asset : trading_config)
-    (current_price : float option)
-    (top_of_book : (float * float * float * float) option)
-    (asset_balance : float option)
-    (quote_balance : float option)
+    (current_price : float)
+    (top_bid : float)
+    (top_ask : float)
+    (asset_balance : float)
+    (quote_balance : float)
     (_open_buy_count : int)
     (_open_sell_count : int)
     (iter_open_orders : ((string -> float -> float -> string -> int option -> unit) -> unit))
     (cycle : int) =
 
   let state = match cached_state with Some s -> s | None -> get_strategy_state asset.symbol in
-  if state.exchange_id = "" then state.exchange_id <- asset.exchange;
+  if state.exchange_id = "" then begin
+    state.exchange_id <- asset.exchange;
+    state.cached_round_price <- get_round_price_fn asset.symbol asset.exchange;
+    state.cached_price_increment <- get_price_increment asset.symbol asset.exchange;
+    state.cached_qty_increment <- get_qty_increment_val asset.symbol asset.exchange;
+    state.cached_qty_min <- 
+      (match get_exchange_module asset.exchange with
+       | Some (module Ex : Exchange.S) -> Option.value (Ex.get_qty_min ~symbol:asset.symbol) ~default:1.0
+       | None -> 1.0);
+    state.exchange_reserved_atomic <- Some (get_exchange_reserved_atomic asset.exchange);
+  end;
   let ecfg = state.cached_ecfg in
 
   (* Only proceed with main strategy if capital_low flag is clear.
@@ -649,117 +654,109 @@ let execute_strategy
      races when concurrent callers target the same symbol. *)
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-   let lot_qty = venue_lot_qty state.grid_qty asset.symbol asset.exchange in
+   let lot_qty = venue_lot_qty state.grid_qty asset.exchange state in
 
    (* Anticipated balance credit decay: clear when balance feed catches up. *)
-   (match asset_balance with
-    | Some asset_bal ->
-        if asset_bal > state.last_seen_asset_balance && state.anticipated_base_credit > 0.0 then begin
+   if not (Float.is_nan asset_balance) then begin
+     let asset_bal = asset_balance in
+     if asset_bal > state.last_seen_asset_balance && state.anticipated_base_credit > 0.0 then begin
+       state.anticipated_base_credit <- 0.0
+     end;
+     state.last_seen_asset_balance <- asset_bal;
 
-          state.anticipated_base_credit <- 0.0
-        end;
-        state.last_seen_asset_balance <- asset_bal
-    | None -> ()
-   );
-
-   (* Asset-low check: clear flag when asset balance recovers.
-      Subtract reserved_base and locked_in_sells so the clearing condition
-      matches the blocking guard in the sell-placement path.  Without
-      subtracting locked_in_sells here, `available_asset` appears large
-      enough to clear asset_low, but the sell path immediately re-sets it,
-      causing a hot loop (~50 ms). *)
-   (match asset_balance with
-    | Some asset_bal ->
-        let qty_f = lot_qty in
-        let asset_needed_fast =
-          if ecfg.sell_uses_mult then
-            qty_f *. state.cached_sell_mult
-          else qty_f  (* 1:1 sells require full qty *)
-        in
-        let locked_in_sells =
-          if ecfg.use_reserved_base_guard then
-            List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
-          else 0.0
-        in
-        let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit -. locked_in_sells in
-        let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
-        let should_clear =
-          if ecfg.asset_low_requires_balance_change then
-            available_asset >= asset_needed_fast && balance_actually_changed
-          else
-            available_asset >= asset_needed_fast
-        in
-        if state.asset_low && should_clear then begin
-          state.asset_low <- false;
-          state.inflight_sell <- false;
-          ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
-          Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
-            asset.symbol asset_bal state.reserved_base state.anticipated_base_credit locked_in_sells available_asset asset_needed_fast
-        end
-    | None -> ()
-   );
+     (* Asset-low check: clear flag when asset balance recovers.
+        Subtract reserved_base and locked_in_sells so the clearing condition
+        matches the blocking guard in the sell-placement path.  Without
+        subtracting locked_in_sells here, `available_asset` appears large
+        enough to clear asset_low, but the sell path immediately re-sets it,
+        causing a hot loop (~50 ms). *)
+     let qty_f = lot_qty in
+     let asset_needed_fast =
+       if ecfg.sell_uses_mult then
+         qty_f *. state.cached_sell_mult
+       else qty_f  (* 1:1 sells require full qty *)
+     in
+     let locked_in_sells =
+       if ecfg.use_reserved_base_guard then
+         List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
+       else 0.0
+     in
+     let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit -. locked_in_sells in
+     let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
+     let should_clear =
+       if ecfg.asset_low_requires_balance_change then
+         available_asset >= asset_needed_fast && balance_actually_changed
+       else
+         available_asset >= asset_needed_fast
+     in
+     if state.asset_low && should_clear then begin
+       state.asset_low <- false;
+       state.inflight_sell <- false;
+       ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
+       Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
+         asset.symbol asset_bal state.reserved_base state.anticipated_base_credit locked_in_sells available_asset asset_needed_fast
+     end
+   end;
 
   (* Capital-low fast path: skip strategy when quote balance is known to be
      insufficient for a buy order. The FIRST loop (capital_low=false) is allowed
      so that any accrued sell orders from previously filled buys can be placed
      to free capital. After that first pass, capital_low is set and the strategy
      short-circuits here. When balance recovers, the flag is cleared. *)
-  (match quote_balance with
-   | Some quote_bal ->
-       let qty_f = lot_qty in
-       let quote_needed_fast = (match current_price with Some p -> p *. qty_f | None -> 0.0) in
-       (* Available balance = total balance minus all domains' reserved quote. *)
-       let total_reserved = get_total_reserved_quote ~exchange:state.exchange_id in
-       let available_quote = quote_bal -. total_reserved in
-       if state.capital_low && available_quote < quote_needed_fast then begin
-         (* Stamp balance snapshot on first capital_low cycle so recovery
-            requires a real balance feed increase, not stale data re-read. *)
-         if state.capital_low_at_balance = 0.0 then
-           state.capital_low_at_balance <- quote_bal;
-         (* Still low: skip entire strategy body to avoid order spam. *)
-         ()
-       end else if state.capital_low && quote_bal > state.capital_low_at_balance then begin
-         (* Balance feed delivered a higher balance than the snapshot taken when
-            capital_low was set. A real event (fill crediting USD or cancel freeing
-            reserve) has occurred. Only now is it safe to retry placement. Clearing
-            on stale balance data (same quote_bal as at rejection) caused tight
-            rejection loops. *)
-         state.capital_low <- false;
-         state.capital_low_logged <- false;
-         state.capital_low_at_balance <- 0.0;  (* reset snapshot for next recovery episode *)
-         (* Flush buy-side placement cooldown so the strategy can place immediately.
-            Without this, the 2s cooldown set when capital_low was first triggered
-            blocks the first buy attempt even after balance recovers. *)
-         Hashtbl.remove state.amend_cooldowns "place_Buy";
-         (* Clear inflight_buy and evict the InFlightOrders duplicate key. *)
-         state.inflight_buy <- false;
-         ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_buy));
-         Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at %.2f) - resuming strategy"
-           asset.symbol available_quote quote_needed_fast total_reserved state.capital_low_at_balance
-       end
-       (* capital_low=false: fall through normally *)
-   | None -> () (* No balance data yet, fall through *)
-  );
+  if not (Float.is_nan quote_balance) then begin
+    let quote_bal = quote_balance in
+    let qty_f = lot_qty in
+    let quote_needed_fast = if not (Float.is_nan current_price) then current_price *. qty_f else 0.0 in
+    (* Available balance = total balance minus all domains' reserved quote. *)
+    let total_reserved = get_total_reserved_quote state in
+    let available_quote = quote_bal -. total_reserved in
+    if state.capital_low && available_quote < quote_needed_fast then begin
+      (* Stamp balance snapshot on first capital_low cycle so recovery
+         requires a real balance feed increase, not stale data re-read. *)
+      if state.capital_low_at_balance = 0.0 then
+        state.capital_low_at_balance <- quote_bal;
+      (* Still low: skip entire strategy body to avoid order spam. *)
+      ()
+    end else if state.capital_low && quote_bal > state.capital_low_at_balance then begin
+      (* Balance feed delivered a higher balance than the snapshot taken when
+         capital_low was set. A real event (fill crediting USD or cancel freeing
+         reserve) has occurred. Only now is it safe to retry placement. Clearing
+         on stale balance data (same quote_bal as at rejection) caused tight
+         rejection loops. *)
+      state.capital_low <- false;
+      state.capital_low_logged <- false;
+      state.capital_low_at_balance <- 0.0;  (* reset snapshot for next recovery episode *)
+      (* Flush buy-side placement cooldown so the strategy can place immediately.
+         Without this, the 2s cooldown set when capital_low was first triggered
+         blocks the first buy attempt even after balance recovers. *)
+      Hashtbl.remove state.amend_cooldowns "place_Buy";
+      (* Clear inflight_buy and evict the InFlightOrders duplicate key. *)
+      state.inflight_buy <- false;
+      ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_buy));
+      Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at %.2f) - resuming strategy"
+        asset.symbol available_quote quote_needed_fast total_reserved state.capital_low_at_balance
+    end
+  end;
 
   if not state.capital_low then begin
 
   (* [now] is provided by the caller to avoid per-cycle syscalls. *)
   
-  match current_price, top_of_book with
-  | None, _ ->
-      if state.last_cycle <> cycle then
-        Logging.info_f ~section "Waiting for price data for %s (no ticker received yet)" asset.symbol
-      (* No price data available yet *)
-  | Some price, top_opt ->
+  if Float.is_nan current_price then begin
+    if state.last_cycle <> cycle then
+      Logging.info_f ~section "Waiting for price data for %s (no ticker received yet)" asset.symbol
+  end else begin
       (* Use l2Book top-of-book bid/ask instead of allMids mid price.
          l2Book updates per-block and tracks actual market state, while
          allMids batches across all coins and can diverge from fill price
          during fast candle movements, causing sell order stacking on Hyperliquid.
          Sell-side calcs use bid_price; buy-side calcs use ask_price.
          Falls back to mid when orderbook data is unavailable. *)
-      let (bid_price, ask_price) = match top_opt with
-        | Some (bid, _, ask, _) when bid > 0.0 && ask > 0.0 -> (bid, ask)
-        | _ -> (price, price)
+      let (bid_price, ask_price) =
+        if not (Float.is_nan top_bid) && top_bid > 0.0 && not (Float.is_nan top_ask) && top_ask > 0.0 then
+          (top_bid, top_ask)
+        else
+          (current_price, current_price)
       in
 
       (* Clean up stale pending orders and enforce a hard limit in a single pass.
@@ -946,25 +943,7 @@ let execute_strategy
 
   (* Check for missing balance data. Stale but present balance data is acceptable.
      Supervisor monitors WebSocket health via heartbeats. *)
-  let is_stale = ecfg.check_stale_balance && (
-    match asset_balance, quote_balance with
-    | None, None ->
-        (* No balance data at all; cannot trade without balance info. *)
-
-        true
-    | Some _, None | None, Some _ ->
-        (* Partial balance data; may indicate feed issue. *)
-
-        true
-    | Some ab, Some qb ->
-        (* Have balance data; check if balances are sufficient. *)
-        if ab = 0.0 && qb < 10.0 then begin
-          (* Very low balances; may not be able to trade. *)
-
-          false
-        end else
-          false
-  ) in
+  let is_stale = ecfg.check_stale_balance && (Float.is_nan asset_balance || Float.is_nan quote_balance) in
 
   (* If balance feed is stale, skip strategy to avoid trading with stale data. *)
   if is_stale then begin
@@ -1015,8 +994,8 @@ let execute_strategy
            On buy fill, the existing sell's InFlightOrders key is still live,
            which would block the new sell via duplicate detection.
            Force-clear the sell key so a fresh sell is always placed alongside the new buy. *)
-        let sell_price = calculate_grid_price bid_price grid_interval true asset.symbol asset.exchange in
-        let buy_price = calculate_grid_price ask_price grid_interval false asset.symbol asset.exchange in
+        let sell_price = calculate_grid_price bid_price grid_interval true state in
+        let buy_price = calculate_grid_price ask_price grid_interval false state in
 
         let buy_cooldown_key = "place_Buy" in
         let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
@@ -1027,8 +1006,8 @@ let execute_strategy
            may be stale after a buy fill. If the exchange rejects, asset_low
            is set and will not clear until (asset_bal - reserved_base) >= needed,
            protecting accumulated base asset. *)
-        (match asset_balance with
-         | Some asset_bal when not state.inflight_sell && not state.asset_low ->
+        if not (Float.is_nan asset_balance) && not state.inflight_sell && not state.asset_low then begin
+             let asset_bal = asset_balance in
              let (sell_qty, is_accumulation_sell) =
                if ecfg.use_accumulation_sells then begin
                  let rounded_sell =
@@ -1106,28 +1085,17 @@ let execute_strategy
                     asset.symbol sell_qty sell_price
                 end
               end
-         | _ -> ()
-        );
+        end;
 
         (* Place buy order if quote balance is available. *)
-        (match quote_balance with
-         | Some _ when is_buy_on_cooldown ->
-             ()
-         | Some _ when state.inflight_buy ->
-             ()
-         | Some _quote_bal ->
+        if not (Float.is_nan quote_balance) then begin
+         if is_buy_on_cooldown || state.inflight_buy then ()
+         else begin
+             let quote_bal = quote_balance in
              (* Compute available balances net of open order commitments *)
-             let available_quote_balance = match quote_balance with
-               | Some total_balance ->
-                   (* Deduct value locked in open buys *)
-                   let locked_in_buys = List.fold_left (fun acc (_, price) -> acc +. (price *. lot_qty)) 0.0 !buy_orders in
-                   Some (total_balance -. locked_in_buys)
-               | None -> None
-             in
-             let balance_ok = match available_quote_balance with
-               | Some avail -> avail >= (buy_price *. qty)
-               | None -> true
-             in
+             let locked_in_buys = List.fold_left (fun acc (_, price) -> acc +. (price *. lot_qty)) 0.0 !buy_orders in
+             let available_quote_balance = quote_bal -. locked_in_buys in
+             let balance_ok = available_quote_balance >= (buy_price *. qty) in
              if balance_ok then begin
                let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
                if push_order ~now ~state order then begin
@@ -1147,8 +1115,8 @@ let execute_strategy
                  (match closest_sell with
                   | Some cs_price ->
                       let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
-                      let target_buy = round_price (cs_price -. double_grid_interval) asset.symbol asset.exchange in
-                      let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
+                      let target_buy = state.cached_round_price (cs_price -. double_grid_interval) in
+                      let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
                       if abs_float (target_buy -. buy_price) > min_move_threshold then
                         Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
                           asset.symbol buy_price target_buy cs_price
@@ -1167,7 +1135,7 @@ let execute_strategy
                 let cooldown_key = "place_Buy" in
                 if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
                   Logging.warn_f ~section "Local balance low for %s buy (need %.2f, available %.2f) - attempting anyway, exchange will reject if truly insufficient"
-                    asset.symbol quote_needed (Option.value available_quote_balance ~default:0.0);
+                    asset.symbol quote_needed available_quote_balance;
                   Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
                   (* Attempt without a reservation; exchange is the final gatekeeper. *)
                   let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
@@ -1175,10 +1143,11 @@ let execute_strategy
                     state.last_buy_order_price <- Some buy_price
                 end
              end
-         | None ->
+          end
+        end else begin
              Logging.warn_f ~section "No quote balance data available for %s buy order"
                asset.symbol
-        );
+        end;
         state.last_cycle <- cycle
       end else if effective_buy_count > 0 then begin
         (* Case 2: open buy exists; check sell orders for spacing enforcement. *)
@@ -1208,11 +1177,11 @@ let execute_strategy
               let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
 
               (* Compute exact 2x target from closest sell price. *)
-              let exact_target = round_price (sell_price -. double_grid_interval) asset.symbol asset.exchange in
+              let exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
               
               if distance > double_grid_interval then begin
                 (* Distance > 2x: trail buy upward to maintain grid_interval below price. *)
-                let proposed_buy_price = calculate_grid_price ask_price grid_interval false asset.symbol asset.exchange in
+                let proposed_buy_price = calculate_grid_price ask_price grid_interval false state in
                 
                 (* Only trail upward; never move buy order down. *)
                 if proposed_buy_price > current_buy_price then begin
@@ -1228,24 +1197,25 @@ let execute_strategy
                       proposed_buy_price
                   in
                   
-                  let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
-                  let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
-                  let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
+                  let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
+                  let current_buy_price_rounded = state.cached_round_price current_buy_price in
+                  let price_diff_rounded = state.cached_round_price (abs_float (target_buy_price -. current_buy_price_rounded)) in
 
                   if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
                        ~current_price_rounded:current_buy_price_rounded
                        ~price_diff:price_diff_rounded ~min_move_threshold then begin
-                    (match quote_balance with
-                     | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
+                    let quote_bal = quote_balance in
+                    if not (Float.is_nan quote_balance) && can_place_buy_order qty quote_bal quote_needed then begin
                          let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                          ignore (push_order ~now ~state order);
                          state.last_buy_order_price <- Some target_buy_price;
                          ()
-                     | Some quote_bal ->
+                    end else if not (Float.is_nan quote_balance) then begin
                          Logging.warn_f ~section "Insufficient quote balance to trail %s: need %.2f, have %.2f"
                            asset.symbol quote_needed quote_bal
-                     | None ->
-                         Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol)
+                    end else begin
+                         Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
+                    end
                   end
                 end else begin
                   (* Price has fallen; hold buy order steady, do not trail down. *)
@@ -1254,57 +1224,58 @@ let execute_strategy
               end else begin
                 (* Distance <= 2x: enforce exact 2x spacing. *)
                 let exact_target_rounded = exact_target in
-                let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
-                let price_diff_rounded = round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) asset.symbol asset.exchange in
-                let min_move_threshold = get_min_move_threshold bid_price grid_interval asset.symbol asset.exchange in
+                let current_buy_price_rounded = state.cached_round_price current_buy_price in
+                let price_diff_rounded = state.cached_round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) in
+                let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
 
                 if amend_allowed ~state ~order_id:buy_order_id ~target_price:exact_target_rounded
                      ~current_price_rounded:current_buy_price_rounded
                      ~price_diff:price_diff_rounded ~min_move_threshold then begin
-                  (match quote_balance with
-                   | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
+                  let quote_bal = quote_balance in
+                  if not (Float.is_nan quote_balance) && can_place_buy_order qty quote_bal quote_needed then begin
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true Grid asset.exchange in
                        ignore (push_order ~now ~state order);
                        state.last_buy_order_price <- Some exact_target;
                        ()
-                   | Some quote_bal ->
+                  end else if not (Float.is_nan quote_balance) then begin
                        Logging.warn_f ~section "Insufficient quote balance for %s: need %.2f, have %.2f"
                          asset.symbol quote_needed quote_bal
-                   | None ->
-                       Logging.warn_f ~section "No quote balance for %s" asset.symbol)
+                  end else begin
+                       Logging.warn_f ~section "No quote balance for %s" asset.symbol
+                  end
                 end else begin
                   ()
                 end
               end
-          | _ ->
-              ()
+          | _ -> ()
         end else begin
           (* No sell orders exist but buy is active.
              Trail buy without sell anchors; sells are only placed
              in the effective_buy_count=0 branch after a buy fills. *)
            match state.last_buy_order_price, state.last_buy_order_id with
            | Some current_buy_price, Some buy_order_id ->
-               let target_buy_price = calculate_grid_price ask_price grid_interval false asset.symbol asset.exchange in
+               let target_buy_price = calculate_grid_price ask_price grid_interval false state in
                             (* Only trail upward; amend buy if target is higher than current. *)
                if target_buy_price > current_buy_price then begin
-                 let min_move_threshold = get_min_move_threshold ask_price grid_interval asset.symbol asset.exchange in
-                 let current_buy_price_rounded = round_price current_buy_price asset.symbol asset.exchange in
-                 let price_diff_rounded = round_price (abs_float (target_buy_price -. current_buy_price_rounded)) asset.symbol asset.exchange in
+                 let min_move_threshold = get_min_move_threshold ask_price grid_interval state in
+                 let current_buy_price_rounded = state.cached_round_price current_buy_price in
+                 let price_diff_rounded = state.cached_round_price (abs_float (target_buy_price -. current_buy_price_rounded)) in
 
                 if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
                      ~current_price_rounded:current_buy_price_rounded
                      ~price_diff:price_diff_rounded ~min_move_threshold then begin
-                  (match quote_balance with
-                   | Some quote_bal when can_place_buy_order qty quote_bal quote_needed ->
+                  let quote_bal = quote_balance in
+                  if not (Float.is_nan quote_balance) && can_place_buy_order qty quote_bal quote_needed then begin
                        let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                        ignore (push_order ~now ~state order);
                        state.last_buy_order_price <- Some target_buy_price;
                        ()
-                   | Some quote_bal ->
+                  end else if not (Float.is_nan quote_balance) then begin
                        Logging.warn_f ~section "Insufficient quote balance to trail buy: need %.2f, have %.2f"
                          quote_needed quote_bal
-                   | None ->
-                       Logging.warn_f ~section "No quote balance for buy trailing")
+                  end else begin
+                       Logging.warn_f ~section "No quote balance for buy trailing"
+                  end
                 end
               end else begin
                 ()
@@ -1318,6 +1289,7 @@ let execute_strategy
         (* No action required for remaining cases. *)
         state.last_cycle <- cycle
       end
+  end  (* end of: if Float.is_nan current_price then ... else begin *)
   end  (* end: is_stale else begin *)
    end) (* end: if not capital_low then begin; close Fun.protect *)
 
@@ -1523,7 +1495,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
-    let acc_qty = venue_lot_qty state.grid_qty asset_symbol state.exchange_id in
+    let acc_qty = venue_lot_qty state.grid_qty state.exchange_id state in
     (* 1. Remove any pending amend matching this order ID. *)
     state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
       not (String.starts_with ~prefix:"pending_amend_" pending_id &&
@@ -1776,7 +1748,7 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
          let old_entry = List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders in
          let old_qty = match old_entry with
            | Some (_, _, q) -> q
-           | None -> venue_lot_qty state.grid_qty asset_symbol state.exchange_id in
+           | None -> venue_lot_qty state.grid_qty state.exchange_id state in
          Logging.info_f ~section "SELL_AMEND [%s] %s -> %s @ %.2f: old_entry=%s old_qty=%.8f sells_before=%d"
            asset_symbol old_order_id new_order_id price
            (match old_entry with Some (_, p, q) -> Printf.sprintf "%.2f/%.8f" p q | None -> "NOT_FOUND")
