@@ -38,10 +38,17 @@ let format_pnl f =
 
 let format_latency_us f =
   if f >= 1000.0 then Printf.sprintf "%.1fms" (f /. 1000.0)
-  else Printf.sprintf "%.0fus" f
+  else Printf.sprintf "%.0fµs" f
+
+let utf8_len s =
+  let len = ref 0 in
+  for i = 0 to String.length s - 1 do
+    if Char.code s.[i] land 0xC0 <> 0x80 then incr len
+  done;
+  !len
 
 let truncate_string n s =
-  if String.length s <= n then s
+  if utf8_len s <= n then s
   else String.sub s 0 (n - 1) ^ "."
 
 (* Color palette: Tokyo Night RGB-888 constants for the TUI theme *)
@@ -118,15 +125,15 @@ let exch_tag_of = function
 (* Drawing primitives *)
 
 let pad_right w s =
-  let len = String.length s in
-  if len >= w then String.sub s 0 w
+  let len = utf8_len s in
+  if len >= w then s (* return intact to prevent splitting utf8 bytes *)
   else s ^ String.make (w - len) ' '
 
 let col w attr s = I.string attr (pad_right w s)
 
 let pad_left w s =
-  let len = String.length s in
-  if len >= w then String.sub s 0 w
+  let len = utf8_len s in
+  if len >= w then s (* return intact to prevent splitting utf8 bytes *)
   else String.make (w - len) ' ' ^ s
 
 let col_right w attr s = I.string attr (pad_left w s)
@@ -208,6 +215,12 @@ let section_title w label =
     lbl_img ::
     gradient_lines @ [end_border]
   )
+
+let section_footer w =
+  let pad_count = max 0 (w - 5) in
+  let pad_buf = Buffer.create pad_count in
+  for _ = 1 to pad_count do Buffer.add_string pad_buf "─" done;
+  I.string A.(fg c_border ++ bg c_bg) (" ╰──" ^ Buffer.contents pad_buf ^ "╯")
 
 let close_row target_w img =
   let d = target_w - I.width img - 2 in

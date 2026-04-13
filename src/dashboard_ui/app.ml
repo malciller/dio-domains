@@ -263,9 +263,6 @@ let run () =
                     Memory.render_memory w !last_json;
                     Holdings.render_strategies w !last_json;
                     Latencies.render_latencies w !last_json;
-                    (let pad_count = max 0 (w - 5) in
-                     let line = List.init pad_count (fun _ -> "─") |> String.concat "" in
-                     I.string A.(fg c_border ++ bg c_bg) (" ╰──" ^ line ^ "╯"));
                     Header.render_header w !last_json;
                   ]
               in

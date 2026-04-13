@@ -149,4 +149,4 @@ let render_latencies w json =
       ))
     ) active_lats in
     let title = section_title w "PERFORMANCE" in
-    I.vcat (title :: header :: rows)
+    I.vcat (title :: header :: rows @ [section_footer w])
