@@ -275,14 +275,27 @@ let process_user_stats json =
 
       let true_balance = max (max c m) (max w a) in
 
-      if true_balance > 0.0 || (c = 0.0 && m = 0.0) then begin
+      if true_balance > 0.0 then begin
         publish_balance_update "USDC" true_balance;
         Logging.debug_f ~section "Balance update: USDC = %.8f (via user_stats. max of col:%.2f mb:%.2f wb:%.2f av:%.2f)" 
           true_balance c m w a;
         notify_ready ()
-      end else
-        Logging.info_f ~section "user_stats received but all fetched metrics are zero (stats_keys=%s)"
+      end else begin
+        (* Never overwrite a positive USDC balance with zero — transient
+           user_stats snapshots can report all-zero metrics during exchange
+           maintenance windows or WebSocket reconnections. Preserve the
+           last known positive balance to keep the dashboard accurate. *)
+        let existing = get_balance "USDC" in
+        if existing <= 0.0 then begin
+          (* No previous balance — publish zero and mark ready so the
+             readiness gate does not block indefinitely. *)
+          publish_balance_update "USDC" 0.0;
+          notify_ready ()
+        end;
+        Logging.info_f ~section "user_stats received with zero balance (existing=%.2f, col:%.2f mb:%.2f wb:%.2f av:%.2f, stats_keys=%s)"
+          existing c m w a
           (try keys stats |> String.concat "," with _ -> "?")
+      end
     end else
       Logging.info_f ~section "user_stats received but expected structural metrics are absent (stats_keys=%s)"
         (try keys stats |> String.concat "," with _ -> "?")
