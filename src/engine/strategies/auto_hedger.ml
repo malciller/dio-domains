@@ -21,19 +21,13 @@ open Strategy_common
 let section = "auto_hedger"
 
 (* Ring buffer dedicated to hedging orders. *)
-let order_buffer = OrderRingBuffer.create 2048
-let order_buffer_mutex = Mutex.create ()
+let order_buffer = LockFreeQueue.create ()
 
 let get_pending_orders limit =
-  Mutex.lock order_buffer_mutex;
-  let orders = OrderRingBuffer.read_batch order_buffer limit in
-  Mutex.unlock order_buffer_mutex;
-  orders
+  LockFreeQueue.read_batch order_buffer limit
 
 let push_order order =
-  Mutex.lock order_buffer_mutex;
-  let write_result = OrderRingBuffer.write order_buffer order in
-  Mutex.unlock order_buffer_mutex;
+  let write_result = LockFreeQueue.write order_buffer order in
   match write_result with
   | None -> Logging.error_f ~section "Failed to write hedge order to ring buffer (buffer full)"
   | Some () -> ()

@@ -149,8 +149,7 @@ type trading_config = {
 }
 
 (** Shared order ringbuffer across all strategy domains. *)
-let order_buffer = OrderRingBuffer.create 2048
-let order_buffer_mutex = Mutex.create ()
+let order_buffer = Strategy_common.LockFreeQueue.create ()
 
 (** Accessor for the shared order ringbuffer. *)
 let get_order_buffer () = order_buffer
@@ -205,99 +204,90 @@ type strategy_state = {
 }
 
 (** Global registry of per-symbol strategy states. *)
-let strategy_states : (string, strategy_state) Hashtbl.t = Hashtbl.create 16
-let strategy_states_mutex = Mutex.create ()
+let strategy_states = Atomic.make Strategy_common.StringMap.empty
 
 (** Retrieves or lazily initializes the strategy state for [asset_symbol].
     On first access, loads persisted state (reserved_base, accumulated_profit,
     last_fill_oid, fill prices) from Dio_persistence.State_persistence. *)
-let get_strategy_state asset_symbol =
-  Mutex.lock strategy_states_mutex;
-  let state =
-    match Hashtbl.find_opt strategy_states asset_symbol with
-    | Some state -> state
-    | None ->
-        (* Load persisted state for this symbol (survives container restarts). *)
-        let persisted_reserved_base = Dio_persistence.State_persistence.load_reserved_base ~symbol:asset_symbol in
-        let persisted_accumulated_profit = Dio_persistence.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
-        let persisted_last_fill_oid = Dio_persistence.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
-        let persisted_last_buy_fill_price = Dio_persistence.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
-        let persisted_last_sell_fill_price = Dio_persistence.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
-        let new_state = {
-          last_buy_order_price = None;
-          last_buy_order_id = None;
-          open_sell_orders = [];
-          recently_injected_sells = [];
-          pending_orders = [];
-          last_cycle = 0;
-          last_order_time = 0.0;
-          inflight_cancel_buy = false;
-          inflight_amend_buy = false;
-          amend_cooldowns = Hashtbl.create 16;
-          last_cleanup_time = 0.0;
-          inflight_buy = false;
-          inflight_sell = false;
-          asset_low = false;
-          capital_low = false;
-          capital_low_logged = false;
-          capital_low_at_balance = 0.0;
-          reserved_quote = 0.0;
-          accumulated_profit = persisted_accumulated_profit;
-          reserved_base = persisted_reserved_base;
-          last_buy_fill_price = persisted_last_buy_fill_price;
-          last_sell_fill_price = persisted_last_sell_fill_price;
-          grid_qty = 0.0;
-          cached_sell_mult = 1.0;
-          cached_ecfg = kraken_config;
-          maker_fee = 0.0;
-          exchange_id = "";
-          startup_replay = true;  (* gates profit calc until set_startup_replay_done *)
-          last_fill_oid = persisted_last_fill_oid;
-          highest_startup_oid = None;
-          anticipated_base_credit = 0.0;
-          last_seen_asset_balance = 0.0;
-          persistence_dirty = false;
-          last_cycle_orders_hash = 0;
-          last_cycle_buy_count = 0;
-          duplicate_key_buy = Printf.sprintf "%s|buy|grid" asset_symbol;
-          duplicate_key_sell = Printf.sprintf "%s|sell|grid" asset_symbol;
-          cached_round_price = Float.round;
-          cached_price_increment = 0.01;
-          cached_qty_increment = 0.01;
-          cached_qty_min = 1.0;
-          exchange_reserved_atomic = None;
-          mutex = Mutex.create ();
-        } in
-        Hashtbl.replace strategy_states asset_symbol new_state;
+let rec get_strategy_state asset_symbol =
+  let map = Atomic.get strategy_states in
+  match Strategy_common.StringMap.find_opt asset_symbol map with
+  | Some state -> state
+  | None ->
+      (* Load persisted state for this symbol (survives container restarts). *)
+      let persisted_reserved_base = Dio_persistence.State_persistence.load_reserved_base ~symbol:asset_symbol in
+      let persisted_accumulated_profit = Dio_persistence.State_persistence.load_accumulated_profit ~symbol:asset_symbol in
+      let persisted_last_fill_oid = Dio_persistence.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
+      let persisted_last_buy_fill_price = Dio_persistence.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
+      let persisted_last_sell_fill_price = Dio_persistence.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
+      let new_state = {
+        last_buy_order_price = None;
+        last_buy_order_id = None;
+        open_sell_orders = [];
+        recently_injected_sells = [];
+        pending_orders = [];
+        last_cycle = 0;
+        last_order_time = 0.0;
+        inflight_cancel_buy = false;
+        inflight_amend_buy = false;
+        amend_cooldowns = Hashtbl.create 16;
+        last_cleanup_time = 0.0;
+        inflight_buy = false;
+        inflight_sell = false;
+        asset_low = false;
+        capital_low = false;
+        capital_low_logged = false;
+        capital_low_at_balance = 0.0;
+        reserved_quote = 0.0;
+        accumulated_profit = persisted_accumulated_profit;
+        reserved_base = persisted_reserved_base;
+        last_buy_fill_price = persisted_last_buy_fill_price;
+        last_sell_fill_price = persisted_last_sell_fill_price;
+        grid_qty = 0.0;
+        cached_sell_mult = 1.0;
+        cached_ecfg = kraken_config;
+        maker_fee = 0.0;
+        exchange_id = "";
+        startup_replay = true;  (* gates profit calc until set_startup_replay_done *)
+        last_fill_oid = persisted_last_fill_oid;
+        highest_startup_oid = None;
+        anticipated_base_credit = 0.0;
+        last_seen_asset_balance = 0.0;
+        persistence_dirty = false;
+        last_cycle_orders_hash = 0;
+        last_cycle_buy_count = 0;
+        duplicate_key_buy = Printf.sprintf "%s|buy|grid" asset_symbol;
+        duplicate_key_sell = Printf.sprintf "%s|sell|grid" asset_symbol;
+        cached_round_price = Float.round;
+        cached_price_increment = 0.01;
+        cached_qty_increment = 0.01;
+        cached_qty_min = 1.0;
+        exchange_reserved_atomic = None;
+        mutex = Mutex.create ();
+      } in
+      if Atomic.compare_and_set strategy_states map (Strategy_common.StringMap.add asset_symbol new_state map) then
         new_state
-  in
-  Mutex.unlock strategy_states_mutex;
-  state
+      else
+        get_strategy_state asset_symbol
 
-(** Mutex protecting all reserved_quote reads and writes across domains.
-    Lock order: state.mutex -> reservation_mutex.
-    reservation_mutex is never held while waiting for state.mutex. *)
-let reservation_mutex = Mutex.create ()
-
-(** Tracking total reserved quote per exchange to avoid O(N) strategy_states_mutex locking. *)
-let total_reserved_by_exchange : (string, float Atomic.t) Hashtbl.t =
-  let h = Hashtbl.create 4 in
-  List.iter (fun ex -> Hashtbl.add h ex (Atomic.make 0.0))
-    ["kraken"; "hyperliquid"; "lighter"; "ibkr"];
-  h
+(** Tracking total reserved quote per exchange to avoid O(N) strategy_states locking. *)
+let total_reserved_by_exchange = Atomic.make (
+  List.fold_left (fun acc ex -> Strategy_common.StringMap.add ex (Atomic.make 0.0) acc)
+    Strategy_common.StringMap.empty ["kraken"; "hyperliquid"; "lighter"; "ibkr"]
+)
 
 (** Gets the cached total reserved quote atomic for [exchange]. *)
-let get_exchange_reserved_atomic exchange =
-  match Hashtbl.find_opt total_reserved_by_exchange exchange with
+let rec get_exchange_reserved_atomic exchange =
+  let map = Atomic.get total_reserved_by_exchange in
+  match Strategy_common.StringMap.find_opt exchange map with
   | Some a -> a
   | None ->
-      Mutex.lock reservation_mutex;
-      let a = match Hashtbl.find_opt total_reserved_by_exchange exchange with
-        | Some a2 -> a2
-        | None -> let a3 = Atomic.make 0.0 in Hashtbl.add total_reserved_by_exchange exchange a3; a3
-      in
-      Mutex.unlock reservation_mutex;
-      a
+      let a3 = Atomic.make 0.0 in
+      let new_map = Strategy_common.StringMap.add exchange a3 map in
+      if Atomic.compare_and_set total_reserved_by_exchange map new_map then
+        a3
+      else
+        get_exchange_reserved_atomic exchange
 
 let get_total_reserved_quote state =
   let a = match state.exchange_reserved_atomic with
@@ -306,10 +296,13 @@ let get_total_reserved_quote state =
   in
   Atomic.get a
 
-(** Sets this asset's reserved_quote under reservation_mutex.
-    May be called from inside state.mutex (respects lock order). *)
+let rec atomic_add a diff =
+  let old_val = Atomic.get a in
+  if not (Atomic.compare_and_set a old_val (old_val +. diff)) then
+    atomic_add a diff
+
+(** Sets this asset's reserved_quote safely. *)
 let set_asset_reserved_quote state v =
-  Mutex.lock reservation_mutex;
   let diff = v -. state.reserved_quote in
   state.reserved_quote <- v;
   if state.exchange_id <> "" then begin
@@ -317,31 +310,35 @@ let set_asset_reserved_quote state v =
       | Some a -> a
       | None -> let atm = get_exchange_reserved_atomic state.exchange_id in state.exchange_reserved_atomic <- Some atm; atm
     in
-    Atomic.set a ((Atomic.get a) +. diff)
-  end;
-  Mutex.unlock reservation_mutex
+    atomic_add a diff
+  end
 
 (** Atomically checks available quote balance and reserves for a buy if sufficient.
-    Returns (balance_ok, available_quote, total_reserved).
-    Must be called from inside state.mutex. On success, sets state.reserved_quote. *)
+    Returns (balance_ok, available_quote, total_reserved). *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
-  Mutex.lock reservation_mutex;
   let a = match state.exchange_reserved_atomic with
     | Some a -> a
     | None -> let atm = get_exchange_reserved_atomic state.exchange_id in state.exchange_reserved_atomic <- Some atm; atm
   in
-  let total_reserved = Atomic.get a in
-  let available = quote_bal -. total_reserved in
-  let ok = available >= quote_needed in
-  if ok then begin
-    let diff = reserve_amount -. state.reserved_quote in
-    state.reserved_quote <- reserve_amount;
-    if state.exchange_id <> "" then begin
-      Atomic.set a (total_reserved +. diff)
-    end
-  end;
-  Mutex.unlock reservation_mutex;
-  (ok, available, total_reserved)
+  let diff = reserve_amount -. state.reserved_quote in
+  let rec attempt () =
+    let total_reserved = Atomic.get a in
+    let available = quote_bal -. total_reserved in
+    if available >= quote_needed then begin
+      if state.exchange_id <> "" then begin
+        if Atomic.compare_and_set a total_reserved (total_reserved +. diff) then begin
+          state.reserved_quote <- reserve_amount;
+          (true, available, total_reserved)
+        end else
+          attempt ()
+      end else begin
+        state.reserved_quote <- reserve_amount;
+        (true, available, total_reserved)
+      end
+    end else
+      (false, available, total_reserved)
+  in
+  attempt ()
 
 (** Parses a config string to float with fallback default and warning. *)
 let parse_config_float config value_name default exchange symbol =
@@ -512,9 +509,7 @@ let push_order ~now ?state order =
        let state = match state with Some s -> s | None -> get_strategy_state order.symbol in
        (match order.order_id with
         | Some _ ->
-            Mutex.lock order_buffer_mutex;
-            let write_result = OrderRingBuffer.write order_buffer order in
-            Mutex.unlock order_buffer_mutex;
+            let write_result = Strategy_common.LockFreeQueue.write order_buffer order in
 
             (match write_result with
             | Some () ->
@@ -546,9 +541,7 @@ let push_order ~now ?state order =
          false
        end else begin
          (* Write Place or Amend to ringbuffer. *)
-         Mutex.lock order_buffer_mutex;
-         let write_result = OrderRingBuffer.write order_buffer order in
-         Mutex.unlock order_buffer_mutex;
+         let write_result = Strategy_common.LockFreeQueue.write order_buffer order in
 
        match write_result with
        | Some () ->
@@ -1886,23 +1879,7 @@ let cleanup_pending_cancellation _asset_symbol _order_id = ()
 
 (** Reads up to [max_orders] orders from the ringbuffer for processing. *)
 let get_pending_orders max_orders =
-  Mutex.lock order_buffer_mutex;
-  let orders =
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock order_buffer_mutex)
-      (fun () ->
-         let orders = ref [] in
-         let count = ref 0 in
-         while !count < max_orders do
-           match OrderRingBuffer.read order_buffer with
-           | Some order ->
-               orders := order :: !orders;
-               incr count
-           | None -> count := max_orders  (* Exit loop when buffer is empty. *)
-         done;
-         List.rev !orders)
-  in
-  orders
+  Strategy_common.LockFreeQueue.read_batch order_buffer max_orders
 
 (** Initializes the strategy module. *)
 let init () =
@@ -1914,14 +1891,12 @@ module Strategy = struct
   type config = trading_config
 
   (** Cleans up strategy state for a symbol when domain stops. *)
-  let cleanup_strategy_state symbol =
-    Mutex.lock strategy_states_mutex;
-    (match Hashtbl.find_opt strategy_states symbol with
-     | Some _ ->
-         Hashtbl.remove strategy_states symbol;
-         ()
-     | None -> ());
-    Mutex.unlock strategy_states_mutex
+  let rec cleanup_strategy_state symbol =
+    let map = Atomic.get strategy_states in
+    if Strategy_common.StringMap.mem symbol map then
+      let new_map = Strategy_common.StringMap.remove symbol map in
+      if not (Atomic.compare_and_set strategy_states map new_map) then
+        cleanup_strategy_state symbol
 
   let execute = execute_strategy
   let flush_persistence = flush_persistence

@@ -267,13 +267,13 @@ let test_post_only_checks () =
   
   (* Clear buffer first *)
   let buffer = Dio_strategies.Market_maker.get_order_buffer () in
-  while Dio_strategies.Strategy_common.OrderRingBuffer.read buffer <> None do () done;
+  while Dio_strategies.Strategy_common.LockFreeQueue.read buffer <> None do () done;
   
   (* Execute strategy - should trigger pause and sell *)
-  Dio_strategies.Market_maker.Strategy.execute asset current_price top_of_book asset_balance quote_balance 0 0 [] 1;
+  Dio_strategies.Market_maker.Strategy.execute asset current_price top_of_book asset_balance quote_balance 0 0 (fun _ -> ()) 1;
   
   (* Check if a sell order was placed *)
-  match Dio_strategies.Strategy_common.OrderRingBuffer.read buffer with
+  match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
   | Some order ->
       check bool "pause sell operation" true (order.Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Place);
       check bool "pause sell side" true (order.side = Dio_strategies.Strategy_common.Sell);
