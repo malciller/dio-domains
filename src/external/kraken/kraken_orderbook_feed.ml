@@ -556,34 +556,37 @@ let process_orderbook_message ~reset json on_heartbeat =
         store.asks <- apply_levels store.asks asks;
         store.last_update <- Unix.time ();
 
-        (* Truncate maps to top 25 levels to bound memory usage. *)
-        store.bids <- rebuild_map_from_top_levels store.bids true 25;
-        store.asks <- rebuild_map_from_top_levels store.asks false 25;
-
-        (* Compute CRC32 from current state using top 10 levels per side. *)
-        let calculated_checksum = calculate_checksum symbol
-          (levels_to_array ~sort_desc:true store.bids 10)
-          (levels_to_array ~sort_desc:false store.asks 10) in
+        (* Truncate maps to configured bound, limiting memory usage. *)
+        store.bids <- rebuild_map_from_top_levels store.bids true orderbook_depth;
+        store.asks <- rebuild_map_from_top_levels store.asks false orderbook_depth;
 
         let orderbook = build_orderbook store symbol entry in
 
-        (* Verify computed checksum against received value. Mismatch triggers full resync. *)
+        (* Compute and verify CRC32 from current state using top 10 levels per side. 
+           If the configured depth is < 10, checksum validation is bypassed because 
+           the stored map lacks the requisite levels to evaluate the CRC. *)
         let checksum_valid =
-          match orderbook.checksum with
-          | Some received_checksum ->
-              if Int32.compare calculated_checksum received_checksum <> 0 then begin
-                Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
-                  symbol received_checksum received_checksum calculated_checksum calculated_checksum;
+          if orderbook_depth >= 10 then begin
+            let calculated_checksum = calculate_checksum symbol
+              (levels_to_array ~sort_desc:true store.bids 10)
+              (levels_to_array ~sort_desc:false store.asks 10) in
+            match orderbook.checksum with
+            | Some received_checksum ->
+                if Int32.compare calculated_checksum received_checksum <> 0 then begin
+                  Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
+                    symbol received_checksum received_checksum calculated_checksum calculated_checksum;
 
-                store.bids <- PriceMap.empty;
-                store.asks <- PriceMap.empty;
-                RingBuffer.clear store.buffer;
-                Atomic.set store.has_snapshot false;
-                Atomic.set store.last_sequence None;
-                false
-              end else
-                true
-          | None -> true
+                  store.bids <- PriceMap.empty;
+                  store.asks <- PriceMap.empty;
+                  RingBuffer.clear store.buffer;
+                  Atomic.set store.has_snapshot false;
+                  Atomic.set store.last_sequence None;
+                  false
+                end else
+                  true
+            | None -> true
+          end else
+            true
         in
 
         if checksum_valid then begin
@@ -829,7 +832,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     ("params", `Assoc [
       ("channel", `String "book");
       ("symbol", `List (List.map (fun s -> `String s) symbols));
-      ("depth", `Int orderbook_depth)
+      ("depth", `Int (max 10 orderbook_depth))
     ])
   ] in
   let msg_str = Yojson.Safe.to_string subscribe_msg in
@@ -895,7 +898,7 @@ let subscribe_symbols symbols =
         ("params", `Assoc [
           ("channel", `String "book");
           ("symbol", `List (List.map (fun s -> `String s) symbols));
-          ("depth", `Int orderbook_depth)
+          ("depth", `Int (max 10 orderbook_depth))
         ])
       ] in
       let msg_str = Yojson.Safe.to_string subscribe_msg in
