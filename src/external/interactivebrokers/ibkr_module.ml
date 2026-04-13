@@ -269,6 +269,18 @@ module Ibkr_impl = struct
          | _ -> None)
     | None -> None
 
+  let get_top_of_book_fast ~symbol =
+    let store = Ibkr_orderbook_feed.ensure_store symbol in
+    (fun () ->
+       match Concurrency.Ring_buffer.RingBuffer.read_latest store.buffer with
+       | Some ob when Array.length ob.Ibkr_orderbook_feed.bids > 0
+                   && Array.length ob.Ibkr_orderbook_feed.asks > 0 ->
+           let bid = ob.bids.(0) in
+           let ask = ob.asks.(0) in
+           Some (bid.Ibkr_orderbook_feed.price, bid.size, ask.price, ask.size)
+       | _ -> None
+    )
+
   let get_balance ~asset = Ibkr_balances.get_balance ~asset
   let get_balance_fast ~asset = (fun () -> Ibkr_balances.get_balance ~asset)
 
@@ -315,6 +327,9 @@ module Ibkr_impl = struct
   let get_orderbook_position ~symbol =
     Ibkr_orderbook_feed.get_current_position symbol
 
+  let get_orderbook_position_fast ~symbol =
+    Ibkr_orderbook_feed.get_current_position_fast symbol
+
   let read_orderbook_events ~symbol ~start_pos =
     List.map (fun (ob : Ibkr_orderbook_feed.orderbook) ->
       let map_levels levels =
@@ -343,9 +358,15 @@ module Ibkr_impl = struct
   let get_execution_feed_position ~symbol =
     Ibkr_executions_feed.get_current_position symbol
 
+  let get_execution_feed_position_fast ~symbol =
+    Ibkr_executions_feed.get_current_position_fast symbol
+
   (** Evaluates the propagation state of the execution feed and returns [true] strictly after the initial execution synchronization payload has been populated into the local cache for the specified [symbol]. *)
   let has_execution_data ~symbol =
     Ibkr_executions_feed.has_execution_data symbol
+
+  let has_execution_data_fast ~symbol =
+    Ibkr_executions_feed.has_execution_data_fast symbol
 
   let read_execution_events ~symbol ~start_pos =
     List.map (fun (e : Ibkr_executions_feed.execution_event) ->

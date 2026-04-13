@@ -246,6 +246,10 @@ let has_execution_data symbol =
     Atomic.get store.ready
   with _ -> false
 
+let has_execution_data_fast symbol =
+  let store = get_symbol_store symbol in
+  (fun () -> Atomic.get store.ready)
+
 (** Blocks until execution data is available for all specified symbols or timeout elapses. *)
 let wait_for_execution_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
@@ -425,6 +429,10 @@ let[@inline always] iter_execution_events symbol last_pos f =
 let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
   RingBuffer.get_position store.events_buffer
+
+let[@inline always] get_current_position_fast symbol =
+  let store = get_symbol_store symbol in
+  (fun () -> RingBuffer.get_position store.events_buffer)
 
 (** Reconciles the open orders table from an incoming execution event.
     Logging is deferred until after the mutex is released to avoid holding

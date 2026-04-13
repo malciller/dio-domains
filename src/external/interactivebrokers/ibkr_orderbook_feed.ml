@@ -159,6 +159,10 @@ let[@inline always] get_current_position symbol =
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 
+let[@inline always] get_current_position_fast symbol =
+  let store = ensure_store symbol in
+  (fun () -> RingBuffer.get_position store.buffer)
+
 (** Pre-allocates memory footprint for orderbook stores across all requested symbols and primes the dispatcher message callbacks. *)
 let initialize symbols =
   Logging.info_f ~section "Initializing orderbook feed for %d symbols" (List.length symbols);

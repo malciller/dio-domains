@@ -173,6 +173,9 @@ module Lighter_impl = struct
   let get_top_of_book ~symbol =
     Lighter_orderbook_feed.get_best_bid_ask symbol
 
+  let get_top_of_book_fast ~symbol =
+    Lighter_orderbook_feed.get_best_bid_ask_fast symbol
+
   let get_balance ~asset =
     Lighter_balances.get_balance asset
 
@@ -243,8 +246,14 @@ module Lighter_impl = struct
   let get_execution_feed_position ~symbol =
     Lighter_executions_feed.get_current_position symbol
 
+  let get_execution_feed_position_fast ~symbol =
+    Lighter_executions_feed.get_current_position_fast symbol
+
   let has_execution_data ~symbol =
     Lighter_executions_feed.has_execution_data symbol
+
+  let has_execution_data_fast ~symbol =
+    Lighter_executions_feed.has_execution_data_fast symbol
 
   let read_execution_events ~symbol ~start_pos =
     let events = Lighter_executions_feed.read_execution_events symbol start_pos in
@@ -281,6 +290,9 @@ module Lighter_impl = struct
 
   let get_orderbook_position ~symbol =
     Lighter_orderbook_feed.get_current_position symbol
+
+  let get_orderbook_position_fast ~symbol =
+    Lighter_orderbook_feed.get_current_position_fast symbol
 
   let read_orderbook_events ~symbol ~start_pos =
     let events = Lighter_orderbook_feed.read_orderbook_events symbol start_pos in
