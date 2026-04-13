@@ -51,7 +51,7 @@ let handle_account_value fields =
   match key with
   | "TotalCashBalance" | "AvailableFunds" | "SettledCash"
   | "NetLiquidation" | "BuyingPower" ->
-      Logging.info_f ~section "Account %s = %.2f %s" key value currency
+      Logging.debug_f ~section "Account %s = %.2f %s" key value currency
   | "UnrealizedPnL" | "RealizedPnL" ->
       Logging.debug_f ~section "Account %s = %.2f %s" key value currency
   | _ ->

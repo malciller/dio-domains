@@ -12,7 +12,7 @@ let ring_buffer_size = 16
 (** Constant defining the maximum permitted depth of price levels retained per side of the order book.
     Imposes strict bounds on memory allocation and ensures structural alignment with downstream
     consumers that strictly require localized top of book liquidity evaluation. *)
-let max_depth = 50
+let max_depth = 1
 
 type level = {
   price: float;

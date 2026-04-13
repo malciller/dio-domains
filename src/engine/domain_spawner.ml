@@ -641,9 +641,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if not !should_execute_strategy || not (Ex.has_execution_data ~symbol:asset_with_fees.symbol) then
           Concurrency.Exchange_wakeup.wait ~symbol:asset_with_fees.symbol;
 
-        if !exec_ready && not !latency_active && (!cycle_count - !exec_ready_cycle >= 100) then begin
+        if !exec_ready && not !latency_active && (!cycle_count - !exec_ready_cycle >= 10) then begin
           latency_active := true;
-          Logging.info_f ~section "[%s/%s] Startup warmup complete (100 cycles post-ready). Latency measurements active." asset_with_fees.exchange asset_with_fees.symbol
+          Logging.info_f ~section "[%s/%s] Startup warmup complete (10 cycles post-ready). Latency measurements active." asset_with_fees.exchange asset_with_fees.symbol
         end;
 
         ()

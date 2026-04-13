@@ -350,6 +350,7 @@ let restart conn =
     - Passive data heartbeat timeout for market data feeds *)
 let monitor_loop () =
   let cycle_count = ref 0 in
+  let last_market_status = ref (Ibkr.Market_hours.market_status_string ()) in
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
     else begin
@@ -358,6 +359,16 @@ let monitor_loop () =
         let current_time = Unix.time () in
         try
           incr cycle_count;
+
+          let current_status = Ibkr.Market_hours.market_status_string () in
+          if !last_market_status <> current_status then begin
+            Logging.info_f ~section "Market status transitioned: %s. Forcing IBKR gateway reconnect to renew streams." current_status;
+            last_market_status := current_status;
+            (try
+               let ibkr_conn = Hashtbl.find connections "ibkr_gateway" in
+               ignore (restart ibkr_conn);
+             with Not_found -> ());
+          end;
 
                 Mutex.lock registry_mutex;
                 let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
@@ -537,9 +548,11 @@ let monitor_loop () =
                         (* Passive heartbeat monitoring for market data feeds *)
                         match conn.last_data_received with
                         | Some last_data when current_time -. last_data > 60.0 ->  (* 60s data silence threshold *)
-                            Logging.warn_f ~section "[%s] No data received for %.0fs, marking connection as failed"
-                              conn.name (current_time -. last_data);
-                            set_state conn (Failed "data timeout")
+                            if not (String.equal conn.name "ibkr_gateway") then begin
+                              Logging.warn_f ~section "[%s] No data received for %.0fs, marking connection as failed"
+                                conn.name (current_time -. last_data);
+                              set_state conn (Failed "data timeout")
+                            end
                         | _ -> ()
                       end
                   | _ -> ()
@@ -975,8 +988,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             Ibkr.Contracts.resolve conn ~symbol >>= fun contract ->
             Lwt.return (symbol, contract)
           ) ibkr_symbols in
-          let%lwt () = Lwt_list.iter_s (fun (_symbol, _contract) ->
-            Lwt.return_unit
+          let%lwt () = Lwt_list.iter_s (fun (_symbol, contract) ->
+            Ibkr.Orderbook_feed.request_snapshot conn ~contract
           ) contracts in
           (* Brief pause to let the gateway deliver snapshot ticks *)
           Lwt_unix.sleep 2.0 >>= fun () ->

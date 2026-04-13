@@ -230,7 +230,32 @@ let run () =
       if List.mem fd ready && not !quit then begin
         (try
           let msg = read_message fd in
-          (try last_json := Yojson.Basic.from_string msg with _ -> ())
+          (try 
+            let new_json = Yojson.Basic.from_string msg in
+            let old_json = !last_json in
+            last_json := new_json;
+            
+            (* Check for order fills by comparing sell_count *)
+            let get_sell_counts json =
+              match Theme.(json |?> "strategies") with
+              | `Assoc l ->
+                  List.map (fun (sym, data) ->
+                    let strat = Theme.(data |?> "strategy") in
+                    sym, Theme.(strat |?> "sell_count" |> to_int_d 0)
+                  ) l
+              | _ -> []
+            in
+            let old_counts = get_sell_counts old_json in
+            let new_counts = get_sell_counts new_json in
+            let filled = List.exists (fun (sym, new_c) ->
+              try let old_c = List.assoc sym old_counts in old_c <> new_c
+              with Not_found -> false
+            ) new_counts in
+            if filled then begin
+              print_char '\007';
+              flush stdout
+            end
+          with _ -> ())
         with
         | End_of_file ->
             disconnect fd;

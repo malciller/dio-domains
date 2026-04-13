@@ -62,6 +62,19 @@ let extended_open_min = 0
 let extended_close_hour = 20
 let extended_close_min = 0
 
+(** Evaluates whether the current system time falls strictly within the US equity Regular Trading Hours (RTH) session.
+    Returns [true] between 9:30 AM and 4:00 PM Eastern Time on weekdays.
+    This precise window directs the dashboard UI to flag trading logic as active (▶) or paused (⏸). *)
+let is_regular_market_open () =
+  let (wday, hour, min) = current_eastern_time () in
+  let is_weekday = wday >= 1 && wday <= 5 in
+  if not is_weekday then false
+  else
+    let time_mins = hour * 60 + min in
+    let open_mins = 9 * 60 + 30 in
+    let close_mins = 16 * 60 in
+    time_mins >= open_mins && time_mins < close_mins
+
 (** Evaluates the current system time against the predefined US equity extended trading schedule.
     Returns [true] if the current time resides within the 4:00 AM to 8:00 PM Eastern Time window on a weekday,
     indicating that the Interactive Brokers gateway is expected to accept connection and routing requests. *)
