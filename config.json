@@ -5,7 +5,7 @@
   "fng_check_threshold": 1.5,
   "gc": {
     "minor_heap_size": 33554432,
-    "space_overhead": 500,
+    "space_overhead": 120,
     "max_overhead": 1000000,
     "window_size": 10,
     "allocation_policy": 2,

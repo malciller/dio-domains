@@ -8,6 +8,13 @@
   mtime.clock.os
   unix))
 
+(executable
+ (name gc_hammer)
+ (libraries
+  dio.latency_profiling
+  mtime
+  unix))
+
 (rule
  (alias runtest)
  (deps
