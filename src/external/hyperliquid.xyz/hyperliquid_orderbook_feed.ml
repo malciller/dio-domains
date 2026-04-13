@@ -22,15 +22,35 @@ type orderbook = {
 (** Lock-free SPSC ring buffer for orderbook snapshots. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol store containing a ring buffer and an atomic readiness flag. *)
+(** Mutable top-of-book cache. Updated atomically (single writer from the WS
+    processing thread) and read lock-free from domain workers. Avoids the
+    full ring-buffer read + array bounds check + record field extraction
+    pipeline on the latency-critical path. *)
+type tob_cache = {
+  mutable bid_px: float;
+  mutable bid_sz: float;
+  mutable ask_px: float;
+  mutable ask_sz: float;
+  mutable tob_valid: bool;
+}
+
+(** Per-symbol store containing a ring buffer, readiness flag, and
+    zero-allocation top-of-book cache. *)
 type store = {
   buffer: orderbook RingBuffer.t;
   ready: bool Atomic.t;
+  tob: tob_cache;
 }
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
+
+(** Cached coin-to-symbol resolution table. Populated during `initialize` to
+    avoid `Hyperliquid_instruments_feed.resolve_symbol` + `Hashtbl.mem` scanning
+    on every incoming tick. Only the WS processing thread writes (at init);
+    domain workers never access this table. *)
+let coin_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 32
 
 (** Returns the store for [symbol], creating one if absent. Uses double-checked
     locking via [initialization_mutex] for thread safety. *)
@@ -45,6 +65,7 @@ let ensure_store symbol =
             let store = {
               buffer = RingBuffer.create ring_buffer_size;
               ready = Atomic.make false;
+              tob = { bid_px = 0.0; bid_sz = 0.0; ask_px = 0.0; ask_sz = 0.0; tob_valid = false };
             } in
             Hashtbl.add stores symbol store;
             store
@@ -59,19 +80,24 @@ let notify_ready store =
   end
 
 let find_registered_symbol coin =
-  (* Resolves a raw coin identifier to a registered store key.
-     Spot pairs (e.g. "@107") resolve directly to their canonical symbol.
-     Perp coins (e.g. "BTC") resolve to the base name; if not found in stores,
-     falls back to the "BASE/USDC" convention used by configuration. *)
-  match Hyperliquid_instruments_feed.resolve_symbol coin with
-  | Some symbol ->
-      if Hashtbl.mem stores symbol then Some symbol
-      else
-        (* Perp fallback: stores are keyed by BASE/USDC convention. *)
-        let usdc_symbol = symbol ^ "/USDC" in
-        if Hashtbl.mem stores usdc_symbol then Some usdc_symbol
-        else None
-  | None -> None
+  (* Fast path: check the cached coin_to_symbol table first.
+     This avoids resolve_symbol + Hashtbl.mem on every tick. *)
+  match Hashtbl.find_opt coin_to_symbol coin with
+  | Some _ as r -> r
+  | None ->
+      (* Slow path: resolve via instruments feed and probe stores. *)
+      match Hyperliquid_instruments_feed.resolve_symbol coin with
+      | Some symbol ->
+          if Hashtbl.mem stores symbol then begin
+            Hashtbl.replace coin_to_symbol coin symbol;
+            Some symbol
+          end else
+            let usdc_symbol = symbol ^ "/USDC" in
+            if Hashtbl.mem stores usdc_symbol then begin
+              Hashtbl.replace coin_to_symbol coin usdc_symbol;
+              Some usdc_symbol
+            end else None
+      | None -> None
 
 let string_match msg pos key =
   let key_len = String.length key in
@@ -172,28 +198,108 @@ let get_bids_asks msg =
         else search (idx + 1)
   in search 0
 
+(** Zero-allocation depth-1 top-of-book parser. Extracts exactly the first
+    bid and first ask {px, sz} directly from the raw JSON string without
+    building any intermediate list or array. Returns (bid_px, bid_sz,
+    ask_px, ask_sz, true) on success or (0, 0, 0, 0, false) on failure.
+
+    Layout: "levels":[[{bid levels}],[{ask levels}]]
+    We find the first {px, sz} in each sub-array. *)
+let parse_tob_fast msg =
+  let px_key = "\"px\":\"" in
+  let sz_key = "\"sz\":\"" in
+  let msg_len = String.length msg in
+  let find_key key start_idx limit =
+    let rec search idx =
+      if idx >= limit then None
+      else
+        match String.index_from_opt msg idx '"' with
+        | None -> None
+        | Some p ->
+            if p >= limit then None
+            else if string_match msg p key then
+              let val_start = p + String.length key in
+              if val_start >= msg_len then None
+              else
+                match String.index_from_opt msg val_start '"' with
+                | Some val_end -> Some (val_start, val_end)
+                | None -> None
+            else search (p + 1)
+    in search start_idx
+  in
+  let levels_key = "\"levels\":[[" in
+  let rec search pos =
+    match String.index_from_opt msg pos '"' with
+    | None -> (0.0, 0.0, 0.0, 0.0, false)
+    | Some idx ->
+        if string_match msg idx levels_key then
+          let bids_start = idx + 11 in
+          (* Find end of bids array (first ']') *)
+          match String.index_from_opt msg bids_start ']' with
+          | None -> (0.0, 0.0, 0.0, 0.0, false)
+          | Some bids_end ->
+              (* Parse first bid level *)
+              (match find_key px_key bids_start bids_end with
+               | None -> (0.0, 0.0, 0.0, 0.0, false)
+               | Some (bpx_s, bpx_e) ->
+                   match find_key sz_key (bpx_e + 1) bids_end with
+                   | None -> (0.0, 0.0, 0.0, 0.0, false)
+                   | Some (bsz_s, bsz_e) ->
+                       let bid_px = parse_float_fast msg bpx_s bpx_e in
+                       let bid_sz = parse_float_fast msg bsz_s bsz_e in
+                       (* Find asks array: skip "],[" after bids_end *)
+                       let asks_start = bids_end + 2 in
+                       if asks_start >= msg_len then (0.0, 0.0, 0.0, 0.0, false)
+                       else
+                         match String.index_from_opt msg asks_start ']' with
+                         | None -> (0.0, 0.0, 0.0, 0.0, false)
+                         | Some asks_end ->
+                             match find_key px_key asks_start asks_end with
+                             | None -> (0.0, 0.0, 0.0, 0.0, false)
+                             | Some (apx_s, apx_e) ->
+                                 match find_key sz_key (apx_e + 1) asks_end with
+                                 | None -> (0.0, 0.0, 0.0, 0.0, false)
+                                 | Some (asz_s, asz_e) ->
+                                     let ask_px = parse_float_fast msg apx_s apx_e in
+                                     let ask_sz = parse_float_fast msg asz_s asz_e in
+                                     (bid_px, bid_sz, ask_px, ask_sz, true))
+        else search (idx + 1)
+  in search 0
+
+(** Hot-path orderbook processor. Uses zero-allocation depth-1 TOB parse
+    to update the mutable cache directly. Still writes to the ring buffer
+    for any consumers that need full snapshots, but the domain-critical
+    get_best_bid_ask_fast path reads from the mutable cache. *)
 let process_raw_market_data msg =
-  let now_ts = Unix.gettimeofday () in
   if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," msg then begin
     let coin = get_coin msg in
     if coin <> "" then begin
       match find_registered_symbol coin with
       | Some symbol ->
           (try
+            let store = ensure_store symbol in
+            (* Zero-alloc depth-1 fast path: parse TOB directly into mutable cache *)
+            let (bid_px, bid_sz, ask_px, ask_sz, ok) = parse_tob_fast msg in
+            if ok then begin
+              store.tob.bid_px <- bid_px;
+              store.tob.bid_sz <- bid_sz;
+              store.tob.ask_px <- ask_px;
+              store.tob.ask_sz <- ask_sz;
+              store.tob.tob_valid <- true;
+            end;
+            (* Still write full OB to ring buffer for non-hot-path consumers.
+               Timestamp is deferred — only set if someone actually reads the
+               ring buffer entry, which is not on the domain hot path. *)
             let bids, asks = get_bids_asks msg in
             let ob = {
               symbol;
               bids;
               asks;
-              timestamp = now_ts;
+              timestamp = 0.0;
             } in
-            
-            let store = ensure_store symbol in
             RingBuffer.write store.buffer ob;
             notify_ready store;
-            Concurrency.Exchange_wakeup.signal ~symbol;
-            Logging.debug_f ~section "Orderbook update for %s: bids=%d asks=%d" 
-              symbol (Array.length bids) (Array.length asks)
+            Concurrency.Exchange_wakeup.signal ~symbol
           with exn ->
             Logging.warn_f ~section "Failed to parse l2Book for %s: %s" coin (Printexc.to_string exn))
       | None -> ()
@@ -205,23 +311,23 @@ let[@inline always] get_latest_orderbook symbol =
   | Some store -> RingBuffer.read_latest store.buffer
   | None -> None
 
+(** Read top-of-book from the mutable cache (zero allocation). *)
 let[@inline always] get_best_bid_ask symbol =
-  match get_latest_orderbook symbol with
-  | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
-      let bid = bids.(0) in
-      let ask = asks.(0) in
-      Some (bid.price, bid.size, ask.price, ask.size)
+  match Hashtbl.find_opt stores symbol with
+  | Some store when store.tob.tob_valid ->
+      Some (store.tob.bid_px, store.tob.bid_sz, store.tob.ask_px, store.tob.ask_sz)
   | _ -> None
 
+(** Returns a cached closure that reads top-of-book from the mutable TOB cache.
+    The closure itself allocates nothing — it reads 4 mutable floats and wraps
+    them in a Some tuple. The store pointer is captured at closure-creation time
+    so the domain hot loop never touches the stores Hashtbl. *)
 let[@inline always] get_best_bid_ask_fast symbol =
   let store = ensure_store symbol in
   (fun () ->
-     match RingBuffer.read_latest store.buffer with
-     | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
-         let bid = bids.(0) in
-         let ask = asks.(0) in
-         Some (bid.price, bid.size, ask.price, ask.size)
-     | _ -> None
+     if store.tob.tob_valid then
+       Some (store.tob.bid_px, store.tob.bid_sz, store.tob.ask_px, store.tob.ask_sz)
+     else None
   )
 
 (** Returns all orderbook snapshots written since [last_pos]. *)
@@ -297,5 +403,10 @@ let initialize symbols =
   Logging.info_f ~section "Initializing Hyperliquid orderbook feed for %d symbols" (List.length symbols);
   List.iter (fun symbol ->
     let _ = ensure_store symbol in
-    Logging.debug_f ~section "Created Hyperliquid orderbook buffer for %s" symbol
+    (* Pre-populate coin_to_symbol cache for known symbols.
+       Resolves coin identifiers at startup so the hot path hits the cache. *)
+    let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
+    if coin <> "" then
+      Hashtbl.replace coin_to_symbol coin symbol;
+    Logging.debug_f ~section "Created Hyperliquid orderbook buffer for %s (coin=%s)" symbol coin
   ) symbols

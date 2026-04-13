@@ -468,6 +468,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             exec_checked := true;
             (* No exec events arrived and feed is ready: fetch snapshot orders 
                and inject them into the strategies to restore tracking state. *)
+            (* Hoist timestamp outside the per-order callback: eliminates
+               one gettimeofday syscall per open order during injection. *)
+            let now_inject = Unix.gettimeofday () in
             Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol (fun oid price _qty side_str userref_opt ->
                 let is_mm = match userref_opt with
                   | Some uref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm uref
@@ -478,14 +481,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                   (match !mm_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
-                         ~now:(Unix.gettimeofday ()) asset_with_fees.symbol oid order_side price;
+                         ~now:now_inject asset_with_fees.symbol oid order_side price;
                        ()
                    | None -> ())
                 end else begin
                   (match !grid_strategy_asset_ref with
                    | Some _ ->
                        Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
-                         ~now:(Unix.gettimeofday ()) asset_with_fees.symbol oid order_side price;
+                         ~now:now_inject asset_with_fees.symbol oid order_side price;
                        ()
                    | None -> ())
                 end
@@ -637,8 +640,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
         end;
 
-        (* Block until the next websocket frame signals new data or until data is ready *)
-        if not !should_execute_strategy || not (Ex.has_execution_data ~symbol:asset_with_fees.symbol) then
+        (* Block until the next websocket frame signals new data or until data is ready.
+           Use cached has_exec_fn closure instead of Ex.has_execution_data to
+           avoid Hashtbl lookup on the hot blocking path. *)
+        if not !should_execute_strategy || not (has_exec_fn ()) then
           Concurrency.Exchange_wakeup.wait ~symbol:asset_with_fees.symbol;
 
         if !exec_ready && not !latency_active && (!cycle_count - !exec_ready_cycle >= 10) then begin

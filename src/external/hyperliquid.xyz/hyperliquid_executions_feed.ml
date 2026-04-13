@@ -83,8 +83,15 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
+(** Dedicated mutex for the global order_to_symbol index.
+    Separated from initialization_mutex (which guards the stores Hashtbl)
+    to eliminate cross-contention between domain workers calling
+    fold_open_orders/get_symbol_store and the WS thread updating
+    order_to_symbol on every incoming event. *)
+let order_index_mutex = Mutex.create ()
+
 (** Global order_id to symbol index with adaptive capacity and FIFO eviction.
-    All access requires holding initialization_mutex. *)
+    All access requires holding order_index_mutex. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
 (** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
@@ -100,7 +107,7 @@ let _startup_snapshot_done : bool Atomic.t = Atomic.make false
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 
 (** Insert an order_id to symbol mapping, evicting the oldest entry when
-    the adaptive cap is exceeded. Caller must hold initialization_mutex. *)
+    the adaptive cap is exceeded. Caller must hold order_index_mutex. *)
 let add_to_order_to_symbol order_id symbol =
   if not (Hashtbl.mem order_to_symbol order_id) then
     Queue.push order_id order_to_symbol_queue;
@@ -122,7 +129,7 @@ let add_to_order_to_symbol order_id symbol =
     invocation takes effect. *)
 let mark_startup_complete () =
   if not (Atomic.exchange order_to_symbol_startup_done true) then begin
-    (* Precondition: initialization_mutex is held by the caller (inject_open_orders). *)
+    (* Precondition: order_index_mutex is held by the caller (inject_open_orders). *)
     let observed = Hashtbl.length order_to_symbol in
     let cap = max 1024 (observed + observed / 2 + 1) in
     order_to_symbol_cap := cap;
@@ -185,9 +192,9 @@ let[@inline always] get_open_order symbol order_id =
 
 let find_order_everywhere order_id =
   (* O(1) lookup via the global order_to_symbol index. *)
-  Mutex.lock initialization_mutex;
+  Mutex.lock order_index_mutex;
   let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
-  Mutex.unlock initialization_mutex;
+  Mutex.unlock order_index_mutex;
   match symbol_opt with
   | Some symbol ->
       let store = get_symbol_store symbol in
@@ -219,18 +226,20 @@ let remove_open_order ~symbol ~order_id =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
   let existed = Hashtbl.mem store.open_orders order_id in
-  if existed then begin
+  if existed then
     Hashtbl.remove store.open_orders order_id;
-    Mutex.lock initialization_mutex;
+  Mutex.unlock store.orders_mutex;
+  (* Deferred global index and blacklist updates: outside orders_mutex
+     to eliminate nested lock acquisition with order_index_mutex. *)
+  if existed then begin
+    Mutex.lock order_index_mutex;
     Hashtbl.remove order_to_symbol order_id;
-    Mutex.unlock initialization_mutex;
-    (* Blacklist this ID to suppress late WebSocket orderUpdates re-insertion. *)
+    Mutex.unlock order_index_mutex;
     Mutex.lock amended_blacklist_mutex;
     Hashtbl.replace amended_blacklist order_id (Unix.gettimeofday ());
     Mutex.unlock amended_blacklist_mutex;
     Logging.debug_f ~section "Removed old order %s [%s] after amendment (blacklisted)" order_id symbol
-  end;
-  Mutex.unlock store.orders_mutex
+  end
 
 (** Return all symbols that have initialized execution stores. *)
 let get_all_symbols () =
@@ -265,14 +274,16 @@ let cleanup_stale_orders () =
     List.iter (fun (_symbol, order_id) ->
       let store = get_symbol_store _symbol in
       Mutex.lock store.orders_mutex;
-      if Hashtbl.mem store.open_orders order_id then begin
+      let removed = Hashtbl.mem store.open_orders order_id in
+      if removed then
         Hashtbl.remove store.open_orders order_id;
-        Mutex.lock initialization_mutex;
+      Mutex.unlock store.orders_mutex;
+      if removed then begin
+        Mutex.lock order_index_mutex;
         Hashtbl.remove order_to_symbol order_id;
-        Mutex.unlock initialization_mutex;
+        Mutex.unlock order_index_mutex;
         Logging.debug_f ~section "Removed stale order during safety cleanup: %s [%s]" order_id _symbol
       end;
-      Mutex.unlock store.orders_mutex;
     ) !stale_orders
   end;
 
@@ -310,7 +321,7 @@ let cleanup_stale_orders () =
      accumulates dead entries over time since the eviction loop only fires
      when the Hashtbl exceeds its cap. This rebuild pass retains only entries
      still present in the Hashtbl. Runs at most once per cleanup cycle. *)
-  Mutex.lock initialization_mutex;
+  Mutex.lock order_index_mutex;
   let original_queue_len = Queue.length order_to_symbol_queue in
   if original_queue_len > 0 then begin
     let temp = Queue.create () in
@@ -326,7 +337,7 @@ let cleanup_stale_orders () =
         "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
         removed original_queue_len (Queue.length order_to_symbol_queue)
   end;
-  Mutex.unlock initialization_mutex
+  Mutex.unlock order_index_mutex
 
 (** Clear all open orders across all symbol stores. Called on WebSocket
     reconnection to prevent stale phantom orders from blocking placement. *)
@@ -342,10 +353,10 @@ let clear_all_open_orders () =
     Mutex.unlock store.orders_mutex;
   ) all_symbols;
   (* Reset the global order_to_symbol index and its eviction queue. *)
-  Mutex.lock initialization_mutex;
+  Mutex.lock order_index_mutex;
   Hashtbl.clear order_to_symbol;
   Queue.clear order_to_symbol_queue;
-  Mutex.unlock initialization_mutex;
+  Mutex.unlock order_index_mutex;
   if !total_removed > 0 then
     Logging.info_f ~section "Cleared %d stale open orders on reconnection" !total_removed
   else
@@ -435,12 +446,14 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     Concurrency.Exchange_wakeup.signal ~symbol:event.symbol
   end else begin
 
+  (* Deferred global index action: computed under orders_mutex, applied
+     after releasing it. Avoids holding orders_mutex while contending
+     for order_index_mutex — matching the Kraken architecture. *)
+  let index_action = ref `None in
+
   if is_terminal then begin
     Hashtbl.remove store.open_orders event.order_id;
-    (* Remove from global order_to_symbol index. *)
-    Mutex.lock initialization_mutex;
-    Hashtbl.remove order_to_symbol event.order_id;
-    Mutex.unlock initialization_mutex;
+    index_action := `Remove event.order_id;
   end else begin
     (* UserRef recovery precedence:
        1. Explicitly provided user_ref (from proactive inject_order).
@@ -489,12 +502,22 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     } in
     
     Hashtbl.replace store.open_orders event.order_id order;
-    (* Add to global order_to_symbol index with bounded FIFO eviction. *)
-    Mutex.lock initialization_mutex;
-    add_to_order_to_symbol event.order_id event.symbol;
-    Mutex.unlock initialization_mutex;
+    index_action := `Add (event.order_id, event.symbol);
   end;
   Mutex.unlock store.orders_mutex;
+
+  (* Deferred global order_to_symbol index update: outside orders_mutex
+     to prevent nested locking with order_index_mutex. *)
+  (match !index_action with
+   | `Remove oid ->
+       Mutex.lock order_index_mutex;
+       Hashtbl.remove order_to_symbol oid;
+       Mutex.unlock order_index_mutex
+   | `Add (oid, sym) ->
+       Mutex.lock order_index_mutex;
+       add_to_order_to_symbol oid sym;
+       Mutex.unlock order_index_mutex
+   | `None -> ());
   
   RingBuffer.write store.events_buffer event;
   notify_ready store;
@@ -565,9 +588,9 @@ let process_order_updates data_json =
         let order_id = (match member "oid" order_obj with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
         
         let symbol_opt = 
-          Mutex.lock initialization_mutex;
+          Mutex.lock order_index_mutex;
           let res = Hashtbl.find_opt order_to_symbol order_id in
-          Mutex.unlock initialization_mutex;
+          Mutex.unlock order_index_mutex;
           match res with
           | Some s -> Some s
           | None -> find_registered_symbol coin
@@ -673,9 +696,9 @@ let process_user_events data_json =
     let order_id = (match member "oid" fill with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
     
     let symbol_opt = 
-      Mutex.lock initialization_mutex;
+      Mutex.lock order_index_mutex;
       let res = Hashtbl.find_opt order_to_symbol order_id in
-      Mutex.unlock initialization_mutex;
+      Mutex.unlock order_index_mutex;
       match res with
       | Some s -> Some s
       | None -> find_registered_symbol coin
@@ -779,9 +802,9 @@ let process_user_events data_json =
     let order_id = (match member "oid" nuc with `Int i -> string_of_int i | `String s -> s | _ -> "0") in
     
     let symbol_opt = 
-      Mutex.lock initialization_mutex;
+      Mutex.lock order_index_mutex;
       let res = Hashtbl.find_opt order_to_symbol order_id in
-      Mutex.unlock initialization_mutex;
+      Mutex.unlock order_index_mutex;
       match res with
       | Some s -> Some s
       | None -> find_registered_symbol coin
@@ -952,8 +975,8 @@ let inject_open_orders data_json =
     Logging.info_f ~section "Injected %d initial open orders from snapshot" !count;
     (* Lock the adaptive capacity now that the startup snapshot is fully consumed.
        Subsequent inserts will evict the oldest entries when exceeding the cap. *)
-    Mutex.lock initialization_mutex;
+    Mutex.lock order_index_mutex;
     mark_startup_complete ();
-    Mutex.unlock initialization_mutex
+    Mutex.unlock order_index_mutex
   with exn ->
     Logging.error_f ~section "Failed to inject open orders: %s" (Printexc.to_string exn)
