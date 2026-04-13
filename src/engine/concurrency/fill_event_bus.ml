@@ -90,3 +90,8 @@ let iter_since last_pos f =
     a fill was published between the caller's last read and this call. *)
 let wait_for_fill () =
   Lwt_condition.wait fill_condition
+
+(** Read and sort the entire buffer returning the most recent fills first. *)
+let get_recent_fills () =
+  let fills = RingBuffer.read_all buffer in
+  List.sort (fun a b -> compare b.timestamp a.timestamp) fills

@@ -1,0 +1,130 @@
+open Notty
+open Theme
+
+(** Recent Fills Feed Component.
+    Scrolls recent filled orders horizontally across the screen below the holdings.
+*)
+
+let current_offset = ref 0.0
+let last_time = ref None
+
+let local_fills : Yojson.Basic.t list ref = ref []
+let capacity = 10
+let initialized = ref false
+
+let render_fills w json =
+  let engine_fills = json |?> "recent_fills" |> to_list_d in
+  if engine_fills = [] then I.empty
+  else
+    let () =
+      if not !initialized then begin
+        local_fills := [ List.hd engine_fills ];
+        initialized := true
+      end else begin
+        let latest_ts = 
+          match !local_fills with
+          | [] -> 0.0
+          | f :: _ -> f |?> "timestamp" |> to_float_d 0.0
+        in
+        let new_fills = 
+          List.filter (fun f -> 
+            let ts = f |?> "timestamp" |> to_float_d 0.0 in
+            ts > latest_ts
+          ) engine_fills
+        in
+        if new_fills <> [] then begin
+          let combined = new_fills @ !local_fills in
+          let rec take n l acc =
+            if n <= 0 then List.rev acc
+            else match l with
+            | [] -> List.rev acc
+            | h :: t -> take (n - 1) t (h :: acc)
+          in
+          local_fills := take capacity combined []
+        end
+      end
+    in
+
+    let fills = !local_fills in
+    if fills = [] then I.empty
+    else
+      (* Build the ticker string chunks grouped by fill *)
+    let chunks = List.map (fun bal_json ->
+      let venue = bal_json |?> "venue" |> to_string_d "?" |> truncate_string 10 in
+      let symbol = bal_json |?> "symbol" |> to_string_d "?" in
+      let side = bal_json |?> "side" |> to_string_d "?" |> String.uppercase_ascii in
+      let amount = bal_json |?> "amount" |> to_float_d 0.0 in
+      let price = bal_json |?> "fill_price" |> to_float_d 0.0 in
+      let timestamp = bal_json |?> "timestamp" |> to_float_d 0.0 in
+
+      (* Format time difference *)
+      let now = Unix.gettimeofday () in
+      let diff = max 0.0 (now -. timestamp) in
+      let time_str = 
+        if diff < 60.0 then Printf.sprintf "%.0fs" diff
+        else if diff < 3600.0 then Printf.sprintf "%.0fm" (diff /. 60.0)
+        else Printf.sprintf "%.1fh" (diff /. 3600.0)
+      in
+
+      let side_attr = if side = "BUY" then A.(fg c_green ++ st bold) else A.(fg c_red ++ st bold) in
+      let sym_attr = exch_sym_attr venue in
+
+      let amount_str = if amount < 1.0 then Printf.sprintf "%.4g" amount else Printf.sprintf "%.2f" amount in
+
+      I.hcat [
+        I.string A.(fg c_dim) (time_str ^ " ago ");
+        I.string sym_attr symbol;
+        I.string A.(fg c_dim) " ";
+        I.string side_attr side;
+        I.string A.(fg c_text) (" " ^ amount_str ^ " @ " ^ format_price price);
+      ]
+    ) fills in
+
+    let separator = I.string A.(fg c_accent ++ bg c_bg) "  ◈  " in
+    let ticker_line =
+      List.fold_left (fun acc chunk ->
+        if I.width acc = 0 then chunk
+        else I.hcat [acc; separator; chunk]
+      ) I.empty chunks
+    in
+
+    let line_w = I.width ticker_line in
+    
+    if line_w = 0 then I.empty
+    else
+      let padded_ticker = I.hcat [ticker_line; separator] in
+      let padded_w = I.width padded_ticker in
+
+      let now = Unix.gettimeofday () in
+      let dt = match !last_time with
+        | None -> 0.0
+        | Some t -> now -. t
+      in
+      last_time := Some now;
+
+      let dt = if dt > 1.0 then 0.0 else dt in
+
+      let scroll_speed = 8.0 in 
+      current_offset := !current_offset +. (dt *. scroll_speed);
+      
+      let max_w = float_of_int padded_w in
+      if !current_offset >= max_w then
+        current_offset := mod_float !current_offset max_w;
+
+      let offset = int_of_float !current_offset in
+      
+      let invert_offset = padded_w - offset - 1 in
+      let invert_offset = if invert_offset < 0 then 0 else invert_offset in
+
+      let scroll_region =
+        if padded_w <= w then
+          let repeats = (w / padded_w) + 2 in
+          let repeated = I.hcat (List.init repeats (fun _ -> padded_ticker)) in
+          I.crop ~l:invert_offset ~r:0 ~t:0 ~b:0 repeated
+        else
+          let repeated = I.hcat [padded_ticker; padded_ticker] in
+          I.crop ~l:invert_offset ~r:0 ~t:0 ~b:0 repeated
+      in
+      
+      let final_img = I.hsnap ~align:`Left w scroll_region in
+      I.(final_img </> I.string A.(bg c_bg) (String.make w ' '))

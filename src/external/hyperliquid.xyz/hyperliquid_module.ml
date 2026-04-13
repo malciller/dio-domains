@@ -358,35 +358,41 @@ module Hyperliquid_impl = struct
 
   let read_execution_events ~symbol ~start_pos =
     let events = Hyperliquid_executions_feed.read_execution_events symbol start_pos in
-    List.map (fun (e : Hyperliquid_executions_feed.execution_event) ->
-      { Types.
-        order_id = e.order_id;
-        order_status = status_of_hyperliquid_status e.order_status;
-        limit_price = e.limit_price;
-        side = side_of_hyperliquid_side e.side;
-        remaining_qty = max 0.0 (e.order_qty -. e.cum_qty);
-        filled_qty = e.cum_qty;
-        avg_price = e.avg_price;
-        timestamp = e.timestamp;
-        is_amended = false;
-        cl_ord_id = e.cl_ord_id;
-      }
+    List.filter_map (fun (e : Hyperliquid_executions_feed.execution_event) ->
+      match e.exec_type with
+      | Hyperliquid_executions_feed.Filled -> None (* Deduplicate: rely on userEvents Trade event *)
+      | _ ->
+          Some { Types.
+            order_id = e.order_id;
+            order_status = status_of_hyperliquid_status e.order_status;
+            limit_price = e.limit_price;
+            side = side_of_hyperliquid_side e.side;
+            remaining_qty = max 0.0 (e.order_qty -. e.cum_qty);
+            filled_qty = e.cum_qty;
+            avg_price = e.avg_price;
+            timestamp = e.timestamp;
+            is_amended = false;
+            cl_ord_id = e.cl_ord_id;
+          }
     ) events
 
   let iter_execution_events ~symbol ~start_pos f =
     Hyperliquid_executions_feed.iter_execution_events symbol start_pos (fun (e : Hyperliquid_executions_feed.execution_event) ->
-      f { Types.
-        order_id = e.order_id;
-        order_status = status_of_hyperliquid_status e.order_status;
-        limit_price = e.limit_price;
-        side = side_of_hyperliquid_side e.side;
-        remaining_qty = max 0.0 (e.order_qty -. e.cum_qty);
-        filled_qty = e.cum_qty;
-        avg_price = e.avg_price;
-        timestamp = e.timestamp;
-        is_amended = false;
-        cl_ord_id = e.cl_ord_id;
-      }
+      match e.exec_type with
+      | Hyperliquid_executions_feed.Filled -> () (* Deduplicate: rely on userEvents Trade event *)
+      | _ ->
+          f { Types.
+            order_id = e.order_id;
+            order_status = status_of_hyperliquid_status e.order_status;
+            limit_price = e.limit_price;
+            side = side_of_hyperliquid_side e.side;
+            remaining_qty = max 0.0 (e.order_qty -. e.cum_qty);
+            filled_qty = e.cum_qty;
+            avg_price = e.avg_price;
+            timestamp = e.timestamp;
+            is_amended = false;
+            cl_ord_id = e.cl_ord_id;
+          }
     )
 
 
