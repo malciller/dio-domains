@@ -1,6 +1,20 @@
 open Notty
 open Theme
 
+let history_len = 15
+let cycle_hist = Hashtbl.create 16
+
+let update_cycle_hist symbol p99 =
+  let arr = try Hashtbl.find cycle_hist symbol with Not_found -> 
+    let a = Array.make history_len 0.0 in
+    Hashtbl.add cycle_hist symbol a; a
+  in
+  for i = 0 to history_len - 2 do
+    arr.(i) <- arr.(i + 1)
+  done;
+  arr.(history_len - 1) <- p99;
+  arr
+
 let render_latencies _w json =
   let lats = match json |?> "latencies" with `Assoc l -> l | _ -> [] in
   (* Build symbol -> exchange lookup from strategies *)
@@ -65,6 +79,7 @@ let render_latencies _w json =
           let img = col 27 a_label s in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
+      @ [ I.string a_border " │ "; col 15 a_label "     TREND     " ]
     ) in
     let header_row2 = I.hcat (
       [ I.string a_border " │  ";
@@ -73,6 +88,7 @@ let render_latencies _w json =
           let img = I.hcat [ col 9 a_dim "p50"; col 9 a_dim "p99"; col 9 a_dim "p999" ] in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
+      @ [ I.string a_border " │ "; col 15 a_label "  (CYCLE P99)  " ]
     ) in
     let header = I.vcat [header_row1; header_row2] in
     let rows = List.map (fun (symbol, metrics) ->
@@ -110,6 +126,11 @@ let render_latencies _w json =
         in
         if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
       ) metric_order in
+      
+      let (_, cycle_p99, _, _) = find_metric "cycle" in
+      let c_arr = update_cycle_hist symbol cycle_p99 in
+      let trend_spark = render_sparkline 15 c_arr 100.0 (attr_of_sev (severity "cycle" cycle_p99 1)) in
+      
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
       I.hcat (
@@ -118,6 +139,7 @@ let render_latencies _w json =
           I.string a_text " ";
           col 14 sym_attr (truncate_string 13 symbol) ]
         @ metric_cells
+        @ [ I.string a_border " │ "; trend_spark ]
       )
     ) active_lats in
     I.vcat (header :: rows)

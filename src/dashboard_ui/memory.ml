@@ -73,10 +73,18 @@ let render_memory w json =
       I.string a_text (Printf.sprintf "%-8s" v);
     ]
   in
+  let kv_bar lbl v ratio p_attr =
+    I.hcat [
+      I.string a_dim ("  " ^ lbl ^ " ");
+      I.string a_text (Printf.sprintf "%-8s" v);
+      I.string a_dim " ";
+      render_progress_bar 15 ratio p_attr;
+    ]
+  in
   let row1 = I.hcat [
     I.string a_border " │";
-    kv "HEAP" (Printf.sprintf "%dMB" heap);
-    kv "LIVE" (Printf.sprintf "%dKB" live);
+    kv_bar "HEAP" (Printf.sprintf "%dMB" heap) (min 1.0 (float_of_int heap /. 500.0)) a_yellow;
+    kv_bar "LIVE" (Printf.sprintf "%dKB" live) live_ratio a_green;
     kv "FREE" (Printf.sprintf "%dKB" free);
   ] in
   let row2 = I.hcat [
