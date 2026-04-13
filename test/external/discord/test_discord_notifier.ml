@@ -31,7 +31,7 @@ let test_format_single_fill () =
       Alcotest.(check int) "has 1 embed" 1 (List.length embeds);
       let embed = List.hd embeds in
       let title = member "title" embed |> to_string in
-      Alcotest.(check string) "title matches" "Order Fill — test_venue" title;
+      Alcotest.(check string) "title matches" "BTC/USD - BUY @ $50000.0000" title;
       let color = member "color" embed |> to_int in
       Alcotest.(check int) "color matches green for buy" 0x2ECC71 color;
       let fields = member "fields" embed |> to_list in
