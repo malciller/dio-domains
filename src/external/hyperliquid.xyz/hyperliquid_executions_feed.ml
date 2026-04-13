@@ -933,10 +933,12 @@ let inject_open_orders data_json =
   try
     let orders = to_list data_json in
     let count = ref 0 in
+    let snapshot_order_ids = Hashtbl.create 32 in
     List.iter (fun order_obj ->
       try
         let coin = member "coin" order_obj |> to_string in
         let order_id = match member "oid" order_obj with `Int i -> string_of_int i | `String s -> s | _ -> "0" in
+        Hashtbl.replace snapshot_order_ids order_id ();
         let symbol_opt = find_registered_symbol coin in
         
         match symbol_opt with
@@ -980,6 +982,46 @@ let inject_open_orders data_json =
       with exn -> Logging.warn_f ~section "Failed to parse open order entry: %s" (Printexc.to_string exn)
     ) orders;
     Logging.info_f ~section "Injected %d initial open orders from snapshot" !count;
+
+    let stale_orders = ref [] in
+    Mutex.lock initialization_mutex;
+    let all_symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores [] in
+    Mutex.unlock initialization_mutex;
+
+    List.iter (fun symbol ->
+      let store = get_symbol_store symbol in
+      Mutex.lock store.orders_mutex;
+      Fun.protect ~finally:(fun () -> Mutex.unlock store.orders_mutex) (fun () ->
+        Hashtbl.iter (fun order_id (cached_order: open_order) ->
+          if not (Hashtbl.mem snapshot_order_ids order_id) then
+            stale_orders := (symbol, store, cached_order) :: !stale_orders
+        ) store.open_orders
+      )
+    ) all_symbols;
+
+    List.iter (fun (symbol, store, (cached_order: open_order)) ->
+      let event : execution_event = {
+        order_id = cached_order.order_id;
+        symbol;
+        exec_type = Canceled;
+        order_status = CanceledStatus;
+        limit_price = cached_order.limit_price;
+        side = cached_order.side;
+        order_qty = cached_order.order_qty;
+        cum_qty = cached_order.cum_qty;
+        cum_cost = cached_order.cum_cost;
+        avg_price = cached_order.avg_price;
+        timestamp = Unix.gettimeofday ();
+        trade_id = None; last_qty = None; last_price = None; fee = None;
+        cl_ord_id = cached_order.cl_ord_id;
+      } in
+      update_orders_internal store event;
+      Logging.info_f ~section "Reconciled stale order: emitted CanceledStatus for %s [%s]" cached_order.order_id symbol
+    ) !stale_orders;
+
+    if !stale_orders <> [] then
+      Logging.info_f ~section "Reconciled open orders: removed %d stale orders not present in snapshot" (List.length !stale_orders);
+
     (* Lock the adaptive capacity now that the startup snapshot is fully consumed.
        Subsequent inserts will evict the oldest entries when exceeding the cap. *)
     Mutex.lock order_index_mutex;
