@@ -196,6 +196,27 @@ let json_of_memory () =
 
 (* Full state snapshot *)
 
+let take n l =
+  let rec aux a n l =
+    if n <= 0 then a else match l with [] -> a | h::t -> aux (h::a) (n-1) t 
+  in List.rev (aux [] n l)
+
+let json_of_recent_fills () =
+  let module B = Concurrency.Fill_event_bus in
+  let fills = B.get_recent_fills () in
+  let recent = take 50 fills in
+  `List (List.map (fun (f : B.fill_event) ->
+    `Assoc [
+      "venue", `String f.venue;
+      "symbol", `String f.symbol;
+      "side", `String f.side;
+      "amount", `Float f.amount;
+      "fill_price", `Float f.fill_price;
+      "value", `Float f.value;
+      "timestamp", `Float f.timestamp;
+    ]
+  ) recent)
+
 let build_snapshot () =
   let now = Unix.gettimeofday () in
   let uptime = now -. !engine_start_time in
@@ -300,6 +321,7 @@ let build_snapshot () =
     "domains", json_of_domains ();
     "strategies", `Assoc strategies;
     "all_balances", `List all_balances;
+    "recent_fills", json_of_recent_fills ();
     "latencies", json_of_domain_latencies ();
   ]
 

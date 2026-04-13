@@ -864,12 +864,16 @@ let execute_strategy
           );
 
        if !open_buy_count_from_scan = 0 && not state.inflight_cancel_buy && not state.inflight_buy then begin
-            set_asset_reserved_quote state 0.0;
-            (match state.last_buy_order_id with
-             | Some _ghost_id ->
-                 state.last_buy_order_id <- None;
-                 state.last_buy_order_price <- None
-             | None -> ())
+            (* Prevent aggressive ghost order clearing during placement/WS transit gap.
+               If we very recently placed an order, give it time to appear in open_orders. *)
+            if (now -. state.last_order_time > 3.0) then begin
+              set_asset_reserved_quote state 0.0;
+              (match state.last_buy_order_id with
+               | Some _ghost_id ->
+                   state.last_buy_order_id <- None;
+                   state.last_buy_order_price <- None
+               | None -> ())
+            end
        end else if not state.inflight_cancel_buy && not state.inflight_buy then begin
             (match !best_buy_id with
              | Some best_order_id ->
@@ -1490,36 +1494,39 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
       sell_id <> order_id
     ) state.open_sell_orders;
 
-    (* 4. Clear buy order tracking only on buy fills.
+    (* 4. Update buy tracking and accumulation on buy fills.
        A sell fill must not clear last_buy_order_id because the buy is still
-       live and only needs spacing adjustment, not a fresh placement cycle.
-       Failing to gate on [side = Buy] caused sell fills to spuriously clear
-       buy tracking, setting effective_buy_count=0 on the next cycle and
-       triggering a redundant buy placement alongside the still-open original. *)
+       live and only needs spacing adjustment, not a fresh placement cycle. *)
     let was_tracked_buy = match side, state.last_buy_order_id with
       | Buy, Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
       | _ -> false
     in
-    if was_tracked_buy then begin
-      (* Record actual buy fill price for profit calculation on matching sell fill. *)
+    if side = Buy then begin
+      (* Record actual buy fill price for profit calculation on matching sell fill.
+         We ALWAYS do this for buy fills, even laggy ones, since they establish our cost basis. *)
       state.last_buy_fill_price <- Some fill_price;
-      (* Clear last_sell_fill_price; next sell is the first after this buy. *)
       state.last_sell_fill_price <- None;
-      state.last_buy_order_id <- None;
-      state.last_buy_order_price <- None;
       (* Mark dirty so flush_persistence writes buy fill price to disk.
          Without this, sell fills after restart have no buy_price reference
          and silently skip profit calculation. *)
       if persistence_accumulation_exchange state.exchange_id then
         state.persistence_dirty <- true;
       (* Credit anticipated base so the sell guard sees incoming asset before
-         the balance feed catches up (exec feed is faster than balance feed). *)
-      if acc_qty > 0.0 then begin
+         the balance feed catches up (exec feed is faster than balance feed).
+         Only credit if this fill was the actively tracked buy to prevent double-crediting
+         on duplicate execution reports. *)
+      if acc_qty > 0.0 && was_tracked_buy then begin
         state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
         Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
           asset_symbol acc_qty state.anticipated_base_credit order_id
       end;
-      ()
+      
+      (* Clear tracking ONLY IF this fill corresponds to the actively tracked buy.
+         Otherwise, we assume a new order is already tracked and we shouldn't orphan it. *)
+      if was_tracked_buy then begin
+        state.last_buy_order_id <- None;
+        state.last_buy_order_price <- None;
+      end
     end;
 
     (* 5. Compute realized net profit on sell fills (discrete sizing accumulator).
@@ -1607,16 +1614,25 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
     if persistence_accumulation_exchange state.exchange_id then
       state.persistence_dirty <- true;
 
-    (* 6. Clear inflight flags, reservation, and global placement trackers for immediate re-placement. *)
-    (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
-    (* Release quote reservation when buy fills (funds transferred to base asset). *)
-    (match side with Buy -> set_asset_reserved_quote state 0.0 | Sell -> ());
-    ignore (InFlightOrders.remove_in_flight_order ((match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
+    let should_clear_locks = 
+      if side = Buy then was_tracked_buy
+      else true
+    in
 
-    (* 7. On buy fill, clear the Sell side's InFlightOrders guard.
+    (* 6. Clear inflight flags, reservation, and global placement trackers for immediate re-placement. *)
+    if should_clear_locks then begin
+      (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+      ignore (InFlightOrders.remove_in_flight_order ((match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
+    end;
+    (* Release quote reservation ONLY when the tracked buy fills. Otherwise we steal reservation from an existing valid in-flight order. *)
+    if was_tracked_buy && side = Buy then begin
+      set_asset_reserved_quote state 0.0
+    end;
+
+    (* 7. On tracked buy fill, clear the Sell side's InFlightOrders guard.
        The strategy places buy+sell together; the previous sell's guard
        would block the new sell via duplicate detection. *)
-    if side = Buy then begin
+    if side = Buy && was_tracked_buy then begin
       ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
       state.inflight_sell <- false
     end;
