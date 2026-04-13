@@ -273,6 +273,10 @@ module Hyperliquid_impl = struct
   let get_balance ~asset =
     Hyperliquid_balances.get_balance asset
 
+  let get_balance_fast ~asset =
+    let store = Hyperliquid_balances.get_balance_store asset in
+    (fun () -> Hyperliquid_balances.BalanceStore.get_balance store)
+
   let get_all_balances () =
     let assets = Hyperliquid_balances.get_all_assets () in
     List.filter_map (fun asset ->
