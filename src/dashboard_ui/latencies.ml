@@ -90,7 +90,7 @@ let render_latencies w json =
         col 15 a_label "  (CYCLE P99)  ";
         I.string a_border " │ " ]
       @ List.mapi (fun i _lbl ->
-          let img = I.hcat [ col 9 a_dim "p50"; col 9 a_dim "p99"; col 9 a_dim "p999" ] in
+          let img = I.hcat [ col_right 9 a_dim "p50"; col_right 9 a_dim "p99"; col_right 9 a_dim "p999" ] in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
     ) in
@@ -117,15 +117,15 @@ let render_latencies w json =
       let metric_cells = List.mapi (fun i label ->
         let (p50, p99, p999, samples) = find_metric label in
         let img = if samples = 0 then
-          I.hcat [col 9 a_dim "--"; col 9 a_dim "--"; col 9 a_dim "--"]
+          I.hcat [col_right 9 a_dim "--"; col_right 9 a_dim "--"; col_right 9 a_dim "--"]
         else
           let s50 = severity label p50 samples in
           let s99 = max s50 (severity label p99 samples) in
           let s999 = max s99 (severity label p999 samples) in
           I.hcat [
-            col 9 (attr_of_sev s50) (format_latency_us p50);
-            col 9 (attr_of_sev s99) (format_latency_us p99);
-            col 9 (attr_of_sev s999) (format_latency_us p999);
+            col_right 9 (attr_of_sev s50) (format_latency_us p50);
+            col_right 9 (attr_of_sev s99) (format_latency_us p99);
+            col_right 9 (attr_of_sev s999) (format_latency_us p999);
           ]
         in
         if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]

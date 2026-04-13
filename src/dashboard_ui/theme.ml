@@ -77,10 +77,10 @@ let c_exch_li    = A.rgb_888 ~r:125 ~g:207 ~b:255
 let c_exch_ib    = A.rgb_888 ~r:255 ~g:158 ~b:100
 
 (* Basis Point generic styling (Pink/Magenta scale to avoid exchange collision) *)
-let c_bps_tight  = A.rgb_888 ~r:247 ~g:118 ~b:142 (* Tokyo Night Red/Pink *)
-let c_bps_norm   = A.rgb_888 ~r:226 ~g:104 ~b:160 (* Magenta *)
-let c_bps_wide   = A.rgb_888 ~r:164 ~g:60  ~b:100  (* Dark Magenta *)
-let c_bps_xtrm   = A.rgb_888 ~r:86  ~g:95  ~b:137  (* Dim *)
+let c_bps_tight  = A.rgb_888 ~r:125 ~g:207 ~b:255 (* Cyan *)
+let c_bps_norm   = A.rgb_888 ~r:86  ~g:95  ~b:137 (* Dim *)
+let c_bps_wide   = A.rgb_888 ~r:226 ~g:104 ~b:160 (* Magenta *)
+let c_bps_xtrm   = A.rgb_888 ~r:247 ~g:118 ~b:142 (* Tokyo Night Red/Pink *)
 
 (* Attribute constructors: foreground + background + optional style *)
 
