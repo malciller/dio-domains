@@ -295,9 +295,14 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           orderbook_read_pos := ob_pos;
           (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
            | Some (bid_price, bid_size, ask_price, ask_size) ->
+               let changed = match !top_of_book with
+                 | Some (old_bid, _, old_ask, _) ->
+                     old_bid <> bid_price || old_ask <> ask_price
+                 | None -> true
+               in
                top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
                current_price := Some ((bid_price +. ask_price) /. 2.0);
-               should_execute_strategy := true
+               if changed then should_execute_strategy := true
            | None -> ());
         end;
         let t2 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in

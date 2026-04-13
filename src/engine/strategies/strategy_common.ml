@@ -103,23 +103,29 @@ module InFlightOrders = struct
     Mutex.unlock mutex;
     size
 
+  let last_cleanup = Atomic.make 0.0
+
   (** Evict entries older than [max_age] seconds. Returns [(0, removed_count)]. *)
   let cleanup ?(max_age=60.0) () =
-    Mutex.lock mutex;
     let now = Unix.gettimeofday () in
-    let removed = ref 0 in
+    let last = Atomic.get last_cleanup in
+    if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now then begin
+      Mutex.lock mutex;
+      let removed = ref 0 in
 
-    (* In-place scan; safe under mutex *)
-    Hashtbl.filter_map_inplace (fun _key timestamp ->
-      if now -. timestamp > max_age then begin
-        incr removed;
-        None
-      end else
-        Some timestamp
-    ) registry;
+      (* In-place scan; safe under mutex *)
+      Hashtbl.filter_map_inplace (fun _key timestamp ->
+        if now -. timestamp > max_age then begin
+          incr removed;
+          None
+        end else
+          Some timestamp
+      ) registry;
 
-    Mutex.unlock mutex;
-    (0, !removed)
+      Mutex.unlock mutex;
+      (0, !removed)
+    end else
+      (0, 0)
 
   (** Return a closure compatible with the event registry cleanup interface. *)
   let get_cleanup_fn () =
@@ -169,23 +175,29 @@ module InFlightAmendments = struct
     Mutex.unlock mutex;
     size
 
+  let last_cleanup = Atomic.make 0.0
+
   (** Evict entries older than [max_age] seconds. Returns [(0, removed_count)]. *)
   let cleanup ?(max_age=60.0) () =
-    Mutex.lock mutex;
     let now = Unix.gettimeofday () in
-    let removed = ref 0 in
+    let last = Atomic.get last_cleanup in
+    if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now then begin
+      Mutex.lock mutex;
+      let removed = ref 0 in
 
-    (* In-place scan; safe under mutex *)
-    Hashtbl.filter_map_inplace (fun _key timestamp ->
-      if now -. timestamp > max_age then begin
-        incr removed;
-        None
-      end else
-        Some timestamp
-    ) registry;
+      (* In-place scan; safe under mutex *)
+      Hashtbl.filter_map_inplace (fun _key timestamp ->
+        if now -. timestamp > max_age then begin
+          incr removed;
+          None
+        end else
+          Some timestamp
+      ) registry;
 
-    Mutex.unlock mutex;
-    (0, !removed)
+      Mutex.unlock mutex;
+      (0, !removed)
+    end else
+      (0, 0)
 
   (** Return a closure compatible with the event registry cleanup interface. *)
   let get_cleanup_fn () =
