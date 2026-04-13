@@ -168,10 +168,11 @@ let bench_grid_price_calc () =
   let name = "price_calc_grid" in
   let n    = 10_000 in
   let p    = LP.create ~max_latency_us:100_000 name in
+  let state = SG.get_strategy_state "BTC/USD" in
   let total_ms = wall_ms (fun () ->
     run_bench p n (fun () ->
-      let _ = SG.calculate_grid_price 50000.0 1.0 true  "BTC/USD" "kraken" in
-      let _ = SG.calculate_grid_price 50000.0 1.0 false "BTC/USD" "kraken" in
+      let _ = SG.calculate_grid_price 50000.0 1.0 true  state in
+      let _ = SG.calculate_grid_price 50000.0 1.0 false state in
       ()
     )
   ) in

@@ -77,18 +77,21 @@ let test_config_parsing () =
 let test_price_rounding () =
   (* Test price rounding - this relies on Kraken instruments feed *)
   (* For now, just test that the function doesn't crash and returns a reasonable value *)
-  let rounded = Dio_strategies.Suicide_grid.round_price 50000.12345678 "BTC/USD" "kraken" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state "BTC/USD" in
+  let rounded = state.cached_round_price 50000.12345678 in
   check bool "price rounding non-negative" true (rounded >= 0.0)
 
 let test_price_increment () =
   (* Test price increment retrieval - this relies on Kraken instruments feed *)
-  let increment = Dio_strategies.Suicide_grid.get_price_increment "BTC/USD" "kraken" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state "BTC/USD" in
+  let increment = state.cached_price_increment in
   check bool "price increment positive" true (increment > 0.0)
 
 let test_grid_price_calculation () =
   (* Test grid price calculations *)
-  let above_price = Dio_strategies.Suicide_grid.calculate_grid_price 50000.0 1.0 true "TEST/USD" "kraken" in
-  let below_price = Dio_strategies.Suicide_grid.calculate_grid_price 50000.0 1.0 false "TEST/USD" "kraken" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state "TEST/USD" in
+  let above_price = Dio_strategies.Suicide_grid.calculate_grid_price 50000.0 1.0 true state in
+  let below_price = Dio_strategies.Suicide_grid.calculate_grid_price 50000.0 1.0 false state in
 
   (* Should be above and below 50000 with 1% grid *)
   check bool "above price correct" true (above_price >= 50499.0 && above_price <= 50501.0);
@@ -474,7 +477,7 @@ let test_accumulation_multi_strategy_isolation () =
   hype.exchange_id <- "hyperliquid";
   Dio_strategies.Suicide_grid.set_asset_reserved_quote btc 16.80;  (* 0.0002 * 84000 = 16.80 USDC *)
   Dio_strategies.Suicide_grid.set_asset_reserved_quote hype 13.80; (* 0.35 * 39.42 ≈ 13.80 USDC *)
-  let total_reserved = Dio_strategies.Suicide_grid.get_total_reserved_quote ~exchange:"hyperliquid" in
+  let total_reserved = Dio_strategies.Suicide_grid.get_total_reserved_quote btc in
   check bool "total reserved USDC includes both domains" true (total_reserved >= 30.0)
 
 let () =

@@ -112,8 +112,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let orderbook_read_pos = ref 0 in
 
       (* Latest market data derived from consumed ring buffer events *)
-      let current_price = ref None in
-      let top_of_book = ref None in
+      let current_price = ref nan in
+      let tob_bid = ref nan in
+      let tob_ask = ref nan in
+      let tob_bsize = ref nan in
+      let tob_asize = ref nan in
 
       (* Event-driven flag: true when new data warrants a strategy execution *)
       let should_execute_strategy = ref true in
@@ -228,16 +231,16 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
          stale ring buffer data. Starting at 0 would replay up to 128 historical
          entries per symbol on every restart, causing excessive allocations. *)
       orderbook_read_pos := Ex.get_orderbook_position ~symbol:asset_with_fees.symbol;
-
       (* Seed current_price and top_of_book from the exchange live cache so
          the first cycle can execute immediately rather than waiting for the
          next incoming update. *)
       (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
-       | Some (bid_price, _, ask_price, _) as tob ->
-           top_of_book := tob;
-           current_price := Some ((bid_price +. ask_price) /. 2.0);
-           Logging.info_f ~section "Seeded initial intial price for %s from cache: %.4f"
-             asset_with_fees.symbol (Option.get !current_price)
+       | Some (bid_price, bid_size, ask_price, ask_size) ->
+           tob_bid := bid_price; tob_ask := ask_price;
+           tob_bsize := bid_size; tob_asize := ask_size;
+           current_price := (bid_price +. ask_price) /. 2.0;
+           Logging.info_f ~section "Seeded initial price for %s from cache: %.4f"
+             asset_with_fees.symbol !current_price
        | None -> ());
       
       Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
@@ -273,7 +276,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       (* Cache strategy state references to avoid repeated mutex acquisition
          on the hot path. References are stable while is_running is true. *)
       let cached_grid_state = match !grid_strategy_asset_ref with
-        | Some _ -> Some (Dio_strategies.Suicide_grid.get_strategy_state asset_with_fees.symbol)
+        | Some _ ->
+            let st = Dio_strategies.Suicide_grid.get_strategy_state asset_with_fees.symbol in
+            st.cached_round_price <- (fun p -> Ex.round_price ~symbol:asset_with_fees.symbol ~price:p);
+            st.cached_price_increment <- Option.value (Ex.get_price_increment ~symbol:asset_with_fees.symbol) ~default:0.01;
+            st.cached_qty_increment <- Option.value (Ex.get_qty_increment ~symbol:asset_with_fees.symbol) ~default:0.01;
+            st.cached_qty_min <- Option.value (Ex.get_qty_min ~symbol:asset_with_fees.symbol) ~default:0.01;
+            Some st
         | None -> None in
       let cached_mm_state = match !mm_strategy_asset_ref with
         | Some _ -> Some (Dio_strategies.Market_maker.get_strategy_state asset_with_fees.symbol)
@@ -296,13 +305,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           orderbook_read_pos := ob_pos;
           (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
            | Some (bid_price, bid_size, ask_price, ask_size) ->
-               let changed = match !top_of_book with
-                 | Some (old_bid, _, old_ask, _) ->
-                     old_bid <> bid_price || old_ask <> ask_price
-                 | None -> true
-               in
-               top_of_book := Some (bid_price, bid_size, ask_price, ask_size);
-               current_price := Some ((bid_price +. ask_price) /. 2.0);
+               let changed = bid_price <> !tob_bid || ask_price <> !tob_ask in
+               tob_bid := bid_price; tob_ask := ask_price;
+               tob_bsize := bid_size; tob_asize := ask_size;
+               current_price := (bid_price +. ask_price) /. 2.0;
                if changed then should_execute_strategy := true
            | None -> ());
         end;
@@ -533,34 +539,31 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let asset_bal_val = 
             match base_balance_fn () with
             | bal -> bal
-            | exception _ -> 0.0
+            | exception _ -> nan
           in
           let quote_bal_val = 
             match quote_balance_fn () with
             | bal -> bal
-            | exception _ -> 0.0
+            | exception _ -> nan
           in
-          
-          let asset_balance = Some asset_bal_val in
-          let quote_balance = Some quote_bal_val in
           
           last_buy_count := !grid_open_buy_count + !mm_open_buy_count;
           last_sell_count := !grid_open_sell_count + !mm_open_sell_count;
 
           (* Trigger async Fear & Greed refresh on significant price movement *)
-          (match !current_price with
-           | Some cp ->
-               (match !baseline_price with
-                | None -> baseline_price := Some cp
-                | Some base ->
-                    let diff_pct = abs_float ((cp -. base) /. base) *. 100.0 in
-                    if diff_pct >= cached_fng_check_threshold then begin
-                      Logging.info_f ~section "[%s/%s] Price moved by %.2f%% from baseline $%.2f to $%.2f. Triggering dynamic Fear & Greed check."
-                        asset_with_fees.exchange asset_with_fees.symbol diff_pct base cp;
-                      baseline_price := Some cp;
-                      Fear_and_greed.force_fetch_async ()
-                    end)
-           | None -> ());
+          if not (Float.is_nan !current_price) then begin
+            let cp = !current_price in
+            (match !baseline_price with
+             | None -> baseline_price := Some cp
+             | Some base ->
+                 let diff_pct = abs_float ((cp -. base) /. base) *. 100.0 in
+                 if diff_pct >= cached_fng_check_threshold then begin
+                   Logging.info_f ~section "[%s/%s] Price moved by %.2f%% from baseline $%.2f to $%.2f. Triggering dynamic Fear & Greed check."
+                     asset_with_fees.exchange asset_with_fees.symbol diff_pct base cp;
+                   baseline_price := Some cp;
+                   Fear_and_greed.force_fetch_async ()
+                 end)
+          end;
 
           (* Apply updated Fear & Greed value to strategy config if changed *)
           let current_fng = match Fear_and_greed.get_cached () with Some v -> v | None -> 50.0 in
@@ -600,11 +603,15 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            | Some asset, Some cs ->
                Dio_strategies.Suicide_grid.Strategy.execute ~cached_state:cs ~now
                  ~precounted_orders:(!grid_buy_orders, !grid_sell_orders, !grid_open_buy_count)
-                 asset !current_price !top_of_book asset_balance quote_balance !grid_open_buy_count !grid_open_sell_count iter_orders !cycle_count
+                 asset !current_price !tob_bid !tob_ask asset_bal_val quote_bal_val !grid_open_buy_count !grid_open_sell_count iter_orders !cycle_count
            | _ -> ());
           (match !mm_strategy_asset_ref, cached_mm_state with
            | Some asset, Some cs ->
-               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset !current_price !top_of_book asset_balance quote_balance !mm_open_buy_count !mm_open_sell_count iter_orders !cycle_count
+               let mm_cp = if Float.is_nan !current_price then None else Some !current_price in
+               let mm_tob = if Float.is_nan !tob_bid then None else Some (!tob_bid, !tob_bsize, !tob_ask, !tob_asize) in
+               let mm_abal = if Float.is_nan asset_bal_val then None else Some asset_bal_val in
+               let mm_qbal = if Float.is_nan quote_bal_val then None else Some quote_bal_val in
+               Dio_strategies.Market_maker.Strategy.execute ~cached_state:cs asset mm_cp mm_tob mm_abal mm_qbal !mm_open_buy_count !mm_open_sell_count iter_orders !cycle_count
            | _ -> ());
         end;
         let t4 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
@@ -621,9 +628,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         
         (* Periodic cycle statistics (gated by cycle_mod) *)
         if !cycle_count mod config.cycle_mod = 0 then begin
-          (match !current_price, !top_of_book with
-          | Some _, Some _ -> ()
-          | _ -> ());
+          if not (Float.is_nan !current_price) && not (Float.is_nan !tob_bid) then
+            ()
         end;
         
         (* Record cycle work time before blocking. Captures active processing
