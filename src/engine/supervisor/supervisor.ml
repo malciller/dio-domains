@@ -1411,10 +1411,9 @@ let order_processing_loop () =
                                   (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                   result.order_id;
                                 (match order.price with
-                                 | Some price when order.exchange <> "lighter" ->
+                                 | Some price ->
                                      Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged ~now:(Unix.gettimeofday ())
                                        order.symbol result.order_id order.side price
-                                 | Some _ -> ()
                                  | None -> ());
                                 Lwt.return_unit
                             | Error err ->

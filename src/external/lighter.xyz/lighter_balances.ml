@@ -182,6 +182,25 @@ let process_asset_balances json =
       if v2 <> `Null then v2
       else json
   in
+  
+  (* In unified accounts, USDC is collateral, reported at the account level.
+     Extract it directly if present. *)
+  let extract_float_opt key =
+    let v = member key account_data in
+    if v <> `Null then (try Some (Lighter_types.parse_json_float v) with _ -> None) else None
+  in
+  let val_of o = Option.value o ~default:0.0 in
+  let acct_collateral = val_of (extract_float_opt "collateral") in
+  let acct_available = val_of (extract_float_opt "available_balance") in
+  let acct_margin = val_of (extract_float_opt "margin_balance") in
+  let unified_usdc = max acct_collateral (max acct_available acct_margin) in
+  
+  if unified_usdc > 0.0 then begin
+    publish_balance_update "USDC" unified_usdc;
+    Logging.debug_f ~section "Unified USDC updated from account_all: %.6f (col:%.2f avail:%.2f)"
+      unified_usdc acct_collateral acct_available
+  end;
+
   let assets = (try member "assets" account_data |> to_assoc with _ -> []) in
   if assets = [] then
     Logging.debug_f ~section "Balance update has no assets field (type=%s, content=%s)"
@@ -223,8 +242,23 @@ let process_asset_balances json =
                                     0.0)))))
           | _ -> Lighter_types.parse_json_float balance_json
         in
-        publish_balance_update normalized_key balance;
-        Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance
+        (* Guard: for unified accounts, USDC is account-level collateral
+           reported via user_stats, not the assets array. The WS
+           account_all_assets snapshot may report USDC balance=0, which would
+           clobber the correct value seeded by REST or user_stats.
+           Never overwrite a positive USDC balance with zero from this path. *)
+        if normalized_key = "USDC" && balance <= 0.0 then begin
+          let existing = get_balance "USDC" in
+          if existing > 0.0 then
+            Logging.debug_f ~section "Skipping USDC zero from account_all_assets (existing=%.6f)" existing
+          else begin
+            publish_balance_update normalized_key balance;
+            Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance
+          end
+        end else begin
+          publish_balance_update normalized_key balance;
+          Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance
+        end
       with exn ->
         Logging.warn_f ~section "Failed to parse balance for %s: %s" asset_id (Printexc.to_string exn)
     ) assets;
@@ -302,9 +336,93 @@ let process_market_data json =
   | _ -> ()
 
 
+(** Timestamp of the last balance refresh request (debounce gate). *)
+let last_refresh_request = Atomic.make 0.0
 
+(** Triggers an asynchronous REST balance fetch to recover stale USDC values.
+    Debounced to max once per 2 seconds to avoid API rate limits.
+    Called when sell fills are detected but the WS balance feed hasn't updated. *)
+let request_balance_refresh () =
+  let now = Unix.gettimeofday () in
+  let last = Atomic.get last_refresh_request in
+  if now -. last > 2.0 then begin
+    Atomic.set last_refresh_request now;
+    Logging.info_f ~section "Balance refresh requested (fill-triggered)";
+    Lwt.async (fun () ->
+      Lwt.catch (fun () ->
+        (* Delay briefly to allow exchange settlement before fetching *)
+        let open Lwt.Infix in
+        Lwt_unix.sleep 0.3 >>= fun () ->
+        let account_index = match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
+          | Some s -> (try int_of_string s with _ -> 0)
+          | None -> 0
+        in
+        let base_url = Lighter_proxy.api_base_url () in
+        let url = Printf.sprintf "%s/api/v1/account?by=index&value=%d"
+          base_url account_index in
+        let uri = Uri.of_string url in
+        let%lwt (resp, body) = Cohttp_lwt_unix.Client.get uri in
+        let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+        let%lwt body_str = Cohttp_lwt.Body.to_string body in
+        if status >= 200 && status < 300 then begin
+          let trimmed = String.trim body_str in
+          if trimmed <> "" && trimmed <> "{}" then begin
+            let json = Yojson.Safe.from_string trimmed in
+            let open Yojson.Safe.Util in
+            let accounts = try member "accounts" json |> to_list with _ -> [] in
+            (match accounts with
+             | account :: _ ->
+                 (* Extract per-asset balances *)
+                 let assets = try member "assets" account |> to_list with _ -> [] in
+                 let assets_assoc = List.map (fun asset_json ->
+                   let asset_id = try member "asset_id" asset_json |> to_int |> string_of_int with _ -> "?" in
+                   (asset_id, asset_json)
+                 ) assets in
+                 (* Check for unified account USDC collateral *)
+                 let has_usdc_in_assets = List.exists (fun (_id, aj) ->
+                   let sym = try member "symbol" aj |> to_string with _ -> "" in
+                   let bal = try Lighter_types.parse_json_float (member "balance" aj) with _ -> 0.0 in
+                   sym = "USDC" && bal > 0.0
+                 ) assets_assoc in
+                 let final_assets = if has_usdc_in_assets then assets_assoc
+                 else begin
+                   let collateral = try Lighter_types.parse_json_float (member "collateral" account) with _ -> 0.0 in
+                   let available = try Lighter_types.parse_json_float (member "available_balance" account) with _ -> 0.0 in
+                   let usdc_balance = max collateral available in
+                   if usdc_balance > 0.0 then
+                     assets_assoc @ [("3", `Assoc [
+                       ("symbol", `String "USDC");
+                       ("asset_id", `Int 3);
+                       ("balance", `String (Printf.sprintf "%.6f" usdc_balance));
+                       ("locked_balance", `String "0.000000")
+                     ])]
+                   else assets_assoc
+                 end in
+                 let synthetic_json = `Assoc [
+                   ("type", `String "snapshot/account_all_assets");
+                   ("channel", `String (Printf.sprintf "account_all_assets/%d" account_index));
+                   ("account_all", `Assoc [("assets", `Assoc final_assets)])
+                 ] in
+                 process_market_data synthetic_json;
+                 let usdc_bal = get_balance "USDC" in
+                 Logging.info_f ~section "Balance refresh complete: USDC=%.6f" usdc_bal
+             | [] ->
+                 Logging.warn_f ~section "Balance refresh: empty accounts array")
+          end;
+          Lwt.return_unit
+        end else begin
+          Logging.warn_f ~section "Balance refresh failed: HTTP %d" status;
+          Lwt.return_unit
+        end
+      ) (fun exn ->
+        Logging.error_f ~section "Balance refresh exception: %s" (Printexc.to_string exn);
+        Lwt.return_unit
+      )
+    )
+  end
 
 let initialize assets =
   Logging.info_f ~section "Initializing Lighter balances feed for %d assets" (List.length assets);
   List.iter (fun asset -> ignore (get_balance_store asset)) assets;
   Logging.info ~section "Lighter balance stores initialized"
+

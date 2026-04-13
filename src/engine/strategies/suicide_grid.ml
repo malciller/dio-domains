@@ -101,7 +101,7 @@ let ibkr_config = {
 
 let lighter_config = {
   time_in_force = "GTC";
-  track_pending_sells = false;
+  track_pending_sells = true;
   use_accumulation_sells = true;
   sell_uses_mult = false;             (* 1:1 sells; accumulation path handles rounding *)
   sell_failure_sets_asset_low = true;
@@ -900,7 +900,26 @@ let execute_strategy
         ) preserved_sells
       end;
 
-
+      (* Stale sell reconciliation: detect sell orders priced at or below the
+         current bid. These should have filled but we may have missed the WS
+         notification during a connection drop. For Lighter, also trigger a
+         balance refresh since fill proceeds may not have been reflected. *)
+      if bid_price > 0.0 then begin
+        let stale_sells = List.filter (fun (_oid, price, _qty) ->
+          price <= bid_price
+        ) state.open_sell_orders in
+        if stale_sells <> [] then begin
+          List.iter (fun (oid, price, qty) ->
+            Logging.warn_f ~section
+              "STALE_SELL_DETECTED [%s] order %s @ %.2f <= bid %.2f (qty=%.8f). \
+               Likely filled during WS outage."
+              asset.symbol oid price bid_price qty
+          ) stale_sells;
+          (* Trigger a balance refresh for Lighter to pick up fill proceeds *)
+          if asset.exchange = "lighter" then
+            Lighter.Balances.request_balance_refresh ()
+        end
+      end;
 
 
 
