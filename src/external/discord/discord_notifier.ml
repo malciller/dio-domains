@@ -76,11 +76,10 @@ let acquire_token () =
 let format_fill_field (fill : Concurrency.Fill_event_bus.fill_event) =
   let side_emoji = if fill.side = "buy" then "🟢" else "🔴" in
   let side_label = String.uppercase_ascii fill.side in
-  let value_after_fee = fill.value -. fill.fee in
   let name = Printf.sprintf "%s %s %s" side_emoji side_label fill.symbol in
   let value = Printf.sprintf
-    "**Amount:** `%.8g`\n**Price:** `$%.4f`\n**Value:** `$%.2f`\n**Fee:** `$%.4f`\n**Net:** `$%.2f`"
-    fill.amount fill.fill_price fill.value fill.fee value_after_fee
+    "**Exchange:** `%s`\n**Amount:** `%.8g`\n**Price:** `$%.4f`\n**Value:** `$%.2f`\n**Fee:** `$%.4f`"
+    fill.venue fill.amount fill.fill_price fill.value fill.fee
   in
   `Assoc [
     ("name", `String name);
@@ -96,17 +95,16 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
       (* Single fill: use a focused embed *)
       let side_label = String.uppercase_ascii fill.side in
       let color = if fill.side = "buy" then 0x2ECC71 else 0xE74C3C in
-      let value_after_fee = fill.value -. fill.fee in
       let embed = `Assoc [
-        ("title", `String (Printf.sprintf "Order Fill — %s" fill.venue));
+        ("title", `String (Printf.sprintf "%s - %s @ $%.4f" fill.symbol side_label fill.fill_price));
         ("color", `Int color);
         ("fields", `List [
+          `Assoc [("name", `String "Exchange"); ("value", `String (Printf.sprintf "`%s`" fill.venue)); ("inline", `Bool true)];
           `Assoc [("name", `String "Pair"); ("value", `String (Printf.sprintf "`%s`" fill.symbol)); ("inline", `Bool true)];
           `Assoc [("name", `String "Side"); ("value", `String side_label); ("inline", `Bool true)];
           `Assoc [("name", `String "Amount"); ("value", `String (Printf.sprintf "`%.8g`" fill.amount)); ("inline", `Bool true)];
           `Assoc [("name", `String "Fill Price"); ("value", `String (Printf.sprintf "`$%.4f`" fill.fill_price)); ("inline", `Bool true)];
           `Assoc [("name", `String "Value"); ("value", `String (Printf.sprintf "`$%.2f`" fill.value)); ("inline", `Bool true)];
-          `Assoc [("name", `String "Net (after fee)"); ("value", `String (Printf.sprintf "`$%.2f`" value_after_fee)); ("inline", `Bool true)];
         ]);
         ("timestamp", `String (let t = Unix.gmtime fill.timestamp in
           Printf.sprintf "%04d-%02d-%02dT%02d:%02d:%02dZ"
