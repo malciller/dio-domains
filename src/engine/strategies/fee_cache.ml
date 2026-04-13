@@ -2,10 +2,8 @@
   Fee Cache
 
   TTL-based in-memory cache for maker and taker fees, keyed by
-  (exchange, symbol). Supports LRU eviction at capacity, deduplication
-  of concurrent fetches via in-flight promise tracking, and exponential
-  backoff retry on transient errors. Cache misses return [None] without
-  blocking the caller; background refresh is scheduled asynchronously.
+  (exchange, symbol). Uses lock-free Atomics for read paths to eliminate 
+  hotpath contention across strategy domains.
 *)
 
 open Lwt.Infix
@@ -15,26 +13,21 @@ open Kraken
 
 let section = "fee_cache"
 
-(** Per-symbol fee record with TTL expiry and LRU metadata. *)
+(** Per-symbol fee record with TTL expiry. *)
 type cache_entry = {
   maker_fee: float;
   taker_fee: float;
   timestamp: float;            (** Unix epoch at insertion. *)
   ttl_seconds: float;          (** Validity window in seconds. *)
-  mutable last_access: float;  (** Unix epoch of most recent read; used for LRU eviction. *)
 }
 
-(** Upper bound on cache entries; triggers LRU eviction when reached. *)
-let max_cache_size = 100
+module StringMap = Map.Make(String)
 
-(** Primary cache table keyed by [(exchange, symbol)]. *)
-let fee_cache : (string * string, cache_entry) Hashtbl.t = Hashtbl.create 32
+(** Primary cache table keyed by "exchange|symbol". *)
+let fee_cache = Atomic.make StringMap.empty
 
-(** Guards all reads and writes to [fee_cache]. *)
-let cache_mutex = Mutex.create ()
-
-(** Tracks pending fetch promises keyed by [(exchange, symbol)] to deduplicate concurrent requests. *)
-let in_flight : (string * string, unit Lwt.t) Hashtbl.t = Hashtbl.create 32
+(** Tracks pending fetch promises keyed by "exchange|symbol" to deduplicate concurrent requests. *)
+let in_flight : (string, unit Lwt.t) Hashtbl.t = Hashtbl.create 32
 
 (** Guards all reads and writes to [in_flight]. *)
 let in_flight_mutex = Mutex.create ()
@@ -42,101 +35,74 @@ let in_flight_mutex = Mutex.create ()
 (** Default entry TTL in seconds (600s = 10 minutes). *)
 let default_ttl = 600.0
 
+let make_key exchange symbol = exchange ^ "|" ^ symbol
+
 (** Returns [true] if [entry] has not exceeded its TTL. *)
 let is_valid entry =
   let now = Unix.time () in
   now -. entry.timestamp < entry.ttl_seconds
 
-(** Removes the least-recently-accessed entry when cache is at [max_cache_size].
-    Must be called while [cache_mutex] is held. *)
-let evict_lru_if_needed () =
-  if Hashtbl.length fee_cache >= max_cache_size then (
-    let oldest_key = ref None in
-    let oldest_time = ref Float.max_float in
-    Hashtbl.iter (fun key entry ->
-      if entry.last_access < !oldest_time then (
-        oldest_time := entry.last_access;
-        oldest_key := Some key
-      )
-    ) fee_cache;
-    match !oldest_key with
-    | Some key ->
-        Hashtbl.remove fee_cache key;
-        Logging.debug_f ~section "Evicted LRU fee cache entry (cache at capacity: %d)" max_cache_size
-    | None -> ()
-  )
+let evict_expired map =
+  let now = Unix.time () in
+  StringMap.filter (fun _ entry -> now -. entry.timestamp < entry.ttl_seconds) map
 
 (** Looks up the cached maker fee for [(exchange, symbol)].
-    Returns [Some fee] on a valid hit, [None] on miss or expiry.
-    Expired entries are removed eagerly. *)
+    Returns [Some fee] on a valid hit, [None] on miss or expiry. *)
 let get_maker_fee ~exchange ~symbol =
-  Mutex.lock cache_mutex;
-  let result = match Hashtbl.find_opt fee_cache (exchange, symbol) with
-    | Some entry when is_valid entry ->
-        entry.last_access <- Unix.time ();
-        Some entry.maker_fee
-    | Some _ ->
-        Hashtbl.remove fee_cache (exchange, symbol);
-        None
-    | None -> None
-  in
-  Mutex.unlock cache_mutex;
-  result
+  let key = make_key exchange symbol in
+  let map = Atomic.get fee_cache in
+  match StringMap.find_opt key map with
+  | Some entry when is_valid entry -> Some entry.maker_fee
+  | _ -> None
 
 (** Looks up the cached taker fee for [(exchange, symbol)].
-    Returns [Some fee] on a valid hit, [None] on miss or expiry.
-    Expired entries are removed eagerly. *)
+    Returns [Some fee] on a valid hit, [None] on miss or expiry. *)
 let get_taker_fee ~exchange ~symbol =
-  Mutex.lock cache_mutex;
-  let result = match Hashtbl.find_opt fee_cache (exchange, symbol) with
-    | Some entry when is_valid entry ->
-        entry.last_access <- Unix.time ();
-        Some entry.taker_fee
-    | Some _ ->
-        Hashtbl.remove fee_cache (exchange, symbol);
-        None
-    | None -> None
-  in
-  Mutex.unlock cache_mutex;
-  result
+  let key = make_key exchange symbol in
+  let map = Atomic.get fee_cache in
+  match StringMap.find_opt key map with
+  | Some entry when is_valid entry -> Some entry.taker_fee
+  | _ -> None
 
 (** Inserts or replaces the fee entry for [(exchange, symbol)].
-    Triggers LRU eviction if the cache is at capacity before insertion. *)
+    Evicts expired entries opportunistically. *)
 let store_fees ~exchange ~symbol ~maker_fee ~taker_fee ~ttl_seconds =
-  let now = Unix.time () in
+  let key = make_key exchange symbol in
   let entry = {
     maker_fee;
     taker_fee;
-    timestamp = now;
+    timestamp = Unix.time ();
     ttl_seconds;
-    last_access = now;
   } in
-  Mutex.lock cache_mutex;
-  evict_lru_if_needed ();
-  Hashtbl.replace fee_cache (exchange, symbol) entry;
-  Mutex.unlock cache_mutex;
-  Logging.debug_f ~section "Cached fees for %s/%s: maker=%.6f, taker=%.6f (TTL: %.0fs, cache size: %d/%d)" 
-    exchange symbol maker_fee taker_fee ttl_seconds (Hashtbl.length fee_cache) max_cache_size
+  let rec loop () =
+    let map = Atomic.get fee_cache in
+    let clean_map = evict_expired map in
+    let new_map = StringMap.add key entry clean_map in
+    if Atomic.compare_and_set fee_cache map new_map then ()
+    else loop ()
+  in loop ();
+  Logging.debug_f ~section "Cached fees for %s: maker=%.6f, taker=%.6f (TTL: %.0fs, cache size: %d)" 
+    key maker_fee taker_fee ttl_seconds (StringMap.cardinal (Atomic.get fee_cache))
 
 (** Asynchronously refreshes the fee for [symbol] on Kraken.
     No-op if a valid entry already exists. Deduplicates concurrent
     calls via the [in_flight] table. Uses linear backoff (0.5s increments,
     up to 3 attempts) on nonce errors. *)
 let refresh_async symbol =
-  Mutex.lock cache_mutex;
+  let key = make_key "kraken" symbol in
+  let map = Atomic.get fee_cache in
   let has_valid_entry =
-    match Hashtbl.find_opt fee_cache ("kraken", symbol) with
+    match StringMap.find_opt key map with
     | Some entry when is_valid entry -> true
     | _ -> false
   in
-  Mutex.unlock cache_mutex;
 
   if has_valid_entry then begin
     Logging.debug_f ~section "Fee for %s already cached and valid, skipping fetch" symbol;
     Lwt.return_unit
   end else begin
     Mutex.lock in_flight_mutex;
-    let existing_promise = Hashtbl.find_opt in_flight ("kraken", symbol) in
+    let existing_promise = Hashtbl.find_opt in_flight key in
     let promise = match existing_promise with
       | Some p ->
           Logging.debug_f ~section "Fee fetch for %s already in-flight, reusing promise" symbol;
@@ -178,7 +144,7 @@ let refresh_async symbol =
             )
           in
           let p = fetch_with_retry 1 in
-          Hashtbl.replace in_flight ("kraken", symbol) p;
+          Hashtbl.replace in_flight key p;
           p
     in
     Mutex.unlock in_flight_mutex;
@@ -187,16 +153,15 @@ let refresh_async symbol =
     Lwt.on_any promise
       (fun () ->
          Mutex.lock in_flight_mutex;
-         Hashtbl.remove in_flight ("kraken", symbol);
+         Hashtbl.remove in_flight key;
          Mutex.unlock in_flight_mutex)
       (fun _ ->
          Mutex.lock in_flight_mutex;
-         Hashtbl.remove in_flight ("kraken", symbol);
+         Hashtbl.remove in_flight key;
          Mutex.unlock in_flight_mutex);
 
     promise
   end
-
 
 (** Performs one-time startup initialization. Logs the configured TTL. *)
 let init () =
@@ -204,18 +169,14 @@ let init () =
 
 (** Removes all entries from the cache. Intended for test teardown. *)
 let clear () =
-  Mutex.lock cache_mutex;
-  Hashtbl.clear fee_cache;
-  Mutex.unlock cache_mutex
-
+  Atomic.set fee_cache StringMap.empty
 
 (** Returns [(total_entries, valid_entries)] for monitoring.
     Counts entries that have not yet exceeded their TTL as valid. *)
 let stats () =
-  Mutex.lock cache_mutex;
-  let count = Hashtbl.length fee_cache in
-  let valid_count = Hashtbl.fold (fun _ entry acc ->
+  let map = Atomic.get fee_cache in
+  let count = StringMap.cardinal map in
+  let valid_count = StringMap.fold (fun _ entry acc ->
     if is_valid entry then acc + 1 else acc
-  ) fee_cache 0 in
-  Mutex.unlock cache_mutex;
+  ) map 0 in
   (count, valid_count)

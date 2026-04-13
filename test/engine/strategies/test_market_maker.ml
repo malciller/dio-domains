@@ -177,7 +177,7 @@ let test_duplicate_cancellation () =
   let open_orders_list = List.map (fun (oid, price, qty, _, _) -> (oid, price, qty)) open_orders in
 
   (* Count duplicates cancelled *)
-  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders_list Dio_strategies.Strategy_common.MM "kraken" in
+  let cancelled_count = Dio_strategies.Market_maker.cancel_duplicate_orders ~state "TEST/USD" 50000.0 Dio_strategies.Strategy_common.Buy open_orders_list Dio_strategies.Strategy_common.MM "kraken" in
 
   (* Should cancel 1 duplicate (order2), order1 is already cancelled *)
   check int "duplicate cancellation count" 1 cancelled_count
