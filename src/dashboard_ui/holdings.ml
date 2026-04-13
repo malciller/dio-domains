@@ -458,7 +458,7 @@ let render_strategies w json =
 
   (* Visual separator between strategy rows and non-strategy rows *)
   let thin_sep label =
-    let lbl = "  ── " ^ label ^ " " in
+    let lbl = " │ ── " ^ label ^ " " in
     let lbl_img = I.string A.(fg c_border ++ bg c_bg) lbl in
     let pad_count = max 0 (w - I.width lbl_img - 1) in
     let pad_buf = Buffer.create (pad_count * 3) in
@@ -492,6 +492,7 @@ let render_strategies w json =
     ]
   in
   let summary_bar = close_row w (I.hcat [
+    I.string A.(fg c_border ++ bg c_bg) " │";
     kv "Cash"      (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
     pipe;
     kv "Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
@@ -501,7 +502,8 @@ let render_strategies w json =
     kv "Sell Val"  (format_pnl   total_up)        up_attr;
   ]) in
   let summary_section = I.vcat (List.filter (fun img -> I.height img > 0) [
+    thin_sep "summary";
     summary_bar;
   ]) in
 
-  I.vcat [ main_table; summary_section ]
+  I.vcat [ main_table; summary_section; section_footer w ]

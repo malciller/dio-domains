@@ -104,4 +104,4 @@ let render_memory w json =
     kv "COMPACT" (string_of_int compact);
     kv "FRAGS" (string_of_int frags);
   ] in
-  I.vcat [title; close_row w row1; close_row w row2; close_row w row3; close_row w row4]
+  I.vcat [title; close_row w row1; close_row w row2; close_row w row3; close_row w row4; section_footer w]
