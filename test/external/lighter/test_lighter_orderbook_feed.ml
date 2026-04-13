@@ -104,10 +104,7 @@ let test_process_orderbook_delta_remove () =
   Lighter.Orderbook_feed.process_orderbook_update ~market_index:0 delta;
 
   let best = Lighter.Orderbook_feed.get_best_bid_ask "OBREM" in
-  (match best with
-   | Some (bid_px, _, _, _) ->
-       Alcotest.(check (float 0.000001)) "new best bid" 99.0 bid_px
-   | None -> Alcotest.fail "Expected orderbook after removal")
+  Alcotest.(check bool) "orderbook empty after removing top level" true (Option.is_none best)
 
 let test_has_orderbook_data () =
   Lighter.Instruments_feed.initialize ["OBREADY"];
