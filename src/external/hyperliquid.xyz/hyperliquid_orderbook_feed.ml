@@ -73,37 +73,83 @@ let find_registered_symbol coin =
         else None
   | None -> None
 
-let process_market_data json =
-  let open Yojson.Safe.Util in
-  let channel = member "channel" json |> to_string_option in
-  (* Hoist timestamp before the match: avoids a gettimeofday syscall
-     inside the per-symbol branch on every l2Book update. *)
+let get_coin msg =
+  let coin_key = "\"coin\":\"" in
+  let rec search pos =
+    match String.index_from_opt msg pos '"' with
+    | None -> ""
+    | Some idx ->
+        if idx + 8 <= String.length msg && String.sub msg idx 8 = coin_key then
+          let start_idx = idx + 8 in
+          match String.index_from_opt msg start_idx '"' with
+          | Some end_idx -> String.sub msg start_idx (end_idx - start_idx)
+          | None -> ""
+        else search (idx + 1)
+  in search 0
+
+let rec parse_levels msg pos end_pos count acc =
+  if count >= 25 || pos >= end_pos then List.rev acc
+  else
+    match String.index_from_opt msg pos '{' with
+    | None -> List.rev acc
+    | Some brace_idx ->
+        if brace_idx >= end_pos then List.rev acc
+        else
+          let px_key = "\"px\":\"" in
+          let sz_key = "\"sz\":\"" in
+          let rec find_key key start_idx =
+            match String.index_from_opt msg start_idx '"' with
+            | None -> None
+            | Some p ->
+                if p + 6 <= end_pos && String.sub msg p 6 = key then
+                  let val_start = p + 6 in
+                  match String.index_from_opt msg val_start '"' with
+                  | Some val_end -> Some (String.sub msg val_start (val_end - val_start), val_end + 1)
+                  | None -> None
+                else find_key key (p + 1)
+          in
+          match find_key px_key brace_idx with
+          | Some (px_str, next_pos) ->
+              (match find_key sz_key next_pos with
+               | Some (sz_str, after_sz) ->
+                    let px = float_of_string px_str in
+                    let sz = float_of_string sz_str in
+                    parse_levels msg after_sz end_pos (count + 1) ({price=px; size=sz} :: acc)
+               | None -> List.rev acc)
+          | None -> List.rev acc
+
+let get_bids_asks msg =
+  let levels_key = "\"levels\":[[" in
+  let rec search pos =
+    match String.index_from_opt msg pos '"' with
+    | None -> ([||], [||])
+    | Some idx ->
+        if idx + 11 <= String.length msg && String.sub msg idx 11 = levels_key then
+          let bids_start = idx + 11 in
+          match String.index_from_opt msg bids_start ']' with
+          | None -> ([||], [||])
+          | Some bids_end ->
+              let bids_list = parse_levels msg bids_start bids_end 0 [] in
+              let asks_start = bids_end + 2 in
+              if asks_start < String.length msg then
+                match String.index_from_opt msg asks_start ']' with
+                | None -> (Array.of_list bids_list, [||])
+                | Some asks_end ->
+                    let asks_list = parse_levels msg asks_start asks_end 0 [] in
+                    (Array.of_list bids_list, Array.of_list asks_list)
+              else (Array.of_list bids_list, [||])
+        else search (idx + 1)
+  in search 0
+
+let process_raw_market_data msg =
   let now_ts = Unix.gettimeofday () in
-  match channel with
-  | Some "l2Book" ->
-      let data = member "data" json in
-      let coin = member "coin" data |> to_string in
-      (match find_registered_symbol coin with
+  if String.length msg > 20 && String.sub msg 0 20 = "{\"channel\":\"l2Book\"," then begin
+    let coin = get_coin msg in
+    if coin <> "" then begin
+      match find_registered_symbol coin with
       | Some symbol ->
           (try
-            let levels = member "levels" data |> to_list in
-            let raw_bids = List.nth levels 0 |> to_list in
-            let raw_asks = List.nth levels 1 |> to_list in
-            
-            (* Build level arrays: convert JSON list to array first (O(N)),
-               then map in-place. Avoids both the intermediate List.map cons-cell
-               allocation and the O(N²) penalty of List.nth inside Array.init. *)
-            let raw_bids_arr = Array.of_list raw_bids in
-            let raw_asks_arr = Array.of_list raw_asks in
-            let bids = Array.map (fun l ->
-              { price = member "px" l |> to_string |> float_of_string;
-                size = member "sz" l |> to_string |> float_of_string }
-            ) raw_bids_arr in
-            let asks = Array.map (fun l ->
-              { price = member "px" l |> to_string |> float_of_string;
-                size = member "sz" l |> to_string |> float_of_string }
-            ) raw_asks_arr in
-            
+            let bids, asks = get_bids_asks msg in
             let ob = {
               symbol;
               bids;
@@ -119,8 +165,9 @@ let process_market_data json =
               symbol (Array.length bids) (Array.length asks)
           with exn ->
             Logging.warn_f ~section "Failed to parse l2Book for %s: %s" coin (Printexc.to_string exn))
-      | None -> ())
-  | _ -> ()
+      | None -> ()
+    end
+  end
 
 let[@inline always] get_latest_orderbook symbol =
   match Hashtbl.find_opt stores symbol with
@@ -180,10 +227,10 @@ let wait_for_orderbook_data symbols timeout_seconds =
 
 let _processor_task =
   let rec run () =
-    let sub = Hyperliquid_ws.subscribe_market_data () in
+    let sub = Hyperliquid_ws.subscribe_raw_market_data () in
     Lwt.catch (fun () ->
       Logging.info ~section "Starting Hyperliquid orderbook processor task";
-      let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
+      let%lwt () = Concurrency.Lwt_util.consume_stream process_raw_market_data sub.stream in
       (* Stream ended (disconnect pushed None). Re-subscribe immediately;
          consume_stream blocks event-driven on the new stream until the
          WS reconnects and data flows. Sever Forward chain via Lwt.async. *)

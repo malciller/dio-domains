@@ -3,18 +3,8 @@ let test_process_market_data () =
   Hyperliquid.Instruments_feed.initialize ["HYPE"];
   Hyperliquid.Orderbook_feed.initialize ["HYPE"];
   
-  let json = `Assoc [
-    ("channel", `String "l2Book");
-    ("data", `Assoc [
-      ("coin", `String "HYPE");
-      ("levels", `List [
-        `List [`Assoc [("px", `String "100.5"); ("sz", `String "1.5")]]; (* bids *)
-        `List [`Assoc [("px", `String "101.0"); ("sz", `String "2.0")]]  (* asks *)
-      ])
-    ])
-  ] in
-  
-  Hyperliquid.Orderbook_feed.process_market_data json;
+  let raw_json_str = "{\"channel\":\"l2Book\",\"data\":{\"coin\":\"HYPE\",\"levels\":[[{\"px\":\"100.5\",\"sz\":\"1.5\"}],[{\"px\":\"101.0\",\"sz\":\"2.0\"}]]}}" in
+  Hyperliquid.Orderbook_feed.process_raw_market_data raw_json_str;
   
   let best_opt = Hyperliquid.Orderbook_feed.get_best_bid_ask "HYPE" in
   match best_opt with

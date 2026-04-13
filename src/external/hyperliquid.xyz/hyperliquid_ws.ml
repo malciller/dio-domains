@@ -13,6 +13,11 @@ type subscription = {
   close: unit -> unit;
 }
 
+type raw_subscription = {
+  stream: string Lwt_stream.t;
+  close: unit -> unit;
+}
+
 let is_connected_ref = Atomic.make false
 let is_connected () = Atomic.get is_connected_ref
 
@@ -39,6 +44,9 @@ let signal_new_data () = Concurrency.Exchange_wakeup.signal_all ()
     the stream. Returns [true] on success, [false] if the message was dropped. *)
 let pushers : (Yojson.Safe.t option -> bool) list ref = ref []
 let pushers_mutex = Mutex.create ()
+
+let raw_pushers : (string option -> bool) list ref = ref []
+let raw_pushers_mutex = Mutex.create ()
 
 module Response_table = Hashtbl.Make (struct
   type t = int
@@ -119,6 +127,17 @@ let close_all_subscribers () =
     List.iter (fun push ->
       (try ignore (push None) with _ -> ())
     ) ps
+  end;
+  Mutex.lock raw_pushers_mutex;
+  let r_ps = !raw_pushers in
+  raw_pushers := [];
+  Mutex.unlock raw_pushers_mutex;
+  let count_raw = List.length r_ps in
+  if count_raw > 0 then begin
+    Logging.info_f ~section "Closing %d raw subscriber streams on disconnect" count_raw;
+    List.iter (fun push ->
+      (try ignore (push None) with _ -> ())
+    ) r_ps
   end
 
 (** Delivers a JSON message to all registered subscribers.
@@ -139,6 +158,23 @@ let broadcast_message json =
     Mutex.lock pushers_mutex;
     pushers := List.filter (fun p -> not (List.memq p !dead)) !pushers;
     Mutex.unlock pushers_mutex
+  end
+
+let broadcast_raw_message msg =
+  Mutex.lock raw_pushers_mutex;
+  let ps = !raw_pushers in
+  Mutex.unlock raw_pushers_mutex;
+  if ps = [] then () else begin
+    let dead = ref [] in
+    List.iter (fun push ->
+      try ignore (push (Some msg))
+      with _ -> dead := push :: !dead
+    ) ps;
+    if !dead <> [] then begin
+      Mutex.lock raw_pushers_mutex;
+      raw_pushers := List.filter (fun p -> not (List.memq p !dead)) !raw_pushers;
+      Mutex.unlock raw_pushers_mutex
+    end
   end
 
 (** Creates a bounded subscriber stream (capacity 16) for incoming messages.
@@ -169,7 +205,32 @@ let subscribe_market_data () =
     pushers := List.filter (fun p -> p != push_fn) !pushers;
     Mutex.unlock pushers_mutex
   in
-  { stream; close }
+  ({ stream; close } : subscription)
+
+let subscribe_raw_market_data () =
+  let (stream, push_source) = Lwt_stream.create_bounded 16 in
+  let push_fn item =
+    match item with
+    | None ->
+        push_source#close;
+        true
+    | Some msg ->
+        let p = push_source#push msg in
+        if Lwt.is_sleeping p then begin
+          Lwt.cancel p;
+          false
+        end else
+          true
+  in
+  Mutex.lock raw_pushers_mutex;
+  raw_pushers := push_fn :: !raw_pushers;
+  Mutex.unlock raw_pushers_mutex;
+  let close () =
+    Mutex.lock raw_pushers_mutex;
+    raw_pushers := List.filter (fun p -> p != push_fn) !raw_pushers;
+    Mutex.unlock raw_pushers_mutex
+  in
+  ({ stream; close } : raw_subscription)
 
 (** Sends a JSON message over the active WebSocket connection.
     No-op with a warning if not currently connected. *)
@@ -222,8 +283,13 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   | Websocket.Frame.Opcode.Text ->
       Concurrency.Tick_event_bus.publish_tick ();
       on_heartbeat ();
-      (try
-        let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
+      let content = frame.Websocket.Frame.content in
+      if String.length content > 20 && String.sub content 0 20 = "{\"channel\":\"l2Book\"," then begin
+        broadcast_raw_message content;
+        Lwt.return_unit
+      end else begin
+        (try
+          let json = Yojson.Safe.from_string content in
         let channel = 
           let open Yojson.Safe.Util in
           try member "channel" json |> to_string with _ -> ""
@@ -308,6 +374,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
       with exn ->
         Logging.warn_f ~section "Failed to parse WS message: %s" (Printexc.to_string exn));
       Lwt.return_unit
+      end
   | Websocket.Frame.Opcode.Close ->
       Logging.debug_f ~section "WebSocket connection closed by server";
       Lwt_mutex.with_lock connection_mutex (fun () ->
