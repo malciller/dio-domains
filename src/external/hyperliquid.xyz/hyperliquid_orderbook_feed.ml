@@ -73,13 +73,23 @@ let find_registered_symbol coin =
         else None
   | None -> None
 
+let string_match msg pos key =
+  let key_len = String.length key in
+  if pos + key_len > String.length msg then false
+  else
+    let rec loop i =
+      if i = key_len then true
+      else if msg.[pos + i] <> key.[i] then false
+      else loop (i + 1)
+    in loop 0
+
 let get_coin msg =
   let coin_key = "\"coin\":\"" in
   let rec search pos =
     match String.index_from_opt msg pos '"' with
     | None -> ""
     | Some idx ->
-        if idx + 8 <= String.length msg && String.sub msg idx 8 = coin_key then
+        if string_match msg idx coin_key then
           let start_idx = idx + 8 in
           match String.index_from_opt msg start_idx '"' with
           | Some end_idx -> String.sub msg start_idx (end_idx - start_idx)
@@ -101,8 +111,8 @@ let rec parse_levels msg pos end_pos count acc =
             match String.index_from_opt msg start_idx '"' with
             | None -> None
             | Some p ->
-                if p + 6 <= end_pos && String.sub msg p 6 = key then
-                  let val_start = p + 6 in
+                if string_match msg p key then
+                  let val_start = p + String.length key in
                   match String.index_from_opt msg val_start '"' with
                   | Some val_end -> Some (String.sub msg val_start (val_end - val_start), val_end + 1)
                   | None -> None
@@ -124,7 +134,7 @@ let get_bids_asks msg =
     match String.index_from_opt msg pos '"' with
     | None -> ([||], [||])
     | Some idx ->
-        if idx + 11 <= String.length msg && String.sub msg idx 11 = levels_key then
+        if string_match msg idx levels_key then
           let bids_start = idx + 11 in
           match String.index_from_opt msg bids_start ']' with
           | None -> ([||], [||])
@@ -143,7 +153,7 @@ let get_bids_asks msg =
 
 let process_raw_market_data msg =
   let now_ts = Unix.gettimeofday () in
-  if String.length msg > 20 && String.sub msg 0 20 = "{\"channel\":\"l2Book\"," then begin
+  if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," msg then begin
     let coin = get_coin msg in
     if coin <> "" then begin
       match find_registered_symbol coin with

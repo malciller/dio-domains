@@ -129,6 +129,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
          exec_ready gate for assets with no open orders (empty snapshot). *)
       let exec_checked = ref false in
       let latency_active = ref false in
+      let exec_ready_cycle = ref 0 in
       
       let open_orders_dirty = ref true in
       let cached_grid_buy_orders = ref [] in
@@ -448,7 +449,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
             (* First exec batch received: open the startup gate for ALL exchanges *)
             if not !exec_ready then begin
               exec_ready := true;
-              latency_active := true;
+              exec_ready_cycle := !cycle_count;
               (match !grid_strategy_asset_ref with
                | Some _ ->
                    Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done asset_with_fees.symbol
@@ -499,7 +500,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                 end
             );
             exec_ready := true;
-            latency_active := true;
+            exec_ready_cycle := !cycle_count;
             (* Mark startup replay complete to ungate profit calculation *)
             (match !grid_strategy_asset_ref with
              | Some _ ->
@@ -700,6 +701,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Block until the next websocket frame signals new data or until data is ready *)
         if not !should_execute_strategy || not (Ex.has_execution_data ~symbol:asset_with_fees.symbol) then
           Concurrency.Exchange_wakeup.wait ~symbol:asset_with_fees.symbol;
+
+        if !exec_ready && not !latency_active && (!cycle_count - !exec_ready_cycle >= 100) then begin
+          latency_active := true;
+          Logging.info_f ~section "[%s/%s] Startup warmup complete (100 cycles post-ready). Latency measurements active." asset_with_fees.exchange asset_with_fees.symbol
+        end;
 
         ()
       done

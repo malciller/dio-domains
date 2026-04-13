@@ -61,12 +61,13 @@ let add_normalized_to_crc crc s =
   in
   find_first 0
 
-(** Single price level. Stores both string and float representations to avoid repeated parsing. *)
 type level = {
   price: string;
   size: string;
   price_float: float;
   size_float: float;
+  crc_price: string;
+  crc_size: string;
 }
 
 type orderbook = {
@@ -202,8 +203,8 @@ end)
 (** Per-symbol mutable orderbook state, including bid/ask maps, ring buffer, and synchronization metadata. *)
 type store = {
   buffer: orderbook RingBuffer.t;
-  mutable bids: (string * string * float * float) PriceMap.t;
-  mutable asks: (string * string * float * float) PriceMap.t;
+  mutable bids: level PriceMap.t;
+  mutable asks: level PriceMap.t;
   ready: bool Atomic.t;
   has_snapshot: bool Atomic.t;  (** True after an initial snapshot has been received. Updates are rejected until set. *)
   last_sequence: int64 option Atomic.t;  (** Last processed sequence number. Used for gap and rollback detection. *)
@@ -224,20 +225,6 @@ let get_precision_from_instruments symbol =
   with _ -> None
 
 let calculate_checksum symbol bids asks : int32 =
-  let pd, ld =
-    (* Prefer instruments feed precision; fall back to AssetPairs cache, then defaults. *)
-    match get_precision_from_instruments symbol with
-    | Some (price_prec, qty_prec) ->
-        Logging.debug_f ~section "Using instruments feed precision for %s: price=%d qty=%d" symbol price_prec qty_prec;
-        (price_prec, qty_prec)
-    | None ->
-
-        try Hashtbl.find decimals_tbl symbol
-        with Not_found ->
-          Logging.debug_f ~section "No precision found for %s, using defaults" symbol;
-          (8, 8)
-  in
-
   (* Check if size string represents zero by scanning for any non-zero, non-decimal digit. *)
   let is_effectively_zero size =
     let rec has_non_zero s i =
@@ -270,16 +257,12 @@ let calculate_checksum symbol bids asks : int32 =
 
   let crc = ref 0xFFFFFFFFl in
   List.iter (fun (level: level) ->
-    let full_price_str = Printf.sprintf "%.*f" pd level.price_float in
-    let full_qty_str = Printf.sprintf "%.*f" ld level.size_float in
-    crc := add_normalized_to_crc !crc full_price_str;
-    crc := add_normalized_to_crc !crc full_qty_str
+    crc := add_normalized_to_crc !crc level.crc_price;
+    crc := add_normalized_to_crc !crc level.crc_size
   ) top_asks;
   List.iter (fun (level: level) ->
-    let full_price_str = Printf.sprintf "%.*f" pd level.price_float in
-    let full_qty_str = Printf.sprintf "%.*f" ld level.size_float in
-    crc := add_normalized_to_crc !crc full_price_str;
-    crc := add_normalized_to_crc !crc full_qty_str
+    crc := add_normalized_to_crc !crc level.crc_price;
+    crc := add_normalized_to_crc !crc level.crc_size
   ) top_bids;
 
   let result = Int32.logxor !crc 0xFFFFFFFFl in
@@ -356,7 +339,9 @@ let parse_level symbol price_json size_json =
   let qty_str = to_decimal_str ~dec:ld size_json in
   let price_float = try float_of_string price_str with _ -> 0.0 in
   let qty_float = try float_of_string qty_str with _ -> 0.0 in
-  Some (price_str, qty_str, price_float, qty_float)
+  let crc_price = Printf.sprintf "%.*f" pd price_float in
+  let crc_size = Printf.sprintf "%.*f" ld qty_float in
+  Some { price = price_str; size = qty_str; price_float; size_float = qty_float; crc_price; crc_size }
 
 (** Parse a JSON array of price levels into (price_str, qty_str, price_float, qty_float) tuples.
     Supports both object format ({price, qty}) and legacy array format ([price, qty]). *)
@@ -378,19 +363,17 @@ let parse_levels symbol json =
 
 (** Apply incremental level updates to a PriceMap. Zero-quantity levels are removed; non-zero levels are upserted. *)
 let apply_levels map levels =
-  List.fold_left (fun acc (price_str, size_str, price_float, size_float) ->
-    if is_effectively_zero size_str then
-      PriceMap.remove price_str acc
+  List.fold_left (fun acc (lvl: level) ->
+    if is_effectively_zero lvl.size then
+      PriceMap.remove lvl.price acc
     else
-      PriceMap.add price_str (price_str, size_str, price_float, size_float) acc
+      PriceMap.add lvl.price lvl acc
   ) map levels
 
 (** Convert a PriceMap to a sorted level array truncated to [depth] entries.
     [sort_desc] controls descending (bids) vs ascending (asks) order. *)
 let levels_to_array ?(sort_desc = false) map depth =
-  let levels_list = PriceMap.fold (fun _ (price_str, size_str, price_float, size_float) acc ->
-    { price = price_str; size = size_str; price_float; size_float } :: acc
-  ) map [] in
+  let levels_list = PriceMap.fold (fun _ lvl acc -> lvl :: acc) map [] in
 
   let sorted_levels = List.sort (fun l1 l2 ->
     if sort_desc then Float.compare l2.price_float l1.price_float else Float.compare l1.price_float l2.price_float
@@ -408,8 +391,8 @@ let levels_to_array ?(sort_desc = false) map depth =
 (** Rebuild a PriceMap containing only the top [max_levels] entries. Used to bound map size. *)
 let rebuild_map_from_top_levels map sort_desc max_levels =
   let levels_array = levels_to_array ~sort_desc map max_levels in
-  Array.fold_left (fun acc level ->
-    PriceMap.add level.price (level.price, level.size, level.price_float, level.size_float) acc
+  Array.fold_left (fun acc lvl ->
+    PriceMap.add lvl.price lvl acc
   ) PriceMap.empty levels_array
 
 (** Construct an [orderbook] record from the current store state and the raw JSON entry metadata. *)

@@ -247,14 +247,12 @@ let subscribe json =
   )
 
 (** Sends subscription messages for all configured channels.
-    Subscribes to allMids unconditionally. If [wallet] is non-empty,
+    If [wallet] is non-empty,
     subscribes to user-specific channels: webData2, userEvents, spotState,
     userFills, userFundings, userNonFundingLedgerUpdates, orderUpdates.
     Subscribes to l2Book for each symbol, using the coin identifier
     resolved via [Hyperliquid_instruments_feed]. *)
 let subscribe_to_feeds ~symbols ~wallet =
-  let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "allMids")])]) in
-  
   let%lwt () = 
     if wallet <> "" then
       let%lwt () = subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "webData2"); ("user", `String wallet)])]) in
@@ -284,7 +282,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
       Concurrency.Tick_event_bus.publish_tick ();
       on_heartbeat ();
       let content = frame.Websocket.Frame.content in
-      if String.length content > 20 && String.sub content 0 20 = "{\"channel\":\"l2Book\"," then begin
+      if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content then begin
         broadcast_raw_message content;
         Lwt.return_unit
       end else begin

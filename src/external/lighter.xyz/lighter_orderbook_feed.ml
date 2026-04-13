@@ -159,12 +159,25 @@ let process_orderbook_snapshot ~market_index json =
       let bids_json = get_list_field ob_data "b" "bids" in
       let asks_json = get_list_field ob_data "a" "asks" in
 
+      let parse_level_opt level =
+        match level with
+        | `List [price_json; size_json] ->
+            let price = Lighter_types.parse_json_float price_json in
+            let size = Lighter_types.parse_json_float size_json in
+            Some (price, size)
+        | `List (price_json :: size_json :: _) ->
+            let price = Lighter_types.parse_json_float price_json in
+            let size = Lighter_types.parse_json_float size_json in
+            Some (price, size)
+        | `Assoc _ ->
+            let price = Lighter_types.parse_json_float (member "price" level) in
+            let size = Lighter_types.parse_json_float (member "size" level) in
+            Some (price, size)
+        | _ -> None
+      in
+
       let parse_levels levels_json =
-        List.map (fun level ->
-          let price = Lighter_types.parse_json_float (member "price" level) in
-          let size = Lighter_types.parse_json_float (member "size" level) in
-          (price, size)
-        ) levels_json
+        List.filter_map parse_level_opt levels_json
       in
 
       let bids = parse_levels bids_json in
@@ -207,29 +220,48 @@ let process_orderbook_update ~market_index json =
       | Some store ->
           Mutex.lock store.ob_mutex;
 
+          let parse_level_opt level =
+            match level with
+            | `List [price_json; size_json] ->
+                let price = Lighter_types.parse_json_float price_json in
+                let size = Lighter_types.parse_json_float size_json in
+                Some (price, size)
+            | `List (price_json :: size_json :: _) ->
+                let price = Lighter_types.parse_json_float price_json in
+                let size = Lighter_types.parse_json_float size_json in
+                Some (price, size)
+            | `Assoc _ ->
+                let price = Lighter_types.parse_json_float (member "price" level) in
+                let size = Lighter_types.parse_json_float (member "size" level) in
+                Some (price, size)
+            | _ -> None
+          in
+
           let b_len = ref (List.length store.local_bids) in
           List.iter (fun level ->
-            let price = Lighter_types.parse_json_float (member "price" level) in
-            let size = Lighter_types.parse_json_float (member "size" level) in
-            store.local_bids <- apply_delta store.local_bids price size ~is_bid:true;
-            incr b_len;
-            if !b_len >= max_depth * 2 then begin
-              store.local_bids <- truncate_to_depth store.local_bids;
-              b_len := max_depth
-            end
+            match parse_level_opt level with
+            | Some (price, size) ->
+                store.local_bids <- apply_delta store.local_bids price size ~is_bid:true;
+                incr b_len;
+                if !b_len >= max_depth * 2 then begin
+                  store.local_bids <- truncate_to_depth store.local_bids;
+                  b_len := max_depth
+                end
+            | None -> ()
           ) bids_json;
           store.local_bids <- truncate_to_depth store.local_bids;
 
           let a_len = ref (List.length store.local_asks) in
           List.iter (fun level ->
-            let price = Lighter_types.parse_json_float (member "price" level) in
-            let size = Lighter_types.parse_json_float (member "size" level) in
-            store.local_asks <- apply_delta store.local_asks price size ~is_bid:false;
-            incr a_len;
-            if !a_len >= max_depth * 2 then begin
-              store.local_asks <- truncate_to_depth store.local_asks;
-              a_len := max_depth
-            end
+            match parse_level_opt level with
+            | Some (price, size) ->
+                store.local_asks <- apply_delta store.local_asks price size ~is_bid:false;
+                incr a_len;
+                if !a_len >= max_depth * 2 then begin
+                  store.local_asks <- truncate_to_depth store.local_asks;
+                  a_len := max_depth
+                end
+            | None -> ()
           ) asks_json;
           store.local_asks <- truncate_to_depth store.local_asks;
 
