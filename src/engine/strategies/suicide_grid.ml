@@ -194,6 +194,8 @@ type strategy_state = {
   mutable persistence_dirty: bool;  (* true when accumulation state changed; flushed by caller outside hotloop *)
   mutable last_cycle_orders_hash: int;  (* tracks exchange state for 0-alloc diffing *)
   mutable last_cycle_buy_count: int;
+  mutable duplicate_key_buy: string;
+  mutable duplicate_key_sell: string;
   mutex: Mutex.t;  (* per-symbol mutex; prevents concurrent strategy execution *)
 }
 
@@ -252,6 +254,8 @@ let get_strategy_state asset_symbol =
           persistence_dirty = false;
           last_cycle_orders_hash = 0;
           last_cycle_buy_count = 0;
+          duplicate_key_buy = Printf.sprintf "%s|buy|grid" asset_symbol;
+          duplicate_key_sell = Printf.sprintf "%s|sell|grid" asset_symbol;
           mutex = Mutex.create ();
         } in
         Hashtbl.replace strategy_states asset_symbol new_state;
@@ -266,21 +270,30 @@ let get_strategy_state asset_symbol =
 let reservation_mutex = Mutex.create ()
 
 (** Tracking total reserved quote per exchange to avoid O(N) strategy_states_mutex locking. *)
-let total_reserved_by_exchange : (string, float) Hashtbl.t = Hashtbl.create 4
+let total_reserved_by_exchange : (string, float Atomic.t) Hashtbl.t =
+  let h = Hashtbl.create 4 in
+  List.iter (fun ex -> Hashtbl.add h ex (Atomic.make 0.0))
+    ["kraken"; "hyperliquid"; "lighter"; "ibkr"];
+  h
 
-(** Gets the cached total reserved quote for [exchange]. Caller must hold reservation_mutex. *)
-let get_total_reserved_quote_locked ~exchange =
+(** Gets the cached total reserved quote atomic for [exchange]. *)
+let get_exchange_reserved_atomic exchange =
   match Hashtbl.find_opt total_reserved_by_exchange exchange with
-  | Some total -> total
-  | None -> 0.0
+  | Some a -> a
+  | None ->
+      Mutex.lock reservation_mutex;
+      let a = match Hashtbl.find_opt total_reserved_by_exchange exchange with
+        | Some a2 -> a2
+        | None -> let a3 = Atomic.make 0.0 in Hashtbl.add total_reserved_by_exchange exchange a3; a3
+      in
+      Mutex.unlock reservation_mutex;
+      a
 
-(** Acquires reservation_mutex and returns total reserved_quote for [exchange].
+(** Fast lock-free read of total reserved.
     Safe to call outside state.mutex. *)
 let get_total_reserved_quote ~exchange =
-  Mutex.lock reservation_mutex;
-  let total = get_total_reserved_quote_locked ~exchange in
-  Mutex.unlock reservation_mutex;
-  total
+  let a = get_exchange_reserved_atomic exchange in
+  Atomic.get a
 
 (** Sets this asset's reserved_quote under reservation_mutex.
     May be called from inside state.mutex (respects lock order). *)
@@ -289,8 +302,8 @@ let set_asset_reserved_quote state v =
   let diff = v -. state.reserved_quote in
   state.reserved_quote <- v;
   if state.exchange_id <> "" then begin
-    let current_total = get_total_reserved_quote_locked ~exchange:state.exchange_id in
-    Hashtbl.replace total_reserved_by_exchange state.exchange_id (current_total +. diff)
+    let a = get_exchange_reserved_atomic state.exchange_id in
+    Atomic.set a ((Atomic.get a) +. diff)
   end;
   Mutex.unlock reservation_mutex
 
@@ -299,14 +312,15 @@ let set_asset_reserved_quote state v =
     Must be called from inside state.mutex. On success, sets state.reserved_quote. *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
   Mutex.lock reservation_mutex;
-  let total_reserved = get_total_reserved_quote_locked ~exchange:state.exchange_id in
+  let a = get_exchange_reserved_atomic state.exchange_id in
+  let total_reserved = Atomic.get a in
   let available = quote_bal -. total_reserved in
   let ok = available >= quote_needed in
   if ok then begin
     let diff = reserve_amount -. state.reserved_quote in
     state.reserved_quote <- reserve_amount;
     if state.exchange_id <> "" then begin
-      Hashtbl.replace total_reserved_by_exchange state.exchange_id (total_reserved +. diff)
+      Atomic.set a (total_reserved +. diff)
     end
   end;
   Mutex.unlock reservation_mutex;
@@ -427,11 +441,8 @@ let can_place_buy_order (_qty : float) quote_balance quote_needed =
 let can_place_sell_order (_qty : float) (_sell_mult : float) asset_balance asset_needed =
   asset_balance >= asset_needed
 
-(** Generates a dedup key for in-flight order tracking. One key per (asset, side) pair. *)
-let generate_side_duplicate_key asset_symbol side =
-  Printf.sprintf "%s|%s|grid" asset_symbol (string_of_order_side side)
 
-let create_place_order asset_symbol side qty price post_only strategy exchange =
+let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =
   let ecfg = get_exchange_config exchange in
   {
     operation = Place;
@@ -446,7 +457,7 @@ let create_place_order asset_symbol side qty price post_only strategy exchange =
     post_only;
     userref = Some Strategy_common.strategy_userref_grid;
     strategy;
-    duplicate_key = generate_side_duplicate_key asset_symbol side;
+    duplicate_key = dup_key;
   }
 
 (** Constructs an Amend strategy_order targeting [order_id]. *)
@@ -487,8 +498,8 @@ let create_cancel_order order_id asset_symbol strategy exchange =
   }
 
 (** Backwards-compatible order constructor. Delegates to create_place_order with Grid strategy. *)
-let create_order asset_symbol side qty price post_only exchange =
-  create_place_order asset_symbol side qty price post_only Grid exchange
+let create_order dup_key asset_symbol side qty price post_only exchange =
+  create_place_order dup_key asset_symbol side qty price post_only Grid exchange
 
 (** Pushes an order to the ringbuffer. Returns true on success, false on duplicate or full buffer.
     [now] is a pre-computed Unix.time() timestamp to avoid redundant syscalls.
@@ -681,7 +692,7 @@ let execute_strategy
         if state.asset_low && should_clear then begin
           state.asset_low <- false;
           state.inflight_sell <- false;
-          ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Sell));
+          ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
           Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
             asset.symbol asset_bal state.reserved_base state.anticipated_base_credit locked_in_sells available_asset asset_needed_fast
         end
@@ -722,7 +733,7 @@ let execute_strategy
          Hashtbl.remove state.amend_cooldowns "place_Buy";
          (* Clear inflight_buy and evict the InFlightOrders duplicate key. *)
          state.inflight_buy <- false;
-         ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset.symbol Buy));
+         ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_buy));
          Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at %.2f) - resuming strategy"
            asset.symbol available_quote quote_needed_fast total_reserved state.capital_low_at_balance
        end
@@ -771,7 +782,7 @@ let execute_strategy
                 let target_oid = String.sub order_id 14 (String.length order_id - 14) in
                 ignore (InFlightAmendments.remove_in_flight_amendment target_oid)
               end else begin
-                let duplicate_key = generate_side_duplicate_key asset.symbol side in
+                let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
                 ignore (InFlightOrders.remove_in_flight_order duplicate_key);
                 (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false)
               end;
@@ -1074,7 +1085,7 @@ let execute_strategy
                   "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
                   asset.symbol (state.accumulated_profit +. required_profit) required_profit state.reserved_base
               end else if balance_ok then begin
-                let sell_order = create_order asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
+                let sell_order = create_order state.duplicate_key_sell asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
                 if push_order ~now ~state sell_order then begin
                    (* Commit accumulation state after push_order succeeds.
                       Persistence is deferred: set dirty flag for the caller
@@ -1118,7 +1129,7 @@ let execute_strategy
                | None -> true
              in
              if balance_ok then begin
-               let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
+               let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
                if push_order ~now ~state order then begin
                  state.last_buy_order_price <- Some buy_price;
                  Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
@@ -1159,7 +1170,7 @@ let execute_strategy
                     asset.symbol quote_needed (Option.value available_quote_balance ~default:0.0);
                   Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
                   (* Attempt without a reservation; exchange is the final gatekeeper. *)
-                  let order = create_order asset.symbol Buy qty (Some buy_price) true asset.exchange in
+                  let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
                   if push_order ~now ~state order then
                     state.last_buy_order_price <- Some buy_price
                 end
@@ -1407,7 +1418,7 @@ let handle_order_failed asset_symbol side reason =
     (match side with Buy -> set_asset_reserved_quote state 0.0 | Sell -> ());
 
     (* Clear global in-flight trackers. *)
-    let duplicate_key = generate_side_duplicate_key asset_symbol side in
+    let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
     
     let lower_reason = String.lowercase_ascii reason in
@@ -1479,7 +1490,7 @@ let handle_order_rejected asset_symbol side price =
   (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
 
   (* Clean up global trackers to allow immediate re-placement after rejection. *)
-  let duplicate_key = generate_side_duplicate_key asset_symbol side in
+  let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
   ignore (InFlightOrders.remove_in_flight_order duplicate_key);
 
   (* Apply short cooldown for buy side only; sell side uses asset_low flag.
@@ -1655,13 +1666,13 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
     (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
     (* Release quote reservation when buy fills (funds transferred to base asset). *)
     (match side with Buy -> set_asset_reserved_quote state 0.0 | Sell -> ());
-    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
+    ignore (InFlightOrders.remove_in_flight_order ((match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
 
     (* 7. On buy fill, clear the Sell side's InFlightOrders guard.
        The strategy places buy+sell together; the previous sell's guard
        would block the new sell via duplicate detection. *)
     if side = Buy then begin
-      ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol Sell));
+      ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
       state.inflight_sell <- false
     end;
 
@@ -1722,7 +1733,7 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
 
     (* Clear inflight flags and global placement trackers for immediate re-placement. *)
     (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
-    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol cancelled_side));
+    ignore (InFlightOrders.remove_in_flight_order ((match cancelled_side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
     
     ()
   )
@@ -1892,7 +1903,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     end;
            
     (* Clear global in-flight trackers to prevent deadlock. *)
-    ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
+    ignore (InFlightOrders.remove_in_flight_order ((match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
   )
 
 (** No-op shim: pending_cancellations removed; cancel state is now tracked via

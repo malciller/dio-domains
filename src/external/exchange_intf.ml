@@ -191,6 +191,9 @@ module type S = sig
   (** Return the current balance for [asset]. Returns [0.0] if unknown. *)
   val get_balance : asset:string -> float
 
+  (** Return a fast path closure for fetching live balance of [asset] without lock acquisition overhead. *)
+  val get_balance_fast : asset:string -> (unit -> float)
+
   (** Return all cached asset balances as [(asset_name, balance)] pairs. *)
   val get_all_balances : unit -> (string * float) list
 

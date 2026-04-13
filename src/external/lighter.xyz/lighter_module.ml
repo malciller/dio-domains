@@ -176,6 +176,10 @@ module Lighter_impl = struct
   let get_balance ~asset =
     Lighter_balances.get_balance asset
 
+  let get_balance_fast ~asset =
+    let store = Lighter_balances.get_balance_store asset in
+    (fun () -> Lighter_balances.BalanceStore.get_balance store)
+
   let get_all_balances () =
     Lighter_balances.get_all_balances ()
 

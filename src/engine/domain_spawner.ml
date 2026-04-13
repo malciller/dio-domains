@@ -258,9 +258,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           (asset_with_fees.symbol, "USD")
       in
 
-      (* Cached values for periodic info-level log output *)
-      let last_asset_balance = ref 0.0 in
-      let last_quote_balance = ref 0.0 in
+      (* Cached closures for highly efficient, allocation-free balance reporting *)
+      let base_balance_fn = Ex.get_balance_fast ~asset:base_asset in
+      let quote_balance_fn = Ex.get_balance_fast ~asset:quote_currency in
+      
       let last_buy_count = ref 0 in
       let last_sell_count = ref 0 in
 
@@ -504,16 +505,20 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
              end
           );
 
-          (* Query current balances for base and quote assets *)
-          (match Ex.get_balance ~asset:base_asset with
-           | bal -> last_asset_balance := bal
-           | exception _ -> ());
-          (match Ex.get_balance ~asset:quote_currency with
-           | bal -> last_quote_balance := bal
-           | exception _ -> ());
+          (* Fast-path tick perfect balance access without hashtable locks *)
+          let asset_bal_val = 
+            match base_balance_fn () with
+            | bal -> bal
+            | exception _ -> 0.0
+          in
+          let quote_bal_val = 
+            match quote_balance_fn () with
+            | bal -> bal
+            | exception _ -> 0.0
+          in
           
-          let asset_balance = Some !last_asset_balance in
-          let quote_balance = Some !last_quote_balance in
+          let asset_balance = Some asset_bal_val in
+          let quote_balance = Some quote_bal_val in
           
           last_buy_count := !grid_open_buy_count + !mm_open_buy_count;
           last_sell_count := !grid_open_sell_count + !mm_open_sell_count;
