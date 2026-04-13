@@ -255,24 +255,36 @@ let process_user_stats json =
       (try member "type" json |> to_string with _ -> "unknown")
       (try keys json |> String.concat "," with _ -> "?")
   else begin
-    let extract_float key =
+    let extract_float_opt key =
       let v = member key stats in
-      if v <> `Null then (try Lighter_types.parse_json_float v with _ -> 0.0) else 0.0
+      if v <> `Null then (try Some (Lighter_types.parse_json_float v) with _ -> None) else None
     in
-    let collateral = extract_float "collateral" in
-    let margin_balance = extract_float "margin_balance" in
-    let wallet_balance = extract_float "wallet_balance" in
-    let account_value = extract_float "account_value" in
-    
-    let true_balance = max (max collateral margin_balance) (max wallet_balance account_value) in
-    
-    if true_balance > 0.0 || (collateral = 0.0 && margin_balance = 0.0) then begin
-      publish_balance_update "USDC" true_balance;
-      Logging.debug_f ~section "Balance update: USDC = %.8f (via user_stats. max of col:%.2f mb:%.2f wb:%.2f av:%.2f)" 
-        true_balance collateral margin_balance wallet_balance account_value;
-      notify_ready ()
+    let collateral = extract_float_opt "collateral" in
+    let margin_balance = extract_float_opt "margin_balance" in
+    let wallet_balance = extract_float_opt "wallet_balance" in
+    let account_value = extract_float_opt "account_value" in
+
+    let has_any = Option.is_some collateral || Option.is_some margin_balance || Option.is_some wallet_balance || Option.is_some account_value in
+
+    if has_any then begin
+      let val_of = Option.value ~default:0.0 in
+      let c = val_of collateral in
+      let m = val_of margin_balance in
+      let w = val_of wallet_balance in
+      let a = val_of account_value in
+
+      let true_balance = max (max c m) (max w a) in
+
+      if true_balance > 0.0 || (c = 0.0 && m = 0.0) then begin
+        publish_balance_update "USDC" true_balance;
+        Logging.debug_f ~section "Balance update: USDC = %.8f (via user_stats. max of col:%.2f mb:%.2f wb:%.2f av:%.2f)" 
+          true_balance c m w a;
+        notify_ready ()
+      end else
+        Logging.info_f ~section "user_stats received but all fetched metrics are zero (stats_keys=%s)"
+          (try keys stats |> String.concat "," with _ -> "?")
     end else
-      Logging.info_f ~section "user_stats received but all metrics are zero (stats_keys=%s)"
+      Logging.info_f ~section "user_stats received but expected structural metrics are absent (stats_keys=%s)"
         (try keys stats |> String.concat "," with _ -> "?")
   end
 
