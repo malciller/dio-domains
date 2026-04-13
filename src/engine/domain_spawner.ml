@@ -449,6 +449,30 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let current_pos_now = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
           if current_pos_now = !exec_read_pos then begin
             exec_checked := true;
+            (* No exec events arrived and feed is ready: fetch snapshot orders 
+               and inject them into the strategies to restore tracking state. *)
+            Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol (fun oid price _qty side_str userref_opt ->
+                let is_mm = match userref_opt with
+                  | Some uref -> Dio_strategies.Strategy_common.is_strategy_order Dio_strategies.Strategy_common.strategy_userref_mm uref
+                  | None -> false
+                in
+                let order_side = if side_str = "buy" then Dio_strategies.Strategy_common.Buy else Dio_strategies.Strategy_common.Sell in
+                if is_mm then begin
+                  (match !mm_strategy_asset_ref with
+                   | Some _ ->
+                       Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
+                         asset_with_fees.symbol oid order_side price;
+                       ()
+                   | None -> ())
+                end else begin
+                  (match !grid_strategy_asset_ref with
+                   | Some _ ->
+                       Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
+                         asset_with_fees.symbol oid order_side price;
+                       ()
+                   | None -> ())
+                end
+            );
             exec_ready := true;
             latency_active := true;
             (* Mark startup replay complete to ungate profit calculation *)
@@ -460,7 +484,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
              | Some _ ->
                  Dio_strategies.Market_maker.Strategy.set_startup_replay_done asset_with_fees.symbol
              | None -> ());
-            Logging.info_f ~section "[%s/%s] Snapshot done, no exec events - strategy now active (no open orders)"
+            Logging.info_f ~section "[%s/%s] Snapshot done, injected open orders - strategy now active"
               asset_with_fees.exchange asset_with_fees.symbol
           end
         end;
