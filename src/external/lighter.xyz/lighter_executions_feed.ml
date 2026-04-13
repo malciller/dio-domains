@@ -600,7 +600,12 @@ let process_account_orders_update json =
                timestamp = Unix.gettimeofday ();
                order_id;
                trade_id = order_id;  (* Fallback resolution utilizing the base order key. *)
-             }
+             };
+             (* Trigger a REST balance refresh after fills. The WS balance
+                channel often lags, especially for unified account USDC
+                collateral. Without this, the strategy may see stale 0.00
+                quote balance and be unable to place new orders. *)
+             Lighter_balances.request_balance_refresh ()
          | CanceledStatus ->
              Logging.info_f ~section "Order CANCELED: %s [%s] %.8f @ %.2f" order_id symbol base_amount price
          | NewStatus ->
