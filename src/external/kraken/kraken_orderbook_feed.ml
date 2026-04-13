@@ -339,8 +339,10 @@ let parse_level symbol price_json size_json =
   let qty_str = to_decimal_str ~dec:ld size_json in
   let price_float = try float_of_string price_str with _ -> 0.0 in
   let qty_float = try float_of_string qty_str with _ -> 0.0 in
-  let crc_price = Printf.sprintf "%.*f" pd price_float in
-  let crc_size = Printf.sprintf "%.*f" ld qty_float in
+  (* Skip CRC string formatting when checksum validation is disabled (depth < 10).
+     Printf.sprintf "%.*f" allocates 2 strings per level per tick — eliminated here. *)
+  let crc_price = if orderbook_depth >= 10 then Printf.sprintf "%.*f" pd price_float else "" in
+  let crc_size = if orderbook_depth >= 10 then Printf.sprintf "%.*f" ld qty_float else "" in
   Some { price = price_str; size = qty_str; price_float; size_float = qty_float; crc_price; crc_size }
 
 (** Parse a JSON array of price levels into (price_str, qty_str, price_float, qty_float) tuples.
@@ -403,22 +405,43 @@ let build_orderbook store symbol entry =
     | Some seq -> Some seq
     | None -> None
   in
+  (* Skip checksum JSON extraction when depth < 10: checksum validation is
+     bypassed anyway, and parsing the JSON field allocates Int32 boxes. *)
   let checksum =
-    let checksum_json = member "checksum" entry in
-    match checksum_json with
-    | `Int i -> Some (Int32.of_int i)
-    | `Intlit s ->
-        (try Some (Int32.of_string s) with _ -> None)
-    | `Float f ->
-        (try Some (Int32.of_float f) with _ -> None)
-    | `String s ->
-        (try Some (Int32.of_string s) with _ -> None)
-    | _ -> None
+    if orderbook_depth >= 10 then
+      let checksum_json = member "checksum" entry in
+      match checksum_json with
+      | `Int i -> Some (Int32.of_int i)
+      | `Intlit s ->
+          (try Some (Int32.of_string s) with _ -> None)
+      | `Float f ->
+          (try Some (Int32.of_float f) with _ -> None)
+      | `String s ->
+          (try Some (Int32.of_string s) with _ -> None)
+      | _ -> None
+    else None
+  in
+  (* Depth-1 fast path: construct singleton arrays directly from PriceMap
+     tree traversal (O(log n)), avoiding the fold->sort->take->of_list pipeline
+     in levels_to_array which allocates 4 intermediate structures. *)
+  let bids =
+    if orderbook_depth = 1 then
+      match PriceMap.max_binding_opt store.bids with
+      | Some (_, v) -> [|v|]
+      | None -> [||]
+    else levels_to_array ~sort_desc:true store.bids orderbook_depth
+  in
+  let asks =
+    if orderbook_depth = 1 then
+      match PriceMap.min_binding_opt store.asks with
+      | Some (_, v) -> [|v|]
+      | None -> [||]
+    else levels_to_array ~sort_desc:false store.asks orderbook_depth
   in
   {
     symbol;
-    bids = levels_to_array ~sort_desc:true store.bids orderbook_depth;
-    asks = levels_to_array ~sort_desc:false store.asks orderbook_depth;
+    bids;
+    asks;
     sequence;
     checksum;
     timestamp = Unix.time ();
@@ -556,9 +579,21 @@ let process_orderbook_message ~reset json on_heartbeat =
         store.asks <- apply_levels store.asks asks;
         store.last_update <- Unix.time ();
 
-        (* Truncate maps to configured bound, limiting memory usage. *)
-        store.bids <- rebuild_map_from_top_levels store.bids true orderbook_depth;
-        store.asks <- rebuild_map_from_top_levels store.asks false orderbook_depth;
+        (* Truncate maps to configured bound, limiting memory usage.
+           Depth-1 fast path: use PriceMap.max/min_binding_opt (O(log n),
+           zero intermediate allocation) instead of the full
+           fold->sort->take->of_list->fold rebuild pipeline. *)
+        if orderbook_depth = 1 then begin
+          store.bids <- (match PriceMap.max_binding_opt store.bids with
+            | Some (k, v) -> PriceMap.singleton k v
+            | None -> PriceMap.empty);
+          store.asks <- (match PriceMap.min_binding_opt store.asks with
+            | Some (k, v) -> PriceMap.singleton k v
+            | None -> PriceMap.empty);
+        end else begin
+          store.bids <- rebuild_map_from_top_levels store.bids true orderbook_depth;
+          store.asks <- rebuild_map_from_top_levels store.asks false orderbook_depth;
+        end;
 
         let orderbook = build_orderbook store symbol entry in
 
