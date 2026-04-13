@@ -235,7 +235,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
             try member "type" json |> to_string with _ -> ""
           in
           if channel <> "" then
-            let ch_prefix = try String.sub channel 0 (String.index channel '/') with Not_found -> channel in
+            let ch_prefix = try String.sub channel 0 (min (try String.index channel '/' with Not_found -> String.length channel) (try String.index channel ':' with Not_found -> String.length channel)) with _ -> channel in
             if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed" then
               raw_type ^ "/" ^ ch_prefix
             else raw_type
@@ -269,7 +269,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
          | "update/account_all_assets" | "snapshot/account_all_assets" | "subscribed/account_all_assets"
          | "update/user_stats" | "snapshot/user_stats" | "subscribed/user_stats" ->
              Atomic.incr msg_counter_account;
-             broadcast_message json
+             Lighter_balances.process_market_data json
          | "pong" ->
               state.last_pong_time := Unix.gettimeofday ();
               (try Lwt_condition.broadcast state.pong_condition () with _ -> ());

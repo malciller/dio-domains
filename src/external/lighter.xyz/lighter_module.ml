@@ -423,6 +423,92 @@ let fetch_open_orders () =
     Lwt.return_unit
   )
 
+(** Fetches all asset balances via the REST API at startup, ensuring balances
+    (including USDC) are populated before domains start. Handles both unified
+    accounts (USDC is account-level collateral) and split accounts (USDC is
+    in the assets array). *)
+let fetch_balances () =
+  let section = "lighter_startup" in
+  let account_index = match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
+    | Some s -> (try int_of_string s with _ -> 0)
+    | None -> 0
+  in
+  let base_url = Lighter_proxy.api_base_url () in
+  let url = Printf.sprintf "%s/api/v1/account?by=index&value=%d"
+    base_url account_index in
+  Lwt.catch (fun () ->
+    let uri = Uri.of_string url in
+    let%lwt (resp, body) = Cohttp_lwt_unix.Client.get uri in
+    let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+    let%lwt body_str = Cohttp_lwt.Body.to_string body in
+    if status < 200 || status >= 300 then begin
+      Logging.error_f ~section "Lighter account request failed: HTTP %d (body=%s)" status
+        (if String.length body_str > 300 then String.sub body_str 0 300 ^ "..." else body_str);
+      if status >= 500 then Lighter_proxy.rotate_proxy ();
+      Lwt.return_unit
+    end else begin
+      let trimmed = String.trim body_str in
+      Logging.info_f ~section "Lighter account response: %s"
+        (if String.length trimmed > 500 then String.sub trimmed 0 500 ^ "..." else trimmed);
+      let json = Yojson.Safe.from_string trimmed in
+      let open Yojson.Safe.Util in
+      let accounts = try member "accounts" json |> to_list with _ -> [] in
+      match accounts with
+      | [] ->
+          Logging.error_f ~section "Lighter account response has no accounts";
+          Lwt.return_unit
+      | account :: _ ->
+          (* Extract per-asset balances from the assets array *)
+          let assets = try member "assets" account |> to_list with _ -> [] in
+          let assets_assoc = List.map (fun asset_json ->
+            let asset_id = try member "asset_id" asset_json |> to_int |> string_of_int with _ -> "?" in
+            (asset_id, asset_json)
+          ) assets in
+
+          (* For unified accounts, USDC lives at the account level as
+             collateral/available_balance, not in the assets array.
+             Check if assets already has a positive USDC entry; if not,
+             inject the account-level collateral as a synthetic USDC asset. *)
+          let has_usdc_in_assets = List.exists (fun (_id, aj) ->
+            let sym = try member "symbol" aj |> to_string with _ -> "" in
+            let bal = try Lighter_types.parse_json_float (member "balance" aj) with _ -> 0.0 in
+            sym = "USDC" && bal > 0.0
+          ) assets_assoc in
+
+          let final_assets = if has_usdc_in_assets then assets_assoc
+          else begin
+            (* Read account-level collateral (unified account USDC balance) *)
+            let collateral = try Lighter_types.parse_json_float (member "collateral" account) with _ -> 0.0 in
+            let available = try Lighter_types.parse_json_float (member "available_balance" account) with _ -> 0.0 in
+            let usdc_balance = max collateral available in
+            Logging.info_f ~section "Unified account detected: injecting USDC from account-level collateral=%.6f available=%.6f -> %.6f"
+              collateral available usdc_balance;
+            if usdc_balance > 0.0 then
+              assets_assoc @ [("3", `Assoc [
+                ("symbol", `String "USDC");
+                ("asset_id", `Int 3);
+                ("balance", `String (Printf.sprintf "%.6f" usdc_balance));
+                ("locked_balance", `String "0.000000")
+              ])]
+            else assets_assoc
+          end in
+
+          let synthetic_json = `Assoc [
+            ("type", `String "snapshot/account_all_assets");
+            ("channel", `String (Printf.sprintf "account_all_assets/%d" account_index));
+            ("account_all", `Assoc [("assets", `Assoc final_assets)])
+          ] in
+          Lighter_balances.process_market_data synthetic_json;
+          let usdc_bal = Lighter_balances.get_balance "USDC" in
+          Logging.info_f ~section "Lighter balances fetched via REST: USDC=%.6f (%d assets from array, %d total injected)"
+            usdc_bal (List.length assets) (List.length final_assets);
+          Lwt.return_unit
+    end
+  ) (fun exn ->
+    Logging.error_f ~section "Failed to fetch Lighter balances: %s" (Printexc.to_string exn);
+    Lwt.return_unit
+  )
+
 (* Dynamically registers the constructed Lighter implementation module with the global Exchange Registry upon module load execution. *)
 let () =
   Exchange.Registry.register (module Lighter_impl)

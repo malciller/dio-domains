@@ -246,12 +246,9 @@ let consumer_loop ~webhook_url () =
                    send_batches rest)
         in
         send_batches fills >>= fun () ->
-        Lwt.async loop;
-        Lwt.return_unit
-      end else begin
-        Lwt.async loop;
-        Lwt.return_unit
-      end
+        loop ()
+      end else
+        loop ()
     end
   in
   loop ()

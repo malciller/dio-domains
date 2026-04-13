@@ -25,33 +25,20 @@ let test_process_asset_balances () =
   let wbtc_bal = Lighter.Balances.get_balance "WBTC" in
   Alcotest.(check (float 0.000001)) "WBTC balance" 0.1 wbtc_bal
 
-let test_usdc_skipped_in_asset_balances () =
-  (* USDC in account_all_assets is explicitly skipped to avoid zeroing out encumbered collateral *)
+let test_usdc_from_asset_balances () =
+  (* USDC is sourced directly from account_all_assets like any other asset *)
   let json = `Assoc [
     ("type", `String "update/account_all_assets");
     ("account_all", `Assoc [
       ("assets", `Assoc [
-        ("0", `Assoc [("symbol", `String "USDC"); ("balance", `String "9999.0")])
+        ("3", `Assoc [("symbol", `String "USDC"); ("balance", `String "9999.0")])
       ])
     ])
   ] in
 
   Lighter.Balances.process_market_data json;
   let usdc_after = Lighter.Balances.get_balance "USDC" in
-  Alcotest.(check (float 0.000001)) "USDC ignored" 0.0 usdc_after
-
-let test_process_user_stats_usdc () =
-  let json = `Assoc [
-    ("type", `String "subscribed/user_stats");
-    ("stats", `Assoc [
-      ("collateral", `String "1500.75")
-    ])
-  ] in
-
-  Lighter.Balances.process_market_data json;
-
-  let usdc_bal = Lighter.Balances.get_balance "USDC" in
-  Alcotest.(check (float 0.000001)) "USDC via user_stats" 1500.75 usdc_bal
+  Alcotest.(check (float 0.000001)) "USDC from asset_balances" 9999.0 usdc_after
 
 let test_get_all_balances () =
   (* After the above tests, we should have at least ETH, WBTC, USDC *)
@@ -77,8 +64,7 @@ let () =
     ];
     "processing", [
       Alcotest.test_case "process_asset_balances" `Quick test_process_asset_balances;
-      Alcotest.test_case "USDC skipped in asset_balances" `Quick test_usdc_skipped_in_asset_balances;
-      Alcotest.test_case "process_user_stats USDC" `Quick test_process_user_stats_usdc;
+      Alcotest.test_case "USDC from asset_balances" `Quick test_usdc_from_asset_balances;
       Alcotest.test_case "user_stats null stats" `Quick test_user_stats_null_stats;
     ];
     "aggregation", [

@@ -793,7 +793,10 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.async (fun () -> Hyperliquid.Module.fetch_spot_balances_ws ())
     end;
     if has_ibkr then Ibkr.Balances.initialize ();
-    if has_lighter then Lighter.Balances.initialize lighter_assets;
+    if has_lighter then begin
+      Lighter.Balances.initialize lighter_assets;
+      Lwt.async (fun () -> Lighter.Module.fetch_balances ())
+    end;
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
