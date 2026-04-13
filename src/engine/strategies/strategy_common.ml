@@ -342,14 +342,14 @@ module type S = sig
     (string * float * float * string * int option) list -> int -> unit
     
   val get_pending_orders : int -> strategy_order list
-  val handle_order_acknowledged : string -> string -> order_side -> float -> unit
-  val handle_order_rejected : string -> order_side -> float -> unit
-  val handle_order_cancelled : string -> string -> order_side -> string option -> unit
-  val handle_order_filled : string -> string -> order_side -> fill_price:float -> string option -> unit
-  val handle_order_amended : string -> string -> string -> order_side -> float -> unit
-  val handle_order_amendment_skipped : string -> string -> order_side -> float -> unit
-  val handle_order_amendment_failed : string -> string -> order_side -> string -> unit
-  val handle_order_failed : string -> order_side -> string -> unit
+  val handle_order_acknowledged : now:float -> string -> string -> order_side -> float -> unit
+  val handle_order_rejected : now:float -> string -> order_side -> float -> unit
+  val handle_order_cancelled : now:float -> string -> string -> order_side -> string option -> unit
+  val handle_order_filled : now:float -> string -> string -> order_side -> fill_price:float -> string option -> unit
+  val handle_order_amended : now:float -> string -> string -> string -> order_side -> float -> unit
+  val handle_order_amendment_skipped : now:float -> string -> string -> order_side -> float -> unit
+  val handle_order_amendment_failed : now:float -> string -> string -> order_side -> string -> unit
+  val handle_order_failed : now:float -> string -> order_side -> string -> unit
   val cleanup_pending_cancellation : string -> string -> unit
   val cleanup_strategy_state : string -> unit
   val init : unit -> unit

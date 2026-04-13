@@ -869,7 +869,7 @@ let generate_side_duplicate_key asset_symbol side =
 
 (** Handles a successful order placement acknowledgment.
     Removes matching pending entries and updates buy order tracking. *)
-let handle_order_acknowledged asset_symbol order_id side price =
+let handle_order_acknowledged ~now:_ asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -908,7 +908,7 @@ let handle_order_acknowledged asset_symbol order_id side price =
 
 (** Handles an order placement failure. Clears in-flight trackers and sets
     capital_low or asset_low flags when the exchange reports insufficient funds. *)
-let handle_order_failed asset_symbol side reason =
+let handle_order_failed ~now:_ asset_symbol side reason =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -958,7 +958,7 @@ let handle_order_failed asset_symbol side reason =
 
 (** Handles an order rejection. Removes pending entries and clears in-flight
     trackers to permit immediate re-placement on the next cycle. *)
-let handle_order_rejected asset_symbol side price =
+let handle_order_rejected ~now:_ asset_symbol side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -994,7 +994,7 @@ let order_or_client_matches tracked order_id cl_ord_id =
   tracked = order_id
   || match cl_ord_id with Some c -> tracked = c | None -> false
 
-let handle_order_filled asset_symbol order_id side ~fill_price:_ cl_ord_id =
+let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price:_ cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1029,7 +1029,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price:_ cl_ord_id =
 
 (** Handles an order cancellation. Distinguishes cancel-replace (amendment)
     from genuine cancellation. Applies cleanup accordingly. *)
-let handle_order_cancelled asset_symbol order_id side cl_ord_id =
+let handle_order_cancelled ~now asset_symbol order_id side cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1057,7 +1057,6 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
   end else begin
     (* Genuine cancellation: full cleanup *)
     (* Blacklist order ID to prevent re-addition during sync *)
-    let now = Unix.time () in
     state.cancelled_orders <-
       (order_id, now)
       :: (match cl_ord_id with
@@ -1108,7 +1107,7 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
 
 (** Handles a successful cancel-replace amendment. Swaps old order ID
     for new order ID in tracking. Blacklists old ID when IDs differ. *)
-let handle_order_amended asset_symbol old_order_id new_order_id side price =
+let handle_order_amended ~now asset_symbol old_order_id new_order_id side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1124,7 +1123,6 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
        in lagging data feeds (e.g., Hyperliquid webData2).
        Skipped when IDs are identical because Kraken amendments often reuse the original order ID. *)
     if old_order_id <> new_order_id then begin
-      let now = Unix.time () in
       state.cancelled_orders <- (old_order_id, now) :: state.cancelled_orders;
     end;
 
@@ -1159,7 +1157,7 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
 
 (** Handles a no-op amendment (price unchanged). Removes the pending
     amend entry to release the amendment guard. *)
-let handle_order_amendment_skipped asset_symbol order_id _ _ =
+let handle_order_amendment_skipped ~now:_ asset_symbol order_id _ _ =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1175,7 +1173,7 @@ let handle_order_amendment_skipped asset_symbol order_id _ _ =
 
 (** Handles an amendment failure. Clears tracking for the affected order
     and releases in-flight guards to permit recovery on the next cycle. *)
-let handle_order_amendment_failed asset_symbol order_id side reason =
+let handle_order_amendment_failed ~now asset_symbol order_id side reason =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1196,7 +1194,6 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
           | Some target_id when target_id = order_id ->
               state.last_buy_order_id <- None;
               state.last_buy_order_price <- None;
-              let now = Unix.time () in
               state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
               Logging.info_f ~section "Amendment failed for buy order %s: cleared tracking (%s)" order_id reason
           | _ -> ())
@@ -1204,7 +1201,6 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
          let original = List.length state.open_sell_orders in
          state.open_sell_orders <- List.filter (fun (sell_id, _, _) -> sell_id <> order_id) state.open_sell_orders;
          if List.length state.open_sell_orders < original then begin
-           let now = Unix.time () in
            state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
            Logging.info_f ~section "Amendment failed for sell order %s: cleared tracking (%s)" order_id reason
          end);

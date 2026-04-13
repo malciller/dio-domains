@@ -1388,7 +1388,7 @@ let order_processing_loop () =
                                   result.order_id;
                                 (match order.price with
                                  | Some price when order.exchange <> "lighter" ->
-                                     Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
+                                     Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged ~now:(Unix.gettimeofday ())
                                        order.symbol result.order_id order.side price
                                  | Some _ -> ()
                                  | None -> ());
@@ -1398,28 +1398,28 @@ let order_processing_loop () =
                                   (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty
                                   (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                   err;
-                                Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side err;
+                                Dio_strategies.Suicide_grid.Strategy.handle_order_failed ~now:(Unix.gettimeofday ()) order.symbol order.side err;
                                 (match order.price with
                                  | Some price ->
-                                     Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                                     Dio_strategies.Suicide_grid.Strategy.handle_order_rejected ~now:(Unix.gettimeofday ()) order.symbol order.side price
                                  | None -> ());
                                 Lwt.return_unit
                           ) (fun exn ->
                             Logging.error_f ~section "✗ Exception placing order %s %s: %s"
                               (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
-                            Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
+                            Dio_strategies.Suicide_grid.Strategy.handle_order_failed ~now:(Unix.gettimeofday ()) order.symbol order.side (Printexc.to_string exn);
                             (match order.price with
                              | Some price ->
-                                 Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                                 Dio_strategies.Suicide_grid.Strategy.handle_order_rejected ~now:(Unix.gettimeofday ()) order.symbol order.side price
                              | None -> ());
                             Lwt.return_unit
                           )
                         )
                       ) (fun err ->
-                        Dio_strategies.Suicide_grid.Strategy.handle_order_failed order.symbol order.side err;
+                        Dio_strategies.Suicide_grid.Strategy.handle_order_failed ~now:(Unix.gettimeofday ()) order.symbol order.side err;
                         (match order.price with
                          | Some price ->
-                             Dio_strategies.Suicide_grid.Strategy.handle_order_rejected order.symbol order.side price
+                             Dio_strategies.Suicide_grid.Strategy.handle_order_rejected ~now:(Unix.gettimeofday ()) order.symbol order.side price
                          | None -> ())
                       )
 
@@ -1453,7 +1453,7 @@ let order_processing_loop () =
 
                                          (match order.price with
                                           | Some price ->
-                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped
+                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped ~now:(Unix.gettimeofday ())
                                                 order.symbol target_order_id order.side price
                                           | None -> Logging.warn_f ~section "Amendment skipped but no price available for strategy update: %s" result.Dio_exchange.Exchange_intf.Types.new_order_id
                                          );
@@ -1467,7 +1467,7 @@ let order_processing_loop () =
                                            result.Dio_exchange.Exchange_intf.Types.new_order_id;
                                          (match order.price with
                                           | Some price ->
-                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amended
+                                              Dio_strategies.Suicide_grid.Strategy.handle_order_amended ~now:(Unix.gettimeofday ())
                                                 order.symbol target_order_id result.Dio_exchange.Exchange_intf.Types.new_order_id order.side price
                                           | None -> Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.Dio_exchange.Exchange_intf.Types.new_order_id
                                          );
@@ -1479,8 +1479,8 @@ let order_processing_loop () =
                                        (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                        err;
                                      (match order.strategy with
-                                      | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                                      | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                      | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
+                                      | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
                                       | Hedger -> ()
                                      );
                                      Lwt.return_unit
@@ -1488,8 +1488,8 @@ let order_processing_loop () =
                                  Logging.error_f ~section "✗ Exception amending order %s %s: %s"
                                    (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
                                  (match order.strategy with
-                                  | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
-                                  | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                  | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side (Printexc.to_string exn)
+                                  | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side (Printexc.to_string exn)
                                   | Hedger -> ()
                                  );
                                  Lwt.return_unit
@@ -1501,8 +1501,8 @@ let order_processing_loop () =
                         (match order.order_id with
                          | Some target_order_id ->
                              (match order.strategy with
-                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
+                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
                               | Hedger -> ()
                              )
                          | None -> ());
@@ -1618,29 +1618,29 @@ let order_processing_loop () =
                                (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market")
                                err;
                              (* Notify strategy to clean up pending/in-flight state *)
-                             Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side err;
+                             Dio_strategies.Market_maker.Strategy.handle_order_failed ~now:(Unix.gettimeofday ()) order.symbol order.side err;
                              (match order.price with
                               | Some price ->
-                                  Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
+                                  Dio_strategies.Market_maker.Strategy.handle_order_rejected ~now:(Unix.gettimeofday ()) order.symbol order.side price
                               | None -> ());
                              Lwt.return_unit
                        ) (fun exn ->
                          Logging.error_f ~section " Exception placing order %s %s: %s"
                            (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
                          (* Notify strategy to clean up pending/in-flight state *)
-                         Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side (Printexc.to_string exn);
+                         Dio_strategies.Market_maker.Strategy.handle_order_failed ~now:(Unix.gettimeofday ()) order.symbol order.side (Printexc.to_string exn);
                          (match order.price with
                           | Some price ->
-                              Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
+                              Dio_strategies.Market_maker.Strategy.handle_order_rejected ~now:(Unix.gettimeofday ()) order.symbol order.side price
                           | None -> ());
                          Lwt.return_unit
                        )
                      )
                      ) (fun err ->
-                        Dio_strategies.Market_maker.Strategy.handle_order_failed order.symbol order.side err;
+                        Dio_strategies.Market_maker.Strategy.handle_order_failed ~now:(Unix.gettimeofday ()) order.symbol order.side err;
                         (match order.price with
                          | Some price ->
-                             Dio_strategies.Market_maker.Strategy.handle_order_rejected order.symbol order.side price
+                             Dio_strategies.Market_maker.Strategy.handle_order_rejected ~now:(Unix.gettimeofday ()) order.symbol order.side price
                          | None -> ())
                       )
 
@@ -1673,8 +1673,8 @@ let order_processing_loop () =
                                         (match order.price with
                                          | Some price ->
                                              (match order.strategy with
-                                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
-                                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_skipped order.symbol target_order_id order.side price
+                                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side price
+                                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_skipped ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side price
                                               | Hedger -> ()
                                              )
                                          | None -> Logging.warn_f ~section "Amendment skipped but no price available for strategy update: %s" result.new_order_id
@@ -1686,8 +1686,8 @@ let order_processing_loop () =
                                         (match order.price with
                                          | Some price ->
                                              (match order.strategy with
-                                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
-                                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amended order.symbol target_order_id result.new_order_id order.side price
+                                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amended ~now:(Unix.gettimeofday ()) order.symbol target_order_id result.new_order_id order.side price
+                                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amended ~now:(Unix.gettimeofday ()) order.symbol target_order_id result.new_order_id order.side price
                                               | Hedger -> ()
                                              )
                                          | None -> Logging.warn_f ~section "Amendment acknowledged but no price available for strategy update: %s" result.new_order_id
@@ -1697,16 +1697,16 @@ let order_processing_loop () =
                                 | Error err ->
                                     Logging.error_f ~section "✗ Order amendment failed: %s %s %.8f @ %s - %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol order.qty (match order.price with Some p -> Printf.sprintf "%.2f" p | None -> "market") err;
                                     (match order.strategy with
-                                     | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                                     | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                                     | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
+                                     | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
                                      | Hedger -> ()
                                     );
                                     Lwt.return_unit
                               ) (fun exn ->
                                 Logging.error_f ~section "✗ Exception amending order %s %s: %s" (match order.side with Buy -> "buy" | Sell -> "sell") order.symbol (Printexc.to_string exn);
                                 (match order.strategy with
-                                 | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
-                                 | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side (Printexc.to_string exn)
+                                 | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side (Printexc.to_string exn)
+                                 | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side (Printexc.to_string exn)
                                  | Hedger -> ()
                                 );
                                 Lwt.return_unit
@@ -1718,8 +1718,8 @@ let order_processing_loop () =
                         (match order.order_id with
                          | Some target_order_id ->
                              (match order.strategy with
-                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
-                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed order.symbol target_order_id order.side err
+                              | Grid -> Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
+                              | MM -> Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed ~now:(Unix.gettimeofday ()) order.symbol target_order_id order.side err
                               | Hedger -> ()
                              )
                          | None -> ());

@@ -1322,7 +1322,7 @@ let flush_persistence asset_symbol =
 
 
 (** Handles order placement acknowledgment. Updates pending and tracking state. *)
-let handle_order_acknowledged asset_symbol order_id side price =
+let handle_order_acknowledged ~now asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1362,14 +1362,14 @@ let handle_order_acknowledged asset_symbol order_id side price =
     ()
    | Sell ->
     state.inflight_sell <- false;
-    state.recently_injected_sells <- (order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
+    state.recently_injected_sells <- (order_id, price, now) :: state.recently_injected_sells;
     ());
 
   ()
   )
 
 (** Handles order placement failure. Clears in-flight trackers so strategy can retry. *)
-let handle_order_failed asset_symbol side reason =
+let handle_order_failed ~now asset_symbol side reason =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1421,7 +1421,6 @@ let handle_order_failed asset_symbol side reason =
      | _ -> ());
 
     (* Apply timer cooldown for buy-side rate limits only; sell side uses asset_low flag. *)
-    let now = Unix.time () in
     (match side with
      | Buy ->
          Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. cooldown)
@@ -1432,7 +1431,7 @@ let handle_order_failed asset_symbol side reason =
   )
 
 (** Handles order rejection. Removes from pending and clears trackers for re-placement. *)
-let handle_order_rejected asset_symbol side price =
+let handle_order_rejected ~now:_ asset_symbol side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1484,7 +1483,7 @@ let buy_tracking_matches_exchange_event tracked order_id cl_ord_id =
   || match cl_ord_id with Some c -> tracked = c | None -> false
 
 (** Handles order fill. Fully clears tracking, pending amends, and computes profit. *)
-let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
+let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1645,7 +1644,7 @@ let handle_order_filled asset_symbol order_id side ~fill_price cl_ord_id =
   )
 
 (** Handles order cancellation. Removes from pending and tracked orders. *)
-let handle_order_cancelled asset_symbol order_id side cl_ord_id =
+let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1704,7 +1703,7 @@ let handle_order_cancelled asset_symbol order_id side cl_ord_id =
   )
 
 (** Handles cancel-replace order amendment. Swaps old ID for new ID in tracking. *)
-let handle_order_amended asset_symbol old_order_id new_order_id side price =
+let handle_order_amended ~now asset_symbol old_order_id new_order_id side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1748,14 +1747,13 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
            old_qty original_sell_count;
          state.open_sell_orders <- (new_order_id, price, old_qty) ::
             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
-         state.recently_injected_sells <- (new_order_id, price, Unix.gettimeofday ()) :: state.recently_injected_sells;
+         state.recently_injected_sells <- (new_order_id, price, now) :: state.recently_injected_sells;
          Logging.info_f ~section "SELL_AMEND [%s] result: sells_after=%d"
            asset_symbol (List.length state.open_sell_orders));
              
     (* Apply a short cooldown to prevent amending the newly amended order
        before the exchange's WebSocket open-orders cache catches up.
        Prevents race-condition duplicate amends on Hyperliquid. *)
-    let now = Unix.time () in
     (* In-place modify (same ID): short cooldown as re-amendment throttle.
        Cancel-replace (different IDs): longer cooldown to cover WS data lag. *)
     let cooldown = if old_order_id = new_order_id then 2.0 else 10.0 in
@@ -1773,7 +1771,7 @@ let handle_order_amended asset_symbol old_order_id new_order_id side price =
   )
 
 (** Handles skipped order amendment. Clears pending lock without swapping IDs. *)
-let handle_order_amendment_skipped asset_symbol order_id _ _ =
+let handle_order_amendment_skipped ~now:_ asset_symbol order_id _ _ =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1788,7 +1786,7 @@ let handle_order_amendment_skipped asset_symbol order_id _ _ =
   )
 
 (** Handles order amendment failure. Clears tracking so replacement can be placed. *)
-let handle_order_amendment_failed asset_symbol order_id side reason =
+let handle_order_amendment_failed ~now asset_symbol order_id side reason =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
@@ -1819,7 +1817,6 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     in
 
     (* Apply cooldown to prevent spamming failed amends. *)
-    let now = Unix.time () in
     Hashtbl.replace state.amend_cooldowns order_id (now +. cooldown_duration);
 
     (* If the order is definitively gone (canceled, filled, or margin error),
@@ -1829,7 +1826,7 @@ let handle_order_amendment_failed asset_symbol order_id side reason =
     if is_order_gone then begin
       (* Send explicit cancel in case the order is wedged in the exchange's cache. *)
       let cancel_order = create_cancel_order order_id asset_symbol Grid state.exchange_id in
-      ignore (push_order ~now:(Unix.time ()) ~state cancel_order);
+      ignore (push_order ~now ~state cancel_order);
 
       (* Mark cancel in flight so the sync block does not reinstall this order. *)
       if side = Buy then
