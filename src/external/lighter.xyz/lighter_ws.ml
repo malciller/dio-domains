@@ -225,13 +225,21 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
         Atomic.set private_stream_confirmed true;
       (try
         let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
-        let msg_type =
-          let open Yojson.Safe.Util in
-          try member "type" json |> to_string with _ -> ""
-        in
         let channel =
           let open Yojson.Safe.Util in
           try member "channel" json |> to_string with _ -> ""
+        in
+        let msg_type =
+          let raw_type =
+            let open Yojson.Safe.Util in
+            try member "type" json |> to_string with _ -> ""
+          in
+          if channel <> "" then
+            let ch_prefix = try String.sub channel 0 (String.index channel '/') with Not_found -> channel in
+            if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed" then
+              raw_type ^ "/" ^ ch_prefix
+            else raw_type
+          else raw_type
         in
 
         let market_index_from_channel ch =

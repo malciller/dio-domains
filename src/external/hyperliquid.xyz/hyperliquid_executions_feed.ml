@@ -611,7 +611,14 @@ let process_order_updates data_json =
             let cl_ord_id = member "cloid" order_obj |> to_string_option in
             
             let store = get_symbol_store symbol in
-            let now = Unix.gettimeofday () in
+            let action_time =
+              match member "timestamp" order_obj with
+              | `Int i -> float_of_int i /. 1000.0
+              | `Float f -> f /. 1000.0
+              | `String s -> (try float_of_string s /. 1000.0 with _ -> Unix.gettimeofday ())
+              | _ -> Unix.gettimeofday ()
+            in
+            let now = action_time in
             
             let order_status = match status with
               | "open" -> NewStatus

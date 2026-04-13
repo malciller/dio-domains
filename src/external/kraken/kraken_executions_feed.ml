@@ -627,6 +627,19 @@ let parse_int64_opt = Kraken_common_types.parse_int64_opt
 (** Parses an optional int from JSON. Delegates to Kraken_common_types. *)
 let parse_int_opt = Kraken_common_types.parse_int_opt
 
+(** Helper to parse UTC RFC3339 string to float timestamp. *)
+let parse_rfc3339_utc s =
+  try
+    Scanf.sscanf s "%d-%d-%dT%d:%d:%f" (fun y m d h min s ->
+      let tm = { Unix.tm_sec = int_of_float s; tm_min = min; tm_hour = h; 
+                 tm_mday = d; tm_mon = m - 1; tm_year = y - 1900; 
+                 tm_wday = 0; tm_yday = 0; tm_isdst = false } in
+      let time, _ = Unix.mktime tm in
+      let utc_time, _ = Unix.mktime (Unix.gmtime time) in
+      time -. (utc_time -. time) +. (s -. floor s)
+    )
+  with _ -> Unix.gettimeofday ()
+
 (** Parses an execution event from JSON. Handles both full and minimal (status-only) events by falling back to cached order data for missing fields. *)
 let parse_execution_event json =
   try
@@ -772,8 +785,15 @@ let parse_execution_event json =
                | None -> None)
         in
 
-        (* Use current wall-clock time as timestamp, avoiding full RFC3339 parsing. *)
-        let timestamp = Unix.gettimeofday () in
+        (* Extract accurate timestamp from payload instead of using wall-clock time *)
+        let timestamp =
+          match member "last_update_time" json |> to_string_option with
+          | Some s -> parse_rfc3339_utc s
+          | None ->
+              match member "timestamp" json |> to_string_option with
+              | Some s -> parse_rfc3339_utc s
+              | None -> Unix.gettimeofday ()
+        in
 
         (* Log when processing a minimal event (symbol resolved from cache). *)
         if symbol_opt = None then

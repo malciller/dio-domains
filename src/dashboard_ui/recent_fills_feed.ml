@@ -14,43 +14,47 @@ let initialized = ref false
 
 let render_fills w json =
   let engine_fills = json |?> "recent_fills" |> to_list_d in
-  if engine_fills = [] then I.empty
-  else
-    let () =
-      if not !initialized then begin
+  (* Merge engine fills into local_fills on every render cycle.
+     On startup, the engine seeds historical fills into the ring buffer
+     so engine_fills is non-empty from the first snapshot. New live fills
+     are detected by timestamp comparison and prepended. *)
+  let () =
+    if not !initialized then begin
+      if engine_fills <> [] then begin
         local_fills := [ List.hd engine_fills ];
         initialized := true
-      end else begin
-        let latest_ts = 
-          match !local_fills with
-          | [] -> 0.0
-          | f :: _ -> f |?> "timestamp" |> to_float_d 0.0
-        in
-        let new_fills = 
-          List.filter (fun f -> 
-            let ts = f |?> "timestamp" |> to_float_d 0.0 in
-            ts > latest_ts
-          ) engine_fills
-        in
-        if new_fills <> [] then begin
-          let combined = new_fills @ !local_fills in
-          let rec take n l acc =
-            if n <= 0 then List.rev acc
-            else match l with
-            | [] -> List.rev acc
-            | h :: t -> take (n - 1) t (h :: acc)
-          in
-          local_fills := take capacity combined []
-        end
       end
-    in
+    end else begin
+      let latest_ts =
+        match !local_fills with
+        | [] -> 0.0
+        | f :: _ -> f |?> "timestamp" |> to_float_d 0.0
+      in
+      let new_fills =
+        List.filter (fun f ->
+          let ts = f |?> "timestamp" |> to_float_d 0.0 in
+          ts > latest_ts
+        ) engine_fills
+      in
+      if new_fills <> [] then begin
+        let combined = new_fills @ !local_fills in
+        let rec take n l acc =
+          if n <= 0 then List.rev acc
+          else match l with
+          | [] -> List.rev acc
+          | h :: t -> take (n - 1) t (h :: acc)
+        in
+        local_fills := take capacity combined []
+      end
+    end
+  in
 
-    let fills = !local_fills in
-    if fills = [] then I.empty
-    else
+  let fills = !local_fills in
+  if fills = [] then I.empty
+  else
       (* Build the ticker string chunks grouped by fill *)
     let chunks = List.map (fun bal_json ->
-      let venue = bal_json |?> "venue" |> to_string_d "?" |> truncate_string 10 in
+      let venue = bal_json |?> "venue" |> to_string_d "?" in
       let symbol = bal_json |?> "symbol" |> to_string_d "?" in
       let side = bal_json |?> "side" |> to_string_d "?" |> String.uppercase_ascii in
       let amount = bal_json |?> "amount" |> to_float_d 0.0 in
@@ -67,7 +71,7 @@ let render_fills w json =
       in
 
       let side_attr = if side = "BUY" then A.(fg c_green ++ st bold) else A.(fg c_red ++ st bold) in
-      let sym_attr = exch_sym_attr venue in
+      let sym_attr = exch_sym_attr (String.lowercase_ascii venue) in
 
       let amount_str = if amount < 1.0 then Printf.sprintf "%.4g" amount else Printf.sprintf "%.2f" amount in
 
@@ -80,11 +84,12 @@ let render_fills w json =
       ]
     ) fills in
 
-    let separator = I.string A.(fg c_accent ++ bg c_bg) "  ◈  " in
+    let order_separator = I.string A.(fg c_dim ++ bg c_bg) "  •  " in
+    let wrap_separator = I.string A.(fg c_accent ++ bg c_bg) "  ◈  " in
     let ticker_line =
       List.fold_left (fun acc chunk ->
         if I.width acc = 0 then chunk
-        else I.hcat [acc; separator; chunk]
+        else I.hcat [acc; order_separator; chunk]
       ) I.empty chunks
     in
 
@@ -92,7 +97,7 @@ let render_fills w json =
     
     if line_w = 0 then I.empty
     else
-      let padded_ticker = I.hcat [ticker_line; separator] in
+      let padded_ticker = I.hcat [ticker_line; wrap_separator] in
       let padded_w = I.width padded_ticker in
 
       let now = Unix.gettimeofday () in
