@@ -917,6 +917,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         let%lwt () = (match !(Ibkr.Module.connection) with
          | Some old_conn ->
              Logging.info ~section "[ibkr_gateway] Disconnecting old connection before reconnect";
+             Ibkr.Module.connection := None;
              Ibkr.Connection.disconnect old_conn
          | None -> Lwt.return_unit) in
         Ibkr.Dispatcher.reset ();
@@ -936,18 +937,26 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Ibkr.Connection.start_reader conn
           ~on_message:Ibkr.Dispatcher.dispatch
           ~on_disconnect:(fun reason ->
-            set_state ibkr_conn_sup (Failed reason);
-            update_circuit_breaker ibkr_conn_sup false;
-            Lwt.async (fun () ->
-              Lwt.catch (fun () ->
-                Lwt.pause () >>= fun () ->
-                start_async ibkr_conn_sup;
-                Lwt.return_unit
-              ) (fun exn ->
-                Logging.warn_f ~section "[ibkr_gateway] Reconnect exception: %s" (Printexc.to_string exn);
-                Lwt.return_unit
+            let is_current = match !(Ibkr.Module.connection) with
+              | Some c -> c == conn
+              | None -> false
+            in
+            if not is_current then
+              Logging.debug_f ~section "[ibkr_gateway] Superseded connection closed: %s (ignoring reconnect)" reason
+            else begin
+              set_state ibkr_conn_sup (Failed reason);
+              update_circuit_breaker ibkr_conn_sup false;
+              Lwt.async (fun () ->
+                Lwt.catch (fun () ->
+                  Lwt.pause () >>= fun () ->
+                  start_async ibkr_conn_sup;
+                  Lwt.return_unit
+                ) (fun exn ->
+                  Logging.warn_f ~section "[ibkr_gateway] Reconnect exception: %s" (Printexc.to_string exn);
+                  Lwt.return_unit
+                )
               )
-            )
+            end
           );
         (* Do NOT set Connected yet — defer until contract resolution succeeds.
            Setting Connected here would reset reconnect_attempts to 0, defeating
