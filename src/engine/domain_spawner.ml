@@ -273,6 +273,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let base_balance_fn = Ex.get_balance_fast ~asset:base_asset in
       let quote_balance_fn = Ex.get_balance_fast ~asset:quote_currency in
       
+      (* Cached closures for latency-sensitive feed access in the hot loop *)
+      let get_ob_pos_fn = Ex.get_orderbook_position_fast ~symbol:asset_with_fees.symbol in
+      let get_tob_fn = Ex.get_top_of_book_fast ~symbol:asset_with_fees.symbol in
+      let get_exec_pos_fn = Ex.get_execution_feed_position_fast ~symbol:asset_with_fees.symbol in
+      let has_exec_fn = Ex.has_execution_data_fast ~symbol:asset_with_fees.symbol in
+      
       let last_buy_count = ref 0 in
       let last_sell_count = ref 0 in
 
@@ -307,11 +313,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         
         let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         (* === ORDERBOOK HOT PATH === *)
-        let ob_pos = Ex.get_orderbook_position ~symbol:asset_with_fees.symbol in
+        let ob_pos = get_ob_pos_fn () in
         let did_ob = ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) in
         if did_ob then begin
           orderbook_read_pos := ob_pos;
-          (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
+          (match get_tob_fn () with
            | Some (bid_price, bid_size, ask_price, ask_size) ->
                let changed = bid_price <> !tob_bid || ask_price <> !tob_ask in
                tob_bid := bid_price; tob_ask := ask_price;
@@ -324,7 +330,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if did_ob && latency_this_cycle then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
         
         (* Consume pending execution events from the ring buffer *)
-        let current_pos = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
+        let current_pos = get_exec_pos_fn () in
         let did_exec = current_pos <> !exec_read_pos in
         if did_exec then begin
           open_orders_dirty := true;
@@ -461,8 +467,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            arrived and the execution data is ready (snapshot ingested), open
            the gate so the strategy can place its initial order. *)
         if not !exec_ready && not !exec_checked
-           && Ex.has_execution_data ~symbol:asset_with_fees.symbol then begin
-          let current_pos_now = Ex.get_execution_feed_position ~symbol:asset_with_fees.symbol in
+           && has_exec_fn () then begin
+          let current_pos_now = get_exec_pos_fn () in
           if current_pos_now = !exec_read_pos then begin
             exec_checked := true;
             (* No exec events arrived and feed is ready: fetch snapshot orders 
@@ -507,7 +513,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
         (* Execute strategy if new events have been consumed and feed is ready (event-driven gate) *)
         let should_execute = !exec_ready && !should_execute_strategy && 
-                             Ex.has_execution_data ~symbol:asset_with_fees.symbol in
+                             has_exec_fn () in
         if should_execute then begin
           should_execute_strategy := false;  (* Clear event-driven trigger *)
 

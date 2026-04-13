@@ -255,6 +255,18 @@ module type S = sig
       Yields primitive order values to the provided closure callback directly. *)
   val iter_open_orders_fast : symbol:string -> (string -> float -> float -> string -> int option -> unit) -> unit
 
+  (** Return a fast path closure for fetching the current orderbook position without lock acquisition/hash lookup overhead. *)
+  val get_orderbook_position_fast : symbol:string -> (unit -> int)
+
+  (** Return a fast path closure for fetching top-of-book data without hash lookup overhead. *)
+  val get_top_of_book_fast : symbol:string -> (unit -> (float * float * float * float) option)
+
+  (** Return a fast path closure for fetching the current execution feed position without hash lookup overhead. *)
+  val get_execution_feed_position_fast : symbol:string -> (unit -> int)
+
+  (** Return a fast path closure for checking if the execution feed has initial data without hash lookup overhead. *)
+  val has_execution_data_fast : symbol:string -> (unit -> bool)
+
   (* ---- Instrument metadata ---- *)
 
   (** Return the minimum price increment (tick size) for [symbol],

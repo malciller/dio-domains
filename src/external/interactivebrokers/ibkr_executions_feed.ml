@@ -383,9 +383,17 @@ let[@inline always] get_current_position symbol =
   let store = get_symbol_store symbol in
   RingBuffer.get_position store.events_buffer
 
+let[@inline always] get_current_position_fast symbol =
+  let store = get_symbol_store symbol in
+  (fun () -> RingBuffer.get_position store.events_buffer)
+
 let[@inline always] has_execution_data symbol =
   let store = get_symbol_store symbol in
   Atomic.get store.ready
+
+let[@inline always] has_execution_data_fast symbol =
+  let store = get_symbol_store symbol in
+  (fun () -> Atomic.get store.ready)
 
 (** Iterates the shared registry and forcefully asserts the readiness constraint across all initialized symbol stores. This function is triggered by the openOrderEnd message, concluding the snapshot synchronization sequence. This logic averts initialization deadlocks initiated by the domain spawner waiting on inactive symbol executions. *)
 let mark_ready_all () =

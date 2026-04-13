@@ -270,6 +270,9 @@ module Hyperliquid_impl = struct
     | Some (bp, bs, ap, as_val) -> Some (bp, bs, ap, as_val)
     | None -> None
 
+  let get_top_of_book_fast ~symbol =
+    Hyperliquid_orderbook_feed.get_best_bid_ask_fast symbol
+
   let get_balance ~asset =
     Hyperliquid_balances.get_balance asset
 
@@ -343,9 +346,15 @@ module Hyperliquid_impl = struct
   let get_execution_feed_position ~symbol =
     Hyperliquid_executions_feed.get_current_position symbol
 
+  let get_execution_feed_position_fast ~symbol =
+    Hyperliquid_executions_feed.get_current_position_fast symbol
+
   (** Return [true] once the initial execution snapshot has been ingested for [symbol]. *)
   let has_execution_data ~symbol =
     Hyperliquid_executions_feed.has_execution_data symbol
+
+  let has_execution_data_fast ~symbol =
+    Hyperliquid_executions_feed.has_execution_data_fast symbol
 
   let read_execution_events ~symbol ~start_pos =
     let events = Hyperliquid_executions_feed.read_execution_events symbol start_pos in
@@ -384,6 +393,9 @@ module Hyperliquid_impl = struct
 
   let get_orderbook_position ~symbol =
     Hyperliquid_orderbook_feed.get_current_position symbol
+
+  let get_orderbook_position_fast ~symbol =
+    Hyperliquid_orderbook_feed.get_current_position_fast symbol
 
   let read_orderbook_events ~symbol ~start_pos =
     let events = Hyperliquid_orderbook_feed.read_orderbook_events symbol start_pos in

@@ -233,6 +233,9 @@ module Kraken_impl = struct
     | Some (bp, bs, ap, as_val) -> Some (bp, bs, ap, as_val)
     | None -> None
 
+  let get_top_of_book_fast ~symbol =
+    Kraken_orderbook_feed.get_best_bid_ask_fast symbol
+
   (** Return the current balance for [asset] from the balances feed cache. *)
   let get_balance ~asset =
     Kraken_balances_feed.get_balance asset
@@ -290,9 +293,15 @@ module Kraken_impl = struct
   let get_execution_feed_position ~symbol =
     Kraken_executions_feed.get_current_position symbol
 
+  let get_execution_feed_position_fast ~symbol =
+    Kraken_executions_feed.get_current_position_fast symbol
+
   (** Return [true] once the initial execution snapshot has been ingested for [symbol]. *)
   let has_execution_data ~symbol =
     Kraken_executions_feed.has_execution_data symbol
+
+  let has_execution_data_fast ~symbol =
+    Kraken_executions_feed.has_execution_data_fast symbol
 
   (** Read execution events from [start_pos] onward for [symbol].
       Derives [remaining_qty] from [order_qty - cum_qty] and coerces status
@@ -347,6 +356,9 @@ module Kraken_impl = struct
   (** Return the current ring-buffer position for orderbook events on [symbol]. *)
   let get_orderbook_position ~symbol =
     Kraken_orderbook_feed.get_current_position symbol
+
+  let get_orderbook_position_fast ~symbol =
+    Kraken_orderbook_feed.get_current_position_fast symbol
 
   (** Read orderbook snapshots from [start_pos] for [symbol]. Each snapshot's
       levels are converted from [Kraken_orderbook_feed.level] (with separate

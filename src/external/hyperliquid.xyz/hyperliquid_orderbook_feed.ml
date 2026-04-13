@@ -182,6 +182,17 @@ let[@inline always] get_best_bid_ask symbol =
       Some (bid.price, bid.size, ask.price, ask.size)
   | _ -> None
 
+let[@inline always] get_best_bid_ask_fast symbol =
+  let store = ensure_store symbol in
+  (fun () ->
+     match RingBuffer.read_latest store.buffer with
+     | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
+         let bid = bids.(0) in
+         let ask = asks.(0) in
+         Some (bid.price, bid.size, ask.price, ask.size)
+     | _ -> None
+  )
+
 (** Returns all orderbook snapshots written since [last_pos]. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
@@ -200,6 +211,10 @@ let[@inline always] get_current_position symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
+
+let[@inline always] get_current_position_fast symbol =
+  let store = ensure_store symbol in
+  (fun () -> RingBuffer.get_position store.buffer)
 
 let has_orderbook_data symbol =
   match Hashtbl.find_opt stores symbol with

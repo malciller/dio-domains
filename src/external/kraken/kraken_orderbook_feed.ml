@@ -647,6 +647,17 @@ let[@inline always] get_best_bid_ask symbol =
       Some (bid.price_float, bid.size_float, ask.price_float, ask.size_float)
   | _ -> None
 
+let[@inline always] get_best_bid_ask_fast symbol =
+  let store = ensure_store symbol in
+  (fun () ->
+     match RingBuffer.read_latest store.buffer with
+     | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
+         let bid = bids.(0) in
+         let ask = asks.(0) in
+         Some (bid.price_float, bid.size_float, ask.price_float, ask.size_float)
+     | _ -> None
+  )
+
 (** Read all orderbook snapshots written since [last_pos]. Returns an empty list if the symbol is unknown. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match store_opt symbol with
@@ -665,6 +676,10 @@ let[@inline always] get_current_position symbol =
   match store_opt symbol with
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
+
+let[@inline always] get_current_position_fast symbol =
+  let store = ensure_store symbol in
+  (fun () -> RingBuffer.get_position store.buffer)
 
 let get_top_levels ?(depth = orderbook_depth) symbol =
   match get_latest_orderbook symbol with
