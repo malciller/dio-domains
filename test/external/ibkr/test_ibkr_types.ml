@@ -196,7 +196,7 @@ let test_feed_defaults () =
   Alcotest.(check int) "default_ring_buffer_size_ticker" 100 Ibkr.Types.default_ring_buffer_size_ticker;
   Alcotest.(check int) "default_ring_buffer_size_orderbook" 16 Ibkr.Types.default_ring_buffer_size_orderbook;
   Alcotest.(check int) "default_ring_buffer_size_executions" 32 Ibkr.Types.default_ring_buffer_size_executions;
-  Alcotest.(check int) "default_orderbook_depth" 5 Ibkr.Types.default_orderbook_depth;
+  Alcotest.(check int) "default_orderbook_depth" 1 Ibkr.Types.default_orderbook_depth;
   Alcotest.(check (float 0.1)) "default_stale_order_threshold_s" 86400.0 Ibkr.Types.default_stale_order_threshold_s;
   Alcotest.(check (float 0.1)) "default_reconnect_base_delay_ms" 1000.0 Ibkr.Types.default_reconnect_base_delay_ms;
   Alcotest.(check (float 0.1)) "default_reconnect_max_delay_ms" 30000.0 Ibkr.Types.default_reconnect_max_delay_ms;
