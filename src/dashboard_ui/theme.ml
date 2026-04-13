@@ -149,7 +149,7 @@ let render_progress_bar w ratio attr =
   let fill_w = int_of_float (float (max 0 (w - 2)) *. ratio) in
   let fill_w = max 0 (min (w - 2) fill_w) in
   let empty_w = w - 2 - fill_w in
-  let fill_str = String.concat "" (List.init fill_w (fun _ -> "█")) in
+  let fill_str = String.concat "" (List.init fill_w (fun _ -> "⣿")) in
   let empty_str = String.concat "" (List.init empty_w (fun _ -> "─")) in
   I.hcat [
     I.string a_border "[";
@@ -158,7 +158,7 @@ let render_progress_bar w ratio attr =
     I.string a_border "]";
   ]
 
-let block_chars = [| " "; "▂"; "▃"; "▄"; "▅"; "▆"; "▇"; "█" |]
+let block_chars = [| "⠀"; "⣀"; "⣄"; "⣤"; "⣦"; "⣶"; "⣷"; "⣿" |]
 
 let render_sparkline w data max_val attr =
   let len = Array.length data in

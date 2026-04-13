@@ -92,15 +92,29 @@ let fetch_value ?(fallback = 50.0) () =
   | Some v -> v
   | None -> set_cached fallback
 
+let fetch_requested = Atomic.make false
+let worker_started = Atomic.make false
+
 let force_fetch_async ?(fallback = 50.0) () =
-  ignore (Thread.create (fun () ->
-    try
-      Lwt_preemptive.run_in_main (fun () ->
-        fetch_value_lwt ~fallback () >>= fun _ -> Lwt.return_unit
-      )
-    with exn ->
-      Logging.error_f ~section "Exception in async fetch fear-and-greed: %s" (Printexc.to_string exn)
-  ) ())
+  if not (Atomic.get worker_started) then begin
+    (* Atomically ensure only one thread starts *)
+    if Atomic.compare_and_set worker_started false true then begin
+      ignore (Thread.create (fun () ->
+        while true do
+          if Atomic.exchange fetch_requested false then begin
+            try
+              Lwt_preemptive.run_in_main (fun () ->
+                fetch_value_lwt ~fallback () >>= fun _ -> Lwt.return_unit
+              )
+            with exn ->
+              Logging.error_f ~section "Exception in async fetch fear-and-greed: %s" (Printexc.to_string exn)
+          end;
+          Unix.sleepf 1.0
+        done
+      ) ())
+    end
+  end;
+  Atomic.set fetch_requested true
 
 (* Linearly interpolates a grid value within [min_val, max_val] based on fear_and_greed clamped to [0, 100]. *)
 let grid_value_for_fng ~grid_interval:(min_val, max_val) ~fear_and_greed =

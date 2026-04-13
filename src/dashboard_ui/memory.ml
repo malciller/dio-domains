@@ -5,7 +5,7 @@ let pressure_max_len = 240
 let pressure_hist = Array.make pressure_max_len 0.0
 let pressure_hist_idx = ref 0
 let pressure_last_time = ref 0.0
-let pressure_blocks = [| " "; " "; "▂"; "▃"; "▄"; "▅"; "▆"; "▇"; "█" |]
+let pressure_blocks = [| "⠀"; "⡀"; "⣀"; "⣄"; "⣤"; "⣦"; "⣶"; "⣷"; "⣿" |]
 
 let render_memory w json =
   let mem = json |?> "memory" in
