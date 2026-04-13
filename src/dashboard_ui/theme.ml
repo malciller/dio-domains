@@ -160,7 +160,7 @@ let render_progress_bar w ratio attr =
 
 let block_chars = [| "⠀"; "⣀"; "⣄"; "⣤"; "⣦"; "⣶"; "⣷"; "⣿" |]
 
-let render_sparkline w data max_val attr =
+let render_sparkline w data max_val attr_fn =
   let len = Array.length data in
   let start_idx = max 0 (len - w) in
   let visible_len = min w len in
@@ -171,7 +171,7 @@ let render_sparkline w data max_val attr =
     let ratio = max 0.0 (min 1.0 ratio) in
     let block_idx = int_of_float (ratio *. 7.0) in
     let block_idx = max 0 (min 7 block_idx) in
-    I.string attr block_chars.(block_idx)
+    I.string (attr_fn v) block_chars.(block_idx)
   ) in
   I.hcat (I.string a_dim (String.make empty_w ' ') :: blocks)
 

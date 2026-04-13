@@ -71,7 +71,10 @@ let render_latencies w json =
     (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
     let header_row1 = I.hcat (
       [ I.string a_border " │  ";
-        col 16 a_label "" ]
+        col 16 a_label "";
+        I.string a_border " │ ";
+        col 15 a_label "     TREND     ";
+        I.string a_border " │ " ]
       @ List.mapi (fun i lbl ->
           let len = String.length lbl in
           let pad = (27 - len) / 2 in
@@ -79,16 +82,17 @@ let render_latencies w json =
           let img = col 27 a_label s in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
-      @ [ I.string a_border " │ "; col 15 a_label "     TREND     " ]
     ) in
     let header_row2 = I.hcat (
       [ I.string a_border " │  ";
-        col 16 a_label "DOMAIN" ]
+        col 16 a_label "DOMAIN";
+        I.string a_border " │ ";
+        col 15 a_label "  (CYCLE P99)  ";
+        I.string a_border " │ " ]
       @ List.mapi (fun i _lbl ->
           let img = I.hcat [ col 9 a_dim "p50"; col 9 a_dim "p99"; col 9 a_dim "p999" ] in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
-      @ [ I.string a_border " │ "; col 15 a_label "  (CYCLE P99)  " ]
     ) in
     let header = I.vcat [close_row w header_row1; close_row w header_row2] in
     let rows = List.map (fun (symbol, metrics) ->
@@ -129,7 +133,7 @@ let render_latencies w json =
       
       let (_, cycle_p99, _, _) = find_metric "cycle" in
       let c_arr = update_cycle_hist symbol cycle_p99 in
-      let trend_spark = render_sparkline 15 c_arr 100.0 (attr_of_sev (severity "cycle" cycle_p99 1)) in
+      let trend_spark = render_sparkline 15 c_arr 100.0 (fun v -> attr_of_sev (severity "cycle" v 1)) in
       
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
@@ -137,9 +141,11 @@ let render_latencies w json =
         [ I.string a_border " │  ";
           I.string dot_attr "●";
           I.string a_text " ";
-          col 14 sym_attr (truncate_string 13 symbol) ]
+          col 14 sym_attr (truncate_string 13 symbol);
+          I.string a_border " │ ";
+          trend_spark;
+          I.string a_border " │ " ]
         @ metric_cells
-        @ [ I.string a_border " │ "; trend_spark ]
       ))
     ) active_lats in
     let title = section_title w "PERFORMANCE" in
