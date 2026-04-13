@@ -180,7 +180,7 @@ let resolve_symbol coin =
   res
 
 (** Returns the coin identifier expected by Hyperliquid WebSocket channels
-    (l2Book, allMids). Perpetuals use the base coin name; spot pairs use
+    (l2Book). Perpetuals use the base coin name; spot pairs use
     the "@N" format derived from asset_index. *)
 let get_subscription_coin symbol =
   Mutex.lock cache_mutex;

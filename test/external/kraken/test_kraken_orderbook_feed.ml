@@ -41,8 +41,8 @@ let test_is_effectively_zero () =
 
 let test_orderbook_structure () =
   (* Test orderbook record structure *)
-  let empty_bids = Array.make 25 { Kraken.Kraken_orderbook_feed.price = "0"; size = "0"; price_float = 0.0; size_float = 0.0 } in
-  let empty_asks = Array.make 25 { Kraken.Kraken_orderbook_feed.price = "0"; size = "0"; price_float = 0.0; size_float = 0.0 } in
+  let empty_bids = Array.make 25 { Kraken.Kraken_orderbook_feed.price = "0"; size = "0"; price_float = 0.0; size_float = 0.0; crc_price = "0"; crc_size = "0" } in
+  let empty_asks = Array.make 25 { Kraken.Kraken_orderbook_feed.price = "0"; size = "0"; price_float = 0.0; size_float = 0.0; crc_price = "0"; crc_size = "0" } in
 
   let test_book = {
     Kraken.Kraken_orderbook_feed.symbol = "BTC/USD";
@@ -67,6 +67,8 @@ let test_level_structure () =
     size = "1.234567";
     price_float = 45000.50;
     size_float = 1.234567;
+    crc_price = "45000.50";
+    crc_size = "1.234567";
   } in
 
   Alcotest.(check string) "level price" "45000.50" test_level.price;
