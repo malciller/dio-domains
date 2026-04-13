@@ -44,8 +44,7 @@ type trading_config = {
 }
 
 (** Global order ring buffer shared across all strategy domains. *)
-let order_buffer = OrderRingBuffer.create 2048
-let order_buffer_mutex = Mutex.create ()
+let order_buffer = Strategy_common.LockFreeQueue.create ()
 
 (** Accessor for the shared order ring buffer. *)
 let get_order_buffer () = order_buffer
@@ -267,9 +266,7 @@ let push_order ?(now = Unix.time ()) order =
               false
             end else begin
               (* Non-duplicate cancel; write to ring buffer *)
-              Mutex.lock order_buffer_mutex;
-              let write_result = OrderRingBuffer.write order_buffer order in
-              Mutex.unlock order_buffer_mutex;
+              let write_result = Strategy_common.LockFreeQueue.write order_buffer order in
 
               match write_result with
               | Some () ->
@@ -301,9 +298,7 @@ let push_order ?(now = Unix.time ()) order =
          false
        end else begin
          (* Write Place or Amend to ring buffer *)
-         Mutex.lock order_buffer_mutex;
-         let write_result = OrderRingBuffer.write order_buffer order in
-         Mutex.unlock order_buffer_mutex;
+         let write_result = Strategy_common.LockFreeQueue.write order_buffer order in
 
        match write_result with
        | Some () ->
@@ -1231,23 +1226,7 @@ let cleanup_pending_cancellation asset_symbol order_id =
 
 (** Drains up to [max_orders] from the ring buffer, returning them in FIFO order. *)
 let get_pending_orders max_orders =
-  Mutex.lock order_buffer_mutex;
-  let orders =
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock order_buffer_mutex)
-      (fun () ->
-         let orders = ref [] in
-         let count = ref 0 in
-         while !count < max_orders do
-           match OrderRingBuffer.read order_buffer with
-           | Some order ->
-               orders := order :: !orders;
-               incr count
-           | None -> count := max_orders  (* exit loop *)
-         done;
-         List.rev !orders)
-  in
-  orders
+  Strategy_common.LockFreeQueue.read_batch order_buffer max_orders
 
 (** Initializes the MM strategy module: fee cache and PRNG. *)
 let init () =

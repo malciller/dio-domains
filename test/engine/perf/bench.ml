@@ -34,18 +34,18 @@ let print_results results =
 
 (* ── benchmarks ───────────────────────────────────────────────────────────── *)
 
-let bench_ringbuffer () =
-  let name = "ringbuffer_write_read" in
+let bench_lockfreequeue () =
+  let name = "lockfreequeue_write_read" in
   let n    = 10_000 in
-  let buf  = SC.OrderRingBuffer.create 16 in
+  let buf  = SC.LockFreeQueue.create () in
   let order =
     SG.create_place_order "BTC/USD|buy|grid" "BTC/USD" SC.Buy 0.001 (Some 50000.0) true SC.Grid "kraken"
   in
   let p = LP.create ~max_latency_us:100_000 name in
   let total_ms = wall_ms (fun () ->
     run_bench p n (fun () ->
-      let _ = SC.OrderRingBuffer.write buf order in
-      let _ = SC.OrderRingBuffer.read  buf       in
+      let _ = SC.LockFreeQueue.write buf order in
+      let _ = SC.LockFreeQueue.read  buf       in
       ()
     )
   ) in
@@ -230,7 +230,7 @@ let () =
   FC.init ();
 
   let results = [
-    bench_ringbuffer          ();
+    bench_lockfreequeue       ();
     bench_inflight_orders     ();
     bench_inflight_amendments ();
     bench_fee_cache           ();

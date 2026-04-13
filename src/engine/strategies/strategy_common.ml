@@ -4,6 +4,8 @@
 
 open Lwt.Infix
 
+module StringMap = Map.Make(String)
+
 (** Integer userref tags for per-strategy order grouping on the exchange. *)
 let strategy_userref_grid = 1  (* grid strategy *)
 let strategy_userref_mm = 2    (* market maker strategy *)
@@ -71,37 +73,34 @@ let generate_duplicate_key symbol side quantity limit_price =
 
 (** In-flight order cache for deduplication of pending place/cancel requests. *)
 module InFlightOrders = struct
-  (* duplicate_key -> insertion timestamp *)
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 16
-  let mutex = Mutex.create ()
+  let registry = Atomic.make StringMap.empty
 
   (** Atomically insert [duplicate_key] if absent. Returns true on insertion,
       false if the key was already present. *)
-  let add_in_flight_order duplicate_key =
-    Mutex.lock mutex;
-    match Hashtbl.mem registry duplicate_key with
-    | true ->
-        Mutex.unlock mutex;
-        false (* already tracked *)
-    | false ->
-        Hashtbl.add registry duplicate_key (Unix.gettimeofday ());
-        Mutex.unlock mutex;
-        true (* newly inserted *)
+  let rec add_in_flight_order duplicate_key =
+    let map = Atomic.get registry in
+    if StringMap.mem duplicate_key map then
+      false
+    else
+      let new_map = StringMap.add duplicate_key (Unix.gettimeofday ()) map in
+      if Atomic.compare_and_set registry map new_map then
+        true
+      else add_in_flight_order duplicate_key
 
   (** Remove [duplicate_key] from the cache. Returns true if it was present. *)
-  let remove_in_flight_order duplicate_key =
-    Mutex.lock mutex;
-    let existed = Hashtbl.mem registry duplicate_key in
-    if existed then Hashtbl.remove registry duplicate_key;
-    Mutex.unlock mutex;
-    existed
+  let rec remove_in_flight_order duplicate_key =
+    let map = Atomic.get registry in
+    if not (StringMap.mem duplicate_key map) then
+      false
+    else
+      let new_map = StringMap.remove duplicate_key map in
+      if Atomic.compare_and_set registry map new_map then
+        true
+      else remove_in_flight_order duplicate_key
 
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
-    Mutex.lock mutex;
-    let size = Hashtbl.length registry in
-    Mutex.unlock mutex;
-    size
+    StringMap.cardinal (Atomic.get registry)
 
   let last_cleanup = Atomic.make 0.0
 
@@ -110,20 +109,16 @@ module InFlightOrders = struct
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
     if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now then begin
-      Mutex.lock mutex;
-      let removed = ref 0 in
-
-      (* In-place scan; safe under mutex *)
-      Hashtbl.filter_map_inplace (fun _key timestamp ->
-        if now -. timestamp > max_age then begin
-          incr removed;
-          None
-        end else
-          Some timestamp
-      ) registry;
-
-      Mutex.unlock mutex;
-      (0, !removed)
+      let rec modify_map () =
+        let map = Atomic.get registry in
+        let new_map = StringMap.filter (fun _key timestamp -> now -. timestamp <= max_age) map in
+        let trimmed = StringMap.cardinal map - StringMap.cardinal new_map in
+        if Atomic.compare_and_set registry map new_map then
+          (0, trimmed)
+        else
+          modify_map ()
+      in
+      modify_map ()
     end else
       (0, 0)
 
@@ -136,44 +131,38 @@ end
 
 (** In-flight amendment cache for deduplication of pending amend requests. *)
 module InFlightAmendments = struct
-  (* order_id -> insertion timestamp *)
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 16
-  let mutex = Mutex.create ()
+  let registry = Atomic.make StringMap.empty
 
   (** Atomically insert [order_id] if absent. Returns true on insertion,
       false if already tracked. *)
-  let add_in_flight_amendment order_id =
-    Mutex.lock mutex;
-    match Hashtbl.mem registry order_id with
-    | true ->
-        Mutex.unlock mutex;
-        false (* already tracked *)
-    | false ->
-        Hashtbl.add registry order_id (Unix.gettimeofday ());
-        Mutex.unlock mutex;
-        true (* newly inserted *)
+  let rec add_in_flight_amendment order_id =
+    let map = Atomic.get registry in
+    if StringMap.mem order_id map then
+      false
+    else
+      let new_map = StringMap.add order_id (Unix.gettimeofday ()) map in
+      if Atomic.compare_and_set registry map new_map then
+        true
+      else add_in_flight_amendment order_id
 
   (** Returns true if [order_id] has a pending amendment. *)
   let is_in_flight order_id =
-    Mutex.lock mutex;
-    let exists = Hashtbl.mem registry order_id in
-    Mutex.unlock mutex;
-    exists
+    StringMap.mem order_id (Atomic.get registry)
 
   (** Remove [order_id] from the cache. Returns true if it was present. *)
-  let remove_in_flight_amendment order_id =
-    Mutex.lock mutex;
-    let existed = Hashtbl.mem registry order_id in
-    if existed then Hashtbl.remove registry order_id;
-    Mutex.unlock mutex;
-    existed
+  let rec remove_in_flight_amendment order_id =
+    let map = Atomic.get registry in
+    if not (StringMap.mem order_id map) then
+      false
+    else
+      let new_map = StringMap.remove order_id map in
+      if Atomic.compare_and_set registry map new_map then
+        true
+      else remove_in_flight_amendment order_id
 
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
-    Mutex.lock mutex;
-    let size = Hashtbl.length registry in
-    Mutex.unlock mutex;
-    size
+    StringMap.cardinal (Atomic.get registry)
 
   let last_cleanup = Atomic.make 0.0
 
@@ -182,20 +171,16 @@ module InFlightAmendments = struct
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
     if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now then begin
-      Mutex.lock mutex;
-      let removed = ref 0 in
-
-      (* In-place scan; safe under mutex *)
-      Hashtbl.filter_map_inplace (fun _key timestamp ->
-        if now -. timestamp > max_age then begin
-          incr removed;
-          None
-        end else
-          Some timestamp
-      ) registry;
-
-      Mutex.unlock mutex;
-      (0, !removed)
+      let rec modify_map () =
+        let map = Atomic.get registry in
+        let new_map = StringMap.filter (fun _key timestamp -> now -. timestamp <= max_age) map in
+        let trimmed = StringMap.cardinal map - StringMap.cardinal new_map in
+        if Atomic.compare_and_set registry map new_map then
+          (0, trimmed)
+        else
+          modify_map ()
+      in
+      modify_map ()
     end else
       (0, 0)
 
@@ -206,63 +191,92 @@ module InFlightAmendments = struct
       Some (Some drift, Some trimmed)
 end
 
-(** Fixed-capacity ring buffer for queuing strategy orders.
-    Not thread-safe; callers must hold [order_buffer_mutex]. *)
-module OrderRingBuffer = struct
+(** Unbounded lock-free workflow queue using Michael-Scott Queue architecture.
+    Completely replaces OrderRingBuffer, eliminating cross-domain pipeline mutex contention. *)
+module LockFreeQueue = struct
+  type 'a node =
+    | Nil
+    | Node of 'a option * 'a node Atomic.t
+
   type 'a t = {
-    data: 'a option array;
-    mutable write_pos: int;  (* next write index *)
-    mutable read_pos: int;   (* next read index *)
-    size: int;               (* capacity of the backing array *)
+    head: 'a node Atomic.t;
+    tail: 'a node Atomic.t;
   }
 
-  let create size =
-    {
-      data = Array.make size None;
-      write_pos = 0;
-      read_pos = 0;
-      size;
-    }
+  let create () =
+    let dummy = Node (None, Atomic.make Nil) in
+    { head = Atomic.make dummy; tail = Atomic.make dummy }
 
-  (** Enqueue [value]. Returns [Some ()] on success, [None] if the buffer is full. *)
-  let write buffer value =
-    let pos = buffer.write_pos in
-    let next_pos = (pos + 1) mod buffer.size in
-    if next_pos = buffer.read_pos then
-      None  (* buffer full *)
-    else begin
-      buffer.data.(pos) <- Some value;
-      buffer.write_pos <- next_pos;
-      Some ()
-    end
+  (** Concurrent enqueue mapping to former write semantics. *)
+  let write q v =
+    let new_node = Node (Some v, Atomic.make Nil) in
+    let rec loop () =
+      let tail_node = Atomic.get q.tail in
+      match tail_node with
+      | Nil -> assert false
+      | Node (_, next) ->
+          let next_node = Atomic.get next in
+          if tail_node == Atomic.get q.tail then begin
+            match next_node with
+            | Nil ->
+                if Atomic.compare_and_set next Nil new_node then begin
+                  ignore (Atomic.compare_and_set q.tail tail_node new_node);
+                  Some ()
+                end else
+                  loop ()
+            | Node _ ->
+                ignore (Atomic.compare_and_set q.tail tail_node next_node);
+                loop ()
+          end else
+            loop ()
+    in loop ()
 
-  (** Dequeue the next item. Returns [None] if the buffer is empty. *)
-  let read buffer =
-    if buffer.read_pos = buffer.write_pos then
-      None  (* empty *)
-    else
-      match buffer.data.(buffer.read_pos) with
-      | Some value ->
-          buffer.data.(buffer.read_pos) <- None;
-          buffer.read_pos <- (buffer.read_pos + 1) mod buffer.size;
-          Some value
-      | None -> None  (* invariant violation: slot should not be None *)
+  (** Concurrent dequeue mapping to former read semantics. *)
+  let read q =
+    let rec loop () =
+      let head_node = Atomic.get q.head in
+      let tail_node = Atomic.get q.tail in
+      match head_node with
+      | Nil -> assert false
+      | Node (_, next) ->
+          let next_node = Atomic.get next in
+          if head_node == Atomic.get q.head then begin
+            if head_node == tail_node then begin
+              match next_node with
+              | Nil -> None
+              | Node _ ->
+                  ignore (Atomic.compare_and_set q.tail tail_node next_node);
+                  loop ()
+            end else begin
+              match next_node with
+              | Nil -> assert false
+              | Node (v_opt, _) ->
+                  if Atomic.compare_and_set q.head head_node next_node then
+                    v_opt
+                  else
+                    loop ()
+            end
+          end else
+            loop ()
+    in loop ()
 
-  (** Return the number of items currently queued. *)
-  let size buffer =
-    if buffer.write_pos >= buffer.read_pos then
-      buffer.write_pos - buffer.read_pos
-    else
-      buffer.size - buffer.read_pos + buffer.write_pos
+  (** Costly size counting proxy - don't use on hot loops. *)
+  let size q =
+    let rec count n node =
+      match node with
+      | Nil -> n
+      | Node (_, next) -> count (n + 1) (Atomic.get next)
+    in
+    match Atomic.get q.head with
+    | Nil -> 0
+    | Node (_, next) -> count 0 (Atomic.get next)
 
-  (** Dequeue up to [max_items] entries, returned in FIFO order. *)
-  let read_batch buffer max_items =
+  let read_batch q max_items =
     let rec read_n acc n =
       if n >= max_items then List.rev acc
-      else
-        match read buffer with
-        | Some item -> read_n (item :: acc) (n + 1)
-        | None -> List.rev acc
+      else match read q with
+      | Some item -> read_n (item :: acc) (n + 1)
+      | None -> List.rev acc
     in
     read_n [] 0
 end
