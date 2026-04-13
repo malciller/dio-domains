@@ -125,10 +125,10 @@ let render_strategies w json =
       if bid <= 0.0 || ask <= 0.0 then a_dim
       else
         let bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
-        if bps < 5.0 then a_green
-        else if bps < 20.0 then a_cyan
-        else if bps < 50.0 then a_yellow
-        else a_red
+        if bps < 5.0 then a_bps_tight
+        else if bps < 20.0 then a_bps_norm
+        else if bps < 50.0 then a_bps_wide
+        else a_bps_xtrm
     in
 
     (* Format buy distance with proximity-based color *)
@@ -350,13 +350,22 @@ let render_strategies w json =
         else "⏹", a_red
       in
       let spread_str = format_spread_bps bid ask in
+      let spread_attr =
+        if bid <= 0.0 || ask <= 0.0 then a_dim
+        else
+          let bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
+          if bps < 5.0 then a_bps_tight
+          else if bps < 20.0 then a_bps_norm
+          else if bps < 50.0 then a_bps_wide
+          else a_bps_xtrm
+      in
       let img = I.hcat [
         I.string a_border " │  ";
         col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
         col 5 a_dim "--";
         I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
         col 12 a_text (if mid > 0.0 then format_price mid else "--");
-        col 8 a_dim spread_str;
+        col 8 spread_attr spread_str;
         I.string a_border " │ ";
         col 12 a_text (format_qty balance);
         col 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
