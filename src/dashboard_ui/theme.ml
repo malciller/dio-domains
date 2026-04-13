@@ -186,8 +186,9 @@ let color_blend (r1, g1, b1) (r2, g2, b2) ratio =
 
 let section_title w label =
   let lbl = " ╭── " ^ label ^ " " in
-  let len = String.length lbl in
-  let pad_count = max 0 (w - len) in
+  let lbl_img = I.string A.(fg c_title ++ bg c_bg ++ st bold) lbl in
+  let len = I.width lbl_img in
+  let pad_count = max 0 (w - len - 1) in
   
   (* Extract direct RGB values for the gradient *)
   let left_rgb = (187, 154, 247) (* c_accent *) in
@@ -201,7 +202,14 @@ let section_title w label =
     I.string A.(fg c ++ bg c_bg) "─"
   ) in
   
+  let end_border = I.string A.(fg c_border ++ bg c_bg) "╮" in
+  
   I.hcat (
-    I.string A.(fg c_title ++ bg c_bg ++ st bold) lbl ::
-    gradient_lines
+    lbl_img ::
+    gradient_lines @ [end_border]
   )
+
+let close_row target_w img =
+  let d = target_w - I.width img - 2 in
+  let d = max 0 d in
+  I.hcat [ img; I.void d 1; I.string A.(fg c_border ++ bg c_bg) " │" ]

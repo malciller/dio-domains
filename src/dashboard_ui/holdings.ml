@@ -5,7 +5,7 @@ let render_strategies w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
   let all_balances = json |?> "all_balances" |> to_list_d in
   (* Column header row *)
-  let header = I.hcat [
+  let header = close_row w (I.hcat [
     I.string a_border " │  ";
     col 16 a_label "SYMBOL";
     col 5 a_label "STGY";
@@ -25,7 +25,7 @@ let render_strategies w json =
     col 12 a_label "SELL @";
     col 6 a_label "SELLS";
     col 12 a_label "SELL VAL";
-  ] in
+  ]) in
 
   (* Build one row per strategy *)
   let strategy_rows = List.map (fun (symbol, data) ->
@@ -204,7 +204,7 @@ let render_strategies w json =
       let bg_color = if near_buy then c_near_fill else if near_sell then c_near_sell else c_bg in
       A.(fg c_border ++ bg bg_color)
     in
-    I.hcat [
+    close_row w (I.hcat [
       I.string border_attr " │  ";
       col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
       col 5 a_cyan (truncate_string 4 stype);
@@ -229,7 +229,7 @@ let render_strategies w json =
         (string_of_int sell_count);
       col 12 (if unrealized_profit >= 0.0 then a_green else a_red)
         (format_pnl unrealized_profit);
-    ]
+    ])
   ) strats in
 
   (* Partition strategies into active and paused groups *)
@@ -359,7 +359,7 @@ let render_strategies w json =
           else if bps < 50.0 then a_bps_wide
           else a_bps_xtrm
       in
-      let img = I.hcat [
+      let img = close_row w (I.hcat [
         I.string a_border " │  ";
         col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
         col 5 a_dim "--";
@@ -382,7 +382,7 @@ let render_strategies w json =
         col 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green
                 else if unrealized_profit > 0.0 then a_dim else a_dim)
           (if sell_count > 0 then format_pnl unrealized_profit else "--");
-      ] in
+      ]) in
       Some (is_quote, img)
     end
   ) all_balances in
@@ -459,12 +459,14 @@ let render_strategies w json =
   (* Visual separator between strategy rows and non-strategy rows *)
   let thin_sep label =
     let lbl = "  ── " ^ label ^ " " in
-    let pad_count = max 0 (w - String.length lbl) in
+    let lbl_img = I.string A.(fg c_border ++ bg c_bg) lbl in
+    let pad_count = max 0 (w - I.width lbl_img - 1) in
     let pad_buf = Buffer.create (pad_count * 3) in
     for _ = 1 to pad_count do Buffer.add_string pad_buf "─" done;
     I.hcat [
-      I.string A.(fg c_border ++ bg c_bg) lbl;
+      lbl_img;
       I.string A.(fg c_border ++ bg c_bg) (Buffer.contents pad_buf);
+      I.string A.(fg c_border ++ bg c_bg) "│"
     ]
   in
   let has_inactive = inactive_rows <> [] in
@@ -489,7 +491,7 @@ let render_strategies w json =
       I.string vattr value_s;
     ]
   in
-  let summary_bar = I.hcat [
+  let summary_bar = close_row w (I.hcat [
     kv "Cash"      (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
     pipe;
     kv "Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
@@ -497,9 +499,8 @@ let render_strategies w json =
     kv "Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
     pipe;
     kv "Sell Val"  (format_pnl   total_up)        up_attr;
-  ] in
+  ]) in
   let summary_section = I.vcat (List.filter (fun img -> I.height img > 0) [
-    I.string A.(fg c_title ++ bg c_section_bg ++ st bold) (pad_right w "  SUMMARY");
     summary_bar;
   ]) in
 

@@ -15,7 +15,7 @@ let update_cycle_hist symbol p99 =
   arr.(history_len - 1) <- p99;
   arr
 
-let render_latencies _w json =
+let render_latencies w json =
   let lats = match json |?> "latencies" with `Assoc l -> l | _ -> [] in
   (* Build symbol -> exchange lookup from strategies *)
   let sym_to_exch = match json |?> "strategies" with
@@ -90,7 +90,7 @@ let render_latencies _w json =
         ) metric_labels
       @ [ I.string a_border " │ "; col 15 a_label "  (CYCLE P99)  " ]
     ) in
-    let header = I.vcat [header_row1; header_row2] in
+    let header = I.vcat [close_row w header_row1; close_row w header_row2] in
     let rows = List.map (fun (symbol, metrics) ->
       let mlist = match metrics with `Assoc l -> l | _ -> [] in
       let find_metric label =
@@ -133,13 +133,14 @@ let render_latencies _w json =
       
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
-      I.hcat (
+      close_row w (I.hcat (
         [ I.string a_border " │  ";
           I.string dot_attr "●";
           I.string a_text " ";
           col 14 sym_attr (truncate_string 13 symbol) ]
         @ metric_cells
         @ [ I.string a_border " │ "; trend_spark ]
-      )
+      ))
     ) active_lats in
-    I.vcat (header :: rows)
+    let title = section_title w "PERFORMANCE" in
+    I.vcat (title :: header :: rows)
