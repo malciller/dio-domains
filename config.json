@@ -48,15 +48,15 @@
     },
     {
       "symbol": "ETH/USDC",
-      "exchange": "lighter",
+      "exchange": "hyperliquid",
       "qty": "0.006",
       "grid_interval": [
-        0.1,
+        0.3,
         1.5
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.23,
+        0.25,
         3.0
       ],
       "strategy": "Grid"
