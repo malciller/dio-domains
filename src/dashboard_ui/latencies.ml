@@ -3,8 +3,13 @@ open Theme
 
 let history_len = 15
 let cycle_hist = Hashtbl.create 16
+let cycle_hist_max = 64
 
 let update_cycle_hist symbol p99 =
+  (* Evict all entries when the table grows beyond the cap.
+     This is safe — sparkline history repopulates within seconds. *)
+  if Hashtbl.length cycle_hist > cycle_hist_max then
+    Hashtbl.clear cycle_hist;
   let arr = try Hashtbl.find cycle_hist symbol with Not_found -> 
     let a = Array.make history_len 0.0 in
     Hashtbl.add cycle_hist symbol a; a

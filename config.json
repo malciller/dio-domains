@@ -74,7 +74,9 @@
         0.07,
         6.25
       ],
-      "strategy": "Grid"
+      "strategy": "Grid",
+      "testnet": false,
+      "hedge": false
     },
     {
       "symbol": "ADA/USD",
