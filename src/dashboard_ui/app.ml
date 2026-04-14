@@ -57,27 +57,24 @@ let connect_and_watch path =
     (try Unix.close fd with _ -> ());
     raise exn
 
-let render_to_stdout (draw : out_channel -> unit) =
-  let tmp_path = Filename.temp_file "dio_dash_" ".ansi" in
-  let oc = open_out_bin tmp_path in
-  (try
-     draw oc;
-     close_out oc
-   with exn ->
-     close_out_noerr oc;
-     Sys.remove tmp_path;
-     raise exn);
-  let ic = open_in_bin tmp_path in
-  let len = in_channel_length ic in
-  let frame = really_input_string ic len in
-  close_in ic;
-  Sys.remove tmp_path;
+(** Reusable frame buffer — avoids per-frame allocation.
+    Cleared and refilled on each render cycle. *)
+let frame_buf = Buffer.create 65536
+
+let write_all_bytes buf =
+  let s = Buffer.contents buf in
+  let len = String.length s in
   let rec go off rem =
     if rem > 0 then
-      let n = Unix.write_substring Unix.stdout frame off rem in
+      let n = Unix.write_substring Unix.stdout s off rem in
       go (off + n) (rem - n)
   in
   go 0 len
+
+let render_to_stdout_buf (draw : Buffer.t -> unit) =
+  Buffer.clear frame_buf;
+  draw frame_buf;
+  write_all_bytes frame_buf
 
 let stdout_alive () =
   try Unix.isatty Unix.stdout
@@ -91,7 +88,7 @@ let render_to_stdout_safe ~timeout_s draw =
   let completed = ref false in
   (try
     ignore (Unix.alarm timeout_s);
-    render_to_stdout draw;
+    render_to_stdout_buf draw;
     ignore (Unix.alarm 0);
     completed := true
   with
@@ -105,14 +102,24 @@ let render_wait_screen w h msg =
             |> I.hsnap ~align:`Left w
             |> I.vsnap ~align:`Top  h
   in
-  render_to_stdout (fun oc ->
-    output_string oc "\027[?2026h";
-    output_string oc "\027[H";
-    Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
-    output_string oc "\027[J";
-    output_string oc "\027[?2026l")
+  render_to_stdout_buf (fun buf ->
+    Buffer.add_string buf "\027[?2026h";
+    Buffer.add_string buf "\027[H";
+    Render.to_buffer buf Cap.ansi (0, 0) (w, I.height img) img;
+    Buffer.add_string buf "\027[J";
+    Buffer.add_string buf "\027[?2026l")
 
 let run () =
+  (* GC tuning for a lightweight single-domain render loop.
+     Small minor heap enables frequent collections of short-lived
+     frame data. Moderate compaction keeps the heap from fragmenting
+     over multi-hour runs. *)
+  Gc.set { (Gc.get ()) with
+    minor_heap_size = 32768;       (* 256KB — fast minor collections *)
+    major_heap_increment = 65536;  (* 512KB — grow major heap slowly *)
+    max_overhead = 500;            (* compact when free > 5x live *)
+  };
+
   let saved_termios = Unix.tcgetattr Unix.stdin in
   let raw_termios = { saved_termios with
     Unix.c_icanon = false;
@@ -257,9 +264,9 @@ let run () =
               | None -> (80, 24)
             in
             
-            let draw oc =
-              output_string oc "\027[?2026h";
-              output_string oc "\027[H";
+            let draw buf =
+              Buffer.add_string buf "\027[?2026h";
+              Buffer.add_string buf "\027[H";
               let content_img =
                   I.vcat [
                     Ticker_feed.render_ticker w !last_json;
@@ -281,9 +288,9 @@ let run () =
                 else I.hsnap ~align:`Left w content_img
               in
               let img = I.(content_img </> I.char A.(bg c_bg) ' ' w h) in
-              Notty_unix.output_image ~cap:Cap.ansi ~fd:oc img;
-              output_string oc "\027[J";
-              output_string oc "\027[?2026l"
+              Render.to_buffer buf Cap.ansi (0, 0) (w, I.height img) img;
+              Buffer.add_string buf "\027[J";
+              Buffer.add_string buf "\027[?2026l"
             in
             let rendered = render_to_stdout_safe ~timeout_s:2 draw in
             if not rendered then begin

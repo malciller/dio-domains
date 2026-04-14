@@ -9,6 +9,9 @@ open Theme
     This primarily targets paused strategies or tracked tickers with zero balance.
 *)
 
+(** Reusable grouping table — cleared each render to avoid per-frame allocation. *)
+let group_tbl : (string, (Notty.attr * string * float * float * float) list) Hashtbl.t = Hashtbl.create 16
+
 let render_ticker w json =
     let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
     let all_balances = json |?> "all_balances" |> to_list_d in
@@ -52,16 +55,16 @@ let render_ticker w json =
       | h :: _ -> h
       | [] -> symbol
     in
-    let tbl = Hashtbl.create 16 in
+    Hashtbl.clear group_tbl;
     List.iter (fun (ex, sym, mid, bid, ask) ->
       let asset = base_asset_of sym in
       let exch_tag = exch_tag_of ex in
       let sym_attr = exch_sym_attr ex in
       let entry = (sym_attr, exch_tag, mid, bid, ask) in
-      let existing = try Hashtbl.find tbl asset with Not_found -> [] in
-      Hashtbl.replace tbl asset (entry :: existing)
+      let existing = try Hashtbl.find group_tbl asset with Not_found -> [] in
+      Hashtbl.replace group_tbl asset (entry :: existing)
     ) combined;
-    Hashtbl.fold (fun asset entries acc -> (asset, List.rev entries) :: acc) tbl []
+    Hashtbl.fold (fun asset entries acc -> (asset, List.rev entries) :: acc) group_tbl []
     |> List.sort (fun (a1, _) (a2, _) -> String.compare a1 a2)
   in
 
