@@ -101,6 +101,7 @@ let render_latencies w json =
       let a_yellow     = A.(Theme.a_yellow ++ bg bg_color) in
       let a_dim        = A.(Theme.a_dim    ++ bg bg_color) in
       let a_border     = A.(Theme.a_border ++ bg bg_color) in
+      let a_border_outer = A.(Theme.a_border ++ bg c_bg) in
       let a_bright     = A.(Theme.a_bright ++ bg bg_color) in
       let exch_sym_attr ?dim exch = A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color) in
 
@@ -112,7 +113,7 @@ let render_latencies w json =
       let col_right w attr s = I.string attr (Theme.pad_left w s) in
       let close_row w img =
         let d = w - I.width img - 2 in
-        I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string a_border " │" ]
+        I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string A.(bg bg_color) " "; I.string a_border_outer "│" ]
       in
 
       let render_sparkline_local w data max_val attr_fn =
@@ -173,7 +174,8 @@ let render_latencies w json =
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
       close_row w (I.hcat (
-        [ I.string a_border " │  ";
+        [ I.string a_border_outer " │";
+          I.string A.(bg bg_color) "  ";
           I.string dot_attr "●";
           I.string a_text " ";
           col 14 sym_attr (truncate_string 13 symbol);

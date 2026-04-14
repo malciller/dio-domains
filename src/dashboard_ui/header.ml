@@ -42,9 +42,12 @@ let render_header w json =
   ) exch_connected ([], 0) in
   let dur_str = format_duration uptime in
   let fng_str = Printf.sprintf "%.0f" fng in
+  let left_space = I.string A.(bg c_bg) "  " in
+  let right_space = I.string A.(bg c_bg) " " in
   let left_text = "q: quit  │  Diophant Solutions  │  " in
   let base_imgs = [
-    I.string A.(bg c_panel) "  ";
+    left_space;
+    I.string A.(bg c_panel) " ";
     I.string A.(fg c_dim ++ bg c_panel) left_text;
     I.string A.(fg c_label ++ bg c_panel) "up ";
     I.string A.(fg c_text ++ bg c_panel) dur_str;
@@ -57,9 +60,10 @@ let render_header w json =
   ] in
   let left_seg = I.hcat base_imgs in
   let conn_seg = I.hcat conn_imgs in
-  let pad_w = max 0 (w - I.width left_seg - I.width conn_seg) in
+  let pad_w = max 0 (w - I.width left_seg - I.width conn_seg - 1) in
   I.hcat [
     left_seg;
     conn_seg;
     I.string A.(bg c_panel) (String.make pad_w ' ');
+    right_space;
   ]

@@ -120,6 +120,7 @@ let render_strategies w json =
     let a_cyan       = A.(Theme.a_cyan   ++ bg bg_color) in
     let a_dim        = A.(Theme.a_dim    ++ bg bg_color) in
     let a_border     = A.(Theme.a_border ++ bg bg_color) in
+    let a_border_outer = A.(Theme.a_border ++ bg c_bg) in
     let a_bps_tight  = A.(Theme.a_bps_tight ++ bg bg_color) in
     let a_bps_norm   = A.(Theme.a_bps_norm  ++ bg bg_color) in
     let a_bps_wide   = A.(Theme.a_bps_wide  ++ bg bg_color) in
@@ -134,7 +135,7 @@ let render_strategies w json =
     let col_right w attr s = I.string attr (pad_left w s) in
     let close_row w img =
       let d = w - I.width img - 2 in
-      I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string a_border " │" ]
+      I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string A.(bg bg_color) " "; I.string a_border_outer "│" ]
     in
 
     let render_gauge b_pct s_pct =
@@ -227,7 +228,8 @@ let render_strategies w json =
     ] in
 
     close_row w (I.hcat [
-      I.string a_border " │  ";
+      I.string a_border_outer " │";
+      I.string A.(bg bg_color) "  ";
       col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
       col 5 a_cyan (truncate_string 4 stype);
       I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
@@ -309,6 +311,7 @@ let render_strategies w json =
     let a_cyan       = A.(Theme.a_cyan   ++ bg bg_color) in
     let a_dim        = A.(Theme.a_dim    ++ bg bg_color) in
     let a_border     = A.(Theme.a_border ++ bg bg_color) in
+    let a_border_outer = A.(Theme.a_border ++ bg c_bg) in
     let a_bps_tight  = A.(Theme.a_bps_tight ++ bg bg_color) in
     let a_bps_norm   = A.(Theme.a_bps_norm  ++ bg bg_color) in
     let a_bps_wide   = A.(Theme.a_bps_wide  ++ bg bg_color) in
@@ -319,7 +322,7 @@ let render_strategies w json =
     let col_right w attr s = I.string attr (pad_left w s) in
     let close_row w img =
       let d = w - I.width img - 2 in
-      I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string a_border " │" ]
+      I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string A.(bg bg_color) " "; I.string a_border_outer "│" ]
     in
 
     let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
@@ -371,7 +374,8 @@ let render_strategies w json =
     ] in
 
     close_row w (I.hcat [
-      I.string a_border " │  ";
+      I.string a_border_outer " │";
+      I.string A.(bg bg_color) "  ";
       col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
       col 5 a_dim "--";
       I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
