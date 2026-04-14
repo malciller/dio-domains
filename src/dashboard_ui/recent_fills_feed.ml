@@ -5,8 +5,6 @@ open Theme
     Scrolls recent filled orders horizontally across the screen below the holdings.
 *)
 
-let current_offset = ref 0.0
-let last_time = ref None
 
 let local_fills : Yojson.Basic.t list ref = ref []
 let capacity = 10
@@ -85,7 +83,6 @@ let render_fills w json =
     ) fills in
 
     let order_separator = I.string A.(fg c_dim ++ bg c_bg) "  •  " in
-    let wrap_separator = I.string A.(fg c_accent ++ bg c_bg) "  ◈  " in
     let ticker_line =
       List.fold_left (fun acc chunk ->
         if I.width acc = 0 then chunk
@@ -97,38 +94,22 @@ let render_fills w json =
     
     if line_w = 0 then I.empty
     else
-      let padded_ticker = I.hcat [ticker_line; wrap_separator] in
+      let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ◈ RECENT FILLS ◈  " in
+      let padded_ticker = I.hcat [feed_start; ticker_line] in
       let padded_w = I.width padded_ticker in
 
-      let now = Unix.gettimeofday () in
-      let dt = match !last_time with
-        | None -> 0.0
-        | Some t -> now -. t
-      in
-      last_time := Some now;
-
-      let dt = if dt > 1.0 then 0.0 else dt in
-
       let scroll_speed = 8.0 in 
-      current_offset := !current_offset +. (dt *. scroll_speed);
-      
-      let max_w = float_of_int padded_w in
-      if !current_offset >= max_w then
-        current_offset := mod_float !current_offset max_w;
-
-      let offset = int_of_float !current_offset in
-      
-      let invert_offset = padded_w - offset - 1 in
-      let invert_offset = if invert_offset < 0 then 0 else invert_offset in
+      let absolute_offset = (Unix.gettimeofday ()) *. scroll_speed in
+      let offset = (int_of_float absolute_offset) mod padded_w in
 
       let scroll_region =
         if padded_w <= w then
           let repeats = (w / padded_w) + 2 in
           let repeated = I.hcat (List.init repeats (fun _ -> padded_ticker)) in
-          I.crop ~l:invert_offset ~r:0 ~t:0 ~b:0 repeated
+          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
         else
           let repeated = I.hcat [padded_ticker; padded_ticker] in
-          I.crop ~l:invert_offset ~r:0 ~t:0 ~b:0 repeated
+          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
       in
       
       let final_img = I.hsnap ~align:`Left w scroll_region in

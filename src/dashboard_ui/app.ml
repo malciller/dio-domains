@@ -285,9 +285,9 @@ let run () =
               let content_img =
                   I.vcat [
                     Ticker_feed.render_ticker w !last_json;
+                    Recent_fills_feed.render_fills w !last_json;
                     Memory.render_memory w !last_json;
                     Holdings.render_strategies w !last_json;
-                    Recent_fills_feed.render_fills w !last_json;
                     Latencies.render_latencies w !last_json;
                     Header.render_header w !last_json;
                   ]
