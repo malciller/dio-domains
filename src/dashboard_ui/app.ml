@@ -200,7 +200,7 @@ let run () =
     while not !quit && not !lost_connection do
       let now = Unix.gettimeofday () in
       let time_since_render = now -. !last_render_time in
-      let target_frame_time = 0.033 in
+      let target_frame_time = 0.05 in (* ~20 FPS perfectly locked to scroll speed *)
       let timeout = if time_since_render >= target_frame_time then 0.0 else target_frame_time -. time_since_render in
 
       let ready, _, _ =
@@ -232,7 +232,6 @@ let run () =
           let msg = read_message fd in
           (try 
             let new_json = Yojson.Basic.from_string msg in
-            let old_json = !last_json in
             last_json := new_json;
           with _ -> ())
         with

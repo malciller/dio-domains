@@ -11,6 +11,7 @@ let capacity = 10
 let initialized = ref false
 
 let render_fills w json =
+
   let engine_fills = json |?> "recent_fills" |> to_list_d in
   (* Merge engine fills into local_fills on every render cycle.
      On startup, the engine seeds historical fills into the ring buffer
@@ -46,7 +47,6 @@ let render_fills w json =
       end
     end
   in
-
   let fills = !local_fills in
   if fills = [] then I.empty
   else
@@ -83,34 +83,15 @@ let render_fills w json =
     ) fills in
 
     let order_separator = I.string A.(fg c_dim ++ bg c_bg) "  •  " in
-    let ticker_line =
+    let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ◈ RECENT FILLS ◈  " in
+    let max_w = w - 2 in
+    
+    let final_img =
       List.fold_left (fun acc chunk ->
-        if I.width acc = 0 then chunk
-        else I.hcat [acc; order_separator; chunk]
-      ) I.empty chunks
+        let candidate = if I.width acc = I.width feed_start then I.hcat [acc; chunk] else I.hcat [acc; order_separator; chunk] in
+        if I.width candidate > max_w then acc else candidate
+      ) feed_start chunks
     in
 
-    let line_w = I.width ticker_line in
-    
-    if line_w = 0 then I.empty
-    else
-      let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ◈ RECENT FILLS ◈  " in
-      let padded_ticker = I.hcat [feed_start; ticker_line] in
-      let padded_w = I.width padded_ticker in
-
-      let scroll_speed = 8.0 in 
-      let absolute_offset = (Unix.gettimeofday ()) *. scroll_speed in
-      let offset = (int_of_float absolute_offset) mod padded_w in
-
-      let scroll_region =
-        if padded_w <= w then
-          let repeats = (w / padded_w) + 2 in
-          let repeated = I.hcat (List.init repeats (fun _ -> padded_ticker)) in
-          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
-        else
-          let repeated = I.hcat [padded_ticker; padded_ticker] in
-          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
-      in
-      
-      let final_img = I.hsnap ~align:`Left w scroll_region in
-      I.(final_img </> I.string A.(bg c_bg) (String.make w ' '))
+    let padded = I.hsnap ~align:`Left w final_img in
+    I.(padded </> I.string A.(bg c_bg) (String.make w ' '))
