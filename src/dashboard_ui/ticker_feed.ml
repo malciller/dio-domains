@@ -67,75 +67,135 @@ let render_ticker w json =
 
   if grouped = [] then I.empty
   else
-    (* Build the ticker string chunks grouped by asset incrementally as they appear in queue *)
-    let chunks = List.map (fun (asset, entries) ->
-      let asset_header = I.string A.(fg c_text ++ st bold) (Printf.sprintf " %s " asset) in
-      
-      let price_images = List.map (fun (sym_attr, _exch_tag, mid, bid, ask) ->
-        let price_str = if mid > 0.0 then format_price mid else "--" in
-        let spread_str = format_spread_bps bid ask in
+    let one_price, multi_price = List.partition (fun (_, entries) -> List.length entries = 1) grouped in
+    
+    let rec pair_ones acc = function
+      | [] -> List.rev acc
+      | [x] -> List.rev ([x] :: acc)
+      | x :: y :: rest -> pair_ones ([x; y] :: acc) rest
+    in
+    let paired_ones = pair_ones [] one_price in
+    let multi_wrapped = List.map (fun x -> [x]) multi_price in
+    
+    let combined_groups = paired_ones @ multi_wrapped in
+    let sorted_groups = List.sort (fun g1 g2 -> String.compare (fst (List.hd g1)) (fst (List.hd g2))) combined_groups in
+
+    (* Build the ticker string chunks grouped by asset and dense-packed by pairs if single-venue *)
+    let chunks_list = List.map (fun group ->
+      let group_imgs = List.map (fun (asset, entries) ->
+        let asset_header = I.string A.(fg c_text ++ st bold) (Printf.sprintf " %s " asset) in
         
-        let spread_attr =
-          if bid <= 0.0 || ask <= 0.0 then a_dim
-          else
-            let bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
-            if bps < 5.0 then a_bps_tight
-            else if bps < 20.0 then a_bps_norm
-            else if bps < 50.0 then a_bps_wide
-            else a_bps_xtrm
+        let price_images = List.map (fun (sym_attr, _exch_tag, mid, bid, ask) ->
+          let price_str = if mid > 0.0 then format_price mid else "--" in
+          let spread_str = format_spread_bps bid ask in
+          
+          let spread_attr =
+            if bid <= 0.0 || ask <= 0.0 then a_dim
+            else
+              let bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
+              if bps < 5.0 then a_bps_tight
+              else if bps < 20.0 then a_bps_norm
+              else if bps < 50.0 then a_bps_wide
+              else a_bps_xtrm
+          in
+          
+          I.hcat [
+            I.string sym_attr price_str;
+            I.string a_dim " ";
+            I.string spread_attr spread_str;
+          ]
+        ) entries in
+        
+        let spacing = I.string a_dim "  " in
+        let entries_combined = 
+          List.fold_left (fun acc ch -> 
+            if I.width acc = 0 then ch else I.hcat [acc; spacing; ch]
+          ) I.empty price_images
         in
         
-        I.hcat [
-          I.string sym_attr price_str;
-          I.string a_dim " ";
-          I.string spread_attr spread_str;
-        ]
-      ) entries in
+        I.hcat [asset_header; entries_combined; I.string a_text " "]
+      ) group in
       
-      let spacing = I.string a_dim "  " in
-      let entries_combined = 
-        List.fold_left (fun acc ch -> 
-          if I.width acc = 0 then ch else I.hcat [acc; spacing; ch]
-        ) I.empty price_images
-      in
-      
-      I.hcat [asset_header; entries_combined; I.string a_text " "]
-    ) grouped in
+      let sub_separator = I.string A.(fg c_dim) " │ " in
+      List.fold_left (fun acc img ->
+        if I.width acc = 0 then img else I.hcat [acc; sub_separator; img]
+      ) I.empty group_imgs
+    ) sorted_groups in
 
+    let chunks = Array.of_list chunks_list in
+    let n = Array.length chunks in
     let separator = I.string A.(fg c_accent ++ bg c_bg) "  ❖  " in
+    let sep_w = I.width separator in
     let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ❖ LIVE TICKER ❖  " in
+    let feed_w = I.width feed_start in
     let max_w = w - 2 in
     
-    let rec pack_pages chunks current_line current_w acc =
-      match chunks with
-      | [] -> 
-          if current_line = [] then List.rev acc
-          else List.rev (List.rev current_line :: acc)
-      | c :: cs ->
-          if current_line = [] then
-            pack_pages cs [c] (I.width feed_start + I.width c) acc
-          else
-            let added_w = I.width separator + I.width c in
-            if current_w + added_w > max_w then
-              (* page full *)
-              pack_pages cs [c] (I.width feed_start + I.width c) (List.rev current_line :: acc)
-            else
-              pack_pages cs (c :: current_line) (current_w + added_w) acc
+    let get_col_slice cols c =
+      let base = n / cols in
+      let rem = n mod cols in
+      let split_c = cols - rem in
+      if c < split_c then
+        c * base, base
+      else
+        split_c * base + (c - split_c) * (base + 1), base + 1
     in
-    let pages = pack_pages chunks [] 0 [] in
 
-    if pages = [] then I.empty
-    else
-      let num_pages = List.length pages in
-      let cycle_time = 5.0 in
-      let page_index = (int_of_float (Unix.gettimeofday () /. cycle_time)) mod num_pages in
-      let current_page_chunks = List.nth pages page_index in
+    let get_col_widths cols =
+      let widths = Array.make cols 0 in
+      for c = 0 to cols - 1 do
+        let (start_idx, size) = get_col_slice cols c in
+        let max_w = ref 0 in
+        for i = 0 to size - 1 do
+          max_w := max !max_w (I.width chunks.(start_idx + i))
+        done;
+        widths.(c) <- !max_w
+      done;
+      widths
+    in
+    
+    let fits cols =
+      let widths = get_col_widths cols in
+      let total_w = ref feed_w in
+      for c = 0 to cols - 1 do
+        total_w := !total_w + widths.(c) + (if c > 0 then sep_w else 0)
+      done;
+      !total_w <= max_w
+    in
+    
+    (* Find maximum columns that fit from n down to 1 *)
+    let rec find_cols c =
+      if c <= 1 then 1
+      else if fits c then c
+      else find_cols (c - 1)
+    in
+    
+    let cols = if n = 0 then 1 else find_cols n in
+    let col_widths = get_col_widths cols in
+    
+    (* Cycle independently on clock *)
+    let cycle_time = 5.0 in
+    let page = int_of_float (Unix.gettimeofday () /. cycle_time) in
+    
+    let slot_images =
+      List.init cols (fun c ->
+        let (start_idx, size) = get_col_slice cols c in
+        let items = List.init size (fun i -> chunks.(start_idx + i)) in
+        if items = [] then I.empty
+        else
+          let len = List.length items in
+          let item = List.nth items (page mod len) in
+          (* Pad strictly to col width so adjacent elements never bounce horizontally *)
+          I.hsnap ~align:`Left col_widths.(c) item
+      )
+    in
+    
+    let valid_slots = List.filter (fun img -> I.width img > 0) slot_images in
+    
+    let final_img =
+      List.fold_left (fun acc slot ->
+        if I.width acc = feed_w then I.hcat [acc; slot] else I.hcat [acc; separator; slot]
+      ) feed_start valid_slots
+    in
 
-      let final_img =
-        List.fold_left (fun acc chunk ->
-          if I.width acc = I.width feed_start then I.hcat [acc; chunk] else I.hcat [acc; separator; chunk]
-        ) feed_start current_page_chunks
-      in
-
-      let padded = I.hsnap ~align:`Left w final_img in
-      I.(padded </> I.string A.(bg c_bg) (String.make w ' '))
+    let padded = I.hsnap ~align:`Left w final_img in
+    I.(padded </> I.string A.(bg c_bg) (String.make w ' '))
