@@ -22,8 +22,8 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.75,
-        2.0
+        0.05,
+        2.00
       ],
       "strategy": "Grid",
       "testnet": false,
@@ -39,8 +39,8 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.5,
-        5.0
+        0.04,
+        5.00
       ],
       "strategy": "Grid",
       "testnet": false,
@@ -49,27 +49,31 @@
     {
       "symbol": "ETH/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.006",
+      "qty": "0.007",
       "grid_interval": [
         0.3,
         5.0
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.25,
-        3.0
+        0.04,
+        5.25
       ],
       "strategy": "Grid"
     },
     {
-      "symbol": "SOL/USD",
-      "exchange": "kraken",
-      "qty": "0.14",
+      "symbol": "SOL/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.15",
       "grid_interval": [
-        2.5,
+        0.3,
         5.0
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.07,
+        6.25
+      ],
       "strategy": "Grid"
     },
     {
@@ -93,8 +97,8 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        25.0,
-        50.0
+        25.00,
+        50.00
       ],
       "strategy": "Grid",
       "testnet": true

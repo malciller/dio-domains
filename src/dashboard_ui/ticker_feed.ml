@@ -9,10 +9,9 @@ open Theme
     This primarily targets paused strategies or tracked tickers with zero balance.
 *)
 
-
 let render_ticker w json =
-  let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
-  let all_balances = json |?> "all_balances" |> to_list_d in
+    let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
+    let all_balances = json |?> "all_balances" |> to_list_d in
 
   (* Find all strategies *)
   let all_strategies =
@@ -66,10 +65,9 @@ let render_ticker w json =
     |> List.sort (fun (a1, _) (a2, _) -> String.compare a1 a2)
   in
 
-  if grouped = [] then
-    I.empty
+  if grouped = [] then I.empty
   else
-    (* Build the ticker string chunks grouped by asset *)
+    (* Build the ticker string chunks grouped by asset incrementally as they appear in queue *)
     let chunks = List.map (fun (asset, entries) ->
       let asset_header = I.string A.(fg c_text ++ st bold) (Printf.sprintf " %s " asset) in
       
@@ -105,39 +103,39 @@ let render_ticker w json =
     ) grouped in
 
     let separator = I.string A.(fg c_accent ++ bg c_bg) "  ❖  " in
-    let ticker_line =
-      List.fold_left (fun acc chunk ->
-        if I.width acc = 0 then chunk
-        else I.hcat [acc; separator; chunk]
-      ) I.empty chunks
-    in
-
-    let line_w = I.width ticker_line in
+    let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ❖ LIVE TICKER ❖  " in
+    let max_w = w - 2 in
     
-    (* If there's nothing to show or it's empty, return empty *)
-    if line_w = 0 then I.empty
+    let rec pack_pages chunks current_line current_w acc =
+      match chunks with
+      | [] -> 
+          if current_line = [] then List.rev acc
+          else List.rev (List.rev current_line :: acc)
+      | c :: cs ->
+          if current_line = [] then
+            pack_pages cs [c] (I.width feed_start + I.width c) acc
+          else
+            let added_w = I.width separator + I.width c in
+            if current_w + added_w > max_w then
+              (* page full *)
+              pack_pages cs [c] (I.width feed_start + I.width c) (List.rev current_line :: acc)
+            else
+              pack_pages cs (c :: current_line) (current_w + added_w) acc
+    in
+    let pages = pack_pages chunks [] 0 [] in
+
+    if pages = [] then I.empty
     else
-      (* Add start indicator to the beginning so infinite wrap connects seamlessly *)
-      let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ❖ LIVE TICKER ❖  " in
-      let padded_ticker = I.hcat [feed_start; ticker_line] in
-      let padded_w = I.width padded_ticker in
+      let num_pages = List.length pages in
+      let cycle_time = 5.0 in
+      let page_index = (int_of_float (Unix.gettimeofday () /. cycle_time)) mod num_pages in
+      let current_page_chunks = List.nth pages page_index in
 
-      let scroll_speed = 8.0 in 
-      (* Use absolute monotonic time to perfectly lock synchronization between scrolling components *)
-      let absolute_offset = (Unix.gettimeofday ()) *. scroll_speed in
-      let offset = (int_of_float absolute_offset) mod padded_w in
-
-      let scroll_region =
-        if padded_w <= w then
-          (* if the ticker is smaller than screen, duplicate it to fill *)
-          let repeats = (w / padded_w) + 2 in
-          let repeated = I.hcat (List.init repeats (fun _ -> padded_ticker)) in
-          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
-        else
-          (* if larger, just append one more copy to wrap around cleanly *)
-          let repeated = I.hcat [padded_ticker; padded_ticker] in
-          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
+      let final_img =
+        List.fold_left (fun acc chunk ->
+          if I.width acc = I.width feed_start then I.hcat [acc; chunk] else I.hcat [acc; separator; chunk]
+        ) feed_start current_page_chunks
       in
-      
-      let final_img = I.hsnap ~align:`Left w scroll_region in
-      I.(final_img </> I.string A.(bg c_bg) (String.make w ' '))
+
+      let padded = I.hsnap ~align:`Left w final_img in
+      I.(padded </> I.string A.(bg c_bg) (String.make w ' '))

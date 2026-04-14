@@ -62,9 +62,6 @@ let render_latencies w json =
         else if f > warn then 1  (* yellow *)
         else 0                 (* green *)
     in
-    let attr_of_sev = function
-      | 2 -> a_red | 1 -> a_yellow | 0 -> a_green | _ -> a_dim
-    in
     (* Metric display order *)
     let metric_order = ["cycle"; "orderbook"; "strategy"; "execution"] in
     let metric_labels = ["CYCLE"; "OB"; "STRAT"; "EXEC"] in
@@ -95,7 +92,45 @@ let render_latencies w json =
         ) metric_labels
     ) in
     let header = I.vcat [close_row w header_row1; close_row w header_row2] in
-    let rows = List.map (fun (symbol, metrics) ->
+    let rows = List.mapi (fun i (symbol, metrics) ->
+      let bg_color = if (i mod 2 = 1) then c_panel else c_bg in
+      
+      let a_text       = A.(Theme.a_text   ++ bg bg_color) in
+      let a_green      = A.(Theme.a_green  ++ bg bg_color) in
+      let a_red        = A.(Theme.a_red    ++ bg bg_color) in
+      let a_yellow     = A.(Theme.a_yellow ++ bg bg_color) in
+      let a_dim        = A.(Theme.a_dim    ++ bg bg_color) in
+      let a_border     = A.(Theme.a_border ++ bg bg_color) in
+      let a_bright     = A.(Theme.a_bright ++ bg bg_color) in
+      let exch_sym_attr ?dim exch = A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color) in
+
+      let attr_of_sev = function
+        | 2 -> a_red | 1 -> a_yellow | 0 -> a_green | _ -> a_dim
+      in
+
+      let col w attr s = I.string attr (Theme.pad_right w s) in
+      let col_right w attr s = I.string attr (Theme.pad_left w s) in
+      let close_row w img =
+        let d = w - I.width img - 2 in
+        I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string a_border " │" ]
+      in
+
+      let render_sparkline_local w data max_val attr_fn =
+        let len = Array.length data in
+        let start_idx = max 0 (len - w) in
+        let visible_len = min w len in
+        let empty_w = w - visible_len in
+        let blocks = List.init visible_len (fun idx ->
+          let v = data.(start_idx + idx) in
+          let ratio = if max_val > 0.0 then v /. max_val else 0.0 in
+          let ratio = max 0.0 (min 1.0 ratio) in
+          let block_idx = int_of_float (ratio *. 7.0) in
+          let block_idx = max 0 (min 7 block_idx) in
+          I.string (attr_fn v) Theme.block_chars.(block_idx)
+        ) in
+        I.hcat (I.string a_dim (String.make empty_w ' ') :: blocks)
+      in
+
       let mlist = match metrics with `Assoc l -> l | _ -> [] in
       let find_metric label =
         match List.assoc_opt label mlist with
@@ -133,7 +168,7 @@ let render_latencies w json =
       
       let (_, cycle_p99, _, _) = find_metric "cycle" in
       let c_arr = update_cycle_hist symbol cycle_p99 in
-      let trend_spark = render_sparkline 15 c_arr 100.0 (fun v -> attr_of_sev (severity "cycle" v 1)) in
+      let trend_spark = render_sparkline_local 15 c_arr 100.0 (fun v -> attr_of_sev (severity "cycle" v 1)) in
       
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
