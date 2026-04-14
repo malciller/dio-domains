@@ -837,6 +837,7 @@ let execute_strategy
           let best_buy_price = ref 0.0 in
           let best_buy_id = ref None in
           let open_buy_count_from_scan = ref 0 in
+          let has_recent_amend_buy = ref false in
           let locked_in_buys = ref 0.0 in
           let locked_in_sells = ref 0.0 in
           let closest_sell_order = ref None in
@@ -854,7 +855,10 @@ let execute_strategy
                 if price > !best_buy_price && price > 0.0 then begin
                   best_buy_price := price;
                   best_buy_id := Some oid
-                end
+                end;
+                (match Hashtbl.find_opt state.amend_cooldowns oid with
+                 | Some expiry when now_time < expiry -> has_recent_amend_buy := true
+                 | _ -> ())
               end else if side_str = "sell" then begin
                 state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
                 locked_in_sells := !locked_in_sells +. qty;
@@ -978,10 +982,15 @@ let execute_strategy
     let open_buy_count = !open_buy_count_from_scan in
     let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
 
+    (* Suppress multiple buy cancellations if an amend occurred recently.
+       This prevents WS data lag (showing both old and new order IDs post-amend)
+       from triggering false-positive single buy order policy violations. *)
+    let suppress_duplicate_buys = !has_recent_amend_buy in
+
     if buy_order_pending then begin
         (* Log every 100,000 iterations to avoid spam. *)
         ();
-    end else if effective_buy_count > 1 && not state.inflight_cancel_buy && not state.inflight_amend_buy then begin
+    end else if effective_buy_count > 1 && not state.inflight_cancel_buy && not state.inflight_amend_buy && not suppress_duplicate_buys then begin
         (* Case 0: Multiple buy orders exist. Cancel all to enforce single buy
            order policy. Fires at startup reconciliation when last_buy_order_id=None
            and the order channel shows multiple buys. inflight_cancel_buy gates

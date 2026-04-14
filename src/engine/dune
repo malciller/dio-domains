@@ -4,8 +4,8 @@
  (libraries
   yojson
   logging
-  
   dio.kraken
+  dio.ibkr
   dio.strategies
   dio.cmc
   threads
