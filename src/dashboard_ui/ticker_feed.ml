@@ -9,8 +9,6 @@ open Theme
     This primarily targets paused strategies or tracked tickers with zero balance.
 *)
 
-let current_offset = ref 0.0
-let last_time = ref None
 
 let render_ticker w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
@@ -119,45 +117,26 @@ let render_ticker w json =
     (* If there's nothing to show or it's empty, return empty *)
     if line_w = 0 then I.empty
     else
-      (* Add separator to the end of the line so infinite wrap connects seamlessly *)
-      let padded_ticker = I.hcat [ticker_line; separator] in
+      (* Add start indicator to the beginning so infinite wrap connects seamlessly *)
+      let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ❖ LIVE TICKER ❖  " in
+      let padded_ticker = I.hcat [feed_start; ticker_line] in
       let padded_w = I.width padded_ticker in
 
-      (* Smooth continuous scroll left-to-right based on delta time to prevent string-length-change jitter. *)
-      let now = Unix.gettimeofday () in
-      let dt = match !last_time with
-        | None -> 0.0
-        | Some t -> now -. t
-      in
-      last_time := Some now;
-
-      (* Prevent huge jumps if the app stalls, suspends, or during the first frame *)
-      let dt = if dt > 1.0 then 0.0 else dt in
-
-      let scroll_speed = 6.0 in 
-      current_offset := !current_offset +. (dt *. scroll_speed);
-      
-      let max_w = float_of_int padded_w in
-      if !current_offset >= max_w then
-        current_offset := mod_float !current_offset max_w;
-
-      let offset = int_of_float !current_offset in
-      
-      (* To scroll left-to-right, the view must shift left over the image. 
-         We achieve this by cropping `padded_w - offset` from the left. *)
-      let invert_offset = padded_w - offset - 1 in
-      let invert_offset = if invert_offset < 0 then 0 else invert_offset in
+      let scroll_speed = 8.0 in 
+      (* Use absolute monotonic time to perfectly lock synchronization between scrolling components *)
+      let absolute_offset = (Unix.gettimeofday ()) *. scroll_speed in
+      let offset = (int_of_float absolute_offset) mod padded_w in
 
       let scroll_region =
         if padded_w <= w then
           (* if the ticker is smaller than screen, duplicate it to fill *)
           let repeats = (w / padded_w) + 2 in
           let repeated = I.hcat (List.init repeats (fun _ -> padded_ticker)) in
-          I.crop ~l:invert_offset ~r:0 ~t:0 ~b:0 repeated
+          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
         else
           (* if larger, just append one more copy to wrap around cleanly *)
           let repeated = I.hcat [padded_ticker; padded_ticker] in
-          I.crop ~l:invert_offset ~r:0 ~t:0 ~b:0 repeated
+          I.crop ~l:offset ~r:0 ~t:0 ~b:0 repeated
       in
       
       let final_img = I.hsnap ~align:`Left w scroll_region in
