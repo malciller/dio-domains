@@ -61,20 +61,11 @@ let connect_and_watch path =
     Cleared and refilled on each render cycle. *)
 let frame_buf = Buffer.create 65536
 
-let write_all_bytes buf =
-  let s = Buffer.contents buf in
-  let len = String.length s in
-  let rec go off rem =
-    if rem > 0 then
-      let n = Unix.write_substring Unix.stdout s off rem in
-      go (off + n) (rem - n)
-  in
-  go 0 len
-
 let render_to_stdout_buf (draw : Buffer.t -> unit) =
   Buffer.clear frame_buf;
   draw frame_buf;
-  write_all_bytes frame_buf
+  Buffer.output_buffer stdout frame_buf;
+  flush stdout
 
 let stdout_alive () =
   try Unix.isatty Unix.stdout
@@ -116,6 +107,7 @@ let run () =
      over multi-hour runs. *)
   Gc.set { (Gc.get ()) with
     minor_heap_size = 32768;       (* 256KB — fast minor collections *)
+    space_overhead = 40;           (* major GC targets 1.4x live data — override engine's o=2000 *)
     major_heap_increment = 65536;  (* 512KB — grow major heap slowly *)
     max_overhead = 500;            (* compact when free > 5x live *)
   };
