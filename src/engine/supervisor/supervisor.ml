@@ -2055,8 +2055,9 @@ let stop_all () =
   interruptible_sleep 0.5;  (* Drain window for in-flight order iterations *)
   Logging.warn ~section "Stopping all supervised connections";
   Mutex.lock registry_mutex;
-  Hashtbl.iter (fun _name conn ->
+  let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
+  Mutex.unlock registry_mutex;
+  List.iter (fun conn ->
     set_state conn Disconnected
-  ) connections;
-  Mutex.unlock registry_mutex
+  ) conn_list
 
