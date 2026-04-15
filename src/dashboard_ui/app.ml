@@ -266,7 +266,7 @@ let run () =
                     Memory.render_memory w !last_json;
                     Holdings.render_strategies w !last_json;
                     Latencies.render_latencies w !last_json;
-                    Header.render_header w !last_json;
+                    Footer.render_footer w !last_json;
                   ]
               in
               let c_h = I.height content_img in

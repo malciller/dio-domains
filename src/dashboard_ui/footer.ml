@@ -4,7 +4,7 @@ open Theme
 (** Reusable table for exchange connectivity deduplication. *)
 let exch_tbl : (string, bool) Hashtbl.t = Hashtbl.create 4
 
-let render_header w json =
+let render_footer w json =
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
   let fng    = json |?> "fear_and_greed" |> to_float_d 0.0 in
   (* Per-exchange connectivity: green if any strategy has a live bid/ask
