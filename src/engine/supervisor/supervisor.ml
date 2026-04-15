@@ -350,6 +350,7 @@ let restart conn =
     - Passive data heartbeat timeout for market data feeds *)
 let monitor_loop () =
   let cycle_count = ref 0 in
+  let last_market_open = ref (Ibkr.Market_hours.is_market_open ()) in
   let last_market_status = ref (Ibkr.Market_hours.market_status_string ()) in
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
@@ -360,15 +361,21 @@ let monitor_loop () =
         try
           incr cycle_count;
 
+          let current_open = Ibkr.Market_hours.is_market_open () in
           let current_status = Ibkr.Market_hours.market_status_string () in
-          if !last_market_status <> current_status then begin
+          (* Only force IBKR reconnect on closed→open transitions.
+             Transitions between closed sub-states (weekend, pre-market,
+             after-hours-ended) should NOT trigger reconnection spam. *)
+          if not !last_market_open && current_open then begin
             Logging.info_f ~section "Market status transitioned: %s. Forcing IBKR gateway reconnect to renew streams." current_status;
-            last_market_status := current_status;
             (try
                let ibkr_conn = Hashtbl.find connections "ibkr_gateway" in
                ignore (restart ibkr_conn);
              with Not_found -> ());
-          end;
+          end else if !last_market_status <> current_status then
+            Logging.info_f ~section "Market status changed: %s" current_status;
+          last_market_open := current_open;
+          last_market_status := current_status;
 
                 Mutex.lock registry_mutex;
                 let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
@@ -455,7 +462,15 @@ let monitor_loop () =
 
                         if current_state = Connecting then begin
                           set_state conn Disconnected;
-                          start_async conn
+                          (* IBKR market hours gate: don't restart against a
+                             closed gateway — let the monitor's Failed handler
+                             defer reconnection to the next market open. *)
+                          if String.equal conn.name "ibkr_gateway"
+                             && not (Ibkr.Market_hours.is_market_open ()) then begin
+                            Logging.info_f ~section "[%s] Market closed, deferring reconnection" conn.name;
+                            set_state conn (Failed "Market closed")
+                          end else
+                            start_async conn
                         end
                       end
                   | Connected, _ ->
@@ -930,7 +945,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
           ~client_id:Ibkr.Module.Config.client_id
         in
         Ibkr.Module.connection := Some conn;
-        Ibkr.Connection.connect_with_retry conn ~max_attempts:10 >>= fun () ->
+        Ibkr.Connection.connect_with_retry conn ~max_attempts:5 >>= fun () ->
         Ibkr.Dispatcher.initialize conn;
         (* Register callback so openOrderEnd marks execution stores as ready.
            Must be set after initialize (which clears state) and before
@@ -948,16 +963,22 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             else begin
               set_state ibkr_conn_sup (Failed reason);
               update_circuit_breaker ibkr_conn_sup false;
-              Lwt.async (fun () ->
-                Lwt.catch (fun () ->
-                  Lwt.pause () >>= fun () ->
-                  start_async ibkr_conn_sup;
-                  Lwt.return_unit
-                ) (fun exn ->
-                  Logging.warn_f ~section "[ibkr_gateway] Reconnect exception: %s" (Printexc.to_string exn);
-                  Lwt.return_unit
+              (* Gate on market hours: don't pile up reconnect attempts
+                 against a closed gateway. The monitor loop's Failed handler
+                 will defer reconnection to the next market open. *)
+              if Ibkr.Market_hours.is_market_open () then
+                Lwt.async (fun () ->
+                  Lwt.catch (fun () ->
+                    Lwt.pause () >>= fun () ->
+                    start_async ibkr_conn_sup;
+                    Lwt.return_unit
+                  ) (fun exn ->
+                    Logging.warn_f ~section "[ibkr_gateway] Reconnect exception: %s" (Printexc.to_string exn);
+                    Lwt.return_unit
+                  )
                 )
-              )
+              else
+                Logging.info_f ~section "[ibkr_gateway] Market closed, deferring reconnection"
             end
           );
         (* Do NOT set Connected yet — defer until contract resolution succeeds.
