@@ -36,10 +36,17 @@ let render_footer w json =
       if live then A.(fg c_green ++ bg c_panel)
               else A.(fg c_red   ++ bg c_panel)
     in
+    let exch_c = match exch with
+      | "hyperliquid" -> c_exch_hl
+      | "kraken"      -> c_exch_kr
+      | "lighter"     -> c_exch_li
+      | "ibkr"        -> c_exch_ib
+      | _             -> c_label
+    in
     let seg = I.hcat [
       I.string A.(fg c_dim ++ bg c_panel) "  │  ";
       I.string dot_attr "◉";
-      I.string A.(fg c_label ++ bg c_panel) (" " ^ tag);
+      I.string A.(fg exch_c ++ bg c_panel) (" " ^ tag);
     ] in
     (seg :: imgs, w_acc + 5 + 1 + 1 + String.length tag)
   ) exch_connected ([], 0) in
