@@ -367,11 +367,31 @@ let monitor_loop () =
              Transitions between closed sub-states (weekend, pre-market,
              after-hours-ended) should NOT trigger reconnection spam. *)
           if not !last_market_open && current_open then begin
-            Logging.info_f ~section "Market status transitioned: %s. Forcing IBKR gateway reconnect to renew streams." current_status;
             (try
                let ibkr_conn = Hashtbl.find connections "ibkr_gateway" in
-               ignore (restart ibkr_conn);
-             with Not_found -> ());
+               let ibkr_state = get_state ibkr_conn in
+               (match ibkr_state with
+                | Connected ->
+                    (* Connection was live during pre-market; tear down and
+                       reconnect to get fresh market-data streams. *)
+                    Logging.info_f ~section "Market status transitioned: %s. Forcing IBKR gateway reconnect to renew streams." current_status;
+                    ignore (restart ibkr_conn)
+                | _ ->
+                    (* connect_fn is already handling reconnection (e.g. waking
+                       from market-closed sleep) or the monitor loop's Failed
+                       handler will pick it up.  A forced restart here would
+                       spawn a duplicate connect_fn, causing two concurrent TCP
+                       connections to race against the gateway on the same
+                       clientId — resulting in interleaved End_of_file errors. *)
+                    Logging.info_f ~section "Market status transitioned: %s. IBKR gateway is %s; existing reconnect will handle."
+                      current_status
+                      (match ibkr_state with
+                       | Connecting -> "connecting"
+                       | Failed r -> Printf.sprintf "failed (%s)" r
+                       | Disconnected -> "disconnected"
+                       | _ -> "unknown"))
+             with Not_found ->
+               Logging.info_f ~section "Market status transitioned: %s." current_status);
           end else if !last_market_status <> current_status then
             Logging.info_f ~section "Market status changed: %s" current_status;
           last_market_open := current_open;
