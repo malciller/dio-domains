@@ -62,11 +62,27 @@ module Config = struct
 
   let is_paper = ref (!trading_mode = "paper")
 
+  let log_initial_config () =
+    (* Seed paper_mode from the initial trading_mode default *)
+    Ibkr_market_hours.paper_mode := !is_paper;
+    Logging.info_f ~section "IBKR config: host=%s port=%d mode=%s clientId=%d"
+      gateway_host !gateway_port !trading_mode client_id;
+    if !is_paper then
+      Logging.info ~section "Running in PAPER trading mode"
+    else
+      Logging.warn ~section "Running in LIVE trading mode. Real money at risk."
+
+  let _init_logged = ref false
+
   (** Dynamically resolves the execution trading mode based upon the serialized [testnet] parameter.
       When [testnet] evaluates to true, the system is forced into paper trading simulation over port 4002.
       When [testnet] evaluates to false, the system is forced into live execution over port 4001.
       The runtime parameter mutation is strictly constrained to only override the transmission port in the event that no explicit environment variable binding for IBKR_GATEWAY_PORT was supplied at the process execution level. *)
   let set_testnet testnet =
+    if not !_init_logged then begin
+      _init_logged := true;
+      log_initial_config ()
+    end;
     let mode = if testnet then "paper" else "live" in
     trading_mode := mode;
     is_paper := testnet;
@@ -77,16 +93,6 @@ module Config = struct
       gateway_port := (if testnet then 4002 else 4001);
     Logging.info_f ~section "IBKR trading mode set to %s (testnet=%b, port=%d)"
       mode testnet !gateway_port
-
-  let () =
-    (* Seed paper_mode from the initial trading_mode default *)
-    Ibkr_market_hours.paper_mode := !is_paper;
-    Logging.info_f ~section "IBKR config: host=%s port=%d mode=%s clientId=%d"
-      gateway_host !gateway_port !trading_mode client_id;
-    if !is_paper then
-      Logging.info ~section "Running in PAPER trading mode"
-    else
-      Logging.warn ~section "Running in LIVE trading mode. Real money at risk."
 end
 
 (** Global thread-safe reference cell holding the active socket connection handle to the Interactive Brokers gateway daemon. *)

@@ -67,14 +67,20 @@ let proxy_urls : string list =
            if String.length s > 0 && s.[String.length s - 1] = '/'
            then String.sub s 0 (String.length s - 1)
            else s)
-      |> fun urls ->
-          if List.length urls > 0 then
-            Logging.info_f ~section "Lighter proxy configured with %d pool(s): %s"
-              (List.length urls) (String.concat ", " urls);
-          urls
   | _ ->
-      Logging.info_f ~section "No LIGHTER_PROXY_URL configured, connecting directly (readonly mode)";
       []
+
+let _init_logged = ref false
+
+let _do_log () =
+  if not !_init_logged then begin
+    _init_logged := true;
+    if List.length proxy_urls > 0 then
+      Logging.info_f ~section "Lighter proxy configured with %d pool(s): %s"
+        (List.length proxy_urls) (String.concat ", " proxy_urls)
+    else
+      Logging.info_f ~section "No LIGHTER_PROXY_URL configured, connecting directly (readonly mode)"
+  end
 
 let current_proxy_index = Atomic.make 0
 
@@ -102,6 +108,7 @@ let has_more_proxies () =
 (** Resolves the current target connection URI mapped to the active execution state
     of the proxy index sequence. Yields no value during direct connectivity modes. *)
 let proxy_url () =
+  _do_log ();
   let len = List.length proxy_urls in
   if len = 0 then None
   else Some (List.nth proxy_urls (Atomic.get current_proxy_index))
