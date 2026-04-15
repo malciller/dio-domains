@@ -198,6 +198,9 @@ deployment, this project relies on [ib-gateway-docker](https://github.com/gnzsnz
 an excellent Docker image created by [@gnzsnz](https://github.com/gnzsnz) that handles
 headless authentication and session management.
 
+> [!WARNING]
+> Only run one trading mode (paper or live) per container. Do not use the 'both' mode with AUTO_RESTART_TIME enabled, as the dual Java applications will fight for VNC window focus during automation and deadlock the gateway.
+
 ### 1. Create gateway directory and credentials
 
 ```bash
@@ -211,6 +214,8 @@ EOF
 
 ### 2. Create `docker-compose.yml`
 
+This example is configured for Paper mode. To use Live mode, switch TRADING_MODE to "live" and swap the exposed port to the live proxy port (4003).
+
 ```yaml
 name: ibkr-gateway
 
@@ -219,15 +224,11 @@ services:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: always
     environment:
-      # Live Credentials
+      # Use paper or live. Do not use both.
+      TRADING_MODE: paper
       TWS_USERID: ${TWS_USERID}
       TWS_PASSWORD: ${TWS_PASSWORD}
       
-      # Paper Credentials (required when mode is 'both')
-      TWS_USERID_PAPER: ${TWS_USERID_PAPER}
-      TWS_PASSWORD_PAPER: ${TWS_PASSWORD_PAPER}
-      
-      TRADING_MODE: both
       READ_ONLY_API: "no"
       TWS_ACCEPT_INCOMING: accept
       EXISTING_SESSION_DETECTED_ACTION: primary
@@ -238,9 +239,14 @@ services:
       ALLOW_BLIND_TRADING: "no"
       VNC_SERVER_PASSWORD: "ibkr"
     ports:
-      - "127.0.0.1:4001:4003"   # Live API
-      - "127.0.0.1:4002:4004"   # Paper API
-      - "127.0.0.1:5900:5900"   # VNC (Usually points to live)
+      # Paper proxy API
+      - "127.0.0.1:4002:4004"
+      
+      # Live proxy API (Uncomment if using TRADING_MODE: live)
+      # - "127.0.0.1:4001:4003"
+      
+      # VNC Display
+      - "127.0.0.1:5900:5900"
     volumes:
       - ibkr-settings:/home/ibgateway/Jts
 
@@ -249,8 +255,7 @@ volumes:
 ```
 
 > [!IMPORTANT]
-> Port `4002:4004` maps the container's paper port to the host. For
-> live trading, change `TRADING_MODE` to `live` and map `4001:4001`.
+> The internal port mapping must point to the container's socat proxy (4003 or 4004) rather than the direct Java ports to safely bypass the JVM's "TrustedIPs=127.0.0.1" local network restriction in Docker.
 
 ### 3. Start and verify
 
@@ -261,7 +266,7 @@ docker compose logs -f   # Look for "Market data farm connection is OK"
 ```
 
 > [!CAUTION]
-> **First-time connection requires 2FA.** When IB Gateway starts for
+> **First-time LIVE connection requires 2FA.** When IB Gateway starts for
 > the first time (or after credential changes), IBKR will send a 2FA
 > challenge to your IBKR mobile app or security device. You must
 > approve it within the timeout window or the gateway will fail to
