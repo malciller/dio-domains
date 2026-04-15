@@ -369,6 +369,7 @@ perp short; spot sell fills close it. Enable with `"hedge": true`.
                |  - Lock-free tick bus & event registry      |
                |  - Histogram latency profiling (μs)        |
                |  - Structured logging (level + section)     |
+               |  - Centralized error handling & backoff     |
                |  - Dashboard UDS server (JSON over socket)  |
                +---------------------------------------------+
                 |                   |                   |
@@ -656,6 +657,14 @@ Structured, domain-safe logging with five severity levels: `DEBUG`,
 - **Zero-allocation fast path** — disabled levels skip formatting entirely
 - **ANSI color output** — distinct color per severity
 - **Millisecond timestamps** with per-second caching
+
+### Error Handling
+
+Centralized under `src/engine/error_handling/`, providing unified classification for network faults, rate limits, and server errors across all integrations. It features:
+
+- **Exponential Backoff**: Canonical retry mechanics for transport errors.
+- **Lwt Exception Wrappers**: Boilerplate elimination (`catch_and_log`, `catch_with_recovery`).
+- **Semantic Classification**: Maps exchange-specific error strings to common `error_kind` variants.
 
 ### Platform Notes
 
