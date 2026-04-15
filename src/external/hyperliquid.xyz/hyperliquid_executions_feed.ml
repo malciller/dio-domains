@@ -902,7 +902,7 @@ let _processor_task =
   let rec run () =
     let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch (fun () ->
-      Logging.info ~section "Starting Hyperliquid executions processor task";
+      Logging.debug_f ~section "Starting Hyperliquid executions processor task";
       let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
       (* Stream ended (disconnect pushed None). Re-subscribe immediately;
          consume_stream blocks event-driven on the new stream until the
