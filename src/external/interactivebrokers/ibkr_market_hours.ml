@@ -13,6 +13,11 @@
 
 let section = "ibkr_market_hours"
 
+(** When true, narrows [is_market_open] to regular trading hours (9:30 AM–4 PM)
+    because IB Gateway in paper mode does not serve useful data during
+    pre-market or after-hours. Set by [Ibkr_module.Config.set_testnet]. *)
+let paper_mode = ref false
+
 (** Computes the current UTC offset for US Eastern Time, dynamically adjusting for Daylight Saving Time.
     The Daylight Saving Time configuration (EDT, UTC-4) applies from 2:00 AM on the second Sunday in March
     until 2:00 AM on the first Sunday in November. For all other periods, the standard time configuration 
@@ -85,13 +90,22 @@ let is_market_open () =
   if not is_weekday then false
   else
     let time_mins = hour * 60 + min in
-    let open_mins = extended_open_hour * 60 + extended_open_min in
-    let close_mins = extended_close_hour * 60 + extended_close_min in
-    time_mins >= open_mins && time_mins < close_mins
+    if !paper_mode then
+      (* Paper mode: restrict to regular trading hours only.
+         IB Gateway paper does not support pre-market/after-hours trading
+         and may not accept connections outside RTH. *)
+      let rth_open = 9 * 60 + 30 in
+      let rth_close = 16 * 60 in
+      time_mins >= rth_open && time_mins < rth_close
+    else
+      let open_mins = extended_open_hour * 60 + extended_open_min in
+      let close_mins = extended_close_hour * 60 + extended_close_min in
+      time_mins >= open_mins && time_mins < close_mins
 
-(** Calculates the precise duration in seconds until the commencement of the next valid extended trading session.
+(** Calculates the precise duration in seconds until the commencement of the next valid trading session.
+    In paper mode, targets 9:30 AM ET (regular trading hours). In live mode, targets 4:00 AM ET (extended hours).
     If the market is currently evaluated as open, this function returns 0.0. The calculation comprehensively accounts
-    for weekend rollovers and time zone offsets to accurately target the next 4:00 AM Eastern Time opening sequence. *)
+    for weekend rollovers and time zone offsets. *)
 let seconds_until_next_open () =
   if is_market_open () then 0.0
   else begin
@@ -101,7 +115,11 @@ let seconds_until_next_open () =
     let tm = Unix.gmtime eastern_t in
     let wday = tm.Unix.tm_wday in
     let time_mins = tm.Unix.tm_hour * 60 + tm.Unix.tm_min in
-    let open_mins = extended_open_hour * 60 + extended_open_min in
+    let target_open_hour, target_open_min =
+      if !paper_mode then (9, 30)
+      else (extended_open_hour, extended_open_min)
+    in
+    let open_mins = target_open_hour * 60 + target_open_min in
 
     (* How many days until the next weekday open? *)
     let days_ahead =
@@ -120,7 +138,7 @@ let seconds_until_next_open () =
       let today_midnight = eastern_t -. (float_of_int (tm.Unix.tm_hour * 3600 + tm.Unix.tm_min * 60 + tm.Unix.tm_sec)) in
       today_midnight +. (float_of_int days_ahead *. 86400.0)
     in
-    let target_open_eastern = target_eastern_midnight +. (float_of_int (extended_open_hour * 3600 + extended_open_min * 60)) in
+    let target_open_eastern = target_eastern_midnight +. (float_of_int (target_open_hour * 3600 + target_open_min * 60)) in
     (* Convert back to UTC *)
     let target_open_utc = target_open_eastern -. (float_of_int offset *. 3600.0) in
     let delta = target_open_utc -. t in

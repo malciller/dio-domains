@@ -70,6 +70,8 @@ module Config = struct
     let mode = if testnet then "paper" else "live" in
     trading_mode := mode;
     is_paper := testnet;
+    (* Propagate paper mode to market hours so it restricts to RTH *)
+    Ibkr_market_hours.paper_mode := testnet;
     (* Conditionally apply the port override logic to preserve explicitly declared environment definitions. *)
     if Sys.getenv_opt "IBKR_GATEWAY_PORT" = None then
       gateway_port := (if testnet then 4002 else 4001);
@@ -77,6 +79,8 @@ module Config = struct
       mode testnet !gateway_port
 
   let () =
+    (* Seed paper_mode from the initial trading_mode default *)
+    Ibkr_market_hours.paper_mode := !is_paper;
     Logging.info_f ~section "IBKR config: host=%s port=%d mode=%s clientId=%d"
       gateway_host !gateway_port !trading_mode client_id;
     if !is_paper then
