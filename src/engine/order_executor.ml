@@ -165,45 +165,30 @@ let validate_cancel_request (request : cancel_request) : (unit, string) result =
       Ok ()
 
 (** Returns [true] if [exn_str] matches a transport-level connection failure.
-    Checks for common Lwt, Conduit, and TLS error substrings. *)
+    Delegates to centralized [Error_handling.classify]. *)
 let is_connection_error exn_str =
-  let error_str = String.lowercase_ascii exn_str in
-  let contains_substring haystack needle =
-    let rec check pos =
-      if pos + String.length needle > String.length haystack then false
-      else if String.sub haystack pos (String.length needle) = needle then true
-      else check (pos + 1)
-    in
-    check 0 in
-  contains_substring error_str "closed socket" ||
-  contains_substring error_str "channel_closed" ||
-  contains_substring error_str "tls:" ||
-  contains_substring error_str "end_of_file"
+  match Error_handling.classify exn_str with
+  | Error_handling.Connection -> true
+  | _ -> false
 
 (** Wraps [f] with exception handling. On connection errors (as classified by
     [is_connection_error]), retries up to [max_retries] times with [retry_delay]
     seconds between attempts. Non-connection errors return [Error] immediately. *)
 let with_error_handling ~operation_name ?(max_retries=3) ?(retry_delay=1.0) f =
-  let rec attempt retry_count =
+  Error_handling.retry_with_backoff ~section ~config:{
+    Error_handling.max_attempts = max_retries;
+    base_delay_ms = retry_delay *. 1000.0;
+    max_delay_ms = retry_delay *. 1000.0;
+    backoff_factor = 1.0;
+  } ~f:(fun () ->
     Lwt.catch
       (fun () -> f ())
       (fun exn ->
         let exn_str = Printexc.to_string exn in
         let err = Printf.sprintf "%s failed: %s" operation_name exn_str in
-
-        (* Retry transient connection errors up to max_retries. *)
-        if is_connection_error exn_str && retry_count < max_retries then begin
-          Logging.warn_f ~section "%s - connection error detected, retrying in %.1fs (attempt %d/%d)"
-            err retry_delay (retry_count + 1) max_retries;
-          Lwt_unix.sleep retry_delay >>= fun () ->
-          attempt (retry_count + 1)
-        end else begin
-          Logging.error_f ~section "%s" err;
-          Lwt.return (Error err)
-        end
-      )
-  in
-  attempt 0
+        Logging.error_f ~section "%s" err;
+        Lwt.return (Error err))
+  ) ~is_retriable_override:is_connection_error ()
 
 (** Resolves [name] to a first-class exchange module via [Exchange.Registry]. *)
 let get_exchange name =

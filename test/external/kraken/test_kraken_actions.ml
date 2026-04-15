@@ -77,13 +77,15 @@ let test_retry_with_backoff_logic () =
       Lwt.return (Ok "Success")
   in
 
-  let config = { Kraken.Kraken_actions.max_attempts = 5; base_delay_ms = 1.0; max_delay_ms = 100.0; backoff_factor = 1.5 } in
+  let config = { Error_handling.max_attempts = 5; base_delay_ms = 1.0; max_delay_ms = 100.0; backoff_factor = 1.5 } in
 
   let result = Lwt_main.run (
-    Kraken.Kraken_actions.retry_with_backoff
+    Error_handling.retry_with_backoff
+      ~section:"test"
       ~config
       ~f:test_function
-      ~is_retriable:(fun _ -> true)
+      ~is_retriable_override:(fun _ -> true)
+      ()
   ) in
 
   match result with
@@ -99,13 +101,15 @@ let test_max_retry_attempts () =
     Lwt.return (Error "Persistent failure")
   in
 
-  let config = { Kraken.Kraken_actions.max_attempts = 2; base_delay_ms = 1.0; max_delay_ms = 10.0; backoff_factor = 1.0 } in
+  let config = { Error_handling.max_attempts = 2; base_delay_ms = 1.0; max_delay_ms = 10.0; backoff_factor = 1.0 } in
 
   let result = Lwt_main.run (
-    Kraken.Kraken_actions.retry_with_backoff
+    Error_handling.retry_with_backoff
+      ~section:"test"
       ~config
       ~f:failing_function
-      ~is_retriable:(fun _ -> true)
+      ~is_retriable_override:(fun _ -> true)
+      ()
   ) in
 
   match result with

@@ -106,8 +106,11 @@ module Types = struct
                                        (Hyperliquid cloid, Lighter client_order_id). *)
   }
 
-  (** Parameters controlling exponential backoff retry behavior. *)
-  type retry_config = {
+  (** Parameters controlling exponential backoff retry behavior.
+      Canonical definition lives in [Error_handling]; re-exported here
+      so exchange module signatures can reference [Types.retry_config]
+      without depending on [Error_handling] directly. *)
+  type retry_config = Error_handling.retry_config = {
     max_attempts: int;     (** Maximum number of attempts (including the initial). *)
     base_delay_ms: float;  (** Initial delay between retries, in milliseconds. *)
     max_delay_ms: float;   (** Upper bound on delay between retries, in milliseconds. *)

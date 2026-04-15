@@ -18,6 +18,7 @@
   ipaddr.unix
   concurrency
   dio.persistence
-  dio.exchange)
+  dio.exchange
+  dio.error_handling)
  (preprocess
   (pps lwt_ppx)))

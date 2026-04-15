@@ -11,5 +11,6 @@
   threads
   dio.concurrency
   dio.latency_profiling
-  dio.exchange)
+  dio.exchange
+  dio.error_handling)
  (modules Config Domain_spawner Order_executor))

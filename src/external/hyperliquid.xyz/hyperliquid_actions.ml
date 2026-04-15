@@ -147,79 +147,23 @@ let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
   else
     Lwt.return (Error (Printf.sprintf "HTTP Error %d: %s" status body_str))
 
-(** Returns true if [substr] occurs anywhere within [str]. Linear scan. *)
-let string_contains (str : string) (substr : string) : bool =
-  let str_len = String.length str in
-  let substr_len = String.length substr in
-  if substr_len > str_len then false
-  else
-    let rec loop i =
-      if i + substr_len > str_len then false
-      else if String.sub str i substr_len = substr then true
-      else loop (i + 1)
-    in
-    loop 0
+(** Returns true if [substr] occurs anywhere within [str].
+    Delegates to centralized [Error_handling.string_contains]. *)
+let string_contains = Error_handling.string_contains
 
-(** Configuration for exponential backoff retry logic. *)
-type retry_config = {
+(** Retry configuration — re-exported from centralized [Error_handling]. *)
+type retry_config = Error_handling.retry_config = {
   max_attempts: int;
   base_delay_ms: float;
   max_delay_ms: float;
   backoff_factor: float;
 }
 
-let default_retry_config = {
-  max_attempts = 3;
-  base_delay_ms = 1000.0;
-  max_delay_ms = 30000.0;
-  backoff_factor = 2.0;
-}
+let default_retry_config = Error_handling.default_retry_config
 
-(** Lwt sleep for the given duration in milliseconds. *)
-let sleep_ms ms = Lwt_unix.sleep (ms /. 1000.0)
-
-(** Retries [f] with exponential backoff according to [config].
-    Stops retrying when max_attempts is reached or [is_retriable] returns false. *)
-let retry_with_backoff ~config ~f ~is_retriable =
-  let rec attempt attempt_num =
-    if attempt_num > config.max_attempts then
-      Lwt.fail_with (Printf.sprintf "Max retry attempts (%d) exceeded" config.max_attempts)
-    else begin
-      f () >>= fun result ->
-      match result with
-      | Ok _ as success -> Lwt.return success
-      | Error err ->
-          if attempt_num >= config.max_attempts || not (is_retriable err) then
-            Lwt.return (Error err)
-          else begin
-            let delay = min config.max_delay_ms (config.base_delay_ms *. (config.backoff_factor ** float_of_int (attempt_num - 1))) in
-            Logging.warn_f ~section "Attempt %d failed: %s. Retrying in %.0fms..." attempt_num err delay;
-            sleep_ms delay >>= fun () ->
-            attempt (attempt_num + 1)
-          end
-    end
-  in
-  attempt 1
-
-(** Classifies an error string as retriable by checking for indicators of
-    network failures, HTTP 5xx server errors, and rate-limit rejections. *)
-let is_retriable_error err =
-  let err_lower = String.lowercase_ascii err in
-  (* Network and connectivity errors. *)
-  string_contains err_lower "timeout" ||
-  string_contains err_lower "connection" ||
-  string_contains err_lower "network" ||
-  string_contains err_lower "reset" ||
-  string_contains err_lower "broken pipe" ||
-  (* HTTP 5xx server errors, potentially transient. *)
-  string_contains err_lower "500" ||
-  string_contains err_lower "502" ||
-  string_contains err_lower "503" ||
-  string_contains err_lower "504" ||
-  (* Hyperliquid rate-limit responses. *)
-  string_contains err_lower "rate limit" ||
-  string_contains err_lower "too many requests" ||
-  string_contains err_lower "too many cumulative requests"
+(** Classifies an error string as retriable.
+    Delegates to centralized [Error_handling.is_retriable_error]. *)
+let is_retriable_error = Error_handling.is_retriable_error
 
 (** Atomic counter for WebSocket request IDs. *)
 
@@ -370,7 +314,7 @@ let place_order ~symbol ~is_buy ~sz ~px ~is_limit:_ ?post_only:_ ?reduce_only ?c
         with exn -> Lwt.return (Error (Printf.sprintf "Failed to parse HL response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res))))
     | Error e -> Lwt.return (Error e)
   in
-  retry_with_backoff ~config:default_retry_config ~f:place_order_once ~is_retriable:is_retriable_error
+  Error_handling.retry_with_backoff ~section ~config:default_retry_config ~f:place_order_once ()
 
 (** Amends an existing order by order_id on Hyperliquid via WebSocket with retry.
     Submits a "modify" action with updated price, size, and side.
@@ -452,7 +396,7 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
         with exn -> Lwt.return (Error (Printf.sprintf "Failed to parse HL response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res))))
     | Error e -> Lwt.return (Error e)
   in
-  retry_with_backoff ~config:default_retry_config ~f:amend_order_once ~is_retriable:is_retriable_error
+  Error_handling.retry_with_backoff ~section ~config:default_retry_config ~f:amend_order_once ()
 
 (** Cancels one or more orders by their order IDs for a given symbol.
     Constructs a batch cancel action and submits via WebSocket with retry. *)
@@ -476,7 +420,7 @@ let cancel_orders ~symbol ~order_ids ~testnet =
     | Ok _ -> Lwt.return (Ok ())
     | Error e -> Lwt.return (Error e)
   in
-  retry_with_backoff ~config:default_retry_config ~f:cancel_orders_once ~is_retriable:is_retriable_error
+  Error_handling.retry_with_backoff ~section ~config:default_retry_config ~f:cancel_orders_once ()
 
 (** Transfers USDC between spot and perpetual wallets via the usdClassTransfer action.
     Uses the REST endpoint (not WebSocket) with exponential backoff retry. *)
@@ -510,4 +454,4 @@ let usd_class_transfer ~amount ~to_perp ~testnet =
         with exn -> Error (Printf.sprintf "Failed to parse HL transfer response: %s (Raw: %s)" (Printexc.to_string exn) (Yojson.Safe.to_string res)))
     | Error e -> Error e
   in
-  retry_with_backoff ~config:default_retry_config ~f:transfer_once ~is_retriable:is_retriable_error
+  Error_handling.retry_with_backoff ~section ~config:default_retry_config ~f:transfer_once ()
