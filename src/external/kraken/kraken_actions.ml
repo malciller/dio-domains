@@ -32,18 +32,9 @@ let truncate_price_to_precision price symbol =
       Logging.warn_f ~section "No price precision info for %s, using original price" symbol;
       price
 
-(** Evaluates string for substring presence. *)
-let string_contains (str : string) (substr : string) : bool =
-  let str_len = String.length str in
-  let substr_len = String.length substr in
-  if substr_len > str_len then false
-  else
-    let rec loop i =
-      if i + substr_len > str_len then false
-      else if String.sub str i substr_len = substr then true
-      else loop (i + 1)
-    in
-    loop 0
+(** Evaluates string for substring presence.
+    Delegates to centralized [Error_handling.string_contains]. *)
+let string_contains = Error_handling.string_contains
 
 (** Serializes JSON applying instrument specific float precision bounds. *)
 let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : string =
@@ -99,67 +90,19 @@ let next_req_id =
       Logging.warn_f ~section "Trading request ID %d approaching ping ID range (ping IDs start at %d) - potential collision risk" id ping_start_id;
     id
 
-(** Request retry configurations. *)
-type retry_config = {
+(** Retry configuration — re-exported from centralized [Error_handling]. *)
+type retry_config = Error_handling.retry_config = {
   max_attempts: int;
   base_delay_ms: float;
   max_delay_ms: float;
   backoff_factor: float;
 }
 
-let default_retry_config = {
-  max_attempts = 3;
-  base_delay_ms = 1000.0;
-  max_delay_ms = 30000.0;
-  backoff_factor = 2.0;
-}
+let default_retry_config = Error_handling.default_retry_config
 
-(** Halts execution thread for millisecond duration. *)
-let sleep_ms ms = Lwt_unix.sleep (ms /. 1000.0)
-
-(** Executes closure repeating upon failure with exponential backoff algorithm. *)
-let retry_with_backoff ~config ~f ~is_retriable =
-  let rec attempt attempt_num =
-    if attempt_num > config.max_attempts then
-      Lwt.fail_with (Printf.sprintf "Max retry attempts (%d) exceeded" config.max_attempts)
-    else begin
-      f () >>= fun result ->
-      match result with
-      | Ok _ as success -> Lwt.return success
-      | Error err ->
-          if attempt_num >= config.max_attempts || not (is_retriable err) then
-            Lwt.return (Error err)
-          else begin
-            let delay = min config.max_delay_ms (config.base_delay_ms *. (config.backoff_factor ** float_of_int (attempt_num - 1))) in
-            Logging.warn_f ~section "Attempt %d failed: %s. Retrying in %.0fms..." attempt_num err delay;
-            sleep_ms delay >>= fun () ->
-            attempt (attempt_num + 1)
-          end
-    end
-  in
-  attempt 1
-
-
-(** Classifies error responses targeting transient network conditions. *)
-let is_retriable_error err =
-  let err_lower = String.lowercase_ascii err in
-  (* Assesses connectivity socket failures. *)
-  string_contains err_lower "timeout" ||
-  string_contains err_lower "connection" ||
-  string_contains err_lower "network" ||
-  string_contains err_lower "reset" ||
-  string_contains err_lower "broken pipe" ||
-  (* Assesses transient server state errors. *)
-  string_contains err_lower "500" ||
-  string_contains err_lower "502" ||
-  string_contains err_lower "503" ||
-  string_contains err_lower "504" ||
-  (* Assesses websocket protocol failures. *)
-  string_contains err_lower "websocket" ||
-  string_contains err_lower "socket" ||
-  (* Assesses API rate limit violations. *)
-  string_contains err_lower "rate limit" ||
-  string_contains err_lower "too many requests"
+(** Classifies error responses targeting transient network conditions.
+    Delegates to centralized [Error_handling.is_retriable_error]. *)
+let is_retriable_error = Error_handling.is_retriable_error
 
 (** Transmits order placement payload utilizing retry handler. *)
 let place_order
@@ -306,7 +249,7 @@ let place_order
     end
   in
 
-  retry_with_backoff ~config ~f:place_order_once ~is_retriable:is_retriable_error
+  Error_handling.retry_with_backoff ~section ~config ~f:place_order_once ()
 
 (** Transmits order modification payload utilizing retry handler. *)
 let amend_order
@@ -452,7 +395,7 @@ let amend_order
     end
   in
 
-  retry_with_backoff ~config ~f:amend_order_once ~is_retriable:is_retriable_error
+  Error_handling.retry_with_backoff ~section ~config ~f:amend_order_once ()
 
 (** Transmits order cancellation payload utilizing retry handler. *)
 let cancel_orders
@@ -533,4 +476,4 @@ let cancel_orders
     end
   in
 
-  retry_with_backoff ~config ~f:cancel_orders_once ~is_retriable:is_retriable_error
+  Error_handling.retry_with_backoff ~section ~config ~f:cancel_orders_once ()

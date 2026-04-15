@@ -46,12 +46,7 @@ let send_tx ~tx_type ~tx_info =
       (* Implement non-blocking auto recovery sequence for cryptographic nonce desynchronization. Ghost modifications executed during periods of WebSocket disconnection will consume nonce values locally but may fail to confirm on the blockchain. This behavior causes the local counter state to diverge from the exchange state. By re-fetching the correct nonce directly from the exchange, subsequent order operations are protected from entering an invalid nonce recursive failure loop. *)
       let lower = String.lowercase_ascii resp_str in
       if String.length lower > 0 then begin
-        let rec find_sub s sub i =
-          if i + String.length sub > String.length s then false
-          else if String.sub s i (String.length sub) = sub then true
-          else find_sub s sub (i + 1)
-        in
-        if find_sub lower "invalid nonce" 0 then begin
+        if Error_handling.string_contains lower "invalid nonce" then begin
           Logging.warn_f ~section "Nonce desync detected. Re-fetching correct nonce from exchange.";
           let base_url = Lighter_proxy.api_base_url () in
           Lwt.dont_wait

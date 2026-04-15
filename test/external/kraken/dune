@@ -1,6 +1,6 @@
 (test
  (name test_kraken_actions)
- (libraries dio.kraken alcotest))
+ (libraries dio.kraken dio.error_handling alcotest))
 
 (test
  (name test_kraken_balances_feed)

@@ -16,6 +16,7 @@
   ctypes
   ctypes-foreign
   concurrency
-  dio.exchange)
+  dio.exchange
+  dio.error_handling)
  (preprocess
   (pps lwt_ppx)))

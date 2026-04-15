@@ -1,0 +1,5 @@
+(library
+ (name error_handling)
+ (public_name dio.error_handling)
+ (libraries lwt lwt.unix dio.logging)
+ (modules Error_handling))

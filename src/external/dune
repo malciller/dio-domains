@@ -1,5 +1,5 @@
 (library
  (name dio_exchange)
  (public_name dio.exchange)
- (libraries lwt)
+ (libraries lwt dio.error_handling)
  (modules Exchange_intf))
