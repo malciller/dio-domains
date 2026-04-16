@@ -679,6 +679,21 @@ let process_order_updates data_json =
               fee = None;
               cl_ord_id = (match cl_ord_id with Some _ -> cl_ord_id | None -> (match existing_order with Some o -> o.cl_ord_id | None -> None));
             } in
+            let is_terminal_ou = match order_status with
+              | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
+              | _ -> false
+            in
+            (* Guard: if the order is already gone from open_orders
+               (removed by a prior userFills Trade event), skip redundant
+               terminal dispatch from orderUpdates.  The userFills path
+               provides accurate fill_price and fee; orderUpdates uses
+               limitPx which can diverge and corrupt strategy state. *)
+            let is_already_terminal = is_terminal_ou && existing_order = None in
+            if is_already_terminal then
+              Logging.debug_f ~section
+                "Skipping redundant %s event for %s [%s] (already processed via userFills)"
+                status order_id symbol
+            else begin
             
             update_orders_internal store event;
             
@@ -689,7 +704,8 @@ let process_order_updates data_json =
                  Logging.debug_f ~section "Order %s: %s [%s] (reason: %s)" (String.uppercase_ascii status) order_id symbol status
              | NewStatus ->
                  Logging.debug_f ~section "Order OPEN: %s [%s] %.8f @ %.2f" order_id symbol qty price
-             | _ -> ());
+             | _ -> ())
+            end;
         | None -> ()
       ) orders
   | _ -> ()
