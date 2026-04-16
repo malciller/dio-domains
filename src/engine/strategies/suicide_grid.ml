@@ -1023,7 +1023,12 @@ let execute_strategy
            On buy fill, the existing sell's InFlightOrders key is still live,
            which would block the new sell via duplicate detection.
            Force-clear the sell key so a fresh sell is always placed alongside the new buy. *)
-        let sell_price = calculate_grid_price bid_price grid_interval true state in
+        let base_price_for_sell =
+          match state.last_buy_fill_price with
+          | Some fill_p -> fill_p
+          | None -> bid_price
+        in
+        let sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
         let buy_price = calculate_grid_price ask_price grid_interval false state in
 
         let buy_cooldown_key = "place_Buy" in
