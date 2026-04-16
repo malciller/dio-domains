@@ -927,7 +927,7 @@ let execute_strategy
           List.iter (fun (oid, price, qty) ->
             Logging.warn_f ~section
               "STALE_SELL_DETECTED [%s] order %s @ %.2f <= bid %.2f (qty=%.8f). \
-               Likely filled during WS outage. Evicting from tracking memory."
+               Order priced at/below bid — likely filled but fill event not received. Evicting from tracking memory."
               asset.symbol oid price bid_price qty;
             Hashtbl.replace state.evicted_orders oid (now +. 86400.0)
           ) stale_sells;
@@ -1123,8 +1123,11 @@ let execute_strategy
 
         (* Place buy order if quote balance is available. *)
         if not (Float.is_nan quote_balance) then begin
-         if is_buy_on_cooldown || state.inflight_buy then ()
-         else begin
+         if is_buy_on_cooldown || state.inflight_buy then begin
+           Logging.debug_f ~section
+             "Buy placement skipped for %s (cooldown=%B, inflight=%B)"
+             asset.symbol is_buy_on_cooldown state.inflight_buy
+         end else begin
              let quote_bal = quote_balance in
              (* Compute available balances net of open order commitments *)
              
@@ -1609,10 +1612,12 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
     else
     (match side with
      | Sell ->
-          (* Determine cost basis: use last_sell_fill_price for consecutive sells
-             (ladder steps), otherwise use last_buy_fill_price (first sell after buy). *)
+          (* Determine cost basis: use last_sell_fill_price for ascending
+             ladder sells (each step strictly higher than the previous).
+             When two sells fill at the same price or descend, each should
+             independently use the original buy fill price. *)
           let cost_basis = match state.last_sell_fill_price with
-            | Some prev_sell when prev_sell > 0.0 -> Some prev_sell
+            | Some prev_sell when prev_sell > 0.0 && prev_sell < sell_fill_price -> Some prev_sell
             | _ -> state.last_buy_fill_price
           in
           (match cost_basis with
