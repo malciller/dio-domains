@@ -285,6 +285,11 @@ see the IB Gateway GUI for debugging login or order issues.
 > timeouts. Paper accounts receive delayed (15-min) market data; the
 > engine sets data type to delayed automatically.
 
+> [!WARNING]
+> **Paper Trading Auto-Restart Bug**: In Paper Trading mode, IB Gateway's internal JVM daily restart (triggered by `AUTO_RESTART_TIME`) frequently hangs at an "Unrecognized Username or Password" dialog because paper session tokens expire. The engine will loop `Connection refused` endlessly.
+> 
+> **Fix**: For Paper Trading, remove `AUTO_RESTART_TIME` from your `docker-compose.yml` and use a host OS crontab (`crontab -e`) to hard-restart the docker container daily before market open (e.g. `59 23 * * * docker restart ib-gateway`). This ensures a completely fresh login sequence, which always succeeds.
+
 ---
 
 ## Strategies

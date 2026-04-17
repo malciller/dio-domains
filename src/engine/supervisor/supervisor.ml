@@ -1926,7 +1926,7 @@ let order_processing_loop () =
     a positive balance and subscribes their orderbook feeds. Runs every 10s.
     Enables portfolio valuation for assets that are held but not actively traded. *)
 let monitor_non_active_assets () =
-  let subscribed_symbols = Hashtbl.create 16 in
+  let subscribed_symbols : (string, float) Hashtbl.t = Hashtbl.create 16 in
   let rec loop () =
     if Atomic.get shutdown_requested then Lwt.return_unit
     else
@@ -1949,25 +1949,56 @@ let monitor_non_active_assets () =
           | Some (module Ex) ->
               let balances = Ex.get_all_balances () in
               let symbols_to_subscribe = ref [] in
-              List.iter (fun (asset, _bal) ->
-                let quote = match exch_name with
-                  | "hyperliquid" | "lighter" -> "USDC"
-                  | _ -> "USD"
-                in
-                let symbol = asset ^ "/" ^ quote in
-                let is_configured = List.exists (fun (ex, sym) ->
-                  ex = exch_name && sym = symbol
-                ) configured_symbols in
-                let is_quote = (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || (asset = "USDT") || (asset = quote) || (asset = "USDe") in
-                
-                if not is_configured && not is_quote then begin
-                  let target_key = exch_name ^ ":" ^ symbol in
-                  if not (Hashtbl.mem subscribed_symbols target_key) then begin
-                    Hashtbl.add subscribed_symbols target_key true;
-                    symbols_to_subscribe := symbol :: !symbols_to_subscribe
-                  end
+              let conn_name = match exch_name with
+                | "kraken" -> "kraken_orderbook_ws"
+                | "hyperliquid" -> "hyperliquid_ws"
+                | "ibkr" -> "ibkr_gateway"
+                | _ -> ""
+              in
+              let current_connected_time =
+                if conn_name = "" then 0.0
+                else begin
+                  Mutex.lock registry_mutex;
+                  let conn_opt = Hashtbl.find_opt connections conn_name in
+                  Mutex.unlock registry_mutex;
+                  match conn_opt with
+                  | Some conn ->
+                      Mutex.lock conn.mutex;
+                      let t = match conn.state, conn.last_connected with
+                      | Connected, Some t -> t
+                      | _ -> 0.0
+                      in
+                      Mutex.unlock conn.mutex;
+                      t
+                  | None -> 0.0
                 end
-              ) balances;
+              in
+              
+              if current_connected_time > 0.0 then begin
+                List.iter (fun (asset, _bal) ->
+                  let quote = match exch_name with
+                    | "hyperliquid" | "lighter" -> "USDC"
+                    | _ -> "USD"
+                  in
+                  let symbol = asset ^ "/" ^ quote in
+                  let is_configured = List.exists (fun (ex, sym) ->
+                    ex = exch_name && sym = symbol
+                  ) configured_symbols in
+                  let is_quote = (asset = "USD") || (asset = "USDC") || (asset = "ZUSD") || (asset = "USDT") || (asset = quote) || (asset = "USDe") in
+                  
+                  if not is_configured && not is_quote then begin
+                    let target_key = exch_name ^ ":" ^ symbol in
+                    let needs_sub = match Hashtbl.find_opt subscribed_symbols target_key with
+                      | None -> true
+                      | Some t -> t < current_connected_time
+                    in
+                    if needs_sub then begin
+                      Hashtbl.replace subscribed_symbols target_key current_connected_time;
+                      symbols_to_subscribe := symbol :: !symbols_to_subscribe
+                    end
+                  end
+                ) balances
+              end;
               if !symbols_to_subscribe <> [] then begin
                 Logging.info_f ~section "Dynamically subscribing non-active assets on %s: %s" 
                   exch_name (String.concat ", " !symbols_to_subscribe);
