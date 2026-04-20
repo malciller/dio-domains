@@ -28,6 +28,10 @@ let format_price f =
   else if f >= 1.0 then Printf.sprintf "$%.2f" f
   else Printf.sprintf "$%.4f" f
 
+let format_usd f =
+  if f < 0.0 then Printf.sprintf "-$%.2f" (abs_float f)
+  else Printf.sprintf "$%.2f" f
+
 let format_qty f =
   if f >= 1.0 then Printf.sprintf "%.4f" f
   else Printf.sprintf "%.6f" f

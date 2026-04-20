@@ -250,9 +250,9 @@ let render_strategies w json =
         (format_pnl unrealized_profit);
       I.string a_border " │ ";
       col_right 12 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
-      col_right 10 row_text (if hold_value > 0.01 then format_price hold_value else "--");
+      col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
       col_right 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
-      col_right 10 row_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
+      col_right 10 row_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
     ])
   in
 
@@ -392,9 +392,9 @@ let render_strategies w json =
         (if sell_count > 0 then format_pnl unrealized_profit else "--");
       I.string a_border " │ ";
       col_right 12 a_text (format_qty balance);
-      col_right 10 a_text (if hold_value > 0.01 then format_price hold_value else "--");
+      col_right 10 a_text (if hold_value > 0.01 then format_usd hold_value else "--");
       col_right 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
-      col_right 10 a_text (if accum_hold_value > 0.01 then format_price accum_hold_value else "--");
+      col_right 10 a_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
     ])
   in
 
@@ -510,11 +510,11 @@ let render_strategies w json =
   in
   let summary_bar = close_row w (I.hcat [
     I.string A.(fg c_border ++ bg c_bg) " │";
-    kv "Cash"      (format_price total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
+    kv "Cash"      (format_usd total_quote_val) A.(fg c_cyan   ++ bg c_bg ++ st bold);
     pipe;
-    kv "Accum Val" (format_price total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
+    kv "Accum Val" (format_usd total_accum_val) A.(fg c_bright ++ bg c_bg ++ st bold);
     pipe;
-    kv "Hold Val"  (format_price total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
+    kv "Hold Val"  (format_usd total_hold_val)  A.(fg c_bright ++ bg c_bg ++ st bold);
     pipe;
     kv "Sell Val"  (format_pnl   total_up)        up_attr;
   ]) in
