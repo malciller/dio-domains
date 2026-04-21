@@ -18,12 +18,12 @@
       "qty": "0.0005",
       "grid_interval": [
         0.25,
-        0.5
+        0.35
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.05,
-        2.00
+        0.15,
+        4.00
       ],
       "strategy": "Grid",
       "testnet": false,
@@ -39,7 +39,7 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.04,
+        0.15,
         5.00
       ],
       "strategy": "Grid",
@@ -56,7 +56,7 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.04,
+        0.15,
         5.25
       ],
       "strategy": "Grid"
@@ -71,7 +71,7 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.07,
+        0.15,
         6.25
       ],
       "strategy": "Grid",
@@ -88,22 +88,6 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"
-    },
-    {
-      "symbol": "XBI",
-      "exchange": "ibkr",
-      "qty": "1.0",
-      "grid_interval": [
-        1.25,
-        2.0
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        1.00,
-        50.00
-      ],
-      "strategy": "Grid",
-      "testnet": true
     }
   ]
 }

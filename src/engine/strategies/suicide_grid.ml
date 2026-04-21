@@ -1564,6 +1564,13 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
          and silently skip profit calculation. *)
       if persistence_accumulation_exchange state.exchange_id then
         state.persistence_dirty <- true;
+      if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0 then begin
+        let base_fee = acc_qty *. state.maker_fee in
+        state.reserved_base <- state.reserved_base -. base_fee;
+        Logging.info_f ~section "Decremented reserved_base for %s by %.8f (base fee leak), now %.8f"
+          asset_symbol base_fee state.reserved_base
+      end;
+
       (* Credit anticipated base so the sell guard sees incoming asset before
          the balance feed catches up (exec feed is faster than balance feed).
          Only credit if this fill was the actively tracked buy to prevent double-crediting
@@ -1625,15 +1632,13 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
               let qty = acc_qty in
               let gross = (sell_fill_price -. base_price) *. qty in
               (* Hyperliquid / Lighter spot: buy fee from base; sell fee from quote.
-                 Only the sell-side fee affects quote (e.g. USDC) balance growth.
-                 Kraken: both legs charged against quote. *)
+                 Even though buy fee was paid in base, we deduct its quote cost basis
+                 here so accumulated_profit accurately reflects economic reality. *)
               let fees =
                 if state.exchange_id = "ibkr" then
                   (* IBKR Pro Tiered: per-share with min/max, charged per leg *)
                   ibkr_commission ~qty ~price:base_price
                   +. ibkr_commission ~qty ~price:sell_fill_price
-                else if hl_like_spot_fee_exchange state.exchange_id then
-                  sell_fill_price *. qty *. state.maker_fee
                 else
                   (sell_fill_price *. qty *. state.maker_fee)
                   +. (base_price *. qty *. state.maker_fee)
