@@ -62,7 +62,7 @@ let string_of_side = function
 
 (* Defaults to Buy for unrecognized side strings. Unknown values are logged as warnings. *)
 let side_of_string s =
-  match s with
+  match String.lowercase_ascii s with
   | "buy" -> Buy
   | "sell" -> Sell
   | other ->
@@ -166,7 +166,7 @@ type symbol_store = {
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
 (** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires global_orders_mutex. *)
-let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
+let order_to_symbol : (string, string * side) Hashtbl.t = Hashtbl.create 16
 (** FIFO queue for O(1) oldest-entry eviction. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
 (** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
@@ -174,10 +174,10 @@ let order_to_symbol_cap : int ref = ref max_int
 let order_to_symbol_startup_done = Atomic.make false
 
 (** Inserts an order ID to symbol mapping. Evicts the oldest entry via FIFO when exceeding cap. Caller must hold global_orders_mutex. *)
-let add_to_order_to_symbol order_id symbol =
+let add_to_order_to_symbol order_id symbol side =
   if not (Hashtbl.mem order_to_symbol order_id) then
     Queue.push order_id order_to_symbol_queue;
-  Hashtbl.replace order_to_symbol order_id symbol;
+  Hashtbl.replace order_to_symbol order_id (symbol, side);
   if Atomic.get order_to_symbol_startup_done then
     while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
       if Queue.is_empty order_to_symbol_queue then
@@ -311,7 +311,7 @@ let find_order_everywhere order_id =
   Mutex.unlock global_orders_mutex;
   match symbol_opt with
   | None -> None
-  | Some symbol ->
+  | Some (symbol, _side) ->
       let store = get_symbol_store symbol in
       Mutex.lock store.orders_mutex;
       let order = Hashtbl.find_opt store.open_orders order_id in
@@ -473,7 +473,7 @@ let update_open_orders store (event : execution_event) =
     | None -> None
   else None in
 
-  if is_terminal_status || is_effectively_filled then begin
+  if is_terminal_status then begin
     (* Terminal: remove from open orders if present. *)
     if was_tracked then Hashtbl.remove store.open_orders event.order_id
   end else begin
@@ -569,7 +569,7 @@ let update_open_orders store (event : execution_event) =
     end
   end else begin
     Mutex.lock global_orders_mutex;
-    add_to_order_to_symbol event.order_id event.symbol;
+    add_to_order_to_symbol event.order_id event.symbol event.side;
     Mutex.unlock global_orders_mutex;
     log_action := `Upserted (was_tracked, !needs_cleanup, remaining_qty)
   end;
@@ -651,20 +651,22 @@ let parse_execution_event json =
     (* Symbol may be absent in minimal status updates (e.g., cancellations). *)
     let symbol_opt = member "symbol" json |> to_string_option in
 
-    (* Resolve symbol from the global order-to-symbol index for minimal events. *)
-    let symbol = match symbol_opt with
-      | Some s -> Some s
+    (* Resolve symbol and side from the global order-to-symbol index for minimal events. *)
+    let symbol_side = match symbol_opt with
+      | Some s -> Some (s, None)
       | None ->
           Mutex.lock global_orders_mutex;
           let s = Hashtbl.find_opt order_to_symbol order_id in
           Mutex.unlock global_orders_mutex;
           (match s with
-           | Some sym -> Some sym
+           | Some (sym, side) -> Some (sym, Some side)
            | None ->
                (* Skip events with no symbol attribution, typical of pre-startup orders. *)
                Logging.debug_f ~section "Skipping event for unknown order %s (likely pre-startup order)" order_id;
                None)
     in
+
+    let symbol = match symbol_side with Some (sym, _) -> Some sym | None -> None in
 
     (* Return None if symbol could not be resolved. *)
     match symbol with
@@ -683,7 +685,10 @@ let parse_execution_event json =
           | None ->
               (match existing_order with
                | Some order -> string_of_side order.side
-               | None -> "buy")  (* Default to buy when no prior data exists. *)
+               | None ->
+                   match symbol_side with
+                   | Some (_, Some side) -> string_of_side side
+                   | _ -> "buy")  (* Default to buy when no prior data exists. *)
         in
 
         let order_qty =
