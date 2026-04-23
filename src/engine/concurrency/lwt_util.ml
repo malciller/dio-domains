@@ -52,10 +52,7 @@ let consume_stream_s f stream =
             Lwt.wakeup_later done_u ();
             Lwt.return_unit
         | Some x ->
-            Lwt.catch
-              (fun () -> f x)
-              (fun _exn -> Lwt.return_unit)
-            >>= fun () ->
+            f x >>= fun () ->
             Lwt.async loop;
             Lwt.return_unit)
       (fun exn ->

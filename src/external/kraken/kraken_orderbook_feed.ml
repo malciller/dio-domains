@@ -6,8 +6,27 @@
 *)
 
 open Lwt.Infix
+open Kraken_common_types
 
 let section = "kraken_orderbook"
+
+module Response_table = Hashtbl.Make (struct
+  type t = int
+  let equal = Int.equal
+  let hash = Hashtbl.hash
+end)
+
+type state_t = {
+  mutable active_conn: Websocket_lwt_unix.conn option;
+  responses: (ws_response Lwt.u * float) Response_table.t;
+  mutex: Lwt_mutex.t;
+}
+
+let state = {
+  active_conn = None;
+  responses = Response_table.create 8;
+  mutex = Lwt_mutex.create ();
+}
 
 let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 
@@ -797,34 +816,90 @@ let trigger_orderbook_cleanup ~reason () =
     Lwt.return_unit
   )
 
-
-
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
-  try
-    let json = Yojson.Safe.from_string message in
-    let open Yojson.Safe.Util in
-    let channel = member "channel" json |> to_string_option in
-    let msg_type = member "type" json |> to_string_option in
-    let method_type = member "method" json |> to_string_option in
+  Lwt.catch
+    (fun () ->
+       let json = Yojson.Safe.from_string message in
+       on_heartbeat ();
+       let open Yojson.Safe.Util in
+       let channel = member "channel" json |> to_string_option in
+       let msg_type = member "type" json |> to_string_option in
+       let method_type = member "method" json |> to_string_option in
+       
+       (match channel, msg_type, method_type with
+       | Some "heartbeat", _, _ -> Lwt.return (on_heartbeat ())
+       | _, _, Some "heartbeat" -> Lwt.return (on_heartbeat ())
+       | _, _, Some "pong" ->
+           let req_id = member "req_id" json |> to_int_option in
+           let success = true in 
+           (match req_id with
+           | Some rid ->
+               Lwt_mutex.with_lock state.mutex (fun () ->
+                 match Response_table.find_opt state.responses rid with
+                 | Some (u, _) ->
+                     Response_table.remove state.responses rid;
+                     let resp = {
+                       method_ = "pong";
+                       success;
+                       req_id = Some rid;
+                       time_in = member "time_in" json |> to_string_option |> Option.value ~default:"";
+                       time_out = member "time_out" json |> to_string_option |> Option.value ~default:"";
+                       result = None;
+                       error = None;
+                       warnings = None;
+                     } in
+                     Lwt.wakeup_later u resp;
+                     Lwt.return_unit
+                 | None -> Lwt.return_unit)
+           | None -> Lwt.return_unit)
+       | Some "book", Some "snapshot", _ ->
+           ignore (process_orderbook_message ~reset:true json on_heartbeat);
+           Lwt.return_unit
+       | Some "book", Some "update", _ ->
+           ignore (process_orderbook_message ~reset:false json on_heartbeat);
+           Lwt.return_unit
+       | _, _, Some "subscribe" ->
+           let result = member "result" json in
+           let symbol = member "symbol" result |> to_string in
+           Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol;
+           Lwt.return_unit
+       | Some "status", _, _ ->
+           Logging.debug_f ~section "Status message received";
+           Lwt.return_unit
+       | _ ->
+           Logging.debug_f ~section "Unhandled orderbook payload: %s" message;
+           Lwt.return_unit
+       ))
+    (fun exn ->
+       Logging.error_f ~section "Error parsing message: %s - %s" 
+         (Printexc.to_string exn) message;
+       Lwt.return_unit)
 
-    match channel, msg_type, method_type with
-  | Some "book", Some "snapshot", _ ->
-      ignore (process_orderbook_message ~reset:true json on_heartbeat)
-  | Some "book", Some "update", _ ->
-      ignore (process_orderbook_message ~reset:false json on_heartbeat)
-    | Some "heartbeat", _, _ -> on_heartbeat ()
-    | _, _, Some "subscribe" ->
-        let result = member "result" json in
-        let symbol = member "symbol" result |> to_string in
-        Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol
-    | Some "status", _, _ ->
-        Logging.debug_f ~section "Status message received"
-    | _ ->
-        Logging.debug_f ~section "Unhandled orderbook payload: %s" message
-  with exn ->
-    Logging.error_f ~section "Error handling orderbook message: %s - %s"
-      (Printexc.to_string exn) message
+let send_ping ~req_id ~timeout_ms =
+  Lwt_mutex.with_lock state.mutex (fun () -> Lwt.return state.active_conn) >>= function
+  | None -> Lwt.fail (Failure "Orderbook WebSocket not connected")
+  | Some conn ->
+      let msg = `Assoc [ ("method", `String "ping"); ("req_id", `Int req_id) ] in
+      let msg_str = Yojson.Safe.to_string msg in
+      let waiter, wakener = Lwt.wait () in
+      
+      Lwt_mutex.with_lock state.mutex (fun () ->
+        Response_table.replace state.responses req_id (wakener, Unix.gettimeofday ());
+        Lwt.return_unit)
+      >>= fun () ->
+      
+      Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ()) >>= fun () ->
+      
+      Lwt.pick [
+        waiter;
+        (Lwt_unix.sleep (float_of_int timeout_ms /. 1000.0) >>= fun () ->
+         Lwt_mutex.with_lock state.mutex (fun () ->
+           Response_table.remove state.responses req_id;
+           Lwt.return_unit)
+         >>= fun () ->
+         Lwt.fail (Failure "Ping timeout"))
+      ]
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
   let start_time = Unix.gettimeofday () in
@@ -886,20 +961,23 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
         Logging.warn ~section "Orderbook WebSocket closed by server";
         on_failure "Connection closed by server";
-        Lwt.fail (Failure "Connection closed by server")
+        Lwt.return_unit
     | frame ->
         Lwt.catch
-          (fun () ->
-             handle_message frame.Websocket.Frame.content on_heartbeat;
-             Lwt.return_unit)
+          (fun () -> handle_message frame.Websocket.Frame.content on_heartbeat)
           (fun exn ->
              Logging.error_f ~section "Error handling Kraken orderbook frame: %s" (Printexc.to_string exn);
              Lwt.return_unit)
   in
 
+  Lwt_mutex.with_lock state.mutex (fun () ->
+    state.active_conn <- Some conn;
+    Lwt.return_unit)
+  >>= fun () ->
+
   let done_p =
     Lwt.catch
-      (fun () -> Concurrency.Lwt_util.consume_stream (fun frame -> Lwt.async (fun () -> process_frame frame)) stream)
+      (fun () -> Concurrency.Lwt_util.consume_stream_s process_frame stream)
       (fun exn ->
          match exn with
          | Failure msg when msg = "Connection closed by server" ->
@@ -909,16 +987,17 @@ let start_message_handler conn symbols on_failure on_heartbeat =
              on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
              Lwt.return_unit)
   in
-let final_done_p =
+  let final_done_p =
     done_p >>= fun () ->
-    (* Only handle EOF case if stream completes without error *)
+    Lwt_mutex.with_lock state.mutex (fun () ->
+      state.active_conn <- None;
+      Lwt.return_unit)
+    >>= fun () ->
     Logging.warn ~section "Orderbook WebSocket connection closed unexpectedly (End_of_file)";
     on_failure "Connection closed unexpectedly (End_of_file)";
     Lwt.return_unit
   in
   final_done_p
-
-let active_conn = ref None
 
 let subscribe_symbols symbols =
   fetch_decimals symbols >>= fun () ->
@@ -926,7 +1005,7 @@ let subscribe_symbols symbols =
     let _ = ensure_store symbol in
     ()
   ) symbols;
-  match !active_conn with
+  Lwt_mutex.with_lock state.mutex (fun () -> Lwt.return state.active_conn) >>= function
   | Some conn ->
       let subscribe_msg = `Assoc [
         ("method", `String "subscribe");
@@ -957,7 +1036,10 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let ctx = get_conduit_ctx () in
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
 
-    active_conn := Some conn;
+    Lwt_mutex.with_lock state.mutex (fun () ->
+      state.active_conn <- Some conn;
+      Lwt.return_unit)
+    >>= fun () ->
     Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
 
     on_connected ();
