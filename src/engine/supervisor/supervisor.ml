@@ -494,8 +494,8 @@ let monitor_loop () =
                         end
                       end
                   | Connected, _ ->
-                      (* Active ping/pong liveness for authenticated connections *)
-                      if String.equal conn.name "kraken_auth_ws" || String.equal conn.name "hyperliquid_ws" || String.equal conn.name "lighter_ws" then begin
+                      (* Active ping/pong liveness for authenticated connections and Kraken orderbook *)
+                      if String.equal conn.name "kraken_auth_ws" || String.equal conn.name "kraken_orderbook_ws" || String.equal conn.name "hyperliquid_ws" || String.equal conn.name "lighter_ws" then begin
                         let should_ping =
                           match conn.last_ping_sent with
                           | None -> true  (* First ping *)
@@ -513,6 +513,26 @@ let monitor_loop () =
                                   Kraken.Kraken_trading_client.send_ping ~req_id ~timeout_ms:5000 >>= fun response ->
                                   if response.success then begin
 
+                                    Atomic.set conn.ping_failures 0;
+                                    update_data_heartbeat conn;
+                                    Lwt.return_unit
+                                  end else begin
+                                    Logging.warn_f ~section "[%s] Ping failed: %s" conn.name
+                                      (match response.error with Some e -> e | None -> "unknown error");
+                                    Atomic.incr conn.ping_failures;
+                                    Lwt.return_unit
+                                  end
+                                )
+                                (fun exn ->
+                                  Logging.warn_f ~section "[%s] Ping exception: %s" conn.name (Printexc.to_string exn);
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit
+                                )
+                            else if String.equal conn.name "kraken_orderbook_ws" then
+                              Lwt.catch
+                                (fun () ->
+                                  Kraken.Kraken_orderbook_feed.send_ping ~req_id ~timeout_ms:5000 >>= fun (response : Kraken.Kraken_common_types.ws_response) ->
+                                  if response.success then begin
                                     Atomic.set conn.ping_failures 0;
                                     update_data_heartbeat conn;
                                     Lwt.return_unit

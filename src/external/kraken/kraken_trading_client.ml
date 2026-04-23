@@ -339,7 +339,8 @@ let start_reader conn generation =
   let process_frame = function
     | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
         Logging.warn_f ~section "Trading WebSocket closed by server (generation %d)" generation;
-        Lwt.fail (Failure "Connection closed by server")
+        reset_state conn ~notify_failure:true "Connection closed by server" >>= fun () ->
+        Lwt.return_unit
     | frame ->
         Lwt.catch
           (fun () -> handle_frame frame ~expected_generation:generation)
@@ -350,7 +351,7 @@ let start_reader conn generation =
 
   let done_p =
     Lwt.catch
-      (fun () -> Concurrency.Lwt_util.consume_stream (fun frame -> Lwt.async (fun () -> process_frame frame)) stream)
+      (fun () -> Concurrency.Lwt_util.consume_stream_s process_frame stream)
       (fun exn ->
          match exn with
          | Failure msg when msg = "Connection closed by server" ->
