@@ -1526,6 +1526,19 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
     let acc_qty = venue_lot_qty state.grid_qty state.exchange_id state in
+
+    (* Determine if this fill should be skipped for accounting purposes (fees, profit).
+       During startup_replay, we skip fills already persisted (OID <= last_fill_oid). *)
+    let is_persisted_fill =
+      match state.last_fill_oid with
+      | Some persisted_oid ->
+          (* OIDs are monotonically increasing on Hyperliquid and Lighter. *)
+          (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
+           with _ -> false)
+      | None -> state.startup_replay  (* New strategy: skip all fills during startup replay. *)
+    in
+    let skip_fill = state.startup_replay && is_persisted_fill in
+
     (* 1. Remove any pending amend matching this order ID. *)
     state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
       not (String.starts_with ~prefix:"pending_amend_" pending_id &&
@@ -1564,7 +1577,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
          and silently skip profit calculation. *)
       if persistence_accumulation_exchange state.exchange_id then
         state.persistence_dirty <- true;
-      if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0 then begin
+      if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0 && not skip_fill then begin
         let base_fee = acc_qty *. state.maker_fee in
         state.reserved_base <- state.reserved_base -. base_fee;
         Logging.info_f ~section "Decremented reserved_base for %s by %.8f (base fee leak), now %.8f"
@@ -1575,7 +1588,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
          the balance feed catches up (exec feed is faster than balance feed).
          Only credit if this fill was the actively tracked buy to prevent double-crediting
          on duplicate execution reports. *)
-      if acc_qty > 0.0 && was_tracked_buy then begin
+      if acc_qty > 0.0 && was_tracked_buy && not state.startup_replay then begin
         state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
         Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
           asset_symbol acc_qty state.anticipated_base_credit order_id
@@ -1605,16 +1618,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
       if dominated then
         state.highest_startup_oid <- Some order_id
     end;
-    let skip_profit_calc =
-      state.startup_replay &&
-      (match state.last_fill_oid with
-       | Some persisted_oid ->
-           (* OIDs are monotonically increasing on Hyperliquid and Lighter. *)
-           (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
-            with _ -> false)
-       | None -> true  (* New strategy: no persisted OID; skip all fills during startup replay. *))
-    in
-    if skip_profit_calc then
+    if skip_fill then
       ()
     else
     (match side with

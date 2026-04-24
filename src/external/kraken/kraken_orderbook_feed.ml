@@ -222,8 +222,8 @@ end)
 (** Per-symbol mutable orderbook state, including bid/ask maps, ring buffer, and synchronization metadata. *)
 type store = {
   buffer: orderbook RingBuffer.t;
-  mutable bids: level PriceMap.t;
-  mutable asks: level PriceMap.t;
+  bids: (string, level) Hashtbl.t;
+  asks: (string, level) Hashtbl.t;
   ready: bool Atomic.t;
   has_snapshot: bool Atomic.t;  (** True after an initial snapshot has been received. Updates are rejected until set. *)
   last_sequence: int64 option Atomic.t;  (** Last processed sequence number. Used for gap and rollback detection. *)
@@ -297,8 +297,8 @@ let ensure_store symbol =
   | None ->
       let store = {
         buffer = RingBuffer.create ring_buffer_size;
-        bids = PriceMap.empty;
-        asks = PriceMap.empty;
+        bids = Hashtbl.create 1024;
+        asks = Hashtbl.create 1024;
         ready = Atomic.make false;
         has_snapshot = Atomic.make false;
         last_sequence = Atomic.make None;
@@ -382,19 +382,19 @@ let parse_levels symbol json =
     ) entries
   | _ -> []
 
-(** Apply incremental level updates to a PriceMap. Zero-quantity levels are removed; non-zero levels are upserted. *)
-let apply_levels map levels =
-  List.fold_left (fun acc (lvl: level) ->
+(** Apply incremental level updates to a Hashtbl. Zero-quantity levels are removed; non-zero levels are upserted. *)
+let apply_levels tbl levels =
+  List.iter (fun (lvl: level) ->
     if is_effectively_zero lvl.size then
-      PriceMap.remove lvl.price acc
+      Hashtbl.remove tbl lvl.price
     else
-      PriceMap.add lvl.price lvl acc
-  ) map levels
+      Hashtbl.replace tbl lvl.price lvl
+  ) levels
 
-(** Convert a PriceMap to a sorted level array truncated to [depth] entries.
+(** Convert a Hashtbl to a sorted level array truncated to [depth] entries.
     [sort_desc] controls descending (bids) vs ascending (asks) order. *)
-let levels_to_array ?(sort_desc = false) map depth =
-  let levels_list = PriceMap.fold (fun _ lvl acc -> lvl :: acc) map [] in
+let levels_to_array ?(sort_desc = false) tbl depth =
+  let levels_list = Hashtbl.fold (fun _ lvl acc -> lvl :: acc) tbl [] in
 
   let sorted_levels = List.sort (fun l1 l2 ->
     if sort_desc then Float.compare l2.price_float l1.price_float else Float.compare l1.price_float l2.price_float
@@ -409,12 +409,13 @@ let levels_to_array ?(sort_desc = false) map depth =
 
   Array.of_list (take depth sorted_levels [])
 
-(** Rebuild a PriceMap containing only the top [max_levels] entries. Used to bound map size. *)
-let rebuild_map_from_top_levels map sort_desc max_levels =
-  let levels_array = levels_to_array ~sort_desc map max_levels in
-  Array.fold_left (fun acc lvl ->
-    PriceMap.add lvl.price lvl acc
-  ) PriceMap.empty levels_array
+(** Rebuild a Hashtbl containing only the top [max_levels] entries. Used to bound map size. *)
+let truncate_hashtbl tbl sort_desc max_levels =
+  let levels_array = levels_to_array ~sort_desc tbl max_levels in
+  Hashtbl.clear tbl;
+  Array.iter (fun lvl ->
+    Hashtbl.replace tbl lvl.price lvl
+  ) levels_array
 
 (** Construct an [orderbook] record from the current store state and the raw JSON entry metadata. *)
 let build_orderbook store symbol entry =
@@ -440,23 +441,9 @@ let build_orderbook store symbol entry =
       | _ -> None
     else None
   in
-  (* Depth-1 fast path: construct singleton arrays directly from PriceMap
-     tree traversal (O(log n)), avoiding the fold->sort->take->of_list pipeline
-     in levels_to_array which allocates 4 intermediate structures. *)
-  let bids =
-    if orderbook_depth = 1 then
-      match PriceMap.max_binding_opt store.bids with
-      | Some (_, v) -> [|v|]
-      | None -> [||]
-    else levels_to_array ~sort_desc:true store.bids orderbook_depth
-  in
-  let asks =
-    if orderbook_depth = 1 then
-      match PriceMap.min_binding_opt store.asks with
-      | Some (_, v) -> [|v|]
-      | None -> [||]
-    else levels_to_array ~sort_desc:false store.asks orderbook_depth
-  in
+  (* Construct arrays directly from Hashtbl by sorting *)
+  let bids = levels_to_array ~sort_desc:true store.bids orderbook_depth in
+  let asks = levels_to_array ~sort_desc:false store.asks orderbook_depth in
   {
     symbol;
     bids;
@@ -538,8 +525,8 @@ let process_orderbook_message ~reset json on_heartbeat =
 
         if reset then begin
           (* Snapshot: clear existing state and reinitialize from this message. *)
-          store.bids <- PriceMap.empty;
-          store.asks <- PriceMap.empty;
+          Hashtbl.clear store.bids;
+          Hashtbl.clear store.asks;
           Atomic.set store.has_snapshot true;
 
 
@@ -571,8 +558,8 @@ let process_orderbook_message ~reset json on_heartbeat =
           | Some curr_seq, Some last_seq when Int64.compare curr_seq last_seq <= 0 ->
               Logging.warn_f ~section "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
                 symbol curr_seq last_seq;
-              store.bids <- PriceMap.empty;
-              store.asks <- PriceMap.empty;
+              Hashtbl.clear store.bids;
+              Hashtbl.clear store.asks;
               RingBuffer.clear store.buffer;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
@@ -581,8 +568,8 @@ let process_orderbook_message ~reset json on_heartbeat =
               let gap = Int64.sub curr_seq last_seq in
               Logging.warn_f ~section "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking out-of-sync"
                 symbol curr_seq last_seq gap;
-              store.bids <- PriceMap.empty;
-              store.asks <- PriceMap.empty;
+              Hashtbl.clear store.bids;
+              Hashtbl.clear store.asks;
               RingBuffer.clear store.buffer;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
@@ -594,24 +581,18 @@ let process_orderbook_message ~reset json on_heartbeat =
         let bids = parse_levels symbol bids_json in
         let asks = parse_levels symbol asks_json in
 
-        store.bids <- apply_levels store.bids bids;
-        store.asks <- apply_levels store.asks asks;
+        apply_levels store.bids bids;
+        apply_levels store.asks asks;
         store.last_update <- Unix.time ();
 
-        (* Truncate maps to configured bound, limiting memory usage.
-           Depth-1 fast path: use PriceMap.max/min_binding_opt (O(log n),
-           zero intermediate allocation) instead of the full
-           fold->sort->take->of_list->fold rebuild pipeline. *)
+        (* Truncate hashtbls to limit memory usage.
+           We only truncate when size exceeds 2x depth to avoid doing it every tick. *)
         if orderbook_depth = 1 then begin
-          store.bids <- (match PriceMap.max_binding_opt store.bids with
-            | Some (k, v) -> PriceMap.singleton k v
-            | None -> PriceMap.empty);
-          store.asks <- (match PriceMap.min_binding_opt store.asks with
-            | Some (k, v) -> PriceMap.singleton k v
-            | None -> PriceMap.empty);
+          if Hashtbl.length store.bids > 10 then truncate_hashtbl store.bids true 1;
+          if Hashtbl.length store.asks > 10 then truncate_hashtbl store.asks false 1;
         end else begin
-          store.bids <- rebuild_map_from_top_levels store.bids true orderbook_depth;
-          store.asks <- rebuild_map_from_top_levels store.asks false orderbook_depth;
+          if Hashtbl.length store.bids > orderbook_depth * 2 then truncate_hashtbl store.bids true orderbook_depth;
+          if Hashtbl.length store.asks > orderbook_depth * 2 then truncate_hashtbl store.asks false orderbook_depth;
         end;
 
         let orderbook = build_orderbook store symbol entry in
@@ -630,8 +611,8 @@ let process_orderbook_message ~reset json on_heartbeat =
                   Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
                     symbol received_checksum received_checksum calculated_checksum calculated_checksum;
 
-                  store.bids <- PriceMap.empty;
-                  store.asks <- PriceMap.empty;
+                  Hashtbl.clear store.bids;
+                  Hashtbl.clear store.asks;
                   RingBuffer.clear store.buffer;
                   Atomic.set store.has_snapshot false;
                   Atomic.set store.last_sequence None;
@@ -741,8 +722,8 @@ let has_orderbook_data symbol =
 let clear_all_stores () =
   Hashtbl.iter (fun symbol store ->
     Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
-    store.bids <- PriceMap.empty;
-    store.asks <- PriceMap.empty;
+    Hashtbl.clear store.bids;
+    Hashtbl.clear store.asks;
 
     RingBuffer.clear store.buffer;
     Atomic.set store.ready false;
@@ -770,17 +751,17 @@ let prune_stale_data () =
       stores_to_remove := symbol :: !stores_to_remove
     end else begin
 
-      let bids_count = PriceMap.cardinal store.bids in
-      let asks_count = PriceMap.cardinal store.asks in
+      let bids_count = Hashtbl.length store.bids in
+      let asks_count = Hashtbl.length store.asks in
       let trimmed = ref false in
 
       if bids_count > max_price_levels then begin
-        store.bids <- rebuild_map_from_top_levels store.bids true max_price_levels;
+        truncate_hashtbl store.bids true max_price_levels;
         trimmed := true
       end;
 
       if asks_count > max_price_levels then begin
-        store.asks <- rebuild_map_from_top_levels store.asks false max_price_levels;
+        truncate_hashtbl store.asks false max_price_levels;
         trimmed := true
       end;
 

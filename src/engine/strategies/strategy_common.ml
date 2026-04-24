@@ -56,54 +56,42 @@ type strategy_order = {
 }
 
 (** Build a composite deduplication key from order parameters.
-    Uses a single [Buffer] pass to avoid intermediate string allocations
-    that nested [Printf.sprintf] calls would incur. *)
+    Uses string concatenation to avoid intermediate buffer allocations. *)
 let generate_duplicate_key symbol side quantity limit_price =
-  let buf = Buffer.create 48 in
-  Buffer.add_string buf symbol;
-  Buffer.add_char   buf '|';
-  Buffer.add_string buf side;
-  Buffer.add_char   buf '|';
-  Buffer.add_string buf (string_of_float quantity);
-  Buffer.add_char   buf '|';
-  (match limit_price with
-   | Some p -> Buffer.add_string buf (string_of_float p)
-   | None   -> Buffer.add_string buf "market");
-  Buffer.contents buf
+  let q_str = string_of_float quantity in
+  match limit_price with
+  | Some p -> symbol ^ "|" ^ side ^ "|" ^ q_str ^ "|" ^ string_of_float p
+  | None   -> symbol ^ "|" ^ side ^ "|" ^ q_str ^ "|market"
 
 (** In-flight order cache for deduplication of pending place/cancel requests. *)
 module InFlightOrders = struct
-  let registry = Atomic.make StringMap.empty
+  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
+  let mutex = Mutex.create ()
 
   (** Atomically insert [duplicate_key] if absent. Returns true on insertion,
       false if the key was already present. *)
   let add_in_flight_order duplicate_key =
     let now = Unix.gettimeofday () in
-    let rec loop () =
-      let map = Atomic.get registry in
-      if StringMap.mem duplicate_key map then
-        false
-      else
-        let new_map = StringMap.add duplicate_key now map in
-        if Atomic.compare_and_set registry map new_map then
-          true
-        else loop ()
-    in loop ()
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry duplicate_key in
+    if not exists then Hashtbl.replace registry duplicate_key now;
+    Mutex.unlock mutex;
+    not exists
 
   (** Remove [duplicate_key] from the cache. Returns true if it was present. *)
-  let rec remove_in_flight_order duplicate_key =
-    let map = Atomic.get registry in
-    if not (StringMap.mem duplicate_key map) then
-      false
-    else
-      let new_map = StringMap.remove duplicate_key map in
-      if Atomic.compare_and_set registry map new_map then
-        true
-      else remove_in_flight_order duplicate_key
+  let remove_in_flight_order duplicate_key =
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry duplicate_key in
+    if exists then Hashtbl.remove registry duplicate_key;
+    Mutex.unlock mutex;
+    exists
 
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
-    StringMap.cardinal (Atomic.get registry)
+    Mutex.lock mutex;
+    let size = Hashtbl.length registry in
+    Mutex.unlock mutex;
+    size
 
   let last_cleanup = Atomic.make 0.0
 
@@ -112,16 +100,14 @@ module InFlightOrders = struct
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
     if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now then begin
-      let rec modify_map () =
-        let map = Atomic.get registry in
-        let new_map = StringMap.filter (fun _key timestamp -> now -. timestamp <= max_age) map in
-        let trimmed = StringMap.cardinal map - StringMap.cardinal new_map in
-        if Atomic.compare_and_set registry map new_map then
-          (0, trimmed)
-        else
-          modify_map ()
-      in
-      modify_map ()
+      Mutex.lock mutex;
+      let initial_size = Hashtbl.length registry in
+      Hashtbl.filter_map_inplace (fun _ timestamp ->
+        if now -. timestamp <= max_age then Some timestamp else None
+      ) registry;
+      let final_size = Hashtbl.length registry in
+      Mutex.unlock mutex;
+      (0, initial_size - final_size)
     end else
       (0, 0)
 
@@ -134,41 +120,40 @@ end
 
 (** In-flight amendment cache for deduplication of pending amend requests. *)
 module InFlightAmendments = struct
-  let registry = Atomic.make StringMap.empty
+  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
+  let mutex = Mutex.create ()
 
   (** Atomically insert [order_id] if absent. Returns true on insertion,
       false if already tracked. *)
   let add_in_flight_amendment order_id =
     let now = Unix.gettimeofday () in
-    let rec loop () =
-      let map = Atomic.get registry in
-      if StringMap.mem order_id map then
-        false
-      else
-        let new_map = StringMap.add order_id now map in
-        if Atomic.compare_and_set registry map new_map then
-          true
-        else loop ()
-    in loop ()
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry order_id in
+    if not exists then Hashtbl.replace registry order_id now;
+    Mutex.unlock mutex;
+    not exists
 
   (** Returns true if [order_id] has a pending amendment. *)
   let is_in_flight order_id =
-    StringMap.mem order_id (Atomic.get registry)
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry order_id in
+    Mutex.unlock mutex;
+    exists
 
   (** Remove [order_id] from the cache. Returns true if it was present. *)
-  let rec remove_in_flight_amendment order_id =
-    let map = Atomic.get registry in
-    if not (StringMap.mem order_id map) then
-      false
-    else
-      let new_map = StringMap.remove order_id map in
-      if Atomic.compare_and_set registry map new_map then
-        true
-      else remove_in_flight_amendment order_id
+  let remove_in_flight_amendment order_id =
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry order_id in
+    if exists then Hashtbl.remove registry order_id;
+    Mutex.unlock mutex;
+    exists
 
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
-    StringMap.cardinal (Atomic.get registry)
+    Mutex.lock mutex;
+    let size = Hashtbl.length registry in
+    Mutex.unlock mutex;
+    size
 
   let last_cleanup = Atomic.make 0.0
 
@@ -177,16 +162,14 @@ module InFlightAmendments = struct
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
     if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now then begin
-      let rec modify_map () =
-        let map = Atomic.get registry in
-        let new_map = StringMap.filter (fun _key timestamp -> now -. timestamp <= max_age) map in
-        let trimmed = StringMap.cardinal map - StringMap.cardinal new_map in
-        if Atomic.compare_and_set registry map new_map then
-          (0, trimmed)
-        else
-          modify_map ()
-      in
-      modify_map ()
+      Mutex.lock mutex;
+      let initial_size = Hashtbl.length registry in
+      Hashtbl.filter_map_inplace (fun _ timestamp ->
+        if now -. timestamp <= max_age then Some timestamp else None
+      ) registry;
+      let final_size = Hashtbl.length registry in
+      Mutex.unlock mutex;
+      (0, initial_size - final_size)
     end else
       (0, 0)
 
