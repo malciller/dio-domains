@@ -304,9 +304,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
         incr cycle_count;
         
-
+        let cycle_events = ref 0 in
         
         let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
+        let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
         (* === ORDERBOOK HOT PATH === *)
         let ob_pos = get_ob_pos_fn () in
         let did_ob = ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) in
@@ -333,6 +334,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
           let now_exec = Unix.gettimeofday () in
           let new_pos = Ex.iter_execution_events ~symbol:asset_with_fees.symbol ~start_pos:!exec_read_pos (fun (event : Types.execution_event) ->
             incr event_count;
+            incr cycle_events;
             match event.order_status with
               | Types.Canceled | Types.Rejected | Types.Expired ->
                   should_execute_strategy := true;
@@ -637,7 +639,13 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         (* Record cycle work time before blocking. Captures active processing
            latency only, excluding sleep time in Exchange_wakeup.wait. *)
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
-        if latency_this_cycle then Latency_profiler.record prof_cycle cycle_span;
+        if latency_this_cycle then begin
+          let cause_thunk () =
+            let alloc_diff = Gc.minor_words () -. alloc_start in
+            Printf.sprintf "ob:%B ex:%d st:%B al:%.0fw" did_ob !cycle_events should_execute alloc_diff
+          in
+          Latency_profiler.record_with_cause prof_cycle cycle_span cause_thunk
+        end;
 
         (* Flush latency reports periodically, gated by cycle_mod to avoid
            5 threshold checks per cycle on the hot path. *)

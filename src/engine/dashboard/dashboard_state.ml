@@ -159,6 +159,7 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
     "p999", `Float snap.p999;
     "samples", `Int snap.samples;
     "overflow", `Int snap.overflow;
+    "max_cause", (match snap.max_cause with Some c -> `String c | None -> `Null);
   ]
 
 let json_of_domain_latencies () =
