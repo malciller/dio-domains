@@ -84,6 +84,7 @@ let render_latencies w json =
           let img = col 27 a_label s in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
+      @ [ I.string a_border " │ "; col 28 a_label "         SPIKE CAUSE        " ]
     ) in
     let header_row2 = I.hcat (
       [ I.string a_border " │  ";
@@ -95,6 +96,7 @@ let render_latencies w json =
           let img = I.hcat [ col_right 9 a_dim "p50"; col_right 9 a_dim "p99"; col_right 9 a_dim "p999" ] in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
+      @ [ I.string a_border " │ "; col 28 a_dim "                            " ]
     ) in
     let header = I.vcat [close_row w header_row1; close_row w header_row2] in
     let rows = List.mapi (fun i (symbol, metrics) ->
@@ -176,6 +178,11 @@ let render_latencies w json =
       let c_arr = update_cycle_hist symbol cycle_p99 in
       let trend_spark = render_sparkline_local 15 c_arr 100.0 (fun v -> attr_of_sev (severity "cycle" v 1)) in
       
+      let cycle_cause = match List.assoc_opt "cycle" mlist with
+        | Some data -> data |?> "max_cause" |> to_string_d "--"
+        | None -> "--"
+      in
+      
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
       close_row w (I.hcat (
@@ -188,6 +195,7 @@ let render_latencies w json =
           trend_spark;
           I.string a_border " │ " ]
         @ metric_cells
+        @ [ I.string a_border " │ "; col 28 a_dim (truncate_string 28 cycle_cause) ]
       ))
     ) active_lats in
     let title = section_title w "PERFORMANCE" in
