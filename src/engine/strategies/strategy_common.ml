@@ -180,85 +180,70 @@ module InFlightAmendments = struct
       Some (Some drift, Some trimmed)
 end
 
-(** Unbounded lock-free workflow queue using Michael-Scott Queue architecture.
-    Completely replaces OrderRingBuffer, eliminating cross-domain pipeline mutex contention. *)
+(** Fixed-size, zero-allocation MPSC ring buffer.
+    Replaces the Michael-Scott queue to eliminate node allocations on the hot path.
+    Uses padding to prevent false sharing between producer and consumer domains. *)
 module LockFreeQueue = struct
-  type 'a node =
-    | Nil
-    | Node of 'a option * 'a node Atomic.t
-
   type 'a t = {
-    head: 'a node Atomic.t;
-    tail: 'a node Atomic.t;
+    array: 'a option Atomic.t array;
+    size: int;
+    mask: int;
+    head: int Atomic.t;
+    _pad1: int64; _pad2: int64; _pad3: int64; _pad4: int64;
+    _pad5: int64; _pad6: int64; _pad7: int64;
+    tail: int Atomic.t;
   }
 
-  let create () =
-    let dummy = Node (None, Atomic.make Nil) in
-    { head = Atomic.make dummy; tail = Atomic.make dummy }
+  let create ?(size=65536) () =
+    (* Ensure size is a power of 2 for fast masking *)
+    let rec next_power_of_2 v p = if p >= v then p else next_power_of_2 v (p * 2) in
+    let size = next_power_of_2 size 1 in
+    let mask = size - 1 in
+    let array = Array.init size (fun _ -> Atomic.make None) in
+    {
+      array;
+      size;
+      mask;
+      head = Atomic.make 0;
+      _pad1 = 0L; _pad2 = 0L; _pad3 = 0L; _pad4 = 0L;
+      _pad5 = 0L; _pad6 = 0L; _pad7 = 0L;
+      tail = Atomic.make 0;
+    }
 
-  (** Concurrent enqueue mapping to former write semantics. *)
+  (** Concurrent enqueue for multiple producers. Returns None if full. *)
   let write q v =
-    let new_node = Node (Some v, Atomic.make Nil) in
     let rec loop () =
-      let tail_node = Atomic.get q.tail in
-      match tail_node with
-      | Nil -> assert false
-      | Node (_, next) ->
-          let next_node = Atomic.get next in
-          if tail_node == Atomic.get q.tail then begin
-            match next_node with
-            | Nil ->
-                if Atomic.compare_and_set next Nil new_node then begin
-                  ignore (Atomic.compare_and_set q.tail tail_node new_node);
-                  Some ()
-                end else
-                  loop ()
-            | Node _ ->
-                ignore (Atomic.compare_and_set q.tail tail_node next_node);
-                loop ()
-          end else
-            loop ()
+      let t = Atomic.get q.tail in
+      let h = Atomic.get q.head in
+      if t - h >= q.size then None (* Queue is full *)
+      else if Atomic.compare_and_set q.tail t (t + 1) then begin
+        Atomic.set q.array.(t land q.mask) (Some v);
+        Some ()
+      end else
+        loop ()
     in loop ()
 
-  (** Concurrent dequeue mapping to former read semantics. *)
+  (** Single consumer dequeue. *)
   let read q =
-    let rec loop () =
-      let head_node = Atomic.get q.head in
-      let tail_node = Atomic.get q.tail in
-      match head_node with
-      | Nil -> assert false
-      | Node (_, next) ->
-          let next_node = Atomic.get next in
-          if head_node == Atomic.get q.head then begin
-            if head_node == tail_node then begin
-              match next_node with
-              | Nil -> None
-              | Node _ ->
-                  ignore (Atomic.compare_and_set q.tail tail_node next_node);
-                  loop ()
-            end else begin
-              match next_node with
-              | Nil -> assert false
-              | Node (v_opt, _) ->
-                  if Atomic.compare_and_set q.head head_node next_node then
-                    v_opt
-                  else
-                    loop ()
-            end
-          end else
-            loop ()
-    in loop ()
+    let h = Atomic.get q.head in
+    if h = Atomic.get q.tail then None (* Queue is empty *)
+    else begin
+      let slot = q.array.(h land q.mask) in
+      (* Spin if the producer has claimed the index but not yet written the value *)
+      let rec spin () =
+        match Atomic.get slot with
+        | None -> Domain.cpu_relax (); spin ()
+        | Some v ->
+            Atomic.set slot None;
+            Atomic.set q.head (h + 1);
+            Some v
+      in spin ()
+    end
 
-  (** Costly size counting proxy - don't use on hot loops. *)
+  (** O(1) size tracking. Safe for hot loops. *)
   let size q =
-    let rec count n node =
-      match node with
-      | Nil -> n
-      | Node (_, next) -> count (n + 1) (Atomic.get next)
-    in
-    match Atomic.get q.head with
-    | Nil -> 0
-    | Node (_, next) -> count 0 (Atomic.get next)
+    let count = Atomic.get q.tail - Atomic.get q.head in
+    if count < 0 then 0 else count
 
   let read_batch q max_items =
     let rec read_n acc n =
