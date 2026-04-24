@@ -108,7 +108,7 @@ ENV LD_PRELOAD=libjemalloc.so.2
 ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 
 # 15. OCaml runtime GC defaults (Forces OCaml 5 minor_heap_size scaling per-domain natively)
-ENV OCAMLRUNPARAM="s=8388608,o=80,O=150,h=100,w=1"
+ENV OCAMLRUNPARAM="s=33554432,o=120,O=1000000,h=100,w=1"
 
 # 15a. Lighter signer library path (linux/amd64 .so in /app)
 ENV LIGHTER_SIGNER_LIB_PATH=./lighter-signer-linux-amd64

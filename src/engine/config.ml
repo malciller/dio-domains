@@ -229,9 +229,9 @@ let parse_gc_config json : gc_config option =
   | gc_json ->
       if validate_keys ~context:"gc" ~allowed:known_gc_keys gc_json then
         exit 1;
-      let minor_heap_size = gc_json |> member "minor_heap_size" |> to_int_option |> Option.value ~default:8_388_608 in
-      let space_overhead = gc_json |> member "space_overhead" |> to_int_option |> Option.value ~default:80 in
-      let max_overhead = gc_json |> member "max_overhead" |> to_int_option |> Option.value ~default:150 in
+      let minor_heap_size = gc_json |> member "minor_heap_size" |> to_int_option |> Option.value ~default:33_554_432 in
+      let space_overhead = gc_json |> member "space_overhead" |> to_int_option |> Option.value ~default:120 in
+      let max_overhead = gc_json |> member "max_overhead" |> to_int_option |> Option.value ~default:1_000_000 in
       let window_size = gc_json |> member "window_size" |> to_int_option |> Option.value ~default:10 in
       let allocation_policy = gc_json |> member "allocation_policy" |> to_int_option |> Option.value ~default:2 in
       let major_heap_increment = gc_json |> member "major_heap_increment" |> to_int_option |> Option.value ~default:100 in
