@@ -651,10 +651,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            5 threshold checks per cycle on the hot path. *)
         if !cycle_count mod config.cycle_mod = 0 then begin
 
-          Latency_profiler.report ~sample_threshold:1000000 prof_ob;
-          Latency_profiler.report ~sample_threshold:100000 prof_exec;
-          Latency_profiler.report ~sample_threshold:1000000 prof_strategy;
-          Latency_profiler.report ~sample_threshold:1000000 prof_cycle;
+          Latency_profiler.report ~sample_threshold:1 prof_ob;
+          Latency_profiler.report ~sample_threshold:1 prof_exec;
+          Latency_profiler.report ~sample_threshold:1 prof_strategy;
+          Latency_profiler.report ~sample_threshold:1 prof_cycle;
         end;
 
         (* Block until the next websocket frame signals new data or until data is ready.
