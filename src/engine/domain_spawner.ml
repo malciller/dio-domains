@@ -308,6 +308,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         
         let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
         let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
+        let gc_start = if latency_this_cycle then Gc_monitor.get_stats () else { minor_collections = 0; major_collections = 0; compactions = 0 } in
         (* === ORDERBOOK HOT PATH === *)
         let ob_pos = get_ob_pos_fn () in
         let did_ob = ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0) in
@@ -640,9 +641,11 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            latency only, excluding sleep time in Exchange_wakeup.wait. *)
         let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
         if latency_this_cycle then begin
+          let gc_end = Gc_monitor.get_stats () in
           let cause_thunk () =
             let alloc_diff = Gc.minor_words () -. alloc_start in
-            Printf.sprintf "ob:%B ex:%d st:%B al:%.0fw" did_ob !cycle_events should_execute alloc_diff
+            let gc_str = Gc_monitor.diff_to_string gc_start gc_end in
+            Printf.sprintf "ob:%B ex:%d st:%B al:%.0fw%s" did_ob !cycle_events should_execute alloc_diff gc_str
           in
           Latency_profiler.record_with_cause prof_cycle cycle_span cause_thunk
         end;

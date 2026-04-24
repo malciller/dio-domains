@@ -223,21 +223,20 @@ module LockFreeQueue = struct
         loop ()
     in loop ()
 
-  (** Single consumer dequeue. *)
+  (** Single consumer dequeue. Non-blocking: returns None if the slot is
+      empty, even if the tail index has been advanced by a producer. 
+      This prevents the consumer from spinning if a producer is preempted. *)
   let read q =
     let h = Atomic.get q.head in
     if h = Atomic.get q.tail then None (* Queue is empty *)
     else begin
       let slot = q.array.(h land q.mask) in
-      (* Spin if the producer has claimed the index but not yet written the value *)
-      let rec spin () =
-        match Atomic.get slot with
-        | None -> Domain.cpu_relax (); spin ()
-        | Some v ->
-            Atomic.set slot None;
-            Atomic.set q.head (h + 1);
-            Some v
-      in spin ()
+      match Atomic.get slot with
+      | None -> None (* Producer claimed slot but hasn't written yet; don't spin *)
+      | Some v ->
+          Atomic.set slot None;
+          Atomic.set q.head (h + 1);
+          Some v
     end
 
   (** O(1) size tracking. Safe for hot loops. *)

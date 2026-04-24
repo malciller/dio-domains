@@ -85,8 +85,6 @@ type level = {
   size: string;
   price_float: float;
   size_float: float;
-  crc_price: string;
-  crc_size: string;
 }
 
 type orderbook = {
@@ -244,51 +242,40 @@ let get_precision_from_instruments symbol =
   with _ -> None
 
 let calculate_checksum symbol bids asks : int32 =
-  (* Check if size string represents zero by scanning for any non-zero, non-decimal digit. *)
-  let is_effectively_zero size =
-    let rec has_non_zero s i =
-      if i >= String.length s then false
-      else if s.[i] <> '0' && s.[i] <> '.' then true
-      else has_non_zero s (i + 1)
-    in
-    not (has_non_zero size 0)
+  let (pd, ld) = 
+    match get_precision_from_instruments symbol with
+    | Some (p, q) -> (p, q)
+    | None -> (8, 8)
   in
 
-  (* Exclude levels with zero quantity. *)
-  let valid_bids = Array.to_list bids |> List.filter (fun level -> not (is_effectively_zero level.size)) in
-  let valid_asks = Array.to_list asks |> List.filter (fun level -> not (is_effectively_zero level.size)) in
-
-  (* Sort bids descending by price, asks ascending by price. *)
-  let sorted_bids = List.sort (fun l1 l2 ->
-    Float.compare l2.price_float l1.price_float
-  ) valid_bids in
-
-  let sorted_asks = List.sort (fun l1 l2 ->
-    Float.compare l1.price_float l2.price_float
-  ) valid_asks in
-
-  (* Select up to 10 levels per side. No padding per Kraken specification. *)
-  let top_bids = take (min 10 (List.length sorted_bids)) sorted_bids in
-  let top_asks = take (min 10 (List.length sorted_asks)) sorted_asks in
-
-  Logging.debug_f ~section "Checksum input: symbol=%s bids=%d asks=%d" symbol (Array.length bids) (Array.length asks);
-  Logging.debug_f ~section "Checksum levels used: bids=%d asks=%d" (List.length top_bids) (List.length top_asks);
-
   let crc = ref 0xFFFFFFFFl in
-  List.iter (fun (level: level) ->
-    crc := add_normalized_to_crc !crc level.crc_price;
-    crc := add_normalized_to_crc !crc level.crc_size
-  ) top_asks;
-  List.iter (fun (level: level) ->
-    crc := add_normalized_to_crc !crc level.crc_price;
-    crc := add_normalized_to_crc !crc level.crc_size
-  ) top_bids;
+  
+  (* Process top 10 asks (ascending price) *)
+  let n_asks = min 10 (Array.length asks) in
+  for i = 0 to n_asks - 1 do
+    let lvl = asks.(i) in
+    (* Format for CRC: exact precision required for spec compliance. 
+       Doing this on-demand only for the top 10 levels saves hundreds of
+       allocations per book update. *)
+    let s_p = Printf.sprintf "%.*f" pd lvl.price_float in
+    let s_q = Printf.sprintf "%.*f" ld lvl.size_float in
+    crc := add_normalized_to_crc !crc s_p;
+    crc := add_normalized_to_crc !crc s_q
+  done;
+
+  (* Process top 10 bids (descending price) *)
+  let n_bids = min 10 (Array.length bids) in
+  for i = 0 to n_bids - 1 do
+    let lvl = bids.(i) in
+    let s_p = Printf.sprintf "%.*f" pd lvl.price_float in
+    let s_q = Printf.sprintf "%.*f" ld lvl.size_float in
+    crc := add_normalized_to_crc !crc s_p;
+    crc := add_normalized_to_crc !crc s_q
+  done;
 
   let result = Int32.logxor !crc 0xFFFFFFFFl in
-
   Logging.debug_f ~section "Checksum CRC32: result=%ld (0x%08lx)"
     result result;
-
   result
 
 let ensure_store symbol =
@@ -358,38 +345,39 @@ let parse_level symbol price_json size_json =
   let qty_str = to_decimal_str ~dec:ld size_json in
   let price_float = try float_of_string price_str with _ -> 0.0 in
   let qty_float = try float_of_string qty_str with _ -> 0.0 in
-  (* Skip CRC string formatting when checksum validation is disabled (depth < 10).
-     Printf.sprintf "%.*f" allocates 2 strings per level per tick — eliminated here. *)
-  let crc_price = if orderbook_depth >= 10 then Printf.sprintf "%.*f" pd price_float else "" in
-  let crc_size = if orderbook_depth >= 10 then Printf.sprintf "%.*f" ld qty_float else "" in
-  Some { price = price_str; size = qty_str; price_float; size_float = qty_float; crc_price; crc_size }
+  Some { price = price_str; size = qty_str; price_float; size_float = qty_float }
 
-(** Parse a JSON array of price levels into (price_str, qty_str, price_float, qty_float) tuples.
-    Supports both object format ({price, qty}) and legacy array format ([price, qty]). *)
-let parse_levels symbol json =
+(** Parse JSON levels and apply them directly to the store's Hashtbl to avoid intermediate list allocations. *)
+let parse_and_apply_levels symbol tbl json =
   match json with
-  | `List entries -> List.filter_map (fun entry ->
-      match entry with
-      (* Object format: {"price": ..., "qty": ...} *)
-      | `Assoc fields ->
-          (match List.assoc_opt "price" fields, List.assoc_opt "qty" fields with
-           | Some price_json, Some qty_json -> parse_level symbol price_json qty_json
-           | _ -> None)
-      (* Array format: [price, qty] or [price, qty, timestamp] *)
-      | `List [price_json; size_json] -> parse_level symbol price_json size_json
-      | `List [price_json; size_json; _] -> parse_level symbol price_json size_json
-      | _ -> None
-    ) entries
-  | _ -> []
-
-(** Apply incremental level updates to a Hashtbl. Zero-quantity levels are removed; non-zero levels are upserted. *)
-let apply_levels tbl levels =
-  List.iter (fun (lvl: level) ->
-    if is_effectively_zero lvl.size then
-      Hashtbl.remove tbl lvl.price
-    else
-      Hashtbl.replace tbl lvl.price lvl
-  ) levels
+  | `List entries -> 
+      List.iter (fun entry ->
+        match entry with
+        (* Object format: {"price": ..., "qty": ...} *)
+        | `Assoc fields ->
+            (match List.assoc_opt "price" fields, List.assoc_opt "qty" fields with
+             | Some price_json, Some qty_json -> 
+                 (match parse_level symbol price_json qty_json with
+                  | Some lvl -> 
+                      if is_effectively_zero lvl.size then
+                        Hashtbl.remove tbl lvl.price
+                      else
+                        Hashtbl.replace tbl lvl.price lvl
+                  | None -> ())
+             | _ -> ())
+        (* Array format: [price, qty] or [price, qty, timestamp] *)
+        | `List [price_json; size_json]
+        | `List [price_json; size_json; _] -> 
+            (match parse_level symbol price_json size_json with
+             | Some lvl -> 
+                 if is_effectively_zero lvl.size then
+                   Hashtbl.remove tbl lvl.price
+                 else
+                   Hashtbl.replace tbl lvl.price lvl
+             | None -> ())
+        | _ -> ()
+      ) entries
+  | _ -> ()
 
 (** Convert a Hashtbl to a sorted level array truncated to [depth] entries.
     [sort_desc] controls descending (bids) vs ascending (asks) order. *)
@@ -578,11 +566,8 @@ let process_orderbook_message ~reset json on_heartbeat =
         end;
         let bids_json = member "bids" entry in
         let asks_json = member "asks" entry in
-        let bids = parse_levels symbol bids_json in
-        let asks = parse_levels symbol asks_json in
-
-        apply_levels store.bids bids;
-        apply_levels store.asks asks;
+        parse_and_apply_levels symbol store.bids bids_json;
+        parse_and_apply_levels symbol store.asks asks_json;
         store.last_update <- Unix.time ();
 
         (* Truncate hashtbls to limit memory usage.
