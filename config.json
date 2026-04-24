@@ -56,7 +56,7 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.15,
+        0.25,
         5.25
       ],
       "strategy": "Grid"
