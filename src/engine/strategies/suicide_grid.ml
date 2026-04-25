@@ -1528,7 +1528,9 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
     let acc_qty = venue_lot_qty state.grid_qty state.exchange_id state in
 
     (* Determine if this fill should be skipped for accounting purposes (fees, profit).
-       During startup_replay, we skip fills already persisted (OID <= last_fill_oid). *)
+       Skip fills with OID <= last_fill_oid regardless of context (startup replay OR
+       live WebSocket reconnect). Without this, WS reconnects replay all historical
+       fills and re-credit accumulated_profit / re-decrement reserved_base. *)
     let is_persisted_fill =
       match state.last_fill_oid with
       | Some persisted_oid ->
@@ -1537,7 +1539,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
            with _ -> false)
       | None -> state.startup_replay  (* New strategy: skip all fills during startup replay. *)
     in
-    let skip_fill = state.startup_replay && is_persisted_fill in
+    let skip_fill = is_persisted_fill in
 
     (* 1. Remove any pending amend matching this order ID. *)
     state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
