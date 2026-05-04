@@ -22,7 +22,7 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.15,
+        0.05,
         4.00
       ],
       "strategy": "Grid",
@@ -35,12 +35,12 @@
       "qty": "0.35",
       "grid_interval": [
         0.3,
-        1.0
+        0.75
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.15,
-        5.00
+        0.05,
+        4.00
       ],
       "strategy": "Grid",
       "testnet": false,
@@ -56,7 +56,7 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.25,
+        0.05,
         5.25
       ],
       "strategy": "Grid"
@@ -71,7 +71,7 @@
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
-        0.15,
+        0.05,
         6.25
       ],
       "strategy": "Grid",

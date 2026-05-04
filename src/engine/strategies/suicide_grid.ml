@@ -1090,13 +1090,13 @@ let execute_strategy
                 (* Whole-share retention: profit covers the cost of a full share.
                    Skip the sell order and retain the share as reserved_base.
                    The reserved_base guard will prevent this share from being sold. *)
-                let required_profit = qty *. sell_price +. asset.accumulation_buffer in
-                state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                let actual_cost = qty *. sell_price in
+                state.accumulated_profit <- state.accumulated_profit -. actual_cost;
                 state.reserved_base <- state.reserved_base +. qty;
                 state.persistence_dirty <- true;
                 Logging.info_f ~section
                   "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
-                  asset.symbol (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+                  asset.symbol (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
               end else if balance_ok then begin
                 let sell_order = create_order state.duplicate_key_sell asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
                 if push_order ~now ~state sell_order then begin
@@ -1106,14 +1106,14 @@ let execute_strategy
                    if is_accumulation_sell then begin
                      let rounded_sell = sell_qty in
                      let rounding_diff = qty -. rounded_sell in
-                     let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
-                     state.accumulated_profit <- state.accumulated_profit -. required_profit;
+                     let actual_cost = rounding_diff *. sell_price in
+                     state.accumulated_profit <- state.accumulated_profit -. actual_cost;
                      let base_increment = qty -. rounded_sell in
                      state.reserved_base <- state.reserved_base +. base_increment;
                      state.persistence_dirty <- true;
                      Logging.info_f ~section
                        "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
-                       asset.symbol rounded_sell (state.accumulated_profit +. required_profit) required_profit state.reserved_base
+                       asset.symbol rounded_sell (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
                    end;
                   Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
                     asset.symbol sell_qty sell_price
