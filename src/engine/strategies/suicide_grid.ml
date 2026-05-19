@@ -650,11 +650,15 @@ let execute_strategy
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
    let lot_qty = venue_lot_qty state.grid_qty asset.exchange state in
 
-   (* Anticipated balance credit decay: clear when balance feed catches up. *)
+   (* Anticipated balance credit decay: decrement by the actual balance delta.
+      Clearing to 0.0 blindly causes race conditions with partial fills where
+      a partial balance update clears the entire anticipated credit before
+      the remainder of the physical balance arrives. *)
    if not (Float.is_nan asset_balance) then begin
      let asset_bal = asset_balance in
      if asset_bal > state.last_seen_asset_balance && state.anticipated_base_credit > 0.0 then begin
-       state.anticipated_base_credit <- 0.0
+       let delta = asset_bal -. state.last_seen_asset_balance in
+       state.anticipated_base_credit <- max 0.0 (state.anticipated_base_credit -. delta)
      end;
      state.last_seen_asset_balance <- asset_bal;
 
