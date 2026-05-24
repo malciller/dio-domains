@@ -874,17 +874,35 @@ let execute_strategy
           );
 
        if !open_buy_count_from_scan = 0 && not state.inflight_cancel_buy && not state.inflight_buy then begin
-            (* Prevent aggressive ghost order clearing during placement/WS transit gap.
-               If we very recently placed an order, give it time to appear in open_orders. *)
+            (* Debounced ghost-order clearing: require the buy to be absent from
+               the open-orders scan for 10 continuous seconds before clearing
+               tracking.  The previous 3s threshold raced with fill events —
+               a resting buy that filled after 3s had its tracking cleared
+               before handle_order_filled ran, causing was_tracked_buy=false
+               and leaving sell-side locks permanently stuck. *)
             if (now -. state.last_order_time > 3.0) then begin
-              set_asset_reserved_quote state 0.0;
               (match state.last_buy_order_id with
                | Some _ghost_id ->
-                   state.last_buy_order_id <- None;
-                   state.last_buy_order_price <- None
-               | None -> ())
+                   let missing_key = "missing_buy" in
+                   let first_missing = match Hashtbl.find_opt state.amend_cooldowns missing_key with
+                     | Some ts -> ts
+                     | None -> Hashtbl.replace state.amend_cooldowns missing_key now; now
+                   in
+                   if now -. first_missing > 10.0 then begin
+                     set_asset_reserved_quote state 0.0;
+                     state.last_buy_order_id <- None;
+                     state.last_buy_order_price <- None;
+                     Hashtbl.remove state.amend_cooldowns missing_key;
+                     Logging.info_f ~section "Ghost buy order cleared for %s after 10s absence" asset.symbol
+                   end
+               | None ->
+                   set_asset_reserved_quote state 0.0;
+                   Hashtbl.remove state.amend_cooldowns "missing_buy")
             end
-       end else if not state.inflight_cancel_buy && not state.inflight_buy && not state.inflight_amend_buy then begin
+       end else begin
+            (* Buy is present in open-orders scan; clear missing_buy debounce. *)
+            Hashtbl.remove state.amend_cooldowns "missing_buy";
+            if not state.inflight_cancel_buy && not state.inflight_buy && not state.inflight_amend_buy then begin
             (match !best_buy_id with
              | Some best_order_id ->
                  let best_price = !best_buy_price in
@@ -903,6 +921,7 @@ let execute_strategy
                    set_asset_reserved_quote state (best_price *. lot_qty)
                  end
              | None -> ())
+       end
        end;
 
       (* Apply exchange sell orders. *)
@@ -1038,6 +1057,11 @@ let execute_strategy
         let buy_cooldown_key = "place_Buy" in
         let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
 
+        (* Track whether the sell leg was successfully dispatched or retained.
+           The buy order is gated on this: if the sell fails to place, skip the
+           buy to prevent accumulating asset without a corresponding sell. *)
+        let sell_placed_or_active = ref false in
+
         (* Place sell order first; sell and buy are always paired.
            asset_low blocks entry to this entire branch at the top level.
            Always attempt the sell regardless of local balance, as cached balance
@@ -1098,12 +1122,14 @@ let execute_strategy
                 state.accumulated_profit <- state.accumulated_profit -. actual_cost;
                 state.reserved_base <- state.reserved_base +. qty;
                 state.persistence_dirty <- true;
+                sell_placed_or_active := true;
                 Logging.info_f ~section
                   "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
                   asset.symbol (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
               end else if balance_ok then begin
                 let sell_order = create_order state.duplicate_key_sell asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
                 if push_order ~now ~state sell_order then begin
+                   sell_placed_or_active := true;
                    (* Commit accumulation state after push_order succeeds.
                       Persistence is deferred: set dirty flag for the caller
                       (domain_spawner) to flush outside the hotloop. *)
@@ -1124,9 +1150,18 @@ let execute_strategy
                 end
               end
         end;
+        (* Consider sell active if there are already open sells or an in-flight sell. *)
+        if not !sell_placed_or_active then
+          sell_placed_or_active := state.inflight_sell || List.length state.open_sell_orders > 0;
 
-        (* Place buy order if quote balance is available. *)
-        if not (Float.is_nan quote_balance) then begin
+        (* Place buy order if quote balance is available AND sell leg succeeded.
+           Gate buy placement on sell_placed_or_active to prevent accumulating
+           asset without a corresponding sell order on the book. *)
+        if not !sell_placed_or_active then begin
+          Logging.warn_f ~section
+            "Buy placement skipped for %s: sell order was not placed (inflight_sell=%B, asset_low=%B, open_sells=%d). Will retry both on next cycle."
+            asset.symbol state.inflight_sell state.asset_low (List.length state.open_sell_orders)
+        end else if not (Float.is_nan quote_balance) then begin
          if is_buy_on_cooldown || state.inflight_buy then begin
            Logging.debug_f ~section
              "Buy placement skipped for %s (cooldown=%B, inflight=%B)"
@@ -1699,10 +1734,13 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
       set_asset_reserved_quote state 0.0
     end;
 
-    (* 7. On tracked buy fill, clear the Sell side's InFlightOrders guard.
-       The strategy places buy+sell together; the previous sell's guard
-       would block the new sell via duplicate detection. *)
-    if side = Buy && was_tracked_buy then begin
+    (* 7. On ANY buy fill, clear the Sell side's InFlightOrders guard and
+       inflight flag. Any buy fill (tracked or not) means the previous sell
+       order is obsolete and a fresh sell must be placed alongside the next
+       buy.  Previously this was gated on was_tracked_buy, which caused
+       sell-side locks to remain permanently stuck when the ghost-order
+       reconciler cleared last_buy_order_id before the fill event arrived. *)
+    if side = Buy then begin
       ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
       state.inflight_sell <- false
     end;
