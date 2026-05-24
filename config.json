@@ -35,7 +35,7 @@
       "qty": "0.35",
       "grid_interval": [
         0.3,
-        0.75
+        0.85
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
