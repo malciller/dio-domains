@@ -1604,7 +1604,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
     (* 4. Update buy tracking and accumulation on buy fills.
        A sell fill must not clear last_buy_order_id because the buy is still
        live and only needs spacing adjustment, not a fresh placement cycle. *)
-    let was_tracked_buy = match side, state.last_buy_order_id with
+    let _was_tracked_buy = match side, state.last_buy_order_id with
       | Buy, Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
       | _ -> false
     in
@@ -1627,20 +1627,22 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
 
       (* Credit anticipated base so the sell guard sees incoming asset before
          the balance feed catches up (exec feed is faster than balance feed).
-         Only credit if this fill was the actively tracked buy to prevent double-crediting
-         on duplicate execution reports. *)
-      if acc_qty > 0.0 && was_tracked_buy && not state.startup_replay then begin
+         Credit on ANY buy fill since rapid fills can cause tracking to be cleared
+         prematurely by amendment-failure races. Upstream executions feed trade ID
+         deduplication prevents double-crediting. *)
+      if acc_qty > 0.0 && not state.startup_replay then begin
         state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
         Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
           asset_symbol acc_qty state.anticipated_base_credit order_id
       end;
       
-      (* Clear tracking ONLY IF this fill corresponds to the actively tracked buy.
-         Otherwise, we assume a new order is already tracked and we shouldn't orphan it. *)
-      if was_tracked_buy then begin
-        state.last_buy_order_id <- None;
-        state.last_buy_order_price <- None;
-      end
+      (* Clear tracking on ANY buy fill. If a new buy is already tracked
+         (placed between the old fill event and now), the next cycle will
+         re-sync from the exchange open orders feed. Failing to clear here
+         when was_tracked_buy=false due to amendment-failure races causes
+         orphaned buy tracking that blocks sell+buy pair placement. *)
+      state.last_buy_order_id <- None;
+      state.last_buy_order_price <- None;
     end;
 
     (* 5. Compute realized net profit on sell fills (discrete sizing accumulator).
@@ -1719,18 +1721,15 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
     if persistence_accumulation_exchange state.exchange_id then
       state.persistence_dirty <- true;
 
-    let should_clear_locks = 
-      if side = Buy then was_tracked_buy
-      else true
-    in
+    let should_clear_locks = true in
 
     (* 6. Clear inflight flags, reservation, and global placement trackers for immediate re-placement. *)
     if should_clear_locks then begin
       (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
       ignore (InFlightOrders.remove_in_flight_order ((match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
     end;
-    (* Release quote reservation ONLY when the tracked buy fills. Otherwise we steal reservation from an existing valid in-flight order. *)
-    if was_tracked_buy && side = Buy then begin
+    (* Release quote reservation on ANY buy fill to prevent orphaned reservations. *)
+    if side = Buy then begin
       set_asset_reserved_quote state 0.0
     end;
 
