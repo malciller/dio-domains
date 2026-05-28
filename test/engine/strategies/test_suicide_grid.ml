@@ -232,19 +232,19 @@ let test_accumulation_gated_sell_insufficient () =
   let sell_price = 40.0 in
   let accumulation_buffer = 0.05 in
 
-  (* Replicate the exact logic from execute_strategy *)
-  let rounded_sell = Dio_strategies.Suicide_grid.round_qty (qty *. sell_mult) symbol "hyperliquid" in
-  let rounding_diff = qty -. rounded_sell in
-  let required_profit = rounding_diff *. sell_price +. accumulation_buffer in
-
-  let sell_qty =
-    if required_profit > 0.0 && state.accumulated_profit >= required_profit then begin
-      state.accumulated_profit <- state.accumulated_profit -. required_profit;
-      rounded_sell
-    end else
-      qty
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let asset = {
+    Dio_strategies.Suicide_grid.exchange = "hyperliquid";
+    symbol; qty = "0.35"; grid_interval = 1.0; sell_mult = "0.999";
+    strategy = "Grid"; maker_fee = Some 0.0004; taker_fee = None;
+    accumulation_buffer;
+  } in
+  let (sell_qty, is_accumulation_sell, required_profit) =
+    Dio_strategies.Suicide_grid.compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
+      ~symbol ~exchange:"hyperliquid"
   in
 
+  check bool "not an accumulation sell when profit insufficient" true (not is_accumulation_sell);
   check bool "sell qty falls back to 1:1 when profit insufficient" true
     (abs_float (sell_qty -. qty) < 0.0001);
   (* Profit should NOT have been debited *)
@@ -267,25 +267,57 @@ let test_accumulation_gated_sell_sufficient () =
   let sell_price = 40.0 in
   let accumulation_buffer = 0.05 in
 
-  let rounded_sell = Dio_strategies.Suicide_grid.round_qty (qty *. sell_mult) symbol "hyperliquid" in
-  let rounding_diff = qty -. rounded_sell in
-  let required_profit = rounding_diff *. sell_price +. accumulation_buffer in
-
-  let sell_qty =
-    if required_profit > 0.0 && state.accumulated_profit >= required_profit then begin
-      state.accumulated_profit <- state.accumulated_profit -. required_profit;
-      rounded_sell
-    end else
-      qty
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let asset = {
+    Dio_strategies.Suicide_grid.exchange = "hyperliquid";
+    symbol; qty = "0.35"; grid_interval = 1.0; sell_mult = "0.999";
+    strategy = "Grid"; maker_fee = Some 0.0004; taker_fee = None;
+    accumulation_buffer;
+  } in
+  let (sell_qty, is_accumulation_sell, required_profit) =
+    Dio_strategies.Suicide_grid.compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
+      ~symbol ~exchange:"hyperliquid"
   in
 
   check bool "sell qty uses reduced amount" true (sell_qty < qty);
+  check bool "is accumulation sell" true is_accumulation_sell;
+  let rounded_sell =
+    Dio_strategies.Suicide_grid.round_qty (qty *. sell_mult) symbol "hyperliquid"
+  in
   check bool "sell qty equals rounded_sell" true
     (abs_float (sell_qty -. rounded_sell) < 0.0001);
-  (* Profit should have been debited by required_profit *)
-  let expected_remaining = 1.00 -. required_profit in
-  check bool "profit debited correctly" true
-    (abs_float (state.accumulated_profit -. expected_remaining) < 0.0001)
+  check bool "profit still above threshold" true (state.accumulated_profit >= required_profit)
+
+let test_accumulation_recovery_blocks_blind_sell () =
+  (* After asset_low/capital_low clears, a new sell must pass the accumulation buffer.
+     Normal cycles allow 1:1 fallback; recovery cycles do not. *)
+  let symbol = "RECOVERY_GATE/USDC" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.accumulated_profit <- 0.10;
+  state.resuming_after_balance_flag <- true;
+
+  let qty = 0.35 in
+  let sell_mult = 0.999 in
+  let sell_price = 40.0 in
+  let accumulation_buffer = 0.05 in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let asset = {
+    Dio_strategies.Suicide_grid.exchange = "hyperliquid";
+    symbol; qty = "0.35"; grid_interval = 1.0; sell_mult = "0.999";
+    strategy = "Grid"; maker_fee = Some 0.0004; taker_fee = None;
+    accumulation_buffer;
+  } in
+  let (sell_qty, is_accumulation_sell, _required_profit) =
+    Dio_strategies.Suicide_grid.compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
+      ~symbol ~exchange:"hyperliquid"
+  in
+  check bool "recovery blocks 1:1 fallback sell" true
+    (not (Dio_strategies.Suicide_grid.accumulation_sell_allowed_on_recovery ~ecfg ~state
+            ~is_accumulation_sell ~sell_qty));
+  state.resuming_after_balance_flag <- false;
+  check bool "normal cycle allows 1:1 fallback" true
+    (Dio_strategies.Suicide_grid.accumulation_sell_allowed_on_recovery ~ecfg ~state
+       ~is_accumulation_sell ~sell_qty)
 
 (* Helper: round qty using instrument feed directly.
    Production code goes through Exchange.Registry -> Hyperliquid_impl -> Instruments_feed,
@@ -515,6 +547,7 @@ let () =
       test_case "profit tracking from sell fills" `Quick test_accumulation_profit_tracking;
       test_case "gated sell - insufficient profit" `Quick test_accumulation_gated_sell_insufficient;
       test_case "gated sell - sufficient profit" `Quick test_accumulation_gated_sell_sufficient;
+      test_case "recovery blocks blind 1:1 sell" `Quick test_accumulation_recovery_blocks_blind_sell;
       test_case "full lifecycle (20 buy-sell cycles)" `Quick test_accumulation_full_lifecycle;
       test_case "multi-strategy isolation (BTC + HYPE)" `Quick test_accumulation_multi_strategy_isolation;
     ];

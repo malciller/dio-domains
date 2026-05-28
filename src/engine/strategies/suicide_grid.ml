@@ -175,7 +175,8 @@ type strategy_state = {
   mutable asset_low: bool;      (* set when asset balance is insufficient for next sell; pauses sell and buy *)
   mutable capital_low: bool;    (* set when quote balance is insufficient for next buy; pauses strategy *)
   mutable capital_low_logged: bool; (* suppresses repeated capital-low log warnings *)
-  mutable capital_low_at_balance: float; (* quote_bal snapshot when capital_low was set; clears only on balance increase *)
+  mutable capital_low_at_balance: float; (* quote_bal snapshot when capital_low was set; clears only on balance increase; -1.0 = unstamped *)
+  mutable resuming_after_balance_flag: bool; (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   mutable reserved_quote: float; (* quote amount reserved by current open buy for this symbol *)
   mutable accumulated_profit: float;    (* realized PnL from buy/sell cycles; gates accumulation sell placement *)
   mutable reserved_base: float;  (* base asset accumulated via sell_mult; excluded from sellable balance *)
@@ -240,6 +241,7 @@ let rec get_strategy_state asset_symbol =
         capital_low = false;
         capital_low_logged = false;
         capital_low_at_balance = 0.0;
+        resuming_after_balance_flag = false;
         reserved_quote = 0.0;
         accumulated_profit = persisted_accumulated_profit;
         reserved_base = persisted_reserved_base;
@@ -433,6 +435,40 @@ let can_place_buy_order (_qty : float) quote_balance quote_needed =
 (** Returns true if asset_balance >= asset_needed. *)
 let can_place_sell_order (_qty : float) (_sell_mult : float) asset_balance asset_needed =
   asset_balance >= asset_needed
+
+(** Computes sell quantity and whether this is a profit-gated accumulation sell.
+    When [use_accumulation_sells], reduced sells require
+    [accumulated_profit >= rounding_diff * sell_price + accumulation_buffer];
+    otherwise falls back to 1:1 [qty]. Returns [(sell_qty, is_accumulation_sell, required_profit)]. *)
+let compute_sell_qty ~ecfg ~state ~(asset : trading_config) ~qty ~sell_price ~sell_mult
+    ~symbol ~exchange =
+  if ecfg.use_accumulation_sells then begin
+    let rounded_sell =
+      if exchange = "ibkr" then
+        max 0.0 (qty -. 1.0)
+      else
+        round_qty (qty *. sell_mult) symbol exchange
+    in
+    let rounding_diff = qty -. rounded_sell in
+    let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
+    if required_profit > 0.0 && state.accumulated_profit >= required_profit then
+      (rounded_sell, true, required_profit)
+    else
+      (qty, false, required_profit)
+  end else if ecfg.sell_uses_mult then
+    (qty *. sell_mult, false, 0.0)
+  else
+    (qty, false, 0.0)
+
+(** After [asset_low] or [capital_low] clears, a new sell must pass the accumulation
+    buffer gate — do not fall back to a blind 1:1 sell on the recovery cycle. *)
+let accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty =
+  if not state.resuming_after_balance_flag || not ecfg.use_accumulation_sells then
+    true
+  else if is_accumulation_sell || sell_qty = 0.0 then
+    true
+  else
+    false
 
 
 let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =
@@ -690,6 +726,7 @@ let execute_strategy
      if state.asset_low && should_clear then begin
        state.asset_low <- false;
        state.inflight_sell <- false;
+       state.resuming_after_balance_flag <- true;
        ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
        Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
          asset.symbol asset_bal state.reserved_base state.anticipated_base_credit locked_in_sells available_asset asset_needed_fast
@@ -708,31 +745,34 @@ let execute_strategy
     (* Available balance = total balance minus all domains' reserved quote. *)
     let total_reserved = get_total_reserved_quote state in
     let available_quote = quote_bal -. total_reserved in
+    if state.capital_low && state.capital_low_at_balance < 0.0 then
+      state.capital_low_at_balance <- quote_bal;
     if state.capital_low && available_quote < quote_needed_fast then begin
-      (* Stamp balance snapshot on first capital_low cycle so recovery
-         requires a real balance feed increase, not stale data re-read. *)
-      if state.capital_low_at_balance = 0.0 then
-        state.capital_low_at_balance <- quote_bal;
       (* Still low: skip entire strategy body to avoid order spam. *)
       ()
-    end else if state.capital_low && quote_bal > state.capital_low_at_balance then begin
+    end else if state.capital_low && state.capital_low_at_balance >= 0.0
+                && quote_bal > state.capital_low_at_balance then begin
       (* Balance feed delivered a higher balance than the snapshot taken when
          capital_low was set. A real event (fill crediting USD or cancel freeing
          reserve) has occurred. Only now is it safe to retry placement. Clearing
          on stale balance data (same quote_bal as at rejection) caused tight
          rejection loops. *)
+      let was_at = state.capital_low_at_balance in
       state.capital_low <- false;
       state.capital_low_logged <- false;
       state.capital_low_at_balance <- 0.0;  (* reset snapshot for next recovery episode *)
+      state.resuming_after_balance_flag <- true;
       (* Flush buy-side placement cooldown so the strategy can place immediately.
          Without this, the 2s cooldown set when capital_low was first triggered
          blocks the first buy attempt even after balance recovers. *)
       Hashtbl.remove state.amend_cooldowns "place_Buy";
-      (* Clear inflight_buy and evict the InFlightOrders duplicate key. *)
+      (* Clear inflight flags so sell+buy placement can run on this recovery cycle. *)
       state.inflight_buy <- false;
+      state.inflight_sell <- false;
       ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_buy));
+      ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
       Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at %.2f) - resuming strategy"
-        asset.symbol available_quote quote_needed_fast total_reserved state.capital_low_at_balance
+        asset.symbol available_quote quote_needed_fast total_reserved was_at
     end
   end;
 
@@ -1070,25 +1110,17 @@ let execute_strategy
            protecting accumulated base asset. *)
         if not (Float.is_nan asset_balance) && not state.inflight_sell && not state.asset_low then begin
              let asset_bal = asset_balance in
-             let (sell_qty, is_accumulation_sell) =
-               if ecfg.use_accumulation_sells then begin
-                 let rounded_sell =
-                   if asset.exchange = "ibkr" then
-                     max 0.0 (qty -. 1.0)
-                   else
-                     round_qty (qty *. sell_mult) asset.symbol asset.exchange
-                 in
-                 let rounding_diff = qty -. rounded_sell in
-                 let required_profit = rounding_diff *. sell_price +. asset.accumulation_buffer in
-                 if required_profit > 0.0 && state.accumulated_profit >= required_profit then
-                   (rounded_sell, true)
-                 else
-                   (qty, false)  (* 1:1 sell until profit covers rounding cost. *)
-               end else if ecfg.sell_uses_mult then
-                 (qty *. sell_mult, false)
-               else
-                 (qty, false)
+             let (sell_qty, is_accumulation_sell, required_profit) =
+               compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
+                 ~symbol:asset.symbol ~exchange:asset.exchange
              in
+             let accumulation_ok_on_recovery =
+               accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty
+             in
+             if not accumulation_ok_on_recovery then
+               Logging.info_f ~section
+                 "Sell deferred for %s on balance recovery: accumulated_profit %.4f < required %.4f (buffer %.4f)"
+                 asset.symbol state.accumulated_profit required_profit asset.accumulation_buffer;
              (* Proactive reserved_base guard: prevent selling accumulated base.
                 Available balance must exclude:
                 1. reserved_base: accumulated base that must not be sold.
@@ -1114,7 +1146,7 @@ let execute_strategy
                  end
                else true
              in
-             if sell_qty = 0.0 && is_accumulation_sell then begin
+             if accumulation_ok_on_recovery && sell_qty = 0.0 && is_accumulation_sell then begin
                 (* Whole-share retention: profit covers the cost of a full share.
                    Skip the sell order and retain the share as reserved_base.
                    The reserved_base guard will prevent this share from being sold. *)
@@ -1126,7 +1158,7 @@ let execute_strategy
                 Logging.info_f ~section
                   "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
                   asset.symbol (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
-              end else if balance_ok then begin
+              end else if accumulation_ok_on_recovery && balance_ok then begin
                 let sell_order = create_order state.duplicate_key_sell asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
                 if push_order ~now ~state sell_order then begin
                    sell_placed_or_active := true;
@@ -1153,6 +1185,7 @@ let execute_strategy
         (* Consider sell active if there are already open sells or an in-flight sell. *)
         if not !sell_placed_or_active then
           sell_placed_or_active := state.inflight_sell || List.length state.open_sell_orders > 0;
+        state.resuming_after_balance_flag <- false;
 
         (* Place buy order if quote balance is available AND sell leg succeeded.
            Gate buy placement on sell_placed_or_active to prevent accumulating
@@ -1358,7 +1391,8 @@ let execute_strategy
       end else begin
         (* No action required for remaining cases. *)
         state.last_cycle <- cycle
-      end
+      end;
+      state.resuming_after_balance_flag <- false
   end  (* end of: if Float.is_nan current_price then ... else begin *)
   end  (* end: is_stale else begin *)
    end) (* end: if not capital_low then begin; close Fun.protect *)
@@ -1479,6 +1513,7 @@ let handle_order_failed ~now asset_symbol side reason =
          if not state.capital_low then begin
            state.capital_low <- true;
            state.capital_low_logged <- true;
+           state.capital_low_at_balance <- (-1.0);  (* stamp quote snapshot on next execute_strategy cycle *)
            Logging.warn_f ~section "Exchange rejected buy for %s with insufficient funds - setting capital_low flag"
              asset_symbol
          end
