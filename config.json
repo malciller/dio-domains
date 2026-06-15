@@ -45,49 +45,7 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
-    },
-    {
-      "symbol": "ETH/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.007",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        0.05,
-        5.25
-      ],
-      "strategy": "Grid"
-    },
-    {
-      "symbol": "SOL/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.15",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        0.05,
-        6.25
-      ],
-      "strategy": "Grid",
-      "testnet": false,
-      "hedge": false
-    },
-    {
-      "symbol": "ADA/USD",
-      "exchange": "kraken",
-      "qty": "50.0",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid"
     }
+
   ]
 }
