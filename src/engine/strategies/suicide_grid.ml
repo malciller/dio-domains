@@ -177,6 +177,7 @@ type strategy_state = {
   mutable capital_low_logged: bool; (* suppresses repeated capital-low log warnings *)
   mutable capital_low_at_balance: float; (* quote_bal snapshot when capital_low was set; clears only on balance increase; -1.0 = unstamped *)
   mutable resuming_after_balance_flag: bool; (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
+  mutable just_filled_buy: bool; (* true when a buy order has filled; bypasses recovery gate on sell placement *)
   mutable reserved_quote: float; (* quote amount reserved by current open buy for this symbol *)
   mutable accumulated_profit: float;    (* realized PnL from buy/sell cycles; gates accumulation sell placement *)
   mutable reserved_base: float;  (* base asset accumulated via sell_mult; excluded from sellable balance *)
@@ -242,6 +243,7 @@ let rec get_strategy_state asset_symbol =
         capital_low_logged = false;
         capital_low_at_balance = 0.0;
         resuming_after_balance_flag = false;
+        just_filled_buy = false;
         reserved_quote = 0.0;
         accumulated_profit = persisted_accumulated_profit;
         reserved_base = persisted_reserved_base;
@@ -465,6 +467,8 @@ let compute_sell_qty ~ecfg ~state ~(asset : trading_config) ~qty ~sell_price ~se
 let accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty =
   if not state.resuming_after_balance_flag || not ecfg.use_accumulation_sells then
     true
+  else if state.just_filled_buy then
+    true
   else if is_accumulation_sell || sell_qty = 0.0 then
     true
   else
@@ -666,6 +670,7 @@ let execute_strategy
   let state = match cached_state with Some s -> s | None -> get_strategy_state asset.symbol in
   if state.exchange_id = "" then begin
     state.exchange_id <- asset.exchange;
+    state.cached_ecfg <- get_exchange_config asset.exchange;
     state.cached_round_price <- get_round_price_fn asset.symbol asset.exchange;
     state.cached_price_increment <- get_price_increment asset.symbol asset.exchange;
     state.cached_qty_increment <- get_qty_increment_val asset.symbol asset.exchange;
@@ -1186,6 +1191,7 @@ let execute_strategy
         if not !sell_placed_or_active then
           sell_placed_or_active := state.inflight_sell || List.length state.open_sell_orders > 0;
         state.resuming_after_balance_flag <- false;
+        state.just_filled_buy <- false;
 
         (* Place buy order if quote balance is available AND sell leg succeeded.
            Gate buy placement on sell_placed_or_active to prevent accumulating
@@ -1392,7 +1398,8 @@ let execute_strategy
         (* No action required for remaining cases. *)
         state.last_cycle <- cycle
       end;
-      state.resuming_after_balance_flag <- false
+      state.resuming_after_balance_flag <- false;
+      state.just_filled_buy <- false
   end  (* end of: if Float.is_nan current_price then ... else begin *)
   end  (* end: is_stale else begin *)
    end) (* end: if not capital_low then begin; close Fun.protect *)
@@ -1678,6 +1685,8 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
          orphaned buy tracking that blocks sell+buy pair placement. *)
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
+      if not state.startup_replay then
+        state.just_filled_buy <- true;
     end;
 
     (* 5. Compute realized net profit on sell fills (discrete sizing accumulator).

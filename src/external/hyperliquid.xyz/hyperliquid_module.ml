@@ -261,7 +261,10 @@ module Hyperliquid_impl = struct
 
 
   let subscribe_orderbook ~symbols =
-    Lwt_list.iter_s (fun coin ->
+    Lwt_list.iter_s (fun symbol ->
+      let _ = Hyperliquid_orderbook_feed.ensure_store symbol in
+      let _ = Hyperliquid_executions_feed.get_symbol_store symbol in
+      let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
       Hyperliquid_ws.subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String coin)])])
     ) symbols
 
