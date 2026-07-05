@@ -7,14 +7,14 @@ let test_balance_store_operations () =
   Alcotest.(check (float 0.001)) "initial balance is zero" 0.0 initial_balance;
 
   (* Update balance data for first wallet *)
-  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 123.45 "margin" "wallet123";
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 123.45 "margin" "wallet123" "BTC";
 
   (* Check updated balance *)
   let updated_balance = Kraken.Kraken_balances_feed.BalanceStore.get_balance store in
   Alcotest.(check (float 0.001)) "updated balance" 123.45 updated_balance;
 
   (* Update balance for second wallet *)
-  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 67.89 "earn" "wallet456";
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 67.89 "earn" "wallet456" "BTC.HOLD";
 
   (* Check aggregated balance *)
   let aggregated_balance = Kraken.Kraken_balances_feed.BalanceStore.get_balance store in
@@ -38,7 +38,7 @@ let test_balance_management () =
   let store = Kraken.Kraken_balances_feed.get_balance_store asset in
 
   (* Update the store *)
-  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 1.5 "spot" "main";
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 1.5 "spot" "main" asset;
 
   (* Now should have balance data *)
   Alcotest.(check bool) "has balance data after update" true (Kraken.Kraken_balances_feed.has_balance_data asset);
@@ -85,7 +85,7 @@ let test_wait_for_balance_data () =
 
   (* Now add data for one asset *)
   let store = Kraken.Kraken_balances_feed.get_balance_store "ADA_TEST" in
-  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 100.0 "spot" "test";
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 100.0 "spot" "test" "ADA_TEST";
 
   (* Wait again - should still timeout since not all assets have data *)
   let result2 = Lwt_main.run (Kraken.Kraken_balances_feed.wait_for_balance_data assets 0.001) in
@@ -93,7 +93,7 @@ let test_wait_for_balance_data () =
 
   (* Add data for second asset *)
   let store2 = Kraken.Kraken_balances_feed.get_balance_store "DOT_TEST" in
-  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store2 200.0 "margin" "test";
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store2 200.0 "margin" "test" "DOT_TEST";
 
   (* Wait again - should succeed now *)
   let result3 = Lwt_main.run (Kraken.Kraken_balances_feed.wait_for_balance_data assets 1.0) in
@@ -124,7 +124,7 @@ let test_concurrent_balance_updates () =
   let update_thread balance_value delay =
     Thread.create (fun () ->
       Thread.delay delay;
-      Kraken.Kraken_balances_feed.BalanceStore.update_wallet store balance_value "concurrent" "thread_test"
+      Kraken.Kraken_balances_feed.BalanceStore.update_wallet store balance_value "concurrent" "thread_test" asset
     ) ()
   in
 
