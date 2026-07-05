@@ -66,6 +66,20 @@ module BalanceStore = struct
     last_updated = Atomic.make 0.0;
   }
 
+  let is_ws_earn_key key =
+    if String.contains key '/' then
+      match String.split_on_char '/' key with
+      | "earn" :: ("flexible" | "bonded" | "locked") :: _ -> true
+      | _ -> false
+    else false
+
+  let has_any_ws_earn store =
+    let found = ref false in
+    Hashtbl.iter (fun key _ ->
+      if is_ws_earn_key key then found := true
+    ) store.wallets;
+    !found
+
   (* Updates a single wallet entry and recomputes the aggregate total. *)
   let update_wallet store balance wallet_type wallet_id original_asset =
     let wallet_key = wallet_type ^ "/" ^ wallet_id ^ "/" ^ original_asset in
@@ -78,7 +92,28 @@ module BalanceStore = struct
     } in
 
     Mutex.lock store.mutex;
-    Hashtbl.replace store.wallets wallet_key wallet_data;
+    let is_updating_ws_earn =
+      wallet_type = "earn" && (wallet_id = "flexible" || wallet_id = "bonded" || wallet_id = "locked")
+    in
+    if is_updating_ws_earn then begin
+      (* Remove all non-WS earn wallets to avoid double counting *)
+      let to_remove = ref [] in
+      Hashtbl.iter (fun k _ ->
+        if not (is_ws_earn_key k) && String.starts_with ~prefix:"earn/" k then
+          to_remove := k :: !to_remove
+      ) store.wallets;
+      List.iter (Hashtbl.remove store.wallets) !to_remove;
+      Hashtbl.replace store.wallets wallet_key wallet_data
+    end else if wallet_type = "earn" then begin
+      (* This is a REST earn wallet. Only add/update if there are no WS earn wallets. *)
+      if has_any_ws_earn store then
+        Hashtbl.remove store.wallets wallet_key
+      else
+        Hashtbl.replace store.wallets wallet_key wallet_data
+    end else begin
+      (* Spot, margin, transfer etc. *)
+      Hashtbl.replace store.wallets wallet_key wallet_data
+    end;
 
     (* Evict the oldest wallet entry when capacity is exceeded. *)
     if Hashtbl.length store.wallets > max_wallets then begin
@@ -443,10 +478,10 @@ let handle_message_json json on_heartbeat =
     
     match channel, msg_type, method_type with
     | Some "balances", Some "snapshot", _ ->
-        Logging.info_f ~section "Balances snapshot received: %s" (Yojson.Safe.to_string json);
+        Logging.debug_f ~section "Balances snapshot received: %s" (Yojson.Safe.to_string json);
         let _ = parse_snapshot json on_heartbeat in ()
     | Some "balances", Some "update", _ ->
-        Logging.info_f ~section "Balances update received: %s" (Yojson.Safe.to_string json);
+        Logging.debug_f ~section "Balances update received: %s" (Yojson.Safe.to_string json);
         let _ = parse_update json on_heartbeat in ()
     | Some "heartbeat", _, _ ->
         on_heartbeat ()
@@ -478,6 +513,18 @@ let handle_message message on_heartbeat =
       (Printexc.to_string exn) message
 
 
+(** Calculates the total pending sell quantity across all symbols for the given base asset. *)
+let get_pending_sell_qty base_asset =
+  let prefix = base_asset ^ "/" in
+  let all_symbols = Kraken_executions_feed.get_all_symbols () in
+  let matching = List.filter (fun sym -> String.starts_with ~prefix sym) all_symbols in
+  let open_orders = List.concat_map (fun symbol -> Kraken_executions_feed.get_open_orders symbol) matching in
+  List.fold_left (fun acc (o : Kraken_executions_feed.open_order) ->
+    match o.side with
+    | Kraken_executions_feed.Sell -> acc +. o.remaining_qty
+    | Kraken_executions_feed.Buy -> acc
+  ) 0.0 open_orders
+
 (** Fetches Earn allocations from private REST API to support Bitcoin Vault balance. *)
 let poll_earn_allocations () =
   let endpoint = "https://api.kraken.com" in
@@ -502,7 +549,7 @@ let poll_earn_allocations () =
       Logging.error_f ~section "Earn/Allocations HTTP %d: %s" status body_str;
       Lwt.return_unit
     end else begin
-      Logging.info_f ~section "Earn/Allocations raw response: %s" body_str;
+      Logging.debug_f ~section "Earn/Allocations raw response: %s" body_str;
       let json = Yojson.Safe.from_string body_str in
       let open Yojson.Safe.Util in
       match member "error" json with
@@ -528,16 +575,29 @@ let poll_earn_allocations () =
               let asset = member "native_asset" allocation |> to_string in
               let strategy_id = member "strategy_id" allocation |> to_string in
               let base_asset = normalize_asset asset in
-              if base_asset = "BTC" then begin
-                let amount_allocated = member "amount_allocated" allocation in
-                let total = member "total" amount_allocated in
-                let native_val = float_member "native" total in
-                if native_val > 0.0 then begin
-                  let store = get_balance_store "BTC" in
-                  BalanceStore.update_wallet store native_val "earn" strategy_id asset;
-                  update_balance_timestamp "BTC";
-                  Logging.info_f ~section "Updated Kraken BTC Vault balance from REST (%s): %.8f" strategy_id native_val;
-                end
+              let amount_allocated = member "amount_allocated" allocation in
+              let total = member "total" amount_allocated in
+              let native_val = float_member "native" total in
+              if native_val > 0.0 then begin
+                let pending_sell = get_pending_sell_qty base_asset in
+                let adjusted_val = max 0.0 (native_val -. pending_sell) in
+                let store = get_balance_store base_asset in
+                BalanceStore.update_wallet store adjusted_val "earn" strategy_id asset;
+                update_balance_timestamp base_asset;
+
+                (* Publish aggregated balance data to event bus subscribers. *)
+                let balance_data = BalanceStore.get_all store in
+                let event_data = {
+                  asset = base_asset;
+                  balance = balance_data.balance;
+                  wallet_type = balance_data.wallet_type;
+                  wallet_id = balance_data.wallet_id;
+                  last_updated = balance_data.last_updated;
+                } in
+                BalanceUpdateEventBus.publish balance_update_event_bus event_data;
+
+                Logging.debug_f ~section "Updated Kraken %s Vault balance from REST (%s): %.8f (raw: %.8f, pending_sell: %.8f)"
+                  base_asset strategy_id adjusted_val native_val pending_sell;
               end
             with e ->
               Logging.warn_f ~section "Failed to parse Earn allocation: %s" (Printexc.to_string e)
