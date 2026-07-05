@@ -207,6 +207,12 @@ module type S = sig
   (** Return all open orders for [symbol]. *)
   val get_open_orders : symbol:string -> Types.open_order list
 
+  (** Return all open orders across all symbol stores whose symbol
+      starts with [asset ^ "/"]. Used by the dashboard to surface orders
+      for non-strategy balance assets that may be stored under a different
+      symbol key than the one the dashboard constructs. *)
+  val get_all_orders_for_asset : asset:string -> Types.open_order list
+
   (* ---- Dynamic Subscription ---- *)
 
   (** Dynamically subscribe additional symbols to the real-time orderbook feed.
@@ -310,4 +316,11 @@ module Registry = struct
       no module has been registered under that name. *)
   let get name =
     Hashtbl.find_opt _exchanges name
+
+  (** Return all registered exchange names. Used by the dashboard to
+      enumerate balances across all exchanges, not just those with
+      configured trading strategies. *)
+  let get_all_names () =
+    Hashtbl.fold (fun name _ acc -> name :: acc) _exchanges []
+    |> List.sort_uniq String.compare
 end

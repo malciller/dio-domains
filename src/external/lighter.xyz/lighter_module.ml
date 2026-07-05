@@ -220,6 +220,12 @@ module Lighter_impl = struct
       }
     ) orders
 
+  let get_all_orders_for_asset ~asset =
+    let prefix = asset ^ "/" in
+    let all_symbols = Lighter_executions_feed.get_all_symbols () in
+    let matching = List.filter (fun sym -> String.starts_with ~prefix sym) all_symbols in
+    List.concat_map (fun symbol -> get_open_orders ~symbol) matching
+
   let fold_open_orders ~symbol ~init ~f =
     Lighter_executions_feed.fold_open_orders symbol ~init ~f:(fun acc (o : Lighter_executions_feed.open_order) ->
       f acc { Types.

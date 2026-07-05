@@ -300,6 +300,14 @@ let find_order_everywhere order_id =
       )
   | None -> None
 
+(** Return all symbols that have initialized execution stores. *)
+let get_all_symbols () =
+  Mutex.lock initialization_mutex;
+  let symbols = Fun.protect ~finally:(fun () -> Mutex.unlock initialization_mutex) (fun () ->
+    Hashtbl.fold (fun symbol _ acc -> symbol :: acc) stores []
+  ) in
+  symbols
+
 (** Triggers a destructive reset operation affecting all parallel
     execution stores, erasing localized order tracking variables
     during catastrophic connectivity events. *)
