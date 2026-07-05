@@ -323,6 +323,12 @@ module Hyperliquid_impl = struct
       }
     ) orders
 
+  let get_all_orders_for_asset ~asset =
+    let prefix = asset ^ "/" in
+    let all_symbols = Hyperliquid_executions_feed.get_all_symbols () in
+    let matching = List.filter (fun sym -> String.starts_with ~prefix sym) all_symbols in
+    List.concat_map (fun symbol -> get_open_orders ~symbol) matching
+
   let fold_open_orders ~symbol ~init ~f =
     Hyperliquid_executions_feed.fold_open_orders symbol ~init ~f:(fun acc (o : Hyperliquid_executions_feed.open_order) ->
       f acc { Types.
@@ -580,9 +586,9 @@ let fetch_spot_balances_ws () =
             let coin = Hyperliquid_balances.canonicalize_coin raw_coin in
             let total = parse_json_float (member "total" item) in
             let store = Hyperliquid_balances.get_balance_store coin in
-            Hyperliquid_balances.BalanceStore.update_wallet store total "spot" "account";
+             Hyperliquid_balances.BalanceStore.update_wallet store total "spot" "account";
             
-            Logging.info_f ~section "Initial Spot %s balance: %.6f" coin total
+            Logging.debug_f ~section "Initial Spot %s balance: %.6f" coin total
           with exn ->
             Logging.warn_f ~section "Failed to parse spot balance entry: %s" (Printexc.to_string exn)
         ) balances;
@@ -619,6 +625,7 @@ let fetch_open_orders_ws () =
     Lwt.catch (fun () ->
       wait_for_ws_connected () >>= fun () ->
       Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000 >>= fun resp_frame ->
+      Logging.info_f ~section "Raw open orders response: %s" (Yojson.Safe.to_string resp_frame);
       let open Yojson.Safe.Util in
       (* Extract payload from data.response.payload.data, falling back to data.response.payload *)
       let response_node = try resp_frame |> member "data" |> member "response" with _ -> `Null in

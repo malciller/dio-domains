@@ -350,6 +350,13 @@ let request_open_orders conn =
 
 (* ---- Public Mutators and Accessors ---- *)
 
+(** Return all symbols that have initialized execution stores. *)
+let get_all_symbols () =
+  Mutex.lock initialization_mutex;
+  let symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) symbol_stores [] in
+  Mutex.unlock initialization_mutex;
+  symbols
+
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;

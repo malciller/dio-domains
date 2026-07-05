@@ -328,6 +328,12 @@ module Ibkr_impl = struct
       }
     ) (Ibkr_executions_feed.get_open_orders symbol)
 
+  let get_all_orders_for_asset ~asset =
+    let prefix = asset ^ "/" in
+    let all_symbols = Ibkr_executions_feed.get_all_symbols () in
+    let matching = List.filter (fun sym -> String.starts_with ~prefix sym) all_symbols in
+    List.concat_map (fun symbol -> get_open_orders ~symbol) matching
+
   (* ============================================================== *)
   (* Linear Ring Buffer Traversal and Event Feed Subsystem Routines *)
   (* ============================================================== *)

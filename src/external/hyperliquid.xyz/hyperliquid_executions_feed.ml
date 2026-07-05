@@ -555,11 +555,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
 
 let find_registered_symbol coin =
   match Hyperliquid_instruments_feed.resolve_symbol coin with
-  | Some symbol -> 
-      Mutex.lock initialization_mutex;
-      let res = if Hashtbl.mem stores symbol then Some symbol else None in
-      Mutex.unlock initialization_mutex;
-      res
+  | Some symbol -> Some symbol
   | None ->
       let result = ref None in
       Mutex.lock initialization_mutex;

@@ -259,8 +259,7 @@ let build_snapshot () =
   let configured_symbols = List.map (fun (tc : Dio_engine.Config.trading_config) ->
     (tc.exchange, tc.symbol)
   ) config.trading in
-  let exchange_names = List.sort_uniq String.compare
-    (List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading) in
+  let exchange_names = Exchange.Registry.get_all_names () in
   let all_balances = List.concat_map (fun exch_name ->
     match Exchange.Registry.get exch_name with
     | None -> []
@@ -286,11 +285,19 @@ let build_snapshot () =
                   if is_quote then `Float 1.0, `Float 1.0
                   else `Null, `Null
             in
-            (* Retrieve open sell orders for this symbol *)
+            (* Retrieve open sell orders for this symbol.
+               Also query across all symbol stores for this asset to catch
+               orders stored under alternative symbol keys. *)
             let open_orders = Ex.get_open_orders ~symbol in
+            let asset_orders = Ex.get_all_orders_for_asset ~asset in
+            let seen = Hashtbl.create 8 in
+            let unique_orders = List.filter (fun (o : Exchange.Types.open_order) ->
+              if Hashtbl.mem seen o.order_id then false
+              else (Hashtbl.replace seen o.order_id (); true)
+            ) (open_orders @ asset_orders) in
             let sell_orders = List.filter (fun (o : Exchange.Types.open_order) ->
               o.side = Exchange.Types.Sell && o.remaining_qty > 0.0
-            ) open_orders in
+            ) unique_orders in
             let sell_orders_json = `List (List.map (fun (o : Exchange.Types.open_order) ->
               `Assoc [
                 "id", `String o.order_id;
