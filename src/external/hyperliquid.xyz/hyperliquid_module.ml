@@ -538,15 +538,83 @@ let initialize_instruments_ws () =
     Lwt.return_unit
   )
 
+let parse_json_float json =
+  match json with
+  | `String s -> (try float_of_string s with _ -> 0.0)
+  | `Float f -> f
+  | `Int i -> float_of_int i
+  | _ -> 0.0
+
+let poll_staking_balance () =
+  let section = "hyperliquid_startup" in
+  let testnet = Atomic.get Hyperliquid_impl.is_testnet in
+  let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
+  Lwt.catch (fun () ->
+    let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+      | Some w -> w
+      | None -> ""
+    in
+    if wallet = "" then Lwt.return_unit
+    else begin
+      let url = Uri.of_string (base_url ^ "/info") in
+      let req_body = `Assoc [
+        "type", `String "delegatorSummary";
+        "user", `String wallet
+      ] in
+      let body_str = Yojson.Safe.to_string req_body in
+      let body = Cohttp_lwt.Body.of_string body_str in
+      let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+      
+      Lwt_unix.with_timeout 5.0 (fun () ->
+        Cohttp_lwt_unix.Client.post ~headers ~body url >>= fun (resp, resp_body) ->
+        Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
+        let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+        if status >= 200 && status < 300 then begin
+          Logging.debug_f ~section "Raw delegator summary response: %s" body_str;
+          let json = Yojson.Safe.from_string body_str in
+          let open Yojson.Safe.Util in
+          
+          let delegated = parse_json_float (member "delegated" json) in
+          let pending_withdrawal = parse_json_float (member "pendingWithdrawal" json) in
+          let withdrawable = parse_json_float (member "withdrawable" json) in
+          
+          let store = Hyperliquid_balances.get_balance_store "HYPE" in
+          Hyperliquid_balances.BalanceStore.update_wallet store delegated "staking" "delegated";
+          Hyperliquid_balances.BalanceStore.update_wallet store pending_withdrawal "staking" "pending_withdrawal";
+          Hyperliquid_balances.BalanceStore.update_wallet store withdrawable "staking" "withdrawable";
+          
+          Logging.debug_f ~section "Updated Hyperliquid HYPE staking balance: delegated=%.6f, pendingWithdrawal=%.6f, withdrawable=%.6f" 
+            delegated pending_withdrawal withdrawable;
+          Lwt.return_unit
+        end else begin
+          Logging.error_f ~section "Hyperliquid staking request HTTP %d: %s" status body_str;
+          Lwt.return_unit
+        end
+      )
+    end
+  ) (fun exn ->
+    Logging.error_f ~section "Failed to fetch staking balances via REST: %s" (Printexc.to_string exn);
+    Lwt.return_unit
+  )
+
+let start_staking_balance_poller () =
+  let rec loop () =
+    Lwt.catch (fun () ->
+      poll_staking_balance ()
+    ) (fun exn ->
+      Logging.error_f ~section:"hyperliquid_startup" "Staking poller loop exception: %s" (Printexc.to_string exn);
+      Lwt.return_unit
+    ) >>= fun () ->
+    Lwt_unix.sleep 10.0 >>= fun () ->
+    loop ()
+  in
+  Lwt.async loop
+
 let fetch_spot_balances_ws () =
   let section = "hyperliquid_startup" in
-  let parse_json_float json =
-    match json with
-    | `String s -> (try float_of_string s with _ -> 0.0)
-    | `Float f -> f
-    | `Int i -> float_of_int i
-    | _ -> 0.0
-  in
+  (* Start staking poller loop asynchronously, independent of WS status *)
+  start_staking_balance_poller ();
+
   let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
     | Some w -> w
     | None -> ""
@@ -625,7 +693,7 @@ let fetch_open_orders_ws () =
     Lwt.catch (fun () ->
       wait_for_ws_connected () >>= fun () ->
       Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000 >>= fun resp_frame ->
-      Logging.info_f ~section "Raw open orders response: %s" (Yojson.Safe.to_string resp_frame);
+      Logging.debug_f ~section "Raw open orders response: %s" (Yojson.Safe.to_string resp_frame);
       let open Yojson.Safe.Util in
       (* Extract payload from data.response.payload.data, falling back to data.response.payload *)
       let response_node = try resp_frame |> member "data" |> member "response" with _ -> `Null in
