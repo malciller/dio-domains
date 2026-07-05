@@ -11,6 +11,21 @@ let section = "kraken_balances"
 
 open Kraken_common_types
 
+(** Normalizes asset names by stripping staking/earn suffixes (e.g. BTC.HOLD -> BTC)
+    and mapping legacy Kraken REST codes (e.g. XXBT -> BTC). *)
+let normalize_asset asset =
+  let base = if String.contains asset '.' then
+    match String.split_on_char '.' asset with
+    | base :: _ -> base
+    | [] -> asset
+  else asset in
+  match base with
+  | "XXBT" | "XBT" -> "BTC"
+  | "XETH" -> "ETH"
+  | "ZUSD" -> "USD"
+  | "ZEUR" -> "EUR"
+  | other -> other
+
 (** Re-exports conduit context constructor with TLS error handling. *)
 let get_conduit_ctx = get_conduit_ctx
 
@@ -52,8 +67,8 @@ module BalanceStore = struct
   }
 
   (* Updates a single wallet entry and recomputes the aggregate total. *)
-  let update_wallet store balance wallet_type wallet_id =
-    let wallet_key = wallet_type ^ "/" ^ wallet_id in
+  let update_wallet store balance wallet_type wallet_id original_asset =
+    let wallet_key = wallet_type ^ "/" ^ wallet_id ^ "/" ^ original_asset in
     let now = Unix.time () in
     let wallet_data = {
       balance;
@@ -127,6 +142,7 @@ let cleanup_handlers_started = Atomic.make false
 
 (** Returns true if the given asset has not been updated within [threshold_seconds]. *)
 let is_balance_stale asset threshold_seconds =
+  let asset = normalize_asset asset in
   try
     Mutex.lock balance_update_mutex;
     match Hashtbl.find_opt last_balance_update asset with
@@ -142,12 +158,14 @@ let is_balance_stale asset threshold_seconds =
 
 (** Records the current time as the latest update timestamp for [asset]. *)
 let update_balance_timestamp asset =
+  let asset = normalize_asset asset in
   Mutex.lock balance_update_mutex;
   Hashtbl.replace last_balance_update asset (Unix.time ());
   Mutex.unlock balance_update_mutex
 
 (** Returns the balance store for [asset], creating one lazily if absent. *)
 let get_balance_store asset =
+  let asset = normalize_asset asset in
   Mutex.lock balance_stores_mutex;
   let store = match Hashtbl.find_opt balance_stores asset with
   | Some store -> store
@@ -168,6 +186,7 @@ let[@inline always] get_balance asset =
 
 (** Returns a [balance_data] record with aggregated balances for [asset]. *)
 let get_balance_data asset =
+  let asset = normalize_asset asset in
   let store = get_balance_store asset in
   let data = BalanceStore.get_all store in
   { data with asset }
@@ -306,7 +325,8 @@ let parse_snapshot json on_heartbeat =
     List.iter (fun asset_data ->
       try
         let asset = member "asset" asset_data |> to_string in
-        let store = get_balance_store asset in
+        let base_asset = normalize_asset asset in
+        let store = get_balance_store base_asset in
 
         (* Iterate over embedded wallet entries and update each. *)
         let wallets = member "wallets" asset_data |> to_list in
@@ -316,7 +336,7 @@ let parse_snapshot json on_heartbeat =
             let wallet_id = member "id" wallet |> to_string in
             let balance = member "balance" wallet |> to_float in
 
-            BalanceStore.update_wallet store balance wallet_type wallet_id;
+            BalanceStore.update_wallet store balance wallet_type wallet_id asset;
 
             Logging.debug_f ~section "Balance snapshot wallet: %s %s/%s = %.8f"
               asset wallet_type wallet_id balance;
@@ -325,12 +345,12 @@ let parse_snapshot json on_heartbeat =
               (Printexc.to_string exn)
         ) wallets;
 
-        update_balance_timestamp asset;
+        update_balance_timestamp base_asset;
         notify_ready ();
 
         let total_balance = BalanceStore.get_balance store in
         Logging.debug_f ~section "Balance snapshot total: %s = %.8f"
-          asset total_balance;
+          base_asset total_balance;
         (* Signal heartbeat to confirm connection liveness. *)
         on_heartbeat ()
       with exn ->
@@ -378,15 +398,16 @@ let parse_update json on_heartbeat =
         let wallet_type = member "wallet_type" ledger_tx |> to_string in
         let wallet_id = member "wallet_id" ledger_tx |> to_string in
         
-        let store = get_balance_store asset in
-        BalanceStore.update_wallet store balance wallet_type wallet_id;
-        update_balance_timestamp asset;
+        let base_asset = normalize_asset asset in
+        let store = get_balance_store base_asset in
+        BalanceStore.update_wallet store balance wallet_type wallet_id asset;
+        update_balance_timestamp base_asset;
         notify_ready ();
 
         (* Publish aggregated balance data to event bus subscribers. *)
         let balance_data = BalanceStore.get_all store in
         let event_data = {
-          asset;
+          asset = base_asset;
           balance = balance_data.balance;
           wallet_type = balance_data.wallet_type;
           wallet_id = balance_data.wallet_id;
@@ -422,8 +443,10 @@ let handle_message_json json on_heartbeat =
     
     match channel, msg_type, method_type with
     | Some "balances", Some "snapshot", _ ->
+        Logging.info_f ~section "Balances snapshot received: %s" (Yojson.Safe.to_string json);
         let _ = parse_snapshot json on_heartbeat in ()
     | Some "balances", Some "update", _ ->
+        Logging.info_f ~section "Balances update received: %s" (Yojson.Safe.to_string json);
         let _ = parse_update json on_heartbeat in ()
     | Some "heartbeat", _, _ ->
         on_heartbeat ()
@@ -455,6 +478,78 @@ let handle_message message on_heartbeat =
       (Printexc.to_string exn) message
 
 
+(** Fetches Earn allocations from private REST API to support Bitcoin Vault balance. *)
+let poll_earn_allocations () =
+  let endpoint = "https://api.kraken.com" in
+  Lwt.catch (fun () ->
+    Kraken_get_fee.get_api_credentials_from_env () >>= fun (api_key, api_secret) ->
+    let path = "/0/private/Earn/Allocations" in
+    let nonce = Kraken_common_types.nonce () in
+    let encoded_body = Uri.encoded_of_query [("nonce", [nonce]); ("hide_zero_allocations", ["true"])] in
+    let signature = Kraken_common_types.sign ~secret:api_secret ~path ~body:encoded_body ~nonce in
+    let headers = Cohttp.Header.of_list [
+      ("API-Key", api_key);
+      ("API-Sign", signature);
+      ("Content-Type", "application/x-www-form-urlencoded")
+    ] in
+    
+    Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string encoded_body) 
+      (Uri.of_string (endpoint ^ path)) >>= fun (resp, body) ->
+      
+    Cohttp_lwt.Body.to_string body >>= fun body_str ->
+    let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+    if status <> 200 then begin
+      Logging.error_f ~section "Earn/Allocations HTTP %d: %s" status body_str;
+      Lwt.return_unit
+    end else begin
+      Logging.info_f ~section "Earn/Allocations raw response: %s" body_str;
+      let json = Yojson.Safe.from_string body_str in
+      let open Yojson.Safe.Util in
+      match member "error" json with
+      | `List (_ :: _ as errs) ->
+          Logging.error_f ~section "Earn/Allocations API error: %s" (errs |> filter_string |> String.concat "; ");
+          Lwt.return_unit
+      | _ ->
+          let result = member "result" json in
+          let allocations_list = match member "items" result with
+            | `List l -> l
+            | _ -> []
+          in
+          let float_member field j =
+            match member field j with
+            | `Float f -> f
+            | `Int i -> float_of_int i
+            | `String s -> (try float_of_string s with _ -> 0.0)
+            | `Intlit s -> (try float_of_string s with _ -> 0.0)
+            | _ -> 0.0
+          in
+          List.iter (fun allocation ->
+            try
+              let asset = member "native_asset" allocation |> to_string in
+              let strategy_id = member "strategy_id" allocation |> to_string in
+              let base_asset = normalize_asset asset in
+              if base_asset = "BTC" then begin
+                let amount_allocated = member "amount_allocated" allocation in
+                let total = member "total" amount_allocated in
+                let native_val = float_member "native" total in
+                if native_val > 0.0 then begin
+                  let store = get_balance_store "BTC" in
+                  BalanceStore.update_wallet store native_val "earn" strategy_id asset;
+                  update_balance_timestamp "BTC";
+                  Logging.info_f ~section "Updated Kraken BTC Vault balance from REST (%s): %.8f" strategy_id native_val;
+                end
+              end
+            with e ->
+              Logging.warn_f ~section "Failed to parse Earn allocation: %s" (Printexc.to_string e)
+          ) allocations_list;
+          notify_ready ();
+          Lwt.return_unit
+    end
+  ) (fun exn ->
+    Logging.error_f ~section "Failed to fetch Earn Allocations: %s" (Printexc.to_string exn);
+    Lwt.return_unit
+  )
+
 (** Deprecated message handler stub. Connection management is handled by [Kraken_trading_client]. *)
 let start_message_handler _conn _token _on_failure _on_heartbeat =
   Lwt.return_unit
@@ -481,6 +576,17 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
     let condition = Kraken_trading_client.get_message_condition () in
     let read_pos = ref (Ring_buffer.RingBuffer.get_position buffer) in
     
+    let rec earn_poll_loop () =
+      if Atomic.get Kraken_trading_client.shutdown_requested then
+        Lwt.return_unit
+      else begin
+        poll_earn_allocations () >>= fun () ->
+        Lwt_unix.sleep 10.0 >>= fun () ->
+        earn_poll_loop ()
+      end
+    in
+    Lwt.async earn_poll_loop;
+    
     let rec loop () =
       Lwt_condition.wait condition >>= fun () ->
       let new_messages = Ring_buffer.RingBuffer.read_since buffer !read_pos in
@@ -505,6 +611,9 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
     Must be called before the WebSocket feed begins producing messages. *)
 let initialize assets =
   Logging.info_f ~section "Initializing balances feed for %d assets" (List.length assets);
+
+  (* Normalize all input assets first *)
+  let assets = List.map normalize_asset assets in
 
   (* Merge user-configured assets with default fiat currencies. *)
   let all_assets = List.sort_uniq String.compare (assets @ Kraken_common_types.default_configured_currencies) in
