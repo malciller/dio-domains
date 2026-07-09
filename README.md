@@ -9,9 +9,6 @@ architecture, and real-time latency profiling. Built for
 high-frequency trading with WebSocket data feeds and asynchronous
 order execution.
 
-> [!NOTE]
-> **Full technical write-up**: [Diogrid v2.0.0](https://diophantsolutions.com/diogrid-wp)
-
 > [!WARNING]
 > **Auto-hedge for Hyperliquid is EXPERIMENTAL.** Testing is ongoing; features may be incomplete or unstable.
 
