@@ -241,15 +241,15 @@ let write_to_disk ~symbol ~state () =
 (** Persists state for a symbol. Required fields: reserved_base, accumulated_profit.
     Optional fields are updated in the cache when provided, and the entire state is
     written to disk synchronously. *)
-let save ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price ?last_sell_fill_price () =
+let save ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_buy_fill_price ~last_sell_fill_price () =
   ensure_symbol_in_cache ~symbol;
   Mutex.lock cache_mutex;
   let state = Hashtbl.find cache symbol in
   state.reserved_base <- reserved_base;
   state.accumulated_profit <- accumulated_profit;
   if last_fill_oid <> None then state.last_fill_oid <- last_fill_oid;
-  if last_buy_fill_price <> None then state.last_buy_fill_price <- last_buy_fill_price;
-  if last_sell_fill_price <> None then state.last_sell_fill_price <- last_sell_fill_price;
+  state.last_buy_fill_price <- last_buy_fill_price;
+  state.last_sell_fill_price <- last_sell_fill_price;
   let snapshot = {
     reserved_base = state.reserved_base;
     accumulated_profit = state.accumulated_profit;
@@ -278,15 +278,15 @@ let rec background_worker () =
 
 let () = ignore (Domain.spawn background_worker)
 
-let save_async ~symbol ~reserved_base ~accumulated_profit ?last_fill_oid ?last_buy_fill_price ?last_sell_fill_price () =
+let save_async ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_buy_fill_price ~last_sell_fill_price () =
   ensure_symbol_in_cache ~symbol;
   Mutex.lock cache_mutex;
   let state = Hashtbl.find cache symbol in
   state.reserved_base <- reserved_base;
   state.accumulated_profit <- accumulated_profit;
   if last_fill_oid <> None then state.last_fill_oid <- last_fill_oid;
-  if last_buy_fill_price <> None then state.last_buy_fill_price <- last_buy_fill_price;
-  if last_sell_fill_price <> None then state.last_sell_fill_price <- last_sell_fill_price;
+  state.last_buy_fill_price <- last_buy_fill_price;
+  state.last_sell_fill_price <- last_sell_fill_price;
   let snapshot = {
     reserved_base = state.reserved_base;
     accumulated_profit = state.accumulated_profit;

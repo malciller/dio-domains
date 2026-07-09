@@ -286,7 +286,7 @@ module Hyperliquid_impl = struct
   let get_all_balances () =
     let assets = Hyperliquid_balances.get_all_assets () in
     List.filter_map (fun asset ->
-      let bal = Hyperliquid_balances.get_balance asset in
+      let bal = Hyperliquid_balances.get_total_balance asset in
       if bal > 0.0 then Some (asset, bal) else None
     ) assets
 

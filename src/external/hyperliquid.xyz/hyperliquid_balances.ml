@@ -32,6 +32,7 @@ module BalanceStore = struct
     wallets: (string, wallet_balance) Hashtbl.t;
     mutex: Mutex.t;
     total_balance: float Atomic.t;
+    trading_balance: float Atomic.t;
     last_updated: float Atomic.t;
   }
 
@@ -39,6 +40,7 @@ module BalanceStore = struct
     wallets = Hashtbl.create 4;
     mutex = Mutex.create ();
     total_balance = Atomic.make 0.0;
+    trading_balance = Atomic.make 0.0;
     last_updated = Atomic.make 0.0;
   }
 
@@ -56,11 +58,17 @@ module BalanceStore = struct
     Hashtbl.replace store.wallets wallet_key wallet_data;
 
     let total = Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0 in
+    let trading = Hashtbl.fold (fun _ wallet acc ->
+      if wallet.wallet_type = "staking" then acc
+      else acc +. wallet.balance
+    ) store.wallets 0.0 in
     Atomic.set store.total_balance total;
+    Atomic.set store.trading_balance trading;
     Atomic.set store.last_updated now;
     Mutex.unlock store.mutex
 
-  let get_balance store = Atomic.get store.total_balance
+  let get_balance store = Atomic.get store.trading_balance
+  let get_total_balance store = Atomic.get store.total_balance
 end
 
 (* Global mutable state: per-asset balance stores and readiness flag. *)
@@ -92,6 +100,10 @@ let get_all_assets () =
 let get_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_balance store
+
+let get_total_balance asset =
+  let store = get_balance_store asset in
+  BalanceStore.get_total_balance store
 
 let notify_ready () =
   if not (Atomic.get is_ready) then begin
