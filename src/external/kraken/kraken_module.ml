@@ -236,13 +236,16 @@ module Kraken_impl = struct
   let get_top_of_book_fast ~symbol =
     Kraken_orderbook_feed.get_best_bid_ask_fast symbol
 
-  (** Return the current balance for [asset] from the balances feed cache. *)
-  let get_balance ~asset =
+  (** Return the current tradeable balance for [asset] from the balances feed cache. *)
+  let get_tradeable_balance ~asset =
     Kraken_balances_feed.get_balance asset
 
-  let get_balance_fast ~asset =
+  let get_tradeable_balance_fast ~asset =
     let store = Kraken_balances_feed.get_balance_store asset in
     (fun () -> Kraken_balances_feed.BalanceStore.get_balance store)
+
+  let get_total_balance ~asset =
+    Kraken_balances_feed.get_total_balance asset
 
   (** Return all assets with a positive balance as [(asset, balance)] pairs. *)
   let get_all_balances () =

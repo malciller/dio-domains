@@ -266,8 +266,8 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       in
 
       (* Cached closures for highly efficient, allocation-free balance reporting *)
-      let base_balance_fn = Ex.get_balance_fast ~asset:base_asset in
-      let quote_balance_fn = Ex.get_balance_fast ~asset:quote_currency in
+      let base_balance_fn = Ex.get_tradeable_balance_fast ~asset:base_asset in
+      let quote_balance_fn = Ex.get_tradeable_balance_fast ~asset:quote_currency in
       
       (* Cached closures for latency-sensitive feed access in the hot loop *)
       let get_ob_pos_fn = Ex.get_orderbook_position_fast ~symbol:asset_with_fees.symbol in

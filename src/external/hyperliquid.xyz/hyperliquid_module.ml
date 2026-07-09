@@ -276,12 +276,15 @@ module Hyperliquid_impl = struct
   let get_top_of_book_fast ~symbol =
     Hyperliquid_orderbook_feed.get_best_bid_ask_fast symbol
 
-  let get_balance ~asset =
+  let get_tradeable_balance ~asset =
     Hyperliquid_balances.get_balance asset
 
-  let get_balance_fast ~asset =
+  let get_tradeable_balance_fast ~asset =
     let store = Hyperliquid_balances.get_balance_store asset in
     (fun () -> Hyperliquid_balances.BalanceStore.get_balance store)
+
+  let get_total_balance ~asset =
+    Hyperliquid_balances.get_total_balance asset
 
   let get_all_balances () =
     let assets = Hyperliquid_balances.get_all_assets () in

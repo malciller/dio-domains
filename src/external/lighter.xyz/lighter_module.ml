@@ -176,12 +176,15 @@ module Lighter_impl = struct
   let get_top_of_book_fast ~symbol =
     Lighter_orderbook_feed.get_best_bid_ask_fast symbol
 
-  let get_balance ~asset =
+  let get_tradeable_balance ~asset =
     Lighter_balances.get_balance asset
 
-  let get_balance_fast ~asset =
+  let get_tradeable_balance_fast ~asset =
     let store = Lighter_balances.get_balance_store asset in
     (fun () -> Lighter_balances.BalanceStore.get_balance store)
+
+  let get_total_balance ~asset =
+    Lighter_balances.get_balance asset
 
   let get_all_balances () =
     Lighter_balances.get_all_balances ()
