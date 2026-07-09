@@ -203,6 +203,8 @@ type strategy_state = {
   mutable cached_qty_increment: float;
   mutable cached_qty_min: float;
   mutable exchange_reserved_atomic: float Atomic.t option;
+  processed_fills: (string, unit) Hashtbl.t;
+  processed_fills_queue: string Queue.t;
   mutex: Mutex.t;  (* per-symbol mutex; prevents concurrent strategy execution *)
 }
 
@@ -269,6 +271,8 @@ let rec get_strategy_state asset_symbol =
         cached_qty_increment = 0.01;
         cached_qty_min = 1.0;
         exchange_reserved_atomic = None;
+        processed_fills = Hashtbl.create 1024;
+        processed_fills_queue = Queue.create ();
         mutex = Mutex.create ();
       } in
       if Atomic.compare_and_set strategy_states map (Strategy_common.StringMap.add asset_symbol new_state map) then
@@ -1432,9 +1436,9 @@ let flush_persistence asset_symbol =
         Dio_persistence.State_persistence.save_async ~symbol:asset_symbol
           ~reserved_base
           ~accumulated_profit
-          ?last_fill_oid
-          ?last_buy_fill_price
-          ?last_sell_fill_price ()
+          ~last_fill_oid
+          ~last_buy_fill_price
+          ~last_sell_fill_price ()
     | None -> ()
   end
 
@@ -1497,8 +1501,13 @@ let handle_order_failed ~now asset_symbol side reason =
     (* Clear inflight flags. *)
     (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
 
-    (* Release this asset's quote reservation on buy failures. *)
-    (match side with Buy -> set_asset_reserved_quote state 0.0 | Sell -> ());
+    (* Release this asset's quote reservation on buy failures; clean up pending sells from tracking on sell failures. *)
+    (match side with
+     | Buy -> set_asset_reserved_quote state 0.0
+     | Sell ->
+         state.open_sell_orders <- List.filter (fun (oid, _, _) ->
+           not (String.starts_with ~prefix:"pending_sell_" oid)
+         ) state.open_sell_orders);
 
     (* Clear global in-flight trackers. *)
     let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
@@ -1569,8 +1578,14 @@ let handle_order_rejected ~now:_ asset_symbol side price =
     not (matches_side_placement || matches_fallback)
   ) state.pending_orders;
 
-  (* Clear inflight flags. *)
-  (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+  (* Clear inflight flags and clean up pending sells from tracking on sell rejections. *)
+  (match side with
+   | Buy -> state.inflight_buy <- false
+   | Sell ->
+       state.inflight_sell <- false;
+       state.open_sell_orders <- List.filter (fun (oid, _, _) ->
+         not (String.starts_with ~prefix:"pending_sell_" oid)
+       ) state.open_sell_orders);
 
   (* Clean up global trackers to allow immediate re-placement after rejection. *)
   let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
@@ -1601,6 +1616,18 @@ let buy_tracking_matches_exchange_event tracked order_id cl_ord_id =
   tracked = order_id
   || match cl_ord_id with Some c -> tracked = c | None -> false
 
+let add_processed_fill state order_id =
+  if not (Hashtbl.mem state.processed_fills order_id) then begin
+    Queue.push order_id state.processed_fills_queue;
+    Hashtbl.replace state.processed_fills order_id ();
+    if Hashtbl.length state.processed_fills > 2000 then begin
+      try
+        let oldest = Queue.pop state.processed_fills_queue in
+        Hashtbl.remove state.processed_fills oldest
+      with _ -> ()
+    end
+  end
+
 (** Handles order fill. Fully clears tracking, pending amends, and computes profit. *)
 let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id =
   let state = get_strategy_state asset_symbol in
@@ -1613,182 +1640,196 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
        live WebSocket reconnect). Without this, WS reconnects replay all historical
        fills and re-credit accumulated_profit / re-decrement reserved_base. *)
     let is_persisted_fill =
-      match state.last_fill_oid with
-      | Some persisted_oid ->
-          (* OIDs are monotonically increasing on Hyperliquid and Lighter. *)
-          (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
-           with _ -> false)
-      | None -> state.startup_replay  (* New strategy: skip all fills during startup replay. *)
+      Hashtbl.mem state.processed_fills order_id
+      || match state.last_fill_oid with
+         | Some persisted_oid ->
+             (* OIDs are monotonically increasing on Hyperliquid and Lighter. *)
+             (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
+              with _ -> false)
+         | None -> state.startup_replay  (* New strategy: skip all fills during startup replay. *)
     in
     let skip_fill = is_persisted_fill in
 
-    (* 1. Remove any pending amend matching this order ID. *)
-    state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
-      not (String.starts_with ~prefix:"pending_amend_" pending_id &&
-           String.length pending_id > 14 &&
-           String.sub pending_id 14 (String.length pending_id - 14) = order_id)
-    ) state.pending_orders;
+    if skip_fill then begin
+      add_processed_fill state order_id;
+      Logging.debug_f ~section "Skipping already processed fill: %s (side=%s)" order_id (match side with Buy -> "buy" | Sell -> "sell");
+      if state.startup_replay then begin
+        let dominated = match state.highest_startup_oid with
+          | None -> true
+          | Some prev ->
+              (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev) > 0
+               with _ -> false)
+        in
+        if dominated then
+          state.highest_startup_oid <- Some order_id
+      end
+    end else begin
+      add_processed_fill state order_id;
+      (* 1. Remove any pending amend matching this order ID. *)
+      state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
+        not (String.starts_with ~prefix:"pending_amend_" pending_id &&
+             String.length pending_id > 14 &&
+             String.sub pending_id 14 (String.length pending_id - 14) = order_id)
+      ) state.pending_orders;
 
-    (* 2. Look up sell price before filtering; needed for profit calculation.
-       Use exec event fill_price as primary source; fall back to open_sell_orders
-       for backward compat. Fixes Hyperliquid amends where webData2 never
-       surfaces the replacement sell order. *)
-    let sell_fill_price = match List.find_opt (fun (id, _, _) -> id = order_id) state.open_sell_orders with
-      | Some (_, p, _) -> p
-      | None -> fill_price  (* exec event fill price; always available *)
-    in
+      (* 2. Look up sell price before filtering; needed for profit calculation.
+         Use exec event fill_price as primary source; fall back to open_sell_orders
+         for backward compat. Fixes Hyperliquid amends where webData2 never
+         surfaces the replacement sell order. *)
+      let sell_fill_price = match List.find_opt (fun (id, _, _) -> id = order_id) state.open_sell_orders with
+        | Some (_, p, _) -> p
+        | None -> fill_price  (* exec event fill price; always available *)
+      in
 
-    (* 3. Remove from sell orders tracking if this was a sell order. *)
-    state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
-      sell_id <> order_id
-    ) state.open_sell_orders;
+      (* 3. Remove from sell orders tracking if this was a sell order. *)
+      state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
+        sell_id <> order_id
+      ) state.open_sell_orders;
 
-    (* 4. Update buy tracking and accumulation on buy fills.
-       A sell fill must not clear last_buy_order_id because the buy is still
-       live and only needs spacing adjustment, not a fresh placement cycle. *)
-    let _was_tracked_buy = match side, state.last_buy_order_id with
-      | Buy, Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
-      | _ -> false
-    in
-    if side = Buy then begin
-      (* Record actual buy fill price for profit calculation on matching sell fill.
-         We ALWAYS do this for buy fills, even laggy ones, since they establish our cost basis. *)
-      state.last_buy_fill_price <- Some fill_price;
-      state.last_sell_fill_price <- None;
-      (* Mark dirty so flush_persistence writes buy fill price to disk.
-         Without this, sell fills after restart have no buy_price reference
-         and silently skip profit calculation. *)
+      (* 4. Update buy tracking and accumulation on buy fills.
+         A sell fill must not clear last_buy_order_id because the buy is still
+         live and only needs spacing adjustment, not a fresh placement cycle. *)
+      let _was_tracked_buy = match side, state.last_buy_order_id with
+        | Buy, Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
+        | _ -> false
+      in
+      if side = Buy then begin
+        (* Record actual buy fill price for profit calculation on matching sell fill.
+           We ALWAYS do this for buy fills, even laggy ones, since they establish our cost basis. *)
+        state.last_buy_fill_price <- Some fill_price;
+        state.last_sell_fill_price <- None;
+        (* Mark dirty so flush_persistence writes buy fill price to disk.
+           Without this, sell fills after restart have no buy_price reference
+           and silently skip profit calculation. *)
+        if persistence_accumulation_exchange state.exchange_id then
+          state.persistence_dirty <- true;
+        if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0 then begin
+          let base_fee = acc_qty *. state.maker_fee in
+          state.reserved_base <- state.reserved_base -. base_fee;
+          Logging.info_f ~section "Decremented reserved_base for %s by %.8f (base fee leak), now %.8f"
+            asset_symbol base_fee state.reserved_base
+        end;
+
+        (* Credit anticipated base so the sell guard sees incoming asset before
+           the balance feed catches up (exec feed is faster than balance feed).
+           Credit on ANY buy fill since rapid fills can cause tracking to be cleared
+           prematurely by amendment-failure races. Upstream executions feed trade ID
+           deduplication prevents double-crediting. *)
+        if acc_qty > 0.0 && not state.startup_replay then begin
+          state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
+          Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
+            asset_symbol acc_qty state.anticipated_base_credit order_id
+        end;
+        
+        (* Clear tracking on ANY buy fill. If a new buy is already tracked
+           (placed between the old fill event and now), the next cycle will
+           re-sync from the exchange open orders feed. Failing to clear here
+           when was_tracked_buy=false due to amendment-failure races causes
+           orphaned buy tracking that blocks sell+buy pair placement. *)
+        state.last_buy_order_id <- None;
+        state.last_buy_order_price <- None;
+        if not state.startup_replay then
+          state.just_filled_buy <- true;
+      end;
+
+      (* 5. Compute realized net profit on sell fills (discrete sizing accumulator).
+         profit = (sell_price - buy_price) * qty - maker fees on both legs.
+         During startup_replay, skip profit calculation for fills already persisted
+         (OID <= last_fill_oid). Tracking state (buy/sell IDs, inflight flags) is
+         still updated above so the strategy enters the correct operational state.
+         Track highest OID seen during startup for new-strategy bootstrapping. *)
+      if state.startup_replay then begin
+        let dominated = match state.highest_startup_oid with
+          | None -> true
+          | Some prev ->
+              (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev) > 0
+               with _ -> false)
+        in
+        if dominated then
+          state.highest_startup_oid <- Some order_id
+      end;
+      (match side with
+       | Sell ->
+            (* Determine cost basis: use last_sell_fill_price for ascending
+               ladder sells (each step strictly higher than the previous).
+               When two sells fill at the same price or descend, each should
+               independently use the original buy fill price. *)
+            let cost_basis = match state.last_sell_fill_price with
+              | Some prev_sell when prev_sell > 0.0 && prev_sell < sell_fill_price -> Some prev_sell
+              | _ -> state.last_buy_fill_price
+            in
+            (match cost_basis with
+             | Some base_price when sell_fill_price > base_price ->
+                let qty = acc_qty in
+                let gross = (sell_fill_price -. base_price) *. qty in
+                (* Hyperliquid / Lighter spot: buy fee from base; sell fee from quote.
+                   Even though buy fee was paid in base, we deduct its quote cost basis
+                   here so accumulated_profit accurately reflects economic reality. *)
+                let fees =
+                  if state.exchange_id = "ibkr" then
+                    (* IBKR Pro Tiered: per-share with min/max, charged per leg *)
+                    ibkr_commission ~qty ~price:base_price
+                    +. ibkr_commission ~qty ~price:sell_fill_price
+                  else
+                    (sell_fill_price *. qty *. state.maker_fee)
+                    +. (base_price *. qty *. state.maker_fee)
+                in
+                let net_profit = gross -. fees in
+                if net_profit > 0.0 then begin
+                  state.accumulated_profit <- state.accumulated_profit +. net_profit;
+                  Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
+                    asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
+                end;
+                (* Always record sell fill price for consecutive sell detection. *)
+                state.last_sell_fill_price <- Some sell_fill_price
+            | _ ->
+                (* Sell at or below cost basis; still record for consecutive sell tracking. *)
+                state.last_sell_fill_price <- Some sell_fill_price)
+       | Buy -> ());
+
+      (* 5b. Advance last_fill_oid on EVERY fill (buy or sell, profitable or not).
+         This ensures startup replay always has a valid watermark to resume from.
+         Without this, symbols that never had a profitable sell would have
+         last_fill_oid=None, causing all fills to be skipped on every restart
+         and preventing profit accumulation permanently. *)
+      let should_update_oid = match state.last_fill_oid with
+        | Some prev_oid ->
+            (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
+             with _ -> true)
+        | None -> true
+      in
+      if should_update_oid then
+        state.last_fill_oid <- Some order_id;
+      (* Persist state on every fill so last_fill_oid, fill prices, and profit
+         all survive container restarts. *)
       if persistence_accumulation_exchange state.exchange_id then
         state.persistence_dirty <- true;
-      if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0 && not skip_fill then begin
-        let base_fee = acc_qty *. state.maker_fee in
-        state.reserved_base <- state.reserved_base -. base_fee;
-        Logging.info_f ~section "Decremented reserved_base for %s by %.8f (base fee leak), now %.8f"
-          asset_symbol base_fee state.reserved_base
+
+      let should_clear_locks = true in
+
+      (* 6. Clear inflight flags, reservation, and global placement trackers for immediate re-placement. *)
+      if should_clear_locks then begin
+        (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+        ignore (InFlightOrders.remove_in_flight_order ((match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
+      end;
+      (* Release quote reservation on ANY buy fill to prevent orphaned reservations. *)
+      if side = Buy then begin
+        set_asset_reserved_quote state 0.0
       end;
 
-      (* Credit anticipated base so the sell guard sees incoming asset before
-         the balance feed catches up (exec feed is faster than balance feed).
-         Credit on ANY buy fill since rapid fills can cause tracking to be cleared
-         prematurely by amendment-failure races. Upstream executions feed trade ID
-         deduplication prevents double-crediting. *)
-      if acc_qty > 0.0 && not state.startup_replay then begin
-        state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
-        Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
-          asset_symbol acc_qty state.anticipated_base_credit order_id
+      (* 7. On ANY buy fill, clear the Sell side's InFlightOrders guard and
+         inflight flag. Any buy fill (tracked or not) means the previous sell
+         order is obsolete and a fresh sell must be placed alongside the next
+         buy.  Previously this was gated on was_tracked_buy, which caused
+         sell-side locks to remain permanently stuck when the ghost-order
+         reconciler cleared last_buy_order_id before the fill event arrived. *)
+      if side = Buy then begin
+        ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
+        state.inflight_sell <- false
       end;
-      
-      (* Clear tracking on ANY buy fill. If a new buy is already tracked
-         (placed between the old fill event and now), the next cycle will
-         re-sync from the exchange open orders feed. Failing to clear here
-         when was_tracked_buy=false due to amendment-failure races causes
-         orphaned buy tracking that blocks sell+buy pair placement. *)
-      state.last_buy_order_id <- None;
-      state.last_buy_order_price <- None;
-      if not state.startup_replay then
-        state.just_filled_buy <- true;
-    end;
 
-    (* 5. Compute realized net profit on sell fills (discrete sizing accumulator).
-       profit = (sell_price - buy_price) * qty - maker fees on both legs.
-       During startup_replay, skip profit calculation for fills already persisted
-       (OID <= last_fill_oid). Tracking state (buy/sell IDs, inflight flags) is
-       still updated above so the strategy enters the correct operational state.
-       Track highest OID seen during startup for new-strategy bootstrapping. *)
-    if state.startup_replay then begin
-      let dominated = match state.highest_startup_oid with
-        | None -> true
-        | Some prev ->
-            (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev) > 0
-             with _ -> false)
-      in
-      if dominated then
-        state.highest_startup_oid <- Some order_id
-    end;
-    if skip_fill then
       ()
-    else
-    (match side with
-     | Sell ->
-          (* Determine cost basis: use last_sell_fill_price for ascending
-             ladder sells (each step strictly higher than the previous).
-             When two sells fill at the same price or descend, each should
-             independently use the original buy fill price. *)
-          let cost_basis = match state.last_sell_fill_price with
-            | Some prev_sell when prev_sell > 0.0 && prev_sell < sell_fill_price -> Some prev_sell
-            | _ -> state.last_buy_fill_price
-          in
-          (match cost_basis with
-           | Some base_price when sell_fill_price > base_price ->
-              let qty = acc_qty in
-              let gross = (sell_fill_price -. base_price) *. qty in
-              (* Hyperliquid / Lighter spot: buy fee from base; sell fee from quote.
-                 Even though buy fee was paid in base, we deduct its quote cost basis
-                 here so accumulated_profit accurately reflects economic reality. *)
-              let fees =
-                if state.exchange_id = "ibkr" then
-                  (* IBKR Pro Tiered: per-share with min/max, charged per leg *)
-                  ibkr_commission ~qty ~price:base_price
-                  +. ibkr_commission ~qty ~price:sell_fill_price
-                else
-                  (sell_fill_price *. qty *. state.maker_fee)
-                  +. (base_price *. qty *. state.maker_fee)
-              in
-              let net_profit = gross -. fees in
-              if net_profit > 0.0 then begin
-                state.accumulated_profit <- state.accumulated_profit +. net_profit;
-                Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
-                  asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
-              end;
-              (* Always record sell fill price for consecutive sell detection. *)
-              state.last_sell_fill_price <- Some sell_fill_price
-          | _ ->
-              (* Sell at or below cost basis; still record for consecutive sell tracking. *)
-              state.last_sell_fill_price <- Some sell_fill_price)
-     | Buy -> ());
-
-    (* 5b. Advance last_fill_oid on EVERY fill (buy or sell, profitable or not).
-       This ensures startup replay always has a valid watermark to resume from.
-       Without this, symbols that never had a profitable sell would have
-       last_fill_oid=None, causing all fills to be skipped on every restart
-       and preventing profit accumulation permanently. *)
-    let should_update_oid = match state.last_fill_oid with
-      | Some prev_oid ->
-          (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
-           with _ -> true)
-      | None -> true
-    in
-    if should_update_oid then
-      state.last_fill_oid <- Some order_id;
-    (* Persist state on every fill so last_fill_oid, fill prices, and profit
-       all survive container restarts. *)
-    if persistence_accumulation_exchange state.exchange_id then
-      state.persistence_dirty <- true;
-
-    let should_clear_locks = true in
-
-    (* 6. Clear inflight flags, reservation, and global placement trackers for immediate re-placement. *)
-    if should_clear_locks then begin
-      (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
-      ignore (InFlightOrders.remove_in_flight_order ((match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
-    end;
-    (* Release quote reservation on ANY buy fill to prevent orphaned reservations. *)
-    if side = Buy then begin
-      set_asset_reserved_quote state 0.0
-    end;
-
-    (* 7. On ANY buy fill, clear the Sell side's InFlightOrders guard and
-       inflight flag. Any buy fill (tracked or not) means the previous sell
-       order is obsolete and a fresh sell must be placed alongside the next
-       buy.  Previously this was gated on was_tracked_buy, which caused
-       sell-side locks to remain permanently stuck when the ghost-order
-       reconciler cleared last_buy_order_id before the fill event arrived. *)
-    if side = Buy then begin
-      ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
-      state.inflight_sell <- false
-    end;
-
-    ()
+    end
   )
 
 (** Handles order cancellation. Removes from pending and tracked orders. *)
@@ -2082,7 +2123,9 @@ module Strategy = struct
         Dio_persistence.State_persistence.save ~symbol
           ~reserved_base:state.reserved_base
           ~accumulated_profit:state.accumulated_profit
-          ~last_fill_oid:(Option.get state.highest_startup_oid) ();
+          ~last_fill_oid:state.last_fill_oid
+          ~last_buy_fill_price:state.last_buy_fill_price
+          ~last_sell_fill_price:state.last_sell_fill_price ();
         Logging.info_f ~section
           "Bootstrapped initial state for %s (last_fill_oid=%s, reserved_base=%.8f, accumulated_profit=%.6f)"
           symbol

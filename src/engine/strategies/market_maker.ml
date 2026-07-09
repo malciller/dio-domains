@@ -942,8 +942,14 @@ let handle_order_failed ~now:_ asset_symbol side reason =
     (* Remove from pending orders *)
     state.pending_orders <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
 
-    (* Clear inflight flags *)
-    (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+    (* Clear inflight flags and clean up pending sells from tracking on sell failures *)
+    (match side with
+     | Buy -> state.inflight_buy <- false
+     | Sell ->
+         state.inflight_sell <- false;
+         state.open_sell_orders <- List.filter (fun (oid, _, _) ->
+           not (String.starts_with ~prefix:"pending_sell_" oid)
+         ) state.open_sell_orders);
     
     (* Clear global in-flight trackers *)
     let duplicate_key = generate_side_duplicate_key asset_symbol side in
@@ -1004,8 +1010,14 @@ let handle_order_rejected ~now:_ asset_symbol side price =
     not (matches_side_placement || matches_fallback)
   ) state.pending_orders;
 
-  (* Clear inflight flags *)
-  (match side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+  (* Clear inflight flags and clean up pending sells from tracking on sell rejections *)
+  (match side with
+   | Buy -> state.inflight_buy <- false
+   | Sell ->
+       state.inflight_sell <- false;
+       state.open_sell_orders <- List.filter (fun (oid, _, _) ->
+         not (String.starts_with ~prefix:"pending_sell_" oid)
+       ) state.open_sell_orders);
 
   (* Release global trackers to permit immediate re-placement *)
   let duplicate_key = generate_side_duplicate_key asset_symbol side in

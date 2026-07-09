@@ -16,9 +16,13 @@ let test_balance_store_operations () =
   (* Update balance for second wallet *)
   Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 67.89 "earn" "wallet456" "BTC.HOLD";
 
-  (* Check aggregated balance *)
+  (* Check aggregated trading balance (earn should be excluded) *)
   let aggregated_balance = Kraken.Kraken_balances_feed.BalanceStore.get_balance store in
-  Alcotest.(check (float 0.001)) "aggregated balance" 191.34 aggregated_balance;
+  Alcotest.(check (float 0.001)) "aggregated balance" 123.45 aggregated_balance;
+
+  (* Check aggregated total balance *)
+  let total_balance = Kraken.Kraken_balances_feed.BalanceStore.get_total_balance store in
+  Alcotest.(check (float 0.001)) "aggregated total balance" 191.34 total_balance;
 
   (* Get full balance data *)
   let data = Kraken.Kraken_balances_feed.BalanceStore.get_all store in

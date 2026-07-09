@@ -56,6 +56,7 @@ module BalanceStore = struct
     wallets: (string, wallet_balance) Hashtbl.t;
     mutex: Mutex.t;
     total_balance: float Atomic.t;  (* Cached sum of all wallet balances for this asset. *)
+    trading_balance: float Atomic.t; (* Cached sum of trading wallets *)
     last_updated: float Atomic.t;
   }
 
@@ -63,6 +64,7 @@ module BalanceStore = struct
     wallets = Hashtbl.create 4;  (* Small initial capacity; most assets have few wallets. *)
     mutex = Mutex.create ();
     total_balance = Atomic.make 0.0;
+    trading_balance = Atomic.make 0.0;
     last_updated = Atomic.make 0.0;
   }
 
@@ -130,12 +132,18 @@ module BalanceStore = struct
 
     (* Recompute aggregate balance across all wallets. *)
     let total = Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0 in
+    let trading = Hashtbl.fold (fun _ wallet acc ->
+      if wallet.wallet_type = "earn" then acc
+      else acc +. wallet.balance
+    ) store.wallets 0.0 in
     Atomic.set store.total_balance total;
+    Atomic.set store.trading_balance trading;
     Atomic.set store.last_updated now;
     Mutex.unlock store.mutex
 
-  (* Returns the aggregate balance across all wallets for this asset. *)
-  let get_balance store = Atomic.get store.total_balance
+  (* Returns the trading balance for this asset. *)
+  let get_balance store = Atomic.get store.trading_balance
+  let get_total_balance store = Atomic.get store.total_balance
 
   let get_all store =
     {
@@ -218,6 +226,10 @@ let get_balance_store asset =
 let[@inline always] get_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_balance store
+
+let[@inline always] get_total_balance asset =
+  let store = get_balance_store asset in
+  BalanceStore.get_total_balance store
 
 (** Returns a [balance_data] record with aggregated balances for [asset]. *)
 let get_balance_data asset =

@@ -248,7 +248,7 @@ module Kraken_impl = struct
   let get_all_balances () =
     let assets = Kraken_balances_feed.get_all_assets () in
     List.filter_map (fun asset ->
-      let bal = Kraken_balances_feed.get_balance asset in
+      let bal = Kraken_balances_feed.get_total_balance asset in
       if bal > 0.0 then Some (asset, bal) else None
     ) assets
 
