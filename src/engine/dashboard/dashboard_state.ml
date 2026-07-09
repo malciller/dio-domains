@@ -133,8 +133,8 @@ let json_of_market_data exchange symbol base_asset quote_currency =
   | None -> `Null
   | Some (module Ex) ->
       let tob = Ex.get_top_of_book ~symbol in
-      let base_balance = (try Ex.get_balance ~asset:base_asset with _ -> 0.0) in
-      let quote_balance = (try Ex.get_balance ~asset:quote_currency with _ -> 0.0) in
+      let base_balance = (try Ex.get_total_balance ~asset:base_asset with _ -> 0.0) in
+      let quote_balance = (try Ex.get_total_balance ~asset:quote_currency with _ -> 0.0) in
       `Assoc [
         "bid", (match tob with Some (b, _, _, _) -> `Float b | None -> `Null);
         "ask", (match tob with Some (_, _, a, _) -> `Float a | None -> `Null);

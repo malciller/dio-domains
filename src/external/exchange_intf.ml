@@ -191,11 +191,14 @@ module type S = sig
       or [None] if orderbook data is unavailable. *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
 
-  (** Return the current balance for [asset]. Returns [0.0] if unknown. *)
-  val get_balance : asset:string -> float
+  (** Return the current tradeable balance for [asset]. Returns [0.0] if unknown. *)
+  val get_tradeable_balance : asset:string -> float
 
-  (** Return a fast path closure for fetching live balance of [asset] without lock acquisition overhead. *)
-  val get_balance_fast : asset:string -> (unit -> float)
+  (** Return a fast path closure for fetching live tradeable balance of [asset] without lock acquisition overhead. *)
+  val get_tradeable_balance_fast : asset:string -> (unit -> float)
+
+  (** Return the total balance for [asset] including staked/earn/vault balances. Returns [0.0] if unknown. *)
+  val get_total_balance : asset:string -> float
 
   (** Return all cached asset balances as [(asset_name, balance)] pairs. *)
   val get_all_balances : unit -> (string * float) list

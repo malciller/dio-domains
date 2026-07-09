@@ -53,7 +53,7 @@ let test_data_accessors_empty () =
 
   let tob = Hyperliquid.Module.Hyperliquid_impl.get_top_of_book ~symbol:"NODATA_TOB" in
   Alcotest.(check bool) "no top of book" true (Option.is_none tob);
-  let bal = Hyperliquid.Module.Hyperliquid_impl.get_balance ~asset:"NODATA_ASSET" in
+  let bal = Hyperliquid.Module.Hyperliquid_impl.get_tradeable_balance ~asset:"NODATA_ASSET" in
   Alcotest.(check (float 0.000001)) "no balance" 0.0 bal
 
 let () =
