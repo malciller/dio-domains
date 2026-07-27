@@ -742,11 +742,9 @@ let execute_strategy
      end
    end;
 
-  (* Capital-low fast path: skip strategy when quote balance is known to be
-     insufficient for a buy order. The FIRST loop (capital_low=false) is allowed
-     so that any accrued sell orders from previously filled buys can be placed
-     to free capital. After that first pass, capital_low is set and the strategy
-     short-circuits here. When balance recovers, the flag is cleared. *)
+  (* Capital-low evaluation: tracks quote balance sufficiency for buy placement.
+     Capital-low ONLY gates buy order placement; it does NOT block sell placement
+     for acquired inventory or sellable asset balance. *)
   if not (Float.is_nan quote_balance) then begin
     let quote_bal = quote_balance in
     let qty_f = lot_qty in
@@ -757,35 +755,28 @@ let execute_strategy
     if state.capital_low && state.capital_low_at_balance < 0.0 then
       state.capital_low_at_balance <- quote_bal;
     if state.capital_low && available_quote < quote_needed_fast then begin
-      (* Still low: skip entire strategy body to avoid order spam. *)
+      (* Still low: capital_low flag remains set for buy placement gating. *)
       ()
     end else if state.capital_low && state.capital_low_at_balance >= 0.0
                 && quote_bal > state.capital_low_at_balance then begin
       (* Balance feed delivered a higher balance than the snapshot taken when
          capital_low was set. A real event (fill crediting USD or cancel freeing
-         reserve) has occurred. Only now is it safe to retry placement. Clearing
-         on stale balance data (same quote_bal as at rejection) caused tight
-         rejection loops. *)
+         reserve) has occurred. Only now is it safe to retry buy placement. *)
       let was_at = state.capital_low_at_balance in
       state.capital_low <- false;
       state.capital_low_logged <- false;
       state.capital_low_at_balance <- 0.0;  (* reset snapshot for next recovery episode *)
       state.resuming_after_balance_flag <- true;
-      (* Flush buy-side placement cooldown so the strategy can place immediately.
-         Without this, the 2s cooldown set when capital_low was first triggered
-         blocks the first buy attempt even after balance recovers. *)
+      (* Flush buy-side placement cooldown so the strategy can place buy orders immediately. *)
       Hashtbl.remove state.amend_cooldowns "place_Buy";
-      (* Clear inflight flags so sell+buy placement can run on this recovery cycle. *)
+      (* Clear buy-side inflight flags so buy placement can resume.
+         Do NOT touch sell-side inflight flags (inflight_sell / duplicate_key_sell). *)
       state.inflight_buy <- false;
-      state.inflight_sell <- false;
       ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_buy));
-      ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
-      Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at %.2f) - resuming strategy"
+      Logging.info_f ~section "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at %.2f) - resuming buy placement"
         asset.symbol available_quote quote_needed_fast total_reserved was_at
     end
   end;
-
-  if not state.capital_low then begin
 
   (* [now] is provided by the caller to avoid per-cycle syscalls. *)
   
@@ -1095,9 +1086,18 @@ let execute_strategy
            On buy fill, the existing sell's InFlightOrders key is still live,
            which would block the new sell via duplicate detection.
            Force-clear the sell key so a fresh sell is always placed alongside the new buy. *)
+        (* Determine cost basis for sell order. If resuming after a balance outage
+           or if the last buy fill price has drifted significantly (> 1 grid interval)
+           from the current market bid price, re-anchor base_price_for_sell to current bid_price. *)
         let base_price_for_sell =
           match state.last_buy_fill_price with
-          | Some fill_p -> fill_p
+          | Some fill_p when not state.resuming_after_balance_flag
+                          && abs_float (bid_price -. fill_p) <= (bid_price *. (grid_interval /. 100.0)) -> fill_p
+          | Some fill_p ->
+              Logging.info_f ~section
+                "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted or resuming_after_balance=%B)"
+                asset.symbol bid_price fill_p state.resuming_after_balance_flag;
+              bid_price
           | None -> bid_price
         in
         let sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
@@ -1117,7 +1117,14 @@ let execute_strategy
            may be stale after a buy fill. If the exchange rejects, asset_low
            is set and will not clear until (asset_bal - reserved_base) >= needed,
            protecting accumulated base asset. *)
-        if not (Float.is_nan asset_balance) && not state.inflight_sell && not state.asset_low then begin
+        (* Place sell order first; sell and buy are always paired.
+           asset_low blocks entry to this entire branch at the top level.
+           Always attempt the sell regardless of local quote balance, as cached balance
+           may be stale after a buy fill. If the exchange rejects, asset_low
+           is set and will not clear until (asset_bal - reserved_base) >= needed,
+           protecting accumulated base asset.
+           Only place sell if no sell is in flight and no open sell order exists. *)
+        if not (Float.is_nan asset_balance) && not state.inflight_sell && List.length state.open_sell_orders = 0 && not state.asset_low then begin
              let asset_bal = asset_balance in
              let (sell_qty, is_accumulation_sell, required_profit) =
                compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
@@ -1199,11 +1206,15 @@ let execute_strategy
 
         (* Place buy order if quote balance is available AND sell leg succeeded.
            Gate buy placement on sell_placed_or_active to prevent accumulating
-           asset without a corresponding sell order on the book. *)
+           asset without a corresponding sell order on the book.
+           Also gate buy placement on capital_low. *)
         if not !sell_placed_or_active then begin
           Logging.warn_f ~section
             "Buy placement skipped for %s: sell order was not placed (inflight_sell=%B, asset_low=%B, open_sells=%d). Will retry both on next cycle."
             asset.symbol state.inflight_sell state.asset_low (List.length state.open_sell_orders)
+        end else if state.capital_low then begin
+          Logging.debug_f ~section "Buy placement skipped for %s: capital_low flag is set"
+            asset.symbol
         end else if not (Float.is_nan quote_balance) then begin
          if is_buy_on_cooldown || state.inflight_buy then begin
            Logging.debug_f ~section
@@ -1289,8 +1300,13 @@ let execute_strategy
               (* Calculate 2x grid_interval as absolute dollar amount from current price. *)
               let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
 
-              (* Compute exact 2x target from closest sell price. *)
-              let exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
+              (* Compute exact 2x target from closest sell price, ensuring it does not exceed current market ask_price - 1 grid interval. *)
+              let grid_buy_from_ask = calculate_grid_price ask_price grid_interval false state in
+              let raw_exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
+              let exact_target =
+                if raw_exact_target > grid_buy_from_ask then grid_buy_from_ask
+                else raw_exact_target
+              in
               
               if distance > double_grid_interval then begin
                 (* Distance > 2x: trail buy upward to maintain grid_interval below price. *)
@@ -1406,7 +1422,7 @@ let execute_strategy
       state.just_filled_buy <- false
   end  (* end of: if Float.is_nan current_price then ... else begin *)
   end  (* end: is_stale else begin *)
-   end) (* end: if not capital_low then begin; close Fun.protect *)
+   ) (* close Fun.protect *)
 
 
 (** Flushes deferred accumulation state to disk when the dirty flag is set.
