@@ -1079,7 +1079,7 @@ let execute_strategy
       let locked_in_sells_local = !locked_in_sells in
       let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells_local in
       let (effective_sell_qty, balance_ok) =
-        if ecfg.use_reserved_base_guard then
+        if ecfg.use_accumulation_sells && ecfg.use_reserved_base_guard then
           if available >= sell_qty then
             (sell_qty, true)
           else if available > 0.0 then
@@ -1092,6 +1092,15 @@ let execute_strategy
                 asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
               (0.0, false)
             end
+          else begin
+            Logging.debug_f ~section
+              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+              asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
+            (0.0, false)
+          end
+        else if ecfg.use_reserved_base_guard then
+          if available >= sell_qty then
+            (sell_qty, true)
           else begin
             Logging.debug_f ~section
               "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
