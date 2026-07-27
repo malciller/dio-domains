@@ -13,7 +13,7 @@ let render_strategies w json =
     col 16 a_label "SYMBOL";
     col 5 a_label "STGY";
     col 3 a_label "ST";
-    col_right 12 a_label "PRICE";
+    col_right 13 a_label "PRICE";
     col_right 8 a_label "SPREAD";
     I.string a_border " │ ";
     col_right 12 a_label "BUY @";
@@ -223,7 +223,7 @@ let render_strategies w json =
     let price_str = if mid > 0.0 then format_price mid else "--" in
     let price_cell = I.hcat [
       I.string p_border_attr "[";
-      col_right 10 row_text price_str;
+      col_right 11 row_text price_str;
       I.string p_border_attr "]";
     ] in
 
@@ -245,7 +245,7 @@ let render_strategies w json =
       col_right 8 sell_dist_attr sell_dist_str;
       col_right 12 sell_price_attr sell_price_str;
       col_right 6 (if sell_count > 0 then a_yellow else a_dim)
-        (string_of_int sell_count);
+        (add_commas (string_of_int sell_count));
       col_right 12 (if unrealized_profit >= 0.0 then a_green else a_red)
         (format_pnl unrealized_profit);
       I.string a_border " │ ";
@@ -369,7 +369,7 @@ let render_strategies w json =
     let price_str = if mid > 0.0 then format_price mid else "--" in
     let price_cell = I.hcat [
       I.string p_border_attr "[";
-      col_right 10 a_text price_str;
+      col_right 11 a_text price_str;
       I.string p_border_attr "]";
     ] in
 
@@ -387,7 +387,7 @@ let render_strategies w json =
       gauge_img;
       col_right 8 sell_dist_attr sell_dist_str;
       col_right 12 sell_price_attr sell_price_str;
-      col_right 6 (if sell_count > 0 then a_yellow else a_dim) (string_of_int sell_count);
+      col_right 6 (if sell_count > 0 then a_yellow else a_dim) (add_commas (string_of_int sell_count));
       col_right 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green else if unrealized_profit > 0.0 then a_dim else a_dim)
         (if sell_count > 0 then format_pnl unrealized_profit else "--");
       I.string a_border " │ ";

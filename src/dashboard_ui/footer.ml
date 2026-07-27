@@ -51,7 +51,7 @@ let render_footer w json =
     (seg :: imgs, w_acc + 5 + 1 + 1 + String.length tag)
   ) exch_connected ([], 0) in
   let dur_str = format_duration uptime in
-  let fng_str = Printf.sprintf "%.0f" fng in
+  let fng_str = add_commas (Printf.sprintf "%.0f" fng) in
   let left_space = I.string A.(bg c_bg) "  " in
   let right_space = I.string A.(bg c_bg) " " in
   let left_text = "q: quit  │  Diophant Solutions  │  " in

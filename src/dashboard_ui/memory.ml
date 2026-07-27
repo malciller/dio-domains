@@ -76,13 +76,13 @@ let render_memory w json =
   let kv lbl v =
     I.hcat [
       I.string a_dim ("  " ^ lbl ^ " ");
-      I.string a_text (Printf.sprintf "%-8s" v);
+      I.string a_text (Printf.sprintf "%-10s" (add_commas v));
     ]
   in
   let kv_bar lbl v ratio p_attr =
     I.hcat [
       I.string a_dim ("  " ^ lbl ^ " ");
-      I.string a_text (Printf.sprintf "%-8s" v);
+      I.string a_text (Printf.sprintf "%-10s" (add_commas v));
       I.string a_dim " ";
       render_progress_bar 15 ratio p_attr;
     ]
