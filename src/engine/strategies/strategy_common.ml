@@ -86,6 +86,13 @@ module InFlightOrders = struct
     Mutex.unlock mutex;
     exists
 
+  (** Check if [duplicate_key] is present in the cache. *)
+  let is_in_flight duplicate_key =
+    Mutex.lock mutex;
+    let exists = Hashtbl.mem registry duplicate_key in
+    Mutex.unlock mutex;
+    exists
+
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
     Mutex.lock mutex;
