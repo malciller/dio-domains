@@ -15,6 +15,46 @@ let to_list_d = function `List l -> l | _ -> []
 
 (* Formatting *)
 
+let add_commas s =
+  let len = String.length s in
+  let rec find_first_digit i =
+    if i >= len then None
+    else match s.[i] with
+    | '0'..'9' -> Some i
+    | _ -> find_first_digit (i + 1)
+  in
+  match find_first_digit 0 with
+  | None -> s
+  | Some prefix_end ->
+      let rec find_int_end i =
+        if i >= len then i
+        else match s.[i] with
+        | '0'..'9' -> find_int_end (i + 1)
+        | _ -> i
+      in
+      let int_end = find_int_end prefix_end in
+      let int_len = int_end - prefix_end in
+      if int_len <= 3 then s
+      else
+        let int_str = String.sub s prefix_end int_len in
+        let rem = int_len mod 3 in
+        let buf = Buffer.create (int_len + int_len / 3) in
+        if rem > 0 then begin
+          Buffer.add_substring buf int_str 0 rem;
+          Buffer.add_char buf ','
+        end;
+        let rec loop i =
+          if i < int_len then begin
+            if i > rem && (i - rem) mod 3 = 0 then Buffer.add_char buf ',';
+            Buffer.add_char buf int_str.[i];
+            loop (i + 1)
+          end
+        in
+        loop rem;
+        let prefix = String.sub s 0 prefix_end in
+        let suffix = String.sub s int_end (len - int_end) in
+        prefix ^ Buffer.contents buf ^ suffix
+
 let format_duration secs =
   let s = int_of_float secs in
   if s < 60 then Printf.sprintf "%ds" s
@@ -23,26 +63,39 @@ let format_duration secs =
   else Printf.sprintf "%dd%02dh" (s / 86400) ((s mod 86400) / 3600)
 
 let format_price f =
-  if f >= 10000.0 then Printf.sprintf "$%.0f" f
-  else if f >= 100.0 then Printf.sprintf "$%.1f" f
-  else if f >= 1.0 then Printf.sprintf "$%.2f" f
-  else Printf.sprintf "$%.4f" f
+  let raw =
+    if f >= 1.0 then Printf.sprintf "$%.2f" f
+    else Printf.sprintf "$%.4f" f
+  in
+  add_commas raw
 
 let format_usd f =
-  if f < 0.0 then Printf.sprintf "-$%.2f" (abs_float f)
-  else Printf.sprintf "$%.2f" f
+  let raw =
+    if f < 0.0 then Printf.sprintf "-$%.2f" (abs_float f)
+    else Printf.sprintf "$%.2f" f
+  in
+  add_commas raw
 
 let format_qty f =
-  if f >= 1.0 then Printf.sprintf "%.4f" f
-  else Printf.sprintf "%.6f" f
+  let raw =
+    if f >= 1.0 then Printf.sprintf "%.4f" f
+    else Printf.sprintf "%.6f" f
+  in
+  add_commas raw
 
 let format_pnl f =
-  if f >= 0.0 then Printf.sprintf "+$%.2f" f
-  else Printf.sprintf "-$%.2f" (abs_float f)
+  let raw =
+    if f >= 0.0 then Printf.sprintf "+$%.2f" f
+    else Printf.sprintf "-$%.2f" (abs_float f)
+  in
+  add_commas raw
 
 let format_latency_us f =
-  if f >= 1000.0 then Printf.sprintf "%.1fms" (f /. 1000.0)
-  else Printf.sprintf "%.0fµs" f
+  let raw =
+    if f >= 1000.0 then Printf.sprintf "%.1fms" (f /. 1000.0)
+    else Printf.sprintf "%.0fµs" f
+  in
+  add_commas raw
 
 let utf8_len s =
   let len = ref 0 in
@@ -143,15 +196,21 @@ let pad_left w s =
 let col_right w attr s = I.string attr (pad_left w s)
 
 let format_pct f =
-  if abs_float f < 0.01 then "<0.01%"
-  else if abs_float f >= 10.0 then Printf.sprintf "%.1f%%" f
-  else Printf.sprintf "%.2f%%" f
+  let raw =
+    if abs_float f < 0.01 then "<0.01%"
+    else if abs_float f >= 10.0 then Printf.sprintf "%.1f%%" f
+    else Printf.sprintf "%.2f%%" f
+  in
+  add_commas raw
 
 let format_spread_bps bid ask =
   if bid > 0.0 && ask > 0.0 then
     let spread_bps = ((ask -. bid) /. ((bid +. ask) /. 2.0)) *. 10000.0 in
-    if spread_bps >= 100.0 then Printf.sprintf "%.0fbp" spread_bps
-    else Printf.sprintf "%.1fbp" spread_bps
+    let raw =
+      if spread_bps >= 100.0 then Printf.sprintf "%.0fbp" spread_bps
+      else Printf.sprintf "%.1fbp" spread_bps
+    in
+    add_commas raw
   else "--"
 
 (* Drawing helpers *)

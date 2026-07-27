@@ -71,7 +71,7 @@ let render_fills w json =
       let side_attr = if side = "BUY" then A.(fg c_green ++ st bold) else A.(fg c_red ++ st bold) in
       let sym_attr = exch_sym_attr (String.lowercase_ascii venue) in
 
-      let amount_str = if amount < 1.0 then Printf.sprintf "%.4g" amount else Printf.sprintf "%.2f" amount in
+      let amount_str = add_commas (if amount < 1.0 then Printf.sprintf "%.4g" amount else Printf.sprintf "%.2f" amount) in
 
       I.hcat [
         I.string A.(fg c_dim) (time_str ^ " ago ");
