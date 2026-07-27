@@ -34,8 +34,8 @@
       "exchange": "hyperliquid",
       "qty": "0.35",
       "grid_interval": [
-        0.5,
-        1.5
+        0.75,
+        2.5
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
@@ -45,6 +45,17 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false
+    },
+    {
+      "symbol": "SOL/USD",
+      "exchange": "kraken",
+      "qty": "0.15",
+      "grid_interval": [
+        2.5,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid"
     },
     {
       "symbol": "ADA/USD",
