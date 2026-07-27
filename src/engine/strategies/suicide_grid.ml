@@ -68,8 +68,8 @@ let kraken_config = {
   track_pending_sells = true;
   use_accumulation_sells = false;
   sell_uses_mult = true;
-  sell_failure_sets_asset_low = false;
-  use_reserved_base_guard = false;
+  sell_failure_sets_asset_low = true;
+  use_reserved_base_guard = true;
   asset_low_requires_balance_change = true;
   merge_preserved_sells = true;
   check_stale_balance = true;
@@ -477,6 +477,17 @@ let accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~se
     true
   else
     false
+
+(** Returns true if a sell order placement is currently in-flight or registered in InFlightOrders.
+    Multiple resting sell orders are allowed; existing open sell orders do not block placing additional sells. *)
+let has_active_sell state =
+  if state.just_filled_buy then
+    false
+  else
+    state.inflight_sell
+    || InFlightOrders.is_in_flight state.duplicate_key_sell
+
+
 
 
 let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =
@@ -1035,19 +1046,99 @@ let execute_strategy
     (* Core strategy logic based on open orders and balances.
        Log state periodically for race condition debugging. *)
 
+    (* 1. INDEPENDENT SELL PLACEMENT LEG:
+       Evaluated on every cycle. Check if available asset balance > reserved_base
+       (available_asset >= sell_qty) and no sell order placement is currently in-flight.
+       Multiple resting sell orders are supported (1 buy order, many sell orders).
+       This is completely independent of capital_low, buy_order_pending, or effective_buy_count. *)
+    if not (Float.is_nan asset_balance) && not (has_active_sell state) then begin
+      let asset_bal = asset_balance in
+      let base_price_for_sell =
+        match state.last_buy_fill_price with
+        | Some fill_p when not state.resuming_after_balance_flag
+                        && abs_float (bid_price -. fill_p) <= (bid_price *. (grid_interval /. 100.0)) -> fill_p
+        | Some fill_p ->
+            Logging.debug_f ~section
+              "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted or resuming_after_balance=%B)"
+              asset.symbol bid_price fill_p state.resuming_after_balance_flag;
+            bid_price
+        | None -> bid_price
+      in
+      let sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
+      let (sell_qty, is_accumulation_sell, required_profit) =
+        compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
+          ~symbol:asset.symbol ~exchange:asset.exchange
+      in
+      let accumulation_ok_on_recovery =
+        accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty
+      in
+      if not accumulation_ok_on_recovery then
+        Logging.info_f ~section
+          "Sell deferred for %s on balance recovery: accumulated_profit %.4f < required %.4f (buffer %.4f)"
+          asset.symbol state.accumulated_profit required_profit asset.accumulation_buffer;
+      let locked_in_sells_local = !locked_in_sells in
+      let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells_local in
+      let (effective_sell_qty, balance_ok) =
+        if ecfg.use_reserved_base_guard then
+          if available >= sell_qty then
+            (sell_qty, true)
+          else if available > 0.0 then
+            let rounded_avail = round_qty available asset.symbol asset.exchange in
+            if rounded_avail > 0.0 then
+              (rounded_avail, true)
+            else begin
+              Logging.debug_f ~section
+                "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+                asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
+              (0.0, false)
+            end
+          else begin
+            Logging.debug_f ~section
+              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+              asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
+            (0.0, false)
+          end
+        else
+          (sell_qty, true)
+      in
+      if accumulation_ok_on_recovery && sell_qty = 0.0 && is_accumulation_sell then begin
+        let actual_cost = qty *. sell_price in
+        state.accumulated_profit <- state.accumulated_profit -. actual_cost;
+        state.reserved_base <- state.reserved_base +. qty;
+        state.persistence_dirty <- true;
+        Logging.info_f ~section
+          "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
+          asset.symbol (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
+      end else if accumulation_ok_on_recovery && balance_ok then begin
+        let sell_order = create_order state.duplicate_key_sell asset.symbol Sell effective_sell_qty (Some sell_price) true asset.exchange in
+        if push_order ~now ~state sell_order then begin
+          state.asset_low <- false;
+          if is_accumulation_sell then begin
+            let rounded_sell = effective_sell_qty in
+            let rounding_diff = qty -. rounded_sell in
+            let actual_cost = rounding_diff *. sell_price in
+            state.accumulated_profit <- state.accumulated_profit -. actual_cost;
+            let base_increment = qty -. rounded_sell in
+            state.reserved_base <- state.reserved_base +. base_increment;
+            state.persistence_dirty <- true;
+            Logging.info_f ~section
+              "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
+              asset.symbol rounded_sell (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
+          end;
+          Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+            asset.symbol effective_sell_qty sell_price
+        end
+      end
+    end;
+    state.resuming_after_balance_flag <- false;
+    state.just_filled_buy <- false;
+
+    (* 2. INDEPENDENT BUY PLACEMENT & TRAILING LEG:
+       Evaluated independently. Check buy order status and place/trail buys. *)
     let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
-    (* Effective buy count: use max of raw count and our own tracking.
-       webData2 snapshots can be stale during cancel-replace amendments.
-       last_buy_order_id is set immediately by orderUpdates events. *)
     let has_tracked_buy = state.last_buy_order_id <> None in
-    (* Use the count from our own scan (precounted or internal), not the
-       external parameter which may include orders from other strategies. *)
     let open_buy_count = !open_buy_count_from_scan in
     let effective_buy_count = if has_tracked_buy && open_buy_count = 0 then 1 else open_buy_count in
-
-    (* Suppress multiple buy cancellations if an amend occurred recently.
-       This prevents WS data lag (showing both old and new order IDs post-amend)
-       from triggering false-positive single buy order policy violations. *)
     let suppress_duplicate_buys = !has_recent_amend_buy in
 
     if buy_order_pending then begin
@@ -1055,9 +1146,7 @@ let execute_strategy
         ();
     end else if effective_buy_count > 1 && not state.inflight_cancel_buy && not state.inflight_amend_buy && not suppress_duplicate_buys then begin
         (* Case 0: Multiple buy orders exist. Cancel all to enforce single buy
-           order policy. Fires at startup reconciliation when last_buy_order_id=None
-           and the order channel shows multiple buys. inflight_cancel_buy gates
-           sync until handle_order_cancelled confirms each cancel. *)
+           order policy. *)
         Logging.info_f ~section "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order policy"
           effective_buy_count asset.symbol;
 
@@ -1073,206 +1162,44 @@ let execute_strategy
           end
         );
 
-        (* Clear buy order tracking; all buys are being cancelled. *)
         state.last_buy_order_id <- None;
         state.last_buy_order_price <- None;
-        (* inflight_cancel_buy is set by push_order for each cancel. *)
-
-
-        (* Update cycle counter. *)
         state.last_cycle <- cycle
       end else if effective_buy_count = 0 && not buy_order_pending then begin
-        (* No open buy: place sell + buy pair.
-           On buy fill, the existing sell's InFlightOrders key is still live,
-           which would block the new sell via duplicate detection.
-           Force-clear the sell key so a fresh sell is always placed alongside the new buy. *)
-        (* Determine cost basis for sell order. If resuming after a balance outage
-           or if the last buy fill price has drifted significantly (> 1 grid interval)
-           from the current market bid price, re-anchor base_price_for_sell to current bid_price. *)
-        let base_price_for_sell =
-          match state.last_buy_fill_price with
-          | Some fill_p when not state.resuming_after_balance_flag
-                          && abs_float (bid_price -. fill_p) <= (bid_price *. (grid_interval /. 100.0)) -> fill_p
-          | Some fill_p ->
-              Logging.info_f ~section
-                "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted or resuming_after_balance=%B)"
-                asset.symbol bid_price fill_p state.resuming_after_balance_flag;
-              bid_price
-          | None -> bid_price
-        in
-        let sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
         let buy_price = calculate_grid_price ask_price grid_interval false state in
-
         let buy_cooldown_key = "place_Buy" in
         let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
 
-        (* Track whether the sell leg was successfully dispatched or retained.
-           The buy order is gated on this: if the sell fails to place, skip the
-           buy to prevent accumulating asset without a corresponding sell. *)
-        let sell_placed_or_active = ref false in
-
-        (* Place sell order first; sell and buy are always paired.
-           asset_low blocks entry to this entire branch at the top level.
-           Always attempt the sell regardless of local balance, as cached balance
-           may be stale after a buy fill. If the exchange rejects, asset_low
-           is set and will not clear until (asset_bal - reserved_base) >= needed,
-           protecting accumulated base asset. *)
-        (* Place sell order first; sell and buy are always paired.
-           asset_low blocks entry to this entire branch at the top level.
-           Always attempt the sell regardless of local quote balance, as cached balance
-           may be stale after a buy fill. If the exchange rejects, asset_low
-           is set and will not clear until (asset_bal - reserved_base) >= needed,
-           protecting accumulated base asset.
-           Only place sell if no sell is in flight and no open sell order exists. *)
-        if not (Float.is_nan asset_balance) && not state.inflight_sell && List.length state.open_sell_orders = 0 && not state.asset_low then begin
-             let asset_bal = asset_balance in
-             let (sell_qty, is_accumulation_sell, required_profit) =
-               compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
-                 ~symbol:asset.symbol ~exchange:asset.exchange
-             in
-             let accumulation_ok_on_recovery =
-               accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty
-             in
-             if not accumulation_ok_on_recovery then
-               Logging.info_f ~section
-                 "Sell deferred for %s on balance recovery: accumulated_profit %.4f < required %.4f (buffer %.4f)"
-                 asset.symbol state.accumulated_profit required_profit asset.accumulation_buffer;
-             (* Proactive reserved_base guard: prevent selling accumulated base.
-                Available balance must exclude:
-                1. reserved_base: accumulated base that must not be sold.
-                2. qty locked in open sell orders on the exchange. *)
-             let balance_ok =
-               if ecfg.use_reserved_base_guard then
-                 let locked_in_sells_local = !locked_in_sells in
-                 let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells_local in
-                 if available >= sell_qty then true
-                 else begin
-                   Logging.warn_f ~section
-                     "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-                     asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
-                   (* Set asset_low to prevent tight-looping on every cycle.
-                      Clears event-driven when balance recovers. Without this,
-                      the strategy re-enters the effective_buy_count=0 branch,
-                      retries the sell, and spams this warning every ~50ms. *)
-                   if not state.asset_low then begin
-                     state.asset_low <- true;
-                     Logging.info_f ~section "Setting asset_low for %s (sell blocked by reserved_base guard)" asset.symbol
-                   end;
-                   false
-                 end
-               else true
-             in
-             if accumulation_ok_on_recovery && sell_qty = 0.0 && is_accumulation_sell then begin
-                (* Whole-share retention: profit covers the cost of a full share.
-                   Skip the sell order and retain the share as reserved_base.
-                   The reserved_base guard will prevent this share from being sold. *)
-                let actual_cost = qty *. sell_price in
-                state.accumulated_profit <- state.accumulated_profit -. actual_cost;
-                state.reserved_base <- state.reserved_base +. qty;
-                state.persistence_dirty <- true;
-                sell_placed_or_active := true;
-                Logging.info_f ~section
-                  "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
-                  asset.symbol (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
-              end else if accumulation_ok_on_recovery && balance_ok then begin
-                let sell_order = create_order state.duplicate_key_sell asset.symbol Sell sell_qty (Some sell_price) true asset.exchange in
-                if push_order ~now ~state sell_order then begin
-                   sell_placed_or_active := true;
-                   (* Commit accumulation state after push_order succeeds.
-                      Persistence is deferred: set dirty flag for the caller
-                      (domain_spawner) to flush outside the hotloop. *)
-                   if is_accumulation_sell then begin
-                     let rounded_sell = sell_qty in
-                     let rounding_diff = qty -. rounded_sell in
-                     let actual_cost = rounding_diff *. sell_price in
-                     state.accumulated_profit <- state.accumulated_profit -. actual_cost;
-                     let base_increment = qty -. rounded_sell in
-                     state.reserved_base <- state.reserved_base +. base_increment;
-                     state.persistence_dirty <- true;
-                     Logging.info_f ~section
-                       "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
-                       asset.symbol rounded_sell (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
-                   end;
-                  Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-                    asset.symbol sell_qty sell_price
-                end
-              end
-        end;
-        (* Consider sell active if there are already open sells or an in-flight sell. *)
-        if not !sell_placed_or_active then
-          sell_placed_or_active := state.inflight_sell || List.length state.open_sell_orders > 0;
-        state.resuming_after_balance_flag <- false;
-        state.just_filled_buy <- false;
-
-        (* Place buy order if quote balance is available AND sell leg succeeded.
-           Gate buy placement on sell_placed_or_active to prevent accumulating
-           asset without a corresponding sell order on the book.
-           Also gate buy placement on capital_low. *)
-        if not !sell_placed_or_active then begin
-          Logging.warn_f ~section
-            "Buy placement skipped for %s: sell order was not placed (inflight_sell=%B, asset_low=%B, open_sells=%d). Will retry both on next cycle."
-            asset.symbol state.inflight_sell state.asset_low (List.length state.open_sell_orders)
-        end else if state.capital_low then begin
+        if state.capital_low then begin
           Logging.debug_f ~section "Buy placement skipped for %s: capital_low flag is set"
             asset.symbol
         end else if not (Float.is_nan quote_balance) then begin
-         if is_buy_on_cooldown || state.inflight_buy then begin
-           Logging.debug_f ~section
-             "Buy placement skipped for %s (cooldown=%B, inflight=%B)"
-             asset.symbol is_buy_on_cooldown state.inflight_buy
-         end else begin
-             let quote_bal = quote_balance in
-             (* Compute available balances net of open order commitments *)
-             
-             let available_quote_balance = quote_bal -. !locked_in_buys in
-             let balance_ok = available_quote_balance >= (buy_price *. qty) in
-             if balance_ok then begin
-               let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
-               if push_order ~now ~state order then begin
-                 state.last_buy_order_price <- Some buy_price;
-                 Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
-                   asset.symbol qty buy_price;
-
-                 (* Enforce exactly 2x grid_interval spacing. *)
-                 let all_sells = (("new_sell", sell_price, 0.0) :: state.open_sell_orders) in
-                 let closest_sell = List.fold_left (fun acc (_, sp, _) ->
-                   if sp > buy_price then
-                     match acc with
-                     | None -> Some sp
-                     | Some best_sp -> if sp < best_sp then Some sp else acc
-                   else acc
-                 ) None all_sells in
-                 (match closest_sell with
-                  | Some cs_price ->
-                      let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
-                      let target_buy = state.cached_round_price (cs_price -. double_grid_interval) in
-                      let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
-                      if abs_float (target_buy -. buy_price) > min_move_threshold then
-                        Logging.info_f ~section "Will enforce 2x spacing for %s on next cycle: buy %.2f -> %.2f (from sell@%.2f)"
-                          asset.symbol buy_price target_buy cs_price
-                  | None -> ())
-               end
-             end else begin
-                (* Local balance appears insufficient but still attempt the buy,
-                   letting the exchange be the arbiter. The rejection handler
-                   (handle_order_rejected) sets capital_low when the exchange
-                   responds with "EOrder:Insufficient funds". Relying solely on
-                   local calculations causes permanent stalls when reservations
-                   are stale or balance data lags behind exchange state (e.g. a
-                   sell fills and frees capital but total_reserved has not caught
-                   up). Apply 2s cooldown to prevent spam while waiting for the
-                   ack or rejection. *)
-                let cooldown_key = "place_Buy" in
-                if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
-                  Logging.warn_f ~section "Local balance low for %s buy (need %.2f, available %.2f) - attempting anyway, exchange will reject if truly insufficient"
-                    asset.symbol quote_needed available_quote_balance;
-                  Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
-                  (* Attempt without a reservation; exchange is the final gatekeeper. *)
-                  let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
-                  if push_order ~now ~state order then
-                    state.last_buy_order_price <- Some buy_price
-                end
-             end
+          if is_buy_on_cooldown || state.inflight_buy then begin
+            Logging.debug_f ~section
+              "Buy placement skipped for %s (cooldown=%B, inflight=%B)"
+              asset.symbol is_buy_on_cooldown state.inflight_buy
+          end else begin
+            let quote_bal = quote_balance in
+            let available_quote_balance = quote_bal -. !locked_in_buys in
+            let balance_ok = available_quote_balance >= (buy_price *. qty) in
+            if balance_ok then begin
+              let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
+              if push_order ~now ~state order then begin
+                state.last_buy_order_price <- Some buy_price;
+                Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
+                  asset.symbol qty buy_price
+              end
+            end else begin
+              let cooldown_key = "place_Buy" in
+              if not (Hashtbl.mem state.amend_cooldowns cooldown_key) then begin
+                Logging.warn_f ~section "Local balance low for %s buy (need %.2f, available %.2f) - attempting anyway, exchange will reject if truly insufficient"
+                  asset.symbol quote_needed available_quote_balance;
+                Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+                let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
+                if push_order ~now ~state order then
+                  state.last_buy_order_price <- Some buy_price
+              end
+            end
           end
         end else begin
              Logging.warn_f ~section "No quote balance data available for %s buy order"
@@ -1737,6 +1664,11 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
             asset_symbol acc_qty state.anticipated_base_credit order_id
         end;
         
+        (* Clear sell-side inflight locks on buy fill so a new sell order can be placed for the acquired inventory. *)
+        state.inflight_sell <- false;
+        state.recently_injected_sells <- [];
+        ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
+
         (* Clear tracking on ANY buy fill. If a new buy is already tracked
            (placed between the old fill event and now), the next cycle will
            re-sync from the exchange open orders feed. Failing to clear here
@@ -2148,7 +2080,14 @@ module Strategy = struct
           (Option.get state.highest_startup_oid)
           state.reserved_base
           state.accumulated_profit
-      end
+      end;
+      (* Clear any transient in-flight locks set during startup execution feed replay
+         so live strategy execution starts with a clean slate. *)
+      state.inflight_sell <- false;
+      state.inflight_buy <- false;
+      state.recently_injected_sells <- [];
+      ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
+      ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_buy);
     end;
     Mutex.unlock state.mutex
 end
