@@ -1046,104 +1046,10 @@ let execute_strategy
     (* Core strategy logic based on open orders and balances.
        Log state periodically for race condition debugging. *)
 
-    (* 1. INDEPENDENT SELL PLACEMENT LEG:
-       Evaluated on every cycle. Check if available asset balance > reserved_base
-       (available_asset >= sell_qty) and no sell order placement is currently in-flight.
-       Multiple resting sell orders are supported (1 buy order, many sell orders).
-       This is completely independent of capital_low, buy_order_pending, or effective_buy_count. *)
-    if not (Float.is_nan asset_balance) && not (has_active_sell state) then begin
-      let asset_bal = asset_balance in
-      let base_price_for_sell =
-        match state.last_buy_fill_price with
-        | Some fill_p when not state.resuming_after_balance_flag
-                        && abs_float (bid_price -. fill_p) <= (bid_price *. (grid_interval /. 100.0)) -> fill_p
-        | Some fill_p ->
-            Logging.debug_f ~section
-              "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted or resuming_after_balance=%B)"
-              asset.symbol bid_price fill_p state.resuming_after_balance_flag;
-            bid_price
-        | None -> bid_price
-      in
-      let sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
-      let (sell_qty, is_accumulation_sell, required_profit) =
-        compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
-          ~symbol:asset.symbol ~exchange:asset.exchange
-      in
-      let accumulation_ok_on_recovery =
-        accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty
-      in
-      if not accumulation_ok_on_recovery then
-        Logging.info_f ~section
-          "Sell deferred for %s on balance recovery: accumulated_profit %.4f < required %.4f (buffer %.4f)"
-          asset.symbol state.accumulated_profit required_profit asset.accumulation_buffer;
-      let locked_in_sells_local = !locked_in_sells in
-      let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells_local in
-      let (effective_sell_qty, balance_ok) =
-        if ecfg.use_accumulation_sells && ecfg.use_reserved_base_guard then
-          if available >= sell_qty then
-            (sell_qty, true)
-          else if available > 0.0 then
-            let rounded_avail = round_qty available asset.symbol asset.exchange in
-            if rounded_avail > 0.0 then
-              (rounded_avail, true)
-            else begin
-              Logging.debug_f ~section
-                "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-                asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
-              (0.0, false)
-            end
-          else begin
-            Logging.debug_f ~section
-              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-              asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
-            (0.0, false)
-          end
-        else if ecfg.use_reserved_base_guard then
-          if available >= sell_qty then
-            (sell_qty, true)
-          else begin
-            Logging.debug_f ~section
-              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-              asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
-            (0.0, false)
-          end
-        else
-          (sell_qty, true)
-      in
-      if accumulation_ok_on_recovery && sell_qty = 0.0 && is_accumulation_sell then begin
-        let actual_cost = qty *. sell_price in
-        state.accumulated_profit <- state.accumulated_profit -. actual_cost;
-        state.reserved_base <- state.reserved_base +. qty;
-        state.persistence_dirty <- true;
-        Logging.info_f ~section
-          "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
-          asset.symbol (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
-      end else if accumulation_ok_on_recovery && balance_ok then begin
-        let sell_order = create_order state.duplicate_key_sell asset.symbol Sell effective_sell_qty (Some sell_price) true asset.exchange in
-        if push_order ~now ~state sell_order then begin
-          state.asset_low <- false;
-          if is_accumulation_sell then begin
-            let rounded_sell = effective_sell_qty in
-            let rounding_diff = qty -. rounded_sell in
-            let actual_cost = rounding_diff *. sell_price in
-            state.accumulated_profit <- state.accumulated_profit -. actual_cost;
-            let base_increment = qty -. rounded_sell in
-            state.reserved_base <- state.reserved_base +. base_increment;
-            state.persistence_dirty <- true;
-            Logging.info_f ~section
-              "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
-              asset.symbol rounded_sell (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
-          end;
-          Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
-            asset.symbol effective_sell_qty sell_price
-        end
-      end
-    end;
-    state.resuming_after_balance_flag <- false;
-    state.just_filled_buy <- false;
-
-    (* 2. INDEPENDENT BUY PLACEMENT & TRAILING LEG:
-       Evaluated independently. Check buy order status and place/trail buys. *)
+    (* 1. BUY PLACEMENT & TRAILING LEG:
+       Evaluated FIRST on every cycle. Check buy order status and place/trail buys.
+       Track whether a buy order was attempted during this cycle. *)
+    let buy_attempted = ref false in
     let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
     let has_tracked_buy = state.last_buy_order_id <> None in
     let open_buy_count = !open_buy_count_from_scan in
@@ -1194,6 +1100,7 @@ let execute_strategy
             if balance_ok then begin
               let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
               if push_order ~now ~state order then begin
+                buy_attempted := true;
                 state.last_buy_order_price <- Some buy_price;
                 Logging.info_f ~section "Placed buy order for %s: %.8f @ %.4f"
                   asset.symbol qty buy_price
@@ -1205,8 +1112,10 @@ let execute_strategy
                   asset.symbol quote_needed available_quote_balance;
                 Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
                 let order = create_order state.duplicate_key_buy asset.symbol Buy qty (Some buy_price) true asset.exchange in
-                if push_order ~now ~state order then
+                if push_order ~now ~state order then begin
+                  buy_attempted := true;
                   state.last_buy_order_price <- Some buy_price
+                end
               end
             end
           end
@@ -1320,7 +1229,7 @@ let execute_strategy
            match state.last_buy_order_price, state.last_buy_order_id with
            | Some current_buy_price, Some buy_order_id ->
                let target_buy_price = calculate_grid_price ask_price grid_interval false state in
-                            (* Only trail upward; amend buy if target is higher than current. *)
+                             (* Only trail upward; amend buy if target is higher than current. *)
                if target_buy_price > current_buy_price then begin
                  let min_move_threshold = get_min_move_threshold ask_price grid_interval state in
                  let current_buy_price_rounded = state.cached_round_price current_buy_price in
@@ -1354,8 +1263,101 @@ let execute_strategy
         (* No action required for remaining cases. *)
         state.last_cycle <- cycle
       end;
-      state.resuming_after_balance_flag <- false;
-      state.just_filled_buy <- false
+
+    (* 2. BUY-TRIGGERED SELL PLACEMENT LEG:
+       Evaluated ONLY when triggered by buy loop entry (buy order attempted/placed)
+       or when a buy order filled (just_filled_buy). A sell fill does NOT trigger sell placement. *)
+    let should_trigger_sell = state.just_filled_buy || !buy_attempted in
+    if should_trigger_sell && not (Float.is_nan asset_balance) && not (has_active_sell state) then begin
+      let asset_bal = asset_balance in
+      let base_price_for_sell =
+        match state.last_buy_fill_price with
+        | Some fill_p when not state.resuming_after_balance_flag
+                        && abs_float (bid_price -. fill_p) <= (bid_price *. (grid_interval /. 100.0)) -> fill_p
+        | Some fill_p ->
+            Logging.debug_f ~section
+              "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted or resuming_after_balance=%B)"
+              asset.symbol bid_price fill_p state.resuming_after_balance_flag;
+            bid_price
+        | None -> bid_price
+      in
+      let sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
+      let (sell_qty, is_accumulation_sell, required_profit) =
+        compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
+          ~symbol:asset.symbol ~exchange:asset.exchange
+      in
+      let accumulation_ok_on_recovery =
+        accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty
+      in
+      if not accumulation_ok_on_recovery then
+        Logging.info_f ~section
+          "Sell deferred for %s on balance recovery: accumulated_profit %.4f < required %.4f (buffer %.4f)"
+          asset.symbol state.accumulated_profit required_profit asset.accumulation_buffer;
+      let locked_in_sells_local = !locked_in_sells in
+      let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells_local in
+      let (effective_sell_qty, balance_ok) =
+        if ecfg.use_accumulation_sells && ecfg.use_reserved_base_guard then
+          if available >= sell_qty then
+            (sell_qty, true)
+          else if available > 0.0 then
+            let rounded_avail = round_qty available asset.symbol asset.exchange in
+            if rounded_avail > 0.0 then
+              (rounded_avail, true)
+            else begin
+              Logging.debug_f ~section
+                "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+                asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
+              (0.0, false)
+            end
+          else begin
+            Logging.debug_f ~section
+              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+              asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
+            (0.0, false)
+          end
+        else if ecfg.use_reserved_base_guard then
+          if available >= sell_qty then
+            (sell_qty, true)
+          else begin
+            Logging.debug_f ~section
+              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+              asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local sell_qty;
+            (0.0, false)
+          end
+        else
+          (sell_qty, true)
+      in
+      if accumulation_ok_on_recovery && sell_qty = 0.0 && is_accumulation_sell then begin
+        let actual_cost = qty *. sell_price in
+        state.accumulated_profit <- state.accumulated_profit -. actual_cost;
+        state.reserved_base <- state.reserved_base +. qty;
+        state.persistence_dirty <- true;
+        Logging.info_f ~section
+          "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now %.0f)"
+          asset.symbol (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
+      end else if accumulation_ok_on_recovery && balance_ok then begin
+        let sell_order = create_order state.duplicate_key_sell asset.symbol Sell effective_sell_qty (Some sell_price) true asset.exchange in
+        if push_order ~now ~state sell_order then begin
+          state.asset_low <- false;
+          if is_accumulation_sell then begin
+            let rounded_sell = effective_sell_qty in
+            let rounding_diff = qty -. rounded_sell in
+            let actual_cost = rounding_diff *. sell_price in
+            state.accumulated_profit <- state.accumulated_profit -. actual_cost;
+            let base_increment = qty -. rounded_sell in
+            state.reserved_base <- state.reserved_base +. base_increment;
+            state.persistence_dirty <- true;
+            Logging.info_f ~section
+              "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
+              asset.symbol rounded_sell (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
+          end;
+          Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
+            asset.symbol effective_sell_qty sell_price
+        end
+      end
+    end;
+    state.resuming_after_balance_flag <- false;
+    state.just_filled_buy <- false
   end  (* end of: if Float.is_nan current_price then ... else begin *)
   end  (* end: is_stale else begin *)
    ) (* close Fun.protect *)
@@ -1656,10 +1658,10 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
         if persistence_accumulation_exchange state.exchange_id then
           state.persistence_dirty <- true;
         if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0 then begin
-          let base_fee = acc_qty *. state.maker_fee in
-          state.reserved_base <- state.reserved_base -. base_fee;
-          Logging.info_f ~section "Decremented reserved_base for %s by %.8f (base fee leak), now %.8f"
-            asset_symbol base_fee state.reserved_base
+          let buy_fee_quote = acc_qty *. fill_price *. state.maker_fee in
+          state.accumulated_profit <- state.accumulated_profit -. buy_fee_quote;
+          Logging.info_f ~section "Deducted buy fee from accumulated_profit for %s by %.6f (quote fee), now %.6f"
+            asset_symbol buy_fee_quote state.accumulated_profit
         end;
 
         (* Credit anticipated base so the sell guard sees incoming asset before
@@ -1707,6 +1709,8 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
       end;
       (match side with
        | Sell ->
+            if acc_qty > 0.0 then
+              state.anticipated_base_credit <- Float.max 0.0 (state.anticipated_base_credit -. acc_qty);
             (* Determine cost basis: use last_sell_fill_price for ascending
                ladder sells (each step strictly higher than the previous).
                When two sells fill at the same price or descend, each should
@@ -1719,14 +1723,15 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
              | Some base_price when sell_fill_price > base_price ->
                 let qty = acc_qty in
                 let gross = (sell_fill_price -. base_price) *. qty in
-                (* Hyperliquid / Lighter spot: buy fee from base; sell fee from quote.
-                   Even though buy fee was paid in base, we deduct its quote cost basis
-                   here so accumulated_profit accurately reflects economic reality. *)
+                (* Hyperliquid / Lighter spot: buy fee was already deducted from accumulated_profit
+                   on buy fill. Sell fee is charged in quote on sell fill. *)
                 let fees =
                   if state.exchange_id = "ibkr" then
                     (* IBKR Pro Tiered: per-share with min/max, charged per leg *)
                     ibkr_commission ~qty ~price:base_price
                     +. ibkr_commission ~qty ~price:sell_fill_price
+                  else if hl_like_spot_fee_exchange state.exchange_id then
+                    sell_fill_price *. qty *. state.maker_fee
                   else
                     (sell_fill_price *. qty *. state.maker_fee)
                     +. (base_price *. qty *. state.maker_fee)

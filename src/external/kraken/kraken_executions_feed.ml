@@ -845,11 +845,12 @@ let handle_snapshot json on_heartbeat =
       match parse_execution_event item with
       | Some event ->
           let store = get_symbol_store event.symbol in
-          write_execution_event store.events_buffer event;
+          (* Do not write snapshot items to events_buffer or trigger per-item Exchange_wakeup.
+             Snapshot events reflect initial/reconnection state for open order tracking.
+             Live execution updates continue to be processed via handle_update. *)
           update_open_orders store event;
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
-          Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
           
           (* Mark order ID as active in snapshot *)
           Hashtbl.replace snapshot_order_ids event.order_id ();
