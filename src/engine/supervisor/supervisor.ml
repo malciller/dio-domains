@@ -898,6 +898,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
     (* Unified authenticated WebSocket for trading, balances, and executions *)
     let auth_ws_conn = register ~name:"kraken_auth_ws" ~connect_fn:None in
+    let subscriptions_registered = ref false in
     let auth_ws_connect_fn () =
       (* Exception boundary for connection establishment *)
       Lwt.catch (fun () ->
@@ -918,13 +919,17 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         let on_heartbeat () = update_data_heartbeat auth_ws_conn in
         let on_connected () =
           set_state auth_ws_conn Connected;
-          (* Subscribe balance and execution feeds on the unified connection *)
-          Lwt.async (fun () ->
-            Lwt.join [
-              Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
-              Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
-            ]
-          )
+          (* Subscribe balance and execution feeds on the unified connection once.
+             Subsequent reconnections automatically replay registered subscriptions via Kraken_trading_client. *)
+          if not !subscriptions_registered then begin
+            subscriptions_registered := true;
+            Lwt.async (fun () ->
+              Lwt.join [
+                Kraken.Kraken_balances_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+                Kraken.Kraken_executions_feed.connect_and_subscribe auth_token ~on_failure ~on_heartbeat ~on_connected:(fun () -> ());
+              ]
+            )
+          end
         in
         Kraken.Kraken_trading_client.connect_and_monitor auth_token ~on_failure ~on_connected >>= fun () ->
         (* Unexpected early return from WebSocket connect_fn *)

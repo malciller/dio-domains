@@ -147,22 +147,22 @@ let rec json_to_string_precise ?field_name symbol json =
   | `Tuple _ | `Variant _ -> failwith "json_to_string_precise: Tuple and Variant not supported"
 
 let parse_ws_response json : Kraken_common_types.ws_response =
-  let method_ = Yojson.Safe.Util.(member "method" json |> to_string) in
+  let method_ = Yojson.Safe.Util.(member "method" json |> to_string_option |> Option.value ~default:"") in
   if String.equal method_ "pong" then begin
     let req_id = Yojson.Safe.Util.(member "req_id" json |> to_int_option) in
-    let time_in = Yojson.Safe.Util.(member "time_in" json |> to_string) in
-    let time_out = Yojson.Safe.Util.(member "time_out" json |> to_string) in
+    let time_in = Yojson.Safe.Util.(member "time_in" json |> to_string_option |> Option.value ~default:"") in
+    let time_out = Yojson.Safe.Util.(member "time_out" json |> to_string_option |> Option.value ~default:"") in
     { method_; success = true; req_id; time_in; time_out; result = None; error = None; warnings = None }
   end else begin
-    let success = Yojson.Safe.Util.(member "success" json |> to_bool) in
+    let success = Yojson.Safe.Util.(member "success" json |> to_bool_option |> Option.value ~default:false) in
     let req_id = Yojson.Safe.Util.(member "req_id" json |> to_int_option) in
-    let time_in = Yojson.Safe.Util.(member "time_in" json |> to_string) in
-    let time_out = Yojson.Safe.Util.(member "time_out" json |> to_string) in
+    let time_in = Yojson.Safe.Util.(member "time_in" json |> to_string_option |> Option.value ~default:"") in
+    let time_out = Yojson.Safe.Util.(member "time_out" json |> to_string_option |> Option.value ~default:"") in
     let result = Yojson.Safe.Util.(member "result" json |> Option.some) in
     let error = Yojson.Safe.Util.(member "error" json |> to_string_option) in
     let warnings =
       match Yojson.Safe.Util.member "warnings" json with
-      | `List lst -> Some (List.map Yojson.Safe.Util.to_string lst)
+      | `List lst -> Some (List.filter_map Yojson.Safe.Util.to_string_option lst)
       | _ -> None
     in
     { method_; success; req_id; time_in; time_out; result; error; warnings }
