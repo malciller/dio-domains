@@ -129,11 +129,13 @@ let place_order
   let config = match retry_config with Some c -> c | None -> default_retry_config in
 
   (* Ensure cl_ord_id is stable across retries for idempotency.
-     If the caller didn't provide one, generate a unique ID before
-     entering the retry loop so re-sends use the same client order ID. *)
-  let cl_ord_id = match cl_ord_id with
-    | Some _ -> cl_ord_id
-    | None -> Some (Printf.sprintf "dio_%d_%d" (next_req_id ()) (int_of_float (Unix.gettimeofday () *. 1000.0)))
+     If the caller didn't provide one and order_userref is not set,
+     generate a unique ID before entering the retry loop.
+     Note: Kraken API errors if both cl_ord_id and order_userref are sent. *)
+  let cl_ord_id = match cl_ord_id, order_userref with
+    | Some _, _ -> cl_ord_id
+    | None, Some _ -> None
+    | None, None -> Some (Printf.sprintf "dio_%d_%d" (next_req_id ()) (int_of_float (Unix.gettimeofday () *. 1000.0)))
   in
 
   let place_order_once () =
