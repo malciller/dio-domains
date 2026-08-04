@@ -128,6 +128,14 @@ let place_order
 
   let config = match retry_config with Some c -> c | None -> default_retry_config in
 
+  (* Ensure cl_ord_id is stable across retries for idempotency.
+     If the caller didn't provide one, generate a unique ID before
+     entering the retry loop so re-sends use the same client order ID. *)
+  let cl_ord_id = match cl_ord_id with
+    | Some _ -> cl_ord_id
+    | None -> Some (Printf.sprintf "dio_%d_%d" (next_req_id ()) (int_of_float (Unix.gettimeofday () *. 1000.0)))
+  in
+
   let place_order_once () =
     (* Submits via REST enforcing sequence isolation constraints. *)
     let req_id = next_req_id () in
@@ -397,7 +405,11 @@ let amend_order
 
   Error_handling.retry_with_backoff ~section ~config ~f:amend_order_once ()
 
-(** Transmits order cancellation payload utilizing retry handler. *)
+(** Transmits order cancellation payloads, one per order, utilizing retry handler.
+    Serializes individual cancels to avoid multi-frame response desync:
+    Kraken sends one response frame per order sharing the same req_id, but
+    resolve_response removes the waiter on the first frame, dropping subsequent
+    frames. Serializing gives each cancel its own req_id for correct correlation. *)
 let cancel_orders
     ~token
     ?order_ids
@@ -408,72 +420,80 @@ let cancel_orders
 
   let config = match retry_config with Some c -> c | None -> default_retry_config in
 
-  let cancel_orders_once () =
-    (* Assumes initialized singleton dependency. *)
-    let req_id = next_req_id () in
-
-    (* Initializes base cancel parameters. *)
-    let params = `Assoc [("token", `String token)] in
-
-    (* Appends target reference identifiers. *)
-    let params = match order_ids with
-      | Some ids -> add_to_assoc params ("order_id", `List (List.map (fun id -> `String id) ids))
-      | None -> params
+  (* Build a list of individual cancel parameter sets, one per order. *)
+  let individual_cancels =
+    let from_order_ids = match order_ids with
+      | Some ids -> List.map (fun id -> ("order_id", `List [`String id])) ids
+      | None -> []
     in
-    let params = match cl_ord_ids with
-      | Some ids -> add_to_assoc params ("cl_ord_id", `List (List.map (fun id -> `String id) ids))
-      | None -> params
+    let from_cl_ord_ids = match cl_ord_ids with
+      | Some ids -> List.map (fun id -> ("cl_ord_id", `List [`String id])) ids
+      | None -> []
     in
-    let params = match order_userrefs with
-      | Some refs -> add_to_assoc params ("order_userref", `List (List.map (fun ref -> `Int ref) refs))
-      | None -> params
+    let from_userrefs = match order_userrefs with
+      | Some refs -> List.map (fun r -> ("order_userref", `List [`Int r])) refs
+      | None -> []
     in
-
-    Logging.debug_f ~section "Cancelling orders: %s%s%s"
-      (match order_ids with Some ids -> Printf.sprintf "order_ids=[%s]" (String.concat "," ids) | None -> "")
-      (match cl_ord_ids with Some ids -> Printf.sprintf "cl_ord_ids=[%s]" (String.concat "," ids) | None -> "")
-      (match order_userrefs with Some refs -> Printf.sprintf "userrefs=[%s]" (String.concat "," (List.map string_of_int refs)) | None -> "");
-
-    Kraken_trading_client.send_request
-      ~symbol:None
-      ~method_:"cancel_order"
-      ~params
-      ~req_id
-      ~timeout_ms:10000 >>= fun response ->
-
-    (* Processes individual sequential cancel responses. *)
-    (* Modifies multi order payload processing behavior routing sequence limits. *)
-
-    if response.success then begin
-      match response.result with
-      | Some result_json ->
-          begin try
-            let order_id = Util.(member "order_id" result_json |> to_string) in
-            let cl_ord_id = Util.(member "cl_ord_id" result_json |> to_string_option) in
-            let result = {
-              Kraken_common_types.order_id;
-              cl_ord_id;
-            } in
-            (* Yields singleton list bypassing streaming payload structures. *)
-            Lwt.return (Ok [result])
-          with exn ->
-            let err = Printf.sprintf "Failed to parse cancel response: %s" (Printexc.to_string exn) in
-            Logging.error_f ~section "%s" err;
-            Lwt.return (Error err)
-          end
-      | None ->
-          (* Validates successful response body allocation. *)
-          let err = "No result in successful cancel response" in
-          Logging.error ~section err;
-          Lwt.return (Error err)
-    end else begin
-      let err = match response.error with
-        | Some e -> e
-        | None -> "Unknown error"
-      in
-      Logging.error_f ~section "Order cancellation failed: %s" err;
-      Lwt.return (Error err)
-    end
+    from_order_ids @ from_cl_ord_ids @ from_userrefs
   in
 
-  Error_handling.retry_with_backoff ~section ~config ~f:cancel_orders_once ()
+  (* Send each cancel as a separate request with its own req_id. *)
+  let cancel_single (key, value) =
+    let cancel_once () =
+      let req_id = next_req_id () in
+      let params = `Assoc [("token", `String token); (key, value)] in
+
+      Logging.debug_f ~section "Cancelling order: %s=%s"
+        key (Yojson.Safe.to_string value);
+
+      Kraken_trading_client.send_request
+        ~symbol:None
+        ~method_:"cancel_order"
+        ~params
+        ~req_id
+        ~timeout_ms:10000 >>= fun response ->
+
+      if response.success then begin
+        match response.result with
+        | Some result_json ->
+            begin try
+              let order_id = Util.(member "order_id" result_json |> to_string) in
+              let cl_ord_id = Util.(member "cl_ord_id" result_json |> to_string_option) in
+              let result = {
+                Kraken_common_types.order_id;
+                cl_ord_id;
+              } in
+              Lwt.return (Ok result)
+            with exn ->
+              let err = Printf.sprintf "Failed to parse cancel response: %s" (Printexc.to_string exn) in
+              Logging.error_f ~section "%s" err;
+              Lwt.return (Error err)
+            end
+        | None ->
+            let err = "No result in successful cancel response" in
+            Logging.error ~section err;
+            Lwt.return (Error err)
+      end else begin
+        let err = match response.error with
+          | Some e -> e
+          | None -> "Unknown error"
+        in
+        Logging.error_f ~section "Order cancellation failed: %s" err;
+        Lwt.return (Error err)
+      end
+    in
+    Error_handling.retry_with_backoff ~section ~config ~f:cancel_once ()
+  in
+
+  (* Execute all cancels sequentially and accumulate results. *)
+  let rec run_all acc = function
+    | [] -> Lwt.return (Ok (List.rev acc))
+    | cancel_params :: rest ->
+        cancel_single cancel_params >>= function
+        | Ok result -> run_all (result :: acc) rest
+        | Error err ->
+            (* Log and continue: don't abort remaining cancels on a single failure *)
+            Logging.warn_f ~section "Cancel failed for one order (%s), continuing with remaining" err;
+            run_all acc rest
+  in
+  run_all [] individual_cancels

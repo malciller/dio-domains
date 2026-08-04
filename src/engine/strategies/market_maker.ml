@@ -923,12 +923,15 @@ let handle_order_acknowledged ~now:_ asset_symbol order_id side price =
      the order is active; cleanup occurs in handle_order_cancelled/filled or on timeout. *)
 
   (* Update buy order tracking on buy acknowledgment *)
-  (match side with
-   | Buy ->
-    state.last_buy_order_id <- Some order_id;
-    state.last_buy_order_price <- Some price;
-    ()
-   | Sell -> ());
+   (match side with
+    | Buy ->
+     state.last_buy_order_id <- Some order_id;
+     state.last_buy_order_price <- Some price;
+     state.inflight_buy <- false;
+     ()
+    | Sell ->
+     state.inflight_sell <- false;
+     ());
 
   ()
   )
@@ -1060,6 +1063,11 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price:_ cl_ord_i
       ()
     end;
 
+    (* Clear inflight flags *)
+    (match side with
+     | Buy -> state.inflight_buy <- false
+     | Sell -> state.inflight_sell <- false);
+
     (* Release global placement trackers to permit immediate re-placement *)
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol side));
 
@@ -1137,6 +1145,11 @@ let handle_order_cancelled ~now asset_symbol order_id side cl_ord_id =
     ) state.open_sell_orders;
 
 
+    (* Clear inflight flags *)
+    (match cancelled_side with
+     | Buy -> state.inflight_buy <- false
+     | Sell -> state.inflight_sell <- false);
+
     (* Release global placement trackers to permit immediate re-placement *)
     ignore (InFlightOrders.remove_in_flight_order (generate_side_duplicate_key asset_symbol cancelled_side));
     
@@ -1191,6 +1204,9 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
          else
            ());
              
+    (* Release in-flight amendment guard *)
+    ignore (InFlightAmendments.remove_in_flight_amendment old_order_id);
+
     ()
   )
 
@@ -1207,6 +1223,9 @@ let handle_order_amendment_skipped ~now:_ asset_symbol order_id _ _ =
       not matches_amend
     ) state.pending_orders;
     
+    (* Release in-flight amendment guard *)
+    ignore (InFlightAmendments.remove_in_flight_amendment order_id);
+
     ()
   )
 
