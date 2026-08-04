@@ -257,29 +257,211 @@ let test_post_only_checks () =
 
   check bool "post-only checks handled" true true
 
-(* let test_full_balance_sell_on_pause () =
-  (* Test that full balance sell is triggered when strategy is paused (e.g. max exposure exceeded) *)
-  let asset = create_test_asset ~max_exposure:(Some "100.0") () in (* Low max exposure to trigger pause *)
-  let current_price = Some 50000.0 in
-  let top_of_book = Some (49950.0, 1.0, 50050.0, 1.0) in
-  let asset_balance = Some 0.5 in (* 0.5 * 50000 = 25000 > 100 max exposure *)
-  let quote_balance = Some 1000.0 in
-  
-  (* Clear buffer first *)
-  let buffer = Dio_strategies.Market_maker.get_order_buffer () in
-  while Dio_strategies.Strategy_common.LockFreeQueue.read buffer <> None do () done;
-  
-  (* Execute strategy - should trigger pause and sell *)
-  Dio_strategies.Market_maker.Strategy.execute asset current_price top_of_book asset_balance quote_balance 0 0 (fun _ -> ()) 1;
-  
-  (* Check if a sell order was placed *)
-  match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
-  | Some order ->
-      check bool "pause sell operation" true (order.Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Place);
-      check bool "pause sell side" true (order.side = Dio_strategies.Strategy_common.Sell);
-      check (float 0.000001) "pause sell qty" 0.5 order.qty; (* Should sell full balance *)
-      check bool "pause sell strategy" true (order.strategy = Dio_strategies.Strategy_common.MM)
-  | None -> fail "No sell order placed during pause" *)
+(* ---- Inflight flag lifecycle tests ----
+   Directly exercises the bug fixed in this changeset: inflight_buy/inflight_sell
+   were set on Place but never cleared on ack/fill/cancel, blocking re-placement
+   after the first cycle. *)
+
+(** Helper: get or create a fresh state for a unique test symbol. *)
+let fresh_state prefix =
+  let symbol = Printf.sprintf "%s_%d/USD" prefix (Random.bits ()) in
+  let state = Dio_strategies.Market_maker.get_strategy_state symbol in
+  (* Ensure clean slate *)
+  state.inflight_buy <- false;
+  state.inflight_sell <- false;
+  state.pending_orders <- [];
+  state.last_buy_order_id <- None;
+  state.last_buy_order_price <- None;
+  state.open_sell_orders <- [];
+  state.cancelled_orders <- [];
+  (symbol, state)
+
+let test_inflight_cleared_on_ack () =
+  let symbol, state = fresh_state "ACK" in
+  (* Simulate: Place buy sets inflight_buy *)
+  state.inflight_buy <- true;
+  state.inflight_sell <- true;
+
+  (* Ack should clear the flags *)
+  Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
+    ~now:(Unix.time ()) symbol "order_buy_1" Dio_strategies.Strategy_common.Buy 50000.0;
+
+  check bool "inflight_buy cleared on ack" false state.inflight_buy;
+  (* Sell flag should also clear on sell ack *)
+  Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
+    ~now:(Unix.time ()) symbol "order_sell_1" Dio_strategies.Strategy_common.Sell 51000.0;
+  check bool "inflight_sell cleared on ack" false state.inflight_sell
+
+let test_inflight_cleared_on_fill () =
+  let symbol, state = fresh_state "FILL" in
+  state.inflight_buy <- true;
+  state.inflight_sell <- true;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_filled
+    ~now:(Unix.time ()) symbol "order_buy_2" Dio_strategies.Strategy_common.Buy ~fill_price:50000.0 None;
+  check bool "inflight_buy cleared on fill" false state.inflight_buy;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_filled
+    ~now:(Unix.time ()) symbol "order_sell_2" Dio_strategies.Strategy_common.Sell ~fill_price:51000.0 None;
+  check bool "inflight_sell cleared on fill" false state.inflight_sell
+
+let test_inflight_cleared_on_cancel () =
+  let symbol, state = fresh_state "CANCEL" in
+  state.inflight_buy <- true;
+  state.inflight_sell <- true;
+
+  (* Genuine cancel (no pending_amend entry) *)
+  Dio_strategies.Market_maker.Strategy.handle_order_cancelled
+    ~now:(Unix.time ()) symbol "order_buy_3" Dio_strategies.Strategy_common.Buy None;
+  check bool "inflight_buy cleared on cancel" false state.inflight_buy;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_cancelled
+    ~now:(Unix.time ()) symbol "order_sell_3" Dio_strategies.Strategy_common.Sell None;
+  check bool "inflight_sell cleared on cancel" false state.inflight_sell
+
+let test_inflight_cleared_on_fail () =
+  let symbol, state = fresh_state "FAIL" in
+  state.inflight_buy <- true;
+  state.inflight_sell <- true;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_failed
+    ~now:(Unix.time ()) symbol Dio_strategies.Strategy_common.Buy "test failure";
+  check bool "inflight_buy cleared on fail" false state.inflight_buy;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_failed
+    ~now:(Unix.time ()) symbol Dio_strategies.Strategy_common.Sell "test failure";
+  check bool "inflight_sell cleared on fail" false state.inflight_sell
+
+let test_inflight_cleared_on_reject () =
+  let symbol, state = fresh_state "REJECT" in
+  state.inflight_buy <- true;
+  state.inflight_sell <- true;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_rejected
+    ~now:(Unix.time ()) symbol Dio_strategies.Strategy_common.Buy 50000.0;
+  check bool "inflight_buy cleared on reject" false state.inflight_buy;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_rejected
+    ~now:(Unix.time ()) symbol Dio_strategies.Strategy_common.Sell 51000.0;
+  check bool "inflight_sell cleared on reject" false state.inflight_sell
+
+let test_inflight_preserves_opposite_side () =
+  let symbol, state = fresh_state "PRESERVE" in
+  state.inflight_buy <- true;
+  state.inflight_sell <- true;
+
+  (* Ack buy should only clear buy, not sell *)
+  Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
+    ~now:(Unix.time ()) symbol "order_buy_5" Dio_strategies.Strategy_common.Buy 50000.0;
+  check bool "inflight_buy cleared" false state.inflight_buy;
+  check bool "inflight_sell preserved" true state.inflight_sell;
+
+  (* Reset and test inverse *)
+  state.inflight_buy <- true;
+  state.inflight_sell <- true;
+  Dio_strategies.Market_maker.Strategy.handle_order_filled
+    ~now:(Unix.time ()) symbol "order_sell_5" Dio_strategies.Strategy_common.Sell ~fill_price:51000.0 None;
+  check bool "inflight_buy preserved" true state.inflight_buy;
+  check bool "inflight_sell cleared" false state.inflight_sell
+
+let test_inflight_full_lifecycle () =
+  (* Simulate: place buy -> ack -> fill -> verify re-placement not blocked *)
+  let symbol, state = fresh_state "LIFECYCLE" in
+
+  (* 1. Simulate placement: set inflight_buy *)
+  state.inflight_buy <- true;
+  check bool "inflight_buy set after place" true state.inflight_buy;
+
+  (* 2. Ack clears inflight *)
+  Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
+    ~now:(Unix.time ()) symbol "lifecycle_buy_1" Dio_strategies.Strategy_common.Buy 50000.0;
+  check bool "inflight_buy cleared after ack" false state.inflight_buy;
+
+  (* 3. Simulate new placement *)
+  state.inflight_buy <- true;
+
+  (* 4. Fill clears inflight *)
+  Dio_strategies.Market_maker.Strategy.handle_order_filled
+    ~now:(Unix.time ()) symbol "lifecycle_buy_1" Dio_strategies.Strategy_common.Buy ~fill_price:50000.0 None;
+  check bool "inflight_buy cleared after fill" false state.inflight_buy;
+
+  (* 5. Verify state is ready for re-placement (not blocked) *)
+  check bool "re-placement not blocked" false state.inflight_buy
+
+let test_inflight_cancel_replace_preserves_flag () =
+  (* Cancel-replace (amendment): cancel should preserve inflight because
+     a replacement order is incoming. *)
+  let symbol, state = fresh_state "AMEND" in
+  state.inflight_buy <- true;
+
+  (* Add pending_amend entry to simulate cancel-replace *)
+  state.pending_orders <- [
+    ("pending_amend_order_buy_cr", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ())
+  ];
+
+  (* Cancel with pending amend should take the cancel-replace path *)
+  Dio_strategies.Market_maker.Strategy.handle_order_cancelled
+    ~now:(Unix.time ()) symbol "order_buy_cr" Dio_strategies.Strategy_common.Buy None;
+
+  (* In cancel-replace path, inflight_buy should NOT be cleared
+     (the replacement order is still pending) *)
+  check bool "inflight_buy preserved during cancel-replace" true state.inflight_buy
+
+(* ---- InFlightAmendments cleanup tests ----
+   Exercises the medium-severity fix: handle_order_amended and
+   handle_order_amendment_skipped now release InFlightAmendments. *)
+
+let test_amendment_clears_inflight_amendment () =
+  let symbol, state = fresh_state "AMEND_IFA" in
+
+  (* Register an in-flight amendment *)
+  let _added = Dio_strategies.Strategy_common.InFlightAmendments.add_in_flight_amendment "amend_order_1" in
+  check bool "amendment registered" true
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "amend_order_1");
+
+  (* Set up buy tracking so the handler finds a match *)
+  state.last_buy_order_id <- Some "amend_order_1";
+  state.last_buy_order_price <- Some 50000.0;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_amended
+    ~now:(Unix.time ()) symbol "amend_order_1" "amend_order_2" Dio_strategies.Strategy_common.Buy 50500.0;
+
+  (* InFlightAmendment should be cleared *)
+  check bool "inflight amendment cleared after amended" false
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "amend_order_1")
+
+let test_amendment_skipped_clears_inflight_amendment () =
+  let symbol, _state = fresh_state "SKIP_IFA" in
+
+  (* Register an in-flight amendment *)
+  let _added = Dio_strategies.Strategy_common.InFlightAmendments.add_in_flight_amendment "skip_order_1" in
+  check bool "amendment registered" true
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "skip_order_1");
+
+  Dio_strategies.Market_maker.Strategy.handle_order_amendment_skipped
+    ~now:(Unix.time ()) symbol "skip_order_1" Dio_strategies.Strategy_common.Buy 50000.0;
+
+  (* InFlightAmendment should be cleared *)
+  check bool "inflight amendment cleared after skip" false
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "skip_order_1")
+
+let test_amendment_failed_clears_inflight_amendment () =
+  let symbol, state = fresh_state "FAIL_IFA" in
+
+  (* Register an in-flight amendment *)
+  let _added = Dio_strategies.Strategy_common.InFlightAmendments.add_in_flight_amendment "fail_order_1" in
+  check bool "amendment registered" true
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "fail_order_1");
+
+  state.last_buy_order_id <- Some "fail_order_1";
+  state.last_buy_order_price <- Some 50000.0;
+
+  Dio_strategies.Market_maker.Strategy.handle_order_amendment_failed
+    ~now:(Unix.time ()) symbol "fail_order_1" Dio_strategies.Strategy_common.Buy "test reason";
+
+  (* InFlightAmendment should be cleared (this already worked before the fix) *)
+  check bool "inflight amendment cleared after fail" false
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "fail_order_1")
 
 let () =
   run "Market Maker" [
@@ -313,10 +495,24 @@ let () =
       test_case "sell first placement" `Quick test_sell_first_placement_logic;
       test_case "profitability checks" `Quick test_profitability_checks;
       test_case "post-only checks" `Quick test_post_only_checks;
-      (* test_case "full balance sell on pause" `Quick test_full_balance_sell_on_pause; *)
     ];
     "config_parsing", [
       test_case "config parsing" `Quick test_config_parsing;
       test_case "config parsing optional" `Quick test_config_parsing_optional;
+    ];
+    "inflight_lifecycle", [
+      test_case "cleared on ack" `Quick test_inflight_cleared_on_ack;
+      test_case "cleared on fill" `Quick test_inflight_cleared_on_fill;
+      test_case "cleared on cancel" `Quick test_inflight_cleared_on_cancel;
+      test_case "cleared on fail" `Quick test_inflight_cleared_on_fail;
+      test_case "cleared on reject" `Quick test_inflight_cleared_on_reject;
+      test_case "preserves opposite side" `Quick test_inflight_preserves_opposite_side;
+      test_case "full lifecycle" `Quick test_inflight_full_lifecycle;
+      test_case "cancel-replace preserves flag" `Quick test_inflight_cancel_replace_preserves_flag;
+    ];
+    "amendment_inflight", [
+      test_case "amended clears InFlightAmendment" `Quick test_amendment_clears_inflight_amendment;
+      test_case "amendment skipped clears InFlightAmendment" `Quick test_amendment_skipped_clears_inflight_amendment;
+      test_case "amendment failed clears InFlightAmendment" `Quick test_amendment_failed_clears_inflight_amendment;
     ];
   ]

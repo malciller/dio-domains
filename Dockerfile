@@ -5,67 +5,60 @@
 # ────────────────────────────────────────────────────────────────────────────────
 
 # ==============================================================================
-# STAGE 1 — Builder
+# STAGE 1 — Builder (Pre-compiled OCaml 5.2 base image for fast cold builds)
 # ==============================================================================
-FROM ubuntu:22.04 AS builder
+FROM ocaml/opam:ubuntu-22.04-ocaml-5.2 AS builder
 ENV QEMU_CPU=host
 
-# 1. System dependencies (build-time only)
+USER root
+
+# 1. System dependencies (build-time C header libraries & tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    sudo \
-    m4 \
     pkg-config \
+    m4 \
+    g++ \
+    make \
     libffi-dev \
     libgmp-dev \
     libpcre3-dev \
     libssl-dev \
     libpq-dev \
     zlib1g-dev \
-    make \
-    g++ \
-    git \
-    curl \
-    opam \
-    ca-certificates \
-    netbase \
     autoconf \
     automake \
     libtool \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Compile libsecp256k1 from source (pinned to v0.7.1 for cache stability)
+# 2. Compile libsecp256k1 from source (pinned to v0.7.1, fast parallel build without test suite)
 RUN git clone --depth 1 --branch v0.7.1 \
         https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1 \
     && cd /tmp/secp256k1 \
     && ./autogen.sh \
-    && ./configure --enable-module-schnorrsig --enable-module-recovery \
-    && make \
-    && make check \
+    && ./configure --enable-module-schnorrsig --enable-module-recovery --disable-tests --disable-benchmark \
+    && make -j$(nproc) \
     && make install \
     && ldconfig \
     && rm -rf /tmp/secp256k1
 
-# 3. OPAM + OCaml switch (5.2.0)
-RUN opam init --disable-sandboxing --reinit -y \
-    && opam switch create 5.2.0 ocaml-base-compiler.5.2.0 \
-    && eval $(opam env --switch=5.2.0)
-
-# 4. Workdir
+# 3. Setup workdir owned by opam
 WORKDIR /app
+RUN chown opam:opam /app
 
-# 5. Copy project descriptors first (layer-cache friendly)
-COPY --chown=root:root dio.opam dune-project ./
+USER opam
 
-# 6. Install OCaml dependencies (cached unless opam deps change)
-RUN eval $(opam env --switch=5.2.0) \
-    && opam install -y . --deps-only --with-test --no-depexts
+# 4. Copy project descriptors first (layer-cache friendly)
+COPY --chown=opam:opam dio.opam dune-project ./
 
-# 7. Copy the rest of the source tree
-COPY --chown=root:root . .
+# 5. Install OCaml dependencies in parallel with BuildKit cache
+RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
+    eval $(opam env) && opam install -y -j $(nproc) . --deps-only --with-test --no-depexts
 
-# 8. Build native executables
-RUN eval $(opam env --switch=5.2.0) \
-    && dune build --profile=release bin/main.exe bin/dashboard.exe
+# 6. Copy the rest of the source tree
+COPY --chown=opam:opam . .
+
+# 7. Build native executables in parallel with Dune cache
+RUN --mount=type=cache,target=/home/opam/.cache/dune,uid=1000,gid=1000 \
+    eval $(opam env) && dune build -j $(nproc) --profile=release bin/main.exe bin/dashboard.exe
 
 # ==============================================================================
 # STAGE 2 — Runtime (minimal)
