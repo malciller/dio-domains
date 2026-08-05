@@ -6,6 +6,24 @@ open Lwt.Infix
 
 module StringMap = Map.Make(String)
 
+(** Per-symbol trading parameters parsed from config.json. *)
+type trading_config = {
+  exchange: string;
+  symbol: string;
+  qty: string;
+  grid_interval: float * float;  (** (min, max) grid interval percentages; resolved to equal bounds when a scalar is provided *)
+  sell_mult: string;
+  min_usd_balance: string option;
+  max_exposure: string option;
+  strategy: string;
+  maker_fee: float option;
+  taker_fee: float option;
+  testnet: bool;
+  hedge: bool;
+  accumulation_buffer: float * float;  (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
+}
+
+
 (** Integer userref tags for per-strategy order grouping on the exchange. *)
 let strategy_userref_grid = 1  (* grid strategy *)
 let strategy_userref_mm = 2    (* market maker strategy *)

@@ -1,5 +1,5 @@
 (** Per-symbol trading parameters parsed from a single entry in the "trading" array of config.json. *)
-type trading_config = {
+type trading_config = Dio_strategies.Strategy_common.trading_config = {
   exchange: string;
   symbol: string;
   qty: string;
@@ -14,6 +14,8 @@ type trading_config = {
   hedge: bool;
   accumulation_buffer: float * float;  (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
 }
+
+
 type logging_config = {
   level: Logging.level;
   sections: string list;

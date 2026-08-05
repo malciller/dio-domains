@@ -1,19 +1,27 @@
 open Alcotest
 
 
-(* Mock trading config for testing - using the Market_maker's local trading_config type *)
+(* Helper to create trading config for testing *)
 let create_test_asset ?(exchange="kraken") ?(symbol="BTC/USD") ?(qty="0.001") ?(strategy="MM")
-    ?(min_usd_balance=None) ?(max_exposure=None) ?(maker_fee=None) ?(taker_fee=None) () =
+    ?(min_usd_balance=None) ?(max_exposure=None) ?(maker_fee=None) ?(taker_fee=None)
+    ?(grid_interval=(1.0, 1.0)) ?(sell_mult="1.0") ?(testnet=false) ?(hedge=false)
+    ?(accumulation_buffer=(0.01, 0.01)) () : Dio_strategies.Strategy_common.trading_config =
   {
-    Dio_strategies.Market_maker.exchange;
+    exchange;
     symbol;
     qty;
+    grid_interval;
+    sell_mult;
     min_usd_balance;
     max_exposure;
     strategy;
     maker_fee;
     taker_fee;
+    testnet;
+    hedge;
+    accumulation_buffer;
   }
+
 
 let test_initialization () =
   (* Test strategy initialization *)
