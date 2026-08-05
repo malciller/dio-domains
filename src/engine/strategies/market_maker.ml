@@ -29,16 +29,8 @@ module Exchange = Dio_exchange.Exchange_intf
 
 
 (** Per-asset trading configuration parsed from config.json. *)
-type trading_config = {
-  exchange: string;
-  symbol: string;
-  qty: string;
-  min_usd_balance: string option;
-  max_exposure: string option;
-  strategy: string;
-  maker_fee: float option;
-  taker_fee: float option;
-}
+type trading_config = Strategy_common.trading_config
+
 
 (** Global order ring buffer shared across all strategy domains. *)
 let order_buffer = Strategy_common.LockFreeQueue.create ()

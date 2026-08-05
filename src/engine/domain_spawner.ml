@@ -170,16 +170,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       in
       let mm_strategy_asset_ref =
         if asset_with_fees.strategy = "MM" then
-          ref (Some {
-            Dio_strategies.Market_maker.exchange = asset_with_fees.exchange;
-            symbol = asset_with_fees.symbol;
-            qty = asset_with_fees.qty;
-            min_usd_balance = asset_with_fees.min_usd_balance;
-            max_exposure = asset_with_fees.max_exposure;
-            strategy = asset_with_fees.strategy;
-            maker_fee = asset_with_fees.maker_fee;
-            taker_fee = asset_with_fees.taker_fee;
-          })
+          ref (Some asset_with_fees)
         else ref None
       in
 
