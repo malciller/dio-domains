@@ -372,11 +372,12 @@ let order_processing_loop () =
       in
 
       let is_connected (order : strategy_order) =
-        if order.exchange = "kraken" then kraken_connected
-        else if order.exchange = "hyperliquid" then is_hyperliquid_connected
-        else if order.exchange = "ibkr" then is_ibkr_connected
-        else if order.exchange = "lighter" then is_lighter_connected
-        else true
+        match Dio_exchange.Exchange_intf.Types.exchange_of_string order.exchange with
+        | Kraken -> kraken_connected
+        | Hyperliquid -> is_hyperliquid_connected
+        | Ibkr -> is_ibkr_connected
+        | Lighter -> is_lighter_connected
+        | Custom _ -> true
       in
 
       (* Drain ring buffers regardless of connection status to prevent backpressure *)

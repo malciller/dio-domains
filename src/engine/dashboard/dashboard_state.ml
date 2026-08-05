@@ -73,7 +73,7 @@ let json_of_domains () =
 
 let json_of_grid_strategy exchange symbol =
   let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
-  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_regular_market_open ()) in
+  let market_is_closed = Exchange.Types.exchange_of_string exchange = Ibkr && not (Ibkr.Market_hours.is_regular_market_open ()) in
   `Assoc [
     "type", `String "Grid";
     "buy_price", json_of_float_opt state.last_buy_order_price;
@@ -100,7 +100,7 @@ let json_of_grid_strategy exchange symbol =
 
 let json_of_mm_strategy exchange symbol =
   let state = Dio_strategies.Market_maker.get_strategy_state symbol in
-  let market_is_closed = exchange = "ibkr" && not (Ibkr.Market_hours.is_regular_market_open ()) in
+  let market_is_closed = Exchange.Types.exchange_of_string exchange = Ibkr && not (Ibkr.Market_hours.is_regular_market_open ()) in
   `Assoc [
     "type", `String "MM";
     "buy_price", json_of_float_opt state.last_buy_order_price;
@@ -266,9 +266,9 @@ let build_snapshot () =
     | Some (module Ex) ->
         List.filter_map (fun (asset, bal) ->
           (* Infer trading pair for this asset *)
-          let quote = match exch_name with
-            | "hyperliquid" | "lighter" -> "USDC"
-            | _ -> "USD"
+          let quote = match Exchange.Types.exchange_of_string exch_name with
+            | Hyperliquid | Lighter -> "USDC"
+            | Kraken | Ibkr | Custom _ -> "USD"
           in
           let symbol = asset ^ "/" ^ quote in
           (* Skip assets already covered by a configured strategy *)

@@ -112,19 +112,24 @@ let lighter_config = {
 }
 
 let get_exchange_config exchange =
-  if exchange = "hyperliquid" then hyperliquid_config
-  else if exchange = "lighter" then lighter_config
-  else if exchange = "ibkr" then ibkr_config
-  else kraken_config
+  match Exchange.Types.exchange_of_string exchange with
+  | Hyperliquid -> hyperliquid_config
+  | Lighter -> lighter_config
+  | Ibkr -> ibkr_config
+  | Kraken | Custom _ -> kraken_config
 
 (** Exchanges that persist accumulation (buy fill price, profit, last_fill_oid) on fills.
     IBKR was missing from this path and never set [persistence_dirty] on buy/sell fills. *)
 let[@inline always] persistence_accumulation_exchange id =
-  id = "hyperliquid" || id = "lighter" || id = "ibkr"
+  match Exchange.Types.exchange_of_string id with
+  | Hyperliquid | Lighter | Ibkr -> true
+  | Kraken | Custom _ -> false
 
 (** Spot venues: sell-leg maker fee only in realized PnL (not IBKR equities). *)
 let[@inline always] hl_like_spot_fee_exchange id =
-  id = "hyperliquid" || id = "lighter"
+  match Exchange.Types.exchange_of_string id with
+  | Hyperliquid | Lighter -> true
+  | Kraken | Ibkr | Custom _ -> false
 
 (** IBKR Pro Tiered commission: $0.0035/share, min $0.35/order, max 1% of trade value.
     Returns the USD commission for a single order leg. *)
@@ -1011,7 +1016,7 @@ let execute_strategy
           ) state.open_sell_orders;
 
           (* Trigger a balance refresh for Lighter to pick up fill proceeds *)
-          if asset.exchange = "lighter" then
+          if Exchange.Types.exchange_of_string asset.exchange = Lighter then
             Lighter.Balances.request_balance_refresh ()
         end
       end;

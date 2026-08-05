@@ -131,7 +131,7 @@ let clear_hedge () =
     Spot sell: close the full open hedge short.
     [perp_tob]: optional (bid_price, bid_size, ask_price, ask_size) from the perp orderbook. *)
 let handle_order_filled testnet exchange hedge_symbol side filled_qty fill_price perp_tob =
-  if exchange <> "hyperliquid" then ()
+  if Dio_exchange.Exchange_intf.Types.exchange_of_string exchange <> Hyperliquid then ()
   else begin
     match side with
     | Buy ->
