@@ -308,7 +308,11 @@ let push_order ~state ?(now = Unix.time ()) order =
                    fire-and-forget; tracking creates ghost entries that trigger
                    re-placement loops during cancel-replace amendments.
                    Kraken retains pending sell tracking. *)
-                let skip_pending = order.exchange = "hyperliquid" && order.side = Sell in
+                let skip_pending =
+                  match Exchange.Types.exchange_of_string order.exchange with
+                  | Hyperliquid -> order.side = Sell
+                  | _ -> false
+                in
                 if not skip_pending then begin
                   (* Assign temporary ID until exchange acknowledgment provides the real one *)
                   let temp_order_id = Printf.sprintf "pending_%s_%.2f"
@@ -399,10 +403,11 @@ let execute_strategy
    | Some asset_bal ->
        let qty_f = (try float_of_string asset.qty with Failure _ -> 0.001) in
        let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
-       let should_clear =
-         if asset.exchange = "hyperliquid" then asset_bal >= qty_f
-         else asset_bal >= qty_f && balance_actually_changed
-       in
+        let is_hl = Exchange.Types.exchange_of_string asset.exchange = Hyperliquid in
+        let should_clear =
+          if is_hl then asset_bal >= qty_f
+          else asset_bal >= qty_f && balance_actually_changed
+        in
        if state.asset_low && should_clear then begin
          state.asset_low <- false;
          state.inflight_sell <- false;
@@ -643,7 +648,8 @@ let execute_strategy
 
           (* Pending orders not cleared here; managed by order response handlers.
              Hyperliquid: preserve buy tracking across sync. kraken clears. *)
-          if asset.exchange <> "hyperliquid" then begin
+          let exch_id = Exchange.Types.exchange_of_string asset.exchange in
+          if exch_id <> Hyperliquid then begin
             state.last_buy_order_price <- None;
             state.last_buy_order_id <- None
           end;
@@ -697,7 +703,8 @@ let execute_strategy
 
           (* Use localized counts instead of duplicate scanning *)
           
-          if asset.exchange <> "hyperliquid" then begin
+          let exch_id = Exchange.Types.exchange_of_string asset.exchange in
+          if exch_id <> Hyperliquid then begin
             state.last_buy_order_price <- !best_buy_price;
             state.last_buy_order_id <- !best_buy_id
           end else begin
@@ -711,7 +718,7 @@ let execute_strategy
           let has_tracked_buy = state.last_buy_order_id <> None in
           
           let actual_open_buy_count = 
-            if asset.exchange = "hyperliquid" && has_tracked_buy && !sync_open_buy_count = 0 then 1
+            if exch_id = Hyperliquid && has_tracked_buy && !sync_open_buy_count = 0 then 1
             else !sync_open_buy_count 
           in
 

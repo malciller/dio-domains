@@ -28,12 +28,12 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
   (* Partition symbols by exchange *)
   let kraken_symbols = app_configs
-                      |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "kraken")
+                      |> List.filter (fun cfg -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.Dio_engine.Config.exchange = Kraken)
                       |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
 
   (* Extract Hyperliquid symbols; include base asset of spot pairs for perp hedge pricing *)
   let hyperliquid_symbols = app_configs
-                           |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "hyperliquid")
+                           |> List.filter (fun cfg -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.Dio_engine.Config.exchange = Hyperliquid)
                            |> List.fold_left (fun acc cfg ->
                                 let sym = cfg.Dio_engine.Config.symbol in
                                 if String.contains sym '/' then
@@ -46,23 +46,23 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   let has_hyperliquid = List.length hyperliquid_symbols > 0 in
   let has_kraken = List.length kraken_symbols > 0 in
   let hyperliquid_testnet =
-    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> cfg.exchange = "hyperliquid") with
+    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.exchange = Hyperliquid) with
     | Some cfg -> cfg.testnet
     | None -> false in
 
   (* Extract IBKR symbols *)
   let ibkr_symbols = app_configs
-                     |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "ibkr")
+                     |> List.filter (fun cfg -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.Dio_engine.Config.exchange = Ibkr)
                      |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
   let has_ibkr = List.length ibkr_symbols > 0 in
   let ibkr_testnet =
-    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> cfg.exchange = "ibkr") with
+    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.exchange = Ibkr) with
     | Some cfg -> cfg.testnet
     | None -> true in
 
   (* Extract Lighter symbols *)
   let lighter_symbols = app_configs
-                        |> List.filter (fun cfg -> cfg.Dio_engine.Config.exchange = "lighter")
+                        |> List.filter (fun cfg -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.Dio_engine.Config.exchange = Lighter)
                         |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
   let has_lighter = List.length lighter_symbols > 0 in
 
@@ -645,8 +645,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   (* Sequentially fetch fees per config; results enrich trading_config with fee fields *)
   let%lwt configs_with_fees = Lwt_list.map_s (fun asset ->
     try
-      if asset.Dio_engine.Config.exchange = "kraken" then begin
-
+      match Dio_exchange.Exchange_intf.Types.exchange_of_string asset.Dio_engine.Config.exchange with
+      | Kraken -> begin
         let%lwt fee_info_opt = Kraken.Kraken_get_fee.get_fee_info asset.Dio_engine.Config.symbol in
         let%lwt result = match fee_info_opt with
         | Some fee_info ->
@@ -678,7 +678,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         (* Sequential Lwt_list.map_s guarantees >10ms between HTTP requests,
            so nonce/timestamp collisions are not possible. *)
         Lwt.return result
-      end else if asset.Dio_engine.Config.exchange = "hyperliquid" then begin
+      end
+      | Hyperliquid -> begin
         let is_spot = String.contains asset.Dio_engine.Config.symbol '/' in
         let%lwt result = match global_hl_fees with
         | Some fee_info ->
@@ -698,7 +699,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
             exit 1
         in
         Lwt.return result
-      end else if asset.Dio_engine.Config.exchange = "ibkr" then begin
+      end
+      | Ibkr -> begin
         (* IBKR uses fixed per-share commissions, not maker/taker %.
            US equities Fixed plan: $0.005/share all-in is a conservative estimate.
            Express as fraction of trade value for Fee_cache compatibility. *)
@@ -714,7 +716,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Lwt.return { asset with
           Dio_engine.Config.maker_fee = Some maker;
           Dio_engine.Config.taker_fee = Some taker }
-      end else if asset.Dio_engine.Config.exchange = "lighter" then begin
+      end
+      | Lighter -> begin
         (* Lighter fees are embedded in orderBookDetails and already cached
            in the instruments feed — no separate fee endpoint needed. *)
         let fees = Lighter.Instruments_feed.lookup_info asset.Dio_engine.Config.symbol in
@@ -730,7 +733,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         Lwt.return { asset with
           Dio_engine.Config.maker_fee = Some maker;
           Dio_engine.Config.taker_fee = Some taker }
-      end else begin
+      end
+      | Custom _ -> begin
         Logging.warn_f ~section "Fee fetching not implemented for exchange: %s, using defaults" asset.Dio_engine.Config.exchange;
         (* Cache default fees for unsupported exchanges *)
         Dio_strategies.Fee_cache.store_fees 

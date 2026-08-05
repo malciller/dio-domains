@@ -321,11 +321,11 @@ let monitor_non_active_assets () =
           | Some (module Ex) ->
               let balances = Ex.get_all_balances () in
               let symbols_to_subscribe = ref [] in
-              let conn_name = match exch_name with
-                | "kraken" -> "kraken_orderbook_ws"
-                | "hyperliquid" -> "hyperliquid_ws"
-                | "ibkr" -> "ibkr_gateway"
-                | _ -> ""
+              let conn_name = match Dio_exchange.Exchange_intf.Types.exchange_of_string exch_name with
+                | Kraken -> "kraken_orderbook_ws"
+                | Hyperliquid -> "hyperliquid_ws"
+                | Ibkr -> "ibkr_gateway"
+                | Lighter | Custom _ -> ""
               in
               let current_connected_time =
                 if conn_name = "" then 0.0
@@ -348,9 +348,9 @@ let monitor_non_active_assets () =
               
               if current_connected_time > 0.0 then begin
                 List.iter (fun (asset, _bal) ->
-                  let quote = match exch_name with
-                    | "hyperliquid" | "lighter" -> "USDC"
-                    | _ -> "USD"
+                  let quote = match Dio_exchange.Exchange_intf.Types.exchange_of_string exch_name with
+                    | Hyperliquid | Lighter -> "USDC"
+                    | Kraken | Ibkr | Custom _ -> "USD"
                   in
                   let symbol = asset ^ "/" ^ quote in
                   let is_configured = List.exists (fun (ex, sym) ->

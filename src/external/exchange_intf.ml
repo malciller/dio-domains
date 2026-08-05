@@ -7,6 +7,28 @@
 (** Shared types for order management, market data events, and retry
     configuration. Used uniformly across all exchange implementations. *)
 module Types = struct
+  (** Supported exchanges for type-safe dispatch. *)
+  type exchange_id =
+    | Hyperliquid
+    | Kraken
+    | Lighter
+    | Ibkr
+    | Custom of string
+
+  let exchange_of_string = function
+    | "hyperliquid" -> Hyperliquid
+    | "kraken" -> Kraken
+    | "lighter" -> Lighter
+    | "ibkr" -> Ibkr
+    | s -> Custom s
+
+  let string_of_exchange = function
+    | Hyperliquid -> "hyperliquid"
+    | Kraken -> "kraken"
+    | Lighter -> "lighter"
+    | Ibkr -> "ibkr"
+    | Custom s -> s
+
   (** Supported order types. [Other s] captures exchange-specific types
       not covered by the standard variants. *)
   type order_type =

@@ -82,8 +82,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
   (* Resolve accumulation_buffer once via Fear & Greed. Hyperliquid and IBKR. *)
   let resolved_accumulation_buffer =
-    if (asset_with_fees.exchange = "hyperliquid" || asset_with_fees.exchange = "ibkr" || asset_with_fees.exchange = "lighter")
-       && (asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid") then
+    let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string asset_with_fees.exchange in
+    let is_accumulation_exch = match exch_id with Hyperliquid | Ibkr | Lighter -> true | _ -> false in
+    if is_accumulation_exch && (asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid") then
       let fallback = let (lo, hi) = asset_with_fees.accumulation_buffer in (lo +. hi) /. 2.0 in
       let fng = Fear_and_greed.fetch_value ~fallback () in
       let resolved = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:fng in
@@ -571,7 +572,9 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
               asset_with_fees.exchange asset_with_fees.symbol current_fng new_interval lo hi;
             
             (* Update accumulation_buffer for exchanges that use it *)
-            if asset_with_fees.exchange = "hyperliquid" || asset_with_fees.exchange = "ibkr" || asset_with_fees.exchange = "lighter" then begin
+            let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string asset_with_fees.exchange in
+            let is_accumulation_exch = match exch_id with Hyperliquid | Ibkr | Lighter -> true | _ -> false in
+            if is_accumulation_exch then begin
               let (ab_lo, ab_hi) = asset_with_fees.accumulation_buffer in
               let new_ab = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:current_fng in
               Logging.info_f ~section "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"

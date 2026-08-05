@@ -150,38 +150,42 @@ let parse_config json =
   let open Yojson.Basic.Util in
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
+  let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string exchange in
   (* Enforce that testnet and hedge are only valid for Hyperliquid entries.
      accumulation_buffer is also valid for ibkr (whole-share accumulation). *)
-  if exchange <> "hyperliquid" && exchange <> "ibkr" && exchange <> "lighter" then begin
-    let restricted = [ "testnet"; "hedge"; "accumulation_buffer" ] in
-    let actual = json |> to_assoc |> List.map fst in
-    let bad = List.filter (fun k -> List.mem k restricted) actual in
-    if bad <> [] then begin
-      List.iter (fun k ->
-        Logging.critical_f ~section "Key '%s' is not valid for exchange '%s' (found in %s/%s)" k exchange exchange symbol
-      ) bad;
-      exit 1
-    end
-  end;
-  if exchange <> "hyperliquid" then begin
-    let hl_only = [ "hedge" ] in
-    let actual = json |> to_assoc |> List.map fst in
-    let bad = List.filter (fun k -> List.mem k hl_only) actual in
-    if bad <> [] then begin
-      List.iter (fun k ->
-        Logging.critical_f ~section "Key '%s' is only valid for hyperliquid (found in %s/%s)" k exchange symbol
-      ) bad;
-      exit 1
-    end
-  end;
-  (* testnet is valid for hyperliquid and ibkr only *)
-  if exchange <> "hyperliquid" && exchange <> "ibkr" && exchange <> "lighter" then begin
-    let actual = json |> to_assoc |> List.map fst in
-    if List.mem "testnet" actual then begin
-      Logging.critical_f ~section "Key 'testnet' is only valid for hyperliquid and ibkr (found in %s/%s)" exchange symbol;
-      exit 1
-    end
-  end;
+  (match exch_id with
+   | Hyperliquid | Ibkr | Lighter -> ()
+   | Kraken | Custom _ ->
+       let restricted = [ "testnet"; "hedge"; "accumulation_buffer" ] in
+       let actual = json |> to_assoc |> List.map fst in
+       let bad = List.filter (fun k -> List.mem k restricted) actual in
+       if bad <> [] then begin
+         List.iter (fun k ->
+           Logging.critical_f ~section "Key '%s' is not valid for exchange '%s' (found in %s/%s)" k exchange exchange symbol
+         ) bad;
+         exit 1
+       end);
+  (match exch_id with
+   | Hyperliquid -> ()
+   | _ ->
+       let hl_only = [ "hedge" ] in
+       let actual = json |> to_assoc |> List.map fst in
+       let bad = List.filter (fun k -> List.mem k hl_only) actual in
+       if bad <> [] then begin
+         List.iter (fun k ->
+           Logging.critical_f ~section "Key '%s' is only valid for hyperliquid (found in %s/%s)" k exchange symbol
+         ) bad;
+         exit 1
+       end);
+  (* testnet is valid for hyperliquid, ibkr, and lighter only *)
+  (match exch_id with
+   | Hyperliquid | Ibkr | Lighter -> ()
+   | Kraken | Custom _ ->
+       let actual = json |> to_assoc |> List.map fst in
+       if List.mem "testnet" actual then begin
+         Logging.critical_f ~section "Key 'testnet' is only valid for hyperliquid and ibkr (found in %s/%s)" exchange symbol;
+         exit 1
+       end);
   let strategy = json |> member "strategy" |> to_string in
   (* Reject grid_interval when strategy is not Grid. *)
   if strategy <> "Grid" then begin
