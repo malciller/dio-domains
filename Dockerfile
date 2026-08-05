@@ -89,8 +89,10 @@ COPY --from=builder /app/_build/default/bin/dashboard.exe /usr/local/bin/dio-das
 # 11a. Copy Lighter signer shared library (Go-compiled .so for linux/amd64)
 COPY --from=builder /app/lighter-signer-linux-amd64.so /app/lighter-signer-linux-amd64.so
 
-# 12. Copy config files needed at runtime
-COPY --chown=root:root config.json /app/config.json
+# 12. Setup non-root system user and runtime directories
+RUN groupadd -g 1000 dio && useradd -u 1000 -g dio -s /bin/false dio \
+    && mkdir -p /var/run/dio /app/data \
+    && chown -R dio:dio /var/run/dio /app
 
 WORKDIR /app
 
@@ -109,5 +111,8 @@ ENV LIGHTER_SIGNER_LIB_PATH=./lighter-signer-linux-amd64
 # 16. Expose metrics broadcast port
 EXPOSE 8080
 
-# 17. Default command
+# 17. Run as non-root user
+USER dio
+
+# 18. Default command
 CMD ["dio"]
