@@ -540,87 +540,98 @@ let get_pending_sell_qty base_asset =
 (** Fetches Earn allocations from private REST API to support Bitcoin Vault balance. *)
 let poll_earn_allocations () =
   let endpoint = "https://api.kraken.com" in
-  Lwt.catch (fun () ->
-    Kraken_get_fee.get_api_credentials_from_env () >>= fun (api_key, api_secret) ->
-    let path = "/0/private/Earn/Allocations" in
-    let nonce = Kraken_common_types.nonce () in
-    let encoded_body = Uri.encoded_of_query [("nonce", [nonce]); ("hide_zero_allocations", ["true"])] in
-    let signature = Kraken_common_types.sign ~secret:api_secret ~path ~body:encoded_body ~nonce in
-    let headers = Cohttp.Header.of_list [
-      ("API-Key", api_key);
-      ("API-Sign", signature);
-      ("Content-Type", "application/x-www-form-urlencoded")
-    ] in
-    
-    Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string encoded_body) 
-      (Uri.of_string (endpoint ^ path)) >>= fun (resp, body) ->
+  let fetch_once () =
+    Lwt.catch (fun () ->
+      Kraken_get_fee.get_api_credentials_from_env () >>= fun (api_key, api_secret) ->
+      let path = "/0/private/Earn/Allocations" in
+      let nonce = Kraken_common_types.nonce () in
+      let encoded_body = Uri.encoded_of_query [("nonce", [nonce]); ("hide_zero_allocations", ["true"])] in
+      let signature = Kraken_common_types.sign ~secret:api_secret ~path ~body:encoded_body ~nonce in
+      let headers = Cohttp.Header.of_list [
+        ("API-Key", api_key);
+        ("API-Sign", signature);
+        ("Content-Type", "application/x-www-form-urlencoded")
+      ] in
       
-    Cohttp_lwt.Body.to_string body >>= fun body_str ->
-    let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-    if status <> 200 then begin
-      Logging.error_f ~section "Earn/Allocations HTTP %d: %s" status body_str;
-      Lwt.return_unit
-    end else begin
+      Lwt_unix.with_timeout 10.0 (fun () ->
+        Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string encoded_body) 
+          (Uri.of_string (endpoint ^ path))
+      ) >>= fun (resp, body) ->
+        
+      Cohttp_lwt.Body.to_string body >>= fun body_str ->
+      let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      if status <> 200 then
+        Lwt.return (Error (Printf.sprintf "Earn/Allocations HTTP %d: %s" status body_str))
+      else
+        Lwt.return (Ok body_str)
+    ) (fun exn ->
+      Lwt.return (Error (Printexc.to_string exn))
+    )
+  in
+  Error_handling.retry_with_backoff ~section ~config:Error_handling.default_retry_config ~f:fetch_once () >>= function
+  | Ok body_str ->
       Logging.debug_f ~section "Earn/Allocations raw response: %s" body_str;
-      let json = Yojson.Safe.from_string body_str in
-      let open Yojson.Safe.Util in
-      match member "error" json with
-      | `List (_ :: _ as errs) ->
-          Logging.error_f ~section "Earn/Allocations API error: %s" (errs |> filter_string |> String.concat "; ");
-          Lwt.return_unit
-      | _ ->
-          let result = member "result" json in
-          let allocations_list = match member "items" result with
-            | `List l -> l
-            | _ -> []
-          in
-          let float_member field j =
-            match member field j with
-            | `Float f -> f
-            | `Int i -> float_of_int i
-            | `String s -> (try float_of_string s with _ -> 0.0)
-            | `Intlit s -> (try float_of_string s with _ -> 0.0)
-            | _ -> 0.0
-          in
-          List.iter (fun allocation ->
-            try
-              let asset = member "native_asset" allocation |> to_string in
-              let strategy_id = member "strategy_id" allocation |> to_string in
-              let base_asset = normalize_asset asset in
-              let amount_allocated = member "amount_allocated" allocation in
-              let total = member "total" amount_allocated in
-              let native_val = float_member "native" total in
-              if native_val > 0.0 then begin
-                let pending_sell = get_pending_sell_qty base_asset in
-                let adjusted_val = max 0.0 (native_val -. pending_sell) in
-                let store = get_balance_store base_asset in
-                BalanceStore.update_wallet store adjusted_val "earn" strategy_id asset;
-                update_balance_timestamp base_asset;
+      (try
+        let json = Yojson.Safe.from_string body_str in
+        let open Yojson.Safe.Util in
+        match member "error" json with
+        | `List (_ :: _ as errs) ->
+            Logging.error_f ~section "Earn/Allocations API error: %s" (errs |> filter_string |> String.concat "; ");
+            Lwt.return_unit
+        | _ ->
+            let result = member "result" json in
+            let allocations_list = match member "items" result with
+              | `List l -> l
+              | _ -> []
+            in
+            let float_member field j =
+              match member field j with
+              | `Float f -> f
+              | `Int i -> float_of_int i
+              | `String s -> (try float_of_string s with _ -> 0.0)
+              | `Intlit s -> (try float_of_string s with _ -> 0.0)
+              | _ -> 0.0
+            in
+            List.iter (fun allocation ->
+              try
+                let asset = member "native_asset" allocation |> to_string in
+                let strategy_id = member "strategy_id" allocation |> to_string in
+                let base_asset = normalize_asset asset in
+                let amount_allocated = member "amount_allocated" allocation in
+                let total = member "total" amount_allocated in
+                let native_val = float_member "native" total in
+                if native_val > 0.0 then begin
+                  let pending_sell = get_pending_sell_qty base_asset in
+                  let adjusted_val = max 0.0 (native_val -. pending_sell) in
+                  let store = get_balance_store base_asset in
+                  BalanceStore.update_wallet store adjusted_val "earn" strategy_id asset;
+                  update_balance_timestamp base_asset;
 
-                (* Publish aggregated balance data to event bus subscribers. *)
-                let balance_data = BalanceStore.get_all store in
-                let event_data = {
-                  asset = base_asset;
-                  balance = balance_data.balance;
-                  wallet_type = balance_data.wallet_type;
-                  wallet_id = balance_data.wallet_id;
-                  last_updated = balance_data.last_updated;
-                } in
-                BalanceUpdateEventBus.publish balance_update_event_bus event_data;
+                  (* Publish aggregated balance data to event bus subscribers. *)
+                  let balance_data = BalanceStore.get_all store in
+                  let event_data = {
+                    asset = base_asset;
+                    balance = balance_data.balance;
+                    wallet_type = balance_data.wallet_type;
+                    wallet_id = balance_data.wallet_id;
+                    last_updated = balance_data.last_updated;
+                  } in
+                  BalanceUpdateEventBus.publish balance_update_event_bus event_data;
 
-                Logging.debug_f ~section "Updated Kraken %s Vault balance from REST (%s): %.8f (raw: %.8f, pending_sell: %.8f)"
-                  base_asset strategy_id adjusted_val native_val pending_sell;
-              end
-            with e ->
-              Logging.warn_f ~section "Failed to parse Earn allocation: %s" (Printexc.to_string e)
-          ) allocations_list;
-          notify_ready ();
-          Lwt.return_unit
-    end
-  ) (fun exn ->
-    Logging.error_f ~section "Failed to fetch Earn Allocations: %s" (Printexc.to_string exn);
-    Lwt.return_unit
-  )
+                  Logging.debug_f ~section "Updated Kraken %s Vault balance from REST (%s): %.8f (raw: %.8f, pending_sell: %.8f)"
+                    base_asset strategy_id adjusted_val native_val pending_sell;
+                end
+              with e ->
+                Logging.warn_f ~section "Failed to parse Earn allocation: %s" (Printexc.to_string e)
+            ) allocations_list;
+            notify_ready ();
+            Lwt.return_unit
+       with exn ->
+         Logging.error_f ~section "Failed to parse Earn Allocations JSON: %s" (Printexc.to_string exn);
+         Lwt.return_unit)
+  | Error err ->
+      Logging.error_f ~section "Failed to fetch Earn Allocations: %s" err;
+      Lwt.return_unit
 
 (** Deprecated message handler stub. Connection management is handled by [Kraken_trading_client]. *)
 let start_message_handler _conn _token _on_failure _on_heartbeat =

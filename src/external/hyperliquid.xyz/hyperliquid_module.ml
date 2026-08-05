@@ -552,28 +552,40 @@ let poll_staking_balance () =
   let section = "hyperliquid_startup" in
   let testnet = Atomic.get Hyperliquid_impl.is_testnet in
   let base_url = if testnet then "https://api.hyperliquid-testnet.xyz" else "https://api.hyperliquid.xyz" in
-  Lwt.catch (fun () ->
-    let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
-      | Some w -> w
-      | None -> ""
-    in
-    if wallet = "" then Lwt.return_unit
-    else begin
-      let url = Uri.of_string (base_url ^ "/info") in
-      let req_body = `Assoc [
-        "type", `String "delegatorSummary";
-        "user", `String wallet
-      ] in
-      let body_str = Yojson.Safe.to_string req_body in
-      let body = Cohttp_lwt.Body.of_string body_str in
-      let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-      
-      Lwt_unix.with_timeout 5.0 (fun () ->
-        Cohttp_lwt_unix.Client.post ~headers ~body url >>= fun (resp, resp_body) ->
+  let wallet = match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+    | Some w -> w
+    | None -> ""
+  in
+  if wallet = "" then Lwt.return_unit
+  else begin
+    let fetch_once () =
+      Lwt.catch (fun () ->
+        let url = Uri.of_string (base_url ^ "/info") in
+        let req_body = `Assoc [
+          "type", `String "delegatorSummary";
+          "user", `String wallet
+        ] in
+        let body_str = Yojson.Safe.to_string req_body in
+        let body = Cohttp_lwt.Body.of_string body_str in
+        let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+        
+        Lwt_unix.with_timeout 10.0 (fun () ->
+          Cohttp_lwt_unix.Client.post ~headers ~body url
+        ) >>= fun (resp, resp_body) ->
         Cohttp_lwt.Body.to_string resp_body >>= fun body_str ->
         let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-        if status >= 200 && status < 300 then begin
-          Logging.debug_f ~section "Raw delegator summary response: %s" body_str;
+        if status >= 200 && status < 300 then
+          Lwt.return (Ok body_str)
+        else
+          Lwt.return (Error (Printf.sprintf "Hyperliquid staking request HTTP %d: %s" status body_str))
+      ) (fun exn ->
+        Lwt.return (Error (Printexc.to_string exn))
+      )
+    in
+    Error_handling.retry_with_backoff ~section ~config:Error_handling.default_retry_config ~f:fetch_once () >>= function
+    | Ok body_str ->
+        Logging.debug_f ~section "Raw delegator summary response: %s" body_str;
+        (try
           let json = Yojson.Safe.from_string body_str in
           let open Yojson.Safe.Util in
           
@@ -589,16 +601,13 @@ let poll_staking_balance () =
           Logging.debug_f ~section "Updated Hyperliquid HYPE staking balance: delegated=%.6f, pendingWithdrawal=%.6f, withdrawable=%.6f" 
             delegated pending_withdrawal withdrawable;
           Lwt.return_unit
-        end else begin
-          Logging.error_f ~section "Hyperliquid staking request HTTP %d: %s" status body_str;
-          Lwt.return_unit
-        end
-      )
-    end
-  ) (fun exn ->
-    Logging.error_f ~section "Failed to fetch staking balances via REST: %s" (Printexc.to_string exn);
-    Lwt.return_unit
-  )
+        with exn ->
+          Logging.error_f ~section "Failed to parse Hyperliquid staking response: %s" (Printexc.to_string exn);
+          Lwt.return_unit)
+    | Error err ->
+        Logging.error_f ~section "Failed to fetch staking balances via REST: %s" err;
+        Lwt.return_unit
+  end
 
 let start_staking_balance_poller () =
   let rec loop () =
