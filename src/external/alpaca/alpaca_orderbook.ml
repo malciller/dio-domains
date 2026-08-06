@@ -20,6 +20,7 @@ module SymbolStore = struct
     capacity: int;
     mutable write_pos: int;
     mutable best_bid_ask: (float * float * float * float) option;
+    mutable last_update_ts: float;
     mutex: Mutex.t;
   }
 
@@ -29,6 +30,7 @@ module SymbolStore = struct
     capacity;
     write_pos = 0;
     best_bid_ask = None;
+    last_update_ts = 0.0;
     mutex = Mutex.create ();
   }
 
@@ -38,8 +40,15 @@ module SymbolStore = struct
     t.buffer.(idx) <- q;
     t.write_pos <- t.write_pos + 1;
     t.best_bid_ask <- Some (q.bid_price, q.bid_size, q.ask_price, q.ask_size);
+    t.last_update_ts <- Unix.gettimeofday ();
     Mutex.unlock t.mutex;
     Concurrency.Exchange_wakeup.signal_all ()
+
+  let get_last_update_ts t =
+    Mutex.lock t.mutex;
+    let ts = t.last_update_ts in
+    Mutex.unlock t.mutex;
+    ts
 
   let get_best_bid_ask t =
     Mutex.lock t.mutex;
@@ -142,7 +151,7 @@ let json_to_float = function
   | `String s -> (try float_of_string s with _ -> 0.0)
   | _ -> 0.0
 
-let parse_timestamp _str = Unix.time ()
+let parse_timestamp _str = Unix.gettimeofday ()
 
 let handle_message_str content =
   let trimmed = String.trim content in
@@ -154,29 +163,32 @@ let handle_message_str content =
       let msg_type = j |> member "T" |> to_string_option |> Option.value ~default:"" in
       match msg_type with
       | "q" ->
-          let symbol = j |> member "S" |> to_string_option |> Option.value ~default:"" in
-          let bp = j |> member "bp" |> json_to_float in
-          let bs = j |> member "bs" |> json_to_float in
-          let ap = j |> member "ap" |> json_to_float in
-          let as_val = j |> member "as" |> json_to_float in
-          let ts_str = j |> member "t" |> to_string_option |> Option.value ~default:"" in
-          let ts = parse_timestamp ts_str in
-          if symbol <> "" then begin
-            let store = get_or_create_store symbol in
-            let (final_bp, final_bs, final_ap, final_as) =
-              match SymbolStore.get_best_bid_ask store with
-              | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
-                  let b_price = if bp > 0.0 then bp else prev_bp in
-                  let b_sz = if bp > 0.0 then bs else prev_bs in
-                  let a_price = if ap > 0.0 then ap else prev_ap in
-                  let a_sz = if ap > 0.0 then as_val else prev_as in
-                  (b_price, b_sz, a_price, a_sz)
-              | None -> (bp, bs, ap, as_val)
-            in
-            if final_bp > 0.0 || final_ap > 0.0 then begin
-              SymbolStore.push store { bid_price = final_bp; bid_size = final_bs; ask_price = final_ap; ask_size = final_as; timestamp = ts };
-              Logging.debug_f ~section "[%s] Quote update: bid %.2f (sz %.2f), ask %.2f (sz %.2f)"
-                symbol final_bp final_bs final_ap final_as
+          let is_reg = Alpaca_market_hours.is_regular_market_open () in
+          if is_reg then begin
+            let symbol = j |> member "S" |> to_string_option |> Option.value ~default:"" in
+            let bp = j |> member "bp" |> json_to_float in
+            let bs = j |> member "bs" |> json_to_float in
+            let ap = j |> member "ap" |> json_to_float in
+            let as_val = j |> member "as" |> json_to_float in
+            let ts_str = j |> member "t" |> to_string_option |> Option.value ~default:"" in
+            let ts = parse_timestamp ts_str in
+            if symbol <> "" then begin
+              let store = get_or_create_store symbol in
+              let (final_bp, final_bs, final_ap, final_as) =
+                match SymbolStore.get_best_bid_ask store with
+                | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
+                    let b_price = if bp > 0.0 then bp else prev_bp in
+                    let b_sz = if bp > 0.0 then bs else prev_bs in
+                    let a_price = if ap > 0.0 then ap else prev_ap in
+                    let a_sz = if ap > 0.0 then as_val else prev_as in
+                    (b_price, b_sz, a_price, a_sz)
+                | None -> (bp, bs, ap, as_val)
+              in
+              if final_bp > 0.0 || final_ap > 0.0 then begin
+                SymbolStore.push store { bid_price = final_bp; bid_size = final_bs; ask_price = final_ap; ask_size = final_as; timestamp = ts };
+                Logging.debug_f ~section "[%s] Quote update: bid %.2f (sz %.2f), ask %.2f (sz %.2f)"
+                  symbol final_bp final_bs final_ap final_as
+              end
             end
           end
       | "t" ->
@@ -187,11 +199,11 @@ let handle_message_str content =
           let ts = parse_timestamp ts_str in
           if symbol <> "" && price > 0.0 then begin
             let store = get_or_create_store symbol in
-            let is_extended = Alpaca_market_hours.is_extended_hours () in
+            let is_non_regular = not (Alpaca_market_hours.is_regular_market_open ()) in
             let (b_p, b_s, a_p, a_s) =
               match SymbolStore.get_best_bid_ask store with
               | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
-                  if is_extended || abs_float (prev_bp -. price) > (price *. 0.005) || prev_bp <= 0.0 || prev_ap <= 0.0 then
+                  if is_non_regular || abs_float (prev_bp -. price) > (price *. 0.005) || prev_bp <= 0.0 || prev_ap <= 0.0 then
                     (price, size, price, size)
                   else
                     (prev_bp, prev_bs, prev_ap, prev_as)
@@ -199,7 +211,7 @@ let handle_message_str content =
             in
             SymbolStore.push store { bid_price = b_p; bid_size = b_s; ask_price = a_p; ask_size = a_s; timestamp = ts };
             Logging.debug_f ~section "[%s] Live trade update: price %.2f (sz %.2f)%s"
-              symbol price size (if is_extended then " [extended_hours]" else "")
+              symbol price size (if is_non_regular then " [after_hours]" else "")
           end
       | "b" ->
           let symbol = j |> member "S" |> to_string_option |> Option.value ~default:"" in
@@ -239,7 +251,40 @@ let send_subscription symbols =
       Websocket_lwt_unix.write conn frame
   | None -> Lwt.return_unit
 
+let polling_started = ref false
+
+let rec poll_snapshots_loop () =
+  Lwt_unix.sleep 2.0 >>= fun () ->
+  let now = Unix.gettimeofday () in
+  let syms = !active_subscriptions in
+  Lwt_list.iter_p (fun sym ->
+    let store = get_or_create_store sym in
+    let last_ts = SymbolStore.get_last_update_ts store in
+    if now -. last_ts >= 5.0 then
+      Alpaca_rest.get_snapshot ~symbol:sym () >>= function
+      | Ok (bp, bs, ap, as_val) ->
+          if bp > 0.0 || ap > 0.0 then begin
+            SymbolStore.push store { bid_price = bp; bid_size = bs; ask_price = ap; ask_size = as_val; timestamp = now };
+            Logging.debug_f ~section "[%s] Refreshed after-hours price via REST snapshot (idle %.1fs): bid %.2f, ask %.2f"
+              sym (now -. last_ts) bp ap
+          end;
+          Lwt.return_unit
+      | Error e ->
+          Logging.debug_f ~section "[%s] Background snapshot poll error: %s" sym e;
+          Lwt.return_unit
+    else
+      Lwt.return_unit
+  ) syms >>= fun () ->
+  poll_snapshots_loop ()
+
+let ensure_polling_started () =
+  if not !polling_started then begin
+    polling_started := true;
+    Lwt.async poll_snapshots_loop
+  end
+
 let subscribe_symbols symbols =
+  ensure_polling_started ();
   let new_syms = List.filter (fun s -> not (List.mem s !active_subscriptions)) symbols in
   if new_syms <> [] then begin
     active_subscriptions := !active_subscriptions @ new_syms;

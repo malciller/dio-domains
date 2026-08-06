@@ -253,6 +253,17 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
             asset_symbol buy_fee_quote state.accumulated_profit
         end;
 
+        if (Exchange.Types.exchange_of_string state.exchange_id = Alpaca) && acc_qty > 0.0 then begin
+          let sell_mult = state.cached_sell_mult in
+          let base_increment = acc_qty -. (sell_mult *. acc_qty) in
+          if base_increment > 0.0 then begin
+            state.reserved_base <- state.reserved_base +. base_increment;
+            state.persistence_dirty <- true;
+            Logging.info_f ~section "Reserving base for %s on buy fill %s: +%.8f (sell_mult %.4f, total reserved_base now %.8f)"
+              asset_symbol order_id base_increment sell_mult state.reserved_base
+          end
+        end;
+
         if acc_qty > 0.0 && not state.startup_replay then begin
           state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
           Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
@@ -317,9 +328,11 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
                   Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
                     asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
                 end;
-                state.last_sell_fill_price <- Some sell_fill_price
+                state.last_sell_fill_price <- Some sell_fill_price;
+                state.last_buy_fill_price <- None
             | _ ->
-                state.last_sell_fill_price <- Some sell_fill_price)
+                state.last_sell_fill_price <- Some sell_fill_price;
+                state.last_buy_fill_price <- None)
        | Buy -> ());
 
       let should_update_oid = match state.last_fill_oid with
