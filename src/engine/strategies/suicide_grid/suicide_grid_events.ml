@@ -93,10 +93,12 @@ let handle_order_failed ~now asset_symbol side reason =
 
     let lower_reason = String.lowercase_ascii reason in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
+    let is_wash_trade = contains_fragment lower_reason "wash trade" in
     let is_insufficient_balance = contains_fragment lower_reason "insufficient funds"
       || contains_fragment lower_reason "insufficient spot balance"
-      || contains_fragment lower_reason "not enough asset balance" in
-    let cooldown = if is_rate_limit then 10.0 else 2.0 in
+      || contains_fragment lower_reason "not enough asset balance"
+      || contains_fragment lower_reason "insufficient qty" in
+    let cooldown = if is_rate_limit || is_wash_trade then 10.0 else 2.0 in
 
     (match side with
      | Buy when is_insufficient_balance ->
@@ -122,6 +124,8 @@ let handle_order_failed ~now asset_symbol side reason =
 
     (match side with
      | Buy ->
+         if is_wash_trade then
+           Logging.warn_f ~section "Buy rejected for %s due to wash trade conflict - cooling down buy placement for 10s" asset_symbol;
          Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. cooldown)
      | Sell -> ());
 
@@ -370,6 +374,7 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
 
     if not is_being_amended then begin
       Hashtbl.remove state.amend_cooldowns order_id;
+      Hashtbl.remove state.evicted_orders order_id;
       ignore (InFlightAmendments.remove_in_flight_amendment order_id);
 
       let cancelled_side = side in

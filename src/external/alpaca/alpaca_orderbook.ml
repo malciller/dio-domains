@@ -163,15 +163,44 @@ let handle_message_str content =
           let ts = parse_timestamp ts_str in
           if symbol <> "" then begin
             let store = get_or_create_store symbol in
-            SymbolStore.push store { bid_price = bp; bid_size = bs; ask_price = ap; ask_size = as_val; timestamp = ts };
-            Logging.debug_f ~section "[%s] Quote update: bid %.2f (sz %.2f), ask %.2f (sz %.2f)"
-              symbol bp bs ap as_val
+            let (final_bp, final_bs, final_ap, final_as) =
+              match SymbolStore.get_best_bid_ask store with
+              | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
+                  let b_price = if bp > 0.0 then bp else prev_bp in
+                  let b_sz = if bp > 0.0 then bs else prev_bs in
+                  let a_price = if ap > 0.0 then ap else prev_ap in
+                  let a_sz = if ap > 0.0 then as_val else prev_as in
+                  (b_price, b_sz, a_price, a_sz)
+              | None -> (bp, bs, ap, as_val)
+            in
+            if final_bp > 0.0 || final_ap > 0.0 then begin
+              SymbolStore.push store { bid_price = final_bp; bid_size = final_bs; ask_price = final_ap; ask_size = final_as; timestamp = ts };
+              Logging.debug_f ~section "[%s] Quote update: bid %.2f (sz %.2f), ask %.2f (sz %.2f)"
+                symbol final_bp final_bs final_ap final_as
+            end
           end
       | "t" ->
           let symbol = j |> member "S" |> to_string_option |> Option.value ~default:"" in
           let price = j |> member "p" |> json_to_float in
           let size = j |> member "s" |> json_to_float in
-          Logging.debug_f ~section "[%s] Market trade: price %.2f (sz %.2f)" symbol price size
+          let ts_str = j |> member "t" |> to_string_option |> Option.value ~default:"" in
+          let ts = parse_timestamp ts_str in
+          if symbol <> "" && price > 0.0 then begin
+            let store = get_or_create_store symbol in
+            let is_extended = Alpaca_market_hours.is_extended_hours () in
+            let (b_p, b_s, a_p, a_s) =
+              match SymbolStore.get_best_bid_ask store with
+              | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
+                  if is_extended || abs_float (prev_bp -. price) > (price *. 0.005) || prev_bp <= 0.0 || prev_ap <= 0.0 then
+                    (price, size, price, size)
+                  else
+                    (prev_bp, prev_bs, prev_ap, prev_as)
+              | None -> (price, size, price, size)
+            in
+            SymbolStore.push store { bid_price = b_p; bid_size = b_s; ask_price = a_p; ask_size = a_s; timestamp = ts };
+            Logging.debug_f ~section "[%s] Live trade update: price %.2f (sz %.2f)%s"
+              symbol price size (if is_extended then " [extended_hours]" else "")
+          end
       | "b" ->
           let symbol = j |> member "S" |> to_string_option |> Option.value ~default:"" in
           let close_p = j |> member "c" |> json_to_float in
@@ -202,6 +231,7 @@ let send_subscription symbols =
       let json = `Assoc [
         ("action", `String "subscribe");
         ("quotes", `List (List.map (fun s -> `String s) symbols));
+        ("trades", `List (List.map (fun s -> `String s) symbols));
       ] in
       let payload = Yojson.Safe.to_string json in
       Logging.info_f ~section "Sending Alpaca Market Data WS subscription for symbols: %s" (String.concat ", " symbols);
@@ -213,6 +243,17 @@ let subscribe_symbols symbols =
   let new_syms = List.filter (fun s -> not (List.mem s !active_subscriptions)) symbols in
   if new_syms <> [] then begin
     active_subscriptions := !active_subscriptions @ new_syms;
+    Lwt.async (fun () ->
+      Lwt_list.iter_p (fun sym ->
+        Alpaca_rest.get_snapshot ~symbol:sym () >|= function
+        | Ok (bp, bs, ap, as_val) ->
+            let store = get_or_create_store sym in
+            SymbolStore.push store { bid_price = bp; bid_size = bs; ask_price = ap; ask_size = as_val; timestamp = Unix.time () };
+            Logging.info_f ~section "[%s] Seeded live price from REST snapshot: bid %.2f, ask %.2f" sym bp ap
+        | Error e ->
+            Logging.warn_f ~section "[%s] Failed to seed REST snapshot: %s" sym e
+      ) new_syms
+    );
     send_subscription new_syms
   end else
     Lwt.return_unit

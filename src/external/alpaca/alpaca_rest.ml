@@ -63,13 +63,20 @@ let place_order
     ?limit_price
     ?time_in_force
     ?cl_ord_id
+    ?extended_hours
     () =
   let base_url = Config.rest_base_url () in
   let url = Uri.of_string (base_url ^ "/v2/orders") in
   let is_crypto = String.contains symbol '/' in
   let is_fractional = Float.floor qty <> qty in
+  let use_extended =
+    match extended_hours with
+    | Some b -> b
+    | None -> !Config.extended_hours
+  in
   let tif_str =
-    if is_fractional && not is_crypto then "day"
+    if use_extended then "day" (* Alpaca API requires time_in_force = day when extended_hours is true *)
+    else if is_fractional && not is_crypto then "day"
     else
       match time_in_force with
       | Some "IOC" | Some "ioc" -> "ioc"
@@ -88,6 +95,10 @@ let place_order
     ("time_in_force", `String tif_str);
   ] in
   let assoc =
+    if use_extended then ("extended_hours", `Bool true) :: assoc
+    else assoc
+  in
+  let assoc =
     match limit_price with
     | Some p -> ("limit_price", `String (Printf.sprintf "%.4f" p)) :: assoc
     | None -> assoc
@@ -99,8 +110,9 @@ let place_order
   in
   let req_body = `Assoc assoc |> Yojson.Safe.to_string in
   let headers = make_headers () in
-  Logging.info_f ~section "Placing Alpaca order: %s %s %.6f %s (TIF=%s)"
-    side_str symbol qty (match limit_price with Some p -> Printf.sprintf "@ %.4f" p | None -> "MKT") tif_str;
+  Logging.info_f ~section "Placing Alpaca order: %s %s %.6f %s (TIF=%s%s)"
+    side_str symbol qty (match limit_price with Some p -> Printf.sprintf "@ %.4f" p | None -> "MKT") tif_str
+    (if use_extended then ", extended_hours=true" else "");
   Lwt.catch (fun () ->
     Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string req_body) url >>= (fun (resp, body) ->
       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
@@ -214,9 +226,14 @@ let cancel_order order_id =
 
 let get_open_orders () =
   let base_url = Config.rest_base_url () in
-  let url = Uri.of_string (base_url ^ "/v2/orders?status=open&nested=false") in
   let headers = make_headers () in
-  Lwt.catch (fun () ->
+  let rec fetch_all acc until_id =
+    let url_str =
+      match until_id with
+      | None -> base_url ^ "/v2/orders?status=open&nested=false&limit=500&direction=asc"
+      | Some uid -> Printf.sprintf "%s/v2/orders?status=open&nested=false&limit=500&direction=asc&after=%s" base_url uid
+    in
+    let url = Uri.of_string url_str in
     Cohttp_lwt_unix.Client.get ~headers url >>= (fun (resp, body) ->
       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
       Cohttp_lwt.Body.to_string body >>= (fun body_str ->
@@ -225,8 +242,16 @@ let get_open_orders () =
             let json = Yojson.Safe.from_string body_str in
             let items = match json with `List l -> l | _ -> [] in
             let orders = List.map parse_order_json items in
-            Logging.info_f ~section "Retrieved %d open orders from Alpaca" (List.length orders);
-            Lwt.return (Ok orders)
+            let count = List.length orders in
+            let combined = acc @ orders in
+            if count >= 500 then
+              (match List.nth_opt orders (count - 1) with
+               | Some last_ord -> fetch_all combined (Some last_ord.created_at)
+               | None -> Lwt.return (Ok combined))
+            else begin
+              Logging.info_f ~section "Retrieved %d open orders from Alpaca" (List.length combined);
+              Lwt.return (Ok combined)
+            end
           with exn ->
             let err = Printf.sprintf "Failed to parse open orders response: %s" (Printexc.to_string exn) in
             Logging.error_f ~section "%s (body: %s)" err body_str;
@@ -237,10 +262,13 @@ let get_open_orders () =
         end
       )
     )
-  ) (fun exn ->
-    let err = Printf.sprintf "Get open orders HTTP exception: %s" (Printexc.to_string exn) in
-    Logging.error_f ~section "%s" err;
-    Lwt.return (Error err))
+  in
+  Lwt.catch
+    (fun () -> fetch_all [] None)
+    (fun exn ->
+      let err = Printf.sprintf "Get open orders HTTP exception: %s" (Printexc.to_string exn) in
+      Logging.error_f ~section "%s" err;
+      Lwt.return (Error err))
 
 let get_account () =
   let base_url = Config.rest_base_url () in
@@ -314,5 +342,49 @@ let get_positions () =
     )
   ) (fun exn ->
     let err = Printf.sprintf "Get positions HTTP exception: %s" (Printexc.to_string exn) in
+    Logging.error_f ~section "%s" err;
+    Lwt.return (Error err))
+
+let get_snapshot ~symbol () =
+  let data_base_url = Config.data_rest_url () in
+  let url = Uri.of_string (Printf.sprintf "%s/v2/stocks/%s/snapshot?feed=%s" data_base_url symbol !Config.data_feed) in
+  let headers = make_headers () in
+  Lwt.catch (fun () ->
+    Cohttp_lwt_unix.Client.get ~headers url >>= (fun (resp, body) ->
+      let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      Cohttp_lwt.Body.to_string body >>= (fun body_str ->
+        if status_code >= 200 && status_code < 300 then
+          (try
+            let json = Yojson.Safe.from_string body_str in
+            let open Yojson.Safe.Util in
+            let lq = json |> member "latestQuote" in
+            let bp = lq |> member "bp" |> json_to_float in
+            let bs = lq |> member "bs" |> json_to_float in
+            let ap = lq |> member "ap" |> json_to_float in
+            let as_val = lq |> member "as" |> json_to_float in
+            let lt = json |> member "latestTrade" in
+            let tp = lt |> member "p" |> json_to_float in
+            let ts = lt |> member "s" |> json_to_float in
+            let is_extended = Alpaca_market_hours.is_extended_hours () in
+            if is_extended && tp > 0.0 then
+              Lwt.return (Ok (tp, ts, tp, ts))
+            else if bp > 0.0 && ap > 0.0 then
+              Lwt.return (Ok (bp, bs, ap, as_val))
+            else if tp > 0.0 then
+              Lwt.return (Ok (tp, ts, tp, ts))
+            else
+              Lwt.return (Error (Printf.sprintf "No valid quote or trade price for %s in snapshot" symbol))
+          with exn ->
+            let err = Printf.sprintf "Failed to parse snapshot response: %s" (Printexc.to_string exn) in
+            Logging.error_f ~section "%s (body: %s)" err body_str;
+            Lwt.return (Error err))
+        else begin
+          Logging.error_f ~section "Get snapshot failed HTTP %d for %s: %s" status_code symbol body_str;
+          Lwt.return (Error (Printf.sprintf "HTTP %d getting snapshot: %s" status_code body_str))
+        end
+      )
+    )
+  ) (fun exn ->
+    let err = Printf.sprintf "Get snapshot HTTP exception: %s" (Printexc.to_string exn) in
     Logging.error_f ~section "%s" err;
     Lwt.return (Error err))
