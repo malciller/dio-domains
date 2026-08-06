@@ -346,6 +346,33 @@ let get_positions () =
     Logging.error_f ~section "%s" err;
     Lwt.return (Error err))
 
+let parse_iso_timestamp s =
+  if String.length s < 19 then 0.0
+  else
+    try
+      let y = int_of_string (String.sub s 0 4) in
+      let m = int_of_string (String.sub s 5 2) in
+      let d = int_of_string (String.sub s 8 2) in
+      let hh = int_of_string (String.sub s 11 2) in
+      let mm = int_of_string (String.sub s 14 2) in
+      let ss = int_of_string (String.sub s 17 2) in
+      let sub_sec =
+        if String.length s > 20 && s.[19] = '.' then
+          let end_idx = try String.index_from s 20 'Z' with _ -> String.length s in
+          let frac_str = String.sub s 19 (end_idx - 19) in
+          try float_of_string frac_str with _ -> 0.0
+        else 0.0
+      in
+      let days_before_month = [| 0; 31; 59; 90; 120; 151; 181; 212; 243; 273; 304; 334 |] in
+      let is_leap_year y = (y mod 4 = 0 && y mod 100 <> 0) || (y mod 400 = 0) in
+      let y_off = y - 1970 in
+      let leap_years = (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400 in
+      let m_days = days_before_month.(m - 1) + (if m > 2 && is_leap_year y then 1 else 0) in
+      let total_days = (y_off * 365) + leap_years + m_days + (d - 1) in
+      let total_secs = (total_days * 86400) + (hh * 3600) + (mm * 60) + ss in
+      float_of_int total_secs +. sub_sec
+    with _ -> 0.0
+
 let get_snapshot ~symbol () =
   let data_base_url = Config.data_rest_url () in
   let fetch feed_name =
@@ -363,17 +390,36 @@ let get_snapshot ~symbol () =
             let bs = lq |> member "bs" |> json_to_float in
             let ap = lq |> member "ap" |> json_to_float in
             let as_val = lq |> member "as" |> json_to_float in
+            let lq_t_str = lq |> member "t" |> to_string_option |> Option.value ~default:"" in
+            let lq_ts = parse_iso_timestamp lq_t_str in
+
             let lt = json |> member "latestTrade" in
             let tp = lt |> member "p" |> json_to_float in
             let ts = lt |> member "s" |> json_to_float in
+            let lt_t_str = lt |> member "t" |> to_string_option |> Option.value ~default:"" in
+            let lt_ts = parse_iso_timestamp lt_t_str in
+
             let mb = json |> member "minuteBar" in
             let mp = mb |> member "c" |> json_to_float in
             let ms = mb |> member "v" |> json_to_float in
-            if bp > 0.0 && ap > 0.0 && ap >= bp then
+            let mb_t_str = mb |> member "t" |> to_string_option |> Option.value ~default:"" in
+            let mb_ts = parse_iso_timestamp mb_t_str in
+
+            let valid_quote = bp > 0.0 && ap > 0.0 && ap >= bp in
+            let valid_trade = tp > 0.0 in
+            let valid_bar = mp > 0.0 in
+
+            if valid_quote && lq_ts >= lt_ts && lq_ts >= mb_ts then
               Lwt.return (Ok (bp, bs, ap, as_val))
-            else if tp > 0.0 then
+            else if valid_trade && lt_ts >= lq_ts && lt_ts >= mb_ts then
               Lwt.return (Ok (tp, ts, tp, ts))
-            else if mp > 0.0 then
+            else if valid_bar && mb_ts >= lq_ts && mb_ts >= lt_ts then
+              Lwt.return (Ok (mp, ms, mp, ms))
+            else if valid_quote then
+              Lwt.return (Ok (bp, bs, ap, as_val))
+            else if valid_trade then
+              Lwt.return (Ok (tp, ts, tp, ts))
+            else if valid_bar then
               Lwt.return (Ok (mp, ms, mp, ms))
             else if bp > 0.0 then
               Lwt.return (Ok (bp, bs, bp, bs))
