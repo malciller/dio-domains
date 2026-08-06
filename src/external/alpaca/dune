@@ -1,0 +1,18 @@
+(library
+ (name alpaca)
+ (public_name dio.alpaca)
+ (libraries
+  yojson
+  lwt
+  lwt.unix
+  cohttp-lwt-unix
+  websocket-lwt-unix
+  dotenv
+  logging
+  uri
+  threads
+  concurrency
+  dio.exchange
+  dio.error_handling)
+ (preprocess
+  (pps lwt_ppx)))

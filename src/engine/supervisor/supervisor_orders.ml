@@ -371,12 +371,21 @@ let order_processing_loop () =
           with Not_found -> false
       in
 
+      let is_alpaca_connected =
+          try
+            let alpaca_conn = Hashtbl.find connections "alpaca_trading_ws" in
+            let st = get_state alpaca_conn in
+            st = Connected || st = Connecting
+          with Not_found -> true
+      in
+
       let is_connected (order : strategy_order) =
         match Dio_exchange.Exchange_intf.Types.exchange_of_string order.exchange with
         | Kraken -> kraken_connected
         | Hyperliquid -> is_hyperliquid_connected
         | Ibkr -> is_ibkr_connected
         | Lighter -> is_lighter_connected
+        | Alpaca -> is_alpaca_connected
         | Custom _ -> true
       in
 

@@ -66,6 +66,20 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
                         |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
   let has_lighter = List.length lighter_symbols > 0 in
 
+  (* Extract Alpaca symbols *)
+  let alpaca_symbols = app_configs
+                       |> List.filter (fun cfg -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.Dio_engine.Config.exchange = Alpaca)
+                       |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol) in
+  let has_alpaca = List.length alpaca_symbols > 0 in
+  let alpaca_testnet =
+    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.exchange = Alpaca) with
+    | Some cfg -> cfg.testnet
+    | None -> true in
+  let alpaca_data_feed =
+    match app_configs |> List.find_opt (fun (cfg : Dio_engine.Config.trading_config) -> Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.exchange = Alpaca) with
+    | Some cfg -> Option.value cfg.data_feed ~default:"iex"
+    | None -> "iex" in
+
   (* Apply testnet flag to Hyperliquid module *)
   if has_hyperliquid then
     Hyperliquid.Module.Hyperliquid_impl.set_testnet hyperliquid_testnet;
@@ -74,6 +88,11 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   if has_ibkr then
     Ibkr.Module.Config.set_testnet ibkr_testnet;
 
+  if has_alpaca then begin
+    Alpaca.Module.Config.set_testnet alpaca_testnet;
+    Alpaca.Module.Config.set_data_feed alpaca_data_feed;
+  end;
+
   Logging.info_f ~section "Connecting to %d Kraken websockets..." (List.length kraken_symbols);
   if has_hyperliquid then
     Logging.info_f ~section "Connecting to %d Hyperliquid websockets..." (List.length hyperliquid_symbols);
@@ -81,6 +100,8 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     Logging.info_f ~section "Connecting to IBKR gateway for %d symbols..." (List.length ibkr_symbols);
   if has_lighter then
     Logging.info_f ~section "Connecting to Lighter L2 for %d symbols..." (List.length lighter_symbols);
+  if has_alpaca then
+    Logging.info_f ~section "Connecting to Alpaca WS for %d symbols (%s feed)..." (List.length alpaca_symbols) alpaca_data_feed;
 
   (* Begin sequential initialization steps *)
 
@@ -195,6 +216,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   if has_hyperliquid then Hyperliquid.Orderbook_feed.initialize all_hyperliquid_symbols;
   if has_ibkr then Ibkr.Orderbook_feed.initialize ibkr_symbols;
   if has_lighter then Lighter.Orderbook_feed.initialize lighter_symbols;
+  if has_alpaca then ignore (Alpaca.Orderbook.subscribe_symbols alpaca_symbols);
 
   Logging.info ~section "Step 4: Getting authentication token...";
   let%lwt auth_token = 
@@ -238,6 +260,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lighter.Balances.initialize lighter_assets;
       Lwt.async (fun () -> Lighter.Module.fetch_balances ())
     end;
+    if has_alpaca then Alpaca.Balances.initialize ();
     Logging.info ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
@@ -248,6 +271,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
   if has_hyperliquid then Hyperliquid.Executions_feed.initialize all_hyperliquid_symbols;
   if has_ibkr then Ibkr.Executions_feed.initialize ibkr_symbols;
   if has_lighter then Lighter.Executions_feed.initialize lighter_symbols;
+  if has_alpaca then Alpaca.Executions.initialize alpaca_symbols;
 
   (* Synchronously fetch open orders before domains start to prevent duplicate placements *)
   let%lwt () =
@@ -329,6 +353,41 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     in
     set_connect_fn auth_ws_conn (Some auth_ws_connect_fn);
     start_async auth_ws_conn;
+  end;
+
+  (* Alpaca WebSocket connections *)
+  if has_alpaca then begin
+    let alpaca_data_conn = register ~name:"alpaca_data_ws" ~connect_fn:None in
+    let alpaca_data_connect_fn () =
+      Lwt.catch (fun () ->
+        let on_failure reason = set_state alpaca_data_conn (Failed reason) in
+        let on_heartbeat () = update_data_heartbeat alpaca_data_conn in
+        let on_connected () = set_state alpaca_data_conn Connected in
+        Alpaca.Orderbook.connect_and_monitor ~on_failure ~on_connected ~on_heartbeat
+      ) (fun exn ->
+        let msg = Printexc.to_string exn in
+        set_state alpaca_data_conn (Failed msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn alpaca_data_conn (Some alpaca_data_connect_fn);
+    start_async alpaca_data_conn;
+
+    let alpaca_trading_conn = register ~name:"alpaca_trading_ws" ~connect_fn:None in
+    let alpaca_trading_connect_fn () =
+      Lwt.catch (fun () ->
+        let on_failure reason = set_state alpaca_trading_conn (Failed reason) in
+        let on_heartbeat () = update_data_heartbeat alpaca_trading_conn in
+        let on_connected () = set_state alpaca_trading_conn Connected in
+        Alpaca.Executions.connect_and_monitor ~on_failure ~on_connected ~on_heartbeat
+      ) (fun exn ->
+        let msg = Printexc.to_string exn in
+        set_state alpaca_trading_conn (Failed msg);
+        Lwt.return_unit
+      )
+    in
+    set_connect_fn alpaca_trading_conn (Some alpaca_trading_connect_fn);
+    start_async alpaca_trading_conn;
   end;
 
   (* IBKR Gateway TCP connection *)
@@ -609,10 +668,19 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
         ]
       else Lwt.return_true
     in
+    let alpaca_p =
+      if has_alpaca then
+        Lwt.pick [
+          Alpaca.Balances.wait_until_ready ();
+          (Lwt_unix.sleep 10.0 >|= fun () -> false)
+        ]
+      else Lwt.return_true
+    in
     let%lwt kraken_ready = kraken_p
     and hl_ready = hl_p
-    and lighter_ready = lighter_p in
-    Lwt.return (kraken_ready && hl_ready && lighter_ready)
+    and lighter_ready = lighter_p
+    and alpaca_ready = alpaca_p in
+    Lwt.return (kraken_ready && hl_ready && lighter_ready && alpaca_ready)
   in
   if not balances_ready then
     Logging.warn ~section "Timeout waiting for balance data, continuing anyway..."
@@ -726,6 +794,21 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
 
         Dio_strategies.Fee_cache.store_fees
           ~exchange:"lighter"
+          ~symbol:asset.Dio_engine.Config.symbol
+          ~maker_fee:maker
+          ~taker_fee:taker
+          ~ttl_seconds:86400.0;
+        Lwt.return { asset with
+          Dio_engine.Config.maker_fee = Some maker;
+          Dio_engine.Config.taker_fee = Some taker }
+      end
+      | Alpaca -> begin
+        (* Alpaca is commission-free for US equities/ETFs *)
+        let maker = 0.0 in
+        let taker = 0.0 in
+
+        Dio_strategies.Fee_cache.store_fees
+          ~exchange:"alpaca"
           ~symbol:asset.Dio_engine.Config.symbol
           ~maker_fee:maker
           ~taker_fee:taker

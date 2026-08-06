@@ -12,6 +12,7 @@ let kraken_config = {
   asset_low_requires_balance_change = true;
   merge_preserved_sells = true;
   check_stale_balance = true;
+  remaintain_expired_sells = false;
 }
 
 let hyperliquid_config = {
@@ -24,6 +25,7 @@ let hyperliquid_config = {
   asset_low_requires_balance_change = false;
   merge_preserved_sells = true;
   check_stale_balance = false;
+  remaintain_expired_sells = false;
 }
 
 let ibkr_config = {
@@ -36,6 +38,7 @@ let ibkr_config = {
   asset_low_requires_balance_change = false;
   merge_preserved_sells = true;
   check_stale_balance = true;
+  remaintain_expired_sells = false;
 }
 
 let lighter_config = {
@@ -48,6 +51,20 @@ let lighter_config = {
   asset_low_requires_balance_change = false;
   merge_preserved_sells = true;
   check_stale_balance = false;
+  remaintain_expired_sells = false;
+}
+
+let alpaca_config = {
+  time_in_force = "GTC";
+  track_pending_sells = true;
+  use_accumulation_sells = false;
+  sell_uses_mult = true;
+  sell_failure_sets_asset_low = true;
+  use_reserved_base_guard = true;
+  asset_low_requires_balance_change = false;
+  merge_preserved_sells = true;
+  check_stale_balance = true;
+  remaintain_expired_sells = true;
 }
 
 let get_exchange_config exchange =
@@ -55,17 +72,18 @@ let get_exchange_config exchange =
   | Hyperliquid -> hyperliquid_config
   | Lighter -> lighter_config
   | Ibkr -> ibkr_config
+  | Alpaca -> alpaca_config
   | Kraken | Custom _ -> kraken_config
 
 let[@inline always] persistence_accumulation_exchange id =
   match Exchange.Types.exchange_of_string id with
-  | Hyperliquid | Lighter | Ibkr -> true
+  | Hyperliquid | Lighter | Ibkr | Alpaca -> true
   | Kraken | Custom _ -> false
 
 let[@inline always] hl_like_spot_fee_exchange id =
   match Exchange.Types.exchange_of_string id with
   | Hyperliquid | Lighter -> true
-  | Kraken | Ibkr | Custom _ -> false
+  | Kraken | Ibkr | Alpaca | Custom _ -> false
 
 let ibkr_commission ~qty ~price =
   let per_share_rate = 0.0035 in

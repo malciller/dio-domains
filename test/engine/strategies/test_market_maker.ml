@@ -5,7 +5,7 @@ open Alcotest
 let create_test_asset ?(exchange="kraken") ?(symbol="BTC/USD") ?(qty="0.001") ?(strategy="MM")
     ?(min_usd_balance=None) ?(max_exposure=None) ?(maker_fee=None) ?(taker_fee=None)
     ?(grid_interval=(1.0, 1.0)) ?(sell_mult="1.0") ?(testnet=false) ?(hedge=false)
-    ?(accumulation_buffer=(0.01, 0.01)) () : Dio_strategies.Strategy_common.trading_config =
+    ?(accumulation_buffer=(0.01, 0.01)) ?(data_feed=None) () : Dio_strategies.Strategy_common.trading_config =
   {
     exchange;
     symbol;
@@ -20,6 +20,7 @@ let create_test_asset ?(exchange="kraken") ?(symbol="BTC/USD") ?(qty="0.001") ?(
     testnet;
     hedge;
     accumulation_buffer;
+    data_feed;
   }
 
 

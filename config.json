@@ -89,6 +89,32 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid"
+    },
+    {
+      "symbol": "SPCX",
+      "exchange": "alpaca",
+      "qty": "0.25",
+      "grid_interval": [
+        0.25,
+        0.75
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid",
+      "testnet": true,
+      "data_feed": "iex"
+    },
+    {
+      "symbol": "QQQ",
+      "exchange": "alpaca",
+      "qty": "1.0",
+      "grid_interval": [
+        0.25,
+        0.75
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid",
+      "testnet": true,
+      "data_feed": "iex"
     }
   ]
 }

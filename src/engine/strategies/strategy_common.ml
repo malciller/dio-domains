@@ -21,6 +21,7 @@ type trading_config = {
   testnet: bool;
   hedge: bool;
   accumulation_buffer: float * float;  (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
+  data_feed: string option;
 }
 
 

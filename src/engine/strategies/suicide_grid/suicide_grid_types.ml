@@ -31,6 +31,7 @@ type exchange_config = {
   asset_low_requires_balance_change: bool;    (** true: clear asset_low only on balance increase *)
   merge_preserved_sells: bool;                (** Merge recently_injected_sells into open_sell_orders *)
   check_stale_balance: bool;                  (** Block strategy execution when balance data is missing *)
+  remaintain_expired_sells: bool;             (** Re-submit missing sell grid levels (Alpaca GTC maintenance) *)
 }
 
 (** Per-asset trading configuration. *)
@@ -51,6 +52,7 @@ type strategy_state = {
   mutable last_buy_order_price: float option;
   mutable last_buy_order_id: string option;
   mutable open_sell_orders: (string * float * float) list;  (* (order_id, price, qty) *)
+  mutable persisted_sell_levels: (float * float) list;      (* (target_price, qty) stack for Alpaca GTC *)
   mutable recently_injected_sells: (string * float * float) list; (* (order_id, price, timestamp) *)
   mutable pending_orders: (string * order_side * float * float) list;  (* (order_id, side, price, timestamp) *)
   mutable last_cycle: int;
@@ -109,6 +111,7 @@ let default_kraken_config = {
   asset_low_requires_balance_change = true;
   merge_preserved_sells = true;
   check_stale_balance = true;
+  remaintain_expired_sells = false;
 }
 
 (** Global registry of per-symbol strategy states. *)
@@ -125,10 +128,12 @@ let rec get_strategy_state asset_symbol =
       let persisted_last_fill_oid = Dio_persistence.State_persistence.load_last_fill_oid ~symbol:asset_symbol in
       let persisted_last_buy_fill_price = Dio_persistence.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol in
       let persisted_last_sell_fill_price = Dio_persistence.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol in
+      let persisted_sell_levels = Dio_persistence.State_persistence.load_persisted_sell_levels ~symbol:asset_symbol in
       let new_state = {
         last_buy_order_price = None;
         last_buy_order_id = None;
         open_sell_orders = [];
+        persisted_sell_levels = persisted_sell_levels;
         recently_injected_sells = [];
         pending_orders = [];
         last_cycle = 0;

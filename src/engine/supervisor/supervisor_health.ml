@@ -325,6 +325,7 @@ let monitor_non_active_assets () =
                 | Kraken -> "kraken_orderbook_ws"
                 | Hyperliquid -> "hyperliquid_ws"
                 | Ibkr -> "ibkr_gateway"
+                | Alpaca -> "alpaca_trading_ws"
                 | Lighter | Custom _ -> ""
               in
               let current_connected_time =
@@ -350,9 +351,9 @@ let monitor_non_active_assets () =
                 List.iter (fun (asset, _bal) ->
                   let quote = match Dio_exchange.Exchange_intf.Types.exchange_of_string exch_name with
                     | Hyperliquid | Lighter -> "USDC"
-                    | Kraken | Ibkr | Custom _ -> "USD"
+                    | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
                   in
-                  let symbol = asset ^ "/" ^ quote in
+                  let symbol = if String.equal exch_name "alpaca" then asset else asset ^ "/" ^ quote in
                   let is_configured = List.exists (fun (ex, sym) ->
                     ex = exch_name && sym = symbol
                   ) configured_symbols in

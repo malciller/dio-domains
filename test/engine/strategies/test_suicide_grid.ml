@@ -512,6 +512,78 @@ let test_accumulation_multi_strategy_isolation () =
   let total_reserved = Dio_strategies.Suicide_grid.get_total_reserved_quote btc in
   check bool "total reserved USDC includes both domains" true (total_reserved >= 30.0)
 
+let test_virtual_gtc_sell_grid_maintenance () =
+  let symbol = "VIRTUAL_GTC/USD" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.persisted_sell_levels <- [(101.00, 1.0); (98.98, 1.0); (96.96, 1.0)];
+  state.last_buy_fill_price <- Some 96.0;
+  state.open_sell_orders <- []; (* Expired or missing DAY orders *)
+  
+  let asset_alpaca = {
+    Dio_strategies.Suicide_grid.exchange = "alpaca";
+    symbol; qty = "1.0"; grid_interval = 1.0; sell_mult = "1.0";
+    strategy = "Grid"; maker_fee = Some 0.0004; taker_fee = None;
+    accumulation_buffer = 0.05;
+  } in
+  let ecfg_alpaca = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
+  
+  (* Run evaluate_sell_leg on Alpaca during a price drop to 90.0 (death spiral) *)
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~state ~now:100.0 ~asset:asset_alpaca ~bid_price:90.0 ~ask_price:90.1 ~asset_balance:3.0
+    ~buy_attempted:false ~ecfg:ecfg_alpaca ~locked_in_sells:0.0;
+    
+  (* Verify that a missing sell order from persisted stack was pushed to order buffer at target price 101.00 *)
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let popped = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
+  check bool "sell order pushed to buffer for Alpaca Virtual GTC maintenance" true (Option.is_some popped);
+  Option.iter (fun (order : Dio_strategies.Strategy_common.strategy_order) ->
+    check string "side is sell" "sell" (Dio_strategies.Strategy_common.string_of_order_side order.side);
+    check string "symbol matches" symbol order.symbol;
+    match order.price with
+    | Some p -> check bool "Alpaca sell price preserved above cost basis (no loss)" true (p >= 96.96)
+    | None -> failwith "missing sell price"
+  ) popped;
+
+  (* Verify offline fill reconciliation: asset_balance is 0.0, so persisted levels must be pruned *)
+  let state_offline = Dio_strategies.Suicide_grid.get_strategy_state "OFFLINE_TEST/USD" in
+  state_offline.persisted_sell_levels <- [(105.00, 1.0)];
+  state_offline.open_sell_orders <- [];
+  let asset_offline = { asset_alpaca with symbol = "OFFLINE_TEST/USD" } in
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~state:state_offline ~now:100.0 ~asset:asset_offline ~bid_price:100.0 ~ask_price:100.1 ~asset_balance:0.0
+    ~buy_attempted:false ~ecfg:ecfg_alpaca ~locked_in_sells:0.0;
+  check bool "offline fill pruned from persisted_sell_levels" true (state_offline.persisted_sell_levels = []);
+
+  (* Verify pre-existing open exchange order adoption in sync_open_orders *)
+  let state_adopt = Dio_strategies.Suicide_grid.get_strategy_state "ADOPT_TEST/USD" in
+  state_adopt.persisted_sell_levels <- [];
+  let iter_orders f = f "oid_ex_1" 105.0 1.0 "sell" (Some 1) in
+  let _ = Dio_strategies.Suicide_grid.sync_open_orders
+    ~state:state_adopt ~now:100.0 ~asset:{ asset_alpaca with symbol = "ADOPT_TEST/USD" }
+    ~bid_price:100.0 ~lot_qty:1.0 ~iter_open_orders:iter_orders ~ecfg:ecfg_alpaca
+  in
+  check bool "pre-existing exchange sell order adopted into persisted_sell_levels" true
+    (List.exists (fun (p, q) -> p = 105.0 && q = 1.0) state_adopt.persisted_sell_levels);
+
+  (* Verify venue isolation: non-Alpaca (Kraken) has remaintain_expired_sells = false *)
+  let kraken_symbol = "KRAKEN_TEST/USD" in
+  let state_kraken = Dio_strategies.Suicide_grid.get_strategy_state kraken_symbol in
+  state_kraken.open_sell_orders <- [];
+  let asset_kraken = {
+    Dio_strategies.Suicide_grid.exchange = "kraken";
+    symbol = kraken_symbol; qty = "1.0"; grid_interval = 1.0; sell_mult = "1.0";
+    strategy = "Grid"; maker_fee = Some 0.0004; taker_fee = None;
+    accumulation_buffer = 0.05;
+  } in
+  let ecfg_kraken = Dio_strategies.Suicide_grid.get_exchange_config "kraken" in
+  check bool "Kraken remaintain_expired_sells is false" false ecfg_kraken.remaintain_expired_sells;
+
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~state:state_kraken ~now:100.0 ~asset:asset_kraken ~bid_price:100.0 ~ask_price:100.1 ~asset_balance:1.0
+    ~buy_attempted:false ~ecfg:ecfg_kraken ~locked_in_sells:0.0;
+  let kraken_popped = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
+  check bool "Kraken does not trigger Virtual GTC maintenance" true (Option.is_none kraken_popped)
+
 let () =
   run "Suicide Grid" [
     "initialization", [
@@ -533,6 +605,7 @@ let () =
     "state", [
       test_case "state management" `Quick test_state_management;
       test_case "userref generation" `Quick test_userref_generation;
+      test_case "virtual gtc sell grid maintenance" `Quick test_virtual_gtc_sell_grid_maintenance;
     ];
     "balance", [
       test_case "balance checking" `Quick test_balance_checking;

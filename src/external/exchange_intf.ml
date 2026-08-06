@@ -13,6 +13,7 @@ module Types = struct
     | Kraken
     | Lighter
     | Ibkr
+    | Alpaca
     | Custom of string
 
   let exchange_of_string = function
@@ -20,6 +21,7 @@ module Types = struct
     | "kraken" -> Kraken
     | "lighter" -> Lighter
     | "ibkr" -> Ibkr
+    | "alpaca" -> Alpaca
     | s -> Custom s
 
   let string_of_exchange = function
@@ -27,6 +29,7 @@ module Types = struct
     | Kraken -> "kraken"
     | Lighter -> "lighter"
     | Ibkr -> "ibkr"
+    | Alpaca -> "alpaca"
     | Custom s -> s
 
   (** Supported order types. [Other s] captures exchange-specific types
