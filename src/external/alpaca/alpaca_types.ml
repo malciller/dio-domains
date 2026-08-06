@@ -160,5 +160,6 @@ type position_record = {
   qty: float;
   market_value: float;
   avg_entry_price: float;
+  current_price: float;
   side: string;
 }

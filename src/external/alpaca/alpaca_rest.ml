@@ -326,6 +326,7 @@ let get_positions () =
                 qty = j |> member "qty" |> json_to_float;
                 market_value = j |> member "market_value" |> json_to_float;
                 avg_entry_price = j |> member "avg_entry_price" |> json_to_float;
+                current_price = j |> member "current_price" |> json_to_float;
                 side = j |> member "side" |> to_string_option |> Option.value ~default:"";
               }
             ) items in
@@ -347,9 +348,9 @@ let get_positions () =
 
 let get_snapshot ~symbol () =
   let data_base_url = Config.data_rest_url () in
-  let url = Uri.of_string (Printf.sprintf "%s/v2/stocks/%s/snapshot?feed=%s" data_base_url symbol !Config.data_feed) in
-  let headers = make_headers () in
-  Lwt.catch (fun () ->
+  let fetch feed_name =
+    let url = Uri.of_string (Printf.sprintf "%s/v2/stocks/%s/snapshot?feed=%s" data_base_url symbol feed_name) in
+    let headers = make_headers () in
     Cohttp_lwt_unix.Client.get ~headers url >>= (fun (resp, body) ->
       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
       Cohttp_lwt.Body.to_string body >>= (fun body_str ->
@@ -365,25 +366,43 @@ let get_snapshot ~symbol () =
             let lt = json |> member "latestTrade" in
             let tp = lt |> member "p" |> json_to_float in
             let ts = lt |> member "s" |> json_to_float in
-            let is_extended = Alpaca_market_hours.is_extended_hours () in
-            if is_extended && tp > 0.0 then
-              Lwt.return (Ok (tp, ts, tp, ts))
-            else if bp > 0.0 && ap > 0.0 then
+            let mb = json |> member "minuteBar" in
+            let mp = mb |> member "c" |> json_to_float in
+            let ms = mb |> member "v" |> json_to_float in
+            if bp > 0.0 && ap > 0.0 && ap >= bp then
               Lwt.return (Ok (bp, bs, ap, as_val))
             else if tp > 0.0 then
               Lwt.return (Ok (tp, ts, tp, ts))
+            else if mp > 0.0 then
+              Lwt.return (Ok (mp, ms, mp, ms))
+            else if bp > 0.0 then
+              Lwt.return (Ok (bp, bs, bp, bs))
+            else if ap > 0.0 then
+              Lwt.return (Ok (ap, as_val, ap, as_val))
             else
-              Lwt.return (Error (Printf.sprintf "No valid quote or trade price for %s in snapshot" symbol))
+              Lwt.return (Error (Printf.sprintf "No valid quote/trade/bar price for %s in %s snapshot" symbol feed_name))
           with exn ->
-            let err = Printf.sprintf "Failed to parse snapshot response: %s" (Printexc.to_string exn) in
-            Logging.error_f ~section "%s (body: %s)" err body_str;
+            let err = Printf.sprintf "Failed to parse %s snapshot response: %s" feed_name (Printexc.to_string exn) in
             Lwt.return (Error err))
         else begin
-          Logging.error_f ~section "Get snapshot failed HTTP %d for %s: %s" status_code symbol body_str;
-          Lwt.return (Error (Printf.sprintf "HTTP %d getting snapshot: %s" status_code body_str))
+          Lwt.return (Error (Printf.sprintf "HTTP %d getting %s snapshot" status_code feed_name))
         end
       )
     )
+  in
+  let is_reg = Alpaca_market_hours.is_regular_market_open () in
+  let primary_feed = !Config.data_feed in
+  Lwt.catch (fun () ->
+    if is_reg then
+      fetch primary_feed
+    else
+      fetch primary_feed >>= function
+      | Ok res -> Lwt.return (Ok res)
+      | Error _ ->
+          if primary_feed <> "overnight" then
+            fetch "overnight"
+          else
+            Lwt.return (Error "Overnight snapshot failed")
   ) (fun exn ->
     let err = Printf.sprintf "Get snapshot HTTP exception: %s" (Printexc.to_string exn) in
     Logging.error_f ~section "%s" err;

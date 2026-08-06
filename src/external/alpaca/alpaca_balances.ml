@@ -47,8 +47,13 @@ let update_balances () =
            List.iter (fun (p : Alpaca_types.position_record) ->
              Hashtbl.replace balances p.symbol p.qty;
              Hashtbl.replace total_balances p.symbol p.qty;
-             Logging.debug_f ~section "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, mkt_val=%.2f"
-               p.symbol p.qty p.avg_entry_price p.market_value
+             if p.current_price > 0.0 then begin
+               let store = Alpaca_orderbook.get_or_create_store p.symbol in
+               Alpaca_orderbook.SymbolStore.push store { bid_price = p.current_price; bid_size = 1.0; ask_price = p.current_price; ask_size = 1.0; timestamp = Unix.time () };
+               Logging.debug_f ~section "Updated [%s] price from Alpaca positions API: %.2f" p.symbol p.current_price
+             end;
+             Logging.debug_f ~section "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, current_price=%.2f, mkt_val=%.2f"
+               p.symbol p.qty p.avg_entry_price p.current_price p.market_value
            ) positions
        | Error err ->
            Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err);
@@ -62,7 +67,7 @@ let update_balances () =
 
 let rec poll_loop () =
   update_balances () >>= fun () ->
-  Lwt_unix.sleep 10.0 >>= fun () ->
+  Lwt_unix.sleep 2.0 >>= fun () ->
   poll_loop ()
 
 let initialize () =
