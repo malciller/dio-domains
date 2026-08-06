@@ -13,6 +13,7 @@ type trading_config = Dio_strategies.Strategy_common.trading_config = {
   testnet: bool;
   hedge: bool;
   accumulation_buffer: float * float;  (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
+  data_feed: string option;
 }
 
 
@@ -55,7 +56,7 @@ let known_gc_keys =
 let known_trading_keys =
   [ "symbol"; "exchange"; "qty"; "grid_interval"; "sell_mult";
     "min_usd_balance"; "max_exposure"; "strategy"; "maker_fee";
-    "taker_fee"; "testnet"; "hedge"; "accumulation_buffer" ]
+    "taker_fee"; "testnet"; "hedge"; "accumulation_buffer"; "data_feed" ]
 
 (** Validates that all keys in a JSON associative object belong to the [allowed] set.
     Logs at CRITICAL level for each unknown key. Returns [true] if any unknown keys are present. *)
@@ -151,12 +152,12 @@ let parse_config json =
   let symbol = json |> member "symbol" |> to_string in
   let exchange = json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken" in
   let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string exchange in
-  (* Enforce that testnet and hedge are only valid for Hyperliquid entries.
-     accumulation_buffer is also valid for ibkr (whole-share accumulation). *)
+  (* Enforce that testnet and hedge are only valid for supported entries.
+     accumulation_buffer is valid for hyperliquid, ibkr, lighter, and alpaca. *)
   (match exch_id with
-   | Hyperliquid | Ibkr | Lighter -> ()
+   | Hyperliquid | Ibkr | Lighter | Alpaca -> ()
    | Kraken | Custom _ ->
-       let restricted = [ "testnet"; "hedge"; "accumulation_buffer" ] in
+       let restricted = [ "testnet"; "hedge"; "accumulation_buffer"; "data_feed" ] in
        let actual = json |> to_assoc |> List.map fst in
        let bad = List.filter (fun k -> List.mem k restricted) actual in
        if bad <> [] then begin
@@ -177,13 +178,13 @@ let parse_config json =
          ) bad;
          exit 1
        end);
-  (* testnet is valid for hyperliquid, ibkr, and lighter only *)
+  (* testnet is valid for hyperliquid, ibkr, lighter, and alpaca *)
   (match exch_id with
-   | Hyperliquid | Ibkr | Lighter -> ()
+   | Hyperliquid | Ibkr | Lighter | Alpaca -> ()
    | Kraken | Custom _ ->
        let actual = json |> to_assoc |> List.map fst in
        if List.mem "testnet" actual then begin
-         Logging.critical_f ~section "Key 'testnet' is only valid for hyperliquid and ibkr (found in %s/%s)" exchange symbol;
+         Logging.critical_f ~section "Key 'testnet' is only valid for hyperliquid, ibkr, lighter, and alpaca (found in %s/%s)" exchange symbol;
          exit 1
        end);
   let strategy = json |> member "strategy" |> to_string in
@@ -197,6 +198,7 @@ let parse_config json =
   end;
   let testnet = json |> member "testnet" |> to_bool_option |> Option.value ~default:false in
   let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
+  let data_feed = json |> member "data_feed" |> to_string_option in
   {
     exchange;
     symbol;
@@ -211,6 +213,7 @@ let parse_config json =
     testnet;
     hedge;
     accumulation_buffer = parse_accumulation_buffer json exchange symbol;
+    data_feed;
   }
 
 (** Parses top-level "logging_level" and "logging_sections" fields into a [logging_config].

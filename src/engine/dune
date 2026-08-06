@@ -6,6 +6,7 @@
   logging
   dio.kraken
   dio.ibkr
+  dio.alpaca
   dio.strategies
   dio.cmc
   threads

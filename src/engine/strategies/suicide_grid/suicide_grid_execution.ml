@@ -162,6 +162,15 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
       end else if side_str = "sell" then begin
         state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
         locked_in_sells := !locked_in_sells +. qty;
+        if ecfg.remaintain_expired_sells then begin
+          let already_tracked = List.exists (fun (p, _) -> abs_float (p -. price) <= (price *. 0.005)) state.persisted_sell_levels in
+          if not already_tracked then begin
+            state.persisted_sell_levels <- (price, qty) :: state.persisted_sell_levels;
+            state.persistence_dirty <- true;
+            Logging.info_f ~section "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into persistent tracking"
+              asset.symbol price qty
+          end
+        end;
         match !closest_sell_order with
         | None -> closest_sell_order := Some (oid, price)
         | Some (_, best_p) -> if price < best_p then closest_sell_order := Some (oid, price)
@@ -273,7 +282,9 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
     state.last_buy_order_price <- None;
     state.last_cycle <- cycle
   end else if effective_buy_count = 0 && not buy_order_pending then begin
-    let buy_price = calculate_grid_price ask_price grid_interval false state in
+    let ref_price = if bid_price > 0.0 then bid_price else ask_price in
+    let raw_buy_price = calculate_grid_price ref_price grid_interval false state in
+    let buy_price = if bid_price > 0.0 then min raw_buy_price bid_price else raw_buy_price in
     let buy_cooldown_key = "place_Buy" in
     let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
 
@@ -334,15 +345,17 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
           let distance = sell_price -. current_buy_price in
           let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
 
-          let grid_buy_from_ask = calculate_grid_price ask_price grid_interval false state in
+          let ref_price = if bid_price > 0.0 then bid_price else ask_price in
+          let grid_buy_from_ref = calculate_grid_price ref_price grid_interval false state in
+          let grid_buy_capped = if bid_price > 0.0 then min grid_buy_from_ref bid_price else grid_buy_from_ref in
           let raw_exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
           let exact_target =
-            if raw_exact_target > grid_buy_from_ask then grid_buy_from_ask
+            if raw_exact_target > grid_buy_capped then grid_buy_capped
             else raw_exact_target
           in
 
           if distance > double_grid_interval then begin
-            let proposed_buy_price = calculate_grid_price ask_price grid_interval false state in
+            let proposed_buy_price = grid_buy_capped in
 
             if proposed_buy_price > current_buy_price then begin
               let proposed_distance = sell_price -. proposed_buy_price in
@@ -401,9 +414,11 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
     end else begin
       match state.last_buy_order_price, state.last_buy_order_id with
       | Some current_buy_price, Some buy_order_id ->
-          let target_buy_price = calculate_grid_price ask_price grid_interval false state in
+          let ref_price = if bid_price > 0.0 then bid_price else ask_price in
+          let raw_target = calculate_grid_price ref_price grid_interval false state in
+          let target_buy_price = if bid_price > 0.0 then min raw_target bid_price else raw_target in
           if target_buy_price > current_buy_price then begin
-            let min_move_threshold = get_min_move_threshold ask_price grid_interval state in
+            let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
             let current_buy_price_rounded = state.cached_round_price current_buy_price in
             let price_diff_rounded = state.cached_round_price (abs_float (target_buy_price -. current_buy_price_rounded)) in
 
@@ -433,30 +448,109 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
 
   !buy_attempted
 
-(** Evaluates buy-triggered sell placement leg. *)
-let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~asset_balance ~buy_attempted ~ecfg ~locked_in_sells =
-  let should_trigger_sell = state.just_filled_buy || buy_attempted in
+(** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell placement leg. *)
+let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price ~asset_balance ~buy_attempted ~ecfg ~locked_in_sells =
+  let qty = venue_lot_qty state.grid_qty asset.exchange state in
+  let available_base =
+    if Float.is_nan asset_balance then 0.0
+    else asset_balance +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells
+  in
+  if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] && not (Float.is_nan asset_balance) then begin
+    let available_for_sells = asset_balance -. state.reserved_base in
+    let (kept_levels, pruned_levels) =
+      List.partition (fun (target_p, target_q) ->
+        let is_open_on_exchange = List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders in
+        is_open_on_exchange || available_for_sells >= target_q
+      ) state.persisted_sell_levels
+    in
+    if pruned_levels <> [] then begin
+      state.persisted_sell_levels <- kept_levels;
+      state.persistence_dirty <- true;
+      List.iter (fun (p, q) ->
+        Logging.info_f ~section "Reconciled offline sell fill for %s @ %.4f (qty %.8f) - balance consumed while offline"
+          asset.symbol p q;
+        state.last_sell_fill_price <- Some p
+      ) pruned_levels
+    end
+  end;
+  let missing_alpaca_sell_grid =
+    if ecfg.remaintain_expired_sells then
+      not (has_active_sell state)
+      && available_base >= qty
+      && (
+        state.just_filled_buy || buy_attempted || state.resuming_after_balance_flag ||
+        (state.persisted_sell_levels <> [] &&
+         List.exists (fun (target_p, _q) ->
+           not (List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders)
+         ) state.persisted_sell_levels) ||
+        (state.open_sell_orders = [] && Option.is_some state.last_buy_fill_price)
+      )
+    else
+      false
+  in
+  let should_trigger_sell =
+    if ecfg.remaintain_expired_sells then
+      missing_alpaca_sell_grid
+    else
+      state.just_filled_buy || buy_attempted
+  in
   if should_trigger_sell && not (Float.is_nan asset_balance) && not (has_active_sell state) then begin
     let asset_bal = asset_balance in
     let grid_interval = asset.grid_interval in
     let qty = venue_lot_qty state.grid_qty asset.exchange state in
     let sell_mult = state.cached_sell_mult in
 
-    let base_price_for_sell =
-      match state.last_buy_fill_price with
-      | Some fill_p when not state.resuming_after_balance_flag
-                      && abs_float (bid_price -. fill_p) <= (bid_price *. (grid_interval /. 100.0)) -> fill_p
-      | Some fill_p ->
-          Logging.debug_f ~section
-            "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted or resuming_after_balance=%B)"
-            asset.symbol bid_price fill_p state.resuming_after_balance_flag;
-          bid_price
-      | None -> bid_price
+    (* Determine target price & qty for sell placement *)
+    let (target_sell_price_opt, target_sell_qty_override) =
+      if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] then
+        let missing_level = List.find_opt (fun (target_p, _q) ->
+          not (List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders)
+        ) state.persisted_sell_levels in
+        match missing_level with
+        | Some (tp, tq) -> (Some tp, Some tq)
+        | None -> (None, None)
+      else
+        (None, None)
     in
-    let sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
+
+    let sell_price =
+      match target_sell_price_opt with
+      | Some tp -> tp
+      | None ->
+          let base_price_for_sell =
+            if ecfg.remaintain_expired_sells then
+              (* Alpaca: Strictly use buy fill price to prevent selling at a loss during price drops *)
+              match state.last_buy_fill_price with
+              | Some fill_p -> fill_p
+              | None -> bid_price
+            else
+              (* Non-Alpaca venues: untouched existing re-anchoring behavior *)
+              match state.last_buy_fill_price with
+              | Some fill_p when not state.resuming_after_balance_flag
+                              && abs_float (bid_price -. fill_p) <= (bid_price *. (grid_interval /. 100.0)) -> fill_p
+              | Some fill_p ->
+                  Logging.debug_f ~section
+                    "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted or resuming_after_balance=%B)"
+                    asset.symbol bid_price fill_p state.resuming_after_balance_flag;
+                  bid_price
+              | None -> bid_price
+          in
+          let raw_sell_price = calculate_grid_price base_price_for_sell grid_interval true state in
+          if ask_price > 0.0 then max raw_sell_price ask_price else raw_sell_price
+    in
+
     let (sell_qty, is_accumulation_sell, required_profit) =
-      compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
-        ~symbol:asset.symbol ~exchange:asset.exchange
+      match target_sell_qty_override with
+      | Some tq when ecfg.remaintain_expired_sells ->
+          let target_q =
+            if ecfg.sell_uses_mult then
+              Float.min tq (round_qty (qty *. sell_mult) asset.symbol asset.exchange)
+            else tq
+          in
+          (target_q, false, 0.0)
+      | _ ->
+          compute_sell_qty ~ecfg ~state ~asset ~qty ~sell_price ~sell_mult
+            ~symbol:asset.symbol ~exchange:asset.exchange
     in
     let accumulation_ok_on_recovery =
       accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty
@@ -511,6 +605,13 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~asset_ba
       let sell_order = create_order state.duplicate_key_sell asset.symbol Sell effective_sell_qty (Some sell_price) true asset.exchange in
       if push_order ~now ~state sell_order then begin
         state.asset_low <- false;
+        if ecfg.remaintain_expired_sells then begin
+          let already_in_stack = List.exists (fun (p, _) -> abs_float (p -. sell_price) <= (sell_price *. 0.005)) state.persisted_sell_levels in
+          if not already_in_stack then begin
+            state.persisted_sell_levels <- (sell_price, effective_sell_qty) :: state.persisted_sell_levels;
+            state.persistence_dirty <- true
+          end
+        end;
         if is_accumulation_sell then begin
           let rounded_sell = effective_sell_qty in
           let rounding_diff = qty -. rounded_sell in
@@ -522,9 +623,59 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~asset_ba
           Logging.info_f ~section
             "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, reserved_base now %.8f)"
             asset.symbol rounded_sell (state.accumulated_profit +. actual_cost) actual_cost state.reserved_base
+        end else if ecfg.sell_uses_mult && persistence_accumulation_exchange state.exchange_id then begin
+          if target_sell_qty_override = None then begin
+            let base_increment = qty -. effective_sell_qty in
+            if base_increment > 0.0 then begin
+              state.reserved_base <- state.reserved_base +. base_increment;
+              state.persistence_dirty <- true;
+              Logging.info_f ~section
+                "Reserving base for %s: +%.8f (sell_mult %.4f, total reserved_base now %.8f)"
+                asset.symbol base_increment sell_mult state.reserved_base
+            end
+          end
         end;
         Logging.info_f ~section "Placed sell order for %s: %.8f @ %.4f"
           asset.symbol effective_sell_qty sell_price
+      end
+    end
+  end;
+  if asset.exchange = "alpaca" && ecfg.sell_uses_mult && ecfg.remaintain_expired_sells
+     && not (Float.is_nan asset_balance) then begin
+    let sell_mult = state.cached_sell_mult in
+    let sell_lot = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
+    let total_in_sells = locked_in_sells +.
+      (List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0
+        (List.filter (fun (id, _, _) ->
+          String.starts_with ~prefix:"pending_sell_" id
+        ) state.open_sell_orders)) in
+    let available_for_excess = asset_balance -. state.reserved_base -. total_in_sells in
+    if sell_lot > 0.0 && available_for_excess >= sell_lot
+       && not state.inflight_sell
+       && not (InFlightOrders.is_in_flight state.duplicate_key_sell) then begin
+      let ref_price = if bid_price > 0.0 then bid_price else ask_price in
+      let excess_sell_price = calculate_grid_price ref_price asset.grid_interval true state in
+      let excess_sell_price = if ask_price > 0.0 then max excess_sell_price ask_price
+                              else excess_sell_price in
+      let sell_order = create_order state.duplicate_key_sell asset.symbol Sell sell_lot
+                         (Some excess_sell_price) true asset.exchange in
+      if push_order ~now ~state sell_order then begin
+        let already_in_stack = List.exists (fun (p, _) ->
+          abs_float (p -. excess_sell_price) <= (excess_sell_price *. 0.005)
+        ) state.persisted_sell_levels in
+        if not already_in_stack then begin
+          state.persisted_sell_levels <- (excess_sell_price, sell_lot)
+                                         :: state.persisted_sell_levels;
+          state.persistence_dirty <- true
+        end;
+        let base_increment = qty -. sell_lot in
+        if base_increment > 0.0 then begin
+          state.reserved_base <- state.reserved_base +. base_increment;
+          state.persistence_dirty <- true
+        end;
+        Logging.info_f ~section
+          "Placed excess inventory sell for %s: %.8f @ %.4f (available_excess %.8f)"
+          asset.symbol sell_lot excess_sell_price available_for_excess
       end
     end
   end;
@@ -603,7 +754,7 @@ let execute_strategy
             ~closest_sell_order_initial:closest_sell_order
         in
 
-        evaluate_sell_leg ~state ~now ~asset ~bid_price ~asset_balance ~buy_attempted ~ecfg ~locked_in_sells
+        evaluate_sell_leg ~state ~now ~asset ~bid_price ~ask_price ~asset_balance ~buy_attempted ~ecfg ~locked_in_sells
       end
     end
   )

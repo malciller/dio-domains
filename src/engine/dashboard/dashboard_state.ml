@@ -265,15 +265,18 @@ let build_snapshot () =
     | None -> []
     | Some (module Ex) ->
         List.filter_map (fun (asset, bal) ->
-          (* Infer trading pair for this asset *)
           let quote = match Exchange.Types.exchange_of_string exch_name with
             | Hyperliquid | Lighter -> "USDC"
-            | Kraken | Ibkr | Custom _ -> "USD"
+            | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
           in
-          let symbol = asset ^ "/" ^ quote in
+          let is_equity_exch = match Exchange.Types.exchange_of_string exch_name with
+            | Alpaca | Ibkr -> true
+            | _ -> false
+          in
+          let symbol = if is_equity_exch && not (String.contains asset '/') then asset else asset ^ "/" ^ quote in
           (* Skip assets already covered by a configured strategy *)
           let is_configured = List.exists (fun (ex, sym) ->
-            ex = exch_name && sym = symbol
+            ex = exch_name && (sym = symbol || sym = asset || fst (split_symbol sym) = asset)
           ) configured_symbols in
           if is_configured then None
           else begin

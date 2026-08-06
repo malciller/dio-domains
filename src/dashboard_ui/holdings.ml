@@ -431,9 +431,22 @@ let render_strategies w json =
   in
 
 
+  let strat_keys = List.map (fun (sym, data) ->
+    let exch = data |?> "exchange" |> to_string_d "" in
+    let market = data |?> "market" in
+    let base = market |?> "base_asset" |> to_string_d "" in
+    (exch, sym), (exch, base)
+  ) strats in
+
   let valid_balances = List.filter (fun bal_json ->
     let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-    balance > 0.0
+    let exch = bal_json |?> "exchange" |> to_string_d "" in
+    let asset = bal_json |?> "asset" |> to_string_d "" in
+    let symbol = bal_json |?> "symbol" |> to_string_d "" in
+    let is_strat_asset = List.exists (fun ((ex1, s1), (ex2, b2)) ->
+      (ex1 = exch && (s1 = symbol || s1 = asset)) || (ex2 = exch && b2 = asset)
+    ) strat_keys in
+    balance > 0.0 && not is_strat_asset
   ) all_balances in
 
   let inactive_jsons = List.filter (fun bal_json ->
@@ -443,10 +456,11 @@ let render_strategies w json =
   ) valid_balances in
 
   let quote_jsons = List.filter (fun bal_json ->
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
     let asset = bal_json |?> "asset" |> to_string_d "?" in
     let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
-    is_quote
-  ) valid_balances in
+    balance > 0.0 && is_quote
+  ) all_balances in
 
   let inactive_rows = List.mapi (fun i bal -> build_balance_row (i mod 2 = 1) bal false) inactive_jsons in
   let quote_rows = List.mapi (fun i bal -> build_balance_row (i mod 2 = 1) bal true) quote_jsons in
