@@ -7,28 +7,48 @@ let render_strategies w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
   let all_balances = json |?> "all_balances" |> to_list_d in
 
+  let is_compact = w < 160 in
+
   (* Column header row *)
-  let header = close_row w (I.hcat [
-    I.string a_border " │  ";
-    col 16 a_label "SYMBOL";
-    col 5 a_label "STGY";
-    col 3 a_label "ST";
-    col_right 13 a_label "PRICE";
-    col_right 8 a_label "SPREAD";
-    I.string a_border " │ ";
-    col_right 12 a_label "BUY @";
-    col_right 8 a_label "Δ BUY";
-    col 17 a_label "";
-    col_right 8 a_label "Δ SELL";
-    col_right 12 a_label "SELL @";
-    col_right 6 a_label "SELLS";
-    col_right 12 a_label "SELL VAL";
-    I.string a_border " │ ";
-    col_right 12 a_label "HOLDING";
-    col_right 10 a_label "HOLD VAL";
-    col_right 12 a_label "ACCUM QTY";
-    col_right 10 a_label "ACCUM VAL";
-  ]) in
+  let header = close_row w (
+    if is_compact then
+      I.hcat [
+        I.string a_border " │  ";
+        col 14 a_label "SYMBOL";
+        col 5 a_label "STGY";
+        col 3 a_label "ST";
+        col_right 12 a_label "PRICE";
+        I.string a_border " │ ";
+        col_right 11 a_label "BUY @";
+        col 17 a_label "";
+        col_right 11 a_label "SELL @";
+        I.string a_border " │ ";
+        col_right 10 a_label "HOLDING";
+        col_right 10 a_label "HOLD VAL";
+      ]
+    else
+      I.hcat [
+        I.string a_border " │  ";
+        col 16 a_label "SYMBOL";
+        col 5 a_label "STGY";
+        col 3 a_label "ST";
+        col_right 13 a_label "PRICE";
+        col_right 8 a_label "SPREAD";
+        I.string a_border " │ ";
+        col_right 12 a_label "BUY @";
+        col_right 8 a_label "Δ BUY";
+        col 17 a_label "";
+        col_right 8 a_label "Δ SELL";
+        col_right 12 a_label "SELL @";
+        col_right 6 a_label "SELLS";
+        col_right 12 a_label "SELL VAL";
+        I.string a_border " │ ";
+        col_right 12 a_label "HOLDING";
+        col_right 10 a_label "HOLD VAL";
+        col_right 12 a_label "ACCUM QTY";
+        col_right 10 a_label "ACCUM VAL";
+      ]
+  ) in
 
   let build_strategy_row is_even (symbol, data) =
     let exchange = data |?> "exchange" |> to_string_d "?" in
@@ -82,21 +102,22 @@ let render_strategies w json =
       match sell_prices with [] -> None | prices -> Some (List.fold_left min (List.hd prices) prices)
     in
 
+    let execution_proximity_opt =
+      match closest_sell_price_opt with
+      | None -> None
+      | Some sell_price ->
+          if (not cap_low) && buy_price > 0.0 && mid > 0.0 && sell_price > buy_price then
+            let range = sell_price -. buy_price in
+            Some (((mid -. buy_price) /. range) *. 100.0)
+          else None
+    in
+
     let near_buy, near_sell =
       let cap_pct_thresh = 0.25 in
       let abs_near_buy = match buy_dist_pct with Some d -> abs_float d <= cap_pct_thresh | None -> false in
       let abs_near_sell = match closest_sell_dist_pct with Some d -> abs_float d <= cap_pct_thresh | None -> false in
 
-      let execution_proximity =
-        match closest_sell_price_opt with
-        | None -> None
-        | Some sell_price ->
-            if (not cap_low) && buy_price > 0.0 && mid > 0.0 && sell_price > buy_price then
-              let range = sell_price -. buy_price in
-              Some (((mid -. buy_price) /. range) *. 100.0)
-            else None
-      in
-      match execution_proximity with
+      match execution_proximity_opt with
       | Some pos -> (pos < 25.0 && abs_near_buy, pos > 75.0 && abs_near_sell)
       | None ->
           let is_near_buy = match buy_dist_pct with Some d -> abs_float d < close_thresh && abs_near_buy | None -> false in
@@ -133,36 +154,11 @@ let render_strategies w json =
     
     let col w attr s = I.string attr (pad_right w s) in
     let col_right w attr s = I.string attr (pad_left w s) in
-    let close_row w img =
-      let d = w - I.width img - 2 in
-      I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string A.(bg bg_color) " "; I.string a_border_outer "│" ]
-    in
+    let close_row w img = close_row w img in
 
-    let render_gauge b_pct s_pct =
-      let half = 7 in
-      let pos d =
-        if d < 0.0 then half
-        else if d < 0.25 *. grid_interval then 0
-        else if d < 0.75 *. grid_interval then 1
-        else if d < 1.5 *. grid_interval  then 2
-        else if d < 3.0 *. grid_interval  then 3
-        else if d < 6.0 *. grid_interval  then 4
-        else if d < 12.0 *. grid_interval then 5
-        else 6
-      in
-      let b_pos = match b_pct with Some d -> pos (abs_float d) | None -> half + 1 in
-      let s_pos = match s_pct with Some d -> pos (abs_float d) | None -> half + 1 in
-      let left_side = List.init half (fun i -> if half - 1 - i = b_pos then "B" else "─") |> String.concat "" in
-      let right_side = List.init half (fun i -> if i = s_pos then "S" else "─") |> String.concat "" in
-      I.hcat [
-        I.string a_border "[";
-        I.string (if b_pos <= 1 then a_green else a_dim) left_side;
-        I.string a_border "┼";
-        I.string (if s_pos <= 1 then a_yellow else a_dim) right_side;
-        I.string a_border "]";
-      ]
-    in
-    let gauge_img = render_gauge buy_dist_pct closest_sell_dist_pct in
+
+
+    let gauge_img = render_proximity_slider 17 execution_proximity_opt in
 
     let status_str, status_attr =
       if cap_low then "⏸", a_yellow else "▶", a_green
@@ -223,40 +219,61 @@ let render_strategies w json =
     let price_str = if mid > 0.0 then format_price mid else "--" in
     let price_cell = I.hcat [
       I.string p_border_attr "[";
-      col_right 11 row_text price_str;
+      col_right 10 row_text price_str;
       I.string p_border_attr "]";
     ] in
 
-    close_row w (I.hcat [
-      I.string a_border_outer " │";
-      I.string A.(bg bg_color) "  ";
-      col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
-      col 5 a_cyan (truncate_string 4 stype);
-      I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
-      price_cell;
-      col_right 8 spread_attr spread_str;
-      I.string a_border " │ ";
-      col_right 12 (if flash_buy then a_near_fill_green
-              else if flash_sell then a_near_sell_red
-              else if buy_price > 0.0 then a_green else a_dim)
-        (if buy_price > 0.0 then format_price buy_price else "--");
-      col_right 8 buy_dist_attr buy_dist_str;
-      gauge_img;
-      col_right 8 sell_dist_attr sell_dist_str;
-      col_right 12 sell_price_attr sell_price_str;
-      col_right 6 (if sell_count > 0 then a_yellow else a_dim)
-        (add_commas (string_of_int sell_count));
-      col_right 12 (if unrealized_profit >= 0.0 then a_green else a_red)
-        (format_pnl unrealized_profit);
-      I.string a_border " │ ";
-      col_right 12 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
-      col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
-      col_right 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
-      col_right 10 row_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
-    ])
+    if is_compact then
+      close_row w (I.hcat [
+        I.string a_border_outer " │";
+        I.string A.(bg bg_color) "  ";
+        col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 symbol) exch_tag);
+        col 5 a_cyan (truncate_string 4 stype);
+        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+        price_cell;
+        I.string a_border " │ ";
+        col_right 11 (if flash_buy then a_near_fill_green
+                else if flash_sell then a_near_sell_red
+                else if buy_price > 0.0 then a_green else a_dim)
+          (if buy_price > 0.0 then format_price buy_price else "--");
+        gauge_img;
+        col_right 11 sell_price_attr sell_price_str;
+        I.string a_border " │ ";
+        col_right 10 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
+        col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
+      ])
+    else
+      close_row w (I.hcat [
+        I.string a_border_outer " │";
+        I.string A.(bg bg_color) "  ";
+        col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
+        col 5 a_cyan (truncate_string 4 stype);
+        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+        price_cell;
+        col_right 8 spread_attr spread_str;
+        I.string a_border " │ ";
+        col_right 12 (if flash_buy then a_near_fill_green
+                else if flash_sell then a_near_sell_red
+                else if buy_price > 0.0 then a_green else a_dim)
+          (if buy_price > 0.0 then format_price buy_price else "--");
+        col_right 8 buy_dist_attr buy_dist_str;
+        gauge_img;
+        col_right 8 sell_dist_attr sell_dist_str;
+        col_right 12 sell_price_attr sell_price_str;
+        col_right 6 (if sell_count > 0 then a_yellow else a_dim)
+          (add_commas (string_of_int sell_count));
+        col_right 12 (if unrealized_profit >= 0.0 then a_green else a_red)
+          (format_pnl unrealized_profit);
+        I.string a_border " │ ";
+        col_right 12 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
+        col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
+        col_right 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+        col_right 10 row_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
+      ])
   in
 
   let active_rows_data, paused_rows_data = List.partition (fun (_symbol, data) ->
+
     let strat = data |?> "strategy" in
     not (strat |?> "capital_low" |> to_bool_d false)
   ) strats in
@@ -320,10 +337,8 @@ let render_strategies w json =
     
     let col w attr s = I.string attr (pad_right w s) in
     let col_right w attr s = I.string attr (pad_left w s) in
-    let close_row w img =
-      let d = w - I.width img - 2 in
-      I.hcat [ img; I.string A.(bg bg_color) (String.make (max 0 d) ' '); I.string A.(bg bg_color) " "; I.string a_border_outer "│" ]
-    in
+    let close_row w img = close_row w img in
+
 
     let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
       | None -> "--", a_dim
@@ -369,34 +384,52 @@ let render_strategies w json =
     let price_str = if mid > 0.0 then format_price mid else "--" in
     let price_cell = I.hcat [
       I.string p_border_attr "[";
-      col_right 11 a_text price_str;
+      col_right 10 a_text price_str;
       I.string p_border_attr "]";
     ] in
 
-    close_row w (I.hcat [
-      I.string a_border_outer " │";
-      I.string A.(bg bg_color) "  ";
-      col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
-      col 5 a_dim "--";
-      I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
-      price_cell;
-      col_right 8 spread_attr spread_str;
-      I.string a_border " │ ";
-      col_right 12 a_dim "--";
-      col_right 8 a_dim "--";
-      gauge_img;
-      col_right 8 sell_dist_attr sell_dist_str;
-      col_right 12 sell_price_attr sell_price_str;
-      col_right 6 (if sell_count > 0 then a_yellow else a_dim) (add_commas (string_of_int sell_count));
-      col_right 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green else if unrealized_profit > 0.0 then a_dim else a_dim)
-        (if sell_count > 0 then format_pnl unrealized_profit else "--");
-      I.string a_border " │ ";
-      col_right 12 a_text (format_qty balance);
-      col_right 10 a_text (if hold_value > 0.01 then format_usd hold_value else "--");
-      col_right 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
-      col_right 10 a_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
-    ])
+    if is_compact then
+      close_row w (I.hcat [
+        I.string a_border_outer " │";
+        I.string A.(bg bg_color) "  ";
+        col 14 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag);
+        col 5 a_dim "--";
+        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+        price_cell;
+        I.string a_border " │ ";
+        col_right 11 a_dim "--";
+        gauge_img;
+        col_right 11 sell_price_attr sell_price_str;
+        I.string a_border " │ ";
+        col_right 10 a_text (format_qty balance);
+        col_right 10 a_text (if hold_value > 0.01 then format_usd hold_value else "--");
+      ])
+    else
+      close_row w (I.hcat [
+        I.string a_border_outer " │";
+        I.string A.(bg bg_color) "  ";
+        col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
+        col 5 a_dim "--";
+        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+        price_cell;
+        col_right 8 spread_attr spread_str;
+        I.string a_border " │ ";
+        col_right 12 a_dim "--";
+        col_right 8 a_dim "--";
+        gauge_img;
+        col_right 8 sell_dist_attr sell_dist_str;
+        col_right 12 sell_price_attr sell_price_str;
+        col_right 6 (if sell_count > 0 then a_yellow else a_dim) (add_commas (string_of_int sell_count));
+        col_right 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green else if unrealized_profit > 0.0 then a_dim else a_dim)
+          (if sell_count > 0 then format_pnl unrealized_profit else "--");
+        I.string a_border " │ ";
+        col_right 12 a_text (format_qty balance);
+        col_right 10 a_text (if hold_value > 0.01 then format_usd hold_value else "--");
+        col_right 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+        col_right 10 a_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
+      ])
   in
+
 
   let valid_balances = List.filter (fun bal_json ->
     let balance = bal_json |?> "balance" |> to_float_d 0.0 in

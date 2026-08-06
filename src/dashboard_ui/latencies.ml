@@ -68,8 +68,9 @@ let render_latencies w json =
         else 0                 (* green *)
     in
     (* Metric display order *)
-    let metric_order = ["cycle"; "orderbook"; "strategy"; "execution"] in
-    let metric_labels = ["CYCLE"; "OB"; "STRAT"; "EXEC"] in
+    let is_compact = w < 160 in
+    let metric_order = if is_compact then ["cycle"; "execution"] else ["cycle"; "orderbook"; "strategy"; "execution"] in
+    let metric_labels = if is_compact then ["CYCLE"; "EXEC"] else ["CYCLE"; "OB"; "STRAT"; "EXEC"] in
     (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
     let header_row1 = I.hcat (
       [ I.string a_border " │  ";
@@ -84,7 +85,7 @@ let render_latencies w json =
           let img = col 27 a_label s in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
-      @ [ I.string a_border " │ "; col 28 a_label "         SPIKE CAUSE        " ]
+      @ (if is_compact then [] else [ I.string a_border " │ "; col 28 a_label "         SPIKE CAUSE        " ])
     ) in
     let header_row2 = I.hcat (
       [ I.string a_border " │  ";
@@ -96,9 +97,10 @@ let render_latencies w json =
           let img = I.hcat [ col_right 9 a_dim "p50"; col_right 9 a_dim "p99"; col_right 9 a_dim "p999" ] in
           if i = 0 then img else I.hcat [ I.string a_border " │ "; img ]
         ) metric_labels
-      @ [ I.string a_border " │ "; col 28 a_dim "                            " ]
+      @ (if is_compact then [] else [ I.string a_border " │ "; col 28 a_dim "                            " ])
     ) in
     let header = I.vcat [close_row w header_row1; close_row w header_row2] in
+
     let rows = List.mapi (fun i (symbol, metrics) ->
       let bg_color = if (i mod 2 = 1) then c_panel else c_bg in
       
@@ -182,6 +184,47 @@ let render_latencies w json =
         | Some data -> data |?> "max_cause" |> to_string_d "--"
         | None -> "--"
       in
+
+      let formatted_cause =
+        if cycle_cause = "--" || cycle_cause = "" then col 28 a_dim "--"
+        else
+          let tags = ref [] in
+          if String.length cycle_cause >= 7 && String.sub cycle_cause 0 7 = "ob:true" then
+            tags := I.string (A.(fg c_cyan ++ bg bg_color ++ st bold)) "[OB]" :: !tags;
+          (try
+            if String.sub cycle_cause (String.index cycle_cause 's') 7 = "st:true" then
+              tags := I.string (A.(fg c_yellow ++ bg bg_color ++ st bold)) "[STRAT]" :: !tags
+          with _ -> ());
+          (try
+            let idx = String.index cycle_cause 'e' in
+            if String.sub cycle_cause idx 3 = "ex:" then
+              let rest = String.sub cycle_cause (idx + 3) (String.length cycle_cause - idx - 3) in
+              let num_str = match String.split_on_char ' ' rest with h :: _ -> h | [] -> "0" in
+              let n = int_of_string num_str in
+              if n > 0 then tags := I.string (A.(fg c_magenta ++ bg bg_color ++ st bold)) (Printf.sprintf "[EXEC:%d]" n) :: !tags
+          with _ -> ());
+          (try
+            let idx = String.index cycle_cause 'a' in
+            if String.sub cycle_cause idx 3 = "al:" then
+              let rest = String.sub cycle_cause (idx + 3) (String.length cycle_cause - idx - 3) in
+              let word_str = match String.split_on_char ' ' rest with h :: _ -> h | [] -> "" in
+              if word_str <> "" then
+                tags := I.string a_dim (Printf.sprintf "[%s]" word_str) :: !tags
+          with _ -> ());
+          if String.contains cycle_cause 'g' then begin
+            (try
+              let idx = String.index cycle_cause 'g' in
+              let gc_sub = String.sub cycle_cause idx (min 6 (String.length cycle_cause - idx)) in
+              if gc_sub = "gc:MAJ" then tags := I.string (A.(fg c_red ++ bg bg_color ++ st bold)) "[GC:MAJ]" :: !tags
+              else if gc_sub = "gc:MIN" then tags := I.string (A.(fg c_yellow ++ bg bg_color ++ st bold)) "[GC:MIN]" :: !tags
+              else if gc_sub = "gc:CMP" then tags := I.string (A.(fg c_red ++ bg bg_color ++ st bold)) "[GC:CMP]" :: !tags
+            with _ -> ())
+          end;
+          if !tags = [] then col 28 a_dim (truncate_string 28 cycle_cause)
+          else
+            let tag_img = I.hcat (List.rev_map (fun t -> I.hcat [t; I.string A.(bg bg_color) " "]) !tags) in
+            I.hsnap ~align:`Left 28 tag_img
+      in
       
       let exch = exch_of_symbol symbol in
       let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
@@ -195,8 +238,9 @@ let render_latencies w json =
           trend_spark;
           I.string a_border " │ " ]
         @ metric_cells
-        @ [ I.string a_border " │ "; col 28 a_dim (truncate_string 28 cycle_cause) ]
+        @ (if is_compact then [] else [ I.string a_border " │ "; formatted_cause ])
       ))
     ) active_lats in
+
     let title = section_title w "PERFORMANCE" in
     I.vcat (title :: header :: rows @ [section_footer w])

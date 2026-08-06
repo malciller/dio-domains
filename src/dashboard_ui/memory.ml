@@ -45,10 +45,11 @@ let render_memory w json =
     let ratio = pressure_hist.(offset) in
     
     let v = 
-      if ratio <= 1.05 then
-        int_of_float ((ratio /. 1.05) *. 8.0)
+      if ratio <= 0.0 then 0
+      else if ratio <= 1.0 then
+        int_of_float ((ratio /. 1.0) *. 8.0)
       else
-        8 + int_of_float (((ratio -. 1.05) /. 0.3) *. 8.0)
+        8 + int_of_float (((min 1.5 ratio -. 1.0) /. 0.5) *. 8.0)
     in
     let v = max 0 (min 16 v) in
     let t_idx, b_idx = if v <= 8 then (0, v) else (v - 8, 8) in
@@ -57,8 +58,9 @@ let render_memory w json =
     let s_bot = pressure_blocks.(b_idx) in
 
     let attr = 
-      if ratio <= 1.05 then A.(fg c_green ++ bg c_bg)
-      else if ratio <= 1.35 then A.(fg c_yellow ++ bg c_bg)
+      if ratio <= 0.0 then A.(fg c_dim ++ bg c_bg)
+      else if ratio <= 1.0 then A.(fg c_green ++ bg c_bg)
+      else if ratio <= 1.25 then A.(fg c_yellow ++ bg c_bg)
       else A.(fg c_red ++ bg c_bg)
     in
     
@@ -105,3 +107,24 @@ let render_memory w json =
     kv "FRAGS" (string_of_int frags);
   ] in
   I.vcat [title; close_row w row1; close_row w row2; close_row w row3; close_row w row4; section_footer w]
+
+let render_memory_card w json =
+  let mem = json |?> "memory" in
+  let heap    = mem |?> "heap_mb"     |> to_int_d 0 in
+  let live    = mem |?> "live_kb"     |> to_int_d 0 in
+  let free    = mem |?> "free_kb"     |> to_int_d 0 in
+  let major   = mem |?> "gc_major"    |> to_int_d 0 in
+  let minor   = mem |?> "gc_minor"    |> to_int_d 0 in
+  let compact = mem |?> "compactions" |> to_int_d 0 in
+
+  let total_kb = float_of_int (live + free) in
+  let live_ratio = if total_kb > 0.0 then (float_of_int live) /. total_kb else 0.0 in
+  let max_seen_heap = max !max_seen_heap_ref heap in
+  max_seen_heap_ref := max_seen_heap;
+  let heap_ratio = if max_seen_heap > 0 then float_of_int heap /. float_of_int max_seen_heap else 0.0 in
+
+  let row1 = I.hcat [ col 10 a_dim "HEAP"; col_right 10 a_yellow (Printf.sprintf "%dMB" heap); I.string a_dim " "; render_progress_bar 12 heap_ratio a_yellow ] in
+  let row2 = I.hcat [ col 10 a_dim "LIVE"; col_right 10 a_green (Printf.sprintf "%dKB" live); I.string a_dim " "; render_progress_bar 12 live_ratio a_green ] in
+  let row3 = I.hcat [ col 10 a_dim "GC COUNTS"; col_right 10 a_text (Printf.sprintf "maj:%d min:%d cmp:%d" major minor compact) ] in
+  render_card w "MEMORY & GC" [row1; row2; row3]
+
