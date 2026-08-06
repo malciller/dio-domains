@@ -95,8 +95,8 @@ let monitor_loop () =
                            outside US equity extended hours (4 AM – 8 PM ET).
                            The connect_fn itself will sleep until the next
                            open window, so there's nothing for the monitor to do. *)
-                        if String.equal conn.name "ibkr_gateway"
-                           && not (Ibkr.Market_hours.is_market_open ()) then
+                        if (String.equal conn.name "ibkr_gateway" && not (Ibkr.Market_hours.is_market_open ()))
+                           || ((String.equal conn.name "alpaca_data_ws" || String.equal conn.name "alpaca_trading_ws") && not (Alpaca.Market_hours.is_market_open ())) then
                           ()  (* Market closed — suppress reconnection *)
                         else begin
                           (* Exponential backoff: 0s, 2s, 4s, 8s, ... capped at 30s (300s for IBKR and Lighter) *)
@@ -154,8 +154,8 @@ let monitor_loop () =
                           (* IBKR market hours gate: don't restart against a
                              closed gateway — let the monitor's Failed handler
                              defer reconnection to the next market open. *)
-                          if String.equal conn.name "ibkr_gateway"
-                             && not (Ibkr.Market_hours.is_market_open ()) then begin
+                          if (String.equal conn.name "ibkr_gateway" && not (Ibkr.Market_hours.is_market_open ()))
+                             || ((String.equal conn.name "alpaca_data_ws" || String.equal conn.name "alpaca_trading_ws") && not (Alpaca.Market_hours.is_market_open ())) then begin
                             Logging.info_f ~section "[%s] Market closed, deferring reconnection" conn.name;
                             set_state conn (Failed "Market closed")
                           end else

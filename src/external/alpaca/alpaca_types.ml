@@ -13,6 +13,7 @@ module Config = struct
 
   let is_paper = ref true
   let data_feed = ref "iex" (* "iex" or "sip" *)
+  let extended_hours = ref true
 
   let set_testnet testnet =
     is_paper := testnet;
@@ -22,6 +23,10 @@ module Config = struct
   let set_data_feed feed =
     data_feed := (if String.lowercase_ascii feed = "sip" then "sip" else "iex");
     Logging.info_f ~section "Alpaca data feed set to %s" !data_feed
+
+  let set_extended_hours enabled =
+    extended_hours := enabled;
+    Logging.info_f ~section "Alpaca extended hours trading set to %B" enabled
 
   let rest_base_url () =
     if !is_paper then "https://paper-api.alpaca.markets"
@@ -33,6 +38,9 @@ module Config = struct
 
   let data_ws_url () =
     Printf.sprintf "wss://stream.data.alpaca.markets/v2/%s" !data_feed
+
+  let data_rest_url () =
+    "https://data.alpaca.markets"
 end
 
 type order_status =

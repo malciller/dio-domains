@@ -4,7 +4,12 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
-module Config = Alpaca_types.Config
+module Config = struct
+  include Alpaca_types.Config
+  let set_testnet testnet =
+    Alpaca_types.Config.set_testnet testnet;
+    Alpaca_market_hours.paper_mode := testnet
+end
 
 module Alpaca_impl = struct
   let name = "alpaca"

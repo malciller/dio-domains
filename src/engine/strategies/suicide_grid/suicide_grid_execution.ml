@@ -113,6 +113,12 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
       Hashtbl.reset state.amend_cooldowns;
       Logging.warn_f ~section "amend_cooldowns exceeded 100 entries for %s, reset" asset.symbol
     end
+  end;
+
+  if Hashtbl.length state.evicted_orders > 0 then begin
+    let to_remove = ref [] in
+    Hashtbl.iter (fun k v -> if now > v then to_remove := k :: !to_remove) state.evicted_orders;
+    List.iter (Hashtbl.remove state.evicted_orders) !to_remove
   end
 
 (** Scans open orders feed, updates local sell tracking, and debounces ghost buy orders. *)
@@ -132,6 +138,7 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
     if List.length state.recently_injected_sells > 20 then
       state.recently_injected_sells <- take 20 state.recently_injected_sells
   end;
+
   let preserved_sells = state.recently_injected_sells in
   state.open_sell_orders <- [];
 
@@ -179,42 +186,29 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
   );
 
   if !open_buy_count_from_scan = 0 && not state.inflight_cancel_buy && not state.inflight_buy then begin
-    if (now -. state.last_order_time > 3.0) then begin
-      (match state.last_buy_order_id with
-       | Some _ghost_id ->
-           let missing_key = "missing_buy" in
-           let first_missing = match Hashtbl.find_opt state.amend_cooldowns missing_key with
-             | Some ts -> ts
-             | None -> Hashtbl.replace state.amend_cooldowns missing_key now; now
-           in
-           if now -. first_missing > 10.0 then begin
-             set_asset_reserved_quote state 0.0;
-             state.last_buy_order_id <- None;
-             state.last_buy_order_price <- None;
-             Hashtbl.remove state.amend_cooldowns missing_key;
-             Logging.info_f ~section "Ghost buy order cleared for %s after 10s absence" asset.symbol
-           end
-       | None ->
-           set_asset_reserved_quote state 0.0;
-           Hashtbl.remove state.amend_cooldowns "missing_buy")
-    end
-  end else begin
-    Hashtbl.remove state.amend_cooldowns "missing_buy";
-    if not state.inflight_cancel_buy && not state.inflight_buy && not state.inflight_amend_buy then begin
-      (match !best_buy_id with
-       | Some best_order_id ->
-           let best_price = !best_buy_price in
-           let recent_amend = match Hashtbl.find_opt state.amend_cooldowns best_order_id with
-             | Some expiry -> (now -. expiry) < 5.0
-             | None -> false
-           in
-           if not recent_amend then begin
-             state.last_buy_order_price <- Some best_price;
-             state.last_buy_order_id <- Some best_order_id;
-             set_asset_reserved_quote state (best_price *. lot_qty)
-           end
-       | None -> ())
-    end
+    (match !best_buy_id with
+     | Some oid ->
+         Logging.warn_f ~section
+           "GHOST_BUY_DETECTED [%s] order %s @ %.2f in memory, but not in open orders feed. Clearing."
+           asset.symbol oid !best_buy_price;
+         state.last_buy_order_id <- None;
+         state.last_buy_order_price <- None;
+         set_asset_reserved_quote state 0.0
+     | None -> ())
+  end else if not state.inflight_cancel_buy && not state.inflight_buy && not state.inflight_amend_buy then begin
+    (match !best_buy_id with
+     | Some best_order_id ->
+         let best_price = !best_buy_price in
+         let recent_amend = match Hashtbl.find_opt state.amend_cooldowns best_order_id with
+           | Some expiry -> (now -. expiry) < 5.0
+           | None -> false
+         in
+         if not recent_amend then begin
+           state.last_buy_order_price <- Some best_price;
+           state.last_buy_order_id <- Some best_order_id;
+           set_asset_reserved_quote state (best_price *. lot_qty)
+         end
+     | None -> ())
   end;
 
   if ecfg.merge_preserved_sells then begin
@@ -231,9 +225,11 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
     if stale_sells <> [] then begin
       List.iter (fun (oid, price, qty) ->
         Logging.warn_f ~section
-          "STALE_SELL_DETECTED [%s] order %s @ %.2f <= bid %.2f (qty=%.8f). Evicting from tracking memory."
+          "STALE_SELL_DETECTED [%s] order %s @ %.2f <= bid %.2f (qty=%.8f). Evicting from tracking memory and cancelling on exchange."
           asset.symbol oid price bid_price qty;
-        Hashtbl.replace state.evicted_orders oid (now +. 86400.0)
+        Hashtbl.replace state.evicted_orders oid (now +. 30.0);
+        let cancel_order = create_cancel_order oid asset.symbol Grid asset.exchange in
+        ignore (push_order ~now ~state cancel_order)
       ) stale_sells;
 
       state.open_sell_orders <- List.filter (fun (oid, _, _) ->
@@ -287,9 +283,16 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
     let buy_price = if bid_price > 0.0 then min raw_buy_price bid_price else raw_buy_price in
     let buy_cooldown_key = "place_Buy" in
     let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
+    let has_crossing_sell =
+      List.exists (fun (_, price, _) -> price <= buy_price || (bid_price > 0.0 && price <= bid_price)) state.open_sell_orders
+      || Hashtbl.length state.evicted_orders > 0
+    in
 
     if state.capital_low then begin
       Logging.debug_f ~section "Buy placement skipped for %s: capital_low flag is set"
+        asset.symbol
+    end else if has_crossing_sell then begin
+      Logging.debug_f ~section "Buy placement deferred for %s: active or evicted sell order price <= buy_price/bid (wash trade protection)"
         asset.symbol
     end else if not (Float.is_nan quote_balance) then begin
       if is_buy_on_cooldown || state.inflight_buy then begin
@@ -392,8 +395,9 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
             let current_buy_price_rounded = state.cached_round_price current_buy_price in
             let price_diff_rounded = state.cached_round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) in
             let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
+            let should_amend = exact_target_rounded > current_buy_price_rounded || (bid_price > 0.0 && bid_price < current_buy_price) in
 
-            if amend_allowed ~state ~order_id:buy_order_id ~target_price:exact_target_rounded
+            if should_amend && amend_allowed ~state ~order_id:buy_order_id ~target_price:exact_target_rounded
                  ~current_price_rounded:current_buy_price_rounded
                  ~price_diff:price_diff_rounded ~min_move_threshold then begin
               let quote_bal = quote_balance in
@@ -641,7 +645,10 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     end
   end;
   if asset.exchange = "alpaca" && ecfg.sell_uses_mult && ecfg.remaintain_expired_sells
-     && not (Float.is_nan asset_balance) then begin
+     && not (Float.is_nan asset_balance)
+     && not (has_active_sell state)
+     && not state.inflight_sell
+     && not (InFlightOrders.is_in_flight state.duplicate_key_sell) then begin
     let sell_mult = state.cached_sell_mult in
     let sell_lot = round_qty (qty *. sell_mult) asset.symbol asset.exchange in
     let total_in_sells = locked_in_sells +.
@@ -650,9 +657,7 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
           String.starts_with ~prefix:"pending_sell_" id
         ) state.open_sell_orders)) in
     let available_for_excess = asset_balance -. state.reserved_base -. total_in_sells in
-    if sell_lot > 0.0 && available_for_excess >= sell_lot
-       && not state.inflight_sell
-       && not (InFlightOrders.is_in_flight state.duplicate_key_sell) then begin
+    if sell_lot > 0.0 && available_for_excess >= sell_lot then begin
       let ref_price = if bid_price > 0.0 then bid_price else ask_price in
       let excess_sell_price = calculate_grid_price ref_price asset.grid_interval true state in
       let excess_sell_price = if ask_price > 0.0 then max excess_sell_price ask_price
