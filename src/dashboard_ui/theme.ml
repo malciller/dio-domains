@@ -62,12 +62,43 @@ let format_duration secs =
   else if s < 86400 then Printf.sprintf "%dh%02dm" (s / 3600) ((s mod 3600) / 60)
   else Printf.sprintf "%dd%02dh" (s / 86400) ((s mod 86400) / 3600)
 
+let subscript_digit = function
+  | '0' -> "₀" | '1' -> "₁" | '2' -> "₂" | '3' -> "₃" | '4' -> "₄"
+  | '5' -> "₅" | '6' -> "₆" | '7' -> "₇" | '8' -> "₈" | '9' -> "₉"
+  | c -> String.make 1 c
+
+let format_subscript_zeros count sig_digits =
+  let count_str = string_of_int count in
+  let sub_str = String.concat "" (List.init (String.length count_str) (fun i -> subscript_digit count_str.[i])) in
+  "$0.0" ^ sub_str ^ sig_digits
+
 let format_price f =
-  let raw =
-    if f >= 1.0 then Printf.sprintf "$%.2f" f
-    else Printf.sprintf "$%.4f" f
-  in
-  add_commas raw
+  if f <= 0.0 then "--" else
+  if f >= 1000.0 then
+    add_commas (Printf.sprintf "$%.2f" f)
+  else if f >= 1.0 then
+    add_commas (Printf.sprintf "$%.4f" f)
+  else if f >= 0.0001 then
+    Printf.sprintf "$%.6f" f
+  else
+    let s = Printf.sprintf "%.10f" f in
+    match String.index_opt s '.' with
+    | None -> add_commas (Printf.sprintf "$%.4f" f)
+    | Some dot_idx ->
+        let rest = String.sub s (dot_idx + 1) (String.length s - dot_idx - 1) in
+        let rec count_zeros i =
+          if i >= String.length rest then i
+          else if rest.[i] = '0' then count_zeros (i + 1)
+          else i
+        in
+        let zero_cnt = count_zeros 0 in
+        if zero_cnt >= 4 then
+          let sig_part = String.sub rest zero_cnt (min 4 (String.length rest - zero_cnt)) in
+          format_subscript_zeros zero_cnt sig_part
+        else
+          Printf.sprintf "$%.6f" f
+
+
 
 let format_usd f =
   let raw =
@@ -76,12 +107,29 @@ let format_usd f =
   in
   add_commas raw
 
+let trim_zeros s =
+  if String.contains s '.' then
+    let len = String.length s in
+    let rec find_end i =
+      if i <= 0 then i
+      else match s.[i] with
+      | '0' -> find_end (i - 1)
+      | '.' -> i - 1
+      | _ -> i
+    in
+    let last_idx = find_end (len - 1) in
+    String.sub s 0 (last_idx + 1)
+  else s
+
 let format_qty f =
   let raw =
-    if f >= 1.0 then Printf.sprintf "%.4f" f
-    else Printf.sprintf "%.6f" f
+    if f >= 1000.0 then Printf.sprintf "%.2f" f
+    else if f >= 1.0 then Printf.sprintf "%.4f" f
+    else if f >= 0.0001 then Printf.sprintf "%.6f" f
+    else Printf.sprintf "%.8f" f
   in
-  add_commas raw
+  trim_zeros (add_commas raw)
+
 
 let format_pnl f =
   let raw =
@@ -126,6 +174,7 @@ let c_cyan       = A.rgb_888 ~r:125 ~g:207 ~b:255
 let c_dim        = A.rgb_888 ~r:86  ~g:95  ~b:137
 let c_near_fill  = A.rgb_888 ~r:29  ~g:42  ~b:60
 let c_near_sell  = A.rgb_888 ~r:65  ~g:35  ~b:55
+let c_magenta    = A.rgb_888 ~r:226 ~g:104 ~b:160
 
 (* Per-exchange brand colors (adapted for dark mode) *)
 let c_exch_hl    = A.rgb_888 ~r:73  ~g:177 ~b:121
@@ -219,7 +268,7 @@ let render_progress_bar w ratio attr =
   let fill_w = int_of_float (float (max 0 (w - 2)) *. ratio) in
   let fill_w = max 0 (min (w - 2) fill_w) in
   let empty_w = w - 2 - fill_w in
-  let fill_str = String.concat "" (List.init fill_w (fun _ -> "⣿")) in
+  let fill_str = String.concat "" (List.init fill_w (fun _ -> "█")) in
   let empty_str = String.concat "" (List.init empty_w (fun _ -> "─")) in
   I.hcat [
     I.string a_border "[";
@@ -286,6 +335,70 @@ let section_footer w =
   I.string A.(fg c_border ++ bg c_bg) (" ╰──" ^ Buffer.contents pad_buf ^ "╯")
 
 let close_row target_w img =
-  let d = target_w - I.width img - 2 in
-  let d = max 0 d in
-  I.hcat [ img; I.void d 1; I.string A.(fg c_border ++ bg c_bg) " │" ]
+  let max_inner = max 0 (target_w - 2) in
+  let img_cropped = I.hsnap ~align:`Left max_inner img in
+  I.hcat [ img_cropped; I.string A.(fg c_border ++ bg c_bg) " │" ]
+
+let render_proximity_slider w pos_pct_opt =
+  let inner_w = max 3 (w - 2) in
+  match pos_pct_opt with
+  | None ->
+      let mid_w = inner_w / 2 in
+      let left_dashes = String.concat "" (List.init mid_w (fun _ -> "─")) in
+      let right_dashes = String.concat "" (List.init (inner_w - 1 - mid_w) (fun _ -> "─")) in
+      I.hcat [
+        I.string a_border "├";
+        I.string a_dim left_dashes;
+        I.string a_cyan "•";
+        I.string a_dim right_dashes;
+        I.string a_border "┤";
+      ]
+  | Some pos ->
+      let clamped = max 0.0 (min 100.0 pos) in
+      let dot_idx = int_of_float ((clamped /. 100.0) *. float (inner_w - 1)) in
+      let dot_idx = max 0 (min (inner_w - 1) dot_idx) in
+      let left_w = dot_idx in
+      let right_w = inner_w - 1 - left_w in
+      let dot_attr =
+        if clamped <= 20.0 then A.(fg c_green ++ st bold)
+        else if clamped >= 80.0 then A.(fg c_red ++ st bold)
+        else A.(fg c_cyan ++ st bold)
+      in
+      I.hcat [
+        I.string a_green "┠";
+        I.string a_green (String.concat "" (List.init left_w (fun _ -> "━")));
+        I.string dot_attr "◈";
+        I.string a_red (String.concat "" (List.init right_w (fun _ -> "━")));
+        I.string a_red "┨";
+      ]
+
+let render_card w title content_rows =
+  let title_str = " ╭── " ^ title ^ " " in
+  let title_img = I.string A.(fg c_title ++ bg c_bg ++ st bold) title_str in
+  let title_len = I.width title_img in
+  let fill_w = max 0 (w - title_len - 1) in
+  let top_bar = I.hcat [
+    title_img;
+    I.string A.(fg c_border ++ bg c_bg) (String.concat "" (List.init fill_w (fun _ -> "─")));
+    I.string A.(fg c_border ++ bg c_bg) "╮";
+  ] in
+  let inner_w = max 0 (w - 5) in
+  let body_rows = List.map (fun row_img ->
+    let row_cropped = I.hsnap ~align:`Left inner_w row_img in
+    I.hcat [
+      I.string A.(fg c_border ++ bg c_bg) " │ ";
+      row_cropped;
+      I.string A.(fg c_border ++ bg c_bg) " │";
+    ]
+  ) content_rows in
+  let bot_fill = max 0 (w - 2) in
+  let bot_bar = I.hcat [
+    I.string A.(fg c_border ++ bg c_bg) " ╰";
+    I.string A.(fg c_border ++ bg c_bg) (String.concat "" (List.init bot_fill (fun _ -> "─")));
+    I.string A.(fg c_border ++ bg c_bg) "╯";
+  ] in
+  I.vcat (top_bar :: body_rows @ [bot_bar])
+
+
+
+

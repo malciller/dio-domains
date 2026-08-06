@@ -260,15 +260,20 @@ let run () =
               Buffer.add_string buf "\027[?2026h";
               Buffer.add_string buf "\027[H";
               let content_img =
-                  I.vcat [
-                    Ticker_feed.render_ticker w !last_json;
-                    Recent_fills_feed.render_fills w !last_json;
-                    Memory.render_memory w !last_json;
-                    Holdings.render_strategies w !last_json;
-                    Latencies.render_latencies w !last_json;
-                    Footer.render_footer w !last_json;
-                  ]
+                let uncropped = I.vcat [
+                  Kpi_cards.render_kpi_cards w !last_json;
+                  Ticker_feed.render_ticker w !last_json;
+                  Holdings.render_strategies w !last_json;
+                  Recent_fills_feed.render_fills w !last_json;
+                  Memory.render_memory w !last_json;
+                  Latencies.render_latencies w !last_json;
+                  Footer.render_footer w !last_json;
+                ] in
+                I.hsnap ~align:`Left w uncropped
               in
+
+
+
               let c_h = I.height content_img in
               let c_w = I.width content_img in
               let content_img = 
