@@ -86,6 +86,11 @@ module Alpaca_impl = struct
       ?retry_config:_
       () =
     let is_fractional = match qty with Some q -> Float.floor q <> q | None -> false in
+    let remove_old_order orig_id =
+      match symbol with
+      | Some s -> Alpaca_executions.remove_open_order s orig_id
+      | None -> List.iter (fun s -> Alpaca_executions.remove_open_order s orig_id) (Alpaca_executions.get_all_symbols ())
+    in
     let perform_rest_amend () =
       Alpaca_rest.amend_order
         ~order_id
@@ -95,6 +100,7 @@ module Alpaca_impl = struct
         ()
       >|= function
       | Ok res ->
+          remove_old_order res.original_order_id;
           Ok {
             Types.original_order_id = res.original_order_id;
             new_order_id = res.new_order_id;
@@ -108,6 +114,7 @@ module Alpaca_impl = struct
         order_id sym (match side with Alpaca_types.Buy -> "buy" | Sell -> "sell") q lp;
       Alpaca_rest.cancel_order order_id >>= function
       | Ok _ ->
+          remove_old_order order_id;
           Alpaca_rest.place_order
             ~symbol:sym
             ~qty:q
