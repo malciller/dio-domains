@@ -106,7 +106,7 @@
     {
       "symbol": "QQQ",
       "exchange": "alpaca",
-      "qty": "1.0",
+      "qty": "0.025",
       "grid_interval": [
         0.25,
         0.75

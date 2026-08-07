@@ -172,6 +172,7 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price:_ ~lot_qty
 
   let best_buy_price = ref 0.0 in
   let best_buy_id = ref None in
+  let best_buy_qty = ref 0.0 in
   let open_buy_count_from_scan = ref 0 in
   let has_recent_amend_buy = ref false in
   let locked_in_buys = ref 0.0 in
@@ -190,7 +191,8 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price:_ ~lot_qty
         locked_in_buys := !locked_in_buys +. (price *. qty);
         if price > !best_buy_price && price > 0.0 then begin
           best_buy_price := price;
-          best_buy_id := Some oid
+          best_buy_id := Some oid;
+          best_buy_qty := qty
         end;
         (match Hashtbl.find_opt state.amend_cooldowns oid with
          | Some expiry when now_time < expiry -> has_recent_amend_buy := true
@@ -266,14 +268,14 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price:_ ~lot_qty
 
 
 
-  (!open_buy_count_from_scan, !has_recent_amend_buy, !locked_in_buys, !locked_in_sells, !closest_sell_order)
+  (!open_buy_count_from_scan, !has_recent_amend_buy, !locked_in_buys, !locked_in_sells, !closest_sell_order, !best_buy_qty)
 
 let compute_buy_ref_price ~bid_price ~ask_price =
   if bid_price > 0.0 then bid_price else ask_price
 
 (** Evaluates buy placement, multi-buy cancellation, and buy trailing. *)
 let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price ~quote_balance
-    ~cycle ~iter_open_orders ~open_buy_count_from_scan ~has_recent_amend_buy ~locked_in_buys ~closest_sell_order_initial =
+    ~cycle ~iter_open_orders ~open_buy_count_from_scan ~has_recent_amend_buy ~locked_in_buys ~closest_sell_order_initial ~pending_buy_qty_from_scan =
   let buy_attempted = ref false in
   let buy_order_pending = List.exists (fun (_, side, _, _) -> side = Buy) state.pending_orders in
   let has_tracked_buy = state.last_buy_order_id <> None in
@@ -370,6 +372,8 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
     ) state.pending_orders;
 
     let closest_sell_order_val = !closest_sell_ref in
+    let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
+    let qty_mismatch = is_alpaca && pending_buy_qty_from_scan > 0.0 && abs_float (pending_buy_qty_from_scan -. qty) > 1e-6 in
     if closest_sell_order_val <> None then begin
       match closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id with
       | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
@@ -387,15 +391,30 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
           let price_diff_rounded = state.cached_round_price (abs_float (target_buy_price -. current_buy_price_rounded)) in
           let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
 
-          if target_buy_price > current_buy_price then begin
-            if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
-                 ~current_price_rounded:current_buy_price_rounded
-                 ~price_diff:price_diff_rounded ~min_move_threshold then begin
+          if target_buy_price > current_buy_price || qty_mismatch then begin
+            let allow =
+              if qty_mismatch then
+                let is_being_amended = List.exists (fun (id, _, _, _) ->
+                  String.starts_with ~prefix:"pending_amend_" id &&
+                  String.sub id 14 (String.length id - 14) = buy_order_id
+                ) state.pending_orders in
+                let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+                let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
+                not is_being_amended && not is_in_flight && not is_on_cooldown
+              else
+                amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
+                     ~current_price_rounded:current_buy_price_rounded
+                     ~price_diff:price_diff_rounded ~min_move_threshold
+            in
+            if allow then begin
               let quote_bal = quote_balance in
               if not (Float.is_nan quote_balance) && can_place_buy_order qty quote_bal quote_needed then begin
                 let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                 ignore (push_order ~now ~state order);
                 state.last_buy_order_price <- Some target_buy_price;
+                if qty_mismatch then
+                  Logging.info_f ~section "Alpaca pending buy order %s qty (%.8f) differs from config (%.8f) - amending price to config target %.4f and qty to %.8f"
+                    buy_order_id pending_buy_qty_from_scan qty target_buy_price qty;
                 ()
               end else if not (Float.is_nan quote_balance) then begin
                 Logging.warn_f ~section "Insufficient quote balance for %s trailing: need %.2f, have %.2f"
@@ -412,19 +431,34 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
           let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
           let raw_target = calculate_grid_price ref_price grid_interval false state in
           let target_buy_price = if bid_price > 0.0 then min raw_target bid_price else raw_target in
-          if target_buy_price > current_buy_price then begin
+          if target_buy_price > current_buy_price || qty_mismatch then begin
             let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
             let current_buy_price_rounded = state.cached_round_price current_buy_price in
             let price_diff_rounded = state.cached_round_price (abs_float (target_buy_price -. current_buy_price_rounded)) in
 
-            if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
-                 ~current_price_rounded:current_buy_price_rounded
-                 ~price_diff:price_diff_rounded ~min_move_threshold then begin
+            let allow =
+              if qty_mismatch then
+                let is_being_amended = List.exists (fun (id, _, _, _) ->
+                  String.starts_with ~prefix:"pending_amend_" id &&
+                  String.sub id 14 (String.length id - 14) = buy_order_id
+                ) state.pending_orders in
+                let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
+                let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
+                not is_being_amended && not is_in_flight && not is_on_cooldown
+              else
+                amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
+                     ~current_price_rounded:current_buy_price_rounded
+                     ~price_diff:price_diff_rounded ~min_move_threshold
+            in
+            if allow then begin
               let quote_bal = quote_balance in
               if not (Float.is_nan quote_balance) && can_place_buy_order qty quote_bal quote_needed then begin
                 let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                 ignore (push_order ~now ~state order);
                 state.last_buy_order_price <- Some target_buy_price;
+                if qty_mismatch then
+                  Logging.info_f ~section "Alpaca pending buy order %s qty (%.8f) differs from config (%.8f) - amending price to config target %.4f and qty to %.8f"
+                    buy_order_id pending_buy_qty_from_scan qty target_buy_price qty;
                 ()
               end else if not (Float.is_nan quote_balance) then begin
                 Logging.warn_f ~section "Insufficient quote balance to trail buy: need %.2f, have %.2f"
@@ -722,7 +756,7 @@ let execute_strategy
 
       cleanup_pending_and_cooldowns ~state ~now ~asset;
 
-      let (open_buy_count_from_scan, has_recent_amend_buy, locked_in_buys, locked_in_sells, closest_sell_order) =
+      let (open_buy_count_from_scan, has_recent_amend_buy, locked_in_buys, locked_in_sells, closest_sell_order, pending_buy_qty_from_scan) =
         sync_open_orders ~state ~now ~asset ~bid_price ~lot_qty ~iter_open_orders ~ecfg
       in
 
@@ -741,7 +775,7 @@ let execute_strategy
       end else begin
         let buy_attempted = evaluate_buy_leg ~state ~now ~asset ~bid_price ~ask_price ~quote_balance
             ~cycle ~iter_open_orders ~open_buy_count_from_scan ~has_recent_amend_buy ~locked_in_buys
-            ~closest_sell_order_initial:closest_sell_order
+            ~closest_sell_order_initial:closest_sell_order ~pending_buy_qty_from_scan
         in
 
         evaluate_sell_leg ~state ~now ~asset ~bid_price ~ask_price ~asset_balance ~buy_attempted ~ecfg ~locked_in_sells
