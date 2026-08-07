@@ -408,7 +408,7 @@ let ensure_connection ?on_failure ?on_connected token =
 
       Lwt.return `Wait
     end else begin
-      Logging.info ~section "Starting new connection";
+      Logging.debug ~section "Starting new connection";
       state.connecting <- true;
       Lwt.return `Connect
     end

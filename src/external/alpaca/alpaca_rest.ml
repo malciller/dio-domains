@@ -167,7 +167,7 @@ let amend_order
   in
   let req_body = `Assoc assoc |> Yojson.Safe.to_string in
   let headers = make_headers () in
-  Logging.info_f ~section "Amending Alpaca order %s" order_id;
+  Logging.debug_f ~section "Amending Alpaca order %s" order_id;
   Lwt.catch (fun () ->
     Cohttp_lwt_unix.Client.patch ~headers ~body:(Cohttp_lwt.Body.of_string req_body) url >>= (fun (resp, body) ->
       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
@@ -202,7 +202,7 @@ let cancel_order order_id =
   let base_url = Config.rest_base_url () in
   let url = Uri.of_string (Printf.sprintf "%s/v2/orders/%s" base_url order_id) in
   let headers = make_headers () in
-  Logging.info_f ~section "Cancelling Alpaca order %s" order_id;
+  Logging.debug_f ~section "Cancelling Alpaca order %s" order_id;
   Lwt.catch (fun () ->
     Cohttp_lwt_unix.Client.delete ~headers url >>= (fun (resp, body) ->
       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in

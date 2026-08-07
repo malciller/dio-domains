@@ -81,7 +81,7 @@ let register ~name ~connect_fn =
   } in
   Hashtbl.replace connections name conn;
   Mutex.unlock registry_mutex;
-  Logging.info_f ~section "Registered supervised connection: %s" name;
+  Logging.debug_f ~section "Registered supervised connection: %s" name;
   conn
 
 (** Registers an existing connection for health monitoring only.
@@ -107,7 +107,7 @@ let register_for_monitoring ~name =
   } in
   Hashtbl.replace connections name conn;
   Mutex.unlock registry_mutex;
-  Logging.info_f ~section "Registered connection for monitoring: %s" name;
+  Logging.debug_f ~section "Registered connection for monitoring: %s" name;
   conn
 
 (** Transitions connection to [new_state], updating timestamps and counters
@@ -136,7 +136,7 @@ let set_state conn new_state =
       Logging.warn_f ~section "[%s] Connection lost" conn.name
   | Connecting ->
       conn.last_connecting <- Some (Unix.time ());
-      Logging.info_f ~section "[%s] Attempting connection (attempt #%d)"
+      Logging.debug_f ~section "[%s] Attempting connection (attempt #%d)"
           conn.name (conn.reconnect_attempts + 1)
   | Failed reason ->
       conn.last_disconnected <- Some (Unix.time ());
@@ -274,7 +274,7 @@ let start_async conn =
               Mutex.unlock conn.mutex;
               
 
-              Logging.info_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num;
+              Logging.debug_f ~section "[%s] Attempting connection (attempt #%d)" conn.name attempt_num;
 
               
               let now = Unix.gettimeofday () in
@@ -283,7 +283,7 @@ let start_async conn =
                 last_supervisor_cache_update := now;
                 Supervisor_cache.force_update ()
               end;
-              Logging.info_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num;
+              Logging.debug_f ~section "[%s] Starting supervised connection (attempt #%d)" conn.name attempt_num;
               true, Some attempt_num
             end
       in

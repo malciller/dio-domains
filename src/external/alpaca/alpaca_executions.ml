@@ -323,16 +323,16 @@ let handle_message_str content =
           let data = item |> member "data" in
           let status = data |> member "status" |> to_string_option |> Option.value ~default:"" in
           let action = data |> member "action" |> to_string_option |> Option.value ~default:"" in
-          Logging.info_f ~section "Alpaca Trading WS authorization status: %s (action: %s)" status action
+          Logging.debug_f ~section "Alpaca Trading WS authorization status: %s (action: %s)" status action
       | "listening" ->
           let data = item |> member "data" in
           let streams = data |> member "streams" |> to_list |> List.filter_map to_string_option in
-          Logging.info_f ~section "Alpaca Trading WS listening on streams: [%s]" (String.concat ", " streams)
+          Logging.debug_f ~section "Alpaca Trading WS listening on streams: [%s]" (String.concat ", " streams)
       | "error" ->
           let msg = item |> member "data" |> member "message" |> to_string_option |> Option.value ~default:"" in
           Logging.error_f ~section "Alpaca Trading WS error: %s" msg
       | other ->
-          Logging.info_f ~section "Alpaca Trading WS frame (%s): %s" other (Yojson.Safe.to_string item)
+          Logging.debug_f ~section "Alpaca Trading WS frame (%s): %s" other (Yojson.Safe.to_string item)
     ) items
   with exn ->
     Logging.error_f ~section "Failed to parse Alpaca trading WS frame: %s (content: %s)"
@@ -365,7 +365,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
         ("secret_key", `String (Alpaca_types.Config.api_secret ()));
       ]);
     ] |> Yojson.Safe.to_string in
-    Logging.info ~section "Sending Alpaca Trading WS authentication...";
+    Logging.debug ~section "Sending Alpaca Trading WS authentication...";
     Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ()) >>= fun () ->
 
     (* Listen on trade_updates *)
@@ -375,7 +375,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
         ("streams", `List [`String "trade_updates"]);
       ]);
     ] |> Yojson.Safe.to_string in
-    Logging.info ~section "Sending Alpaca Trading WS listen request for trade_updates...";
+    Logging.debug ~section "Sending Alpaca Trading WS listen request for trade_updates...";
     Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:listen_msg ()) >>= fun () ->
 
     on_connected ();

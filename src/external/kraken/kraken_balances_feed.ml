@@ -640,7 +640,7 @@ let start_message_handler _conn _token _on_failure _on_heartbeat =
 (** Subscribes to the balances channel on the unified authenticated WebSocket connection.
     Registers a ring buffer consumer to process incoming balance messages. *)
 let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
-  Logging.info ~section "Registering balances subscription on unified authenticated connection";
+  Logging.debug ~section "Registering balances subscription on unified authenticated connection";
   
   let subscribe_msg = `Assoc [
     ("method", `String "subscribe");
@@ -718,7 +718,7 @@ let initialize assets =
   Mutex.unlock balance_stores_mutex;
 
   Atomic.set initialized true;
-  Logging.info ~section "Balance stores initialized - now thread-safe";
+  Logging.debug ~section "Balance stores initialized - now thread-safe";
   ()
 
 (** Logs warnings for any assets whose balance data exceeds the staleness threshold. *)

@@ -158,7 +158,7 @@ let load_reserved_base ~symbol =
   let result = state.reserved_base in
   Mutex.unlock cache_mutex;
   if result > 0.0 then
-    Logging.info_f ~section "Loaded reserved_base=%.8f for %s" result symbol;
+    Logging.debug_f ~section "Loaded reserved_base=%.8f for %s" result symbol;
   result
 
 (** Loads accumulated_profit for a symbol. Returns 0.0 if absent. Acquires cache_mutex. *)
@@ -169,7 +169,7 @@ let load_accumulated_profit ~symbol =
   let result = state.accumulated_profit in
   Mutex.unlock cache_mutex;
   if result > 0.0 then
-    Logging.info_f ~section "Loaded accumulated_profit=%.6f for %s" result symbol;
+    Logging.debug_f ~section "Loaded accumulated_profit=%.6f for %s" result symbol;
   result
 
 (** Loads last_fill_oid for a symbol. Returns [None] if absent. Acquires cache_mutex. *)
@@ -180,7 +180,7 @@ let load_last_fill_oid ~symbol =
   let result = state.last_fill_oid in
   Mutex.unlock cache_mutex;
   (match result with
-   | Some oid -> Logging.info_f ~section "Loaded last_fill_oid=%s for %s" oid symbol
+   | Some oid -> Logging.debug_f ~section "Loaded last_fill_oid=%s for %s" oid symbol
    | None -> ());
   result
 
@@ -192,7 +192,7 @@ let load_last_buy_fill_price ~symbol =
   let result = state.last_buy_fill_price in
   Mutex.unlock cache_mutex;
   (match result with
-   | Some price -> Logging.info_f ~section "Loaded last_buy_fill_price=%.8f for %s" price symbol
+   | Some price -> Logging.debug_f ~section "Loaded last_buy_fill_price=%.8f for %s" price symbol
    | None -> ());
   result
 
@@ -204,7 +204,7 @@ let load_last_sell_fill_price ~symbol =
   let result = state.last_sell_fill_price in
   Mutex.unlock cache_mutex;
   (match result with
-   | Some price -> Logging.info_f ~section "Loaded last_sell_fill_price=%.8f for %s" price symbol
+   | Some price -> Logging.debug_f ~section "Loaded last_sell_fill_price=%.8f for %s" price symbol
    | None -> ());
   result
 
@@ -216,7 +216,7 @@ let load_persisted_sell_levels ~symbol =
   let result = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) state.persisted_sell_levels in
   Mutex.unlock cache_mutex;
   if result <> [] then
-    Logging.info_f ~section "Loaded %d persisted_sell_levels for %s" (List.length result) symbol;
+    Logging.debug_f ~section "Loaded %d persisted_sell_levels for %s" (List.length result) symbol;
   result
 
 (** Helper function that performs the actual read-modify-write cycle on disk under file_mutex. *)

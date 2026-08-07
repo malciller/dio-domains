@@ -141,7 +141,7 @@ module Strategy = struct
     Mutex.lock state.mutex;
     if state.startup_replay then begin
       state.startup_replay <- false;
-      Logging.info_f ~section "Startup replay complete for %s (last_fill_oid=%s, accumulated_profit=%.6f)"
+      Logging.debug_f ~section "Startup replay complete for %s (last_fill_oid=%s, accumulated_profit=%.6f)"
         symbol
         (Option.value state.last_fill_oid ~default:"none")
         state.accumulated_profit;
