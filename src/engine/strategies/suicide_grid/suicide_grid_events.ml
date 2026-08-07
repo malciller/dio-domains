@@ -156,9 +156,13 @@ let handle_order_rejected ~now:_ asset_symbol side price =
            not (String.starts_with ~prefix:"pending_sell_" oid)
          ) state.open_sell_orders;
          if state.persisted_sell_levels <> [] then begin
-           state.persisted_sell_levels <- List.filter (fun (sp, _) ->
-             abs_float (sp -. price) > (price *. 0.005)
-           ) state.persisted_sell_levels;
+           let rec remove_one acc found = function
+             | [] -> List.rev acc
+             | (sp, _sq) :: rest when not found && (abs_float (sp -. price) <= (price *. 0.0001) || abs_float (sp -. price) <= 1e-4) ->
+                 remove_one acc true rest
+             | item :: rest -> remove_one (item :: acc) found rest
+           in
+           state.persisted_sell_levels <- remove_one [] false state.persisted_sell_levels;
            state.persistence_dirty <- true
          end);
 
@@ -301,7 +305,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
             if state.persisted_sell_levels <> [] then begin
               let rec remove_one acc found = function
                 | [] -> List.rev acc
-                | (sp, _sq) :: rest when not found && abs_float (sp -. sell_fill_price) <= (sell_fill_price *. 0.01) ->
+                | (sp, _sq) :: rest when not found && (abs_float (sp -. sell_fill_price) <= (sell_fill_price *. 0.0001) || abs_float (sp -. sell_fill_price) <= 1e-4) ->
                     remove_one acc true rest
                 | item :: rest -> remove_one (item :: acc) found rest
               in
@@ -470,14 +474,19 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
          state.open_sell_orders <- (new_order_id, price, old_qty) ::
             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
          state.recently_injected_sells <- (new_order_id, price, now) :: state.recently_injected_sells;
-         (match old_entry with
-          | Some (_, old_p, _) when state.persisted_sell_levels <> [] ->
-              let filtered = List.filter (fun (sp, _) -> abs_float (sp -. old_p) > (old_p *. 0.005)) state.persisted_sell_levels in
-              let already_in_stack = List.exists (fun (p, _) -> abs_float (p -. price) <= (price *. 0.005)) filtered in
-              let updated = if already_in_stack then filtered else (price, old_qty) :: filtered in
-              state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) updated;
-              state.persistence_dirty <- true
-          | _ -> ());
+          (match old_entry with
+           | Some (_, old_p, _) when state.persisted_sell_levels <> [] ->
+               let rec remove_one acc found = function
+                 | [] -> List.rev acc
+                 | (sp, _sq) :: rest when not found && (abs_float (sp -. old_p) <= (old_p *. 0.0001) || abs_float (sp -. old_p) <= 1e-4) ->
+                     remove_one acc true rest
+                 | item :: rest -> remove_one (item :: acc) found rest
+               in
+               let filtered = remove_one [] false state.persisted_sell_levels in
+               let updated = (price, old_qty) :: filtered in
+               state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) updated;
+               state.persistence_dirty <- true
+           | _ -> ());
          Logging.info_f ~section "SELL_AMEND [%s] result: sells_after=%d"
            asset_symbol (List.length state.open_sell_orders));
 

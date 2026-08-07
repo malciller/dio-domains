@@ -6,6 +6,31 @@ open Suicide_grid_config
 open Suicide_grid_reservation
 open Suicide_grid_orders
 
+(** Performs 1-to-1 multiset matching between persisted sell levels and open sell orders.
+    Returns (open_levels, missing_levels). *)
+let partition_persisted_sell_levels persisted open_orders =
+  let open_matched = Array.make (List.length open_orders) false in
+  let open_orders_arr = Array.of_list open_orders in
+  let open_acc = ref [] in
+  let missing_acc = ref [] in
+  List.iter (fun ((target_p, _target_q) as level) ->
+    let found = ref None in
+    for i = 0 to Array.length open_orders_arr - 1 do
+      if !found = None && not open_matched.(i) then begin
+        let (_, open_p, _open_q) = open_orders_arr.(i) in
+        if abs_float (open_p -. target_p) <= (target_p *. 0.0001) || abs_float (open_p -. target_p) <= 1e-4 then
+          found := Some i
+      end
+    done;
+    match !found with
+    | Some idx ->
+        open_matched.(idx) <- true;
+        open_acc := level :: !open_acc
+    | None ->
+        missing_acc := level :: !missing_acc
+  ) persisted;
+  (List.rev !open_acc, List.rev !missing_acc)
+
 (** Evaluates asset balance recovery and clears asset_low when available balance is restored. *)
 let evaluate_asset_low_recovery ~state ~ecfg ~(asset : trading_config) ~asset_balance ~lot_qty =
   if not (Float.is_nan asset_balance) then begin
@@ -149,6 +174,7 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
   let closest_sell_order = ref None in
+  let matched_persisted_indices = Hashtbl.create 16 in
 
   iter_open_orders (fun oid price qty side_str userref_opt ->
     let is_our_strategy = match userref_opt with
@@ -170,12 +196,21 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
         state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
         locked_in_sells := !locked_in_sells +. qty;
         if ecfg.remaintain_expired_sells then begin
-          let existing_opt = List.find_opt (fun (p, _) -> abs_float (p -. price) <= (price *. 0.005)) state.persisted_sell_levels in
-          match existing_opt with
-          | Some (existing_p, existing_q) ->
+          let match_idx = ref None in
+          List.iteri (fun idx (p, _q) ->
+            if !match_idx = None && not (Hashtbl.mem matched_persisted_indices idx) then begin
+              if abs_float (p -. price) <= (price *. 0.0001) || abs_float (p -. price) <= 1e-4 then
+                match_idx := Some idx
+            end
+          ) state.persisted_sell_levels;
+          match !match_idx with
+          | Some idx ->
+              Hashtbl.add matched_persisted_indices idx ();
+              let (_existing_p, existing_q) = List.nth state.persisted_sell_levels idx in
               if abs_float (existing_q -. qty) > 1e-6 then begin
-                let filtered = List.filter (fun (p, _) -> abs_float (p -. existing_p) > (existing_p *. 0.005)) state.persisted_sell_levels in
-                state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) ((price, qty) :: filtered);
+                state.persisted_sell_levels <- List.mapi (fun i item ->
+                  if i = idx then (price, qty) else item
+                ) state.persisted_sell_levels;
                 state.persistence_dirty <- true;
                 Logging.info_f ~section "Updated persisted sell level quantity for %s @ %.4f: %.8f -> %.8f"
                   asset.symbol price existing_q qty
@@ -245,9 +280,15 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
       ) state.open_sell_orders;
 
       if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] then begin
-        state.persisted_sell_levels <- List.filter (fun (sp, _) ->
-          not (List.exists (fun (_, stale_p, _) -> abs_float (sp -. stale_p) <= (stale_p *. 0.005)) stale_sells)
-        ) state.persisted_sell_levels;
+        List.iter (fun (_oid, stale_p, _stale_q) ->
+          let rec remove_one acc found = function
+            | [] -> List.rev acc
+            | (sp, _sq) :: rest when not found && (abs_float (sp -. stale_p) <= (stale_p *. 0.0001) || abs_float (sp -. stale_p) <= 1e-4) ->
+                remove_one acc true rest
+            | item :: rest -> remove_one (item :: acc) found rest
+          in
+          state.persisted_sell_levels <- remove_one [] false state.persisted_sell_levels
+        ) stale_sells;
         state.persistence_dirty <- true
       end;
 
@@ -481,10 +522,7 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     let available_for_missing_sells =
       max 0.0 (asset_balance +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells)
     in
-    let is_open (target_p, _) =
-      List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders
-    in
-    let (open_levels, missing_levels) = List.partition is_open state.persisted_sell_levels in
+    let (open_levels, missing_levels) = partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders in
     let missing_desc = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels in
     let rem_avail = ref available_for_missing_sells in
     let kept_missing = ref [] in
@@ -517,14 +555,12 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
   in
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells then
+      let (_, missing_lvl_check) = partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders in
       not (has_active_sell state)
       && available_base >= min_needed_base
       && (
         state.just_filled_buy || buy_attempted || state.resuming_after_balance_flag ||
-        (state.persisted_sell_levels <> [] &&
-         List.exists (fun (target_p, _q) ->
-           not (List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders)
-         ) state.persisted_sell_levels) ||
+        missing_lvl_check <> [] ||
         (state.open_sell_orders = [] && Option.is_some state.last_buy_fill_price)
       )
     else
@@ -545,9 +581,7 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     (* Determine target price & qty for sell placement *)
     let (target_sell_price_opt, target_sell_qty_override) =
       if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] then
-        let missing_levels = List.filter (fun (target_p, _q) ->
-          not (List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders)
-        ) state.persisted_sell_levels in
+        let (_, missing_levels) = partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders in
         let missing_sorted_desc = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels in
         match missing_sorted_desc with
         | (tp, tq) :: _ -> (Some tp, Some tq)
@@ -606,15 +640,27 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     let available = asset_bal +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells_local in
     let (effective_sell_qty, balance_ok) =
       if is_alpaca then
-        let avail_rounded = round_qty available asset.symbol asset.exchange in
-        let sell_q = avail_rounded in
-        if sell_q > 0.0 then (sell_q, true)
-        else begin
-          Logging.debug_f ~section
-            "Sell order blocked for Alpaca %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) <= 0"
-            asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local;
-          (0.0, false)
-        end
+        match target_sell_qty_override with
+        | Some tq ->
+            let rounded_tq = round_qty tq asset.symbol asset.exchange in
+            if available >= (rounded_tq -. 1e-6) && rounded_tq > 0.0 then
+              (rounded_tq, true)
+            else begin
+              Logging.debug_f ~section
+                "Sell order blocked for Alpaca %s: available %.8f < target_q %.8f"
+                asset.symbol available rounded_tq;
+              (0.0, false)
+            end
+        | None ->
+            let avail_rounded = round_qty available asset.symbol asset.exchange in
+            let sell_q = avail_rounded in
+            if sell_q > 0.0 then (sell_q, true)
+            else begin
+              Logging.debug_f ~section
+                "Sell order blocked for Alpaca %s: available %.8f (bal %.8f + anticipated %.8f - reserved %.8f - locked_sells %.8f) <= 0"
+                asset.symbol available asset_bal state.anticipated_base_credit state.reserved_base locked_in_sells_local;
+              (0.0, false)
+            end
       else if ecfg.use_accumulation_sells && ecfg.use_reserved_base_guard then
         if available >= sell_qty then
           (sell_qty, true)
@@ -659,8 +705,7 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
       if push_order ~now ~state sell_order then begin
         state.asset_low <- false;
         if ecfg.remaintain_expired_sells then begin
-          let filtered = List.filter (fun (p, _) -> abs_float (p -. sell_price) > (sell_price *. 0.005)) state.persisted_sell_levels in
-          state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) ((sell_price, effective_sell_qty) :: filtered);
+          state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) ((sell_price, effective_sell_qty) :: state.persisted_sell_levels);
           state.persistence_dirty <- true
         end;
         if is_accumulation_sell then begin
