@@ -27,7 +27,7 @@ order execution.
 - [Development](#development)
 - [Contributing](#contributing)
 
----t
+---
 
 ## Requirements
 
