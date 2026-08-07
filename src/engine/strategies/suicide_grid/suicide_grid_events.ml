@@ -154,17 +154,7 @@ let handle_order_rejected ~now:_ asset_symbol side price =
          state.inflight_sell <- false;
          state.open_sell_orders <- List.filter (fun (oid, _, _) ->
            not (String.starts_with ~prefix:"pending_sell_" oid)
-         ) state.open_sell_orders;
-         if state.persisted_sell_levels <> [] then begin
-           let rec remove_one acc found = function
-             | [] -> List.rev acc
-             | (sp, _sq) :: rest when not found && (abs_float (sp -. price) <= (price *. 0.0001) || abs_float (sp -. price) <= 1e-4) ->
-                 remove_one acc true rest
-             | item :: rest -> remove_one (item :: acc) found rest
-           in
-           state.persisted_sell_levels <- remove_one [] false state.persisted_sell_levels;
-           state.persistence_dirty <- true
-         end);
+         ) state.open_sell_orders);
 
     let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
