@@ -127,7 +127,8 @@ let handle_order_failed ~now asset_symbol side reason =
          if is_wash_trade then
            Logging.warn_f ~section "Buy rejected for %s due to wash trade conflict - cooling down buy placement for 10s" asset_symbol;
          Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. cooldown)
-     | Sell -> ());
+     | Sell ->
+         Hashtbl.replace state.amend_cooldowns "place_Sell" (now +. cooldown));
 
     Logging.warn_f ~section "Order failed for %s (%s): %s. Cleared in-flight tracker."
       asset_symbol (string_of_order_side side) reason
@@ -333,9 +334,13 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
                   Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
                     asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
                 end;
-                state.last_sell_fill_price <- Some sell_fill_price
+                state.last_sell_fill_price <- Some sell_fill_price;
+                if state.open_sell_orders = [] && state.persisted_sell_levels = [] then
+                  state.last_buy_fill_price <- None
             | _ ->
-                state.last_sell_fill_price <- Some sell_fill_price)
+                state.last_sell_fill_price <- Some sell_fill_price;
+                if state.open_sell_orders = [] && state.persisted_sell_levels = [] then
+                  state.last_buy_fill_price <- None)
        | Buy -> ());
 
       let should_update_oid = match state.last_fill_oid with

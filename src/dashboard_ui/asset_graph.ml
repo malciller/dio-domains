@@ -133,7 +133,7 @@ let render_asset_detail w h asset_key json =
       msg
   | Some a ->
       let exch_tag = exch_tag_of a.exchange in
-      let title_str = Printf.sprintf "15-MIN PRICE TIME SERIES & DOCKED ORDERS: %s (%s)" a.symbol exch_tag in
+      let title_str = Printf.sprintf "%s (%s)" a.symbol exch_tag in
       let header_bar = section_title w title_str in
 
       (* Extract market data *)
@@ -316,12 +316,194 @@ let render_asset_detail w h asset_key json =
       in
 
       (* Available canvas dimensions *)
+      let ob_col_w = max 24 (w / 5) in
+      let chart_area_w = max 35 (w - ob_col_w - 4) in
       let y_axis_w = 14 in
-      let pin_col_w = min 36 (max 26 (w / 3)) in
-      let canvas_w = max 20 (w - y_axis_w - pin_col_w - 4) in
+      let pin_col_w = min 32 (max 18 (chart_area_w / 3)) in
+      let canvas_w = max 15 (chart_area_w - y_axis_w - pin_col_w - 4) in
       let canvas_h = max 8 (h - 8) in
       let sub_h = canvas_h * 4 in
       let sub_w = canvas_w * 2 in
+
+      (* Extract L2 orderbook depth *)
+      let ob_bids_json = market |?> "bids" |> to_list_d in
+      let ob_asks_json = market |?> "asks" |> to_list_d in
+      let ob_bids_raw = List.filter_map (fun s ->
+        let p = s |?> "price" |> to_float_d 0.0 in
+        let q = s |?> "qty" |> to_float_d 0.0 in
+        if p > 0.0 then Some (p, q) else None
+      ) ob_bids_json in
+      let ob_asks_raw = List.filter_map (fun s ->
+        let p = s |?> "price" |> to_float_d 0.0 in
+        let q = s |?> "qty" |> to_float_d 0.0 in
+        if p > 0.0 then Some (p, q) else None
+      ) ob_asks_json in
+
+      (* Fallbacks if orderbook feed has single top-of-book level or is synthetic *)
+      let ob_asks_clean =
+        if ob_asks_raw <> [] then ob_asks_raw
+        else if ask > 0.0 then
+          List.init 5 (fun i -> (ask *. (1.0 +. float i *. 0.001), 1.0))
+        else []
+      in
+      let ob_bids_clean =
+        if ob_bids_raw <> [] then ob_bids_raw
+        else if bid > 0.0 then
+          List.init 5 (fun i -> (bid *. (1.0 -. float i *. 0.001), 1.0))
+        else []
+      in
+
+      (* Extract trade prints if present (e.g. for Alpaca or trade feeds) *)
+      let ob_trades_json = market |?> "trades" |> to_list_d in
+      let ob_trades_raw = List.filter_map (fun s ->
+        let p = s |?> "price" |> to_float_d 0.0 in
+        let q = s |?> "qty" |> to_float_d 0.0 in
+        let ts = s |?> "timestamp" |> to_float_d 0.0 in
+        let side = s |?> "side" |> to_string_d "trade" in
+        if p > 0.0 then Some (p, q, ts, side) else None
+      ) ob_trades_json in
+
+      let is_alpaca = String.equal (String.lowercase_ascii a.exchange) "alpaca" in
+      let show_trade_prints = is_alpaca || ob_trades_raw <> [] in
+
+      (* Calculate orderbook sidebar lines *)
+      let ob_rows = Array.make canvas_h (I.string A.(fg c_bg ++ bg c_bg) (String.make ob_col_w ' ')) in
+      let has_fill_footer = canvas_h >= 10 in
+      let bot_fill_rows = if has_fill_footer then 1 else 0 in
+      let avail_level_rows = max 2 (canvas_h - 2 - bot_fill_rows) in
+      let ask_rows_cnt = max 1 (avail_level_rows / 2) in
+      let bid_rows_cnt = max 1 (avail_level_rows - ask_rows_cnt) in
+
+      if show_trade_prints then begin
+        ob_rows.(0) <- I.string A.(fg c_title ++ bg c_bg ++ st bold) (pad_right ob_col_w " ══ RECENT TRADES ══");
+        if canvas_h > 1 then
+          ob_rows.(1) <- I.string A.(fg c_dim ++ bg c_bg) (pad_right ob_col_w " TIME     PRICE      QTY");
+
+        if ob_trades_raw = [] then begin
+          if canvas_h > 2 then
+            ob_rows.(2) <- I.string A.(fg c_dim ++ bg c_bg) (pad_right ob_col_w "  Waiting for trades...")
+        end else begin
+          let avail_rows = canvas_h - 2 in
+          let trades_to_show = List.filteri (fun i _ -> i < avail_rows) ob_trades_raw in
+          List.iteri (fun idx (p, q, ts, side) ->
+            let r = 2 + idx in
+            if r < canvas_h then begin
+              let time_str =
+                if ts > 0.0 then
+                  let tm = Unix.localtime ts in
+                  Printf.sprintf "%02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
+                else "--:--:--"
+              in
+              let p_str = format_price p in
+              let q_str = format_qty q in
+              let attr =
+                match String.lowercase_ascii side with
+                | "buy" -> A.(fg c_cyan ++ bg c_bg)
+                | "sell" -> A.(fg c_magenta ++ bg c_bg)
+                | _ -> A.(fg c_text ++ bg c_bg)
+              in
+              let line_txt = Printf.sprintf " %s  %s  %s" time_str p_str q_str in
+              ob_rows.(r) <- I.string attr (pad_right ob_col_w line_txt)
+            end
+          ) trades_to_show
+        end
+      end else begin
+        (* Sort asks ascending (best ask at bottom near mid, higher asks on top) *)
+        let sorted_asks = List.sort (fun (p1, _) (p2, _) -> compare p1 p2) ob_asks_clean in
+        let asks_to_show =
+          let taken = List.filteri (fun i _ -> i < ask_rows_cnt) sorted_asks in
+          List.rev taken
+        in
+
+        (* Sort bids descending (best bid on top near mid, lower bids below) *)
+        let sorted_bids = List.sort (fun (p1, _) (p2, _) -> compare p2 p1) ob_bids_clean in
+        let bids_to_show = List.filteri (fun i _ -> i < bid_rows_cnt) sorted_bids in
+
+        let max_ask_q = List.fold_left (fun acc (_, q) -> max acc q) 0.0 ob_asks_clean in
+        let max_bid_q = List.fold_left (fun acc (_, q) -> max acc q) 0.0 ob_bids_clean in
+
+        (* Top Title *)
+        ob_rows.(0) <- I.string A.(fg c_title ++ bg c_bg ++ st bold) (pad_right ob_col_w " ══ L2 ORDER BOOK ══");
+
+        (* Fill Asks *)
+        List.iteri (fun idx (p, q) ->
+          let r = 1 + idx in
+          if r < 1 + ask_rows_cnt && r < canvas_h then begin
+            let has_my_sell = List.exists (fun (_, up, _) -> abs_float (up -. p) /. p < 0.0005) sell_orders in
+            let p_str = format_price p in
+            let q_str = format_qty q in
+            let bar_max_len = max 3 (ob_col_w - String.length p_str - String.length q_str - (if has_my_sell then 8 else 4)) in
+            let bar_len = if max_ask_q > 0.0 then max 1 (int_of_float ((q /. max_ask_q) *. float bar_max_len)) else 1 in
+            let bar_str = repeat_utf8 "█" bar_len in
+            let line_img =
+              if has_my_sell then
+                let line_txt = Printf.sprintf " %s %s " p_str q_str in
+                I.hcat [
+                  I.string A.(fg c_magenta ++ bg c_bg ++ st bold) line_txt;
+                  I.string A.(fg c_magenta ++ bg c_bg) bar_str;
+                  I.string A.(fg c_yellow ++ bg c_bg ++ st bold) " ★MY";
+                ]
+              else
+                let line_txt = Printf.sprintf " %s %s " p_str q_str in
+                I.hcat [
+                  I.string A.(fg c_magenta ++ bg c_bg) line_txt;
+                  I.string A.(fg c_magenta ++ bg c_bg) bar_str;
+                ]
+            in
+            ob_rows.(r) <- I.hsnap ~align:`Left ob_col_w line_img
+          end
+        ) asks_to_show;
+
+        (* Mid / Spread Banner *)
+        let mid_row_idx = 1 + ask_rows_cnt in
+        if mid_row_idx < canvas_h then begin
+          let spread = if ask > 0.0 && bid > 0.0 then max 0.0 (ask -. bid) else 0.0 in
+          let sprd_str = if spread > 0.0 then Printf.sprintf " (±%s)" (format_price spread) else "" in
+          let mid_str = Printf.sprintf "▶ MID %s%s" (format_price mid) sprd_str in
+          ob_rows.(mid_row_idx) <- I.string A.(fg c_bg ++ bg c_green ++ st bold) (pad_right ob_col_w mid_str)
+        end;
+
+        (* Fill Bids *)
+        List.iteri (fun idx (p, q) ->
+          let r = mid_row_idx + 1 + idx in
+          if r < canvas_h - bot_fill_rows then begin
+            let has_my_buy = List.exists (fun (_, up, _) -> abs_float (up -. p) /. p < 0.0005) buy_orders in
+            let p_str = format_price p in
+            let q_str = format_qty q in
+            let bar_max_len = max 3 (ob_col_w - String.length p_str - String.length q_str - (if has_my_buy then 8 else 4)) in
+            let bar_len = if max_bid_q > 0.0 then max 1 (int_of_float ((q /. max_bid_q) *. float bar_max_len)) else 1 in
+            let bar_str = repeat_utf8 "█" bar_len in
+            let line_img =
+              if has_my_buy then
+                let line_txt = Printf.sprintf " %s %s " p_str q_str in
+                I.hcat [
+                  I.string A.(fg c_cyan ++ bg c_bg ++ st bold) line_txt;
+                  I.string A.(fg c_cyan ++ bg c_bg) bar_str;
+                  I.string A.(fg c_yellow ++ bg c_bg ++ st bold) " ★MY";
+                ]
+              else
+                let line_txt = Printf.sprintf " %s %s " p_str q_str in
+                I.hcat [
+                  I.string A.(fg c_cyan ++ bg c_bg) line_txt;
+                  I.string A.(fg c_cyan ++ bg c_bg) bar_str;
+                ]
+            in
+            ob_rows.(r) <- I.hsnap ~align:`Left ob_col_w line_img
+          end
+        ) bids_to_show;
+      end;
+
+      (* Bottom Fill Footprint *)
+      if has_fill_footer then begin
+        let fill_idx = canvas_h - 1 in
+        let fill_str =
+          if last_buy_fill > 0.0 && last_sell_fill > 0.0 then Printf.sprintf " B:%s S:%s" (format_price last_buy_fill) (format_price last_sell_fill)
+          else if last_buy_fill > 0.0 then Printf.sprintf " L.BUY: %s" (format_price last_buy_fill)
+          else if last_sell_fill > 0.0 then Printf.sprintf " L.SELL: %s" (format_price last_sell_fill)
+          else " NO RECENT FILLS"
+        in
+        ob_rows.(fill_idx) <- I.string A.(fg c_dim ++ bg c_bg) (pad_right ob_col_w fill_str)
+      end;
 
       let price_to_sub_y p =
         let ratio = (max_p -. p) /. (max 0.000001 (max_p -. min_p)) in
@@ -334,69 +516,107 @@ let render_asset_detail w h asset_key json =
         min (canvas_h - 1) (sy / 4)
       in
 
-      let raw_mid_row = price_to_row mid in
+      let mid_row = price_to_row mid in
 
-      let has_sells = sell_orders <> [] in
-      let has_buys = buy_orders <> [] || (a.is_strategy && (strat_json |?> "buy_price" |> to_float_d 0.0) > 0.0) in
-
-      let mid_row =
-        let r = raw_mid_row in
-        let r = if has_sells && r = 0 && canvas_h > 1 then 1 else r in
-        let r = if has_buys && r = canvas_h - 1 && canvas_h > 1 then canvas_h - 2 else r in
-        r
-      in
-
-      (* Group sell orders by canvas row, ensuring they are placed strictly ABOVE mid_row (smaller row index) *)
+      (* Group sell orders by exact canvas row *)
       let sell_by_row = Hashtbl.create 16 in
       List.iter (fun (id, p, q) ->
-        let r_raw = price_to_row p in
-        let r = min (mid_row - 1) r_raw in
-        let r = max 0 r in
+        let r = price_to_row p in
         let existing = try Hashtbl.find sell_by_row r with Not_found -> [] in
         Hashtbl.replace sell_by_row r ((id, p, q) :: existing)
       ) sell_orders;
 
-      (* Group buy orders by canvas row, ensuring they are placed strictly BELOW mid_row (larger row index) *)
+      (* Group buy orders by exact canvas row *)
       let buy_by_row = Hashtbl.create 16 in
       List.iter (fun (id, p, q) ->
-        let r_raw = price_to_row p in
-        let r = max (mid_row + 1) r_raw in
-        let r = min (canvas_h - 1) r in
+        let r = price_to_row p in
         let existing = try Hashtbl.find buy_by_row r with Not_found -> [] in
         Hashtbl.replace buy_by_row r ((id, p, q) :: existing)
       ) buy_orders;
 
-      let get_assigned_row_for_price p =
-        if abs_float (p -. mid) < 0.000001 then mid_row
-        else if p > mid then
-          let r_raw = price_to_row p in
-          if has_sells then max 0 (min (mid_row - 1) r_raw) else r_raw
-        else
-          let r_raw = price_to_row p in
-          if has_buys then min (canvas_h - 1) (max (mid_row + 1) r_raw) else r_raw
+      (* Subpixel line drawing algorithm on 2x4 braille grid *)
+      let draw_line grid x0 y0 x1 y1 =
+        let dx = abs (x1 - x0) in
+        let dy = abs (y1 - y0) in
+        let sx = if x0 < x1 then 1 else -1 in
+        let sy = if y0 < y1 then 1 else -1 in
+        let err = ref (dx - dy) in
+        let x = ref x0 in
+        let y = ref y0 in
+        let loop = ref true in
+        while !loop do
+          if !x >= 0 && !x < sub_w && !y >= 0 && !y < sub_h then
+            grid.(!x).(!y) <- true;
+          if !x = x1 && !y = y1 then loop := false
+          else begin
+            let e2 = 2 * !err in
+            if e2 > -dy then (err := !err - dy; x := !x + sx);
+            if e2 < dx then (err := !err + dx; y := !y + sy);
+          end
+        done
       in
 
-      let price_to_aligned_sub_y p =
-        let sy_raw = price_to_sub_y p in
-        let r_raw = sy_raw / 4 in
-        let target_r = get_assigned_row_for_price p in
-        if target_r = r_raw then sy_raw
-        else
-          let offset = sy_raw mod 4 in
-          let sy = target_r * 4 + offset in
-          max 0 (min (sub_h - 1) sy)
-      in
-
-      (* Plot live price & order level dots across 15m timeline aligned with target pin rows. *)
+      (* Plot live price & order level continuous curves across 15m timeline *)
+      let mid_grid = Array.make_matrix sub_w sub_h false in
+      let buy_grid = Array.make_matrix sub_w sub_h false in
+      let sell_grid = Array.make_matrix sub_w sub_h false in
       let mid_sub_y = Array.make sub_w (-1) in
-      let buy_sub_y_list = Array.make sub_w [] in
-      let sell_sub_y_list = Array.make sub_w [] in
+
+      (* Connect pin traces across time using 1-to-1 greedy matching within threshold. *)
+      let connect_pin_traces grid sub_y_list =
+        let max_delta = 5 in
+        for sx = 0 to sub_w - 2 do
+          let sys0 = sub_y_list.(sx) in
+          let sys1 = sub_y_list.(sx + 1) in
+          match sys0, sys1 with
+          | [], [] -> ()
+          | l0, [] -> List.iter (fun sy -> draw_line grid sx sy sx sy) l0
+          | [], l1 -> List.iter (fun sy -> draw_line grid (sx + 1) sy (sx + 1) sy) l1
+          | l0, l1 ->
+              let l0_idx = List.mapi (fun i sy -> (i, sy)) l0 in
+              let l1_idx = List.mapi (fun j sy -> (j, sy)) l1 in
+              let candidates =
+                List.concat_map (fun (i, sy0) ->
+                  List.filter_map (fun (j, sy1) ->
+                    let d = abs (sy0 - sy1) in
+                    if d <= max_delta then Some (i, sy0, j, sy1, d) else None
+                  ) l1_idx
+                ) l0_idx
+              in
+              let sorted = List.sort (fun (_, _, _, _, d1) (_, _, _, _, d2) -> compare d1 d2) candidates in
+              let used0 = Hashtbl.create 8 in
+              let used1 = Hashtbl.create 8 in
+              List.iter (fun (i, sy0, j, sy1, _) ->
+                if not (Hashtbl.mem used0 i || Hashtbl.mem used1 j) then begin
+                  Hashtbl.add used0 i true;
+                  Hashtbl.add used1 j true;
+                  draw_line grid sx sy0 (sx + 1) sy1
+                end
+              ) sorted;
+              List.iter (fun (i, sy0) ->
+                if not (Hashtbl.mem used0 i) then draw_line grid sx sy0 sx sy0
+              ) l0_idx;
+              List.iter (fun (j, sy1) ->
+                if not (Hashtbl.mem used1 j) then draw_line grid (sx + 1) sy1 (sx + 1) sy1
+              ) l1_idx
+        done;
+        if sub_w > 0 then
+          List.iter (fun sy -> draw_line grid (sub_w - 1) sy (sub_w - 1) sy) sub_y_list.(sub_w - 1)
+      in
 
       (match hist_points with
        | [] ->
-           mid_sub_y.(sub_w - 1) <- price_to_aligned_sub_y mid;
-           buy_sub_y_list.(sub_w - 1) <- List.map (fun (_, p, _) -> price_to_aligned_sub_y p) buy_orders;
-           sell_sub_y_list.(sub_w - 1) <- List.map (fun (_, p, _) -> price_to_aligned_sub_y p) sell_orders
+           let sy_mid = price_to_sub_y mid in
+           draw_line mid_grid 0 sy_mid (sub_w - 1) sy_mid;
+           for sx = 0 to sub_w - 1 do mid_sub_y.(sx) <- sy_mid done;
+           List.iter (fun (_, p, _) ->
+             let sy = price_to_sub_y p in
+             draw_line buy_grid 0 sy (sub_w - 1) sy
+           ) buy_orders;
+           List.iter (fun (_, p, _) ->
+             let sy = price_to_sub_y p in
+             draw_line sell_grid 0 sy (sub_w - 1) sy
+           ) sell_orders
        | pts ->
            let t_earliest = (List.hd pts).timestamp in
 
@@ -420,19 +640,42 @@ let render_asset_detail w h asset_key json =
                  else Some s0
            in
 
+           let buy_sub_y_list = Array.make sub_w [] in
+           let sell_sub_y_list = Array.make sub_w [] in
+
            for sx = 0 to sub_w - 1 do
              let ratio_x = float sx /. float (max 1 (sub_w - 1)) in
              let target_t = window_start +. (ratio_x *. window_seconds) in
              if target_t >= t_earliest then begin
                let p = mid_at_t target_t pts in
-               mid_sub_y.(sx) <- price_to_aligned_sub_y p;
+               mid_sub_y.(sx) <- price_to_sub_y p;
                match snap_at_t target_t pts with
                | Some snap ->
-                   buy_sub_y_list.(sx) <- List.map price_to_aligned_sub_y snap.buy_ps;
-                   sell_sub_y_list.(sx) <- List.map price_to_aligned_sub_y snap.sell_ps
+                   buy_sub_y_list.(sx) <- List.map price_to_sub_y snap.buy_ps;
+                   sell_sub_y_list.(sx) <- List.map price_to_sub_y snap.sell_ps
                | None -> ()
              end
-           done);
+           done;
+
+           (* Interpolate mid price continuous curve across columns *)
+           for sx = 0 to sub_w - 2 do
+             let sy0 = mid_sub_y.(sx) in
+             let sy1 = mid_sub_y.(sx + 1) in
+             if sy0 >= 0 && sy1 >= 0 then
+               draw_line mid_grid sx sy0 (sx + 1) sy1
+             else if sy0 >= 0 then
+               draw_line mid_grid sx sy0 sx sy0
+             else if sy1 >= 0 then
+               draw_line mid_grid (sx + 1) sy1 (sx + 1) sy1
+           done;
+           if mid_sub_y.(sub_w - 1) >= 0 then
+             let sy_last = mid_sub_y.(sub_w - 1) in
+             draw_line mid_grid (sub_w - 1) sy_last (sub_w - 1) sy_last;
+
+           (* Interpolate buy and sell order level pin traces across columns *)
+           connect_pin_traces buy_grid buy_sub_y_list;
+           connect_pin_traces sell_grid sell_sub_y_list
+      );
 
       let buy_row_opt =
         if buy_orders <> [] then
@@ -442,12 +685,7 @@ let render_asset_detail w h asset_key json =
           match buy_orders_parsed with
           | [] ->
               let bp = strat_json |?> "buy_price" |> to_float_d 0.0 in
-              if bp > 0.0 then
-                let r_raw = price_to_row bp in
-                let r = max (mid_row + 1) r_raw in
-                let r = min (canvas_h - 1) r in
-                Some r
-              else None
+              if bp > 0.0 then Some (price_to_row bp) else None
           | _ -> None
         else None
       in
@@ -461,23 +699,9 @@ let render_asset_detail w h asset_key json =
       done;
 
       show_y_label.(mid_row) <- true;
-      label_prices.(mid_row) <- mid;
-
-      (match buy_row_opt with
-       | Some br ->
-           show_y_label.(br) <- true;
-           (match buy_orders with (_, bp, _) :: _ -> label_prices.(br) <- bp | [] -> ())
-       | None -> ());
-
-      Hashtbl.iter (fun r orders ->
-        show_y_label.(r) <- true;
-        match orders with (_, p, _) :: _ -> label_prices.(r) <- p | [] -> ()
-      ) buy_by_row;
-
-      Hashtbl.iter (fun r orders ->
-        show_y_label.(r) <- true;
-        match orders with (_, p, _) :: _ -> label_prices.(r) <- p | [] -> ()
-      ) sell_by_row;
+      (match buy_row_opt with Some br -> show_y_label.(br) <- true | None -> ());
+      Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) buy_by_row;
+      Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) sell_by_row;
 
       for r = 0 to canvas_h - 1 do
         if not show_y_label.(r) && (r = 0 || r = canvas_h - 1 || r mod 4 = 0) then begin
@@ -519,10 +743,6 @@ let render_asset_detail w h asset_key json =
           let sx1 = c * 2 + 1 in
           let mid_sy0 = mid_sub_y.(sx0) in
           let mid_sy1 = mid_sub_y.(sx1) in
-          let buy_sys0 = buy_sub_y_list.(sx0) in
-          let buy_sys1 = buy_sub_y_list.(sx1) in
-          let sell_sys0 = sell_sub_y_list.(sx0) in
-          let sell_sys1 = sell_sub_y_list.(sx1) in
 
           let cell_sy_start = r * 4 in
           let mid_mask = ref 0 in
@@ -531,14 +751,14 @@ let render_asset_detail w h asset_key json =
 
           for sub_y = 0 to 3 do
             let current_sy = cell_sy_start + sub_y in
-            if mid_sy0 >= 0 && current_sy = mid_sy0 then mid_mask := !mid_mask lor braille_bit 0 sub_y;
-            if mid_sy1 >= 0 && current_sy = mid_sy1 then mid_mask := !mid_mask lor braille_bit 1 sub_y;
-
-            if List.mem current_sy buy_sys0 then buy_mask := !buy_mask lor braille_bit 0 sub_y;
-            if List.mem current_sy buy_sys1 then buy_mask := !buy_mask lor braille_bit 1 sub_y;
-
-            if List.mem current_sy sell_sys0 then sell_mask := !sell_mask lor braille_bit 0 sub_y;
-            if List.mem current_sy sell_sys1 then sell_mask := !sell_mask lor braille_bit 1 sub_y;
+            if current_sy >= 0 && current_sy < sub_h then begin
+              if mid_grid.(sx0).(current_sy) then mid_mask := !mid_mask lor braille_bit 0 sub_y;
+              if mid_grid.(sx1).(current_sy) then mid_mask := !mid_mask lor braille_bit 1 sub_y;
+              if buy_grid.(sx0).(current_sy) then buy_mask := !buy_mask lor braille_bit 0 sub_y;
+              if buy_grid.(sx1).(current_sy) then buy_mask := !buy_mask lor braille_bit 1 sub_y;
+              if sell_grid.(sx0).(current_sy) then sell_mask := !sell_mask lor braille_bit 0 sub_y;
+              if sell_grid.(sx1).(current_sy) then sell_mask := !sell_mask lor braille_bit 1 sub_y;
+            end
           done;
 
           let valid_sy =
@@ -547,28 +767,36 @@ let render_asset_detail w h asset_key json =
             else mid_sy1
           in
 
-          if !mid_mask <> 0 then
-            let str = braille_to_utf8 !mid_mask in
-            I.string A.(fg c_green ++ bg c_bg ++ st bold) str
-          else if !buy_mask <> 0 then
-            let str = braille_to_utf8 !buy_mask in
-            let pin_color = if is_synthetic_buy then c_yellow else c_cyan in
-            I.string A.(fg pin_color ++ bg c_bg ++ st bold) str
-          else if !sell_mask <> 0 then
-            let str = braille_to_utf8 !sell_mask in
-            I.string A.(fg c_magenta ++ bg c_bg ++ st bold) str
-          else if valid_sy >= 0 && cell_sy_start > valid_sy then
-            let fill_dist = float (cell_sy_start - valid_sy) /. float sub_h in
-            let fill_rgb =
-              color_blend (35, 65, 80) (26, 27, 38) (min 1.0 (fill_dist *. 1.5))
+          let is_in_liquid = valid_sy >= 0 && cell_sy_start + 2 > valid_sy in
+          let fill_dist = if is_in_liquid then float (cell_sy_start - valid_sy) /. float sub_h else 0.0 in
+          let fill_rgb = color_blend (75, 62, 32) (26, 27, 38) (min 1.0 (fill_dist *. 1.5)) in
+          let bg_attr = if is_in_liquid then A.bg fill_rgb else A.bg c_bg in
+
+          let combined_mask = !mid_mask lor !buy_mask lor !sell_mask in
+
+          if combined_mask <> 0 then
+            let str = braille_to_utf8 combined_mask in
+            let fg_color =
+              if !mid_mask <> 0 && !buy_mask <> 0 then color_blend (158, 206, 106) (125, 207, 255) 0.5
+              else if !mid_mask <> 0 && !sell_mask <> 0 then color_blend (158, 206, 106) (226, 104, 160) 0.5
+              else if !buy_mask <> 0 && !sell_mask <> 0 then color_blend (125, 207, 255) (226, 104, 160) 0.5
+              else if !mid_mask <> 0 then c_green
+              else if !buy_mask <> 0 then (if is_synthetic_buy then c_yellow else c_cyan)
+              else if !sell_mask <> 0 then c_magenta
+              else c_bright
             in
-            let fill_char = if is_grid_line && c mod 4 = 0 then "┼" else if c mod 6 = 0 then "┊" else "░" in
-            I.string A.(fg fill_rgb ++ bg c_bg) fill_char
+            I.string A.(fg fg_color ++ bg_attr ++ st bold) str
+          else if is_grid_line && c mod 8 = 0 then
+            let g_attr = if is_in_liquid then A.(fg fill_rgb ++ bg c_bg) else A.(fg c_border ++ bg c_bg) in
+            I.string g_attr "┼"
           else if is_grid_line then
-            let g_char = if c mod 8 = 0 then "┼" else "╌" in
-            I.string A.(fg c_border ++ bg c_bg) g_char
+            let g_attr = if is_in_liquid then A.(fg fill_rgb ++ bg c_bg) else A.(fg c_border ++ bg c_bg) in
+            I.string g_attr "╌"
           else if c mod 8 = 0 then
-            I.string A.(fg c_border ++ bg c_bg) "┊"
+            let g_attr = if is_in_liquid then A.(fg fill_rgb ++ bg c_bg) else A.(fg c_border ++ bg c_bg) in
+            I.string g_attr "┊"
+          else if is_in_liquid then
+            I.string A.(fg fill_rgb ++ bg c_bg) "░"
           else
             I.string A.(fg c_bg ++ bg c_bg) " "
         ) in
@@ -625,6 +853,8 @@ let render_asset_detail w h asset_key json =
 
         close_row w (
           I.hcat [
+            I.string a_border " │";
+            ob_rows.(r);
             I.string a_border " │ ";
             I.string y_attr y_label_str;
             I.string a_border " │ ";
@@ -639,6 +869,8 @@ let render_asset_detail w h asset_key json =
         let tick_bar = repeat_utf8 "─" (canvas_w + pin_col_w) in
         close_row w (
           I.hcat [
+            I.string a_border " │";
+            I.string A.(fg c_title ++ bg c_bg ++ st bold) (pad_right ob_col_w "  EXCHANGE DEPTH  ");
             I.string a_border " │ ";
             I.string A.(fg c_border ++ bg c_bg) " 15M TIME ──";
             I.string a_border " ┴─";
@@ -657,6 +889,8 @@ let render_asset_detail w h asset_key json =
         let pin_title = pad_left pin_col_w "ORDER TARGET PINS ──▶" in
         close_row w (
           I.hcat [
+            I.string a_border " │";
+            I.string a_dim (pad_right ob_col_w "  L2 BOOK FEED    ");
             I.string a_border " │ ";
             I.string a_dim "             ";
             I.string a_border "   ";
@@ -670,7 +904,7 @@ let render_asset_detail w h asset_key json =
       let num_buys = List.length buy_orders in
       let buy_summary_str = if is_synthetic_buy then "1 Est Buy" else Printf.sprintf "%d Buy" num_buys in
       let orders_summary = Printf.sprintf "(%d Sell, %s pending)" num_sells buy_summary_str in
-      let graph_title = section_title w ("15-MIN PRICE TIME SERIES & DOCKED ORDERS " ^ orders_summary) in
+      let graph_title = section_title w ("LIVE EXCHANGE ORDERBOOK & 15M PRICE HISTORY " ^ orders_summary) in
 
       let zoom_tag = if z > 0 then Printf.sprintf " [Zoom: %dx] " z else "" in
 

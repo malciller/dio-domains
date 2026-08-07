@@ -189,7 +189,11 @@ let render_strategies ?(selected_index=None) w json =
       if sp > 0.0 && sq > 0.0 then (up +. (sp *. sq), qty_acc +. sq) else (up, qty_acc)
     ) (0.0, 0.0) sell_orders in
     
-    let accum_holding = max 0.0 (base_bal -. pending_sell_qty) in
+    let accum_holding =
+      let res_base = strat |?> "reserved_base" |> to_float_d 0.0 in
+      if res_base > 0.0 then res_base
+      else max 0.0 (base_bal -. pending_sell_qty)
+    in
     let accum_hold_value = accum_holding *. mid in
 
     let buy_dist_pct =

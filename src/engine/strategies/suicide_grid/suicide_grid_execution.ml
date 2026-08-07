@@ -39,7 +39,6 @@ let evaluate_asset_low_recovery ~state ~ecfg ~(asset : trading_config) ~asset_ba
       let delta = asset_bal -. state.last_seen_asset_balance in
       state.anticipated_base_credit <- max 0.0 (state.anticipated_base_credit -. delta)
     end;
-    state.last_seen_asset_balance <- asset_bal;
 
     let qty_f = lot_qty in
     let asset_needed_fast =
@@ -54,16 +53,20 @@ let evaluate_asset_low_recovery ~state ~ecfg ~(asset : trading_config) ~asset_ba
     in
     let available_asset = asset_bal -. state.reserved_base +. state.anticipated_base_credit -. locked_in_sells in
     let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
+    state.last_seen_asset_balance <- asset_bal;
+
+    let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
     let should_clear =
       if ecfg.asset_low_requires_balance_change then
         available_asset >= asset_needed_fast && balance_actually_changed
       else
-        available_asset >= asset_needed_fast
+        available_asset >= asset_needed_fast && not is_sell_on_cooldown
     in
     if state.asset_low && should_clear then begin
       state.asset_low <- false;
       state.inflight_sell <- false;
       state.resuming_after_balance_flag <- true;
+      Hashtbl.remove state.amend_cooldowns "place_Sell";
       ignore (InFlightOrders.remove_in_flight_order (state.duplicate_key_sell));
       Logging.info_f ~section "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit %.8f, locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy placement"
         asset.symbol asset_bal state.reserved_base state.anticipated_base_credit locked_in_sells available_asset asset_needed_fast
@@ -538,7 +541,8 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     else
       state.just_filled_buy || buy_attempted
   in
-  if should_trigger_sell && not (Float.is_nan asset_balance) && not (has_active_sell state) then begin
+  let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
+  if should_trigger_sell && not (Float.is_nan asset_balance) && not (has_active_sell state) && not state.asset_low && not is_sell_on_cooldown then begin
     let asset_bal = asset_balance in
     let grid_interval = asset.grid_interval in
     let qty = venue_lot_qty state.grid_qty asset.exchange state in
@@ -670,7 +674,7 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
       let sell_order = create_order state.duplicate_key_sell asset.symbol Sell effective_sell_qty (Some sell_price) true asset.exchange in
       if push_order ~now ~state sell_order then begin
         state.asset_low <- false;
-        if ecfg.remaintain_expired_sells then begin
+        if ecfg.remaintain_expired_sells && target_sell_price_opt = None then begin
           state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) ((sell_price, effective_sell_qty) :: state.persisted_sell_levels);
           state.persistence_dirty <- true
         end;

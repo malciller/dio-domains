@@ -315,7 +315,9 @@ let handle_trade_update json =
   Logging.info_f ~section "Trade update [%s]: order %s %s %s %.4f @ %.4f (filled: %.4f, remaining: %.4f)"
     event ord.id ord.symbol (match side with Buy -> "BUY" | Sell -> "SELL") ord.qty price ord.filled_qty exec_event.remaining_qty;
   let store = get_or_create_store ord.symbol in
-  SymbolExecStore.push_event store exec_event
+  SymbolExecStore.push_event store exec_event;
+  if event = "fill" || event = "partial_fill" || event = "canceled" || event = "rejected" then
+    Lwt.async (fun () -> Alpaca_balances.update_balances ())
 
 let handle_message_str content =
   let trimmed = String.trim content in

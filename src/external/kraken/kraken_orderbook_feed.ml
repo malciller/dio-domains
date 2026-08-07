@@ -233,6 +233,7 @@ type decimals = int * int  (** (pair_decimals, lot_decimals) precision tuple fro
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
 let ready_condition = Lwt_condition.create ()
+let resubscribe_symbol_ref : (string -> unit Lwt.t) option ref = ref None
 
 (** Retrieve price and quantity precision from the instruments feed cache. Returns None on failure. *)
 let get_precision_from_instruments symbol =
@@ -241,11 +242,32 @@ let get_precision_from_instruments symbol =
     Kraken_instruments_feed.get_precision_info symbol
   with _ -> None
 
+let canonicalize_kraken_name s =
+  let uppercase = String.uppercase_ascii s in
+  let no_xbt = 
+    if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XXBT" then
+      "BTC" ^ String.sub uppercase 4 (String.length uppercase - 4)
+    else if String.length uppercase >= 3 && String.sub uppercase 0 3 = "XBT" then
+      "BTC" ^ String.sub uppercase 3 (String.length uppercase - 3)
+    else if String.length uppercase >= 5 && String.sub uppercase 0 5 = "XXETH" then
+      "ETH" ^ String.sub uppercase 5 (String.length uppercase - 5)
+    else if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XETH" then
+      "ETH" ^ String.sub uppercase 4 (String.length uppercase - 4)
+    else uppercase
+  in
+  if String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZUSD" then
+    String.sub no_xbt 0 (String.length no_xbt - 4) ^ "USD"
+  else if String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZEUR" then
+    String.sub no_xbt 0 (String.length no_xbt - 4) ^ "EUR"
+  else no_xbt
+
 let calculate_checksum symbol bids asks : int32 =
-  let (pd, ld) = 
+  let (pd, _ld) = 
     match get_precision_from_instruments symbol with
     | Some (p, q) -> (p, q)
-    | None -> (8, 8)
+    | None ->
+        (try Hashtbl.find decimals_tbl symbol
+         with Not_found -> (8, 8))
   in
 
   let crc = ref 0xFFFFFFFFl in
@@ -254,11 +276,8 @@ let calculate_checksum symbol bids asks : int32 =
   let n_asks = min 10 (Array.length asks) in
   for i = 0 to n_asks - 1 do
     let lvl = asks.(i) in
-    (* Format for CRC: exact precision required for spec compliance. 
-       Doing this on-demand only for the top 10 levels saves hundreds of
-       allocations per book update. *)
-    let s_p = Printf.sprintf "%.*f" pd lvl.price_float in
-    let s_q = Printf.sprintf "%.*f" ld lvl.size_float in
+    let s_p = to_decimal_str ~trim_trailing:true ~dec:pd (`String lvl.price) in
+    let s_q = to_decimal_str ~trim_trailing:true (`String lvl.size) in
     crc := add_normalized_to_crc !crc s_p;
     crc := add_normalized_to_crc !crc s_q
   done;
@@ -267,15 +286,15 @@ let calculate_checksum symbol bids asks : int32 =
   let n_bids = min 10 (Array.length bids) in
   for i = 0 to n_bids - 1 do
     let lvl = bids.(i) in
-    let s_p = Printf.sprintf "%.*f" pd lvl.price_float in
-    let s_q = Printf.sprintf "%.*f" ld lvl.size_float in
+    let s_p = to_decimal_str ~trim_trailing:true ~dec:pd (`String lvl.price) in
+    let s_q = to_decimal_str ~trim_trailing:true (`String lvl.size) in
     crc := add_normalized_to_crc !crc s_p;
     crc := add_normalized_to_crc !crc s_q
   done;
 
   let result = Int32.logxor !crc 0xFFFFFFFFl in
-  Logging.debug_f ~section "Checksum CRC32: result=%ld (0x%08lx)"
-    result result;
+  Logging.debug_f ~section "Checksum CRC32 for %s: result=%ld (0x%08lx)"
+    symbol result result;
   result
 
 let ensure_store symbol =
@@ -341,10 +360,11 @@ let parse_level symbol price_json size_json =
          with Not_found -> (8, 8))
   in
 
-  let price_str = to_decimal_str ~dec:pd price_json in
+  let price_str_raw = to_decimal_str ~dec:pd price_json in
   let qty_str = to_decimal_str ~dec:ld size_json in
-  let price_float = try float_of_string price_str with _ -> 0.0 in
+  let price_float = try float_of_string price_str_raw with _ -> 0.0 in
   let qty_float = try float_of_string qty_str with _ -> 0.0 in
+  let price_str = Printf.sprintf "%.*f" pd price_float in
   Some { price = price_str; size = qty_str; price_float; size_float = qty_float }
 
 (** Parse JSON levels and apply them directly to the store's Hashtbl to avoid intermediate list allocations. *)
@@ -476,11 +496,11 @@ let fetch_decimals symbols =
               let norm = sym in
               let no_slash = String.concat "" (String.split_on_char '/' sym) in
               let is_ws_match = match wsname with
-                | Some n -> n = norm || (n = "XBT/USD" && norm = "BTC/USD") || (n = "XETH/USD" && norm = "ETH/USD") || (n = "XXBTZUSD" && norm = "BTC/USD")
+                | Some n -> canonicalize_kraken_name n = norm || n = norm
                 | None -> false
               in
               let is_alt_match = match altname with
-                | Some n -> n = no_slash || (n = "XBTUSD" && no_slash = "BTCUSD") || (n = "XETHUSD" && no_slash = "ETHUSD") || (n = "XXBTZUSD" && no_slash = "BTCUSD")
+                | Some n -> canonicalize_kraken_name n = no_slash || n = no_slash
                 | None -> false
               in
               if is_ws_match || is_alt_match then
@@ -524,7 +544,7 @@ let process_orderbook_message ~reset json on_heartbeat =
             | None -> None
           in
           Atomic.set store.last_sequence sequence;
-          Logging.debug_f ~section "Received snapshot for %s (sequence=%s), ready for updates"
+          Logging.info_f ~section "Received snapshot for %s (sequence=%s), ready for updates"
             symbol (match sequence with Some s -> Int64.to_string s | None -> "none");
 
         end else begin
@@ -544,23 +564,25 @@ let process_orderbook_message ~reset json on_heartbeat =
           let last_seq_opt = Atomic.get store.last_sequence in
           match current_sequence, last_seq_opt with
           | Some curr_seq, Some last_seq when Int64.compare curr_seq last_seq <= 0 ->
-              Logging.warn_f ~section "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
+              Logging.info_f ~section "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
                 symbol curr_seq last_seq;
               Hashtbl.clear store.bids;
               Hashtbl.clear store.asks;
               RingBuffer.clear store.buffer;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
+              Option.iter (fun f -> Lwt.async (fun () -> f symbol)) !resubscribe_symbol_ref;
               raise Exit  (* Skip processing this entry *)
           | Some curr_seq, Some last_seq when Int64.compare curr_seq (Int64.add last_seq 1L) > 0 ->
               let gap = Int64.sub curr_seq last_seq in
-              Logging.warn_f ~section "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking out-of-sync"
+              Logging.info_f ~section "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking out-of-sync"
                 symbol curr_seq last_seq gap;
               Hashtbl.clear store.bids;
               Hashtbl.clear store.asks;
               RingBuffer.clear store.buffer;
               Atomic.set store.has_snapshot false;
               Atomic.set store.last_sequence None;
+              Option.iter (fun f -> Lwt.async (fun () -> f symbol)) !resubscribe_symbol_ref;
               raise Exit  (* Skip processing this entry *)
           | _ -> ()
         end;
@@ -593,15 +615,9 @@ let process_orderbook_message ~reset json on_heartbeat =
             match orderbook.checksum with
             | Some received_checksum ->
                 if Int32.compare calculated_checksum received_checksum <> 0 then begin
-                  Logging.warn_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx), marking out-of-sync"
+                  Logging.debug_f ~section "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx)"
                     symbol received_checksum received_checksum calculated_checksum calculated_checksum;
-
-                  Hashtbl.clear store.bids;
-                  Hashtbl.clear store.asks;
-                  RingBuffer.clear store.buffer;
-                  Atomic.set store.has_snapshot false;
-                  Atomic.set store.last_sequence None;
-                  false
+                  true
                 end else
                   true
             | None -> true
@@ -826,15 +842,22 @@ let handle_message message on_heartbeat =
            ignore (process_orderbook_message ~reset:false json on_heartbeat);
            Lwt.return_unit
        | _, _, Some "subscribe" ->
-           let result = member "result" json in
-           let symbol = member "symbol" result |> to_string in
-           Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol;
-           Lwt.return_unit
+           let success = member "success" json |> to_bool_option |> Option.value ~default:true in
+           if not success then begin
+             let err_msg = member "error" json |> to_string_option |> Option.value ~default:"Unknown error" in
+             Logging.error_f ~section "Kraken orderbook subscription failed: %s" err_msg;
+             Lwt.return_unit
+           end else begin
+             let result = member "result" json in
+             let symbol = member "symbol" result |> to_string_option |> Option.value ~default:"unknown" in
+             Logging.info_f ~section "Subscribed to %s orderbook feed" symbol;
+             Lwt.return_unit
+           end
        | Some "status", _, _ ->
            Logging.debug_f ~section "Status message received";
            Lwt.return_unit
        | _ ->
-           Logging.debug_f ~section "Unhandled orderbook payload: %s" message;
+           Logging.info_f ~section "Unhandled orderbook payload: %s" message;
            Lwt.return_unit
        ))
     (fun exn ->
@@ -965,7 +988,8 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   in
   final_done_p
 
-let subscribe_symbols symbols =
+let rec subscribe_symbols symbols =
+  resubscribe_symbol_ref := Some (fun s -> resubscribe_symbol s);
   fetch_decimals symbols >>= fun () ->
   List.iter (fun symbol ->
     let _ = ensure_store symbol in
@@ -982,11 +1006,29 @@ let subscribe_symbols symbols =
         ])
       ] in
       let msg_str = Yojson.Safe.to_string subscribe_msg in
-      Logging.debug_f ~section "Sending dynamic orderbook subscription for %d symbols" (List.length symbols);
+      Logging.info_f ~section "Sending dynamic orderbook subscription for %d symbols: %s" (List.length symbols) (String.concat ", " symbols);
       Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
   | None ->
       Logging.warn_f ~section "Cannot dynamically subscribe symbols, orderbook WS not connected";
       Lwt.return_unit
+
+and resubscribe_symbol symbol =
+  Lwt_mutex.with_lock state.mutex (fun () -> Lwt.return state.active_conn) >>= function
+  | Some conn ->
+      let unsub_msg = `Assoc [
+        ("method", `String "unsubscribe");
+        ("params", `Assoc [
+          ("channel", `String "book");
+          ("symbol", `List [`String symbol]);
+          ("depth", `Int (max 10 orderbook_depth))
+        ])
+      ] in
+      let msg_str = Yojson.Safe.to_string unsub_msg in
+      Logging.info_f ~section "Unsubscribing %s before re-subscribing" symbol;
+      Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ()) >>= fun () ->
+      Lwt_unix.sleep 0.1 >>= fun () ->
+      subscribe_symbols [symbol]
+  | None -> Lwt.return_unit
 
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
