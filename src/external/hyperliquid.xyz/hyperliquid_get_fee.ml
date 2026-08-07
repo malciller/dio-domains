@@ -86,7 +86,7 @@ let get_fee_info ~testnet () : fee_info option Lwt.t =
     let body = Cohttp_lwt.Body.of_string (Printf.sprintf "{\"type\":\"userFees\",\"user\":\"%s\"}" wallet) in
     let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
     
-    Logging.info_f ~section "Fetching Hyperliquid fees for wallet %s..." wallet;
+    Logging.debug_f ~section "Fetching Hyperliquid fees for wallet %s..." wallet;
     
     (* 5-second timeout guard against unresponsive upstream *)
     Lwt_unix.with_timeout 5.0 (fun () ->

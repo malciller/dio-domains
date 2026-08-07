@@ -107,7 +107,7 @@ let place_order
   in
   let req_body = `Assoc assoc |> Yojson.Safe.to_string in
   let headers = make_headers () in
-  Logging.info_f ~section "Placing Alpaca order: %s %s %.6f %s (TIF=%s%s)"
+  Logging.debug_f ~section "Placing Alpaca order: %s %s %.6f %s (TIF=%s%s)"
     side_str symbol qty (match limit_price with Some p -> Printf.sprintf "@ %.4f" p | None -> "MKT") tif_str
     (if use_extended then ", extended_hours=true" else "");
   Lwt.catch (fun () ->
@@ -118,7 +118,7 @@ let place_order
           (try
             let json = Yojson.Safe.from_string body_str in
             let ord = parse_order_json json in
-            Logging.info_f ~section "Placed Alpaca order %s [%s %s %.6f]: status=%s"
+            Logging.debug_f ~section "Placed Alpaca order %s [%s %s %.6f]: status=%s"
               ord.id ord.symbol ord.side_str ord.qty (string_of_status ord.status);
             let userref =
               match ord.client_order_id with
@@ -176,7 +176,7 @@ let amend_order
           (try
             let json = Yojson.Safe.from_string body_str in
             let ord = parse_order_json json in
-            Logging.info_f ~section "Amended Alpaca order %s -> %s [%s]" order_id ord.id ord.symbol;
+            Logging.debug_f ~section "Amended Alpaca order %s -> %s [%s]" order_id ord.id ord.symbol;
             Lwt.return (Ok {
               original_order_id = order_id;
               new_order_id = ord.id;
@@ -208,7 +208,7 @@ let cancel_order order_id =
       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
       Cohttp_lwt.Body.to_string body >>= (fun body_str ->
         if status_code >= 200 && status_code < 300 then begin
-          Logging.info_f ~section "Cancelled Alpaca order %s" order_id;
+          Logging.debug_f ~section "Cancelled Alpaca order %s" order_id;
           Lwt.return (Ok [{ order_id; cl_ord_id = None }])
         end else begin
           Logging.error_f ~section "Cancel order failed HTTP %d for %s: %s" status_code order_id body_str;
@@ -246,7 +246,7 @@ let get_open_orders () =
                | Some last_ord -> fetch_all combined (Some last_ord.created_at)
                | None -> Lwt.return (Ok combined))
             else begin
-              Logging.info_f ~section "Retrieved %d open orders from Alpaca" (List.length combined);
+              Logging.debug_f ~section "Retrieved %d open orders from Alpaca" (List.length combined);
               Lwt.return (Ok combined)
             end
           with exn ->

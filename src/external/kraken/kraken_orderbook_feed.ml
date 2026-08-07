@@ -544,7 +544,7 @@ let process_orderbook_message ~reset json on_heartbeat =
             | None -> None
           in
           Atomic.set store.last_sequence sequence;
-          Logging.info_f ~section "Received snapshot for %s (sequence=%s), ready for updates"
+          Logging.debug_f ~section "Received snapshot for %s (sequence=%s), ready for updates"
             symbol (match sequence with Some s -> Int64.to_string s | None -> "none");
 
         end else begin
@@ -850,7 +850,7 @@ let handle_message message on_heartbeat =
            end else begin
              let result = member "result" json in
              let symbol = member "symbol" result |> to_string_option |> Option.value ~default:"unknown" in
-             Logging.info_f ~section "Subscribed to %s orderbook feed" symbol;
+             Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol;
              Lwt.return_unit
            end
        | Some "status", _, _ ->
@@ -1006,7 +1006,7 @@ let rec subscribe_symbols symbols =
         ])
       ] in
       let msg_str = Yojson.Safe.to_string subscribe_msg in
-      Logging.info_f ~section "Sending dynamic orderbook subscription for %d symbols: %s" (List.length symbols) (String.concat ", " symbols);
+      Logging.debug_f ~section "Sending dynamic orderbook subscription for %d symbols: %s" (List.length symbols) (String.concat ", " symbols);
       Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
   | None ->
       Logging.warn_f ~section "Cannot dynamically subscribe symbols, orderbook WS not connected";

@@ -65,7 +65,7 @@ let fetch_value_lwt ?(fallback = 50.0) () =
         ) else
           match parse_value body_str with
           | Some value ->
-              Logging.info_f ~section "Fetched fear & greed index: %.2f" value;
+              Logging.debug_f ~section "Fetched fear & greed index: %.2f" value;
               Lwt.return (set_cached value)
           | None ->
               Logging.error_f ~section "Failed to parse fear-and-greed response: %s" body_str;

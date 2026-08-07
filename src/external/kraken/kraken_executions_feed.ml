@@ -195,7 +195,7 @@ let lock_order_to_symbol_cap () =
     let observed = Hashtbl.length order_to_symbol in
     let cap = max 32 (observed + observed / 2 + 1) in
     order_to_symbol_cap := cap;
-    Logging.info_f ~section
+    Logging.debug_f ~section
       "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)" cap observed
   end
 
@@ -597,13 +597,13 @@ let update_open_orders store (event : execution_event) =
        if needs_cleanup then
          trigger_stale_order_cleanup ~reason:"open_orders_exceeds_1000" ();
        if was_present then
-         Logging.info_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
+         Logging.debug_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
            event.order_id event.symbol remaining_qty 
            (Option.value event.limit_price ~default:0.0) 
            event.cum_qty event.order_qty
            (string_of_order_status event.order_status)
        else
-         Logging.info_f ~section "Added new open order: %s [%s] %s side %.8f@%.2f status=%s"
+         Logging.debug_f ~section "Added new open order: %s [%s] %s side %.8f@%.2f status=%s"
            event.order_id event.symbol 
            (string_of_side event.side)
            event.order_qty
@@ -611,7 +611,7 @@ let update_open_orders store (event : execution_event) =
            (string_of_order_status event.order_status);
        (* Log trade fills at info level for real-time monitoring. *)
        if event.exec_type = Trade then
-         Logging.info_f ~section "Trade fill: %s [%s] qty=%.8f price=%.2f (total filled: %.8f/%.8f)"
+         Logging.debug_f ~section "Trade fill: %s [%s] qty=%.8f price=%.2f (total filled: %.8f/%.8f)"
            event.order_id event.symbol 
            (Option.value event.last_qty ~default:0.0)
            (Option.value event.last_price ~default:0.0)
@@ -836,7 +836,7 @@ let handle_snapshot json on_heartbeat =
     let open Yojson.Safe.Util in
     let data = member "data" json |> to_list in
     
-    Logging.info_f ~section "Processing execution snapshot with %d items" (List.length data);
+    Logging.debug_f ~section "Processing execution snapshot with %d items" (List.length data);
     
     (* Track order IDs present in this snapshot for reconciliation. *)
     let snapshot_order_ids = Hashtbl.create (List.length data) in
@@ -881,7 +881,7 @@ let handle_snapshot json on_heartbeat =
     (* Remove identified stale orders. *)
     let removed_count = List.length !stale_orders in
     if removed_count > 0 then begin
-      Logging.info_f ~section "Reconciling open orders: removing %d stale orders not present in snapshot" removed_count;
+      Logging.debug_f ~section "Reconciling open orders: removing %d stale orders not present in snapshot" removed_count;
       
       List.iter (fun (symbol, order_id) ->
         let store = get_symbol_store symbol in
@@ -908,7 +908,7 @@ let handle_snapshot json on_heartbeat =
       notify_ready store;
     ) all_symbols;
     
-    Logging.info_f ~section "Execution snapshot processed and reconciled";
+    Logging.debug_f ~section "Execution snapshot processed and reconciled";
     (* Lock the adaptive order_to_symbol cap after startup snapshot ingestion. *)
     lock_order_to_symbol_cap ()
   with exn ->
@@ -993,7 +993,7 @@ let handle_message_json json on_heartbeat =
         let success = member "success" json |> to_bool_option in
         (match success with
         | Some true -> 
-            Logging.info ~section "Subscribed to executions feed";
+            Logging.debug_f ~section "Subscribed to executions feed";
         | Some false -> 
             let error = member "error" json |> to_string_option in
             Logging.error_f ~section "Subscription failed: %s" 
@@ -1073,7 +1073,7 @@ let subscribe_order_updates () =
 (** Initializes execution stores for the given symbols and starts periodic maintenance. *)
 let initialize symbols =
   start_periodic_tasks ();
-  Logging.info_f ~section "Initializing executions feed for %d symbols" (List.length symbols);
+  Logging.debug_f ~section "Initializing executions feed for %d symbols" (List.length symbols);
 
   (* Pre-create symbol stores so hot-path lookups are wait-free. *)
   List.iter (fun symbol ->

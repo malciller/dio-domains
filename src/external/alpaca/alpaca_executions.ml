@@ -316,6 +316,31 @@ let handle_trade_update json =
     event ord.id ord.symbol (match side with Buy -> "BUY" | Sell -> "SELL") ord.qty price ord.filled_qty exec_event.remaining_qty;
   let store = get_or_create_store ord.symbol in
   SymbolExecStore.push_event store exec_event;
+
+  (* Publish to centralized fill event bus for Discord notifications if live trading is enabled *)
+  (if not !(Alpaca_types.Config.is_paper) && (event = "fill" || exec_event.order_status = Filled) then begin
+    let fill_value = ord.filled_qty *. price in
+    let maker_fee_rate =
+      match Dio_exchange.Exchange_intf.Registry.get "alpaca" with
+      | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+          (match Ex.get_fees ~symbol:ord.symbol with (Some f, _) -> f | _ -> 0.0)
+      | None -> 0.0
+    in
+    let fee = fill_value *. maker_fee_rate in
+    Concurrency.Fill_event_bus.publish_fill {
+      venue = "alpaca";
+      symbol = ord.symbol;
+      side = (if side = Buy then "buy" else "sell");
+      amount = ord.filled_qty;
+      fill_price = price;
+      value = fill_value;
+      fee;
+      timestamp = Unix.time ();
+      order_id = ord.id;
+      trade_id = ord.id;
+    }
+  end);
+
   if event = "fill" || event = "partial_fill" || event = "canceled" || event = "rejected" then
     Lwt.async (fun () -> Alpaca_balances.update_balances ())
 

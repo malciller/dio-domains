@@ -123,7 +123,7 @@ let close_all_subscribers () =
   Mutex.unlock pushers_mutex;
   let count = List.length ps in
   if count > 0 then begin
-    Logging.info_f ~section "Closing %d subscriber streams on disconnect" count;
+    Logging.debug_f ~section "Closing %d subscriber streams on disconnect" count;
     List.iter (fun push ->
       (try ignore (push None) with _ -> ())
     ) ps
@@ -134,7 +134,7 @@ let close_all_subscribers () =
   Mutex.unlock raw_pushers_mutex;
   let count_raw = List.length r_ps in
   if count_raw > 0 then begin
-    Logging.info_f ~section "Closing %d raw subscriber streams on disconnect" count_raw;
+    Logging.debug_f ~section "Closing %d raw subscriber streams on disconnect" count_raw;
     List.iter (fun push ->
       (try ignore (push None) with _ -> ())
     ) r_ps
@@ -349,7 +349,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
                     Lwt.return_unit
                   with Not_found -> 
                     if channel = "post" then
-                      Logging.info_f ~section "Received 'post' response for unknown req_id %d: %s" id (Yojson.Safe.to_string json);
+                      Logging.debug_f ~section "Received 'post' response for unknown req_id %d: %s" id (Yojson.Safe.to_string json);
                     Lwt.return_unit
                 )
               );
@@ -396,7 +396,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
   let url = Printf.sprintf "wss://%s/ws" base_url in
   let hostname = base_url in
   let port = 443 in
-  Logging.info_f ~section "Connecting to Hyperliquid WebSocket: %s" url;
+  Logging.debug_f ~section "Connecting to Hyperliquid WebSocket: %s" url;
   let uri = Uri.of_string url in
   Lwt.catch (fun () ->
     Lwt_unix.getaddrinfo hostname (string_of_int port) [Unix.AI_FAMILY Unix.PF_INET] >>= fun addresses ->
@@ -502,7 +502,7 @@ let close () : unit Lwt.t =
   ) >>= function
   | None -> Lwt.return_unit
   | Some conn ->
-      Logging.info ~section "Closing Hyperliquid WebSocket connection";
+      Logging.debug ~section "Closing Hyperliquid WebSocket connection";
       fail_all_pending "Client requested close";
       close_all_subscribers ();
       signal_new_data ();

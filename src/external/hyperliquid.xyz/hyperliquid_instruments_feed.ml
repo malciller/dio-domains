@@ -92,7 +92,7 @@ let process_meta_response payload_perp payload_spot =
     ) universe_spot;
     Mutex.unlock cache_mutex;
     
-    Logging.info_f ~section "Initialized Hyperliquid instrument feed via WS payload with %d perps and %d spot pairs" (List.length universe_perp) (List.length universe_spot);
+    Logging.debug_f ~section "Initialized Hyperliquid instrument feed via WS payload with %d perps and %d spot pairs" (List.length universe_perp) (List.length universe_spot);
     notify_ready ();
     Lwt.return_unit
   ) (fun exn ->
@@ -114,7 +114,7 @@ let initialize symbols =
     Hashtbl.replace pair_cache symbol info
   ) symbols;
   Mutex.unlock cache_mutex;
-  Logging.info_f ~section "Initialized Hyperliquid instruments feed with %d mock symbols" (List.length symbols)
+  Logging.debug_f ~section "Initialized Hyperliquid instruments feed with %d mock symbols" (List.length symbols)
 
 (** Registers a single instrument entry with caller-specified sz_decimals.
     Also inserts a base-asset alias for perpetual-style lookups.

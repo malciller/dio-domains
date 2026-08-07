@@ -17,16 +17,16 @@ module Config = struct
 
   let set_testnet testnet =
     is_paper := testnet;
-    Logging.info_f ~section "Alpaca trading mode set to %s"
+    Logging.debug_f ~section "Alpaca trading mode set to %s"
       (if testnet then "PAPER" else "LIVE")
 
   let set_data_feed feed =
     data_feed := (if String.lowercase_ascii feed = "sip" then "sip" else "iex");
-    Logging.info_f ~section "Alpaca data feed set to %s" !data_feed
+    Logging.debug_f ~section "Alpaca data feed set to %s" !data_feed
 
   let set_extended_hours enabled =
     extended_hours := enabled;
-    Logging.info_f ~section "Alpaca extended hours trading set to %B" enabled
+    Logging.debug_f ~section "Alpaca extended hours trading set to %B" enabled
 
   let rest_base_url () =
     if !is_paper then "https://paper-api.alpaca.markets"

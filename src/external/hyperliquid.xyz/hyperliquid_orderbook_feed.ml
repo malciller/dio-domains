@@ -400,7 +400,7 @@ let _processor_task =
   Lwt.async run
 
 let initialize symbols =
-  Logging.info_f ~section "Initializing Hyperliquid orderbook feed for %d symbols" (List.length symbols);
+  Logging.debug_f ~section "Initializing Hyperliquid orderbook feed for %d symbols" (List.length symbols);
   List.iter (fun symbol ->
     let _ = ensure_store symbol in
     (* Pre-populate coin_to_symbol cache for known symbols.

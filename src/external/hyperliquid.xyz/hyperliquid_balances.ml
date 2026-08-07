@@ -231,7 +231,7 @@ let _processor_task =
          consume_stream blocks event-driven on the new stream until the
          WS reconnects and data flows. Sever Forward chain via Lwt.async. *)
       sub.close ();
-      Logging.info ~section "Balances stream ended (disconnect), re-subscribing...";
+      Logging.debug ~section "Balances stream ended (disconnect), re-subscribing...";
       Lwt.async run;
       Lwt.return_unit
     ) (fun exn ->
@@ -244,7 +244,7 @@ let _processor_task =
   Lwt.async run
 
 let initialize ~testnet assets =
-  Logging.info_f ~section "Initializing Hyperliquid balances feed for %d assets (testnet=%b)" (List.length assets) testnet;
+  Logging.debug_f ~section "Initializing Hyperliquid balances feed for %d assets (testnet=%b)" (List.length assets) testnet;
   
   (* Pre-allocate balance stores for each requested asset. *)
   List.iter (fun asset -> ignore (get_balance_store asset)) assets;

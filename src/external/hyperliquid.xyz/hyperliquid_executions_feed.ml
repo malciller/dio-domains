@@ -133,7 +133,7 @@ let mark_startup_complete () =
     let observed = Hashtbl.length order_to_symbol in
     let cap = max 1024 (observed + observed / 2 + 1) in
     order_to_symbol_cap := cap;
-    Logging.info_f ~section
+    Logging.debug_f ~section
       "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)" cap observed
   end
 
@@ -176,7 +176,7 @@ let notify_ready store =
 
 let set_startup_snapshot_done () =
   if not (Atomic.exchange _startup_snapshot_done true) then begin
-    Logging.info ~section "HL open-order snapshot injected — domains may now activate";
+    Logging.debug_f ~section "HL open-order snapshot injected — domains may now activate";
     Hashtbl.iter (fun _symbol store ->
       notify_ready store
     ) stores;
@@ -787,7 +787,7 @@ let process_user_events data_json =
           
           if is_filled then begin
             if is_startup_snapshot_done () then
-              Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid
+              Logging.debug_f ~section "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid
             else
               Logging.debug_f ~section "Order FILLED (startup snapshot): %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid;
             (* Publish to centralized fill event bus for Discord notifications *)
@@ -813,7 +813,7 @@ let process_user_events data_json =
             }
           end else
             if is_startup_snapshot_done () then
-              Logging.info_f ~section "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty
+              Logging.debug_f ~section "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty
             else
               Logging.debug_f ~section "Order PARTIALLY FILLED (startup snapshot): %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty
         end
@@ -926,7 +926,7 @@ let _processor_task =
          consume_stream blocks event-driven on the new stream until the
          WS reconnects and data flows. Sever Forward chain via Lwt.async. *)
       sub.close ();
-      Logging.info ~section "Executions stream ended (disconnect), re-subscribing...";
+      Logging.debug ~section "Executions stream ended (disconnect), re-subscribing...";
       Lwt.async run;
       Lwt.return_unit
     ) (fun exn ->
@@ -940,7 +940,7 @@ let _processor_task =
 
 let initialize symbols =
   start_periodic_tasks ();
-  Logging.info ~section "Initializing Hyperliquid executions feed";
+  Logging.debug ~section "Initializing Hyperliquid executions feed";
   List.iter (fun symbol ->
     let _ = get_symbol_store symbol in
     Logging.debug_f ~section "Created Hyperliquid executions buffer for %s" symbol
@@ -999,7 +999,7 @@ let inject_open_orders data_json =
         | None -> ()
       with exn -> Logging.warn_f ~section "Failed to parse open order entry: %s" (Printexc.to_string exn)
     ) orders;
-    Logging.info_f ~section "Injected %d initial open orders from snapshot" !count;
+    Logging.debug_f ~section "Injected %d initial open orders from snapshot" !count;
 
     let stale_orders = ref [] in
     Mutex.lock initialization_mutex;
@@ -1034,11 +1034,11 @@ let inject_open_orders data_json =
         cl_ord_id = cached_order.cl_ord_id;
       } in
       update_orders_internal store event;
-      Logging.info_f ~section "Reconciled stale order: emitted CanceledStatus for %s [%s]" cached_order.order_id symbol
+      Logging.debug_f ~section "Reconciled stale order: emitted CanceledStatus for %s [%s]" cached_order.order_id symbol
     ) !stale_orders;
 
     if !stale_orders <> [] then
-      Logging.info_f ~section "Reconciled open orders: removed %d stale orders not present in snapshot" (List.length !stale_orders);
+      Logging.debug_f ~section "Reconciled open orders: removed %d stale orders not present in snapshot" (List.length !stale_orders);
 
     (* Lock the adaptive capacity now that the startup snapshot is fully consumed.
        Subsequent inserts will evict the oldest entries when exceeding the cap. *)
