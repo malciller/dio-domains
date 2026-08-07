@@ -786,7 +786,10 @@ let process_user_events data_json =
           update_orders_internal store event;
           
           if is_filled then begin
-            Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid;
+            if is_startup_snapshot_done () then
+              Logging.info_f ~section "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid
+            else
+              Logging.debug_f ~section "Order FILLED (startup snapshot): %s [%s] %.8f @ %.2f (trade_id: %Ld)" order_id symbol size price tid;
             (* Publish to centralized fill event bus for Discord notifications *)
             let fill_value = cum_qty *. avg_price in
             let maker_fee_rate =
@@ -809,7 +812,10 @@ let process_user_events data_json =
               trade_id = Int64.to_string tid;
             }
           end else
-            Logging.info_f ~section "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty
+            if is_startup_snapshot_done () then
+              Logging.info_f ~section "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty
+            else
+              Logging.debug_f ~section "Order PARTIALLY FILLED (startup snapshot): %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)" order_id symbol size price cum_qty order_qty
         end
     | None -> ()
   ) fills;

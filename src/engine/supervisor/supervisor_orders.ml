@@ -229,7 +229,7 @@ let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) targe
           end else begin
             Atomic.incr orders_placed;
             let amend_id_str = match result.Dio_exchange.Exchange_intf.Types.amend_id with Some id -> id | None -> "none" in
-            Logging.info_f ~section "✓ Order amended (Amend ID: %s)" amend_id_str;
+            Logging.debug_f ~section "✓ Order amended (Amend ID: %s)" amend_id_str;
             cb.on_amend_ok order target_order_id result.Dio_exchange.Exchange_intf.Types.new_order_id;
             Lwt.return_unit
           end

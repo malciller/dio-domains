@@ -201,7 +201,7 @@ let fetch_from_rest symbols =
             marginable = safe_get (fun m -> to_int m > 0) false "margin_call";
             has_index = true; last_updated = Unix.time () } in
 
-          Logging.info_f ~section "Instrument data for %s: status=%s, qty_precision=%d, qty_increment=%.8f, qty_min=%.8f, price_precision=%d, price_increment=%.8f, cost_precision=%d, cost_min=%.2f, marginable=%b"
+          Logging.debug_f ~section "Instrument data for %s: status=%s, qty_precision=%d, qty_increment=%.8f, qty_min=%.8f, price_precision=%d, price_increment=%.8f, cost_precision=%d, cost_min=%.2f, marginable=%b"
             symbol (status_to_string pair_info.status) pair_info.qty_precision pair_info.qty_increment pair_info.qty_min
             pair_info.price_precision pair_info.price_increment pair_info.cost_precision pair_info.cost_min pair_info.marginable;
 

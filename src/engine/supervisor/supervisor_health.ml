@@ -373,7 +373,7 @@ let monitor_non_active_assets () =
                 ) balances
               end;
               if !symbols_to_subscribe <> [] then begin
-                Logging.info_f ~section "Dynamically subscribing non-active assets on %s: %s" 
+                Logging.debug_f ~section "Dynamically subscribing non-active assets on %s: %s" 
                   exch_name (String.concat ", " !symbols_to_subscribe);
                 Ex.subscribe_orderbook ~symbols:!symbols_to_subscribe
               end else

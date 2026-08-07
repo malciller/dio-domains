@@ -73,7 +73,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let fng = Fear_and_greed.fetch_value ~fallback () in
       let resolved = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.grid_interval ~fear_and_greed:fng in
       let (lo, hi) = asset_with_fees.grid_interval in
-      Logging.info_f ~section "Resolved grid_interval for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
+      Logging.debug_f ~section "Resolved grid_interval for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
         asset_with_fees.exchange asset_with_fees.symbol resolved fng lo hi;
       Some resolved
     else
@@ -89,7 +89,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
       let fng = Fear_and_greed.fetch_value ~fallback () in
       let resolved = Fear_and_greed.grid_value_for_fng ~grid_interval:asset_with_fees.accumulation_buffer ~fear_and_greed:fng in
       let (lo, hi) = asset_with_fees.accumulation_buffer in
-      Logging.info_f ~section "Resolved accumulation_buffer for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
+      Logging.debug_f ~section "Resolved accumulation_buffer for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
         asset_with_fees.exchange asset_with_fees.symbol resolved fng lo hi;
       Some resolved
     else
@@ -202,7 +202,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
          Hyperliquid replayed from 0, causing a race condition where Kraken
          domains could execute their first strategy cycle before the snapshot
          populated the open_orders Hashtbl. *)
-      Logging.info_f ~section "About to get execution feed position for %s" asset_with_fees.symbol;
+      Logging.debug_f ~section "About to get execution feed position for %s" asset_with_fees.symbol;
       exec_read_pos := 0;
 
       (* Wait for execution snapshot to be ingested before entering the loop.
@@ -217,10 +217,10 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
         Logging.warn_f ~section "Execution data not ready for %s/%s after 15s, proceeding anyway"
           asset_with_fees.exchange asset_with_fees.symbol
       else
-        Logging.info_f ~section "Execution data confirmed ready for %s/%s"
+        Logging.debug_f ~section "Execution data confirmed ready for %s/%s"
           asset_with_fees.exchange asset_with_fees.symbol;
 
-      Logging.info_f ~section "Domain for %s/%s starting consumption from exec position 0 (full replay)"
+      Logging.debug_f ~section "Domain for %s/%s starting consumption from exec position 0 (full replay)"
         asset_with_fees.exchange asset_with_fees.symbol;
       
       (* Set orderbook positions to current write position, skipping
@@ -235,18 +235,18 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            tob_bid := bid_price; tob_ask := ask_price;
            tob_bsize := bid_size; tob_asize := ask_size;
            current_price := (bid_price +. ask_price) /. 2.0;
-           Logging.info_f ~section "Seeded initial price for %s from cache: %.4f"
+           Logging.debug_f ~section "Seeded initial price for %s from cache: %.4f"
              asset_with_fees.symbol !current_price
        | None -> ());
       
-      Logging.info_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
+      Logging.debug_f ~section "Domain initialized for asset: %s/%s (Strategy: %s)"
         asset_with_fees.exchange asset_with_fees.symbol asset_with_fees.strategy;
 
 
       let key = domain_key asset_with_fees in
       let state = Hashtbl.find domain_registry key in
 
-      Logging.info_f ~section "Entering domain loop for %s. is_running=%B" key (Atomic.get state.is_running);
+      Logging.debug_f ~section "Entering domain loop for %s. is_running=%B" key (Atomic.get state.is_running);
       
       (* Parse base/quote currency pair from the symbol *)
       let (base_asset, quote_currency) =
@@ -293,7 +293,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
       while Atomic.get state.is_running do
         let latency_this_cycle = !latency_active in
-        if !cycle_count = 0 then Logging.info_f ~section "First cycle for %s" key;
+        if !cycle_count = 0 then Logging.debug_f ~section "First cycle for %s" key;
         incr cycle_count;
         
         let cycle_events = ref 0 in
@@ -444,7 +444,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
                | Some _ ->
                    Dio_strategies.Market_maker.Strategy.set_startup_replay_done asset_with_fees.symbol
                | None -> ());
-              Logging.info_f ~section "[%s/%s] First exec event batch received, strategy now active"
+              Logging.debug_f ~section "[%s/%s] First exec event batch received, strategy now active"
                 asset_with_fees.exchange asset_with_fees.symbol
             end
           end;
@@ -499,7 +499,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
              | Some _ ->
                  Dio_strategies.Market_maker.Strategy.set_startup_replay_done asset_with_fees.symbol
              | None -> ());
-            Logging.info_f ~section "[%s/%s] Snapshot done, injected open orders - strategy now active"
+            Logging.debug_f ~section "[%s/%s] Snapshot done, injected open orders - strategy now active"
               asset_with_fees.exchange asset_with_fees.symbol
           end
         end;
@@ -662,7 +662,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
 
         if !exec_ready && not !latency_active && (!cycle_count - !exec_ready_cycle >= 10) then begin
           latency_active := true;
-          Logging.info_f ~section "[%s/%s] Startup warmup complete (10 cycles post-ready). Latency measurements active." asset_with_fees.exchange asset_with_fees.symbol
+          Logging.debug_f ~section "[%s/%s] Startup warmup complete (10 cycles post-ready). Latency measurements active." asset_with_fees.exchange asset_with_fees.symbol
         end;
 
         ()
@@ -729,7 +729,7 @@ let start_domain config state fee_fetcher =
          shared cached_gc_config would silently kill the domain. *)
       try
         Config.apply_gc_config ();
-        Logging.info_f ~section "Domain for %s/%s started (restart #%d)"
+        Logging.debug_f ~section "Domain for %s/%s started (restart #%d)"
           asset.exchange asset.symbol (Atomic.get state.restart_count);
 
         asset_domain_worker config fee_fetcher asset;

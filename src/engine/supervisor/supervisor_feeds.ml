@@ -223,7 +223,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     if has_kraken then Kraken.Kraken_generate_auth_token.get_token ()
     else Lwt.return "temp_token_for_hyperliquid_only"
   in
-  Logging.info ~section "Authentication token obtained";
+  Logging.debug ~section "Authentication token obtained";
 
   (* Store token globally for order executor reuse *)
   Token_store.set (Some auth_token);
@@ -261,7 +261,7 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
       Lwt.async (fun () -> Lighter.Module.fetch_balances ())
     end;
     if has_alpaca then Alpaca.Balances.initialize ();
-    Logging.info ~section "Balances feed stores initialized";
+    Logging.debug ~section "Balances feed stores initialized";
   with exn ->
     Logging.error_f ~section "Failed to initialize balances feed stores: %s" (Printexc.to_string exn)
   in

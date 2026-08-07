@@ -268,7 +268,7 @@ let subscribe_to_feeds ~symbols ~wallet =
   Lwt_list.iter_s (fun symbol ->
     (* Perps use the base name (e.g. "HYPE"); spot pairs use "@N" format. *)
     let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-    Logging.info_f ~section "Subscribing to l2Book for %s (coin=%s)" symbol coin;
+    Logging.debug_f ~section "Subscribing to l2Book for %s (coin=%s)" symbol coin;
     subscribe (`Assoc [("method", `String "subscribe"); ("subscription", `Assoc [("type", `String "l2Book"); ("coin", `String coin)])])
   ) symbols
 

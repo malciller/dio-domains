@@ -1024,7 +1024,7 @@ let start_message_handler _conn _token _on_failure _on_heartbeat =
 
 (** Subscribes to the Kraken executions channel on the authenticated WebSocket and starts the message consumption loop. *)
 let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
-  Logging.info ~section "Registering executions subscription on unified authenticated connection";
+  Logging.debug ~section "Registering executions subscription on unified authenticated connection";
   
   let subscribe_msg = `Assoc [
     ("method", `String "subscribe");
@@ -1081,4 +1081,4 @@ let initialize symbols =
     Logging.debug_f ~section "Created lock-free execution store for %s" symbol
   ) symbols;
 
-  Logging.info ~section "Execution stores initialized - now operating lock-free";
+  Logging.debug ~section "Execution stores initialized - now operating lock-free";

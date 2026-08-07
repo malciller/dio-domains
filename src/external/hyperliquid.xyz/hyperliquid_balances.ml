@@ -249,4 +249,4 @@ let initialize ~testnet assets =
   (* Pre-allocate balance stores for each requested asset. *)
   List.iter (fun asset -> ignore (get_balance_store asset)) assets;
   
-  Logging.info ~section "Hyperliquid balance stores initialized"
+  Logging.debug ~section "Hyperliquid balance stores initialized"

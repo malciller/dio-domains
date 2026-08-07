@@ -221,18 +221,18 @@ let handle_message_str content =
           Logging.debug_f ~section "[%s] Bar close: %.2f" symbol close_p
       | "success" ->
           let msg = j |> member "msg" |> to_string_option |> Option.value ~default:"" in
-          Logging.info_f ~section "Alpaca Market Data WS status: %s" msg
+          Logging.debug_f ~section "Alpaca Market Data WS status: %s" msg
       | "subscription" ->
           let quotes = match j |> member "quotes" with `List l -> List.filter_map to_string_option l | _ -> [] in
           let trades = match j |> member "trades" with `List l -> List.filter_map to_string_option l | _ -> [] in
-          Logging.info_f ~section "Alpaca Market Data WS subscription confirmed - quotes: [%s], trades: [%s]"
+          Logging.debug_f ~section "Alpaca Market Data WS subscription confirmed - quotes: [%s], trades: [%s]"
             (String.concat ", " quotes) (String.concat ", " trades)
       | "error" ->
           let code = j |> member "code" |> to_int_option |> Option.value ~default:0 in
           let msg = j |> member "msg" |> to_string_option |> Option.value ~default:"" in
           Logging.error_f ~section "Alpaca Market Data WS error (%d): %s" code msg
       | other ->
-          Logging.info_f ~section "Alpaca Market Data WS received msg (T=%s): %s" other (Yojson.Safe.to_string j)
+          Logging.debug_f ~section "Alpaca Market Data WS received msg (T=%s): %s" other (Yojson.Safe.to_string j)
     ) items
   with exn ->
     Logging.error_f ~section "Failed to parse WS data frame: %s (content: %s)"
@@ -248,7 +248,7 @@ let send_subscription symbols =
         ("trades", `List (List.map (fun s -> `String s) symbols));
       ] in
       let payload = Yojson.Safe.to_string json in
-      Logging.info_f ~section "Sending Alpaca Market Data WS subscription for symbols: %s" (String.concat ", " symbols);
+      Logging.debug_f ~section "Sending Alpaca Market Data WS subscription for symbols: %s" (String.concat ", " symbols);
       let frame = Websocket.Frame.create ~content:payload () in
       Websocket_lwt_unix.write conn frame
   | None -> Lwt.return_unit
@@ -296,7 +296,7 @@ let subscribe_symbols symbols =
         | Ok (bp, bs, ap, as_val) ->
             let store = get_or_create_store sym in
             SymbolStore.push store { bid_price = bp; bid_size = bs; ask_price = ap; ask_size = as_val; timestamp = Unix.time () };
-            Logging.info_f ~section "[%s] Seeded live price from REST snapshot: bid %.2f, ask %.2f" sym bp ap
+            Logging.debug_f ~section "[%s] Seeded live price from REST snapshot: bid %.2f, ask %.2f" sym bp ap
         | Error e ->
             Logging.warn_f ~section "[%s] Failed to seed REST snapshot: %s" sym e
       ) new_syms
@@ -330,7 +330,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
       ("key", `String (Alpaca_types.Config.api_key ()));
       ("secret", `String (Alpaca_types.Config.api_secret ()));
     ] |> Yojson.Safe.to_string in
-    Logging.info ~section "Sending Alpaca Market Data WS authentication...";
+    Logging.debug ~section "Sending Alpaca Market Data WS authentication...";
     Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ()) >>= fun () ->
 
     on_connected ();
