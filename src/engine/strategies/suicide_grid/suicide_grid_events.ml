@@ -154,7 +154,13 @@ let handle_order_rejected ~now:_ asset_symbol side price =
          state.inflight_sell <- false;
          state.open_sell_orders <- List.filter (fun (oid, _, _) ->
            not (String.starts_with ~prefix:"pending_sell_" oid)
-         ) state.open_sell_orders);
+         ) state.open_sell_orders;
+         if state.persisted_sell_levels <> [] then begin
+           state.persisted_sell_levels <- List.filter (fun (sp, _) ->
+             abs_float (sp -. price) > (price *. 0.005)
+           ) state.persisted_sell_levels;
+           state.persistence_dirty <- true
+         end);
 
     let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
@@ -461,6 +467,14 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
          state.open_sell_orders <- (new_order_id, price, old_qty) ::
             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
          state.recently_injected_sells <- (new_order_id, price, now) :: state.recently_injected_sells;
+         (match old_entry with
+          | Some (_, old_p, _) when state.persisted_sell_levels <> [] ->
+              let filtered = List.filter (fun (sp, _) -> abs_float (sp -. old_p) > (old_p *. 0.005)) state.persisted_sell_levels in
+              let already_in_stack = List.exists (fun (p, _) -> abs_float (p -. price) <= (price *. 0.005)) filtered in
+              let updated = if already_in_stack then filtered else (price, old_qty) :: filtered in
+              state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) updated;
+              state.persistence_dirty <- true
+          | _ -> ());
          Logging.info_f ~section "SELL_AMEND [%s] result: sells_after=%d"
            asset_symbol (List.length state.open_sell_orders));
 

@@ -170,13 +170,21 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
         state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
         locked_in_sells := !locked_in_sells +. qty;
         if ecfg.remaintain_expired_sells then begin
-          let already_tracked = List.exists (fun (p, _) -> abs_float (p -. price) <= (price *. 0.005)) state.persisted_sell_levels in
-          if not already_tracked then begin
-            state.persisted_sell_levels <- (price, qty) :: state.persisted_sell_levels;
-            state.persistence_dirty <- true;
-            Logging.info_f ~section "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into persistent tracking"
-              asset.symbol price qty
-          end
+          let existing_opt = List.find_opt (fun (p, _) -> abs_float (p -. price) <= (price *. 0.005)) state.persisted_sell_levels in
+          match existing_opt with
+          | Some (existing_p, existing_q) ->
+              if abs_float (existing_q -. qty) > 1e-6 then begin
+                let filtered = List.filter (fun (p, _) -> abs_float (p -. existing_p) > (existing_p *. 0.005)) state.persisted_sell_levels in
+                state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) ((price, qty) :: filtered);
+                state.persistence_dirty <- true;
+                Logging.info_f ~section "Updated persisted sell level quantity for %s @ %.4f: %.8f -> %.8f"
+                  asset.symbol price existing_q qty
+              end
+          | None ->
+              state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) ((price, qty) :: state.persisted_sell_levels);
+              state.persistence_dirty <- true;
+              Logging.info_f ~section "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into persistent tracking"
+                asset.symbol price qty
         end;
         match !closest_sell_order with
         | None -> closest_sell_order := Some (oid, price)
@@ -235,6 +243,13 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
       state.open_sell_orders <- List.filter (fun (oid, _, _) ->
         not (Hashtbl.mem state.evicted_orders oid)
       ) state.open_sell_orders;
+
+      if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] then begin
+        state.persisted_sell_levels <- List.filter (fun (sp, _) ->
+          not (List.exists (fun (_, stale_p, _) -> abs_float (sp -. stale_p) <= (stale_p *. 0.005)) stale_sells)
+        ) state.persisted_sell_levels;
+        state.persistence_dirty <- true
+      end;
 
       if Exchange.Types.exchange_of_string asset.exchange = Lighter then
         Lighter.Balances.request_balance_refresh ()
@@ -467,21 +482,34 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     else asset_balance +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells
   in
   if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] && not (Float.is_nan asset_balance) then begin
-    let available_for_sells = asset_balance -. state.reserved_base in
-    let (kept_levels, pruned_levels) =
-      List.partition (fun (target_p, target_q) ->
-        let is_open_on_exchange = List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders in
-        is_open_on_exchange || available_for_sells >= target_q
-      ) state.persisted_sell_levels
+    let available_for_missing_sells =
+      max 0.0 (asset_balance +. state.anticipated_base_credit -. state.reserved_base -. locked_in_sells)
     in
-    if pruned_levels <> [] then begin
-      state.persisted_sell_levels <- kept_levels;
+    let is_open (target_p, _) =
+      List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders
+    in
+    let (open_levels, missing_levels) = List.partition is_open state.persisted_sell_levels in
+    let missing_desc = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels in
+    let rem_avail = ref available_for_missing_sells in
+    let kept_missing = ref [] in
+    let pruned_missing = ref [] in
+    List.iter (fun ((_target_p, target_q) as level) ->
+      if !rem_avail >= (target_q -. 1e-6) then begin
+        kept_missing := level :: !kept_missing;
+        rem_avail := max 0.0 (!rem_avail -. target_q)
+      end else begin
+        pruned_missing := level :: !pruned_missing
+      end
+    ) missing_desc;
+    let new_persisted = open_levels @ (List.rev !kept_missing) in
+    state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) new_persisted;
+    if !pruned_missing <> [] then begin
       state.persistence_dirty <- true;
       List.iter (fun (p, q) ->
         Logging.info_f ~section "Reconciled offline sell fill for %s @ %.4f (qty %.8f) - balance consumed while offline"
           asset.symbol p q;
         state.last_sell_fill_price <- Some p
-      ) pruned_levels
+      ) !pruned_missing
     end
   end;
   let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
@@ -521,12 +549,13 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     (* Determine target price & qty for sell placement *)
     let (target_sell_price_opt, target_sell_qty_override) =
       if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] then
-        let missing_level = List.find_opt (fun (target_p, _q) ->
+        let missing_levels = List.filter (fun (target_p, _q) ->
           not (List.exists (fun (_, open_p, _) -> abs_float (open_p -. target_p) <= (target_p *. 0.005)) state.open_sell_orders)
         ) state.persisted_sell_levels in
-        match missing_level with
-        | Some (tp, tq) -> (Some tp, Some tq)
-        | None -> (None, None)
+        let missing_sorted_desc = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels in
+        match missing_sorted_desc with
+        | (tp, tq) :: _ -> (Some tp, Some tq)
+        | [] -> (None, None)
       else
         (None, None)
     in
@@ -582,11 +611,7 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
     let (effective_sell_qty, balance_ok) =
       if is_alpaca then
         let avail_rounded = round_qty available asset.symbol asset.exchange in
-        let sell_q =
-          match target_sell_qty_override with
-          | Some tq when ecfg.remaintain_expired_sells -> Float.min tq avail_rounded
-          | _ -> Float.min sell_qty avail_rounded
-        in
+        let sell_q = avail_rounded in
         if sell_q > 0.0 then (sell_q, true)
         else begin
           Logging.debug_f ~section
@@ -638,11 +663,9 @@ let evaluate_sell_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_pric
       if push_order ~now ~state sell_order then begin
         state.asset_low <- false;
         if ecfg.remaintain_expired_sells then begin
-          let already_in_stack = List.exists (fun (p, _) -> abs_float (p -. sell_price) <= (sell_price *. 0.005)) state.persisted_sell_levels in
-          if not already_in_stack then begin
-            state.persisted_sell_levels <- (sell_price, effective_sell_qty) :: state.persisted_sell_levels;
-            state.persistence_dirty <- true
-          end
+          let filtered = List.filter (fun (p, _) -> abs_float (p -. sell_price) > (sell_price *. 0.005)) state.persisted_sell_levels in
+          state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) ((sell_price, effective_sell_qty) :: filtered);
+          state.persistence_dirty <- true
         end;
         if is_accumulation_sell then begin
           let rounded_sell = effective_sell_qty in

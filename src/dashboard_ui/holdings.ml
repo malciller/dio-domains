@@ -148,7 +148,7 @@ let render_strategies ?(selected_index=None) w json =
         col 16 a_label "SYMBOL";
         col 5 a_label "STGY";
         col 3 a_label "ST";
-        col_right 13 a_label "PRICE";
+        col_right 12 a_label "PRICE";
         col_right 8 a_label "SPREAD";
         I.string a_border " │ ";
         col_right 12 a_label "BUY @";
@@ -159,6 +159,8 @@ let render_strategies ?(selected_index=None) w json =
         col_right 6 a_label "SELLS";
         col_right 12 a_label "SELL VAL";
         I.string a_border " │ ";
+        col_right 12 a_label "HOLD QTY";
+        col_right 10 a_label "HOLD VAL";
         col_right 12 a_label "ACCUM QTY";
         col_right 10 a_label "ACCUM VAL";
       ]
