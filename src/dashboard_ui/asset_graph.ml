@@ -1,11 +1,11 @@
 open Notty
 open Theme
 
-type level_info = {
-  level_price: float;
-  is_mid: bool;
-  sell_orders: (string * float * float) list;
-  buy_orders: (string * float * float) list;
+type price_snapshot = {
+  timestamp: float;
+  mid_p: float;
+  buy_ps: float list;
+  sell_ps: float list;
 }
 
 let repeat_utf8 str count =
@@ -32,9 +32,9 @@ let braille_bit sub_x sub_y =
 (** Fixed 15-minute time window in seconds (900s). *)
 let window_seconds = 900.0
 
-(** Rolling price history buffer per asset key.
-    Tracks live mid prices across the 15-minute window for all assets. *)
-let price_history : (string, (float * float) Queue.t) Hashtbl.t = Hashtbl.create 32
+(** Rolling price & order history buffer per asset key.
+    Tracks live mid prices as well as active buy and sell order price levels over 15 minutes. *)
+let price_history : (string, price_snapshot Queue.t) Hashtbl.t = Hashtbl.create 32
 
 (** Global zoom level per asset key.
     0 = Full view showing all orders.
@@ -61,6 +61,37 @@ let record_all_prices json =
     let bid = market |?> "bid" |> to_float_d 0.0 in
     let ask = market |?> "ask" |> to_float_d 0.0 in
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
+
+    let strat_json = if a.is_strategy then a.data |?> "strategy" else `Null in
+
+    let sell_orders_json =
+      if a.is_strategy then strat_json |?> "sell_orders" |> to_list_d
+      else a.data |?> "sell_orders" |> to_list_d
+    in
+    let sell_ps = List.filter_map (fun s ->
+      let p = s |?> "price" |> to_float_d 0.0 in
+      let q = s |?> "qty" |> to_float_d 0.0 in
+      if p > 0.0 && q > 0.0 then Some p else None
+    ) sell_orders_json in
+
+    let buy_orders_json =
+      if a.is_strategy then strat_json |?> "buy_orders" |> to_list_d
+      else a.data |?> "buy_orders" |> to_list_d
+    in
+    let buy_orders_parsed = List.filter_map (fun s ->
+      let p = s |?> "price" |> to_float_d 0.0 in
+      let q = s |?> "qty" |> to_float_d 0.0 in
+      if p > 0.0 && q > 0.0 then Some p else None
+    ) buy_orders_json in
+
+    let buy_ps =
+      if buy_orders_parsed <> [] then buy_orders_parsed
+      else if a.is_strategy then
+        let bp = strat_json |?> "buy_price" |> to_float_d 0.0 in
+        if bp > 0.0 then [bp] else []
+      else []
+    in
+
     if mid > 0.0 then begin
       let q = match Hashtbl.find_opt price_history a.key with
         | Some q -> q
@@ -70,16 +101,20 @@ let record_all_prices json =
             q
       in
       (* Prune entries older than 15 minutes *)
-      while (not (Queue.is_empty q)) && (now -. fst (Queue.peek q) > window_seconds) do
+      while (not (Queue.is_empty q)) && (now -. (Queue.peek q).timestamp > window_seconds) do
         ignore (Queue.pop q)
       done;
       let should_push =
         if Queue.is_empty q then true
         else
-          let (last_t, last_p) = Queue.fold (fun _ item -> item) (0.0, 0.0) q in
-          now -. last_t >= 1.0 || abs_float (mid -. last_p) > 0.000001
+          let last_snap = Queue.fold (fun _ item -> item) { timestamp = 0.0; mid_p = 0.0; buy_ps = []; sell_ps = [] } q in
+          now -. last_snap.timestamp >= 1.0 ||
+          abs_float (mid -. last_snap.mid_p) > 0.000001 ||
+          buy_ps <> last_snap.buy_ps ||
+          sell_ps <> last_snap.sell_ps
       in
-      if should_push then Queue.push (now, mid) q
+      if should_push then
+        Queue.push { timestamp = now; mid_p = mid; buy_ps; sell_ps } q
     end
   ) assets
 
@@ -110,7 +145,7 @@ let render_asset_detail w h asset_key json =
       let quote_bal = market |?> "quote_balance" |> to_float_d 0.0 in
       let hold_val = base_bal *. mid in
 
-      (* Record live mid price into time series history buffer *)
+      (* Record live mid price and active order levels into history buffer *)
       record_all_prices json;
 
       (* Extract strategy & order details *)
@@ -201,19 +236,21 @@ let render_asset_detail w h asset_key json =
         match Hashtbl.find_opt price_history a.key with
         | None -> []
         | Some q ->
-            while (not (Queue.is_empty q)) && (now -. fst (Queue.peek q) > window_seconds) do
+            while (not (Queue.is_empty q)) && (now -. (Queue.peek q).timestamp > window_seconds) do
               ignore (Queue.pop q)
             done;
             Queue.fold (fun acc pt -> pt :: acc) [] q |> List.rev
       in
-      let hist_prices = List.map snd hist_points in
+      let hist_mid_prices = List.map (fun s -> s.mid_p) hist_points in
+      let hist_buy_prices = List.concat_map (fun s -> s.buy_ps) hist_points in
+      let hist_sell_prices = List.concat_map (fun s -> s.sell_ps) hist_points in
 
-      (* Scale to show ALL buy and sell orders + fills + 15m historical mid prices *)
+      (* Scale to show ALL buy and sell orders + fills + 15m historical mid and order prices *)
       let all_prices =
         (if mid > 0.0 then [mid] else []) @
         (if last_buy_fill > 0.0 then [last_buy_fill] else []) @
         (if last_sell_fill > 0.0 then [last_sell_fill] else []) @
-        hist_prices @
+        hist_mid_prices @ hist_buy_prices @ hist_sell_prices @
         List.map (fun (_, p, _) -> p) buy_orders @
         List.map (fun (_, p, _) -> p) sell_orders
       in
@@ -297,68 +334,123 @@ let render_asset_detail w h asset_key json =
         min (canvas_h - 1) (sy / 4)
       in
 
-      (* Plot live price dots across 15m timeline. Subpixel Y = -1 for uncollected past *)
-      let curve_sub_y = Array.make sub_w (-1) in
+      let raw_mid_row = price_to_row mid in
+
+      let has_sells = sell_orders <> [] in
+      let has_buys = buy_orders <> [] || (a.is_strategy && (strat_json |?> "buy_price" |> to_float_d 0.0) > 0.0) in
+
+      let mid_row =
+        let r = raw_mid_row in
+        let r = if has_sells && r = 0 && canvas_h > 1 then 1 else r in
+        let r = if has_buys && r = canvas_h - 1 && canvas_h > 1 then canvas_h - 2 else r in
+        r
+      in
+
+      (* Group sell orders by canvas row, ensuring they are placed strictly ABOVE mid_row (smaller row index) *)
+      let sell_by_row = Hashtbl.create 16 in
+      List.iter (fun (id, p, q) ->
+        let r_raw = price_to_row p in
+        let r = min (mid_row - 1) r_raw in
+        let r = max 0 r in
+        let existing = try Hashtbl.find sell_by_row r with Not_found -> [] in
+        Hashtbl.replace sell_by_row r ((id, p, q) :: existing)
+      ) sell_orders;
+
+      (* Group buy orders by canvas row, ensuring they are placed strictly BELOW mid_row (larger row index) *)
+      let buy_by_row = Hashtbl.create 16 in
+      List.iter (fun (id, p, q) ->
+        let r_raw = price_to_row p in
+        let r = max (mid_row + 1) r_raw in
+        let r = min (canvas_h - 1) r in
+        let existing = try Hashtbl.find buy_by_row r with Not_found -> [] in
+        Hashtbl.replace buy_by_row r ((id, p, q) :: existing)
+      ) buy_orders;
+
+      let get_assigned_row_for_price p =
+        if abs_float (p -. mid) < 0.000001 then mid_row
+        else if p > mid then
+          let r_raw = price_to_row p in
+          if has_sells then max 0 (min (mid_row - 1) r_raw) else r_raw
+        else
+          let r_raw = price_to_row p in
+          if has_buys then min (canvas_h - 1) (max (mid_row + 1) r_raw) else r_raw
+      in
+
+      let price_to_aligned_sub_y p =
+        let sy_raw = price_to_sub_y p in
+        let r_raw = sy_raw / 4 in
+        let target_r = get_assigned_row_for_price p in
+        if target_r = r_raw then sy_raw
+        else
+          let offset = sy_raw mod 4 in
+          let sy = target_r * 4 + offset in
+          max 0 (min (sub_h - 1) sy)
+      in
+
+      (* Plot live price & order level dots across 15m timeline aligned with target pin rows. *)
+      let mid_sub_y = Array.make sub_w (-1) in
+      let buy_sub_y_list = Array.make sub_w [] in
+      let sell_sub_y_list = Array.make sub_w [] in
 
       (match hist_points with
        | [] ->
-           (* If no points yet, plot dot at far right (LIVE NOW) *)
-           curve_sub_y.(sub_w - 1) <- price_to_sub_y mid
+           mid_sub_y.(sub_w - 1) <- price_to_aligned_sub_y mid;
+           buy_sub_y_list.(sub_w - 1) <- List.map (fun (_, p, _) -> price_to_aligned_sub_y p) buy_orders;
+           sell_sub_y_list.(sub_w - 1) <- List.map (fun (_, p, _) -> price_to_aligned_sub_y p) sell_orders
        | pts ->
-           let t_earliest = fst (List.hd pts) in
+           let t_earliest = (List.hd pts).timestamp in
 
-           let rec price_at_t target_t = function
+           let rec mid_at_t target_t = function
              | [] -> mid
-             | [(_, p0)] -> p0
-             | (t0, p0) :: (t1, p1) :: rest ->
-                 if target_t >= t0 && target_t <= t1 then
-                   let ratio = (target_t -. t0) /. (max 0.0001 (t1 -. t0)) in
-                   p0 +. (p1 -. p0) *. ratio
+             | [s0] -> s0.mid_p
+             | s0 :: s1 :: rest ->
+                 if target_t >= s0.timestamp && target_t <= s1.timestamp then
+                   let ratio = (target_t -. s0.timestamp) /. (max 0.0001 (s1.timestamp -. s0.timestamp)) in
+                   s0.mid_p +. (s1.mid_p -. s0.mid_p) *. ratio
                  else
-                   price_at_t target_t ((t1, p1) :: rest)
+                   mid_at_t target_t (s1 :: rest)
+           in
+
+           let rec snap_at_t target_t = function
+             | [] -> None
+             | [s0] -> Some s0
+             | s0 :: (s1 :: _ as rest) ->
+                 if target_t >= s0.timestamp && target_t < s1.timestamp then Some s0
+                 else if target_t >= s1.timestamp then snap_at_t target_t rest
+                 else Some s0
            in
 
            for sx = 0 to sub_w - 1 do
              let ratio_x = float sx /. float (max 1 (sub_w - 1)) in
              let target_t = window_start +. (ratio_x *. window_seconds) in
              if target_t >= t_earliest then begin
-               let p = price_at_t target_t pts in
-               curve_sub_y.(sx) <- price_to_sub_y p
+               let p = mid_at_t target_t pts in
+               mid_sub_y.(sx) <- price_to_aligned_sub_y p;
+               match snap_at_t target_t pts with
+               | Some snap ->
+                   buy_sub_y_list.(sx) <- List.map price_to_aligned_sub_y snap.buy_ps;
+                   sell_sub_y_list.(sx) <- List.map price_to_aligned_sub_y snap.sell_ps
+               | None -> ()
              end
            done);
 
-      let mid_row = price_to_row mid in
-
       let buy_row_opt =
-        match buy_orders with
-        | (_, bp, _) :: _ when bp > 0.0 ->
-            let r = price_to_row bp in
-            let r_distinct =
-              if r = mid_row && canvas_h > 2 then min (canvas_h - 1) (mid_row + 1)
-              else r
-            in
-            Some r_distinct
-        | _ -> None
+        if buy_orders <> [] then
+          let r_best = Hashtbl.fold (fun r _ acc -> match acc with None -> Some r | Some r_prev -> Some (min r r_prev)) buy_by_row None in
+          r_best
+        else if is_synthetic_buy then
+          match buy_orders_parsed with
+          | [] ->
+              let bp = strat_json |?> "buy_price" |> to_float_d 0.0 in
+              if bp > 0.0 then
+                let r_raw = price_to_row bp in
+                let r = max (mid_row + 1) r_raw in
+                let r = min (canvas_h - 1) r in
+                Some r
+              else None
+          | _ -> None
+        else None
       in
-
-      (* Group sell orders by canvas row *)
-      let sell_by_row = Hashtbl.create 16 in
-      List.iter (fun (id, p, q) ->
-        let r = price_to_row p in
-        let existing = try Hashtbl.find sell_by_row r with Not_found -> [] in
-        Hashtbl.replace sell_by_row r ((id, p, q) :: existing)
-      ) sell_orders;
-
-      (* Group buy orders by canvas row *)
-      let buy_by_row = Hashtbl.create 16 in
-      (match buy_row_opt with
-       | Some br -> Hashtbl.replace buy_by_row br buy_orders
-       | None ->
-           List.iter (fun (id, p, q) ->
-             let r = price_to_row p in
-             let existing = try Hashtbl.find buy_by_row r with Not_found -> [] in
-             Hashtbl.replace buy_by_row r ((id, p, q) :: existing)
-           ) buy_orders);
 
       (* Clean Y-axis price ticks *)
       let show_y_label = Array.make canvas_h false in
@@ -380,6 +472,11 @@ let render_asset_detail w h asset_key json =
       Hashtbl.iter (fun r orders ->
         show_y_label.(r) <- true;
         match orders with (_, p, _) :: _ -> label_prices.(r) <- p | [] -> ()
+      ) buy_by_row;
+
+      Hashtbl.iter (fun r orders ->
+        show_y_label.(r) <- true;
+        match orders with (_, p, _) :: _ -> label_prices.(r) <- p | [] -> ()
       ) sell_by_row;
 
       for r = 0 to canvas_h - 1 do
@@ -391,8 +488,6 @@ let render_asset_detail w h asset_key json =
           if not has_adj then show_y_label.(r) <- true
         end
       done;
-
-      let last_badge_row = ref (-3) in
 
       (* Render rows of the 2D matrix canvas *)
       let canvas_rows = List.init canvas_h (fun r ->
@@ -422,34 +517,46 @@ let render_asset_detail w h asset_key json =
         let cells = List.init canvas_w (fun c ->
           let sx0 = c * 2 in
           let sx1 = c * 2 + 1 in
-          let sy_sub0 = curve_sub_y.(sx0) in
-          let sy_sub1 = curve_sub_y.(sx1) in
+          let mid_sy0 = mid_sub_y.(sx0) in
+          let mid_sy1 = mid_sub_y.(sx1) in
+          let buy_sys0 = buy_sub_y_list.(sx0) in
+          let buy_sys1 = buy_sub_y_list.(sx1) in
+          let sell_sys0 = sell_sub_y_list.(sx0) in
+          let sell_sys1 = sell_sub_y_list.(sx1) in
 
           let cell_sy_start = r * 4 in
-          let mask = ref 0 in
-          let on_curve = ref false in
+          let mid_mask = ref 0 in
+          let buy_mask = ref 0 in
+          let sell_mask = ref 0 in
 
           for sub_y = 0 to 3 do
             let current_sy = cell_sy_start + sub_y in
-            if sy_sub0 >= 0 && current_sy = sy_sub0 then begin
-              mask := !mask lor braille_bit 0 sub_y;
-              on_curve := true
-            end;
-            if sy_sub1 >= 0 && current_sy = sy_sub1 then begin
-              mask := !mask lor braille_bit 1 sub_y;
-              on_curve := true
-            end
+            if mid_sy0 >= 0 && current_sy = mid_sy0 then mid_mask := !mid_mask lor braille_bit 0 sub_y;
+            if mid_sy1 >= 0 && current_sy = mid_sy1 then mid_mask := !mid_mask lor braille_bit 1 sub_y;
+
+            if List.mem current_sy buy_sys0 then buy_mask := !buy_mask lor braille_bit 0 sub_y;
+            if List.mem current_sy buy_sys1 then buy_mask := !buy_mask lor braille_bit 1 sub_y;
+
+            if List.mem current_sy sell_sys0 then sell_mask := !sell_mask lor braille_bit 0 sub_y;
+            if List.mem current_sy sell_sys1 then sell_mask := !sell_mask lor braille_bit 1 sub_y;
           done;
 
           let valid_sy =
-            if sy_sub0 >= 0 && sy_sub1 >= 0 then min sy_sub0 sy_sub1
-            else if sy_sub0 >= 0 then sy_sub0
-            else sy_sub1
+            if mid_sy0 >= 0 && mid_sy1 >= 0 then min mid_sy0 mid_sy1
+            else if mid_sy0 >= 0 then mid_sy0
+            else mid_sy1
           in
 
-          if !on_curve && !mask <> 0 then
-            let str = braille_to_utf8 !mask in
+          if !mid_mask <> 0 then
+            let str = braille_to_utf8 !mid_mask in
             I.string A.(fg c_green ++ bg c_bg ++ st bold) str
+          else if !buy_mask <> 0 then
+            let str = braille_to_utf8 !buy_mask in
+            let pin_color = if is_synthetic_buy then c_yellow else c_cyan in
+            I.string A.(fg pin_color ++ bg c_bg ++ st bold) str
+          else if !sell_mask <> 0 then
+            let str = braille_to_utf8 !sell_mask in
+            I.string A.(fg c_magenta ++ bg c_bg ++ st bold) str
           else if valid_sy >= 0 && cell_sy_start > valid_sy then
             let fill_dist = float (cell_sy_start - valid_sy) /. float sub_h in
             let fill_rgb =
@@ -469,11 +576,8 @@ let render_asset_detail w h asset_key json =
         let chart_line_img = I.hcat cells in
 
         (* Render Right-Docked Order Target Pins *)
-        let can_draw_badge = r - !last_badge_row >= 2 || is_mid_l || is_buy_l in
-
         let right_pin_img =
           if is_mid_l then begin
-            last_badge_row := r;
             let tracer = repeat_utf8 "╌" 4 in
             let mid_badge = Printf.sprintf " ◀ LIVE NOW %s " (format_price mid) in
             I.hcat [
@@ -481,8 +585,7 @@ let render_asset_detail w h asset_key json =
               I.string A.(fg c_bright ++ bg c_green ++ st bold) (pad_right (pin_col_w - 4) mid_badge);
             ]
           end
-          else if is_buy_l && can_draw_badge then begin
-            last_badge_row := r;
+          else if is_buy_l then begin
             let orders = if b_orders_l <> [] then b_orders_l else buy_orders in
             let count = List.length orders in
             let total_q = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 orders in
@@ -503,8 +606,7 @@ let render_asset_detail w h asset_key json =
                 I.string A.(fg c_bg ++ bg c_cyan ++ st bold) (pad_right (pin_col_w - 4) buy_badge);
               ]
           end
-          else if is_sell_l && can_draw_badge then begin
-            last_badge_row := r;
+          else if is_sell_l then begin
             let count = List.length s_orders_l in
             let total_q = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 s_orders_l in
             let avg_p = (List.fold_left (fun acc (_, p, _) -> acc +. p) 0.0 s_orders_l) /. float count in
