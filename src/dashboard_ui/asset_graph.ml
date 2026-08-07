@@ -1,6 +1,13 @@
 open Notty
 open Theme
 
+type level_info = {
+  level_price: float;
+  is_mid: bool;
+  sell_orders: (string * float * float) list;
+  buy_orders: (string * float * float) list;
+}
+
 let repeat_utf8 str count =
   let count = max 0 count in
   let buf = Buffer.create (String.length str * count) in
@@ -94,206 +101,132 @@ let render_asset_detail w h asset_key json =
         ]
       ) in
 
-      (* Determine lowest buy price anchor *)
-      let lowest_buy_price_opt =
-        match buy_orders with
-        | [] -> None
-        | orders ->
-            let prices = List.map (fun (_, p, _) -> p) orders in
-            Some (List.fold_left min (List.hd prices) prices)
-      in
-
-      (* Anchor min_p at the buy price so the Buy Order is the visible bottom anchor *)
+      (* Determine price range bounds (min_p, max_p) to encompass ALL orders *)
       let min_p, max_p =
-        match lowest_buy_price_opt with
-        | Some bp ->
-            let base_min = bp *. 0.998 in
-            let span = if mid > bp then mid -. bp else bp *. 0.02 in
-            let base_max = mid +. (span *. 2.5) in
-            let sell_prices = List.map (fun (_, p, _) -> p) sell_orders in
-            let max_p_val =
-              match sell_prices with
-              | [] -> base_max
-              | prices ->
-                  let max_sell = List.fold_left max (List.hd prices) prices in
-                  min (max_sell *. 1.005) (max base_max (mid +. span *. 3.0))
-            in
-            (base_min, max_p_val)
-        | None ->
-            let all_prices = (if mid > 0.0 then [mid] else []) @ List.map (fun (_, p, _) -> p) sell_orders in
-            (match all_prices with
-             | [] -> (100.0, 110.0)
-             | [p] -> (p *. 0.97, p *. 1.03)
-             | prices ->
-                 let low = List.fold_left min (List.hd prices) prices in
-                 let high = List.fold_left max (List.hd prices) prices in
-                 (low *. 0.995, high *. 1.005))
+        let all_buy_prices = List.map (fun (_, p, _) -> p) buy_orders in
+        let all_sell_prices = List.map (fun (_, p, _) -> p) sell_orders in
+        let all_prices = (if mid > 0.0 then [mid] else []) @ all_buy_prices @ all_sell_prices in
+        match all_prices with
+        | [] -> (100.0, 110.0)
+        | [p] -> (p *. 0.97, p *. 1.03)
+        | prices ->
+            let low = List.fold_left min (List.hd prices) prices in
+            let high = List.fold_left max (List.hd prices) prices in
+            let span = max (high -. low) (low *. 0.005) in
+            (low -. (span *. 0.03), high +. (span *. 0.03))
       in
 
-      (* Recent fills for this asset *)
-      let recent_fills = json |?> "recent_fills" |> to_list_d in
-      let asset_fills = List.filter (fun f ->
-        let fsym = f |?> "symbol" |> to_string_d "" in
-        fsym = a.symbol || fsym = a.asset || (String.contains fsym '/' && List.hd (String.split_on_char '/' fsym) = a.asset)
-      ) recent_fills in
+      (* Render Price Graph Ladder — takes 100% of remaining terminal height *)
+      (* Overhead: header(1) + summary(1) + graph_title(1) + footers(2) = 5 lines *)
+      let raw_height = max 10 (h - 5) in
+      let price_step = (max_p -. min_p) /. float_of_int (max 1 (raw_height - 1)) in
 
-      let fills_count = min 3 (List.length asset_fills) in
-      let fills_h = if fills_count > 0 then 1 + fills_count else 0 in
-
-      (* Render Price Graph Ladder *)
-      let graph_height = max 6 (min 12 (h - 18 - fills_h)) in
-      let price_step = (max_p -. min_p) /. float_of_int (max 1 (graph_height - 1)) in
-
-      let graph_rows = List.init graph_height (fun row_idx ->
+      let all_levels = List.init raw_height (fun row_idx ->
         let level_price = max_p -. (float_of_int row_idx *. price_step) in
         let lower_bound = level_price -. (price_step /. 2.0) in
         let upper_bound = level_price +. (price_step /. 2.0) in
 
-        let is_mid_level = mid >= lower_bound && mid < upper_bound in
-        let s_orders_at_level = List.filter (fun (_, p, _) -> p >= lower_bound && p < upper_bound) sell_orders in
-        let b_orders_at_level = List.filter (fun (_, p, _) -> p >= lower_bound && p < upper_bound) buy_orders in
+        let is_mid = mid >= lower_bound && mid < upper_bound in
+        let s_orders = List.filter (fun (_, p, _) -> p >= lower_bound && p < upper_bound) sell_orders in
+        let b_orders = List.filter (fun (_, p, _) -> p >= lower_bound && p < upper_bound) buy_orders in
 
-        let price_lbl = pad_left 11 (format_price level_price) in
-
-        let bar_width = max 20 (w - 45) in
-
-        let content_img =
-          if is_mid_level then
-            let mid_str = Printf.sprintf " ═════════◄ MARKET MID %s (Bid: %.2f / Ask: %.2f) ═════════"
-              (format_price mid) bid ask in
-            I.string A.(fg c_green ++ bg c_panel ++ st bold) (pad_right bar_width mid_str)
-          else if s_orders_at_level <> [] then
-            let total_qty = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 s_orders_at_level in
-            let dist_pct = if mid > 0.0 then ((level_price -. mid) /. mid) *. 100.0 else 0.0 in
-            let bar_len = min bar_width (max 4 (int_of_float (total_qty *. 10.0))) in
-            let bar_str = repeat_utf8 "█" bar_len in
-            let info_str = Printf.sprintf " SELL %s (%s @ %s [%s])"
-              bar_str (format_qty total_qty) (format_price level_price) (format_pct dist_pct) in
-            I.string A.(fg c_red ++ bg c_bg ++ st bold) (pad_right bar_width info_str)
-          else if b_orders_at_level <> [] then
-            let total_qty = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 b_orders_at_level in
-            let dist_pct = if mid > 0.0 then ((level_price -. mid) /. mid) *. 100.0 else 0.0 in
-            let bar_len = min bar_width (max 4 (int_of_float (total_qty *. 10.0))) in
-            let bar_str = repeat_utf8 "█" bar_len in
-            let info_str = Printf.sprintf " BUY  %s (%s @ %s [%s])"
-              bar_str (format_qty total_qty) (format_price level_price) (format_pct dist_pct) in
-            I.string A.(fg c_cyan ++ bg c_bg ++ st bold) (pad_right bar_width info_str)
-          else
-            let dot_pattern = String.concat " " (List.init (bar_width / 2) (fun _ -> "·")) in
-            I.string A.(fg c_border ++ bg c_bg) (pad_right bar_width dot_pattern)
-        in
-
-        close_row w (
-          I.hcat [
-            I.string a_border " │ ";
-            I.string A.(fg c_title ++ bg c_bg) price_lbl;
-            I.string a_border " │ ";
-            content_img;
-            I.string a_border " │";
-          ]
-        )
+        { level_price; is_mid; sell_orders = s_orders; buy_orders = b_orders }
       ) in
 
-      let graph_section = I.vcat [
-        close_row w (I.string A.(fg c_border ++ bg c_bg) (" ├── PRICE LADDER & ORDER GRAPH " ^ repeat_utf8 "─" (max 0 (w - 32))));
-        I.vcat graph_rows;
-      ] in
+      let is_empty lvl = (not lvl.is_mid) && lvl.sell_orders = [] && lvl.buy_orders = [] in
 
-      (* Open Orders Table *)
-      let order_headers = close_row w (
-        I.hcat [
-          I.string a_border " │  ";
-          col 6 a_label "SIDE";
-          col 18 a_label "ORDER ID";
-          col_right 12 a_label "PRICE";
-          col_right 12 a_label "QTY";
-          col_right 14 a_label "VALUE ($)";
-          col_right 12 a_label "Δ MID";
-        ]
-      ) in
-
-      let render_order_row is_sell (id, price, qty) =
-        let side_str, side_attr = if is_sell then "SELL", a_red else "BUY ", a_green in
-        let val_usd = price *. qty in
-        let dist_pct = if mid > 0.0 then ((price -. mid) /. mid) *. 100.0 else 0.0 in
-        close_row w (
-          I.hcat [
-            I.string a_border " │  ";
-            col 6 side_attr side_str;
-            col 18 a_text (truncate_string 16 id);
-            col_right 12 (if is_sell then a_yellow else a_green) (format_price price);
-            col_right 12 a_text (format_qty qty);
-            col_right 14 a_text (format_usd val_usd);
-            col_right 12 (if is_sell then a_yellow else a_cyan) (format_pct dist_pct);
-          ]
-        )
+      let rec compress acc current_empty = function
+        | [] ->
+            (match current_empty with
+             | [] -> List.rev acc
+             | [single] -> List.rev (`Single single :: acc)
+             | [e1; e2] -> List.rev (`Single e2 :: `Single e1 :: acc)
+             | elist -> List.rev (`Gap elist :: acc))
+        | lvl :: rest ->
+            if is_empty lvl then
+              compress acc (current_empty @ [lvl]) rest
+            else
+              let acc' = match current_empty with
+                | [] -> acc
+                | [single] -> `Single single :: acc
+                | [e1; e2] -> `Single e2 :: `Single e1 :: acc
+                | elist -> `Gap elist :: acc
+              in
+              compress (`Single lvl :: acc') [] rest
       in
 
-      let sorted_sell_orders = List.sort (fun (_, p1, _) (_, p2, _) -> Float.compare p1 p2) sell_orders in
+      let compressed_items = compress [] [] all_levels in
+      let bar_width = max 20 (w - 45) in
 
-      let static_h = 1 (* header *) + 1 (* summary *) + 1 (* graph title *) + graph_height + 2 (* orders title+header *) + fills_h + 3 (* footers *) in
-      let total_available_order_rows = max 3 (h - static_h) in
-      let buy_order_count = List.length buy_orders in
-      let max_sell_display = max 1 (total_available_order_rows - buy_order_count - 1) in
-
-      let rec take n = function
-        | [] -> []
-        | head :: tail -> if n <= 0 then [] else head :: take (n - 1) tail
-      in
-      let display_sell_orders = take max_sell_display sorted_sell_orders in
-      let hidden_sell_count = List.length sorted_sell_orders - List.length display_sell_orders in
-      let max_sell_price = List.fold_left (fun acc (_, p, _) -> max acc p) 0.0 sorted_sell_orders in
-
-      let sell_order_rows = List.map (render_order_row true) (List.rev display_sell_orders) in
-      let buy_order_rows = List.map (render_order_row false) buy_orders in
-
-      let hidden_sell_row =
-        if hidden_sell_count > 0 then
-          [close_row w (
-            I.hcat [
-              I.string a_border " │  ";
-              I.string a_dim (Printf.sprintf "... plus %d more sell orders higher up (up to %s)" hidden_sell_count (format_price max_sell_price));
-            ]
-          )]
-        else []
-      in
-
-      let orders_table = I.vcat (
-        [
-          close_row w (I.string A.(fg c_border ++ bg c_bg) (" ├── ACTIVE PENDING ORDERS (" ^ string_of_int (List.length sell_orders + List.length buy_orders) ^ ") " ^ repeat_utf8 "─" (max 0 (w - 32))));
-          order_headers;
-        ] @
-        hidden_sell_row @
-        sell_order_rows @
-        buy_order_rows @
-        (if sell_orders = [] && buy_orders = [] then
-          [close_row w (I.hcat [ I.string a_border " │  "; I.string a_dim "No pending orders active for this asset." ])]
-         else [])
-      ) in
-
-      let fills_section =
-        if asset_fills = [] then I.empty
-        else
-          let fill_rows = List.mapi (fun _idx f ->
-            let side = f |?> "side" |> to_string_d "?" in
-            let fp = f |?> "fill_price" |> to_float_d 0.0 in
-            let amt = f |?> "amount" |> to_float_d 0.0 in
-            let fval = f |?> "value" |> to_float_d 0.0 in
-            let side_attr = if String.lowercase_ascii side = "buy" then a_green else a_red in
+      let graph_rows = List.map (function
+        | `Single lvl ->
+            let price_lbl = pad_left 11 (format_price lvl.level_price) in
+            let content_img =
+              if lvl.buy_orders <> [] then
+                let count = List.length lvl.buy_orders in
+                let total_qty = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 lvl.buy_orders in
+                let dist_pct = if mid > 0.0 then ((lvl.level_price -. mid) /. mid) *. 100.0 else 0.0 in
+                let bar_len = min 6 (max 3 (int_of_float (log10 (max 1.0 total_qty) *. 1.5 +. 3.0))) in
+                let bar_str = repeat_utf8 "█" bar_len in
+                let count_tag = if count > 1 then Printf.sprintf "[%dx] " count else "" in
+                let mid_tag = if lvl.is_mid then Printf.sprintf " ◄ MARKET MID %s" (format_price mid) else "" in
+                let info_str = Printf.sprintf " BUY  %s%s (%s @ %s [%s])%s"
+                  count_tag bar_str (format_qty total_qty) (format_price lvl.level_price) (format_pct dist_pct) mid_tag in
+                I.string A.(fg c_cyan ++ bg c_bg ++ st bold) (pad_right bar_width info_str)
+              else if lvl.sell_orders <> [] then
+                let count = List.length lvl.sell_orders in
+                let total_qty = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 lvl.sell_orders in
+                let dist_pct = if mid > 0.0 then ((lvl.level_price -. mid) /. mid) *. 100.0 else 0.0 in
+                let bar_len = min 6 (max 3 (int_of_float (log10 (max 1.0 total_qty) *. 1.5 +. 3.0))) in
+                let bar_str = repeat_utf8 "█" bar_len in
+                let count_tag = if count > 1 then Printf.sprintf "[%dx] " count else "" in
+                let mid_tag = if lvl.is_mid then Printf.sprintf " ◄ MARKET MID %s" (format_price mid) else "" in
+                let info_str = Printf.sprintf " SELL %s%s (%s @ %s [%s])%s"
+                  count_tag bar_str (format_qty total_qty) (format_price lvl.level_price) (format_pct dist_pct) mid_tag in
+                I.string A.(fg c_red ++ bg c_bg ++ st bold) (pad_right bar_width info_str)
+              else if lvl.is_mid then
+                let mid_str = Printf.sprintf " ═════════◄ MARKET MID %s (Bid: %.2f / Ask: %.2f) ═════════"
+                  (format_price mid) bid ask in
+                I.string A.(fg c_green ++ bg c_panel ++ st bold) (pad_right bar_width mid_str)
+              else
+                let dot_pattern = String.concat " " (List.init (bar_width / 2) (fun _ -> "·")) in
+                I.string A.(fg c_border ++ bg c_bg) (pad_right bar_width dot_pattern)
+            in
             close_row w (
               I.hcat [
-                I.string a_border " │  ";
-                col 6 side_attr (String.uppercase_ascii side);
-                col_right 12 a_text (format_price fp);
-                col_right 12 a_text (format_qty amt);
-                col_right 14 a_text (format_usd fval);
+                I.string a_border " │ ";
+                I.string A.(fg c_title ++ bg c_bg) price_lbl;
+                I.string a_border " │ ";
+                content_img;
+                I.string a_border " │";
               ]
             )
-          ) (List.filteri (fun i _ -> i < 3) asset_fills) in
-          I.vcat ([
-            close_row w (I.string A.(fg c_border ++ bg c_bg) (" ├── RECENT FILLS FOR " ^ a.symbol ^ " " ^ repeat_utf8 "─" (max 0 (w - 25))));
-          ] @ fill_rows)
-      in
+        | `Gap elist ->
+            let top_lvl = List.hd elist in
+            let bot_lvl = List.hd (List.rev elist) in
+            let price_lbl = pad_left 11 (format_price bot_lvl.level_price) in
+            let gap_str = Printf.sprintf " ─────── ░░ PRICE GAP: %s ── %s (%d empty steps) ░░ ───────"
+              (format_price bot_lvl.level_price) (format_price top_lvl.level_price) (List.length elist) in
+            close_row w (
+              I.hcat [
+                I.string a_border " │ ";
+                I.string A.(fg c_dim ++ bg c_bg) price_lbl;
+                I.string a_border " │ ";
+                I.string A.(fg c_dim ++ bg c_bg) (pad_right bar_width gap_str);
+                I.string a_border " │";
+              ]
+            )
+      ) compressed_items in
+
+      let num_sells = List.length sell_orders in
+      let num_buys = List.length buy_orders in
+      let orders_summary = Printf.sprintf " (%d Sell, %d Buy Pending) " num_sells num_buys in
+      let graph_title_text = " ├── PRICE LADDER & ORDER GRAPH" ^ orders_summary in
+
+      let graph_section = I.vcat [
+        close_row w (I.string A.(fg c_border ++ bg c_bg) (graph_title_text ^ repeat_utf8 "─" (max 0 (w - String.length graph_title_text - 1))));
+        I.vcat graph_rows;
+      ] in
 
       (* Navigation Footer *)
       let nav_footer = close_row w (
@@ -311,8 +244,9 @@ let render_asset_detail w h asset_key json =
         header_bar;
         summary_card;
         graph_section;
-        orders_table;
-        fills_section;
         section_footer w;
         nav_footer;
       ]
+
+
+
