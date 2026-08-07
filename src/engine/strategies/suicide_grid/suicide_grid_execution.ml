@@ -258,12 +258,8 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
 
   (!open_buy_count_from_scan, !has_recent_amend_buy, !locked_in_buys, !locked_in_sells, !closest_sell_order)
 
-let compute_buy_ref_price ~state ~bid_price ~ask_price =
-  let market_ref = if bid_price > 0.0 then bid_price else ask_price in
-  match state.last_buy_fill_price with
-  | Some fill_p when fill_p > 0.0 ->
-      if market_ref > 0.0 then min market_ref fill_p else fill_p
-  | _ -> market_ref
+let compute_buy_ref_price ~bid_price ~ask_price =
+  if bid_price > 0.0 then bid_price else ask_price
 
 (** Evaluates buy placement, multi-buy cancellation, and buy trailing. *)
 let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price ~quote_balance
@@ -300,7 +296,7 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
     state.last_buy_order_price <- None;
     state.last_cycle <- cycle
   end else if effective_buy_count = 0 && not buy_order_pending then begin
-    let ref_price = compute_buy_ref_price ~state ~bid_price ~ask_price in
+    let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
     let raw_buy_price = calculate_grid_price ref_price grid_interval false state in
     let buy_price = if bid_price > 0.0 then min raw_buy_price bid_price else raw_buy_price in
     let buy_cooldown_key = "place_Buy" in
@@ -370,7 +366,7 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
           let distance = sell_price -. current_buy_price in
           let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
 
-          let ref_price = compute_buy_ref_price ~state ~bid_price ~ask_price in
+          let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
           let grid_buy_from_ref = calculate_grid_price ref_price grid_interval false state in
           let grid_buy_capped = if bid_price > 0.0 then min grid_buy_from_ref bid_price else grid_buy_from_ref in
           let raw_exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
@@ -417,7 +413,7 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
             let current_buy_price_rounded = state.cached_round_price current_buy_price in
             let price_diff_rounded = state.cached_round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) in
             let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
-            let should_amend = exact_target_rounded > current_buy_price_rounded || (bid_price > 0.0 && bid_price < current_buy_price) in
+            let should_amend = exact_target_rounded > current_buy_price_rounded in
 
             if should_amend && amend_allowed ~state ~order_id:buy_order_id ~target_price:exact_target_rounded
                  ~current_price_rounded:current_buy_price_rounded
@@ -440,7 +436,7 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
     end else begin
       match state.last_buy_order_price, state.last_buy_order_id with
       | Some current_buy_price, Some buy_order_id ->
-          let ref_price = compute_buy_ref_price ~state ~bid_price ~ask_price in
+          let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
           let raw_target = calculate_grid_price ref_price grid_interval false state in
           let target_buy_price = if bid_price > 0.0 then min raw_target bid_price else raw_target in
           if target_buy_price > current_buy_price then begin

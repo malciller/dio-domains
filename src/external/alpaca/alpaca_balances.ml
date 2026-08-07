@@ -44,6 +44,21 @@ let update_balances () =
        | Ok positions ->
            if positions <> [] then
              Logging.debug_f ~section "Alpaca loaded %d active position(s)" (List.length positions);
+           let pos_symbols = List.map (fun (p : Alpaca_types.position_record) -> p.symbol) positions in
+           let to_remove_b = ref [] in
+           Hashtbl.iter (fun k _ ->
+             if k <> "USD" && k <> "USDC" && not (List.mem k pos_symbols) then
+               to_remove_b := k :: !to_remove_b
+           ) balances;
+           List.iter (Hashtbl.remove balances) !to_remove_b;
+
+           let to_remove_tb = ref [] in
+           Hashtbl.iter (fun k _ ->
+             if k <> "USD" && k <> "USDC" && not (List.mem k pos_symbols) then
+               to_remove_tb := k :: !to_remove_tb
+           ) total_balances;
+           List.iter (Hashtbl.remove total_balances) !to_remove_tb;
+
            List.iter (fun (p : Alpaca_types.position_record) ->
              Hashtbl.replace balances p.symbol p.qty;
              Hashtbl.replace total_balances p.symbol p.qty;

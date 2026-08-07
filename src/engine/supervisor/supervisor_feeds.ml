@@ -278,6 +278,10 @@ let initialize_feeds () : ((Dio_engine.Config.trading_config list * string) Lwt.
     if has_hyperliquid then Hyperliquid.Module.fetch_open_orders_ws ()
     else Lwt.return_unit
   in
+  let%lwt () =
+    if has_alpaca then Alpaca.Executions.bootstrap_open_orders ()
+    else Lwt.return_unit
+  in
 
   (* Step 7: Register and start remaining supervised WebSocket connections *)
   Logging.info ~section "Step 7: Starting Kraken websocket connections...";
