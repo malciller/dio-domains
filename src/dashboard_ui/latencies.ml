@@ -185,45 +185,103 @@ let render_latencies w json =
         | None -> "--"
       in
 
+      let contains_sub str sub =
+        let len_s = String.length str in
+        let len_sub = String.length sub in
+        if len_sub = 0 then true
+        else if len_s < len_sub then false
+        else
+          let found = ref false in
+          let i = ref 0 in
+          while !i <= len_s - len_sub && not !found do
+            if String.sub str !i len_sub = sub then found := true
+            else incr i
+          done;
+          !found
+      in
+
+      let find_sub_idx str sub =
+        let len_s = String.length str in
+        let len_sub = String.length sub in
+        if len_sub = 0 then Some 0
+        else if len_s < len_sub then None
+        else
+          let res = ref None in
+          let i = ref 0 in
+          while !i <= len_s - len_sub && !res = None do
+            if String.sub str !i len_sub = sub then res := Some !i
+            else incr i
+          done;
+          !res
+      in
+
+      let parse_first_int s =
+        let len = String.length s in
+        let buf = Buffer.create 8 in
+        let i = ref 0 in
+        while !i < len && (s.[!i] >= '0' && s.[!i] <= '9') do
+          Buffer.add_char buf s.[!i];
+          incr i
+        done;
+        try int_of_string (Buffer.contents buf) with _ -> 0
+      in
+
+      let get_word s =
+        let len = String.length s in
+        let buf = Buffer.create 16 in
+        let i = ref 0 in
+        while !i < len && s.[!i] <> ' ' && s.[!i] <> '(' do
+          Buffer.add_char buf s.[!i];
+          incr i
+        done;
+        Buffer.contents buf
+      in
+
       let formatted_cause =
         if cycle_cause = "--" || cycle_cause = "" then col 28 a_dim "--"
         else
           let tags = ref [] in
-          if String.length cycle_cause >= 7 && String.sub cycle_cause 0 7 = "ob:true" then
+          if contains_sub cycle_cause "ob:true" then
             tags := I.string (A.(fg c_cyan ++ bg bg_color ++ st bold)) "[OB]" :: !tags;
-          (try
-            if String.sub cycle_cause (String.index cycle_cause 's') 7 = "st:true" then
-              tags := I.string (A.(fg c_yellow ++ bg bg_color ++ st bold)) "[STRAT]" :: !tags
-          with _ -> ());
-          (try
-            let idx = String.index cycle_cause 'e' in
-            if String.sub cycle_cause idx 3 = "ex:" then
-              let rest = String.sub cycle_cause (idx + 3) (String.length cycle_cause - idx - 3) in
-              let num_str = match String.split_on_char ' ' rest with h :: _ -> h | [] -> "0" in
-              let n = int_of_string num_str in
-              if n > 0 then tags := I.string (A.(fg c_magenta ++ bg bg_color ++ st bold)) (Printf.sprintf "[EXEC:%d]" n) :: !tags
-          with _ -> ());
-          (try
-            let idx = String.index cycle_cause 'a' in
-            if String.sub cycle_cause idx 3 = "al:" then
-              let rest = String.sub cycle_cause (idx + 3) (String.length cycle_cause - idx - 3) in
-              let word_str = match String.split_on_char ' ' rest with h :: _ -> h | [] -> "" in
-              if word_str <> "" then
-                tags := I.string a_dim (Printf.sprintf "[%s]" word_str) :: !tags
-          with _ -> ());
-          if String.contains cycle_cause 'g' then begin
-            (try
-              let idx = String.index cycle_cause 'g' in
-              let gc_sub = String.sub cycle_cause idx (min 6 (String.length cycle_cause - idx)) in
-              if gc_sub = "gc:MAJ" then tags := I.string (A.(fg c_red ++ bg bg_color ++ st bold)) "[GC:MAJ]" :: !tags
-              else if gc_sub = "gc:MIN" then tags := I.string (A.(fg c_yellow ++ bg bg_color ++ st bold)) "[GC:MIN]" :: !tags
-              else if gc_sub = "gc:CMP" then tags := I.string (A.(fg c_red ++ bg bg_color ++ st bold)) "[GC:CMP]" :: !tags
-            with _ -> ())
-          end;
-          if !tags = [] then col 28 a_dim (truncate_string 28 cycle_cause)
-          else
-            let tag_img = I.hcat (List.rev_map (fun t -> I.hcat [t; I.string A.(bg bg_color) " "]) !tags) in
-            I.hsnap ~align:`Left 28 tag_img
+          if contains_sub cycle_cause "st:true" then
+            tags := I.string (A.(fg c_yellow ++ bg bg_color ++ st bold)) "[STRAT]" :: !tags;
+          (match find_sub_idx cycle_cause "ex:" with
+           | Some idx ->
+               let rest = String.sub cycle_cause (idx + 3) (String.length cycle_cause - idx - 3) in
+               let n = parse_first_int rest in
+               if n > 0 then tags := I.string (A.(fg c_magenta ++ bg bg_color ++ st bold)) (Printf.sprintf "[EXEC:%d]" n) :: !tags
+           | None -> ());
+          (match find_sub_idx cycle_cause "al:" with
+           | Some idx ->
+               let rest = String.sub cycle_cause (idx + 3) (String.length cycle_cause - idx - 3) in
+               let word_str = get_word rest in
+               if word_str <> "" then
+                 tags := I.string a_dim (Printf.sprintf "[%s]" word_str) :: !tags
+           | None -> ());
+          let has_gc_maj =
+            contains_sub cycle_cause "gc:MAJ" || contains_sub cycle_cause "gc:CMP" ||
+            (match find_sub_idx cycle_cause "major=" with
+             | Some idx -> parse_first_int (String.sub cycle_cause (idx + 6) (String.length cycle_cause - idx - 6)) > 0
+             | None -> match find_sub_idx cycle_cause "comp=" with
+             | Some idx -> parse_first_int (String.sub cycle_cause (idx + 5) (String.length cycle_cause - idx - 5)) > 0
+             | None -> false)
+          in
+          let has_gc_min =
+            contains_sub cycle_cause "gc:MIN" ||
+            (match find_sub_idx cycle_cause "minor=" with
+             | Some idx -> parse_first_int (String.sub cycle_cause (idx + 6) (String.length cycle_cause - idx - 6)) > 0
+             | None -> false)
+          in
+          if has_gc_maj then
+            tags := I.string (A.(fg c_red ++ bg bg_color ++ st bold)) "[GC:MAJ]" :: !tags
+          else if has_gc_min then
+            tags := I.string (A.(fg c_yellow ++ bg bg_color ++ st bold)) "[GC:MIN]" :: !tags;
+          
+          if !tags = [] then
+            tags := [ I.string a_dim (Printf.sprintf "[%s]" (truncate_string 24 cycle_cause)) ];
+
+          let tag_img = I.hcat (List.rev_map (fun t -> I.hcat [t; I.string A.(bg bg_color) " "]) !tags) in
+          I.hsnap ~align:`Left 28 tag_img
       in
       
       let exch = exch_of_symbol symbol in
