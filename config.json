@@ -2,7 +2,7 @@
   "logging_level": "info",
   "logging_sections": "",
   "cycle_mod": 10000,
-  "fng_check_threshold": 1.5,
+  "fng_check_threshold": 2.5,
   "gc": {
     "minor_heap_size": 33554432,
     "space_overhead": 120,
