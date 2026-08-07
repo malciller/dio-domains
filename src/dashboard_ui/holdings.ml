@@ -44,13 +44,6 @@ let get_selectable_assets json =
     not is_quote
   ) valid_balances in
 
-  let quote_jsons = List.filter (fun bal_json ->
-    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-    let asset = bal_json |?> "asset" |> to_string_d "?" in
-    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
-    balance > 0.0 && is_quote
-  ) all_balances in
-
   let active_items = List.map (fun (sym, data) ->
     let exch = data |?> "exchange" |> to_string_d "?" in
     let exch_tag = exch_tag_of exch in
@@ -99,23 +92,7 @@ let get_selectable_assets json =
     }
   ) inactive_jsons in
 
-  let quote_items = List.map (fun bal ->
-    let exch = bal |?> "exchange" |> to_string_d "?" in
-    let asset = bal |?> "asset" |> to_string_d "?" in
-    let symbol = bal |?> "symbol" |> to_string_d asset in
-    let exch_tag = exch_tag_of exch in
-    {
-      key = "bal:" ^ exch ^ ":" ^ asset;
-      display_name = Printf.sprintf "%s (%s)" asset exch_tag;
-      exchange = exch;
-      symbol;
-      asset;
-      is_strategy = false;
-      data = bal;
-    }
-  ) quote_jsons in
-
-  active_items @ paused_items @ inactive_items @ quote_items
+  active_items @ paused_items @ inactive_items
 
 let render_strategies ?(selected_index=None) w json =
   let now = Unix.gettimeofday () in
@@ -248,9 +225,9 @@ let render_strategies ?(selected_index=None) w json =
     let flash_sell = near_sell && flash_on in
 
     let bg_color =
-      if is_selected then c_selected
-      else if flash_buy then c_near_fill
+      if flash_buy then c_near_fill
       else if flash_sell then c_near_sell
+      else if is_selected then c_selected
       else if is_even then c_panel
       else c_bg
     in
@@ -440,7 +417,19 @@ let render_strategies ?(selected_index=None) w json =
       match sell_prices with [] -> None | prices -> Some (List.fold_left min (List.hd prices) prices)
     in
 
-    let bg_color = if is_selected then c_selected else if is_even then c_panel else c_bg in
+    let near_sell =
+      match closest_sell_dist_pct with
+      | Some d -> abs_float d <= 0.25
+      | None -> false
+    in
+    let flash_sell = near_sell && flash_on in
+
+    let bg_color =
+      if flash_sell then c_near_sell
+      else if is_selected then c_selected
+      else if is_even then c_panel
+      else c_bg
+    in
     
     let a_text       = A.(Theme.a_text   ++ bg bg_color) in
     let a_green      = A.(Theme.a_green  ++ bg bg_color) in
@@ -454,7 +443,12 @@ let render_strategies ?(selected_index=None) w json =
     let a_bps_norm   = A.(Theme.a_bps_norm  ++ bg bg_color) in
     let a_bps_wide   = A.(Theme.a_bps_wide  ++ bg bg_color) in
     let a_bps_xtrm   = A.(Theme.a_bps_xtrm  ++ bg bg_color) in
+    let a_near_sell  = A.(Theme.a_near_sell ++ bg bg_color) in
+    let a_near_sell_red = A.(Theme.a_near_sell_red ++ bg bg_color) in
     let exch_sym_attr ?dim exch = A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color) in
+
+    let row_text = if flash_sell then a_near_sell else a_text in
+    let sym_attr = if flash_sell then a_near_sell else exch_sym_attr ~dim:true exchange in
     
     let col w attr s = I.string attr (pad_right w s) in
     let col_right w attr s = I.string attr (pad_left w s) in
@@ -474,7 +468,9 @@ let render_strategies ?(selected_index=None) w json =
     in
 
     let sell_price_str, sell_price_attr =
-      match closest_sell_price_opt with Some sp -> format_price sp, a_yellow | None -> "--", a_dim
+      match closest_sell_price_opt with
+      | Some sp -> format_price sp, (if flash_sell then a_near_sell_red else a_yellow)
+      | None -> "--", a_dim
     in
 
     let render_gauge b_pct s_pct =
@@ -509,7 +505,7 @@ let render_strategies ?(selected_index=None) w json =
     let price_str = if mid > 0.0 then format_price mid else "--" in
     let price_cell = I.hcat [
       I.string p_border_attr "[";
-      col_right 10 a_text price_str;
+      col_right 10 row_text price_str;
       I.string p_border_attr "]";
     ] in
 
@@ -517,25 +513,25 @@ let render_strategies ?(selected_index=None) w json =
       close_row w (I.hcat [
         cursor_img;
         I.string A.(bg bg_color) "  ";
-        col 14 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag);
+        col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag);
         col 5 a_dim "--";
-        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+        I.hcat [ I.string status_attr status_str; I.string row_text "  " ];
         price_cell;
         I.string a_border " │ ";
         col_right 11 a_dim "--";
         gauge_img;
         col_right 11 sell_price_attr sell_price_str;
         I.string a_border " │ ";
-        col_right 10 a_text (format_qty balance);
-        col_right 10 a_text (if hold_value > 0.01 then format_usd hold_value else "--");
+        col_right 10 row_text (format_qty balance);
+        col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
       ])
     else
       close_row w (I.hcat [
         cursor_img;
         I.string A.(bg bg_color) "  ";
-        col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
+        col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
         col 5 a_dim "--";
-        I.hcat [ I.string status_attr status_str; I.string a_text "  " ];
+        I.hcat [ I.string status_attr status_str; I.string row_text "  " ];
         price_cell;
         col_right 8 spread_attr spread_str;
         I.string a_border " │ ";
@@ -548,10 +544,10 @@ let render_strategies ?(selected_index=None) w json =
         col_right 12 (if unrealized_profit >= 0.0 && sell_count > 0 then a_green else if unrealized_profit > 0.0 then a_dim else a_dim)
           (if sell_count > 0 then format_pnl unrealized_profit else "--");
         I.string a_border " │ ";
-        col_right 12 a_text (format_qty balance);
-        col_right 10 a_text (if hold_value > 0.01 then format_usd hold_value else "--");
-        col_right 12 a_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
-        col_right 10 a_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
+        col_right 12 row_text (format_qty balance);
+        col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
+        col_right 12 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+        col_right 10 row_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
       ])
   in
 
@@ -606,10 +602,8 @@ let render_strategies ?(selected_index=None) w json =
     build_balance_row ~is_selected:(selected_index = Some idx) (idx mod 2 = 1) bal false
   ) inactive_jsons in
 
-  let quote_rows = List.map (fun bal ->
-    let idx = !curr_row_idx in
-    incr curr_row_idx;
-    build_balance_row ~is_selected:(selected_index = Some idx) (idx mod 2 = 1) bal true
+  let quote_rows = List.mapi (fun idx bal ->
+    build_balance_row ~is_selected:false (idx mod 2 = 1) bal true
   ) quote_jsons in
 
   let total_up_strats, total_hold_strats, total_accum_val_strats = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) (_symbol, data) ->
