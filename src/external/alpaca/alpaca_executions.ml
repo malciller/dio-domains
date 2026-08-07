@@ -40,7 +40,8 @@ let status_of_alpaca_status = function
   | Alpaca_types.Expired -> Expired
   | Alpaca_types.Rejected -> Rejected
   | Alpaca_types.PendingNew | Alpaca_types.PendingCancel | Alpaca_types.PendingReplace -> Pending
-  | Alpaca_types.Accepted | Alpaca_types.AcceptedForBidding | Alpaca_types.Calculated | Alpaca_types.Replaced -> New
+  | Alpaca_types.Accepted | Alpaca_types.AcceptedForBidding | Alpaca_types.Calculated -> New
+  | Alpaca_types.Replaced -> Canceled
   | Alpaca_types.Suspended -> Unknown "suspended"
   | Alpaca_types.Unknown s -> Unknown s
 
@@ -156,6 +157,14 @@ let get_open_order symbol order_id =
       Mutex.unlock store.mutex;
       res
   | None -> None
+
+let remove_open_order symbol order_id =
+  match Hashtbl.find_opt stores symbol with
+  | Some store ->
+      Mutex.lock store.mutex;
+      Hashtbl.remove store.open_orders order_id;
+      Mutex.unlock store.mutex
+  | None -> ()
 
 let get_open_orders symbol =
   match Hashtbl.find_opt stores symbol with
@@ -282,7 +291,7 @@ let handle_trade_update json =
   let order_json = json |> member "order" in
   let ord = Alpaca_rest.parse_order_json order_json in
   let side = match ord.side with Alpaca_types.Buy -> Buy | Sell -> Sell in
-  let is_amended = (event = "replaced") in
+  let is_amended = false in
   let price =
     match json |> member "price" with
     | `Float f -> f
