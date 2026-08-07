@@ -274,7 +274,7 @@ let bootstrap_open_orders () =
         SymbolExecStore.set_open_orders_snapshot store sym_orders
       ) stores;
       Mutex.unlock stores_mutex;
-      Logging.info_f ~section "Bootstrapped %d open orders across symbols" (List.length orders);
+      Logging.debug_f ~section "Bootstrapped %d open orders across symbols" (List.length orders);
       Lwt.return_unit
   | Error err ->
       Logging.error_f ~section "Failed to bootstrap open orders: %s" err;
@@ -312,7 +312,7 @@ let handle_trade_update json =
     is_amended;
     cl_ord_id = ord.client_order_id;
   } in
-  Logging.info_f ~section "Trade update [%s]: order %s %s %s %.4f @ %.4f (filled: %.4f, remaining: %.4f)"
+  Logging.debug_f ~section "Trade update [%s]: order %s %s %s %.4f @ %.4f (filled: %.4f, remaining: %.4f)"
     event ord.id ord.symbol (match side with Buy -> "BUY" | Sell -> "SELL") ord.qty price ord.filled_qty exec_event.remaining_qty;
   let store = get_or_create_store ord.symbol in
   SymbolExecStore.push_event store exec_event;
@@ -367,7 +367,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
     let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
     Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
     active_conn := Some conn;
-    Logging.info_f ~section "Connected to Alpaca Trading WS at %s" url_str;
+    Logging.debug_f ~section "Connected to Alpaca Trading WS at %s" url_str;
 
     (* Authenticate *)
     let auth_msg = `Assoc [

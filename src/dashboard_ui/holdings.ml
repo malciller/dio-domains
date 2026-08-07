@@ -100,7 +100,7 @@ let render_strategies ?(selected_index=None) w json =
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
   let all_balances = json |?> "all_balances" |> to_list_d in
 
-  let is_compact = w < 160 in
+  let is_compact = w < 120 in
 
   (* Column header row *)
   let header = close_row w (
@@ -116,8 +116,10 @@ let render_strategies ?(selected_index=None) w json =
         col 17 a_label "";
         col_right 11 a_label "SELL @";
         I.string a_border " │ ";
-        col_right 10 a_label "HOLDING";
+        col_right 10 a_label "HOLD QTY";
         col_right 10 a_label "HOLD VAL";
+        col_right 10 a_label "ACCUM QTY";
+        col_right 10 a_label "ACCUM VAL";
       ]
     else
       I.hcat [
@@ -342,6 +344,8 @@ let render_strategies ?(selected_index=None) w json =
         I.string a_border " │ ";
         col_right 10 row_text (if base_bal > 0.0 then format_qty base_bal else "0");
         col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
+        col_right 10 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+        col_right 10 row_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
       ])
     else
       close_row w (I.hcat [
@@ -524,6 +528,8 @@ let render_strategies ?(selected_index=None) w json =
         I.string a_border " │ ";
         col_right 10 row_text (format_qty balance);
         col_right 10 row_text (if hold_value > 0.01 then format_usd hold_value else "--");
+        col_right 10 row_text (if accum_holding > 0.0001 then format_qty accum_holding else "0");
+        col_right 10 row_text (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--");
       ])
     else
       close_row w (I.hcat [
