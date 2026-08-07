@@ -147,7 +147,7 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
   end
 
 (** Scans open orders feed, updates local sell tracking, and debounces ghost buy orders. *)
-let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~iter_open_orders ~ecfg =
+let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price:_ ~lot_qty ~iter_open_orders ~ecfg =
   let now_time = now in
   let needs_sells_cleanup =
     let rec check_injected count = function
@@ -261,41 +261,7 @@ let sync_open_orders ~state ~now ~(asset : trading_config) ~bid_price ~lot_qty ~
     ) preserved_sells
   end;
 
-  if bid_price > 0.0 then begin
-    let stale_sells = List.filter (fun (_oid, price, _qty) ->
-      price <= bid_price
-    ) state.open_sell_orders in
-    if stale_sells <> [] then begin
-      List.iter (fun (oid, price, qty) ->
-        Logging.warn_f ~section
-          "STALE_SELL_DETECTED [%s] order %s @ %.2f <= bid %.2f (qty=%.8f). Evicting from tracking memory and cancelling on exchange."
-          asset.symbol oid price bid_price qty;
-        Hashtbl.replace state.evicted_orders oid (now +. 30.0);
-        let cancel_order = create_cancel_order oid asset.symbol Grid asset.exchange in
-        ignore (push_order ~now ~state cancel_order)
-      ) stale_sells;
 
-      state.open_sell_orders <- List.filter (fun (oid, _, _) ->
-        not (Hashtbl.mem state.evicted_orders oid)
-      ) state.open_sell_orders;
-
-      if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> [] then begin
-        List.iter (fun (_oid, stale_p, _stale_q) ->
-          let rec remove_one acc found = function
-            | [] -> List.rev acc
-            | (sp, _sq) :: rest when not found && (abs_float (sp -. stale_p) <= (stale_p *. 0.0001) || abs_float (sp -. stale_p) <= 1e-4) ->
-                remove_one acc true rest
-            | item :: rest -> remove_one (item :: acc) found rest
-          in
-          state.persisted_sell_levels <- remove_one [] false state.persisted_sell_levels
-        ) stale_sells;
-        state.persistence_dirty <- true
-      end;
-
-      if Exchange.Types.exchange_of_string asset.exchange = Lighter then
-        Lighter.Balances.request_balance_refresh ()
-    end
-  end;
 
   (!open_buy_count_from_scan, !has_recent_amend_buy, !locked_in_buys, !locked_in_sells, !closest_sell_order)
 
