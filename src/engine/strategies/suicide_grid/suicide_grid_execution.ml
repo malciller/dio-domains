@@ -373,72 +373,35 @@ let evaluate_buy_leg ~state ~now ~(asset : trading_config) ~bid_price ~ask_price
     if closest_sell_order_val <> None then begin
       match closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id with
       | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
-          let distance = sell_price -. current_buy_price in
           let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
 
           let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
           let grid_buy_from_ref = calculate_grid_price ref_price grid_interval false state in
           let grid_buy_capped = if bid_price > 0.0 then min grid_buy_from_ref bid_price else grid_buy_from_ref in
-          let raw_exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
-          let exact_target =
-            if raw_exact_target > grid_buy_capped then grid_buy_capped
-            else raw_exact_target
-          in
+          let exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
 
-          if distance > double_grid_interval then begin
-            let proposed_buy_price = grid_buy_capped in
+          let proposed_buy_price = grid_buy_capped in
+          let target_buy_price = min proposed_buy_price exact_target in
 
-            if proposed_buy_price > current_buy_price then begin
-              let proposed_distance = sell_price -. proposed_buy_price in
-              let target_buy_price =
-                if proposed_distance <= double_grid_interval then
-                  exact_target
-                else
-                  proposed_buy_price
-              in
+          let current_buy_price_rounded = state.cached_round_price current_buy_price in
+          let price_diff_rounded = state.cached_round_price (abs_float (target_buy_price -. current_buy_price_rounded)) in
+          let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
 
-              let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
-              let current_buy_price_rounded = state.cached_round_price current_buy_price in
-              let price_diff_rounded = state.cached_round_price (abs_float (target_buy_price -. current_buy_price_rounded)) in
-
-              if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
-                   ~current_price_rounded:current_buy_price_rounded
-                   ~price_diff:price_diff_rounded ~min_move_threshold then begin
-                let quote_bal = quote_balance in
-                if not (Float.is_nan quote_balance) && can_place_buy_order qty quote_bal quote_needed then begin
-                  let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
-                  ignore (push_order ~now ~state order);
-                  state.last_buy_order_price <- Some target_buy_price;
-                  ()
-                end else if not (Float.is_nan quote_balance) then begin
-                  Logging.warn_f ~section "Insufficient quote balance to trail %s: need %.2f, have %.2f"
-                    asset.symbol quote_needed quote_bal
-                end else begin
-                  Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
-                end
-              end
-            end
-          end else begin
-            let exact_target_rounded = exact_target in
-            let current_buy_price_rounded = state.cached_round_price current_buy_price in
-            let price_diff_rounded = state.cached_round_price (abs_float (exact_target_rounded -. current_buy_price_rounded)) in
-            let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
-            let should_amend = exact_target_rounded > current_buy_price_rounded in
-
-            if should_amend && amend_allowed ~state ~order_id:buy_order_id ~target_price:exact_target_rounded
+          if target_buy_price > current_buy_price then begin
+            if amend_allowed ~state ~order_id:buy_order_id ~target_price:target_buy_price
                  ~current_price_rounded:current_buy_price_rounded
                  ~price_diff:price_diff_rounded ~min_move_threshold then begin
               let quote_bal = quote_balance in
               if not (Float.is_nan quote_balance) && can_place_buy_order qty quote_bal quote_needed then begin
-                let order = create_amend_order buy_order_id asset.symbol Buy qty (Some exact_target) true Grid asset.exchange in
+                let order = create_amend_order buy_order_id asset.symbol Buy qty (Some target_buy_price) true Grid asset.exchange in
                 ignore (push_order ~now ~state order);
-                state.last_buy_order_price <- Some exact_target;
+                state.last_buy_order_price <- Some target_buy_price;
                 ()
               end else if not (Float.is_nan quote_balance) then begin
-                Logging.warn_f ~section "Insufficient quote balance for %s: need %.2f, have %.2f"
+                Logging.warn_f ~section "Insufficient quote balance for %s trailing: need %.2f, have %.2f"
                   asset.symbol quote_needed quote_bal
               end else begin
-                Logging.warn_f ~section "No quote balance for %s" asset.symbol
+                Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
               end
             end
           end

@@ -134,7 +134,8 @@ let render_asset_detail w h asset_key json =
   | Some a ->
       let exch_tag = exch_tag_of a.exchange in
       let title_str = Printf.sprintf "%s (%s)" a.symbol exch_tag in
-      let header_bar = section_title w title_str in
+      let exch_attr = exch_sym_attr a.exchange in
+      let header_bar = section_title ~title_attr:exch_attr w title_str in
 
       (* Extract market data *)
       let market = if a.is_strategy then a.data |?> "market" else a.data in
@@ -196,32 +197,66 @@ let render_asset_detail w h asset_key json =
         else ([], false)
       in
 
-      (* Asset Summary Card *)
+      (* Asset Summary Card Layout:
+         Line 1: Strategy: ... │ B: ... M: ... A: ... │ Holding: ...
+         Line 2: Last BUY/SELL: ... │ Quote Balance: ... │ Accum Qty: ...
+      *)
       let r1 = I.hcat [
-        I.string a_label " STRATEGY: "; I.string a_cyan (pad_right 7 stype);
-        I.string a_dim "│";
-        I.string a_label " MID: "; I.string (if mid > 0.0 then a_bright else a_dim) (pad_right 11 (if mid > 0.0 then format_price mid else "--"));
-        I.string a_dim "│";
-        I.string a_label " BID/ASK: "; I.string a_text (Printf.sprintf "%s / %s" (if bid > 0.0 then format_price bid else "--") (if ask > 0.0 then format_price ask else "--"));
+        I.string a_label " Strategy: ";
+        I.string a_cyan stype;
         I.string a_dim " │ ";
-        I.string a_label "HOLDING: "; I.string a_bright (format_qty base_bal ^ " " ^ a.asset);
+        I.string a_label "B: ";
+        I.string a_text (if bid > 0.0 then format_price bid else "--");
+        I.string a_dim " ";
+        I.string a_label "M: ";
+        I.string (if mid > 0.0 then a_bright else a_dim) (if mid > 0.0 then format_price mid else "--");
+        I.string a_dim " ";
+        I.string a_label "A: ";
+        I.string a_text (if ask > 0.0 then format_price ask else "--");
+        I.string a_dim " │ ";
+        I.string a_label "Holding: ";
+        I.string a_bright (format_qty base_bal ^ " " ^ a.asset);
         I.string a_dim " ("; I.string a_cyan (format_usd hold_val); I.string a_dim ")";
       ] in
+
+      let last_trade_item =
+        if last_buy_fill > 0.0 && last_sell_fill > 0.0 then
+          I.hcat [
+            I.string a_green ("BUY " ^ format_price last_buy_fill);
+            I.string a_dim " / ";
+            I.string a_red ("SELL " ^ format_price last_sell_fill);
+          ]
+        else if last_buy_fill > 0.0 then
+          I.string a_green ("BUY " ^ format_price last_buy_fill)
+        else if last_sell_fill > 0.0 then
+          I.string a_red ("SELL " ^ format_price last_sell_fill)
+        else
+          I.string a_dim "--"
+      in
+
       let r2 =
         if a.is_strategy then
           I.hcat [
-            I.string a_label " ACCUM QTY: "; I.string a_cyan (format_qty accum_qty ^ " " ^ a.asset);
+            I.string a_label " Last BUY/SELL: ";
+            last_trade_item;
+            I.string a_dim " │ ";
+            I.string a_label "Quote Balance: ";
+            I.string a_text (format_usd quote_bal);
+            I.string a_dim " │ ";
+            I.string a_label "Accum Qty: ";
+            I.string a_cyan (format_qty accum_qty ^ " " ^ a.asset);
             I.string a_dim " ("; I.string a_cyan (format_usd accum_val); I.string a_dim ")";
-            I.string a_dim "  │  ";
-            I.string a_label "QUOTE BAL: "; I.string a_text (format_usd quote_bal);
-            (if last_buy_fill > 0.0 then I.hcat [ I.string a_dim "  │  "; I.string a_label "LAST BUY: "; I.string a_green (format_price last_buy_fill) ] else I.empty);
-            (if last_sell_fill > 0.0 then I.hcat [ I.string a_dim "  │  "; I.string a_label "LAST SELL: "; I.string a_red (format_price last_sell_fill) ] else I.empty);
           ]
         else
           I.hcat [
-            I.string a_label " QUOTE BAL: "; I.string a_text (format_usd quote_bal);
+            I.string a_label " Last BUY/SELL: ";
+            last_trade_item;
+            I.string a_dim " │ ";
+            I.string a_label "Quote Balance: ";
+            I.string a_text (format_usd quote_bal);
           ]
       in
+
       let summary_card = I.vcat [
         close_row w (I.hcat [ I.string a_border " │"; r1 ]);
         close_row w (I.hcat [ I.string a_border " │"; r2 ]);
@@ -869,7 +904,7 @@ let render_asset_detail w h asset_key json =
         )
       ) in
 
-      (* X-Axis Ticks & Labels: Fixed 15-Minute Timeline *)
+      (* X-Axis Ticks & Labels: Dynamic Realtime Timeline *)
       let x_axis_ticks =
         let tick_bar = repeat_utf8 "─" (canvas_w + pin_col_w) in
         close_row w (
@@ -877,7 +912,7 @@ let render_asset_detail w h asset_key json =
             I.string a_border " │";
             I.string A.(fg c_title ++ bg c_bg ++ st bold) (pad_right ob_col_w "  EXCHANGE DEPTH  ");
             I.string a_border " │ ";
-            I.string A.(fg c_border ++ bg c_bg) " 15M TIME ──";
+            I.string A.(fg c_border ++ bg c_bg) " REALTIME ──";
             I.string a_border " ┴─";
             I.string A.(fg c_border ++ bg c_bg) tick_bar;
           ]
@@ -885,11 +920,20 @@ let render_asset_detail w h asset_key json =
       in
 
       let x_axis_labels =
+        let now = Unix.gettimeofday () in
+        let fmt_time tm_float =
+          let tm = Unix.localtime tm_float in
+          Printf.sprintf "%02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
+        in
+        let t_15m = now -. 900.0 in
+        let t_10m = now -. 600.0 in
+        let t_5m = now -. 300.0 in
+        let t_now = now in
         let step_w = canvas_w / 4 in
-        let lbl0 = pad_right step_w "-15m" in
-        let lbl1 = pad_right step_w "-10m" in
-        let lbl2 = pad_right step_w "-5m" in
-        let lbl3 = pad_right step_w "-1m" in
+        let lbl0 = pad_right step_w (fmt_time t_15m) in
+        let lbl1 = pad_right step_w (fmt_time t_10m) in
+        let lbl2 = pad_right step_w (fmt_time t_5m) in
+        let lbl3 = pad_right step_w (fmt_time t_now) in
         let time_str = lbl0 ^ lbl1 ^ lbl2 ^ lbl3 in
         let pin_title = pad_left pin_col_w "ORDER TARGET PINS ──▶" in
         close_row w (

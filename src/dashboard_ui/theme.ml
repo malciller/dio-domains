@@ -312,9 +312,9 @@ let color_blend (r1, g1, b1) (r2, g2, b2) ratio =
   let b = b1 + int_of_float (float (b2 - b1) *. ratio) in
   A.rgb_888 ~r:(clamp r) ~g:(clamp g) ~b:(clamp b)
 
-let section_title w label =
+let section_title ?(title_attr=A.(fg c_title ++ bg c_bg ++ st bold)) w label =
   let lbl = " ╭── " ^ label ^ " " in
-  let lbl_img = I.string A.(fg c_title ++ bg c_bg ++ st bold) lbl in
+  let lbl_img = I.string title_attr lbl in
   let len = I.width lbl_img in
   let pad_count = max 0 (w - len - 1) in
   
