@@ -149,6 +149,35 @@ let json_of_market_data exchange symbol base_asset quote_currency =
       let tob = Ex.get_top_of_book ~symbol in
       let base_balance = (try Ex.get_total_balance ~asset:base_asset with _ -> 0.0) in
       let quote_balance = (try Ex.get_total_balance ~asset:quote_currency with _ -> 0.0) in
+      let pos = (try Ex.get_orderbook_position ~symbol with _ -> 0) in
+      let ob_event =
+        if pos > 0 then
+          match (try Ex.read_orderbook_events ~symbol ~start_pos:(pos - 1) with _ -> []) with
+          | ev :: _ -> Some ev
+          | [] -> None
+        else None
+      in
+      let bids_json = match ob_event with
+        | Some ev -> `List (Array.to_list (Array.map (fun (p, q) -> `Assoc ["price", `Float p; "qty", `Float q]) ev.bids))
+        | None -> (match tob with Some (b, bs, _, _) -> `List [`Assoc ["price", `Float b; "qty", `Float bs]] | None -> `List [])
+      in
+      let asks_json = match ob_event with
+        | Some ev -> `List (Array.to_list (Array.map (fun (p, q) -> `Assoc ["price", `Float p; "qty", `Float q]) ev.asks))
+        | None -> (match tob with Some (_, _, a, as_) -> `List [`Assoc ["price", `Float a; "qty", `Float as_]] | None -> `List [])
+      in
+      let trades_json =
+        if String.equal exchange "alpaca" then
+          let recent_trades = Alpaca.Orderbook.get_recent_trades symbol 25 in
+          `List (List.map (fun (t : Alpaca.Orderbook.trade) ->
+            `Assoc [
+              "price", `Float t.price;
+              "qty", `Float t.size;
+              "timestamp", `Float t.timestamp;
+              "side", `String t.side;
+            ]
+          ) recent_trades)
+        else `List []
+      in
       `Assoc [
         "bid", (match tob with Some (b, _, _, _) -> `Float b | None -> `Null);
         "ask", (match tob with Some (_, _, a, _) -> `Float a | None -> `Null);
@@ -160,6 +189,9 @@ let json_of_market_data exchange symbol base_asset quote_currency =
         "quote_currency", `String quote_currency;
         "base_balance", `Float base_balance;
         "quote_balance", `Float quote_balance;
+        "bids", bids_json;
+        "asks", asks_json;
+        "trades", trades_json;
       ]
 
 (* Latency profiler snapshots *)
@@ -322,6 +354,22 @@ let build_snapshot () =
                 "qty", `Float o.remaining_qty;
               ]
             ) sell_orders) in
+            let pos = (try Ex.get_orderbook_position ~symbol with _ -> 0) in
+            let ob_event =
+              if pos > 0 then
+                match (try Ex.read_orderbook_events ~symbol ~start_pos:(pos - 1) with _ -> []) with
+                | ev :: _ -> Some ev
+                | [] -> None
+              else None
+            in
+            let bids_json = match ob_event with
+              | Some ev -> `List (Array.to_list (Array.map (fun (p, q) -> `Assoc ["price", `Float p; "qty", `Float q]) ev.bids))
+              | None -> (match tob with Some (b, bs, _, _) -> `List [`Assoc ["price", `Float b; "qty", `Float bs]] | None -> `List [])
+            in
+            let asks_json = match ob_event with
+              | Some ev -> `List (Array.to_list (Array.map (fun (p, q) -> `Assoc ["price", `Float p; "qty", `Float q]) ev.asks))
+              | None -> (match tob with Some (_, _, a, as_) -> `List [`Assoc ["price", `Float a; "qty", `Float as_]] | None -> `List [])
+            in
             Some (`Assoc [
               "exchange", `String exch_name;
               "asset", `String asset;
@@ -329,6 +377,8 @@ let build_snapshot () =
               "balance", `Float bal;
               "bid", bid_json;
               "ask", ask_json;
+              "bids", bids_json;
+              "asks", asks_json;
               "sell_orders", sell_orders_json;
               "sell_count", `Int (List.length sell_orders);
             ])

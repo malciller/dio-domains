@@ -150,6 +150,26 @@ let fetch_from_rest symbols =
     let json = Yojson.Safe.from_string body_str in
     let result = member "result" json in
     
+    let canonicalize_kraken_name s =
+      let uppercase = String.uppercase_ascii s in
+      let no_xbt = 
+        if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XXBT" then
+          "BTC" ^ String.sub uppercase 4 (String.length uppercase - 4)
+        else if String.length uppercase >= 3 && String.sub uppercase 0 3 = "XBT" then
+          "BTC" ^ String.sub uppercase 3 (String.length uppercase - 3)
+        else if String.length uppercase >= 5 && String.sub uppercase 0 5 = "XXETH" then
+          "ETH" ^ String.sub uppercase 5 (String.length uppercase - 5)
+        else if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XETH" then
+          "ETH" ^ String.sub uppercase 4 (String.length uppercase - 4)
+        else uppercase
+      in
+      if String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZUSD" then
+        String.sub no_xbt 0 (String.length no_xbt - 4) ^ "USD"
+      else if String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZEUR" then
+        String.sub no_xbt 0 (String.length no_xbt - 4) ^ "EUR"
+      else no_xbt
+    in
+
     Lwt_list.iter_s (fun symbol ->
       let norm = String.uppercase_ascii symbol in
       let no_slash = String.map (fun c -> if c = '/' then '\000' else c) norm |> String.split_on_char '\000' |> String.concat "" in
@@ -158,8 +178,8 @@ let fetch_from_rest symbols =
         try
           let altname = member "altname" pair_json |> to_string_option in
           let wsname = member "wsname" pair_json |> to_string_option in
-          let ws_match = function Some n -> n = norm || (n = "XBT/USD" && norm = "BTC/USD") || (n = "XETH/USD" && norm = "ETH/USD") | None -> false in
-          let alt_match = function Some n -> n = no_slash || (n = "XBTUSD" && no_slash = "BTCUSD") || (n = "XETHUSD" && no_slash = "ETHUSD") | None -> false in
+          let ws_match = function Some n -> canonicalize_kraken_name n = norm || n = norm | None -> false in
+          let alt_match = function Some n -> canonicalize_kraken_name n = no_slash || n = no_slash | None -> false in
           ws_match wsname || alt_match altname
         with _ -> false
       in

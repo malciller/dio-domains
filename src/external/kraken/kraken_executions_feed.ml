@@ -597,13 +597,13 @@ let update_open_orders store (event : execution_event) =
        if needs_cleanup then
          trigger_stale_order_cleanup ~reason:"open_orders_exceeds_1000" ();
        if was_present then
-         Logging.debug_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
+         Logging.info_f ~section "Updated open order: %s [%s] %.8f@%.2f (filled: %.8f/%.8f) status=%s"
            event.order_id event.symbol remaining_qty 
            (Option.value event.limit_price ~default:0.0) 
            event.cum_qty event.order_qty
            (string_of_order_status event.order_status)
        else
-         Logging.debug_f ~section "Added new open order: %s [%s] %s side %.8f@%.2f status=%s"
+         Logging.info_f ~section "Added new open order: %s [%s] %s side %.8f@%.2f status=%s"
            event.order_id event.symbol 
            (string_of_side event.side)
            event.order_qty
@@ -836,7 +836,7 @@ let handle_snapshot json on_heartbeat =
     let open Yojson.Safe.Util in
     let data = member "data" json |> to_list in
     
-    Logging.debug_f ~section "Processing execution snapshot with %d items" (List.length data);
+    Logging.info_f ~section "Processing execution snapshot with %d items" (List.length data);
     
     (* Track order IDs present in this snapshot for reconciliation. *)
     let snapshot_order_ids = Hashtbl.create (List.length data) in
@@ -908,7 +908,7 @@ let handle_snapshot json on_heartbeat =
       notify_ready store;
     ) all_symbols;
     
-    Logging.debug_f ~section "Execution snapshot processed and reconciled";
+    Logging.info_f ~section "Execution snapshot processed and reconciled";
     (* Lock the adaptive order_to_symbol cap after startup snapshot ingestion. *)
     lock_order_to_symbol_cap ()
   with exn ->

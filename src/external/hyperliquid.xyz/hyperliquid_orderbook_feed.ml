@@ -145,7 +145,7 @@ let parse_float_fast str start_idx end_idx =
     sign *. loop start_idx 0.0 false 1.0
 
 let rec parse_levels msg pos end_pos count acc =
-  if count >= 1 || pos >= end_pos then List.rev acc
+  if count >= 10 || pos >= end_pos then List.rev acc
   else
     match String.index_from_opt msg pos '{' with
     | None -> List.rev acc

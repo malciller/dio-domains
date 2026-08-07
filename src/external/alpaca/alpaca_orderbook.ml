@@ -13,12 +13,22 @@ type quote = {
   timestamp: float;
 }
 
+type trade = {
+  price: float;
+  size: float;
+  timestamp: float;
+  side: string;
+}
+
 module SymbolStore = struct
   type t = {
     symbol: string;
     buffer: quote array;
+    trades_buffer: trade array;
     capacity: int;
+    trades_capacity: int;
     mutable write_pos: int;
+    mutable trades_write_pos: int;
     mutable best_bid_ask: (float * float * float * float) option;
     mutable last_update_ts: float;
     mutex: Mutex.t;
@@ -27,8 +37,11 @@ module SymbolStore = struct
   let create symbol capacity = {
     symbol;
     buffer = Array.make capacity { bid_price = 0.0; bid_size = 0.0; ask_price = 0.0; ask_size = 0.0; timestamp = 0.0 };
+    trades_buffer = Array.make 100 { price = 0.0; size = 0.0; timestamp = 0.0; side = "trade" };
     capacity;
+    trades_capacity = 100;
     write_pos = 0;
+    trades_write_pos = 0;
     best_bid_ask = None;
     last_update_ts = 0.0;
     mutex = Mutex.create ();
@@ -43,6 +56,27 @@ module SymbolStore = struct
     t.last_update_ts <- Unix.gettimeofday ();
     Mutex.unlock t.mutex;
     Concurrency.Exchange_wakeup.signal_all ()
+
+  let push_trade t (tr : trade) =
+    Mutex.lock t.mutex;
+    let idx = t.trades_write_pos mod t.trades_capacity in
+    t.trades_buffer.(idx) <- tr;
+    t.trades_write_pos <- t.trades_write_pos + 1;
+    t.last_update_ts <- Unix.gettimeofday ();
+    Mutex.unlock t.mutex;
+    Concurrency.Exchange_wakeup.signal_all ()
+
+  let get_recent_trades t count =
+    Mutex.lock t.mutex;
+    let current_pos = t.trades_write_pos in
+    let start_idx = max 0 (current_pos - count) in
+    let trades = ref [] in
+    for i = current_pos - 1 downto start_idx do
+      let idx = i mod t.trades_capacity in
+      trades := t.trades_buffer.(idx) :: !trades
+    done;
+    Mutex.unlock t.mutex;
+    !trades
 
   let get_last_update_ts t =
     Mutex.lock t.mutex;
@@ -140,6 +174,11 @@ let read_orderbook_events symbol start_pos =
   | Some store -> SymbolStore.read_events store start_pos
   | None -> []
 
+let get_recent_trades symbol count =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> SymbolStore.get_recent_trades store count
+  | None -> []
+
 let iter_orderbook_events symbol start_pos f =
   match Hashtbl.find_opt stores symbol with
   | Some store -> SymbolStore.iter_events store start_pos f
@@ -196,6 +235,15 @@ let handle_message_str content =
           let ts = parse_timestamp ts_str in
           if symbol <> "" && price > 0.0 then begin
             let store = get_or_create_store symbol in
+            let side_str =
+              match SymbolStore.get_best_bid_ask store with
+              | Some (bp, _, ap, _) ->
+                  if ap > 0.0 && price >= ap then "buy"
+                  else if bp > 0.0 && price <= bp then "sell"
+                  else "trade"
+              | None -> "trade"
+            in
+            SymbolStore.push_trade store { price; size; timestamp = ts; side = side_str };
             let is_non_regular = not (Alpaca_market_hours.is_regular_market_open ()) in
             let (b_p, b_s, a_p, a_s) =
               match SymbolStore.get_best_bid_ask store with
