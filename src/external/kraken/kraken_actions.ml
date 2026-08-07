@@ -254,7 +254,7 @@ let place_order
         | Some e -> e
         | None -> "Unknown error"
       in
-      Logging.error_f ~section "Order placement failed: %s" err;
+      Logging.debug_f ~section "Order placement failed: %s" err;
       Lwt.return (Error err)
     end
   in

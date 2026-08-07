@@ -110,7 +110,7 @@ module Alpaca_impl = struct
       | Error e -> Error e
     in
     let fallback_cancel_replace sym q lp side =
-      Logging.info_f ~section "Alpaca fallback cancel & replace for fractional order %s (%s %s %.4f @ %.4f)"
+      Logging.debug_f ~section "Alpaca fallback cancel & replace for fractional order %s (%s %s %.4f @ %.4f)"
         order_id sym (match side with Alpaca_types.Buy -> "buy" | Sell -> "sell") q lp;
       Alpaca_rest.cancel_order order_id >>= function
       | Ok _ ->

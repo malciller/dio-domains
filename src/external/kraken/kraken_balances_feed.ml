@@ -693,7 +693,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
 (** Pre-creates balance stores for the given assets and default fiat currencies.
     Must be called before the WebSocket feed begins producing messages. *)
 let initialize assets =
-  Logging.info_f ~section "Initializing balances feed for %d assets" (List.length assets);
+  Logging.debug_f ~section "Initializing balances feed for %d assets" (List.length assets);
 
   (* Normalize all input assets first *)
   let assets = List.map normalize_asset assets in

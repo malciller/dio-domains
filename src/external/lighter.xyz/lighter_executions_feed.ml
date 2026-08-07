@@ -97,7 +97,7 @@ let mark_startup_complete () =
     let observed = Hashtbl.length order_to_symbol in
     let cap = max 32 (observed + observed / 2 + 1) in
     order_to_symbol_cap := cap;
-    Logging.info_f ~section
+    Logging.debug_f ~section
       "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)" cap observed
   end
 

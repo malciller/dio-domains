@@ -86,7 +86,7 @@ let rec poll_loop () =
   poll_loop ()
 
 let initialize () =
-  Logging.info ~section "Initializing Alpaca balances polling background worker...";
+  Logging.debug ~section "Initializing Alpaca balances polling background worker...";
   Lwt.async poll_loop
 
 let wait_until_ready () =

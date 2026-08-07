@@ -382,7 +382,7 @@ let start_reader conn generation =
 
 let connect _token : Websocket_lwt_unix.conn Lwt.t =
   let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
-  Logging.info ~section "Connecting to Kraken authenticated WebSocket for trading...";
+  Logging.debug ~section "Connecting to Kraken authenticated WebSocket for trading...";
   Lwt_unix.getaddrinfo "ws-auth.kraken.com" "443" [ Unix.AI_FAMILY Unix.PF_INET ] >>= fun addresses ->
   let ip =
     match addresses with
@@ -392,7 +392,7 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
   let client = `TLS (`Hostname "ws-auth.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
   Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
-  Logging.info ~section "Trading WebSocket connection established";
+  Logging.debug ~section "Trading WebSocket connection established";
   Lwt.return conn
 
 let ensure_connection ?on_failure ?on_connected token =
@@ -454,7 +454,7 @@ let ensure_connection ?on_failure ?on_connected token =
           Logging.error ~section "Connection establishment failed, no connection returned";
           Lwt.return_unit
       | Some (conn, generation) ->
-          Logging.info_f ~section "Connection established successfully (generation %d)" generation;
+          Logging.debug_f ~section "Connection established successfully (generation %d)" generation;
           start_reader conn generation;
 
           notify_connection `Connected;

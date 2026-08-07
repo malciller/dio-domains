@@ -370,7 +370,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
     let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
     Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
     active_conn := Some conn;
-    Logging.info_f ~section "Connected to Alpaca Market Data WS at %s" url_str;
+    Logging.debug_f ~section "Connected to Alpaca Market Data WS at %s" url_str;
 
     (* Authenticate *)
     let auth_msg = `Assoc [

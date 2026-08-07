@@ -14,7 +14,7 @@ module Hyperliquid_impl = struct
   let is_testnet = Atomic.make true
   let set_testnet testnet =
     Atomic.set is_testnet testnet;
-    Logging.info_f ~section "Hyperliquid module configured for %s" (if testnet then "testnet" else "mainnet")
+    Logging.debug_f ~section "Hyperliquid module configured for %s" (if testnet then "testnet" else "mainnet")
 
   (* Per-symbol fee cache. Maps symbol to (perp_maker, perp_taker, spot_maker, spot_taker).
      Populated once during initialize_fees and read on every get_fees call. *)
