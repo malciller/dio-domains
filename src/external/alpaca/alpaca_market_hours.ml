@@ -57,31 +57,30 @@ let is_regular_market_open () =
     let close_mins = 16 * 60 in
     time_mins >= open_mins && time_mins < close_mins
 
-(** Evaluates whether the current system time falls within extended US equity trading session (4:00 AM - 8:00 PM ET). *)
+(** Evaluates whether current system time is strictly within overnight trading hours (8:00 PM ET - 4:00 AM ET). *)
+let is_overnight_hours () =
+  let (wday, hour, _min) = current_eastern_time () in
+  match wday with
+  | 0 -> hour >= 20
+  | 1 | 2 | 3 | 4 -> hour < 4 || hour >= 20
+  | 5 -> hour < 4
+  | _ -> false
+
+(** Evaluates whether the current system time falls within the 24/5 Alpaca trading schedule
+    (Sunday 8:00 PM ET to Friday 8:00 PM ET continuously). *)
 let is_market_open () =
-  let (wday, hour, min) = current_eastern_time () in
-  let is_weekday = wday >= 1 && wday <= 5 in
-  if not is_weekday then false
-  else
-    let time_mins = hour * 60 + min in
-    let open_mins = extended_open_hour * 60 + extended_open_min in
-    let close_mins = extended_close_hour * 60 + extended_close_min in
-    time_mins >= open_mins && time_mins < close_mins
+  let (wday, hour, _min) = current_eastern_time () in
+  match wday with
+  | 0 -> hour >= 20
+  | 1 | 2 | 3 | 4 -> true
+  | 5 -> hour < 20
+  | _ -> false
 
-(** Evaluates whether current system time is strictly within pre-market (4 AM - 9:30 AM) or after-hours (4 PM - 8 PM). *)
+(** Evaluates whether current system time is strictly within pre-market (4 AM - 9:30 AM), after-hours (4 PM - 8 PM), or overnight (8 PM - 4 AM). *)
 let is_extended_hours () =
-  let (wday, hour, min) = current_eastern_time () in
-  let is_weekday = wday >= 1 && wday <= 5 in
-  if not is_weekday then false
-  else
-    let time_mins = hour * 60 + min in
-    let ext_open = 4 * 60 in
-    let rth_open = 9 * 60 + 30 in
-    let rth_close = 16 * 60 in
-    let ext_close = 20 * 60 in
-    (time_mins >= ext_open && time_mins < rth_open) || (time_mins >= rth_close && time_mins < ext_close)
+  is_market_open () && not (is_regular_market_open ())
 
-(** Calculates seconds until next extended market open (4:00 AM ET). *)
+(** Calculates seconds until next 24/5 market open (Sunday 8:00 PM ET). *)
 let seconds_until_next_open () =
   if is_market_open () then 0.0
   else begin
@@ -90,22 +89,16 @@ let seconds_until_next_open () =
     let eastern_t = t +. (float_of_int offset *. 3600.0) in
     let tm = Unix.gmtime eastern_t in
     let wday = tm.Unix.tm_wday in
-    let time_mins = tm.Unix.tm_hour * 60 + tm.Unix.tm_min in
-    let target_open_hour, target_open_min = (extended_open_hour, extended_open_min) in
-    let open_mins = target_open_hour * 60 + target_open_min in
     let days_ahead =
-      if wday >= 1 && wday <= 5 then begin
-        if time_mins < open_mins then 0
-        else if wday = 5 then 3
-        else 1
-      end else if wday = 6 then 2
-      else 1
+      match wday with
+      | 5 -> 2 (* Friday evening -> Sunday *)
+      | 6 -> 1 (* Saturday -> Sunday *)
+      | 0 -> 0 (* Sunday morning/afternoon -> Sunday 8 PM *)
+      | _ -> 0
     in
-    let target_eastern_midnight =
-      let today_midnight = eastern_t -. (float_of_int (tm.Unix.tm_hour * 3600 + tm.Unix.tm_min * 60 + tm.Unix.tm_sec)) in
-      today_midnight +. (float_of_int days_ahead *. 86400.0)
-    in
-    let target_open_eastern = target_eastern_midnight +. (float_of_int (target_open_hour * 3600 + target_open_min * 60)) in
+    let today_midnight = eastern_t -. float_of_int (tm.Unix.tm_hour * 3600 + tm.Unix.tm_min * 60 + tm.Unix.tm_sec) in
+    let target_eastern_midnight = today_midnight +. (float_of_int days_ahead *. 86400.0) in
+    let target_open_eastern = target_eastern_midnight +. (20.0 *. 3600.0) in
     let target_open_utc = target_open_eastern -. (float_of_int offset *. 3600.0) in
     let delta = target_open_utc -. t in
     Float.max delta 1.0
@@ -113,24 +106,17 @@ let seconds_until_next_open () =
 
 (** Human readable representation of current Alpaca US equity market session status. *)
 let market_status_string () =
-  let (wday, hour, min) = current_eastern_time () in
-  let is_weekday = wday >= 1 && wday <= 5 in
-  if not is_weekday then "closed (weekend)"
-  else begin
-    let time_mins = hour * 60 + min in
-    let open_mins = extended_open_hour * 60 + extended_open_min in
-    let close_mins = extended_close_hour * 60 + extended_close_min in
-    if time_mins < open_mins then
-      Printf.sprintf "closed (pre-market opens at %d:%02d ET)" extended_open_hour extended_open_min
-    else if time_mins >= close_mins then
-      "closed (after hours ended)"
-    else if hour < 9 || (hour = 9 && min < 30) then
-      "open (pre-market)"
-    else if hour >= 16 then
-      "open (after-hours)"
-    else
-      "open (regular hours)"
-  end
+  let (_wday, hour, min) = current_eastern_time () in
+  if not (is_market_open ()) then
+    "closed (weekend, overnight opens Sun 8:00 PM ET)"
+  else if is_overnight_hours () then
+    "open (overnight 24/5)"
+  else if hour < 9 || (hour = 9 && min < 30) then
+    "open (pre-market)"
+  else if hour >= 16 && hour < 20 then
+    "open (after-hours)"
+  else
+    "open (regular hours)"
 
 let log_market_status () =
   let status = market_status_string () in

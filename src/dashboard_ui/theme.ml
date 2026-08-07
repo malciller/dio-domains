@@ -175,6 +175,7 @@ let c_dim        = A.rgb_888 ~r:86  ~g:95  ~b:137
 let c_near_fill  = A.rgb_888 ~r:29  ~g:42  ~b:60
 let c_near_sell  = A.rgb_888 ~r:65  ~g:35  ~b:55
 let c_magenta    = A.rgb_888 ~r:226 ~g:104 ~b:160
+let c_selected   = A.rgb_888 ~r:40  ~g:60  ~b:95
 
 (* Per-exchange brand colors (adapted for dark mode) *)
 let c_exch_hl    = A.rgb_888 ~r:73  ~g:177 ~b:121

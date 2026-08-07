@@ -75,15 +75,12 @@ let place_order
     | None -> !Config.extended_hours
   in
   let tif_str =
-    if use_extended then "day" (* Alpaca API requires time_in_force = day when extended_hours is true *)
-    else if is_fractional && not is_crypto then "day"
-    else
-      match time_in_force with
-      | Some "IOC" | Some "ioc" -> "ioc"
-      | Some "FOK" | Some "fok" -> "fok"
-      | Some "DAY" | Some "day" -> "day"
-      | Some "GTC" | Some "gtc" -> "gtc"
-      | _ -> "gtc"
+    match time_in_force with
+    | Some "GTC" | Some "gtc" -> "gtc"
+    | Some "IOC" | Some "ioc" -> if use_extended then "day" else "ioc"
+    | Some "FOK" | Some "fok" -> if use_extended then "day" else "fok"
+    | Some "DAY" | Some "day" -> "day"
+    | _ -> if use_extended then "day" else if is_fractional && not is_crypto then "day" else "gtc"
   in
   let side_str = match side with Buy -> "buy" | Sell -> "sell" in
   let type_str = match order_type with "limit" -> "limit" | _ -> "market" in

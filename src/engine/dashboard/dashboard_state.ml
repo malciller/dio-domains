@@ -83,6 +83,7 @@ let json_of_grid_strategy exchange symbol =
   `Assoc [
     "type", `String "Grid";
     "buy_price", json_of_float_opt state.last_buy_order_price;
+    "buy_qty", `Float state.grid_qty;
     "buy_id", json_of_string_opt state.last_buy_order_id;
     "sell_orders", `List (List.map (fun (oid, price, qty) ->
       `Assoc ["id", `String oid; "price", `Float price; "qty", `Float qty]
@@ -116,6 +117,7 @@ let json_of_mm_strategy exchange symbol =
   `Assoc [
     "type", `String "MM";
     "buy_price", json_of_float_opt state.last_buy_order_price;
+    "buy_qty", `Float 0.0;
     "buy_id", json_of_string_opt state.last_buy_order_id;
     "sell_orders", `List (List.map (fun (oid, price, qty) ->
       `Assoc ["id", `String oid; "price", `Float price; "qty", `Float qty]
