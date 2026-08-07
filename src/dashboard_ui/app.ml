@@ -133,6 +133,44 @@ let run () =
   let quit = ref false in
   let input_buf = Bytes.create 64 in
 
+  let view_mode_ref = ref `MainView in
+  let selected_index_ref = ref 0 in
+
+  let find_asset_index key assets =
+    let rec aux i = function
+      | [] -> None
+      | (a : Holdings.selectable_asset) :: rest ->
+          if a.key = key then Some i else aux (i + 1) rest
+    in aux 0 assets
+  in
+
+  let parse_key_bytes buf n =
+    let rec parse i acc =
+      if i >= n then acc
+      else
+        let ch = Bytes.get buf i in
+        if ch = '\027' then
+          if i + 2 < n && Bytes.get buf (i + 1) = '[' then
+            match Bytes.get buf (i + 2) with
+            | 'A' -> parse (i + 3) (`Key_up :: acc)
+            | 'B' -> parse (i + 3) (`Key_down :: acc)
+            | 'C' -> parse (i + 3) (`Key_right :: acc)
+            | 'D' -> parse (i + 3) (`Key_left :: acc)
+            | _ -> parse (i + 3) (`Key_back :: acc)
+          else parse (i + 1) (`Key_back :: acc)
+        else match ch with
+          | 'q' | 'Q' -> parse (i + 1) (`Key_quit :: acc)
+          | 'k' | 'K' -> parse (i + 1) (`Key_up :: acc)
+          | 'j' | 'J' -> parse (i + 1) (`Key_down :: acc)
+          | 'h' | 'H' -> parse (i + 1) (`Key_left :: acc)
+          | 'l' | 'L' -> parse (i + 1) (`Key_right :: acc)
+          | '\r' | '\n' | ' ' -> parse (i + 1) (`Key_enter :: acc)
+          | 'b' | 'B' | '\b' | '\127' -> parse (i + 1) (`Key_back :: acc)
+          | _ -> parse (i + 1) acc
+    in
+    List.rev (parse 0 [])
+  in
+
   Sys.set_signal Sys.sighup (Sys.Signal_handle (fun _ -> quit := true));
 
   let fd_ref : Unix.file_descr option ref = ref None in
@@ -211,18 +249,52 @@ let run () =
         let n = try Unix.read Unix.stdin input_buf 0 64 with _ -> 0 in
         if n = 0 then quit := true
         else begin
-          let rec check_bytes i =
-            if i >= n then ()
-            else begin
-              (match Bytes.get input_buf i with
-               | 'q' | 'Q' -> quit := true
-               | '\027' ->
-                   if i + 1 >= n then quit := true
-               | _ -> ());
-              check_bytes (i + 1)
-            end
-          in
-          check_bytes 0
+          let actions = parse_key_bytes input_buf n in
+          let assets = Holdings.get_selectable_assets !last_json in
+          let asset_count = List.length assets in
+          List.iter (fun action ->
+            match !view_mode_ref with
+            | `MainView ->
+                (match action with
+                 | `Key_quit -> quit := true
+                 | `Key_up ->
+                     if asset_count > 0 then
+                       selected_index_ref := max 0 (!selected_index_ref - 1)
+                 | `Key_down ->
+                     if asset_count > 0 then
+                       selected_index_ref := min (asset_count - 1) (!selected_index_ref + 1)
+                 | `Key_enter ->
+                     if asset_count > 0 then begin
+                       let idx = min (asset_count - 1) (max 0 !selected_index_ref) in
+                       let asset = List.nth assets idx in
+                       view_mode_ref := `DetailView asset.key
+                     end
+                 | `Key_back -> quit := true
+                 | _ -> ())
+            | `DetailView curr_key ->
+                (match action with
+                 | `Key_quit -> quit := true
+                 | `Key_back -> view_mode_ref := `MainView
+                 | `Key_up | `Key_left ->
+                     if asset_count > 0 then begin
+                       let curr_idx = match find_asset_index curr_key assets with
+                         | Some i -> i | None -> 0 in
+                       let new_idx = if curr_idx > 0 then curr_idx - 1 else asset_count - 1 in
+                       selected_index_ref := new_idx;
+                       let new_asset = List.nth assets new_idx in
+                       view_mode_ref := `DetailView new_asset.key
+                     end
+                 | `Key_down | `Key_right ->
+                     if asset_count > 0 then begin
+                       let curr_idx = match find_asset_index curr_key assets with
+                         | Some i -> i | None -> 0 in
+                       let new_idx = if curr_idx < asset_count - 1 then curr_idx + 1 else 0 in
+                       selected_index_ref := new_idx;
+                       let new_asset = List.nth assets new_idx in
+                       view_mode_ref := `DetailView new_asset.key
+                     end
+                 | _ -> ())
+          ) actions
         end
       end;
 
@@ -260,16 +332,21 @@ let run () =
               Buffer.add_string buf "\027[?2026h";
               Buffer.add_string buf "\027[H";
               let content_img =
-                let uncropped = I.vcat [
-                  Kpi_cards.render_kpi_cards w !last_json;
-                  Ticker_feed.render_ticker w !last_json;
-                  Holdings.render_strategies w !last_json;
-                  Recent_fills_feed.render_fills w !last_json;
-                  Memory.render_memory w !last_json;
-                  Latencies.render_latencies w !last_json;
-                  Footer.render_footer w !last_json;
-                ] in
-                I.hsnap ~align:`Left w uncropped
+                match !view_mode_ref with
+                | `MainView ->
+                    let uncropped = I.vcat [
+                      Kpi_cards.render_kpi_cards w !last_json;
+                      Ticker_feed.render_ticker w !last_json;
+                      Holdings.render_strategies ~selected_index:(Some !selected_index_ref) w !last_json;
+                      Recent_fills_feed.render_fills w !last_json;
+                      Memory.render_memory w !last_json;
+                      Latencies.render_latencies w !last_json;
+                      Footer.render_footer w !last_json;
+                    ] in
+                    I.hsnap ~align:`Left w uncropped
+                | `DetailView asset_key ->
+                    let detail_img = Asset_graph.render_asset_detail w h asset_key !last_json in
+                    I.hsnap ~align:`Left w detail_img
               in
 
 
