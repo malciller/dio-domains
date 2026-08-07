@@ -255,6 +255,7 @@ let bootstrap_open_orders () =
   | Ok orders ->
       let grouped = Hashtbl.create 8 in
       List.iter (fun (o : Alpaca_types.order_record) ->
+        ignore (get_or_create_store o.symbol);
         let existing = try Hashtbl.find grouped o.symbol with _ -> [] in
         Hashtbl.replace grouped o.symbol (o :: existing)
       ) orders;

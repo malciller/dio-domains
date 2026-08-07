@@ -312,7 +312,12 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
               state.anticipated_base_credit <- Float.max 0.0 (state.anticipated_base_credit -. acc_qty);
             let cost_basis = match state.last_sell_fill_price with
               | Some prev_sell when prev_sell > 0.0 && prev_sell < sell_fill_price -> Some prev_sell
-              | _ -> state.last_buy_fill_price
+              | _ ->
+                  (match state.last_buy_fill_price with
+                   | Some buy_p when buy_p > 0.0 && buy_p < sell_fill_price -> Some buy_p
+                   | _ ->
+                       let grid_spread = 0.005 in
+                       Some (sell_fill_price /. (1.0 +. grid_spread)))
             in
             (match cost_basis with
              | Some base_price when sell_fill_price > base_price ->
@@ -334,11 +339,9 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
                   Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
                     asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
                 end;
-                state.last_sell_fill_price <- Some sell_fill_price;
-                state.last_buy_fill_price <- None
+                state.last_sell_fill_price <- Some sell_fill_price
             | _ ->
-                state.last_sell_fill_price <- Some sell_fill_price;
-                state.last_buy_fill_price <- None)
+                state.last_sell_fill_price <- Some sell_fill_price)
        | Buy -> ());
 
       let should_update_oid = match state.last_fill_oid with

@@ -132,11 +132,16 @@ let format_qty f =
 
 
 let format_pnl f =
+  let abs_f = abs_float f in
+  let sign = if f >= 0.0 then "+" else "-" in
   let raw =
-    if f >= 0.0 then Printf.sprintf "+$%.2f" f
-    else Printf.sprintf "-$%.2f" (abs_float f)
+    if abs_f >= 1000.0 then sign ^ add_commas (Printf.sprintf "$%.2f" abs_f)
+    else if abs_f >= 1.0 then sign ^ Printf.sprintf "$%.2f" abs_f
+    else if abs_f >= 0.0001 then sign ^ Printf.sprintf "$%.4f" abs_f
+    else if abs_f > 0.0 then sign ^ Printf.sprintf "$%.6f" abs_f
+    else "$0.00"
   in
-  add_commas raw
+  raw
 
 let format_latency_us f =
   let raw =

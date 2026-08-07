@@ -319,6 +319,9 @@ module Alpaca_impl = struct
 
   let get_qty_min ~symbol:_ = Some 0.000000001
 
+  let fetch_open_orders () =
+    Alpaca_executions.bootstrap_open_orders ()
+
   let round_price ~symbol:_ ~price =
     Float.round (price *. 100.0) /. 100.0
 

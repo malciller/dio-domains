@@ -165,6 +165,8 @@ let run () =
           | 'h' | 'H' -> parse (i + 1) (`Key_left :: acc)
           | 'l' | 'L' -> parse (i + 1) (`Key_right :: acc)
           | '\r' | '\n' | ' ' -> parse (i + 1) (`Key_enter :: acc)
+          | '=' | '+' -> parse (i + 1) (`Key_zoom_in :: acc)
+          | '-' | '_' -> parse (i + 1) (`Key_zoom_out :: acc)
           | 'b' | 'B' | '\b' | '\127' -> parse (i + 1) (`Key_back :: acc)
           | _ -> parse (i + 1) acc
     in
@@ -293,6 +295,8 @@ let run () =
                        let new_asset = List.nth assets new_idx in
                        view_mode_ref := `DetailView new_asset.key
                      end
+                 | `Key_zoom_in -> Asset_graph.zoom_in curr_key
+                 | `Key_zoom_out -> Asset_graph.zoom_out curr_key
                  | _ -> ())
           ) actions
         end
@@ -304,6 +308,7 @@ let run () =
           (try 
             let new_json = Yojson.Basic.from_string msg in
             last_json := new_json;
+            Asset_graph.record_all_prices new_json;
           with _ -> ())
         with
         | End_of_file ->
