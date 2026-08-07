@@ -1,7 +1,123 @@
 open Notty
 open Theme
 
-let render_strategies w json =
+type selectable_asset = {
+  key : string;
+  display_name : string;
+  exchange : string;
+  symbol : string;
+  asset : string;
+  is_strategy : bool;
+  data : Yojson.Basic.t;
+}
+
+let get_selectable_assets json =
+  let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
+  let all_balances = json |?> "all_balances" |> to_list_d in
+
+  let active_strats, paused_strats = List.partition (fun (_symbol, data) ->
+    let strat = data |?> "strategy" in
+    not (strat |?> "capital_low" |> to_bool_d false)
+  ) strats in
+
+  let strat_keys = List.map (fun (sym, data) ->
+    let exch = data |?> "exchange" |> to_string_d "" in
+    let market = data |?> "market" in
+    let base = market |?> "base_asset" |> to_string_d "" in
+    (exch, sym), (exch, base)
+  ) strats in
+
+  let valid_balances = List.filter (fun bal_json ->
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+    let exch = bal_json |?> "exchange" |> to_string_d "" in
+    let asset = bal_json |?> "asset" |> to_string_d "" in
+    let symbol = bal_json |?> "symbol" |> to_string_d "" in
+    let is_strat_asset = List.exists (fun ((ex1, s1), (ex2, b2)) ->
+      (ex1 = exch && (s1 = symbol || s1 = asset)) || (ex2 = exch && b2 = asset)
+    ) strat_keys in
+    balance > 0.0 && not is_strat_asset
+  ) all_balances in
+
+  let inactive_jsons = List.filter (fun bal_json ->
+    let asset = bal_json |?> "asset" |> to_string_d "?" in
+    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
+    not is_quote
+  ) valid_balances in
+
+  let quote_jsons = List.filter (fun bal_json ->
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+    let asset = bal_json |?> "asset" |> to_string_d "?" in
+    let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
+    balance > 0.0 && is_quote
+  ) all_balances in
+
+  let active_items = List.map (fun (sym, data) ->
+    let exch = data |?> "exchange" |> to_string_d "?" in
+    let exch_tag = exch_tag_of exch in
+    let market = data |?> "market" in
+    let base = market |?> "base_asset" |> to_string_d sym in
+    {
+      key = "strat:" ^ exch ^ ":" ^ sym;
+      display_name = Printf.sprintf "%s (%s)" sym exch_tag;
+      exchange = exch;
+      symbol = sym;
+      asset = base;
+      is_strategy = true;
+      data;
+    }
+  ) active_strats in
+
+  let paused_items = List.map (fun (sym, data) ->
+    let exch = data |?> "exchange" |> to_string_d "?" in
+    let exch_tag = exch_tag_of exch in
+    let market = data |?> "market" in
+    let base = market |?> "base_asset" |> to_string_d sym in
+    {
+      key = "strat:" ^ exch ^ ":" ^ sym;
+      display_name = Printf.sprintf "%s (%s)" sym exch_tag;
+      exchange = exch;
+      symbol = sym;
+      asset = base;
+      is_strategy = true;
+      data;
+    }
+  ) paused_strats in
+
+  let inactive_items = List.map (fun bal ->
+    let exch = bal |?> "exchange" |> to_string_d "?" in
+    let asset = bal |?> "asset" |> to_string_d "?" in
+    let symbol = bal |?> "symbol" |> to_string_d asset in
+    let exch_tag = exch_tag_of exch in
+    {
+      key = "bal:" ^ exch ^ ":" ^ asset;
+      display_name = Printf.sprintf "%s (%s)" asset exch_tag;
+      exchange = exch;
+      symbol;
+      asset;
+      is_strategy = false;
+      data = bal;
+    }
+  ) inactive_jsons in
+
+  let quote_items = List.map (fun bal ->
+    let exch = bal |?> "exchange" |> to_string_d "?" in
+    let asset = bal |?> "asset" |> to_string_d "?" in
+    let symbol = bal |?> "symbol" |> to_string_d asset in
+    let exch_tag = exch_tag_of exch in
+    {
+      key = "bal:" ^ exch ^ ":" ^ asset;
+      display_name = Printf.sprintf "%s (%s)" asset exch_tag;
+      exchange = exch;
+      symbol;
+      asset;
+      is_strategy = false;
+      data = bal;
+    }
+  ) quote_jsons in
+
+  active_items @ paused_items @ inactive_items @ quote_items
+
+let render_strategies ?(selected_index=None) w json =
   let now = Unix.gettimeofday () in
   let flash_on = fst (modf (now *. 1.5)) < 0.5 in
   let strats = match json |?> "strategies" with `Assoc l -> l | _ -> [] in
@@ -32,7 +148,7 @@ let render_strategies w json =
         col 16 a_label "SYMBOL";
         col 5 a_label "STGY";
         col 3 a_label "ST";
-        col_right 13 a_label "PRICE";
+        col_right 12 a_label "PRICE";
         col_right 8 a_label "SPREAD";
         I.string a_border " │ ";
         col_right 12 a_label "BUY @";
@@ -43,14 +159,14 @@ let render_strategies w json =
         col_right 6 a_label "SELLS";
         col_right 12 a_label "SELL VAL";
         I.string a_border " │ ";
-        col_right 12 a_label "HOLDING";
+        col_right 12 a_label "HOLD QTY";
         col_right 10 a_label "HOLD VAL";
         col_right 12 a_label "ACCUM QTY";
         col_right 10 a_label "ACCUM VAL";
       ]
   ) in
 
-  let build_strategy_row is_even (symbol, data) =
+  let build_strategy_row ?(is_selected=false) is_even (symbol, data) =
     let exchange = data |?> "exchange" |> to_string_d "?" in
     let strat = data |?> "strategy" in
     let market = data |?> "market" in
@@ -128,7 +244,8 @@ let render_strategies w json =
     let flash_sell = near_sell && flash_on in
 
     let bg_color =
-      if flash_buy then c_near_fill
+      if is_selected then c_selected
+      else if flash_buy then c_near_fill
       else if flash_sell then c_near_sell
       else if is_even then c_panel
       else c_bg
@@ -156,7 +273,10 @@ let render_strategies w json =
     let col_right w attr s = I.string attr (pad_left w s) in
     let close_row w img = close_row w img in
 
-
+    let cursor_img =
+      if is_selected then I.string A.(fg c_cyan ++ bg bg_color ++ st bold) " ▶"
+      else I.string a_border_outer " │"
+    in
 
     let gauge_img = render_proximity_slider 17 execution_proximity_opt in
 
@@ -225,7 +345,7 @@ let render_strategies w json =
 
     if is_compact then
       close_row w (I.hcat [
-        I.string a_border_outer " │";
+        cursor_img;
         I.string A.(bg bg_color) "  ";
         col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 symbol) exch_tag);
         col 5 a_cyan (truncate_string 4 stype);
@@ -244,7 +364,7 @@ let render_strategies w json =
       ])
     else
       close_row w (I.hcat [
-        I.string a_border_outer " │";
+        cursor_img;
         I.string A.(bg bg_color) "  ";
         col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag);
         col 5 a_cyan (truncate_string 4 stype);
@@ -278,10 +398,7 @@ let render_strategies w json =
     not (strat |?> "capital_low" |> to_bool_d false)
   ) strats in
 
-  let active_images = List.mapi (fun i row_data -> build_strategy_row (i mod 2 = 1) row_data) active_rows_data in
-  let paused_images = List.mapi (fun i row_data -> build_strategy_row (i mod 2 = 1) row_data) paused_rows_data in
-
-  let build_balance_row is_even bal_json img_is_quote =
+  let build_balance_row ?(is_selected=false) is_even bal_json img_is_quote =
     let exchange = bal_json |?> "exchange" |> to_string_d "?" in
     let asset = bal_json |?> "asset" |> to_string_d "?" in
     let balance = bal_json |?> "balance" |> to_float_d 0.0 in
@@ -319,7 +436,7 @@ let render_strategies w json =
       match sell_prices with [] -> None | prices -> Some (List.fold_left min (List.hd prices) prices)
     in
 
-    let bg_color = if is_even then c_panel else c_bg in
+    let bg_color = if is_selected then c_selected else if is_even then c_panel else c_bg in
     
     let a_text       = A.(Theme.a_text   ++ bg bg_color) in
     let a_green      = A.(Theme.a_green  ++ bg bg_color) in
@@ -339,6 +456,10 @@ let render_strategies w json =
     let col_right w attr s = I.string attr (pad_left w s) in
     let close_row w img = close_row w img in
 
+    let cursor_img =
+      if is_selected then I.string A.(fg c_cyan ++ bg bg_color ++ st bold) " ▶"
+      else I.string a_border_outer " │"
+    in
 
     let sell_dist_str, sell_dist_attr = match closest_sell_dist_pct with
       | None -> "--", a_dim
@@ -390,7 +511,7 @@ let render_strategies w json =
 
     if is_compact then
       close_row w (I.hcat [
-        I.string a_border_outer " │";
+        cursor_img;
         I.string A.(bg bg_color) "  ";
         col 14 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag);
         col 5 a_dim "--";
@@ -406,7 +527,7 @@ let render_strategies w json =
       ])
     else
       close_row w (I.hcat [
-        I.string a_border_outer " │";
+        cursor_img;
         I.string A.(bg bg_color) "  ";
         col 16 (exch_sym_attr ~dim:true exchange) (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag);
         col 5 a_dim "--";
@@ -430,10 +551,22 @@ let render_strategies w json =
       ])
   in
 
+  let strat_keys = List.map (fun (sym, data) ->
+    let exch = data |?> "exchange" |> to_string_d "" in
+    let market = data |?> "market" in
+    let base = market |?> "base_asset" |> to_string_d "" in
+    (exch, sym), (exch, base)
+  ) strats in
 
   let valid_balances = List.filter (fun bal_json ->
     let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-    balance > 0.0
+    let exch = bal_json |?> "exchange" |> to_string_d "" in
+    let asset = bal_json |?> "asset" |> to_string_d "" in
+    let symbol = bal_json |?> "symbol" |> to_string_d "" in
+    let is_strat_asset = List.exists (fun ((ex1, s1), (ex2, b2)) ->
+      (ex1 = exch && (s1 = symbol || s1 = asset)) || (ex2 = exch && b2 = asset)
+    ) strat_keys in
+    balance > 0.0 && not is_strat_asset
   ) all_balances in
 
   let inactive_jsons = List.filter (fun bal_json ->
@@ -443,13 +576,37 @@ let render_strategies w json =
   ) valid_balances in
 
   let quote_jsons = List.filter (fun bal_json ->
+    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
     let asset = bal_json |?> "asset" |> to_string_d "?" in
     let is_quote = asset = "USD" || asset = "USDC" || asset = "USDT" || asset = "ZUSD" || asset = "USDe" in
-    is_quote
-  ) valid_balances in
+    balance > 0.0 && is_quote
+  ) all_balances in
 
-  let inactive_rows = List.mapi (fun i bal -> build_balance_row (i mod 2 = 1) bal false) inactive_jsons in
-  let quote_rows = List.mapi (fun i bal -> build_balance_row (i mod 2 = 1) bal true) quote_jsons in
+  let curr_row_idx = ref 0 in
+
+  let active_images = List.map (fun row_data ->
+    let idx = !curr_row_idx in
+    incr curr_row_idx;
+    build_strategy_row ~is_selected:(selected_index = Some idx) (idx mod 2 = 1) row_data
+  ) active_rows_data in
+
+  let paused_images = List.map (fun row_data ->
+    let idx = !curr_row_idx in
+    incr curr_row_idx;
+    build_strategy_row ~is_selected:(selected_index = Some idx) (idx mod 2 = 1) row_data
+  ) paused_rows_data in
+
+  let inactive_rows = List.map (fun bal ->
+    let idx = !curr_row_idx in
+    incr curr_row_idx;
+    build_balance_row ~is_selected:(selected_index = Some idx) (idx mod 2 = 1) bal false
+  ) inactive_jsons in
+
+  let quote_rows = List.map (fun bal ->
+    let idx = !curr_row_idx in
+    incr curr_row_idx;
+    build_balance_row ~is_selected:(selected_index = Some idx) (idx mod 2 = 1) bal true
+  ) quote_jsons in
 
   let total_up_strats, total_hold_strats, total_accum_val_strats = List.fold_left (fun (up_acc, hold_acc, accum_val_acc) (_symbol, data) ->
     let strat = data |?> "strategy" in

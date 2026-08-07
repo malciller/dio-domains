@@ -112,7 +112,7 @@ let compute_sell_qty ~ecfg ~state ~(asset : trading_config) ~qty ~sell_price ~se
     else
       (qty, false, required_profit)
   end else if ecfg.sell_uses_mult then
-    (qty *. sell_mult, false, 0.0)
+    (round_qty (qty *. sell_mult) symbol exchange, false, 0.0)
   else
     (qty, false, 0.0)
 

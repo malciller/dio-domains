@@ -20,18 +20,20 @@ let flush_persistence asset_symbol =
             state.accumulated_profit,
             state.last_fill_oid,
             state.last_buy_fill_price,
-            state.last_sell_fill_price
+            state.last_sell_fill_price,
+            state.persisted_sell_levels
           )
         end else None)
     in
     match snapshot_to_save with
-    | Some (reserved_base, accumulated_profit, last_fill_oid, last_buy_fill_price, last_sell_fill_price) ->
+    | Some (reserved_base, accumulated_profit, last_fill_oid, last_buy_fill_price, last_sell_fill_price, persisted_sell_levels) ->
         Dio_persistence.State_persistence.save_async ~symbol:asset_symbol
           ~reserved_base
           ~accumulated_profit
           ~last_fill_oid
           ~last_buy_fill_price
-          ~last_sell_fill_price ()
+          ~last_sell_fill_price
+          ~persisted_sell_levels ()
     | None -> ()
   end
 
@@ -59,6 +61,13 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
      | Sell ->
          state.inflight_sell <- false;
          state.recently_injected_sells <- (order_id, price, now) :: state.recently_injected_sells;
+         let replaced = ref false in
+         state.open_sell_orders <- List.map (fun (oid, p, q) ->
+           if not !replaced && String.starts_with ~prefix:"pending_sell_" oid && abs_float (p -. price) < (price *. 0.01) then begin
+             replaced := true;
+             (order_id, p, q)
+           end else (oid, p, q)
+         ) state.open_sell_orders;
          ());
 
     ()
@@ -84,10 +93,12 @@ let handle_order_failed ~now asset_symbol side reason =
 
     let lower_reason = String.lowercase_ascii reason in
     let is_rate_limit = contains_fragment lower_reason "too many cumulative requests" || contains_fragment lower_reason "rate limit" in
+    let is_wash_trade = contains_fragment lower_reason "wash trade" in
     let is_insufficient_balance = contains_fragment lower_reason "insufficient funds"
       || contains_fragment lower_reason "insufficient spot balance"
-      || contains_fragment lower_reason "not enough asset balance" in
-    let cooldown = if is_rate_limit then 10.0 else 2.0 in
+      || contains_fragment lower_reason "not enough asset balance"
+      || contains_fragment lower_reason "insufficient qty" in
+    let cooldown = if is_rate_limit || is_wash_trade then 10.0 else 2.0 in
 
     (match side with
      | Buy when is_insufficient_balance ->
@@ -113,6 +124,8 @@ let handle_order_failed ~now asset_symbol side reason =
 
     (match side with
      | Buy ->
+         if is_wash_trade then
+           Logging.warn_f ~section "Buy rejected for %s due to wash trade conflict - cooling down buy placement for 10s" asset_symbol;
          Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. cooldown)
      | Sell -> ());
 
@@ -141,7 +154,13 @@ let handle_order_rejected ~now:_ asset_symbol side price =
          state.inflight_sell <- false;
          state.open_sell_orders <- List.filter (fun (oid, _, _) ->
            not (String.starts_with ~prefix:"pending_sell_" oid)
-         ) state.open_sell_orders);
+         ) state.open_sell_orders;
+         if state.persisted_sell_levels <> [] then begin
+           state.persisted_sell_levels <- List.filter (fun (sp, _) ->
+             abs_float (sp -. price) > (price *. 0.005)
+           ) state.persisted_sell_levels;
+           state.persistence_dirty <- true
+         end);
 
     let duplicate_key = (match side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell) in
     ignore (InFlightOrders.remove_in_flight_order duplicate_key);
@@ -189,7 +208,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
       || match state.last_fill_oid with
          | Some persisted_oid ->
              (try Int64.compare (Int64.of_string order_id) (Int64.of_string persisted_oid) <= 0
-              with _ -> false)
+              with _ -> order_id = persisted_oid)
          | None -> state.startup_replay
     in
     let skip_fill = is_persisted_fill in
@@ -240,6 +259,17 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
             asset_symbol buy_fee_quote state.accumulated_profit
         end;
 
+        if (Exchange.Types.exchange_of_string state.exchange_id = Alpaca) && acc_qty > 0.0 then begin
+          let sell_mult = state.cached_sell_mult in
+          let base_increment = acc_qty -. (sell_mult *. acc_qty) in
+          if base_increment > 0.0 then begin
+            state.reserved_base <- state.reserved_base +. base_increment;
+            state.persistence_dirty <- true;
+            Logging.info_f ~section "Reserving base for %s on buy fill %s: +%.8f (sell_mult %.4f, total reserved_base now %.8f)"
+              asset_symbol order_id base_increment sell_mult state.reserved_base
+          end
+        end;
+
         if acc_qty > 0.0 && not state.startup_replay then begin
           state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
           Logging.info_f ~section "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
@@ -268,6 +298,16 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
       end;
       (match side with
        | Sell ->
+            if state.persisted_sell_levels <> [] then begin
+              let rec remove_one acc found = function
+                | [] -> List.rev acc
+                | (sp, _sq) :: rest when not found && abs_float (sp -. sell_fill_price) <= (sell_fill_price *. 0.01) ->
+                    remove_one acc true rest
+                | item :: rest -> remove_one (item :: acc) found rest
+              in
+              state.persisted_sell_levels <- remove_one [] false state.persisted_sell_levels;
+              state.persistence_dirty <- true
+            end;
             if acc_qty > 0.0 then
               state.anticipated_base_credit <- Float.max 0.0 (state.anticipated_base_credit -. acc_qty);
             let cost_basis = match state.last_sell_fill_price with
@@ -294,15 +334,17 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
                   Logging.debug_f ~section "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f base@%.4f x %.8f), accumulated: %.6f"
                     asset_symbol net_profit gross fees sell_fill_price base_price qty state.accumulated_profit
                 end;
-                state.last_sell_fill_price <- Some sell_fill_price
+                state.last_sell_fill_price <- Some sell_fill_price;
+                state.last_buy_fill_price <- None
             | _ ->
-                state.last_sell_fill_price <- Some sell_fill_price)
+                state.last_sell_fill_price <- Some sell_fill_price;
+                state.last_buy_fill_price <- None)
        | Buy -> ());
 
       let should_update_oid = match state.last_fill_oid with
         | Some prev_oid ->
             (try Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
-             with _ -> true)
+             with _ -> order_id <> prev_oid)
         | None -> true
       in
       if should_update_oid then
@@ -331,6 +373,16 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) (fun () ->
+    let is_being_amended =
+      InFlightAmendments.is_in_flight order_id ||
+      state.inflight_amend_buy ||
+      List.exists (fun (pending_id, _, _, _) ->
+        String.starts_with ~prefix:"pending_amend_" pending_id &&
+        String.length pending_id > 14 &&
+        String.sub pending_id 14 (String.length pending_id - 14) = order_id
+      ) state.pending_orders
+    in
+
     state.pending_orders <- List.filter (fun (pending_id, _, _, _) ->
       let matches = pending_id = order_id ||
                    (String.starts_with ~prefix:"pending_amend_" pending_id &&
@@ -339,36 +391,40 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
       not matches
     ) state.pending_orders;
 
-    Hashtbl.remove state.amend_cooldowns order_id;
-    ignore (InFlightAmendments.remove_in_flight_amendment order_id);
+    if not is_being_amended then begin
+      Hashtbl.remove state.amend_cooldowns order_id;
+      Hashtbl.remove state.evicted_orders order_id;
+      ignore (InFlightAmendments.remove_in_flight_amendment order_id);
 
-    let cancelled_side = side in
+      let cancelled_side = side in
 
-    let was_tracked_buy = match state.last_buy_order_id with
-      | Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
-      | _ -> false
-    in
+      let was_tracked_buy = match state.last_buy_order_id with
+        | Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id -> true
+        | _ -> false
+      in
 
-    if was_tracked_buy then begin
-      state.last_buy_order_id <- None;
-      state.last_buy_order_price <- None;
-      ()
-    end;
+      if was_tracked_buy then begin
+        state.last_buy_order_id <- None;
+        state.last_buy_order_price <- None;
+        ()
+      end;
 
-    if cancelled_side = Buy then begin
-      state.inflight_cancel_buy <- false;
-      state.inflight_amend_buy <- false;
-      Hashtbl.remove state.amend_cooldowns "place_Buy"
-    end;
+      if cancelled_side = Buy then begin
+        state.inflight_cancel_buy <- false;
+        state.inflight_amend_buy <- false;
+        Hashtbl.remove state.amend_cooldowns "place_Buy"
+      end;
 
-    state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
-      sell_id <> order_id
-    ) state.open_sell_orders;
+      state.open_sell_orders <- List.filter (fun (sell_id, _, _) ->
+        sell_id <> order_id
+      ) state.open_sell_orders;
 
-    (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
-    ignore (InFlightOrders.remove_in_flight_order ((match cancelled_side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)));
-
-    ()
+      (match cancelled_side with Buy -> state.inflight_buy <- false | Sell -> state.inflight_sell <- false);
+      ignore (InFlightOrders.remove_in_flight_order ((match cancelled_side with Buy -> state.duplicate_key_buy | Sell -> state.duplicate_key_sell)))
+    end else begin
+      Logging.info_f ~section "Order cancellation for %s (%s) ignored for tracking reset because order amendment is in progress"
+        asset_symbol order_id
+    end
   )
 
 (** Handles order amendment. *)
@@ -411,6 +467,14 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
          state.open_sell_orders <- (new_order_id, price, old_qty) ::
             List.filter (fun (sell_id, _, _) -> sell_id <> old_order_id) state.open_sell_orders;
          state.recently_injected_sells <- (new_order_id, price, now) :: state.recently_injected_sells;
+         (match old_entry with
+          | Some (_, old_p, _) when state.persisted_sell_levels <> [] ->
+              let filtered = List.filter (fun (sp, _) -> abs_float (sp -. old_p) > (old_p *. 0.005)) state.persisted_sell_levels in
+              let already_in_stack = List.exists (fun (p, _) -> abs_float (p -. price) <= (price *. 0.005)) filtered in
+              let updated = if already_in_stack then filtered else (price, old_qty) :: filtered in
+              state.persisted_sell_levels <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) updated;
+              state.persistence_dirty <- true
+          | _ -> ());
          Logging.info_f ~section "SELL_AMEND [%s] result: sells_after=%d"
            asset_symbol (List.length state.open_sell_orders));
 

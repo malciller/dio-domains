@@ -175,12 +175,14 @@ let c_dim        = A.rgb_888 ~r:86  ~g:95  ~b:137
 let c_near_fill  = A.rgb_888 ~r:29  ~g:42  ~b:60
 let c_near_sell  = A.rgb_888 ~r:65  ~g:35  ~b:55
 let c_magenta    = A.rgb_888 ~r:226 ~g:104 ~b:160
+let c_selected   = A.rgb_888 ~r:40  ~g:60  ~b:95
 
 (* Per-exchange brand colors (adapted for dark mode) *)
 let c_exch_hl    = A.rgb_888 ~r:73  ~g:177 ~b:121
 let c_exch_kr    = A.rgb_888 ~r:187 ~g:154 ~b:247
 let c_exch_li    = A.rgb_888 ~r:125 ~g:207 ~b:255
 let c_exch_ib    = A.rgb_888 ~r:255 ~g:158 ~b:100
+let c_exch_alp   = A.rgb_888 ~r:246 ~g:193 ~b:119
 
 (* Basis Point generic styling (Pink/Magenta scale to avoid exchange collision) *)
 let c_bps_tight  = A.rgb_888 ~r:125 ~g:207 ~b:255 (* Cyan *)
@@ -218,6 +220,7 @@ let exch_sym_attr ?(dim=false) exchange =
     | "kraken"      -> c_exch_kr
     | "lighter"     -> c_exch_li
     | "ibkr"        -> c_exch_ib
+    | "alpaca"      -> c_exch_alp
     | _             -> c_bright
   in
   if dim then A.(fg c ++ bg c_bg)
@@ -226,6 +229,7 @@ let exch_sym_attr ?(dim=false) exchange =
 let exch_tag_of = function
   | "kraken" -> "krkn" | "hyperliquid" -> "hypr"
   | "lighter" -> "ltr" | "ibkr" -> "ibkr"
+  | "alpaca" -> "alpc"
   | e -> String.sub e 0 (min 3 (String.length e))
 
 (* Drawing primitives *)

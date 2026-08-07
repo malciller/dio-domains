@@ -30,6 +30,7 @@ let render_footer w json =
     let tag = match exch with
       | "kraken"       -> "kraken"
       | "hyperliquid"  -> "hyperliquid"
+      | "alpaca"       -> "alpaca"
       | e              -> truncate_string 10 e
     in
     let dot_attr =
@@ -41,6 +42,7 @@ let render_footer w json =
       | "kraken"      -> c_exch_kr
       | "lighter"     -> c_exch_li
       | "ibkr"        -> c_exch_ib
+      | "alpaca"      -> c_exch_alp
       | _             -> c_label
     in
     let seg = I.hcat [

@@ -95,8 +95,8 @@ let monitor_loop () =
                            outside US equity extended hours (4 AM – 8 PM ET).
                            The connect_fn itself will sleep until the next
                            open window, so there's nothing for the monitor to do. *)
-                        if String.equal conn.name "ibkr_gateway"
-                           && not (Ibkr.Market_hours.is_market_open ()) then
+                        if (String.equal conn.name "ibkr_gateway" && not (Ibkr.Market_hours.is_market_open ()))
+                           || ((String.equal conn.name "alpaca_data_ws" || String.equal conn.name "alpaca_trading_ws") && not (Alpaca.Market_hours.is_market_open ())) then
                           ()  (* Market closed — suppress reconnection *)
                         else begin
                           (* Exponential backoff: 0s, 2s, 4s, 8s, ... capped at 30s (300s for IBKR and Lighter) *)
@@ -154,8 +154,8 @@ let monitor_loop () =
                           (* IBKR market hours gate: don't restart against a
                              closed gateway — let the monitor's Failed handler
                              defer reconnection to the next market open. *)
-                          if String.equal conn.name "ibkr_gateway"
-                             && not (Ibkr.Market_hours.is_market_open ()) then begin
+                          if (String.equal conn.name "ibkr_gateway" && not (Ibkr.Market_hours.is_market_open ()))
+                             || ((String.equal conn.name "alpaca_data_ws" || String.equal conn.name "alpaca_trading_ws") && not (Alpaca.Market_hours.is_market_open ())) then begin
                             Logging.info_f ~section "[%s] Market closed, deferring reconnection" conn.name;
                             set_state conn (Failed "Market closed")
                           end else
@@ -325,6 +325,7 @@ let monitor_non_active_assets () =
                 | Kraken -> "kraken_orderbook_ws"
                 | Hyperliquid -> "hyperliquid_ws"
                 | Ibkr -> "ibkr_gateway"
+                | Alpaca -> "alpaca_trading_ws"
                 | Lighter | Custom _ -> ""
               in
               let current_connected_time =
@@ -350,9 +351,9 @@ let monitor_non_active_assets () =
                 List.iter (fun (asset, _bal) ->
                   let quote = match Dio_exchange.Exchange_intf.Types.exchange_of_string exch_name with
                     | Hyperliquid | Lighter -> "USDC"
-                    | Kraken | Ibkr | Custom _ -> "USD"
+                    | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
                   in
-                  let symbol = asset ^ "/" ^ quote in
+                  let symbol = if String.equal exch_name "alpaca" then asset else asset ^ "/" ^ quote in
                   let is_configured = List.exists (fun (ex, sym) ->
                     ex = exch_name && sym = symbol
                   ) configured_symbols in
