@@ -84,6 +84,7 @@ type symbol_state = {
   mutable last_fill_oid: string option;
   mutable last_buy_fill_price: float option;
   mutable last_sell_fill_price: float option;
+  mutable persisted_sell_levels: (float * float) list;
 }
 
 (** Global cache of state fields per symbol to ensure O(1) thread-safe reads and survive strategy restarts. *)
@@ -101,12 +102,24 @@ let populate_cache_from_file_unsafe () =
     let last_fill_oid = get_string_opt json ~symbol ~field:"last_fill_oid" in
     let last_buy_fill_price = get_float_opt json ~symbol ~field:"last_buy_fill_price" in
     let last_sell_fill_price = get_float_opt json ~symbol ~field:"last_sell_fill_price" in
+    let persisted_sell_levels =
+      try
+        json |> member symbol |> member "sell_levels" |> to_list |> List.filter_map (fun item ->
+          try
+            let price = item |> member "price" |> to_float in
+            let qty = item |> member "qty" |> to_float in
+            Some (price, qty)
+          with _ -> None
+        )
+      with _ -> []
+    in
     let state = {
       reserved_base;
       accumulated_profit;
       last_fill_oid;
       last_buy_fill_price;
       last_sell_fill_price;
+      persisted_sell_levels;
     } in
     Hashtbl.replace cache symbol state
   ) entries
@@ -128,6 +141,7 @@ let ensure_symbol_in_cache ~symbol =
           last_fill_oid = None;
           last_buy_fill_price = None;
           last_sell_fill_price = None;
+          persisted_sell_levels = [];
         } in
         Hashtbl.replace cache symbol default_state
       end
@@ -194,6 +208,17 @@ let load_last_sell_fill_price ~symbol =
    | None -> ());
   result
 
+(** Loads persisted_sell_levels for a symbol. Returns [] if absent. Acquires cache_mutex. *)
+let load_persisted_sell_levels ~symbol =
+  ensure_symbol_in_cache ~symbol;
+  Mutex.lock cache_mutex;
+  let state = Hashtbl.find cache symbol in
+  let result = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) state.persisted_sell_levels in
+  Mutex.unlock cache_mutex;
+  if result <> [] then
+    Logging.info_f ~section "Loaded %d persisted_sell_levels for %s" (List.length result) symbol;
+  result
+
 (** Helper function that performs the actual read-modify-write cycle on disk under file_mutex. *)
 let write_to_disk ~symbol ~state () =
   Mutex.lock file_mutex;
@@ -221,7 +246,15 @@ let write_to_disk ~symbol ~state () =
         | Some price -> [("last_sell_fill_price", `Float price)]
         | None -> []
       in
-      let new_entry = `Assoc (base_fields @ oid_field @ buy_price_field @ sell_price_field) in
+      let sell_levels_field =
+        if state.persisted_sell_levels <> [] then
+          let list_json = `List (List.map (fun (price, qty) ->
+            `Assoc [("price", `Float price); ("qty", `Float qty)]
+          ) state.persisted_sell_levels) in
+          [("sell_levels", list_json)]
+        else []
+      in
+      let new_entry = `Assoc (base_fields @ oid_field @ buy_price_field @ sell_price_field @ sell_levels_field) in
       let updated = List.filter (fun (k, _) -> k <> symbol) entries in
       let final = `Assoc ((symbol, new_entry) :: updated) in
 
@@ -241,7 +274,7 @@ let write_to_disk ~symbol ~state () =
 (** Persists state for a symbol. Required fields: reserved_base, accumulated_profit.
     Optional fields are updated in the cache when provided, and the entire state is
     written to disk synchronously. *)
-let save ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_buy_fill_price ~last_sell_fill_price () =
+let save ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_buy_fill_price ~last_sell_fill_price ?persisted_sell_levels () =
   ensure_symbol_in_cache ~symbol;
   Mutex.lock cache_mutex;
   let state = Hashtbl.find cache symbol in
@@ -250,12 +283,14 @@ let save ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_buy_fil
   if last_fill_oid <> None then state.last_fill_oid <- last_fill_oid;
   state.last_buy_fill_price <- last_buy_fill_price;
   state.last_sell_fill_price <- last_sell_fill_price;
+  Option.iter (fun levels -> state.persisted_sell_levels <- levels) persisted_sell_levels;
   let snapshot = {
     reserved_base = state.reserved_base;
     accumulated_profit = state.accumulated_profit;
     last_fill_oid = state.last_fill_oid;
     last_buy_fill_price = state.last_buy_fill_price;
     last_sell_fill_price = state.last_sell_fill_price;
+    persisted_sell_levels = state.persisted_sell_levels;
   } in
   Mutex.unlock cache_mutex;
   write_to_disk ~symbol ~state:snapshot ()
@@ -278,7 +313,7 @@ let rec background_worker () =
 
 let () = ignore (Domain.spawn background_worker)
 
-let save_async ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_buy_fill_price ~last_sell_fill_price () =
+let save_async ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_buy_fill_price ~last_sell_fill_price ?persisted_sell_levels () =
   ensure_symbol_in_cache ~symbol;
   Mutex.lock cache_mutex;
   let state = Hashtbl.find cache symbol in
@@ -287,12 +322,14 @@ let save_async ~symbol ~reserved_base ~accumulated_profit ~last_fill_oid ~last_b
   if last_fill_oid <> None then state.last_fill_oid <- last_fill_oid;
   state.last_buy_fill_price <- last_buy_fill_price;
   state.last_sell_fill_price <- last_sell_fill_price;
+  Option.iter (fun levels -> state.persisted_sell_levels <- levels) persisted_sell_levels;
   let snapshot = {
     reserved_base = state.reserved_base;
     accumulated_profit = state.accumulated_profit;
     last_fill_oid = state.last_fill_oid;
     last_buy_fill_price = state.last_buy_fill_price;
     last_sell_fill_price = state.last_sell_fill_price;
+    persisted_sell_levels = state.persisted_sell_levels;
   } in
   Mutex.unlock cache_mutex;
 

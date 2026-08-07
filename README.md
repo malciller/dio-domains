@@ -2,7 +2,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 High-performance OCaml 5.2 trading engine for Kraken, Hyperliquid,
-Lighter, and Interactive Brokers (IBKR) featuring domain-based
+Lighter, Interactive Brokers (IBKR), and Alpaca featuring domain-based
 parallel strategy execution. Each trading asset runs in its own
 isolated domain with lock-free communication, tick-driven event
 architecture, and real-time latency profiling. Built for
@@ -38,6 +38,7 @@ order execution.
   - **Hyperliquid**: Wallet address, agent address, and private key
   - **Lighter**: API private key, account index, and signer shared library
   - **IBKR**: IB Gateway (Docker) with TWS credentials
+  - **Alpaca**: API key and secret (Paper or Live)
 
 ---
 
@@ -83,6 +84,10 @@ IBKR_GATEWAY_PORT=4002          # Default: 4002
 IBKR_TRADING_MODE=paper         # "paper" or "live" (default: paper)
 IBKR_CLIENT_ID=0                # Default: 0
 IBKR_ACCOUNT_ID=                # Auto-detected from gateway if omitted
+
+# ── Alpaca ──
+ALPACA_API_KEY=your_alpaca_api_key
+ALPACA_API_SECRET=your_alpaca_api_secret
 
 # ── Lighter ──
 LIGHTER_API_PRIVATE_KEY=your_lighter_private_key
@@ -153,6 +158,17 @@ engine spawns an isolated domain per entry.
       "sell_mult": "0.999",
       "accumulation_buffer": [25.0, 50.0],
       "strategy": "Grid"
+    },
+    {
+      "symbol": "SPY",
+      "exchange": "alpaca",
+      "qty": "1.0",
+      "grid_interval": [0.25, 0.75],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [10.0, 25.0],
+      "strategy": "Grid",
+      "testnet": true,
+      "data_feed": "iex"
     }
   ]
 }
@@ -162,17 +178,18 @@ engine spawns an isolated domain per entry.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `symbol` | string | Trading pair (e.g. `"BTC/USD"`) or ticker (e.g. `"TQQQ"`) |
-| `exchange` | string | `"kraken"`, `"hyperliquid"`, `"lighter"`, or `"ibkr"` |
+| `symbol` | string | Trading pair (e.g. `"BTC/USD"`) or ticker (e.g. `"TQQQ"`, `"SPY"`) |
+| `exchange` | string | `"kraken"`, `"hyperliquid"`, `"lighter"`, `"ibkr"`, or `"alpaca"` |
 | `qty` | string | Order quantity per grid level |
 | `grid_interval` | [min, max] | Grid spacing as `%` of price, resolved via Fear & Greed |
 | `sell_mult` | string | Sell quantity multiplier (`qty × sell_mult`). Values < 1.0 trigger accumulation |
-| `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, Lighter, IBKR) |
+| `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, Lighter, IBKR, Alpaca) |
 | `strategy` | string | `"Grid"` or `"MM"` |
 | `min_usd_balance` | string | Minimum USD balance to run (MM only) |
 | `max_exposure` | string | Maximum asset exposure before pausing (MM only) |
-| `testnet` | bool | Use testnet (Hyperliquid, IBKR only) |
+| `testnet` | bool | Use testnet / paper mode (Hyperliquid, IBKR, Alpaca) |
 | `hedge` | bool | Enable auto-hedge (Hyperliquid only) |
+| `data_feed` | string | Market data feed channel (`"iex"` or `"sip"`; Alpaca only) |
 | `maker_fee` / `taker_fee` | float | Override exchange fee rates |
 
 #### GC Tuning
@@ -289,6 +306,39 @@ see the IB Gateway GUI for debugging login or order issues.
 
 ---
 
+## Alpaca Setup
+
+The engine supports US equities and crypto trading via Alpaca Markets REST & WebSocket APIs, including full support for extended hours trading (pre-market and post-market sessions).
+
+### 1. Credentials
+
+Generate API keys from your [Alpaca Dashboard](https://app.alpaca.markets/). Add your credentials to `.env`:
+
+```bash
+ALPACA_API_KEY=your_alpaca_api_key_id
+ALPACA_API_SECRET=your_alpaca_api_secret
+```
+
+### 2. Account Mode & Data Feeds
+
+Configure account environment and streaming data feed per asset in `config.json`:
+
+- **Paper vs. Live Trading**: Set `"testnet": true` for paper trading (`https://paper-api.alpaca.markets`) or `"testnet": false` for live trading (`https://api.alpaca.markets`).
+- **Data Feed Source**: Set `"data_feed"` to `"iex"` (default, free Investors Exchange feed) or `"sip"` (paid Securities Information Processor feed with consolidated cross-exchange coverage).
+
+### 3. Extended Hours Trading
+
+Alpaca supports extended hours sessions for US equities:
+- **Pre-Market**: 4:00 AM – 9:30 AM ET
+- **Post-Market**: 4:00 PM – 8:00 PM ET
+
+The engine automatically handles market session transitions:
+- Orders submitted during extended sessions automatically use `time_in_force: "day"` and `extended_hours: true` (only limit orders are supported by Alpaca during extended hours).
+- Real-time orderbook snapshots and live quotes continue streaming during pre-market and post-market sessions.
+- Order amendments (`PATCH /v2/orders/{id}`) automatically track and update replacement order IDs across live session changes.
+
+---
+
 ## Strategies
 
 ### Grid
@@ -334,13 +384,21 @@ prevents retained shares from being sold.
 - **Position-gated sells**: Pre-checked via `updatePortfolio` to prevent short-selling
 - **GTC orders**: All IBKR orders use Good-Til-Cancelled time-in-force
 
+#### Accumulation (Alpaca)
+
+Alpaca supports whole/fractional share equity trading and crypto pairs. DCA accumulation (`sell_mult < 1.0`) calculates valid lot precision and floors sell quantities. The strategy trades 1:1, accumulating USD profit. When `accumulated_profit` exceeds `share_price + accumulation_buffer`, the sell order is reduced or skipped, retaining shares as `reserved_base`.
+
+- **Extended hours execution**: Automatically routes limit orders with `extended_hours=true` and `TIF=day` during pre/post-market sessions
+- **Order amendment tracking**: Supports REST order replacement with automatic replacement ID tracking
+- **GTC & Day TIF support**: Uses Good-Til-Cancelled (`GTC`) during regular market hours and `DAY` during extended sessions
+
 #### `accumulation_buffer` and Fear & Greed
 
 `accumulation_buffer` is resolved via linear interpolation against the
 CoinMarketCap Fear & Greed index (0–100): fear resolves closer to
 `min` (accumulate faster), greed resolves closer to `max` (wait
 longer). Re-evaluated dynamically when price moves ≥3.5% from
-baseline. Applies to Hyperliquid, Lighter, and IBKR.
+baseline. Applies to Hyperliquid, Lighter, IBKR, and Alpaca.
 
 ### MM (Adaptive Market Maker)
 
@@ -381,13 +439,13 @@ perp short; spot sell fills close it. Enable with `"hedge": true`.
                +---------------------------------------------+
                 |                   |                   |
                 v                   v                   v
-   +------------------+  +------------------+  +------------------+  +------------------+
-   | Kraken           |  | Hyperliquid      |  | Lighter          |  | IBKR             |
-   | WS: ticker,      |  | WS: allMids, L2, |  | WS: ticker, L2,  |  | TWS API: ticker, |
-   | book, balance,   |  | webData2, spot   |  | exec, balances   |  | orderbook, exec  |
-   | exec             |  | REST: L1 sigs    |  | FFI: EdDSA signer|  | portfolio, acct  |
-   | Ring buffer store|  | Global order idx |  | REST: instruments|  | Contract cache   |
-   +------------------+  +------------------+  +------------------+  +------------------+
+    +------------------+  +------------------+  +------------------+  +------------------+  +------------------+
+    | Kraken           |  | Hyperliquid      |  | Lighter          |  | IBKR             |  | Alpaca           |
+    | WS: ticker,      |  | WS: allMids, L2, |  | WS: ticker, L2,  |  | TWS API: ticker, |  | WS: quote (IEX/  |
+    | book, balance,   |  | webData2, spot   |  | exec, balances   |  | orderbook, exec  |  | SIP), executions |
+    | exec             |  | REST: L1 sigs    |  | FFI: EdDSA signer|  | portfolio, acct  |  | REST: orders,    |
+    | Ring buffer store|  | Global order idx |  | REST: instruments|  | Contract cache   |  | balances, acct   |
+    +------------------+  +------------------+  +------------------+  +------------------+  +------------------+
 ```
 
 ---
@@ -602,7 +660,7 @@ egress point:
 
 The Grid strategy persists accumulation state to disk so
 `reserved_base`, `accumulated_profit`, and `last_fill_oid` survive
-restarts. Used by Hyperliquid, Lighter, and IBKR.
+restarts. Used by Hyperliquid, Lighter, IBKR, and Alpaca.
 
 **State file**: `data/accumulated_state.json` (local) or
 `/app/data/accumulated_state.json` (Docker).
@@ -623,6 +681,11 @@ restarts. Used by Hyperliquid, Lighter, and IBKR.
     "reserved_base": 3.0,
     "accumulated_profit": 12.45,
     "last_fill_oid": "42"
+  },
+  "SPY": {
+    "reserved_base": 2.0,
+    "accumulated_profit": 45.10,
+    "last_fill_oid": "6a82b9e1-2c09-411a-8c88-e21ad5813bfb"
   }
 }
 ```
@@ -701,6 +764,7 @@ inside the WSL filesystem, not on `/mnt/c/`. You will have to compile your own l
      - Hyperliquid feeds: src/external/hyperliquid/
      - Lighter feeds:    src/external/lighter/
      - IBKR feeds:       src/external/ibkr/
+     - Alpaca feeds:     src/external/alpaca/
      - Lighter proxy:    proxy/cloudflare/
      - Exchange interface: src/external/exchange_intf.ml
 3. Commit  -->  git commit -m "..."

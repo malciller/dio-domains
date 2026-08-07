@@ -83,7 +83,7 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
   (* Resolve accumulation_buffer once via Fear & Greed. Hyperliquid and IBKR. *)
   let resolved_accumulation_buffer =
     let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string asset_with_fees.exchange in
-    let is_accumulation_exch = match exch_id with Hyperliquid | Ibkr | Lighter -> true | _ -> false in
+    let is_accumulation_exch = match exch_id with Hyperliquid | Ibkr | Lighter | Alpaca -> true | _ -> false in
     if is_accumulation_exch && (asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid") then
       let fallback = let (lo, hi) = asset_with_fees.accumulation_buffer in (lo +. hi) /. 2.0 in
       let fng = Fear_and_greed.fetch_value ~fallback () in
@@ -510,12 +510,12 @@ let asset_domain_worker (config : config) (fee_fetcher : trading_config -> tradi
            amendments against stale delayed data, the gateway rejects with
            error 354 (no market data), but our in-memory state already recorded
            the amend as successful — causing an infinite amend spam loop. *)
-        let ibkr_market_closed =
-          asset_with_fees.exchange = "ibkr"
-          && not (Ibkr.Market_hours.is_market_open ())
+        let equity_market_closed =
+          (asset_with_fees.exchange = "ibkr" && not (Ibkr.Market_hours.is_market_open ()))
+          || (asset_with_fees.exchange = "alpaca" && not (Alpaca.Market_hours.is_market_open ()))
         in
         let should_execute = !exec_ready && !should_execute_strategy && 
-                             has_exec_fn () && not ibkr_market_closed in
+                             has_exec_fn () && not equity_market_closed in
         if should_execute then begin
           should_execute_strategy := false;  (* Clear event-driven trigger *)
 

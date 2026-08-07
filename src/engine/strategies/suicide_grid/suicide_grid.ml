@@ -22,6 +22,7 @@ type exchange_config = Suicide_grid_types.exchange_config = {
   asset_low_requires_balance_change: bool;
   merge_preserved_sells: bool;
   check_stale_balance: bool;
+  remaintain_expired_sells: bool;
 }
 
 type trading_config = Suicide_grid_types.trading_config = {
@@ -84,6 +85,8 @@ let create_cancel_order = Suicide_grid_orders.create_cancel_order
 let create_order = Suicide_grid_orders.create_order
 let push_order = Suicide_grid_orders.push_order
 
+let sync_open_orders = Suicide_grid_execution.sync_open_orders
+let evaluate_sell_leg = Suicide_grid_execution.evaluate_sell_leg
 let execute_strategy = Suicide_grid_execution.execute_strategy
 
 let flush_persistence = Suicide_grid_events.flush_persistence
