@@ -422,6 +422,11 @@ let render_asset_detail w h asset_key json =
         let max_ask_q = List.fold_left (fun acc (_, q) -> max acc q) 0.0 ob_asks_clean in
         let max_bid_q = List.fold_left (fun acc (_, q) -> max acc q) 0.0 ob_bids_clean in
 
+        let is_my_order_level order_p level_p =
+          abs_float (order_p -. level_p) < 0.000001 ||
+          String.equal (format_price order_p) (format_price level_p)
+        in
+
         (* Top Title *)
         ob_rows.(0) <- I.string A.(fg c_title ++ bg c_bg ++ st bold) (pad_right ob_col_w " ══ L2 ORDER BOOK ══");
 
@@ -429,7 +434,7 @@ let render_asset_detail w h asset_key json =
         List.iteri (fun idx (p, q) ->
           let r = 1 + idx in
           if r < 1 + ask_rows_cnt && r < canvas_h then begin
-            let has_my_sell = List.exists (fun (_, up, _) -> abs_float (up -. p) /. p < 0.0005) sell_orders in
+            let has_my_sell = List.exists (fun (_, up, _) -> is_my_order_level up p) sell_orders in
             let p_str = format_price p in
             let q_str = format_qty q in
             let bar_max_len = max 3 (ob_col_w - String.length p_str - String.length q_str - (if has_my_sell then 8 else 4)) in
@@ -467,7 +472,7 @@ let render_asset_detail w h asset_key json =
         List.iteri (fun idx (p, q) ->
           let r = mid_row_idx + 1 + idx in
           if r < canvas_h - bot_fill_rows then begin
-            let has_my_buy = List.exists (fun (_, up, _) -> abs_float (up -. p) /. p < 0.0005) buy_orders in
+            let has_my_buy = List.exists (fun (_, up, _) -> is_my_order_level up p) buy_orders in
             let p_str = format_price p in
             let q_str = format_qty q in
             let bar_max_len = max 3 (ob_col_w - String.length p_str - String.length q_str - (if has_my_buy then 8 else 4)) in
