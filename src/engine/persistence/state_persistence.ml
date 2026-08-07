@@ -213,7 +213,7 @@ let load_persisted_sell_levels ~symbol =
   ensure_symbol_in_cache ~symbol;
   Mutex.lock cache_mutex;
   let state = Hashtbl.find cache symbol in
-  let result = state.persisted_sell_levels in
+  let result = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) state.persisted_sell_levels in
   Mutex.unlock cache_mutex;
   if result <> [] then
     Logging.info_f ~section "Loaded %d persisted_sell_levels for %s" (List.length result) symbol;
