@@ -180,6 +180,33 @@ let json_of_market_data exchange symbol base_asset quote_currency =
           ) recent_trades)
         else `List []
       in
+      let open_orders = Ex.get_open_orders ~symbol in
+      let asset_orders = Ex.get_all_orders_for_asset ~asset:base_asset in
+      let seen = Hashtbl.create 8 in
+      let unique_orders = List.filter (fun (o : Exchange.Types.open_order) ->
+        if Hashtbl.mem seen o.order_id then false
+        else (Hashtbl.replace seen o.order_id (); true)
+      ) (open_orders @ asset_orders) in
+      let exch_buy_orders = List.filter (fun (o : Exchange.Types.open_order) ->
+        o.side = Exchange.Types.Buy && o.remaining_qty > 0.0
+      ) unique_orders in
+      let exch_sell_orders = List.filter (fun (o : Exchange.Types.open_order) ->
+        o.side = Exchange.Types.Sell && o.remaining_qty > 0.0
+      ) unique_orders in
+      let buy_orders_json = `List (List.map (fun (o : Exchange.Types.open_order) ->
+        `Assoc [
+          "id", `String o.order_id;
+          "price", `Float (Option.value o.limit_price ~default:0.0);
+          "qty", `Float o.remaining_qty;
+        ]
+      ) exch_buy_orders) in
+      let sell_orders_json = `List (List.map (fun (o : Exchange.Types.open_order) ->
+        `Assoc [
+          "id", `String o.order_id;
+          "price", `Float (Option.value o.limit_price ~default:0.0);
+          "qty", `Float o.remaining_qty;
+        ]
+      ) exch_sell_orders) in
       `Assoc [
         "bid", (match tob with Some (b, _, _, _) -> `Float b | None -> `Null);
         "ask", (match tob with Some (_, _, a, _) -> `Float a | None -> `Null);
@@ -194,6 +221,8 @@ let json_of_market_data exchange symbol base_asset quote_currency =
         "bids", bids_json;
         "asks", asks_json;
         "trades", trades_json;
+        "buy_orders", buy_orders_json;
+        "sell_orders", sell_orders_json;
       ]
 
 (* Latency profiler snapshots *)

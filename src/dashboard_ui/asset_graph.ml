@@ -156,8 +156,11 @@ let render_asset_detail w h asset_key json =
       let last_sell_fill = strat_json |?> "last_sell_fill" |> to_float_d 0.0 in
 
       (* Collect sell orders *)
+      let market_json = a.data |?> "market" in
       let sell_orders_json =
-        if a.is_strategy then strat_json |?> "sell_orders" |> to_list_d
+        let strat_sells = if a.is_strategy then strat_json |?> "sell_orders" |> to_list_d else [] in
+        if strat_sells <> [] then strat_sells
+        else if a.is_strategy then market_json |?> "sell_orders" |> to_list_d
         else a.data |?> "sell_orders" |> to_list_d
       in
       let sell_orders = List.filter_map (fun s ->
@@ -174,7 +177,9 @@ let render_asset_detail w h asset_key json =
 
       (* Collect buy orders and differentiate real exchange orders vs synthetic strategy targets *)
       let buy_orders_json =
-        if a.is_strategy then strat_json |?> "buy_orders" |> to_list_d
+        let strat_buys = if a.is_strategy then strat_json |?> "buy_orders" |> to_list_d else [] in
+        if strat_buys <> [] then strat_buys
+        else if a.is_strategy then market_json |?> "buy_orders" |> to_list_d
         else a.data |?> "buy_orders" |> to_list_d
       in
       let buy_orders_parsed = List.filter_map (fun s ->
