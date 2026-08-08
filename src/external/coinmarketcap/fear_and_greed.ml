@@ -12,21 +12,26 @@ let api_key_env = "CMC_API_KEY"
 
 (* Process-lifetime atomic cache for the most recently fetched index value. *)
 let cached_value : float option Atomic.t = Atomic.make None
-
 let clear_cache () = Atomic.set cached_value None
 
 let set_cached v =
   Atomic.set cached_value (Some v);
   v
+;;
 
 let load_dotenv () =
-  try Dotenv.export ~path:".env" () with _ -> ()
+  try Dotenv.export ~path:".env" () with
+  | _ -> ()
+;;
 
 let float_of_any = function
   | `Float f -> Some f
   | `Int i -> Some (float_of_int i)
-  | `String s -> (try Some (float_of_string s) with _ -> None)
+  | `String s ->
+    (try Some (float_of_string s) with
+     | _ -> None)
   | _ -> None
+;;
 
 let parse_value body_str =
   try
@@ -37,53 +42,64 @@ let parse_value body_str =
     match try_key "value" with
     | Some v -> Some v
     | None -> try_key "value "
-  with _ -> None
+  with
+  | _ -> None
+;;
 
 let fetch_value_lwt ?(fallback = 50.0) () =
   load_dotenv ();
   match Sys.getenv_opt api_key_env with
   | None ->
-      Logging.warn_f ~section "Missing %s; using fallback value" api_key_env;
-      Lwt.return (set_cached fallback)
+    Logging.warn_f ~section "Missing %s; using fallback value" api_key_env;
+    Lwt.return (set_cached fallback)
   | Some api_key when String.trim api_key = "" ->
-      Logging.warn_f ~section "Empty %s; using fallback value" api_key_env;
-      Lwt.return (set_cached fallback)
+    Logging.warn_f ~section "Empty %s; using fallback value" api_key_env;
+    Lwt.return (set_cached fallback)
   | Some api_key ->
-      let headers = Cohttp.Header.of_list [ ("X-CMC_PRO_API_KEY", api_key) ] in
-      let timeout =
-        Lwt_unix.sleep 5.0 >>= fun () ->
-        Logging.warn_f ~section "CMC fear-and-greed request timed out after 5s";
-        Lwt.return (set_cached fallback)
-      in
-      let fetch =
-        Client.get ~headers (Uri.of_string endpoint) >>= fun (resp, body) ->
-        Cohttp_lwt.Body.to_string body >>= fun body_str ->
-        let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-        if status <> 200 then (
-          Logging.error_f ~section "CMC fear-and-greed HTTP %d: %s" status body_str;
-          Lwt.return (set_cached fallback)
-        ) else
-          match parse_value body_str with
-          | Some value ->
-              Logging.debug_f ~section "Fetched fear & greed index: %.2f" value;
-              Lwt.return (set_cached value)
-          | None ->
-              Logging.error_f ~section "Failed to parse fear-and-greed response: %s" body_str;
-              Lwt.return (set_cached fallback)
-      in
-      Lwt.pick [fetch; timeout]
+    let headers = Cohttp.Header.of_list [ "X-CMC_PRO_API_KEY", api_key ] in
+    let timeout =
+      Lwt_unix.sleep 5.0
+      >>= fun () ->
+      Logging.warn_f ~section "CMC fear-and-greed request timed out after 5s";
+      Lwt.return (set_cached fallback)
+    in
+    let fetch =
+      Client.get ~headers (Uri.of_string endpoint)
+      >>= fun (resp, body) ->
+      Cohttp_lwt.Body.to_string body
+      >>= fun body_str ->
+      let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      if status <> 200
+      then (
+        Logging.error_f ~section "CMC fear-and-greed HTTP %d: %s" status body_str;
+        Lwt.return (set_cached fallback))
+      else (
+        match parse_value body_str with
+        | Some value ->
+          Logging.debug_f ~section "Fetched fear & greed index: %.2f" value;
+          Lwt.return (set_cached value)
+        | None ->
+          Logging.error_f ~section "Failed to parse fear-and-greed response: %s" body_str;
+          Lwt.return (set_cached fallback))
+    in
+    Lwt.pick [ fetch; timeout ]
+;;
 
 let fetch_and_cache_sync ?(fallback = 50.0) () =
   match Atomic.get cached_value with
   | Some v -> v
   | None ->
-      let value =
-        try Lwt_main.run (fetch_value_lwt ~fallback ())
-        with exn ->
-          Logging.error_f ~section "Exception fetching fear-and-greed: %s" (Printexc.to_string exn);
-          fallback
-      in
-      set_cached value
+    let value =
+      try Lwt_main.run (fetch_value_lwt ~fallback ()) with
+      | exn ->
+        Logging.error_f
+          ~section
+          "Exception fetching fear-and-greed: %s"
+          (Printexc.to_string exn);
+        fallback
+    in
+    set_cached value
+;;
 
 let get_cached () = Atomic.get cached_value
 
@@ -91,33 +107,40 @@ let fetch_value ?(fallback = 50.0) () =
   match Atomic.get cached_value with
   | Some v -> v
   | None -> set_cached fallback
+;;
 
 let fetch_requested = Atomic.make false
 let worker_started = Atomic.make false
 
 let force_fetch_async ?(fallback = 50.0) () =
-  if not (Atomic.get worker_started) then begin
+  if not (Atomic.get worker_started)
+  then
     (* Atomically ensure only one thread starts *)
-    if Atomic.compare_and_set worker_started false true then begin
-      ignore (Thread.create (fun () ->
-        while true do
-          if Atomic.exchange fetch_requested false then begin
-            try
-              Lwt_preemptive.run_in_main (fun () ->
-                fetch_value_lwt ~fallback () >>= fun _ -> Lwt.return_unit
-              )
-            with exn ->
-              Logging.error_f ~section "Exception in async fetch fear-and-greed: %s" (Printexc.to_string exn)
-          end;
-          Unix.sleepf 1.0
-        done
-      ) ())
-    end
-  end;
+    if Atomic.compare_and_set worker_started false true
+    then
+      ignore
+        (Thread.create
+           (fun () ->
+              while true do
+                if Atomic.exchange fetch_requested false
+                then (
+                  try
+                    Lwt_preemptive.run_in_main (fun () ->
+                      fetch_value_lwt ~fallback () >>= fun _ -> Lwt.return_unit)
+                  with
+                  | exn ->
+                    Logging.error_f
+                      ~section
+                      "Exception in async fetch fear-and-greed: %s"
+                      (Printexc.to_string exn));
+                Unix.sleepf 1.0
+              done)
+           ());
   Atomic.set fetch_requested true
+;;
 
 (* Linearly interpolates a grid value within [min_val, max_val] based on fear_and_greed clamped to [0, 100]. *)
 let grid_value_for_fng ~grid_interval:(min_val, max_val) ~fear_and_greed =
   let fng = max 0.0 (min 100.0 fear_and_greed) in
   min_val +. (fng *. (max_val -. min_val) /. 100.0)
-
+;;

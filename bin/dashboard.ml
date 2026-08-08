@@ -10,9 +10,12 @@
 
 let () =
   (* Parse command-line arg early to set the socket override if any *)
-  let speclist = [
-    "--socket", Arg.Set_string Dashboard_ui.App.socket_path, " Path to engine UDS (auto-discovers if not set)";
-  ] in
+  let speclist =
+    [ ( "--socket"
+      , Arg.Set_string Dashboard_ui.App.socket_path
+      , " Path to engine UDS (auto-discovers if not set)" )
+    ]
+  in
   Arg.parse speclist (fun _ -> ()) "dio-dashboard [--socket /tmp/dio-<pid>.sock]";
-  
   Dashboard_ui.App.run ()
+;;

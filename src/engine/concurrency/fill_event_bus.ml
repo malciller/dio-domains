@@ -17,18 +17,18 @@
 module RingBuffer = Ring_buffer.RingBuffer
 
 (** Fill event record published on each complete order fill. *)
-type fill_event = {
-  venue: string;       (** Exchange name (e.g., "kraken", "lighter", "hyperliquid"). *)
-  symbol: string;      (** Trading pair (e.g., "BTC/USD"). *)
-  side: string;        (** "buy" or "sell". *)
-  amount: float;       (** Filled quantity. *)
-  fill_price: float;   (** Average fill price. *)
-  value: float;        (** Gross value: amount * fill_price. *)
-  fee: float;          (** Estimated fee: value * maker_fee. *)
-  timestamp: float;    (** Unix timestamp of the fill. *)
-  order_id: string;    (** Exchange order ID for deduplication. *)
-  trade_id: string;    (** Exchange trade/execution ID for deduplication. *)
-}
+type fill_event =
+  { venue : string (** Exchange name (e.g., "kraken", "lighter", "hyperliquid"). *)
+  ; symbol : string (** Trading pair (e.g., "BTC/USD"). *)
+  ; side : string (** "buy" or "sell". *)
+  ; amount : float (** Filled quantity. *)
+  ; fill_price : float (** Average fill price. *)
+  ; value : float (** Gross value: amount * fill_price. *)
+  ; fee : float (** Estimated fee: value * maker_fee. *)
+  ; timestamp : float (** Unix timestamp of the fill. *)
+  ; order_id : string (** Exchange order ID for deduplication. *)
+  ; trade_id : string (** Exchange trade/execution ID for deduplication. *)
+  }
 
 (** Global fill event ring buffer. Capacity 256 provides ample headroom
     for bursty grid strategies while bounding memory usage. *)
@@ -44,6 +44,7 @@ let fill_condition : unit Lwt_condition.t = Lwt_condition.create ()
     Prevents WebSocket reconnect replays from re-publishing fills that
     were already sent to Discord. Key: (order_id, trade_id). *)
 let dedup_cap = 512
+
 let dedup_set : (string * string, unit) Hashtbl.t = Hashtbl.create dedup_cap
 let dedup_queue : (string * string) Queue.t = Queue.create ()
 
@@ -52,46 +53,44 @@ let dedup_queue : (string * string) Queue.t = Queue.create ()
     then broadcasts [fill_condition] to wake Lwt consumers.
     Silently drops duplicate fills based on (order_id, trade_id). *)
 let publish_fill (event : fill_event) =
-  let key = (event.order_id, event.trade_id) in
+  let key = event.order_id, event.trade_id in
   Mutex.lock write_mutex;
-  if Hashtbl.mem dedup_set key then begin
-    Mutex.unlock write_mutex;
-    (* Duplicate fill — already published, skip silently *)
-  end else begin
+  if Hashtbl.mem dedup_set key
+  then Mutex.unlock write_mutex
+  (* Duplicate fill — already published, skip silently *)
+  else (
     Hashtbl.replace dedup_set key ();
     Queue.push key dedup_queue;
     (* Evict oldest entries when cap is exceeded *)
     while Hashtbl.length dedup_set > dedup_cap do
-      if Queue.is_empty dedup_queue then
-        ignore (Hashtbl.length dedup_set)
-      else begin
+      if Queue.is_empty dedup_queue
+      then ignore (Hashtbl.length dedup_set)
+      else (
         let oldest = Queue.pop dedup_queue in
-        Hashtbl.remove dedup_set oldest
-      end
+        Hashtbl.remove dedup_set oldest)
     done;
     RingBuffer.write buffer event;
     Mutex.unlock write_mutex;
     (* Broadcast is safe to call from any thread — Lwt_condition internally
        handles cross-domain signaling via the Lwt scheduler. *)
-    (try Lwt_condition.broadcast fill_condition () with _ -> ())
-  end
+    try Lwt_condition.broadcast fill_condition () with
+    | _ -> ())
+;;
 
 (** Return the current write position. Consumers use this as their
     starting cursor for [iter_since]. *)
-let get_position () =
-  RingBuffer.get_position buffer
+let get_position () = RingBuffer.get_position buffer
 
 (** Iterate over fill events from [last_pos] to the current write position
     without allocating an intermediate list. Returns the new read position. *)
-let iter_since last_pos f =
-  RingBuffer.iter_since buffer last_pos f
+let iter_since last_pos f = RingBuffer.iter_since buffer last_pos f
 
 (** Block until [fill_condition] is broadcast. Returns immediately if
     a fill was published between the caller's last read and this call. *)
-let wait_for_fill () =
-  Lwt_condition.wait fill_condition
+let wait_for_fill () = Lwt_condition.wait fill_condition
 
 (** Read and sort the entire buffer returning the most recent fills first. *)
 let get_recent_fills () =
   let fills = RingBuffer.read_all buffer in
   List.sort (fun a b -> compare b.timestamp a.timestamp) fills
+;;

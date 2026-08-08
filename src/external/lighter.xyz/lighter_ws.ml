@@ -9,55 +9,60 @@ let section = "lighter_ws"
 (** Cached subscription state parameters for automated reconnection loops.
     Populated initially by [subscribe_to_feeds] and leveraged by the isolated connection reconnection callbacks to restore channel subscriptions without external supervisor intervention. *)
 let subscribed_symbols : string list ref = ref []
+
 let subscribed_account_index : int ref = ref 0
 let subscribed_auth_token : string ref = ref ""
 
 (** Subscription handle returned to downstream consumers invoking [subscribe_market_data]. *)
-type subscription = {
-  stream: Yojson.Safe.t Lwt_stream.t;
-  close: unit -> unit;
-}
+type subscription =
+  { stream : Yojson.Safe.t Lwt_stream.t
+  ; close : unit -> unit
+  }
 
-type connection_state = {
-  active_connection : Websocket_lwt_unix.conn option ref;
-  connection_mutex : Lwt_mutex.t;
-  is_connected_ref : bool Atomic.t;
-  connected_wakeup : unit Lwt_condition.t;
-  last_pong_time : float ref;
-  pong_condition : unit Lwt_condition.t;
-}
+type connection_state =
+  { active_connection : Websocket_lwt_unix.conn option ref
+  ; connection_mutex : Lwt_mutex.t
+  ; is_connected_ref : bool Atomic.t
+  ; connected_wakeup : unit Lwt_condition.t
+  ; last_pong_time : float ref
+  ; pong_condition : unit Lwt_condition.t
+  }
 
-let create_connection_state () = {
-  active_connection = ref None;
-  connection_mutex = Lwt_mutex.create ();
-  is_connected_ref = Atomic.make false;
-  connected_wakeup = Lwt_condition.create ();
-  last_pong_time = ref 0.0;
-  pong_condition = Lwt_condition.create ();
-}
+let create_connection_state () =
+  { active_connection = ref None
+  ; connection_mutex = Lwt_mutex.create ()
+  ; is_connected_ref = Atomic.make false
+  ; connected_wakeup = Lwt_condition.create ()
+  ; last_pong_time = ref 0.0
+  ; pong_condition = Lwt_condition.create ()
+  }
+;;
 
 let public_state = create_connection_state ()
 let private_state = create_connection_state ()
-
 let public_connected () = Atomic.get public_state.is_connected_ref
 let private_connected () = Atomic.get private_state.is_connected_ref
 let is_connected () = public_connected () && private_connected ()
 
 let wait_for_connected () =
   let wait_one state =
-    if Atomic.get state.is_connected_ref then Lwt.return_unit
+    if Atomic.get state.is_connected_ref
+    then Lwt.return_unit
     else Lwt_condition.wait state.connected_wakeup
   in
-  Lwt.join [wait_one public_state; wait_one private_state]
+  Lwt.join [ wait_one public_state; wait_one private_state ]
+;;
 
 let signal_new_data () = Concurrency.Exchange_wakeup.signal_all ()
 
 (** Global mutable list of stream push functions for all active subscribers. *)
 let pushers : (Yojson.Safe.t option -> bool) list ref = ref []
+
 let pushers_mutex = Mutex.create ()
 
 (** Atomic counter tracking consecutive unacknowledged ping operations, monitored by the upper level supervisor. *)
 let ping_failures = Atomic.make 0
+
 let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
@@ -79,12 +84,15 @@ let close_all_subscribers () =
   pushers := [];
   Mutex.unlock pushers_mutex;
   let count = List.length ps in
-  if count > 0 then begin
+  if count > 0
+  then (
     Logging.debug_f ~section "Closing %d subscriber streams on disconnect" count;
-    List.iter (fun push ->
-      (try ignore (push None) with _ -> ())
-    ) ps
-  end
+    List.iter
+      (fun push ->
+         try ignore (push None) with
+         | _ -> ())
+      ps)
+;;
 
 (** Broadcasts a parsed Yojson message payload to all currently registered active subscribers via their respective stream push functions. *)
 let broadcast_message json =
@@ -92,43 +100,43 @@ let broadcast_message json =
   let ps = !pushers in
   Mutex.unlock pushers_mutex;
   let alive = ref [] in
-  List.iter (fun push ->
-    try
-      if push (Some json) then alive := push :: !alive
-    with _ -> ()
-  ) ps;
-  if List.length !alive <> List.length ps then begin
+  List.iter
+    (fun push ->
+       try if push (Some json) then alive := push :: !alive with
+       | _ -> ())
+    ps;
+  if List.length !alive <> List.length ps
+  then (
     let dead = List.filter (fun p -> not (List.memq p !alive)) ps in
     Mutex.lock pushers_mutex;
     pushers := List.filter (fun p -> not (List.memq p dead)) !pushers;
-    Mutex.unlock pushers_mutex
-  end
+    Mutex.unlock pushers_mutex)
+;;
 
 (** Instantiates a bounded Lwt stream to act as a receiver queue for incoming WebSocket message payloads. *)
 let subscribe_market_data () =
-  let (stream, push_source) = Lwt_stream.create_bounded 16 in
+  let stream, push_source = Lwt_stream.create_bounded 16 in
   let closed = Atomic.make false in
   let close_internal () =
-    if not (Atomic.exchange closed true) then begin
+    if not (Atomic.exchange closed true)
+    then (
       push_source#close;
-      true
-    end else
-      false
+      true)
+    else false
   in
   let push_fn item =
-    if Atomic.get closed then
-      false
-    else
-    match item with
-    | None ->
-        close_internal ()
-    | Some json ->
+    if Atomic.get closed
+    then false
+    else (
+      match item with
+      | None -> close_internal ()
+      | Some json ->
         let p = push_source#push json in
-        if Lwt.is_sleeping p then begin
+        if Lwt.is_sleeping p
+        then (
           ignore (close_internal ());
-          false
-        end else
-          true
+          false)
+        else true)
   in
   Mutex.lock pushers_mutex;
   pushers := push_fn :: !pushers;
@@ -140,41 +148,50 @@ let subscribe_market_data () =
     ignore (close_internal ())
   in
   { stream; close }
+;;
 
 (** Serializes and transmits a Yojson payload over the specified active WebSocket connection state reference. *)
 let send_json_on state json label =
   Lwt_mutex.with_lock state.connection_mutex (fun () ->
     match !(state.active_connection) with
     | Some conn ->
-        let msg = Yojson.Safe.to_string json in
-        Logging.debug_f ~section "[%s] Sending WS message: %s" label
-          (if String.length msg > 500 then String.sub msg 0 500 ^ "..." else msg);
-        Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg ())
+      let msg = Yojson.Safe.to_string json in
+      Logging.debug_f
+        ~section
+        "[%s] Sending WS message: %s"
+        label
+        (if String.length msg > 500 then String.sub msg 0 500 ^ "..." else msg);
+      Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg ())
     | None ->
-        Logging.warn_f ~section "[%s] Cannot send: WebSocket not connected" label;
-        Lwt.return_unit
-  )
+      Logging.warn_f ~section "[%s] Cannot send: WebSocket not connected" label;
+      Lwt.return_unit)
+;;
 
 let send_public_json = send_json_on public_state
 let send_private_json = send_json_on private_state
 
 let subscribe_public_orderbook ~symbols =
   let public_stream = Lwt_stream.of_list symbols in
-  Concurrency.Lwt_util.consume_stream_s (fun symbol ->
-    match Lighter_instruments_feed.get_market_index ~symbol with
-    | Some market_index ->
-        let mi_str = string_of_int market_index in
-        let%lwt () = send_public_json (`Assoc [
-          ("type", `String "subscribe");
-          ("channel", `String ("order_book/" ^ mi_str))
-        ]) "Public" in
-        Logging.debug_f ~section "Subscribed to order_book/%s for %s" mi_str symbol;
-        Lwt.return_unit
-    | None ->
-        Logging.error_f ~section "Cannot subscribe: no market_index for symbol %s" symbol;
-        Lwt.return_unit
-  ) public_stream
-
+  Concurrency.Lwt_util.consume_stream_s
+    (fun symbol ->
+       match Lighter_instruments_feed.get_market_index ~symbol with
+       | Some market_index ->
+         let mi_str = string_of_int market_index in
+         let%lwt () =
+           send_public_json
+             (`Assoc
+                 [ "type", `String "subscribe"
+                 ; "channel", `String ("order_book/" ^ mi_str)
+                 ])
+             "Public"
+         in
+         Logging.debug_f ~section "Subscribed to order_book/%s for %s" mi_str symbol;
+         Lwt.return_unit
+       | None ->
+         Logging.error_f ~section "Cannot subscribe: no market_index for symbol %s" symbol;
+         Lwt.return_unit)
+    public_stream
+;;
 
 (** Issues subscription commands routed appropriately between the public and private dual WebSocket connections.
     Caches the provided subscription parameters in module level references to facilitate autonomous channel restoral by the isolated reconnection loops without requiring supervisor coordination. *)
@@ -183,232 +200,333 @@ let subscribe_to_feeds ~symbols ~account_index ~auth_token =
   subscribed_symbols := symbols;
   subscribed_account_index := account_index;
   subscribed_auth_token := auth_token;
-
   (* Dispatch subscription requests for the orderbook channels corresponding to each requested symbol over the public network connection *)
   let%lwt () = subscribe_public_orderbook ~symbols in
-
   (* Dispatch subscription requests for the authenticated user and account specific channels over the private network connection *)
   let acct_str = string_of_int account_index in
-  let private_commands = [
-    `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_orders/" ^ acct_str)); ("auth", `String auth_token)];
-    `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all/" ^ acct_str)); ("auth", `String auth_token)];
-    `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_assets/" ^ acct_str)); ("auth", `String auth_token)];
-    `Assoc [("type", `String "subscribe"); ("channel", `String ("user_stats/" ^ acct_str)); ("auth", `String auth_token)]
-  ] in
+  let private_commands =
+    [ `Assoc
+        [ "type", `String "subscribe"
+        ; "channel", `String ("account_all_orders/" ^ acct_str)
+        ; "auth", `String auth_token
+        ]
+    ; `Assoc
+        [ "type", `String "subscribe"
+        ; "channel", `String ("account_all/" ^ acct_str)
+        ; "auth", `String auth_token
+        ]
+    ; `Assoc
+        [ "type", `String "subscribe"
+        ; "channel", `String ("account_all_assets/" ^ acct_str)
+        ; "auth", `String auth_token
+        ]
+    ; `Assoc
+        [ "type", `String "subscribe"
+        ; "channel", `String ("user_stats/" ^ acct_str)
+        ; "auth", `String auth_token
+        ]
+    ]
+  in
   let private_stream = Lwt_stream.of_list private_commands in
-  let%lwt () = Concurrency.Lwt_util.consume_stream_s (fun cmd ->
-    send_private_json cmd "Private"
-  ) private_stream in
-  
+  let%lwt () =
+    Concurrency.Lwt_util.consume_stream_s
+      (fun cmd -> send_private_json cmd "Private")
+      private_stream
+  in
   Logging.debug_f ~section "Subscribed to private channels for %s" acct_str;
   Lwt.return_unit
+;;
 
 (** Formats and transmits a cryptographically signed transaction payload via the private authenticated WebSocket connection. *)
 let send_tx_ws ~tx_type ~tx_info =
-  let json = `Assoc [
-    ("type", `String "jsonapi/sendtx");
-    ("data", `Assoc [
-      ("tx_type", `Int tx_type);
-      ("tx_info", Yojson.Safe.from_string tx_info)
-    ])
-  ] in
+  let json =
+    `Assoc
+      [ "type", `String "jsonapi/sendtx"
+      ; ( "data"
+        , `Assoc [ "tx_type", `Int tx_type; "tx_info", Yojson.Safe.from_string tx_info ] )
+      ]
+  in
   send_private_json json "Private"
+;;
 
 (** Parses and dispatches a single WebSocket frame payload based on the operation code and underlying business logic message type. *)
 let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
   | Websocket.Frame.Opcode.Text ->
-      Concurrency.Tick_event_bus.publish_tick ();
-      on_heartbeat ();
-      (* Flag the private stream as confirmed functional upon receiving the first valid arbitrary text frame *)
-      if state == private_state && not (Atomic.get private_stream_confirmed) then
-        Atomic.set private_stream_confirmed true;
-      (try
-        let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
-        let channel =
-          let open Yojson.Safe.Util in
-          try member "channel" json |> to_string with _ -> ""
-        in
-        let msg_type =
-          let raw_type =
-            let open Yojson.Safe.Util in
-            try member "type" json |> to_string with _ -> ""
-          in
-          if channel <> "" then
-            let ch_prefix = try String.sub channel 0 (min (try String.index channel '/' with Not_found -> String.length channel) (try String.index channel ':' with Not_found -> String.length channel)) with _ -> channel in
-            if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed" then
-              raw_type ^ "/" ^ ch_prefix
-            else raw_type
-          else raw_type
-        in
-
-        let market_index_from_channel ch =
-          try
-            let sep_pos =
-              try String.index ch ':'
-              with Not_found -> String.index ch '/'
-            in
-            int_of_string (String.sub ch (sep_pos + 1) (String.length ch - sep_pos - 1))
-          with _ -> -1
-        in
-
-        (match msg_type with
-
-         | "snapshot/order_book" | "subscribed/order_book" ->
-             Atomic.incr msg_counter_orderbook;
-             let mi = market_index_from_channel channel in
-             if mi >= 0 then Lighter_orderbook_feed.process_orderbook_snapshot ~market_index:mi json
-         | "update/order_book" ->
-             Atomic.incr msg_counter_orderbook;
-             let mi = market_index_from_channel channel in
-             if mi >= 0 then Lighter_orderbook_feed.process_orderbook_update ~market_index:mi json
-         | "update/account_all_orders" | "snapshot/account_all_orders" | "subscribed/account_all_orders" ->
-             Atomic.incr msg_counter_account;
-             Lighter_executions_feed.process_account_orders_update json
-         | "update/account_all" | "snapshot/account_all" | "subscribed/account_all"
-         | "update/account_all_assets" | "snapshot/account_all_assets" | "subscribed/account_all_assets"
-         | "update/user_stats" | "snapshot/user_stats" | "subscribed/user_stats" ->
-             Atomic.incr msg_counter_account;
-             Lighter_balances.process_market_data json
-         | "pong" ->
-              state.last_pong_time := Unix.gettimeofday ();
-              (try Lwt_condition.broadcast state.pong_condition () with _ -> ());
-              on_heartbeat ()
-         | t ->
-             Atomic.incr msg_counter_other;
-             if Atomic.get msg_counter_other <= 5 then
-               Logging.debug_f ~section "Unmatched WS message type: '%s' channel='%s' (len=%d)" t channel
-                 (String.length frame.Websocket.Frame.content));
-        Atomic.incr msg_counter_total
-      with exn ->
-        Logging.warn_f ~section "Failed to parse WS message: %s (content_prefix=%s)"
-          (Printexc.to_string exn)
-          (let c = frame.Websocket.Frame.content in
-           if String.length c > 100 then String.sub c 0 100 ^ "..." else c));
-      Lwt.return_unit
+    Concurrency.Tick_event_bus.publish_tick ();
+    on_heartbeat ();
+    (* Flag the private stream as confirmed functional upon receiving the first valid arbitrary text frame *)
+    if state == private_state && not (Atomic.get private_stream_confirmed)
+    then Atomic.set private_stream_confirmed true;
+    (try
+       let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
+       let channel =
+         let open Yojson.Safe.Util in
+         try member "channel" json |> to_string with
+         | _ -> ""
+       in
+       let msg_type =
+         let raw_type =
+           let open Yojson.Safe.Util in
+           try member "type" json |> to_string with
+           | _ -> ""
+         in
+         if channel <> ""
+         then (
+           let ch_prefix =
+             try
+               String.sub
+                 channel
+                 0
+                 (min
+                    (try String.index channel '/' with
+                     | Not_found -> String.length channel)
+                    (try String.index channel ':' with
+                     | Not_found -> String.length channel))
+             with
+             | _ -> channel
+           in
+           if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed"
+           then raw_type ^ "/" ^ ch_prefix
+           else raw_type)
+         else raw_type
+       in
+       let market_index_from_channel ch =
+         try
+           let sep_pos =
+             try String.index ch ':' with
+             | Not_found -> String.index ch '/'
+           in
+           int_of_string (String.sub ch (sep_pos + 1) (String.length ch - sep_pos - 1))
+         with
+         | _ -> -1
+       in
+       (match msg_type with
+        | "snapshot/order_book" | "subscribed/order_book" ->
+          Atomic.incr msg_counter_orderbook;
+          let mi = market_index_from_channel channel in
+          if mi >= 0
+          then Lighter_orderbook_feed.process_orderbook_snapshot ~market_index:mi json
+        | "update/order_book" ->
+          Atomic.incr msg_counter_orderbook;
+          let mi = market_index_from_channel channel in
+          if mi >= 0
+          then Lighter_orderbook_feed.process_orderbook_update ~market_index:mi json
+        | "update/account_all_orders"
+        | "snapshot/account_all_orders"
+        | "subscribed/account_all_orders" ->
+          Atomic.incr msg_counter_account;
+          Lighter_executions_feed.process_account_orders_update json
+        | "update/account_all"
+        | "snapshot/account_all"
+        | "subscribed/account_all"
+        | "update/account_all_assets"
+        | "snapshot/account_all_assets"
+        | "subscribed/account_all_assets"
+        | "update/user_stats"
+        | "snapshot/user_stats"
+        | "subscribed/user_stats" ->
+          Atomic.incr msg_counter_account;
+          Lighter_balances.process_market_data json
+        | "pong" ->
+          state.last_pong_time := Unix.gettimeofday ();
+          (try Lwt_condition.broadcast state.pong_condition () with
+           | _ -> ());
+          on_heartbeat ()
+        | t ->
+          Atomic.incr msg_counter_other;
+          if Atomic.get msg_counter_other <= 5
+          then
+            Logging.debug_f
+              ~section
+              "Unmatched WS message type: '%s' channel='%s' (len=%d)"
+              t
+              channel
+              (String.length frame.Websocket.Frame.content));
+       Atomic.incr msg_counter_total
+     with
+     | exn ->
+       Logging.warn_f
+         ~section
+         "Failed to parse WS message: %s (content_prefix=%s)"
+         (Printexc.to_string exn)
+         (let c = frame.Websocket.Frame.content in
+          if String.length c > 100 then String.sub c 0 100 ^ "..." else c));
+    Lwt.return_unit
   | Websocket.Frame.Opcode.Pong ->
-      state.last_pong_time := Unix.gettimeofday ();
-      (try Lwt_condition.broadcast state.pong_condition () with _ -> ());
-      on_heartbeat ();
-      Lwt.return_unit
+    state.last_pong_time := Unix.gettimeofday ();
+    (try Lwt_condition.broadcast state.pong_condition () with
+     | _ -> ());
+    on_heartbeat ();
+    Lwt.return_unit
   | Websocket.Frame.Opcode.Close ->
-      Logging.debug_f ~section "WebSocket connection closed by server";
-      Lwt_mutex.with_lock state.connection_mutex (fun () ->
-        state.active_connection := None;
-        Atomic.set state.is_connected_ref false;
-        Lwt.return_unit
-      ) >>= fun () ->
-      (* Intentionally avoid closing active subscriber streams. An isolated disconnect event on a specific connection must not terminate consumer interfaces, as the dedicated reconnection loop will independently reestablish the broken socket. *)
-      signal_new_data ();
-      Lwt.return_unit
+    Logging.debug_f ~section "WebSocket connection closed by server";
+    Lwt_mutex.with_lock state.connection_mutex (fun () ->
+      state.active_connection := None;
+      Atomic.set state.is_connected_ref false;
+      Lwt.return_unit)
+    >>= fun () ->
+    (* Intentionally avoid closing active subscriber streams. An isolated disconnect event on a specific connection must not terminate consumer interfaces, as the dedicated reconnection loop will independently reestablish the broken socket. *)
+    signal_new_data ();
+    Lwt.return_unit
   | _ -> Lwt.return_unit
+;;
 
 (** Establishes a targeted WebSocket connection and blocks the asynchronous thread while continually reading incoming frames.
     Evaluates to unit upon connection closure regardless of the underlying termination reason.
     Specifically avoids invoking the global subscriber closure mechanism as isolated connection failures are mitigated by the concurrent autonomous reconnection loop provisioned in [connect_and_monitor]. *)
-let rec connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_heartbeat ~label =
-  let (connect_host, connect_port) = connect_target () in
+let rec connect_one
+          ~state
+          ~connect_target
+          ~ws_url
+          ~on_failure
+          ~on_connected
+          ~on_heartbeat
+          ~label
+  =
+  let connect_host, connect_port = connect_target () in
   let url = ws_url () in
-  Logging.debug_f ~section "Connecting to [%s] Lighter WebSocket: %s (host=%s:%d)" label url connect_host connect_port;
+  Logging.debug_f
+    ~section
+    "Connecting to [%s] Lighter WebSocket: %s (host=%s:%d)"
+    label
+    url
+    connect_host
+    connect_port;
   let uri = Uri.of_string url in
-  Lwt.catch (fun () ->
-    Lwt_unix.getaddrinfo connect_host (string_of_int connect_port) [Unix.AI_FAMILY Unix.PF_INET] >>= fun addresses ->
-    let ip = match addresses with
-      | {Unix.ai_addr = Unix.ADDR_INET (addr, _); _} :: _ ->
-          Ipaddr_unix.of_inet_addr addr
-      | _ -> failwith (Printf.sprintf "Failed to resolve %s" connect_host)
-    in
-    let client = `TLS (`Hostname connect_host, `IP ip, `Port connect_port) in
-    let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-    Websocket_lwt_unix.connect ~ctx client uri >>= fun conn ->
-    Lwt_mutex.with_lock state.connection_mutex (fun () ->
-      state.active_connection := Some conn;
-      Atomic.set state.is_connected_ref true;
-      (* Reset the private stream confirmation flag ensuring ping messages remain suppressed until arbitrary inbound data confirms the upstream network relay is operational. *)
-      if state == private_state then
-        Atomic.set private_stream_confirmed false;
-      Lwt_condition.broadcast state.connected_wakeup ();
-      Lwt.return_unit
-    ) >>= fun () ->
-    on_connected ();
-
-    let stream = Lwt_stream.from (fun () ->
-      if not (Atomic.get state.is_connected_ref) then Lwt.return_none
-      else Lwt.catch (fun () ->
-        Websocket_lwt_unix.read conn >>= fun frame ->
-        Lwt.return_some frame
-      ) (function
-        | End_of_file -> Lwt.return_none
-        | exn -> Lwt.fail exn)
-    ) in
-
-    let done_p =
-      Concurrency.Lwt_util.consume_stream_s
-        (fun frame ->
-          Lwt.catch
-            (fun () -> handle_frame ~state ~on_heartbeat frame)
-            (fun exn ->
-              Logging.error_f ~section "[%s] Error handling frame: %s" label (Printexc.to_string exn);
-              Lwt.return_unit))
-        stream
-    in
-
-    Lwt.catch (fun () -> done_p) (function
-      | End_of_file ->
-          Logging.debug_f ~section "[%s] WebSocket connection closed (End_of_file)" label;
-          Lwt_mutex.with_lock state.connection_mutex (fun () ->
-            state.active_connection := None;
-            Atomic.set state.is_connected_ref false;
-            Lwt.return_unit
-          ) >>= fun () ->
-          Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
-          Lwt.fail_with ("[" ^ label ^ "] Connection closed unexpectedly (End_of_file)")
-      | exn ->
-          Logging.debug_f ~section "[%s] WebSocket read error: %s" label (Printexc.to_string exn);
-          Lwt_mutex.with_lock state.connection_mutex (fun () ->
-            state.active_connection := None;
-            Atomic.set state.is_connected_ref false;
-            Lwt.return_unit
-          ) >>= fun () ->
-          Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
-          Lwt.fail exn
-    ) >>= fun () ->
-    Lwt_mutex.with_lock state.connection_mutex (fun () ->
-      state.active_connection := None;
-      Atomic.set state.is_connected_ref false;
-      Lwt.return_unit
-    ) >>= fun () ->
-    Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit) >>= fun () ->
-    Lwt.fail_with ("[" ^ label ^ "] WebSocket closed by server")
-  ) (fun exn ->
-    let error_msg = Printexc.to_string exn in
-    Logging.debug_f ~section "[%s] WebSocket connection error: %s" label error_msg;
-    let is_server_error =
-      let rec contains_5xx i =
-        if i > String.length error_msg - 3 then false
-        else
-          let sub = String.sub error_msg i 3 in
-          if sub = "500" || sub = "502" || sub = "503" || sub = "504" then true
-          else contains_5xx (i + 1)
-      in
-      contains_5xx 0
-    in
-    if label = "Private" && is_server_error then begin
-      Lighter_proxy.rotate_proxy ();
-      if Lighter_proxy.has_more_proxies () then begin
-        Atomic.set state.is_connected_ref false;
-        connect_one ~state ~connect_target ~ws_url ~on_failure ~on_connected ~on_heartbeat ~label
-      end else begin
-        Atomic.set state.is_connected_ref false;
-        on_failure error_msg;
-        Lwt.return_unit
-      end
-    end else begin
-      Atomic.set state.is_connected_ref false;
-      on_failure error_msg;
-      Lwt.return_unit
-    end
-  )
+  Lwt.catch
+    (fun () ->
+       Lwt_unix.getaddrinfo
+         connect_host
+         (string_of_int connect_port)
+         [ Unix.AI_FAMILY Unix.PF_INET ]
+       >>= fun addresses ->
+       let ip =
+         match addresses with
+         | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
+           Ipaddr_unix.of_inet_addr addr
+         | _ -> failwith (Printf.sprintf "Failed to resolve %s" connect_host)
+       in
+       let client = `TLS (`Hostname connect_host, `IP ip, `Port connect_port) in
+       let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+       Websocket_lwt_unix.connect ~ctx client uri
+       >>= fun conn ->
+       Lwt_mutex.with_lock state.connection_mutex (fun () ->
+         state.active_connection := Some conn;
+         Atomic.set state.is_connected_ref true;
+         (* Reset the private stream confirmation flag ensuring ping messages remain suppressed until arbitrary inbound data confirms the upstream network relay is operational. *)
+         if state == private_state then Atomic.set private_stream_confirmed false;
+         Lwt_condition.broadcast state.connected_wakeup ();
+         Lwt.return_unit)
+       >>= fun () ->
+       on_connected ();
+       let stream =
+         Lwt_stream.from (fun () ->
+           if not (Atomic.get state.is_connected_ref)
+           then Lwt.return_none
+           else
+             Lwt.catch
+               (fun () ->
+                  Websocket_lwt_unix.read conn >>= fun frame -> Lwt.return_some frame)
+               (function
+                 | End_of_file -> Lwt.return_none
+                 | exn -> Lwt.fail exn))
+       in
+       let done_p =
+         Concurrency.Lwt_util.consume_stream_s
+           (fun frame ->
+              Lwt.catch
+                (fun () -> handle_frame ~state ~on_heartbeat frame)
+                (fun exn ->
+                   Logging.error_f
+                     ~section
+                     "[%s] Error handling frame: %s"
+                     label
+                     (Printexc.to_string exn);
+                   Lwt.return_unit))
+           stream
+       in
+       Lwt.catch
+         (fun () -> done_p)
+         (function
+           | End_of_file ->
+             Logging.debug_f
+               ~section
+               "[%s] WebSocket connection closed (End_of_file)"
+               label;
+             Lwt_mutex.with_lock state.connection_mutex (fun () ->
+               state.active_connection := None;
+               Atomic.set state.is_connected_ref false;
+               Lwt.return_unit)
+             >>= fun () ->
+             Lwt.catch
+               (fun () -> Websocket_lwt_unix.close_transport conn)
+               (fun _ -> Lwt.return_unit)
+             >>= fun () ->
+             Lwt.fail_with ("[" ^ label ^ "] Connection closed unexpectedly (End_of_file)")
+           | exn ->
+             Logging.debug_f
+               ~section
+               "[%s] WebSocket read error: %s"
+               label
+               (Printexc.to_string exn);
+             Lwt_mutex.with_lock state.connection_mutex (fun () ->
+               state.active_connection := None;
+               Atomic.set state.is_connected_ref false;
+               Lwt.return_unit)
+             >>= fun () ->
+             Lwt.catch
+               (fun () -> Websocket_lwt_unix.close_transport conn)
+               (fun _ -> Lwt.return_unit)
+             >>= fun () -> Lwt.fail exn)
+       >>= fun () ->
+       Lwt_mutex.with_lock state.connection_mutex (fun () ->
+         state.active_connection := None;
+         Atomic.set state.is_connected_ref false;
+         Lwt.return_unit)
+       >>= fun () ->
+       Lwt.catch
+         (fun () -> Websocket_lwt_unix.close_transport conn)
+         (fun _ -> Lwt.return_unit)
+       >>= fun () -> Lwt.fail_with ("[" ^ label ^ "] WebSocket closed by server"))
+    (fun exn ->
+       let error_msg = Printexc.to_string exn in
+       Logging.debug_f ~section "[%s] WebSocket connection error: %s" label error_msg;
+       let is_server_error =
+         let rec contains_5xx i =
+           if i > String.length error_msg - 3
+           then false
+           else (
+             let sub = String.sub error_msg i 3 in
+             if sub = "500" || sub = "502" || sub = "503" || sub = "504"
+             then true
+             else contains_5xx (i + 1))
+         in
+         contains_5xx 0
+       in
+       if label = "Private" && is_server_error
+       then (
+         Lighter_proxy.rotate_proxy ();
+         if Lighter_proxy.has_more_proxies ()
+         then (
+           Atomic.set state.is_connected_ref false;
+           connect_one
+             ~state
+             ~connect_target
+             ~ws_url
+             ~on_failure
+             ~on_connected
+             ~on_heartbeat
+             ~label)
+         else (
+           Atomic.set state.is_connected_ref false;
+           on_failure error_msg;
+           Lwt.return_unit))
+       else (
+         Atomic.set state.is_connected_ref false;
+         on_failure error_msg;
+         Lwt.return_unit))
+;;
 
 let close () : unit Lwt.t =
   let close_one state label =
@@ -416,23 +534,21 @@ let close () : unit Lwt.t =
       match !(state.active_connection) with
       | None -> Lwt.return None
       | Some conn ->
-          state.active_connection := None;
-          Atomic.set state.is_connected_ref false;
-          Lwt.return (Some conn)
-    ) >>= function
+        state.active_connection := None;
+        Atomic.set state.is_connected_ref false;
+        Lwt.return (Some conn))
+    >>= function
     | None -> Lwt.return_unit
     | Some conn ->
-        Logging.info_f ~section "Closing %s Lighter WebSocket connection" label;
-        Lwt.catch
-          (fun () -> Websocket_lwt_unix.close_transport conn)
-          (fun _ -> Lwt.return_unit)
+      Logging.info_f ~section "Closing %s Lighter WebSocket connection" label;
+      Lwt.catch
+        (fun () -> Websocket_lwt_unix.close_transport conn)
+        (fun _ -> Lwt.return_unit)
   in
   close_all_subscribers ();
   signal_new_data ();
-  Lwt.join [
-    close_one public_state "Public";
-    close_one private_state "Private";
-  ]
+  Lwt.join [ close_one public_state "Public"; close_one private_state "Private" ]
+;;
 
 (** Forcefully terminates the underlying transport for the public WebSocket connection. *)
 let close_public () : unit Lwt.t =
@@ -440,14 +556,17 @@ let close_public () : unit Lwt.t =
     match !(public_state.active_connection) with
     | None -> Lwt.return None
     | Some conn ->
-        public_state.active_connection := None;
-        Atomic.set public_state.is_connected_ref false;
-        Lwt.return (Some conn)
-  ) >>= function
+      public_state.active_connection := None;
+      Atomic.set public_state.is_connected_ref false;
+      Lwt.return (Some conn))
+  >>= function
   | None -> Lwt.return_unit
   | Some conn ->
-      Logging.info ~section "Closing Public Lighter WebSocket connection";
-      Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit)
+    Logging.info ~section "Closing Public Lighter WebSocket connection";
+    Lwt.catch
+      (fun () -> Websocket_lwt_unix.close_transport conn)
+      (fun _ -> Lwt.return_unit)
+;;
 
 (** Forcefully terminates the underlying transport for the private WebSocket connection. *)
 let close_private () : unit Lwt.t =
@@ -455,45 +574,59 @@ let close_private () : unit Lwt.t =
     match !(private_state.active_connection) with
     | None -> Lwt.return None
     | Some conn ->
-        private_state.active_connection := None;
-        Atomic.set private_state.is_connected_ref false;
-        Lwt.return (Some conn)
-  ) >>= function
+      private_state.active_connection := None;
+      Atomic.set private_state.is_connected_ref false;
+      Lwt.return (Some conn))
+  >>= function
   | None -> Lwt.return_unit
   | Some conn ->
-      Logging.info ~section "Closing Private Lighter WebSocket connection";
-      Lwt.catch (fun () -> Websocket_lwt_unix.close_transport conn) (fun _ -> Lwt.return_unit)
+    Logging.info ~section "Closing Private Lighter WebSocket connection";
+    Lwt.catch
+      (fun () -> Websocket_lwt_unix.close_transport conn)
+      (fun _ -> Lwt.return_unit)
+;;
 
 let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
   let pub_ready = Atomic.make false in
   let priv_ready = Atomic.make false in
   let both_ready_fired = Atomic.make false in
-
   (* Trigger the connection callback exclusively when both the public and private connections achieve an active state.
      The mechanism ensures idempotent invocation within a continuous session, firing strictly during the initial state transition to universal readiness. *)
   let check_both_ready () =
-    if Atomic.get pub_ready && Atomic.get priv_ready then begin
-      if not (Atomic.exchange both_ready_fired true) then begin
+    if Atomic.get pub_ready && Atomic.get priv_ready
+    then
+      if not (Atomic.exchange both_ready_fired true)
+      then (
         reset_ping_failures ();
         Lighter_proxy.reset_proxy_failures ();
-        on_connected ()
-      end
-    end
+        on_connected ())
   in
-
   (* Implements a continuous autonomous reconnection loop assigned to a specific connection.
      The sequence executes indefinitely upon transport disconnection. Isolated network instability events are resolved internally without escalating failure states to the central supervisor. The supervisor relies on passive heartbeat monitoring functionality to detect verified prolonged network outages. *)
-  let reconnect_loop ~state ~connect_target ~ws_url ~label
-      ~ready_flag ~other_ready_flag ~on_side_reconnected =
+  let reconnect_loop
+        ~state
+        ~connect_target
+        ~ws_url
+        ~label
+        ~ready_flag
+        ~other_ready_flag
+        ~on_side_reconnected
+    =
     let side_on_failure msg =
       Atomic.set ready_flag false;
       Atomic.set both_ready_fired false;
-      Logging.warn_f ~section "[%s] Disconnected: %s (reconnecting independently)" label msg;
+      Logging.warn_f
+        ~section
+        "[%s] Disconnected: %s (reconnecting independently)"
+        label
+        msg;
       (* Prevent escalation to the supervisor failure callback as the localized reconnection loop handles mitigation. Providing external failure notifications here creates race conditions against the internal recovery procedures and risks unintended duplication of monitoring threads generated by the supervisor. *)
-      if not (Atomic.get other_ready_flag) then begin
-        Logging.error_f ~section "[lighter_ws] Both sides down — internal loops will recover";
-        close_all_subscribers ()
-      end
+      if not (Atomic.get other_ready_flag)
+      then (
+        Logging.error_f
+          ~section
+          "[lighter_ws] Both sides down — internal loops will recover";
+        close_all_subscribers ())
     in
     let side_on_connected () =
       Atomic.set ready_flag true;
@@ -501,111 +634,150 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
         Lwt.catch
           (fun () -> on_side_reconnected ())
           (fun exn ->
-            Logging.error_f ~section "[%s] Error in reconnect callback: %s" label (Printexc.to_string exn);
-            Lwt.return_unit)
-      );
+             Logging.error_f
+               ~section
+               "[%s] Error in reconnect callback: %s"
+               label
+               (Printexc.to_string exn);
+             Lwt.return_unit));
       check_both_ready ()
     in
-    Concurrency.Lwt_util.run_periodic ~interval:0.5 ~stop:(fun () -> false) (fun () ->
-      Lwt.catch (fun () ->
-        connect_one ~state ~connect_target ~ws_url
-          ~on_failure:side_on_failure
-          ~on_connected:side_on_connected
-          ~on_heartbeat ~label
-      ) (fun exn ->
-        Logging.debug_f ~section "[%s] connect_one raised: %s" label (Printexc.to_string exn);
-        Lwt.return_unit
-      ) >>= fun () ->
-      (* The underlying connection has terminated. Execute a defined subsecond delay before initiating a new connection sequence. *)
-      Atomic.set ready_flag false;
-      Atomic.set both_ready_fired false;
-      Logging.debug_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
-      Lwt.return_unit
-    )
+    Concurrency.Lwt_util.run_periodic
+      ~interval:0.5
+      ~stop:(fun () -> false)
+      (fun () ->
+         Lwt.catch
+           (fun () ->
+              connect_one
+                ~state
+                ~connect_target
+                ~ws_url
+                ~on_failure:side_on_failure
+                ~on_connected:side_on_connected
+                ~on_heartbeat
+                ~label)
+           (fun exn ->
+              Logging.debug_f
+                ~section
+                "[%s] connect_one raised: %s"
+                label
+                (Printexc.to_string exn);
+              Lwt.return_unit)
+         >>= fun () ->
+         (* The underlying connection has terminated. Execute a defined subsecond delay before initiating a new connection sequence. *)
+         Atomic.set ready_flag false;
+         Atomic.set both_ready_fired false;
+         Logging.debug_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
+         Lwt.return_unit)
   in
-
-  Lwt.join [
-    reconnect_loop
-      ~state:public_state
-      ~connect_target:Lighter_proxy.public_ws_connect_target
-      ~ws_url:Lighter_proxy.public_ws_url
-      ~label:"Public"
-      ~ready_flag:pub_ready
-      ~other_ready_flag:priv_ready
-      ~on_side_reconnected:(fun () ->
-        (* Execute lightweight reconnection logic strictly issuing subset subscriptions for orderbook channels corresponding to the cached instrument symbols data *)
-        let symbols = !subscribed_symbols in
-        if List.length symbols > 0 then begin
-          Logging.debug_f ~section "Public WS reconnected — resubscribing %d orderbook channels" (List.length symbols);
-          subscribe_public_orderbook ~symbols
-        end else
-          Lwt.return_unit
-      );
-    reconnect_loop
-      ~state:private_state
-      ~connect_target:Lighter_proxy.private_ws_connect_target
-      ~ws_url:Lighter_proxy.private_ws_url
-      ~label:"Private"
-      ~ready_flag:priv_ready
-      ~other_ready_flag:pub_ready
-      ~on_side_reconnected:(fun () ->
-        (* Execute comprehensive reconnection logic issuing full subscription requests for all authenticated private account channels *)
-        let symbols = !subscribed_symbols in
-        let account_index = !subscribed_account_index in
-        let auth_token = !subscribed_auth_token in
-        if List.length symbols > 0 then begin
-          Logging.info_f ~section "Private WS reconnected — resubscribing private channels";
-          let acct_str = string_of_int account_index in
-          let private_commands = [
-            `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_orders/" ^ acct_str)); ("auth", `String auth_token)];
-            `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all/" ^ acct_str)); ("auth", `String auth_token)];
-            `Assoc [("type", `String "subscribe"); ("channel", `String ("account_all_assets/" ^ acct_str)); ("auth", `String auth_token)];
-            `Assoc [("type", `String "subscribe"); ("channel", `String ("user_stats/" ^ acct_str)); ("auth", `String auth_token)]
-          ] in
-          let private_stream = Lwt_stream.of_list private_commands in
-          Concurrency.Lwt_util.consume_stream_s (fun cmd ->
-            send_private_json cmd "Private"
-          ) private_stream
-        end else
-          Lwt.return_unit
-      );
-  ]
+  Lwt.join
+    [ reconnect_loop
+        ~state:public_state
+        ~connect_target:Lighter_proxy.public_ws_connect_target
+        ~ws_url:Lighter_proxy.public_ws_url
+        ~label:"Public"
+        ~ready_flag:pub_ready
+        ~other_ready_flag:priv_ready
+        ~on_side_reconnected:(fun () ->
+          (* Execute lightweight reconnection logic strictly issuing subset subscriptions for orderbook channels corresponding to the cached instrument symbols data *)
+          let symbols = !subscribed_symbols in
+          if List.length symbols > 0
+          then (
+            Logging.debug_f
+              ~section
+              "Public WS reconnected — resubscribing %d orderbook channels"
+              (List.length symbols);
+            subscribe_public_orderbook ~symbols)
+          else Lwt.return_unit)
+    ; reconnect_loop
+        ~state:private_state
+        ~connect_target:Lighter_proxy.private_ws_connect_target
+        ~ws_url:Lighter_proxy.private_ws_url
+        ~label:"Private"
+        ~ready_flag:priv_ready
+        ~other_ready_flag:pub_ready
+        ~on_side_reconnected:(fun () ->
+          (* Execute comprehensive reconnection logic issuing full subscription requests for all authenticated private account channels *)
+          let symbols = !subscribed_symbols in
+          let account_index = !subscribed_account_index in
+          let auth_token = !subscribed_auth_token in
+          if List.length symbols > 0
+          then (
+            Logging.info_f
+              ~section
+              "Private WS reconnected — resubscribing private channels";
+            let acct_str = string_of_int account_index in
+            let private_commands =
+              [ `Assoc
+                  [ "type", `String "subscribe"
+                  ; "channel", `String ("account_all_orders/" ^ acct_str)
+                  ; "auth", `String auth_token
+                  ]
+              ; `Assoc
+                  [ "type", `String "subscribe"
+                  ; "channel", `String ("account_all/" ^ acct_str)
+                  ; "auth", `String auth_token
+                  ]
+              ; `Assoc
+                  [ "type", `String "subscribe"
+                  ; "channel", `String ("account_all_assets/" ^ acct_str)
+                  ; "auth", `String auth_token
+                  ]
+              ; `Assoc
+                  [ "type", `String "subscribe"
+                  ; "channel", `String ("user_stats/" ^ acct_str)
+                  ; "auth", `String auth_token
+                  ]
+              ]
+            in
+            let private_stream = Lwt_stream.of_list private_commands in
+            Concurrency.Lwt_util.consume_stream_s
+              (fun cmd -> send_private_json cmd "Private")
+              private_stream)
+          else Lwt.return_unit)
+    ]
+;;
 
 let send_ping ~req_id:_ ~timeout_ms =
   let timeout = float_of_int timeout_ms /. 1000.0 in
-  
   let ping_one state _label =
     let send_time = Unix.gettimeofday () in
-    Lwt.catch (fun () ->
-      Lwt_mutex.with_lock state.connection_mutex (fun () ->
-        match !(state.active_connection) with
-        | Some conn ->
-            Websocket_lwt_unix.write conn (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ())
-        | None ->
-            Lwt.return_unit
-      ) >>= fun () ->
-      Lwt.pick [
-        (Lwt_condition.wait state.pong_condition >>= fun () -> Lwt.return true);
-        (Lwt_unix.sleep timeout >>= fun () ->
-         if !(state.last_pong_time) > send_time then Lwt.return true
-         else Lwt.return false)
-      ]
-    ) (fun _ -> Lwt.return false)
+    Lwt.catch
+      (fun () ->
+         Lwt_mutex.with_lock state.connection_mutex (fun () ->
+           match !(state.active_connection) with
+           | Some conn ->
+             Websocket_lwt_unix.write
+               conn
+               (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ())
+           | None -> Lwt.return_unit)
+         >>= fun () ->
+         Lwt.pick
+           [ (Lwt_condition.wait state.pong_condition >>= fun () -> Lwt.return true)
+           ; (Lwt_unix.sleep timeout
+              >>= fun () ->
+              if !(state.last_pong_time) > send_time
+              then Lwt.return true
+              else Lwt.return false)
+           ])
+      (fun _ -> Lwt.return false)
   in
-  
   (* Suppress outbound ping frames targeting the private connection until the underlying data stream confirms bidirectional transit. The Durable Object proxy requires latency to verify its upstream network relay target. Issuing ping requests prior to confirmation yields false negative failure states. *)
   let priv_p =
-    if not (Atomic.get private_stream_confirmed) then Lwt.return true
+    if not (Atomic.get private_stream_confirmed)
+    then Lwt.return true
     else ping_one private_state "Private"
   in
-  Lwt.both (ping_one public_state "Public") priv_p >>= fun (pub_ok, priv_ok) ->
-  if pub_ok && priv_ok then begin
+  Lwt.both (ping_one public_state "Public") priv_p
+  >>= fun (pub_ok, priv_ok) ->
+  if pub_ok && priv_ok
+  then (
     reset_ping_failures ();
-    Lwt.return true
-  end else begin
+    Lwt.return true)
+  else (
     Logging.warn_f ~section "Ping failed (pub=%b, priv=%b)" pub_ok priv_ok;
     incr_ping_failures ();
     let%lwt () = if not pub_ok then close_public () else Lwt.return_unit in
     let%lwt () = if not priv_ok then close_private () else Lwt.return_unit in
-    Lwt.return false
-  end
+    Lwt.return false)
+;;

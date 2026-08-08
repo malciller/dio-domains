@@ -8,7 +8,7 @@ module Payload = struct
   type t = unit
 end
 
-include Event_bus.Make(Payload)
+include Event_bus.Make (Payload)
 
 (** Singleton bus instance used as the global tick distribution channel. *)
 let global_bus = create "global_tick"

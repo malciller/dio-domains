@@ -17,12 +17,14 @@ let section = "ibkr_balances"
 
 (** Primary memory store for account metrics mapping parameter identifiers to a tuple containing the floating point magnitude and currency designation string. *)
 let account_values : (string, float * string) Hashtbl.t = Hashtbl.create 32
+
 let account_values_mutex = Mutex.create ()
 let ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
 (** Primary memory store for portfolio positions mapping the instrument symbol string to a tuple representing quantity, current market quotation, calculated market value, and volume weighted average cost. *)
 let positions : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 32
+
 let positions_mutex = Mutex.create ()
 
 (** Dispatch handler for the updateAccountValue network callback.
@@ -33,29 +35,28 @@ let handle_account_value fields =
   let value, fields = Ibkr_codec.read_float fields in
   let currency, fields = Ibkr_codec.read_string fields in
   let _account, _fields = Ibkr_codec.read_string fields in
-
   (* Index payload using a currency qualified string key to support multiple currency environments, while preserving the baseline key index for default USD queries. *)
   Mutex.lock account_values_mutex;
   Hashtbl.replace account_values key (value, currency);
-  if currency <> "" then
-    Hashtbl.replace account_values (key ^ "-" ^ currency) (value, currency);
+  if currency <> ""
+  then Hashtbl.replace account_values (key ^ "-" ^ currency) (value, currency);
   Mutex.unlock account_values_mutex;
-
-  if not (Atomic.get ready) then begin
+  if not (Atomic.get ready)
+  then (
     Atomic.set ready true;
-    (try Lwt_condition.broadcast ready_condition ()
-     with _ -> ())
-  end;
-
+    try Lwt_condition.broadcast ready_condition () with
+    | _ -> ());
   (* Emit telemetry regarding significant account balance parametric shifts at the informational severity level. *)
   match key with
-  | "TotalCashBalance" | "AvailableFunds" | "SettledCash"
-  | "NetLiquidation" | "BuyingPower" ->
-      Logging.debug_f ~section "Account %s = %.2f %s" key value currency
+  | "TotalCashBalance"
+  | "AvailableFunds"
+  | "SettledCash"
+  | "NetLiquidation"
+  | "BuyingPower" -> Logging.debug_f ~section "Account %s = %.2f %s" key value currency
   | "UnrealizedPnL" | "RealizedPnL" ->
-      Logging.debug_f ~section "Account %s = %.2f %s" key value currency
-  | _ ->
-      Logging.debug_f ~section "Account %s = %.2f %s" key value currency
+    Logging.debug_f ~section "Account %s = %.2f %s" key value currency
+  | _ -> Logging.debug_f ~section "Account %s = %.2f %s" key value currency
+;;
 
 (** Dispatch handler for the updatePortfolio network callback delivering position level modifications.
     Expected data structure fields: protocol version, contract identifier, primary symbol string, security classification type, expiration or last trade indicator, strike price, option right classification, contract multiplier, primary venue exchange, currency denomination, localized symbol designation, proprietary trading class, net position quantity, current market quotation, calculated market value, volume weighted average cost, unsecured profit and loss, secured profit and loss, and target account identifier. *)
@@ -78,17 +79,24 @@ let handle_portfolio_value fields =
   let avg_cost, fields = Ibkr_codec.read_float fields in
   let unrealized_pnl, fields = Ibkr_codec.read_float fields in
   let realized_pnl, _fields = Ibkr_codec.read_float fields in
-
   Mutex.lock positions_mutex;
-  if position = 0.0 then
-    Hashtbl.remove positions symbol
-  else
-    Hashtbl.replace positions symbol (position, market_price, market_value, avg_cost);
+  if position = 0.0
+  then Hashtbl.remove positions symbol
+  else Hashtbl.replace positions symbol (position, market_price, market_value, avg_cost);
   Mutex.unlock positions_mutex;
-
-  if position <> 0.0 then
-    Logging.debug_f ~section "Position: %s qty=%.0f mktPrice=%.2f mktValue=%.2f avgCost=%.2f uPnL=%.2f rPnL=%.2f"
-      symbol position market_price market_value avg_cost unrealized_pnl realized_pnl
+  if position <> 0.0
+  then
+    Logging.debug_f
+      ~section
+      "Position: %s qty=%.0f mktPrice=%.2f mktValue=%.2f avgCost=%.2f uPnL=%.2f rPnL=%.2f"
+      symbol
+      position
+      market_price
+      market_value
+      avg_cost
+      unrealized_pnl
+      realized_pnl
+;;
 
 (** Execute registration sequence for ingress payload handlers and initialize subscriptions for account level metrics. *)
 let register_handlers () =
@@ -98,28 +106,35 @@ let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_portfolio_value
     ~handler:handle_portfolio_value
+;;
 
 (** Transmit subscription request payload for account state parameter updates targeted at the specified account identifier string. *)
 let subscribe conn ~account_id =
   Logging.info_f ~section "Subscribing to account updates for %s" account_id;
-  Ibkr_connection.send conn [
-    string_of_int Ibkr_types.msg_req_account_updates;
-    "2";    (* Protocol structure version *)
-    "1";    (* Subscription boolean flag equivalent to true *)
-    account_id;
-  ]
+  Ibkr_connection.send
+    conn
+    [ string_of_int Ibkr_types.msg_req_account_updates
+    ; "2"
+    ; (* Protocol structure version *)
+      "1"
+    ; (* Subscription boolean flag equivalent to true *)
+      account_id
+    ]
+;;
 
 (* Public structural access procedures *)
 
 (** Access specific account parameter value by string key index. Resolves to a zero component float magnitude if the parameter is not present in the primary memory store. *)
 let[@inline always] get_account_value key =
   Mutex.lock account_values_mutex;
-  let r = match Hashtbl.find_opt account_values key with
+  let r =
+    match Hashtbl.find_opt account_values key with
     | Some (v, _) -> v
     | None -> 0.0
   in
   Mutex.unlock account_values_mutex;
   r
+;;
 
 (** Retrieve aggregate cash balance including pending settlement allocations. *)
 let get_total_cash () = get_account_value "TotalCashBalance"
@@ -154,19 +169,21 @@ let get_balance ~asset =
   | "NET_LIQ" -> get_net_liquidation ()
   | "BUYING_POWER" -> get_buying_power ()
   | symbol ->
-      (* For equity instruments, query the positions memory store populated via the updatePortfolio callback mechanism.
+    (* For equity instruments, query the positions memory store populated via the updatePortfolio callback mechanism.
          Implement a secondary fallback to the account values memory store for unmapped operational parameters. *)
-      (Mutex.lock positions_mutex;
-       let r = Hashtbl.find_opt positions symbol in
-       Mutex.unlock positions_mutex;
-       match r with
-       | Some (qty, _, _, _) -> qty
-       | None -> get_account_value symbol)
+    Mutex.lock positions_mutex;
+    let r = Hashtbl.find_opt positions symbol in
+    Mutex.unlock positions_mutex;
+    (match r with
+     | Some (qty, _, _, _) -> qty
+     | None -> get_account_value symbol)
+;;
 
 (** Construct an aggregated balance payload formatted for compatibility with the supervisor inactive asset monitoring sequence. Interactive Brokers account states leverage internal parametric keys rather than tradable external asset designations. This interface strictly surfaces the USD identifier mapped to AvailableFunds metrics. Component positions are independently tracked via the updatePortfolio mechanism. *)
 let get_all_balances () =
   let usd = get_available_funds () in
-  if usd > 0.0 then [("USD", usd)] else []
+  if usd > 0.0 then [ "USD", usd ] else []
+;;
 
 (** Access the internal position parameters for a provided symbol string, returning an unwrapped tuple representing the numeric quantity, current market quotation, calculated market value, and volume weighted average cost parameters. *)
 let get_position ~symbol =
@@ -174,8 +191,10 @@ let get_position ~symbol =
   let r = Hashtbl.find_opt positions symbol in
   Mutex.unlock positions_mutex;
   r
+;;
 
 (** Execute the structural module initialization sequence and mount required network dispatch payload listener targets. *)
 let initialize () =
   register_handlers ();
   Logging.info ~section "Balances module initialized"
+;;

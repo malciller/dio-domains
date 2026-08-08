@@ -1,4 +1,4 @@
- (test
-  (name test_fear_and_greed)
-  (modules test_fear_and_greed)
-  (libraries alcotest dio.cmc))
+(test
+ (name test_fear_and_greed)
+ (modules test_fear_and_greed)
+ (libraries alcotest dio.cmc))

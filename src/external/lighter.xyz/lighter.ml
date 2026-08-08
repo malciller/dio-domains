@@ -23,8 +23,6 @@ module Actions = Lighter_actions
     collateral updates from WebSocket channels to maintain an accurate internal ledger. *)
 module Balances = Lighter_balances
 
-
-
 (** Level 2 market data feed handler. Constructs and maintains a local cache of the
     orderbook depth by processing initial snapshots followed by sequential delta updates. *)
 module Orderbook_feed = Lighter_orderbook_feed

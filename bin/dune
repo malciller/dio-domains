@@ -23,9 +23,4 @@
  (public_name dio-dashboard)
  (name dashboard)
  (modes exe)
- (libraries
-  notty
-  notty.unix
-  yojson
-  unix
-  dio.dashboard_ui))
+ (libraries notty notty.unix yojson unix dio.dashboard_ui))
