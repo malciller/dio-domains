@@ -23,6 +23,7 @@ module Types = struct
     | "ibkr" -> Ibkr
     | "alpaca" -> Alpaca
     | s -> Custom s
+  ;;
 
   let string_of_exchange = function
     | Hyperliquid -> "hyperliquid"
@@ -31,6 +32,7 @@ module Types = struct
     | Ibkr -> "ibkr"
     | Alpaca -> "alpaca"
     | Custom s -> s
+  ;;
 
   (** Supported order types. [Other s] captures exchange-specific types
       not covered by the standard variants. *)
@@ -59,11 +61,11 @@ module Types = struct
     | FOK
 
   (** Acknowledgment returned after successful order placement. *)
-  type add_order_result = {
-    order_id: string;           (** Exchange-assigned order identifier. *)
-    cl_ord_id: string option;   (** Client-supplied order identifier, if provided. *)
-    order_userref: int option;  (** User reference integer, if provided. *)
-  }
+  type add_order_result =
+    { order_id : string (** Exchange-assigned order identifier. *)
+    ; cl_ord_id : string option (** Client-supplied order identifier, if provided. *)
+    ; order_userref : int option (** User reference integer, if provided. *)
+    }
 
   (** Lifecycle states of an order on the exchange. [Unknown s] captures
       any status string not mapped to a known variant. *)
@@ -79,68 +81,71 @@ module Types = struct
 
   (** Snapshot of a single open order, including fill progress and
       optional client identifiers. *)
-  type open_order = {
-    order_id: string;         (** Exchange-assigned order identifier. *)
-    symbol: string;           (** Trading pair symbol. *)
-    side: order_side;         (** Buy or sell. *)
-    qty: float;               (** Original order quantity. *)
-    cum_qty: float;           (** Cumulative filled quantity. *)
-    remaining_qty: float;     (** Quantity remaining to be filled. *)
-    limit_price: float option;(** Limit price, if applicable. *)
-    status: order_status;     (** Current order lifecycle status. *)
-    user_ref: int option;     (** User reference integer, if set. *)
-    cl_ord_id: string option; (** Client order identifier, if set. *)
-  }
+  type open_order =
+    { order_id : string (** Exchange-assigned order identifier. *)
+    ; symbol : string (** Trading pair symbol. *)
+    ; side : order_side (** Buy or sell. *)
+    ; qty : float (** Original order quantity. *)
+    ; cum_qty : float (** Cumulative filled quantity. *)
+    ; remaining_qty : float (** Quantity remaining to be filled. *)
+    ; limit_price : float option (** Limit price, if applicable. *)
+    ; status : order_status (** Current order lifecycle status. *)
+    ; user_ref : int option (** User reference integer, if set. *)
+    ; cl_ord_id : string option (** Client order identifier, if set. *)
+    }
 
   (** Acknowledgment returned after successful order amendment. *)
-  type amend_order_result = {
-    original_order_id: string; (** Identifier of the amended order. *)
-    new_order_id: string;      (** Identifier assigned to the replacement order. *)
-    amend_id: string option;   (** Exchange-assigned amendment identifier, if any. *)
-    cl_ord_id: string option;  (** Client order identifier, if provided. *)
-  }
+  type amend_order_result =
+    { original_order_id : string (** Identifier of the amended order. *)
+    ; new_order_id : string (** Identifier assigned to the replacement order. *)
+    ; amend_id : string option (** Exchange-assigned amendment identifier, if any. *)
+    ; cl_ord_id : string option (** Client order identifier, if provided. *)
+    }
 
   (** Acknowledgment returned after successful order cancellation. *)
-  type cancel_order_result = {
-    order_id: string;          (** Identifier of the canceled order. *)
-    cl_ord_id: string option;  (** Client order identifier, if provided. *)
-  }
+  type cancel_order_result =
+    { order_id : string (** Identifier of the canceled order. *)
+    ; cl_ord_id : string option (** Client order identifier, if provided. *)
+    }
 
   (** Orderbook depth snapshot with arrays of (price, size) levels. *)
-  type orderbook_event = {
-    bids: (float * float) array; (** Bid levels: (price, size). *)
-    asks: (float * float) array; (** Ask levels: (price, size). *)
-    timestamp: float;            (** Unix timestamp of the snapshot. *)
-  }
+  type orderbook_event =
+    { bids : (float * float) array (** Bid levels: (price, size). *)
+    ; asks : (float * float) array (** Ask levels: (price, size). *)
+    ; timestamp : float (** Unix timestamp of the snapshot. *)
+    }
 
   (** Execution report describing a state change on an order. *)
-  type execution_event = {
-    order_id: string;              (** Exchange-assigned order identifier. *)
-    order_status: order_status;    (** Updated order status. *)
-    limit_price: float option;     (** Limit price, if applicable. *)
-    side: order_side;              (** Buy or sell. *)
-    remaining_qty: float;          (** Quantity remaining after this event. *)
-    filled_qty: float;             (** Cumulative filled quantity. *)
-    avg_price: float;              (** Volume-weighted average fill price. *)
-    timestamp: float;              (** Unix timestamp of the execution report. *)
-    is_amended: bool;              (** True when this event is an in-place amendment
+  type execution_event =
+    { order_id : string (** Exchange-assigned order identifier. *)
+    ; order_status : order_status (** Updated order status. *)
+    ; limit_price : float option (** Limit price, if applicable. *)
+    ; side : order_side (** Buy or sell. *)
+    ; remaining_qty : float (** Quantity remaining after this event. *)
+    ; filled_qty : float (** Cumulative filled quantity. *)
+    ; avg_price : float (** Volume-weighted average fill price. *)
+    ; timestamp : float (** Unix timestamp of the execution report. *)
+    ; is_amended : bool
+      (** True when this event is an in-place amendment
                                        confirmation (Kraken exec_type=amended), not a
                                        genuine new-order acknowledgment. Domain workers
                                        must skip handle_order_acknowledged for these. *)
-    cl_ord_id: string option;     (** Client order id when the venue provides one
+    ; cl_ord_id : string option
+      (** Client order id when the venue provides one
                                        (Hyperliquid cloid, Lighter client_order_id). *)
-  }
+    }
 
   (** Parameters controlling exponential backoff retry behavior.
       Canonical definition lives in [Error_handling]; re-exported here
       so exchange module signatures can reference [Types.retry_config]
       without depending on [Error_handling] directly. *)
-  type retry_config = Error_handling.retry_config = {
-    max_attempts: int;     (** Maximum number of attempts (including the initial). *)
-    base_delay_ms: float;  (** Initial delay between retries, in milliseconds. *)
-    max_delay_ms: float;   (** Upper bound on delay between retries, in milliseconds. *)
-    backoff_factor: float; (** Multiplicative factor applied to the delay after each attempt. *)
-  }
+  type retry_config = Error_handling.retry_config =
+    { max_attempts : int (** Maximum number of attempts (including the initial). *)
+    ; base_delay_ms : float (** Initial delay between retries, in milliseconds. *)
+    ; max_delay_ms : float (** Upper bound on delay between retries, in milliseconds. *)
+    ; backoff_factor : float
+      (** Multiplicative factor applied to the delay after each attempt. *)
+    }
 end
 
 (** Module signature that every exchange backend must satisfy.
@@ -160,55 +165,55 @@ module type S = sig
       trigger price, iceberg display quantity, and retry behavior.
 
       Returns [Ok add_order_result] on acceptance or [Error msg] on failure. *)
-  val place_order :
-    token:string ->
-    order_type:Types.order_type ->
-    side:Types.order_side ->
-    qty:float ->
-    symbol:string ->
-    ?limit_price:float ->
-    ?time_in_force:Types.time_in_force ->
-    ?post_only:bool ->
-    ?reduce_only:bool ->
-    ?order_userref:int ->
-    ?cl_ord_id:string ->
-    ?trigger_price:float ->
-    ?display_qty:float ->
-    ?retry_config:Types.retry_config ->
-    unit ->
-    (Types.add_order_result, string) result Lwt.t
+  val place_order
+    :  token:string
+    -> order_type:Types.order_type
+    -> side:Types.order_side
+    -> qty:float
+    -> symbol:string
+    -> ?limit_price:float
+    -> ?time_in_force:Types.time_in_force
+    -> ?post_only:bool
+    -> ?reduce_only:bool
+    -> ?order_userref:int
+    -> ?cl_ord_id:string
+    -> ?trigger_price:float
+    -> ?display_qty:float
+    -> ?retry_config:Types.retry_config
+    -> unit
+    -> (Types.add_order_result, string) result Lwt.t
 
   (** Amend an existing order (price, quantity, trigger, display qty).
 
       Requires [token] and [order_id]. All mutable order fields are optional.
       Returns [Ok amend_order_result] on acceptance or [Error msg] on failure. *)
-  val amend_order :
-    token:string ->
-    order_id:string ->
-    ?cl_ord_id:string ->
-    ?qty:float ->
-    ?limit_price:float ->
-    ?post_only:bool ->
-    ?trigger_price:float ->
-    ?display_qty:float ->
-    ?symbol:string ->
-    ?retry_config:Types.retry_config ->
-    unit ->
-    (Types.amend_order_result, string) result Lwt.t
+  val amend_order
+    :  token:string
+    -> order_id:string
+    -> ?cl_ord_id:string
+    -> ?qty:float
+    -> ?limit_price:float
+    -> ?post_only:bool
+    -> ?trigger_price:float
+    -> ?display_qty:float
+    -> ?symbol:string
+    -> ?retry_config:Types.retry_config
+    -> unit
+    -> (Types.amend_order_result, string) result Lwt.t
 
   (** Cancel one or more orders identified by order id, client order id,
       or user reference. At least one identifier list should be non-empty.
 
       Returns [Ok cancel_order_result list] or [Error msg]. *)
-  val cancel_orders :
-    token:string ->
-    ?order_ids:string list ->
-    ?cl_ord_ids:string list ->
-    ?order_userrefs:int list ->
-    ?symbol:string ->
-    ?retry_config:Types.retry_config ->
-    unit ->
-    (Types.cancel_order_result list, string) result Lwt.t
+  val cancel_orders
+    :  token:string
+    -> ?order_ids:string list
+    -> ?cl_ord_ids:string list
+    -> ?order_userrefs:int list
+    -> ?symbol:string
+    -> ?retry_config:Types.retry_config
+    -> unit
+    -> (Types.cancel_order_result list, string) result Lwt.t
 
   (* ---- Market data accessors ---- *)
 
@@ -220,7 +225,7 @@ module type S = sig
   val get_tradeable_balance : asset:string -> float
 
   (** Return a fast path closure for fetching live tradeable balance of [asset] without lock acquisition overhead. *)
-  val get_tradeable_balance_fast : asset:string -> (unit -> float)
+  val get_tradeable_balance_fast : asset:string -> unit -> float
 
   (** Return the total balance for [asset] including staked/earn/vault balances. Returns [0.0] if unknown. *)
   val get_total_balance : asset:string -> float
@@ -259,13 +264,21 @@ module type S = sig
 
   (** Iterate over orderbook events from [start_pos] without allocating
       an intermediate list. Returns the new read position. *)
-  val iter_orderbook_events : symbol:string -> start_pos:int -> (Types.orderbook_event -> unit) -> int
+  val iter_orderbook_events
+    :  symbol:string
+    -> start_pos:int
+    -> (Types.orderbook_event -> unit)
+    -> int
 
   (** Iterate over orderbook events from [start_pos], extracting only
       top-of-book (best bid, best ask) without allocating converted arrays.
       Callback receives [(bid_price, bid_size, ask_price, ask_size)].
       Returns the new read position. *)
-  val iter_top_of_book_events : symbol:string -> start_pos:int -> (float -> float -> float -> float -> unit) -> int
+  val iter_top_of_book_events
+    :  symbol:string
+    -> start_pos:int
+    -> (float -> float -> float -> float -> unit)
+    -> int
 
   (** Return the current write position of the execution feed ring buffer
       for [symbol]. Used as the starting cursor for [read_execution_events]. *)
@@ -282,27 +295,41 @@ module type S = sig
 
   (** Iterate over execution events from [start_pos] without allocating
       an intermediate list. Returns the new read position. *)
-  val iter_execution_events : symbol:string -> start_pos:int -> (Types.execution_event -> unit) -> int
+  val iter_execution_events
+    :  symbol:string
+    -> start_pos:int
+    -> (Types.execution_event -> unit)
+    -> int
 
   (** Fold over open orders for [symbol] without allocating an intermediate
       list. Applies [f] to each open order, threading the accumulator. *)
-  val fold_open_orders : symbol:string -> init:'a -> f:('a -> Types.open_order -> 'a) -> 'a
+  val fold_open_orders
+    :  symbol:string
+    -> init:'a
+    -> f:('a -> Types.open_order -> 'a)
+    -> 'a
 
   (** Fast path iterator that avoids creating Types.open_order intermediate records.
       Yields primitive order values to the provided closure callback directly. *)
-  val iter_open_orders_fast : symbol:string -> (string -> float -> float -> string -> int option -> unit) -> unit
+  val iter_open_orders_fast
+    :  symbol:string
+    -> (string -> float -> float -> string -> int option -> unit)
+    -> unit
 
   (** Return a fast path closure for fetching the current orderbook position without lock acquisition/hash lookup overhead. *)
-  val get_orderbook_position_fast : symbol:string -> (unit -> int)
+  val get_orderbook_position_fast : symbol:string -> unit -> int
 
   (** Return a fast path closure for fetching top-of-book data without hash lookup overhead. *)
-  val get_top_of_book_fast : symbol:string -> (unit -> (float * float * float * float) option)
+  val get_top_of_book_fast
+    :  symbol:string
+    -> unit
+    -> (float * float * float * float) option
 
   (** Return a fast path closure for fetching the current execution feed position without hash lookup overhead. *)
-  val get_execution_feed_position_fast : symbol:string -> (unit -> int)
+  val get_execution_feed_position_fast : symbol:string -> unit -> int
 
   (** Return a fast path closure for checking if the execution feed has initial data without hash lookup overhead. *)
-  val has_execution_data_fast : symbol:string -> (unit -> bool)
+  val has_execution_data_fast : symbol:string -> unit -> bool
 
   (* ---- Instrument metadata ---- *)
 
@@ -326,7 +353,7 @@ module type S = sig
 
   (** Return cached (maker_fee, taker_fee) for [symbol]. Each component
       is [None] if the fee has not been fetched. *)
-  val get_fees : symbol:string -> (float option * float option)
+  val get_fees : symbol:string -> float option * float option
 end
 
 (** Dynamic registry mapping exchange names to their [(module S)]
@@ -339,11 +366,11 @@ module Registry = struct
       same [Exchange.name]. *)
   let register (module Exchange : S) =
     Hashtbl.replace _exchanges Exchange.name (module Exchange)
+  ;;
 
   (** Look up a registered exchange module by name. Returns [None] if
       no module has been registered under that name. *)
-  let get name =
-    Hashtbl.find_opt _exchanges name
+  let get name = Hashtbl.find_opt _exchanges name
 
   (** Return all registered exchange names. Used by the dashboard to
       enumerate balances across all exchanges, not just those with
@@ -351,4 +378,5 @@ module Registry = struct
   let get_all_names () =
     Hashtbl.fold (fun name _ acc -> name :: acc) _exchanges []
     |> List.sort_uniq String.compare
+  ;;
 end

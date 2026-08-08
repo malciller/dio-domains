@@ -21,22 +21,24 @@ let consume_stream f stream =
   let rec loop () =
     Lwt.catch
       (fun () ->
-        Lwt_stream.get stream >>= function
-        | None ->
-            Lwt.wakeup_later done_u ();
-            Lwt.return_unit
-        | Some x ->
-            f x;
-            (* Spawn next iteration independently to sever the Forward chain.
+         Lwt_stream.get stream
+         >>= function
+         | None ->
+           Lwt.wakeup_later done_u ();
+           Lwt.return_unit
+         | Some x ->
+           f x;
+           (* Spawn next iteration independently to sever the Forward chain.
                The current promise resolves immediately with unit. *)
-            Lwt.async loop;
-            Lwt.return_unit)
+           Lwt.async loop;
+           Lwt.return_unit)
       (fun exn ->
-        Lwt.wakeup_later_exn done_u exn;
-        Lwt.return_unit)
+         Lwt.wakeup_later_exn done_u exn;
+         Lwt.return_unit)
   in
   Lwt.async loop;
   done_p
+;;
 
 (** Sequentially applies async [f] to each element of [stream] without
     accumulating [Forward] nodes. Unlike [consume_stream], this awaits [f x]
@@ -47,20 +49,23 @@ let consume_stream_s f stream =
   let rec loop () =
     Lwt.catch
       (fun () ->
-        Lwt_stream.get stream >>= function
-        | None ->
-            Lwt.wakeup_later done_u ();
-            Lwt.return_unit
-        | Some x ->
-            f x >>= fun () ->
-            Lwt.async loop;
-            Lwt.return_unit)
+         Lwt_stream.get stream
+         >>= function
+         | None ->
+           Lwt.wakeup_later done_u ();
+           Lwt.return_unit
+         | Some x ->
+           f x
+           >>= fun () ->
+           Lwt.async loop;
+           Lwt.return_unit)
       (fun exn ->
-        Lwt.wakeup_later_exn done_u exn;
-        Lwt.return_unit)
+         Lwt.wakeup_later_exn done_u exn;
+         Lwt.return_unit)
   in
   Lwt.async loop;
   done_p
+;;
 
 (** Runs [f ()] every [interval] seconds until [stop ()] returns [true].
     Each iteration is spawned via [Lwt.async] to sever the promise chain,
@@ -71,32 +76,36 @@ let consume_stream_s f stream =
 
     Returns a promise that resolves when the loop exits (i.e. [stop ()]
     returns [true]). *)
-let run_periodic ?(initial_delay=0.0) ~interval ~stop f =
+let run_periodic ?(initial_delay = 0.0) ~interval ~stop f =
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
-    if stop () then begin
+    if stop ()
+    then (
       Lwt.wakeup_later done_u ();
-      Lwt.return_unit
-    end else
-      Lwt.catch
-        (fun () -> f ())
-        (fun _exn -> Lwt.return_unit)
+      Lwt.return_unit)
+    else
+      Lwt.catch (fun () -> f ()) (fun _exn -> Lwt.return_unit)
       >>= fun () ->
-      Lwt_unix.sleep interval >>= fun () ->
-      if stop () then begin
+      Lwt_unix.sleep interval
+      >>= fun () ->
+      if stop ()
+      then (
         Lwt.wakeup_later done_u ();
-        Lwt.return_unit
-      end else begin
+        Lwt.return_unit)
+      else (
         Lwt.async loop;
-        Lwt.return_unit
-      end
+        Lwt.return_unit)
   in
-  if initial_delay > 0.0 then
-    Lwt.async (fun () -> Lwt_unix.sleep initial_delay >>= fun () ->
-      Lwt.async loop; Lwt.return_unit)
-  else
-    Lwt.async loop;
+  if initial_delay > 0.0
+  then
+    Lwt.async (fun () ->
+      Lwt_unix.sleep initial_delay
+      >>= fun () ->
+      Lwt.async loop;
+      Lwt.return_unit)
+  else Lwt.async loop;
   done_p
+;;
 
 (** Polls [check ()] on each wakeup until it returns [true] or the
     [timeout] expires.  [wait_signal] should return a promise that
@@ -110,25 +119,29 @@ let poll_until ~timeout ~wait_signal ~check =
   let done_p, done_u = Lwt.wait () in
   let deadline = Unix.gettimeofday () +. timeout in
   let rec loop () =
-    if check () then begin
+    if check ()
+    then (
       Lwt.wakeup_later done_u true;
-      Lwt.return_unit
-    end else
+      Lwt.return_unit)
+    else (
       let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0.0 then begin
+      if remaining <= 0.0
+      then (
         Lwt.wakeup_later done_u (check ());
-        Lwt.return_unit
-      end else
-        Lwt.pick [
-          (wait_signal () >|= fun () -> `Again);
-          (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-        ] >>= function
+        Lwt.return_unit)
+      else
+        Lwt.pick
+          [ (wait_signal () >|= fun () -> `Again)
+          ; (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
+          ]
+        >>= function
         | `Again ->
-            Lwt.async loop;
-            Lwt.return_unit
+          Lwt.async loop;
+          Lwt.return_unit
         | `Timeout ->
-            Lwt.wakeup_later done_u (check ());
-            Lwt.return_unit
+          Lwt.wakeup_later done_u (check ());
+          Lwt.return_unit)
   in
   Lwt.async loop;
   done_p
+;;

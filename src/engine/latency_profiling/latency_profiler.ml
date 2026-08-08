@@ -15,31 +15,31 @@ let max_latency_us = 100_000
 
 (** Profiler state. Contains a fixed-size histogram array and
     running counters for total samples and overflow events. *)
-type t = {
-  name : string;          (* Identifier for this profiler instance. *)
-  buckets : int array;    (* Histogram bin counts. *)
-  bucket_us : int;        (* Width of each bucket in microseconds. *)
-  bucket_count : int;     (* Total number of histogram buckets. *)
-  mutable samples : int;  (* Total recorded samples. *)
-  mutable overflow : int; (* Samples exceeding the histogram range. *)
-  mutable max_latency_us : int;
-  mutable max_cause : string option;
-}
+type t =
+  { name : string (* Identifier for this profiler instance. *)
+  ; buckets : int array (* Histogram bin counts. *)
+  ; bucket_us : int (* Width of each bucket in microseconds. *)
+  ; bucket_count : int (* Total number of histogram buckets. *)
+  ; mutable samples : int (* Total recorded samples. *)
+  ; mutable overflow : int (* Samples exceeding the histogram range. *)
+  ; mutable max_latency_us : int
+  ; mutable max_cause : string option
+  }
 
 (** [create ?bucket_us ?max_latency_us name] allocates a profiler with
     [max_latency_us / bucket_us] histogram buckets, all initialized to zero. *)
-let create ?(bucket_us=1) ?(max_latency_us=10_000) name = 
+let create ?(bucket_us = 1) ?(max_latency_us = 10_000) name =
   let count = max_latency_us / bucket_us in
-  {
-    name;
-    buckets = Array.make count 0;
-    bucket_us;
-    bucket_count = count;
-    samples = 0;
-    overflow = 0;
-    max_latency_us = 0;
-    max_cause = None;
+  { name
+  ; buckets = Array.make count 0
+  ; bucket_us
+  ; bucket_count = count
+  ; samples = 0
+  ; overflow = 0
+  ; max_latency_us = 0
+  ; max_cause = None
   }
+;;
 
 let one_k_l = 1000L
 
@@ -50,17 +50,17 @@ let one_k_l = 1000L
 let[@inline] record t span =
   let us = Int64.to_int (Int64.div (Span.to_uint64_ns span) one_k_l) in
   let bucket_idx = us / t.bucket_us in
-  if bucket_idx >= t.bucket_count then begin
+  if bucket_idx >= t.bucket_count
+  then (
     t.buckets.(t.bucket_count - 1) <- t.buckets.(t.bucket_count - 1) + 1;
-    t.overflow <- t.overflow + 1
-  end else begin
-    t.buckets.(bucket_idx) <- t.buckets.(bucket_idx) + 1
-  end;
+    t.overflow <- t.overflow + 1)
+  else t.buckets.(bucket_idx) <- t.buckets.(bucket_idx) + 1;
   t.samples <- t.samples + 1;
-  if us > t.max_latency_us then begin
+  if us > t.max_latency_us
+  then (
     t.max_latency_us <- us;
-    t.max_cause <- None
-  end
+    t.max_cause <- None)
+;;
 
 (** [record_with_cause t span cause_thunk] is like [record] but if the span
     establishes a new maximum latency, it evaluates [cause_thunk ()] and
@@ -68,17 +68,17 @@ let[@inline] record t span =
 let[@inline] record_with_cause t span cause_thunk =
   let us = Int64.to_int (Int64.div (Span.to_uint64_ns span) one_k_l) in
   let bucket_idx = us / t.bucket_us in
-  if bucket_idx >= t.bucket_count then begin
+  if bucket_idx >= t.bucket_count
+  then (
     t.buckets.(t.bucket_count - 1) <- t.buckets.(t.bucket_count - 1) + 1;
-    t.overflow <- t.overflow + 1
-  end else begin
-    t.buckets.(bucket_idx) <- t.buckets.(bucket_idx) + 1
-  end;
+    t.overflow <- t.overflow + 1)
+  else t.buckets.(bucket_idx) <- t.buckets.(bucket_idx) + 1;
   t.samples <- t.samples + 1;
-  if us > t.max_latency_us then begin
+  if us > t.max_latency_us
+  then (
     t.max_latency_us <- us;
-    t.max_cause <- Some (cause_thunk ())
-  end
+    t.max_cause <- Some (cause_thunk ()))
+;;
 
 (** [percentile t p] computes the p-th percentile (0.0 to 1.0) from the
     histogram by performing a cumulative scan over buckets. Returns the
@@ -87,8 +87,9 @@ let[@inline] record_with_cause t span cause_thunk =
     target cumulative count is reached — critical for large histograms
     (e.g. the cycle profiler with 100,000 buckets). *)
 let percentile t p =
-  if t.samples = 0 then 0.0
-  else
+  if t.samples = 0
+  then 0.0
+  else (
     let target = int_of_float (ceil (float t.samples *. p)) in
     let cumulative = ref 0 in
     let i = ref 0 in
@@ -96,7 +97,8 @@ let percentile t p =
       cumulative := !cumulative + t.buckets.(!i);
       if !cumulative < target then incr i
     done;
-    float (!i * t.bucket_us)
+    float (!i * t.bucket_us))
+;;
 
 (** [reset t] zeroes all histogram buckets and resets sample/overflow counters. *)
 let reset t =
@@ -105,15 +107,13 @@ let reset t =
   t.overflow <- 0;
   t.max_latency_us <- 0;
   t.max_cause <- None
+;;
 
 (** [report ?sample_threshold t] logs the current percentile distribution
     if at least [sample_threshold] samples have been collected. Includes
     overflow count in the log output when overflow is nonzero. Resets the
     profiler state after reporting. *)
-let report ?(sample_threshold=1) t =
-  if t.samples >= sample_threshold then (
-    reset t
-  )
+let report ?(sample_threshold = 1) t = if t.samples >= sample_threshold then reset t
 
 (** [time_it t f] measures the wall-clock execution time of [f ()],
     records the resulting span in the profiler, and returns the result of [f]. *)
@@ -124,36 +124,46 @@ let time_it t f =
   let span = Span.of_uint64_ns (Int64.sub stop start) in
   record t span;
   res
+;;
 
 (** Read-only snapshot of percentile data. Computed without mutating
     the profiler state, so it does not interfere with the periodic
     report-and-reset cycle. *)
-type snapshot = {
-  name: string;     (* Profiler instance name. *)
-  p50: float;       (* 50th percentile in microseconds. *)
-  p90: float;       (* 90th percentile in microseconds. *)
-  p95: float;       (* 95th percentile in microseconds. *)
-  p99: float;       (* 99th percentile in microseconds. *)
-  p999: float;      (* 99.9th percentile in microseconds. *)
-  samples: int;     (* Total samples at snapshot time. *)
-  overflow: int;    (* Overflow count at snapshot time. *)
-  max_cause: string option; (* Cause of the max latency in this window. *)
-}
+type snapshot =
+  { name : string (* Profiler instance name. *)
+  ; p50 : float (* 50th percentile in microseconds. *)
+  ; p90 : float (* 90th percentile in microseconds. *)
+  ; p95 : float (* 95th percentile in microseconds. *)
+  ; p99 : float (* 99th percentile in microseconds. *)
+  ; p999 : float (* 99.9th percentile in microseconds. *)
+  ; samples : int (* Total samples at snapshot time. *)
+  ; overflow : int (* Overflow count at snapshot time. *)
+  ; max_cause : string option (* Cause of the max latency in this window. *)
+  }
 
 (** [snapshot prof] returns [Some snapshot] with current percentile values,
     or [None] if no samples have been recorded. Does not reset the profiler. *)
 let snapshot (prof : t) : snapshot option =
-  if prof.samples = 0 then None
-  else
+  if prof.samples = 0
+  then None
+  else (
     let p50 = percentile prof 0.50 in
     let p90 = percentile prof 0.90 in
     let p95 = percentile prof 0.95 in
     let p99 = percentile prof 0.99 in
     let p999 = percentile prof 0.999 in
-    Some { name = prof.name; p50; p90; p95; p99; p999;
-           samples = prof.samples; overflow = prof.overflow;
-           max_cause = prof.max_cause }
+    Some
+      { name = prof.name
+      ; p50
+      ; p90
+      ; p95
+      ; p99
+      ; p999
+      ; samples = prof.samples
+      ; overflow = prof.overflow
+      ; max_cause = prof.max_cause
+      })
+;;
 
 (** [name t] returns the profiler instance identifier. *)
 let name t = t.name
-

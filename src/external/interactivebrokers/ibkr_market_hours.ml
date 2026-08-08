@@ -28,30 +28,76 @@ let us_eastern_offset_hours () =
   let year = tm.Unix.tm_year + 1900 in
   (* Second Sunday in March: find day-of-week of March 1,
      then compute the date of the second Sunday. *)
-  let march_1 = fst (Unix.mktime { tm with
-    Unix.tm_mon = 2; tm_mday = 1; tm_hour = 7; tm_min = 0; tm_sec = 0;
-    tm_wday = 0; tm_yday = 0; tm_isdst = false }) in
+  let march_1 =
+    fst
+      (Unix.mktime
+         { tm with
+           Unix.tm_mon = 2
+         ; tm_mday = 1
+         ; tm_hour = 7
+         ; tm_min = 0
+         ; tm_sec = 0
+         ; tm_wday = 0
+         ; tm_yday = 0
+         ; tm_isdst = false
+         })
+  in
   let march_1_tm = Unix.gmtime march_1 in
-  let march_1_wday = march_1_tm.Unix.tm_wday in  (* 0=Sun *)
+  let march_1_wday = march_1_tm.Unix.tm_wday in
+  (* 0=Sun *)
   let first_sun = if march_1_wday = 0 then 1 else 8 - march_1_wday in
   let second_sun = first_sun + 7 in
   (* DST starts at 2:00 AM EST = 7:00 AM UTC on second Sunday of March *)
-  let dst_start = fst (Unix.mktime { tm with
-    Unix.tm_mon = 2; tm_mday = second_sun; tm_hour = 7; tm_min = 0; tm_sec = 0;
-    tm_wday = 0; tm_yday = 0; tm_isdst = false }) in
+  let dst_start =
+    fst
+      (Unix.mktime
+         { tm with
+           Unix.tm_mon = 2
+         ; tm_mday = second_sun
+         ; tm_hour = 7
+         ; tm_min = 0
+         ; tm_sec = 0
+         ; tm_wday = 0
+         ; tm_yday = 0
+         ; tm_isdst = false
+         })
+  in
   (* First Sunday in November *)
-  let nov_1 = fst (Unix.mktime { tm with
-    Unix.tm_mon = 10; tm_mday = 1; tm_hour = 6; tm_min = 0; tm_sec = 0;
-    tm_wday = 0; tm_yday = 0; tm_isdst = false }) in
+  let nov_1 =
+    fst
+      (Unix.mktime
+         { tm with
+           Unix.tm_mon = 10
+         ; tm_mday = 1
+         ; tm_hour = 6
+         ; tm_min = 0
+         ; tm_sec = 0
+         ; tm_wday = 0
+         ; tm_yday = 0
+         ; tm_isdst = false
+         })
+  in
   let nov_1_tm = Unix.gmtime nov_1 in
   let nov_1_wday = nov_1_tm.Unix.tm_wday in
   let first_sun_nov = if nov_1_wday = 0 then 1 else 8 - nov_1_wday in
   (* DST ends at 2:00 AM EDT = 6:00 AM UTC on first Sunday of November *)
-  let dst_end = fst (Unix.mktime { tm with
-    Unix.tm_mon = 10; tm_mday = first_sun_nov; tm_hour = 6; tm_min = 0; tm_sec = 0;
-    tm_wday = 0; tm_yday = 0; tm_isdst = false }) in
+  let dst_end =
+    fst
+      (Unix.mktime
+         { tm with
+           Unix.tm_mon = 10
+         ; tm_mday = first_sun_nov
+         ; tm_hour = 6
+         ; tm_min = 0
+         ; tm_sec = 0
+         ; tm_wday = 0
+         ; tm_yday = 0
+         ; tm_isdst = false
+         })
+  in
   ignore year;
   if t >= dst_start && t < dst_end then -4 else -5
+;;
 
 (** Calculates the current day of the week, hour, and minute localized to US Eastern Time based on the current UTC timestamp and daylight saving adjustments. *)
 let current_eastern_time () =
@@ -59,10 +105,12 @@ let current_eastern_time () =
   let offset = us_eastern_offset_hours () in
   let eastern_t = t +. (float_of_int offset *. 3600.0) in
   let tm = Unix.gmtime eastern_t in
-  (tm.Unix.tm_wday, tm.Unix.tm_hour, tm.Unix.tm_min)
+  tm.Unix.tm_wday, tm.Unix.tm_hour, tm.Unix.tm_min
+;;
 
 (** Defines the operational hour and minute boundaries for the extended US equity trading session, spanning from 4:00 AM to 8:00 PM Eastern Time. *)
 let extended_open_hour = 4
+
 let extended_open_min = 0
 let extended_close_hour = 20
 let extended_close_min = 0
@@ -71,103 +119,120 @@ let extended_close_min = 0
     Returns [true] between 9:30 AM and 4:00 PM Eastern Time on weekdays.
     This precise window directs the dashboard UI to flag trading logic as active (▶) or paused (⏸). *)
 let is_regular_market_open () =
-  let (wday, hour, min) = current_eastern_time () in
+  let wday, hour, min = current_eastern_time () in
   let is_weekday = wday >= 1 && wday <= 5 in
-  if not is_weekday then false
-  else
-    let time_mins = hour * 60 + min in
-    let open_mins = 9 * 60 + 30 in
+  if not is_weekday
+  then false
+  else (
+    let time_mins = (hour * 60) + min in
+    let open_mins = (9 * 60) + 30 in
     let close_mins = 16 * 60 in
-    time_mins >= open_mins && time_mins < close_mins
+    time_mins >= open_mins && time_mins < close_mins)
+;;
 
 (** Evaluates the current system time against the predefined US equity extended trading schedule.
     Returns [true] if the current time resides within the 4:00 AM to 8:00 PM Eastern Time window on a weekday,
     indicating that the Interactive Brokers gateway is expected to accept connection and routing requests. *)
 let is_market_open () =
-  let (wday, hour, min) = current_eastern_time () in
+  let wday, hour, min = current_eastern_time () in
   (* Monday=1 through Friday=5; Saturday=6, Sunday=0 *)
   let is_weekday = wday >= 1 && wday <= 5 in
-  if not is_weekday then false
-  else
-    let time_mins = hour * 60 + min in
-    if !paper_mode then
+  if not is_weekday
+  then false
+  else (
+    let time_mins = (hour * 60) + min in
+    if !paper_mode
+    then (
       (* Paper mode: restrict to regular trading hours only.
          IB Gateway paper does not support pre-market/after-hours trading
          and may not accept connections outside RTH. *)
-      let rth_open = 9 * 60 + 30 in
+      let rth_open = (9 * 60) + 30 in
       let rth_close = 16 * 60 in
-      time_mins >= rth_open && time_mins < rth_close
-    else
-      let open_mins = extended_open_hour * 60 + extended_open_min in
-      let close_mins = extended_close_hour * 60 + extended_close_min in
-      time_mins >= open_mins && time_mins < close_mins
+      time_mins >= rth_open && time_mins < rth_close)
+    else (
+      let open_mins = (extended_open_hour * 60) + extended_open_min in
+      let close_mins = (extended_close_hour * 60) + extended_close_min in
+      time_mins >= open_mins && time_mins < close_mins))
+;;
 
 (** Calculates the precise duration in seconds until the commencement of the next valid trading session.
     In paper mode, targets 9:30 AM ET (regular trading hours). In live mode, targets 4:00 AM ET (extended hours).
     If the market is currently evaluated as open, this function returns 0.0. The calculation comprehensively accounts
     for weekend rollovers and time zone offsets. *)
 let seconds_until_next_open () =
-  if is_market_open () then 0.0
-  else begin
+  if is_market_open ()
+  then 0.0
+  else (
     let t = Unix.gettimeofday () in
     let offset = us_eastern_offset_hours () in
     let eastern_t = t +. (float_of_int offset *. 3600.0) in
     let tm = Unix.gmtime eastern_t in
     let wday = tm.Unix.tm_wday in
-    let time_mins = tm.Unix.tm_hour * 60 + tm.Unix.tm_min in
+    let time_mins = (tm.Unix.tm_hour * 60) + tm.Unix.tm_min in
     let target_open_hour, target_open_min =
-      if !paper_mode then (9, 30)
-      else (extended_open_hour, extended_open_min)
+      if !paper_mode then 9, 30 else extended_open_hour, extended_open_min
     in
-    let open_mins = target_open_hour * 60 + target_open_min in
-
+    let open_mins = (target_open_hour * 60) + target_open_min in
     (* How many days until the next weekday open? *)
     let days_ahead =
-      if wday >= 1 && wday <= 5 then begin
+      if wday >= 1 && wday <= 5
+      then
         (* Weekday: if before open today, 0 days; if after close, next day *)
-        if time_mins < open_mins then 0
-        else if wday = 5 then 3  (* Friday after close → Monday *)
+        if time_mins < open_mins
+        then 0
+        else if wday = 5
+        then 3 (* Friday after close → Monday *)
         else 1
-      end else if wday = 6 then 2  (* Saturday → Monday *)
-      else 1  (* Sunday → Monday *)
+      else if wday = 6
+      then 2 (* Saturday → Monday *)
+      else 1 (* Sunday → Monday *)
     in
-
     (* Compute the target open time in UTC *)
     let target_eastern_midnight =
       (* Truncate to midnight eastern *)
-      let today_midnight = eastern_t -. (float_of_int (tm.Unix.tm_hour * 3600 + tm.Unix.tm_min * 60 + tm.Unix.tm_sec)) in
+      let today_midnight =
+        eastern_t
+        -. float_of_int ((tm.Unix.tm_hour * 3600) + (tm.Unix.tm_min * 60) + tm.Unix.tm_sec)
+      in
       today_midnight +. (float_of_int days_ahead *. 86400.0)
     in
-    let target_open_eastern = target_eastern_midnight +. (float_of_int (target_open_hour * 3600 + target_open_min * 60)) in
+    let target_open_eastern =
+      target_eastern_midnight
+      +. float_of_int ((target_open_hour * 3600) + (target_open_min * 60))
+    in
     (* Convert back to UTC *)
     let target_open_utc = target_open_eastern -. (float_of_int offset *. 3600.0) in
     let delta = target_open_utc -. t in
     (* Safety: never return negative; minimum 1 second *)
-    Float.max delta 1.0
-  end
+    Float.max delta 1.0)
+;;
 
 (** Generates an exact, human-readable string representation of the current US equity market session status.
     This output is utilized by the telemetry and logging systems to provide clear operational context regarding
     pre-market, regular, after-hours, or closed states. *)
 let market_status_string () =
-  let (wday, hour, min) = current_eastern_time () in
+  let wday, hour, min = current_eastern_time () in
   let is_weekday = wday >= 1 && wday <= 5 in
-  if not is_weekday then "closed (weekend)"
-  else begin
-    let time_mins = hour * 60 + min in
-    let open_mins = extended_open_hour * 60 + extended_open_min in
-    let close_mins = extended_close_hour * 60 + extended_close_min in
-    if time_mins < open_mins then
-      Printf.sprintf "closed (pre-market opens at %d:%02d ET)" extended_open_hour extended_open_min
-    else if time_mins >= close_mins then
-      "closed (after hours ended)"
-    else if hour < 9 || (hour = 9 && min < 30) then
-      "open (pre-market)"
-    else if hour >= 16 then
-      "open (after-hours)"
-    else
-      "open (regular hours)"
-  end
+  if not is_weekday
+  then "closed (weekend)"
+  else (
+    let time_mins = (hour * 60) + min in
+    let open_mins = (extended_open_hour * 60) + extended_open_min in
+    let close_mins = (extended_close_hour * 60) + extended_close_min in
+    if time_mins < open_mins
+    then
+      Printf.sprintf
+        "closed (pre-market opens at %d:%02d ET)"
+        extended_open_hour
+        extended_open_min
+    else if time_mins >= close_mins
+    then "closed (after hours ended)"
+    else if hour < 9 || (hour = 9 && min < 30)
+    then "open (pre-market)"
+    else if hour >= 16
+    then "open (after-hours)"
+    else "open (regular hours)")
+;;
 
 (** Dispatches an informational log entry detailing the current market session status and the calculated time
     until the next trading window. This operation is typically invoked during system initialization and upon successful
@@ -175,8 +240,13 @@ let market_status_string () =
 let log_market_status () =
   let status = market_status_string () in
   let secs = seconds_until_next_open () in
-  if secs > 0.0 then begin
+  if secs > 0.0
+  then (
     let hours = secs /. 3600.0 in
-    Logging.info_f ~section "US equity market status: %s (next open in %.1f hours)" status hours
-  end else
-    Logging.info_f ~section "US equity market status: %s" status
+    Logging.info_f
+      ~section
+      "US equity market status: %s (next open in %.1f hours)"
+      status
+      hours)
+  else Logging.info_f ~section "US equity market status: %s" status
+;;

@@ -12,10 +12,10 @@
     such as shutdown or snapshot completion.
 *)
 
-type symbol_sync = {
-  mutex: Mutex.t;
-  condition: Condition.t;
-}
+type symbol_sync =
+  { mutex : Mutex.t
+  ; condition : Condition.t
+  }
 
 (** Mutex protecting ONLY the creation of new symbol_sync records.
     Not held during wait/signal. *)
@@ -31,16 +31,18 @@ let[@inline] get_sync symbol =
   match Hashtbl.find_opt syncs symbol with
   | Some s -> s
   | None ->
-      Mutex.lock registry_mutex;
-      let s = match Hashtbl.find_opt syncs symbol with
-        | Some s -> s
-        | None ->
-            let s = { mutex = Mutex.create (); condition = Condition.create () } in
-            Hashtbl.add syncs symbol s;
-            s
-      in
-      Mutex.unlock registry_mutex;
-      s
+    Mutex.lock registry_mutex;
+    let s =
+      match Hashtbl.find_opt syncs symbol with
+      | Some s -> s
+      | None ->
+        let s = { mutex = Mutex.create (); condition = Condition.create () } in
+        Hashtbl.add syncs symbol s;
+        s
+    in
+    Mutex.unlock registry_mutex;
+    s
+;;
 
 (** Signals the condition variable for [symbol], waking the domain worker
     blocked on that symbol. Acquires and releases ONLY the per-symbol mutex. *)
@@ -49,6 +51,7 @@ let signal ~symbol =
   Mutex.lock sync.mutex;
   Condition.signal sync.condition;
   Mutex.unlock sync.mutex
+;;
 
 (** Signals all per-symbol condition variables. Used for events that require 
     waking every waiting worker, such as shutdown or snapshot completion. 
@@ -59,11 +62,13 @@ let signal_all () =
   Mutex.lock registry_mutex;
   let all_syncs = Hashtbl.fold (fun _ sync acc -> sync :: acc) syncs [] in
   Mutex.unlock registry_mutex;
-  List.iter (fun sync ->
-    Mutex.lock sync.mutex;
-    Condition.signal sync.condition;
-    Mutex.unlock sync.mutex
-  ) all_syncs
+  List.iter
+    (fun sync ->
+       Mutex.lock sync.mutex;
+       Condition.signal sync.condition;
+       Mutex.unlock sync.mutex)
+    all_syncs
+;;
 
 (** Blocks the calling domain worker until the condition variable for [symbol]
     is signaled. Acquires the per-symbol mutex, waits on the
@@ -73,3 +78,4 @@ let wait ~symbol =
   Mutex.lock sync.mutex;
   Condition.wait sync.condition sync.mutex;
   Mutex.unlock sync.mutex
+;;
