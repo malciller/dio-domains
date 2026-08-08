@@ -92,7 +92,8 @@ let json_of_grid_strategy exchange symbol =
     "accumulated_profit", `Float state.accumulated_profit;
     "reserved_base", `Float state.reserved_base;
     "reserved_quote", `Float state.reserved_quote;
-    "capital_low", `Bool (state.capital_low || market_is_closed);
+    "capital_low", `Bool state.capital_low;
+    "market_is_closed", `Bool market_is_closed;
     "asset_low", `Bool state.asset_low;
     "inflight_buy", `Bool state.inflight_buy;
     "inflight_sell", `Bool state.inflight_sell;
@@ -123,7 +124,8 @@ let json_of_mm_strategy exchange symbol =
       `Assoc ["id", `String oid; "price", `Float price; "qty", `Float qty]
     ) state.open_sell_orders);
     "sell_count", `Int (List.length state.open_sell_orders);
-    "capital_low", `Bool (state.capital_low || market_is_closed);
+    "capital_low", `Bool state.capital_low;
+    "market_is_closed", `Bool market_is_closed;
     "asset_low", `Bool state.asset_low;
     "inflight_buy", `Bool state.inflight_buy;
     "inflight_sell", `Bool state.inflight_sell;

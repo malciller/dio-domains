@@ -263,8 +263,11 @@ let render_strategies ?(selected_index=None) w json =
 
     let gauge_img = render_proximity_slider 17 execution_proximity_opt in
 
+    let market_is_closed = strat |?> "market_is_closed" |> to_bool_d false in
     let status_str, status_attr =
-      if cap_low then "⏸", a_yellow else "▶", a_green
+      if cap_low then "⏸", a_yellow
+      else if market_is_closed then "💤", a_yellow
+      else "▶", a_green
     in
 
     let exch_tag = exch_tag_of exchange in
