@@ -38,6 +38,10 @@ type config =
   ; gc : gc_config option
   ; trading : trading_config list
   ; fng_check_threshold : float
+  ; latency_window_seconds : float
+    (** Duration of each per-domain latency accumulation window before the
+        histogram is snapshotted and reset. Shorter windows make the dashboard
+        percentiles move faster but reduce sample counts per window. *)
   }
 
 (** Logging section identifier for this module. *)
@@ -48,6 +52,7 @@ let known_top_level_keys =
   [ "logging_level"
   ; "logging_sections"
   ; "cycle_mod"
+  ; "latency_window_seconds"
   ; "engine"
   ; "trading"
   ; "gc"
@@ -403,7 +408,13 @@ let read_config () : config =
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_option |> Option.value ~default:1.5
     in
-    { cycle_mod; logging; gc; trading; fng_check_threshold }
+    let latency_window_seconds =
+      json
+      |> member "latency_window_seconds"
+      |> to_float_option
+      |> Option.value ~default:5.0
+    in
+    { cycle_mod; logging; gc; trading; fng_check_threshold; latency_window_seconds }
   with
   | Yojson.Json_error msg ->
     Logging.critical_f ~section "Failed to parse config.json: %s" msg;
@@ -415,6 +426,7 @@ let read_config () : config =
     ; gc = None
     ; trading = []
     ; fng_check_threshold = 1.5
+    ; latency_window_seconds = 5.0
     }
 ;;
 

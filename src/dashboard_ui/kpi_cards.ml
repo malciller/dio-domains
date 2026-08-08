@@ -60,9 +60,9 @@ let render_kpi_cards w json =
     | _ -> []
   in
   let all_balances = json |?> "all_balances" |> to_list_d in
-  let total_hold_strats, total_accum_strats, active_count =
+  let total_hold_strats, total_accum_strats =
     List.fold_left
-      (fun (hv_acc, av_acc, cnt) (_sym, data) ->
+      (fun (hv_acc, av_acc) (_sym, data) ->
          let market = data |?> "market" in
          let bid = market |?> "bid" |> to_float_d 0.0 in
          let ask = market |?> "ask" |> to_float_d 0.0 in
@@ -77,8 +77,8 @@ let render_kpi_cards w json =
              sell_orders
          in
          let accum_qty = max 0.0 (base_bal -. pending_sell_qty) in
-         hv_acc +. (base_bal *. mid), av_acc +. (accum_qty *. mid), cnt + 1)
-      (0.0, 0.0, 0)
+         hv_acc +. (base_bal *. mid), av_acc +. (accum_qty *. mid))
+      (0.0, 0.0)
       strats
   in
   let total_hold_bals, total_accum_bals, total_quote_val =
@@ -128,33 +128,67 @@ let render_kpi_cards w json =
   let card1 = "PORTFOLIO", c1_row1, c1_row2 in
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
   let recent_fills = json |?> "recent_fills" |> to_list_d in
-  let c2_row1 =
-    I.hcat
-      [ col 10 a_dim "STRATEGIES"
-      ; col_right 12 a_green (Printf.sprintf "%d active" active_count)
-      ]
-  in
-  let c2_row2 =
-    I.hcat
-      [ col 10 a_dim "UPTIME   "
-      ; col_right
-          12
-          a_text
-          (format_duration uptime
-           ^ " │ "
-           ^ string_of_int (List.length recent_fills)
-           ^ " fills")
-      ]
-  in
-  let card2 = "SYSTEM ENGINE", c2_row1, c2_row2 in
   let lats =
     match json |?> "latencies" with
     | `Assoc l -> l
     | _ -> []
   in
-  let cycle_p50, cycle_p99 =
+  let snapshot_ts = json |?> "timestamp" |> to_float_d 0.0 in
+  (* Strategy activity from consistent windows: active = ran this window,
+     idle = running (fresh cycle window) but executed nothing (S1/S2). *)
+  let strat_active, strat_idle, exec_per_sec =
     List.fold_left
-      (fun (p50_acc, p99_acc) (_sym, metrics) ->
+      (fun (a, i, e) (_sym, metrics) ->
+         let mlist =
+           match metrics with
+           | `Assoc l -> l
+           | _ -> []
+         in
+         match List.assoc_opt "strategy" mlist with
+         | Some data ->
+           let window_end = data |?> "window_end" |> to_float_d 0.0 in
+           let fresh =
+             window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 15.0
+           in
+           if not fresh
+           then a, i, e
+           else (
+             let execs = data |?> "executions" |> to_int_d 0 in
+             let eps = data |?> "executions_per_sec" |> to_float_d 0.0 in
+             if execs > 0 then a + 1, i, e +. eps else a, i + 1, e)
+         | None -> a, i, e)
+      (0, 0, 0.0)
+      lats
+  in
+  let c2_row1 =
+    I.hcat
+      [ col 10 a_dim "STRATEGIES"
+      ; col_right
+          20
+          a_green
+          (Printf.sprintf "%d active / %d idle" strat_active strat_idle)
+      ]
+  in
+  let c2_row2 =
+    I.hcat
+      [ col 10 a_dim "UPTIME"
+      ; col_right
+          28
+          a_text
+          (format_duration uptime
+           ^ " │ "
+           ^ string_of_int (List.length recent_fills)
+           ^ " fills │ "
+           ^ Printf.sprintf "%.1f/s" exec_per_sec)
+      ]
+  in
+  let card2 = "SYSTEM ENGINE", c2_row1, c2_row2 in
+  (* Aggregate over consistent windows (F6): consider only domains whose cycle
+     window is fresh and non-empty, then take the median p50/p99 so a single
+     pathological domain can no longer drive the whole card. *)
+  let fresh_p50s, fresh_p99s =
+    List.fold_left
+      (fun (p50s, p99s) (_sym, metrics) ->
          let mlist =
            match metrics with
            | `Assoc l -> l
@@ -162,13 +196,28 @@ let render_kpi_cards w json =
          in
          match List.assoc_opt "cycle" mlist with
          | Some data ->
-           let p50 = data |?> "p50" |> to_float_d 0.0 in
-           let p99 = data |?> "p99" |> to_float_d 0.0 in
-           max p50_acc p50, max p99_acc p99
-         | None -> p50_acc, p99_acc)
-      (0.0, 0.0)
+           let window_end = data |?> "window_end" |> to_float_d 0.0 in
+           let samples = data |?> "samples" |> to_int_d 0 in
+           let fresh =
+             window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 15.0
+           in
+           if fresh && samples > 0
+           then (
+             let p50 = data |?> "p50" |> to_float_d 0.0 in
+             let p99 = data |?> "p99" |> to_float_d 0.0 in
+             p50 :: p50s, p99 :: p99s)
+           else p50s, p99s
+         | None -> p50s, p99s)
+      ([], [])
       lats
   in
+  let median lst =
+    match List.sort Float.compare lst with
+    | [] -> 0.0
+    | sorted -> List.nth sorted (List.length sorted / 2)
+  in
+  let cycle_p50 = median fresh_p50s in
+  let cycle_p99 = median fresh_p99s in
   let lat_attr p = if p > 100.0 then a_red else if p > 50.0 then a_yellow else a_green in
   let c3_row1 =
     I.hcat

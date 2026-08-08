@@ -5,7 +5,7 @@
 (generate_opam_files true)
 
 (source
- (github malciller/dio))
+ (github malciller/dio-domains))
 
 (authors "Cal Miller <malciller@gmail.com>")
 

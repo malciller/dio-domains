@@ -334,6 +334,29 @@ let asset_domain_worker
     let { prof_ob; prof_exec; prof_strategy; prof_cycle } =
       get_domain_profilers asset_with_fees.symbol
     in
+    (* Rolling latency window: publish + reset each profiler every
+       [latency_window_seconds] so the dashboard reads fresh, moving
+       percentiles instead of multi-minute accumulations with abrupt wipes
+       (F1/F4). Publishing swaps an immutable snapshot into an Atomic cell,
+       so the dashboard never scans a histogram being mutated by this domain. *)
+    let latency_window_seconds = config.latency_window_seconds in
+    let last_window_time = ref (Unix.gettimeofday ()) in
+    let publish_windows () =
+      ignore (Latency_profiler.snapshot_and_reset prof_ob);
+      ignore (Latency_profiler.snapshot_and_reset prof_exec);
+      ignore (Latency_profiler.snapshot_and_reset prof_strategy);
+      ignore (Latency_profiler.snapshot_and_reset prof_cycle)
+    in
+    (* Publish an initial empty window so the dashboard renders this domain as
+       idle immediately rather than after the first window elapses, and clears
+       any stale snapshot left by a previous domain incarnation. *)
+    publish_windows ();
+    last_window_time := Unix.gettimeofday ();
+    (* Cache the equity market-hours evaluation (~1s TTL). The underlying check
+       does gmtime+mktime+DST math per call (alpaca_market_hours.ml:11-105);
+       evaluating it on every hot ibkr/alpaca cycle inflated the cycle latency
+       profile (F7). *)
+    let mh_cache = ref (None : (float * bool) option) in
     (* Cache strategy state references to avoid repeated mutex acquisition
          on the hot path. References are stable while is_running is true. *)
     let cached_grid_state =
@@ -668,9 +691,21 @@ let asset_domain_worker
            error 354 (no market data), but our in-memory state already recorded
            the amend as successful — causing an infinite amend spam loop. *)
       let equity_market_closed =
-        (asset_with_fees.exchange = "ibkr" && not (Ibkr.Market_hours.is_market_open ()))
-        || (asset_with_fees.exchange = "alpaca"
-            && not (Alpaca.Market_hours.is_market_open ()))
+        match asset_with_fees.exchange with
+        | "ibkr" | "alpaca" ->
+          let now_mh = Unix.gettimeofday () in
+          (match !mh_cache with
+           | Some (t, closed) when now_mh -. t < 1.0 -> closed
+           | _ ->
+             let closed =
+               (asset_with_fees.exchange = "ibkr"
+                && not (Ibkr.Market_hours.is_market_open ()))
+               || (asset_with_fees.exchange = "alpaca"
+                   && not (Alpaca.Market_hours.is_market_open ()))
+             in
+             mh_cache := Some (now_mh, closed);
+             closed)
+        | _ -> false
       in
       let should_execute =
         !exec_ready
@@ -792,6 +827,10 @@ let asset_domain_worker
         (* Compute wall-clock timestamp once per cycle for strategy use,
              eliminating Unix.time/gettimeofday syscalls inside the strategy. *)
         let now = Unix.gettimeofday () in
+        (* Count this strategy invocation as an activity tick so the dashboard
+             can report executions/sec and last-execution time even when the
+             window's latency sample count is zero (S2). *)
+        Latency_profiler.tick_exec prof_strategy ~now;
         (match !grid_strategy_asset_ref, cached_grid_state with
          | Some asset, Some cs ->
            Dio_strategies.Suicide_grid.Strategy.execute
@@ -842,13 +881,13 @@ let asset_domain_worker
         | Some _ ->
           Dio_strategies.Suicide_grid.Strategy.flush_persistence asset_with_fees.symbol
         | None -> ());
-      (* Periodic cycle statistics (gated by cycle_mod) *)
-      if !cycle_count mod config.cycle_mod = 0
-      then if (not (Float.is_nan !current_price)) && not (Float.is_nan !tob_bid) then ();
       (* Record cycle work time before blocking. Captures active processing
-           latency only, excluding sleep time in Exchange_wakeup.wait. *)
+           latency only, excluding sleep time in Exchange_wakeup.wait.
+           Only busy cycles (real book/exec/strategy work) are recorded: idle
+           wakeups would otherwise pin cycle p50/p99 at 0us (F2). *)
+      let cycle_busy = did_ob || did_exec || should_execute in
       let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
-      if latency_this_cycle
+      if latency_this_cycle && cycle_busy
       then (
         let gc_end = Gc_monitor.get_stats () in
         let cause_thunk () =
@@ -863,14 +902,14 @@ let asset_domain_worker
             gc_str
         in
         Latency_profiler.record_with_cause prof_cycle cycle_span cause_thunk);
-      (* Flush latency reports periodically, gated by cycle_mod to avoid
-           5 threshold checks per cycle on the hot path. *)
-      if !cycle_count mod config.cycle_mod = 0
+      (* Roll the latency window on a fixed time cadence rather than a cycle
+           count: at typical domain cycle rates the old cycle_mod gate (10000
+           cycles) accumulated minutes of samples before an abrupt wipe (F1). *)
+      let now_flush = Unix.gettimeofday () in
+      if now_flush -. !last_window_time >= latency_window_seconds
       then (
-        Latency_profiler.report ~sample_threshold:1 prof_ob;
-        Latency_profiler.report ~sample_threshold:1 prof_exec;
-        Latency_profiler.report ~sample_threshold:1 prof_strategy;
-        Latency_profiler.report ~sample_threshold:1 prof_cycle);
+        last_window_time := now_flush;
+        publish_windows ());
       (* Block until the next websocket frame signals new data or until data is ready.
            Use cached has_exec_fn closure instead of Ex.has_execution_data to
            avoid Hashtbl lookup on the hot blocking path. *)
@@ -1151,32 +1190,29 @@ let clear_domain_registry () =
   Mutex.unlock registry_mutex
 ;;
 
-(** Return non-destructive latency profiler snapshots for all domains.
+(** Return latency profiler snapshots for all domains from their most
+    recently completed windows.
     Result type: (symbol, [(label, snapshot option)]) list.
-    Safe to call from the dashboard; does not reset profiler data.
+    Safe to call from the dashboard; does not touch live profiler state.
 
-    Implementation: snapshots profiler references under profiler_cache_mutex
-    in O(N) then computes percentiles outside the lock. This prevents the
-    dashboard from blocking domain workers (which acquire the same mutex
-    in get_domain_profilers) during the O(bucket_count) percentile scans. *)
+    Reads the immutable snapshots published by each domain's rolling window
+    via [Latency_profiler.published_snapshot] — a lock-free [Atomic.get].
+    No percentile scan runs against a histogram that the domain thread is
+    concurrently mutating, which eliminates the torn-read race between the
+    dashboard and the domain writer (F4). *)
 let get_domain_profiler_snapshots () =
-  (* Phase 1: snapshot profiler references under mutex (fast, O(N) pointer copies). *)
   Mutex.lock profiler_cache_mutex;
   let profiler_refs =
     Hashtbl.fold (fun symbol profs acc -> (symbol, profs) :: acc) domain_profiler_cache []
   in
   Mutex.unlock profiler_cache_mutex;
-  (* Phase 2: compute percentiles outside mutex (slow, O(bucket_count) per percentile).
-     Profiler.snapshot reads only immutable-ish fields (samples, buckets array)
-     that are monotonically updated by a single domain writer. Reading stale
-     counts is harmless — the next snapshot will pick up the latest values. *)
   List.map
     (fun (symbol, profs) ->
        let snaps =
-         [ "orderbook", Latency_profiler.snapshot profs.prof_ob
-         ; "execution", Latency_profiler.snapshot profs.prof_exec
-         ; "strategy", Latency_profiler.snapshot profs.prof_strategy
-         ; "cycle", Latency_profiler.snapshot profs.prof_cycle
+         [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
+         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
+         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
          ]
        in
        symbol, snaps)

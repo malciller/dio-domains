@@ -454,6 +454,10 @@ perp short; spot sell fills close it. Enable with `"hedge": true`.
 
 Standalone TUI dashboard (`bin/dashboard.exe`) connecting to the
 engine via Unix domain socket at `/var/run/dio/dashboard.sock`.
+It renders the engine's JSON state stream (~20 FPS) as a live
+terminal UI with two views: the **Main Dashboard** (all assets,
+portfolio, engine health) and a per-asset **Detail View** (L2 depth,
+15-minute price history, and order pins).
 
 ### Usage
 
@@ -469,18 +473,149 @@ docker run --rm -it -v dio-sock:/var/run/dio dio dio-dashboard
 > Do not use `docker exec -it` for the dashboard — it keeps the PTY
 > alive after SSH disconnects, leaving zombie connections.
 
-### Panels
+If the socket is unavailable, the dashboard shows a "Waiting for
+engine..." screen and auto-reconnects. When multiple engine sockets
+are detected (e.g. stale `/tmp/dio-*.sock` files) it tries the newest
+first.
 
-| Panel | Description |
-|-------|-------------|
-| **Header** | Uptime, Fear & Greed index, per-exchange connectivity |
-| **Memory & GC** | Heap size, live/free KB, major/minor collections |
-| **Holdings & Strategy** | Balances, mid-price, accumulated holdings, pending orders, portfolio summary |
-| **Latency Profiling** | Per-domain p50/p90/p99/p999 in microseconds |
-| **Domains** | Running/stopped status, restart count, last restart age |
+### Controls
 
-Wire protocol: 4-byte big-endian length-prefixed JSON frames. Max 5
-concurrent clients. Send `Q` to close a connection.
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` or `k` / `j` | Move selection in the strategy table |
+| `Enter` | Open the selected asset in Detail View |
+| `q` / `Q` | Quit |
+| `Esc` / `b` / `Backspace` | Return to Main Dashboard (Detail View) / quit (Main) |
+
+In **Detail View**, `←` / `→` (or `↑` / `↓`) cycle to the previous/next
+asset, `+` / `=` zoom the chart in around the mid price, and `-` / `_`
+zoom back out. Zoom is clamped so at most one order level is visible on
+each side of the mid.
+
+### Main Dashboard
+
+The main view is composed of the following sections, top to bottom:
+
+#### KPI Cards
+
+Four summary cards across the top:
+
+| Card | Information |
+|------|-------------|
+| **Portfolio** | Net worth (holdings + cash) and accumulated value (`ACCUM VAL`) across all exchanges |
+| **System Engine** | Active/idle strategy count, uptime, recent fill count, and aggregate strategy execution rate (`strat/s`) |
+| **Latency** | Aggregate cycle p50/p99 (median across domains with fresh windows). Green `<50µs`, yellow `<100µs`, red `≥100µs` |
+| **Memory / GC** | Heap size (MB) with usage bar and live ratio (%) vs. the configured `space_overhead` |
+
+#### Live Ticker
+
+A scrolling strip of mid prices for assets that are **not** active
+strategies. Entries are grouped by base asset, deduplicated by venue, and
+show the mid price plus the bid/ask spread in basis points. The spread
+is color-coded by tightness: `<5bp` (tight), `<20bp`, `<50bp`, and
+`≥50bp` (extreme).
+
+#### Holdings & Strategy
+
+The main table. One row per configured strategy, followed by a
+`balances` subsection (non-strategy assets with a positive balance) and
+a `cash` subsection (quote currencies).
+
+| Column | Meaning |
+|--------|---------|
+| **SYMBOL** | Asset symbol with venue tag |
+| **STGY** | Strategy type (`Grid` / `MM`) |
+| **ST** | Status: `▶` running, `⏸` paused (low capital or market closed), `⏹` / `$` balance row |
+| **PRICE** | Mid price (bracketed) |
+| **SPREAD** | Bid/ask spread in basis points |
+| **BUY @ / Δ BUY** | Last buy order price and its distance from mid in % |
+| **gauge** | Proximity slider showing where price sits between the nearest buy and sell levels |
+| **Δ SELL / SELL @** | Closest sell distance (%) and price |
+| **SELLS / SELL VAL** | Open sell count and total pending sell value (unrealized) |
+| **HOLD QTY / HOLD VAL** | Total base balance and its value at mid |
+| **ACCUM QTY / ACCUM VAL** | Accumulated (non-committed) quantity and value — retained DCA/reserved base |
+
+Rows flash green when price is within ~0.25% of the buy level and
+magenta near a sell level. A row whose `capital_low` flag is set renders
+paused (`⏸`). A summary bar at the bottom shows `Cash`, `Accum Val`,
+`Hold Val`, and `Sell Val` totals.
+
+#### Recent Fills
+
+A scrolling feed of the last 50 fills from the engine's fill event
+bus, in the form `Xs ago SYMBOL BUY/SELL amount @ price`. Buys render
+green, sells red, with venue-colored symbols.
+
+#### Memory & GC
+
+Engine-wide OCaml GC stats:
+
+| Field | Meaning |
+|-------|---------|
+| **HEAP** | Major heap size (MB) with a bar relative to the max seen this session |
+| **LIVE / FREE** | Live and free heap words (KB) |
+| **MAJOR / MINOR / COMPACT / FRAGS** | Major/minor collection counts, compactions, and heap fragments |
+| **PRESSURE** | Two-row sparkline of live-ratio normalized against the expected ratio from `space_overhead`. Green ≤100%, yellow ≤125%, red above |
+
+#### Engine Latency
+
+Per-domain latency profiling for the four internal stages:
+
+| Metric | What it measures | Thresholds (µs) |
+|--------|------------------|-----------------|
+| **CYCLE** | Full busy wakeup-to-sleep cycle (work time only) | 50 / 100 |
+| **OB** | Orderbook ring-buffer consumption | 10 / 30 |
+| **STRAT** | Grid/MM strategy execution | 30 / 75 |
+| **EXEC** | Execution event consumption | 50 / 150 |
+
+Each row shows p50/p99/p999 in µs, a **trend** sparkline (EMA-smoothed
+cycle p99 over the last 15 windows), the **spike cause** tags for the
+window's max latency (`[OB]`, `[STRAT]`, `[EXEC:n]`, `[GC:MAJ]`,
+`[GC:MIN]`, allocation words), and the strategy rate in **strat/s**.
+Idle windows render as `idle`; domains whose cycle window is stale
+(>15s) drop out of the list.
+
+> [!NOTE]
+> These measure **internal processing latency only** — the CPU time the
+> engine spends per stage. Time blocked waiting for exchange data
+> (`Exchange_wakeup.wait`) and network round-trips are excluded. The
+> `strat/s` column reflects how often the strategy actually ran per
+> window.
+
+#### Footer
+
+Uptime, the Fear & Greed index (colored by sentiment: green ≥60,
+yellow 40–60, red <40), and per-exchange connectivity dots (`◉` green
+= live bid/ask feed, red = none).
+
+### Asset Detail View
+
+Press `Enter` on a strategy row to drill into a single asset. The view
+shows, top to bottom:
+
+1. **Header bar** — asset symbol and venue.
+2. **Summary card** — strategy type, bid / mid / ask, holding quantity
+   and value, last buy/sell fill prices, quote balance, and accumulated
+   quantity/value.
+3. **L2 order book sidebar** — venue depth. Your own buy orders render
+   cyan and sell orders magenta, each flagged `★MY`. The mid row is a
+   green `▶ MID` banner with the spread; the bottom row shows the last
+   buy/sell fill. On Alpaca this pane becomes a **recent trades** feed
+   (time, price, qty, side).
+4. **Price history chart** — a 15-minute rolling window plotted with
+   subpixel braille rendering. The mid price traces green; buy order
+   levels cyan, sell levels magenta. The live mid is annotated with a
+   `◀ LIVE NOW` badge and a warm liquid-depth gradient. Order pins on
+   the right summarize qty and distance from mid (`◆ BUY`, `◆ SELL`;
+   a synthetic strategy target renders `◇ EST BUY` in yellow).
+5. **X-axis** — realtime timeline with 15m/10m/5m/now tick labels and
+   zoom indicator (`[Zoom: Nx]`).
+
+### Wire Protocol
+
+4-byte big-endian length-prefixed JSON frames. Max 5 concurrent
+clients. Client sends `W` to subscribe (watch), `P` to ping (keeps the
+connection alive), and `Q` to close a connection.
 
 ---
 
