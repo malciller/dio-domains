@@ -353,12 +353,36 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
   if has_alpaca then Alpaca.Executions.initialize alpaca_symbols;
   (* Synchronously fetch open orders before domains start to prevent duplicate placements *)
   let%lwt () =
-    if has_hyperliquid
-    then Hyperliquid.Module.fetch_open_orders_ws ()
-    else Lwt.return_unit
+    let open_orders_p =
+      if has_hyperliquid
+      then
+        Lwt.pick
+          [ (Hyperliquid.Module.fetch_open_orders_ws () >|= fun () -> `Ok)
+          ; (Lwt_unix.sleep 10.0 >|= fun () -> `Timed_out)
+          ]
+      else Lwt.return `Ok
+    in
+    match%lwt open_orders_p with
+    | `Ok -> Lwt.return_unit
+    | `Timed_out ->
+      Logging.warn_f ~section "Hyperliquid open-orders fetch timed out after 10s";
+      Lwt.return_unit
   in
   let%lwt () =
-    if has_alpaca then Alpaca.Executions.bootstrap_open_orders () else Lwt.return_unit
+    let open_orders_p =
+      if has_alpaca
+      then
+        Lwt.pick
+          [ (Alpaca.Executions.bootstrap_open_orders () >|= fun () -> `Ok)
+          ; (Lwt_unix.sleep 10.0 >|= fun () -> `Timed_out)
+          ]
+      else Lwt.return `Ok
+    in
+    match%lwt open_orders_p with
+    | `Ok -> Lwt.return_unit
+    | `Timed_out ->
+      Logging.warn_f ~section "Alpaca open-orders bootstrap timed out after 10s";
+      Lwt.return_unit
   in
   (* Step 7: Register and start remaining supervised WebSocket connections *)
   Logging.info ~section "Step 7: Starting Kraken websocket connections...";
