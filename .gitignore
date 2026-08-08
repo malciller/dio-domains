@@ -38,7 +38,7 @@ uniswap/
 # ocamlbuild and Dune default working directory
 _build/
 
-opencode/
+.opencode/
 opencode.json
 
 # ocamlbuild targets
