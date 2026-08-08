@@ -321,6 +321,7 @@ let json_of_market_data exchange symbol base_asset quote_currency =
 (* Latency profiler snapshots *)
 
 let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
+  let window_s = max 0.000001 (snap.window_end -. snap.window_start) in
   `Assoc
     [ "name", `String snap.name
     ; "p50", `Float snap.p50
@@ -329,6 +330,12 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
     ; "p999", `Float snap.p999
     ; "samples", `Int snap.samples
     ; "overflow", `Int snap.overflow
+    ; "executions", `Int snap.executions
+    ; "executions_per_sec", `Float (float snap.executions /. window_s)
+    ; ( "last_exec_time"
+      , if snap.last_exec_time > 0.0 then `Float snap.last_exec_time else `Null )
+    ; "window_start", `Float snap.window_start
+    ; "window_end", `Float snap.window_end
     ; ( "max_cause"
       , match snap.max_cause with
         | Some c -> `String c

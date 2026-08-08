@@ -5,6 +5,18 @@ let history_len = 15
 let cycle_hist = Hashtbl.create 16
 let cycle_hist_max = 64
 
+(** Exponential moving average over a history array. Smooths the windowed
+    p99 samples so the sparkline tracks trend rather than single-window noise. *)
+let ema_smooth (arr : float array) ~alpha =
+  let out = Array.copy arr in
+  let prev = ref arr.(0) in
+  for i = 1 to Array.length arr - 1 do
+    prev := (alpha *. arr.(i)) +. ((1.0 -. alpha) *. !prev);
+    out.(i) <- !prev
+  done;
+  out
+;;
+
 let update_cycle_hist symbol p99 =
   (* Evict all entries when the table grows beyond the cap.
      This is safe — sparkline history repopulates within seconds. *)
@@ -41,7 +53,11 @@ let render_latencies w json =
     | Some e when e <> "" -> e
     | _ -> ""
   in
-  (* Filter to domains that have at least one metric with samples *)
+  (* Filter to domains whose cycle window is fresh (published within the last
+     15s of the snapshot timestamp). A running domain always publishes a window
+     even with zero samples, so idle-but-running domains stay visible instead of
+     flickering out between resets (F1/S3). *)
+  let snapshot_ts = json |?> "timestamp" |> to_float_d 0.0 in
   let active_lats =
     List.filter
       (fun (_symbol, metrics) ->
@@ -50,7 +66,11 @@ let render_latencies w json =
            | `Assoc l -> l
            | _ -> []
          in
-         List.exists (fun (_label, data) -> data |?> "samples" |> to_int_d 0 > 0) mlist)
+         match List.assoc_opt "cycle" mlist with
+         | Some data ->
+           let window_end = data |?> "window_end" |> to_float_d 0.0 in
+           window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 15.0
+         | None -> false)
       lats
   in
   if active_lats = []
@@ -83,8 +103,10 @@ let render_latencies w json =
         then 1 (* yellow *)
         else 0 (* green *))
     in
-    (* Metric display order *)
-    let is_compact = w < 160 in
+    (* Metric display order. The wide layout (4 metrics) tops out at ~170
+       columns, the same intrinsic width as the HOLDINGS & STRATEGY table, so
+       the section conforms to the space the other sections occupy. *)
+    let is_compact = w < 170 in
     let metric_order =
       if is_compact
       then [ "cycle"; "execution" ]
@@ -93,51 +115,54 @@ let render_latencies w json =
     let metric_labels =
       if is_compact then [ "CYCLE"; "EXEC" ] else [ "CYCLE"; "OB"; "STRAT"; "EXEC" ]
     in
+    let metric_cell_w = 8 in
     (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
     let header_row1 =
       I.hcat
         ([ I.string a_border " │  "
-         ; col 16 a_label ""
+         ; col 13 a_label ""
          ; I.string a_border " │ "
-         ; col 15 a_label "     TREND     "
+         ; col 11 a_label "   TREND   "
          ; I.string a_border " │ "
          ]
          @ List.mapi
              (fun i lbl ->
                 let len = String.length lbl in
-                let pad = (27 - len) / 2 in
+                let pad = (24 - len) / 2 in
                 let s = String.make pad ' ' ^ lbl in
-                let img = col 27 a_label s in
+                let img = col 24 a_label s in
                 if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
              metric_labels
-         @
-         if is_compact
-         then []
-         else [ I.string a_border " │ "; col 28 a_label "         SPIKE CAUSE        " ])
+         @ [ I.string a_border " │ "
+           ; col 16 a_label "  SPIKE CAUSE  "
+           ; I.string a_border " │ "
+           ; col 7 a_label "STRAT/S"
+           ])
     in
     let header_row2 =
       I.hcat
         ([ I.string a_border " │  "
-         ; col 16 a_label "DOMAIN"
+         ; col 13 a_label "DOMAIN"
          ; I.string a_border " │ "
-         ; col 15 a_label "  (CYCLE P99)  "
+         ; col 11 a_label "(CYCLE P99)"
          ; I.string a_border " │ "
          ]
          @ List.mapi
              (fun i _lbl ->
                 let img =
                   I.hcat
-                    [ col_right 9 a_dim "p50"
-                    ; col_right 9 a_dim "p99"
-                    ; col_right 9 a_dim "p999"
+                    [ col_right metric_cell_w a_dim "p50"
+                    ; col_right metric_cell_w a_dim "p99"
+                    ; col_right metric_cell_w a_dim "p999"
                     ]
                 in
                 if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
              metric_labels
-         @
-         if is_compact
-         then []
-         else [ I.string a_border " │ "; col 28 a_dim "                            " ])
+         @ [ I.string a_border " │ "
+           ; col 16 a_dim "                "
+           ; I.string a_border " │ "
+           ; col 7 a_dim "  rate  "
+           ])
     in
     let header = I.vcat [ close_row w header_row1; close_row w header_row2 ] in
     let rows =
@@ -219,20 +244,29 @@ let render_latencies w json =
                   let p50, p99, p999, samples = find_metric label in
                   let img =
                     if samples = 0
-                    then
-                      I.hcat
-                        [ col_right 9 a_dim "--"
-                        ; col_right 9 a_dim "--"
-                        ; col_right 9 a_dim "--"
-                        ]
+                    then (
+                      (* Running domain with an idle window: distinct from
+                          "missing" so the row reads idle, not broken (S3). *)
+                      let cell_w = 3 * metric_cell_w in
+                      let pad = (cell_w - 4) / 2 in
+                      col cell_w a_dim (String.make pad ' ' ^ "idle"))
                     else (
                       let s50 = severity label p50 samples in
                       let s99 = max s50 (severity label p99 samples) in
                       let s999 = max s99 (severity label p999 samples) in
                       I.hcat
-                        [ col_right 9 (attr_of_sev s50) (format_latency_us p50)
-                        ; col_right 9 (attr_of_sev s99) (format_latency_us p99)
-                        ; col_right 9 (attr_of_sev s999) (format_latency_us p999)
+                        [ col_right
+                            metric_cell_w
+                            (attr_of_sev s50)
+                            (format_latency_us p50)
+                        ; col_right
+                            metric_cell_w
+                            (attr_of_sev s99)
+                            (format_latency_us p99)
+                        ; col_right
+                            metric_cell_w
+                            (attr_of_sev s999)
+                            (format_latency_us p999)
                         ])
                   in
                   if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
@@ -240,8 +274,9 @@ let render_latencies w json =
            in
            let _, cycle_p99, _, _ = find_metric "cycle" in
            let c_arr = update_cycle_hist symbol cycle_p99 in
+           let c_smooth = ema_smooth c_arr ~alpha:0.5 in
            let trend_spark =
-             render_sparkline_local 15 c_arr 100.0 (fun v ->
+             render_sparkline_local 11 c_smooth 100.0 (fun v ->
                attr_of_sev (severity "cycle" v 1))
            in
            let cycle_cause =
@@ -302,7 +337,7 @@ let render_latencies w json =
            in
            let formatted_cause =
              if cycle_cause = "--" || cycle_cause = ""
-             then col 28 a_dim "--"
+             then col 16 a_dim "--"
              else (
                let tags = ref [] in
                if contains_sub cycle_cause "ob:true"
@@ -384,7 +419,7 @@ let render_latencies w json =
                  tags
                  := [ I.string
                         a_dim
-                        (Printf.sprintf "[%s]" (truncate_string 24 cycle_cause))
+                        (Printf.sprintf "[%s]" (truncate_string 12 cycle_cause))
                     ];
                let tag_img =
                  I.hcat
@@ -392,10 +427,22 @@ let render_latencies w json =
                       (fun t -> I.hcat [ t; I.string A.(bg bg_color) " " ])
                       !tags)
                in
-               I.hsnap ~align:`Left 28 tag_img)
+               I.hsnap ~align:`Left 16 tag_img)
            in
            let exch = exch_of_symbol symbol in
            let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
+           (* Strategy activity rate from the current window (S2): executions
+                per second when the strategy ran, dim idle otherwise. *)
+           let exec_s_cell =
+             match List.assoc_opt "strategy" mlist with
+             | Some data ->
+               let eps = data |?> "executions_per_sec" |> to_float_d 0.0 in
+               let execs = data |?> "executions" |> to_int_d 0 in
+               if execs > 0
+               then col_right 7 a_bright (Printf.sprintf "%.1f/s" eps)
+               else col_right 7 a_dim "idle"
+             | None -> col_right 7 a_dim "--"
+           in
            close_row
              w
              (I.hcat
@@ -403,16 +450,19 @@ let render_latencies w json =
                  ; I.string A.(bg bg_color) "  "
                  ; I.string dot_attr "●"
                  ; I.string a_text " "
-                 ; col 14 sym_attr (truncate_string 13 symbol)
+                 ; col 11 sym_attr (truncate_string 10 symbol)
                  ; I.string a_border " │ "
                  ; trend_spark
                  ; I.string a_border " │ "
                  ]
                  @ metric_cells
-                 @ if is_compact then [] else [ I.string a_border " │ "; formatted_cause ]
-                )))
+                 @ [ I.string a_border " │ "
+                   ; formatted_cause
+                   ; I.string a_border " │ "
+                   ; exec_s_cell
+                   ])))
         active_lats
     in
-    let title = section_title w "PERFORMANCE" in
+    let title = section_title w "ENGINE LATENCY" in
     I.vcat ((title :: header :: rows) @ [ section_footer w ]))
 ;;

@@ -46,6 +46,7 @@ let test_spawn_domains_basic () =
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
     ; trading = assets
+    ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
   in
@@ -72,6 +73,7 @@ let test_spawn_domains_empty () =
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
     ; trading = []
+    ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
   in
@@ -155,6 +157,7 @@ let test_domain_error_handling () =
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
     ; trading = [ failing_asset ]
+    ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
   in

@@ -7,8 +7,8 @@ maintainer: ["Cal Miller <malciller@gmail.com>"]
 authors: ["Cal Miller <malciller@gmail.com>"]
 license: "LICENSE"
 tags: ["trading" "finance" "multicore" "ocaml" "domains"]
-homepage: "https://github.com/malciller/dio"
-bug-reports: "https://github.com/malciller/dio/issues"
+homepage: "https://github.com/malciller/dio-domains"
+bug-reports: "https://github.com/malciller/dio-domains/issues"
 depends: [
   "ocaml"
   "dune" {>= "3.17"}
@@ -48,4 +48,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
-dev-repo: "git+https://github.com/malciller/dio.git"
+dev-repo: "git+https://github.com/malciller/dio-domains.git"
