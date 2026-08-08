@@ -161,7 +161,11 @@ let render_strategies ?(selected_index=None) w json =
     let buy_price = strat |?> "buy_price" |> to_float_d 0.0 in
     let sell_count = strat |?> "sell_count" |> to_int_d 0 in
 
-    let sell_orders = strat |?> "sell_orders" |> to_list_d in
+    let sell_orders =
+      let strat_sells = strat |?> "sell_orders" |> to_list_d in
+      if strat_sells <> [] then strat_sells
+      else market |?> "sell_orders" |> to_list_d
+    in
     let unrealized_profit, pending_sell_qty = List.fold_left (fun (up, qty_acc) s ->
       let sp = s |?> "price" |> to_float_d 0.0 in
       let sq = s |?> "qty" |> to_float_d 0.0 in
@@ -265,8 +269,7 @@ let render_strategies ?(selected_index=None) w json =
 
     let market_is_closed = strat |?> "market_is_closed" |> to_bool_d false in
     let status_str, status_attr =
-      if cap_low then "⏸", a_yellow
-      else if market_is_closed then "💤", a_yellow
+      if cap_low || market_is_closed then "⏸", a_yellow
       else "▶", a_green
     in
 
