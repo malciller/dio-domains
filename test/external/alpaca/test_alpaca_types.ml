@@ -91,6 +91,109 @@ let test_paper_seconds_until_next_open_zero () =
   restore_defaults ()
 ;;
 
+(* ── effective_tif_and_extended (session-aware TIF) ──────────────────────── *)
+
+let tif
+      ?(crypto = false)
+      ?(fractional = false)
+      ?(order_type = "limit")
+      ?(time_in_force = Some "GTC")
+      ?(in_extended = false)
+      ?(use_extended = true)
+      ()
+  =
+  Alpaca.Rest.effective_tif_and_extended
+    ~is_crypto:crypto
+    ~is_fractional:fractional
+    ~order_type
+    ~time_in_force
+    ~in_extended_session:in_extended
+    ~use_extended
+;;
+
+let test_regular_session_gtc () =
+  let tif_str, ext = tif () in
+  Alcotest.(check string) "regular GTC stays gtc" "gtc" tif_str;
+  Alcotest.(check bool) "regular GTC no extended flag" false ext
+;;
+
+let test_regular_session_ioc () =
+  let tif_str, ext = tif ~time_in_force:(Some "IOC") () in
+  Alcotest.(check string) "regular IOC stays ioc" "ioc" tif_str;
+  Alcotest.(check bool) "regular IOC no extended flag" false ext
+;;
+
+let test_regular_session_fok () =
+  let tif_str, ext = tif ~time_in_force:(Some "FOK") () in
+  Alcotest.(check string) "regular FOK stays fok" "fok" tif_str;
+  Alcotest.(check bool) "regular FOK no extended flag" false ext
+;;
+
+let test_regular_session_day () =
+  let tif_str, ext = tif ~time_in_force:(Some "DAY") () in
+  Alcotest.(check string) "regular DAY stays day" "day" tif_str;
+  Alcotest.(check bool) "regular DAY no extended flag" false ext
+;;
+
+let test_regular_session_default_fractional () =
+  let tif_str, ext = tif ~fractional:true ~time_in_force:None () in
+  Alcotest.(check string) "regular fractional default day" "day" tif_str;
+  Alcotest.(check bool) "regular fractional no extended flag" false ext
+;;
+
+let test_regular_session_default_whole () =
+  let tif_str, ext = tif ~time_in_force:None () in
+  Alcotest.(check string) "regular whole default gtc" "gtc" tif_str;
+  Alcotest.(check bool) "regular whole no extended flag" false ext
+;;
+
+let test_extended_session_gtc_downgraded () =
+  let tif_str, ext = tif ~in_extended:true () in
+  Alcotest.(check string) "extended GTC downgraded to day" "day" tif_str;
+  Alcotest.(check bool) "extended GTC marked extended" true ext
+;;
+
+let test_extended_session_ioc_downgraded () =
+  let tif_str, ext = tif ~in_extended:true ~time_in_force:(Some "IOC") () in
+  Alcotest.(check string) "extended IOC downgraded to day" "day" tif_str;
+  Alcotest.(check bool) "extended IOC marked extended" true ext
+;;
+
+let test_extended_session_fok_downgraded () =
+  let tif_str, ext = tif ~in_extended:true ~time_in_force:(Some "FOK") () in
+  Alcotest.(check string) "extended FOK downgraded to day" "day" tif_str;
+  Alcotest.(check bool) "extended FOK marked extended" true ext
+;;
+
+let test_extended_session_day () =
+  let tif_str, ext = tif ~in_extended:true ~time_in_force:(Some "DAY") () in
+  Alcotest.(check string) "extended DAY stays day" "day" tif_str;
+  Alcotest.(check bool) "extended DAY marked extended" true ext
+;;
+
+let test_extended_session_market_order_not_marked () =
+  let tif_str, ext = tif ~in_extended:true ~order_type:"market" () in
+  Alcotest.(check string) "extended market keeps gtc" "gtc" tif_str;
+  Alcotest.(check bool) "extended market not marked" false ext
+;;
+
+let test_extended_session_disabled () =
+  let tif_str, ext = tif ~in_extended:true ~use_extended:false () in
+  Alcotest.(check string) "extended trading disabled keeps gtc" "gtc" tif_str;
+  Alcotest.(check bool) "extended trading disabled no flag" false ext
+;;
+
+let test_crypto_never_extended () =
+  let tif_str, ext = tif ~crypto:true ~in_extended:true () in
+  Alcotest.(check string) "crypto keeps gtc" "gtc" tif_str;
+  Alcotest.(check bool) "crypto not marked extended" false ext
+;;
+
+let test_crypto_default () =
+  let tif_str, _ext = tif ~crypto:true ~fractional:true ~time_in_force:None () in
+  Alcotest.(check string) "crypto default gtc" "gtc" tif_str
+;;
+
 let () =
   Alcotest.run
     "alpaca"
@@ -117,6 +220,40 @@ let () =
             "paper mode never waits for open"
             `Quick
             test_paper_seconds_until_next_open_zero
+        ] )
+    ; ( "session TIF"
+      , [ Alcotest.test_case "regular GTC" `Quick test_regular_session_gtc
+        ; Alcotest.test_case "regular IOC" `Quick test_regular_session_ioc
+        ; Alcotest.test_case "regular FOK" `Quick test_regular_session_fok
+        ; Alcotest.test_case "regular DAY" `Quick test_regular_session_day
+        ; Alcotest.test_case
+            "regular default fractional"
+            `Quick
+            test_regular_session_default_fractional
+        ; Alcotest.test_case
+            "regular default whole"
+            `Quick
+            test_regular_session_default_whole
+        ; Alcotest.test_case
+            "extended GTC downgraded"
+            `Quick
+            test_extended_session_gtc_downgraded
+        ; Alcotest.test_case
+            "extended IOC downgraded"
+            `Quick
+            test_extended_session_ioc_downgraded
+        ; Alcotest.test_case
+            "extended FOK downgraded"
+            `Quick
+            test_extended_session_fok_downgraded
+        ; Alcotest.test_case "extended DAY" `Quick test_extended_session_day
+        ; Alcotest.test_case
+            "extended market order"
+            `Quick
+            test_extended_session_market_order_not_marked
+        ; Alcotest.test_case "extended disabled" `Quick test_extended_session_disabled
+        ; Alcotest.test_case "crypto never extended" `Quick test_crypto_never_extended
+        ; Alcotest.test_case "crypto default" `Quick test_crypto_default
         ] )
     ]
 ;;

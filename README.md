@@ -328,13 +328,15 @@ Configure account environment and streaming data feed per asset in `config.json`
 
 ### 3. Extended Hours Trading
 
-Alpaca supports extended hours sessions for US equities:
+Alpaca supports extended and overnight sessions for US equities:
 - **Pre-Market**: 4:00 AM – 9:30 AM ET
 - **Post-Market**: 4:00 PM – 8:00 PM ET
+- **Overnight (24/5)**: 8:00 PM ET Sunday – 4:00 AM ET Friday
 
 The engine automatically handles market session transitions:
-- Orders submitted during extended sessions automatically use `time_in_force: "day"` and `extended_hours: true` (only limit orders are supported by Alpaca during extended hours).
-- Real-time orderbook snapshots and live quotes continue streaming during pre-market and post-market sessions.
+- Orders submitted during regular market hours (9:30 AM – 4:00 PM ET) preserve the requested `time_in_force` (`GTC`, `IOC`, `FOK`, or `DAY`) and do not set `extended_hours`.
+- Orders submitted during extended or overnight sessions automatically use `time_in_force: "day"` and `extended_hours: true` (only limit orders are supported by Alpaca outside regular hours). `GTC`, `IOC`, and `FOK` are all downgraded to `day` so the order is accepted unconditionally and cancels at the end of the session.
+- Real-time orderbook snapshots and live quotes continue streaming during pre-market, post-market, and overnight sessions.
 - Order amendments (`PATCH /v2/orders/{id}`) automatically track and update replacement order IDs across live session changes.
 
 ---
