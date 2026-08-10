@@ -281,8 +281,6 @@ let render_strategies ?(selected_index = None) w json =
       then c_near_fill
       else if flash_sell
       then c_near_sell
-      else if is_selected
-      then c_selected
       else if is_even
       then c_panel
       else c_bg
@@ -549,13 +547,7 @@ let render_strategies ?(selected_index = None) w json =
     in
     let flash_sell = near_sell && flash_on in
     let bg_color =
-      if flash_sell
-      then c_near_sell
-      else if is_selected
-      then c_selected
-      else if is_even
-      then c_panel
-      else c_bg
+      if flash_sell then c_near_sell else if is_even then c_panel else c_bg
     in
     let a_text = A.(Theme.a_text ++ bg bg_color) in
     let a_green = A.(Theme.a_green ++ bg bg_color) in
