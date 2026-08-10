@@ -16,6 +16,8 @@
 
 (subdir external/ibkr)
 
+(subdir external/alpaca)
+
 (subdir external/cmc)
 
 (subdir external/lighter)
