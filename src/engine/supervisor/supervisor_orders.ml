@@ -578,7 +578,7 @@ let order_processing_loop () =
           let st = get_state alpaca_conn in
           st = Connected || st = Connecting
         with
-        | Not_found -> true
+        | Not_found -> false
       in
       let is_connected (order : strategy_order) =
         match Dio_exchange.Exchange_intf.Types.exchange_of_string order.exchange with

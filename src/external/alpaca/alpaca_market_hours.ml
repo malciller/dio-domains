@@ -115,23 +115,30 @@ let is_overnight_hours () =
   | _ -> false
 ;;
 
-(** Evaluates whether the current system time falls within the 24/5 Alpaca trading schedule
+(** Evaluates whether the current system time falls within the Alpaca trading schedule.
+    Paper accounts accept orders 24/7; live accounts trade on the 24/5 schedule
     (Sunday 8:00 PM ET to Friday 8:00 PM ET continuously). *)
 let is_market_open () =
-  let wday, hour, _min = current_eastern_time () in
-  match wday with
-  | 0 -> hour >= 20
-  | 1 | 2 | 3 | 4 -> true
-  | 5 -> hour < 20
-  | _ -> false
+  if !paper_mode
+  then true
+  else (
+    let wday, hour, _min = current_eastern_time () in
+    match wday with
+    | 0 -> hour >= 20
+    | 1 | 2 | 3 | 4 -> true
+    | 5 -> hour < 20
+    | _ -> false)
 ;;
 
 (** Evaluates whether current system time is strictly within pre-market (4 AM - 9:30 AM), after-hours (4 PM - 8 PM), or overnight (8 PM - 4 AM). *)
 let is_extended_hours () = is_market_open () && not (is_regular_market_open ())
 
-(** Calculates seconds until next 24/5 market open (Sunday 8:00 PM ET). *)
+(** Calculates seconds until next 24/5 market open (Sunday 8:00 PM ET).
+    Paper mode never closes, so this is always 0. *)
 let seconds_until_next_open () =
-  if is_market_open ()
+  if !paper_mode
+  then 0.0
+  else if is_market_open ()
   then 0.0
   else (
     let t = Unix.gettimeofday () in

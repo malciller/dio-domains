@@ -94,6 +94,28 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
     |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol)
   in
   let has_alpaca = List.length alpaca_symbols > 0 in
+  let alpaca_configs =
+    app_configs
+    |> List.filter (fun (cfg : Dio_engine.Config.trading_config) ->
+      Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.exchange = Alpaca)
+  in
+  (* The Alpaca trading mode is a module-global ref (paper vs live), so all
+     Alpaca configs must agree on testnet. Mixed modes would silently route
+     orders against whichever account the first config selected. *)
+  let alpaca_testnet_values =
+    alpaca_configs
+    |> List.map (fun cfg -> cfg.Dio_engine.Config.testnet)
+    |> List.sort_uniq Bool.compare
+  in
+  (match alpaca_testnet_values with
+   | [ _ ] -> ()
+   | _ ->
+     Logging.critical_f
+       ~section
+       "Alpaca configs must share the same 'testnet' value (paper vs live is a \
+        module-global setting). Found mixed values: %s. Exiting."
+       (String.concat ", " (List.map string_of_bool alpaca_testnet_values));
+     exit 1);
   let alpaca_testnet =
     match
       app_configs

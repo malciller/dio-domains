@@ -93,7 +93,7 @@
     {
       "symbol": "SPCX",
       "exchange": "alpaca",
-      "qty": "0.25",
+      "qty": "0.1",
       "grid_interval": [
         0.25,
         0.75
