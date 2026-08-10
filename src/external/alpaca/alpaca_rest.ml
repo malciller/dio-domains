@@ -71,6 +71,51 @@ let parse_order_json json =
   }
 ;;
 
+(** Compute the effective time-in-force and extended-hours eligibility for an
+    order given the market session. Returns (tif_str, mark_extended).
+
+    Alpaca session rules for US equities:
+    - Regular hours (9:30 AM - 4:00 PM ET): GTC/IOC/FOK/DAY are accepted. The
+      requested TIF is preserved and no [extended_hours] flag is sent (IOC/FOK
+      cannot carry [extended_hours], and GTC + [extended_hours] requires account
+      enablement).
+    - Extended (pre/post-market) and overnight sessions: only [limit] orders are
+      accepted and only with TIF [day] (or [gtc] when GTC-for-extended is enabled
+      on the account). Every requested TIF is downgraded to [day] with
+      [extended_hours=true] so the order is accepted unconditionally, executes in
+      the current session, carries through the upcoming sessions, and cancels at
+      8:00 PM ET.
+    - Crypto (24/7) is never marked extended-hours eligible. *)
+let effective_tif_and_extended
+      ~is_crypto
+      ~is_fractional
+      ~order_type
+      ~time_in_force
+      ~in_extended_session
+      ~use_extended
+  =
+  let type_str =
+    match order_type with
+    | "limit" -> "limit"
+    | _ -> "market"
+  in
+  let mark_extended =
+    (not is_crypto) && use_extended && in_extended_session && type_str = "limit"
+  in
+  let tif_str =
+    if mark_extended
+    then "day"
+    else (
+      match time_in_force with
+      | Some "GTC" | Some "gtc" -> "gtc"
+      | Some "IOC" | Some "ioc" -> "ioc"
+      | Some "FOK" | Some "fok" -> "fok"
+      | Some "DAY" | Some "day" -> "day"
+      | _ -> if is_fractional && not is_crypto then "day" else "gtc")
+  in
+  tif_str, mark_extended
+;;
+
 let place_order
       ~symbol
       ~qty
@@ -91,18 +136,20 @@ let place_order
     | Some b -> b
     | None -> !Config.extended_hours
   in
-  let tif_str =
-    match time_in_force with
-    | Some "GTC" | Some "gtc" -> "gtc"
-    | Some "IOC" | Some "ioc" -> if use_extended then "day" else "ioc"
-    | Some "FOK" | Some "fok" -> if use_extended then "day" else "fok"
-    | Some "DAY" | Some "day" -> "day"
-    | _ ->
-      if use_extended
-      then "day"
-      else if is_fractional && not is_crypto
-      then "day"
-      else "gtc"
+  (* Session-aware: outside the regular session (pre/after-market, overnight, or
+     closed) orders must be day + extended_hours to execute in the current
+     session; during regular hours the requested TIF is preserved. *)
+  let in_extended_session =
+    (not is_crypto) && not (Alpaca_market_hours.is_regular_market_open ())
+  in
+  let tif_str, mark_extended =
+    effective_tif_and_extended
+      ~is_crypto
+      ~is_fractional
+      ~order_type
+      ~time_in_force
+      ~in_extended_session
+      ~use_extended
   in
   let side_str =
     match side with
@@ -122,7 +169,7 @@ let place_order
     ; "time_in_force", `String tif_str
     ]
   in
-  let assoc = if use_extended then ("extended_hours", `Bool true) :: assoc else assoc in
+  let assoc = if mark_extended then ("extended_hours", `Bool true) :: assoc else assoc in
   let assoc =
     match limit_price with
     | Some p -> ("limit_price", `String (Printf.sprintf "%.4f" p)) :: assoc
@@ -145,7 +192,7 @@ let place_order
      | Some p -> Printf.sprintf "@ %.4f" p
      | None -> "MKT")
     tif_str
-    (if use_extended then ", extended_hours=true" else "");
+    (if mark_extended then ", extended_hours=true" else "");
   Lwt.catch
     (fun () ->
        Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string req_body) url
