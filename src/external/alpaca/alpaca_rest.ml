@@ -105,13 +105,15 @@ let effective_tif_and_extended
   let tif_str =
     if mark_extended
     then "day"
+    else if is_fractional && not is_crypto
+    then "day"
     else (
       match time_in_force with
       | Some "GTC" | Some "gtc" -> "gtc"
       | Some "IOC" | Some "ioc" -> "ioc"
       | Some "FOK" | Some "fok" -> "fok"
       | Some "DAY" | Some "day" -> "day"
-      | _ -> if is_fractional && not is_crypto then "day" else "gtc")
+      | _ -> "gtc")
   in
   tif_str, mark_extended
 ;;

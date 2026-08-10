@@ -141,6 +141,18 @@ let test_regular_session_default_fractional () =
   Alcotest.(check bool) "regular fractional no extended flag" false ext
 ;;
 
+let test_regular_session_fractional_gtc () =
+  let tif_str, ext = tif ~fractional:true ~time_in_force:(Some "GTC") () in
+  Alcotest.(check string) "regular fractional GTC forced to day" "day" tif_str;
+  Alcotest.(check bool) "regular fractional GTC no extended flag" false ext
+;;
+
+let test_regular_session_fractional_ioc () =
+  let tif_str, ext = tif ~fractional:true ~time_in_force:(Some "IOC") () in
+  Alcotest.(check string) "regular fractional IOC forced to day" "day" tif_str;
+  Alcotest.(check bool) "regular fractional IOC no extended flag" false ext
+;;
+
 let test_regular_session_default_whole () =
   let tif_str, ext = tif ~time_in_force:None () in
   Alcotest.(check string) "regular whole default gtc" "gtc" tif_str;
@@ -230,6 +242,14 @@ let () =
             "regular default fractional"
             `Quick
             test_regular_session_default_fractional
+        ; Alcotest.test_case
+            "regular fractional GTC"
+            `Quick
+            test_regular_session_fractional_gtc
+        ; Alcotest.test_case
+            "regular fractional IOC"
+            `Quick
+            test_regular_session_fractional_ioc
         ; Alcotest.test_case
             "regular default whole"
             `Quick
