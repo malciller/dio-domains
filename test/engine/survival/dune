@@ -1,0 +1,27 @@
+(test
+ (name test_survival_mfd)
+ (libraries dio.survival alcotest))
+
+(test
+ (name test_survival_stats)
+ (libraries dio.survival alcotest))
+
+(test
+ (name test_survival_calendar)
+ (libraries dio.survival alcotest))
+
+(test
+ (name test_survival_config)
+ (libraries dio.survival dio.strategies alcotest))
+
+(test
+ (name test_grid_core)
+ (libraries dio.strategies alcotest))
+
+(test
+ (name test_grid_core_contract)
+ (libraries dio.strategies alcotest))
+
+(test
+ (name test_analytical_vs_core)
+ (libraries dio.strategies dio.survival alcotest))

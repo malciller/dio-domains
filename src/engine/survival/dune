@@ -1,0 +1,12 @@
+(library
+ (name dio_survival)
+ (public_name dio.survival)
+ (libraries
+  unix
+  yojson
+  lwt
+  cohttp-lwt-unix
+  dotenv
+  dio.logging
+  dio.strategies
+  dio.alpaca))
