@@ -144,7 +144,8 @@ let parse_args () =
             (fun f ->
               total_capital := Some f;
               portfolio := true)
-        , " total portfolio quote capital (split equally unless allocations are given)" )
+        , " total quote capital across venues (split equally per venue unless \
+           allocations are given)" )
       ; ( "--split"
         , Arg.Symbol
             ( [ "equal"; "explicit" ]
@@ -157,7 +158,7 @@ let parse_args () =
             (fun value ->
               allocations := value :: !allocations;
               portfolio := true)
-        , " repeat VENUE/SYMBOL=AMOUNT to allocate portfolio capital" )
+        , " repeat VENUE/SYMBOL=AMOUNT to fund a venue pool (summed per venue)" )
       ; ( "--transfer"
         , Arg.String
             (fun value ->
@@ -808,13 +809,6 @@ type portfolio_node =
   ; initial_base : float
   }
 
-let same_account
-      (left : Survival_topology.instrument_key)
-      (right : Survival_topology.instrument_key)
-  =
-  left.venue = right.venue && left.testnet = right.testnet && left.quote = right.quote
-;;
-
 let task_for_key
       (tasks : Survival_tasks.task list)
       (key : Survival_topology.instrument_key)
@@ -945,9 +939,41 @@ let portfolio_series (a : args) (key : Survival_topology.instrument_key) ~(offli
   else Lwt_main.run (fetch_series_for a ~exchange:key.venue key.symbol)
 ;;
 
+(* Capital assignment for the venue-pooled portfolio model.
+
+   The model's top level is the venue: each venue account (venue + quote +
+   testnet) owns one pool, and all of that venue's assets draw from it. The
+   per-asset share below is only accounting; the venue pool is the sum of its
+   assets' shares and is what the replay actually spends.
+
+   A venue pool resolves to:
+   - the sum of its explicit --allocation / topology capitals when any asset on
+     the venue is explicit,
+   - --total-capital split equally per venue (explicit venues keep their sums),
+   - --capital per venue,
+   - 1000.0 per venue offline,
+   - the venue's fetched available quote balance online.
+
+   Unspecified assets on a venue split the venue pool equally among
+   themselves. *)
 let portfolio_capitals (a : args) ~(offline : bool) (nodes : portfolio_node list)
   : (portfolio_node * float) list
   =
+  let same_account
+        (left : Survival_topology.instrument_key)
+        (right : Survival_topology.instrument_key)
+    =
+    left.venue = right.venue && left.testnet = right.testnet && left.quote = right.quote
+  in
+  let accounts =
+    List.fold_left
+      (fun acc (node : portfolio_node) ->
+         if List.exists (fun key -> same_account key node.spec.key) acc
+         then acc
+         else node.spec.key :: acc)
+      []
+      nodes
+  in
   let explicit_total =
     List.fold_left
       (fun total (node : portfolio_node) ->
@@ -955,99 +981,98 @@ let portfolio_capitals (a : args) ~(offline : bool) (nodes : portfolio_node list
       0.0
       nodes
   in
-  let unspecified =
-    List.filter (fun (node : portfolio_node) -> node.spec.capital = None) nodes
-  in
-  let direct =
-    List.filter_map
-      (fun (node : portfolio_node) ->
-         Option.map (fun capital -> node, capital) node.spec.capital)
+  let explicit_on account =
+    List.fold_left
+      (fun total (node : portfolio_node) ->
+         if same_account account node.spec.key
+         then total +. Option.value node.spec.capital ~default:0.0
+         else total)
+      0.0
       nodes
   in
-  if a.split = "explicit" && unspecified <> []
-  then failwith "survival: --split explicit requires a capital for every position";
-  let assign_equal total =
-    if unspecified = []
-    then (
-      if total +. 1e-9 < explicit_total
-      then failwith "survival: explicit topology allocations exceed --total-capital";
-      direct)
-    else (
-      let remaining = total -. explicit_total in
-      if remaining < 0.0
-      then failwith "survival: explicit topology allocations exceed --total-capital"
-      else (
-        let each = remaining /. float_of_int (List.length unspecified) in
-        direct @ List.map (fun node -> node, each) unspecified))
+  let has_explicit account =
+    List.exists
+      (fun (node : portfolio_node) ->
+         node.spec.capital <> None && same_account account node.spec.key)
+      nodes
   in
-  match a.total_capital with
-  | Some total when total < 0.0 || not (Float.is_finite total) ->
-    failwith "survival: --total-capital must be finite and non-negative"
-  | Some total -> assign_equal total
-  | None ->
-    (match a.capital with
-     | Some capital when capital < 0.0 || not (Float.is_finite capital) ->
-       failwith "survival: --capital must be finite and non-negative"
-     | Some capital -> direct @ List.map (fun node -> node, capital) unspecified
-     | None when offline -> direct @ List.map (fun node -> node, 1000.0) unspecified
-     | None ->
-       let same_key (left : Survival_topology.instrument_key) right =
-         same_account left right
-       in
-       let groups : (Survival_topology.instrument_key * portfolio_node list) list =
-         List.fold_left
-           (fun groups (node : portfolio_node) ->
-              if node.spec.capital <> None
-              then groups
-              else (
-                match
-                  List.find_opt (fun (key, _) -> same_key key node.spec.key) groups
-                with
-                | Some (key, _group_nodes) ->
-                  List.map
-                    (fun (group_key, values) ->
-                       if same_key group_key key
-                       then group_key, node :: values
-                       else group_key, values)
-                    groups
-                | None -> (node.spec.key, [ node ]) :: groups))
-           []
-           nodes
-       in
-       let grouped =
-         List.concat_map
-           (fun ((account_key : Survival_topology.instrument_key), group_nodes) ->
-              let task = (List.hd group_nodes).task in
-              let snapshot =
-                match Lwt_main.run (Survival_balances.fetch_task task) with
-                | Ok snapshot -> snapshot
-                | Error error -> failwith ("survival: balance fetch failed: " ^ error)
-              in
-              let available =
-                Survival_balances.available_quote snapshot ~quote:account_key.quote
-              in
-              let reserved_explicit =
-                List.fold_left
-                  (fun total (node : portfolio_node) ->
-                     if same_account account_key node.spec.key
-                     then total +. Option.value node.spec.capital ~default:0.0
-                     else total)
-                  0.0
-                  nodes
-              in
-              let each =
-                (available -. reserved_explicit) /. float_of_int (List.length group_nodes)
-              in
-              if each < 0.0
-              then
-                failwith
-                  ("survival: insufficient "
-                   ^ account_key.quote
-                   ^ " balance for portfolio")
-              else List.map (fun node -> node, each) group_nodes)
-           groups
-       in
-       direct @ grouped)
+  let unspecified_on account =
+    List.filter
+      (fun (node : portfolio_node) ->
+         node.spec.capital = None && same_account account node.spec.key)
+      nodes
+  in
+  if
+    a.split = "explicit"
+    && List.exists (fun (node : portfolio_node) -> node.spec.capital = None) nodes
+  then failwith "survival: --split explicit requires a capital for every position";
+  (match a.total_capital with
+   | Some total when total < 0.0 || not (Float.is_finite total) ->
+     failwith "survival: --total-capital must be finite and non-negative"
+   | Some total when total +. 1e-9 < explicit_total ->
+     failwith "survival: explicit topology allocations exceed --total-capital"
+   | _ -> ());
+  (match a.capital with
+   | Some capital when capital < 0.0 || not (Float.is_finite capital) ->
+     failwith "survival: --capital must be finite and non-negative"
+   | _ -> ());
+  let unspecified_accounts =
+    List.filter (fun account -> not (has_explicit account)) accounts
+  in
+  let venue_pool (account : Survival_topology.instrument_key) =
+    if has_explicit account
+    then explicit_on account
+    else (
+      match a.total_capital with
+      | Some total ->
+        if unspecified_accounts = []
+        then 0.0
+        else (total -. explicit_total) /. float_of_int (List.length unspecified_accounts)
+      | None ->
+        (match a.capital with
+         | Some capital -> capital
+         | None when offline -> 1000.0
+         | None ->
+           let task =
+             match
+               List.find_opt
+                 (fun (node : portfolio_node) -> same_account account node.spec.key)
+                 nodes
+             with
+             | Some node -> node.task
+             | None -> failwith "survival: no position on venue account"
+           in
+           (match Lwt_main.run (Survival_balances.fetch_task task) with
+            | Ok snapshot ->
+              Survival_balances.available_quote snapshot ~quote:account.quote
+            | Error error -> failwith ("survival: balance fetch failed: " ^ error))))
+  in
+  let capitals =
+    List.map
+      (fun (node : portfolio_node) ->
+         let account = node.spec.key in
+         let pool = venue_pool account in
+         let share =
+           if node.spec.capital <> None
+           then Option.value node.spec.capital ~default:0.0
+           else (
+             let unspecified = unspecified_on account in
+             let remaining = pool -. explicit_on account in
+             if remaining < 0.0 || unspecified = []
+             then 0.0
+             else remaining /. float_of_int (List.length unspecified))
+         in
+         if share < 0.0
+         then
+           failwith
+             ("survival: insufficient "
+              ^ account.quote
+              ^ " balance for portfolio venue "
+              ^ account.venue);
+         node, share)
+      nodes
+  in
+  capitals
 ;;
 
 let portfolio_grid (a : args) (node : portfolio_node) capital ~(offline : bool) =
@@ -1077,6 +1102,14 @@ let portfolio_grid (a : args) (node : portfolio_node) capital ~(offline : bool) 
   }
 ;;
 
+let venue_id (v : Survival_portfolio.venue_outcome) =
+  Printf.sprintf "%s/%s%s" v.venue v.quote (if v.testnet then "@testnet" else "")
+;;
+
+let venue_of_node (key : Survival_topology.instrument_key) =
+  Printf.sprintf "%s/%s%s" key.venue key.quote (if key.testnet then "@testnet" else "")
+;;
+
 let report_portfolio_text
       (definition : Survival_topology.definition)
       (nodes : (portfolio_node * float) list)
@@ -1099,28 +1132,45 @@ let report_portfolio_text
      | Some session -> string_of_int session
      | None -> "none");
   line
-    "Positions: %d   Transfers: %d"
+    "Venues: %d   Positions: %d   Transfers: %d"
+    (List.length result.venues)
     (List.length nodes)
     (List.length definition.transfers);
   List.iter
-    (fun ((node, capital) : portfolio_node * float) ->
-       let outcome =
-         List.find
-           (fun (value : Survival_portfolio.position_outcome) ->
-              value.venue = node.spec.key.venue && value.asset = node.spec.key.symbol)
-           result.positions
-       in
+    (fun (venue : Survival_portfolio.venue_outcome) ->
        line
-         "  %s  capital %.2f -> %.2f  D_surv %.1f%%  low %b  fills %d/%d  base %.6f"
-         (Survival_topology.key_id node.spec.key)
-         capital
-         outcome.final_pool
-         (outcome.d_surv *. 100.0)
-         outcome.capital_low
-         outcome.buy_fills
-         outcome.sell_fills
-         outcome.final_base)
-    nodes;
+         "  %s  pool %.2f -> %.2f   min DD %s   D_surv %s   low %b   fills %d/%d   base \
+          %.6f   assets: %s"
+         (venue_id venue)
+         venue.initial_pool
+         venue.final_pool
+         (pct venue.pool_min_drawdown)
+         (pct venue.d_surv)
+         venue.capital_low
+         venue.buy_fills
+         venue.sell_fills
+         venue.final_base
+         (String.concat ", " venue.assets);
+       List.iter
+         (fun ((node, capital) : portfolio_node * float) ->
+            if venue_of_node node.spec.key = venue_id venue
+            then (
+              let outcome =
+                List.find
+                  (fun (value : Survival_portfolio.position_outcome) ->
+                     value.venue = node.spec.key.venue
+                     && value.asset = node.spec.key.symbol)
+                  result.positions
+              in
+              line
+                "      %s  share %.2f  fills %d/%d  base %.6f"
+                (Survival_topology.key_id node.spec.key)
+                capital
+                outcome.buy_fills
+                outcome.sell_fills
+                outcome.final_base))
+         nodes)
+    result.venues;
   List.iter
     (fun (transfer : Survival_topology.transfer_spec) ->
        line
@@ -1139,6 +1189,32 @@ let report_portfolio_json
       (result : Survival_portfolio.result)
   : Yojson.Safe.t
   =
+  let venue_json (venue : Survival_portfolio.venue_outcome) =
+    `Assoc
+      [ "venue", `String venue.venue
+      ; "quote", `String venue.quote
+      ; "testnet", `Bool venue.testnet
+      ; "assets", `List (List.map (fun asset -> `String asset) venue.assets)
+      ; "initial_pool", `Float venue.initial_pool
+      ; "final_pool", `Float venue.final_pool
+      ; "pool_min_drawdown", `Float venue.pool_min_drawdown
+      ; "d_surv", `Float venue.d_surv
+      ; "capital_low", `Bool venue.capital_low
+      ; ( "first_exhausted_drawdown"
+        , Option.fold
+            ~none:`Null
+            ~some:(fun value -> `Float value)
+            venue.first_exhausted_drawdown )
+      ; ( "first_exhausted_session"
+        , Option.fold
+            ~none:`Null
+            ~some:(fun value -> `Int value)
+            venue.first_exhausted_session )
+      ; "buy_fills", `Int venue.buy_fills
+      ; "sell_fills", `Int venue.sell_fills
+      ; "final_base", `Float venue.final_base
+      ]
+  in
   let outcome_json ((node, capital) : portfolio_node * float) =
     let outcome =
       List.find
@@ -1152,16 +1228,7 @@ let report_portfolio_json
       ; "base", `String node.spec.key.base
       ; "quote", `String node.spec.key.quote
       ; "testnet", `Bool node.spec.key.testnet
-      ; "initial_pool", `Float capital
-      ; "final_pool", `Float outcome.final_pool
-      ; "pool_min_drawdown", `Float outcome.pool_min_drawdown
-      ; "d_surv", `Float outcome.d_surv
-      ; "capital_low", `Bool outcome.capital_low
-      ; ( "first_exhausted_session"
-        , Option.fold
-            ~none:`Null
-            ~some:(fun value -> `Int value)
-            outcome.first_exhausted_session )
+      ; "share", `Float capital
       ; "buy_fills", `Int outcome.buy_fills
       ; "sell_fills", `Int outcome.sell_fills
       ; "final_base", `Float outcome.final_base
@@ -1177,6 +1244,7 @@ let report_portfolio_json
           ~some:(fun value -> `Int value)
           result.first_exhausted_session )
     ; "topology", Survival_topology.to_json definition
+    ; "venues", `List (List.map venue_json result.venues)
     ; "positions", `List (List.map outcome_json nodes)
     ; "transfers", `List (List.map Survival_topology.transfer_json definition.transfers)
     ]
@@ -1229,6 +1297,8 @@ let run_portfolio (a : args) (tasks : Survival_tasks.task list) : Yojson.Safe.t 
          let capital = capital_by_key node.spec.key in
          { Survival_portfolio.venue = node.spec.key.venue
          ; asset = node.spec.key.symbol
+         ; quote = node.spec.key.quote
+         ; testnet = node.spec.key.testnet
          ; pool = capital
          ; initial_base = node.initial_base
          ; bars = Survival_topology.align_series timeline node.series
@@ -1238,6 +1308,12 @@ let run_portfolio (a : args) (tasks : Survival_tasks.task list) : Yojson.Safe.t 
   in
   let transfers = List.map Survival_topology.to_portfolio_transfer definition.transfers in
   let result = Survival_portfolio.simulate_aligned ~timeline ~positions ~transfers () in
+  let venue_of_key (key : Survival_topology.instrument_key) =
+    List.find_opt
+      (fun (venue : Survival_portfolio.venue_outcome) ->
+         venue.venue = key.venue && venue.quote = key.quote && venue.testnet = key.testnet)
+      result.venues
+  in
   (match a.save_positions with
    | None -> ()
    | Some path ->
@@ -1250,8 +1326,14 @@ let run_portfolio (a : args) (tasks : Survival_tasks.task list) : Yojson.Safe.t 
                    value.venue = node.spec.key.venue && value.asset = node.spec.key.symbol)
                 result.positions
             in
+            let share =
+              match venue_of_key node.spec.key with
+              | Some venue when venue.assets <> [] ->
+                venue.final_pool /. float_of_int (List.length venue.assets)
+              | _ -> 0.0
+            in
             { Survival_portfolio_state.key = node.spec.key
-            ; pool = outcome.final_pool
+            ; pool = share
             ; base = outcome.final_base
             })
          nodes
@@ -1272,12 +1354,24 @@ let main () =
   let config = Dio_engine.Config.read_config () in
   let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
   let tasks, unsupported =
-    Survival_tasks.resolve_tasks
-      ~symbol:a.symbol
-      ~exchange:a.exchange
-      ~exchange_explicit:a.exchange_explicit
-      ~trading:config.trading
-      ~offline
+    if a.portfolio && offline && a.symbol = ""
+    then
+      (* Portfolio mode with a topology file never needs a positional SYMBOL:
+         positions come from the topology, and offline runs skip venue init.
+         Resolve the config trading list as the task pool. *)
+      Survival_tasks.resolve_tasks
+        ~symbol:""
+        ~exchange:a.exchange
+        ~exchange_explicit:a.exchange_explicit
+        ~trading:config.trading
+        ~offline:false
+    else
+      Survival_tasks.resolve_tasks
+        ~symbol:a.symbol
+        ~exchange:a.exchange
+        ~exchange_explicit:a.exchange_explicit
+        ~trading:config.trading
+        ~offline
   in
   (* Populate venue instrument metadata (ticks/lots) before any grid replay so
      increments resolve from the real exchange, not the 0.01 fallback. *)

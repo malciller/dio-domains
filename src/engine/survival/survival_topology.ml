@@ -270,6 +270,16 @@ let validate (definition : definition) : (unit, string list) result =
        then add ("unknown transfer source: " ^ key_id transfer.from_key);
        if not (has_position transfer.to_key)
        then add ("unknown transfer destination: " ^ key_id transfer.to_key);
+       if
+         transfer.from_key.venue = transfer.to_key.venue
+         && transfer.from_key.testnet = transfer.to_key.testnet
+         && transfer.from_key.quote = transfer.to_key.quote
+       then
+         add
+           ("same-venue transfer is a no-op (capital is pooled per venue): "
+            ^ key_id transfer.from_key
+            ^ " -> "
+            ^ key_id transfer.to_key);
        if transfer.from_key.quote <> transfer.to_key.quote
        then
          add
@@ -320,8 +330,10 @@ let align_series (timeline : string array) (series : Survival_types.series) =
   Array.map (fun date -> Hashtbl.find_opt by_date date) timeline
 ;;
 
+(* Capital is pooled per venue account, so a topology instrument maps onto the
+   venue pool it trades against. *)
 let to_pool_key (key : instrument_key) : Survival_portfolio.pool_key =
-  { venue = key.venue; asset = key.symbol }
+  { venue = key.venue; quote = key.quote; testnet = key.testnet }
 ;;
 
 let to_portfolio_transfer (transfer : transfer_spec) : Survival_portfolio.transfer =

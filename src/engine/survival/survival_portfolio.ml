@@ -1,17 +1,18 @@
-(* Survival_portfolio - multi-asset capital model over shared budgets.
+(* Survival_portfolio - multi-asset capital model over per-venue budgets.
 
-   A portfolio is a set of positions. Each position is a (venue, asset) with
-   one shared budget pool and one or more subgrids (Grid_core configs) trading
-   that asset. All subgrids of a position draw their buy capital from the same
-   pool and credit it on sells, which is exactly the "ven-diagram merge"
-   semantics: when the pool cannot fund one subgrid's resting buy, every other
-   subgrid on that position is starved too, and the position's survival is the
-   pool's survival.
+   The top level of the capital survival model is the venue: capital is pooled
+   per venue (account: venue + quote + testnet), never per asset and never at
+   the whole-system level. Every position on the same venue draws its buy
+   capital from one shared venue pool and credits it on sells, which is the
+   venue-locked runway semantics: quote that exists on an exchange cannot fund
+   positions on another exchange, so each venue is an independent runway. When
+   the pool cannot fund one subgrid's resting buy, every other subgrid on that
+   venue is starved too, and the venue's survival is the pool's survival.
 
    Budgets are spend + recover only (no inflation), matching the live grid:
    - buys:   pool -= qty * price * (1 + maker_fee)
    - sells:  pool += proceeds
-   - transfers: manual budget moves between positions at session boundaries
+   - transfers: manual budget moves between venue pools at session boundaries
      (user re-allocations), applied before that session's bars.
 
    Pure: takes OHLC bars per position and runs Grid_core in lockstep. No
@@ -19,9 +20,12 @@
 
 open Survival_types
 
+(** Identity of a venue account pool. Positions on the same account share one
+    pool. *)
 type pool_key =
   { venue : string
-  ; asset : string
+  ; quote : string
+  ; testnet : bool
   }
 
 type transfer =
@@ -40,7 +44,11 @@ type subgrid =
 type position_input =
   { venue : string
   ; asset : string
-  ; pool : float (** Initial shared budget (quote). *)
+  ; quote : string
+  ; testnet : bool
+  ; pool : float
+    (** This position's share of the venue pool; all shares on a venue are
+        summed into one pool before the replay. *)
   ; bars : Survival_types.bar array (** This position's OHLC history. *)
   ; subgrids : Dio_strategies.Grid_core.config list
     (** One config per subgrid; start_price/start_quote are per-subgrid. *)
@@ -49,6 +57,8 @@ type position_input =
 type aligned_position_input =
   { venue : string
   ; asset : string
+  ; quote : string
+  ; testnet : bool
   ; pool : float
   ; initial_base : float
   ; bars : Survival_types.bar option array
@@ -56,9 +66,9 @@ type aligned_position_input =
   }
 
 type pos_rt =
-  { venue : string
+  { key : pool_key
   ; asset : string
-  ; initial_pool : float
+  ; initial_pool : float (** The venue pool at session 0, shared by all positions. *)
   ; bars : Survival_types.bar option array
   ; pool : float ref
   ; subgrids : subgrid list
@@ -73,35 +83,58 @@ type position_outcome =
   { venue : string
   ; asset : string
   ; pool_min_drawdown : float
-    (** Worst pool drawdown over the replay: the position-level survival metric
-        (all subgrids share one pool). *)
+    (** Worst drawdown of the shared venue pool over the replay: the
+        position-level survival metric (all positions on the venue share one
+        pool). *)
   ; first_exhausted_drawdown : float option
-    (** Pool drawdown at the first session a subgrid was capital-low. *)
+    (** Venue pool drawdown at the first session a subgrid was capital-low. *)
   ; first_exhausted_session : int option
   ; capital_low : bool
   ; d_surv : float (** [pool_min_drawdown] when exhausted, else 1.0. *)
   ; buy_fills : int
   ; sell_fills : int
+  ; final_pool : float (** The shared venue pool at the end of the replay. *)
+  ; final_base : float
+  }
+
+(** Venue-level headline: one row per venue account pool. *)
+type venue_outcome =
+  { venue : string
+  ; quote : string
+  ; testnet : bool
+  ; assets : string list
+  ; initial_pool : float
   ; final_pool : float
+  ; pool_min_drawdown : float
+  ; first_exhausted_drawdown : float option
+  ; first_exhausted_session : int option
+  ; capital_low : bool
+  ; d_surv : float
+  ; buy_fills : int
+  ; sell_fills : int
   ; final_base : float
   }
 
 type result =
   { n_sessions : int
   ; positions : position_outcome list
+  ; venues : venue_outcome list
   ; exhausted : bool
   ; first_exhausted_session : int option
   }
 
-let key_of_position (p : position_input) : pool_key = { venue = p.venue; asset = p.asset }
+let key_of_position (p : aligned_position_input) : pool_key =
+  { venue = p.venue; quote = p.quote; testnet = p.testnet }
+;;
 
 let to_grid_bar (b : Survival_types.bar) : Dio_strategies.Grid_core_types.bar =
   Dio_strategies.Grid_core_types.{ high = b.high; low = b.low; close = b.close }
 ;;
 
 (** Run the portfolio replay. Each position advances over its own bars; the
-    session count is the longest series. Transfers are applied at their
-    session before any position trades that session. *)
+    session count is the longest series. All positions on the same venue share
+    one pool, seeded by the sum of their [pool] shares. Transfers are applied
+    at their session before any position trades that session. *)
 let simulate_aligned
       ~(timeline : string array)
       ~(positions : aligned_position_input list)
@@ -114,21 +147,27 @@ let simulate_aligned
   let module GT = Dio_strategies.Grid_core_types in
   let n_sessions = Array.length timeline in
   let transfers = List.sort (fun a b -> Int.compare a.session b.session) transfers in
-  (* Build position runtime state: a shared pool hook for all its subgrids. *)
-  let pools : (string * string, float ref) Hashtbl.t = Hashtbl.create 8 in
+  (* One shared pool per venue account. *)
+  let pools : (string * string * bool, float ref) Hashtbl.t = Hashtbl.create 8 in
   let pool_of (key : pool_key) =
-    match Hashtbl.find_opt pools (key.venue, key.asset) with
+    match Hashtbl.find_opt pools (key.venue, key.quote, key.testnet) with
     | Some r -> r
     | None ->
       let r = ref 0.0 in
-      Hashtbl.add pools (key.venue, key.asset) r;
+      Hashtbl.add pools (key.venue, key.quote, key.testnet) r;
       r
   in
+  (* Seed every venue pool with the sum of its positions' shares. *)
+  List.iter
+    (fun (p : aligned_position_input) ->
+       let pool = pool_of (key_of_position p) in
+       pool := !pool +. p.pool)
+    positions;
   let position_runtime =
     List.map
       (fun (p : aligned_position_input) ->
-         let pool = pool_of { venue = p.venue; asset = p.asset } in
-         pool := !pool +. p.pool;
+         let key = key_of_position p in
+         let pool = pool_of key in
          let hook =
            Some
              { G.balance = (fun () -> !pool)
@@ -151,9 +190,9 @@ let simulate_aligned
               sg.state.G.base
               <- p.initial_base /. float_of_int (max 1 (List.length subgrids)))
            subgrids;
-         { venue = p.venue
+         { key
          ; asset = p.asset
-         ; initial_pool = p.pool
+         ; initial_pool = !pool
          ; bars = p.bars
          ; pool
          ; subgrids
@@ -173,7 +212,7 @@ let simulate_aligned
      it are applied. *)
   let n_iter = if n_sessions = 0 then 1 else n_sessions in
   for i = 0 to n_iter - 1 do
-    (* Transfers scheduled for this session: move budget between pools. *)
+    (* Transfers scheduled for this session: move budget between venue pools. *)
     List.iter
       (fun t ->
          if t.session = i
@@ -191,6 +230,18 @@ let simulate_aligned
                   := Float.max !(rt.pool_min_dd) (pool_drawdown rt.pool rt.initial_pool))
              position_runtime))
       transfers;
+    (* Snapshot each venue pool at the session start so every position on the
+       venue measures its trough against the same base level. *)
+    let session_start = Hashtbl.create 8 in
+    List.iter
+      (fun (rt : pos_rt) ->
+         if not (Hashtbl.mem session_start (rt.key.venue, rt.key.quote, rt.key.testnet))
+         then
+           Hashtbl.add
+             session_start
+             (rt.key.venue, rt.key.quote, rt.key.testnet)
+             !(rt.pool))
+      position_runtime;
     (* Advance every position over its own session bar. *)
     List.iter
       (fun (rt : pos_rt) ->
@@ -200,7 +251,9 @@ let simulate_aligned
            | None -> ()
            | Some source_bar ->
              let bar = to_grid_bar source_bar in
-             let start_pool = !(rt.pool) in
+             let start_pool =
+               Hashtbl.find session_start (rt.key.venue, rt.key.quote, rt.key.testnet)
+             in
              let trough = ref start_pool in
              let running = ref start_pool in
              List.iter
@@ -235,7 +288,7 @@ let simulate_aligned
     List.map
       (fun (rt : pos_rt) ->
          let capital_low = !(rt.first_cl_session) <> None in
-         { venue = rt.venue
+         { venue = rt.key.venue
          ; asset = rt.asset
          ; pool_min_drawdown = !(rt.pool_min_dd)
          ; first_exhausted_drawdown = !(rt.first_cl_dd)
@@ -250,9 +303,70 @@ let simulate_aligned
          })
       position_runtime
   in
+  let venues_order =
+    List.fold_left
+      (fun acc (rt : pos_rt) ->
+         if List.exists (fun key -> key = rt.key) acc then acc else acc @ [ rt.key ])
+      []
+      position_runtime
+  in
+  let venues_out =
+    List.map
+      (fun (key : pool_key) ->
+         let rts = List.filter (fun (rt : pos_rt) -> rt.key = key) position_runtime in
+         let initial_pool =
+           match rts with
+           | rt :: _ -> rt.initial_pool
+           | [] -> 0.0
+         in
+         let pool_min_dd =
+           List.fold_left
+             (fun acc (rt : pos_rt) -> Float.max acc !(rt.pool_min_dd))
+             0.0
+             rts
+         in
+         let first_dd =
+           match List.filter_map (fun (rt : pos_rt) -> !(rt.first_cl_dd)) rts with
+           | [] -> None
+           | values -> Some (List.fold_left Float.min Float.infinity values)
+         in
+         let first_session =
+           match List.filter_map (fun (rt : pos_rt) -> !(rt.first_cl_session)) rts with
+           | [] -> None
+           | values -> Some (List.fold_left min max_int values)
+         in
+         let capital_low =
+           List.exists (fun (rt : pos_rt) -> !(rt.first_cl_session) <> None) rts
+         in
+         { venue = key.venue
+         ; quote = key.quote
+         ; testnet = key.testnet
+         ; assets = List.map (fun (rt : pos_rt) -> rt.asset) rts
+         ; initial_pool
+         ; final_pool = !(pool_of key)
+         ; pool_min_drawdown = pool_min_dd
+         ; first_exhausted_drawdown = first_dd
+         ; first_exhausted_session = first_session
+         ; capital_low
+         ; d_surv = (if capital_low then pool_min_dd else 1.0)
+         ; buy_fills =
+             List.fold_left (fun acc (rt : pos_rt) -> acc + !(rt.buy_fills)) 0 rts
+         ; sell_fills =
+             List.fold_left (fun acc (rt : pos_rt) -> acc + !(rt.sell_fills)) 0 rts
+         ; final_base =
+             List.fold_left
+               (fun acc (rt : pos_rt) ->
+                  acc
+                  +. List.fold_left (fun acc sg -> acc +. sg.state.G.base) 0.0 rt.subgrids)
+               0.0
+               rts
+         })
+      venues_order
+  in
   { n_sessions
   ; positions = positions_out
-  ; exhausted = List.exists (fun (o : position_outcome) -> o.capital_low) positions_out
+  ; venues = venues_out
+  ; exhausted = List.exists (fun (o : venue_outcome) -> o.capital_low) venues_out
   ; first_exhausted_session = !first_cl_global
   }
 ;;
@@ -276,6 +390,8 @@ let simulate
       (fun (p : position_input) ->
          { venue = p.venue
          ; asset = p.asset
+         ; quote = p.quote
+         ; testnet = p.testnet
          ; pool = p.pool
          ; initial_base = 0.0
          ; bars = Array.map (fun bar -> Some bar) p.bars

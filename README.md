@@ -209,27 +209,35 @@ class's survival curve; `dio-survival` fetches the listed symbols per venue
 #### Portfolio Survival
 
 Use `dio-survival --portfolio` to replay multiple qualified instruments on a
-shared date timeline. Capital can be split equally with `--total-capital`, or
-assigned explicitly with repeated `--allocation VENUE/SYMBOL=AMOUNT` options.
-Manual quote transfers use `--transfer SESSION:FROM->TO=AMOUNT`. A topology JSON
-file can define the same positions and transfers:
+shared date timeline. The model's top level is the venue: capital is pooled per
+venue account (venue + quote + testnet), and every asset on the same venue
+draws its buy capital from that one pool — quote locked on an exchange cannot
+fund positions on another exchange, so each venue is an independent runway.
+`--total-capital` is split equally per venue; explicit funding uses repeated
+`--allocation VENUE/SYMBOL=AMOUNT` options (summed per venue). Manual quote
+transfers between venues use `--transfer SESSION:FROM->TO=AMOUNT`; transfers
+within one venue are rejected as no-ops and cross-quote transfers are rejected.
+A topology JSON file can define the same positions and transfers:
 
 ```json
 {
   "positions": [
     { "venue": "hyperliquid", "symbol": "BTC/USDC", "capital": 1000.0 },
-    { "venue": "kraken", "symbol": "ETH/USD", "capital": 1000.0 }
+    { "venue": "kraken", "symbol": "ETH/USD", "capital": 1000.0 },
+    { "venue": "alpaca", "symbol": "QQQ" }
   ],
   "transfers": [
-    { "session": 10, "from": "hyperliquid/BTC/USDC", "to": "kraken/ETH/USD", "amount": 250.0 }
+    { "session": 10, "from": "kraken/ETH/USD", "to": "alpaca/QQQ", "amount": 250.0 }
   ]
 }
 ```
 
-When `--capital` is omitted, online runs fetch available quote balances from
-Kraken, Hyperliquid, or Alpaca and split each account's balance across its
-unspecified positions. `--positions-file` and `--save-positions` persist
-qualified pool/base checkpoints separately from live strategy state.
+When `--capital` is omitted, online runs fetch each venue account's available
+quote balance and pool it per venue, splitting it across that venue's
+unspecified assets. `--positions-file` and `--save-positions` persist
+per-asset pool shares and base checkpoints separately from live strategy state
+(an asset's saved share is its venue pool divided by the venue's asset count,
+so the shares sum back to the venue pool).
 
 #### GC Tuning
 

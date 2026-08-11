@@ -18,7 +18,7 @@ let test_qualified_identity () =
 let test_parse_and_validate () =
   let json =
     Yojson.Safe.from_string
-      {|{"positions":[{"venue":"hyperliquid","symbol":"BTC/USDC","capital":1000},{"venue":"hyperliquid","symbol":"ETH/USDC","capital":1000}],"transfers":[{"session":2,"from":"hyperliquid/BTC/USDC","to":"hyperliquid/ETH/USDC","amount":25}]}|}
+      {|{"positions":[{"venue":"hyperliquid","symbol":"BTC/USDC","capital":1000},{"venue":"lighter","symbol":"ETH/USDC","capital":1000}],"transfers":[{"session":2,"from":"hyperliquid/BTC/USDC","to":"lighter/ETH/USDC","amount":25}]}|}
   in
   match Dio_survival.Survival_topology.parse json with
   | Error error -> Alcotest.fail error
@@ -26,6 +26,28 @@ let test_parse_and_validate () =
     (match Dio_survival.Survival_topology.validate definition with
      | Ok () -> ()
      | Error errors -> Alcotest.fail (String.concat "; " errors))
+;;
+
+let test_reject_same_venue_transfer () =
+  let hl1 =
+    Dio_survival.Survival_topology.key ~venue:"hyperliquid" ~symbol:"BTC/USDC" ()
+  in
+  let hl2 =
+    Dio_survival.Survival_topology.key ~venue:"hyperliquid" ~symbol:"ETH/USDC" ()
+  in
+  let definition =
+    { Dio_survival.Survival_topology.positions =
+        [ { key = hl1; capital = Some 1.0 }; { key = hl2; capital = Some 1.0 } ]
+    ; transfers = [ { session = 0; from_key = hl1; to_key = hl2; amount = 1.0 } ]
+    }
+  in
+  match Dio_survival.Survival_topology.validate definition with
+  | Ok () -> Alcotest.fail "expected same-venue transfer validation error"
+  | Error errors ->
+    Alcotest.(check bool)
+      "same venue rejected"
+      true
+      (List.exists (fun error -> String.contains error 'o') errors)
 ;;
 
 let test_reject_cross_quote_transfer () =
@@ -70,6 +92,7 @@ let () =
       , [ Alcotest.test_case "qualified identity" `Quick test_qualified_identity
         ; Alcotest.test_case "parse and validate" `Quick test_parse_and_validate
         ; Alcotest.test_case "reject cross quote" `Quick test_reject_cross_quote_transfer
+        ; Alcotest.test_case "reject same venue" `Quick test_reject_same_venue_transfer
         ; Alcotest.test_case
             "align without forward fill"
             `Quick
