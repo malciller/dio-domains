@@ -490,7 +490,9 @@ let report_text
   line
     "  columns: asset = linear-interp percentile of the asset's own MFD windows; class = \
      weighted pooled percentile of the class members; blended = inverted z-blend CDF";
-  line "  (three estimators: a step-function inverted CDF can sit off the other two)";
+  line
+    "  sample sizes: n = asset overlapping starts; asset_eff = the asset's own \
+     non-overlapping windows; class_eff = the pooled class effective sample size";
   let class_tbls =
     match r.class_estimates with
     | c_ :: _ -> c_.Survival_types.percentile_tables
@@ -521,7 +523,13 @@ let report_text
         rows3
       |> String.concat "   "
     in
-    line "  %-7s n=%d eff=%d   %s" at.horizon_label at.n_starts at.n_eff row
+    line
+      "  %-7s n=%d asset_eff=%d class_eff=%d   %s"
+      at.horizon_label
+      at.n_starts
+      at.n_eff
+      ct.n_eff
+      row
   done;
   line "";
   line

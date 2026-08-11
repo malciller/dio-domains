@@ -2,8 +2,8 @@
 
    Replays the grid over the asset's OHLC history (pessimistic Buy_first
    ordering) and extracts the survival event: D_surv =
-   first_capital_low_drawdown, or 100% when the grid never runs dry (it then
-   survived every drawdown the history produced, so F_h(1.0) = 1.0). The
+   first_exhaustion_price_drawdown, or 100% when the grid never runs dry (it
+   then survived every drawdown the history produced, so F_h(1.0) = 1.0). The
    headline number is historical_path_coverage = F_blend_h(D_surv): the share
    of the asset's own history (blended toward the class) whose max drawdown the
    grid would have survived, with a target-survival probability.
@@ -16,6 +16,12 @@
                       own volatility regime, so a low-vol asset is not punished
                       for a classmate's raw swing size
      F_blend(d)     = (n_a * F_asset(d) + kappa * F_class_avg(d)) / (n_a + kappa)
+   All three are estimated over the same window set: starts with a defined
+   volatility regime (sigma > 0) only. Flat/gap-adjacent windows carry no
+   volatility information (sigma = 0 would map to tau = +infinity and false
+   100% class certainty), so they are excluded from F_asset, n_a and
+   F_class_avg alike - the blend is a true weighted average of the valid
+   windows, never an inconsistent mix of differently-sized denominators.
 
    All of F_asset, F_class_avg and F_blend are monotone non-decreasing in d
    (composition of empirical CDFs), so bisection over d is sound even though
@@ -52,7 +58,7 @@ type outcome =
   }
 
 let d_surv_of_result (r : Grid_core.result) =
-  match r.first_capital_low_drawdown with
+  match r.first_exhaustion_price_drawdown with
   | Some d -> d
   (* The grid never ran dry: it survived every drawdown the history produced,
      so the survival threshold is 100% and F_h(1.0) = 1.0. This keeps coverage
@@ -96,10 +102,14 @@ type blend_model =
 
 and blend_index =
   { mfd_sorted : float array
-    (** Asset MFD samples (stride basis), sorted ascending, for F_asset. *)
+    (** Asset MFD samples (stride basis, sigma > 0 starts only), sorted
+        ascending, for F_asset. *)
   ; sigma : float array
     (** Asset trailing vol per start, aligned with the MFD samples (same loop
-        and stride), for the per-start class-z evaluation. *)
+        and stride), for the per-start class-z evaluation. Only starts with a
+        defined volatility regime (sigma > 0) are included - flat/gap-adjacent
+        windows carry no volatility information and are excluded from both
+        F_asset and the blend weight. *)
   ; n_asset : int
     (** Blend weight: the window count on the model's own sampling basis
         ([stride] = horizon sessions by default, i.e. the effective sample
@@ -147,7 +157,40 @@ let blend_index_of
       ~stride
       ()
   in
-  let mfd_sorted = Array.copy regime.mfd in
+  (* Exclude starts with sigma = 0 (flat or gap-adjacent windows): they carry
+     no volatility information, so they must not contribute to either side of
+     the blend. Mapping them to tau = +infinity would inject false 100% class
+     certainty, and keeping them in F_asset while excluding them from
+     F_class_avg would make the blend an inconsistent weighted average (the
+     class side averaged over fewer starts than the asset side). Filtering here
+     keeps [mfd_sorted], [sigma] and [n_asset] aligned with the class
+     component's valid starts, so the blend is a true weighted average of the
+     valid, non-zero-volatility periods. *)
+  let n_flat = ref 0 in
+  let mfd = ref [] in
+  let sigma = ref [] in
+  Array.iteri
+    (fun i s ->
+       if s > 0.0
+       then (
+         mfd := regime.mfd.(i) :: !mfd;
+         sigma := s :: !sigma)
+       else incr n_flat)
+    regime.sigma;
+  if !n_flat > 0
+  then
+    Logging.warn_f
+      ~section
+      "Survival_replay: %d/%d start windows for %s @%d have zero trailing volatility \
+       (flat or gap-adjacent data); they are excluded from both the asset CDF and the \
+       class contribution"
+      !n_flat
+      (Array.length regime.sigma)
+      asset.symbol
+      horizon.sessions;
+  let mfd = Array.of_list (List.rev !mfd) in
+  let sigma = Array.of_list (List.rev !sigma) in
+  let mfd_sorted = Array.copy mfd in
   Array.sort Float.compare mfd_sorted;
   let class_z =
     Survival_classes.z_index_of
@@ -161,9 +204,10 @@ let blend_index_of
   in
   (* The blend weight is the window count on this model's sampling basis (the
      effective sample size when stride = horizon): F_asset is estimated from
-     exactly [regime.sigma] windows, so kappa is a true pseudocount against
-     the asset's independent information content. *)
-  { mfd_sorted; sigma = regime.sigma; n_asset = Array.length regime.sigma; class_z }
+     exactly [sigma] windows (all with a defined volatility regime), so kappa
+     is a true pseudocount against the asset's independent information
+     content. *)
+  { mfd_sorted; sigma; n_asset = Array.length sigma; class_z }
 ;;
 
 type coverage_at_d =
@@ -177,8 +221,9 @@ type coverage_at_d =
 (** Pooled class z-coverage averaged over the asset starts with a defined
     trailing volatility regime (sigma > 0). Starts with sigma = 0 (flat/gap
     windows) carry no volatility information; mapping them to tau = +infinity
-    would inject false 100% class certainty, so they are excluded here (they
-    stay in F_asset, where a flat window's raw MFD of ~0 is legitimate). *)
+    would inject false 100% class certainty, so they are excluded up-front in
+    [blend_index_of] from the asset CDF, the blend weight and this average -
+    the blend is a true weighted average over the valid windows only. *)
 let class_fraction (m : blend_model) ~(d : float) =
   let sqrt_h = sqrt (float_of_int m.horizon.sessions) in
   let cls = ref 0.0 in
@@ -278,8 +323,9 @@ let coverage_of_capital
     single severe regime dominate the target-survival inversion. Pass
     ~stride:1 explicitly only when an overlapping basis is wanted. Warns when
     the effective sample is thin (n_eff < 5, the asset history cannot support
-    an authoritative tail) or when windows have zero trailing volatility (flat
-    or gap-adjacent data), which are excluded from the class contribution. *)
+    an authoritative tail). Windows with zero trailing volatility (flat or
+    gap-adjacent data) are excluded from the asset CDF, the blend weight and
+    the class contribution inside [blend_index_of] (which also warns). *)
 let blend_model_of
       ?(weight_by_sessions = true)
       ?stride
@@ -296,20 +342,6 @@ let blend_model_of
     blend_index_of ~horizon ~asset ~class_members ~warmup ~weight_by_sessions ~stride
   in
   let n_eff = Array.length index.sigma in
-  let n_flat =
-    Array.fold_left (fun acc sigma -> if sigma = 0.0 then acc + 1 else acc) 0 index.sigma
-  in
-  if n_flat > 0
-  then
-    Logging.warn_f
-      ~section
-      "Survival_replay: %d/%d start windows for %s @%d have zero trailing volatility \
-       (flat or gap-adjacent data); they are excluded from the class contribution to \
-       avoid false 100%% certainty"
-      n_flat
-      n_eff
-      asset.symbol
-      horizon.sessions;
   if n_eff > 0 && n_eff < 5
   then
     Logging.warn_f
@@ -330,9 +362,9 @@ let blend_model_of
     with f(hi) >= target and returns it: a CDF is a step function, so the
     lower bound can sit on a step edge whose value is still below target, and
     downstream sizing must consume the coverage the grid actually achieves.
-    The blended column prints to one decimal in percent, so 20 iterations
-    (~1e-6 precision) is far past report precision; extra iterations buy
-    nothing on a step function. *)
+    40 iterations narrow the bracket to ~1e-12 - far past any float
+    distinguishability on the [0, 1] axis - so the returned edge is exact to
+    machine precision regardless of where the empirical step lies. *)
 let d_for_coverage ~(f : float -> float) ~(target : float) =
   if target <= 0.0
   then 0.0
@@ -344,7 +376,7 @@ let d_for_coverage ~(f : float -> float) ~(target : float) =
         let mid = (lo +. hi) /. 2.0 in
         if f mid >= target then bisect lo mid (i - 1) else bisect mid hi (i - 1))
     in
-    bisect 0.0 0.999999 20)
+    bisect 0.0 0.999999 40)
 ;;
 
 (** Smallest drawdown d in (0, 1) whose blended coverage F_blend(d) reaches

@@ -42,10 +42,17 @@ let std ?(sample = true) xs =
     sqrt var)
 ;;
 
-(** Percentile of a weighted empirical distribution: the smallest value [v]
-    whose cumulative weight reaches [p]/100 of the total. Weights must be
-    positive; values are sorted internally. Used to invert the blended
-    (asset + kappa-weighted class) CDF. *)
+(** Percentile of a weighted empirical distribution by weighted linear
+    interpolation - the Type 7 analog of [percentile]. Each sample is anchored
+    at the end of its cumulative weight mass, and the quantile position
+    h = (total - 1) * p/100 + 1 is linearly interpolated between the two
+    samples bracketing it. With unit weights this reduces EXACTLY to the
+    unweighted [percentile] estimator, so the class and asset percentiles
+    report consistent values on the same underlying distribution (a step
+    function can sit off a linear interpolation and make the two estimators
+    disagree at the same percentile). Weights must be positive; values are
+    sorted internally. Used to invert the blended (asset + kappa-weighted
+    class) CDF. *)
 let weighted_percentile (pairs : (float * float) array) p =
   if Array.length pairs = 0
   then
@@ -61,16 +68,32 @@ let weighted_percentile (pairs : (float * float) array) p =
       invalid_arg
         "Survival_math.weighted_percentile: zero total weight; refusing to fabricate a \
          percentile"
+    else if p <= 0.0
+    then fst arr.(0)
+    else if p >= 100.0
+    then fst arr.(Array.length arr - 1)
     else (
-      let target = p /. 100.0 *. total in
+      let h = ((total -. 1.0) *. (p /. 100.0)) +. 1.0 in
+      let n = Array.length arr in
+      (* [j] = largest index whose cumulative weight (including its own) still
+         ends at or below [h]; [acc] ends holding the cumulative weight
+         through [j + 1]. *)
       let acc = ref 0.0 in
-      let found = ref None in
-      Array.iter
-        (fun (v, w) ->
-           if !found = None
-           then (
-             acc := !acc +. w;
-             if !acc >= target then found := Some v))
-        arr;
-      Option.value !found ~default:(fst arr.(Array.length arr - 1))))
+      let j = ref (-1) in
+      let i = ref 0 in
+      while !i < n && !acc <= h do
+        acc := !acc +. snd arr.(!i);
+        if !acc <= h then j := !i;
+        incr i
+      done;
+      if !j < 0
+      then fst arr.(0)
+      else if !j >= n - 1
+      then fst arr.(n - 1)
+      else (
+        let v_lo = fst arr.(!j) in
+        let v_hi = fst arr.(!j + 1) in
+        let w_hi = snd arr.(!j + 1) in
+        let frac = Float.max 0.0 (Float.min 1.0 ((h -. !acc +. w_hi) /. w_hi)) in
+        v_lo +. (frac *. (v_hi -. v_lo)))))
 ;;

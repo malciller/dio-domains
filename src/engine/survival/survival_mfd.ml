@@ -21,25 +21,34 @@
 open Survival_types
 
 (** MFD from start session [s] over [horizon] sessions. None when the window is
-    out of range or [horizon] <= 0. *)
+    out of range, [horizon] <= 0, or the start close / window min low is
+    non-finite or non-positive. The window is strict: a start whose half-open
+    (s, s+h] window would run past the end of the series (start + horizon >=
+    n) is rejected - an incomplete window's smaller min low would silently
+    bias the empirical CDF toward smaller drawdowns. *)
 let mfd ~closes ~lows ~start ~horizon =
   let n = Array.length closes in
   if n = 0 || start < 0 || start >= n || horizon <= 0
   then None
   else (
     let c = closes.(start) in
-    if c <= 0.0
+    if (not (Float.is_finite c)) || c <= 0.0
     then None
     else (
-      let fin = min n (start + horizon + 1) in
-      if fin <= start + 1
+      let fin = start + horizon + 1 in
+      if fin > n || fin <= start + 1
       then None
       else (
         let m = ref lows.(start + 1) in
+        let valid = ref true in
         for i = start + 2 to fin - 1 do
-          if lows.(i) < !m then m := lows.(i)
+          let l = lows.(i) in
+          if (not (Float.is_finite l)) || l <= 0.0 then valid := false;
+          if l < !m then m := l
         done;
-        Some (1.0 -. (!m /. c)))))
+        if (not !valid) || (not (Float.is_finite !m)) || !m <= 0.0
+        then None
+        else Some (1.0 -. (!m /. c)))))
 ;;
 
 (** Empirical F_h(d): share of valid start sessions in [warmup, n-horizon-1]

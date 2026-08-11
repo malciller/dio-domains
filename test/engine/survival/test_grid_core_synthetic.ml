@@ -123,7 +123,7 @@ let test_scenario_b_monotonic_decline () =
   Alcotest.(check bool) "halt cause is capital" (res.halt_cause = Some `Capital) true;
   (* Exhaustion fired exactly when Quote < Cost(N+1). *)
   let halt_level = level (!expected_n + 1) in
-  (match res.first_capital_low_drawdown with
+  (match res.first_exhaustion_price_drawdown with
    | Some dd -> near (1.0 -. (halt_level /. 100.0)) dd
    | None -> Alcotest.fail "expected capital-low drawdown");
   let out = Dio_survival.Survival_replay.replay_series c (series_of ~symbol:"B" bars) in
@@ -184,7 +184,7 @@ let test_scenario_c_dynamic_scaling () =
   near quote res.final_quote;
   Alcotest.(check bool) "exhausted" true res.exhausted;
   Alcotest.(check bool) "halt cause is capital" (res.halt_cause = Some `Capital) true;
-  (match res.first_capital_low_drawdown with
+  (match res.first_exhaustion_price_drawdown with
    | Some dd -> near (1.0 -. (halt_level /. 100.0)) dd
    | None -> Alcotest.fail "expected capital-low drawdown");
   (* The floor was breached and orders were up-sized to clear it. *)
@@ -304,6 +304,103 @@ let test_scenario_d_fee_drain () =
   Alcotest.(check bool) "quote never negative" (res.min_quote >= 0.0) true;
   Alcotest.(check bool) "exhausted" true res.exhausted;
   Alcotest.(check bool) "halt cause is capital" (res.halt_cause = Some `Capital) true
+;;
+
+(* ---- Scenario H: fee sensitivity on an infinite oscillation ---- *)
+
+let test_scenario_h_fee_sensitivity () =
+  (* The same oscillating path, two fee schedules: with zero fee every
+     buy-sell cycle nets +gi (> 0), so the quote never drains and the grid
+     runs forever; with a fee above gi/2 the identical path drains through
+     fees alone and exhausts (scenario D). This pins the fee as the survival
+     driver on flat-ish oscillations: a zero-fee grid must never run dry on
+     an infinite oscillation. *)
+  let mk_bars (c : Dio_strategies.Grid_core.config) ~cycles =
+    let open Dio_strategies.Grid_core in
+    let b = ref (buy_level c ~ref:c.start_price) in
+    Array.init cycles (fun _ ->
+      let s = sell_level c ~ref:!b in
+      let b_ = !b in
+      b := trail_buy_level c ~bid:b_ ~sell:s;
+      Dio_strategies.Grid_core_types.{ high = s; low = b_; close = b_ })
+  in
+  let cycles = 300 in
+  let free = cfg ~grid_interval_pct:0.1 ~fee:0.0 ~start_quote:150.0 () in
+  let res_free = replay free (mk_bars free ~cycles) in
+  Alcotest.(check int) "zero-fee buys" cycles res_free.buy_fills;
+  Alcotest.(check int) "zero-fee sells" cycles res_free.sell_fills;
+  Alcotest.(check bool) "zero-fee never exhausts" (not res_free.exhausted) true;
+  Alcotest.(check bool)
+    "zero-fee quote grows (positive grid carry)"
+    (res_free.final_quote > 150.0)
+    true;
+  let priced = cfg ~grid_interval_pct:0.1 ~fee:0.002 ~start_quote:150.0 () in
+  let res_priced = replay priced (mk_bars priced ~cycles) in
+  Alcotest.(check bool) "fee grid drains to exhaustion" true res_priced.exhausted;
+  Alcotest.(check bool)
+    "fee grid's halt cause is capital"
+    (res_priced.halt_cause = Some `Capital)
+    true
+;;
+
+(* ---- Scenario I: grid spacing vs survival depth ---- *)
+
+let test_scenario_i_grid_spacing () =
+  (* Same capital and qty, two grid spacings, on an identical monotonic
+     decline: a wider grid takes larger price steps per rung, so the same
+     capital funds more price distance before running dry - the exhaustion
+     drawdown (and the fill count) must be strictly deeper for the wider
+     grid. *)
+  let replay_with gi =
+    let open Dio_strategies.Grid_core in
+    (* 800 funds ~8 rungs at gi 1% but ~10 at gi 5%: the wider ladder's cost
+       sum converges slower, so the same capital buys more price distance. *)
+    let c = cfg ~grid_interval_pct:gi ~start_quote:800.0 () in
+    let n_bars = 200 in
+    let b = ref (buy_level c ~ref:c.start_price) in
+    let bars =
+      Array.init n_bars (fun _ ->
+        let b_ = !b in
+        b := trail_buy_level c ~bid:b_ ~sell:(sell_level c ~ref:b_);
+        bar ~high:(b_ *. 1.005) ~low:b_ ())
+    in
+    ( c
+    , bars
+    , Dio_strategies.Grid_core.replay
+        c
+        ~bars
+        ~ordering:Dio_strategies.Grid_core_types.Buy_first )
+  in
+  let c_narrow, bars_n, res_narrow = replay_with 1.0 in
+  let c_wide, bars_w, res_wide = replay_with 5.0 in
+  Alcotest.(check bool)
+    "both exhaust on the monotonic decline"
+    (res_narrow.exhausted && res_wide.exhausted)
+    true;
+  Alcotest.(check bool)
+    "wider grid fills more rungs"
+    (res_wide.buy_fills > res_narrow.buy_fills)
+    true;
+  let dd (res : Dio_strategies.Grid_core.result) =
+    match res.first_exhaustion_price_drawdown with
+    | Some d -> d
+    | None -> 1.0
+  in
+  Alcotest.(check bool)
+    "wider grid survives a deeper price drop"
+    (dd res_wide > dd res_narrow)
+    true;
+  (* The same ordering holds through the replay's D_surv extraction. *)
+  let out_narrow =
+    Dio_survival.Survival_replay.replay_series c_narrow (series_of ~symbol:"N" bars_n)
+  in
+  let out_wide =
+    Dio_survival.Survival_replay.replay_series c_wide (series_of ~symbol:"W" bars_w)
+  in
+  Alcotest.(check bool)
+    "replay D_surv deeper for the wider grid"
+    (out_wide.d_surv > out_narrow.d_surv)
+    true
 ;;
 
 (* ---- Statistical invariants ---- *)
@@ -551,12 +648,17 @@ let test_default_capital_is_viable () =
      let out = replay_series { c with start_quote = capital } series in
      Alcotest.(check bool) "fills occurred" (out.buy_fills > 0) true;
      Alcotest.(check bool) "survives beyond the first level" (out.d_surv > 0.01) true);
-  (* An impossible target yields no default (caller must require --capital). *)
+  (* An impossible target yields no default (caller must require --capital):
+     a class pool with no volatility information (every member window is
+     flat, so all class starts are excluded) caps the blended coverage at
+     n_eff/(n_eff + kappa) - the 0.9 target sits in that coverage gap. (A
+     fully flat ASSET yields an empty blend model instead and raises, per the
+     empty-distribution contract; the gap case needs an asset with vol.) *)
   let flat = mk_flat_series ~symbol:"M2" () in
   let m =
     Dio_survival.Survival_replay.blend_model_of
       ~horizon:h30
-      ~asset:flat
+      ~asset:(mk_series ~symbol:"M2" ~sc:1.0 ())
       ~class_members:[ flat ]
       ~kappa:200
       ~warmup:60
@@ -670,6 +772,8 @@ let () =
             test_scenario_b_monotonic_decline
         ; Alcotest.test_case "C dynamic scaling" `Quick test_scenario_c_dynamic_scaling
         ; Alcotest.test_case "D fee drain" `Quick test_scenario_d_fee_drain
+        ; Alcotest.test_case "H fee sensitivity" `Quick test_scenario_h_fee_sensitivity
+        ; Alcotest.test_case "I grid spacing" `Quick test_scenario_i_grid_spacing
         ; Alcotest.test_case
             "empirical min capital converges with floor"
             `Quick

@@ -152,7 +152,7 @@ let test_capital_low_exhaustion () =
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
   Alcotest.(check bool) "replay exhausted" true res.exhausted;
-  match res.first_capital_low_drawdown with
+  match res.first_exhaustion_price_drawdown with
   | Some dd -> near (1.0 -. (98.01 /. 100.0)) dd
   | None -> Alcotest.fail "expected capital-low drawdown"
 ;;
@@ -178,7 +178,7 @@ let test_capital_low_recovers () =
   Alcotest.(check bool) "exhausted at some point" true res.exhausted;
   Alcotest.(check int) "buys (1 + 4 + 1)" 6 res.buy_fills;
   Alcotest.(check int) "sells" 1 res.sell_fills;
-  match res.first_capital_low_drawdown with
+  match res.first_exhaustion_price_drawdown with
   | Some dd -> near (1.0 -. (0.99 ** 6.0)) dd
   | None -> Alcotest.fail "expected capital-low drawdown"
 ;;
@@ -244,7 +244,7 @@ let test_min_notional_dynamic_scaling () =
   Alcotest.(check int) "oracle fills" n res.buy_fills;
   Alcotest.(check bool) "exhausted on capital" true res.exhausted;
   Alcotest.(check bool) "halt cause is capital" (res.halt_cause = Some `Capital) true;
-  (match res.first_capital_low_drawdown with
+  (match res.first_exhaustion_price_drawdown with
    | Some dd -> near (1.0 -. (b_next /. 100.0)) dd
    | None -> Alcotest.fail "expected blocked level");
   near quote res.final_quote;

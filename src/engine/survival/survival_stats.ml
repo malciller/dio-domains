@@ -44,8 +44,9 @@ let z_mfd ~closes ~lows ~s ~horizon ~w =
     the z-blend: F_asset stays the raw MFD CDF while the class contribution is
     evaluated at the asset's own vol regime, tau_s(d) = d / (sigma_s * sqrt h).
     A start whose trailing vol is unavailable (or exactly zero, i.e. a flat
-    window) gets sigma = 0.0, which maps to tau = +infinity -> class coverage
-    1.0. [stride] mirrors Survival_mfd.samples. *)
+    window) gets sigma = 0.0; the z-blend (Survival_replay.blend_index_of)
+    excludes those starts from both sides of the blend, since they carry no
+    volatility information. [stride] mirrors Survival_mfd.samples. *)
 type asset_regime =
   { mfd : float array
   ; sigma : float array
