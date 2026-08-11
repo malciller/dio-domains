@@ -12,7 +12,7 @@ order execution.
 > [!WARNING]
 > **Auto-hedge for Hyperliquid is EXPERIMENTAL.** Testing is ongoing; features may be incomplete or unstable.
 
----
+---s
 
 ## Table of Contents
 
