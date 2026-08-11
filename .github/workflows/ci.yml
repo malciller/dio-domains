@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prep system deps for OCaml action
+      - name: Install system build dependencies
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -28,10 +28,14 @@ jobs:
           sudo make install
           sudo ldconfig
 
-      - uses: ocaml/setup-ocaml@v2
-        with:
-          ocaml-compiler: '5.2.0'
-          dune-cache: false # Disable built-in dune cache
+      - name: Set up opam and OCaml 5.2.0
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y opam
+          opam init --bare --disable-sandboxing -y --no-setup
+          if ! opam switch list --short 2>/dev/null | grep -qx "default"; then
+            opam switch create default ocaml-base-compiler.5.2.0
+          fi
+          eval "$(opam env --switch default)"
 
       - name: Restore Dune cache
         if: github.server_url == 'https://github.com'
