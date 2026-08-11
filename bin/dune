@@ -24,3 +24,10 @@
  (name dashboard)
  (modes exe)
  (libraries notty notty.unix yojson unix dio.dashboard_ui))
+
+(executable
+ (package dio)
+ (public_name dio-survival)
+ (name survival)
+ (modes exe)
+ (libraries unix yojson lwt dio.survival dio.engine dio.strategies))

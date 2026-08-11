@@ -22,6 +22,8 @@
   Suicide_grid_orders
   Suicide_grid_execution
   Suicide_grid_events
+  Grid_core
+  Grid_core_types
   Market_maker
   Fee_cache
   Auto_hedger))
