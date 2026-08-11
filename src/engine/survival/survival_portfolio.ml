@@ -147,14 +147,27 @@ let simulate_aligned
   let module GT = Dio_strategies.Grid_core_types in
   let n_sessions = Array.length timeline in
   let transfers = List.sort (fun a b -> Int.compare a.session b.session) transfers in
-  (* One shared pool per venue account. *)
+  (* One shared pool per venue account, plus its running trough for the current
+     session. The trough tracks the ACTUAL shared pool minimum: it is updated by
+     every position's cash hook (and by transfers), so a position's reported
+     pool_min_drawdown reflects the joint path of all positions on the venue -
+     one sibling's buys draw the same pool the other's sells credit. *)
   let pools : (string * string * bool, float ref) Hashtbl.t = Hashtbl.create 8 in
+  let troughs : (string * string * bool, float ref) Hashtbl.t = Hashtbl.create 8 in
   let pool_of (key : pool_key) =
     match Hashtbl.find_opt pools (key.venue, key.quote, key.testnet) with
     | Some r -> r
     | None ->
       let r = ref 0.0 in
       Hashtbl.add pools (key.venue, key.quote, key.testnet) r;
+      r
+  in
+  let trough_of (key : pool_key) =
+    match Hashtbl.find_opt troughs (key.venue, key.quote, key.testnet) with
+    | Some r -> r
+    | None ->
+      let r = ref 0.0 in
+      Hashtbl.add troughs (key.venue, key.quote, key.testnet) r;
       r
   in
   (* Seed every venue pool with the sum of its positions' shares. *)
@@ -168,10 +181,14 @@ let simulate_aligned
       (fun (p : aligned_position_input) ->
          let key = key_of_position p in
          let pool = pool_of key in
+         let trough = trough_of key in
          let hook =
            Some
              { G.balance = (fun () -> !pool)
-             ; spend = (fun a -> pool := !pool -. a)
+             ; spend =
+                 (fun a ->
+                   pool := !pool -. a;
+                   trough := Float.min !trough !pool)
              ; recover = (fun a -> pool := !pool +. a)
              }
          in
@@ -205,9 +222,6 @@ let simulate_aligned
       positions
   in
   let first_cl_global = ref None in
-  let pool_drawdown (pool : float ref) (init : float) =
-    if init > 0.0 then 1.0 -. (!pool /. init) else 1.0
-  in
   (* Even with no bars at all we run session 0 so that transfers scheduled for
      it are applied. *)
   let n_iter = if n_sessions = 0 then 1 else n_sessions in
@@ -222,25 +236,18 @@ let simulate_aligned
            let amt = Float.max 0.0 (Float.min t.amount (Float.max 0.0 !from_pool)) in
            from_pool := !from_pool -. amt;
            to_pool := !to_pool +. amt;
-           List.iter
-             (fun (rt : pos_rt) ->
-                if rt.pool == from_pool || rt.pool == to_pool
-                then
-                  rt.pool_min_dd
-                  := Float.max !(rt.pool_min_dd) (pool_drawdown rt.pool rt.initial_pool))
-             position_runtime))
+           let from_trough = trough_of t.from in
+           let to_trough = trough_of t.to_ in
+           from_trough := Float.min !from_trough !from_pool;
+           to_trough := Float.min !to_trough !to_pool))
       transfers;
-    (* Snapshot each venue pool at the session start so every position on the
-       venue measures its trough against the same base level. *)
-    let session_start = Hashtbl.create 8 in
+    (* Reset each venue pool's trough to its session-start level (after
+       transfers), so the session's drawdown is measured against the level the
+       venue actually started from. *)
     List.iter
       (fun (rt : pos_rt) ->
-         if not (Hashtbl.mem session_start (rt.key.venue, rt.key.quote, rt.key.testnet))
-         then
-           Hashtbl.add
-             session_start
-             (rt.key.venue, rt.key.quote, rt.key.testnet)
-             !(rt.pool))
+         let trough = trough_of rt.key in
+         trough := !(rt.pool))
       position_runtime;
     (* Advance every position over its own session bar. *)
     List.iter
@@ -251,37 +258,36 @@ let simulate_aligned
            | None -> ()
            | Some source_bar ->
              let bar = to_grid_bar source_bar in
-             let start_pool =
-               Hashtbl.find session_start (rt.key.venue, rt.key.quote, rt.key.testnet)
-             in
-             let trough = ref start_pool in
-             let running = ref start_pool in
              List.iter
                (fun sg ->
                   let fs = G.on_bar sg.grid ~state:sg.state ~bar ~ordering in
                   List.iter
                     (fun f ->
-                       running := !running +. f.GT.quote_delta;
-                       trough := Float.min !trough !running;
                        if f.GT.side = `Buy then incr rt.buy_fills else incr rt.sell_fills)
                     fs;
                   if sg.state.G.ever_capital_low
                   then if !first_cl_global = None then first_cl_global := Some i)
-               rt.subgrids;
-             rt.pool_min_dd
-             := Float.max
-                  !(rt.pool_min_dd)
-                  (if rt.initial_pool > 0.0
-                   then 1.0 -. (!trough /. rt.initial_pool)
-                   else 1.0);
-             (* First exhaustion: first session any subgrid of this position was
-              capital-low. *)
-             if
-               !(rt.first_cl_session) = None
-               && List.exists (fun sg -> sg.state.G.ever_capital_low) rt.subgrids
-             then (
-               rt.first_cl_session := Some i;
-               rt.first_cl_dd := Some (pool_drawdown rt.pool rt.initial_pool))))
+               rt.subgrids))
+      position_runtime;
+    (* Record the venue trough: every position on the venue shares the one
+       pool, so they all report the same pool_min_drawdown for this session.
+       Running this after ALL positions have traded keeps the metric on the
+       actual pool path (sibling buys and sells included). *)
+    List.iter
+      (fun (rt : pos_rt) ->
+         let trough = trough_of rt.key in
+         let dd =
+           if rt.initial_pool > 0.0 then 1.0 -. (!trough /. rt.initial_pool) else 1.0
+         in
+         rt.pool_min_dd := Float.max !(rt.pool_min_dd) dd;
+         (* First exhaustion: first session any subgrid of this position was
+            capital-low. *)
+         if
+           !(rt.first_cl_session) = None
+           && List.exists (fun sg -> sg.state.G.ever_capital_low) rt.subgrids
+         then (
+           rt.first_cl_session := Some i;
+           rt.first_cl_dd := Some dd))
       position_runtime
   done;
   let positions_out =

@@ -304,19 +304,6 @@ let historical_path_coverage (m : blend_model) ~(d_surv : float)
   }
 ;;
 
-(** Coverage of a candidate capital: replay with [start_quote = capital]. *)
-let coverage_of_capital
-      (base : Grid_core.config)
-      ~(series : series)
-      (m : blend_model)
-      (capital : float)
-  : coverage_at_d
-  =
-  let cfg = { base with start_quote = capital } in
-  let out = replay_series cfg series in
-  blended_coverage m ~d_surv:out.d_surv
-;;
-
 (** Builds the coverage model. [stride] defaults to the horizon (non-
     overlapping windows) for every coverage evaluation: overlapping (stride-1)
     samples would count one contiguous crash once per rolling start and let a
@@ -364,7 +351,16 @@ let blend_model_of
     downstream sizing must consume the coverage the grid actually achieves.
     40 iterations narrow the bracket to ~1e-12 - far past any float
     distinguishability on the [0, 1] axis - so the returned edge is exact to
-    machine precision regardless of where the empirical step lies. *)
+    machine precision regardless of where the empirical step lies.
+
+    Coupling caveat: [hi] is capped at 0.999999, so for a target above
+    f(0.999999) (the target sits in the gap between the deepest exhausting
+    coverage and the never-exhausted coverage of 1.0) the bisection returns
+    0.999999 with f(hi) < target. Callers must re-check the achieved coverage
+    (as [find_min_capital] / [max_qty] do) instead of trusting the value; the
+    cap deliberately stays below 1.0 so the returned drawdown can never
+    propagate a d = 1.0 into [fills_for_drawdown] (whose log would saturate).
+    *)
 let d_for_coverage ~(f : float -> float) ~(target : float) =
   if target <= 0.0
   then 0.0
@@ -389,11 +385,18 @@ let drawdown_for_target ~(model : blend_model) ~(target_survival : float) =
     ~target:target_survival
 ;;
 
+(** Grid interval as a fraction, capped to stay clear of the log singularity
+    at gi >= 1.0 (shared by the fill-count and drawdown inverses so they can
+    never disagree). *)
+let grid_interval_frac (grid : Grid_core.config) =
+  Float.min (grid.grid_interval_pct /. 100.0) 0.99
+;;
+
 (** Smallest number of ladder fills whose static runway drawdown
     1-(1-gi)^n reaches [d]. At least one fill is required (a grid below the
     first buy is exhausted at the first level). *)
 let fills_for_drawdown ~(grid : Grid_core.config) ~(d : float) =
-  let gi = Float.min (grid.grid_interval_pct /. 100.0) 0.99 in
+  let gi = grid_interval_frac grid in
   if d <= 0.0
   then 1
   else max 1 (int_of_float (Float.ceil (Float.log (1.0 -. d) /. Float.log (1.0 -. gi))))
@@ -415,9 +418,10 @@ let capital_for_fills ~(grid : Grid_core.config) ~(n_fills : int) =
     ~n_fills
 ;;
 
-(** Static drawdown survived by [n_fills] ladder steps. *)
+(** Static drawdown survived by [n_fills] ladder steps. [gi] is capped like
+    [fills_for_drawdown] so the two inverses agree for degenerate grids. *)
 let drawdown_of_fills ~(grid : Grid_core.config) ~(n_fills : int) =
-  let gi = grid.grid_interval_pct /. 100.0 in
+  let gi = grid_interval_frac grid in
   1.0 -. ((1.0 -. gi) ** float_of_int n_fills)
 ;;
 
