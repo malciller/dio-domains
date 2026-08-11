@@ -17,6 +17,13 @@ open Dio_survival
 
 let pct f = Printf.sprintf "%6.1f%%" (f *. 100.0)
 
+let string_contains haystack needle =
+  let hl = String.length haystack in
+  let nl = String.length needle in
+  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+  nl > 0 && go 0
+;;
+
 let float_list_of_string s =
   String.split_on_char ',' s |> List.map String.trim |> List.map float_of_string
 ;;
@@ -1489,15 +1496,28 @@ let main () =
       print_endline (Yojson.Safe.to_string report)
     | _ -> ())
   else (
-    let multiple = List.length tasks > 1 in
+    let failures = ref 0 in
     let one (task : Survival_tasks.task) =
       try run_one a config.classes task with
-      | exn when multiple ->
-        Printf.eprintf
-          "survival: '%s' (%s) failed: %s\n"
-          task.Survival_tasks.symbol
-          task.Survival_tasks.exchange
-          (Printexc.to_string exn);
+      | exn ->
+        incr failures;
+        let msg = Printexc.to_string exn in
+        if string_contains msg "empty distribution"
+        then
+          Printf.eprintf
+            "survival: '%s' (%s) skipped: history too short for the requested \
+             horizon/warmup (each horizon needs warmup + horizon + 2 bars; pass \
+             --vol-window and --horizons to fit the available data, or remove the asset \
+             from config.json trading): %s\n"
+            task.Survival_tasks.symbol
+            task.Survival_tasks.exchange
+            msg
+        else
+          Printf.eprintf
+            "survival: '%s' (%s) failed: %s\n"
+            task.Survival_tasks.symbol
+            task.Survival_tasks.exchange
+            msg;
         None
     in
     if not a.json then List.iter print_endline warnings;
@@ -1514,13 +1534,14 @@ let main () =
             | `Assoc l -> l
             | other -> [ "assets", other ]))
     in
-    match reports, a.json with
-    | [ r ], true -> print_endline (Yojson.Safe.to_string (add_warnings r))
-    | _ :: _ :: _, true ->
-      print_endline (Yojson.Safe.to_string (add_warnings (`List reports)))
-    | [], true when warnings <> [] ->
-      print_endline (Yojson.Safe.to_string (`Assoc [ "warnings", warn_j ]))
-    | _ -> ())
+    (match reports, a.json with
+     | [ r ], true -> print_endline (Yojson.Safe.to_string (add_warnings r))
+     | _ :: _ :: _, true ->
+       print_endline (Yojson.Safe.to_string (add_warnings (`List reports)))
+     | [], true when warnings <> [] ->
+       print_endline (Yojson.Safe.to_string (`Assoc [ "warnings", warn_j ]))
+     | _ -> ());
+    if !failures > 0 then exit 1)
 ;;
 
 let () = main ()
