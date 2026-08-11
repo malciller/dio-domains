@@ -67,8 +67,9 @@ type survival_surface =
   { horizon_label : string
   ; calendar_days : int
   ; n_starts : int
-    (** Number of valid per-start MFD windows pooled for this horizon. This is
-        the [n_asset] weight in the kappa blend. *)
+    (** Number of valid per-start MFD windows over all (overlapping) starts.
+        Display-only: the kappa blend weights by the window count on the
+        model's sampling basis instead (see Survival_replay.blend_index). *)
   ; rows : surface_row list
   }
 
@@ -146,7 +147,7 @@ type historical_path_coverage =
     (** Pooled class F_h(D_surv), volatility-translated: the class z-CDF
         evaluated at each asset start's own regime d / (sigma_s * sqrt h),
         averaged over the asset's starts. *)
-  ; blended_coverage : float (** (n_asset*F_asset + kappa*F_class)/(n_asset + kappa). *)
+  ; blended_coverage : float (** (n_a*F_asset + kappa*F_class)/(n_a + kappa). *)
   }
 
 (** Result of inverse sizing: the capital / qty that just clears a target

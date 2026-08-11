@@ -138,7 +138,9 @@ let parse_args () =
         , " kraken|alpaca|hyperliquid (default kraken; sets the calendar kind)" )
       ; ( "--capital"
         , Arg.Float (fun f -> capital := Some f)
-        , " override quote capital; online default is fetched balance, offline 1000.0" )
+        , " override quote capital; default is the computed static min capital for the \
+           target survival (max across horizons) - the grid needs capital only to place \
+           buy orders" )
       ; ( "--portfolio"
         , Arg.Set portfolio
         , " run all requested assets as one shared portfolio" )
@@ -395,34 +397,46 @@ let load_members
     >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)
 ;;
 
-let quote_of_task (task : Survival_tasks.task) =
-  (Survival_topology.key
-     ~venue:task.exchange
-     ~symbol:task.symbol
-     ~testnet:task.config.testnet
-     ())
-    .quote
-;;
-
-let live_capital_for_task (task : Survival_tasks.task) ~(offline : bool) =
-  if offline
-  then 1000.0
-  else (
-    match Lwt_main.run (Survival_balances.fetch_task task) with
-    | Ok snapshot ->
-      let capital =
-        Survival_balances.available_quote snapshot ~quote:(quote_of_task task)
-      in
-      if capital > 0.0
-      then capital
-      else
-        failwith
-          (Printf.sprintf
-             "survival: no available %s balance for %s/%s"
-             (quote_of_task task)
-             task.exchange
-             task.symbol)
-    | Error error -> failwith ("survival: balance fetch failed: " ^ error))
+(** Replay capital for the analysis: an explicit --capital wins; otherwise the
+    model's own static min capital for the target survival, maxed across
+    horizons. The strategy needs capital only to place buy orders (sell-side
+    inventory is not required to run it), so the sizing's own recommendation -
+    which funds the ladder through the target drawdown on the deepest horizon -
+    is the meaningful default. The live exchange balance is never used: it is
+    actively deployed in live trading (open orders) and is unrelated to what
+    the analysis needs. Fails with a clear error when no horizon reaches a
+    finite sizing (caller should pass --capital). *)
+let resolve_start_quote
+      (a : args)
+      (task : Survival_tasks.task)
+      (grid : Dio_strategies.Grid_core.config)
+      (models : Survival_replay.blend_model list)
+  =
+  match a.capital with
+  | Some capital -> capital
+  | None ->
+    (match
+       Survival_replay.min_capital_for_horizons
+         ~grid
+         ~models
+         ~target_survival:a.target_survival
+         ?hi:a.max_capital
+         ()
+     with
+     | Some capital -> capital
+     | None ->
+       failwith
+         (Printf.sprintf
+            "survival: no reachable static min capital for %s/%s at target survival \
+             %.1f%% within --max-capital %s; the blended history cannot support the \
+             target at that bound - pass an explicit --capital to run the grid replay \
+             with a chosen capital"
+            task.Survival_tasks.exchange
+            task.Survival_tasks.symbol
+            (a.target_survival *. 100.0)
+            (match a.max_capital with
+             | Some hi -> Printf.sprintf "%.0f" hi
+             | None -> "1e9")))
 ;;
 
 type coverage_row =
@@ -473,6 +487,10 @@ let report_text
     (Option.value a.gap_tolerance ~default:5);
   line "";
   line "MFD percentile tables (%s of max drawdown at each percentile):" "%";
+  line
+    "  columns: asset = linear-interp percentile of the asset's own MFD windows; class = \
+     weighted pooled percentile of the class members; blended = inverted z-blend CDF";
+  line "  (three estimators: a step-function inverted CDF can sit off the other two)";
   let class_tbls =
     match r.class_estimates with
     | c_ :: _ -> c_.Survival_types.percentile_tables
@@ -774,11 +792,7 @@ let run_one
   in
   let grid_interval_pct = Option.value a.grid_interval ~default:(snd tc.grid_interval) in
   let grid =
-    Grid_adapter.of_trading_config
-      tc
-      ~start_price
-      ~start_quote:(Option.value a.capital ~default:(live_capital_for_task task ~offline))
-      ~grid_interval_pct
+    Grid_adapter.of_trading_config tc ~start_price ~start_quote:0.0 ~grid_interval_pct
   in
   let grid =
     { grid with
@@ -853,6 +867,10 @@ let run_one
       ~warmup:vol_window
       ()
   in
+  (* Resolve the replay capital (explicit --capital or the model's own static
+     min capital across horizons), then replay with it. *)
+  let start_quote = resolve_start_quote a task grid (List.map model horizons) in
+  let grid = { grid with start_quote } in
   let replay_out = Survival_replay.replay_series grid asset in
   let coverages =
     List.map

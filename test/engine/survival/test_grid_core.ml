@@ -440,6 +440,102 @@ let test_cash_hook_replay_tracks_pool () =
   near plain.final_quote with_hook.final_quote
 ;;
 
+(* ---- Sell-side inventory semantics ----
+   The strategy runs on quote capital alone: sell inventory is not required,
+   and a sell order that the sellable base cannot cover is skipped - quote is
+   only ever reconciled (recovered) on valid sell fills. *)
+
+let test_sell_skipped_without_inventory () =
+  (* Alpaca 1:1 with sell_mult 0: every buy fully reserves its base, so the
+     sellable inventory is always zero. The sell level can be crossed forever
+     - no sell order is placed, no quote is recovered, no phantom base is
+     sold. *)
+  let c = cfg ~sell_mult:0.0 ~model:Dio_strategies.Grid_core_types.Alpaca () in
+  let st = Dio_strategies.Grid_core.create c in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:99.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "one buy" 1 st.buy_fills;
+  let fs =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~high:200.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "no sells (no inventory)" 0 st.sell_fills;
+  Alcotest.(check int) "no fills" 0 (List.length fs);
+  (* quote consumed only by the buy; nothing recovered *)
+  near 9_901.0 st.quote;
+  near 1.0 st.base
+;;
+
+let test_upsell_bounded_by_inventory () =
+  (* Alpaca 1:1 with sell_mult 0.5 reserves half of every buy, so the
+     sellable inventory (base - reserved) is 0.5 while the $50 floor up-sizes
+     the intended 1.0 sell to 0.5001: the up-sized quantity exceeds the
+     inventory, the order is clamped and the notional gate rejects it - the
+     sell is SKIPPED instead of selling phantom base. *)
+  let c =
+    cfg
+      ~qty:1.0
+      ~sell_mult:0.5
+      ~min_notional:50.0
+      ~model:Dio_strategies.Grid_core_types.Alpaca
+      ()
+  in
+  let st = Dio_strategies.Grid_core.create c in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:99.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "one buy" 1 st.buy_fills;
+  let fs =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~high:200.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  (* upsized 0.5001 > sellable 0.5 -> clamped, notional 0.5*99.99 < 50 -> skip *)
+  Alcotest.(check int) "no sell fills (inventory cannot cover upsell)" 0 st.sell_fills;
+  Alcotest.(check int) "no fills" 0 (List.length fs);
+  Alcotest.(check bool) "no phantom recovery" (st.quote = 9_901.0) true;
+  Alcotest.(check bool) "base intact" (st.base = 1.0) true;
+  (* the resting sell remains for a later, inventory-covering crossing *)
+  Alcotest.(check bool) "sell order still resting" (st.resting_sell <> None) true
+;;
+
+let test_sell_reconciliation_with_fee () =
+  (* Capital reconciliation on valid sell fills with a fee: quote = start -
+     buy cost + sell proceeds (gross - fee), and the buy fee is spent once. *)
+  let c = cfg ~fee:0.001 () in
+  let st = Dio_strategies.Grid_core.create c in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:99.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~high:101.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let expected = 10_000.0 -. (99.0 *. 1.001) +. (99.99 *. 0.999) in
+  Alcotest.(check (float 1e-9)) "quote reconciled with fee" expected st.quote
+;;
+
 let () =
   Alcotest.run
     "grid_core"
@@ -483,6 +579,18 @@ let () =
             "cash hook replay tracks pool"
             `Quick
             test_cash_hook_replay_tracks_pool
+        ; Alcotest.test_case
+            "sell skipped without inventory"
+            `Quick
+            test_sell_skipped_without_inventory
+        ; Alcotest.test_case
+            "upsell bounded by inventory"
+            `Quick
+            test_upsell_bounded_by_inventory
+        ; Alcotest.test_case
+            "sell reconciliation with fee"
+            `Quick
+            test_sell_reconciliation_with_fee
         ] )
     ]
 ;;

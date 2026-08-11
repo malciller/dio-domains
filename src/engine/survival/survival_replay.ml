@@ -29,8 +29,13 @@
    (non-overlapping windows) for every coverage evaluation - target-survival
    inversion, blended surfaces and percentile tables alike - so a single
    contiguous crash is counted once, not once per overlapping start.
-   [n_asset] (the kappa blend weight) is always the stride-1 overlapping count
-   so kappa keeps its pseudo-session meaning regardless of the basis. *)
+   [n_asset] (the kappa blend weight) is the window count on the model's own
+   sampling basis: F_asset is estimated from exactly those windows, so
+   weighting the blend by the same count makes kappa a true pseudocount
+   against the asset's effective sample size (n_eff on the default basis). A
+   short non-overlapping sample therefore shrinks toward the class instead of
+   pretending the asset's overlapping window count is independent
+   information. *)
 
 open Survival_types
 open Dio_strategies
@@ -96,9 +101,13 @@ and blend_index =
     (** Asset trailing vol per start, aligned with the MFD samples (same loop
         and stride), for the per-start class-z evaluation. *)
   ; n_asset : int
-    (** Blend weight: the stride-1 (overlapping) window count, so kappa keeps
-        its "pseudo-sessions against all the asset's own data" meaning even
-        when the sample basis is non-overlapping. *)
+    (** Blend weight: the window count on the model's own sampling basis
+        ([stride] = horizon sessions by default, i.e. the effective sample
+        size [n_eff]). F_asset is estimated from exactly these windows, so the
+        kappa pseudocount is measured against the asset's true independent
+        information content; a thin non-overlapping sample shrinks toward the
+        class rather than being weighted as if every overlapping start were an
+        independent observation. *)
   ; class_z : Survival_classes.z_index
   }
 
@@ -128,9 +137,6 @@ let blend_index_of
   : blend_index
   =
   let closes, lows = asset_closes_lows asset in
-  let n_asset =
-    Survival_mfd.n_starts ~closes ~lows ~horizon:horizon.sessions ~warmup ()
-  in
   let regime =
     Survival_stats.asset_regime_of
       ~closes
@@ -153,11 +159,16 @@ let blend_index_of
       ~stride
       ()
   in
-  { mfd_sorted; sigma = regime.sigma; n_asset; class_z }
+  (* The blend weight is the window count on this model's sampling basis (the
+     effective sample size when stride = horizon): F_asset is estimated from
+     exactly [regime.sigma] windows, so kappa is a true pseudocount against
+     the asset's independent information content. *)
+  { mfd_sorted; sigma = regime.sigma; n_asset = Array.length regime.sigma; class_z }
 ;;
 
 type coverage_at_d =
   { n_asset : int
+    (** Blend weight on the model's sampling basis (see [blend_index.n_asset]). *)
   ; asset : float
   ; class_ : float
   ; blended : float
@@ -315,19 +326,25 @@ let blend_model_of
 (** Smallest drawdown d in (0, 1) whose coverage [f](d) reaches [target].
     Empirical coverage functions used here are monotone non-decreasing in d,
     so a bisection is sound - unlike replay D_surv, which is path-dependent
-    and not monotone in capital. *)
+    and not monotone in capital. The bisection keeps the upper bound [hi]
+    with f(hi) >= target and returns it: a CDF is a step function, so the
+    lower bound can sit on a step edge whose value is still below target, and
+    downstream sizing must consume the coverage the grid actually achieves.
+    The blended column prints to one decimal in percent, so 20 iterations
+    (~1e-6 precision) is far past report precision; extra iterations buy
+    nothing on a step function. *)
 let d_for_coverage ~(f : float -> float) ~(target : float) =
   if target <= 0.0
   then 0.0
   else (
     let rec bisect lo hi i =
       if i = 0
-      then lo
+      then hi
       else (
         let mid = (lo +. hi) /. 2.0 in
         if f mid >= target then bisect lo mid (i - 1) else bisect mid hi (i - 1))
     in
-    bisect 0.0 0.999999 60)
+    bisect 0.0 0.999999 20)
 ;;
 
 (** Smallest drawdown d in (0, 1) whose blended coverage F_blend(d) reaches
@@ -350,13 +367,19 @@ let fills_for_drawdown ~(grid : Grid_core.config) ~(d : float) =
   else max 1 (int_of_float (Float.ceil (Float.log (1.0 -. d) /. Float.log (1.0 -. gi))))
 ;;
 
-(** Quote capital that exactly funds [n_fills] ladder buys (closed form). *)
+(** Quote capital that exactly funds [n_fills] ladder buys. Floor-aware: walks
+    the ladder with dynamic buy up-sizing (Grid_core.required_buy_qty), so a
+    binding min_notional cannot make the sizing understate the true cost. With
+    no floor this reduces to the closed-form geometric sum. *)
 let capital_for_fills ~(grid : Grid_core.config) ~(n_fills : int) =
-  Survival_mfd.static_runway_cost
+  Survival_mfd.floor_aware_runway_cost
     ~qty:grid.qty
     ~grid_interval_pct:grid.grid_interval_pct
     ~fee:grid.maker_fee
     ~start_price:grid.start_price
+    ~min_notional:grid.min_notional
+    ~price_increment:grid.price_increment
+    ~qty_increment:grid.qty_increment
     ~n_fills
 ;;
 
@@ -368,11 +391,11 @@ let drawdown_of_fills ~(grid : Grid_core.config) ~(n_fills : int) =
 
 (** Inverse sizing: smallest [capital] whose static runway survives the
     drawdown d* (the smallest d with F_blend(d) >= target). The CDF is monotone
-    in d, and the runway cost is a closed-form monotone function of the fill
-    count, so this is well-defined even though path-replay D_surv is not
-    monotone in capital. Returns [reachable = false] when the required capital
-    exceeds [hi] (or the target would need surviving the entire history with
-    certainty). *)
+    in d, and the runway cost (floor-aware; see [capital_for_fills]) is a
+    monotone function of the fill count, so this is well-defined even though
+    path-replay D_surv is not monotone in capital. Returns
+    [reachable = false] when the required capital exceeds [hi] (or the target
+    would need surviving the entire history with certainty). *)
 let find_min_capital
       ?(hi = 1e9)
       ~(grid : Grid_core.config)
@@ -390,15 +413,58 @@ let find_min_capital
   else (
     let d_surv = drawdown_of_fills ~grid ~n_fills:n in
     let coverage = (blended_coverage model ~d_surv).blended in
-    { parameter = "capital"; value = capital; d_surv; coverage; reachable = true })
+    (* The bisection returns the CDF step top (f(hi) >= target), so a blended
+       coverage still below target here means the target sits in a gap the
+       blended history cannot reach (surviving the whole history is not
+       achievable with certainty) - explicitly unreachable, not a capital
+       number. *)
+    if coverage +. 1e-12 < target_survival
+    then
+      { parameter = "capital"
+      ; value = hi
+      ; d_surv = 1.0
+      ; coverage = 0.0
+      ; reachable = false
+      }
+    else { parameter = "capital"; value = capital; d_surv; coverage; reachable = true })
 ;;
 
-(** Inverse sizing: largest [qty] whose static runway (given the grid's
-    [start_quote]) survives the drawdown d* (the smallest d with
-    F_blend(d) >= target). The runway cost is linear in qty, so the boundary is
-    closed form. Returns [reachable = false] when even [qty_increment] is too
-    large (or the target would need surviving the entire history with
-    certainty). *)
+(** Static min capital for a set of horizons: the max over horizons of
+    [find_min_capital] (the model's own "safe recommendation" for the target
+    survival). This is the default [start_quote] the CLI replays when no
+    --capital is given: the grid needs capital only to place buy orders (sell
+    inventory is not required to run it), so the sizing's own recommendation -
+    which funds the ladder through the target drawdown on the deepest horizon -
+    is a meaningful replay capital instead of an unrelated live account
+    balance. Returns [None] when no horizon reaches a finite sizing within
+    [hi] (e.g. the target sits in a coverage gap); callers should then require
+    an explicit capital. *)
+let min_capital_for_horizons
+      ?(hi = 1e9)
+      ~(grid : Grid_core.config)
+      ~(models : blend_model list)
+      ~(target_survival : float)
+      ()
+  =
+  let best =
+    List.fold_left
+      (fun acc (m : blend_model) ->
+         let r = find_min_capital ~hi ~grid ~model:m ~target_survival () in
+         if r.reachable then Float.max acc r.value else acc)
+      0.0
+      models
+  in
+  if best > 0.0 then Some best else None
+;;
+
+(** Largest [qty] whose static runway (given the grid's [start_quote]) survives
+    the drawdown d* (the smallest d with F_blend(d) >= target). The runway cost
+    is linear in qty when the venue floor does not bind, so the boundary is
+    closed form; under a binding floor the per-unit cost understates the true
+    cost of large qtys (the floor caps the cost of small ones), so the result
+    is advisory there - the replay-based empirical sizing is authoritative.
+    Returns [reachable = false] when even [qty_increment] is too large (or the
+    target would need surviving the entire history with certainty). *)
 let max_qty
       ?(hi = 1e6)
       ~(grid : Grid_core.config)
@@ -411,19 +477,25 @@ let max_qty
   let n = fills_for_drawdown ~grid ~d in
   let d_surv = drawdown_of_fills ~grid ~n_fills:n in
   let coverage = (blended_coverage model ~d_surv).blended in
-  let gi = grid.grid_interval_pct /. 100.0 in
-  let per_unit =
-    (1.0 +. grid.maker_fee)
-    *. grid.start_price
-    *. (1.0 -. gi)
-    *. ((1.0 -. ((1.0 -. gi) ** float_of_int n)) /. gi)
-  in
-  let qty = grid.start_quote /. per_unit in
-  if qty < grid.qty_increment || qty > hi
-  then (
-    let qty = Float.max qty grid.qty_increment |> Float.min hi in
-    { parameter = "qty"; value = qty; d_surv; coverage; reachable = false })
-  else { parameter = "qty"; value = qty; d_surv; coverage; reachable = true }
+  (* Same unreachable detection as [find_min_capital]: the bisection returns a
+     CDF step top, so a coverage below target here is a coverage gap the
+     blended history cannot clear with certainty. *)
+  if coverage +. 1e-12 < target_survival
+  then { parameter = "qty"; value = hi; d_surv = 1.0; coverage = 0.0; reachable = false }
+  else (
+    let gi = grid.grid_interval_pct /. 100.0 in
+    let per_unit =
+      (1.0 +. grid.maker_fee)
+      *. grid.start_price
+      *. (1.0 -. gi)
+      *. ((1.0 -. ((1.0 -. gi) ** float_of_int n)) /. gi)
+    in
+    let qty = grid.start_quote /. per_unit in
+    if qty < grid.qty_increment || qty > hi
+    then (
+      let qty = Float.max qty grid.qty_increment |> Float.min hi in
+      { parameter = "qty"; value = qty; d_surv; coverage; reachable = false })
+    else { parameter = "qty"; value = qty; d_surv; coverage; reachable = true })
 ;;
 
 (** Empirical min capital (advisory): the smallest [start_quote] whose actual
