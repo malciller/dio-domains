@@ -27,7 +27,7 @@
 
 (executable
  (package dio)
- (public_name dio-survival)
- (name survival)
+ (public_name dio-oracle)
+ (name oracle)
  (modes exe)
- (libraries unix yojson lwt dio.survival dio.engine dio.strategies))
+ (libraries unix yojson lwt dio.oracle dio.engine dio.strategies dio.cmc))

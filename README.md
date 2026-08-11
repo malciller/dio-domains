@@ -122,10 +122,10 @@ engine spawns an isolated domain per entry.
     "major_heap_increment": 100
   },
   "classes": {
-    "large_cap_stable": ["BTC/USD", "ETH/USD"],
-    "large_cap_volatile": ["SOL/USD", "DOGE/USD", "ADA/USD"],
-    "equity_index": ["SPY", "QQQ"],
-    "equity_volatile": ["NVDA", "AMD"]
+    "crypto_core": ["BTC/USD", "ETH/USD"],
+    "crypto_alt": ["SOL/USD", "DOGE/USD", "ADA/USD"],
+    "equity_etf": ["SPY", "QQQ"],
+    "equity_momentum": ["NVDA", "AMD"]
   },
   "trading": [
     {
@@ -135,7 +135,7 @@ engine spawns an isolated domain per entry.
       "grid_interval": [0.25, 1.25],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "asset_class": "large_cap_stable"
+      "asset_class": "crypto_core"
     },
     {
       "symbol": "HYPE/USDC",
@@ -147,7 +147,7 @@ engine spawns an isolated domain per entry.
       "strategy": "Grid",
       "testnet": false,
       "hedge": true,
-      "asset_class": "large_cap_volatile"
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "ETH/USDC",
@@ -177,7 +177,7 @@ engine spawns an isolated domain per entry.
       "strategy": "Grid",
       "testnet": true,
       "data_feed": "iex",
-      "asset_class": "equity_index"
+      "asset_class": "equity_etf"
     }
   ]
 }
@@ -200,16 +200,16 @@ engine spawns an isolated domain per entry.
 | `hedge` | bool | Enable auto-hedge (Hyperliquid only) |
 | `data_feed` | string | Market data feed channel (`"iex"` or `"sip"`; Alpaca only) |
 | `maker_fee` / `taker_fee` | float | Override exchange fee rates |
-| `asset_class` | string | Risk class for capital-survival modeling (e.g. `"large_cap_stable"`); must match a key in the top-level `classes` map, required for `dio-survival` runs |
+| `asset_class` | string | Risk class for capital-survival modeling (e.g. `"crypto_core"`); must match a key in the top-level `classes` map, required for `dio-oracle` runs |
 
 The top-level `classes` object defines the member pools backing each risk
-class's survival curve; `dio-survival` fetches the listed symbols per venue
+class's survival curve; `dio-oracle` fetches the listed symbols per venue
 (never from hardcoded code lists). Two schemas are accepted:
 
 ```json
 "classes": {
-  "large_cap_stable": ["BTC/USD", "ETH/USD"],
-  "large_cap_volatile": { "members": ["SOL/USD", "DOGE/USD"], "kappa": 250 }
+  "crypto_core": ["BTC/USD", "ETH/USD"],
+  "crypto_alt": { "members": ["SOL/USD", "DOGE/USD"], "kappa": 250 }
 }
 ```
 
@@ -232,9 +232,9 @@ safe closed-form static minimum capital (a straight-down worst case) and an
 advisory empirical minimum capital from actual path replay, whose
 static/empirical ratio shows the capital buffer the static sizing pays for.
 
-#### Portfolio Survival
+#### Portfolio Oracle
 
-Use `dio-survival --portfolio` to replay multiple qualified instruments on a
+Use `dio-oracle --portfolio` to replay multiple qualified instruments on a
 shared date timeline. The model's top level is the venue: capital is pooled per
 venue account (venue + quote + testnet), and every asset on the same venue
 draws its buy capital from that one pool — quote locked on an exchange cannot

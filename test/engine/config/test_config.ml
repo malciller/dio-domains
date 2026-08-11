@@ -1,6 +1,6 @@
 let test_parse_trading_config_valid () =
   let json_str =
-    {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002, "asset_class": "large_cap_stable"}|}
+    {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002, "asset_class": "crypto_core"}|}
   in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
@@ -13,7 +13,7 @@ let test_parse_trading_config_valid () =
   Alcotest.(check (option (float 0.001))) "taker_fee" (Some 0.002) config.taker_fee;
   Alcotest.(check (option string))
     "asset_class"
-    (Some "large_cap_stable")
+    (Some "crypto_core")
     config.asset_class
 ;;
 
@@ -92,35 +92,35 @@ let test_read_config_defaults () =
 
 let test_parse_classes () =
   let json_str =
-    {|{"classes": {"large_cap_stable": ["BTC/USD", "ETH/USD"], "equity_index": ["SPY", "QQQ"]}}|}
+    {|{"classes": {"crypto_core": ["BTC/USD", "ETH/USD"], "equity_etf": ["SPY", "QQQ"]}}|}
   in
   let json = Yojson.Basic.from_string json_str in
   let classes = Dio_engine.Config.parse_classes json in
   let open Dio_engine.Config in
   Alcotest.(check (list (pair string (list string))))
     "legacy schema members"
-    [ "large_cap_stable", [ "BTC/USD"; "ETH/USD" ]; "equity_index", [ "SPY"; "QQQ" ] ]
+    [ "crypto_core", [ "BTC/USD"; "ETH/USD" ]; "equity_etf", [ "SPY"; "QQQ" ] ]
     (List.map (fun ((name, pool) : string * class_pool) -> name, pool.members) classes);
   Alcotest.(check (list (pair string (option int))))
     "legacy schema kappa unset"
-    [ "large_cap_stable", None; "equity_index", None ]
+    [ "crypto_core", None; "equity_etf", None ]
     (List.map (fun ((name, pool) : string * class_pool) -> name, pool.kappa) classes)
 ;;
 
 let test_parse_classes_extended_schema () =
   let json_str =
-    {|{"classes": {"large_cap_stable": {"members": ["BTC/USD", "ETH/USD"], "kappa": 250}, "equity_index": {"members": ["SPY", "QQQ"]}}}|}
+    {|{"classes": {"crypto_core": {"members": ["BTC/USD", "ETH/USD"], "kappa": 250}, "equity_etf": {"members": ["SPY", "QQQ"]}}}|}
   in
   let json = Yojson.Basic.from_string json_str in
   let classes = Dio_engine.Config.parse_classes json in
   let open Dio_engine.Config in
   Alcotest.(check (list (pair string (list string))))
     "extended schema members"
-    [ "large_cap_stable", [ "BTC/USD"; "ETH/USD" ]; "equity_index", [ "SPY"; "QQQ" ] ]
+    [ "crypto_core", [ "BTC/USD"; "ETH/USD" ]; "equity_etf", [ "SPY"; "QQQ" ] ]
     (List.map (fun ((name, pool) : string * class_pool) -> name, pool.members) classes);
   Alcotest.(check (list (pair string (option int))))
     "extended schema kappa"
-    [ "large_cap_stable", Some 250; "equity_index", None ]
+    [ "crypto_core", Some 250; "equity_etf", None ]
     (List.map (fun ((name, pool) : string * class_pool) -> name, pool.kappa) classes)
 ;;
 
