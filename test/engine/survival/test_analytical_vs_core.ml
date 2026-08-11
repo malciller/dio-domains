@@ -241,6 +241,7 @@ let test_blend_asset_matches_f_h () =
       ~class_members:[ series ]
       ~kappa:200
       ~warmup:60
+      ~stride:1
       ()
   in
   let d = 0.15 in
