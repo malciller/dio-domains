@@ -1,9 +1,18 @@
-(* Survival math - dependency-free numerical helpers shared by MFD and stats. *)
+(* Survival math - dependency-free numerical helpers shared by MFD and stats.
+
+   A percentile of an empty sample is indistinguishable from a legitimate
+   "zero drawdown" observation, so both percentile estimators raise
+   [Invalid_argument] on empty (or zero-total-weight) input instead of
+   returning 0.0: an empty distribution must never masquerade as "this asset
+   never drew down" or feed false precision into a percentile table. *)
 
 let percentile xs p =
   let n = Array.length xs in
   if n = 0
-  then 0.0
+  then
+    invalid_arg
+      "Survival_math.percentile: empty distribution (no samples); refusing to fabricate \
+       a percentile"
   else (
     let arr = Array.copy xs in
     Array.sort Float.compare arr;
@@ -39,13 +48,19 @@ let std ?(sample = true) xs =
     (asset + kappa-weighted class) CDF. *)
 let weighted_percentile (pairs : (float * float) array) p =
   if Array.length pairs = 0
-  then 0.0
+  then
+    invalid_arg
+      "Survival_math.weighted_percentile: empty distribution (no samples); refusing to \
+       fabricate a percentile"
   else (
     let arr = Array.copy pairs in
     Array.sort (fun (a, _) (b, _) -> Float.compare a b) arr;
     let total = Array.fold_left (fun acc (_, w) -> acc +. w) 0.0 arr in
     if total <= 0.0
-    then 0.0
+    then
+      invalid_arg
+        "Survival_math.weighted_percentile: zero total weight; refusing to fabricate a \
+         percentile"
     else (
       let target = p /. 100.0 *. total in
       let acc = ref 0.0 in

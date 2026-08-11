@@ -9,6 +9,59 @@ let test_percentile () =
   near 5.0 (Dio_survival.Survival_stats.percentile xs 100.)
 ;;
 
+let test_percentile_empty_raises () =
+  (* An empty sample must never masquerade as a zero drawdown: a 0.0 MFD
+     percentile for an asset with no windows is indistinguishable from
+     "never drew down" and silently injects false precision downstream. *)
+  (try
+     ignore (Dio_survival.Survival_stats.percentile [||] 50.0);
+     Alcotest.fail "percentile: expected Invalid_argument"
+   with
+   | Invalid_argument _ -> ());
+  try
+    ignore (Dio_survival.Survival_math.weighted_percentile [||] 50.0);
+    Alcotest.fail "weighted_percentile: expected Invalid_argument"
+  with
+  | Invalid_argument _ ->
+    ();
+    (* Zero total weight is the same disease: no information to invert. *)
+    (try
+       ignore
+         (Dio_survival.Survival_math.weighted_percentile [| 1.0, 0.0; 2.0, 0.0 |] 50.0);
+       Alcotest.fail "weighted_percentile: expected Invalid_argument on zero weight"
+     with
+     | Invalid_argument _ -> ())
+;;
+
+let test_percentile_ordering () =
+  (* Percentile rows must be non-decreasing in p for both estimators: the
+     table's P50 <= P75 <= P90 <= P95 <= P99 invariant. *)
+  let xs =
+    Array.init 137 (fun i -> 100.0 *. sin (float_of_int (i * 7))) |> Array.map abs_float
+  in
+  let prev = ref (-1.0) in
+  List.iter
+    (fun p ->
+       let v = Dio_survival.Survival_stats.percentile xs p in
+       Alcotest.(check bool)
+         (Printf.sprintf "percentile P%g ordered" p)
+         (v >= !prev -. 1e-9)
+         true;
+       prev := v)
+    [ 50.; 75.; 90.; 95.; 99. ];
+  let pairs = Array.mapi (fun i v -> v, 1.0 +. float_of_int (i mod 3)) xs in
+  let prev = ref (-1.0) in
+  List.iter
+    (fun p ->
+       let v = Dio_survival.Survival_math.weighted_percentile pairs p in
+       Alcotest.(check bool)
+         (Printf.sprintf "weighted P%g ordered" p)
+         (v >= !prev -. 1e-9)
+         true;
+       prev := v)
+    [ 50.; 75.; 90.; 95.; 99. ]
+;;
+
 let test_trailing_vol_constant () =
   let closes = Array.make 100 100.0 in
   near 0.0 (Option.get (Dio_survival.Survival_stats.trailing_vol ~closes ~s:80 ~w:60))
@@ -180,6 +233,8 @@ let () =
     "survival_stats"
     [ ( "stats"
       , [ Alcotest.test_case "percentile" `Quick test_percentile
+        ; Alcotest.test_case "percentile empty raises" `Quick test_percentile_empty_raises
+        ; Alcotest.test_case "percentile ordering" `Quick test_percentile_ordering
         ; Alcotest.test_case "trailing vol constant" `Quick test_trailing_vol_constant
         ; Alcotest.test_case
             "trailing vol no lookahead"

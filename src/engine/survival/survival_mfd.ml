@@ -12,7 +12,11 @@
    Also hosts the closed-form static drawdown runway used to cross-check the
    Grid_core replay:
      C_used(N) = (1+fee) * q * C_s * (1-gi) * (1-(1-gi)^N) / gi
-     N* = max N with C_used(N) <= C  =>  D_surv = 1-(1-gi)^N*            *)
+     N* = max N with C_used(N) <= C  =>  D_surv = 1-(1-gi)^N*
+   and the floor-aware variant [floor_aware_runway_cost], which walks the same
+   ladder with Grid_core's dynamic buy up-sizing (q_k = max(qty, ceil_lot
+   (min_notional / level_k))) so the static sizing stays conservative when the
+   venue's notional floor binds. *)
 
 open Survival_types
 
@@ -39,9 +43,11 @@ let mfd ~closes ~lows ~start ~horizon =
 ;;
 
 (** Empirical F_h(d): share of valid start sessions in [warmup, n-horizon-1]
-    whose MFD over the next [horizon] sessions is <= [d]. Returns 0.0 when no
-    valid start exists. [stride] steps through starts (default 1 = every
-    session); stride = horizon gives non-overlapping windows. *)
+    whose MFD over the next [horizon] sessions is <= [d]. Raises when no valid
+    start exists: a coverage of 0.0 from zero observations is meaningless, not
+    informative, and must not masquerade as "every window drew down more than
+    [d]". [stride] steps through starts (default 1 = every session); stride =
+    horizon gives non-overlapping windows. *)
 let f_h ~closes ~lows ~horizon ~threshold ~warmup ?(stride = 1) () =
   let n = Array.length closes in
   let stride = max 1 stride in
@@ -56,7 +62,15 @@ let f_h ~closes ~lows ~horizon ~threshold ~warmup ?(stride = 1) () =
      | None -> ());
     s := !s + stride
   done;
-  if !total = 0 then 0.0 else float_of_int !hits /. float_of_int !total
+  if !total = 0
+  then
+    invalid_arg
+      (Printf.sprintf
+         "Survival_mfd.f_h: empty distribution for horizon %d warmup %d: no valid start \
+          window (needs >= warmup + horizon + 2 sessions)"
+         horizon
+         warmup)
+  else float_of_int !hits /. float_of_int !total
 ;;
 
 let survival ~closes ~lows ~horizon ~threshold ~warmup ?(stride = 1) () =
@@ -140,18 +154,34 @@ let static_runway_cost ~qty ~grid_interval_pct ~fee ~start_price ~n_fills =
   (1.0 +. fee) *. qty *. first *. ((1.0 -. ((1.0 -. gi) ** float_of_int n_fills)) /. gi)
 ;;
 
-(** Number of consecutive ladder buys affordable from [capital]; >= 0. *)
+(** Number of consecutive ladder buys affordable from [capital]; >= 0. The
+    closed-form ladder cost converges to the total geometric sum
+    (1+fee)*qty*first/gi as the fill count grows, so capital at or above that
+    limit funds the whole ladder - the recursion must terminate there instead
+    of searching forever. *)
 let max_affordable_fills ~qty ~grid_interval_pct ~fee ~start_price ~capital =
   if capital <= 0.0
   then 0
   else (
-    let rec go n =
-      let cost =
-        static_runway_cost ~qty ~grid_interval_pct ~fee ~start_price ~n_fills:(n + 1)
+    let gi = grid_interval_pct /. 100.0 in
+    let first = start_price *. (1.0 -. gi) in
+    let total_ladder = (1.0 +. fee) *. qty *. first /. gi in
+    if capital >= total_ladder
+    then
+      (* Capital funds the entire ladder: cap at the fill count whose drawdown
+         is within 1e-12 of 100% - beyond it the runways differ by less than
+         the closed form's own float precision, so the count is arbitrary. *)
+      max 1 (int_of_float (Float.ceil (Float.log 1e-12 /. Float.log (1.0 -. gi))))
+    else (
+      (* capital < total_ladder, so the cost strictly increases to a limit
+         above capital and the recursion terminates. *)
+      let rec go n =
+        let cost =
+          static_runway_cost ~qty ~grid_interval_pct ~fee ~start_price ~n_fills:(n + 1)
+        in
+        if cost <= capital then go (n + 1) else n
       in
-      if cost <= capital then go (n + 1) else n
-    in
-    go 0)
+      go 0))
 ;;
 
 (** Static (closed-form) drawdown the grid survives before quote capital can no
@@ -162,4 +192,42 @@ let static_drawdown_runway ~qty ~grid_interval_pct ~fee ~start_price ~capital =
   let gi = grid_interval_pct /. 100.0 in
   let drawdown = 1.0 -. ((1.0 -. gi) ** float_of_int n) in
   n, drawdown
+;;
+
+(** Floor-aware runway cost of [n_fills] ladder buys: walks the grid's own
+    ladder (same rounding as Grid_core.buy_level / sell_level /
+    trail_buy_level) with dynamic buy up-sizing (q_k = max(qty,
+    ceil_lot(min_notional / level_k)) per Grid_core.required_buy_qty), so the
+    cost is exact when the venue floor binds and reduces to the closed-form
+    geometric sum when it does not. The closed-form [static_runway_cost]
+    assumes a fixed qty at every rung and therefore UNDERSTATES the true
+    requirement whenever min_notional forces up-sizing deep in the ladder;
+    this variant is the conservative bound used by the sizing layer. *)
+let floor_aware_runway_cost
+      ~qty
+      ~grid_interval_pct
+      ~fee
+      ~start_price
+      ~min_notional
+      ~price_increment
+      ~qty_increment
+      ~n_fills
+  =
+  let gi = grid_interval_pct /. 100.0 in
+  let inv_p = 1.0 /. price_increment in
+  let round_price p = Float.round (p *. inv_p) /. inv_p in
+  let inv_q = 1.0 /. qty_increment in
+  let ceil_lot q = Float.ceil ((q *. inv_q) -. 1e-9) /. inv_q in
+  let level = ref (round_price (start_price *. (1.0 -. gi))) in
+  let acc = ref 0.0 in
+  for _ = 1 to n_fills do
+    let floor_q = if min_notional > 0.0 then ceil_lot (min_notional /. !level) else 0.0 in
+    let q = Float.max qty floor_q in
+    acc := !acc +. (q *. !level *. (1.0 +. fee));
+    let sell = round_price (!level *. (1.0 +. gi)) in
+    let grid_buy = round_price (!level *. (1.0 -. gi)) in
+    let exact = round_price (sell -. (!level *. (2.0 *. gi))) in
+    level := Float.min grid_buy exact
+  done;
+  !acc
 ;;

@@ -13,12 +13,18 @@
      construction). Exhaustion (capital_low) fires only when quote cannot fund
      the (up-sized) order; a qty_min failure with ample capital halts the grid
      as [`Not_placeable] instead.
-   - sell gate      = sell notional q_s * price >= min_notional and
-     q_s >= qty_min. Dynamic sell sizing: non-accumulation venues (Kraken
-     sell_mult, Alpaca 1:1) up-size the sell qty to ceil_lot(min_notional /
-     price) so the grid recovers safely; accumulation venues (HL/Lighter/IBKR)
-     keep the resting sell (accumulate) until the reduced sell clears the floor,
-     mirroring live order rejection.
+    - sell gate      = sell notional q_s * price >= min_notional and
+      q_s >= qty_min. Dynamic sell sizing: non-accumulation venues (Kraken
+      sell_mult, Alpaca 1:1) up-size the sell qty to ceil_lot(min_notional /
+      price) so the grid recovers safely; accumulation venues (HL/Lighter/IBKR)
+      keep the resting sell (accumulate) until the reduced sell clears the floor,
+      mirroring live order rejection.
+    - sell inventory  = sell-side base is NOT required to run the strategy:
+      the grid needs only quote capital to place a buy order, and a sell order
+      is only placed (and only fills) if the sellable inventory
+      base - reserved_base covers the (up-sized) quantity. An order that the
+      inventory cannot cover is skipped - never filled with phantom base - so
+      quote is reconciled (recovered) exactly on valid sell fills.
    - sell qty per venue: Kraken qty*sell_mult; HL/Lighter/IBKR accumulation
      sells once accumulated_profit >= rounding_diff*sell_price + buffer;
      Alpaca 1:1.
@@ -195,8 +201,10 @@ let required_buy_qty cfg ~price =
     letting the grid recover capital instead of stranding base below the floor;
     accumulation venues (HL/Lighter/IBKR) keep the resting sell (accumulate)
     until the reduced sell clears the floor, mirroring live order rejection.
-    When the available base cannot cover the up-sized quantity the placeability
-    check (notional >= min_notional) still rejects the sell. *)
+    The caller clamps the result to the sellable inventory (base -
+    reserved_base) AFTER up-sizing: an up-sized order that the inventory
+    cannot cover is not placeable (the notional gate then rejects it) - the
+    grid never sells base it does not hold. *)
 let upsell_to_notional cfg ~price ~qty =
   if
     cfg.min_notional > 0.0
@@ -356,8 +364,11 @@ let on_bar cfg ~state ~bar ~ordering =
     | Some s when bar.high >= s ->
       let q_s, required = compute_sell_qty cfg ~state ~sell_price:s in
       let available = Float.max 0.0 (state.base -. state.reserved_base) in
-      let q_s = Float.min q_s available in
-      let q_s = upsell_to_notional cfg ~price:s ~qty:q_s in
+      (* Clamp to the sellable inventory AFTER up-sizing: an up-sized quantity
+         is only an order if the inventory covers it, so a floor up-size can
+         never sell phantom base. With no sellable inventory the order is
+         skipped (q_s = 0) and quote is only ever reconciled on valid fills. *)
+      let q_s = Float.min (upsell_to_notional cfg ~price:s ~qty:q_s) available in
       if q_s > 0.0 && q_s >= cfg.qty_min && q_s *. s >= cfg.min_notional -. 1e-9
       then (
         state.resting_sell <- None;
