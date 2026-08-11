@@ -657,7 +657,7 @@ Idle windows render as `idle`; domains whose cycle window is stale
 > `strat/s` column reflects how often the strategy actually ran per
 > window.
 
-#### Footers
+#### Footer
 
 Uptime, the Fear & Greed index (colored by sentiment: green ≥60,
 yellow 40–60, red <40), and per-exchange connectivity dots (`◉` green
