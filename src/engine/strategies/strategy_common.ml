@@ -23,6 +23,9 @@ type trading_config =
   ; accumulation_buffer : float * float
     (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
+  ; asset_class : string option
+    (** Risk class for capital-survival modeling (explicit from config.json;
+        required for dio-survival runs). *)
   }
 
 (** Integer userref tags for per-strategy order grouping on the exchange. *)

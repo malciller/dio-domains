@@ -1,7 +1,7 @@
 (* Tests for Dio_survival.Survival_tasks (symbol/exchange resolution, calendar kind) and the
    Hyperliquid candle parser. *)
 
-let trading_config ?(exchange = "kraken") ?(symbol = "X") ()
+let trading_config ?(exchange = "kraken") ?(symbol = "X") ?(asset_class = None) ()
   : Dio_strategies.Strategy_common.trading_config
   =
   { exchange
@@ -18,6 +18,7 @@ let trading_config ?(exchange = "kraken") ?(symbol = "X") ()
   ; hedge = false
   ; accumulation_buffer = 0.01, 0.01
   ; data_feed = None
+  ; asset_class
   }
 ;;
 

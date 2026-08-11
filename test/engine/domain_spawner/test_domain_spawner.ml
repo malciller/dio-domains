@@ -22,6 +22,7 @@ let test_spawn_domains_basic () =
       ; hedge = false
       ; accumulation_buffer = 0.01, 0.01
       ; data_feed = None
+      ; asset_class = None
       }
     ; { Dio_engine.Config.exchange = "kraken"
       ; symbol = "ETH/USD"
@@ -37,6 +38,7 @@ let test_spawn_domains_basic () =
       ; hedge = false
       ; accumulation_buffer = 0.01, 0.01
       ; data_feed = None
+      ; asset_class = None
       }
     ]
   in
@@ -46,6 +48,7 @@ let test_spawn_domains_basic () =
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
     ; trading = assets
+    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
@@ -73,6 +76,7 @@ let test_spawn_domains_empty () =
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
     ; trading = []
+    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
@@ -104,6 +108,7 @@ let test_fee_fetcher_integration () =
     ; hedge = false
     ; accumulation_buffer = 0.01, 0.01
     ; data_feed = None
+    ; asset_class = None
     }
   in
   (* Verify fee fetcher adds fees correctly *)
@@ -149,6 +154,7 @@ let test_domain_error_handling () =
     ; hedge = false
     ; accumulation_buffer = 0.01, 0.01
     ; data_feed = None
+    ; asset_class = None
     }
   in
   (* This should not crash the test runner, domains should handle errors internally *)
@@ -157,6 +163,7 @@ let test_domain_error_handling () =
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
     ; trading = [ failing_asset ]
+    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }

@@ -1,6 +1,6 @@
 let test_parse_trading_config_valid () =
   let json_str =
-    {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002}|}
+    {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002, "asset_class": "large_cap_stable"}|}
   in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
@@ -10,7 +10,11 @@ let test_parse_trading_config_valid () =
   Alcotest.(check string) "sell_mult" "1.1" config.sell_mult;
   Alcotest.(check string) "strategy" "market_maker" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee" (Some 0.001) config.maker_fee;
-  Alcotest.(check (option (float 0.001))) "taker_fee" (Some 0.002) config.taker_fee
+  Alcotest.(check (option (float 0.001))) "taker_fee" (Some 0.002) config.taker_fee;
+  Alcotest.(check (option string))
+    "asset_class"
+    (Some "large_cap_stable")
+    config.asset_class
 ;;
 
 let test_parse_trading_config_defaults () =
@@ -28,6 +32,7 @@ let test_parse_trading_config_defaults () =
   Alcotest.(check string) "strategy" "Grid" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee none" None config.taker_fee;
+  Alcotest.(check (option string)) "asset_class none" None config.asset_class;
   Alcotest.(check (option string)) "min_usd_balance none" None config.min_usd_balance;
   Alcotest.(check (option string)) "max_exposure none" None config.max_exposure
 ;;
@@ -85,6 +90,25 @@ let test_read_config_defaults () =
   Alcotest.(check bool) "empty trading config" true (config.trading = [])
 ;;
 
+let test_parse_classes () =
+  let json_str =
+    {|{"classes": {"large_cap_stable": ["BTC/USD", "ETH/USD"], "equity_index": ["SPY", "QQQ"]}}|}
+  in
+  let json = Yojson.Basic.from_string json_str in
+  let classes = Dio_engine.Config.parse_classes json in
+  Alcotest.(check (list (pair string (list string))))
+    "classes map"
+    [ "large_cap_stable", [ "BTC/USD"; "ETH/USD" ]; "equity_index", [ "SPY"; "QQQ" ] ]
+    classes
+;;
+
+let test_parse_classes_absent () =
+  Alcotest.(check (list (pair string (list string))))
+    "absent classes key parses to empty list"
+    []
+    (Dio_engine.Config.parse_classes (Yojson.Basic.from_string {|{"trading": []}|}))
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -107,6 +131,10 @@ let () =
             "empty sections"
             `Quick
             test_parse_logging_config_empty_sections
+        ] )
+    ; ( "classes"
+      , [ Alcotest.test_case "parse classes" `Quick test_parse_classes
+        ; Alcotest.test_case "classes absent" `Quick test_parse_classes_absent
         ] )
     ; ( "file_handling"
       , [ Alcotest.test_case "config defaults" `Quick test_read_config_defaults ] )

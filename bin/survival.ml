@@ -117,7 +117,7 @@ let parse_args () =
         , " grid interval %% (default max of config.json grid_interval)" )
       ; ( "--fee"
         , Arg.Float (fun f -> fee := Some f)
-        , " maker fee (default from config.json)" )
+        , " maker fee (default live exchange fee per asset; else config.json maker_fee)" )
       ; ( "--sell-mult"
         , Arg.Float (fun f -> sell_mult := Some f)
         , " sell multiplier (default from config.json)" )
@@ -160,7 +160,7 @@ let parse_args () =
         , " rolling vol window for warmup (default 60)" )
       ; ( "--class"
         , Arg.Set_string class_name
-        , " risk class name (default from symbol registry)" )
+        , " risk class name (default from config.json asset_class)" )
       ; ( "--members"
         , Arg.String
             (fun s ->
@@ -249,25 +249,29 @@ let fetch_series (a : args) (symbol : string) : Survival_types.series Lwt.t =
     series
 ;;
 
-(** Load the class member pool: explicit --members when online, registry members
-    online, otherwise the asset alone (offline mode). *)
-let load_members (a : args) (asset : Survival_types.series)
+(** Load the class member pool: explicit --members when online, config.json
+    "classes" members for the resolved class when online, otherwise the asset
+    alone (offline mode). *)
+let load_members
+      (a : args)
+      (classes : (string * string list) list)
+      ~(class_name : string)
+      (asset : Survival_types.series)
   : Survival_types.series list Lwt.t
   =
-  let class_name =
-    Option.value
-      a.class_name
-      ~default:(Survival_classes.Registry.class_of_symbol a.symbol)
-  in
   let syms =
     match a.members with
     | Some ms when ms <> [] -> ms
-    | _ -> Survival_classes.Registry.member_symbols class_name
+    | _ ->
+      (match List.assoc_opt class_name classes with
+       | Some ms when ms <> [] -> ms
+       | _ -> [])
   in
   if syms = []
   then (
     Printf.eprintf
-      "survival: no class members known for '%s'; using asset alone\n"
+      "survival: no class members known for '%s' (add a \"classes\" entry in config.json \
+       or pass --members); using asset alone\n"
       class_name;
     Lwt.return [ asset ])
   else (
@@ -519,7 +523,12 @@ let report_json
 
 (** Run the full per-asset pipeline. In text mode prints the report and returns
     [None]; in JSON mode returns the report value without printing. *)
-let run_one (a : args) (task : Survival_tasks.task) : Yojson.Safe.t option =
+let run_one
+      (a : args)
+      (classes : (string * string list) list)
+      (task : Survival_tasks.task)
+  : Yojson.Safe.t option
+  =
   let a =
     { a with
       symbol = task.Survival_tasks.symbol
@@ -527,15 +536,30 @@ let run_one (a : args) (task : Survival_tasks.task) : Yojson.Safe.t option =
     }
   in
   let calendar_kind = Survival_tasks.calendar_kind_of_exchange a.exchange in
-  let tc = task.Survival_tasks.config in
   let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
+  let tc = task.Survival_tasks.config in
+  let class_name =
+    match a.class_name, tc.asset_class with
+    | Some cl, _ -> cl
+    | None, Some cl -> cl
+    | None, None ->
+      failwith
+        (Printf.sprintf
+           "survival: no risk class for %s/%s: set \"asset_class\" in its config.json \
+            trading entry or pass --class"
+           task.Survival_tasks.exchange
+           task.Survival_tasks.symbol)
+  in
+  let tc = Lwt_main.run (Survival_fees.enrich tc ~offline) in
   let asset =
     match a.from_csv, a.from_json with
     | Some path, _ -> Survival_loader.load_csv_file ~symbol:a.symbol ~calendar_kind ~path
     | _, Some path -> Survival_loader.load_json_file ~symbol:a.symbol ~calendar_kind ~path
     | None, None -> Lwt_main.run (fetch_series a a.symbol)
   in
-  let members = if offline then [ asset ] else Lwt_main.run (load_members a asset) in
+  let members =
+    if offline then [ asset ] else Lwt_main.run (load_members a classes ~class_name asset)
+  in
   let start_price =
     Option.value
       a.start_price
@@ -562,11 +586,6 @@ let run_one (a : args) (task : Survival_tasks.task) : Yojson.Safe.t option =
     ; price_increment = Option.value a.price_increment ~default:grid.price_increment
     ; qty_increment = Option.value a.qty_increment ~default:grid.qty_increment
     }
-  in
-  let class_name =
-    Option.value
-      a.class_name
-      ~default:(Survival_classes.Registry.class_of_symbol a.symbol)
   in
   let equity_sessions =
     if a.exchange = "alpaca"
@@ -667,6 +686,9 @@ let main () =
       ~trading:config.trading
       ~offline
   in
+  (* Populate venue instrument metadata (ticks/lots) before any grid replay so
+     increments resolve from the real exchange, not the 0.01 fallback. *)
+  if not offline then Lwt_main.run (Survival_venues.init tasks);
   let warnings =
     List.map
       (fun (symbol, exchange) ->
@@ -684,7 +706,7 @@ let main () =
   else (
     let multiple = List.length tasks > 1 in
     let one (task : Survival_tasks.task) =
-      try run_one a task with
+      try run_one a config.classes task with
       | exn when multiple ->
         Printf.eprintf
           "survival: '%s' (%s) failed: %s\n"
