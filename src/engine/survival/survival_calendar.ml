@@ -10,7 +10,12 @@
 
 open Survival_types
 
-(* ---- ISO date helpers (YYYY-MM-DD) ---- *)
+(* ---- ISO date helpers (YYYY-MM-DD) ----
+   All arithmetic is pure civil-date math (days from the 1970-01-01 epoch, via
+   Howard Hinnant's algorithms). The previous mktime/gmtime implementation was
+   local-timezone dependent: in any positive-UTC-offset timezone the reconstructed
+   weekday and day+1 were off by one day, which corrupted equity gap detection
+   and could non-terminate the gap-bounding walks in [gaps_of_missing]. *)
 
 let iso_ymd s =
   if String.length s < 10 then invalid_arg ("Survival_calendar.iso_ymd: bad date " ^ s);
@@ -20,58 +25,51 @@ let iso_ymd s =
   y, m, d
 ;;
 
-let iso_to_unix s =
-  let y, m, d = iso_ymd s in
-  fst
-    (Unix.mktime
-       { Unix.tm_sec = 0
-       ; tm_min = 0
-       ; tm_hour = 0
-       ; tm_mday = d
-       ; tm_mon = m - 1
-       ; tm_year = y - 1900
-       ; tm_wday = 0
-       ; tm_yday = 0
-       ; tm_isdst = false
-       })
+(** Days since 1970-01-01 of a civil (y, m, d) date. Exact integer arithmetic;
+    independent of timezone, DST and Unix.mktime. Valid for the proleptic
+    Gregorian calendar (all dates in use here are >= 1970). *)
+let days_from_civil y m d =
+  let y = if m <= 2 then y - 1 else y in
+  let era = (if y >= 0 then y else y - 399) / 400 in
+  let yoe = y - (era * 400) in
+  let doy = (((153 * if m > 2 then m - 3 else m + 9) + 2) / 5) + d - 1 in
+  let doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy in
+  (era * 146097) + doe - 719468
+;;
+
+(** Inverse of [days_from_civil]: the civil (y, m, d) date of a day count. *)
+let civil_from_days z =
+  let z = z + 719468 in
+  let era = (if z >= 0 then z else z - 146096) / 146097 in
+  let doe = z - (era * 146097) in
+  let yoe = (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365 in
+  let y = yoe + (era * 400) in
+  let doy = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100)) in
+  let mp = ((5 * doy) + 2) / 153 in
+  let d = doy - (((153 * mp) + 2) / 5) + 1 in
+  let m = if mp < 10 then mp + 3 else mp - 9 in
+  (y + if m <= 2 then 1 else 0), m, d
 ;;
 
 (** Day of week of an ISO date: 0 = Sunday .. 6 = Saturday. *)
 let iso_wday s =
   let y, m, d = iso_ymd s in
-  let tm =
-    Unix.gmtime
-      (fst
-         (Unix.mktime
-            { Unix.tm_sec = 0
-            ; tm_min = 0
-            ; tm_hour = 0
-            ; tm_mday = d
-            ; tm_mon = m - 1
-            ; tm_year = y - 1900
-            ; tm_wday = 0
-            ; tm_yday = 0
-            ; tm_isdst = false
-            }))
-  in
-  tm.Unix.tm_wday
+  (* 1970-01-01 was a Thursday (4). *)
+  (days_from_civil y m d + 4) mod 7
 ;;
 
 (** Number of calendar days between two ISO dates (b - a). *)
 let n_days_between a b =
-  let secs = iso_to_unix b -. iso_to_unix a in
-  int_of_float (Float.round (secs /. 86_400.0))
+  let ya, ma, da = iso_ymd a in
+  let yb, mb, db = iso_ymd b in
+  days_from_civil yb mb db - days_from_civil ya ma da
 ;;
 
 (** ISO date [n] calendar days after [d]. *)
 let add_days d n =
-  let t = iso_to_unix d +. (float_of_int n *. 86_400.0) in
-  let tm = Unix.gmtime t in
-  Printf.sprintf
-    "%04d-%02d-%02d"
-    (tm.Unix.tm_year + 1900)
-    (tm.Unix.tm_mon + 1)
-    tm.Unix.tm_mday
+  let y, m, d = iso_ymd d in
+  let y, m, d = civil_from_days (days_from_civil y m d + n) in
+  Printf.sprintf "%04d-%02d-%02d" y m d
 ;;
 
 (** Inclusive ascending list of ISO dates from [from_date] to [to_date]. *)

@@ -132,11 +132,14 @@ let blended_percentile_table
 ;;
 
 (** One class across all horizons: pooled class curves plus the blended surface
-    and blended percentile table per horizon. *)
+    and blended percentile table per horizon. [warmup] is the (already
+    series-adapted) warmup the asset surfaces were computed with, so the class
+    and blend estimates sit on the same window basis as the asset curves. *)
 let estimate_class
       ~(asset : series)
       ~(class_input : class_input)
       ~(config : config)
+      ~warmup
       ~(asset_surfaces : survival_surface list)
   : class_estimate * blended_surface list * blended_percentile_table list
   =
@@ -152,7 +155,7 @@ let estimate_class
            ~members:class_input.members
            ~horizon:h
            ~thresholds_pct:config.thresholds_pct
-           ~warmup:config.vol_window
+           ~warmup
            ()
        in
        let class_table =
@@ -161,7 +164,7 @@ let estimate_class
            ~members:class_input.members
            ~horizon:h
            ~percentiles:config.percentiles
-           ~warmup:config.vol_window
+           ~warmup
            ()
        in
        let n_asset = asset_surface.n_starts in
@@ -171,7 +174,7 @@ let estimate_class
            ~asset
            ~class_members:class_input.members
            ~kappa:class_input.kappa
-           ~warmup:config.vol_window
+           ~warmup
            ~weight_by_sessions:config.weight_by_sessions
            ()
        in
@@ -198,7 +201,7 @@ let estimate_class
            ~class_input
            ~h
            ~percentiles:config.percentiles
-           ~warmup:config.vol_window
+           ~warmup
            ~weight_by_sessions:config.weight_by_sessions
        in
        cs := class_surface :: !cs;
@@ -267,7 +270,12 @@ let analyze series config =
   List.iter
     (fun (ci : class_input) ->
        let est, bs, bts =
-         estimate_class ~asset:series ~class_input:ci ~config ~asset_surfaces:surfaces
+         estimate_class
+           ~asset:series
+           ~class_input:ci
+           ~config
+           ~warmup
+           ~asset_surfaces:surfaces
        in
        class_estimates := est :: !class_estimates;
        blended_surfaces := !blended_surfaces @ bs;

@@ -262,6 +262,33 @@ let test_aligned_missing_bar_does_not_trade () =
   Alcotest.(check int) "only present bars trade" 3 outcome.buy_fills
 ;;
 
+let test_venue_pool_trough_is_joint () =
+  (* Two positions on the SAME venue each buy 99 from a shared 200 pool. The
+     actual pool hits 2 (drawdown 0.99); per-position own-delta tracking would
+     report only 0.495 for each. Every position and the venue headline must
+     report the joint trough. *)
+  let bars = [| pbar ~low:98.5 () |] in
+  let r =
+    run
+      ~positions:
+        [ position "hype" "A" 100.0 bars [ grid_cfg () ]
+        ; position "hype" "B" 100.0 bars [ grid_cfg () ]
+        ]
+      ()
+  in
+  let a = find_o "hype" "A" r in
+  let b = find_o "hype" "B" r in
+  let v = find_v "hype" "USD" r in
+  Alcotest.(check int) "A buys once" 1 a.buy_fills;
+  Alcotest.(check int) "B buys once" 1 b.buy_fills;
+  Alcotest.(check bool) "no position capital low" false r.exhausted;
+  near 0.99 a.pool_min_drawdown;
+  near 0.99 b.pool_min_drawdown;
+  near 0.99 v.pool_min_drawdown;
+  near 2.0 a.final_pool;
+  near 2.0 v.final_pool
+;;
+
 let () =
   Alcotest.run
     "survival_portfolio"
@@ -299,6 +326,10 @@ let () =
             "aligned missing bar does not trade"
             `Quick
             test_aligned_missing_bar_does_not_trade
+        ; Alcotest.test_case
+            "venue pool trough is joint"
+            `Quick
+            test_venue_pool_trough_is_joint
         ] )
     ]
 ;;
