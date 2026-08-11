@@ -20,6 +20,7 @@ jobs:
 
       - name: Build libsecp256k1 with schnorrsig support
         run: |
+          rm -rf /tmp/secp256k1
           git clone https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1
           cd /tmp/secp256k1
           ./autogen.sh
