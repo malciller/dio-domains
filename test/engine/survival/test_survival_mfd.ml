@@ -70,16 +70,17 @@ let test_surface () =
 let test_stride_sampling () =
   let closes = Array.make 100 100.0 in
   let lows = Array.make 100 100.0 in
-  (* Valid stride-1 starts are s in [10, 98] = 89 windows (s=99 has no room
-     for the half-open window). *)
+  (* Valid stride-1 starts are s in [10, 69] = 60 windows: the half-open
+     (s, s+30] window must be complete, so start + 30 < n (s=69 uses lows
+     70..99; s=70 would need index 100). *)
   Alcotest.(check int)
     "stride 1 windows"
-    89
+    60
     (Dio_survival.Survival_mfd.n_starts ~closes ~lows ~horizon:30 ~warmup:10 ());
-  (* stride 30 -> starts 10, 40, 70 -> 3 non-overlapping windows. *)
+  (* stride 30 -> starts 10, 40 -> 2 non-overlapping windows. *)
   Alcotest.(check int)
     "stride 30 windows"
-    3
+    2
     (Dio_survival.Survival_mfd.n_starts
        ~closes
        ~lows
@@ -100,8 +101,58 @@ let test_stride_sampling () =
       ~percentiles:[ 50.; 99. ]
       ~warmup:10
   in
-  Alcotest.(check int) "table n_starts" 89 t.n_starts;
-  Alcotest.(check int) "table n_eff" 3 t.n_eff
+  Alcotest.(check int) "table n_starts" 60 t.n_starts;
+  Alcotest.(check int) "table n_eff" 2 t.n_eff
+;;
+
+let test_mfd_truncated_window_excluded () =
+  (* A start whose half-open (s, s+h] window runs past the end of the series
+     must be rejected: an incomplete window's smaller min low would silently
+     bias the empirical CDF toward smaller drawdowns. *)
+  let closes = [| 100.; 100.; 100.; 100.; 100. |] in
+  let lows = [| 100.; 99.; 98.; 97.; 96. |] in
+  (* Full window: s=0, h=2 covers lows 1..2 -> MFD 1 - 98/100. *)
+  near 0.02 (Option.get (Dio_survival.Survival_mfd.mfd ~closes ~lows ~start:0 ~horizon:2));
+  (* s=2, h=2 would need lows 3..4 - complete, so Some. *)
+  Alcotest.(check bool)
+    "complete tail window accepted"
+    (Dio_survival.Survival_mfd.mfd ~closes ~lows ~start:2 ~horizon:2 <> None)
+    true;
+  (* s=3, h=2 would need low index 5, which does not exist: the truncated
+     window must be excluded even though it could read lows 4..min(n-1,..). *)
+  Alcotest.(check bool)
+    "truncated tail window excluded"
+    (Dio_survival.Survival_mfd.mfd ~closes ~lows ~start:3 ~horizon:2 = None)
+    true;
+  (* The exclusion must also remove the truncated start from the sample
+     counts: n_starts over warmup 0 must be exactly the complete windows. *)
+  Alcotest.(check int)
+    "samples exclude truncated starts"
+    3
+    (Dio_survival.Survival_mfd.n_starts ~closes ~lows ~horizon:2 ~warmup:0 ())
+;;
+
+let test_mfd_non_finite_guards () =
+  (* NaN / non-positive start close or min low must be rejected explicitly,
+     not silently folded into the CDF. *)
+  let closes = [| 100.; nan; 100.; 100. |] in
+  let lows = [| 100.; 98.; 96.; 94. |] in
+  Alcotest.(check bool)
+    "NaN start close excluded"
+    (Dio_survival.Survival_mfd.mfd ~closes ~lows ~start:1 ~horizon:1 = None)
+    true;
+  let closes = [| 100.; 100.; 100.; 100. |] in
+  let lows = [| 100.; 98.; nan; 94. |] in
+  Alcotest.(check bool)
+    "NaN min low excluded"
+    (Dio_survival.Survival_mfd.mfd ~closes ~lows ~start:0 ~horizon:2 = None)
+    true;
+  let closes = [| 100.; 100.; 100.; 100. |] in
+  let lows = [| 100.; 98.; 0.0; 94. |] in
+  Alcotest.(check bool)
+    "non-positive min low excluded"
+    (Dio_survival.Survival_mfd.mfd ~closes ~lows ~start:0 ~horizon:2 = None)
+    true
 ;;
 
 let test_static_runway () =
@@ -315,6 +366,11 @@ let () =
         ; Alcotest.test_case "f_h and survival" `Quick test_f_h_and_survival
         ; Alcotest.test_case "surface" `Quick test_surface
         ; Alcotest.test_case "stride sampling" `Quick test_stride_sampling
+        ; Alcotest.test_case
+            "truncated tail window excluded"
+            `Quick
+            test_mfd_truncated_window_excluded
+        ; Alcotest.test_case "non-finite guards" `Quick test_mfd_non_finite_guards
         ; Alcotest.test_case "static runway" `Quick test_static_runway
         ; Alcotest.test_case "runway cost accumulates" `Quick test_runway_cost_accumulates
         ; Alcotest.test_case

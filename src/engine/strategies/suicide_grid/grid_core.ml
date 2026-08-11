@@ -100,7 +100,10 @@ type result =
   ; quote_by_session : float array
   ; min_quote : float
   ; min_quote_drawdown : float
-  ; first_capital_low_drawdown : float option
+  ; first_exhaustion_price_drawdown : float option
+    (** Price drawdown (1 - level/start_price) at the point of exhaustion -
+        the price drop at which the grid's first capital-low event fired, not
+        the capital loss. [None] when the grid never ran dry. *)
   ; first_capital_low_session : int option
   ; halt_cause : halt_cause option
   ; exhausted : bool
@@ -314,6 +317,15 @@ let on_bar cfg ~state ~bar ~ordering =
     match state.resting_buy with
     | Some b when can_place_buy cfg ~state ~price:b -> state.capital_low <- false
     | _ -> ());
+  (* Buy-fill bookkeeping. The buy fee is deducted from [accumulated_profit] on
+   EVERY buy fill (all venues), by design: this mirrors the live exchange
+   accounting on Hyperliquid-like venues, where the buy fee is charged against
+   accumulated_profit on every buy (suicide_grid_events.ml), and the sell
+   side then credits profit net of its own fee - so a full buy/sell cycle
+   charges the fee twice, exactly as the live strategy does. The live behavior
+   is a known quirk (the fee is "double-counted" as a cost of re-entering the
+   grid); the replay reproduces it deliberately rather than "fixing" it, so
+   the survival numbers answer "can the live grid survive this history?". *)
   let on_buy_fill b qty =
     state.buy_fills <- state.buy_fills + 1;
     state.accumulated_profit <- state.accumulated_profit -. (b *. qty *. cfg.maker_fee);
@@ -359,6 +371,13 @@ let on_bar cfg ~state ~bar ~ordering =
     in
     loop ()
   in
+  (* Processes AT MOST ONE sell per bar (the highest resting sell the bar high
+   crosses), even when the bar could fill several. This is an intentional
+   conservative fidelity choice, not a modeling gap: the live strategy also
+   settles at most one sell fill per bar at daily resolution, and allowing
+   multiple same-bar sells would over-credit quote recovery inside a crash
+   (a bar whose range crosses several sell levels is typically a volatile
+   reversal the strategy cannot monetize several times over). *)
   let process_sell () =
     match state.resting_sell with
     | Some s when bar.high >= s ->
@@ -437,7 +456,7 @@ let replay cfg ~bars ~ordering =
   ; quote_by_session = quote_series
   ; min_quote = !min_quote
   ; min_quote_drawdown = 1.0 -. (!min_quote /. initial_quote)
-  ; first_capital_low_drawdown = first_cl_dd
+  ; first_exhaustion_price_drawdown = first_cl_dd
   ; first_capital_low_session = !first_cl_session
   ; halt_cause = state.first_halt_cause
   ; exhausted = state.ever_capital_low

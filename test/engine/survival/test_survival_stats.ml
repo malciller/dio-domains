@@ -62,6 +62,31 @@ let test_percentile_ordering () =
     [ 50.; 75.; 90.; 95.; 99. ]
 ;;
 
+let test_weighted_percentile_matches_unweighted () =
+  (* The weighted estimator is the Type 7 analog: with unit weights it must
+     reduce EXACTLY to the unweighted [percentile] on the same values, so the
+     class and asset percentile columns report consistent numbers. *)
+  let xs =
+    Array.init 137 (fun i -> 100.0 *. sin (float_of_int (i * 7))) |> Array.map abs_float
+  in
+  let pairs = Array.map (fun v -> v, 1.0) xs in
+  List.iter
+    (fun p ->
+       let want = Dio_survival.Survival_stats.percentile xs p in
+       let got = Dio_survival.Survival_math.weighted_percentile pairs p in
+       Alcotest.(check (float 1e-12))
+         (Printf.sprintf "weighted P%g = unweighted P%g" p p)
+         want
+         got)
+    [ 0.; 5.; 50.; 75.; 90.; 95.; 99.; 100. ];
+  (* Interpolation between the two brackets: P50 of {1, 10} with unit weights
+     is the midpoint 5.5; shifting mass onto the low sample pulls the median
+     toward it (2/3 of the mass at 1.0 -> P50 = 1.0, sitting at the heavier
+     sample's anchor). *)
+  near 5.5 (Dio_survival.Survival_math.weighted_percentile [| 1.0, 1.0; 10.0, 1.0 |] 50.0);
+  near 1.0 (Dio_survival.Survival_math.weighted_percentile [| 1.0, 2.0; 10.0, 1.0 |] 50.0)
+;;
+
 let test_trailing_vol_constant () =
   let closes = Array.make 100 100.0 in
   near 0.0 (Option.get (Dio_survival.Survival_stats.trailing_vol ~closes ~s:80 ~w:60))
@@ -87,7 +112,7 @@ let test_z_mfd () =
   let closes = Array.init 200 (fun i -> 100.0 *. (1.001 ** float_of_int i)) in
   let lows = Array.map (fun c -> c *. 0.95) closes in
   let z =
-    Option.get (Dio_survival.Survival_stats.z_mfd ~closes ~lows ~s:180 ~horizon:30 ~w:60)
+    Option.get (Dio_survival.Survival_stats.z_mfd ~closes ~lows ~s:169 ~horizon:30 ~w:60)
   in
   Alcotest.(check bool) "finite" (Float.is_finite z) true
 ;;
@@ -137,8 +162,9 @@ let z_samples ~closes ~lows =
 
 let test_asset_regime_zero_sigma () =
   (* Constant log-returns -> trailing vol is 0 up to FP noise, so every sigma
-     is ~0.0 (mapped to tau = +infinity in the z-blend) and the start count
-     matches f_h's. Valid starts are s in [60, 198] = 139 windows. *)
+     is ~0.0 (excluded from the z-blend by Survival_replay) and the start
+     count matches f_h's. Valid starts are s in [60, 169] = 110 windows (the
+     half-open (s, s+30] window must be complete). *)
   let closes = Array.init 200 (fun i -> 100.0 *. (1.01 ** float_of_int i)) in
   let lows = Array.map (fun c -> c *. 0.99) closes in
   let r =
@@ -150,7 +176,7 @@ let test_asset_regime_zero_sigma () =
       ~warmup:60
       ()
   in
-  Alcotest.(check int) "start count" 139 r.n;
+  Alcotest.(check int) "start count" 110 r.n;
   Alcotest.(check bool)
     "all sigma ~zero"
     (Array.for_all (fun sigma -> abs_float sigma < 1e-12) r.sigma)
@@ -235,6 +261,10 @@ let () =
       , [ Alcotest.test_case "percentile" `Quick test_percentile
         ; Alcotest.test_case "percentile empty raises" `Quick test_percentile_empty_raises
         ; Alcotest.test_case "percentile ordering" `Quick test_percentile_ordering
+        ; Alcotest.test_case
+            "weighted percentile = unweighted with unit weights"
+            `Quick
+            test_weighted_percentile_matches_unweighted
         ; Alcotest.test_case "trailing vol constant" `Quick test_trailing_vol_constant
         ; Alcotest.test_case
             "trailing vol no lookahead"

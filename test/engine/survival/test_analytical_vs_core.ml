@@ -52,7 +52,7 @@ let test_replay_matches_closed_form () =
   Alcotest.(check int) "fill count matches closed form" n_static res.buy_fills;
   (* The first capital_low is at the ladder step just past the last affordable
      fill, i.e. 1-(1-gi)^(N*+1). *)
-  match res.first_capital_low_drawdown with
+  match res.first_exhaustion_price_drawdown with
   | Some dd ->
     near (1.0 -. (0.99 ** float_of_int (n_static + 1))) dd;
     near dd_static (1.0 -. (0.99 ** float_of_int n_static))
@@ -86,7 +86,7 @@ let test_replay_no_fill_when_unaffordable () =
   in
   Alcotest.(check bool) "exhausted" true res.exhausted;
   Alcotest.(check int) "no fills" 0 res.buy_fills;
-  match res.first_capital_low_drawdown with
+  match res.first_exhaustion_price_drawdown with
   | Some dd -> near 0.01 dd
   | None -> Alcotest.fail "expected capital-low drawdown"
 ;;
