@@ -204,7 +204,33 @@ engine spawns an isolated domain per entry.
 
 The top-level `classes` object defines the member pools backing each risk
 class's survival curve; `dio-survival` fetches the listed symbols per venue
-(never from hardcoded code lists).
+(never from hardcoded code lists). Two schemas are accepted:
+
+```json
+"classes": {
+  "large_cap_stable": ["BTC/USD", "ETH/USD"],
+  "large_cap_volatile": { "members": ["SOL/USD", "DOGE/USD"], "kappa": 250 }
+}
+```
+
+- legacy: `"name": [member symbols]`
+- extended: `"name": {"members": [...], "kappa": N}` — per-class blend weight
+
+The survival blend pulls the asset's empirical drawdown coverage toward its
+class curve: `F_blend = (n_asset·F_asset + kappa·F_class)/(n_asset + kappa)`,
+where `kappa` is a pseudocount of class pseudo-sessions (default 200 ≈ 11% of
+the vote for a ~1600-session history, decaying as the asset's own history
+grows; `--kappa` overrides, config.json per-class kappa wins otherwise). The
+class contribution is volatility-normalized (`z = drawdown/(vol·√h)` pooled
+across members, then translated back through the asset's own trailing
+volatility), so a low-vol asset is not punished for a high-vol classmate's raw
+swing size. Percentile tables (asset/class/blended) are estimated from
+non-overlapping windows (one window per horizon block) so tail percentiles are
+not autocorrelation-dominated; `n_eff` reports the independent-window count
+next to the overlapping `n_starts` count. Inverse sizing reports both the
+safe closed-form static minimum capital (a straight-down worst case) and an
+advisory empirical minimum capital from actual path replay, whose
+static/empirical ratio shows the capital buffer the static sizing pays for.
 
 #### Portfolio Survival
 

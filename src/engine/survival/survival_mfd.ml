@@ -40,47 +40,58 @@ let mfd ~closes ~lows ~start ~horizon =
 
 (** Empirical F_h(d): share of valid start sessions in [warmup, n-horizon-1]
     whose MFD over the next [horizon] sessions is <= [d]. Returns 0.0 when no
-    valid start exists. *)
-let f_h ~closes ~lows ~horizon ~threshold ~warmup =
+    valid start exists. [stride] steps through starts (default 1 = every
+    session); stride = horizon gives non-overlapping windows. *)
+let f_h ~closes ~lows ~horizon ~threshold ~warmup ?(stride = 1) () =
   let n = Array.length closes in
+  let stride = max 1 stride in
   let hits = ref 0 in
   let total = ref 0 in
-  for s = warmup to n - 1 do
-    match mfd ~closes ~lows ~start:s ~horizon with
-    | Some m ->
-      incr total;
-      if m <= threshold then incr hits
-    | None -> ()
+  let s = ref warmup in
+  while !s <= n - 1 do
+    (match mfd ~closes ~lows ~start:!s ~horizon with
+     | Some m ->
+       incr total;
+       if m <= threshold then incr hits
+     | None -> ());
+    s := !s + stride
   done;
   if !total = 0 then 0.0 else float_of_int !hits /. float_of_int !total
 ;;
 
-let survival ~closes ~lows ~horizon ~threshold ~warmup =
-  1.0 -. f_h ~closes ~lows ~horizon ~threshold ~warmup
+let survival ~closes ~lows ~horizon ~threshold ~warmup ?(stride = 1) () =
+  1.0 -. f_h ~closes ~lows ~horizon ~threshold ~warmup ~stride ()
 ;;
 
 (** Number of valid per-start MFD windows in [warmup, n-horizon-1]. This is the
-    [n_asset] weight for the kappa blend. *)
-let n_starts ~closes ~lows ~horizon ~warmup =
+    [n_asset] weight for the kappa blend. [stride] mirrors [f_h]. *)
+let n_starts ~closes ~lows ~horizon ~warmup ?(stride = 1) () =
   let n = Array.length closes in
+  let stride = max 1 stride in
   let total = ref 0 in
-  for s = warmup to n - 1 do
-    match mfd ~closes ~lows ~start:s ~horizon with
-    | Some _ -> incr total
-    | None -> ()
+  let s = ref warmup in
+  while !s <= n - 1 do
+    (match mfd ~closes ~lows ~start:!s ~horizon with
+     | Some _ -> incr total
+     | None -> ());
+    s := !s + stride
   done;
   !total
 ;;
 
 (** Per-start MFD samples over [warmup, n-horizon-1]. Shared by the asset
-    percentile table and the blended-percentile inversion. *)
-let samples ~closes ~lows ~horizon ~warmup =
+    percentile table and the blended-percentile inversion. [stride] mirrors
+    [f_h]. *)
+let samples ~closes ~lows ~horizon ~warmup ?(stride = 1) () =
   let n = Array.length closes in
+  let stride = max 1 stride in
   let xs = ref [] in
-  for s = warmup to n - 1 do
-    match mfd ~closes ~lows ~start:s ~horizon with
-    | Some m -> xs := m :: !xs
-    | None -> ()
+  let s = ref warmup in
+  while !s <= n - 1 do
+    (match mfd ~closes ~lows ~start:!s ~horizon with
+     | Some m -> xs := m :: !xs
+     | None -> ());
+    s := !s + stride
   done;
   Array.of_list (List.rev !xs)
 ;;
@@ -89,12 +100,12 @@ let samples ~closes ~lows ~horizon ~warmup =
 let surface ~closes ~lows ~horizon:(h : horizon) ~thresholds_pct ~warmup
   : survival_surface
   =
-  let n_starts = n_starts ~closes ~lows ~horizon:h.sessions ~warmup in
+  let n_starts = n_starts ~closes ~lows ~horizon:h.sessions ~warmup () in
   let rows =
     List.map
       (fun d ->
          let d_frac = d /. 100.0 in
-         let f = f_h ~closes ~lows ~horizon:h.sessions ~threshold:d_frac ~warmup in
+         let f = f_h ~closes ~lows ~horizon:h.sessions ~threshold:d_frac ~warmup () in
          { drawdown_pct = d; coverage = f; survival = 1.0 -. f })
       thresholds_pct
   in
@@ -102,18 +113,23 @@ let surface ~closes ~lows ~horizon:(h : horizon) ~thresholds_pct ~warmup
 ;;
 
 (** Percentile table for one horizon: the MFD level not exceeded with
-    probability p. Uses the empirical CDF of per-start MFDs. *)
+    probability p. Uses the empirical CDF of per-start MFDs. Rows are
+    estimated from non-overlapping windows (stride = horizon sessions) so tail
+    percentiles are not dominated by one contiguous crash counted once per
+    overlapping start; [n_starts] reports the full (overlapping) window count
+    and [n_eff] the number of independent windows actually used. *)
 let percentile_table ~closes ~lows ~horizon:(h : horizon) ~percentiles ~warmup
   : percentile_table
   =
-  let arr = samples ~closes ~lows ~horizon:h.sessions ~warmup in
-  let n_starts = Array.length arr in
+  let n_starts = n_starts ~closes ~lows ~horizon:h.sessions ~warmup () in
+  let arr = samples ~closes ~lows ~horizon:h.sessions ~warmup ~stride:h.sessions () in
+  let n_eff = Array.length arr in
   let rows =
     List.map
       (fun p -> { percentile = p; mfd = Survival_math.percentile arr p })
       percentiles
   in
-  { horizon_label = h.label; calendar_days = h.calendar_days; n_starts; rows }
+  { horizon_label = h.label; calendar_days = h.calendar_days; n_starts; n_eff; rows }
 ;;
 
 (* ---- Closed-form static drawdown runway ---- *)

@@ -59,6 +59,122 @@ let test_blend () =
        ~class_f:0.6)
 ;;
 
+(* Synthetic deterministic paths with nonzero vol and known scaling: scaling
+   the log-path by [sc] scales volatility exactly 10x-consistent and drawdowns
+   ~proportionally (constant low fraction per bar), leaving
+   z = MFD/(sigma*sqrt(h)) approximately invariant (small residual from the
+   intra-window close ratio, verified ~1%). *)
+let mk_closes ~sc () =
+  Array.init 400 (fun i ->
+    let x = float_of_int i in
+    100.0 *. exp (sc *. ((0.002 *. x) +. (0.01 *. sin (x /. 9.0)))))
+;;
+
+let mk_lows closes ~sc = Array.map (fun c -> c *. (1.0 -. (0.02 *. sc))) closes
+
+let z_samples ~closes ~lows =
+  let acc = ref [] in
+  for s = 60 to Array.length closes - 1 do
+    match Dio_survival.Survival_stats.z_mfd ~closes ~lows ~s ~horizon:30 ~w:60 with
+    | Some z -> acc := z :: !acc
+    | None -> ()
+  done;
+  Array.of_list (List.rev !acc)
+;;
+
+let test_asset_regime_zero_sigma () =
+  (* Constant log-returns -> trailing vol is 0 up to FP noise, so every sigma
+     is ~0.0 (mapped to tau = +infinity in the z-blend) and the start count
+     matches f_h's. Valid starts are s in [60, 198] = 139 windows. *)
+  let closes = Array.init 200 (fun i -> 100.0 *. (1.01 ** float_of_int i)) in
+  let lows = Array.map (fun c -> c *. 0.99) closes in
+  let r =
+    Dio_survival.Survival_stats.asset_regime_of
+      ~closes
+      ~lows
+      ~horizon:30
+      ~w:60
+      ~warmup:60
+      ()
+  in
+  Alcotest.(check int) "start count" 139 r.n;
+  Alcotest.(check bool)
+    "all sigma ~zero"
+    (Array.for_all (fun sigma -> abs_float sigma < 1e-12) r.sigma)
+    true
+;;
+
+let test_z_scale_invariance () =
+  (* Scaling the log-path by 5x scales drawdowns ~5x and vol exactly 5x,
+     leaving z = MFD/(sigma*sqrt(h)) invariant. This is the property that
+     makes pooling across differently-volatile class members valid. *)
+  let c1 = mk_closes ~sc:1.0 () in
+  let l1 = mk_lows c1 ~sc:1.0 in
+  let c2 = mk_closes ~sc:5.0 () in
+  let l2 = mk_lows c2 ~sc:5.0 in
+  let z1 = z_samples ~closes:c1 ~lows:l1 in
+  let z2 = z_samples ~closes:c2 ~lows:l2 in
+  Alcotest.(check bool) "nonempty" (Array.length z1 > 0 && Array.length z2 > 0) true;
+  let mean xs = Array.fold_left ( +. ) 0.0 xs /. float_of_int (Array.length xs) in
+  let m1 = mean z1 in
+  let m2 = mean z2 in
+  Alcotest.(check bool)
+    "z means within 5%"
+    (abs_float (m1 -. m2) <= 0.05 *. Float.max 1.0 (abs_float m1))
+    true
+;;
+
+let test_z_index_cdf () =
+  (* z_index with weight_by_sessions over two identical members: every z value
+     has weight 2, so the CDF at tau is the share of z <= tau; at tau = 0.5 the
+     coverage must equal the empirical share exactly. *)
+  let c = mk_closes ~sc:1.0 () in
+  let l = mk_lows c ~sc:1.0 in
+  let bars =
+    Array.mapi
+      (fun i close ->
+         { Dio_survival.Survival_types.date = Printf.sprintf "2023-%03d" i
+         ; open_ = close
+         ; high = close
+         ; low = l.(i)
+         ; close
+         ; volume = 1000.0
+         })
+      c
+  in
+  let series : Dio_survival.Survival_types.series =
+    { symbol = "T"; calendar_kind = Crypto; bars; gaps = [] }
+  in
+  let idx =
+    Dio_survival.Survival_classes.z_index_of
+      ~members:[ series; series ]
+      ~horizon:30
+      ~vol_window:60
+      ~warmup:60
+      ()
+  in
+  let zs = z_samples ~closes:c ~lows:l in
+  let expected tau =
+    let hits = ref 0 in
+    Array.iter (fun z -> if z <= tau then incr hits) zs;
+    float_of_int !hits /. float_of_int (Array.length zs)
+  in
+  Alcotest.(check bool) "index nonempty" (idx.n > 0) true;
+  Alcotest.(check (float 1e-9))
+    "cdf at 0"
+    (Dio_survival.Survival_classes.z_cdf_of idx ~tau:0.0)
+    (expected 0.0);
+  let tau = 0.5 in
+  Alcotest.(check (float 1e-9))
+    "cdf at 0.5"
+    (Dio_survival.Survival_classes.z_cdf_of idx ~tau)
+    (expected tau);
+  Alcotest.(check (float 1e-9))
+    "cdf at +infinity"
+    (Dio_survival.Survival_classes.z_cdf_of idx ~tau:Float.infinity)
+    1.0
+;;
+
 let () =
   Alcotest.run
     "survival_stats"
@@ -72,6 +188,9 @@ let () =
         ; Alcotest.test_case "trailing vol known" `Quick test_trailing_vol_known
         ; Alcotest.test_case "z mfd" `Quick test_z_mfd
         ; Alcotest.test_case "blend" `Quick test_blend
+        ; Alcotest.test_case "asset regime zero sigma" `Quick test_asset_regime_zero_sigma
+        ; Alcotest.test_case "z scale invariance" `Quick test_z_scale_invariance
+        ; Alcotest.test_case "z index cdf" `Quick test_z_index_cdf
         ] )
     ]
 ;;
