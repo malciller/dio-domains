@@ -96,17 +96,40 @@ let test_parse_classes () =
   in
   let json = Yojson.Basic.from_string json_str in
   let classes = Dio_engine.Config.parse_classes json in
+  let open Dio_engine.Config in
   Alcotest.(check (list (pair string (list string))))
-    "classes map"
+    "legacy schema members"
     [ "large_cap_stable", [ "BTC/USD"; "ETH/USD" ]; "equity_index", [ "SPY"; "QQQ" ] ]
-    classes
+    (List.map (fun ((name, pool) : string * class_pool) -> name, pool.members) classes);
+  Alcotest.(check (list (pair string (option int))))
+    "legacy schema kappa unset"
+    [ "large_cap_stable", None; "equity_index", None ]
+    (List.map (fun ((name, pool) : string * class_pool) -> name, pool.kappa) classes)
+;;
+
+let test_parse_classes_extended_schema () =
+  let json_str =
+    {|{"classes": {"large_cap_stable": {"members": ["BTC/USD", "ETH/USD"], "kappa": 250}, "equity_index": {"members": ["SPY", "QQQ"]}}}|}
+  in
+  let json = Yojson.Basic.from_string json_str in
+  let classes = Dio_engine.Config.parse_classes json in
+  let open Dio_engine.Config in
+  Alcotest.(check (list (pair string (list string))))
+    "extended schema members"
+    [ "large_cap_stable", [ "BTC/USD"; "ETH/USD" ]; "equity_index", [ "SPY"; "QQQ" ] ]
+    (List.map (fun ((name, pool) : string * class_pool) -> name, pool.members) classes);
+  Alcotest.(check (list (pair string (option int))))
+    "extended schema kappa"
+    [ "large_cap_stable", Some 250; "equity_index", None ]
+    (List.map (fun ((name, pool) : string * class_pool) -> name, pool.kappa) classes)
 ;;
 
 let test_parse_classes_absent () =
-  Alcotest.(check (list (pair string (list string))))
+  Alcotest.(check int)
     "absent classes key parses to empty list"
-    []
-    (Dio_engine.Config.parse_classes (Yojson.Basic.from_string {|{"trading": []}|}))
+    0
+    (List.length
+       (Dio_engine.Config.parse_classes (Yojson.Basic.from_string {|{"trading": []}|})))
 ;;
 
 let () =
@@ -134,6 +157,10 @@ let () =
         ] )
     ; ( "classes"
       , [ Alcotest.test_case "parse classes" `Quick test_parse_classes
+        ; Alcotest.test_case
+            "parse classes extended schema"
+            `Quick
+            test_parse_classes_extended_schema
         ; Alcotest.test_case "classes absent" `Quick test_parse_classes_absent
         ] )
     ; ( "file_handling"

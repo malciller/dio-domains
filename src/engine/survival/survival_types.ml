@@ -81,6 +81,14 @@ type percentile_table =
   { horizon_label : string
   ; calendar_days : int
   ; n_starts : int
+    (** Number of valid per-start MFD windows over all (overlapping) starts.
+        Overlapping windows are autocorrelated, so this overstates the
+        information content for tail percentiles. *)
+  ; n_eff : int
+    (** Effective sample size: number of non-overlapping windows (stride =
+        horizon sessions) the percentile rows are actually estimated from.
+        A 365-session horizon on ~1600 sessions yields ~4 independent
+        windows; P99 is then the worst of those, which is the honest answer. *)
   ; rows : percentile_row list
   }
 
@@ -134,7 +142,10 @@ type historical_path_coverage =
   ; asset_coverage : float
     (** F_asset_h(D_surv): share of the asset's own starts that survived a
         drawdown at least as deep as the grid's. *)
-  ; class_coverage : float (** Pooled class F_h(D_surv). *)
+  ; class_coverage : float
+    (** Pooled class F_h(D_surv), volatility-translated: the class z-CDF
+        evaluated at each asset start's own regime d / (sigma_s * sqrt h),
+        averaged over the asset's starts. *)
   ; blended_coverage : float (** (n_asset*F_asset + kappa*F_class)/(n_asset + kappa). *)
   }
 

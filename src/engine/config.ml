@@ -34,14 +34,24 @@ type gc_config =
   ; major_heap_increment : int
   }
 
+(** Risk-class member pool: member symbols plus an optional per-class blend
+    weight (kappa). *)
+type class_pool =
+  { members : string list
+  ; kappa : int option
+  }
+
 type config =
   { cycle_mod : int
   ; logging : logging_config
   ; gc : gc_config option
   ; trading : trading_config list
-  ; classes : (string * string list) list
-    (** Risk-class definitions (class name -> member symbols) from the
-        top-level "classes" map; the class pools backing the kappa blend. *)
+  ; classes : (string * class_pool) list
+    (** Risk-class definitions (class name -> member pool) from the top-level
+        "classes" map; the class pools backing the kappa blend. The legacy
+        schema `"name": [syms]` parses with kappa = None; the extended schema
+        `"name": {"members": [syms], "kappa": N}` carries a per-class blend
+        weight. *)
   ; fng_check_threshold : float
   ; latency_window_seconds : float
     (** Duration of each per-domain latency accumulation window before the
@@ -217,15 +227,29 @@ let parse_accumulation_buffer json exchange symbol =
   | _ -> default
 ;;
 
-(** Parses the optional top-level "classes" object: class name -> member
-    symbols. Class pools for the capital-survival kappa blend are read from
-    here (no hardcoded lists in code). Returns [] when the key is absent. *)
+(** Parses the optional top-level "classes" object. Two schemas:
+    - legacy: class name -> [member symbols]
+    - extended: class name -> {"members": [...], "kappa": N (optional)}
+    Class pools for the capital-survival kappa blend are read from here (no
+    hardcoded lists in code). Returns [] when the key is absent. *)
 let parse_classes json =
   let open Yojson.Basic.Util in
   match json |> member "classes" with
   | `Assoc entries ->
     List.map
-      (fun (name, members) -> name, members |> to_list |> List.map to_string)
+      (fun (name, value) ->
+         let pool =
+           match value with
+           | `List _ ->
+             (* Legacy schema: bare member symbol list, default kappa. *)
+             { members = value |> to_list |> List.map to_string; kappa = None }
+           | `Assoc _ ->
+             { members = value |> member "members" |> to_list |> List.map to_string
+             ; kappa = value |> member "kappa" |> to_int_option
+             }
+           | _ -> { members = []; kappa = None }
+         in
+         name, pool)
       entries
   | _ -> []
 ;;

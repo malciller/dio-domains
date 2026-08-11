@@ -73,44 +73,19 @@ let default_config ~(calendar_kind : calendar_kind) =
 ;;
 
 (** Per-start MFD samples of a bar series over [warmup, n-horizon-1]. *)
-let asset_samples ~(series : series) ~horizon ~warmup =
+let asset_samples ~(series : series) ~horizon ~warmup ?(stride = 1) () =
   let bars = series.bars |> Survival_calendar.sort_bars |> Survival_calendar.dedup in
   let closes = Array.map (fun b -> b.close) bars in
   let lows = Array.map (fun b -> b.low) bars in
-  Survival_mfd.samples ~closes ~lows ~horizon ~warmup
+  Survival_mfd.samples ~closes ~lows ~horizon ~warmup ~stride ()
 ;;
 
-(** Blended percentile pairs: asset samples at weight 1, class pooled samples
-    re-weighted so the class contributes [kappa] of the total mass. *)
-let blended_percentile_pairs
-      ~(asset : series)
-      ~(class_input : class_input)
-      ~horizon
-      ~warmup
-      ~weight_by_sessions
-  =
-  let asset_xs = asset_samples ~series:asset ~horizon ~warmup in
-  let cls =
-    Survival_classes.pooled
-      ~weight_by_sessions
-      ~members:class_input.members
-      ~horizon
-      ~warmup
-      ()
-  in
-  let class_total = Array.fold_left (fun acc (_, w) -> acc +. w) 0.0 cls.samples in
-  let scale =
-    if class_total > 0.0 then float_of_int class_input.kappa /. class_total else 0.0
-  in
-  let pairs = ref [] in
-  Array.iter (fun v -> pairs := (v, 1.0) :: !pairs) asset_xs;
-  Array.iter (fun (v, w) -> pairs := (v, w *. scale) :: !pairs) cls.samples;
-  Array.of_list (List.rev !pairs)
-;;
-
-(** Blended percentile table for one horizon: invert the blended CDF on the
-    weighted sample set (exact for the empirical CDF; see
-    Survival_math.weighted_percentile). *)
+(** Blended percentile table for one horizon: invert the unified z-blend
+    (Survival_replay.blended_f on a non-overlapping stride model) per
+    percentile - the smallest d with F_blend(d) >= p/100. The blend is
+    monotone in d, so bisection is exact for the empirical CDF. Rows are
+    estimated on non-overlapping windows so the tail is autocorrelation-honest;
+    [n_starts]/[n_eff] mirror the asset percentile tables. *)
 let blended_percentile_table
       ~(asset : series)
       ~(class_input : class_input)
@@ -120,24 +95,37 @@ let blended_percentile_table
       ~weight_by_sessions
   : blended_percentile_table
   =
-  let pairs =
-    blended_percentile_pairs
+  let model =
+    Survival_replay.blend_model_of
+      ~horizon:h
       ~asset
-      ~class_input
-      ~horizon:h.sessions
+      ~class_members:class_input.members
+      ~kappa:class_input.kappa
       ~warmup
       ~weight_by_sessions
+      ~stride:h.sessions
+      ()
   in
   let rows =
     List.map
-      (fun p -> { percentile = p; mfd = Survival_math.weighted_percentile pairs p })
+      (fun p ->
+         { percentile = p
+         ; mfd =
+             Survival_replay.d_for_coverage
+               ~f:(fun d -> Survival_replay.blended_f model ~d)
+               ~target:(p /. 100.0)
+         })
       percentiles
   in
   { class_name = class_input.name
   ; table =
       { horizon_label = h.label
       ; calendar_days = h.calendar_days
-      ; n_starts = asset_samples ~series:asset ~horizon:h.sessions ~warmup |> Array.length
+      ; n_starts =
+          asset_samples ~series:asset ~horizon:h.sessions ~warmup () |> Array.length
+      ; n_eff =
+          asset_samples ~series:asset ~horizon:h.sessions ~warmup ~stride:h.sessions ()
+          |> Array.length
       ; rows
       }
   }
@@ -177,19 +165,22 @@ let estimate_class
            ()
        in
        let n_asset = asset_surface.n_starts in
+       let model =
+         Survival_replay.blend_model_of
+           ~horizon:h
+           ~asset
+           ~class_members:class_input.members
+           ~kappa:class_input.kappa
+           ~warmup:config.vol_window
+           ~weight_by_sessions:config.weight_by_sessions
+           ()
+       in
        let blended_rows =
-         List.map2
-           (fun (ar : surface_row) (cr : surface_row) ->
-              let f =
-                Survival_stats.blend
-                  ~n_asset:(float_of_int n_asset)
-                  ~asset_f:ar.coverage
-                  ~kappa:(float_of_int class_input.kappa)
-                  ~class_f:cr.coverage
-              in
+         List.map
+           (fun (ar : surface_row) ->
+              let f = Survival_replay.blended_f model ~d:(ar.drawdown_pct /. 100.0) in
               { drawdown_pct = ar.drawdown_pct; coverage = f; survival = 1.0 -. f })
            asset_surface.rows
-           class_surface.rows
        in
        let blended_surface =
          { class_name = class_input.name

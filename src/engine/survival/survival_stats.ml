@@ -2,7 +2,11 @@
    blend.
 
    No-lookahead invariant: trailing volatility at start [s] uses only closes
-   from [s-W, s] (bars <= s). z(s,h) = MFD(s,h) / (sigma_s * sqrt(h)). *)
+   from [s-W, s] (bars <= s). z(s,h) = MFD(s,h) / (sigma_s * sqrt(h)).
+
+   The z-blend reads through [asset_regime_of] (the asset's per-start MFD and
+   trailing vol) plus the class's pooled z-CDF (Survival_classes.z_index_of):
+   the class contribution is evaluated at each asset start's own vol regime. *)
 
 let percentile = Survival_math.percentile
 let std = Survival_math.std
@@ -36,23 +40,46 @@ let z_mfd ~closes ~lows ~s ~horizon ~w =
      | _ -> None)
 ;;
 
-(** Empirical CDF of z over all valid starts. *)
-let z_f_h ~closes ~lows ~horizon ~threshold ~w ~warmup =
+(** Per-start (MFD, trailing-vol) pairs over [warmup, n-horizon-1], shared by
+    the z-blend: F_asset stays the raw MFD CDF while the class contribution is
+    evaluated at the asset's own vol regime, tau_s(d) = d / (sigma_s * sqrt h).
+    A start whose trailing vol is unavailable (or exactly zero, i.e. a flat
+    window) gets sigma = 0.0, which maps to tau = +infinity -> class coverage
+    1.0. [stride] mirrors Survival_mfd.samples. *)
+type asset_regime =
+  { mfd : float array
+  ; sigma : float array
+  ; n : int
+  }
+
+let asset_regime_of ~closes ~lows ~horizon ~w ~warmup ?(stride = 1) () : asset_regime =
   let n = Array.length closes in
-  let hits = ref 0 in
-  let total = ref 0 in
-  for s = warmup to n - 1 do
-    match z_mfd ~closes ~lows ~s ~horizon ~w with
-    | Some z ->
-      incr total;
-      if z <= threshold then incr hits
-    | None -> ()
+  let stride = max 1 stride in
+  let ms = ref [] in
+  let ss = ref [] in
+  let s = ref warmup in
+  while !s <= n - 1 do
+    (match Survival_mfd.mfd ~closes ~lows ~start:!s ~horizon with
+     | Some m ->
+       ms := m :: !ms;
+       let sigma =
+         match trailing_vol ~closes ~s:!s ~w with
+         | Some v when v > 0.0 -> v
+         | _ -> 0.0
+       in
+       ss := sigma :: !ss
+     | None -> ());
+    s := !s + stride
   done;
-  if !total = 0 then 0.0 else float_of_int !hits /. float_of_int !total
+  let mfd = Array.of_list (List.rev !ms) in
+  let sigma = Array.of_list (List.rev !ss) in
+  { mfd; sigma; n = Array.length mfd }
 ;;
 
 (** Blend an asset's empirical CDF with its class CDF using kappa:
-    F_blend = (n_a * F_asset + kappa * F_class) / (n_a + kappa). *)
+    F_blend = (n_a * F_asset + kappa * F_class) / (n_a + kappa).
+    kappa is a pseudocount of class pseudo-sessions: the class pull is ~
+    kappa / n_a and decays naturally as the asset's own history grows. *)
 let blend ~n_asset ~asset_f ~kappa ~class_f =
   ((n_asset *. asset_f) +. (kappa *. class_f)) /. (n_asset +. kappa)
 ;;

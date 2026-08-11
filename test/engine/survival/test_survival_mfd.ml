@@ -26,7 +26,7 @@ let test_f_h_and_survival () =
   let lows = [| 100.; 99.; 90.; 95. |] in
   near
     0.0
-    (Dio_survival.Survival_mfd.f_h ~closes ~lows ~horizon:3 ~threshold:0.05 ~warmup:0);
+    (Dio_survival.Survival_mfd.f_h ~closes ~lows ~horizon:3 ~threshold:0.05 ~warmup:0 ());
   near
     1.0
     (Dio_survival.Survival_mfd.survival
@@ -34,10 +34,11 @@ let test_f_h_and_survival () =
        ~lows
        ~horizon:3
        ~threshold:0.05
-       ~warmup:0);
+       ~warmup:0
+       ());
   near
     1.0
-    (Dio_survival.Survival_mfd.f_h ~closes ~lows ~horizon:3 ~threshold:0.10 ~warmup:0)
+    (Dio_survival.Survival_mfd.f_h ~closes ~lows ~horizon:3 ~threshold:0.10 ~warmup:0 ())
 ;;
 
 let test_surface () =
@@ -64,6 +65,43 @@ let test_surface () =
   in
   (* Low falls ~0.01/session; over 30 sessions worst is ~0.30, so F(30%) ~ 1. *)
   Alcotest.(check bool) "30% covered" (row.coverage > 0.9) true
+;;
+
+let test_stride_sampling () =
+  let closes = Array.make 100 100.0 in
+  let lows = Array.make 100 100.0 in
+  (* Valid stride-1 starts are s in [10, 98] = 89 windows (s=99 has no room
+     for the half-open window). *)
+  Alcotest.(check int)
+    "stride 1 windows"
+    89
+    (Dio_survival.Survival_mfd.n_starts ~closes ~lows ~horizon:30 ~warmup:10 ());
+  (* stride 30 -> starts 10, 40, 70 -> 3 non-overlapping windows. *)
+  Alcotest.(check int)
+    "stride 30 windows"
+    3
+    (Dio_survival.Survival_mfd.n_starts
+       ~closes
+       ~lows
+       ~horizon:30
+       ~warmup:10
+       ~stride:30
+       ());
+  (* Percentile tables estimate from the non-overlapping basis and report both
+     the raw (overlapping) and effective window counts. *)
+  let h =
+    { Dio_survival.Survival_types.label = "30d"; sessions = 30; calendar_days = 30 }
+  in
+  let t : Dio_survival.Survival_types.percentile_table =
+    Dio_survival.Survival_mfd.percentile_table
+      ~closes
+      ~lows
+      ~horizon:h
+      ~percentiles:[ 50.; 99. ]
+      ~warmup:10
+  in
+  Alcotest.(check int) "table n_starts" 89 t.n_starts;
+  Alcotest.(check int) "table n_eff" 3 t.n_eff
 ;;
 
 let test_static_runway () =
@@ -111,6 +149,7 @@ let () =
         ; Alcotest.test_case "mfd uses lows only" `Quick test_mfd_uses_only_lows
         ; Alcotest.test_case "f_h and survival" `Quick test_f_h_and_survival
         ; Alcotest.test_case "surface" `Quick test_surface
+        ; Alcotest.test_case "stride sampling" `Quick test_stride_sampling
         ; Alcotest.test_case "static runway" `Quick test_static_runway
         ; Alcotest.test_case "runway cost accumulates" `Quick test_runway_cost_accumulates
         ] )

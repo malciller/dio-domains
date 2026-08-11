@@ -68,6 +68,7 @@ type args =
   ; class_name : string option
   ; members : string list option
   ; kappa : int
+  ; kappa_explicit : bool
   ; target_survival : float
   ; weight_by_sessions : bool
   ; json : bool
@@ -111,7 +112,8 @@ let parse_args () =
   let vol_window = ref None in
   let class_name = ref "" in
   let members = ref None in
-  let kappa = ref 2 in
+  let kappa = ref 200 in
+  let kappa_explicit = ref false in
   let target_survival = ref 0.99 in
   let weight_by_sessions = ref true in
   let json = ref false in
@@ -241,7 +243,13 @@ let parse_args () =
             (fun s ->
               members := Some (String.split_on_char ',' s |> List.map String.trim))
         , " comma member symbols for the class pool" )
-      ; "--kappa", Arg.Int (fun i -> kappa := i), " class weight in the blend (default 2)"
+      ; ( "--kappa"
+        , Arg.Int
+            (fun i ->
+              kappa := i;
+              kappa_explicit := true)
+        , " class weight in the blend (default 200; a config.json per-class kappa wins \
+           unless this is passed)" )
       ; ( "--target-survival"
         , Arg.Float (fun f -> target_survival := f)
         , " target blended survival for inverse sizing (default 0.99)" )
@@ -294,6 +302,7 @@ let parse_args () =
   ; class_name = (if !class_name = "" then None else Some !class_name)
   ; members = !members
   ; kappa = !kappa
+  ; kappa_explicit = !kappa_explicit
   ; target_survival = !target_survival
   ; weight_by_sessions = !weight_by_sessions
   ; json = !json
@@ -345,7 +354,7 @@ let fetch_series (a : args) (symbol : string) : Survival_types.series Lwt.t =
     alone (offline mode). *)
 let load_members
       (a : args)
-      (classes : (string * string list) list)
+      (classes : (string * Dio_engine.Config.class_pool) list)
       ~(class_name : string)
       (asset : Survival_types.series)
   : Survival_types.series list Lwt.t
@@ -355,7 +364,7 @@ let load_members
     | Some ms when ms <> [] -> ms
     | _ ->
       (match List.assoc_opt class_name classes with
-       | Some ms when ms <> [] -> ms
+       | Some pool when pool.members <> [] -> pool.members
        | _ -> [])
   in
   if syms = []
@@ -414,6 +423,9 @@ type coverage_row =
   * Survival_types.historical_path_coverage
   * Survival_types.sizing_result
   * Survival_types.sizing_result
+  * Survival_types.sizing_result
+(* horizon, path coverage, static min capital, max qty, empirical min
+     capital *)
 
 let horizon_label_of (c_ : Survival_types.historical_path_coverage) =
   c_.Survival_types.horizon.Survival_types.label
@@ -484,7 +496,7 @@ let report_text
         rows3
       |> String.concat "   "
     in
-    line "  %-7s n=%d   %s" at.horizon_label at.n_starts row
+    line "  %-7s n=%d eff=%d   %s" at.horizon_label at.n_starts at.n_eff row
   done;
   line "";
   line
@@ -507,7 +519,7 @@ let report_text
   line "Historical path coverage at D_surv:";
   line "  %-7s %10s %10s %10s" "horizon" "asset" "class" "blended";
   List.iter
-    (fun ((_h, c_, _cap, _q) : coverage_row) ->
+    (fun ((_h, c_, _cap, _q, _emp) : coverage_row) ->
        line
          "  %-7s %10s %10s %10s"
          (horizon_label_of c_)
@@ -526,7 +538,7 @@ let report_text
     "max-qty"
     "cov";
   List.iter
-    (fun ((_h, c_, cap, q) : coverage_row) ->
+    (fun ((_h, c_, cap, q, _emp) : coverage_row) ->
        let cov_str reachable v =
          let s = pct v in
          if reachable then s else s ^ " *"
@@ -540,9 +552,32 @@ let report_text
          q.value
          (cov_str q.reachable q.coverage))
     coverages;
+  line "";
+  line
+    "Empirical min capital (advisory, from actual path replay; the static sizing above \
+     is the safe recommendation):";
+  line "  %-7s %14s %8s %8s %10s" "horizon" "empirical" "cov" "d_surv" "buffer x";
+  List.iter
+    (fun ((_h, c_, cap, _q, emp) : coverage_row) ->
+       let cov_str reachable v =
+         let s = pct v in
+         if reachable then s else s ^ " *"
+       in
+       let buffer =
+         if emp.reachable && emp.value > 0.0 then cap.value /. emp.value else 0.0
+       in
+       line
+         "  %-7s %14.2f %8s %8s %10.2f"
+         (horizon_label_of c_)
+         emp.value
+         (cov_str emp.reachable emp.coverage)
+         (pct emp.d_surv)
+         buffer)
+    coverages;
   let any_unreachable =
     List.exists
-      (fun ((_h, _c_, cap, q) : coverage_row) -> (not cap.reachable) || not q.reachable)
+      (fun ((_h, _c_, cap, q, emp) : coverage_row) ->
+         (not cap.reachable) || (not q.reachable) || not emp.reachable)
       coverages
   in
   if any_unreachable
@@ -575,13 +610,15 @@ let report_json
   in
   let percentile_rows (t : Survival_types.percentile_table) =
     `Assoc
-      (List.map
-         (fun (row : Survival_types.percentile_row) ->
-            Printf.sprintf "p%g" row.percentile, `Float row.mfd)
-         t.rows)
+      (("n_starts", `Int t.n_starts)
+       :: ("n_eff", `Int t.n_eff)
+       :: List.map
+            (fun (row : Survival_types.percentile_row) ->
+               Printf.sprintf "p%g" row.percentile, `Float row.mfd)
+            t.rows)
   in
   let asset_tbls = List.map percentile_rows r.percentile_tables in
-  let sizing_j ((_h, c_, cap, q) : coverage_row) =
+  let sizing_j ((_h, c_, cap, q, emp) : coverage_row) =
     `Assoc
       [ "horizon", `String (horizon_label_of c_)
       ; "asset_coverage", `Float c_.asset_coverage
@@ -594,6 +631,13 @@ let report_json
       ; "max_qty", `Float q.value
       ; "max_qty_coverage", `Float q.coverage
       ; "max_qty_reachable", `Bool q.reachable
+      ; "empirical_min_capital", `Float emp.value
+      ; "empirical_min_capital_d_surv", `Float emp.d_surv
+      ; "empirical_min_capital_coverage", `Float emp.coverage
+      ; "empirical_min_capital_reachable", `Bool emp.reachable
+      ; ( "empirical_capital_buffer_ratio"
+        , `Float
+            (if emp.reachable && emp.value > 0.0 then cap.value /. emp.value else 0.0) )
       ]
   in
   `Assoc
@@ -651,7 +695,7 @@ let report_json
     [None]; in JSON mode returns the report value without printing. *)
 let run_one
       (a : args)
-      (classes : (string * string list) list)
+      (classes : (string * Dio_engine.Config.class_pool) list)
       (task : Survival_tasks.task)
   : Yojson.Safe.t option
   =
@@ -676,6 +720,17 @@ let run_one
            task.Survival_tasks.exchange
            task.Survival_tasks.symbol)
   in
+  (* Effective kappa: explicit --kappa > per-class kappa in config.json >
+     the 200 default. *)
+  let kappa =
+    if a.kappa_explicit
+    then a.kappa
+    else (
+      match List.assoc_opt class_name classes with
+      | Some pool -> Option.value pool.kappa ~default:200
+      | None -> 200)
+  in
+  let a = { a with kappa } in
   let tc = Lwt_main.run (Survival_fees.enrich tc ~offline) in
   let asset =
     match a.from_csv, a.from_json with
@@ -792,7 +847,15 @@ let run_one
          let qty_res =
            Survival_replay.max_qty ~grid ~model:m ~target_survival:a.target_survival ()
          in
-         h, c_, capital_res, qty_res)
+         let empirical_res =
+           Survival_replay.empirical_min_capital
+             ~grid
+             ~model:m
+             ~target_survival:a.target_survival
+             ?hi:a.max_capital
+             ()
+         in
+         h, c_, capital_res, qty_res, empirical_res)
       horizons
   in
   if a.json
