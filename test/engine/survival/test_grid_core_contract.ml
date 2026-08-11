@@ -64,9 +64,12 @@ let cfg ?(price_increment = 0.01) ?(qty_increment = 0.01) () =
   ; accumulation_buffer = 0.0
   ; price_increment
   ; qty_increment
+  ; qty_min = 0.0
+  ; min_notional = 0.0
   ; exchange_model = Hyperliquid
   ; start_price = 100.0
   ; start_quote = 10_000.0
+  ; cash_hook = None
   }
 ;;
 

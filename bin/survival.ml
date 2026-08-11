@@ -9,7 +9,8 @@
    overridable from the CLI. With no SYMBOL, every asset in config.json's
    "trading" list is analyzed on its own configured exchange. Offline mode via
    --from-csv / --from-json loads a single asset series from a file instead of
-   the network and still requires a SYMBOL. *)
+   the network and still requires a SYMBOL. Portfolio mode is enabled with
+   --portfolio or any topology/allocation option. *)
 
 open Lwt.Infix
 open Dio_survival
@@ -38,6 +39,14 @@ type args =
   ; exchange : string
   ; exchange_explicit : bool
   ; capital : float option
+  ; portfolio : bool
+  ; topology : string option
+  ; total_capital : float option
+  ; split : string
+  ; allocations : string list
+  ; transfer_specs : string list
+  ; positions_file : string option
+  ; save_positions : string option
   ; qty : float option
   ; grid_interval : float option
   ; fee : float option
@@ -45,6 +54,8 @@ type args =
   ; accumulation_buffer : float option
   ; price_increment : float option
   ; qty_increment : float option
+  ; qty_min : float option
+  ; min_notional : float option
   ; data_feed : string option
   ; start_price : float option
   ; start_date : string option
@@ -72,6 +83,14 @@ let parse_args () =
   let exchange = ref "kraken" in
   let exchange_explicit = ref false in
   let capital = ref None in
+  let portfolio = ref false in
+  let topology = ref None in
+  let total_capital = ref None in
+  let split = ref "equal" in
+  let allocations = ref [] in
+  let transfer_specs = ref [] in
+  let positions_file = ref None in
+  let save_positions = ref None in
   let qty = ref None in
   let grid_interval = ref None in
   let fee = ref None in
@@ -79,6 +98,8 @@ let parse_args () =
   let accumulation_buffer = ref None in
   let price_increment = ref None in
   let qty_increment = ref None in
+  let qty_min = ref None in
+  let min_notional = ref None in
   let data_feed = ref "" in
   let start_price = ref None in
   let start_date = ref "" in
@@ -108,7 +129,53 @@ let parse_args () =
         , " kraken|alpaca|hyperliquid (default kraken; sets the calendar kind)" )
       ; ( "--capital"
         , Arg.Float (fun f -> capital := Some f)
-        , " quote capital for grid replay (default 1000.0)" )
+        , " override quote capital; online default is fetched balance, offline 1000.0" )
+      ; ( "--portfolio"
+        , Arg.Set portfolio
+        , " run all requested assets as one shared portfolio" )
+      ; ( "--topology"
+        , Arg.String
+            (fun path ->
+              topology := Some path;
+              portfolio := true)
+        , " portfolio topology JSON file" )
+      ; ( "--total-capital"
+        , Arg.Float
+            (fun f ->
+              total_capital := Some f;
+              portfolio := true)
+        , " total portfolio quote capital (split equally unless allocations are given)" )
+      ; ( "--split"
+        , Arg.Symbol
+            ( [ "equal"; "explicit" ]
+            , fun value ->
+                split := value;
+                portfolio := true )
+        , " portfolio fund split: equal or explicit allocations" )
+      ; ( "--allocation"
+        , Arg.String
+            (fun value ->
+              allocations := value :: !allocations;
+              portfolio := true)
+        , " repeat VENUE/SYMBOL=AMOUNT to allocate portfolio capital" )
+      ; ( "--transfer"
+        , Arg.String
+            (fun value ->
+              transfer_specs := value :: !transfer_specs;
+              portfolio := true)
+        , " repeat SESSION:FROM->TO=AMOUNT for a manual portfolio transfer" )
+      ; ( "--positions-file"
+        , Arg.String
+            (fun path ->
+              positions_file := Some path;
+              portfolio := true)
+        , " load saved portfolio pool/base state" )
+      ; ( "--save-positions"
+        , Arg.String
+            (fun path ->
+              save_positions := Some path;
+              portfolio := true)
+        , " save final portfolio pool/base state" )
       ; ( "--qty"
         , Arg.Float (fun f -> qty := Some f)
         , " order size (default from config.json)" )
@@ -130,6 +197,13 @@ let parse_args () =
       ; ( "--qty-increment"
         , Arg.Float (fun f -> qty_increment := Some f)
         , " lot size (default exchange registry / 0.01)" )
+      ; ( "--qty-min"
+        , Arg.Float (fun f -> qty_min := Some f)
+        , " venue minimum order quantity (default exchange registry / 0.0)" )
+      ; ( "--min-notional"
+        , Arg.Float (fun f -> min_notional := Some f)
+        , " venue minimum order notional in quote; hyperliquid defaults to 10.0 (USDC \
+           spot floor), others 0.0" )
       ; ( "--data-feed"
         , Arg.Set_string data_feed
         , " alpaca feed iex|sip (default from config.json)" )
@@ -190,6 +264,14 @@ let parse_args () =
   ; exchange = !exchange
   ; exchange_explicit = !exchange_explicit
   ; capital = !capital
+  ; portfolio = !portfolio
+  ; topology = !topology
+  ; total_capital = !total_capital
+  ; split = !split
+  ; allocations = List.rev !allocations
+  ; transfer_specs = List.rev !transfer_specs
+  ; positions_file = !positions_file
+  ; save_positions = !save_positions
   ; qty = !qty
   ; grid_interval = !grid_interval
   ; fee = !fee
@@ -197,6 +279,8 @@ let parse_args () =
   ; accumulation_buffer = !accumulation_buffer
   ; price_increment = !price_increment
   ; qty_increment = !qty_increment
+  ; qty_min = !qty_min
+  ; min_notional = !min_notional
   ; data_feed = (if !data_feed = "" then None else Some !data_feed)
   ; start_price = !start_price
   ; start_date = (if !start_date = "" then None else Some !start_date)
@@ -223,12 +307,14 @@ let parse_args () =
 let fetch_cache : (string * string, Survival_types.series) Hashtbl.t = Hashtbl.create 32
 
 (** Fetch one symbol's daily series over the network (cached per run). *)
-let fetch_series (a : args) (symbol : string) : Survival_types.series Lwt.t =
-  match Hashtbl.find_opt fetch_cache (a.exchange, symbol) with
+let fetch_series_for (a : args) ~(exchange : string) (symbol : string)
+  : Survival_types.series Lwt.t
+  =
+  match Hashtbl.find_opt fetch_cache (exchange, symbol) with
   | Some s -> Lwt.return s
   | None ->
     let fetch =
-      match a.exchange with
+      match exchange with
       | "kraken" ->
         Survival_fetch_kraken.fetch_ohlc ~symbol ()
         >|= Survival_fetch_kraken.series_of_bars ~symbol
@@ -247,6 +333,10 @@ let fetch_series (a : args) (symbol : string) : Survival_types.series Lwt.t =
     >|= fun series ->
     Hashtbl.add fetch_cache (a.exchange, symbol) series;
     series
+;;
+
+let fetch_series (a : args) (symbol : string) : Survival_types.series Lwt.t =
+  fetch_series_for a ~exchange:a.exchange symbol
 ;;
 
 (** Load the class member pool: explicit --members when online, config.json
@@ -286,6 +376,36 @@ let load_members
     in
     go syms
     >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)
+;;
+
+let quote_of_task (task : Survival_tasks.task) =
+  (Survival_topology.key
+     ~venue:task.exchange
+     ~symbol:task.symbol
+     ~testnet:task.config.testnet
+     ())
+    .quote
+;;
+
+let live_capital_for_task (task : Survival_tasks.task) ~(offline : bool) =
+  if offline
+  then 1000.0
+  else (
+    match Lwt_main.run (Survival_balances.fetch_task task) with
+    | Ok snapshot ->
+      let capital =
+        Survival_balances.available_quote snapshot ~quote:(quote_of_task task)
+      in
+      if capital > 0.0
+      then capital
+      else
+        failwith
+          (Printf.sprintf
+             "survival: no available %s balance for %s/%s"
+             (quote_of_task task)
+             task.exchange
+             task.symbol)
+    | Error error -> failwith ("survival: balance fetch failed: " ^ error))
 ;;
 
 type coverage_row =
@@ -372,6 +492,7 @@ let report_text
     grid.grid_interval_pct
     grid.start_quote
     (grid.maker_fee *. 100.0);
+  line "  gates: qty_min %.4f  min_notional %.2f quote" grid.qty_min grid.min_notional;
   line
     "  D_surv = %s (%s)"
     (pct replay_out.d_surv)
@@ -501,6 +622,10 @@ let report_json
           ; "grid_interval_pct", `Float grid.grid_interval_pct
           ; "maker_fee", `Float grid.maker_fee
           ; "accumulation_buffer", `Float grid.accumulation_buffer
+          ; "price_increment", `Float grid.price_increment
+          ; "qty_increment", `Float grid.qty_increment
+          ; "qty_min", `Float grid.qty_min
+          ; "min_notional", `Float grid.min_notional
           ; "start_price", `Float grid.start_price
           ; "start_quote", `Float grid.start_quote
           ] )
@@ -573,7 +698,7 @@ let run_one
     Grid_adapter.of_trading_config
       tc
       ~start_price
-      ~start_quote:(Option.value a.capital ~default:1000.0)
+      ~start_quote:(Option.value a.capital ~default:(live_capital_for_task task ~offline))
       ~grid_interval_pct
   in
   let grid =
@@ -585,6 +710,8 @@ let run_one
         Option.value a.accumulation_buffer ~default:grid.accumulation_buffer
     ; price_increment = Option.value a.price_increment ~default:grid.price_increment
     ; qty_increment = Option.value a.qty_increment ~default:grid.qty_increment
+    ; qty_min = Option.value a.qty_min ~default:grid.qty_min
+    ; min_notional = Option.value a.min_notional ~default:grid.min_notional
     }
   in
   let equity_sessions =
@@ -674,6 +801,472 @@ let run_one
     None)
 ;;
 
+type portfolio_node =
+  { spec : Survival_topology.position_spec
+  ; task : Survival_tasks.task
+  ; series : Survival_types.series
+  ; initial_base : float
+  }
+
+let same_account
+      (left : Survival_topology.instrument_key)
+      (right : Survival_topology.instrument_key)
+  =
+  left.venue = right.venue && left.testnet = right.testnet && left.quote = right.quote
+;;
+
+let task_for_key
+      (tasks : Survival_tasks.task list)
+      (key : Survival_topology.instrument_key)
+  =
+  match
+    List.find_opt
+      (fun (task : Survival_tasks.task) ->
+         String.lowercase_ascii task.exchange = key.venue
+         && String.lowercase_ascii task.symbol = String.lowercase_ascii key.symbol
+         && task.config.testnet = key.testnet)
+      tasks
+  with
+  | Some task -> task
+  | None ->
+    let config = Survival_tasks.default_trading_config key.venue key.symbol in
+    { Survival_tasks.symbol = key.symbol
+    ; exchange = key.venue
+    ; config = { config with testnet = key.testnet }
+    }
+;;
+
+let portfolio_definition (a : args) (tasks : Survival_tasks.task list) =
+  let definition : Survival_topology.definition =
+    match a.topology with
+    | None -> Survival_topology.definition_of_tasks tasks
+    | Some path ->
+      (match Survival_topology.load path with
+       | Ok definition -> definition
+       | Error error -> failwith ("survival: " ^ error))
+  in
+  let add_allocation (definition : Survival_topology.definition) value =
+    match Survival_topology.parse_allocation value with
+    | Error error -> failwith ("survival: " ^ error)
+    | Ok allocation ->
+      let positions =
+        if
+          List.exists
+            (fun (position : Survival_topology.position_spec) ->
+               Survival_topology.equal_key position.key allocation.key)
+            definition.positions
+        then
+          List.map
+            (fun (position : Survival_topology.position_spec) ->
+               if Survival_topology.equal_key position.key allocation.key
+               then allocation
+               else position)
+            definition.positions
+        else allocation :: definition.positions
+      in
+      { definition with positions }
+  in
+  let definition = List.fold_left add_allocation definition a.allocations in
+  let add_transfer transfers value =
+    match Survival_topology.parse_transfer value with
+    | Ok transfer -> transfer :: transfers
+    | Error error -> failwith ("survival: " ^ error)
+  in
+  let definition =
+    { definition with
+      transfers = List.fold_left add_transfer definition.transfers a.transfer_specs
+    }
+  in
+  match Survival_topology.validate definition with
+  | Ok () -> definition
+  | Error errors -> failwith ("survival: invalid topology: " ^ String.concat "; " errors)
+;;
+
+let loaded_portfolio_state (a : args) =
+  match a.positions_file with
+  | None -> []
+  | Some path ->
+    (match Survival_portfolio_state.load path with
+     | Ok positions -> positions
+     | Error error -> failwith ("survival: " ^ error))
+;;
+
+let apply_saved_allocations
+      (definition : Survival_topology.definition)
+      (saved : Survival_portfolio_state.position list)
+  =
+  let positions =
+    List.map
+      (fun (position : Survival_topology.position_spec) ->
+         if position.capital <> None
+         then position
+         else (
+           match
+             List.find_opt
+               (fun (saved_position : Survival_portfolio_state.position) ->
+                  Survival_topology.equal_key saved_position.key position.key)
+               saved
+           with
+           | Some saved_position -> { position with capital = Some saved_position.pool }
+           | None -> position))
+      definition.positions
+  in
+  { definition with positions }
+;;
+
+let saved_base_for key saved =
+  match
+    List.find_opt
+      (fun (position : Survival_portfolio_state.position) ->
+         Survival_topology.equal_key position.key key)
+      saved
+  with
+  | Some position -> position.base
+  | None -> 0.0
+;;
+
+let portfolio_series (a : args) (key : Survival_topology.instrument_key) ~(offline : bool)
+  =
+  if offline
+  then (
+    match a.from_csv, a.from_json with
+    | Some path, _ ->
+      Survival_loader.load_csv_file
+        ~symbol:key.symbol
+        ~calendar_kind:(Survival_tasks.calendar_kind_of_exchange key.venue)
+        ~path
+    | _, Some path ->
+      Survival_loader.load_json_file
+        ~symbol:key.symbol
+        ~calendar_kind:(Survival_tasks.calendar_kind_of_exchange key.venue)
+        ~path
+    | None, None ->
+      failwith "survival: offline portfolio mode requires --from-csv or --from-json")
+  else Lwt_main.run (fetch_series_for a ~exchange:key.venue key.symbol)
+;;
+
+let portfolio_capitals (a : args) ~(offline : bool) (nodes : portfolio_node list)
+  : (portfolio_node * float) list
+  =
+  let explicit_total =
+    List.fold_left
+      (fun total (node : portfolio_node) ->
+         total +. Option.value node.spec.capital ~default:0.0)
+      0.0
+      nodes
+  in
+  let unspecified =
+    List.filter (fun (node : portfolio_node) -> node.spec.capital = None) nodes
+  in
+  let direct =
+    List.filter_map
+      (fun (node : portfolio_node) ->
+         Option.map (fun capital -> node, capital) node.spec.capital)
+      nodes
+  in
+  if a.split = "explicit" && unspecified <> []
+  then failwith "survival: --split explicit requires a capital for every position";
+  let assign_equal total =
+    if unspecified = []
+    then (
+      if total +. 1e-9 < explicit_total
+      then failwith "survival: explicit topology allocations exceed --total-capital";
+      direct)
+    else (
+      let remaining = total -. explicit_total in
+      if remaining < 0.0
+      then failwith "survival: explicit topology allocations exceed --total-capital"
+      else (
+        let each = remaining /. float_of_int (List.length unspecified) in
+        direct @ List.map (fun node -> node, each) unspecified))
+  in
+  match a.total_capital with
+  | Some total when total < 0.0 || not (Float.is_finite total) ->
+    failwith "survival: --total-capital must be finite and non-negative"
+  | Some total -> assign_equal total
+  | None ->
+    (match a.capital with
+     | Some capital when capital < 0.0 || not (Float.is_finite capital) ->
+       failwith "survival: --capital must be finite and non-negative"
+     | Some capital -> direct @ List.map (fun node -> node, capital) unspecified
+     | None when offline -> direct @ List.map (fun node -> node, 1000.0) unspecified
+     | None ->
+       let same_key (left : Survival_topology.instrument_key) right =
+         same_account left right
+       in
+       let groups : (Survival_topology.instrument_key * portfolio_node list) list =
+         List.fold_left
+           (fun groups (node : portfolio_node) ->
+              if node.spec.capital <> None
+              then groups
+              else (
+                match
+                  List.find_opt (fun (key, _) -> same_key key node.spec.key) groups
+                with
+                | Some (key, _group_nodes) ->
+                  List.map
+                    (fun (group_key, values) ->
+                       if same_key group_key key
+                       then group_key, node :: values
+                       else group_key, values)
+                    groups
+                | None -> (node.spec.key, [ node ]) :: groups))
+           []
+           nodes
+       in
+       let grouped =
+         List.concat_map
+           (fun ((account_key : Survival_topology.instrument_key), group_nodes) ->
+              let task = (List.hd group_nodes).task in
+              let snapshot =
+                match Lwt_main.run (Survival_balances.fetch_task task) with
+                | Ok snapshot -> snapshot
+                | Error error -> failwith ("survival: balance fetch failed: " ^ error)
+              in
+              let available =
+                Survival_balances.available_quote snapshot ~quote:account_key.quote
+              in
+              let reserved_explicit =
+                List.fold_left
+                  (fun total (node : portfolio_node) ->
+                     if same_account account_key node.spec.key
+                     then total +. Option.value node.spec.capital ~default:0.0
+                     else total)
+                  0.0
+                  nodes
+              in
+              let each =
+                (available -. reserved_explicit) /. float_of_int (List.length group_nodes)
+              in
+              if each < 0.0
+              then
+                failwith
+                  ("survival: insufficient "
+                   ^ account_key.quote
+                   ^ " balance for portfolio")
+              else List.map (fun node -> node, each) group_nodes)
+           groups
+       in
+       direct @ grouped)
+;;
+
+let portfolio_grid (a : args) (node : portfolio_node) capital ~(offline : bool) =
+  let tc = Lwt_main.run (Survival_fees.enrich node.task.config ~offline) in
+  let start_price =
+    Option.value
+      a.start_price
+      ~default:
+        (if Array.length node.series.bars = 0
+         then 0.0
+         else node.series.bars.(Array.length node.series.bars - 1).close)
+  in
+  let grid_interval_pct = Option.value a.grid_interval ~default:(snd tc.grid_interval) in
+  let grid =
+    Grid_adapter.of_trading_config tc ~start_price ~start_quote:capital ~grid_interval_pct
+  in
+  { grid with
+    qty = Option.value a.qty ~default:grid.qty
+  ; sell_mult = Option.value a.sell_mult ~default:grid.sell_mult
+  ; maker_fee = Option.value a.fee ~default:grid.maker_fee
+  ; accumulation_buffer =
+      Option.value a.accumulation_buffer ~default:grid.accumulation_buffer
+  ; price_increment = Option.value a.price_increment ~default:grid.price_increment
+  ; qty_increment = Option.value a.qty_increment ~default:grid.qty_increment
+  ; qty_min = Option.value a.qty_min ~default:grid.qty_min
+  ; min_notional = Option.value a.min_notional ~default:grid.min_notional
+  }
+;;
+
+let report_portfolio_text
+      (definition : Survival_topology.definition)
+      (nodes : (portfolio_node * float) list)
+      (result : Survival_portfolio.result)
+  =
+  let b = Buffer.create 2048 in
+  let line fmt =
+    Printf.ksprintf
+      (fun value ->
+         Buffer.add_string b value;
+         Buffer.add_char b '\n')
+      fmt
+  in
+  line "=== DIO Capital Survival Portfolio ===";
+  line
+    "Sessions: %d   exhausted: %b   first exhausted session: %s"
+    result.n_sessions
+    result.exhausted
+    (match result.first_exhausted_session with
+     | Some session -> string_of_int session
+     | None -> "none");
+  line
+    "Positions: %d   Transfers: %d"
+    (List.length nodes)
+    (List.length definition.transfers);
+  List.iter
+    (fun ((node, capital) : portfolio_node * float) ->
+       let outcome =
+         List.find
+           (fun (value : Survival_portfolio.position_outcome) ->
+              value.venue = node.spec.key.venue && value.asset = node.spec.key.symbol)
+           result.positions
+       in
+       line
+         "  %s  capital %.2f -> %.2f  D_surv %.1f%%  low %b  fills %d/%d  base %.6f"
+         (Survival_topology.key_id node.spec.key)
+         capital
+         outcome.final_pool
+         (outcome.d_surv *. 100.0)
+         outcome.capital_low
+         outcome.buy_fills
+         outcome.sell_fills
+         outcome.final_base)
+    nodes;
+  List.iter
+    (fun (transfer : Survival_topology.transfer_spec) ->
+       line
+         "  transfer session %d: %s -> %s  %.2f"
+         transfer.session
+         (Survival_topology.key_id transfer.from_key)
+         (Survival_topology.key_id transfer.to_key)
+         transfer.amount)
+    definition.transfers;
+  Buffer.contents b
+;;
+
+let report_portfolio_json
+      (definition : Survival_topology.definition)
+      (nodes : (portfolio_node * float) list)
+      (result : Survival_portfolio.result)
+  : Yojson.Safe.t
+  =
+  let outcome_json ((node, capital) : portfolio_node * float) =
+    let outcome =
+      List.find
+        (fun (value : Survival_portfolio.position_outcome) ->
+           value.venue = node.spec.key.venue && value.asset = node.spec.key.symbol)
+        result.positions
+    in
+    `Assoc
+      [ "venue", `String node.spec.key.venue
+      ; "symbol", `String node.spec.key.symbol
+      ; "base", `String node.spec.key.base
+      ; "quote", `String node.spec.key.quote
+      ; "testnet", `Bool node.spec.key.testnet
+      ; "initial_pool", `Float capital
+      ; "final_pool", `Float outcome.final_pool
+      ; "pool_min_drawdown", `Float outcome.pool_min_drawdown
+      ; "d_surv", `Float outcome.d_surv
+      ; "capital_low", `Bool outcome.capital_low
+      ; ( "first_exhausted_session"
+        , Option.fold
+            ~none:`Null
+            ~some:(fun value -> `Int value)
+            outcome.first_exhausted_session )
+      ; "buy_fills", `Int outcome.buy_fills
+      ; "sell_fills", `Int outcome.sell_fills
+      ; "final_base", `Float outcome.final_base
+      ]
+  in
+  `Assoc
+    [ "mode", `String "portfolio"
+    ; "n_sessions", `Int result.n_sessions
+    ; "exhausted", `Bool result.exhausted
+    ; ( "first_exhausted_session"
+      , Option.fold
+          ~none:`Null
+          ~some:(fun value -> `Int value)
+          result.first_exhausted_session )
+    ; "topology", Survival_topology.to_json definition
+    ; "positions", `List (List.map outcome_json nodes)
+    ; "transfers", `List (List.map Survival_topology.transfer_json definition.transfers)
+    ]
+;;
+
+let run_portfolio (a : args) (tasks : Survival_tasks.task list) : Yojson.Safe.t option =
+  let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
+  let saved = loaded_portfolio_state a in
+  let definition =
+    portfolio_definition a tasks |> fun value -> apply_saved_allocations value saved
+  in
+  if definition.positions = []
+  then failwith "survival: portfolio topology has no positions";
+  if offline && List.length definition.positions > 1
+  then failwith "survival: offline portfolio mode supports one historical input file";
+  let nodes =
+    List.map
+      (fun (spec : Survival_topology.position_spec) ->
+         let task = task_for_key tasks spec.key in
+         if not (Survival_tasks.known_exchange task.exchange)
+         then failwith ("survival: unsupported portfolio exchange " ^ task.exchange);
+         { spec
+         ; task
+         ; series = portfolio_series a spec.key ~offline
+         ; initial_base = saved_base_for spec.key saved
+         })
+      definition.positions
+  in
+  let node_tasks = List.map (fun (node : portfolio_node) -> node.task) nodes in
+  if not offline then Lwt_main.run (Survival_venues.init node_tasks);
+  let capitals = portfolio_capitals a ~offline nodes in
+  let capital_by_key key =
+    match
+      List.find_opt
+        (fun ((node, _) : portfolio_node * float) ->
+           Survival_topology.equal_key node.spec.key key)
+        capitals
+    with
+    | Some (_, capital) -> capital
+    | None ->
+      failwith ("survival: no capital allocation for " ^ Survival_topology.key_id key)
+  in
+  let timeline =
+    Survival_topology.timeline_of_series
+      (List.map (fun (node : portfolio_node) -> node.series) nodes)
+  in
+  let positions =
+    List.map
+      (fun (node : portfolio_node) ->
+         let capital = capital_by_key node.spec.key in
+         { Survival_portfolio.venue = node.spec.key.venue
+         ; asset = node.spec.key.symbol
+         ; pool = capital
+         ; initial_base = node.initial_base
+         ; bars = Survival_topology.align_series timeline node.series
+         ; subgrids = [ portfolio_grid a node capital ~offline ]
+         })
+      nodes
+  in
+  let transfers = List.map Survival_topology.to_portfolio_transfer definition.transfers in
+  let result = Survival_portfolio.simulate_aligned ~timeline ~positions ~transfers () in
+  (match a.save_positions with
+   | None -> ()
+   | Some path ->
+     let saved_positions =
+       List.map
+         (fun (node : portfolio_node) ->
+            let outcome =
+              List.find
+                (fun (value : Survival_portfolio.position_outcome) ->
+                   value.venue = node.spec.key.venue && value.asset = node.spec.key.symbol)
+                result.positions
+            in
+            { Survival_portfolio_state.key = node.spec.key
+            ; pool = outcome.final_pool
+            ; base = outcome.final_base
+            })
+         nodes
+     in
+     (try Survival_portfolio_state.save path saved_positions with
+      | exn ->
+        failwith
+          (Printf.sprintf "survival: cannot save positions: %s" (Printexc.to_string exn))));
+  if a.json
+  then Some (report_portfolio_json definition capitals result)
+  else (
+    print_endline (report_portfolio_text definition capitals result);
+    None)
+;;
+
 let main () =
   let a = parse_args () in
   let config = Dio_engine.Config.read_config () in
@@ -697,12 +1290,31 @@ let main () =
            (if exchange = "" then symbol else Printf.sprintf "%s (%s)" symbol exchange))
       unsupported
   in
-  if tasks = [] && warnings = []
+  if tasks = [] && warnings = [] && not a.portfolio
   then (
     Printf.eprintf
       "survival: no SYMBOL given and config.json has no runnable trading assets (see \
        --help)\n";
     exit 1)
+  else if a.portfolio
+  then (
+    if not a.json then List.iter print_endline warnings;
+    let report = run_portfolio a tasks in
+    match report, a.json with
+    | Some report, true ->
+      let report =
+        if warnings = []
+        then report
+        else
+          `Assoc
+            (("warnings", `List (List.map (fun w -> `String w) warnings))
+             ::
+             (match report with
+              | `Assoc fields -> fields
+              | other -> [ "portfolio", other ]))
+      in
+      print_endline (Yojson.Safe.to_string report)
+    | _ -> ())
   else (
     let multiple = List.length tasks > 1 in
     let one (task : Survival_tasks.task) =

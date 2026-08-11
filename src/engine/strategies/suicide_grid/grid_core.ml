@@ -3,12 +3,15 @@
    Mirrors the live grid (Suicide_grid_execution):
    - buy level      = ref * (1 - gi/100), sell level = last_buy_fill * (1 + gi/100)
    - trailing buy   = min(ref*(1-gi/100), sell - 2*gi/100*ref)   [exact_target rule]
-   - buy gate       = quote >= q * price * (1 + fee)
+   - buy gate       = quote >= q * price * (1 + fee) AND the order is placeable
+     (qty >= qty_min, notional q*price >= min_notional)
+   - sell gate      = sell notional q_s * price >= min_notional and
+     q_s >= qty_min (accumulated sells too small to be placeable are skipped)
    - sell qty per venue: Kraken qty*sell_mult; HL/Lighter/IBKR accumulation
      sells once accumulated_profit >= rounding_diff*sell_price + buffer;
      Alpaca 1:1.
-   - at most one sell per bar; buys may ladder down as far as the bar low and
-     quote allow (worst-case intraday fills).
+   - at most one sell per bar; buys may ladder down as far as the bar low,
+     quote and the min_notional floor allow (worst-case intraday fills).
    - capital_low (quote can't fund the next buy) pauses buying and clears when
      quote recovers; the FIRST occurrence is the survival event.
 
@@ -22,6 +25,17 @@
 
 open Grid_core_types
 
+(** Optional external cash ledger. When present, the grid reads its buy
+    affordability and applies spend/recover to the ledger instead of
+    [state.quote]; the portfolio layer uses this to share one budget across
+    subgrids (merge/ven-diagram semantics) and to track pool-level min drawdown
+    across bar replay. When absent the grid is self-contained (its own quote). *)
+type cash_hook =
+  { balance : unit -> float
+  ; spend : float -> unit
+  ; recover : float -> unit
+  }
+
 type config =
   { qty : float
   ; sell_mult : float
@@ -30,9 +44,17 @@ type config =
   ; accumulation_buffer : float
   ; price_increment : float
   ; qty_increment : float
+  ; qty_min : float
+    (** Venue minimum order quantity: buys (always full qty) and reduced
+        accumulation sells below this are never placeable. *)
+  ; min_notional : float
+    (** Venue minimum order notional (quote): an order whose limit price * qty
+        is below this is never placeable (e.g. Hyperliquid's 10 USDC spot
+        floor). *)
   ; exchange_model : exchange_model
   ; start_price : float
   ; start_quote : float
+  ; cash_hook : cash_hook option
   }
 
 type state =
@@ -132,7 +154,35 @@ let min_move_threshold cfg price =
 ;;
 
 let buy_fill_cost cfg price = price *. cfg.qty *. (1.0 +. cfg.maker_fee)
-let can_place_buy cfg ~state ~price = state.quote >= buy_fill_cost cfg price
+let buy_notional cfg price = price *. cfg.qty
+
+let read_quote cfg state =
+  match cfg.cash_hook with
+  | Some h -> h.balance ()
+  | None -> state.quote
+;;
+
+let spend_quote cfg state amount =
+  match cfg.cash_hook with
+  | Some h -> h.spend amount
+  | None -> state.quote <- state.quote -. amount
+;;
+
+let recover_quote cfg state amount =
+  match cfg.cash_hook with
+  | Some h -> h.recover amount
+  | None -> state.quote <- state.quote +. amount
+;;
+
+(** A buy order at [price] is placeable when capital covers the cost, the full
+    qty clears the venue minimum and the order notional clears the venue floor.
+    (Live orders are gated the same way; an unplaceable order means the grid
+    cannot buy, which surfaces as capital_low / exhaustion in the replay.) *)
+let can_place_buy cfg ~state ~price =
+  read_quote cfg state >= buy_fill_cost cfg price
+  && cfg.qty >= cfg.qty_min
+  && buy_notional cfg price >= cfg.min_notional
+;;
 
 let create cfg =
   let b = buy_level cfg ~ref:cfg.start_price in
@@ -188,7 +238,7 @@ let on_bar cfg ~state ~bar ~ordering =
   if state.capital_low
   then (
     match state.resting_buy with
-    | Some b when state.quote >= buy_fill_cost cfg b -> state.capital_low <- false
+    | Some b when can_place_buy cfg ~state ~price:b -> state.capital_low <- false
     | _ -> ());
   let on_buy_fill b =
     state.buy_fills <- state.buy_fills + 1;
@@ -209,7 +259,7 @@ let on_bar cfg ~state ~bar ~ordering =
           if can_place_buy cfg ~state ~price:b
           then (
             let cost = buy_fill_cost cfg b in
-            state.quote <- state.quote -. cost;
+            spend_quote cfg state cost;
             state.base <- state.base +. cfg.qty;
             state.last_buy_fill_price <- Some b;
             state.resting_buy <- None;
@@ -238,13 +288,13 @@ let on_bar cfg ~state ~bar ~ordering =
       let q_s, required = compute_sell_qty cfg ~state ~sell_price:s in
       let available = Float.max 0.0 (state.base -. state.reserved_base) in
       let q_s = Float.min q_s available in
-      if q_s > 0.0
+      if q_s > 0.0 && q_s >= cfg.qty_min && q_s *. s >= cfg.min_notional
       then (
         state.resting_sell <- None;
         let gross = s *. q_s in
         let fee = gross *. cfg.maker_fee in
         let proceeds = gross -. fee in
-        state.quote <- state.quote +. proceeds;
+        recover_quote cfg state proceeds;
         state.base <- Float.max 0.0 (state.base -. q_s);
         state.sell_fills <- state.sell_fills + 1;
         if required > 0.0
@@ -279,11 +329,12 @@ let replay cfg ~bars ~ordering =
   let n = Array.length bars in
   let quote_series = Array.make n 0.0 in
   let fills = ref [] in
-  let min_quote = ref cfg.start_quote in
+  let initial_quote = read_quote cfg state in
+  let min_quote = ref initial_quote in
   let first_cl_session = ref None in
   Array.iteri
     (fun i bar ->
-       let start_q = state.quote in
+       let start_q = read_quote cfg state in
        let fs = on_bar cfg ~state ~bar ~ordering in
        fills := List.rev_append fs !fills;
        let q = ref start_q in
@@ -292,8 +343,9 @@ let replay cfg ~bars ~ordering =
             q := !q +. f.quote_delta;
             min_quote := Float.min !min_quote !q)
          fs;
-       quote_series.(i) <- state.quote;
-       min_quote := Float.min !min_quote state.quote;
+       let after_q = read_quote cfg state in
+       quote_series.(i) <- after_q;
+       min_quote := Float.min !min_quote after_q;
        if state.ever_capital_low && !first_cl_session = None
        then first_cl_session := Some i)
     bars;
@@ -303,11 +355,11 @@ let replay cfg ~bars ~ordering =
   { fills = List.rev !fills
   ; quote_by_session = quote_series
   ; min_quote = !min_quote
-  ; min_quote_drawdown = 1.0 -. (!min_quote /. cfg.start_quote)
+  ; min_quote_drawdown = 1.0 -. (!min_quote /. initial_quote)
   ; first_capital_low_drawdown = first_cl_dd
   ; first_capital_low_session = !first_cl_session
   ; exhausted = state.ever_capital_low
-  ; final_quote = state.quote
+  ; final_quote = read_quote cfg state
   ; final_base = state.base
   ; buy_fills = state.buy_fills
   ; sell_fills = state.sell_fills

@@ -25,3 +25,19 @@
 (test
  (name test_analytical_vs_core)
  (libraries dio.strategies dio.survival alcotest))
+
+(test
+ (name test_survival_portfolio)
+ (libraries dio.survival dio.strategies alcotest))
+
+(test
+ (name test_survival_balances)
+ (libraries dio.survival dio.strategies alcotest))
+
+(test
+ (name test_survival_topology)
+ (libraries dio.survival dio.strategies alcotest))
+
+(test
+ (name test_survival_portfolio_state)
+ (libraries dio.survival dio.strategies alcotest))

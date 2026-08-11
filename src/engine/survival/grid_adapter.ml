@@ -7,7 +7,13 @@
    get_qty_increment_val) and fall back to 0.01 when the registry is empty
    (offline CLI runs); the guide's Phase 2 flag: pass explicit increments from
    the CLI to override. start_price/start_quote/grid_interval are supplied by
-   the caller (quote capital is the inverse-sizing variable). *)
+   the caller (quote capital is the inverse-sizing variable).
+
+   Order-placeability floors: qty_min comes from the live venue registry
+   (get_qty_min_val; 0.0 = unknown). min_notional defaults to the venue's
+   documented minimum order notional (Hyperliquid's 10 USDC spot floor;
+   Kraken/others are notional-unconstrained here - their qty_min governs), and
+   both can be overridden from the CLI. *)
 
 open Dio_strategies
 
@@ -15,6 +21,18 @@ let default_price_increment = 0.01
 let default_qty_increment = 0.01
 let default_maker_fee = 0.001
 let exchange_model_of_string = Grid_core.exchange_model_of_string
+
+(** Venue default minimum order notional (quote). Hyperliquid spot enforces
+    MinTradeSpotNtl = 10 USDC; the perp/equity venues below are not
+    notional-constrained in this model. *)
+let default_min_notional exchange_model =
+  match exchange_model with
+  | Grid_core_types.Hyperliquid -> 10.0
+  | Grid_core_types.Kraken
+  | Grid_core_types.Lighter
+  | Grid_core_types.Ibkr
+  | Grid_core_types.Alpaca -> 0.0
+;;
 
 let price_increment_of (tc : Strategy_common.trading_config) =
   try Suicide_grid_config.get_price_increment tc.symbol tc.exchange with
@@ -24,6 +42,11 @@ let price_increment_of (tc : Strategy_common.trading_config) =
 let qty_increment_of (tc : Strategy_common.trading_config) =
   try Suicide_grid_config.get_qty_increment_val tc.symbol tc.exchange with
   | _ -> default_qty_increment
+;;
+
+let qty_min_of (tc : Strategy_common.trading_config) =
+  try Suicide_grid_config.get_qty_min_val tc.symbol tc.exchange with
+  | _ -> 0.0
 ;;
 
 let float_of_string_opt def s =
@@ -51,8 +74,11 @@ let of_trading_config
   ; accumulation_buffer
   ; price_increment = price_increment_of tc
   ; qty_increment = qty_increment_of tc
+  ; qty_min = qty_min_of tc
+  ; min_notional = default_min_notional exchange_model
   ; exchange_model
   ; start_price
   ; start_quote
+  ; cash_hook = None
   }
 ;;

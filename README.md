@@ -206,6 +206,31 @@ The top-level `classes` object defines the member pools backing each risk
 class's survival curve; `dio-survival` fetches the listed symbols per venue
 (never from hardcoded code lists).
 
+#### Portfolio Survival
+
+Use `dio-survival --portfolio` to replay multiple qualified instruments on a
+shared date timeline. Capital can be split equally with `--total-capital`, or
+assigned explicitly with repeated `--allocation VENUE/SYMBOL=AMOUNT` options.
+Manual quote transfers use `--transfer SESSION:FROM->TO=AMOUNT`. A topology JSON
+file can define the same positions and transfers:
+
+```json
+{
+  "positions": [
+    { "venue": "hyperliquid", "symbol": "BTC/USDC", "capital": 1000.0 },
+    { "venue": "kraken", "symbol": "ETH/USD", "capital": 1000.0 }
+  ],
+  "transfers": [
+    { "session": 10, "from": "hyperliquid/BTC/USDC", "to": "kraken/ETH/USD", "amount": 250.0 }
+  ]
+}
+```
+
+When `--capital` is omitted, online runs fetch available quote balances from
+Kraken, Hyperliquid, or Alpaca and split each account's balance across its
+unspecified positions. `--positions-file` and `--save-positions` persist
+qualified pool/base checkpoints separately from live strategy state.
+
 #### GC Tuning
 
 | Field | Default | Description |
