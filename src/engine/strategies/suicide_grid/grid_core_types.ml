@@ -36,3 +36,14 @@ type fill =
   ; qty : float
   ; quote_delta : float
   }
+
+(** Why the grid's first capital-low event fired.
+    [`Capital]: the quote balance could not fund the (dynamically up-sized)
+    buy cost - true capital exhaustion.
+    [`Not_placeable]: the required quantity still fails the venue's qty_min
+    gate even after dynamic up-sizing - a parameter/venue-sizing halt that
+    more capital cannot fix. *)
+type halt_cause =
+  [ `Capital
+  | `Not_placeable
+  ]

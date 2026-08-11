@@ -19,6 +19,10 @@
  (libraries dio.strategies alcotest))
 
 (test
+ (name test_grid_core_synthetic)
+ (libraries dio.strategies dio.survival alcotest))
+
+(test
  (name test_grid_core_contract)
  (libraries dio.strategies alcotest))
 

@@ -40,6 +40,41 @@ let bar ?(high = -1.0) ?(low = -1.0) ?(close = -1.0) () =
 
 let near a b = Alcotest.(check (float 1e-6)) "approx" a b
 
+(** Independent oracle for a monotone geometric decline (one ladder step per
+    level, no sells): fills continue while quote can fund the dynamically
+    sized cost. Replicates the level/qty rules without the state machine. *)
+let oracle_ladder
+      ~(min_notional : float)
+      ~(qty : float)
+      ~(start_price : float)
+      ~(gi : float)
+      ~(start_quote : float)
+      ~(max_levels : int)
+  =
+  (* Same float arithmetic as Grid_core.ceil_lot (multiply by 1e9, subtract,
+     then divide) so lot boundaries agree bit-for-bit. *)
+  let rec go b quote n =
+    if n >= max_levels
+    then n, b, quote
+    else (
+      let floor_q =
+        if min_notional > 0.0
+        then Float.ceil ((min_notional /. b *. 1e9) -. 1e-9) /. 1e9
+        else 0.0
+      in
+      let q = Float.max qty floor_q in
+      let cost = q *. b in
+      if cost <= quote
+      then
+        go
+          (Float.round (b *. (1.0 -. (gi /. 100.0)) *. 1e9) /. 1e9)
+          (quote -. cost)
+          (n + 1)
+      else n, b, quote)
+  in
+  go (Float.round (start_price *. (1.0 -. (gi /. 100.0)) *. 1e9) /. 1e9) start_quote 0
+;;
+
 let test_initial_buy_level () =
   let c = cfg () in
   let st = Dio_strategies.Grid_core.create c in
@@ -106,6 +141,7 @@ let test_capital_low_exhaustion () =
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
   Alcotest.(check bool) "exhausted" true st.ever_capital_low;
+  Alcotest.(check bool) "halt cause is capital" (st.first_halt_cause = Some `Capital) true;
   (match st.first_capital_low_buy with
    | Some b -> near 98.01 b
    | None -> Alcotest.fail "expected first capital-low buy level");
@@ -184,28 +220,46 @@ let test_no_sell_without_buy () =
   Alcotest.(check int) "no sells" 0 st.sell_fills
 ;;
 
-let test_min_notional_stops_ladder () =
-  (* Hyperliquid spot floor: with min_notional = 90 and qty = 1.0, the ladder
-     fills at 99.0 .. 90.45 (notional >= 90) and is blocked at 89.54 even
-     though capital is ample. *)
+let test_min_notional_dynamic_scaling () =
+  (* Hyperliquid spot floor: below the base-notional price the buy qty is
+     up-sized to ceil(min_notional / level) so the ladder stays engaged
+     instead of halting on a fixed-qty notional violation; it halts only when
+     quote cannot fund the up-sized cost. *)
   let c = cfg ~min_notional:90.0 ~start_quote:10_000.0 () in
   let res =
     Dio_strategies.Grid_core.replay
       c
-      ~bars:[| bar ~low:5.0 () |]
+      ~bars:[| bar ~low:0.5 () |]
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
-  Alcotest.(check int) "buys down to 90.45" 10 res.buy_fills;
-  Alcotest.(check bool) "exhausted on notional floor" true res.exhausted;
-  (* Blocked level 99*0.99^10 = 89.53 < 90 -> drawdown 1 - 0.99^11. *)
-  match res.first_capital_low_drawdown with
-  | Some dd -> near (1.0 -. (0.99 ** 11.0)) dd
-  | None -> Alcotest.fail "expected blocked level"
+  let n, b_next, quote =
+    oracle_ladder
+      ~min_notional:90.0
+      ~qty:1.0
+      ~start_price:100.0
+      ~gi:1.0
+      ~start_quote:10_000.0
+      ~max_levels:2000
+  in
+  Alcotest.(check int) "oracle fills" n res.buy_fills;
+  Alcotest.(check bool) "exhausted on capital" true res.exhausted;
+  Alcotest.(check bool) "halt cause is capital" (res.halt_cause = Some `Capital) true;
+  (match res.first_capital_low_drawdown with
+   | Some dd -> near (1.0 -. (b_next /. 100.0)) dd
+   | None -> Alcotest.fail "expected blocked level");
+  near quote res.final_quote;
+  (* Some rungs were up-sized above the base qty to clear the floor. *)
+  Alcotest.(check bool)
+    "up-sized fills exist"
+    (List.exists (fun (f : Dio_strategies.Grid_core_types.fill) -> f.qty > 1.0) res.fills)
+    true
 ;;
 
-let test_min_notional_blocks_reduced_sell () =
+let test_min_notional_upsizes_reduced_sell () =
   (* Kraken sells qty * sell_mult = 0.05; with min_notional = 50 the reduced
-     sell notional 0.05 * 99.99 < 50 is not placeable and no sell fills. *)
+     sell notional 0.05 * 99.99 < 50, so the sell qty is up-sized to
+     ceil(50 / 99.99) and fills, letting the grid recover capital instead of
+     stranding base below the floor. *)
   let c =
     cfg ~sell_mult:0.05 ~min_notional:50.0 ~model:Dio_strategies.Grid_core_types.Kraken ()
   in
@@ -224,8 +278,14 @@ let test_min_notional_blocks_reduced_sell () =
       ~bar:(bar ~high:101.0 ())
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
-  Alcotest.(check int) "no sells below min notional" 0 st.sell_fills;
-  Alcotest.(check int) "no fills" 0 (List.length fs)
+  Alcotest.(check int) "sell fills" 1 st.sell_fills;
+  Alcotest.(check int) "one fill" 1 (List.length fs);
+  let expected = Float.ceil ((50.0 /. 99.99 /. 1e-9) -. 1e-9) *. 1e-9 in
+  near expected (List.hd fs).qty;
+  Alcotest.(check bool)
+    "notional clears the floor"
+    ((List.hd fs).qty *. 99.99 >= 50.0)
+    true
 ;;
 
 let test_min_notional_full_sell_fills () =
@@ -265,7 +325,13 @@ let test_qty_min_blocks_under_min_qty () =
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
   Alcotest.(check int) "no buys" 0 res.buy_fills;
-  Alcotest.(check bool) "exhausted" true res.exhausted
+  Alcotest.(check bool) "exhausted" true res.exhausted;
+  (* The halt is a parameter/venue sizing failure, not a capital one: more
+     quote cannot make a sub-qty_min order placeable. *)
+  Alcotest.(check bool)
+    "halt cause not placeable"
+    (res.halt_cause = Some `Not_placeable)
+    true
 ;;
 
 let test_qty_min_allows_at_least_min () =
@@ -386,13 +452,13 @@ let () =
         ; Alcotest.test_case "ordering affects trough" `Quick test_ordering_affects_trough
         ; Alcotest.test_case "no sell without buy" `Quick test_no_sell_without_buy
         ; Alcotest.test_case
-            "min notional stops ladder"
+            "min notional dynamic scaling"
             `Quick
-            test_min_notional_stops_ladder
+            test_min_notional_dynamic_scaling
         ; Alcotest.test_case
-            "min notional blocks reduced sell"
+            "min notional upsizes reduced sell"
             `Quick
-            test_min_notional_blocks_reduced_sell
+            test_min_notional_upsizes_reduced_sell
         ; Alcotest.test_case
             "min notional allows full sell"
             `Quick

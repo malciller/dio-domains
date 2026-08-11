@@ -510,6 +510,16 @@ let report_text
     "  D_surv = %s (%s)"
     (pct replay_out.d_surv)
     (if replay_out.exhausted then "capital low hit" else "never exhausted");
+  (match replay_out.halt_cause with
+   | None -> ()
+   | Some `Capital ->
+     line
+       "  halt cause: quote capital exhausted - the grid could no longer fund the \
+        (dynamically sized) next buy order"
+   | Some `Not_placeable ->
+     line
+       "  halt cause: parameter sizing - the required buy quantity stays below qty_min \
+        even after dynamic up-sizing; more capital cannot fix this");
   line
     "  fills: %d buy / %d sell   min quote drawdown %s"
     replay_out.buy_fills
@@ -678,6 +688,12 @@ let report_json
       , `Assoc
           [ "d_surv", `Float replay_out.d_surv
           ; "exhausted", `Bool replay_out.exhausted
+          ; "grid_halted", `Bool (replay_out.halt_cause <> None)
+          ; ( "halt_cause"
+            , match replay_out.halt_cause with
+              | None -> `Null
+              | Some `Capital -> `String "capital"
+              | Some `Not_placeable -> `String "not_placeable" )
           ; "min_quote_drawdown", `Float replay_out.min_quote_drawdown
           ; "buy_fills", `Int replay_out.buy_fills
           ; "sell_fills", `Int replay_out.sell_fills

@@ -25,15 +25,22 @@
    MFD samples + trailing vols (Survival_stats.asset_regime_of) and the pooled
    class z-index (Survival_classes.z_index_of). Coverage evaluations then cost
    O(n * log n_class) instead of rescanning windows, keeping the bisection
-   fast. [stride] selects the sampling basis: 1 for coverage/sizing (unbiased
-   mean estimate), horizon for percentile tables (non-overlapping tail). *)
+   fast. [stride] selects the sampling basis: the default is horizon sessions
+   (non-overlapping windows) for every coverage evaluation - target-survival
+   inversion, blended surfaces and percentile tables alike - so a single
+   contiguous crash is counted once, not once per overlapping start.
+   [n_asset] (the kappa blend weight) is always the stride-1 overlapping count
+   so kappa keeps its pseudo-session meaning regardless of the basis. *)
 
 open Survival_types
 open Dio_strategies
 
+let section = "survival_replay"
+
 type outcome =
   { d_surv : float
   ; exhausted : bool
+  ; halt_cause : Grid_core_types.halt_cause option
   ; min_quote_drawdown : float
   ; buy_fills : int
   ; sell_fills : int
@@ -60,6 +67,7 @@ let replay_series (cfg : Grid_core.config) (s : series) : outcome =
   let r = Grid_core.replay cfg ~bars ~ordering:Grid_core_types.Buy_first in
   { d_surv = d_surv_of_result r
   ; exhausted = r.exhausted
+  ; halt_cause = r.halt_cause
   ; min_quote_drawdown = r.min_quote_drawdown
   ; buy_fills = r.buy_fills
   ; sell_fills = r.sell_fills
@@ -76,7 +84,8 @@ type blend_model =
   ; warmup : int
   ; weight_by_sessions : bool
   ; stride : int
-    (** Sampling basis: 1 for coverage/sizing, horizon for percentile tables. *)
+    (** Sampling basis: horizon sessions by default (non-overlapping windows)
+        for all coverage evaluations; stride 1 only when explicitly requested. *)
   ; index : blend_index
   }
 
@@ -154,21 +163,45 @@ type coverage_at_d =
   ; blended : float
   }
 
-(** The unified z-blend F_blend(d). Monotone non-decreasing in [d]. *)
+(** Pooled class z-coverage averaged over the asset starts with a defined
+    trailing volatility regime (sigma > 0). Starts with sigma = 0 (flat/gap
+    windows) carry no volatility information; mapping them to tau = +infinity
+    would inject false 100% class certainty, so they are excluded here (they
+    stay in F_asset, where a flat window's raw MFD of ~0 is legitimate). *)
+let class_fraction (m : blend_model) ~(d : float) =
+  let sqrt_h = sqrt (float_of_int m.horizon.sessions) in
+  let cls = ref 0.0 in
+  let n_valid = ref 0 in
+  Array.iter
+    (fun sigma ->
+       if sigma > 0.0
+       then (
+         incr n_valid;
+         let tau = d /. (sigma *. sqrt_h) in
+         cls := !cls +. Survival_classes.z_cdf_of m.index.class_z ~tau))
+    m.index.sigma;
+  if !n_valid = 0 then 0.0 else !cls /. float_of_int !n_valid
+;;
+
+(** The unified z-blend F_blend(d). Monotone non-decreasing in [d]. Raises on
+    an empty distribution (no MFD windows on this horizon/warmup/stride basis)
+    instead of returning 0.0 - an empty distribution must never masquerade as
+    "zero coverage" or feed a bogus inverse-size. *)
 let blended_f (m : blend_model) ~(d : float) =
   let n = Array.length m.index.sigma in
   if n = 0
-  then 0.0
+  then
+    invalid_arg
+      (Printf.sprintf
+         "Survival_replay.blended_f: empty distribution for %s (horizon %d, warmup %d, \
+          stride %d): no MFD windows to evaluate coverage on"
+         m.asset.symbol
+         m.horizon.sessions
+         m.warmup
+         m.stride)
   else (
     let f_asset = float_of_int (count_le m.index.mfd_sorted d) /. float_of_int n in
-    let sqrt_h = sqrt (float_of_int m.horizon.sessions) in
-    let cls = ref 0.0 in
-    Array.iter
-      (fun sigma ->
-         let tau = if sigma > 0.0 then d /. (sigma *. sqrt_h) else Float.infinity in
-         cls := !cls +. Survival_classes.z_cdf_of m.index.class_z ~tau)
-      m.index.sigma;
-    let f_class = !cls /. float_of_int n in
+    let f_class = class_fraction m ~d in
     Survival_stats.blend
       ~n_asset:(float_of_int m.index.n_asset)
       ~asset_f:f_asset
@@ -176,21 +209,23 @@ let blended_f (m : blend_model) ~(d : float) =
       ~class_f:f_class)
 ;;
 
-(** F_asset_h(d), translated F_class_h(d) and the kappa blend at drawdown [d]. *)
+(** F_asset_h(d), translated F_class_h(d) and the kappa blend at drawdown [d].
+    Raises on an empty distribution (see [blended_f]). *)
 let blended_coverage (m : blend_model) ~(d_surv : float) : coverage_at_d =
   let n = Array.length m.index.sigma in
   if n = 0
-  then { n_asset = m.index.n_asset; asset = 0.0; class_ = 0.0; blended = 0.0 }
+  then
+    invalid_arg
+      (Printf.sprintf
+         "Survival_replay.blended_coverage: empty distribution for %s (horizon %d, \
+          warmup %d, stride %d): no MFD windows to evaluate coverage on"
+         m.asset.symbol
+         m.horizon.sessions
+         m.warmup
+         m.stride)
   else (
-    let sqrt_h = sqrt (float_of_int m.horizon.sessions) in
     let f_asset = float_of_int (count_le m.index.mfd_sorted d_surv) /. float_of_int n in
-    let cls = ref 0.0 in
-    Array.iter
-      (fun sigma ->
-         let tau = if sigma > 0.0 then d_surv /. (sigma *. sqrt_h) else Float.infinity in
-         cls := !cls +. Survival_classes.z_cdf_of m.index.class_z ~tau)
-      m.index.sigma;
-    let f_class = !cls /. float_of_int n in
+    let f_class = class_fraction m ~d:d_surv in
     let f_blend =
       Survival_stats.blend
         ~n_asset:(float_of_int m.index.n_asset)
@@ -226,9 +261,17 @@ let coverage_of_capital
   blended_coverage m ~d_surv:out.d_surv
 ;;
 
+(** Builds the coverage model. [stride] defaults to the horizon (non-
+    overlapping windows) for every coverage evaluation: overlapping (stride-1)
+    samples would count one contiguous crash once per rolling start and let a
+    single severe regime dominate the target-survival inversion. Pass
+    ~stride:1 explicitly only when an overlapping basis is wanted. Warns when
+    the effective sample is thin (n_eff < 5, the asset history cannot support
+    an authoritative tail) or when windows have zero trailing volatility (flat
+    or gap-adjacent data), which are excluded from the class contribution. *)
 let blend_model_of
       ?(weight_by_sessions = true)
-      ?(stride = 1)
+      ?stride
       ~(horizon : horizon)
       ~(asset : series)
       ~(class_members : series list)
@@ -237,9 +280,35 @@ let blend_model_of
       ()
   : blend_model
   =
+  let stride = Option.value stride ~default:horizon.sessions in
   let index =
     blend_index_of ~horizon ~asset ~class_members ~warmup ~weight_by_sessions ~stride
   in
+  let n_eff = Array.length index.sigma in
+  let n_flat =
+    Array.fold_left (fun acc sigma -> if sigma = 0.0 then acc + 1 else acc) 0 index.sigma
+  in
+  if n_flat > 0
+  then
+    Logging.warn_f
+      ~section
+      "Survival_replay: %d/%d start windows for %s @%d have zero trailing volatility \
+       (flat or gap-adjacent data); they are excluded from the class contribution to \
+       avoid false 100%% certainty"
+      n_flat
+      n_eff
+      asset.symbol
+      horizon.sessions;
+  if n_eff > 0 && n_eff < 5
+  then
+    Logging.warn_f
+      ~section
+      "Survival_replay: only %d independent %d-session windows for %s (warmup %d); \
+       coverage/sizing is not authoritative below 5 windows"
+      n_eff
+      horizon.sessions
+      asset.symbol
+      warmup;
   { horizon; asset; class_members; kappa; warmup; weight_by_sessions; stride; index }
 ;;
 
@@ -365,7 +434,11 @@ let max_qty
     theoretical lower bound a path could hit, so it is structurally
     pessimistic: real paths bounce, sells free quote, and the grid survives
     deeper than the static runway predicts. The empirical number measures the
-    "capital buffer" the static sizing pays for.
+    "capital buffer" the static sizing pays for. Caveat: the static runway is
+    a pure geometric ladder, so when the venue's min_notional binds (dynamic
+    buy up-sizing), the replayed path can burn capital faster per rung than
+    the closed form - the empirical number may then exceed the static one
+    instead of landing below it.
 
     Path-replay D_surv is NOT monotone in capital (intermediate sells shift
     which ladder level exhausts the grid), so this cannot be a plain binary

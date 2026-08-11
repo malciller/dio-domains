@@ -3,23 +3,39 @@
    Mirrors the live grid (Suicide_grid_execution):
    - buy level      = ref * (1 - gi/100), sell level = last_buy_fill * (1 + gi/100)
    - trailing buy   = min(ref*(1-gi/100), sell - 2*gi/100*ref)   [exact_target rule]
-   - buy gate       = quote >= q * price * (1 + fee) AND the order is placeable
-     (qty >= qty_min, notional q*price >= min_notional)
+   - dynamic buy sizing: the quantity is up-sized per level so the order
+     notional always clears the venue floor:
+       required_qty = max(cfg.qty, ceil_lot(min_notional / price))
+     so the grid stays engaged deep into drawdowns at the cost of higher
+     capital burn (the fixed-qty notional floor used to halt the grid).
+   - buy gate       = quote >= required_qty * price * (1 + fee) AND the order
+     is placeable (required_qty >= qty_min; the notional floor is cleared by
+     construction). Exhaustion (capital_low) fires only when quote cannot fund
+     the (up-sized) order; a qty_min failure with ample capital halts the grid
+     as [`Not_placeable] instead.
    - sell gate      = sell notional q_s * price >= min_notional and
-     q_s >= qty_min (accumulated sells too small to be placeable are skipped)
+     q_s >= qty_min. Dynamic sell sizing: non-accumulation venues (Kraken
+     sell_mult, Alpaca 1:1) up-size the sell qty to ceil_lot(min_notional /
+     price) so the grid recovers safely; accumulation venues (HL/Lighter/IBKR)
+     keep the resting sell (accumulate) until the reduced sell clears the floor,
+     mirroring live order rejection.
    - sell qty per venue: Kraken qty*sell_mult; HL/Lighter/IBKR accumulation
      sells once accumulated_profit >= rounding_diff*sell_price + buffer;
      Alpaca 1:1.
    - at most one sell per bar; buys may ladder down as far as the bar low,
-     quote and the min_notional floor allow (worst-case intraday fills).
+     quote and the (dynamically sized) buy cost allow (worst-case intraday
+     fills).
    - capital_low (quote can't fund the next buy) pauses buying and clears when
-     quote recovers; the FIRST occurrence is the survival event.
+     quote recovers; the FIRST occurrence is the survival event (halt_cause).
 
    Known simplifications (documented in the plan):
    - ref price = the triggering fill price (no live bid/ask at bar resolution),
      so the ladder is exactly geometric: B_{n+1} = round(B_n * (1 - gi/100)).
    - the daily model fills one ladder step per crossing; multi-step same-bar
      fills are modeled conservatively (buy loop), never more than quote allows.
+   - pessimistic Buy_first ordering (max buys before any sell in a bar):
+     oscillatory bars drain fees differently than live sequential execution;
+     conservative by construction.
    - capital_low clears on quote recovery (live requires a balance increase);
      the recovery gate on sells is approximated by the profit/buffer check. *)
 
@@ -68,6 +84,7 @@ type state =
   ; mutable capital_low : bool
   ; mutable ever_capital_low : bool
   ; mutable first_capital_low_buy : float option
+  ; mutable first_halt_cause : halt_cause option
   ; mutable buy_fills : int
   ; mutable sell_fills : int
   }
@@ -79,6 +96,7 @@ type result =
   ; min_quote_drawdown : float
   ; first_capital_low_drawdown : float option
   ; first_capital_low_session : int option
+  ; halt_cause : halt_cause option
   ; exhausted : bool
   ; final_quote : float
   ; final_base : float
@@ -127,6 +145,14 @@ let round_lot cfg q =
   Float.floor ((q *. inv) +. 1e-9) /. inv
 ;;
 
+(** Ceiling lot rounding: smallest multiple of qty_increment >= [q]. Used to
+    up-size orders so the notional clears min_notional; the 1e-9 guard absorbs
+    float dust around lot boundaries without overshooting aligned values. *)
+let ceil_lot cfg q =
+  let inv = 1.0 /. cfg.qty_increment in
+  Float.ceil ((q *. inv) -. 1e-9) /. inv
+;;
+
 (* Level helpers. These must agree with Suicide_grid_config.calculate_grid_price
    when that function is used with an identity rounding state (contract test). *)
 let buy_level cfg ~ref = round_price cfg (ref *. (1.0 -. (cfg.grid_interval_pct /. 100.0)))
@@ -153,8 +179,32 @@ let min_move_threshold cfg price =
     (price *. (cfg.grid_interval_pct *. 0.05 /. 100.0))
 ;;
 
-let buy_fill_cost cfg price = price *. cfg.qty *. (1.0 +. cfg.maker_fee)
-let buy_notional cfg price = price *. cfg.qty
+(** Dynamic buy quantity at [price]: the base qty, up-sized (ceiling lot) so
+    the order notional clears the venue floor. This is what keeps the grid
+    engaged at deep drawdowns where qty * price would drop below min_notional;
+    the cost is proportionally higher capital burn per rung. *)
+let required_buy_qty cfg ~price =
+  let floor_qty =
+    if cfg.min_notional > 0.0 then ceil_lot cfg (cfg.min_notional /. price) else 0.0
+  in
+  Float.max cfg.qty floor_qty
+;;
+
+(** Dynamic sell quantity: non-accumulation venues (Kraken sell_mult, Alpaca
+    1:1) up-size the intended sell so its notional clears the venue floor,
+    letting the grid recover capital instead of stranding base below the floor;
+    accumulation venues (HL/Lighter/IBKR) keep the resting sell (accumulate)
+    until the reduced sell clears the floor, mirroring live order rejection.
+    When the available base cannot cover the up-sized quantity the placeability
+    check (notional >= min_notional) still rejects the sell. *)
+let upsell_to_notional cfg ~price ~qty =
+  if
+    cfg.min_notional > 0.0
+    && qty *. price < cfg.min_notional -. 1e-9
+    && not (use_accumulation_sells cfg)
+  then ceil_lot cfg (cfg.min_notional /. price)
+  else qty
+;;
 
 let read_quote cfg state =
   match cfg.cash_hook with
@@ -174,14 +224,29 @@ let recover_quote cfg state amount =
   | None -> state.quote <- state.quote +. amount
 ;;
 
-(** A buy order at [price] is placeable when capital covers the cost, the full
-    qty clears the venue minimum and the order notional clears the venue floor.
-    (Live orders are gated the same way; an unplaceable order means the grid
-    cannot buy, which surfaces as capital_low / exhaustion in the replay.) *)
+(** Buy gate at [price]: (required_qty, placeable, affordable). Placeability
+    (qty_min) is evaluated on the dynamically sized quantity, so an up-sized
+    order can clear the qty_min gate the base qty failed; affordability is the
+    capital gate quote >= required_qty * price * (1 + fee). Both checks use the
+    fill price (the resting buy level), not the bar low: the fill happens at
+    the level, so gating at a lower price would understate the true cost. The
+    notional floor is cleared by construction (up to float dust, hence the
+    epsilon). *)
+let buy_gate cfg ~state ~price =
+  let q = required_buy_qty cfg ~price in
+  let placeable = q >= cfg.qty_min && q *. price >= cfg.min_notional -. 1e-9 in
+  let affordable = read_quote cfg state >= q *. price *. (1.0 +. cfg.maker_fee) in
+  q, placeable, affordable
+;;
+
+(** A buy order at [price] is placeable and affordable: capital covers the
+    dynamically sized cost and the required quantity clears qty_min. (Live
+    orders are gated the same way; an unaffordable order surfaces as
+    capital_low / exhaustion in the replay, an unplaceable one as a
+    [`Not_placeable] halt.) *)
 let can_place_buy cfg ~state ~price =
-  read_quote cfg state >= buy_fill_cost cfg price
-  && cfg.qty >= cfg.qty_min
-  && buy_notional cfg price >= cfg.min_notional
+  let _, placeable, affordable = buy_gate cfg ~state ~price in
+  placeable && affordable
 ;;
 
 let create cfg =
@@ -196,6 +261,7 @@ let create cfg =
   ; capital_low = false
   ; ever_capital_low = false
   ; first_capital_low_buy = None
+  ; first_halt_cause = None
   ; buy_fills = 0
   ; sell_fills = 0
   }
@@ -240,12 +306,12 @@ let on_bar cfg ~state ~bar ~ordering =
     match state.resting_buy with
     | Some b when can_place_buy cfg ~state ~price:b -> state.capital_low <- false
     | _ -> ());
-  let on_buy_fill b =
+  let on_buy_fill b qty =
     state.buy_fills <- state.buy_fills + 1;
-    state.accumulated_profit <- state.accumulated_profit -. (b *. cfg.qty *. cfg.maker_fee);
+    state.accumulated_profit <- state.accumulated_profit -. (b *. qty *. cfg.maker_fee);
     match cfg.exchange_model with
     | Alpaca ->
-      let inc = cfg.qty -. (cfg.sell_mult *. cfg.qty) in
+      let inc = qty -. (cfg.sell_mult *. qty) in
       if inc > 0.0 then state.reserved_base <- state.reserved_base +. inc
     | _ -> ()
   in
@@ -255,20 +321,21 @@ let on_bar cfg ~state ~bar ~ordering =
       | None -> ()
       | Some b ->
         if bar.low <= b && b > 0.0
-        then
-          if can_place_buy cfg ~state ~price:b
+        then (
+          let q, placeable, affordable = buy_gate cfg ~state ~price:b in
+          if placeable && affordable
           then (
-            let cost = buy_fill_cost cfg b in
+            let cost = q *. b *. (1.0 +. cfg.maker_fee) in
             spend_quote cfg state cost;
-            state.base <- state.base +. cfg.qty;
+            state.base <- state.base +. q;
             state.last_buy_fill_price <- Some b;
             state.resting_buy <- None;
             let s = sell_level cfg ~ref:b in
             state.resting_sell <- Some s;
             let nb = trail_buy_level cfg ~bid:b ~sell:s in
             state.resting_buy <- Some nb;
-            on_buy_fill b;
-            add { side = `Buy; price = b; qty = cfg.qty; quote_delta = -.cost };
+            on_buy_fill b q;
+            add { side = `Buy; price = b; qty = q; quote_delta = -.cost };
             (* Only continue the ladder while the level strictly descends,
                otherwise a degenerate bar (price -> 0) would loop forever. *)
             if nb < b then loop ())
@@ -277,7 +344,9 @@ let on_bar cfg ~state ~bar ~ordering =
             if not state.ever_capital_low
             then (
               state.ever_capital_low <- true;
-              state.first_capital_low_buy <- Some b))
+              state.first_capital_low_buy <- Some b;
+              state.first_halt_cause
+              <- Some (if affordable then `Not_placeable else `Capital))))
         else ()
     in
     loop ()
@@ -288,7 +357,8 @@ let on_bar cfg ~state ~bar ~ordering =
       let q_s, required = compute_sell_qty cfg ~state ~sell_price:s in
       let available = Float.max 0.0 (state.base -. state.reserved_base) in
       let q_s = Float.min q_s available in
-      if q_s > 0.0 && q_s >= cfg.qty_min && q_s *. s >= cfg.min_notional
+      let q_s = upsell_to_notional cfg ~price:s ~qty:q_s in
+      if q_s > 0.0 && q_s >= cfg.qty_min && q_s *. s >= cfg.min_notional -. 1e-9
       then (
         state.resting_sell <- None;
         let gross = s *. q_s in
@@ -358,6 +428,7 @@ let replay cfg ~bars ~ordering =
   ; min_quote_drawdown = 1.0 -. (!min_quote /. initial_quote)
   ; first_capital_low_drawdown = first_cl_dd
   ; first_capital_low_session = !first_cl_session
+  ; halt_cause = state.first_halt_cause
   ; exhausted = state.ever_capital_low
   ; final_quote = read_quote cfg state
   ; final_base = state.base
