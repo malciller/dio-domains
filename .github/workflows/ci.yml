@@ -34,6 +34,7 @@ jobs:
           dune-cache: false # Disable built-in dune cache
 
       - name: Restore Dune cache
+        if: github.server_url == 'https://github.com'
         uses: actions/cache@v4
         with:
           path: ~/.cache/dune
