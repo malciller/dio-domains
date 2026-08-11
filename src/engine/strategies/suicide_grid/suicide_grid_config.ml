@@ -180,6 +180,12 @@ let round_qty qty symbol exchange =
   floor (qty *. inv) /. inv
 ;;
 
+let get_qty_min_val symbol exchange =
+  match get_exchange_module exchange with
+  | Some (module Ex : Exchange.S) -> Option.value (Ex.get_qty_min ~symbol) ~default:0.0
+  | None -> 0.0
+;;
+
 let venue_lot_qty grid_qty exchange state =
   match exchange with
   | "ibkr" ->

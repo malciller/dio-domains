@@ -2,9 +2,12 @@
 
 let cfg
       ?(qty = 1.0)
+      ?(sell_mult = 1.0)
       ?(grid_interval_pct = 1.0)
       ?(price_increment = 1e-9)
       ?(qty_increment = 1e-9)
+      ?(qty_min = 0.0)
+      ?(min_notional = 0.0)
       ?(start_price = 100.0)
       ?(start_quote = 10_000.0)
       ?(fee = 0.0)
@@ -13,15 +16,18 @@ let cfg
   =
   let open Dio_strategies.Grid_core in
   { qty
-  ; sell_mult = 1.0
+  ; sell_mult
   ; grid_interval_pct
   ; maker_fee = fee
   ; accumulation_buffer = 0.0
   ; price_increment
   ; qty_increment
+  ; qty_min
+  ; min_notional
   ; exchange_model = model
   ; start_price
   ; start_quote
+  ; cash_hook = None
   }
 ;;
 
@@ -178,6 +184,196 @@ let test_no_sell_without_buy () =
   Alcotest.(check int) "no sells" 0 st.sell_fills
 ;;
 
+let test_min_notional_stops_ladder () =
+  (* Hyperliquid spot floor: with min_notional = 90 and qty = 1.0, the ladder
+     fills at 99.0 .. 90.45 (notional >= 90) and is blocked at 89.54 even
+     though capital is ample. *)
+  let c = cfg ~min_notional:90.0 ~start_quote:10_000.0 () in
+  let res =
+    Dio_strategies.Grid_core.replay
+      c
+      ~bars:[| bar ~low:5.0 () |]
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "buys down to 90.45" 10 res.buy_fills;
+  Alcotest.(check bool) "exhausted on notional floor" true res.exhausted;
+  (* Blocked level 99*0.99^10 = 89.53 < 90 -> drawdown 1 - 0.99^11. *)
+  match res.first_capital_low_drawdown with
+  | Some dd -> near (1.0 -. (0.99 ** 11.0)) dd
+  | None -> Alcotest.fail "expected blocked level"
+;;
+
+let test_min_notional_blocks_reduced_sell () =
+  (* Kraken sells qty * sell_mult = 0.05; with min_notional = 50 the reduced
+     sell notional 0.05 * 99.99 < 50 is not placeable and no sell fills. *)
+  let c =
+    cfg ~sell_mult:0.05 ~min_notional:50.0 ~model:Dio_strategies.Grid_core_types.Kraken ()
+  in
+  let st = Dio_strategies.Grid_core.create c in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:99.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let fs =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~high:101.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "no sells below min notional" 0 st.sell_fills;
+  Alcotest.(check int) "no fills" 0 (List.length fs)
+;;
+
+let test_min_notional_full_sell_fills () =
+  (* Same Kraken setup but with a low floor: the reduced sell notional
+     0.05 * 99.99 >= 0.05 so it fills. *)
+  let c =
+    cfg ~sell_mult:0.05 ~min_notional:0.05 ~model:Dio_strategies.Grid_core_types.Kraken ()
+  in
+  let st = Dio_strategies.Grid_core.create c in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:99.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let fs =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~high:101.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "sell fills" 1 st.sell_fills;
+  Alcotest.(check int) "one fill" 1 (List.length fs);
+  near 0.05 (List.hd fs).qty
+;;
+
+let test_qty_min_blocks_under_min_qty () =
+  (* qty 0.05 < qty_min 0.1: the buy order is never placeable and the grid is
+     exhausted at the first level. *)
+  let c = cfg ~qty:0.05 ~qty_min:0.1 () in
+  let res =
+    Dio_strategies.Grid_core.replay
+      c
+      ~bars:[| bar ~low:99.0 () |]
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "no buys" 0 res.buy_fills;
+  Alcotest.(check bool) "exhausted" true res.exhausted
+;;
+
+let test_qty_min_allows_at_least_min () =
+  (* qty = qty_min: the buy places (notional floor also clear). *)
+  let c = cfg ~qty:0.1 ~qty_min:0.1 () in
+  let st = Dio_strategies.Grid_core.create c in
+  let fs =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:99.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "one buy" 1 (List.length fs);
+  Alcotest.(check int) "buy_fills" 1 st.buy_fills
+;;
+
+let cash_hook pool =
+  { Dio_strategies.Grid_core.balance = (fun () -> !pool)
+  ; spend = (fun a -> pool := !pool -. a)
+  ; recover = (fun a -> pool := !pool +. a)
+  }
+;;
+
+let test_cash_hook_spends_and_recovers () =
+  (* With a cash hook, buys spend the ledger and sells recover it. *)
+  let pool = ref 10_000.0 in
+  let c = { (cfg ()) with cash_hook = Some (cash_hook pool) } in
+  let st = Dio_strategies.Grid_core.create c in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:99.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  near 9_901.0 !pool;
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~high:101.0 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  near 10_000.99 !pool
+;;
+
+let test_cash_hook_shared_pool_merge () =
+  (* Two subgrids on the same asset draw from one shared pool (ven-diagram
+     merge): total buying is bounded by the pool, so when one grid's ladder
+     exhausts it, the other cannot place a buy either. *)
+  let pool = ref 150.0 in
+  let hook = cash_hook pool in
+  let mk gi = { (cfg ~grid_interval_pct:gi ()) with cash_hook = Some hook } in
+  let g1 = mk 1.0 in
+  let g2 = mk 2.0 in
+  let s1 = Dio_strategies.Grid_core.create g1 in
+  let s2 = Dio_strategies.Grid_core.create g2 in
+  let crash = bar ~low:50.0 () in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      g1
+      ~state:s1
+      ~bar:crash
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      g2
+      ~state:s2
+      ~bar:crash
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  (* g1: buy 99 (pool 51); its next level 98.01 is unaffordable. g2: 98 not
+     affordable from the exhausted pool. *)
+  Alcotest.(check int) "g1 one buy" 1 s1.buy_fills;
+  Alcotest.(check bool) "g1 capital low" true s1.ever_capital_low;
+  Alcotest.(check int) "g2 no buys (pool shared)" 0 s2.buy_fills;
+  Alcotest.(check bool) "g2 capital low from pool" true s2.ever_capital_low;
+  near 51.0 !pool
+;;
+
+let test_cash_hook_replay_tracks_pool () =
+  (* Grid_core.replay with a hook tracks the ledger the same way a
+     self-contained grid tracks its own quote. *)
+  let pool = ref 10_000.0 in
+  let hook = cash_hook pool in
+  let c = { (cfg ()) with cash_hook = Some hook } in
+  let bars = [| bar ~low:99.0 (); bar ~high:103.0 ~low:90.0 () |] in
+  let with_hook =
+    Dio_strategies.Grid_core.replay
+      c
+      ~bars
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let plain =
+    Dio_strategies.Grid_core.replay
+      (cfg ())
+      ~bars
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check int) "same buy fills" plain.buy_fills with_hook.buy_fills;
+  Alcotest.(check int) "same sell fills" plain.sell_fills with_hook.sell_fills;
+  near plain.min_quote with_hook.min_quote;
+  near plain.min_quote_drawdown with_hook.min_quote_drawdown;
+  near plain.final_quote with_hook.final_quote
+;;
+
 let () =
   Alcotest.run
     "grid_core"
@@ -189,6 +385,38 @@ let () =
         ; Alcotest.test_case "capital_low recovery" `Quick test_capital_low_recovers
         ; Alcotest.test_case "ordering affects trough" `Quick test_ordering_affects_trough
         ; Alcotest.test_case "no sell without buy" `Quick test_no_sell_without_buy
+        ; Alcotest.test_case
+            "min notional stops ladder"
+            `Quick
+            test_min_notional_stops_ladder
+        ; Alcotest.test_case
+            "min notional blocks reduced sell"
+            `Quick
+            test_min_notional_blocks_reduced_sell
+        ; Alcotest.test_case
+            "min notional allows full sell"
+            `Quick
+            test_min_notional_full_sell_fills
+        ; Alcotest.test_case
+            "qty_min blocks under-min qty"
+            `Quick
+            test_qty_min_blocks_under_min_qty
+        ; Alcotest.test_case
+            "qty_min allows at least min"
+            `Quick
+            test_qty_min_allows_at_least_min
+        ; Alcotest.test_case
+            "cash hook spends and recovers"
+            `Quick
+            test_cash_hook_spends_and_recovers
+        ; Alcotest.test_case
+            "cash hook shared pool merge"
+            `Quick
+            test_cash_hook_shared_pool_merge
+        ; Alcotest.test_case
+            "cash hook replay tracks pool"
+            `Quick
+            test_cash_hook_replay_tracks_pool
         ] )
     ]
 ;;

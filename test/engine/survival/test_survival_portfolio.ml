@@ -1,0 +1,233 @@
+(* Survival_portfolio multi-asset shared-budget tests.
+
+   Bars are chosen so high < every resting sell level (98.99 is the lowest
+   after the second buy) and the ladder stops mid-grid: with low = 97.5 a
+   qty-1 grid buys at 99 and 98.01 then stops (97.03 not traded). A pool of
+   200 exactly funds that ladder (197.01), leaving 2.99. *)
+
+let near a b = Alcotest.(check (float 1e-6)) "approx" a b
+
+let grid_cfg ?(qty = 1.0) ?(start_price = 100.0) ?(fee = 0.0) ()
+  : Dio_strategies.Grid_core.config
+  =
+  let open Dio_strategies.Grid_core in
+  { qty
+  ; sell_mult = 1.0
+  ; grid_interval_pct = 1.0
+  ; maker_fee = fee
+  ; accumulation_buffer = 0.0
+  ; price_increment = 1e-9
+  ; qty_increment = 1e-9
+  ; qty_min = 0.0
+  ; min_notional = 0.0
+  ; exchange_model = Dio_strategies.Grid_core_types.Hyperliquid
+  ; start_price
+  ; start_quote = 0.0 (* budget lives in the position pool, not the grid *)
+  ; cash_hook = None (* portfolio injects the shared pool hook *)
+  }
+;;
+
+let pbar ?(low = 97.5) ?(high = 98.5) () : Dio_survival.Survival_types.bar =
+  { date = "d"; open_ = 100.0; high; low; close = low; volume = 1.0 }
+;;
+
+let run ?(transfers = []) ~positions () =
+  Dio_survival.Survival_portfolio.simulate ~positions ~transfers ()
+;;
+
+let position venue asset pool bars subgrids
+  : Dio_survival.Survival_portfolio.position_input
+  =
+  { Dio_survival.Survival_portfolio.venue; asset; pool; bars; subgrids }
+;;
+
+let find_o venue asset (r : Dio_survival.Survival_portfolio.result) =
+  List.find
+    (fun (o : Dio_survival.Survival_portfolio.position_outcome) ->
+       o.venue = venue && o.asset = asset)
+    r.positions
+;;
+
+let test_shared_pool_merge () =
+  (* Three qty-1 subgrids share a 200-pool on one (venue,asset). A single
+     subgrid's ladder costs 197.01 and just fits; three would cost 591.03.
+     The pool funds only the first subgrid's ladder and starves the rest:
+     the merged position is capital-low. *)
+  let subgrids = List.init 3 (fun _ -> grid_cfg ()) in
+  let r = run ~positions:[ position "hype" "HYPE" 200.0 [| pbar () |] subgrids ] () in
+  let o = find_o "hype" "HYPE" r in
+  Alcotest.(check int) "one ladder funded" 2 o.buy_fills;
+  Alcotest.(check bool) "siblings starved" true o.capital_low;
+  Alcotest.(check (option int))
+    "exhausted at session 0"
+    (Some 0)
+    o.first_exhausted_session;
+  near 0.98505 o.pool_min_drawdown;
+  near 0.98505 o.d_surv;
+  near 2.99 o.final_pool;
+  near 2.0 o.final_base
+;;
+
+let test_separate_positions_all_survive () =
+  (* The same three grids split into three positions each with its own 200-pool
+     all survive: the ven-diagram distinction between merged and split. *)
+  let positions =
+    List.init 3 (fun i ->
+      position
+        (Printf.sprintf "v%d" i)
+        (Printf.sprintf "A%d" i)
+        200.0
+        [| pbar () |]
+        [ grid_cfg () ])
+  in
+  let r = run ~positions () in
+  Alcotest.(check bool) "no position exhausted" false r.exhausted;
+  List.iter
+    (fun (o : Dio_survival.Survival_portfolio.position_outcome) ->
+       Alcotest.(check int) "ladder funded" 2 o.buy_fills;
+       near 1.0 o.d_surv)
+    r.positions
+;;
+
+let test_shared_pool_merge_ok_with_capital () =
+  (* Two subgrids on a 400-pool: both ladders (197.01 x2) fit, no starvation. *)
+  let subgrids = List.init 2 (fun _ -> grid_cfg ()) in
+  let r = run ~positions:[ position "hype" "HYPE" 400.0 [| pbar () |] subgrids ] () in
+  let o = find_o "hype" "HYPE" r in
+  Alcotest.(check int) "both ladders funded" 4 o.buy_fills;
+  Alcotest.(check bool) "no starvation" false o.capital_low;
+  near 1.0 o.d_surv;
+  near 5.98 o.final_pool
+;;
+
+let test_independent_position_pools () =
+  (* Pools are per (venue,asset): exhausting one position must not touch the
+     other's budget. *)
+  let positions =
+    [ position "kraken" "BTC" 200.0 [| pbar () |] (List.init 3 (fun _ -> grid_cfg ()))
+    ; position "hype" "HYPE" 200.0 [| pbar () |] [ grid_cfg () ]
+    ]
+  in
+  let r = run ~positions () in
+  let kl = find_o "kraken" "BTC" r in
+  let hy = find_o "hype" "HYPE" r in
+  Alcotest.(check bool) "kraken exhausted" true kl.capital_low;
+  Alcotest.(check bool) "hype survives" false hy.capital_low;
+  near 1.0 hy.d_surv;
+  Alcotest.(check int) "hype ladder funded" 2 hy.buy_fills;
+  Alcotest.(check int) "kraken one ladder funded" 2 kl.buy_fills;
+  Alcotest.(check bool) "portfolio exhausted" true r.exhausted
+;;
+
+let test_transfer_rescues_position () =
+  (* B's 200-pool runs down to 2.99 after session 0. An idle position A
+     donates 300 at session 1 before B's second bar, funding the 97.03 buy
+     that would otherwise be blocked (capital-low). *)
+  let a_key = Dio_survival.Survival_portfolio.{ venue = "kraken"; asset = "USD" } in
+  let b_key = Dio_survival.Survival_portfolio.{ venue = "hype"; asset = "HYPE" } in
+  let bars = [| pbar (); pbar ~low:96.5 ~high:97.8 () |] in
+  let with_transfer =
+    let positions =
+      [ position "kraken" "USD" 500.0 [||] []
+      ; position "hype" "HYPE" 200.0 bars [ grid_cfg () ]
+      ]
+    in
+    let transfers =
+      [ { Dio_survival.Survival_portfolio.session = 1
+        ; from = a_key
+        ; to_ = b_key
+        ; amount = 300.0
+        }
+      ]
+    in
+    run ~positions ~transfers ()
+  in
+  let hy = find_o "hype" "HYPE" with_transfer in
+  Alcotest.(check bool) "rescued before blocked buy" false hy.capital_low;
+  near 1.0 hy.d_surv;
+  Alcotest.(check int) "three buys" 3 hy.buy_fills;
+  near 205.9601 hy.final_pool;
+  Alcotest.(check int) "two sessions" 2 with_transfer.n_sessions;
+  near 200.0 (find_o "kraken" "USD" with_transfer).final_pool;
+  (* Without the transfer the 97.03 buy is blocked at session 1. *)
+  let without = run ~positions:[ position "hype" "HYPE" 200.0 bars [ grid_cfg () ] ] () in
+  let hy' = find_o "hype" "HYPE" without in
+  Alcotest.(check bool) "blocked without rescue" true hy'.capital_low;
+  near 0.98505 hy'.d_surv
+;;
+
+let test_transfer_capped_at_pool () =
+  (* A transfer larger than the source pool is capped at the source balance.
+     Applied even though no position has any bars (n_sessions = 0). *)
+  let a_key = Dio_survival.Survival_portfolio.{ venue = "a"; asset = "x" } in
+  let b_key = Dio_survival.Survival_portfolio.{ venue = "b"; asset = "y" } in
+  let positions = [ position "a" "x" 100.0 [||] []; position "b" "y" 100.0 [||] [] ] in
+  let transfers =
+    [ { Dio_survival.Survival_portfolio.session = 0
+      ; from = a_key
+      ; to_ = b_key
+      ; amount = 500.0
+      }
+    ]
+  in
+  let r = run ~positions ~transfers () in
+  near 0.0 (find_o "a" "x" r).final_pool;
+  near 200.0 (find_o "b" "y" r).final_pool;
+  Alcotest.(check int) "no sessions" 0 r.n_sessions
+;;
+
+let test_aligned_missing_bar_does_not_trade () =
+  let timeline = [| "d1"; "d2"; "d3" |] in
+  let positions : Dio_survival.Survival_portfolio.aligned_position_input list =
+    [ { venue = "hype"
+      ; asset = "HYPE"
+      ; pool = 1_000.0
+      ; initial_base = 0.0
+      ; bars = [| Some (pbar ()); None; Some (pbar ~low:96.5 ~high:97.8 ()) |]
+      ; subgrids = [ grid_cfg () ]
+      }
+    ]
+  in
+  let result =
+    Dio_survival.Survival_portfolio.simulate_aligned ~timeline ~positions ~transfers:[] ()
+  in
+  let outcome = find_o "hype" "HYPE" result in
+  Alcotest.(check int) "timeline retained" 3 result.n_sessions;
+  Alcotest.(check int) "only present bars trade" 3 outcome.buy_fills
+;;
+
+let () =
+  Alcotest.run
+    "survival_portfolio"
+    [ ( "portfolio"
+      , [ Alcotest.test_case
+            "shared pool merge (ven diagram)"
+            `Quick
+            test_shared_pool_merge
+        ; Alcotest.test_case
+            "separate positions all survive"
+            `Quick
+            test_separate_positions_all_survive
+        ; Alcotest.test_case
+            "shared pool merge ok with capital"
+            `Quick
+            test_shared_pool_merge_ok_with_capital
+        ; Alcotest.test_case
+            "independent position pools"
+            `Quick
+            test_independent_position_pools
+        ; Alcotest.test_case
+            "transfer rescues a position"
+            `Quick
+            test_transfer_rescues_position
+        ; Alcotest.test_case
+            "transfer capped at source pool"
+            `Quick
+            test_transfer_capped_at_pool
+        ; Alcotest.test_case
+            "aligned missing bar does not trade"
+            `Quick
+            test_aligned_missing_bar_does_not_trade
+        ] )
+    ]
+;;

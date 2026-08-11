@@ -20,9 +20,12 @@ let test_replay_matches_closed_form () =
     ; accumulation_buffer = 0.0
     ; price_increment = 1e-9
     ; qty_increment = 1e-9
+    ; qty_min = 0.0
+    ; min_notional = 0.0
     ; exchange_model = Dio_strategies.Grid_core_types.Hyperliquid
     ; start_price
     ; start_quote = capital
+    ; cash_hook = None
     }
   in
   let n_bars = 80 in
@@ -67,9 +70,12 @@ let test_replay_no_fill_when_unaffordable () =
     ; accumulation_buffer = 0.0
     ; price_increment = 1e-9
     ; qty_increment = 1e-9
+    ; qty_min = 0.0
+    ; min_notional = 0.0
     ; exchange_model = Dio_strategies.Grid_core_types.Hyperliquid
     ; start_price = 100.0
     ; start_quote = 50.0
+    ; cash_hook = None
     }
   in
   let res =
@@ -148,9 +154,12 @@ let test_inverse_sizing_matches_closed_form () =
       ; accumulation_buffer = 0.0
       ; price_increment = 0.01
       ; qty_increment = 0.01
+      ; qty_min = 0.0
+      ; min_notional = 0.0
       ; exchange_model = Dio_strategies.Grid_core_types.Hyperliquid
       ; start_price
       ; start_quote = capital
+      ; cash_hook = None
       }
   in
   let open Dio_survival.Survival_replay in
