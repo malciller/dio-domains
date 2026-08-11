@@ -121,6 +121,12 @@ engine spawns an isolated domain per entry.
     "allocation_policy": 2,
     "major_heap_increment": 100
   },
+  "classes": {
+    "large_cap_stable": ["BTC/USD", "ETH/USD"],
+    "large_cap_volatile": ["SOL/USD", "DOGE/USD", "ADA/USD"],
+    "equity_index": ["SPY", "QQQ"],
+    "equity_volatile": ["NVDA", "AMD"]
+  },
   "trading": [
     {
       "symbol": "BTC/USD",
@@ -128,7 +134,8 @@ engine spawns an isolated domain per entry.
       "qty": "0.0002",
       "grid_interval": [0.25, 1.25],
       "sell_mult": "0.999",
-      "strategy": "Grid"
+      "strategy": "Grid",
+      "asset_class": "large_cap_stable"
     },
     {
       "symbol": "HYPE/USDC",
@@ -139,7 +146,8 @@ engine spawns an isolated domain per entry.
       "accumulation_buffer": [0.5, 5.0],
       "strategy": "Grid",
       "testnet": false,
-      "hedge": true
+      "hedge": true,
+      "asset_class": "large_cap_volatile"
     },
     {
       "symbol": "ETH/USDC",
@@ -168,7 +176,8 @@ engine spawns an isolated domain per entry.
       "accumulation_buffer": [10.0, 25.0],
       "strategy": "Grid",
       "testnet": true,
-      "data_feed": "iex"
+      "data_feed": "iex",
+      "asset_class": "equity_index"
     }
   ]
 }
@@ -191,6 +200,11 @@ engine spawns an isolated domain per entry.
 | `hedge` | bool | Enable auto-hedge (Hyperliquid only) |
 | `data_feed` | string | Market data feed channel (`"iex"` or `"sip"`; Alpaca only) |
 | `maker_fee` / `taker_fee` | float | Override exchange fee rates |
+| `asset_class` | string | Risk class for capital-survival modeling (e.g. `"large_cap_stable"`); must match a key in the top-level `classes` map, required for `dio-survival` runs |
+
+The top-level `classes` object defines the member pools backing each risk
+class's survival curve; `dio-survival` fetches the listed symbols per venue
+(never from hardcoded code lists).
 
 #### GC Tuning
 

@@ -16,6 +16,8 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
   ; accumulation_buffer : float * float
     (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
+  ; asset_class : string option
+    (** Risk class for capital-survival modeling (explicit from config.json). *)
   }
 
 type logging_config =
@@ -37,6 +39,9 @@ type config =
   ; logging : logging_config
   ; gc : gc_config option
   ; trading : trading_config list
+  ; classes : (string * string list) list
+    (** Risk-class definitions (class name -> member symbols) from the
+        top-level "classes" map; the class pools backing the kappa blend. *)
   ; fng_check_threshold : float
   ; latency_window_seconds : float
     (** Duration of each per-domain latency accumulation window before the
@@ -56,6 +61,7 @@ let known_top_level_keys =
   ; "engine"
   ; "trading"
   ; "gc"
+  ; "classes"
   ; "fng_check_threshold"
   ]
 ;;
@@ -87,6 +93,7 @@ let known_trading_keys =
   ; "hedge"
   ; "accumulation_buffer"
   ; "data_feed"
+  ; "asset_class"
   ]
 ;;
 
@@ -210,6 +217,19 @@ let parse_accumulation_buffer json exchange symbol =
   | _ -> default
 ;;
 
+(** Parses the optional top-level "classes" object: class name -> member
+    symbols. Class pools for the capital-survival kappa blend are read from
+    here (no hardcoded lists in code). Returns [] when the key is absent. *)
+let parse_classes json =
+  let open Yojson.Basic.Util in
+  match json |> member "classes" with
+  | `Assoc entries ->
+    List.map
+      (fun (name, members) -> name, members |> to_list |> List.map to_string)
+      entries
+  | _ -> []
+;;
+
 (** Parses a single trading entry from the JSON "trading" array into a [trading_config].
     Validates keys, enforces exchange-specific constraints (e.g. testnet/hedge/accumulation_buffer
     are restricted to Hyperliquid), and restricts grid_interval to the Grid strategy. Exits on
@@ -295,6 +315,7 @@ let parse_config json =
   in
   let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
   let data_feed = json |> member "data_feed" |> to_string_option in
+  let asset_class = json |> member "asset_class" |> to_string_option in
   { exchange
   ; symbol
   ; qty = json |> member "qty" |> to_string
@@ -310,6 +331,7 @@ let parse_config json =
   ; hedge
   ; accumulation_buffer = parse_accumulation_buffer json exchange symbol
   ; data_feed
+  ; asset_class
   }
 ;;
 
@@ -405,6 +427,7 @@ let read_config () : config =
     let logging = parse_logging_config json in
     let gc = parse_gc_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
+    let classes = parse_classes json in
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_option |> Option.value ~default:1.5
     in
@@ -414,7 +437,14 @@ let read_config () : config =
       |> to_float_option
       |> Option.value ~default:5.0
     in
-    { cycle_mod; logging; gc; trading; fng_check_threshold; latency_window_seconds }
+    { cycle_mod
+    ; logging
+    ; gc
+    ; trading
+    ; classes
+    ; fng_check_threshold
+    ; latency_window_seconds
+    }
   with
   | Yojson.Json_error msg ->
     Logging.critical_f ~section "Failed to parse config.json: %s" msg;
@@ -425,6 +455,7 @@ let read_config () : config =
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
     ; trading = []
+    ; classes = []
     ; fng_check_threshold = 1.5
     ; latency_window_seconds = 5.0
     }

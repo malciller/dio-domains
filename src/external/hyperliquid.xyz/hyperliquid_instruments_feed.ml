@@ -6,6 +6,8 @@
 
 let section = "hyperliquid_instruments_feed"
 
+open Lwt.Infix
+
 type pair_info =
   { symbol : string
   ; sz_decimals : int
@@ -179,10 +181,38 @@ let lookup_info symbol =
   result
 ;;
 
-(** Returns a fixed minimum price increment.
-    Hyperliquid enforces 5 significant figures with up to 6 decimal places;
-    this static accessor returns the smallest representable tick. *)
-let get_price_increment _symbol = Some 0.00001
+(** Returns the venue price increment. Hyperliquid quotes prices to 2 decimal
+    places, so the tick is 0.01 regardless of symbol. *)
+let get_price_increment _symbol = Some 0.01
+
+(** Fetch the perpetual + spot instrument metadata from the Hyperliquid REST
+    /info endpoint and populate the cache. Used by out-of-process consumers
+    (e.g. the capital survival CLI) that do not run the WebSocket instrument
+    feed. *)
+let fetch_meta_from_rest () : unit Lwt.t =
+  Lwt.catch
+    (fun () ->
+       let url = Uri.of_string "https://api.hyperliquid.xyz/info" in
+       let post_one typ =
+         let req_body = Yojson.Safe.to_string (`Assoc [ "type", `String typ ]) in
+         let body = Cohttp_lwt.Body.of_string req_body in
+         let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+         Cohttp_lwt_unix.Client.post ~headers ~body url
+         >>= fun (_resp, resp_body) ->
+         Cohttp_lwt.Body.to_string resp_body
+         >>= fun body_str -> Lwt.return (Yojson.Safe.from_string body_str)
+       in
+       post_one "meta"
+       >>= fun payload_perp ->
+       post_one "spotMeta"
+       >>= fun payload_spot -> process_meta_response payload_perp payload_spot)
+    (fun exn ->
+       Logging.error_f
+         ~section
+         "Failed to fetch instrument metadata from REST: %s"
+         (Printexc.to_string exn);
+       Lwt.return_unit)
+;;
 
 let get_qty_increment symbol =
   match lookup_info symbol with

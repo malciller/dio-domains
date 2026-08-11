@@ -9,4 +9,6 @@
   dotenv
   dio.logging
   dio.strategies
-  dio.alpaca))
+  dio.alpaca
+  dio.kraken
+  dio.hyperliquid))
