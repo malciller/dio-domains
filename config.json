@@ -14,10 +14,7 @@
   "classes": {
     "crypto_core": [
       "BTC/USD",
-      "ETH/USD",
-      "LTC/USD",
-      "XRP/USD",
-      "BNB/USD"
+      "ETH/USD"
     ],
     "crypto_alt": [
       "SOL/USD",
@@ -27,7 +24,10 @@
       "XMR/USD",
       "LINK/USD",
       "AVAX/USD",
-      "DOT/USD"
+      "DOT/USD",
+      "LTC/USD",
+      "XRP/USD",
+      "BNB/USD"
     ],
     "equity_etf": [
       "SPY",
