@@ -12,10 +12,37 @@
     "major_heap_increment": 8388608
   },
   "classes": {
-    "large_cap_stable": ["BTC/USD", "ETH/USD"],
-    "large_cap_volatile": ["SOL/USD", "DOGE/USD", "ADA/USD", "HYPE/USD", "XMR/USD"],
-    "equity_index": ["SPY", "QQQ"],
-    "equity_volatile": ["NVDA", "TSLA"]
+    "crypto_core": [
+      "BTC/USD",
+      "ETH/USD",
+      "LTC/USD",
+      "XRP/USD",
+      "BNB/USD"
+    ],
+    "crypto_alt": [
+      "SOL/USD",
+      "DOGE/USD",
+      "ADA/USD",
+      "HYPE/USD",
+      "XMR/USD",
+      "LINK/USD",
+      "AVAX/USD",
+      "DOT/USD"
+    ],
+    "equity_etf": [
+      "SPY",
+      "QQQ",
+      "DIA",
+      "IWM",
+      "VTI"
+    ],
+    "equity_momentum": [
+      "NVDA",
+      "TSLA",
+      "AMD",
+      "META",
+      "NFLX"
+    ]
   },
   "trading": [
     {
@@ -34,7 +61,7 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false,
-      "asset_class": "large_cap_stable"
+      "asset_class": "crypto_core"
     },
     {
       "symbol": "HYPE/USDC",
@@ -52,7 +79,7 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false,
-      "asset_class": "large_cap_volatile"
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "ETH/USD",
@@ -64,7 +91,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "asset_class": "large_cap_stable"
+      "asset_class": "crypto_core"
     },
     {
       "symbol": "SOL/USD",
@@ -76,7 +103,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "asset_class": "large_cap_volatile"
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "XMR/USD",
@@ -88,7 +115,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "asset_class": "large_cap_volatile"
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "ADA/USD",
@@ -100,7 +127,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
-      "asset_class": "large_cap_volatile"
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "SPCX",
@@ -114,7 +141,7 @@
       "strategy": "Grid",
       "testnet": true,
       "data_feed": "iex",
-      "asset_class": "equity_volatile"
+      "asset_class": "equity_momentum"
     },
     {
       "symbol": "QQQ",
@@ -128,7 +155,7 @@
       "strategy": "Grid",
       "testnet": true,
       "data_feed": "iex",
-      "asset_class": "equity_index"
+      "asset_class": "equity_etf"
     }
   ]
 }

@@ -6,7 +6,7 @@
 
 (subdir engine/strategies)
 
-(subdir engine/survival)
+(subdir engine/oracle)
 
 (subdir engine/supervisor)
 

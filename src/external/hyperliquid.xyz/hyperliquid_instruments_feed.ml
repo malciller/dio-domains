@@ -187,7 +187,7 @@ let get_price_increment _symbol = Some 0.01
 
 (** Fetch the perpetual + spot instrument metadata from the Hyperliquid REST
     /info endpoint and populate the cache. Used by out-of-process consumers
-    (e.g. the capital survival CLI) that do not run the WebSocket instrument
+    (e.g. the capital oracle CLI) that do not run the WebSocket instrument
     feed. *)
 let fetch_meta_from_rest () : unit Lwt.t =
   Lwt.catch

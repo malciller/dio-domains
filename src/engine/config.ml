@@ -17,7 +17,7 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
     (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
   ; asset_class : string option
-    (** Risk class for capital-survival modeling (explicit from config.json). *)
+    (** Risk class for capital-oracle modeling (explicit from config.json). *)
   }
 
 type logging_config =
@@ -230,7 +230,7 @@ let parse_accumulation_buffer json exchange symbol =
 (** Parses the optional top-level "classes" object. Two schemas:
     - legacy: class name -> [member symbols]
     - extended: class name -> {"members": [...], "kappa": N (optional)}
-    Class pools for the capital-survival kappa blend are read from here (no
+    Class pools for the capital-oracle kappa blend are read from here (no
     hardcoded lists in code). Returns [] when the key is absent. *)
 let parse_classes json =
   let open Yojson.Basic.Util in
