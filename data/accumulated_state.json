@@ -1,19 +1,19 @@
 {
   "QQQ": {
     "reserved_base": 0.0,
-    "accumulated_profit": 0.0,
-    "last_sell_fill_price": 720.1900000000001,
-    "sell_levels": [
-      { "price": 726.5599999999999, "qty": 0.024974999 },
-      { "price": 722.4, "qty": 0.028074999000000003 }
-    ]
+    "accumulated_profit": 0.10389599583999921,
+    "last_fill_oid": "d0960757-b0f7-4acc-a517-0f1dae51c2f6",
+    "last_sell_fill_price": 726.5599999999999,
+    "last_sell_fill_qty": 0.024974999
   },
   "SPCX": {
-    "reserved_base": 0.003936558700000004,
-    "accumulated_profit": 0.0,
-    "last_fill_oid": "4fad9585-71e0-4708-9932-eb37cc3589d5",
-    "last_buy_fill_price": 132.5,
-    "last_sell_fill_price": 132.83,
+    "reserved_base": 0.004236558700000005,
+    "accumulated_profit": 0.06598394999999849,
+    "last_fill_oid": "535b5f67-ff7c-4912-aaab-b3f557d6ac6e",
+    "last_buy_fill_price": 134.5395,
+    "last_sell_fill_price": 135.2,
+    "last_buy_fill_qty": 0.1,
+    "last_sell_fill_qty": 0.0999,
     "sell_levels": [
       { "price": 140.0, "qty": 0.099899999 },
       { "price": 140.0, "qty": 0.099899999 },
@@ -23,7 +23,8 @@
       { "price": 137.69, "qty": 0.0999 },
       { "price": 137.69, "qty": 0.0999 },
       { "price": 136.41, "qty": 0.0999 },
-      { "price": 136.41, "qty": 0.0999 }
+      { "price": 136.41, "qty": 0.0999 },
+      { "price": 135.5, "qty": 0.09990000000000002 }
     ]
   },
   "BTC/USDC": {

@@ -78,6 +78,8 @@ type decision =
   ; deployed : float (** Capital the ladder consumes at the recommended sizing. *)
   ; pool_share : float (** Capital this asset drew from the venue pool. *)
   ; remainder : float (** Pool share passed to the next asset. *)
+  ; range : Oracle_types.range_stats option
+    (** Per-asset historical price-range reference (ATH / low / position). *)
   ; warnings : string list
   ; updated_at : float (** Unix time of the pass that produced this decision. *)
   }
@@ -95,6 +97,13 @@ type class_pool =
 type runtime_config =
   { target_survival : float (** Blended survival target for sizing (default 0.99). *)
   ; fng_weight : float (** Weight of the F&G side in the gi blend (default 0.5). *)
+  ; range_weight : float
+    (** Weight of the per-asset historical range side in the gi blend
+        (default 0.25): near the ATH the potential fall is the whole
+        historical span, so spacing widens (preserve runway); near the lows
+        the remaining downside is bounded, so spacing tightens (aggressive
+        accumulation zone). The survival side carries the remainder, and the
+        blend is never tighter than the survival-constrained parameter. *)
   ; min_active_dsurv : float
     (** Assets whose replayed D_surv stays below this are recommended inactive
         and their capital passes down (default 0.0 = fundable means active). *)
@@ -127,6 +136,7 @@ type runtime_config =
 let default_config () =
   { target_survival = 0.99
   ; fng_weight = 0.5
+  ; range_weight = 0.25
   ; min_active_dsurv = 0.0
   ; qty_cap_mult = 0.0
   ; no_deep_history = false
@@ -388,9 +398,16 @@ let load_members
     >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)
 ;;
 
-(** Resolved Fear & Greed: the live index (blocking, cached, fallback None). *)
+(** Resolved Fear & Greed: the live index (blocking, cached, fallback None).
+    [None] means no live reading was ever fetched (missing key, timeout, HTTP
+    error): the F&G cache holds genuinely fetched values only, so a failed
+    fetch is distinguishable from a neutral reading and the deployment blends
+    pure survival instead of a fabricated sentiment value. *)
 let resolve_fng () : float option =
-  try Some (Cmc.Fear_and_greed.fetch_and_cache_sync ()) with
+  try
+    let _ = Cmc.Fear_and_greed.fetch_and_cache_sync () in
+    Cmc.Fear_and_greed.get_cached ()
+  with
   | _ -> None
 ;;
 
@@ -747,6 +764,7 @@ let size_asset
       ~pool
       ~fng
       ~fng_weight:rc.fng_weight
+      ~range_weight:rc.range_weight
       ~min_active_dsurv:rc.min_active_dsurv
       ~use_fng:(calendar_kind = Oracle_types.Crypto)
       ~param_steps:10
@@ -772,6 +790,23 @@ let size_asset
     (if deployment.Oracle_types.governing_horizon = ""
      then "-"
      else deployment.Oracle_types.governing_horizon);
+  (match deployment.Oracle_types.range with
+   | Some r ->
+     Logging.info_f
+       ~section
+       "[%d/%d] %s/%s range: ATH %.2f, low %.2f, price %.2f, d_from_ath %.1f%%, d_to_low \
+        %.1f%%, span %.1f%%"
+       index
+       n_tasks
+       exchange
+       symbol
+       r.Oracle_types.ath
+       r.Oracle_types.all_time_low
+       r.Oracle_types.price
+       (r.Oracle_types.d_from_ath *. 100.0)
+       (r.Oracle_types.d_to_low *. 100.0)
+       (r.Oracle_types.range_span *. 100.0)
+   | None -> ());
   let warnings = deployment.Oracle_types.warnings in
   let warn_key = Printf.sprintf "%s/%s" exchange symbol in
   let warnings_changed =
@@ -799,6 +834,7 @@ let size_asset
      ; deployed = deployment.Oracle_types.deployed
      ; pool_share = deployment.Oracle_types.pool_share
      ; remainder = deployment.Oracle_types.remainder
+     ; range = deployment.Oracle_types.range
      ; warnings = deployment.Oracle_types.warnings
      ; updated_at = Unix.gettimeofday ()
      }
@@ -980,11 +1016,12 @@ let start
      live engine's oracle is doing is visible from the first log lines. *)
   Logging.info_f
     ~section
-    "runtime knobs: target_survival %.2f, fng_weight %.2f, min_active_dsurv %.2f, \
-     qty_cap_mult %.2f, weight_by_sessions %b, deep_history %s, refresh %.0fs, poll \
-     %.0fs, horizons [%s]"
+    "runtime knobs: target_survival %.2f, fng_weight %.2f, range_weight %.2f, \
+     min_active_dsurv %.2f, qty_cap_mult %.2f, weight_by_sessions %b, deep_history %s, \
+     refresh %.0fs, poll %.0fs, horizons [%s]"
     config.target_survival
     config.fng_weight
+    config.range_weight
     config.min_active_dsurv
     config.qty_cap_mult
     config.weight_by_sessions

@@ -125,6 +125,7 @@ engine spawns an isolated domain per entry.
     "qty_cap_mult": 0.0,
     "target_survival": 0.99,
     "fng_weight": 0.5,
+    "range_weight": 0.25,
     "min_active_dsurv": 0.0,
     "weight_by_sessions": true,
     "no_deep_history": false,
@@ -200,7 +201,7 @@ engine spawns an isolated domain per entry.
 | `symbol` | string | Trading pair (e.g. `"BTC/USD"`) or ticker (e.g. `"TQQQ"`, `"SPY"`) |
 | `exchange` | string | `"kraken"`, `"hyperliquid"`, `"lighter"`, `"ibkr"`, or `"alpaca"` |
 | `qty` | string | Order quantity per grid level |
-| `grid_interval` | [min, max] | Grid spacing as `%` of price, resolved via Fear & Greed |
+| `grid_interval` | [min, max] | Grid spacing as `%` of price. A constraint range, never a default: the capital oracle picks within it, or Fear & Greed resolves it when the oracle has no decision |
 | `sell_mult` | string | Sell quantity multiplier (`qty × sell_mult`). Values < 1.0 trigger accumulation |
 | `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, Lighter, IBKR, Alpaca) |
 | `strategy` | string | `"Grid"` or `"MM"` |
@@ -230,7 +231,8 @@ its first buy cannot be funded.
 |------------|------|---------|-------------|
 | `qty_cap_mult` | float | `0.0` | Deployment ceiling as a multiple of the config qty. `0.0` = uncapped: each asset grows its order qty until the ladder's runway through the governing drawdown consumes the budget it is handed (the pool minus the lower-priority assets' reserved minimum drawdown funding), bounded only by the venue floor (`>= qty_min`) and the survival replay; the config `qty` stays the template/fallback, not a ceiling. A value `> 0` caps each asset's deployment at `config qty × mult` so surplus capital passes down the config priority order |
 | `target_survival` | float | `0.99` | Replay coverage required to accept a sizing (fraction of blended-history paths that must clear the drawdown) |
-| `fng_weight` | float | `0.5` | Sentiment weight of the Fear & Greed blend for the grid interval: `gi = fng_weight × gi_fng + (1 - fng_weight) × gi_survival`; `0.0` = pure survival |
+| `fng_weight` | float | `0.5` | Sentiment weight of the Fear & Greed blend for the grid interval (crypto only): `gi = fng_weight·gi_fng + range_weight·gi_range + (1 − fng_weight − range_weight)·gi_survival`; `0.0` removes the F&G side |
+| `range_weight` | float | `0.25` | Weight of the per-asset historical range side in the gi blend. The range side reads the asset's position within its ATH → all-time-low span (the deepened history): near the ATH the potential fall is the whole span, so spacing widens toward `hi` (preserve runway); near the lows the remaining downside is bounded, so spacing tightens toward `lo` (aggressive accumulation zone, working with the F&G contrarian convention). The blend is never tighter than the survival-constrained parameter - runway wins over sentiment and range aggression alike |
 | `min_active_dsurv` | float | `0.0` | Minimum achieved D_surv an asset must replay at to be published `active` (a threshold above the achievable runway marks under-funded assets inactive until capital returns) |
 | `weight_by_sessions` | bool | `true` | Weight class members by session count when blending class survival curves |
 | `no_deep_history` | bool | `false` | Disable the Yahoo deep-history extension |
@@ -238,6 +240,25 @@ its first buy cannot be funded.
 | `poll_seconds` | float | `30.0` | Fast cadence while no asset is active - kept as a safety net: capital that becomes available on sell fills is normally recognized by the event-driven wake (fill → `request_pass`), but a slow poll guarantees a fresh pass even if an event is ever missed |
 | `horizons` | [int] | `None` | Session horizons in days (defaults per calendar kind) |
 | `max_capital` | float | `None` | Upper bound of the sizing binary search (in quote currency) |
+
+Grid spacing and order size are dynamic, driven by the oracle's drawdown-survival
+output. The grid interval is a three-way blend of Fear & Greed (the contrarian
+accumulator: low F&G tightens the grid and accumulates base at depressed
+prices), the per-asset historical range position (ATH → all-time low over the
+deepened history: spacing widens near the top of the range to preserve runway
+for the potential fall, tightens near the lows to accumulate aggressively), and
+the survival-constrained tightness - clamped so the runway always wins. The
+order qty grows until the ladder's cost through the governing drawdown consumes
+the budget, bounded by the survival replay.
+
+Sizing signals are never fabricated. The grid domain's startup gate stays
+closed until at least ONE source is ready with real information: a
+capital-oracle decision for the asset, or a live Fear & Greed reading (the F&G
+cache holds genuinely fetched values only - a failed fetch is distinguishable
+from a neutral reading). With neither available the grid withholds orders
+entirely: it cannot profitably and accurately size them, so it does not create
+them. When only one source is active and the other failed, a one-shot warning
+names the failed one.
 
 The top-level `classes` object defines the member pools backing each risk
 class's survival curve; `dio-oracle` fetches the listed symbols per venue
@@ -510,7 +531,10 @@ Alpaca supports whole/fractional share equity trading and crypto pairs. DCA accu
 CoinMarketCap Fear & Greed index (0–100): fear resolves closer to
 `min` (accumulate faster), greed resolves closer to `max` (wait
 longer). Re-evaluated dynamically when price moves ≥3.5% from
-baseline. Applies to Hyperliquid, Lighter, IBKR, and Alpaca.
+baseline. Applies to Hyperliquid, Lighter, IBKR, and Alpaca. Only a
+live F&G reading resolves it - there is no midpoint default, and
+without a live F&G reading or a capital-oracle decision the grid does
+not place orders.
 
 ### MM (Adaptive Market Maker)
 

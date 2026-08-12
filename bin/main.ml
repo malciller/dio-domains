@@ -408,13 +408,20 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
   Logging.info ~section:"main" "Step 0: Fetching Fear & Greed index...";
   let () =
     try
-      let value = Fear_and_greed.fetch_and_cache_sync ~fallback:50.0 () in
-      Logging.info_f ~section:"main" "Startup Fear & Greed index: %.2f" value
+      let _ = Fear_and_greed.fetch_and_cache_sync ~fallback:50.0 () in
+      match Fear_and_greed.get_cached () with
+      | Some value ->
+        Logging.info_f ~section:"main" "Startup Fear & Greed index: %.2f" value
+      | None ->
+        Logging.warn_f
+          ~section:"main"
+          "Startup Fear & Greed unavailable (fetch failed); grid domains withhold orders \
+           until a live F&G reading or a capital-oracle decision exists"
     with
     | exn ->
       Logging.warn_f
         ~section:"main"
-        "Failed to fetch Fear & Greed at startup, using fallbacks: %s"
+        "Failed to fetch Fear & Greed at startup: %s"
         (Printexc.to_string exn)
   in
   (* Start supervisor monitoring; returns trading configs augmented with fee schedules. *)

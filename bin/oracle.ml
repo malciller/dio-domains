@@ -86,6 +86,7 @@ type args =
   ; target_survival : float
   ; fng : float option
   ; fng_weight : float
+  ; range_weight : float
   ; min_active_dsurv : float
   ; qty_cap_mult : float
   ; no_deep_history : bool
@@ -136,6 +137,7 @@ let parse_args () =
   let target_survival = ref 0.99 in
   let fng = ref None in
   let fng_weight = ref 0.5 in
+  let range_weight = ref 0.25 in
   let min_active_dsurv = ref 0.0 in
   let qty_cap_mult = ref 0.0 in
   let no_deep_history = ref false in
@@ -281,8 +283,14 @@ let parse_args () =
            equities use the survival model alone)" )
       ; ( "--fng-weight"
         , Arg.Float (fun f -> fng_weight := f)
-        , " weight of the F&G side in the gi blend (default 0.5; the survival side \
-           carries the rest)" )
+        , " weight of the F&G side in the gi blend (default 0.5; the survival and range \
+           sides carry the rest)" )
+      ; ( "--range-weight"
+        , Arg.Float (fun f -> range_weight := f)
+        , " weight of the per-asset historical range side in the gi blend (default \
+           0.25): near the ATH spacing widens (preserve runway), near the all-time low \
+           it tightens (aggressive accumulation); the blend is never tighter than the \
+           survival-constrained parameter" )
       ; ( "--min-active-dsurv"
         , Arg.Float (fun f -> min_active_dsurv := f)
         , " assets whose replayed D_surv stays below this are recommended inactive and \
@@ -350,6 +358,7 @@ let parse_args () =
   ; target_survival = !target_survival
   ; fng = !fng
   ; fng_weight = !fng_weight
+  ; range_weight = !range_weight
   ; min_active_dsurv = !min_active_dsurv
   ; qty_cap_mult = !qty_cap_mult
   ; no_deep_history = !no_deep_history
@@ -471,8 +480,12 @@ let load_members
 ;;
 
 (** Per-run Fear & Greed: an explicit --fng wins; otherwise fetch the live
-    index (blocking, cached, fallback 50). Offline runs get None (the caller
-    decides per calendar kind whether F&G applies at all). *)
+    index (blocking, cached). [None] when no live reading was ever fetched
+    (missing key, timeout, HTTP error): the F&G cache holds genuinely fetched
+    values only, so a failed fetch is distinguishable from a neutral reading
+    and the deployment blends pure survival instead of a fabricated sentiment
+    value. Offline runs get None (the caller decides per calendar kind whether
+    F&G applies at all). *)
 let resolve_fng (a : args) =
   match a.fng with
   | Some f -> Some f
@@ -480,7 +493,10 @@ let resolve_fng (a : args) =
     if Option.is_some a.from_csv || Option.is_some a.from_json
     then None
     else (
-      try Some (Cmc.Fear_and_greed.fetch_and_cache_sync ()) with
+      try
+        let _ = Cmc.Fear_and_greed.fetch_and_cache_sync () in
+        Cmc.Fear_and_greed.get_cached ()
+      with
       | _ -> None)
 ;;
 
@@ -630,14 +646,30 @@ let deployment_block
   then (
     let pc = d.parameter_components in
     let gi_desc =
-      match pc.fng_parameter, pc.fng with
-      | Some fng_parameter, Some fng ->
+      match pc.fng_parameter, pc.fng, pc.range_parameter with
+      | Some fng_parameter, Some fng, Some rp ->
+        Printf.sprintf
+          "fng %.0f -> %.2f%% | surv %.2f%% | range %.2f%% | w %.2f/%.2f/%.2f"
+          fng
+          fng_parameter
+          pc.survival_parameter
+          rp
+          pc.fng_weight
+          pc.range_weight
+          (Float.max 0.0 (1.0 -. pc.fng_weight -. pc.range_weight))
+      | Some fng_parameter, Some fng, None ->
         Printf.sprintf
           "fng %.0f -> %.2f%% | surv %.2f%% | w %.2f"
           fng
           fng_parameter
           pc.survival_parameter
           pc.fng_weight
+      | None, _, Some rp ->
+        Printf.sprintf
+          "surv %.2f%% | range %.2f%% | w %.2f"
+          pc.survival_parameter
+          rp
+          pc.range_weight
       | _ -> Printf.sprintf "surv %.2f%%" pc.survival_parameter
     in
     line "    ACTIVE   qty %.4f   gi %.2f%%   (%s)" d.qty d.parameter gi_desc;
@@ -647,6 +679,18 @@ let deployment_block
       (pct d.d_gov)
       (pct d.d_surv)
       (pct d.min_quote_drawdown);
+    (match d.range with
+     | None -> ()
+     | Some r ->
+       line
+         "    range: ATH %.2f, low %.2f, price %.2f   d_from_ath %s   d_to_low %s   span \
+          %s"
+         r.ath
+         r.all_time_low
+         r.price
+         (pct r.d_from_ath)
+         (pct r.d_to_low)
+         (pct r.range_span));
     let reserve =
       if d.remainder +. 1e-9 > 0.0
       then Printf.sprintf "   reserve %.2f (passes to the next asset)" d.remainder
@@ -1004,8 +1048,22 @@ let report_json
       ; "fng", Option.fold ~none:`Null ~some:(fun f -> `Float f) pc.fng
       ; "gi_fng", Option.fold ~none:`Null ~some:(fun g -> `Float g) pc.fng_parameter
       ; "gi_survival", `Float pc.survival_parameter
+      ; "gi_range", Option.fold ~none:`Null ~some:(fun g -> `Float g) pc.range_parameter
       ; "gi_resolved", `Float pc.resolved_parameter
       ; "fng_weight", `Float pc.fng_weight
+      ; "range_weight", `Float pc.range_weight
+      ; ( "range"
+        , match d.range with
+          | None -> `Null
+          | Some r ->
+            `Assoc
+              [ "ath", `Float r.ath
+              ; "all_time_low", `Float r.all_time_low
+              ; "price", `Float r.price
+              ; "d_from_ath", `Float r.d_from_ath
+              ; "d_to_low", `Float r.d_to_low
+              ; "range_span", `Float r.range_span
+              ] )
       ; "d_surv", `Float d.d_surv
       ; "min_quote_drawdown", `Float d.min_quote_drawdown
       ; "coverage", `Assoc (List.map coverage_j d.coverage)
@@ -1274,6 +1332,7 @@ let run_one
       ~pool
       ~fng
       ~fng_weight
+      ~range_weight:a.range_weight
       ~min_active_dsurv
       ~use_fng:(calendar_kind = Oracle_types.Crypto)
       ~param_steps:10

@@ -18,6 +18,7 @@ let make_decision ~active =
   ; deployed = 100.0
   ; pool_share = 100.0
   ; remainder = 0.0
+  ; range = None
   ; warnings = []
   ; updated_at = 0.0
   }

@@ -115,6 +115,7 @@ let deploy
       ?(pool = 10_000.0)
       ?(fng = Some 50.0)
       ?(fng_weight = 0.5)
+      ?(range_weight = 0.0)
       ?(min_active_dsurv = 0.0)
       ?(use_fng = true)
       ?(lo = 0.5)
@@ -135,6 +136,7 @@ let deploy
     ~pool
     ~fng
     ~fng_weight
+    ~range_weight
     ~min_active_dsurv
     ~use_fng
     ~param_steps:5
@@ -769,6 +771,171 @@ let test_floor_aware_shrink () =
       d.coverage)
 ;;
 
+(** A strictly monotone series (high = low = close): every close is its own
+    ATH on the way up and its own all-time low on the way down, so the range
+    position is exactly 0 (at the ATH) or 1 (at the low). *)
+let linear_series ~n ~slope =
+  let iso day = Oracle_calendar.add_days "2020-01-01" day in
+  let price = ref 100.0 in
+  let bars =
+    Array.make
+      n
+      Oracle_types.{ date = ""; open_ = 0.; high = 0.; low = 0.; close = 0.; volume = 0. }
+  in
+  for i = 0 to n - 1 do
+    price := !price *. (1.0 +. slope);
+    let p = !price in
+    bars.(i)
+    <- { Oracle_types.date = iso i
+       ; open_ = p
+       ; high = p
+       ; low = p
+       ; close = p
+       ; volume = 1000.0
+       }
+  done;
+  { Oracle_types.symbol = "LIN"; calendar_kind = Oracle_types.Crypto; bars; gaps = [] }
+;;
+
+let test_range_stats () =
+  (* ATH / all-time low / price and the derived stats over the synthetic
+     history: the reference for the per-asset potential price range. *)
+  let r =
+    match Oracle_deploy.range_stats_of asset with
+    | Some r -> r
+    | None -> Alcotest.fail "expected range stats"
+  in
+  Alcotest.(check bool) "ath is the max high" (r.ath > 100.0) true;
+  Alcotest.(check bool) "low is below the price" (r.all_time_low < r.price) true;
+  Alcotest.(check bool)
+    "price is the last close"
+    (r.price = asset.bars.(Array.length asset.bars - 1).Oracle_types.close)
+    true;
+  Alcotest.(check bool)
+    "d_from_ath in [0, range_span]"
+    (r.d_from_ath >= 0.0 && r.d_from_ath <= r.range_span)
+    true;
+  Alcotest.(check bool) "span positive" (r.range_span > 0.0) true;
+  Alcotest.(check bool) "d_to_low in [0, range_span]" (r.d_to_low >= 0.0) true;
+  (* Empty history -> None. *)
+  Alcotest.(check bool)
+    "empty history -> None"
+    (Oracle_deploy.range_stats_of
+       { Oracle_types.symbol = "E"
+       ; calendar_kind = Oracle_types.Crypto
+       ; bars = [||]
+       ; gaps = []
+       }
+     = None)
+    true
+;;
+
+let test_range_parameter_direction () =
+  (* The range side of the blend widens spacing near the ATH (the whole
+     historical fall is still ahead: preserve runway) and tightens it near
+     the all-time low (bounded remaining downside: the aggressive
+     accumulation zone), working with the F&G contrarian convention. *)
+  let lo, hi = 0.5, 2.0 in
+  let r_ath =
+    match Oracle_deploy.range_stats_of (linear_series ~n:60 ~slope:0.02) with
+    | Some r -> r
+    | None -> Alcotest.fail "expected stats for the rising series"
+  in
+  let r_low =
+    match Oracle_deploy.range_stats_of (linear_series ~n:60 ~slope:(-0.02)) with
+    | Some r -> r
+    | None -> Alcotest.fail "expected stats for the falling series"
+  in
+  near r_ath.d_from_ath 0.0;
+  near r_low.d_from_ath r_low.range_span;
+  (* At the ATH (position 0) the range side is hi; at the low (position 1)
+     it is lo. *)
+  (match Oracle_deploy.range_parameter ~lo ~hi r_ath with
+   | Some p -> near p hi
+   | None -> Alcotest.fail "expected a range parameter at the ATH");
+  match Oracle_deploy.range_parameter ~lo ~hi r_low with
+  | Some p -> near p lo
+  | None -> Alcotest.fail "expected a range parameter at the low"
+;;
+
+let test_deploy_range_blend () =
+  (* With a huge pool the survival side allows gi_lo and F&G is neutral: the
+     range side joins the blend. The synth asset ends in the UPPER part of
+     its historical range (position ~0.2), so its range side sits above the
+     config midpoint - spacing widens while the asset is still far from its
+     lows (runway for the potential fall to the historical low). The final
+     parameter is never tighter than the survival side: when the blended row
+     itself fails the replayed path, the engine falls back to
+     survival_parameter (runway wins over sentiment and range aggression). *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let d =
+    deploy
+      ~pool:100_000.0
+      ~g
+      ~fng:(Some 50.0)
+      ~fng_weight:0.5
+      ~range_weight:0.25
+      ~models:ms
+      ()
+  in
+  Alcotest.(check bool) "active" d.active true;
+  (match d.parameter_components.range_parameter with
+   | Some rp ->
+     Alcotest.(check bool)
+       "range side above the midpoint (asset in the upper part of its range)"
+       (rp > 1.25)
+       true
+   | None -> Alcotest.fail "expected a range parameter");
+  Alcotest.(check bool)
+    "range_weight carried"
+    (d.parameter_components.range_weight = 0.25)
+    true;
+  Alcotest.(check bool)
+    "gi never tighter than the survival side"
+    (d.parameter >= d.parameter_components.survival_parameter -. 1e-9)
+    true;
+  Alcotest.(check bool) "gi within the config range" (d.parameter <= 2.0 +. 1e-9) true;
+  Alcotest.(check bool)
+    "blend row passes or falls back to survival_parameter"
+    (d.row.passed
+     || abs_float (d.parameter -. d.parameter_components.survival_parameter) < 1e-9)
+    true
+;;
+
+let test_deploy_range_equity () =
+  (* Equities (use_fng = false) have no F&G side: the survival and range
+     sides are renormalized over their combined weight (fng_weight = 0.5,
+     range_weight = 0.25 -> each carries 50% of the blend). *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let d =
+    deploy
+      ~pool:100_000.0
+      ~g
+      ~fng:None
+      ~use_fng:false
+      ~fng_weight:0.5
+      ~range_weight:0.25
+      ~models:ms
+      ()
+  in
+  Alcotest.(check bool) "active" d.active true;
+  Alcotest.(check bool)
+    "equity fng_parameter is None"
+    (d.parameter_components.fng_parameter = None)
+    true;
+  Alcotest.(check bool)
+    "equity gi blends survival and range"
+    (d.parameter >= d.parameter_components.survival_parameter -. 1e-9
+     && d.parameter <= 2.0 +. 1e-9)
+    true;
+  Alcotest.(check bool)
+    "equity range side present"
+    (Option.is_some d.parameter_components.range_parameter)
+    true
+;;
+
 let () =
   Alcotest.run
     "oracle_deploy"
@@ -807,12 +974,21 @@ let () =
             test_fallback_deploys_at_floor
         ; Alcotest.test_case "inactive cases" `Quick test_deploy_inactive
         ; Alcotest.test_case "floor-aware down-sizing" `Quick test_floor_aware_shrink
+        ; Alcotest.test_case "range blend" `Quick test_deploy_range_blend
+        ; Alcotest.test_case "range equity blend" `Quick test_deploy_range_equity
         ] )
     ; ( "deepest_observed_drawdown"
       , [ Alcotest.test_case
             "deepest window, None on empty"
             `Quick
             test_deepest_observed_drawdown
+        ] )
+    ; ( "range"
+      , [ Alcotest.test_case "range stats" `Quick test_range_stats
+        ; Alcotest.test_case
+            "range parameter direction"
+            `Quick
+            test_range_parameter_direction
         ] )
     ]
 ;;

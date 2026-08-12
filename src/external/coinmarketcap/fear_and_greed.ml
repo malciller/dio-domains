@@ -1,7 +1,14 @@
 (* Fear_and_greed -- CoinMarketCap Fear and Greed Index client.
    Fetches the latest index value via the CMC Pro API, caches it atomically
    for process lifetime, and provides a linear interpolation utility for
-   mapping the index to configurable grid intervals. *)
+   mapping the index to configurable grid intervals.
+
+   Availability semantics: the cache holds ONLY genuinely fetched index
+   values. Fallback values (missing API key, timeout, HTTP error, parse
+   failure) are returned to the caller but never cached, so
+   [get_cached () = None] means "no live F&G signal" - never a neutral 50.
+   Callers that must not trade without a signal (the grid domains) use this
+   to withhold orders when neither the capital oracle nor F&G can size them. *)
 
 open Lwt.Infix
 open Cohttp_lwt_unix
@@ -51,17 +58,17 @@ let fetch_value_lwt ?(fallback = 50.0) () =
   match Sys.getenv_opt api_key_env with
   | None ->
     Logging.warn_f ~section "Missing %s; using fallback value" api_key_env;
-    Lwt.return (set_cached fallback)
+    Lwt.return fallback
   | Some api_key when String.trim api_key = "" ->
     Logging.warn_f ~section "Empty %s; using fallback value" api_key_env;
-    Lwt.return (set_cached fallback)
+    Lwt.return fallback
   | Some api_key ->
     let headers = Cohttp.Header.of_list [ "X-CMC_PRO_API_KEY", api_key ] in
     let timeout =
       Lwt_unix.sleep 5.0
       >>= fun () ->
       Logging.warn_f ~section "CMC fear-and-greed request timed out after 5s";
-      Lwt.return (set_cached fallback)
+      Lwt.return fallback
     in
     let fetch =
       Client.get ~headers (Uri.of_string endpoint)
@@ -72,7 +79,7 @@ let fetch_value_lwt ?(fallback = 50.0) () =
       if status <> 200
       then (
         Logging.error_f ~section "CMC fear-and-greed HTTP %d: %s" status body_str;
-        Lwt.return (set_cached fallback))
+        Lwt.return fallback)
       else (
         match parse_value body_str with
         | Some value ->
@@ -80,7 +87,7 @@ let fetch_value_lwt ?(fallback = 50.0) () =
           Lwt.return (set_cached value)
         | None ->
           Logging.error_f ~section "Failed to parse fear-and-greed response: %s" body_str;
-          Lwt.return (set_cached fallback))
+          Lwt.return fallback)
     in
     Lwt.pick [ fetch; timeout ]
 ;;
@@ -98,7 +105,11 @@ let fetch_and_cache_sync ?(fallback = 50.0) () =
           (Printexc.to_string exn);
         fallback
     in
-    set_cached value
+    (* Only a genuinely fetched index is cached: the fetch paths above cache
+       on success only, so an empty cache here means the fetch failed and the
+       caller received the fallback - it must not masquerade as a live
+       reading. *)
+    if Atomic.get cached_value = None then fallback else value
 ;;
 
 let get_cached () = Atomic.get cached_value
@@ -106,7 +117,7 @@ let get_cached () = Atomic.get cached_value
 let fetch_value ?(fallback = 50.0) () =
   match Atomic.get cached_value with
   | Some v -> v
-  | None -> set_cached fallback
+  | None -> fallback
 ;;
 
 let fetch_requested = Atomic.make false
