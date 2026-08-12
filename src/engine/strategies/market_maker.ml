@@ -1271,7 +1271,15 @@ let order_or_client_matches tracked order_id cl_ord_id =
   | None -> false
 ;;
 
-let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price:_ cl_ord_id =
+let handle_order_filled
+      ~now:_
+      asset_symbol
+      order_id
+      side
+      ~fill_price:_
+      ~fill_qty:_
+      cl_ord_id
+  =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect

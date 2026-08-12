@@ -133,11 +133,20 @@ let get_round_price_fn symbol exchange =
 let get_price_increment symbol exchange =
   match get_exchange_module exchange with
   | Some (module Ex : Exchange.S) ->
-    Option.value (Ex.get_price_increment ~symbol) ~default:0.01
+    (match Ex.get_price_increment ~symbol with
+     | Some inc -> inc
+     | None ->
+       Logging.warn_f
+         ~section
+         "No price increment info for %s/%s (venue metadata missing); using default 0.01"
+         exchange
+         symbol;
+       0.01)
   | None ->
     Logging.warn_f
       ~section
-      "No price increment info for %s/%s, using default 0.01"
+      "No price increment info for %s/%s (exchange module not registered); using default \
+       0.01"
       exchange
       symbol;
     0.01
@@ -146,14 +155,35 @@ let get_price_increment symbol exchange =
 let get_qty_increment_val symbol exchange =
   match get_exchange_module exchange with
   | Some (module Ex : Exchange.S) ->
-    Option.value (Ex.get_qty_increment ~symbol) ~default:0.01
-  | None -> 0.01
+    (match Ex.get_qty_increment ~symbol with
+     | Some inc -> inc
+     | None ->
+       Logging.warn_f
+         ~section
+         "No qty increment info for %s/%s (venue metadata missing); using default 0.01"
+         exchange
+         symbol;
+       0.01)
+  | None ->
+    Logging.warn_f
+      ~section
+      "No qty increment info for %s/%s (exchange module not registered); using default \
+       0.01"
+      exchange
+      symbol;
+    0.01
 ;;
 
 let round_qty qty symbol exchange =
   let increment = get_qty_increment_val symbol exchange in
   let inv = 1.0 /. increment in
   floor (qty *. inv) /. inv
+;;
+
+let get_qty_min_val symbol exchange =
+  match get_exchange_module exchange with
+  | Some (module Ex : Exchange.S) -> Option.value (Ex.get_qty_min ~symbol) ~default:0.0
+  | None -> 0.0
 ;;
 
 let venue_lot_qty grid_qty exchange state =

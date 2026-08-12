@@ -84,9 +84,11 @@ let test_get_qty_increment () =
 ;;
 
 let test_get_price_increment () =
+  (* Hyperliquid quotes prices to 2 decimal places; the venue increment is
+     0.01 regardless of symbol. *)
   let incr = Hyperliquid.Instruments_feed.get_price_increment "any" in
   Alcotest.(check bool) "always Some" true (Option.is_some incr);
-  Alcotest.(check (option (float 0.0000001))) "value" (Some 0.00001) incr
+  Alcotest.(check (option (float 0.0000001))) "value" (Some 0.01) incr
 ;;
 
 let test_round_price_for_symbol () =

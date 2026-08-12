@@ -22,6 +22,7 @@ let test_spawn_domains_basic () =
       ; hedge = false
       ; accumulation_buffer = 0.01, 0.01
       ; data_feed = None
+      ; asset_class = None
       }
     ; { Dio_engine.Config.exchange = "kraken"
       ; symbol = "ETH/USD"
@@ -37,6 +38,7 @@ let test_spawn_domains_basic () =
       ; hedge = false
       ; accumulation_buffer = 0.01, 0.01
       ; data_feed = None
+      ; asset_class = None
       }
     ]
   in
@@ -45,7 +47,9 @@ let test_spawn_domains_basic () =
     { Dio_engine.Config.cycle_mod = 10000
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
+    ; oracle = None
     ; trading = assets
+    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
@@ -72,7 +76,9 @@ let test_spawn_domains_empty () =
     { Dio_engine.Config.cycle_mod = 10000
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
+    ; oracle = None
     ; trading = []
+    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
@@ -104,6 +110,7 @@ let test_fee_fetcher_integration () =
     ; hedge = false
     ; accumulation_buffer = 0.01, 0.01
     ; data_feed = None
+    ; asset_class = None
     }
   in
   (* Verify fee fetcher adds fees correctly *)
@@ -149,6 +156,7 @@ let test_domain_error_handling () =
     ; hedge = false
     ; accumulation_buffer = 0.01, 0.01
     ; data_feed = None
+    ; asset_class = None
     }
   in
   (* This should not crash the test runner, domains should handle errors internally *)
@@ -156,7 +164,9 @@ let test_domain_error_handling () =
     { Dio_engine.Config.cycle_mod = 10000
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
+    ; oracle = None
     ; trading = [ failing_asset ]
+    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
@@ -174,6 +184,35 @@ let test_domain_error_handling () =
   Alcotest.(check int) "domain created for failing asset" 1 (List.length status)
 ;;
 
+let test_grid_gate_should_open () =
+  (* The grid startup gate gives BOTH sizing sources their chance at startup:
+     it opens immediately on a capital-oracle decision for the asset, or on a
+     live Fear & Greed reading once the oracle's first pass attempt has
+     finished / the startup deadline elapsed. It never opens on fabricated
+     config defaults - with neither signal the grid withholds orders. *)
+  let open Dio_engine.Domain_spawner in
+  Alcotest.(check bool)
+    "oracle decision alone opens the gate"
+    true
+    (grid_gate_should_open ~oracle_decision:true ~fng_available:false ~gate_waiver:false);
+  Alcotest.(check bool)
+    "oracle decision opens regardless of F&G"
+    true
+    (grid_gate_should_open ~oracle_decision:true ~fng_available:false ~gate_waiver:true);
+  Alcotest.(check bool)
+    "F&G opens once the oracle's chance elapsed"
+    true
+    (grid_gate_should_open ~oracle_decision:false ~fng_available:true ~gate_waiver:true);
+  Alcotest.(check bool)
+    "F&G alone does not open before the oracle's chance"
+    false
+    (grid_gate_should_open ~oracle_decision:false ~fng_available:true ~gate_waiver:false);
+  Alcotest.(check bool)
+    "neither keeps the gate closed (orders withheld)"
+    false
+    (grid_gate_should_open ~oracle_decision:false ~fng_available:false ~gate_waiver:true)
+;;
+
 let () =
   Alcotest.run
     "Domain Spawner"
@@ -181,6 +220,12 @@ let () =
       , [ Alcotest.test_case "basic spawning" `Quick test_spawn_domains_basic
         ; Alcotest.test_case "empty list" `Quick test_spawn_domains_empty
         ; Alcotest.test_case "error handling" `Quick test_domain_error_handling
+        ] )
+    ; ( "gate"
+      , [ Alcotest.test_case
+            "grid gate opens on one real signal, never on defaults"
+            `Quick
+            test_grid_gate_should_open
         ] )
     ; ( "integration"
       , [ Alcotest.test_case "fee fetcher" `Quick test_fee_fetcher_integration

@@ -162,6 +162,8 @@ module Strategy = struct
           ~last_fill_oid:state.last_fill_oid
           ~last_buy_fill_price:state.last_buy_fill_price
           ~last_sell_fill_price:state.last_sell_fill_price
+          ~last_buy_fill_qty:state.last_buy_fill_qty
+          ~last_sell_fill_qty:state.last_sell_fill_qty
           ();
         Logging.info_f
           ~section

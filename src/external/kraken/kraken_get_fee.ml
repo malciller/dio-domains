@@ -81,10 +81,14 @@ let get_fee_info symbol : fee_info option Lwt.t =
            ; "Content-Type", "application/x-www-form-urlencoded"
            ]
        in
-       Client.post
-         ~headers
-         ~body:(Cohttp_lwt.Body.of_string encoded_body)
-         (Uri.of_string (endpoint ^ path))
+       (* 5-second timeout guard against unresponsive upstream - a hung
+          TradeVolume call must not freeze the oracle pass (mirrors the
+          Hyperliquid fee module's guard). *)
+       Lwt_unix.with_timeout 5.0 (fun () ->
+         Client.post
+           ~headers
+           ~body:(Cohttp_lwt.Body.of_string encoded_body)
+           (Uri.of_string (endpoint ^ path)))
        >>= fun (resp, body) ->
        Cohttp_lwt.Body.to_string body
        >>= fun body_str ->

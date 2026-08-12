@@ -1,9 +1,36 @@
 {
+  "SPCX": {
+    "reserved_base": 0.016286558700000016,
+    "accumulated_profit": 6.636978046351993,
+    "last_fill_oid": "d0ac2a83-900c-4625-a3af-f6c1089a3741",
+    "last_buy_fill_price": 148.258,
+    "last_sell_fill_price": 148.63,
+    "last_buy_fill_qty": 0.25,
+    "last_sell_fill_qty": 0.24975,
+    "sell_levels": [
+      { "price": 149.0, "qty": 0.24975000000000003 },
+      { "price": 149.0, "qty": 0.24975000000000003 }
+    ]
+  },
   "HYPE/USDC": {
+    "reserved_base": 0.020000000000000018,
+    "accumulated_profit": 22.35655968469651,
+    "last_fill_oid": "57769828845",
+    "last_buy_fill_price": 33.966,
+    "last_buy_fill_qty": 0.5
+  },
+  "ETH/USDC": {
     "reserved_base": 0.0,
-    "accumulated_profit": 1.6313850000000034,
-    "last_fill_oid": "514027198088",
-    "last_buy_fill_price": 54.675
+    "accumulated_profit": 0.0,
+    "last_fill_oid": "57763339442"
+  },
+  "QQQ": {
+    "reserved_base": 4.113359800000004e-05,
+    "accumulated_profit": 0.10389599583999921,
+    "last_fill_oid": "399fe7e8-02d2-4e36-ae46-eb3a035e0ec2",
+    "last_buy_fill_price": 724.018,
+    "last_buy_fill_qty": 0.041133598,
+    "sell_levels": [ { "price": 725.83, "qty": 0.041092465 } ]
   },
   "BTC/USDC": {
     "reserved_base": 0.0,

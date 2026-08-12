@@ -11,15 +11,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prep system deps for OCaml action
+      - name: Install system build dependencies
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-               bubblewrap darcs g++-multilib gcc-multilib m4 make mercurial \
-               musl-tools rsync autoconf automake libtool
+               bubblewrap g++-multilib gcc-multilib m4 make mercurial \
+               musl-tools rsync autoconf automake libtool \
+               libffi-dev libgmp-dev libpcre3-dev libssl-dev pkg-config
 
       - name: Build libsecp256k1 with schnorrsig support
         run: |
+          rm -rf /tmp/secp256k1
           git clone https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1
           cd /tmp/secp256k1
           ./autogen.sh
@@ -28,12 +30,17 @@ jobs:
           sudo make install
           sudo ldconfig
 
-      - uses: ocaml/setup-ocaml@v2
-        with:
-          ocaml-compiler: '5.2.0'
-          dune-cache: false # Disable built-in dune cache
+      - name: Set up opam and OCaml 5.2.0
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y opam
+          opam init --bare --disable-sandboxing -y --no-setup
+          if ! opam switch list --short 2>/dev/null | grep -qx "default"; then
+            opam switch create default ocaml-base-compiler.5.2.0
+          fi
+          eval "$(opam env --switch default)"
 
       - name: Restore Dune cache
+        if: github.server_url == 'https://github.com'
         uses: actions/cache@v4
         with:
           path: ~/.cache/dune
@@ -42,7 +49,7 @@ jobs:
             ${{ runner.os }}-dune-cache-
 
       - name: Install opam deps
-        run: opam install . --deps-only --with-test -y
+        run: opam install . --deps-only --with-test --assume-depexts -y
 
       - name: Build
         run: opam exec -- dune build @all

@@ -321,10 +321,51 @@ let render_asset_detail w h asset_key json =
           ]
     in
     let summary_card =
-      I.vcat
-        [ close_row w (I.hcat [ I.string a_border " │"; r1 ])
-        ; close_row w (I.hcat [ I.string a_border " │"; r2 ])
-        ]
+      (* Capital-oracle line: the published decision for this asset - the
+         ACTIVE/INACTIVE verdict (the oracle-paused state), the sizing and
+         the reason. Rendered when a decision exists. *)
+      let oracle_line =
+        let oracle = if a.is_strategy then a.data |?> "oracle" else `Null in
+        match oracle with
+        | `Assoc _ ->
+          let o_active = oracle |?> "active" |> to_bool_d false in
+          let o_qty = oracle |?> "qty" |> to_float_d 0.0 in
+          let o_gi = oracle |?> "grid_interval" |> to_float_d 0.0 in
+          let o_dsurv = oracle |?> "d_surv" |> to_float_d 0.0 in
+          let o_reason = oracle |?> "reason" |> to_string_d "" in
+          let status_img =
+            if o_active
+            then I.string a_green "Oracle: ACTIVE"
+            else I.string a_yellow "Oracle: INACTIVE"
+          in
+          let sizing_img =
+            if o_qty > 0.0
+            then
+              I.string
+                a_text
+                (Printf.sprintf
+                   " qty %.6g gi %.4f%% D_surv %.1f%%"
+                   o_qty
+                   o_gi
+                   (o_dsurv *. 100.0))
+            else I.string a_dim " (no sizing)"
+          in
+          let reason_img =
+            if o_reason = "" then I.string a_text "" else I.string a_dim ("  " ^ o_reason)
+          in
+          Some (I.hcat [ status_img; sizing_img; reason_img ])
+        | _ -> None
+      in
+      let summary =
+        I.vcat
+          [ close_row w (I.hcat [ I.string a_border " │"; r1 ])
+          ; close_row w (I.hcat [ I.string a_border " │"; r2 ])
+          ]
+      in
+      match oracle_line with
+      | Some line ->
+        I.vcat [ summary; close_row w (I.hcat [ I.string a_border " │"; line ]) ]
+      | None -> summary
     in
     (* 15-minute window time bounds *)
     let now = Unix.gettimeofday () in

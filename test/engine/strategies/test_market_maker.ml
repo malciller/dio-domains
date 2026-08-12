@@ -16,6 +16,7 @@ let create_test_asset
       ?(hedge = false)
       ?(accumulation_buffer = 0.01, 0.01)
       ?(data_feed = None)
+      ?(asset_class = None)
       ()
   : Dio_strategies.Strategy_common.trading_config
   =
@@ -33,6 +34,7 @@ let create_test_asset
   ; hedge
   ; accumulation_buffer
   ; data_feed
+  ; asset_class
   }
 ;;
 
@@ -467,6 +469,7 @@ let test_inflight_cleared_on_fill () =
     "order_buy_2"
     Dio_strategies.Strategy_common.Buy
     ~fill_price:50000.0
+    ~fill_qty:1.0
     None;
   check bool "inflight_buy cleared on fill" false state.inflight_buy;
   Dio_strategies.Market_maker.Strategy.handle_order_filled
@@ -475,6 +478,7 @@ let test_inflight_cleared_on_fill () =
     "order_sell_2"
     Dio_strategies.Strategy_common.Sell
     ~fill_price:51000.0
+    ~fill_qty:1.0
     None;
   check bool "inflight_sell cleared on fill" false state.inflight_sell
 ;;
@@ -558,6 +562,7 @@ let test_inflight_preserves_opposite_side () =
     "order_sell_5"
     Dio_strategies.Strategy_common.Sell
     ~fill_price:51000.0
+    ~fill_qty:1.0
     None;
   check bool "inflight_buy preserved" true state.inflight_buy;
   check bool "inflight_sell cleared" false state.inflight_sell
@@ -586,6 +591,7 @@ let test_inflight_full_lifecycle () =
     "lifecycle_buy_1"
     Dio_strategies.Strategy_common.Buy
     ~fill_price:50000.0
+    ~fill_qty:1.0
     None;
   check bool "inflight_buy cleared after fill" false state.inflight_buy;
   (* 5. Verify state is ready for re-placement (not blocked) *)

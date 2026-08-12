@@ -12,6 +12,9 @@
   dio.cmc
   dio.strategies
   dio.dashboard
+  dio.engine
+  dio.oracle
+  dio.concurrency
   lwt
   supervisor
   mirage-crypto-rng.unix)
@@ -24,3 +27,10 @@
  (name dashboard)
  (modes exe)
  (libraries notty notty.unix yojson unix dio.dashboard_ui))
+
+(executable
+ (package dio)
+ (public_name dio-oracle)
+ (name oracle)
+ (modes exe)
+ (libraries unix yojson lwt dio.oracle dio.engine dio.strategies dio.cmc))

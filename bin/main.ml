@@ -18,6 +18,10 @@
 
 open Lwt.Infix
 
+(* Capital-oracle runtime (wrapped library: explicit alias avoids opening the
+   whole Dio_oracle namespace). *)
+module Oracle_runtime = Dio_oracle.Oracle_runtime
+
 (** Conditionally enable backtraces via DIO_BACKTRACE to avoid allocation overhead in production. *)
 let () = Printexc.record_backtrace (Sys.getenv_opt "DIO_BACKTRACE" |> Option.is_some)
 
@@ -404,13 +408,20 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
   Logging.info ~section:"main" "Step 0: Fetching Fear & Greed index...";
   let () =
     try
-      let value = Fear_and_greed.fetch_and_cache_sync ~fallback:50.0 () in
-      Logging.info_f ~section:"main" "Startup Fear & Greed index: %.2f" value
+      let _ = Fear_and_greed.fetch_and_cache_sync ~fallback:50.0 () in
+      match Fear_and_greed.get_cached () with
+      | Some value ->
+        Logging.info_f ~section:"main" "Startup Fear & Greed index: %.2f" value
+      | None ->
+        Logging.warn_f
+          ~section:"main"
+          "Startup Fear & Greed unavailable (fetch failed); grid domains withhold orders \
+           until a live F&G reading or a capital-oracle decision exists"
     with
     | exn ->
       Logging.warn_f
         ~section:"main"
-        "Failed to fetch Fear & Greed at startup, using fallbacks: %s"
+        "Failed to fetch Fear & Greed at startup: %s"
         (Printexc.to_string exn)
   in
   (* Start supervisor monitoring; returns trading configs augmented with fee schedules. *)
@@ -428,6 +439,34 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
     ~section:"main"
     "%d supervised asset domains initialized!"
     (List.length configs_with_fees);
+  (* Start the capital-oracle live runtime: one analysis pass immediately,
+     then background refreshes on the configured cadence. Trading domains
+     read the published qty / grid_interval / active decisions every cycle;
+     the on_publish hook wakes them so a new decision applies right away
+     instead of on the next market event. The runtime tolerates every
+     failure mode (network, history, balance) with last-known-good fallback
+     and never blocks or crashes the engine. *)
+  (try
+     Oracle_runtime.start
+       ~config:(Option.value config.oracle ~default:(Oracle_runtime.default_config ()))
+       ~trading:configs_with_fees
+       ~classes:
+         (List.map
+            (fun ((name, pool) : string * Dio_engine.Config.class_pool) ->
+               ( name
+               , { Oracle_runtime.members = pool.members
+                 ; Oracle_runtime.kappa = pool.kappa
+                 } ))
+            config.classes)
+       ~on_publish:(fun _ -> Concurrency.Exchange_wakeup.signal_all ())
+       ();
+     Logging.info ~section:"main" "Capital oracle runtime started"
+   with
+   | exn ->
+     Logging.warn_f
+       ~section:"main"
+       "Capital oracle runtime failed to start (%s); engine runs on config/F&G sizing"
+       (Printexc.to_string exn));
   configs_with_fees
 ;;
 
