@@ -50,6 +50,19 @@ let init ?(offline = false) (tasks : Oracle_tasks.task list) : unit Lwt.t =
            if t.exchange = "hyperliquid" then Some t.symbol else None)
         tasks
     in
+    (* The Hyperliquid instrument cache is shared with the live engine's
+       WebSocket feed (which uses the trading environment), so the REST
+       metadata must be fetched from the SAME environment. Mainnet and
+       testnet spot pair indices differ (e.g. HYPE/USDC: 107 mainnet vs
+       1035 testnet); fetching mainnet meta while trading testnet poisons
+       the asset-id cache and routes orders to the wrong spot pair. *)
+    let hyperliquid_testnet =
+      List.find_map
+        (fun (t : Oracle_tasks.task) ->
+           if t.exchange = "hyperliquid" then Some t.config.testnet else None)
+        tasks
+      |> Option.value ~default:true
+    in
     Lwt.catch
       (fun () ->
          let init_kraken =
@@ -61,7 +74,10 @@ let init ?(offline = false) (tasks : Oracle_tasks.task list) : unit Lwt.t =
          >>= fun () ->
          if hyperliquid_symbols = []
          then Lwt.return_unit
-         else Hyperliquid.Instruments_feed.fetch_meta_from_rest ())
+         else
+           Hyperliquid.Instruments_feed.fetch_meta_from_rest
+             ~testnet:hyperliquid_testnet
+             ())
       (fun exn ->
          Logging.warn_f
            ~section

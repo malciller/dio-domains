@@ -45,6 +45,13 @@ open Oracle_types
 
 let section = "oracle_replay"
 
+(* Dedupe keys for the per-(asset, horizon) diagnostics below: the oracle
+   re-analyzes the same history on every pass, so thin-sample warnings would
+   otherwise re-log every refresh. Warn once per (asset, horizon) per run;
+   identical repeats drop to debug. *)
+let warned_flat_windows : (string, unit) Hashtbl.t = Hashtbl.create 64
+let warned_thin_windows : (string, unit) Hashtbl.t = Hashtbl.create 64
+
 (** Everything needed to evaluate F_blend_h(d) for one horizon on one sampling
     basis. The index is precomputed eagerly by [blend_model_of]. *)
 type blend_model =
@@ -138,16 +145,29 @@ let blend_index_of
        else incr n_flat)
     regime.sigma;
   if !n_flat > 0
-  then
-    Logging.warn_f
-      ~section
-      "Oracle_replay: %d/%d start windows for %s @%d have zero trailing volatility (flat \
-       or gap-adjacent data); they are excluded from both the asset CDF and the class \
-       contribution"
-      !n_flat
-      (Array.length regime.sigma)
-      asset.symbol
-      horizon.sessions;
+  then (
+    let key = Printf.sprintf "%s@%d" asset.symbol horizon.sessions in
+    let first = not (Hashtbl.mem warned_flat_windows key) in
+    if first then Hashtbl.add warned_flat_windows key ();
+    if first
+    then
+      Logging.warn_f
+        ~section
+        "Oracle_replay: %d/%d start windows for %s @%d have zero trailing volatility \
+         (flat or gap-adjacent data); they are excluded from both the asset CDF and the \
+         class contribution"
+        !n_flat
+        (Array.length regime.sigma)
+        asset.symbol
+        horizon.sessions
+    else
+      Logging.debug_f
+        ~section
+        "Oracle_replay: %d/%d flat windows for %s @%d (already reported this run)"
+        !n_flat
+        (Array.length regime.sigma)
+        asset.symbol
+        horizon.sessions);
   let mfd = Array.of_list (List.rev !mfd) in
   let sigma = Array.of_list (List.rev !sigma) in
   let mfd_sorted = Array.copy mfd in
@@ -290,15 +310,28 @@ let blend_model_of
   in
   let n_eff = Array.length index.sigma in
   if n_eff > 0 && n_eff < 5
-  then
-    Logging.warn_f
-      ~section
-      "Oracle_replay: only %d independent %d-session windows for %s (warmup %d); \
-       coverage/sizing is not authoritative below 5 windows"
-      n_eff
-      horizon.sessions
-      asset.symbol
-      warmup;
+  then (
+    let key = Printf.sprintf "%s@%d" asset.symbol horizon.sessions in
+    let first = not (Hashtbl.mem warned_thin_windows key) in
+    if first then Hashtbl.add warned_thin_windows key ();
+    if first
+    then
+      Logging.warn_f
+        ~section
+        "Oracle_replay: only %d independent %d-session windows for %s (warmup %d); \
+         coverage/sizing is not authoritative below 5 windows"
+        n_eff
+        horizon.sessions
+        asset.symbol
+        warmup
+    else
+      Logging.debug_f
+        ~section
+        "Oracle_replay: only %d independent %d-session windows for %s (already reported \
+         this run)"
+        n_eff
+        horizon.sessions
+        asset.symbol);
   { horizon; asset; class_members; kappa; warmup; weight_by_sessions; stride; index }
 ;;
 

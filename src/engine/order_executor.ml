@@ -345,7 +345,7 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
             let stop_time = Mtime_clock.now_ns () in
             let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
             Latency_profiler.record profiler span;
-            Latency_profiler.report ~sample_threshold:1 profiler;
+            Latency_profiler.report ~sample_threshold:100 profiler;
             Lwt.return result)))
 ;;
 
@@ -507,7 +507,7 @@ let amend_order ~token ?retry_config (request : amend_request) =
              let stop_time = Mtime_clock.now_ns () in
              let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
              Latency_profiler.record profiler span;
-             Latency_profiler.report ~sample_threshold:1 profiler;
+             Latency_profiler.report ~sample_threshold:100 profiler;
              (* Clear in-flight entry after successful exchange response. *)
              let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
              Lwt.return result))))
@@ -563,7 +563,7 @@ let cancel_orders ~token ?retry_config (request : cancel_request) =
          let stop_time = Mtime_clock.now_ns () in
          let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
          Latency_profiler.record profiler span;
-         Latency_profiler.report ~sample_threshold:1 profiler;
+         Latency_profiler.report ~sample_threshold:100 profiler;
          Lwt.return result))
 ;;
 
