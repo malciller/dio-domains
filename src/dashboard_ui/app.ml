@@ -10,7 +10,9 @@ let socket_path = ref ""
 let default_socket_path = "/var/run/dio/dashboard.sock"
 
 let discover_socket_candidates () =
-  let fixed = [ default_socket_path ] |> List.filter Sys.file_exists in
+  let fixed =
+    [ default_socket_path; "/tmp/dio/dashboard.sock" ] |> List.filter Sys.file_exists
+  in
   if fixed <> []
   then fixed
   else (

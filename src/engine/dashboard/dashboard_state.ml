@@ -387,6 +387,36 @@ let json_of_memory () =
     ]
 ;;
 
+(** One capital-oracle decision, serialized for the dashboard: the dashboard
+    shows the oracle's ACTIVE/INACTIVE verdict (the pause state), the sizing
+    it published and how much capital it consumed. *)
+let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
+  `Assoc
+    [ "exchange", `String d.exchange
+    ; "symbol", `String d.symbol
+    ; "active", `Bool d.active
+    ; "reason", `String d.reason
+    ; "qty", `Float d.qty
+    ; "grid_interval", `Float d.grid_interval
+    ; "d_surv", `Float d.d_surv
+    ; "d_cover", `Float d.d_cover
+    ; "deployed", `Float d.deployed
+    ; "pool_share", `Float d.pool_share
+    ; "remainder", `Float d.remainder
+    ; "updated_at", `Float d.updated_at
+    ]
+;;
+
+(** All current oracle decisions, keyed by symbol (one decision per tracked
+    asset). *)
+let json_of_oracle_decisions () =
+  let decisions = Dio_oracle.Oracle_runtime.decisions () in
+  `Assoc
+    (List.map
+       (fun (d : Dio_oracle.Oracle_runtime.decision) -> d.symbol, json_of_decision d)
+       decisions)
+;;
+
 (* Full state snapshot *)
 
 let take n l =
@@ -432,7 +462,19 @@ let build_snapshot () =
     | Some v -> `Float v
     | None -> `Null
   in
-  (* Per-symbol strategy state and market data *)
+  (* Per-symbol strategy state, market data and the capital-oracle decision
+     (the oracle verdict drives the dashboard's paused status; before the
+     first oracle pass there is no decision and the oracle field is null). *)
+  let oracle_by_symbol =
+    match json_of_oracle_decisions () with
+    | `Assoc l -> l
+    | _ -> []
+  in
+  let oracle_of symbol =
+    match List.assoc_opt symbol oracle_by_symbol with
+    | Some j -> j
+    | None -> `Null
+  in
   let strategies =
     List.map
       (fun (tc : Dio_engine.Config.trading_config) ->
@@ -451,6 +493,7 @@ let build_snapshot () =
              [ "exchange", `String tc.exchange
              ; "strategy", strategy_json
              ; "market", market_json
+             ; "oracle", oracle_of tc.symbol
              ; "qty", `String tc.qty
              ; "grid_interval_lo", `Float (fst tc.grid_interval)
              ; "grid_interval_hi", `Float (snd tc.grid_interval)
@@ -619,6 +662,7 @@ let build_snapshot () =
     ; "connections", `List (List.map json_of_connection_snapshot connections)
     ; "domains", json_of_domains ()
     ; "strategies", `Assoc strategies
+    ; "oracle", `Assoc oracle_by_symbol
     ; "all_balances", `List all_balances
     ; "recent_fills", json_of_recent_fills ()
     ; "latencies", json_of_domain_latencies ()

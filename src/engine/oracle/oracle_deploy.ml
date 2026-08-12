@@ -240,6 +240,7 @@ module Engine (M : Oracle_strategy.S) = struct
       path - the ladder buys far more levels over years than the d_cover fill
       count - and would falsely brand well-funded assets as under-funded.) *)
   let verify_at_qty
+        ~(seed : Dio_strategies.Grid_core_types.seed option)
         ~(cfg : M.config)
         ~(pool : float)
         ~(asset : series)
@@ -247,7 +248,7 @@ module Engine (M : Oracle_strategy.S) = struct
         ~(qty : float)
     =
     let cfg = M.set_qty (M.set_start_quote cfg pool) qty in
-    let out = M.replay cfg asset in
+    let out = M.replay ?seed cfg asset in
     let coverage =
       List.map
         (fun (m : Oracle_replay.blend_model) ->
@@ -278,6 +279,7 @@ module Engine (M : Oracle_strategy.S) = struct
       it and fails the criterion, which is what bounds the "deploy all
       capital" scale-up. *)
   let max_qty_for_survival
+        ~(seed : Dio_strategies.Grid_core_types.seed option)
         ~(cfg : M.config)
         ~(pool : float)
         ~(asset : series)
@@ -288,7 +290,7 @@ module Engine (M : Oracle_strategy.S) = struct
     : float
     =
     let passes qty =
-      let _, out, _ = verify_at_qty ~cfg ~pool ~asset ~models ~qty in
+      let _, out, _ = verify_at_qty ~seed ~cfg ~pool ~asset ~models ~qty in
       survives_all out
     in
     if q_hi <= q_lo
@@ -350,6 +352,7 @@ module Engine (M : Oracle_strategy.S) = struct
       [deployed] is the floor-aware cost through [d_cover] at the final qty,
       capped at the pool. *)
   let row_at
+        ~(seed : Dio_strategies.Grid_core_types.seed option)
         ~(asset : series)
         ~(cfg : M.config)
         ~(models : Oracle_replay.blend_model list)
@@ -364,7 +367,7 @@ module Engine (M : Oracle_strategy.S) = struct
     let q_min = sizing_floor ~cfg in
     let d_surv_static = M.drawdown_of_fills cfg ~n_fills in
     let static_funded = M.cost_at cfg ~qty:q_min ~n_fills <= pool +. 1e-9 in
-    let _, out, coverage = verify_at_qty ~cfg ~pool ~asset ~models ~qty in
+    let _, out, coverage = verify_at_qty ~seed ~cfg ~pool ~asset ~models ~qty in
     let deployed = Float.min pool (M.cost_at cfg ~qty ~n_fills) in
     { parameter
     ; qty
@@ -419,6 +422,8 @@ module Engine (M : Oracle_strategy.S) = struct
        caller compatibility but are INERT: the sizing is survival-driven and
        no sentiment blend is applied. *)
   let deploy_asset
+        ~(seed : Dio_strategies.Grid_core_types.seed option)
+        ~(has_committed_buy : bool)
         ~(asset : series)
         ~(cfg : M.config)
         ~(lo : float)
@@ -546,7 +551,14 @@ module Engine (M : Oracle_strategy.S) = struct
             models
       in
       let cost_one = M.cost_at (M.set_parameter cfg hi) ~qty:q_min ~n_fills:1 in
-      if pool +. 1e-9 < cost_one
+      (* The first-buy gate: an asset whose pool cannot fund its first buy at
+         the minimum order size is inactive and its whole share passes down
+         the priority order. EXCEPTION: a grid with a committed resting buy
+         (the first buy is already funded and resting on the exchange - its
+         cost is locked in the account balance) is never "cannot fund the
+         first buy": the committed grid keeps running, the grid's own
+         capital gates pause it when the pool cannot extend another rung. *)
+      if pool +. 1e-9 < cost_one && not has_committed_buy
       then
         inactive
           (Printf.sprintf
@@ -568,7 +580,7 @@ module Engine (M : Oracle_strategy.S) = struct
         let rows =
           Array.map
             (fun parameter ->
-               row_at ~asset ~cfg ~models ~pool ~d_cover ~parameter ~qty:q_min)
+               row_at ~seed ~asset ~cfg ~models ~pool ~d_cover ~parameter ~qty:q_min)
             candidates
           |> Array.to_list
         in
@@ -600,6 +612,7 @@ module Engine (M : Oracle_strategy.S) = struct
             let cfg_at = M.set_parameter cfg parameter in
             let q =
               max_qty_for_survival
+                ~seed
                 ~cfg:cfg_at
                 ~pool
                 ~asset
@@ -628,7 +641,7 @@ module Engine (M : Oracle_strategy.S) = struct
         (* 3. The final row at the resolved (gi, qty): the verification replay
            reports the honest D_surv / coverage / deployed for the sizing that
            actually runs. *)
-        let row = row_at ~asset ~cfg ~models ~pool ~d_cover ~parameter ~qty in
+        let row = row_at ~seed ~asset ~cfg ~models ~pool ~d_cover ~parameter ~qty in
         let warnings = ref [] in
         if stretch
         then

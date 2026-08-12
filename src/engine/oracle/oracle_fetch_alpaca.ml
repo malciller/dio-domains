@@ -11,7 +11,6 @@
    [parse_*] functions are fixture-testable without network. *)
 
 open Lwt.Infix
-open Cohttp_lwt_unix
 
 let section = "oracle_alpaca"
 let data_base_url = "https://data.alpaca.markets"
@@ -136,7 +135,7 @@ let fetch_bars
            | None -> "")
       in
       let fetch =
-        Client.get ~headers:(auth_headers ()) (Uri.of_string url)
+        Oracle_http.get ~headers:(auth_headers ()) (Uri.of_string url)
         >>= fun (resp, body) ->
         Cohttp_lwt.Body.to_string body
         >>= fun body_str ->
@@ -182,7 +181,7 @@ let fetch_calendar ~(start_date : string) ~(end_date : string) () : string list 
   let url =
     Printf.sprintf "%s/v2/calendar?start=%s&end=%s" trading_base_url start_date end_date
   in
-  Client.get ~headers:(auth_headers ()) (Uri.of_string url)
+  Oracle_http.get ~headers:(auth_headers ()) (Uri.of_string url)
   >>= fun (resp, body) ->
   Cohttp_lwt.Body.to_string body
   >>= fun body_str ->

@@ -12,6 +12,8 @@
 
 (subdir engine/config)
 
+(subdir engine/dashboard)
+
 (subdir engine/domain_spawner)
 
 (subdir external/kraken)

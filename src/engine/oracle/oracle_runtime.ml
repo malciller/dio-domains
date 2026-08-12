@@ -68,6 +68,7 @@
 open Lwt.Infix
 module G = Oracle_strategy.Grid
 module D = Oracle_deploy.Engine (G)
+module Exchange = Dio_exchange.Exchange_intf
 
 let section = "oracle_runtime"
 
@@ -575,14 +576,19 @@ let group_by_account (tasks : Oracle_tasks.task list) =
     accounts
 ;;
 
-(** Venue-locked pool per account: the account's live available quote balance.
-    [None] means the balance could not be fetched this pass - the caller skips
-    the whole account rather than publish a decision based on a wrong pool. *)
+(** Venue-locked pool per account: the account's live available quote balance
+    together with the balance snapshot (the sizing seeds its replay grid from
+    the account's held base). [None] means the balance could not be fetched
+    this pass - the caller skips the whole account rather than publish a
+    decision based on a wrong pool. *)
 let venue_pools (tasks : Oracle_tasks.task list)
-  : (Oracle_topology.instrument_key * float option) list Lwt.t
+  : (Oracle_topology.instrument_key * (float * Oracle_balances.snapshot) option) list
+      Lwt.t
   =
   let accounts = List.map fst (group_by_account tasks) in
-  let pool_for (account : Oracle_topology.instrument_key) : float option Lwt.t =
+  let pool_for (account : Oracle_topology.instrument_key)
+    : (float * Oracle_balances.snapshot) option Lwt.t
+    =
     match
       List.find_opt
         (fun (task : Oracle_tasks.task) -> same_account account (account_of_task task))
@@ -623,7 +629,7 @@ let venue_pools (tasks : Oracle_tasks.task list)
                (account_id account)
                (String.concat " · " lines)
                pool;
-             Some pool)
+             Some (pool, snapshot))
         (fun exn ->
            Logging.warn_f
              ~section
@@ -886,14 +892,56 @@ let size_asset
       (analysis : analysis)
       ~(pool : float)
       ~(venue_pool : float)
+      ~(snapshot : Oracle_balances.snapshot option)
       ~(fng : float option)
       ~(index : int)
       ~(n_tasks : int)
   : decision Lwt.t
   =
   let { exchange; symbol; asset; calendar_kind; grid; lo; hi; models; _ } = analysis in
+  (* The sizing replay starts from the account's ACTUAL grid state: the base
+     it holds (available on the venue), the base locked in resting sells and
+     the accumulated profit buffer (persisted + live - the strategy state
+     loads accumulated_state.json on first access) - so the survival verdict
+     answers "can THIS grid, as it runs, survive?" instead of "can a
+     hypothetical fresh grid?". The accumulation-sell gate (Hyperliquid)
+     needs the profit buffer; without the seed the replay can never sell and
+     systematically understates D_surv. *)
+  let seed =
+    match snapshot with
+    | None -> None
+    | Some snapshot ->
+      let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+      let base_asset =
+        match String.split_on_char '/' symbol with
+        | b :: _ -> b
+        | [] -> symbol
+      in
+      let base = Oracle_balances.available_asset snapshot ~asset:base_asset in
+      Some
+        { Dio_strategies.Grid_core_types.initial_base = base
+        ; initial_reserved_base = st.reserved_base
+        ; initial_accumulated_profit = st.accumulated_profit
+        }
+  in
+  (* A committed resting buy (already funded and resting on the exchange -
+     its cost is locked in the account balance, which is why the available
+     pool reads low) keeps the grid alive: the asset is never "cannot fund
+     the first buy" while it has one. The grid's own capital gates pause it
+     when the pool cannot extend another rung. *)
+  let has_committed_buy =
+    match Exchange.Registry.get exchange with
+    | None -> false
+    | Some (module Ex) ->
+      List.exists
+        (fun (o : Exchange.Types.open_order) ->
+           o.side = Exchange.Types.Buy && o.remaining_qty > 0.0)
+        (Ex.get_open_orders ~symbol)
+  in
   let deployment =
     D.deploy_asset
+      ~seed
+      ~has_committed_buy
       ~asset
       ~cfg:grid
       ~lo
@@ -1076,7 +1124,21 @@ let size_asset
       deployment.Oracle_types.parameter
       deployment.Oracle_types.gi_reason
       deployment.Oracle_types.qty
-      deployment.Oracle_types.qty_reason);
+      deployment.Oracle_types.qty_reason;
+    (* The accumulated-state seed: what the sizing replay started from (held
+       base, base locked in resting sells, the accumulated profit buffer) -
+       the grid is modeled as it actually runs, not as a fresh grid. *)
+    (match seed with
+     | Some
+         { Dio_strategies.Grid_core_types.initial_base = b
+         ; initial_reserved_base = r
+         ; initial_accumulated_profit = p
+         }
+       when b > 0.0 || r > 0.0 || p > 0.0 ->
+       add "      seeded: base %.6g, reserved %.6g, accumulated profit %.6g" b r p
+     | _ -> ());
+    if has_committed_buy
+    then add "      committed buy resting: the grid keeps running on committed capital");
   let detail_str = Buffer.contents detail in
   let detail_changed =
     match Hashtbl.find_opt last_detail_lines key with
@@ -1191,18 +1253,41 @@ let run_pass
     (* Phase A: analyze every asset in priority order FIRST, so each asset's
        sizing reservation (minimum drawdown funding + first-buy cost) is known
        before any capital is handed out. *)
+    (* One asset's analysis is bounded: a fetch (or a future fetch) that
+       hangs cannot freeze the whole pass - the asset times out, keeps its
+       last-known-good decision, and the pass continues. The fetch libraries
+       carry their own timeouts; this is the belt-and-braces. *)
+    let analysis_timeout = 60.0 in
     let rec analyze_all acc = function
       | [] -> Lwt.return (List.rev acc)
       | task :: rest ->
         Lwt.catch
           (fun () ->
-             analyze_asset
-               config
-               classes
-               task
-               ~index:(List.length rest + 1)
-               ~n_tasks:(List.length tasks)
-             >|= fun analysis -> analysis :: acc)
+             Lwt.pick
+               [ (analyze_asset
+                    config
+                    classes
+                    task
+                    ~index:(List.length rest + 1)
+                    ~n_tasks:(List.length tasks)
+                  >|= fun analysis -> `Ok analysis)
+               ; (Lwt_unix.sleep analysis_timeout
+                  >|= fun () ->
+                  `Timeout
+                    (Printf.sprintf "analysis timed out after %.0fs" analysis_timeout))
+               ]
+             >|= function
+             | `Ok analysis -> analysis :: acc
+             | `Timeout why ->
+               Logging.warn_f
+                 ~section
+                 "capital-oracle analysis timed out for %s/%s (%s); \
+                  keeping                   last-known-good decision, capital stays in \
+                  the venue pool"
+                 task.Oracle_tasks.exchange
+                 task.Oracle_tasks.symbol
+                 why;
+               acc)
           (fun exn ->
              Logging.warn_f
                ~section
@@ -1225,7 +1310,11 @@ let run_pass
        The pool is venue-locked and the pass-down subtracts each deployment,
        so pool resources are never double-counted across the account's
        assets. *)
-    let rec size_all ~(venue_pool : float) (pool : float) = function
+    let rec size_all
+              ~(venue_pool : float)
+              ~(snapshot : Oracle_balances.snapshot option)
+              (pool : float)
+      = function
       | [] -> Lwt.return pool
       | analysis :: rest ->
         Lwt.catch
@@ -1235,6 +1324,7 @@ let run_pass
                analysis
                ~pool
                ~venue_pool
+               ~snapshot
                ~fng
                ~index:(List.length rest + 1)
                ~n_tasks:(List.length tasks)
@@ -1250,23 +1340,23 @@ let run_pass
                analysis.symbol
                (Printexc.to_string exn);
              Lwt.return pool)
-        >>= fun next -> size_all ~venue_pool next rest
+        >>= fun next -> size_all ~venue_pool ~snapshot next rest
     in
     venue_pools tasks
     >>= fun pools ->
     let account_pool account =
       match List.assoc_opt account pools with
-      | Some (Some pool) -> Some pool
+      | Some (Some (pool, snapshot)) -> Some (pool, snapshot)
       | _ -> None
     in
     Lwt_list.iter_s
       (fun (account, account_tasks) ->
          match account_pool account with
          | None -> Lwt.return_unit
-         | Some pool ->
+         | Some (pool, snapshot) ->
            analyze_all [] account_tasks
            >>= fun analyses ->
-           size_all ~venue_pool:pool pool analyses
+           size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool analyses
            >|= fun surplus ->
            Logging.info_f
              ~section

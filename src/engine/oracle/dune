@@ -9,6 +9,7 @@
   dotenv
   dio.logging
   dio.strategies
+  dio.exchange
   dio.cmc
   dio.alpaca
   dio.kraken

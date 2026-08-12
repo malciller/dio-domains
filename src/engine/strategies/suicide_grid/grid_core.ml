@@ -269,12 +269,12 @@ let can_place_buy cfg ~state ~price =
   placeable && affordable
 ;;
 
-let create cfg =
+let create ?(seed = empty_seed) cfg =
   let b = buy_level cfg ~ref:cfg.start_price in
   { quote = cfg.start_quote
-  ; base = 0.0
-  ; accumulated_profit = 0.0
-  ; reserved_base = 0.0
+  ; base = seed.initial_base
+  ; accumulated_profit = seed.initial_accumulated_profit
+  ; reserved_base = seed.initial_reserved_base
   ; resting_buy = Some b
   ; resting_sell = None
   ; last_buy_fill_price = None
@@ -444,9 +444,12 @@ let on_bar cfg ~state ~bar ~ordering =
 ;;
 
 (** Replays the grid over a bar series. `min_quote` is tracked after every fill
-    (intra-bar trough), so ordering is observable. *)
-let replay cfg ~bars ~ordering =
-  let state = create cfg in
+    (intra-bar trough), so ordering is observable. [seed] (optional) starts the
+    grid from an existing account state instead of a fresh grid - the oracle
+    uses it to model the strategy as it actually runs (held base, resting-sell
+    reservations, accumulated profit). *)
+let replay ?seed cfg ~bars ~ordering =
+  let state = create ?seed cfg in
   let n = Array.length bars in
   let quote_series = Array.make n 0.0 in
   let fills = ref [] in

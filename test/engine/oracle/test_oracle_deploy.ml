@@ -126,6 +126,8 @@ let grid ?(min_notional = 0.0) ?(qty_min = 0.01) ?(gi = 1.0) ~(start_price : flo
 let deploy
       ?(asset = asset)
       ?(pool = 10_000.0)
+      ?(seed = None)
+      ?(has_committed_buy = false)
       ?(fng = Some 50.0)
       ?(fng_weight = 0.5)
       ?(range_weight = 0.0)
@@ -140,6 +142,8 @@ let deploy
       ()
   =
   D.deploy_asset
+    ~seed
+    ~has_committed_buy
     ~asset
     ~cfg:g
     ~lo
@@ -504,6 +508,78 @@ let recover_series ~n =
   ; bars
   ; gaps = []
   }
+;;
+
+let test_deploy_committed_buy_gate () =
+  (* The first-buy gate: an asset whose pool cannot fund its first buy at the
+     minimum order size is inactive - UNLESS a committed resting buy is
+     already in place (the first buy is funded and resting on the exchange;
+     its cost is locked in the account balance). A committed grid keeps
+     running - the grid's own capital gates pause it when the pool cannot
+     extend another rung - instead of the oracle freezing a live grid. *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let q_min = D.sizing_floor ~cfg:g in
+  let cost_one =
+    Oracle_mfd.floor_aware_runway_cost
+      ~qty:q_min
+      ~grid_interval_pct:2.0
+      ~fee:g.maker_fee
+      ~start_price:100.0
+      ~min_notional:0.0
+      ~price_increment:0.01
+      ~qty_increment:0.01
+      ~n_fills:1
+  in
+  (* Un-fundable pool, no committed buy: INACTIVE with the gate reason. *)
+  let d = deploy ~pool:(0.5 *. cost_one) ~g ~models:ms () in
+  Alcotest.(check bool) "inactive without a committed buy" (not d.active) true;
+  Alcotest.(check bool)
+    "reason names the first-buy gate"
+    (contains d.reason "cannot fund the first buy")
+    true;
+  (* Same pool, committed buy in place: the grid keeps running. *)
+  let dc = deploy ~pool:(0.5 *. cost_one) ~g ~has_committed_buy:true ~models:ms () in
+  Alcotest.(check bool) "active with a committed buy" dc.active true;
+  (* The sizing is still the honest survival-driven sizing on the pool: qty
+     at the minimum (stretch - the pool cannot fund a fresh ladder) and the
+     grid interval at the config maximum. *)
+  Alcotest.(check bool)
+    "committed-buy sizing stays within the qty range"
+    (dc.qty >= q_min)
+    true;
+  Alcotest.(check bool)
+    "committed-buy gi within the config range"
+    (dc.parameter >= 0.5 -. 1e-9 && dc.parameter <= 2.0 +. 1e-9)
+    true
+;;
+
+let test_deploy_seeded_replay () =
+  (* The sizing replay starts from the account's accumulated state (held
+     base / reserved base / accumulated profit) when a seed is provided: on
+     an accumulation venue the seeded grid can sell reduced from the start,
+     so the survival verdict models the strategy as it actually runs. The
+     seed must flow through without disturbing the sizing contract. *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let seed =
+    Some
+      Dio_strategies.Grid_core_types.
+        { initial_base = 1.0
+        ; initial_reserved_base = 0.0
+        ; initial_accumulated_profit = 0.0
+        }
+  in
+  let d = deploy ~pool:10_000.0 ~seed ~g ~models:ms () in
+  Alcotest.(check bool) "seeded deployment active" d.active true;
+  Alcotest.(check bool)
+    "seeded sizing keeps the survival target (100% survival at qty min)"
+    (d.d_surv >= 1.0 -. 1e-9)
+    true;
+  Alcotest.(check bool)
+    "seeded gi is the most aggressive with 100% survival"
+    (abs_float (d.parameter -. 0.5) < 1e-9)
+    true
 ;;
 
 let test_deepest_observed_drawdown () =
@@ -1760,6 +1836,14 @@ let () =
             "fallback grows qty while funded"
             `Quick
             test_fallback_grows_qty_while_funded
+        ; Alcotest.test_case
+            "committed buy keeps a running grid alive"
+            `Quick
+            test_deploy_committed_buy_gate
+        ; Alcotest.test_case
+            "seeded replay models the accumulated state"
+            `Quick
+            test_deploy_seeded_replay
         ; Alcotest.test_case "inactive cases" `Quick test_deploy_inactive
         ; Alcotest.test_case "floor-aware down-sizing" `Quick test_floor_aware_shrink
         ; Alcotest.test_case "range blend" `Quick test_deploy_range_blend

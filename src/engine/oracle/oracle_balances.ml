@@ -6,7 +6,6 @@
    keeps the parsing functions pure for fixture tests. *)
 
 open Lwt.Infix
-open Cohttp_lwt_unix
 
 type balance =
   { asset : string
@@ -237,6 +236,20 @@ let available_quote (snapshot : snapshot) ~(quote : string) =
        0.0
 ;;
 
+(** Available (unlocked) balance of one base asset: what the strategy can
+    actually sell or the sizing can count as held inventory. The oracle seeds
+    its replay grid with this. *)
+let available_asset (snapshot : snapshot) ~(asset : string) =
+  let asset = String.uppercase_ascii (String.trim asset) in
+  snapshot.balances
+  |> List.fold_left
+       (fun total balance ->
+          if String.uppercase_ascii balance.asset = asset
+          then total +. balance.available
+          else total)
+       0.0
+;;
+
 let total_asset (snapshot : snapshot) ~(asset : string) =
   let asset = String.uppercase_ascii (String.trim asset) in
   snapshot.balances
@@ -258,7 +271,7 @@ let post_json ~url (payload : Yojson.Safe.t) : (Yojson.Safe.t, string) result Lw
   let body = Cohttp_lwt.Body.of_string (Yojson.Safe.to_string payload) in
   Lwt.catch
     (fun () ->
-       Client.post ~headers ~body (Uri.of_string url)
+       Oracle_http.post ~headers ~body (Uri.of_string url)
        >>= fun (response, response_body) ->
        Cohttp_lwt.Body.to_string response_body
        >|= fun body ->
@@ -290,7 +303,7 @@ let fetch_kraken ~testnet:_ () : (balance list, string) result Lwt.t =
            ; "Content-Type", "application/x-www-form-urlencoded"
            ]
        in
-       Client.post
+       Oracle_http.post
          ~headers
          ~body:(Cohttp_lwt.Body.of_string body)
          (Uri.of_string ("https://api.kraken.com" ^ path))

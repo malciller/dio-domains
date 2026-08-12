@@ -1,0 +1,7 @@
+(test
+ (name test_dashboard_state)
+ (libraries dio.dashboard dio.oracle alcotest))
+
+(test
+ (name test_dashboard_holdings)
+ (libraries dio.dashboard_ui alcotest))

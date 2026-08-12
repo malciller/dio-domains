@@ -1337,8 +1337,24 @@ let run_one
   let models = List.map model horizons in
   (* The engine's decision: qty, gi, active, deployed capital against this
      asset's share of the venue pool. *)
+  (* The sizing replay starts from the strategy's accumulated state (base
+     locked in resting sells + the accumulated profit buffer, loaded from
+     accumulated_state.json via the strategy state) so the survival verdict
+     models the grid as it actually runs. The held base is seeded from the
+     account balance snapshot in the live engine; the CLI has no snapshot at
+     this point, so it seeds the persisted amounts only. *)
+  let st = Dio_strategies.Suicide_grid.get_strategy_state task.Oracle_tasks.symbol in
+  let seed =
+    Some
+      { Dio_strategies.Grid_core_types.initial_base = 0.0
+      ; initial_reserved_base = st.reserved_base
+      ; initial_accumulated_profit = st.accumulated_profit
+      }
+  in
   let deployment =
     D.deploy_asset
+      ~seed
+      ~has_committed_buy:false
       ~asset
       ~cfg:grid
       ~lo:gi_lo

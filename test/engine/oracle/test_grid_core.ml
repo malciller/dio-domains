@@ -11,6 +11,7 @@ let cfg
       ?(start_price = 100.0)
       ?(start_quote = 10_000.0)
       ?(fee = 0.0)
+      ?(accumulation_buffer = 0.0)
       ?(model = Dio_strategies.Grid_core_types.Hyperliquid)
       ()
   =
@@ -19,7 +20,7 @@ let cfg
   ; sell_mult
   ; grid_interval_pct
   ; maker_fee = fee
-  ; accumulation_buffer = 0.0
+  ; accumulation_buffer
   ; price_increment
   ; qty_increment
   ; qty_min
@@ -536,6 +537,130 @@ let test_sell_reconciliation_with_fee () =
   Alcotest.(check (float 1e-9)) "quote reconciled with fee" expected st.quote
 ;;
 
+let test_seed_initializes_state () =
+  (* The optional seed starts the grid from an existing account state: held
+     base, base locked in resting sells and the accumulated profit buffer -
+     the oracle models the strategy as it actually runs. *)
+  let c = cfg () in
+  let st = Dio_strategies.Grid_core.create c in
+  Alcotest.(check (float 1e-9)) "fresh base" 0.0 st.base;
+  Alcotest.(check (float 1e-9)) "fresh reserved" 0.0 st.reserved_base;
+  Alcotest.(check (float 1e-9)) "fresh profit" 0.0 st.accumulated_profit;
+  let seed =
+    Dio_strategies.Grid_core_types.
+      { initial_base = 0.134293
+      ; initial_reserved_base = 0.02
+      ; initial_accumulated_profit = 22.3566
+      }
+  in
+  let st2 = Dio_strategies.Grid_core.create ~seed c in
+  Alcotest.(check (float 1e-9)) "seeded base" seed.initial_base st2.base;
+  Alcotest.(check (float 1e-9))
+    "seeded reserved"
+    seed.initial_reserved_base
+    st2.reserved_base;
+  Alcotest.(check (float 1e-9))
+    "seeded profit"
+    seed.initial_accumulated_profit
+    st2.accumulated_profit
+;;
+
+let test_seed_enables_accumulation_sells () =
+  (* Hyperliquid accumulation sells: the reduced (sell_mult) sell only fires
+     while accumulated_profit >= rounding_diff*price + buffer. A fresh grid
+     (profit 0, large buffer) sells at FULL qty and retains nothing; a grid
+     seeded with the account's accumulated profit sells reduced and reserves
+     the rounding base each cycle - the live accumulator behavior the oracle
+     must model. *)
+  let c =
+    cfg
+      ~qty:0.5
+      ~sell_mult:0.999
+      ~fee:0.0004
+      ~start_quote:10_000.0
+      ~accumulation_buffer:5.0
+      ()
+  in
+  let fresh = Dio_strategies.Grid_core.create c in
+  let seed =
+    Dio_strategies.Grid_core_types.
+      { initial_base = 0.0
+      ; initial_reserved_base = 0.0
+      ; initial_accumulated_profit = 10.0
+      }
+  in
+  let seeded = Dio_strategies.Grid_core.create ~seed c in
+  (* Two buy-dip / sell-rise cycles. *)
+  List.iter
+    (fun st ->
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~low:99.0 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first);
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~high:101.0 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first);
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~low:97.0 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first);
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~high:100.0 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first))
+    [ fresh; seeded ];
+  Alcotest.(check int) "fresh sells at full qty" 2 fresh.sell_fills;
+  Alcotest.(check (float 1e-9)) "fresh retains no base" 0.0 fresh.reserved_base;
+  Alcotest.(check int) "seeded sells too" 2 seeded.sell_fills;
+  Alcotest.(check bool)
+    "seeded retains the rounding base (accumulation)"
+    (seeded.reserved_base > 0.0)
+    true;
+  Alcotest.(check bool)
+    "seeded grid holds more base than fresh"
+    (seeded.base > fresh.base)
+    true
+;;
+
+let test_replay_with_seed () =
+  (* The seed flows through the replay entry point. *)
+  let c = cfg ~accumulation_buffer:5.0 () in
+  let bars =
+    [| bar ~low:99.0 (); bar ~high:101.0 (); bar ~low:97.0 (); bar ~high:100.0 () |]
+  in
+  let r_fresh =
+    Dio_strategies.Grid_core.replay
+      c
+      ~bars
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let r_seeded =
+    Dio_strategies.Grid_core.replay
+      ~seed:
+        Dio_strategies.Grid_core_types.
+          { initial_base = 0.0
+          ; initial_reserved_base = 0.0
+          ; initial_accumulated_profit = 10.0
+          }
+      c
+      ~bars
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  Alcotest.(check bool)
+    "seeded replay retains base"
+    (r_seeded.final_base > r_fresh.final_base)
+    true
+;;
+
 let () =
   Alcotest.run
     "grid_core"
@@ -591,6 +716,15 @@ let () =
             "sell reconciliation with fee"
             `Quick
             test_sell_reconciliation_with_fee
+        ; Alcotest.test_case
+            "seed initializes the grid state"
+            `Quick
+            test_seed_initializes_state
+        ; Alcotest.test_case
+            "seed enables accumulation sells"
+            `Quick
+            test_seed_enables_accumulation_sells
+        ; Alcotest.test_case "replay accepts the seed" `Quick test_replay_with_seed
         ] )
     ]
 ;;
