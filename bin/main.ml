@@ -439,15 +439,20 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
     ~section:"main"
     "%d supervised asset domains initialized!"
     (List.length configs_with_fees);
-  (* Start the capital-oracle live runtime: one analysis pass immediately,
-     then background refreshes on the configured cadence. Trading domains
-     read the published qty / grid_interval / active decisions every cycle;
-     the on_publish hook wakes them so a new decision applies right away
-     instead of on the next market event. The runtime tolerates every
-     failure mode (network, history, balance) with last-known-good fallback
-     and never blocks or crashes the engine. *)
+  (* Start the capital-oracle live runtime as a SUPERVISED module (like the
+     exchange feeds and the order executor): it is registered in the
+     supervisor's connection registry, started through the standard
+     lifecycle machinery, heartbeated on each pass and liveness tick, and
+     auto-restarted by the health monitor if its loop ever dies. One
+     analysis pass runs immediately, then background refreshes on the
+     configured cadence. Trading domains read the published qty /
+     grid_interval / active decisions every cycle; the on_publish hook wakes
+     them so a new decision applies right away instead of on the next market
+     event. The runtime tolerates every failure mode (network, history,
+     balance) with last-known-good fallback and never blocks or crashes the
+     engine. *)
   (try
-     Oracle_runtime.start
+     Supervisor.start_oracle
        ~config:(Option.value config.oracle ~default:(Oracle_runtime.default_config ()))
        ~trading:configs_with_fees
        ~classes:
@@ -460,7 +465,7 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
             config.classes)
        ~on_publish:(fun _ -> Concurrency.Exchange_wakeup.signal_all ())
        ();
-     Logging.info ~section:"main" "Capital oracle runtime started"
+     Logging.info ~section:"main" "Capital oracle runtime started (supervised)"
    with
    | exn ->
      Logging.warn_f

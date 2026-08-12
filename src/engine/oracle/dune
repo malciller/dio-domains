@@ -13,4 +13,5 @@
   dio.cmc
   dio.alpaca
   dio.kraken
-  dio.hyperliquid))
+  dio.hyperliquid
+  dio.latency_profiling))

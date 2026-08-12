@@ -218,6 +218,18 @@ knobs. Every key is optional; absent keys fall back to the runtime defaults
 (`Oracle_runtime.default_config`), so a minimal section like
 `{"qty_cap_mult": 0.0}` is valid. Unknown keys are rejected at startup.
 
+The live runtime is managed by the supervisor like every other engine module
+(`Supervisor.start_oracle`): it registers an `"oracle"` entry in the
+connection registry, is started through the standard lifecycle machinery,
+is heartbeated on every published pass plus a 10s liveness ticker, and is
+auto-restarted by the health monitor if its loop ever dies. It also prefers
+the engine's in-process websocket-fed data over standalone HTTP where
+semantics match: venue pools come from the live balance stores (Kraken /
+Alpaca; Hyperliquid stays REST because its live store mixes perp margin into
+the spot USDC entry), and the grid ladder anchors at the live top-of-book
+bid (the grid's first order is a resting buy) with the last history close as
+fallback. The CLI keeps its pure HTTP paths.
+
 Allocation is two-phase and joint across each venue account: every asset is
 analyzed first (each one computes its sizing reservation - the minimum funding
 needed to reach its ATH-anchored survival runway at the tightest grid
@@ -671,7 +683,7 @@ Four summary cards across the top:
 |------|-------------|
 | **Portfolio** | Net worth (holdings + cash) and accumulated value (`ACCUM VAL`) across all exchanges |
 | **System Engine** | Active/idle strategy count, uptime, recent fill count, and aggregate strategy execution rate (`strat/s`) |
-| **Latency** | Aggregate cycle p50/p99 (median across domains with fresh windows). Green `<50µs`, yellow `<100µs`, red `≥100µs` |
+| **Latency** | Capital-oracle pass p50/p99 (the oracle runtime's per-pass window, replacing the old per-domain cycle aggregate). Green `<5s`, yellow `<30s`, red `≥30s`; dims while no fresh pass window exists |
 | **Memory / GC** | Heap size (MB) with usage bar and live ratio (%) vs. the configured `space_overhead` |
 
 #### Live Ticker
@@ -726,21 +738,25 @@ Engine-wide OCaml GC stats:
 
 #### Engine Latency
 
-Per-domain latency profiling for the four internal stages:
+Per-domain latency profiling, with the capital-oracle column replacing the
+old per-domain cycle column:
 
 | Metric | What it measures | Thresholds (µs) |
 |--------|------------------|-----------------|
-| **CYCLE** | Full busy wakeup-to-sleep cycle (work time only) | 50 / 100 |
+| **ORACLE** | The capital-oracle per-asset pipeline for that domain's asset (history fetch + survival analysis + sizing), windowed per pass | 1,000,000 / 10,000,000 |
 | **OB** | Orderbook ring-buffer consumption | 10 / 30 |
 | **STRAT** | Grid/MM strategy execution | 30 / 75 |
 | **EXEC** | Execution event consumption | 50 / 150 |
 
 Each row shows p50/p99/p999 in µs, a **trend** sparkline (EMA-smoothed
-cycle p99 over the last 15 windows), the **spike cause** tags for the
-window's max latency (`[OB]`, `[STRAT]`, `[EXEC:n]`, `[GC:MAJ]`,
-`[GC:MIN]`, allocation words), and the strategy rate in **strat/s**.
-Idle windows render as `idle`; domains whose cycle window is stale
-(>15s) drop out of the list.
+oracle p99 over the last 15 windows), the **spike cause** tags for the
+window's max latency (`[fetch]`, `[sizing]`, plus the domain tags
+`[OB]`, `[STRAT]`, `[EXEC:n]`, `[GC:MAJ]`, `[GC:MIN]`, allocation words),
+and the strategy rate in **strat/s**.
+Idle windows render as `idle`; domains whose windows are stale (oracle
+windows age out beyond the pass horizon, ~10 min; the domain stages after
+15s) drop out of the list. The engine-global oracle pass latency also
+appears in the LATENCY KPI card (p50/p99).
 
 > [!NOTE]
 > These measure **internal processing latency only** — the CPU time the

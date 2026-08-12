@@ -207,7 +207,9 @@ let format_pnl f =
 
 let format_latency_us f =
   let raw =
-    if f >= 1000.0
+    if f >= 1_000_000.0
+    then Printf.sprintf "%.1fs" (f /. 1_000_000.0)
+    else if f >= 1000.0
     then Printf.sprintf "%.1fms" (f /. 1000.0)
     else Printf.sprintf "%.0fµs" f
   in

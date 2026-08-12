@@ -343,20 +343,61 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
     ]
 ;;
 
+(** Merge the capital-oracle per-asset latency windows into the per-domain
+    latency map under the "oracle" label, so the dashboard's ENGINE LATENCY
+    rows show how long the oracle's per-asset pipeline took this pass. Keys
+    match the trading-config symbols the domains are keyed by (case
+    insensitive); the original key spelling is preserved. *)
+let merge_oracle_asset_latencies latencies =
+  let by_symbol = Hashtbl.create 16 in
+  List.iter
+    (fun (symbol, json) ->
+       Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
+    latencies;
+  List.iter
+    (fun (symbol, snap_opt) ->
+       let key = String.lowercase_ascii symbol in
+       match Hashtbl.find_opt by_symbol key, snap_opt with
+       | Some (orig, `Assoc l), Some snap ->
+         Hashtbl.replace
+           by_symbol
+           key
+           (orig, `Assoc (("oracle", json_of_latency_snapshot snap) :: l))
+       | _ -> ())
+    (Dio_oracle.Oracle_runtime.asset_profiler_snapshots ());
+  Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
+;;
+
 let json_of_domain_latencies () =
   let profilers = Dio_engine.Domain_spawner.get_domain_profiler_snapshots () in
+  let latencies =
+    List.map
+      (fun (symbol, snaps) ->
+         ( symbol
+         , `Assoc
+             (List.filter_map
+                (fun (label, snap_opt) ->
+                   match snap_opt with
+                   | Some snap -> Some (label, json_of_latency_snapshot snap)
+                   | None -> None)
+                snaps) ))
+      profilers
+  in
+  `Assoc (merge_oracle_asset_latencies latencies)
+;;
+
+(** The engine-global capital-oracle latency windows (per-pass stages),
+    serialized for the dashboard's latency cards. Empty until the runtime has
+    completed its first pass. *)
+let json_of_oracle_latency () =
+  let snaps = Dio_oracle.Oracle_runtime.profiler_snapshots () in
   `Assoc
-    (List.map
-       (fun (symbol, snaps) ->
-          ( symbol
-          , `Assoc
-              (List.filter_map
-                 (fun (label, snap_opt) ->
-                    match snap_opt with
-                    | Some snap -> Some (label, json_of_latency_snapshot snap)
-                    | None -> None)
-                 snaps) ))
-       profilers)
+    (List.filter_map
+       (fun (label, snap_opt) ->
+          match snap_opt with
+          | Some snap -> Some (label, json_of_latency_snapshot snap)
+          | None -> None)
+       snaps)
 ;;
 
 (* Memory and GC stats *)
@@ -666,6 +707,7 @@ let build_snapshot () =
     ; "all_balances", `List all_balances
     ; "recent_fills", json_of_recent_fills ()
     ; "latencies", json_of_domain_latencies ()
+    ; "oracle_latency", json_of_oracle_latency ()
     ]
 ;;
 

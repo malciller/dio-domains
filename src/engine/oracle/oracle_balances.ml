@@ -1,11 +1,26 @@
-(* One-shot account balance snapshots for the survival CLI.
+(* Account balance snapshots for the survival oracle.
 
-   This module deliberately does not use the live exchange balance stores:
-   those stores are background-feed caches owned by the trading supervisor.
-   Oracle is a short-lived process, so it fetches read-only snapshots and
-   keeps the parsing functions pure for fixture tests. *)
+   Two sources, chosen by the caller's context:
+
+   1. The live exchange balance stores (websocket-fed by the engine's
+      supervisor) - [snapshot_of_live_store]. Preferred by the live runtime
+      (oracle_runtime.ml): the data is already in-process over websocket
+      channels, so the oracle pass never pays a standalone HTTP round-trip.
+      Best-effort: an unregistered exchange or an empty store yields None and
+      the caller falls back to REST.
+
+   2. One-shot REST fetches - [fetch_account] / [fetch_task]. Used by the
+      standalone CLI (bin/oracle.ml), which has no supervisor, and by the
+      runtime when the live store is unavailable. Read-only snapshots with
+      pure parsing functions for fixture tests.
+
+   Hyperliquid is always REST: the live balance store aggregates the perp
+   clearinghouse USDC into the same "USDC" entry as spot, while the oracle's
+   pool must count spot capital only (perp margin is not grid capital), so
+   the REST spotClearinghouseState path stays authoritative there. *)
 
 open Lwt.Infix
+module Exchange = Dio_exchange.Exchange_intf
 
 type balance =
   { asset : string
@@ -381,6 +396,9 @@ let fetch_alpaca ~testnet () : (balance list, string) result Lwt.t =
 let cache : (string * bool, snapshot) Hashtbl.t = Hashtbl.create 8
 let clear_cache () = Hashtbl.clear cache
 
+(** One-shot REST account fetch, cached per (exchange, testnet) for the
+    short-lived CLI oracle. The engine runtime prefers the live websocket-fed
+    store ([fetch_account_live]) and only hits this path as fallback. *)
 let fetch_account ~exchange ~testnet () : (snapshot, string) result Lwt.t =
   let exchange = String.lowercase_ascii exchange in
   match Hashtbl.find_opt cache (exchange, testnet) with
@@ -408,6 +426,70 @@ let fetch_account ~exchange ~testnet () : (snapshot, string) result Lwt.t =
        Ok snapshot)
 ;;
 
+(** Build a balance snapshot from the live exchange registry stores - the
+    websocket-fed caches owned by the engine supervisor - instead of a
+    standalone REST call. Returns [None] when the exchange is not registered
+    (standalone CLI runs, unknown venue) or its store is empty (no websocket
+    snapshot received yet), so callers fall back to the REST fetch.
+
+    Live stores only, and only where the store's semantics match the oracle's
+    REST path:
+    - Kraken: the authenticated balances WS feed tracks the account's wallets;
+      tradeable = the WS store's spendable balance.
+    - Alpaca: the account feed holds cash (available) / equity (total) plus
+      per-symbol positions, mirroring the REST account+positions fetch.
+    - Hyperliquid is deliberately excluded: the live "USDC" store aggregates
+      the perp clearinghouse USDC with the spot wallet, while the oracle pool
+      counts spot only (margin is not grid capital). REST
+      spotClearinghouseState stays authoritative there. *)
+let snapshot_of_live_store ~(exchange : string) ~(testnet : bool) () : snapshot option =
+  let exchange = String.lowercase_ascii exchange in
+  match exchange with
+  | "kraken" | "alpaca" ->
+    (match Exchange.Registry.get exchange with
+     | None -> None
+     | Some (module Ex) ->
+       let balances = Ex.get_all_balances () in
+       if balances = []
+       then None
+       else
+         Some
+           { exchange
+           ; testnet
+           ; balances =
+               List.map
+                 (fun (asset, total) ->
+                    let available =
+                      try Ex.get_tradeable_balance ~asset with
+                      | _ -> 0.0
+                    in
+                    { asset
+                    ; available
+                    ; total
+                    ; wallet_type = "live"
+                    ; wallet_id = "engine"
+                    })
+                 balances
+           ; fetched_at = Unix.gettimeofday ()
+           })
+  | _ -> None
+;;
+
+(** Fetch an account balance snapshot, preferring the live websocket-fed
+    exchange store when it has data and falling back to the standalone REST
+    fetch (CLI behavior). *)
+let fetch_account_live ~exchange ~testnet () : (snapshot, string) result Lwt.t =
+  match snapshot_of_live_store ~exchange ~testnet () with
+  | Some snapshot -> Lwt.return (Ok snapshot)
+  | None -> fetch_account ~exchange ~testnet ()
+;;
+
 let fetch_task (task : Oracle_tasks.task) =
   fetch_account ~exchange:task.exchange ~testnet:task.config.testnet ()
+;;
+
+(** Live-store-first task fetch for the engine runtime: the websocket-fed
+    store when available, else the REST one-shot path. *)
+let fetch_task_live (task : Oracle_tasks.task) =
+  fetch_account_live ~exchange:task.exchange ~testnet:task.config.testnet ()
 ;;

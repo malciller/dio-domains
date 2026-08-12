@@ -8,6 +8,8 @@
     - Supervisor_feeds:      per-exchange WS setup, readiness gates, fees
     - Supervisor_orders:     order processing loop *)
 
+open Lwt.Infix
+
 (* Re-export public API from Supervisor_connection so callers
    (main.ml, dashboard) can continue using Supervisor.X directly. *)
 
@@ -70,4 +72,95 @@ let start_order_executor () : unit Lwt.t =
       token
   in
   Dio_engine.Order_executor.init
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Capital-oracle as a supervised module.                             *)
+(* ------------------------------------------------------------------ *)
+
+(** Capital-oracle runtime (wrapped library: explicit alias avoids opening the
+    whole Dio_oracle namespace). *)
+module Oracle_runtime = Dio_oracle.Oracle_runtime
+
+(** Heartbeat interval for the oracle connection's liveness ticker: well under
+    the health monitor's 60s passive-data timeout so a healthy loop (which can
+    legitimately sleep the full refresh cadence between passes) never reads as
+    dead, while a truly wedged loop is still flagged and restarted. *)
+let oracle_heartbeat_interval = 10.0
+
+(** The oracle's supervised connect_fn, run through the standard supervisor
+    machinery ([start_async], circuit breaker, health monitor, auto-restart):
+
+    - Transitions the connection to Connected as soon as the loop is
+      scheduled (the loop itself can take minutes on a slow first pass; the
+      meaningful liveness is "the loop is running", not "a pass finished").
+    - Keeps the connection heartbeat alive while the loop runs: a liveness
+      ticker every [oracle_heartbeat_interval] seconds, plus a heartbeat on
+      every published pass (via the composed [on_publish]).
+    - Resolves when the oracle loop ends - normally on engine shutdown
+      (graceful), or as a failure that the health monitor picks up and
+      restarts with exponential backoff. *)
+let oracle_connect_fn
+      (conn : Supervisor_types.supervised_connection)
+      ~(config : Oracle_runtime.runtime_config)
+      ~(trading : Dio_strategies.Strategy_common.trading_config list)
+      ~(classes : (string * Oracle_runtime.class_pool) list)
+      ~(on_publish : Oracle_runtime.decision list -> unit)
+      ()
+  : unit Lwt.t
+  =
+  set_state conn Connected;
+  update_data_heartbeat conn;
+  let rec liveness () =
+    if Atomic.get shutdown_requested
+    then Lwt.return_unit
+    else
+      Lwt_unix.sleep oracle_heartbeat_interval
+      >>= fun () ->
+      if Atomic.get shutdown_requested
+      then Lwt.return_unit
+      else (
+        update_data_heartbeat conn;
+        liveness ())
+  in
+  Lwt.pick
+    [ Oracle_runtime.run_loop ~config ~trading ~classes ~on_publish (); liveness () ]
+  >>= fun () ->
+  (* The loop ended: normal when either shutdown flag is set (the engine's
+     supervisor shutdown sets both); abnormal otherwise - surface it as a
+     connection failure so the health monitor restarts the oracle. *)
+  if Atomic.get shutdown_requested || Oracle_runtime.is_stopped ()
+  then Lwt.return_unit
+  else Lwt.fail (Failure "capital-oracle loop ended unexpectedly")
+;;
+
+(** Start the capital oracle as a supervised module: registered in the
+    connection registry like every other module ("oracle"), started through
+    the standard supervisor machinery, heartbeated on liveness ticks and
+    published passes, and auto-restarted by the health monitor if the loop
+    ever dies. [on_publish] is composed with the oracle's own pass hook - the
+    engine uses it to wake trading domains; the supervisor adds the
+    connection heartbeat. *)
+let start_oracle
+      ~(config : Oracle_runtime.runtime_config)
+      ~(trading : Dio_strategies.Strategy_common.trading_config list)
+      ~(classes : (string * Oracle_runtime.class_pool) list)
+      ~(on_publish : Oracle_runtime.decision list -> unit)
+      ()
+  =
+  let conn = register ~name:"oracle" ~connect_fn:None in
+  let supervised_loop () =
+    oracle_connect_fn
+      conn
+      ~config
+      ~trading
+      ~classes
+      ~on_publish:(fun decisions ->
+        (* Every published pass is a data heartbeat for the supervisor. *)
+        update_data_heartbeat conn;
+        on_publish decisions)
+      ()
+  in
+  set_connect_fn conn (Some supervised_loop);
+  start_async conn
 ;;
