@@ -441,6 +441,7 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
      and never blocks or crashes the engine. *)
   (try
      Oracle_runtime.start
+       ~config:(Option.value config.oracle ~default:(Oracle_runtime.default_config ()))
        ~trading:configs_with_fees
        ~classes:
          (List.map

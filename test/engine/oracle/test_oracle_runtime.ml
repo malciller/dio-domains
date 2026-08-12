@@ -59,7 +59,45 @@ let test_default_qty_cap_mult_uncapped () =
      with all capital deployed). *)
   let d = default_config () in
   Alcotest.(check (float 0.0001)) "qty_cap_mult default" 0.0 d.qty_cap_mult;
-  Alcotest.(check (float 0.0001)) "poll_seconds default" 30.0 d.poll_seconds
+  Alcotest.(check (float 0.0001)) "poll_seconds default" 30.0 d.poll_seconds;
+  Alcotest.(check (float 0.0001))
+    "startup_wait_seconds default"
+    60.0
+    d.startup_wait_seconds
+;;
+
+let test_tracks_asset () =
+  (* Only assets on the exchanges the runtime models (kraken, hyperliquid,
+     alpaca) get a published decision, so only they are startup-gated. *)
+  Alcotest.(check bool)
+    "kraken tracked"
+    true
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"kraken" ~symbol:"BTC/USD");
+  Alcotest.(check bool)
+    "hyperliquid tracked"
+    true
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"hyperliquid" ~symbol:"BTC");
+  Alcotest.(check bool)
+    "alpaca tracked"
+    true
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"alpaca" ~symbol:"QQQ");
+  Alcotest.(check bool)
+    "ibkr not tracked"
+    false
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"ibkr" ~symbol:"AAPL");
+  Alcotest.(check bool)
+    "lighter not tracked"
+    false
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"lighter" ~symbol:"BTC")
+;;
+
+let test_first_pass_attempt_done_fresh () =
+  (* Fresh process, no runtime loop running: no pass attempt has finished, so
+     the flag is false (domains stay gated on the startup wait). *)
+  Alcotest.(check bool)
+    "first pass attempt not done"
+    false
+    (Dio_oracle.Oracle_runtime.first_pass_attempt_done ())
 ;;
 
 let test_jitter_bounded () =
@@ -132,6 +170,13 @@ let () =
             `Quick
             test_default_qty_cap_mult_uncapped
         ; Alcotest.test_case "jitter bounded" `Quick test_jitter_bounded
+        ] )
+    ; ( "startup-gate support"
+      , [ Alcotest.test_case "tracks_asset" `Quick test_tracks_asset
+        ; Alcotest.test_case
+            "first pass attempt not done fresh"
+            `Quick
+            test_first_pass_attempt_done_fresh
         ] )
     ; ( "trigger"
       , [ Alcotest.test_case "request_pass wakes early" `Quick test_trigger_wakes_early

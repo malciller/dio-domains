@@ -402,8 +402,20 @@ let amend_order ~token ?retry_config (request : amend_request) =
                        Ex.round_price ~symbol ~price:current_price
                      in
                      let diff = abs_float (rounded_new_price -. rounded_current_price) in
-                     (* Skip if difference is below epsilon (1e-9). *)
-                     diff < 0.000000001
+                     (* Quantity must ALSO be checked: a qty-only amendment
+                        (e.g. grid re-sizing at an unchanged price) must not be
+                        suppressed here, or the qty change is silently dropped
+                        while the strategy keeps re-pushing it every cycle —
+                        visible as an amend that "hangs" with no log output.
+                        Compare against the order's original qty; an amend that
+                        only differs in remaining/partial fill is still a change. *)
+                     let qty_matches =
+                       match request.new_quantity with
+                       | Some nq -> abs_float (nq -. current_order.qty) < 1e-9
+                       | None -> true
+                     in
+                     (* Skip only if NO requested field actually changes. *)
+                     diff < 0.000000001 && qty_matches
                    | None -> false)
                 | None ->
                   (* Order absent from local WS cache. This does not imply
@@ -425,6 +437,26 @@ let amend_order ~token ?retry_config (request : amend_request) =
            then (
              (* Clear in-flight entry; amendment was suppressed as a no-op. *)
              let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
+             (* Log at INFO so no-op suppression is visible: previously this
+                 path was silent, making repeated suppressed amends look like
+                 a hung order. *)
+             let reason =
+               match request.new_quantity with
+               | Some nq ->
+                 Printf.sprintf
+                   "price=%.10f qty=%.8f"
+                   (Option.value request.new_limit_price ~default:0.0)
+                   nq
+               | None ->
+                 Printf.sprintf
+                   "price=%.10f"
+                   (Option.value request.new_limit_price ~default:0.0)
+             in
+             Logging.info_f
+               ~section
+               "Amendment suppressed for order %s (no-op: %s unchanged)"
+               request.order_id
+               reason;
              (* Return sentinel [amend_id = "skipped_no_change"] so the
                  supervisor routes to [handle_order_amendment_skipped] rather
                  than [handle_order_amended], preserving tracking state. *)

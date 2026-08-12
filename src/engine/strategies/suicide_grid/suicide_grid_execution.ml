@@ -734,7 +734,11 @@ let evaluate_sell_leg
       ~ecfg
       ~locked_in_sells
   =
-  let qty = venue_lot_qty state.grid_qty asset.exchange state in
+  let qty =
+    match state.last_buy_fill_qty with
+    | Some q when q > 0.0 -> q
+    | _ -> venue_lot_qty state.grid_qty asset.exchange state
+  in
   let available_base =
     if Float.is_nan asset_balance
     then 0.0
@@ -827,7 +831,11 @@ let evaluate_sell_leg
   then (
     let asset_bal = asset_balance in
     let grid_interval = asset.grid_interval in
-    let qty = venue_lot_qty state.grid_qty asset.exchange state in
+    let qty =
+      match state.last_buy_fill_qty with
+      | Some q when q > 0.0 -> q
+      | _ -> venue_lot_qty state.grid_qty asset.exchange state
+    in
     let sell_mult = state.cached_sell_mult in
     (* Determine target price & qty for sell placement *)
     let target_sell_price_opt, target_sell_qty_override =

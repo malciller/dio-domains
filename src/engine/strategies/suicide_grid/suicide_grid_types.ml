@@ -101,6 +101,10 @@ type strategy_state =
     (* fill price of most recent buy; cost basis for sell profit calc *)
   ; mutable last_sell_fill_price : float option
     (* fill price of most recent sell; cost basis for consecutive sells *)
+  ; mutable last_buy_fill_qty : float option
+    (* filled qty of most recent buy; sizes follow-up sells *)
+  ; mutable last_sell_fill_qty : float option
+    (* filled qty of most recent sell; sizes consecutive sells *)
   ; mutable grid_qty : float (* cached config qty; used by fill handler for profit calc *)
   ; mutable cached_sell_mult : float
     (* cached parsed sell_mult; avoids float_of_string per cycle *)
@@ -174,6 +178,12 @@ let rec get_strategy_state asset_symbol =
     let persisted_last_sell_fill_price =
       Dio_persistence.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol
     in
+    let persisted_last_buy_fill_qty =
+      Dio_persistence.State_persistence.load_last_buy_fill_qty ~symbol:asset_symbol
+    in
+    let persisted_last_sell_fill_qty =
+      Dio_persistence.State_persistence.load_last_sell_fill_qty ~symbol:asset_symbol
+    in
     let persisted_sell_levels =
       Dio_persistence.State_persistence.load_persisted_sell_levels ~symbol:asset_symbol
     in
@@ -204,6 +214,8 @@ let rec get_strategy_state asset_symbol =
       ; reserved_base = persisted_reserved_base
       ; last_buy_fill_price = persisted_last_buy_fill_price
       ; last_sell_fill_price = persisted_last_sell_fill_price
+      ; last_buy_fill_qty = persisted_last_buy_fill_qty
+      ; last_sell_fill_qty = persisted_last_sell_fill_qty
       ; grid_qty = 0.0
       ; cached_sell_mult = 1.0
       ; cached_ecfg = default_kraken_config

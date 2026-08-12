@@ -131,7 +131,7 @@ let test_parse_classes_absent () =
 
 let test_parse_oracle_config_full () =
   let json_str =
-    {|{"oracle": {"qty_cap_mult": 0.0, "poll_seconds": 5.0, "refresh_seconds": 60.0, "target_survival": 0.95, "max_capital": 1000.5, "horizons": [1, 7, 30]}}|}
+    {|{"oracle": {"qty_cap_mult": 0.0, "poll_seconds": 5.0, "refresh_seconds": 60.0, "target_survival": 0.95, "max_capital": 1000.5, "horizons": [1, 7, 30], "startup_wait_seconds": 45.0}}|}
   in
   let json = Yojson.Basic.from_string json_str in
   match Dio_engine.Config.parse_oracle_config json with
@@ -141,6 +141,7 @@ let test_parse_oracle_config_full () =
     Alcotest.(check (float 0.0001)) "poll_seconds" 5.0 c.poll_seconds;
     Alcotest.(check (float 0.0001)) "refresh_seconds" 60.0 c.refresh_seconds;
     Alcotest.(check (float 0.0001)) "target_survival" 0.95 c.target_survival;
+    Alcotest.(check (float 0.0001)) "startup_wait_seconds" 45.0 c.startup_wait_seconds;
     Alcotest.(check (option (float 0.0001))) "max_capital" (Some 1000.5) c.max_capital;
     Alcotest.(check (option (list int))) "horizons" (Some [ 1; 7; 30 ]) c.horizons
 ;;
@@ -163,7 +164,11 @@ let test_parse_oracle_config_partial_defaults () =
     Alcotest.(check (option (float 0.0001)))
       "max_capital default"
       d.max_capital
-      c.max_capital
+      c.max_capital;
+    Alcotest.(check (float 0.0001))
+      "startup_wait_seconds default"
+      d.startup_wait_seconds
+      c.startup_wait_seconds
 ;;
 
 let test_parse_oracle_config_absent () =
