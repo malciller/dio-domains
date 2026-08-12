@@ -1,6 +1,10 @@
 open Config
 module Fear_and_greed = Cmc.Fear_and_greed
 
+(* Capital-oracle runtime (wrapped library: explicit alias avoids opening the
+   whole Dio_oracle namespace). *)
+module Oracle_runtime = Dio_oracle.Oracle_runtime
+
 (* Exchange interface and types *)
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
@@ -173,18 +177,43 @@ let asset_domain_worker
     let latency_active = ref false in
     let exec_ready_cycle = ref 0 in
     let open_orders_dirty = ref true in
-    (* Initialize strategy configuration refs based on strategy type *)
+    (* Initialize strategy configuration refs based on strategy type.
+       The capital-oracle runtime publishes a per-asset decision (qty,
+       grid_interval, active) to a lock-free snapshot; when a decision exists
+       and the asset is active, its qty/gi win over the F&G-resolved values. *)
     let baseline_price = ref None in
     let last_known_fng = ref (Fear_and_greed.fetch_value ()) in
+    let oracle_decision_at_startup =
+      Oracle_runtime.decision_for
+        ~exchange:asset_with_fees.exchange
+        ~symbol:asset_with_fees.symbol
+    in
+    (* Tracks the last applied oracle halt state so the per-cycle block only
+         logs on active<->inactive transitions. Initialized from the startup
+         decision (an asset born inactive starts quiet). *)
+    let oracle_halted_prev =
+      ref
+        (match oracle_decision_at_startup with
+         | Some d -> not d.active
+         | None -> false)
+    in
     let grid_strategy_asset_ref =
       if asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid"
       then (
         let grid_interval =
-          match resolved_grid_interval with
-          | Some g -> g
-          | None ->
-            let lo, hi = asset_with_fees.grid_interval in
-            (lo +. hi) /. 2.0
+          match oracle_decision_at_startup with
+          | Some d when d.active -> d.grid_interval
+          | _ ->
+            (match resolved_grid_interval with
+             | Some g -> g
+             | None ->
+               let lo, hi = asset_with_fees.grid_interval in
+               (lo +. hi) /. 2.0)
+        in
+        let qty =
+          match oracle_decision_at_startup with
+          | Some d when d.active -> Printf.sprintf "%.8g" d.qty
+          | _ -> asset_with_fees.qty
         in
         let accumulation_buffer =
           match resolved_accumulation_buffer with
@@ -198,7 +227,7 @@ let asset_domain_worker
           (Some
              { Dio_strategies.Suicide_grid.exchange = asset_with_fees.exchange
              ; symbol = asset_with_fees.symbol
-             ; qty = asset_with_fees.qty
+             ; qty
              ; grid_interval
              ; sell_mult = asset_with_fees.sell_mult
              ; strategy = asset_with_fees.strategy
@@ -707,11 +736,84 @@ let asset_domain_worker
              closed)
         | _ -> false
       in
+      (* Capital-oracle decision application. Read every cycle (a lock-free
+            Atomic.get of an immutable snapshot), so a halted asset can be
+            re-activated and a changed qty/gi adopted as soon as the runtime
+            publishes - not only when market events trigger a cycle. Runs
+            OUTSIDE the should_execute gate on purpose: an inactive asset
+            never enters the execution block, so its re-activation must not
+            depend on it. The oracle's qty/gi win over the F&G re-evaluation
+            above (the oracle owns the sizing while it has a decision). *)
+      let oracle_decision =
+        Oracle_runtime.decision_for
+          ~exchange:asset_with_fees.exchange
+          ~symbol:asset_with_fees.symbol
+      in
+      let oracle_halted =
+        match oracle_decision with
+        | Some d -> not d.active
+        | None -> false
+      in
+      (match oracle_decision, !grid_strategy_asset_ref with
+       | Some d, Some asset when d.active ->
+         let qty_str = Printf.sprintf "%.8g" d.qty in
+         let qty_changed = qty_str <> asset.qty in
+         let gi_changed = abs_float (d.grid_interval -. asset.grid_interval) > 1e-12 in
+         if qty_changed || gi_changed
+         then (
+           let new_asset =
+             { asset with qty = qty_str; grid_interval = d.grid_interval }
+           in
+           grid_strategy_asset_ref := Some new_asset;
+           let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
+           (try st.grid_qty <- float_of_string qty_str with
+            | Failure _ -> ());
+           should_execute_strategy := true;
+           Logging.info_f
+             ~section
+             "[%s/%s] Capital oracle updated sizing: qty %.8g gi %.4f%% (D_surv %.1f%%)"
+             asset.exchange
+             asset.symbol
+             d.qty
+             d.grid_interval
+             (d.d_surv *. 100.0))
+       | _ -> ());
+      (* Log only on active<->inactive transitions, not every cycle. *)
+      if oracle_halted <> !oracle_halted_prev
+      then (
+        oracle_halted_prev := oracle_halted;
+        match oracle_decision with
+        | Some d when d.active ->
+          Logging.info_f
+            ~section
+            "[%s/%s] Capital oracle re-activated (qty %.8g gi %.4f%%); resuming orders"
+            asset.exchange
+            asset.symbol
+            d.qty
+            d.grid_interval
+        | Some d ->
+          Logging.warn_f
+            ~section
+            "[%s/%s] Capital oracle INACTIVE: %s (D_surv %.1f%%, qty %.8g, gi %.4f%%); \
+             new orders suspended, fills still tracked"
+            asset.exchange
+            asset.symbol
+            (if d.reason = "" then "capital reallocated" else d.reason)
+            (d.d_surv *. 100.0)
+            d.qty
+            d.grid_interval
+        | None ->
+          Logging.info_f
+            ~section
+            "[%s/%s] No capital-oracle decision; resuming config/F&G behavior"
+            asset.exchange
+            asset.symbol);
       let should_execute =
         !exec_ready
         && !should_execute_strategy
         && has_exec_fn ()
-        && not equity_market_closed
+        && (not equity_market_closed)
+        && not oracle_halted
       in
       if should_execute
       then (
