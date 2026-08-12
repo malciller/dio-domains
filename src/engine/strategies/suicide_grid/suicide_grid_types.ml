@@ -91,6 +91,14 @@ type strategy_state =
     (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   ; mutable just_filled_buy : bool
     (* true when a buy order has filled; bypasses recovery gate on sell placement *)
+  ; mutable force_buy_reanchor : bool
+    (* true when the sizing source (capital oracle) published a changed
+       qty/grid_interval: the buy-trailing leg then re-anchors the resting
+       buy to the new sizing target even when that means amending it DOWN
+       (normal trailing only moves the buy up, so a widening grid interval
+       would otherwise leave the book running at the old, tighter spacing).
+       Set by the domain worker on sizing change, cleared by the strategy
+       once the buy sits at the target. *)
   ; mutable reserved_quote : float
     (* quote amount reserved by current open buy for this symbol *)
   ; mutable accumulated_profit : float
@@ -209,6 +217,7 @@ let rec get_strategy_state asset_symbol =
       ; capital_low_at_balance = 0.0
       ; resuming_after_balance_flag = false
       ; just_filled_buy = false
+      ; force_buy_reanchor = false
       ; reserved_quote = 0.0
       ; accumulated_profit = persisted_accumulated_profit
       ; reserved_base = persisted_reserved_base

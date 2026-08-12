@@ -513,6 +513,9 @@ let evaluate_buy_leg
           then (
             buy_attempted := true;
             state.last_buy_order_price <- Some buy_price;
+            (* A fresh buy is placed at the current sizing target, so any
+               pending re-anchor is satisfied. *)
+            state.force_buy_reanchor <- false;
             Logging.info_f
               ~section
               "Placed buy order for %s: %.8f @ %.4f"
@@ -594,7 +597,15 @@ let evaluate_buy_leg
             (abs_float (target_buy_price -. current_buy_price_rounded))
         in
         let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
-        if target_buy_price > current_buy_price || qty_mismatch
+        (* A sizing re-anchor (the capital oracle published a changed qty/gi -
+           flagged by the domain worker on [force_buy_reanchor]) amends the
+           resting buy to the new sizing target in BOTH directions. Normal
+           trailing only moves the buy UP, so a widened grid interval would
+           otherwise leave the book running at the old, tighter spacing (buy
+           too close to the market, rungs not 2*gi apart) until the market
+           happens to rise. *)
+        let reanchor_buy = state.force_buy_reanchor in
+        if target_buy_price > current_buy_price || qty_mismatch || reanchor_buy
         then (
           let allow =
             if qty_mismatch
@@ -638,6 +649,7 @@ let evaluate_buy_leg
               in
               ignore (push_order ~now ~state order);
               state.last_buy_order_price <- Some target_buy_price;
+              state.force_buy_reanchor <- false;
               if qty_mismatch
               then
                 Logging.info_f
@@ -658,7 +670,12 @@ let evaluate_buy_leg
                 asset.symbol
                 quote_needed
                 quote_bal
-            else Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol))
+            else
+              Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
+              (* The re-anchor target is already where the buy sits (within the
+             min-move threshold): nothing to amend, the sizing is applied. *))
+          else if reanchor_buy && price_diff_rounded < min_move_threshold
+          then state.force_buy_reanchor <- false)
       | _ -> ())
     else (
       match state.last_buy_order_price, state.last_buy_order_id with
@@ -668,14 +685,17 @@ let evaluate_buy_leg
         let target_buy_price =
           if bid_price > 0.0 then min raw_target bid_price else raw_target
         in
-        if target_buy_price > current_buy_price || qty_mismatch
+        let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
+        let current_buy_price_rounded = state.cached_round_price current_buy_price in
+        let price_diff_rounded =
+          state.cached_round_price
+            (abs_float (target_buy_price -. current_buy_price_rounded))
+        in
+        (* Sizing re-anchor (see the with-sell branch): amend the resting buy
+           to the oracle's target in both directions. *)
+        let reanchor_buy = state.force_buy_reanchor in
+        if target_buy_price > current_buy_price || qty_mismatch || reanchor_buy
         then (
-          let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
-          let current_buy_price_rounded = state.cached_round_price current_buy_price in
-          let price_diff_rounded =
-            state.cached_round_price
-              (abs_float (target_buy_price -. current_buy_price_rounded))
-          in
           let allow =
             if qty_mismatch
             then (
@@ -718,6 +738,7 @@ let evaluate_buy_leg
               in
               ignore (push_order ~now ~state order);
               state.last_buy_order_price <- Some target_buy_price;
+              state.force_buy_reanchor <- false;
               if qty_mismatch
               then
                 Logging.info_f
@@ -737,7 +758,11 @@ let evaluate_buy_leg
                 "Insufficient quote balance to trail buy: need %.2f, have %.2f"
                 quote_needed
                 quote_bal
-            else Logging.warn_f ~section "No quote balance for buy trailing"))
+            else
+              Logging.warn_f ~section "No quote balance for buy trailing"
+              (* The re-anchor target is already where the buy sits: done. *))
+          else if reanchor_buy && price_diff_rounded < min_move_threshold
+          then state.force_buy_reanchor <- false)
       | _ -> ());
     state.last_cycle <- cycle)
   else state.last_cycle <- cycle;
