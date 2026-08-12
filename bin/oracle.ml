@@ -478,7 +478,12 @@ let deepen_series (a : args) ~(exchange : string) (series : Oracle_types.series)
 
 (** Load the class member pool: explicit --members when online, config.json
     "classes" members for the resolved class when online, otherwise the asset
-    alone (offline mode). Members are deepened like the asset itself. *)
+    alone (offline mode). The member that IS the active asset uses the
+    exchange (fetched + deepened like the asset); every other member gathers
+    its history PURELY from Yahoo (whitelisted, disk-cached, delta through
+    today) - the class surface is a blend input, never a decision subject,
+    so the exchange is not probed for alt coins it does not even list (the
+    old per-pass Hyperliquid "no spot history" warning spam). *)
 let load_members
       (a : args)
       (classes : (string * Dio_engine.Config.class_pool) list)
@@ -505,15 +510,44 @@ let load_members
     let rec go = function
       | [] -> Lwt.return []
       | s :: rest ->
-        fetch_series a s
-        >>= fun series ->
-        go rest
-        >>= fun acc ->
-        if Array.length series.bars = 0
-        then Lwt.return acc
-        else
-          deepen_series a ~exchange:a.exchange series
-          >>= fun (series, _) -> Lwt.return (series :: acc)
+        (match
+           Dio_oracle.Oracle_runtime.class_member_source
+             ~exchange:a.exchange
+             ~asset_symbol:asset.Oracle_types.symbol
+             s
+         with
+         | `None -> go rest
+         | `Exchange ->
+           fetch_series a s
+           >>= fun series ->
+           go rest
+           >>= fun acc ->
+           if Array.length series.bars = 0
+           then Lwt.return acc
+           else
+             deepen_series a ~exchange:a.exchange series
+             >>= fun (series, _) -> Lwt.return (series :: acc)
+         | `Yahoo yahoo_symbol ->
+           Oracle_cache.with_delta
+             ~exchange:"yahoo-class"
+             ~symbol:yahoo_symbol
+             ~today:(today_iso ())
+             ~fetch:(fun boundary ->
+               let start_date = Option.value boundary ~default:"2015-01-01" in
+               Oracle_fetch_yahoo.fetch_daily
+                 ~start_date
+                 ~symbol:yahoo_symbol
+                 ~end_date:(today_iso ())
+                 ())
+             ()
+           >>= fun bars ->
+           go rest
+           >>= fun acc ->
+           if bars = []
+           then Lwt.return acc
+           else
+             Lwt.return
+               (Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol bars :: acc))
     in
     go syms
     >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)
