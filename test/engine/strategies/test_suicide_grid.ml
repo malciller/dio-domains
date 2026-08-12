@@ -335,6 +335,7 @@ let test_accumulation_profit_tracking () =
     "buy001"
     Dio_strategies.Strategy_common.Buy
     ~fill_price:39.50
+    ~fill_qty:0.35
     None;
   (* Verify buy fill recorded the price for later profit calc *)
   check
@@ -350,6 +351,7 @@ let test_accumulation_profit_tracking () =
     "sell001"
     Dio_strategies.Strategy_common.Sell
     ~fill_price:39.90
+    ~fill_qty:0.35
     None;
   (* Verify profit was accumulated *)
   let expected_gross = (39.90 -. 39.50) *. 0.35 in
@@ -594,6 +596,7 @@ let test_accumulation_full_lifecycle () =
       buy_id
       Dio_strategies.Strategy_common.Buy
       ~fill_price:buy_price
+      ~fill_qty:0.35
       None;
     state.open_sell_orders <- [ sell_id, sell_price, 1.0 ];
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled
@@ -602,6 +605,7 @@ let test_accumulation_full_lifecycle () =
       sell_id
       Dio_strategies.Strategy_common.Sell
       ~fill_price:sell_price
+      ~fill_qty:0.35
       None
   done;
   (* After 5 cycles: ~5 * 0.128884 ≈ 0.644 USDC accumulated *)
@@ -710,6 +714,7 @@ let test_accumulation_multi_strategy_isolation () =
       buy_id
       Dio_strategies.Strategy_common.Buy
       ~fill_price:84000.0
+      ~fill_qty:0.0002
       None;
     btc.open_sell_orders <- [ sell_id, 84336.0, 1.0 ];
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled
@@ -718,6 +723,7 @@ let test_accumulation_multi_strategy_isolation () =
       sell_id
       Dio_strategies.Strategy_common.Sell
       ~fill_price:84336.0
+      ~fill_qty:0.0002
       None
   done;
   let btc_profit = btc.accumulated_profit in
@@ -740,6 +746,7 @@ let test_accumulation_multi_strategy_isolation () =
       buy_id
       Dio_strategies.Strategy_common.Buy
       ~fill_price:39.50
+      ~fill_qty:0.35
       None;
     hype.open_sell_orders <- [ sell_id, 39.90, 1.0 ];
     Dio_strategies.Suicide_grid.Strategy.handle_order_filled
@@ -748,6 +755,7 @@ let test_accumulation_multi_strategy_isolation () =
       sell_id
       Dio_strategies.Strategy_common.Sell
       ~fill_price:39.90
+      ~fill_qty:0.35
       None
   done;
   let hype_profit = hype.accumulated_profit in

@@ -25,6 +25,8 @@ let flush_persistence asset_symbol =
                , state.last_fill_oid
                , state.last_buy_fill_price
                , state.last_sell_fill_price
+               , state.last_buy_fill_qty
+               , state.last_sell_fill_qty
                , state.persisted_sell_levels ))
            else None)
     in
@@ -35,6 +37,8 @@ let flush_persistence asset_symbol =
         , last_fill_oid
         , last_buy_fill_price
         , last_sell_fill_price
+        , last_buy_fill_qty
+        , last_sell_fill_qty
         , persisted_sell_levels ) ->
       Dio_persistence.State_persistence.save_async
         ~symbol:asset_symbol
@@ -43,6 +47,8 @@ let flush_persistence asset_symbol =
         ~last_fill_oid
         ~last_buy_fill_price
         ~last_sell_fill_price
+        ~last_buy_fill_qty
+        ~last_sell_fill_qty
         ~persisted_sell_levels
         ()
     | None -> ())
@@ -264,13 +270,17 @@ let add_processed_fill state order_id =
 ;;
 
 (** Handles order fill. *)
-let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id =
+let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       let acc_qty = venue_lot_qty state.grid_qty state.exchange_id state in
+       let acc_qty =
+         if fill_qty > 0.0
+         then fill_qty
+         else venue_lot_qty state.grid_qty state.exchange_id state
+       in
        let is_persisted_fill =
          Hashtbl.mem state.processed_fills order_id
          ||
@@ -337,7 +347,9 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
          if side = Buy
          then (
            state.last_buy_fill_price <- Some fill_price;
+           state.last_buy_fill_qty <- Some acc_qty;
            state.last_sell_fill_price <- None;
+           state.last_sell_fill_qty <- None;
            if persistence_accumulation_exchange state.exchange_id
            then state.persistence_dirty <- true;
            if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0
@@ -417,6 +429,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price cl_ord_id 
             then
               state.anticipated_base_credit
               <- Float.max 0.0 (state.anticipated_base_credit -. acc_qty);
+            state.last_sell_fill_qty <- Some acc_qty;
             let cost_basis =
               match state.last_sell_fill_price with
               | Some prev_sell when prev_sell > 0.0 && prev_sell < sell_fill_price ->
@@ -661,8 +674,12 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
        ())
 ;;
 
-(** Handles skipped order amendment. *)
-let handle_order_amendment_skipped ~now:_ asset_symbol order_id _ _ =
+(** Handles skipped order amendment (suppressed as a no-op by the executor).
+
+    Clears the pending-amend entry and applies a short cooldown so the
+    strategy does not re-push the same suppressed amendment every cycle
+    (previously this produced a silent retry loop that looked like a hang). *)
+let handle_order_amendment_skipped ~now asset_symbol order_id side _ =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
@@ -677,6 +694,15 @@ let handle_order_amendment_skipped ~now:_ asset_symbol order_id _ _ =
                in
                not matches_amend)
             state.pending_orders;
+       (* Throttle re-issue of a suppressed amendment. *)
+       Hashtbl.replace state.amend_cooldowns order_id (now +. 5.0);
+       (* A suppressed amendment is a terminal outcome of the amend lifecycle:
+          clear the in-flight flag or it stays set forever, silently blocking
+          every later qty-only amendment on this symbol (the qty_mismatch gate
+          requires [not state.inflight_amend_buy]). *)
+       (match side with
+        | Buy -> state.inflight_amend_buy <- false
+        | Sell -> ());
        ())
 ;;
 
@@ -722,6 +748,11 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
          else 2.0
        in
        Hashtbl.replace state.amend_cooldowns order_id (now +. cooldown_duration);
+       (* Terminal outcome of the amend lifecycle: clear the in-flight flag
+          so later qty-only amendments are not silently blocked. *)
+       (match side with
+        | Buy -> state.inflight_amend_buy <- false
+        | Sell -> ());
        let is_order_gone = is_cache_miss || is_cannot_modify || is_margin_error in
        if is_order_gone
        then (

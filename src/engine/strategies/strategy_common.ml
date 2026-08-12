@@ -421,6 +421,7 @@ module type S = sig
     -> string
     -> order_side
     -> fill_price:float
+    -> fill_qty:float
     -> string option
     -> unit
 

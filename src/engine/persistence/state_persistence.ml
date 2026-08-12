@@ -11,6 +11,8 @@
    - last_buy_fill_price: fill price of the most recent buy, used to
      compute profit on the subsequent sell fill.
    - last_sell_fill_price: fill price of the most recent sell.
+   - last_buy_fill_qty: filled quantity of the most recent buy.
+   - last_sell_fill_qty: filled quantity of the most recent sell.
 
    Storage path: /app/data/accumulated_state.json (production),
    ./data/accumulated_state.json (development).
@@ -18,7 +20,8 @@
    File format:
    { "SYMBOL": { "reserved_base": float, "accumulated_profit": float,
      "last_fill_oid": string, "last_buy_fill_price": float,
-     "last_sell_fill_price": float }, ... }
+     "last_sell_fill_price": float, "last_buy_fill_qty": float,
+     "last_sell_fill_qty": float }, ... }
 *)
 
 let section = "state_persistence"
@@ -82,6 +85,8 @@ type symbol_state =
   ; mutable last_fill_oid : string option
   ; mutable last_buy_fill_price : float option
   ; mutable last_sell_fill_price : float option
+  ; mutable last_buy_fill_qty : float option
+  ; mutable last_sell_fill_qty : float option
   ; mutable persisted_sell_levels : (float * float) list
   }
 
@@ -111,6 +116,8 @@ let populate_cache_from_file_unsafe () =
        let last_sell_fill_price =
          get_float_opt json ~symbol ~field:"last_sell_fill_price"
        in
+       let last_buy_fill_qty = get_float_opt json ~symbol ~field:"last_buy_fill_qty" in
+       let last_sell_fill_qty = get_float_opt json ~symbol ~field:"last_sell_fill_qty" in
        let persisted_sell_levels =
          try
            json
@@ -133,6 +140,8 @@ let populate_cache_from_file_unsafe () =
          ; last_fill_oid
          ; last_buy_fill_price
          ; last_sell_fill_price
+         ; last_buy_fill_qty
+         ; last_sell_fill_qty
          ; persisted_sell_levels
          }
        in
@@ -160,6 +169,8 @@ let ensure_symbol_in_cache ~symbol =
           ; last_fill_oid = None
           ; last_buy_fill_price = None
           ; last_sell_fill_price = None
+          ; last_buy_fill_qty = None
+          ; last_sell_fill_qty = None
           ; persisted_sell_levels = []
           }
         in
@@ -233,6 +244,34 @@ let load_last_sell_fill_price ~symbol =
   result
 ;;
 
+(** Loads last_buy_fill_qty for a symbol. Returns [None] if absent. Acquires cache_mutex. *)
+let load_last_buy_fill_qty ~symbol =
+  ensure_symbol_in_cache ~symbol;
+  Mutex.lock cache_mutex;
+  let state = Hashtbl.find cache symbol in
+  let result = state.last_buy_fill_qty in
+  Mutex.unlock cache_mutex;
+  (match result with
+   | Some qty ->
+     Logging.debug_f ~section "Loaded last_buy_fill_qty=%.8f for %s" qty symbol
+   | None -> ());
+  result
+;;
+
+(** Loads last_sell_fill_qty for a symbol. Returns [None] if absent. Acquires cache_mutex. *)
+let load_last_sell_fill_qty ~symbol =
+  ensure_symbol_in_cache ~symbol;
+  Mutex.lock cache_mutex;
+  let state = Hashtbl.find cache symbol in
+  let result = state.last_sell_fill_qty in
+  Mutex.unlock cache_mutex;
+  (match result with
+   | Some qty ->
+     Logging.debug_f ~section "Loaded last_sell_fill_qty=%.8f for %s" qty symbol
+   | None -> ());
+  result
+;;
+
 (** Loads persisted_sell_levels for a symbol. Returns [] if absent. Acquires cache_mutex. *)
 let load_persisted_sell_levels ~symbol =
   ensure_symbol_in_cache ~symbol;
@@ -288,6 +327,16 @@ let write_to_disk ~symbol ~state () =
            | Some price -> [ "last_sell_fill_price", `Float price ]
            | None -> []
          in
+         let buy_qty_field =
+           match state.last_buy_fill_qty with
+           | Some qty -> [ "last_buy_fill_qty", `Float qty ]
+           | None -> []
+         in
+         let sell_qty_field =
+           match state.last_sell_fill_qty with
+           | Some qty -> [ "last_sell_fill_qty", `Float qty ]
+           | None -> []
+         in
          let sell_levels_field =
            if state.persisted_sell_levels <> []
            then (
@@ -307,6 +356,8 @@ let write_to_disk ~symbol ~state () =
               @ oid_field
               @ buy_price_field
               @ sell_price_field
+              @ buy_qty_field
+              @ sell_qty_field
               @ sell_levels_field)
          in
          let updated = List.filter (fun (k, _) -> k <> symbol) entries in
@@ -340,6 +391,8 @@ let save
       ~last_fill_oid
       ~last_buy_fill_price
       ~last_sell_fill_price
+      ?last_buy_fill_qty
+      ?last_sell_fill_qty
       ?persisted_sell_levels
       ()
   =
@@ -351,6 +404,8 @@ let save
   if last_fill_oid <> None then state.last_fill_oid <- last_fill_oid;
   state.last_buy_fill_price <- last_buy_fill_price;
   state.last_sell_fill_price <- last_sell_fill_price;
+  Option.iter (fun qty -> state.last_buy_fill_qty <- qty) last_buy_fill_qty;
+  Option.iter (fun qty -> state.last_sell_fill_qty <- qty) last_sell_fill_qty;
   Option.iter (fun levels -> state.persisted_sell_levels <- levels) persisted_sell_levels;
   let snapshot =
     { reserved_base = state.reserved_base
@@ -358,6 +413,8 @@ let save
     ; last_fill_oid = state.last_fill_oid
     ; last_buy_fill_price = state.last_buy_fill_price
     ; last_sell_fill_price = state.last_sell_fill_price
+    ; last_buy_fill_qty = state.last_buy_fill_qty
+    ; last_sell_fill_qty = state.last_sell_fill_qty
     ; persisted_sell_levels = state.persisted_sell_levels
     }
   in
@@ -389,6 +446,8 @@ let save_async
       ~last_fill_oid
       ~last_buy_fill_price
       ~last_sell_fill_price
+      ?last_buy_fill_qty
+      ?last_sell_fill_qty
       ?persisted_sell_levels
       ()
   =
@@ -400,6 +459,8 @@ let save_async
   if last_fill_oid <> None then state.last_fill_oid <- last_fill_oid;
   state.last_buy_fill_price <- last_buy_fill_price;
   state.last_sell_fill_price <- last_sell_fill_price;
+  Option.iter (fun qty -> state.last_buy_fill_qty <- qty) last_buy_fill_qty;
+  Option.iter (fun qty -> state.last_sell_fill_qty <- qty) last_sell_fill_qty;
   Option.iter (fun levels -> state.persisted_sell_levels <- levels) persisted_sell_levels;
   let snapshot =
     { reserved_base = state.reserved_base
@@ -407,6 +468,8 @@ let save_async
     ; last_fill_oid = state.last_fill_oid
     ; last_buy_fill_price = state.last_buy_fill_price
     ; last_sell_fill_price = state.last_sell_fill_price
+    ; last_buy_fill_qty = state.last_buy_fill_qty
+    ; last_sell_fill_qty = state.last_sell_fill_qty
     ; persisted_sell_levels = state.persisted_sell_levels
     }
   in

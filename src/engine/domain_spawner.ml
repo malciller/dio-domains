@@ -237,6 +237,33 @@ let asset_domain_worker
              }))
       else ref None
     in
+    (* Oracle startup gate: for grid strategies on assets the capital oracle
+       models (kraken / hyperliquid / alpaca), withhold strategy execution
+       until the runtime's first decision for this asset arrives, so the grid
+       never places or amends orders at config/F&G default sizing that the
+       first decision would immediately overwrite (the startup qty bounce).
+       Event-driven, matching the rest of the startup sequencing: while gated
+       the domain clears its execute flag and blocks on the normal per-symbol
+       [Exchange_wakeup.wait]; the oracle runtime's on_publish hook
+       (Exchange_wakeup.signal_all wired in bin/main.ml) wakes it ~one cycle
+       after a decision - or after the first pass attempt - is published.
+       [oracle_gate_deadline] is only a watchdog for a runtime that never
+       completes a pass at all; it is checked on wakeups, never polled. *)
+    let is_grid_strategy =
+      asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid"
+    in
+    let oracle_tracks_asset =
+      Oracle_runtime.tracks_asset
+        ~exchange:asset_with_fees.exchange
+        ~symbol:asset_with_fees.symbol
+    in
+    let oracle_startup_wait =
+      match config.oracle with
+      | Some o -> o.startup_wait_seconds
+      | None -> (Oracle_runtime.default_config ()).startup_wait_seconds
+    in
+    let oracle_gate_open = ref (not (is_grid_strategy && oracle_tracks_asset)) in
+    let oracle_gate_deadline = ref (Unix.gettimeofday () +. oracle_startup_wait) in
     let mm_strategy_asset_ref =
       if asset_with_fees.strategy = "MM" then ref (Some asset_with_fees) else ref None
     in
@@ -514,6 +541,7 @@ let asset_domain_worker
                       event.order_id
                       side
                       ~fill_price:event.avg_price
+                      ~fill_qty:event.filled_qty
                       event.cl_ord_id;
                     ()
                   | None -> ());
@@ -525,6 +553,7 @@ let asset_domain_worker
                       event.order_id
                       side
                       ~fill_price:event.avg_price
+                      ~fill_qty:event.filled_qty
                       event.cl_ord_id;
                     ()
                   | None -> ());
@@ -817,12 +846,54 @@ let asset_domain_worker
             "[%s/%s] No capital-oracle decision; resuming config/F&G behavior"
             asset.exchange
             asset.symbol);
+      (* Oracle startup gate (see the gate state initialized above). Opens -
+         once, monotonically - when the first decision for this asset is
+         published (active or INACTIVE: an INACTIVE one halts new orders
+         through oracle_halted above), or when the first pass attempt has
+         finished without a decision for this asset (analysis failed / the
+         runtime could not complete a pass: last-known-good is empty at fresh
+         startup, so fall back to config/F&G instead of stalling), or when the
+         watchdog deadline elapses. While closed, the execute flag is cleared
+         so the domain falls through to the per-symbol wakeup wait below
+         instead of busy-spinning. *)
+      if not !oracle_gate_open
+      then (
+        match oracle_decision with
+        | Some d ->
+          oracle_gate_open := true;
+          should_execute_strategy := true;
+          Logging.info_f
+            ~section
+            "[%s/%s] Capital oracle first decision received (%s, qty %.8g gi %.4f%%, \
+             D_surv %.1f%%); grid gate open"
+            asset_with_fees.exchange
+            asset_with_fees.symbol
+            (if d.active then "ACTIVE" else "INACTIVE")
+            d.qty
+            d.grid_interval
+            (d.d_surv *. 100.0)
+        | None ->
+          if
+            Oracle_runtime.first_pass_attempt_done ()
+            || Unix.gettimeofday () >= !oracle_gate_deadline
+          then (
+            oracle_gate_open := true;
+            should_execute_strategy := true;
+            Logging.warn_f
+              ~section
+              "[%s/%s] No capital-oracle decision for this asset yet (first pass done or \
+               watchdog elapsed); grid gate open on config/F&G sizing"
+              asset_with_fees.exchange
+              asset_with_fees.symbol)
+          else should_execute_strategy := false)
+      else ();
       let should_execute =
         !exec_ready
         && !should_execute_strategy
         && has_exec_fn ()
         && (not equity_market_closed)
-        && not oracle_halted
+        && (not oracle_halted)
+        && !oracle_gate_open
       in
       if should_execute
       then (
@@ -876,6 +947,16 @@ let asset_domain_worker
         if current_fng <> !last_known_fng
         then (
           last_known_fng := current_fng;
+          (* The capital oracle owns the grid interval while it has an active
+             decision; the F&G re-evaluation must not clobber it (the oracle
+             re-applies its gi every cycle and would fight the F&G value,
+             flickering the grid). F&G still manages accumulation_buffer,
+             which the oracle does not size. *)
+          let oracle_governing =
+            match oracle_decision with
+            | Some d when d.active -> true
+            | _ -> false
+          in
           let lo, hi = asset_with_fees.grid_interval in
           let new_interval =
             Fear_and_greed.grid_value_for_fng
@@ -918,6 +999,12 @@ let asset_domain_worker
               ab_lo
               ab_hi;
             match !grid_strategy_asset_ref with
+            | Some asset when oracle_governing ->
+              (* Oracle owns the grid interval; refresh only the buffer. *)
+              let new_asset =
+                { asset with Dio_strategies.Suicide_grid.accumulation_buffer = new_ab }
+              in
+              grid_strategy_asset_ref := Some new_asset
             | Some asset ->
               let new_asset =
                 { asset with
@@ -929,6 +1016,13 @@ let asset_domain_worker
             | None -> ())
           else (
             match !grid_strategy_asset_ref with
+            | Some _ when oracle_governing ->
+              Logging.debug_f
+                ~section
+                "[%s/%s] F&G grid_interval re-evaluation skipped: capital oracle owns \
+                 sizing"
+                asset_with_fees.exchange
+                asset_with_fees.symbol
             | Some asset ->
               let new_asset =
                 { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval }

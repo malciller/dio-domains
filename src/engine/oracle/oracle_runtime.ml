@@ -108,6 +108,14 @@ type runtime_config =
         config priority order) quickly. *)
   ; horizons : int list option (** Session horizons (default per calendar kind). *)
   ; max_capital : float option (** Upper bound of the sizing binary search. *)
+  ; startup_wait_seconds : float
+    (** How long a trading domain withholds grid strategy execution while it
+        waits for the runtime's first published decision for its asset before
+        falling back to config/F&G sizing (default 60). The runtime's first
+        pass fetches histories and can take several seconds; the wait keeps
+        the strategy from placing/amending orders with un-blessed default
+        sizing and then bouncing to the oracle values when the first decision
+        lands. *)
   }
 
 let default_config () =
@@ -121,6 +129,7 @@ let default_config () =
   ; poll_seconds = 30.0
   ; horizons = None
   ; max_capital = None
+  ; startup_wait_seconds = 60.0
   }
 ;;
 
@@ -180,6 +189,30 @@ let publish (fresh : decision list) =
 
 (** Pass counters for observability (logged, never read on a hot path). *)
 let pass_count : int Atomic.t = Atomic.make 0
+
+(** Completed pass attempts, successes and failures alike: incremented in the
+    runtime loop right before [on_publish] wakes the domains, so by the time a
+    domain wakes on the publish signal this counter already reflects the
+    attempt that just finished. Trading domains open their startup gate once
+    the FIRST attempt is done and no decision exists for their asset
+    (analysis failed, or the runtime could not complete a pass at all):
+    last-known-good is empty at fresh startup, so waiting longer only delays
+    the config/F&G fallback the engine intends. *)
+let pass_attempts : int Atomic.t = Atomic.make 0
+
+let first_pass_attempt_done () = Atomic.get pass_attempts >= 1
+
+(** Whether the runtime models this asset at all: only assets on the
+    known exchanges (kraken, hyperliquid, alpaca) are analyzed and get a
+    published decision. Pure name check (same predicate Oracle_tasks uses to
+    build its task list), so it is safe to call from a domain before the
+    runtime's first pass -- or even if the runtime never started. Assets this
+    returns false for are not gated at domain startup and keep trading on
+    config/F&G sizing from the first cycle. *)
+let tracks_asset ~(exchange : string) ~(symbol : string) : bool =
+  ignore symbol;
+  Oracle_tasks.known_exchange exchange
+;;
 
 let last_pass_at : float Atomic.t = Atomic.make 0.0
 let last_pass_ok : bool Atomic.t = Atomic.make true
@@ -973,6 +1006,9 @@ let start
              (Printexc.to_string exn);
            Lwt.return_unit)
       >>= fun () ->
+      (* Mark the attempt finished BEFORE waking the domains: a domain that
+         wakes on this publish signal must already see it in its gate check. *)
+      Atomic.incr pass_attempts;
       on_publish (decisions ());
       (* The next pass runs at the cadence deadline, or early when the engine
          requests one ([request_pass] on fills / canceled-rejected-expired

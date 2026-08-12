@@ -107,6 +107,7 @@ let known_oracle_keys =
   ; "poll_seconds"
   ; "horizons"
   ; "max_capital"
+  ; "startup_wait_seconds"
   ]
 ;;
 
@@ -513,6 +514,11 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
           (match oracle_json |> member "max_capital" with
            | `Null -> defaults.max_capital
            | v -> to_float_option v)
+      ; startup_wait_seconds =
+          oracle_json
+          |> member "startup_wait_seconds"
+          |> to_float_option
+          |> Option.value ~default:defaults.startup_wait_seconds
       }
 ;;
 
