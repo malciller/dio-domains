@@ -105,6 +105,110 @@ let test_tracks_asset () =
     (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"lighter" ~symbol:"BTC")
 ;;
 
+let test_class_member_source () =
+  (* Class members are blend inputs, never decision subjects: they gather
+     their history purely from Yahoo (whitelisted) UNLESS the member IS the
+     active asset on that exchange, which uses the exchange itself. Symbols
+     with no trusted Yahoo mapping contribute nothing. *)
+  let src exchange asset member =
+    Dio_oracle.Oracle_runtime.class_member_source ~exchange ~asset_symbol:asset member
+  in
+  (* The active asset itself -> the exchange, whatever the venue. *)
+  Alcotest.(
+    check
+      (of_pp (fun fmt v ->
+         Format.fprintf
+           fmt
+           "%s"
+           (match v with
+            | `Exchange -> "exchange"
+            | `Yahoo y -> "yahoo " ^ y
+            | `None -> "none"))))
+    "SOL/USD asset on kraken uses the exchange"
+    `Exchange
+    (src "kraken" "SOL/USD" "SOL/USD");
+  Alcotest.(
+    check
+      (of_pp (fun fmt v ->
+         Format.fprintf
+           fmt
+           "%s"
+           (match v with
+            | `Exchange -> "exchange"
+            | `Yahoo y -> "yahoo " ^ y
+            | `None -> "none"))))
+    "case-insensitive active asset match"
+    `Exchange
+    (src "kraken" "sol/usd" "SOL/USD");
+  (* Any other member -> pure Yahoo, never the venue's view of it. *)
+  Alcotest.(
+    check
+      (of_pp (fun fmt v ->
+         Format.fprintf
+           fmt
+           "%s"
+           (match v with
+            | `Exchange -> "exchange"
+            | `Yahoo y -> "yahoo " ^ y
+            | `None -> "none"))))
+    "SOL/USD member of another asset's class comes from Yahoo"
+    (`Yahoo "SOL-USD")
+    (src "kraken" "XMR/USD" "SOL/USD");
+  Alcotest.(
+    check
+      (of_pp (fun fmt v ->
+         Format.fprintf
+           fmt
+           "%s"
+           (match v with
+            | `Exchange -> "exchange"
+            | `Yahoo y -> "yahoo " ^ y
+            | `None -> "none"))))
+    "alt member of a Hyperliquid class comes from Yahoo, not Hyperliquid"
+    (`Yahoo "ADA-USD")
+    (src "hyperliquid" "HYPE/USDC" "ADA/USD");
+  Alcotest.(
+    check
+      (of_pp (fun fmt v ->
+         Format.fprintf
+           fmt
+           "%s"
+           (match v with
+            | `Exchange -> "exchange"
+            | `Yahoo y -> "yahoo " ^ y
+            | `None -> "none"))))
+    "equity member comes from Yahoo"
+    (`Yahoo "SPY")
+    (src "alpaca" "QQQ" "SPY");
+  (* No trusted Yahoo mapping (dead-token collisions) -> contributes nothing. *)
+  Alcotest.(
+    check
+      (of_pp (fun fmt v ->
+         Format.fprintf
+           fmt
+           "%s"
+           (match v with
+            | `Exchange -> "exchange"
+            | `Yahoo y -> "yahoo " ^ y
+            | `None -> "none"))))
+    "HYPE has no trusted Yahoo mapping"
+    `None
+    (src "hyperliquid" "BTC/USDC" "HYPE/USD");
+  Alcotest.(
+    check
+      (of_pp (fun fmt v ->
+         Format.fprintf
+           fmt
+           "%s"
+           (match v with
+            | `Exchange -> "exchange"
+            | `Yahoo y -> "yahoo " ^ y
+            | `None -> "none"))))
+    "BNB has no trusted Yahoo mapping"
+    `None
+    (src "kraken" "XMR/USD" "BNB/USD")
+;;
+
 let test_first_pass_attempt_done_fresh () =
   (* Fresh process, no runtime loop running: no pass attempt has finished, so
      the flag is false (domains stay gated on the startup wait). *)
@@ -413,6 +517,7 @@ let () =
             "first pass attempt not done fresh"
             `Quick
             test_first_pass_attempt_done_fresh
+        ; Alcotest.test_case "class member source policy" `Quick test_class_member_source
         ] )
     ; ( "trigger"
       , [ Alcotest.test_case "request_pass wakes early" `Quick test_trigger_wakes_early

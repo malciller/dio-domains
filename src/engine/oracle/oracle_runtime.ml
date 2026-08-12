@@ -608,10 +608,34 @@ let live_buy_anchor ~(exchange : string) ~(symbol : string) ~(fallback : float) 
      | _ -> fallback)
 ;;
 
+(** Pure: the source of one class member's price history. The class surface
+    is a blend input, never a decision subject - members gather their
+    history PURELY from Yahoo (whitelisted symbols only, see
+    [Oracle_fetch_yahoo.symbol_of]) UNLESS the member IS the active asset on
+    this exchange, which uses the exchange's own history (it is the decision
+    subject and needs venue data). A symbol with no trusted Yahoo mapping
+    (`None) contributes nothing to the class. This keeps the oracle from
+    probing every alt coin on every venue (e.g. DOGE/ADA/XMR/LINK... on
+    Hyperliquid, which have no spot pairs there - the per-pass
+    "no spot history" warning spam). *)
+let class_member_source
+      ~(exchange : string)
+      ~(asset_symbol : string)
+      (member_symbol : string)
+  =
+  if String.lowercase_ascii member_symbol = String.lowercase_ascii asset_symbol
+  then `Exchange
+  else (
+    match Oracle_fetch_yahoo.symbol_of ~exchange member_symbol with
+    | Some yahoo_symbol -> `Yahoo yahoo_symbol
+    | None -> `None)
+;;
+
 (** Load the class member pool for [class_name] from the runtime's class
-    pools (config.json "classes"), fetched on the asset's own exchange and
-    deepened like the asset itself. Falls back to the asset alone when no
-    pool is known. *)
+    pools (config.json "classes"): the member that IS the active asset uses
+    the exchange (fetched and deepened like the asset), every other member
+    is fetched purely from Yahoo (whitelisted) - see [class_member_source].
+    Falls back to the asset alone when no pool is known. *)
 let load_members
       (rc : runtime_config)
       (classes : (string * class_pool) list)
@@ -637,15 +661,45 @@ let load_members
     let rec go = function
       | [] -> Lwt.return []
       | symbol :: rest ->
-        fetch_series_for tc symbol
-        >>= fun series ->
-        go rest
-        >>= fun acc ->
-        if Array.length series.bars = 0
-        then Lwt.return acc
-        else
-          deepen_series rc ~exchange:tc.exchange series
-          >>= fun (series, _) -> Lwt.return (series :: acc)
+        (match
+           class_member_source ~exchange:tc.exchange ~asset_symbol:asset.symbol symbol
+         with
+         | `None -> go rest
+         | `Exchange ->
+           (* The active asset itself: the exchange's history (deepened like
+              the asset - it is the decision subject). *)
+           fetch_series_for tc symbol
+           >>= fun series ->
+           go rest
+           >>= fun acc ->
+           if Array.length series.bars = 0
+           then Lwt.return acc
+           else
+             deepen_series rc ~exchange:tc.exchange series
+             >>= fun (series, _) -> Lwt.return (series :: acc)
+         | `Yahoo yahoo_symbol ->
+           (* Any other member: purely Yahoo, disk-cached, delta through
+              today - the exchange never sees it. *)
+           Oracle_cache.with_delta
+             ~exchange:"yahoo-class"
+             ~symbol:yahoo_symbol
+             ~today:(today_iso ())
+             ~fetch:(fun boundary ->
+               let start_date = Option.value boundary ~default:"2015-01-01" in
+               Oracle_fetch_yahoo.fetch_daily
+                 ~start_date
+                 ~symbol:yahoo_symbol
+                 ~end_date:(today_iso ())
+                 ())
+             ()
+           >>= fun bars ->
+           go rest
+           >>= fun acc ->
+           if bars = []
+           then Lwt.return acc
+           else
+             Lwt.return
+               (Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol bars :: acc))
     in
     go syms
     >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)

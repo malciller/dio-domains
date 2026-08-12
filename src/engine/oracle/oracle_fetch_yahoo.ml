@@ -29,10 +29,26 @@ let endpoint = "https://query1.finance.yahoo.com/v8/finance/chart/%s"
 let window_seconds = 1_100_000_000L (* ~35 months: ~1050 daily points per request *)
 let day_seconds = 86_400L
 
-(* Yahoo throttles aggressive parallel clients (crumb/429). The oracle pass
-   now analyzes assets concurrently, so the deep-history fetches would fire
-   ~10 at once on a cold cache; serialize them - one Yahoo walk at a time. *)
+(* Yahoo throttles sustained bursts (and the crumbless chart API degrades to
+   empty 200s when hammered - the "unexpected ... (no bars)" symptom). The
+   oracle pass now analyzes assets concurrently, so the deep/class fetches
+   would fire many at once. Two guards: [yahoo_mutex] serializes the walks
+   (one at a time), and [pace] keeps a global minimum gap between individual
+   requests (~2/s - the pre-cache sequential engine stayed below Yahoo's
+   tolerance and never hit this). *)
 let yahoo_mutex = Lwt_mutex.create ()
+let last_request_at : float ref = ref 0.0
+let min_request_gap = 0.5
+
+let pace () =
+  let now = Unix.gettimeofday () in
+  let wait = !last_request_at +. min_request_gap -. now in
+  if wait > 0.0
+  then Lwt_unix.sleep wait >|= fun () -> last_request_at := Unix.gettimeofday ()
+  else (
+    last_request_at := now;
+    Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Pre-listing window handling: Yahoo answers a request whose range sits
@@ -326,6 +342,8 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
             Printf.sprintf "%s?period1=%Ld&period2=%Ld&interval=1d" base_url from_ms to_ms
           in
           let fetch =
+            pace ()
+            >>= fun () ->
             Oracle_http.get ~headers (Uri.of_string url)
             >>= fun (resp, body) ->
             Cohttp_lwt.Body.to_string body
