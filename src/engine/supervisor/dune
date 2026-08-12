@@ -15,6 +15,8 @@
   threads
   lwt.unix
   dio.engine
+  dio.oracle
+  dio.strategies
   dio.kraken
   dio.hyperliquid
   dio.ibkr

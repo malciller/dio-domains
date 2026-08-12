@@ -183,52 +183,52 @@ let render_kpi_cards w json =
       ]
   in
   let card2 = "SYSTEM ENGINE", c2_row1, c2_row2 in
-  (* Aggregate over consistent windows (F6): consider only domains whose cycle
-     window is fresh and non-empty, then take the median p50/p99 so a single
-     pathological domain can no longer drive the whole card. *)
-  let fresh_p50s, fresh_p99s =
-    List.fold_left
-      (fun (p50s, p99s) (_sym, metrics) ->
-         let mlist =
-           match metrics with
-           | `Assoc l -> l
-           | _ -> []
-         in
-         match List.assoc_opt "cycle" mlist with
-         | Some data ->
-           let window_end = data |?> "window_end" |> to_float_d 0.0 in
-           let samples = data |?> "samples" |> to_int_d 0 in
-           let fresh =
-             window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 15.0
-           in
-           if fresh && samples > 0
-           then (
-             let p50 = data |?> "p50" |> to_float_d 0.0 in
-             let p99 = data |?> "p99" |> to_float_d 0.0 in
-             p50 :: p50s, p99 :: p99s)
-           else p50s, p99s
-         | None -> p50s, p99s)
-      ([], [])
-      lats
+  (* Capital-oracle engine latency from the oracle runtime's per-pass window
+     (replaces the old per-domain cycle column): the pass p50/p99 from the
+     most recently completed oracle pass. Fresh when a pass window exists
+     within the refresh horizon (the oracle re-analyzes every ~5 min). *)
+  let oracle_lat =
+    match json |?> "oracle_latency" with
+    | `Assoc l ->
+      (match List.assoc_opt "pass" l with
+       | Some data -> Some data
+       | None -> None)
+    | _ -> None
   in
-  let median lst =
-    match List.sort Float.compare lst with
-    | [] -> 0.0
-    | sorted -> List.nth sorted (List.length sorted / 2)
+  let oracle_p50, oracle_p99, oracle_fresh =
+    match oracle_lat with
+    | Some data ->
+      let window_end = data |?> "window_end" |> to_float_d 0.0 in
+      let samples = data |?> "samples" |> to_int_d 0 in
+      let fresh =
+        window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 600.0
+      in
+      ( data |?> "p50" |> to_float_d 0.0
+      , data |?> "p99" |> to_float_d 0.0
+      , fresh && samples > 0 )
+    | None -> 0.0, 0.0, false
   in
-  let cycle_p50 = median fresh_p50s in
-  let cycle_p99 = median fresh_p99s in
-  let lat_attr p = if p > 100.0 then a_red else if p > 50.0 then a_yellow else a_green in
+  (* Oracle pass thresholds: a pass normally completes in a few seconds
+     (history fetches dominate); 5s+ warrants yellow, 30s+ red. *)
+  let lat_attr p =
+    if not oracle_fresh
+    then a_dim
+    else if p > 30_000_000.0
+    then a_red
+    else if p > 5_000_000.0
+    then a_yellow
+    else a_green
+  in
   let c3_row1 =
     I.hcat
-      [ col 10 a_dim "CYCLE P50 "
-      ; col_right 12 (lat_attr cycle_p50) (format_latency_us cycle_p50)
+      [ col 10 a_dim "ORACLE P50"
+      ; col_right 12 (lat_attr oracle_p50) (format_latency_us oracle_p50)
       ]
   in
   let c3_row2 =
     I.hcat
-      [ col 10 a_dim "CYCLE P99 "
-      ; col_right 12 (lat_attr cycle_p99) (format_latency_us cycle_p99)
+      [ col 10 a_dim "ORACLE P99"
+      ; col_right 12 (lat_attr oracle_p99) (format_latency_us oracle_p99)
       ]
   in
   let card3 = "LATENCY", c3_row1, c3_row2 in

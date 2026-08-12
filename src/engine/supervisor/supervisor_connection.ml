@@ -422,9 +422,17 @@ let stop_order_processing () =
 ;;
 
 (** Stops order processing and transitions all registered connections
-    to Disconnected. Includes a 500ms drain window for in-flight orders. *)
+    to Disconnected. Includes a 500ms drain window for in-flight orders.
+    Also stops the supervised capital-oracle runtime (registered by
+    [Supervisor.start_oracle]) so its pass loop exits on the same shutdown
+    signal as every other supervised module. *)
 let stop_all () =
   stop_order_processing ();
+  (* The capital oracle is a supervised module: signal its loop to stop
+     (the loop checks its own flag at every wait slice and on the next
+     pass). *)
+  (try Dio_oracle.Oracle_runtime.shutdown () with
+   | _ -> ());
   interruptible_sleep 0.5;
   (* Drain window for in-flight order iterations *)
   Logging.warn ~section "Stopping all supervised connections";

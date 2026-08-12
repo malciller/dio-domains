@@ -2,8 +2,8 @@ open Notty
 open Theme
 
 let history_len = 15
-let cycle_hist = Hashtbl.create 16
-let cycle_hist_max = 64
+let oracle_hist = Hashtbl.create 16
+let oracle_hist_max = 64
 
 (** Exponential moving average over a history array. Smooths the windowed
     p99 samples so the sparkline tracks trend rather than single-window noise. *)
@@ -17,15 +17,15 @@ let ema_smooth (arr : float array) ~alpha =
   out
 ;;
 
-let update_cycle_hist symbol p99 =
+let update_oracle_hist symbol p99 =
   (* Evict all entries when the table grows beyond the cap.
      This is safe — sparkline history repopulates within seconds. *)
-  if Hashtbl.length cycle_hist > cycle_hist_max then Hashtbl.clear cycle_hist;
+  if Hashtbl.length oracle_hist > oracle_hist_max then Hashtbl.clear oracle_hist;
   let arr =
-    try Hashtbl.find cycle_hist symbol with
+    try Hashtbl.find oracle_hist symbol with
     | Not_found ->
       let a = Array.make history_len 0.0 in
-      Hashtbl.add cycle_hist symbol a;
+      Hashtbl.add oracle_hist symbol a;
       a
   in
   for i = 0 to history_len - 2 do
@@ -34,6 +34,18 @@ let update_cycle_hist symbol p99 =
   arr.(history_len - 1) <- p99;
   arr
 ;;
+
+(** Freshness tolerance per metric label: the oracle windows are published
+    once per analysis pass (~5 min cadence + jitter), everything else every
+    ~15s. *)
+let freshness_tolerance = function
+  | "oracle" -> 600.0
+  | _ -> 15.0
+;;
+
+(** The metric columns of the table (the oracle column replaces the old
+    per-domain cycle column). *)
+let table_metric_order = [ "oracle"; "orderbook"; "strategy"; "execution" ]
 
 let render_latencies w json =
   let lats =
@@ -53,26 +65,31 @@ let render_latencies w json =
     | Some e when e <> "" -> e
     | _ -> ""
   in
-  (* Filter to domains whose cycle window is fresh (published within the last
-     15s of the snapshot timestamp). A running domain always publishes a window
-     even with zero samples, so idle-but-running domains stay visible instead of
-     flickering out between resets (F1/S3). *)
+  (* Filter to rows with at least one fresh metric window (published within
+     the snapshot timestamp's freshness tolerance for that metric - 15s for
+     the domain stages, up to the oracle refresh horizon for the oracle
+     column). A running domain always publishes a window even with zero
+     samples, so idle-but-running domains stay visible instead of flickering
+     out between resets (F1/S3). *)
   let snapshot_ts = json |?> "timestamp" |> to_float_d 0.0 in
-  let active_lats =
-    List.filter
-      (fun (_symbol, metrics) ->
-         let mlist =
-           match metrics with
-           | `Assoc l -> l
-           | _ -> []
-         in
-         match List.assoc_opt "cycle" mlist with
+  let row_is_active (_symbol, metrics) =
+    let mlist =
+      match metrics with
+      | `Assoc l -> l
+      | _ -> []
+    in
+    List.exists
+      (fun label ->
+         match List.assoc_opt label mlist with
          | Some data ->
            let window_end = data |?> "window_end" |> to_float_d 0.0 in
-           window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 15.0
+           window_end > 0.0
+           && snapshot_ts > 0.0
+           && snapshot_ts -. window_end < freshness_tolerance label
          | None -> false)
-      lats
+      table_metric_order
   in
+  let active_lats = List.filter row_is_active lats in
   if active_lats = []
   then I.empty
   else (
@@ -83,13 +100,16 @@ let render_latencies w json =
        - ticker/ob:  in-memory struct update from ring buffer; should be <5us
        - strategy:   grid logic + mutex + order push; target <25us p50
        - execution:  ringbuffer write + signal broadcast; short path
-       - cycle:      full wakeup-to-sleep; sum of all stages *)
+       - oracle:     the capital-oracle per-asset pipeline (history fetch +
+                     survival analysis + sizing) for that domain's asset;
+                     fetches dominate, so seconds-scale is normal, 10s+ is a
+                     degraded fetch/analysis *)
     let latency_thresholds label =
       match label with
       | "orderbook" -> 10.0, 30.0
       | "strategy" -> 30.0, 75.0
       | "execution" -> 50.0, 150.0
-      | "cycle" -> 50.0, 100.0
+      | "oracle" -> 1_000_000.0, 10_000_000.0
       | _ -> 50.0, 100.0
     in
     let severity label f samples =
@@ -105,15 +125,17 @@ let render_latencies w json =
     in
     (* Metric display order. The wide layout (4 metrics) tops out at ~170
        columns, the same intrinsic width as the HOLDINGS & STRATEGY table, so
-       the section conforms to the space the other sections occupy. *)
+       the section conforms to the space the other sections occupy. The
+       oracle column (the capital-oracle per-asset pipeline latency for this
+       domain's asset) replaces the old per-domain cycle column. *)
     let is_compact = w < 170 in
     let metric_order =
       if is_compact
-      then [ "cycle"; "execution" ]
-      else [ "cycle"; "orderbook"; "strategy"; "execution" ]
+      then [ "oracle"; "execution" ]
+      else [ "oracle"; "orderbook"; "strategy"; "execution" ]
     in
     let metric_labels =
-      if is_compact then [ "CYCLE"; "EXEC" ] else [ "CYCLE"; "OB"; "STRAT"; "EXEC" ]
+      if is_compact then [ "ORACLE"; "EXEC" ] else [ "ORACLE"; "OB"; "STRAT"; "EXEC" ]
     in
     let metric_cell_w = 8 in
     (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
@@ -144,7 +166,7 @@ let render_latencies w json =
         ([ I.string a_border " │  "
          ; col 13 a_label "DOMAIN"
          ; I.string a_border " │ "
-         ; col 11 a_label "(CYCLE P99)"
+         ; col 11 a_label "(ORACLE P99)"
          ; I.string a_border " │ "
          ]
          @ List.mapi
@@ -272,15 +294,17 @@ let render_latencies w json =
                   if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
                metric_order
            in
-           let _, cycle_p99, _, _ = find_metric "cycle" in
-           let c_arr = update_cycle_hist symbol cycle_p99 in
-           let c_smooth = ema_smooth c_arr ~alpha:0.5 in
+           let _, oracle_p99, _, _ = find_metric "oracle" in
+           let o_arr = update_oracle_hist symbol oracle_p99 in
+           let o_smooth = ema_smooth o_arr ~alpha:0.5 in
+           (* Oracle sparkline full scale: 10s (fetches dominate the per-asset
+               pipeline; anything at the top of the scale is a degraded pass). *)
            let trend_spark =
-             render_sparkline_local 11 c_smooth 100.0 (fun v ->
-               attr_of_sev (severity "cycle" v 1))
+             render_sparkline_local 11 o_smooth 10_000_000.0 (fun v ->
+               attr_of_sev (severity "oracle" v 1))
            in
            let cycle_cause =
-             match List.assoc_opt "cycle" mlist with
+             match List.assoc_opt "oracle" mlist with
              | Some data -> data |?> "max_cause" |> to_string_d "--"
              | None -> "--"
            in

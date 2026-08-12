@@ -333,6 +333,83 @@ let publish (fresh : decision list) =
 (** Pass counters for observability (logged, never read on a hot path). *)
 let pass_count : int Atomic.t = Atomic.make 0
 
+(* ------------------------------------------------------------------ *)
+(* Oracle engine latency metrics.                                     *)
+(* ------------------------------------------------------------------ *)
+
+(** Engine-global latency profilers for one analysis pass, windowed per pass
+    (published at the end of every pass). The dashboard reads the published
+    snapshots through [profiler_snapshots]. All recording happens on the Lwt
+    scheduler thread (passes are sequential in one fiber), so the live
+    histograms need no extra locking; readers touch only the atomically
+    published snapshot of the completed window. *)
+type engine_profilers =
+  { prof_pass : Latency_profiler.t
+    (** Whole [run_pass]: cadence-to-cadence oracle work. *)
+  ; prof_balance : Latency_profiler.t
+    (** Venue pool / balance resolution (Fear & Greed + live store or REST
+        balance phase). *)
+  ; prof_fetch : Latency_profiler.t
+    (** Per-asset history fetch + analysis phase (Phase A). *)
+  ; prof_sizing : Latency_profiler.t (** Sizing / deployment phase (Phase B). *)
+  }
+
+let engine_profs =
+  { prof_pass =
+      Latency_profiler.create ~bucket_us:1_000 ~max_latency_us:60_000_000 "oracle:pass"
+  ; prof_balance =
+      Latency_profiler.create ~bucket_us:1_000 ~max_latency_us:60_000_000 "oracle:balance"
+  ; prof_fetch =
+      Latency_profiler.create ~bucket_us:1_000 ~max_latency_us:60_000_000 "oracle:fetch"
+  ; prof_sizing =
+      Latency_profiler.create ~bucket_us:100 ~max_latency_us:10_000_000 "oracle:sizing"
+  }
+;;
+
+(** Per-asset latency profilers: one histogram per tracked asset covering its
+    whole per-pass pipeline (fetch + analysis + sizing). Keyed by the trading
+    config symbol so the dashboard can match domain rows; windows are
+    published per pass, like the engine-global profilers. *)
+let asset_profiler_cache : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
+
+let asset_profiler_of symbol =
+  match Hashtbl.find_opt asset_profiler_cache symbol with
+  | Some prof -> prof
+  | None ->
+    let prof =
+      Latency_profiler.create
+        ~bucket_us:1_000
+        ~max_latency_us:60_000_000
+        (symbol ^ ":oracle")
+    in
+    Hashtbl.replace asset_profiler_cache symbol prof;
+    prof
+;;
+
+(** Record one span into an asset's per-asset profiler. *)
+let record_asset_latency symbol span cause =
+  Latency_profiler.record_with_cause (asset_profiler_of symbol) span cause
+;;
+
+(** Engine-global oracle latency snapshots (most recently completed windows),
+    for the dashboard. *)
+let profiler_snapshots () =
+  [ "pass", Latency_profiler.published_snapshot engine_profs.prof_pass
+  ; "balance", Latency_profiler.published_snapshot engine_profs.prof_balance
+  ; "fetch", Latency_profiler.published_snapshot engine_profs.prof_fetch
+  ; "sizing", Latency_profiler.published_snapshot engine_profs.prof_sizing
+  ]
+;;
+
+(** Per-asset oracle latency snapshots: (symbol, snapshot option) list, for
+    the dashboard's per-domain latency rows. *)
+let asset_profiler_snapshots () =
+  Hashtbl.fold
+    (fun symbol prof acc -> (symbol, Latency_profiler.published_snapshot prof) :: acc)
+    asset_profiler_cache
+    []
+;;
+
 (** Completed pass attempts, successes and failures alike: incremented in the
     runtime loop right before [on_publish] wakes the domains, so by the time a
     domain wakes on the publish signal this counter already reflects the
@@ -475,6 +552,28 @@ let deepen_series
       Oracle_fetch_yahoo.merge_series ~venue:series ~deep)
 ;;
 
+(** Top-of-book anchor for the grid's order type: the live websocket-fed bid
+    for the buy ladder the sizing seeds. The grid's first order is a resting
+    BUY, and the live strategy prices buys off the bid (compute_buy_ref_price
+    is bid-first and buy targets are capped at the bid), so the replay anchor
+    uses the bid - never a mid - with the ask backing a missing bid and the
+    history close as the last resort. A live price that diverges from the
+    history close by more than the sanity band (stale feed, wrong symbol)
+    falls back to the close. *)
+let live_buy_anchor ~(exchange : string) ~(symbol : string) ~(fallback : float) =
+  let band = 0.30 in
+  let sane price =
+    fallback > 0.0 && price > 0.0 && Float.abs (price -. fallback) /. fallback <= band
+  in
+  match Exchange.Registry.get exchange with
+  | None -> fallback
+  | Some (module Ex) ->
+    (match Ex.get_top_of_book ~symbol with
+     | Some (bid, _, _, _) when sane bid -> bid
+     | Some (_, _, ask, _) when sane ask -> ask
+     | _ -> fallback)
+;;
+
 (** Load the class member pool for [class_name] from the runtime's class
     pools (config.json "classes"), fetched on the asset's own exchange and
     deepened like the asset itself. Falls back to the asset alone when no
@@ -598,7 +697,11 @@ let venue_pools (tasks : Oracle_tasks.task list)
     | Some task ->
       Lwt.catch
         (fun () ->
-           Oracle_balances.fetch_task task
+           (* Live-engine path first: the websocket-fed balance store (already
+              in-process, no standalone HTTP round-trip) when it has data;
+              REST one-shot fallback otherwise (CLI parity, and the
+              authoritative path for Hyperliquid spot-only pools). *)
+           Oracle_balances.fetch_task_live task
            >|= function
            | Error error ->
              Logging.warn_f
@@ -614,6 +717,11 @@ let venue_pools (tasks : Oracle_tasks.task list)
                  0.0
                  (Oracle_balances.available_quote snapshot ~quote:account.quote)
              in
+             let source =
+               match snapshot.Oracle_balances.balances with
+               | { Oracle_balances.wallet_type = "live"; _ } :: _ -> "live store"
+               | _ -> "rest"
+             in
              let lines =
                snapshot.balances
                |> List.filter (fun (b : Oracle_balances.balance) ->
@@ -625,8 +733,9 @@ let venue_pools (tasks : Oracle_tasks.task list)
              in
              Logging.info_f
                ~section
-               "venue %s balance: %s -> pool $%.2f"
+               "venue %s balance (%s): %s -> pool $%.2f"
                (account_id account)
+               source
                (String.concat " · " lines)
                pool;
              Some (pool, snapshot))
@@ -712,11 +821,38 @@ let analyze_asset
   >>= fun (asset, deep_bars) ->
   load_members global_rc classes tc ~class_name asset
   >>= fun members ->
-  let start_price =
+  (* The grid ladder is anchored at the live top-of-book bid (the websocket
+     orderbook feed, not a standalone HTTP call) when the engine holds one -
+     the grid's first order is a resting buy and buys price off the bid -
+     with the history close as fallback. The mid is never used: the sizing
+     models the buy leg at the price a buy actually references. *)
+  let last_close =
     if Array.length asset.bars = 0
     then 0.0
     else asset.bars.(Array.length asset.bars - 1).Oracle_types.close
   in
+  let start_price =
+    live_buy_anchor ~exchange ~symbol:task.Oracle_tasks.symbol ~fallback:last_close
+  in
+  let live_anchor =
+    start_price > 0.0
+    && last_close > 0.0
+    && Float.abs (start_price -. last_close) /. last_close > 1e-6
+  in
+  Logging.debug_f
+    ~section
+    "[%d/%d] %s/%s start price %.6g (%s, history close %.6g)"
+    index
+    n_tasks
+    exchange
+    task.Oracle_tasks.symbol
+    start_price
+    (if live_anchor
+     then "live top-of-book bid"
+     else if start_price > 0.0
+     then "history close"
+     else "unavailable")
+    last_close;
   let gi_lo, gi_hi = tc.grid_interval in
   let grid =
     Grid_adapter.of_trading_config
@@ -1237,12 +1373,19 @@ let run_pass
     Logging.info ~section "no runnable assets for the capital oracle this pass";
     Lwt.return_unit)
   else (
+    (* Engine latency window for this pass: each stage records its span into
+       the stage profiler; the per-asset profilers record the assets touched
+       this pass; everything is published (snapshot_and_reset) at the end. *)
+    let pass_start = Mtime_clock.now_ns () in
+    let touched_assets = ref [] in
+    let span_from t = Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t) in
     Hashtbl.reset fetch_cache;
     (* Balance snapshots must also refresh each pass: Oracle_balances caches
        per (exchange, testnet) for the short-lived CLI oracle, but the engine
        runs continuously - without this, venue pools stay frozen at the
        startup snapshot forever. *)
     Oracle_balances.clear_cache ();
+    let balance_start = Mtime_clock.now_ns () in
     let fng = resolve_fng () in
     let grouped = group_by_account tasks in
     Logging.info_f
@@ -1268,6 +1411,7 @@ let run_pass
       | task :: rest ->
         Lwt.catch
           (fun () ->
+             let t_asset = Mtime_clock.now_ns () in
              Lwt.pick
                [ (analyze_asset
                     config
@@ -1275,7 +1419,13 @@ let run_pass
                     task
                     ~index:(List.length rest + 1)
                     ~n_tasks:(List.length tasks)
-                  >|= fun analysis -> `Ok analysis)
+                  >|= fun analysis ->
+                  record_asset_latency
+                    task.Oracle_tasks.symbol
+                    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_asset))
+                    (fun () -> "fetch");
+                  touched_assets := task.Oracle_tasks.symbol :: !touched_assets;
+                  `Ok analysis)
                ; (Lwt_unix.sleep analysis_timeout
                   >|= fun () ->
                   `Timeout
@@ -1324,6 +1474,7 @@ let run_pass
       | analysis :: rest ->
         Lwt.catch
           (fun () ->
+             let t_asset = Mtime_clock.now_ns () in
              size_asset
                analysis.rc
                analysis
@@ -1334,6 +1485,10 @@ let run_pass
                ~index:(List.length rest + 1)
                ~n_tasks:(List.length tasks)
              >|= fun decision ->
+             record_asset_latency
+               analysis.symbol
+               (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_asset))
+               (fun () -> "sizing");
              decisions := decision :: !decisions;
              decision.remainder)
           (fun exn ->
@@ -1349,6 +1504,8 @@ let run_pass
     in
     venue_pools tasks
     >>= fun pools ->
+    let balance_span = span_from balance_start in
+    Latency_profiler.record engine_profs.prof_balance balance_span;
     let account_pool account =
       match List.assoc_opt account pools with
       | Some (Some (pool, snapshot)) -> Some (pool, snapshot)
@@ -1359,10 +1516,14 @@ let run_pass
          match account_pool account with
          | None -> Lwt.return_unit
          | Some (pool, snapshot) ->
+           let t_fetch = Mtime_clock.now_ns () in
            analyze_all [] account_tasks
            >>= fun analyses ->
+           Latency_profiler.record engine_profs.prof_fetch (span_from t_fetch);
+           let t_size = Mtime_clock.now_ns () in
            size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool analyses
            >|= fun surplus ->
+           Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
            Logging.info_f
              ~section
              "venue %s: pool %.2f, surplus %.2f (idle reserve)"
@@ -1375,26 +1536,46 @@ let run_pass
     Atomic.incr pass_count;
     Atomic.set last_pass_at (Unix.gettimeofday ());
     Atomic.set last_pass_ok true;
+    (* Publish the latency window: the pass span and the stage spans, plus
+       the per-asset windows for the assets this pass actually processed
+       (assets that failed or timed out keep their previous snapshot so the
+       dashboard reads last-good instead of idle). *)
+    let pass_span = span_from pass_start in
+    Latency_profiler.record engine_profs.prof_pass pass_span;
+    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_pass in
+    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_balance in
+    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_fetch in
+    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_sizing in
+    List.iter
+      (fun symbol ->
+         ignore (Latency_profiler.snapshot_and_reset (asset_profiler_of symbol)))
+      !touched_assets;
     Logging.info_f
       ~section
-      "capital-oracle pass complete: %d decision(s) published (pass #%d)"
+      "capital-oracle pass complete: %d decision(s) published (pass #%d, pass %.1fs)"
       (List.length !decisions)
-      (Atomic.get pass_count);
+      (Atomic.get pass_count)
+      (Int64.to_float (Mtime.Span.to_uint64_ns pass_span) /. 1e9);
     Lwt.return_unit)
 ;;
 
-(** Start the live runtime: initialize venue metadata once, run the first
+(** Run the live oracle loop: initialize venue metadata once, run the first
     pass immediately, then refresh on the configured cadence. Runs on the Lwt
-    scheduler ([Lwt.async]); the engine's domains pick up each published
-    snapshot on their next cycle. [on_publish] (optional) is invoked after
-    each pass with the full snapshot - the engine uses it to wake domains so
-    a new decision applies immediately instead of on the next market event. *)
-let start
+    scheduler; the engine's domains pick up each published snapshot on their
+    next cycle. [on_publish] (optional) is invoked after each pass with the
+    full snapshot - the engine uses it to wake domains so a new decision
+    applies immediately instead of on the next market event.
+
+    Resolves when [shutdown] is requested or the loop ends. The supervisor
+    runs this as the oracle's supervised connect_fn so the runtime is managed
+    like every other supervised module (registered, heartbeated, restarted). *)
+let run_loop
       ?(config = default_config ())
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
       ~(classes : (string * class_pool) list)
       ?(on_publish : decision list -> unit = fun _ -> ())
       ()
+  : unit Lwt.t
   =
   Random.self_init ();
   Atomic.set shutdown_requested false;
@@ -1510,17 +1691,43 @@ let start
   in
   (* Venue instrument metadata is initialized once here (idempotent; the
      supervisor keeps its own). *)
+  Lwt.catch
+    (fun () -> Oracle_venues.init tasks)
+    (fun exn ->
+       Logging.warn_f
+         ~section
+         "venue instrument metadata init failed (%s); increments fall back"
+         (Printexc.to_string exn);
+       Lwt.return_unit)
+  >>= fun () -> loop ()
+;;
+
+(** Start the runtime detached on the Lwt scheduler (fire-and-forget; the
+    loop's failures are logged and never crash the engine). The supervisor
+    path (Supervisor.start_oracle) uses [run_loop] directly so it owns the
+    lifecycle: registration, heartbeat monitoring, and auto-restart. *)
+let start
+      ?(config = default_config ())
+      ~(trading : Dio_strategies.Strategy_common.trading_config list)
+      ~(classes : (string * class_pool) list)
+      ?(on_publish : decision list -> unit = fun _ -> ())
+      ()
+  =
   Lwt.async (fun () ->
     Lwt.catch
-      (fun () -> Oracle_venues.init tasks)
+      (fun () -> run_loop ~config ~trading ~classes ~on_publish ())
       (fun exn ->
-         Logging.warn_f
+         Logging.error_f
            ~section
-           "venue instrument metadata init failed (%s); increments fall back"
+           "capital-oracle loop ended unexpectedly (%s); keeping last-known-good \
+            decisions"
            (Printexc.to_string exn);
-         Lwt.return_unit)
-    >>= fun () -> loop ());
+         Lwt.return_unit));
   ()
 ;;
+
+(** Whether the runtime has been told to stop (the supervisor sets this on
+    engine shutdown via [shutdown]). *)
+let is_stopped () = Atomic.get shutdown_requested
 
 let shutdown () = Atomic.set shutdown_requested true
