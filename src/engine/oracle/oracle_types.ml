@@ -210,6 +210,10 @@ type deployment_row =
     (** Worst realized dip of the quote balance over the replayed path. *)
   ; coverage : deployment_coverage list
     (** Per-horizon blended coverage at the replayed D_surv. *)
+  ; static_funded : bool
+    (** The ATH-anchored runway (d_cover) is fundable at the sizing floor:
+        cost at q_min through d_cover fits the pool. The survival floor for
+        the parameter scan when the replay cannot clear the target. *)
   ; passed : bool (** Every horizon clears the target survival on the replayed path. *)
   ; profit_proxy : float
     (** Net profit of one strategy cycle per unit of deployed capital
@@ -232,8 +236,12 @@ type parameter_components =
         depressed prices). *)
   ; survival_parameter : float
     (** Tightest parameter in the config range whose deployment clears the
-        target survival on the replayed path: the density the available
-        capital and the asset's historical volatility can actually afford. *)
+        target survival on the replayed path (in fallback mode, whose static
+        ladder cost through the observed drawdown fits the pool). When no
+        parameter can clear the replay target, the tightest parameter whose
+        ATH-anchored runway (d_cover) the pool can fund at the sizing floor -
+        the density the available capital and the asset's historical
+        volatility can actually afford. *)
   ; resolved_parameter : float
     (** Final parameter: the weighted blend of the fng / survival / range
         sides, clamped to the range and never tighter than
@@ -263,6 +271,13 @@ type asset_deployment =
   ; governing_horizon : string
     (** The horizon whose target drawdown is the deepest (the binding one). *)
   ; d_gov : float (** Deepest drawdown with F_blend(d) >= target across the horizons. *)
+  ; d_cover : float
+    (** ATH-anchored survival drawdown: the fall from the current price down
+        to the absolute target level ATH * (1 - d_gov) that the grid must
+        fund. Anchoring at the ATH caps the ladder's scale absolutely - the
+        grid always covers down to the same price level, so the scale never
+        shrinks endlessly as the market grinds down. 0 once the price is at
+        or below the target level (only the first buy needs funding). *)
   ; parameter_components : parameter_components
   ; qty : float
   ; parameter : float (** Resolved strategy parameter (grid: grid interval in %). *)

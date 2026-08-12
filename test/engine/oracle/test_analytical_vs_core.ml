@@ -318,7 +318,15 @@ let test_empirical_matches_static_on_crash () =
      static runway (one ladder fill per bar, no sells), so the empirical
      (path-replay) min capital must equal the static one: the crash IS the
      worst case the static bound prices. The tail stays flat at the crash
-     bottom (no rise, so the ladder never re-anchors up). *)
+     bottom (no rise, so the ladder never re-anchors up).
+
+     The static inversion is ATH-anchored: the series ends ~55% below its
+     ATH, deeper than the target level ATH x (1 - d-star), so the ATH-anchored
+     runway is zero - the static recommendation collapses to the first buy
+     (the model's absolute cap). The empirical number (full path replay) is
+     the honest full-history survival cost and lands above it: the anchor is
+     a deliberate cap, and the difference is exactly the span the model
+     considers already traversed. *)
   let gi = 1.0 in
   let fee = 0.0004 in
   let start_price = 100.0 in
@@ -392,13 +400,18 @@ let test_empirical_matches_static_on_crash () =
   let emp = S.empirical_min_capital ~grid ~model ~target_survival:target () in
   Alcotest.(check bool) "static reachable" true static.reachable;
   Alcotest.(check bool) "empirical reachable" true emp.reachable;
-  (* The replay's survival event is the exhaustion drawdown, which fires one
-     ladder step deeper than the drawdown the funded fills survive, so the
-     empirical capital lands strictly below the static sizing (which prices
-     the drawdown its fills fund) even on the worst-case monotone crash. *)
+  (* The ATH-anchored static recommendation is the first-buy cost (the price
+     sits below the target level ATH x (1 - d-star): the runway is spent). *)
   Alcotest.(check bool)
-    "empirical strictly below static on the crash"
-    (emp.value > 0.0 && emp.value < static.value)
+    "static collapsed to the first buy (ATH-anchored cap)"
+    (static.value > 0.0 && static.value < 150.0)
+    true;
+  (* The empirical (full-path replay) number is the honest survival cost and
+     exceeds the anchored recommendation: surviving the whole crash needs the
+     full ladder funding. *)
+  Alcotest.(check bool)
+    "empirical covers the full crash path (above the anchored cap)"
+    (emp.value > static.value)
     true
 ;;
 

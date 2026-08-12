@@ -11,13 +11,32 @@ module Types = Exchange.Types
 
 let section = "domain_spawner"
 
-(** Pure startup-gate decision for grid domains: the gate opens when at
-    least ONE sizing source is ready with real information - a capital-oracle
-    decision for this asset, or a live Fear & Greed reading. It never opens
-    on fabricated config defaults: with neither signal the grid cannot
-    profitably and accurately create orders, so it does not. *)
-let grid_gate_should_open ~(oracle_decision : bool) ~(fng_available : bool) =
-  oracle_decision || fng_available
+(** Pure startup-gate decision for grid domains: the gate opens when the
+    capital oracle published a decision for this asset, or when a live Fear &
+    Greed reading exists AND the startup window has been given to both
+    signals (the oracle's first pass attempt finished, or the startup
+    deadline elapsed). Startup always attempts BOTH signals - event-driven
+    wakeups carry the oracle pass completion and the per-cycle check picks up
+    an F&G fetch - and only after one connects and the other times out does
+    the gate proceed on the single live one. It never opens on fabricated
+    config defaults: with neither signal the grid cannot profitably and
+    accurately create orders, so it does not. *)
+let grid_gate_should_open
+      ~(oracle_decision : bool)
+      ~(fng_available : bool)
+      ~(gate_waiver : bool)
+  =
+  oracle_decision || (fng_available && gate_waiver)
+;;
+
+(** Crypto vs equity for F&G blending, mirroring the capital oracle's own
+    rule (Oracle_tasks.calendar_kind_of_exchange): crypto assets blend the
+    Fear & Greed signal into their sizing; equities are sized by the capital
+    oracle alone (pure oracle) and never take F&G values - neither for the
+    grid interval/qty nor as a startup signal. *)
+let is_crypto_exchange = function
+  | "hyperliquid" | "kraken" -> true
+  | _ -> false
 ;;
 
 (** Construct a unique registry key from exchange and symbol. *)
@@ -215,6 +234,10 @@ let asset_domain_worker
        signal at all" withhold case each fire once per domain. *)
     let fng_unavailable_warned = ref false in
     let no_signal_warned = ref false in
+    (* One-shot info: F&G is live but the startup window still gives the
+       oracle's first pass its chance - the gate waits instead of jumping on
+       F&G alone. *)
+    let fng_ready_wait_warned = ref false in
     (* The grid strategy asset is materialized only when a sizing signal
        exists - the capital oracle's decision (qty/gi win) or a live F&G
        reading. With neither, the ref stays None and the startup gate below
@@ -253,20 +276,24 @@ let asset_domain_worker
       else ref None
     in
     (* Oracle/signal startup gate: grid strategies withhold strategy
-       execution until at least ONE sizing source is ready with real
-       information - a capital-oracle decision for this asset, or a live Fear
-       & Greed reading. It never opens on fabricated config defaults: with
-       neither signal the grid cannot profitably and accurately create
-       orders, so it does not (orders are withheld, and a one-shot warning
-       fires once the grace period elapses). Non-grid strategies are not
-       gated. Event-driven, matching the rest of the startup sequencing:
-       while gated the domain clears its execute flag and blocks on the
-       normal per-symbol [Exchange_wakeup.wait]; the oracle runtime's
-       on_publish hook (Exchange_wakeup.signal_all wired in bin/main.ml)
-       wakes it ~one cycle after a decision - or after the first pass attempt
-       - is published. [oracle_gate_deadline] is the grace period before the
-       "no signal at all" withhold warning fires; it is checked on wakeups,
-       never polled. *)
+       execution until the startup window has given BOTH sizing sources their
+       chance - the capital-oracle's first pass attempt (event-driven: its
+       on_publish hook wakes the domains via Exchange_wakeup.signal_all) and
+       the Fear & Greed fetch (startup fetch in main.ml, retried on every
+       oracle pass, plus async refresh on price moves). The gate opens on the
+       oracle's first decision for this asset at any time; otherwise, once
+       the first pass attempt has finished or the startup deadline elapsed,
+       a live F&G reading alone is enough to proceed (one real signal
+       suffices after both had their chance). It never opens on fabricated
+       config defaults: with neither signal the grid cannot profitably and
+       accurately create orders, so it does not (orders are withheld, and a
+       one-shot warning fires once the grace period elapses). When only one
+       source is active and the other failed, a one-shot warning names the
+       failed one. While gated the domain clears its execute flag and blocks
+       on the normal per-symbol [Exchange_wakeup.wait].
+       [oracle_gate_deadline] is the startup window: how long both signals
+       get before the gate proceeds on whichever single one is live; it is
+       checked on wakeups, never polled. *)
     let is_grid_strategy =
       asset_with_fees.strategy = "suicide_grid" || asset_with_fees.strategy = "Grid"
     in
@@ -885,17 +912,20 @@ let asset_domain_worker
             asset.exchange
             asset.symbol);
       (* Oracle/signal startup gate (see the gate state initialized above).
-         Opens - once, monotonically - when at least ONE sizing source is
-         ready with real information: the first capital-oracle decision for
-         this asset (active or INACTIVE: an INACTIVE one halts new orders
-         through oracle_halted above), or a live Fear & Greed reading. It
-         never opens on fabricated config defaults - with neither signal the
-         grid cannot profitably and accurately create orders, so it does not
-         (the execute flag stays cleared and a one-shot warning fires once
-         the grace period elapses). When only one source is active, a
-         one-shot warning names the failed one. While closed, the execute
-         flag is cleared so the domain falls through to the per-symbol
-         wakeup wait below instead of busy-spinning. *)
+         Opens - once, monotonically - when the startup window has given BOTH
+         signals their chance: the first capital-oracle decision for this
+         asset (active or INACTIVE: an INACTIVE one halts new orders through
+         oracle_halted above) opens it at any time; otherwise a live Fear &
+         Greed reading opens it once the oracle's first pass attempt has
+         finished or the startup deadline has elapsed (one real signal
+         suffices after both had their chance). It never opens on fabricated
+         config defaults - with neither signal the grid cannot profitably and
+         accurately create orders, so it does not (the execute flag stays
+         cleared and a one-shot warning fires once the grace period elapses).
+         When only one source is active, a one-shot warning names the failed
+         one. While closed, the execute flag is cleared so the domain falls
+         through to the per-symbol wakeup wait below instead of busy-
+         spinning. *)
       if not !oracle_gate_open
       then (
         let fng_available =
@@ -903,6 +933,10 @@ let asset_domain_worker
           | Some _ -> true
           | None -> false
         in
+        (* Equities are pure oracle: F&G is never a valid sizing signal or
+           gate opener for them (only the capital oracle can open an equity
+           grid domain). *)
+        let is_crypto = is_crypto_exchange asset_with_fees.exchange in
         let gate_waiver =
           Oracle_runtime.first_pass_attempt_done ()
           || Unix.gettimeofday () >= !oracle_gate_deadline
@@ -933,7 +967,11 @@ let asset_domain_worker
             (d.d_surv *. 100.0)
         | None
           when fng_available
-               && grid_gate_should_open ~oracle_decision:false ~fng_available:true ->
+               && is_crypto
+               && grid_gate_should_open
+                    ~oracle_decision:false
+                    ~fng_available:true
+                    ~gate_waiver ->
           oracle_gate_open := true;
           should_execute_strategy := true;
           (* Materialize the grid strategy from F&G when it started with no
@@ -946,7 +984,9 @@ let asset_domain_worker
                 grid_strategy_asset_ref := Some (grid_asset_of ~grid_interval:gi ())
               | None -> ()));
           (* Only F&G is active: warn once if the oracle failed to produce a
-             decision for an asset it models; plain info otherwise. *)
+             decision for an asset it models (pass finished without one, or
+             the startup window elapsed without a completed pass); plain info
+             otherwise. *)
           if oracle_tracks_asset && Oracle_runtime.first_pass_attempt_done ()
           then
             Logging.warn_f
@@ -957,10 +997,10 @@ let asset_domain_worker
               asset_with_fees.symbol
           else if oracle_tracks_asset
           then
-            Logging.info_f
+            Logging.warn_f
               ~section
-              "[%s/%s] Capital-oracle first pass still running; sizing from Fear & Greed \
-               until its first decision"
+              "[%s/%s] Capital-oracle never completed a pass (startup window elapsed); \
+               sizing from Fear & Greed only"
               asset_with_fees.exchange
               asset_with_fees.symbol
           else
@@ -969,22 +1009,52 @@ let asset_domain_worker
               "[%s/%s] Asset not modeled by the capital oracle; sizing from Fear & Greed"
               asset_with_fees.exchange
               asset_with_fees.symbol
+        | None when fng_available ->
+          (* F&G is live but the startup window has not closed (the oracle's
+             first pass attempt has not finished and the deadline has not
+             elapsed): keep the gate closed so BOTH signals get their chance
+             at startup. The gate opens on the oracle's first decision, or on
+             F&G alone once the pass attempt finishes / the deadline elapses -
+             whichever comes first (crypto only; an equity opens on the oracle
+             decision alone - pure oracle). *)
+          should_execute_strategy := false;
+          if not !fng_ready_wait_warned
+          then (
+            fng_ready_wait_warned := true;
+            Logging.info_f
+              ~section
+              "[%s/%s] %s; waiting for the capital-oracle first pass before sizing"
+              asset_with_fees.exchange
+              asset_with_fees.symbol
+              (if is_crypto
+               then "Fear & Greed live"
+               else "equity asset sizes from the capital oracle only (pure oracle)"))
         | None ->
-          (* Neither source is ready: withhold orders. The execute flag stays
-             cleared; the gate re-checks every cycle, so the first signal
-             (oracle decision or a live F&G reading arriving on a later
-             fetch) opens it. Warn once after the grace period. *)
+          (* Neither source can open the gate (no oracle decision, and either
+             no F&G reading or an equity asset that never takes F&G): withhold
+             orders. The execute flag stays cleared; the gate re-checks every
+             cycle, so the first oracle decision opens it. Warn once after the
+             grace period. *)
           should_execute_strategy := false;
           if gate_waiver && not !no_signal_warned
           then (
             no_signal_warned := true;
-            Logging.warn_f
-              ~section
-              "[%s/%s] No capital-oracle decision and no Fear & Greed signal; orders \
-               withheld until the oracle publishes a decision or a live F&G reading \
-               exists"
-              asset_with_fees.exchange
-              asset_with_fees.symbol))
+            if is_crypto
+            then
+              Logging.warn_f
+                ~section
+                "[%s/%s] No capital-oracle decision and no Fear & Greed signal; orders \
+                 withheld until the oracle publishes a decision or a live F&G reading \
+                 exists"
+                asset_with_fees.exchange
+                asset_with_fees.symbol
+            else
+              Logging.warn_f
+                ~section
+                "[%s/%s] No capital-oracle decision; equity sizing is pure oracle, so \
+                 orders are withheld until the oracle publishes one"
+                asset_with_fees.exchange
+                asset_with_fees.symbol))
       else ();
       let should_execute =
         !exec_ready
@@ -1047,6 +1117,18 @@ let asset_domain_worker
           last_known_fng := current_fng_opt;
           match current_fng_opt with
           | None -> ()
+          | Some current_fng when not (is_crypto_exchange asset_with_fees.exchange) ->
+            (* Equities are pure oracle: F&G never enters the sizing (the
+               capital oracle owns the equity grid entirely). Log once so the
+               operator knows the signal was deliberately ignored, then keep
+               last_known_fng bookkeeping so a later change re-checks. *)
+            Logging.debug_f
+              ~section
+              "[%s/%s] Fear & Greed updated to %.2f but ignored: equity asset sizes from \
+               the capital oracle only (pure oracle)"
+              asset_with_fees.exchange
+              asset_with_fees.symbol
+              current_fng
           | Some current_fng ->
             (* The capital oracle owns the grid interval while it has an active
              decision; the F&G re-evaluation must not clobber it (the oracle

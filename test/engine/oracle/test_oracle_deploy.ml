@@ -5,11 +5,22 @@
      floor),
    - governing_drawdown picks the deepest reachable horizon target and is
      None when no horizon can clear the target,
-   - a fully funded asset deploys (almost) the whole pool, passes the target
-     survival on the replayed path, and blends gi from F&G and the survival
-     side (equities: pure survival),
+   - the ATH-anchored survival drawdown d_cover caps the ladder's scale
+     absolutely: at the ATH d_cover = d_gov, below the target level
+     ATH*(1-d_gov) the required runway is zero (maximally aggressive),
+   - the verification replay is funded with the asset's pool budget, so a
+     well-funded asset passes (no false "under-funded" verdicts) and the
+     sizing grows to the qty_cap,
+   - the deployment is as aggressive as possible within the constraints:
+     equities are pure oracle (parameter = survival_parameter, qty =
+     survival-max, F&G never blends in), crypto blends the F&G contrarian
+     signal on both gi and qty (fear tightens and up-sizes, greed loosens and
+     pulls back) clamped to never break the survival constraint,
    - under-funded active assets run at qty_min with the shortfall warned and
      keep their whole share (config-order priority),
+   - fallback (immature-history) assets are sized on the deepest observed
+     drawdown, ATH-anchored; qty still grows up to the qty_cap while the
+     static funding check holds (volume-driven),
    - inactive when the pool cannot fund the first buy, no horizon clears the
      target, or the replayed D_surv stays below --min-active-dsurv. *)
 
@@ -112,6 +123,7 @@ let grid ?(min_notional = 0.0) ?(qty_min = 0.01) ?(gi = 1.0) ~(start_price : flo
 ;;
 
 let deploy
+      ?(asset = asset)
       ?(pool = 10_000.0)
       ?(fng = Some 50.0)
       ?(fng_weight = 0.5)
@@ -223,20 +235,12 @@ let test_governing_drawdown () =
 let test_deploy_fully_funded () =
   let g = grid ~start_price:100.0 () in
   let ms = models ~asset in
-  (* Uncapped: the asset deploys the whole pool. *)
+  (* Crypto, neutral F&G (50): the qty is blended toward the middle of
+     [q_min, survival-max], so roughly half the pool deploys; the row passes
+     (the replay, funded with the full pool budget, clears the target). *)
   let d = deploy ~pool:10_000.0 ~qty_cap_mult:0.0 ~g ~models:ms () in
   Alcotest.(check bool) "active" d.Oracle_types.active true;
-  (* Fully deployed: the ladder consumes essentially the whole pool (within
-     one lot's slack from the lot-rounded qty inversion). *)
-  Alcotest.(check bool)
-    "deployed >= 99% of pool"
-    (d.deployed >= 0.99 *. d.pool_share)
-    true;
   Alcotest.(check bool) "row passed" d.Oracle_types.row.passed true;
-  Alcotest.(check bool)
-    "remainder within one lot's slack"
-    (d.remainder < 0.01 *. d.pool_share)
-    true;
   (* Every horizon clears the target at the replayed D_surv. *)
   List.iter
     (fun (c : Oracle_types.deployment_coverage) ->
@@ -245,7 +249,8 @@ let test_deploy_fully_funded () =
          (c.blended_coverage +. 1e-9 >= 0.99)
          true)
     d.coverage;
-  (* D_surv covers the governing drawdown. *)
+  (* D_surv covers the governing drawdown (the replay is pool-funded, so a
+     well-capitalized asset survives the whole path). *)
   Alcotest.(check bool) "d_surv >= d_gov" (d.d_surv +. 0.02 >= d.d_gov) true;
   (* gi is within the config range and never tighter than the survival side. *)
   Alcotest.(check bool)
@@ -255,6 +260,26 @@ let test_deploy_fully_funded () =
   Alcotest.(check bool)
     "gi >= gi_survival"
     (d.parameter +. 1e-9 >= d.parameter_components.survival_parameter)
+    true;
+  (* At neutral F&G the qty blend sits in the middle of [q_min, survival-max]:
+     the deployed capital is roughly half the pool, not the whole pool. *)
+  Alcotest.(check bool)
+    "deployed ~ half the pool at neutral F&G"
+    (d.deployed > 0.4 *. d.pool_share && d.deployed < 0.6 *. d.pool_share)
+    true;
+  (* Equities are pure oracle: no F&G qty blend, so the survival-max qty
+     deploys (almost) the whole pool. *)
+  let d_eq =
+    deploy ~pool:10_000.0 ~qty_cap_mult:0.0 ~g ~fng:None ~use_fng:false ~models:ms ()
+  in
+  Alcotest.(check bool) "equity active" d_eq.active true;
+  Alcotest.(check bool)
+    "equity row passed"
+    (d_eq.row.passed || d_eq.d_surv +. 0.02 >= d_eq.d_gov)
+    true;
+  Alcotest.(check bool)
+    "equity deploys >= 99% of pool (pure oracle, no F&G blend)"
+    (d_eq.deployed >= 0.99 *. d_eq.pool_share)
     true
 ;;
 
@@ -407,6 +432,41 @@ let trough_series ~n =
   { Oracle_types.symbol = "TROUGH"; calendar_kind = Oracle_types.Crypto; bars; gaps = [] }
 ;;
 
+(** A series that crashes hard in the middle (bars 60-69, -5%/bar: ~40%
+    drawdown) and then RECOVERS to near its peak: the price ends in the upper
+    part of its range (d_from_ath small), so the ATH-anchored runway is a
+    real positive fraction of the drawdown - the fallback parameter must
+    loosen until the pool funds that runway. *)
+let recover_series ~n =
+  let iso day = Oracle_calendar.add_days "2020-01-01" day in
+  let price = ref 100.0 in
+  let bars =
+    Array.make
+      n
+      Oracle_types.{ date = ""; open_ = 0.; high = 0.; low = 0.; close = 0.; volume = 0. }
+  in
+  for i = 0 to n - 1 do
+    let osc = 0.003 *. sin (float_of_int i /. 9.0) in
+    let crash = if i >= 60 && i < 70 then 0.95 else 1.0 in
+    let recover = if i >= 70 then 1.025 else 1.0 in
+    price := !price *. (1.0 +. osc) *. crash *. recover;
+    let p = !price in
+    bars.(i)
+    <- { Oracle_types.date = iso i
+       ; open_ = p
+       ; high = p *. 1.001
+       ; low = p *. 0.999
+       ; close = p
+       ; volume = 1000.0
+       }
+  done;
+  { Oracle_types.symbol = "RECOVER"
+  ; calendar_kind = Oracle_types.Crypto
+  ; bars
+  ; gaps = []
+  }
+;;
+
 let test_deepest_observed_drawdown () =
   let ms = models ~asset in
   let d, label =
@@ -460,7 +520,9 @@ let test_deploy_fallback_immature () =
   (match Oracle_deploy.governing_drawdown ~models:[ m ] ~target_survival:1.0 with
    | Some _ -> Alcotest.fail "expected unreachable governing drawdown"
    | None -> ());
-  let d = deploy ~pool:5_000.0 ~qty_cap_mult:0.0 ~g ~target:1.0 ~models:[ m ] () in
+  let d =
+    deploy ~pool:5_000.0 ~asset:immature ~qty_cap_mult:0.0 ~g ~target:1.0 ~models:[ m ] ()
+  in
   Alcotest.(check bool) "immature asset still active" d.Oracle_types.active true;
   Alcotest.(check bool)
     "d_gov is the deepest observed drawdown"
@@ -481,19 +543,19 @@ let test_deploy_fallback_immature () =
 
 let test_fallback_tunes_parameter_to_funding () =
   (* The fallback (immature-history) parameter must be tuned by the static
-     funding check against the observed max drawdown - not collapse onto
+     funding check against the ATH-anchored runway - not collapse onto
      gi_lo. A replay-based fallback criterion is unusable on an immature
      history (the replay is not authoritative), so the criterion is the
-     static funding check: the pool must fund the observed drawdown at the
-     floor qty at the chosen gi. The grid loosens until the pool can fund
-     it. *)
-  let trough = trough_series ~n:90 in
+     static funding check: the pool must fund the ATH-anchored drawdown at
+     the floor qty at the chosen gi. The grid loosens until the pool can
+     fund it. *)
+  let recover = recover_series ~n:90 in
   let crash = crash_series ~n:200 in
   let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
   let m =
     Oracle_replay.blend_model_of
       ~horizon:h21
-      ~asset:trough
+      ~asset:recover
       ~class_members:[ crash ]
       ~kappa:10
       ~warmup
@@ -510,17 +572,20 @@ let test_fallback_tunes_parameter_to_funding () =
   in
   Alcotest.(check bool) "observed crash drawdown is real" (d_gov > 0.3) true;
   let lo, hi = 0.5, 2.0 in
-  (* The oracle anchors the ladder at the last close - the trough - so the
-     crash sits entirely above the anchor and the path replay never buys,
-     let alone exhausts (the degenerate SPCX premise). *)
-  let sp = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
+  let sp = recover.bars.(Array.length recover.bars - 1).Oracle_types.close in
   let g = grid ~start_price:sp () in
+  let r = Option.get (Oracle_math.range_stats_of recover) in
+  let d_cover = Oracle_math.ath_anchored_drawdown ~d_gov r in
+  (* The recover series ends near its peak, so the ATH-anchored runway is a
+     real positive fraction of the observed drawdown (not collapsed to 0). *)
+  Alcotest.(check bool) "runway positive" (d_cover > 0.05 && d_cover < d_gov) true;
   let q_min = D.sizing_floor ~cfg:g in
   let fills_at gi =
     let gi_frac = Float.min (gi /. 100.0) 0.99 in
     max
       1
-      (int_of_float (Float.ceil (Float.log (1.0 -. d_gov) /. Float.log (1.0 -. gi_frac))))
+      (int_of_float
+         (Float.ceil (Float.log (1.0 -. d_cover) /. Float.log (1.0 -. gi_frac))))
   in
   let cost_at gi =
     Oracle_mfd.floor_aware_runway_cost
@@ -538,16 +603,27 @@ let test_fallback_tunes_parameter_to_funding () =
   Alcotest.(check bool) "tighter grid costs more" (cost_lo > cost_hi) true;
   (* Pool between the two: un-fundable at gi_lo, fundable at gi_hi. *)
   let pool = (cost_lo +. cost_hi) /. 2.0 in
-  let d = deploy ~pool ~g ~lo ~hi ~fng:None ~use_fng:false ~target:1.0 ~models:[ m ] () in
+  let d =
+    deploy
+      ~asset:recover
+      ~pool
+      ~g
+      ~lo
+      ~hi
+      ~fng:None
+      ~use_fng:false
+      ~target:1.0
+      ~models:[ m ]
+      ()
+  in
   Alcotest.(check bool) "fallback asset still active" d.active true;
   Alcotest.(check bool)
     "grid loosened to the fundable parameter (not gi_lo)"
     (d.parameter > lo +. 0.001)
     true;
   Alcotest.(check bool)
-    "the replay honestly realizes the observed crash (D_surv ~ d_gov, not the degenerate \
-     100%)"
-    (d.d_surv > 0.3 && d.d_surv < 0.5)
+    "the ATH-anchored runway is the sizing basis"
+    (abs_float (d.d_cover -. d_cover) < 1e-9)
     true;
   Alcotest.(check bool) "deployed fits the pool" (d.deployed <= pool +. 1e-9) true;
   Alcotest.(check bool)
@@ -557,7 +633,7 @@ let test_fallback_tunes_parameter_to_funding () =
 ;;
 
 let test_fallback_abundant_pool_squeezes_to_lo () =
-  (* With capital far beyond the observed drawdown's worst-case cost, the
+  (* With capital far beyond the ATH-anchored runway's worst-case cost, the
      static funding check funds even the tightest config grid: the squeeze
      onto gi_lo is a computed outcome of the observed drawdown + the pool,
      not the degenerate replay collapse. *)
@@ -579,6 +655,7 @@ let test_fallback_abundant_pool_squeezes_to_lo () =
   let d =
     let trough_close = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
     deploy
+      ~asset:trough
       ~pool:1_000_000.0
       ~g:(grid ~start_price:trough_close ())
       ~lo:0.5
@@ -596,13 +673,13 @@ let test_fallback_abundant_pool_squeezes_to_lo () =
     true
 ;;
 
-let test_fallback_deploys_at_floor () =
-  (* An immature asset never grows its order qty beyond the floor: the
-     observed drawdown is fully funded at the sizing floor, and a larger qty
-     would deploy more capital for zero additional survival - "allocate to
-     meet the target, never exceed it". The deployment is exactly the
-     reservation and the rest of the pool passes down the priority order,
-     regardless of qty_cap_mult. *)
+let test_fallback_grows_qty_while_funded () =
+  (* An immature asset is volume driven too: the order qty grows up to the
+     qty_cap while the static funding check (the pool funds the ATH-anchored
+     drawdown at the sizing floor) holds. The trough asset ended below its
+     ATH-anchored target level (d_cover = 0), so only the first buy needs
+     funding and the qty squeezes to the cap; the excess passes down the
+     priority order. *)
   let trough = trough_series ~n:90 in
   let crash = crash_series ~n:200 in
   let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
@@ -618,35 +695,12 @@ let test_fallback_deploys_at_floor () =
   (match Oracle_deploy.governing_drawdown ~models:[ m ] ~target_survival:1.0 with
    | Some _ -> Alcotest.fail "expected unreachable governing drawdown"
    | None -> ());
-  let d_gov, _ =
-    match Oracle_deploy.deepest_observed_drawdown [ m ] with
-    | Some x -> x
-    | None -> Alcotest.fail "expected a deepest observed drawdown"
-  in
   let sp = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
   let g = grid ~start_price:sp () in
   let q_min = D.sizing_floor ~cfg:g in
-  let n_fills =
-    let gi_frac = Float.min (0.5 /. 100.0) 0.99 in
-    max
-      1
-      (int_of_float (Float.ceil (Float.log (1.0 -. d_gov) /. Float.log (1.0 -. gi_frac))))
-  in
-  let reservation =
-    Oracle_mfd.floor_aware_runway_cost
-      ~qty:q_min
-      ~grid_interval_pct:0.5
-      ~fee:0.0004
-      ~start_price:sp
-      ~min_notional:0.0
-      ~price_increment:0.01
-      ~qty_increment:0.01
-      ~n_fills
-  in
-  (* Abundant pool and a permissive qty cap (10x design): the fallback
-     deployment must still be the floor qty = the reservation. *)
   let d =
     deploy
+      ~asset:trough
       ~pool:1_000_000.0
       ~g
       ~lo:0.5
@@ -660,12 +714,12 @@ let test_fallback_deploys_at_floor () =
   in
   Alcotest.(check bool) "fallback asset active" d.active true;
   Alcotest.(check bool)
-    "fallback qty pinned at the sizing floor"
-    (abs_float (d.qty -. q_min) < 1e-9)
+    "fallback qty grows to the cap while the funding check holds"
+    (abs_float (d.qty -. (10.0 *. q_min)) < 1e-9)
     true;
   Alcotest.(check bool)
-    "fallback deployment is the reservation (target need, not cap growth)"
-    (abs_float (d.deployed -. reservation) < 0.01)
+    "fallback deployed is the first-buy funding at the cap qty"
+    (d.deployed > q_min *. sp *. 0.5 && d.deployed < 10.0 *. q_min *. sp)
     true;
   Alcotest.(check bool)
     "the rest of the pool passes down"
@@ -801,7 +855,7 @@ let test_range_stats () =
   (* ATH / all-time low / price and the derived stats over the synthetic
      history: the reference for the per-asset potential price range. *)
   let r =
-    match Oracle_deploy.range_stats_of asset with
+    match Oracle_math.range_stats_of asset with
     | Some r -> r
     | None -> Alcotest.fail "expected range stats"
   in
@@ -820,7 +874,7 @@ let test_range_stats () =
   (* Empty history -> None. *)
   Alcotest.(check bool)
     "empty history -> None"
-    (Oracle_deploy.range_stats_of
+    (Oracle_math.range_stats_of
        { Oracle_types.symbol = "E"
        ; calendar_kind = Oracle_types.Crypto
        ; bars = [||]
@@ -837,12 +891,12 @@ let test_range_parameter_direction () =
      accumulation zone), working with the F&G contrarian convention. *)
   let lo, hi = 0.5, 2.0 in
   let r_ath =
-    match Oracle_deploy.range_stats_of (linear_series ~n:60 ~slope:0.02) with
+    match Oracle_math.range_stats_of (linear_series ~n:60 ~slope:0.02) with
     | Some r -> r
     | None -> Alcotest.fail "expected stats for the rising series"
   in
   let r_low =
-    match Oracle_deploy.range_stats_of (linear_series ~n:60 ~slope:(-0.02)) with
+    match Oracle_math.range_stats_of (linear_series ~n:60 ~slope:(-0.02)) with
     | Some r -> r
     | None -> Alcotest.fail "expected stats for the falling series"
   in
@@ -904,9 +958,12 @@ let test_deploy_range_blend () =
 ;;
 
 let test_deploy_range_equity () =
-  (* Equities (use_fng = false) have no F&G side: the survival and range
-     sides are renormalized over their combined weight (fng_weight = 0.5,
-     range_weight = 0.25 -> each carries 50% of the blend). *)
+  (* Equities (use_fng = false) are pure oracle: no F&G side AND no sentiment
+     blend - the parameter is exactly the survival-constrained value (the
+     tightest density that clears the target / the funding the capital
+     allows). The range side stays computed for the record but never loosens
+     the equity grid: survival is the only constraint and aggression the
+     only tune. *)
   let g = grid ~start_price:100.0 () in
   let ms = models ~asset in
   let d =
@@ -926,14 +983,232 @@ let test_deploy_range_equity () =
     (d.parameter_components.fng_parameter = None)
     true;
   Alcotest.(check bool)
-    "equity gi blends survival and range"
-    (d.parameter >= d.parameter_components.survival_parameter -. 1e-9
-     && d.parameter <= 2.0 +. 1e-9)
+    "equity gi = survival parameter (pure oracle, no sentiment blend)"
+    (abs_float (d.parameter -. d.parameter_components.survival_parameter) < 1e-9)
     true;
   Alcotest.(check bool)
-    "equity range side present"
+    "equity range side still computed for the record"
     (Option.is_some d.parameter_components.range_parameter)
     true
+;;
+
+let test_ath_anchored_drawdown () =
+  (* The ATH-anchored survival drawdown d_cover caps the ladder's scale
+     absolutely: the grid always covers down to the absolute target level
+     ATH*(1 - d_gov), so the scale never shrinks endlessly as the market
+     grinds down. *)
+  let mk ~ath ~low ~price =
+    { Oracle_types.ath
+    ; all_time_low = low
+    ; price
+    ; d_from_ath = (if ath > 0.0 then (ath -. price) /. ath else 0.0)
+    ; d_to_low = (if price > 0.0 then (price -. low) /. price else 0.0)
+    ; range_span = (if ath > 0.0 then (ath -. low) /. ath else 0.0)
+    }
+  in
+  let d_gov = 0.5 in
+  (* At the ATH: the fall from the current price to ATH*(1-d_gov) is exactly
+     d_gov. *)
+  let r_ath = mk ~ath:100.0 ~low:10.0 ~price:100.0 in
+  near (Oracle_math.ath_anchored_drawdown ~d_gov r_ath) d_gov;
+  (* 20% below the ATH: part of the fall to the target level has already
+     happened, so the remaining runway is smaller than d_gov (but positive). *)
+  let r_mid = mk ~ath:100.0 ~low:10.0 ~price:80.0 in
+  let d_mid = Oracle_math.ath_anchored_drawdown ~d_gov r_mid in
+  Alcotest.(check bool) "middle runway in (0, d_gov)" (d_mid > 0.0 && d_mid < d_gov) true;
+  (* At or below the target level ATH*(1-d_gov) = 50: the whole span has been
+     traversed - the required runway is zero (only the first buy needs
+     funding), so the model can be maximally aggressive. *)
+  let r_deep = mk ~ath:100.0 ~low:10.0 ~price:50.0 in
+  near (Oracle_math.ath_anchored_drawdown ~d_gov r_deep) 0.0;
+  let r_below = mk ~ath:100.0 ~low:10.0 ~price:30.0 in
+  near (Oracle_math.ath_anchored_drawdown ~d_gov r_below) 0.0;
+  (* A new ATH (d_from_ath = 0 via the clamp) still sizes at d_gov. *)
+  let r_new = mk ~ath:110.0 ~low:10.0 ~price:115.0 in
+  near (Oracle_math.ath_anchored_drawdown ~d_gov r_new) d_gov;
+  (* Monotone: the deeper the price sits below the ATH, the smaller the
+     remaining runway. *)
+  Alcotest.(check bool)
+    "monotone in d_from_ath"
+    (Oracle_math.ath_anchored_drawdown ~d_gov r_mid
+     > Oracle_math.ath_anchored_drawdown ~d_gov r_deep)
+    true
+;;
+
+let test_deploy_replay_pool_funded () =
+  (* The verification replay is funded with the asset's pool budget, not the
+     static ladder cost: a well-funded asset must pass and grow its qty to
+     the cap instead of being falsely branded under-funded. (The old funding
+     rule - min(pool, static ladder cost) - systematically under-stated the
+     burn of a long replayed path and produced absurd "pool cannot fund"
+     verdicts for deep-pooled assets like QQQ.) *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let d_gov, _ =
+    match Oracle_deploy.governing_drawdown ~models:ms ~target_survival:0.99 with
+    | Some x -> x
+    | None -> Alcotest.fail "governing drawdown unreachable"
+  in
+  let r = Option.get (Oracle_math.range_stats_of asset) in
+  let d_cover = Oracle_math.ath_anchored_drawdown ~d_gov r in
+  let n_fills =
+    Oracle_strategy.Grid.fills_for_drawdown { g with grid_interval_pct = 0.5 } ~d:d_cover
+  in
+  let cost_floor =
+    Oracle_mfd.floor_aware_runway_cost
+      ~qty:(D.sizing_floor ~cfg:g)
+      ~grid_interval_pct:0.5
+      ~fee:g.maker_fee
+      ~start_price:g.start_price
+      ~min_notional:g.min_notional
+      ~price_increment:g.price_increment
+      ~qty_increment:g.qty_increment
+      ~n_fills
+  in
+  (* A pool far beyond the static runway cost (the old funding cap): the
+     replay must still clear the target - the pool is the honest budget. *)
+  let d = deploy ~pool:(50.0 *. cost_floor) ~g ~fng:None ~use_fng:false ~models:ms () in
+  Alcotest.(check bool) "active with a deep pool" d.active true;
+  Alcotest.(check bool)
+    "row passes with the pool-funded replay"
+    (d.row.passed || d.d_surv +. 0.02 >= d.d_gov)
+    true;
+  Alcotest.(check bool)
+    "no under-funded warning"
+    (not (List.exists (fun (w : string) -> contains w "under-funded") d.warnings))
+    true;
+  (* Equity, pure oracle: the qty grows to the cap (the whole headroom the
+     config allows) and the gi squeezes to the survival-constrained lo. *)
+  Alcotest.(check bool)
+    "qty at the cap (aggressive within the qty range)"
+    (abs_float (d.qty -. D.sizing_floor ~cfg:g) < 1e-9)
+    true;
+  Alcotest.(check bool)
+    "gi at the survival-constrained lo"
+    (abs_float (d.parameter -. d.parameter_components.survival_parameter) < 1e-9)
+    true
+;;
+
+let test_deploy_crypto_qty_blend () =
+  (* Crypto blends BOTH the grid interval and the qty with the F&G
+     contrarian signal: max fear (fng 0) tightens the grid to the
+     survival-constrained lo and up-sizes the qty to the survival-max; max
+     greed (fng 100) loosens the grid and pulls the qty back toward the
+     floor. Neither may break the survival constraint. *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let d_fear =
+    deploy ~pool:100_000.0 ~g ~fng:(Some 0.0) ~qty_cap_mult:2.0 ~models:ms ()
+  in
+  let d_greed =
+    deploy ~pool:100_000.0 ~g ~fng:(Some 100.0) ~qty_cap_mult:2.0 ~models:ms ()
+  in
+  Alcotest.(check bool) "fear active" d_fear.active true;
+  Alcotest.(check bool) "greed active" d_greed.active true;
+  (* Fear: qty = survival-max = the cap (q_min * 2). *)
+  let q_min = D.sizing_floor ~cfg:g in
+  Alcotest.(check bool)
+    "fear qty at the survival-max (the cap)"
+    (abs_float (d_fear.qty -. (2.0 *. q_min)) < 1e-9)
+    true;
+  (* Greed: qty pulled back to the floor. *)
+  Alcotest.(check bool)
+    "greed qty at the floor"
+    (abs_float (d_greed.qty -. q_min) < 1e-9)
+    true;
+  (* Fear tightens the grid (fng side = lo), greed loosens it. *)
+  Alcotest.(check bool)
+    "fear gi tighter than greed gi"
+    (d_fear.parameter < d_greed.parameter)
+    true;
+  (* The qty blend never exceeds the survival-max. *)
+  Alcotest.(check bool)
+    "blended qty bounded by the survival-max"
+    (d_fear.qty +. 1e-9 >= q_min && d_fear.qty <= (2.0 *. q_min) +. 1e-9)
+    true
+;;
+
+let test_deploy_equity_ignores_fng () =
+  (* Equities are pure oracle: the F&G value never enters the sizing, so the
+     parameter and qty are identical at fng 0 and fng 100. *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let d0 = deploy ~pool:100_000.0 ~g ~fng:(Some 0.0) ~use_fng:false ~models:ms () in
+  let d100 = deploy ~pool:100_000.0 ~g ~fng:(Some 100.0) ~use_fng:false ~models:ms () in
+  Alcotest.(check bool) "equity active" (d0.active && d100.active) true;
+  Alcotest.(check bool)
+    "equity fng_parameter None in both"
+    (d0.parameter_components.fng_parameter = None
+     && d100.parameter_components.fng_parameter = None)
+    true;
+  Alcotest.(check bool)
+    "equity parameter identical across fng"
+    (abs_float (d0.parameter -. d100.parameter) < 1e-9)
+    true;
+  Alcotest.(check bool)
+    "equity qty identical across fng"
+    (abs_float (d0.qty -. d100.qty) < 1e-9)
+    true;
+  Alcotest.(check bool)
+    "equity sizing is the pure-oracle survival-max"
+    (abs_float (d0.parameter -. d0.parameter_components.survival_parameter) < 1e-9)
+    true
+;;
+
+let test_deploy_ath_cap_below_target () =
+  (* Once the price is at or below the ATH-anchored target level
+     ATH*(1-d_gov), the required runway is zero: only the first buy needs
+     funding, so a small pool keeps the asset active and the sizing is
+     maximally aggressive (gi_lo) instead of clamping to the widest grid. *)
+  let trough = trough_series ~n:90 in
+  let crash = crash_series ~n:200 in
+  let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
+  let m =
+    Oracle_replay.blend_model_of
+      ~horizon:h21
+      ~asset:trough
+      ~class_members:[ crash ]
+      ~kappa:10
+      ~warmup
+      ()
+  in
+  let sp = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
+  let g = grid ~start_price:sp () in
+  let q_min = D.sizing_floor ~cfg:g in
+  let cost_one =
+    Oracle_mfd.floor_aware_runway_cost
+      ~qty:q_min
+      ~grid_interval_pct:2.0
+      ~fee:g.maker_fee
+      ~start_price:sp
+      ~min_notional:0.0
+      ~price_increment:0.01
+      ~qty_increment:0.01
+      ~n_fills:1
+  in
+  let d =
+    deploy
+      ~asset:trough
+      ~pool:(1.5 *. cost_one)
+      ~g
+      ~lo:0.5
+      ~hi:2.0
+      ~fng:None
+      ~use_fng:false
+      ~target:1.0
+      ~models:[ m ]
+      ()
+  in
+  Alcotest.(check bool) "active funded by the first buy alone" d.active true;
+  Alcotest.(check bool)
+    "d_cover 0 (price below the ATH-anchored target level)"
+    (d.d_cover = 0.0)
+    true;
+  Alcotest.(check bool)
+    "gi squeezed to the tightest config value (max aggression)"
+    (abs_float (d.parameter -. 0.5) < 1e-9)
+    true;
+  Alcotest.(check bool) "deployed fits the pool" (d.deployed <= d.pool_share +. 1e-9) true
 ;;
 
 let () =
@@ -951,11 +1226,30 @@ let () =
       )
     ; ( "governing_basis"
       , [ Alcotest.test_case "target vs fallback vs none" `Quick test_governing_basis ] )
+    ; ( "ath_anchored_drawdown"
+      , [ Alcotest.test_case "absolute cap on the scale" `Quick test_ath_anchored_drawdown
+        ] )
     ; ( "deploy_asset"
       , [ Alcotest.test_case "fully funded" `Quick test_deploy_fully_funded
         ; Alcotest.test_case "gi blend and equity rule" `Quick test_deploy_gi_blend
         ; Alcotest.test_case "under-funded priority" `Quick test_deploy_under_funded
         ; Alcotest.test_case "qty cap passes excess down" `Quick test_deploy_qty_cap
+        ; Alcotest.test_case
+            "replay funded by the pool budget"
+            `Quick
+            test_deploy_replay_pool_funded
+        ; Alcotest.test_case
+            "crypto qty blended with F&G"
+            `Quick
+            test_deploy_crypto_qty_blend
+        ; Alcotest.test_case
+            "equity ignores F&G entirely"
+            `Quick
+            test_deploy_equity_ignores_fng
+        ; Alcotest.test_case
+            "ATH cap: below-target price runs at max aggression"
+            `Quick
+            test_deploy_ath_cap_below_target
         ; Alcotest.test_case
             "immature fallback sizing"
             `Quick
@@ -969,9 +1263,9 @@ let () =
             `Quick
             test_fallback_abundant_pool_squeezes_to_lo
         ; Alcotest.test_case
-            "fallback deploys at the floor"
+            "fallback grows qty while funded"
             `Quick
-            test_fallback_deploys_at_floor
+            test_fallback_grows_qty_while_funded
         ; Alcotest.test_case "inactive cases" `Quick test_deploy_inactive
         ; Alcotest.test_case "floor-aware down-sizing" `Quick test_floor_aware_shrink
         ; Alcotest.test_case "range blend" `Quick test_deploy_range_blend

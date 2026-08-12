@@ -74,6 +74,9 @@ type decision =
   ; grid_interval : float (** Recommended grid interval in %. *)
   ; d_surv : float (** Replayed D_surv at the recommended sizing. *)
   ; d_gov : float (** Governing drawdown across the reachable horizons. *)
+  ; d_cover : float
+    (** ATH-anchored survival drawdown: the fall from the current price down
+        to the absolute target level ATH * (1 - d_gov) the grid must fund. *)
   ; governing_horizon : string (** The binding horizon. *)
   ; deployed : float (** Capital the ladder consumes at the recommended sizing. *)
   ; pool_share : float (** Capital this asset drew from the venue pool. *)
@@ -532,10 +535,11 @@ let venue_pools (tasks : Oracle_tasks.task list)
 type reservation =
   { q_min : float (** sizing floor (venue lot / config qty) *)
   ; d_gov : float (** governing drawdown on the sizing basis *)
+  ; d_cover : float (** ATH-anchored survival drawdown (the sizing runway) *)
   ; governing_horizon : string
   ; fallback : bool (** basis is the raw deepest-observed fallback *)
-  ; n_fills : int (** ladder fills through [d_gov] at the tightest interval *)
-  ; min_cost : float (** ladder cost at [q_min] through [d_gov] at gi_lo *)
+  ; n_fills : int (** ladder fills through [d_cover] at the tightest interval *)
+  ; min_cost : float (** ladder cost at [q_min] through [d_cover] at gi_lo *)
   ; first_buy : float (** cost of the first fill at [q_min] at gi_lo *)
   }
 
@@ -697,6 +701,7 @@ let analyze_asset
     | None ->
       { q_min = D.sizing_floor ~cfg:grid
       ; d_gov = 0.0
+      ; d_cover = 0.0
       ; governing_horizon = ""
       ; fallback = false
       ; n_fills = 0
@@ -705,16 +710,25 @@ let analyze_asset
       }
     | Some (d_gov, governing_horizon, fallback) ->
       let q_min = D.sizing_floor ~cfg:grid in
+      (* The reservation funds the ATH-anchored runway: the fall from the
+         current price down to the absolute target level ATH*(1 - d_gov), so
+         the reserve (and the whole sizing) is capped at an absolute scale
+         instead of shrinking endlessly as the price grinds down. *)
+      let d_cover =
+        match Oracle_math.range_stats_of asset with
+        | Some r -> Oracle_math.ath_anchored_drawdown ~d_gov r
+        | None -> d_gov
+      in
       let grid_lo = G.set_parameter grid gi_lo in
-      let n_fills = G.fills_for_drawdown grid_lo ~d:d_gov in
+      let n_fills = G.fills_for_drawdown grid_lo ~d:d_cover in
       let min_cost = G.cost_at grid_lo ~qty:q_min ~n_fills in
       let first_buy = G.cost_at grid_lo ~qty:q_min ~n_fills:1 in
-      { q_min; d_gov; governing_horizon; fallback; n_fills; min_cost; first_buy }
+      { q_min; d_gov; d_cover; governing_horizon; fallback; n_fills; min_cost; first_buy }
   in
   Logging.info_f
     ~section
     "[%d/%d] %s/%s: reservation qty_min %.6g, first buy %.2f, min drawdown cost %.2f \
-     through d_gov %.1f%% @ %s (%s) at gi_lo %.2f%%"
+     through d_gov %.1f%% (ATH-anchored %.1f%%) @ %s (%s) at gi_lo %.2f%%"
     index
     n_tasks
     exchange
@@ -723,6 +737,7 @@ let analyze_asset
     reservation.first_buy
     reservation.min_cost
     (reservation.d_gov *. 100.0)
+    (reservation.d_cover *. 100.0)
     (if reservation.governing_horizon = "" then "-" else reservation.governing_horizon)
     (if reservation.fallback then "raw/fallback" else "target")
     gi_lo;
@@ -774,7 +789,7 @@ let size_asset
   Logging.info_f
     ~section
     "[%d/%d] %s/%s %s qty %.6g gi %.2f%% deployed %.2f / share %.2f remainder %.2f \
-     (D_surv %.1f%%, governing %.1f%% @ %s)"
+     (D_surv %.1f%%, governing %.1f%% (ATH-anchored %.1f%%) @ %s)"
     index
     n_tasks
     exchange
@@ -787,6 +802,7 @@ let size_asset
     deployment.Oracle_types.remainder
     (deployment.Oracle_types.d_surv *. 100.0)
     (deployment.Oracle_types.d_gov *. 100.0)
+    (deployment.Oracle_types.d_cover *. 100.0)
     (if deployment.Oracle_types.governing_horizon = ""
      then "-"
      else deployment.Oracle_types.governing_horizon);
@@ -830,6 +846,7 @@ let size_asset
      ; grid_interval = deployment.Oracle_types.parameter
      ; d_surv = deployment.Oracle_types.d_surv
      ; d_gov = deployment.Oracle_types.d_gov
+     ; d_cover = deployment.Oracle_types.d_cover
      ; governing_horizon = deployment.Oracle_types.governing_horizon
      ; deployed = deployment.Oracle_types.deployed
      ; pool_share = deployment.Oracle_types.pool_share
