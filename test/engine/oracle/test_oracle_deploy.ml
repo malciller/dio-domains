@@ -171,7 +171,8 @@ let test_qty_for_pool_round_trip () =
 let test_qty_for_pool_under_funded () =
   let g = grid ~start_price:100.0 () in
   let qty = D.qty_for_pool ~cfg:g ~n_fills:30 ~pool:1.0 in
-  near (Float.max g.qty_min g.qty_increment) qty
+  (* The floor is the venue lot OR the config qty, whichever is larger. *)
+  near (Float.max (Float.max g.qty_min g.qty_increment) g.qty) qty
 ;;
 
 let test_governing_drawdown () =
@@ -285,8 +286,9 @@ let test_deploy_under_funded () =
   let n_fills =
     Oracle_strategy.Grid.fills_for_drawdown { g with grid_interval_pct = gi } ~d:d_gov
   in
-  (* A pool below the qty_min runway through d_gov: under-funded. *)
-  let q_min = Float.max g.qty_min g.qty_increment in
+  (* A pool below the sizing-floor runway through d_gov: under-funded. The
+     floor is the venue lot or the config qty, whichever is larger. *)
+  let q_min = Float.max (Float.max g.qty_min g.qty_increment) g.qty in
   let full =
     Oracle_mfd.floor_aware_runway_cost
       ~qty:q_min
@@ -441,6 +443,48 @@ let test_deploy_fallback_immature () =
   Alcotest.(check bool) "deployed fits the pool" (d.deployed <= 5_000.0 +. 1e-9) true
 ;;
 
+let test_governing_basis () =
+  (* Reachable history: the basis is the target-clearing governing drawdown,
+     flagged as authoritative (not fallback), identical to governing_drawdown. *)
+  let ms = models ~asset in
+  (match Oracle_deploy.governing_basis ~models:ms ~target_survival:0.99 with
+   | Some (d, h, fallback) ->
+     Alcotest.(check bool) "target basis not fallback" (not fallback) true;
+     (match Oracle_deploy.governing_drawdown ~models:ms ~target_survival:0.99 with
+      | Some (d2, h2) ->
+        near d d2;
+        Alcotest.(check string) "same governing horizon" h h2
+      | None -> Alcotest.fail "governing_drawdown should be reachable")
+   | None -> Alcotest.fail "expected a target basis");
+  (* Immature history (one window) with an unreachable target: the basis falls
+     back to the deepest observed drawdown and is flagged as such. *)
+  let immature = synth_series ~n:90 in
+  let crash = crash_series ~n:200 in
+  let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
+  let m =
+    Oracle_replay.blend_model_of
+      ~horizon:h21
+      ~asset:immature
+      ~class_members:[ crash ]
+      ~kappa:10
+      ~warmup
+      ()
+  in
+  (match Oracle_deploy.governing_basis ~models:[ m ] ~target_survival:1.0 with
+   | Some (d, h, fallback) ->
+     Alcotest.(check bool) "fallback flagged" fallback true;
+     Alcotest.(check string) "fallback horizon is 21s" h "21s";
+     Alcotest.(check bool) "fallback d in (0,1)" (d > 0.0 && d < 1.0) true;
+     (match Oracle_deploy.deepest_observed_drawdown [ m ] with
+      | Some (d2, _) -> near d d2
+      | None -> Alcotest.fail "deepest observed should exist")
+   | None -> Alcotest.fail "expected a fallback basis");
+  (* No models at all: nothing computable. *)
+  match Oracle_deploy.governing_basis ~models:[] ~target_survival:0.99 with
+  | Some _ -> Alcotest.fail "expected no basis for an empty model set"
+  | None -> ()
+;;
+
 let test_deploy_inactive () =
   let g = grid ~start_price:100.0 () in
   let ms = models ~asset in
@@ -510,6 +554,8 @@ let () =
     ; ( "governing_drawdown"
       , [ Alcotest.test_case "deepest reachable horizon" `Quick test_governing_drawdown ]
       )
+    ; ( "governing_basis"
+      , [ Alcotest.test_case "target vs fallback vs none" `Quick test_governing_basis ] )
     ; ( "deploy_asset"
       , [ Alcotest.test_case "fully funded" `Quick test_deploy_fully_funded
         ; Alcotest.test_case "gi blend and equity rule" `Quick test_deploy_gi_blend

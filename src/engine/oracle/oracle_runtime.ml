@@ -3,12 +3,49 @@
    The CLI (bin/oracle.ml) analyzes the config's trading assets on demand and
    prints a report. This module runs the same pipeline continuously inside the
    trading engine: each pass resolves the trading assets, fetches their
-   histories, runs the deployment engine per venue account (threading the pool
-   down the config priority order), and publishes one decision per asset to a
-   lock-free snapshot. Trading domains read their asset's decision every cycle
-   (an Atomic.get of an immutable list) and adopt the qty / grid_interval /
-   active flags; an inactive asset stops placing new orders and its capital
-   passes to the next asset in the account's priority order.
+   histories, runs the deployment engine per venue account, and publishes one
+   decision per asset to a lock-free snapshot. Trading domains read their
+   asset's decision every cycle (an Atomic.get of an immutable list) and adopt
+   the qty / grid_interval / active flags; an inactive asset stops placing new
+   orders and its capital passes to the next asset in the account's priority
+   order.
+
+   Allocation is two-phase and joint across each account's assets. Phase A
+   analyzes every asset first, computing each one's sizing reservation: the
+   funding needed to reach its governing drawdown at the tightest config grid
+   interval (minimum ladder cost at the sizing floor, plus the first-buy cost).
+   Phase B then sizes sequentially, highest priority first, against a budget
+   that is the remaining pool minus a reserve for the lower-priority assets'
+   minimum drawdown funding - so a priority asset only grows after the rest of
+   the account can still fill their drawdowns at minimum qty, and an asset is
+   disabled only when even its first buy cannot be funded. With enough capital
+   every active asset reaches its full drawdown runway; only under a genuine
+   capital shortage does the lowest-priority asset go inactive.
+
+   Deployment is capital-maximizing (qty_cap_mult = 0 by default): each asset
+   grows its order qty until the ladder's runway through the governing drawdown
+   consumes the budget it is handed, or the replayed path can no longer clear
+   the target survival (the sizing is then shrunk back to the largest surviving
+   qty and the excess passes to the next asset). The qty only ever respects the
+   venue floor (>= qty_min) and the survival constraint; the config qty remains
+   the template/fallback, not a ceiling.
+
+   A fully deployed account shows a ~zero available-quote pool, so every asset
+   publishes inactive ("cannot fund the first buy") while it awaits sell fills
+   to restore capital. This is a normal state, never a failure: when a fill
+   returns quote to the account, the next pass re-sizes the assets in config
+   priority order and the domains resume on the published decision. The runtime
+   polls at the fast [poll_seconds] cadence while no asset is active so a
+   capital return is recognized quickly instead of waiting for the full
+   refresh cadence.
+
+   Passes are also event-driven: the engine calls [request_pass] (one lock-free
+   Atomic increment, microsecond-scale, from the domain worker loop) on every
+   fill and canceled/rejected/expired order, and the runtime wakes within ~50ms
+   instead of sleeping out the cadence - so a decision that may change with the
+   parameters (pool, sizing, survival) is recomputed and re-published as soon
+   as the market state that could change it moves, without busy-waiting.
+   Bursts of events coalesce into a single pass through [min_trigger_gap].
 
    Failures are last-known-good: an asset whose analysis fails this pass keeps
    its previous decision, an account whose balance cannot be fetched is skipped
@@ -56,13 +93,19 @@ type runtime_config =
     (** Assets whose replayed D_surv stays below this are recommended inactive
         and their capital passes down (default 0.0 = fundable means active). *)
   ; qty_cap_mult : float
-    (** Deployment ceiling as a multiple of the config qty (default 1.0: each
-        asset's qty is capped at its config qty so surplus capital passes down
-        the priority order; 0.0 = uncapped, the priority asset deploys the
-        whole pool). *)
+    (** Deployment ceiling as a multiple of the config qty (default 0.0 =
+        uncapped: each asset grows its qty to deploy the whole pool share it
+        is handed, bounded only by the survival replay; a value > 0 caps each
+        asset's deployment at [config qty * mult] so surplus capital passes
+        down the priority order). *)
   ; no_deep_history : bool (** Disable the Yahoo deep-history extension. *)
   ; weight_by_sessions : bool (** Weight class members by session count. *)
   ; refresh_seconds : float (** Cadence between analysis passes (default 300). *)
+  ; poll_seconds : float
+    (** Fast cadence used while no asset is active (default 30): a fully
+        deployed account with a ~zero pool polls at this rate so capital that
+        becomes available on sell fills is recognized (and trading resumed in
+        config priority order) quickly. *)
   ; horizons : int list option (** Session horizons (default per calendar kind). *)
   ; max_capital : float option (** Upper bound of the sizing binary search. *)
   }
@@ -71,14 +114,32 @@ let default_config () =
   { target_survival = 0.99
   ; fng_weight = 0.5
   ; min_active_dsurv = 0.0
-  ; qty_cap_mult = 1.0
+  ; qty_cap_mult = 0.0
   ; no_deep_history = false
   ; weight_by_sessions = true
   ; refresh_seconds = 300.0
+  ; poll_seconds = 30.0
   ; horizons = None
   ; max_capital = None
   }
 ;;
+
+(** The sleep until the next pass. While every published decision is inactive
+    (e.g. a fully deployed account with a ~zero available-quote pool, awaiting
+    sell fills to restore capital) the runtime polls at the fast [poll_seconds]
+    cadence so a capital return is recognized quickly; otherwise it keeps the
+    normal [refresh_seconds] cadence. An empty snapshot (nothing has published
+    yet) keeps the normal cadence. *)
+let next_sleep ~(config : runtime_config) ~(decisions : decision list) =
+  let any_active = List.exists (fun (d : decision) -> d.active) decisions in
+  if decisions <> [] && not any_active
+  then config.poll_seconds
+  else config.refresh_seconds
+;;
+
+(** Refresh/poll cadence with a small random jitter so passes from multiple
+    engine instances (or accounts) do not pile up on the same clock tick. *)
+let jittered base = base +. Random.float (Float.min 15.0 (base /. 2.0))
 
 (** The published snapshot: an immutable list swapped atomically. Domain
     workers call [decision_for] every cycle; the write side only ever replaces
@@ -123,6 +184,41 @@ let pass_count : int Atomic.t = Atomic.make 0
 let last_pass_at : float Atomic.t = Atomic.make 0.0
 let last_pass_ok : bool Atomic.t = Atomic.make true
 let shutdown_requested = Atomic.make false
+
+(** Event-driven trigger: the engine calls [request_pass] (a single Atomic
+    increment - lock-free, no allocation, no scheduler handoff) whenever a
+    fill or a canceled/rejected/expired order could change an asset's pool or
+    sizing, and the loop honors it at the next [wait_until] slice instead of
+    sleeping out the full cadence. The generation counter makes each wake
+    one-shot: [wait_until] captures the value before sleeping, so only a NEW
+    [request_pass] (another increment) wakes the next wait. *)
+let pass_requested : int Atomic.t = Atomic.make 0
+
+let request_pass () = Atomic.incr pass_requested
+
+(** Minimum gap between event-triggered passes (seconds): a burst of events
+    (e.g. the engine ingesting the startup execution snapshot) coalesces into
+    one pass instead of one pass per event. *)
+let min_trigger_gap = 2.0
+
+(** Sleep until [deadline], waking early when a [request_pass] arrives at
+    least [min_trigger_gap] after the last pass. Checked in 50ms slices: a
+    trigger is honored within ~50ms of [request_pass] (well inside a
+    market-event latency budget) while a plain sleep still holds the exact
+    cadence. *)
+let rec wait_until ~(deadline : float) ~(generation : int) () =
+  if
+    Atomic.get pass_requested <> generation
+    && Unix.gettimeofday () >= Atomic.get last_pass_at +. min_trigger_gap
+  then Lwt.return_unit
+  else (
+    let now = Unix.gettimeofday () in
+    if now >= deadline
+    then Lwt.return_unit
+    else
+      Lwt_unix.sleep (Float.min 0.05 (deadline -. now))
+      >>= fun () -> wait_until ~deadline ~generation ())
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Per-pass pipeline (ported from bin/oracle.ml's run_one core).      *)
@@ -325,10 +421,32 @@ let venue_pools (tasks : Oracle_tasks.task list)
                error;
              None
            | Ok snapshot ->
-             Some
-               (Float.max
-                  0.0
-                  (Oracle_balances.available_quote snapshot ~quote:account.quote)))
+             let pool =
+               Float.max
+                 0.0
+                 (Oracle_balances.available_quote snapshot ~quote:account.quote)
+             in
+             let lines =
+               List.map
+                 (fun (b : Oracle_balances.balance) ->
+                    Printf.sprintf
+                      "%s: avail %.6g / total %.6g (%s %s)"
+                      b.asset
+                      b.available
+                      b.total
+                      b.wallet_type
+                      b.wallet_id)
+                 snapshot.balances
+             in
+             Logging.info_f
+               ~section
+               "venue %s balance snapshot (%s%s): %s -> pool %.2f"
+               (account_id account)
+               snapshot.exchange
+               (if snapshot.testnet then ", testnet" else "")
+               (String.concat "; " lines)
+               pool;
+             Some pool)
         (fun exn ->
            Logging.warn_f
              ~section
@@ -341,19 +459,45 @@ let venue_pools (tasks : Oracle_tasks.task list)
   Lwt_list.map_s pool_for accounts >|= fun pools -> List.combine accounts pools
 ;;
 
-(** The deployment decision for one asset against its venue pool share. This
-    is the CLI's run_one core without the report tables: series fetch +
-    deepen + members + analysis + deployment engine. [index]/[n_tasks] are
-    only for logging. *)
-let decide_asset
+(** One asset's sizing reservation: the funding it needs to reach its
+    governing drawdown at the tightest config grid interval - the conservative
+    (worst-case) end of its range. Lower-priority assets reserve this minimum
+    before a higher-priority asset grows, so the joint budget guarantees every
+    active asset can fund its drawdown while there is enough capital, and an
+    asset is only disabled when even its first buy cannot be funded. *)
+type reservation =
+  { q_min : float (** sizing floor (venue lot / config qty) *)
+  ; d_gov : float (** governing drawdown on the sizing basis *)
+  ; governing_horizon : string
+  ; fallback : bool (** basis is the raw deepest-observed fallback *)
+  ; n_fills : int (** ladder fills through [d_gov] at the tightest interval *)
+  ; min_cost : float (** ladder cost at [q_min] through [d_gov] at gi_lo *)
+  ; first_buy : float (** cost of the first fill at [q_min] at gi_lo *)
+  }
+
+(** One asset's per-pass analysis: everything sizing needs against any pool.
+    This is the CLI's run_one core without the report tables: series fetch +
+    deepen + members + analysis + model build. [index]/[n_tasks] are only for
+    logging. *)
+type analysis =
+  { exchange : string
+  ; symbol : string
+  ; asset : Oracle_types.series
+  ; calendar_kind : Oracle_types.calendar_kind
+  ; grid : G.config
+  ; lo : float
+  ; hi : float
+  ; models : Oracle_replay.blend_model list
+  ; reservation : reservation
+  }
+
+let analyze_asset
       (rc : runtime_config)
       (classes : (string * class_pool) list)
       (task : Oracle_tasks.task)
-      ~(pool : float)
-      ~(fng : float option)
       ~(index : int)
       ~(n_tasks : int)
-  : decision Lwt.t
+  : analysis Lwt.t
   =
   let exchange = task.Oracle_tasks.exchange in
   let calendar_kind = Oracle_tasks.calendar_kind_of_exchange exchange in
@@ -373,7 +517,7 @@ let decide_asset
   fetch_series_for tc task.Oracle_tasks.symbol
   >>= fun asset ->
   deepen_series rc ~exchange asset
-  >>= fun (asset, _deep_bars) ->
+  >>= fun (asset, deep_bars) ->
   load_members rc classes tc ~class_name asset
   >>= fun members ->
   let start_price =
@@ -440,6 +584,22 @@ let decide_asset
       (fun (h : Oracle_types.horizon) -> n_bars >= warmup + h.sessions + 2)
       horizons
   in
+  (* Analysis inputs of this pass, so the history/member/horizon basis each
+     decision was computed on is traceable in the engine log. *)
+  Logging.info_f
+    ~section
+    "[%d/%d] %s/%s: history %d bars (+%d deep), %d class member(s) [%s], warmup %d, \
+     horizons [%s]"
+    index
+    n_tasks
+    exchange
+    task.Oracle_tasks.symbol
+    n_bars
+    deep_bars
+    (List.length members)
+    (String.concat "," (List.map (fun (m : Oracle_types.series) -> m.symbol) members))
+    warmup
+    (String.concat "," (List.map (fun (h : Oracle_types.horizon) -> h.label) horizons));
   if horizons = []
   then
     failwith
@@ -468,12 +628,73 @@ let decide_asset
       ()
   in
   let models = List.map model horizons in
+  let reservation =
+    match Oracle_deploy.governing_basis ~models ~target_survival:rc.target_survival with
+    | None ->
+      { q_min = D.sizing_floor ~cfg:grid
+      ; d_gov = 0.0
+      ; governing_horizon = ""
+      ; fallback = false
+      ; n_fills = 0
+      ; min_cost = 0.0
+      ; first_buy = 0.0
+      }
+    | Some (d_gov, governing_horizon, fallback) ->
+      let q_min = D.sizing_floor ~cfg:grid in
+      let grid_lo = G.set_parameter grid gi_lo in
+      let n_fills = G.fills_for_drawdown grid_lo ~d:d_gov in
+      let min_cost = G.cost_at grid_lo ~qty:q_min ~n_fills in
+      let first_buy = G.cost_at grid_lo ~qty:q_min ~n_fills:1 in
+      { q_min; d_gov; governing_horizon; fallback; n_fills; min_cost; first_buy }
+  in
+  Logging.info_f
+    ~section
+    "[%d/%d] %s/%s: reservation qty_min %.6g, first buy %.2f, min drawdown cost %.2f \
+     through d_gov %.1f%% @ %s (%s) at gi_lo %.2f%%"
+    index
+    n_tasks
+    exchange
+    task.Oracle_tasks.symbol
+    reservation.q_min
+    reservation.first_buy
+    reservation.min_cost
+    (reservation.d_gov *. 100.0)
+    (if reservation.governing_horizon = "" then "-" else reservation.governing_horizon)
+    (if reservation.fallback then "raw/fallback" else "target")
+    gi_lo;
+  Lwt.return
+    { exchange
+    ; symbol = task.Oracle_tasks.symbol
+    ; asset
+    ; calendar_kind
+    ; grid
+    ; lo = gi_lo
+    ; hi = gi_hi
+    ; models
+    ; reservation
+    }
+;;
+
+(** Size one analyzed asset against a budget: the pool share handed to it by
+    the runtime's allocation (its own budget after reserving the lower-
+    priority assets' minimum drawdown funding). Runs the deployment engine and
+    logs the decision. [index]/[n_tasks] are only for logging. *)
+let size_asset
+      (rc : runtime_config)
+      (analysis : analysis)
+      ~(pool : float)
+      ~(fng : float option)
+      ~(index : int)
+      ~(n_tasks : int)
+  : decision Lwt.t
+  =
+  let { exchange; symbol; asset; calendar_kind; grid; lo; hi; models; _ } = analysis in
   let deployment =
     D.deploy_asset
       ~asset
       ~cfg:grid
-      ~lo:gi_lo
-      ~hi:gi_hi
+      ~lo
+      ~hi
       ~models
       ~target_survival:rc.target_survival
       ~pool
@@ -487,36 +708,43 @@ let decide_asset
   in
   Logging.info_f
     ~section
-    "[%d/%d] %s/%s %s qty %.6g gi %.2f%% deployed %.2f / share %.2f remainder %.2f"
+    "[%d/%d] %s/%s %s qty %.6g gi %.2f%% deployed %.2f / share %.2f remainder %.2f \
+     (D_surv %.1f%%, governing %.1f%% @ %s)"
     index
     n_tasks
     exchange
-    task.Oracle_tasks.symbol
+    symbol
     (if deployment.Oracle_types.active then "ACTIVE" else "INACTIVE")
     deployment.Oracle_types.qty
     deployment.Oracle_types.parameter
     deployment.Oracle_types.deployed
     deployment.Oracle_types.pool_share
-    deployment.Oracle_types.remainder;
+    deployment.Oracle_types.remainder
+    (deployment.Oracle_types.d_surv *. 100.0)
+    (deployment.Oracle_types.d_gov *. 100.0)
+    (if deployment.Oracle_types.governing_horizon = ""
+     then "-"
+     else deployment.Oracle_types.governing_horizon);
   List.iter
-    (fun w -> Logging.warn_f ~section "%s/%s: %s" exchange task.Oracle_tasks.symbol w)
+    (fun w -> Logging.warn_f ~section "%s/%s: %s" exchange symbol w)
     deployment.Oracle_types.warnings;
   Lwt.return
-    { exchange
-    ; symbol = task.Oracle_tasks.symbol
-    ; active = deployment.Oracle_types.active
-    ; reason = deployment.Oracle_types.reason
-    ; qty = deployment.Oracle_types.qty
-    ; grid_interval = deployment.Oracle_types.parameter
-    ; d_surv = deployment.Oracle_types.d_surv
-    ; d_gov = deployment.Oracle_types.d_gov
-    ; governing_horizon = deployment.Oracle_types.governing_horizon
-    ; deployed = deployment.Oracle_types.deployed
-    ; pool_share = deployment.Oracle_types.pool_share
-    ; remainder = deployment.Oracle_types.remainder
-    ; warnings = deployment.Oracle_types.warnings
-    ; updated_at = Unix.gettimeofday ()
-    }
+    ({ exchange
+     ; symbol
+     ; active = deployment.Oracle_types.active
+     ; reason = deployment.Oracle_types.reason
+     ; qty = deployment.Oracle_types.qty
+     ; grid_interval = deployment.Oracle_types.parameter
+     ; d_surv = deployment.Oracle_types.d_surv
+     ; d_gov = deployment.Oracle_types.d_gov
+     ; governing_horizon = deployment.Oracle_types.governing_horizon
+     ; deployed = deployment.Oracle_types.deployed
+     ; pool_share = deployment.Oracle_types.pool_share
+     ; remainder = deployment.Oracle_types.remainder
+     ; warnings = deployment.Oracle_types.warnings
+     ; updated_at = Unix.gettimeofday ()
+     }
+     : decision)
 ;;
 
 (** Run one full analysis pass over the trading assets and publish the
@@ -548,29 +776,37 @@ let run_pass
     unsupported;
   if tasks = []
   then (
-    Logging.debug ~section "no runnable assets for the capital oracle this pass";
+    Logging.info ~section "no runnable assets for the capital oracle this pass";
     Lwt.return_unit)
   else (
     Hashtbl.reset fetch_cache;
     let fng = resolve_fng () in
     let grouped = group_by_account tasks in
+    Logging.info_f
+      ~section
+      "capital-oracle pass #%d starting: %d asset(s) in %d account(s)%s"
+      (Atomic.get pass_count + 1)
+      (List.length tasks)
+      (List.length grouped)
+      (match fng with
+       | Some f -> Printf.sprintf ", f&g %.2f" f
+       | None -> ", f&g unavailable");
     let decisions = ref [] in
-    let rec thread_pool pool = function
-      | [] -> Lwt.return pool
+    (* Phase A: analyze every asset in priority order FIRST, so each asset's
+       sizing reservation (minimum drawdown funding + first-buy cost) is known
+       before any capital is handed out. *)
+    let rec analyze_all acc = function
+      | [] -> Lwt.return (List.rev acc)
       | task :: rest ->
         Lwt.catch
           (fun () ->
-             decide_asset
+             analyze_asset
                config
                classes
                task
-               ~pool
-               ~fng
                ~index:(List.length rest + 1)
                ~n_tasks:(List.length tasks)
-             >|= fun decision ->
-             decisions := decision :: !decisions;
-             decision.remainder)
+             >|= fun analysis -> analysis :: acc)
           (fun exn ->
              Logging.warn_f
                ~section
@@ -579,8 +815,48 @@ let run_pass
                task.Oracle_tasks.exchange
                task.Oracle_tasks.symbol
                (Printexc.to_string exn);
+             Lwt.return acc)
+        >>= fun acc' -> analyze_all acc' rest
+    in
+    (* Phase B: size sequentially, highest priority first. Each asset's budget
+       is the remaining pool minus a reserve for the lower-priority assets'
+       minimum drawdown funding, so a priority asset only grows after the rest
+       of the account can still fill their drawdowns at minimum qty - and an
+       asset is disabled only when even its first buy cannot be funded. *)
+    let rec allocate pool = function
+      | [] -> Lwt.return pool
+      | analysis :: rest ->
+        let reserve =
+          Float.min
+            (List.fold_left
+               (fun acc (a : analysis) -> acc +. a.reservation.min_cost)
+               0.0
+               rest)
+            (Float.max 0.0 (pool -. analysis.reservation.first_buy))
+        in
+        let budget = pool -. reserve in
+        Lwt.catch
+          (fun () ->
+             size_asset
+               config
+               analysis
+               ~pool:budget
+               ~fng
+               ~index:(List.length rest + 1)
+               ~n_tasks:(List.length tasks)
+             >|= fun decision ->
+             decisions := decision :: !decisions;
+             decision.remainder +. reserve)
+          (fun exn ->
+             Logging.warn_f
+               ~section
+               "capital-oracle sizing failed for %s/%s (%s); keeping last-known-good \
+                decision, capital stays in the venue pool"
+               analysis.exchange
+               analysis.symbol
+               (Printexc.to_string exn);
              Lwt.return pool)
-        >>= fun remaining -> thread_pool remaining rest
+        >>= fun next -> allocate next rest
     in
     venue_pools tasks
     >>= fun pools ->
@@ -594,9 +870,11 @@ let run_pass
          match account_pool account with
          | None -> Lwt.return_unit
          | Some pool ->
-           thread_pool pool account_tasks
+           analyze_all [] account_tasks
+           >>= fun analyses ->
+           allocate pool analyses
            >|= fun surplus ->
-           Logging.debug_f
+           Logging.info_f
              ~section
              "venue %s: pool %.2f, surplus %.2f (idle reserve)"
              (account_id account)
@@ -639,6 +917,48 @@ let start
       ~trading
       ~offline:false
   in
+  (* Startup summary: the effective runtime knobs, the class pools feeding the
+     kappa blend, and the assets/accounts the oracle will track, so what the
+     live engine's oracle is doing is visible from the first log lines. *)
+  Logging.info_f
+    ~section
+    "runtime knobs: target_survival %.2f, fng_weight %.2f, min_active_dsurv %.2f, \
+     qty_cap_mult %.2f, weight_by_sessions %b, deep_history %s, refresh %.0fs, poll \
+     %.0fs, horizons [%s]"
+    config.target_survival
+    config.fng_weight
+    config.min_active_dsurv
+    config.qty_cap_mult
+    config.weight_by_sessions
+    (if config.no_deep_history then "off" else "on")
+    config.refresh_seconds
+    config.poll_seconds
+    (match config.horizons with
+     | Some ns -> String.concat "," (List.map string_of_int ns)
+     | None -> "default");
+  List.iter
+    (fun ((name, pool) : string * class_pool) ->
+       Logging.info_f
+         ~section
+         "class '%s': members [%s], kappa %s"
+         name
+         (String.concat "," pool.members)
+         (match pool.kappa with
+          | Some k -> string_of_int k
+          | None -> "default"))
+    classes;
+  List.iter
+    (fun (task : Oracle_tasks.task) ->
+       Logging.info_f
+         ~section
+         "tracking %s/%s (account %s, class %s)"
+         task.Oracle_tasks.exchange
+         task.Oracle_tasks.symbol
+         (account_id (account_of_task task))
+         (match task.Oracle_tasks.config.asset_class with
+          | Some c -> c
+          | None -> "default"))
+    tasks;
   let rec loop () =
     if Atomic.get shutdown_requested
     then Lwt.return_unit
@@ -654,7 +974,16 @@ let start
            Lwt.return_unit)
       >>= fun () ->
       on_publish (decisions ());
-      Lwt_unix.sleep (config.refresh_seconds +. Random.float 15.0) >>= loop
+      (* The next pass runs at the cadence deadline, or early when the engine
+         requests one ([request_pass] on fills / canceled-rejected-expired
+         events): the wait captures the current generation, so only a NEW
+         request wakes it, and honors the request at the next 50ms slice
+         (coalescing bursts through [min_trigger_gap]). *)
+      let generation = Atomic.get pass_requested in
+      let deadline =
+        Unix.gettimeofday () +. jittered (next_sleep ~config ~decisions:(decisions ()))
+      in
+      wait_until ~deadline ~generation () >>= loop
   in
   (* Venue instrument metadata is initialized once here (idempotent; the
      supervisor keeps its own). *)

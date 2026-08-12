@@ -145,8 +145,7 @@ let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Oracle_types.bar lis
     []
 ;;
 
-let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list)
-  : Oracle_types.series
+let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list) : Oracle_types.series
   =
   { Oracle_types.symbol
   ; calendar_kind = Oracle_types.Crypto

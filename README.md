@@ -121,6 +121,16 @@ engine spawns an isolated domain per entry.
     "allocation_policy": 2,
     "major_heap_increment": 100
   },
+  "oracle": {
+    "qty_cap_mult": 0.0,
+    "target_survival": 0.99,
+    "fng_weight": 0.5,
+    "min_active_dsurv": 0.0,
+    "weight_by_sessions": true,
+    "no_deep_history": false,
+    "refresh_seconds": 300.0,
+    "poll_seconds": 30.0
+  },
   "classes": {
     "crypto_core": ["BTC/USD", "ETH/USD"],
     "crypto_alt": ["SOL/USD", "DOGE/USD", "ADA/USD"],
@@ -201,6 +211,33 @@ engine spawns an isolated domain per entry.
 | `data_feed` | string | Market data feed channel (`"iex"` or `"sip"`; Alpaca only) |
 | `maker_fee` / `taker_fee` | float | Override exchange fee rates |
 | `asset_class` | string | Risk class for capital-survival modeling (e.g. `"crypto_core"`); must match a key in the top-level `classes` map, required for `dio-oracle` runs |
+
+The optional top-level `oracle` object configures the capital-oracle runtime
+knobs. Every key is optional; absent keys fall back to the runtime defaults
+(`Oracle_runtime.default_config`), so a minimal section like
+`{"qty_cap_mult": 0.0}` is valid. Unknown keys are rejected at startup.
+
+Allocation is two-phase and joint across each venue account: every asset is
+analyzed first (each one computes its sizing reservation - the minimum funding
+needed to reach its governing drawdown at the tightest grid interval), then
+assets are sized in config priority order against a budget equal to the
+remaining pool minus the lower-priority assets' reserved minimum funding. A
+priority asset therefore only grows after the rest of the account can still
+fill their drawdowns at minimum qty, and an asset is disabled only when even
+its first buy cannot be funded.
+
+| Oracle key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `qty_cap_mult` | float | `0.0` | Deployment ceiling as a multiple of the config qty. `0.0` = uncapped: each asset grows its order qty until the ladder's runway through the governing drawdown consumes the budget it is handed (the pool minus the lower-priority assets' reserved minimum drawdown funding), bounded only by the venue floor (`>= qty_min`) and the survival replay; the config `qty` stays the template/fallback, not a ceiling. A value `> 0` caps each asset's deployment at `config qty × mult` so surplus capital passes down the config priority order |
+| `target_survival` | float | `0.99` | Replay coverage required to accept a sizing (fraction of blended-history paths that must clear the drawdown) |
+| `fng_weight` | float | `0.5` | Sentiment weight of the Fear & Greed blend for the grid interval: `gi = fng_weight × gi_fng + (1 - fng_weight) × gi_survival`; `0.0` = pure survival |
+| `min_active_dsurv` | float | `0.0` | Minimum achieved D_surv an asset must replay at to be published `active` (a threshold above the achievable runway marks under-funded assets inactive until capital returns) |
+| `weight_by_sessions` | bool | `true` | Weight class members by session count when blending class survival curves |
+| `no_deep_history` | bool | `false` | Disable the Yahoo deep-history extension |
+| `refresh_seconds` | float | `300.0` | Baseline cadence between analysis passes. Passes also wake early (within ~50ms) whenever the engine requests one on a fill or canceled/rejected/expired order, so this is the fallback rhythm, not the only one |
+| `poll_seconds` | float | `30.0` | Fast cadence while no asset is active - kept as a safety net: capital that becomes available on sell fills is normally recognized by the event-driven wake (fill → `request_pass`), but a slow poll guarantees a fresh pass even if an event is ever missed |
+| `horizons` | [int] | `None` | Session horizons in days (defaults per calendar kind) |
+| `max_capital` | float | `None` | Upper bound of the sizing binary search (in quote currency) |
 
 The top-level `classes` object defines the member pools backing each risk
 class's survival curve; `dio-oracle` fetches the listed symbols per venue

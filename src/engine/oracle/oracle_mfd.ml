@@ -148,9 +148,7 @@ let percentile_table ~closes ~lows ~horizon:(h : horizon) ~percentiles ~warmup
   let arr = samples ~closes ~lows ~horizon:h.sessions ~warmup ~stride:h.sessions () in
   let n_eff = Array.length arr in
   let rows =
-    List.map
-      (fun p -> { percentile = p; mfd = Oracle_math.percentile arr p })
-      percentiles
+    List.map (fun p -> { percentile = p; mfd = Oracle_math.percentile arr p }) percentiles
   in
   { horizon_label = h.label; calendar_days = h.calendar_days; n_starts; n_eff; rows }
 ;;

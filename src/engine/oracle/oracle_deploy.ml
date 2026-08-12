@@ -108,17 +108,46 @@ let deepest_observed_drawdown (models : Oracle_replay.blend_model list)
   !best
 ;;
 
+(** The sizing basis, shared by [deploy_asset] and the runtime's allocation
+    layer so both always agree: the target-clearing governing drawdown when
+    any horizon can reach it, otherwise (immature asset / coverage gap on
+    every horizon) the deepest drawdown the asset's own history has actually
+    observed - the "raw" fallback, carrying a not-authoritative caveat.
+    Returns [(d_gov, governing_horizon, is_fallback)]; [None] only when no
+    model has a single MFD window (history shorter than warmup + horizon + 2
+    on every horizon), i.e. nothing can be computed. *)
+let governing_basis ~(models : Oracle_replay.blend_model list) ~(target_survival : float)
+  : (float * string * bool) option
+  =
+  match governing_drawdown ~models ~target_survival with
+  | Some (d, h) -> Some (d, h, false)
+  | None ->
+    (match deepest_observed_drawdown models with
+     | Some (d, h) -> Some (d, h, true)
+     | None -> None)
+;;
+
 (** The deployment engine, parameterized by a strategy model [M] (see
     Oracle_strategy.S). All deployment math goes through the model's funding
     function, replay and qty floors. *)
 module Engine (M : Oracle_strategy.S) = struct
-  (** Largest lot-rounded qty (>= min_qty) whose floor-aware cost through the
-      target drawdown fits the pool. The cost is monotone non-decreasing in
-      qty (the floor up-size term max(qty, ceil_lot(min_notional/level)) is),
-      so a bisection is sound after an exponential upper-bound search. Returns
-      the min_qty floor when the pool cannot fund the full runway at min_qty. *)
+  (** The sizing floor: the venue's minimum order qty OR the configured design
+      qty, whichever is larger. A venue qty_min is a lot precision (Alpaca
+      reports 1e-9 for fractional shares), not a minimum order size: sizing an
+      order to it produces a sub-minimum buy whose cost basis the venue rejects
+      ("cost basis must be >= minimal amount"). The floor therefore never drops
+      below the config qty, and an asset that cannot fund even that goes
+      inactive instead of emitting an un-placeable order. *)
+  let sizing_floor ~(cfg : M.config) = Float.max (M.min_qty cfg) (M.design_qty cfg)
+
+  (** Largest lot-rounded qty (>= sizing_floor) whose floor-aware cost through
+      the target drawdown fits the pool. The cost is monotone non-decreasing
+      in qty (the floor up-size term max(qty, ceil_lot(min_notional/level))
+      is), so a bisection is sound after an exponential upper-bound search.
+      Returns the sizing floor when the pool cannot fund the full runway at
+      it. *)
   let qty_for_pool ~(cfg : M.config) ~(n_fills : int) ~(pool : float) =
-    let q_min = M.min_qty cfg in
+    let q_min = sizing_floor ~cfg in
     if pool <= 0.0
     then q_min
     else (
@@ -293,11 +322,11 @@ module Engine (M : Oracle_strategy.S) = struct
     =
     let cfg = M.set_parameter cfg parameter in
     let n_fills = M.fills_for_drawdown cfg ~d:d_gov in
-    let q_min = M.min_qty cfg in
+    let q_min = sizing_floor ~cfg in
     let qty_full =
       let qty = qty_for_pool ~cfg ~n_fills ~pool in
       match qty_cap with
-      | Some cap when cap > q_min -> Float.min qty cap
+      | Some cap when cap >= q_min -> Float.min qty cap
       | _ -> qty
     in
     let d_surv_static = M.drawdown_of_fills cfg ~n_fills in
@@ -362,9 +391,11 @@ module Engine (M : Oracle_strategy.S) = struct
          needed).
 
       Inactive reasons: no reachable horizon, a pool that cannot fund even the
-      first buy at min_qty, or a replayed D_surv below [min_active_dsurv]. An
-      under-funded ACTIVE asset keeps its whole share (config-order priority)
-      and runs at min_qty with the shortfall flagged in [warnings].
+      first buy at the sizing floor (the venue lot or the config qty,
+      whichever is larger - sizing never drops below the configured qty), or a
+      replayed D_surv below [min_active_dsurv]. An under-funded ACTIVE asset
+      keeps its whole share (config-order priority) and runs at the floor with
+      the shortfall flagged in [warnings].
 
       [qty_cap_mult] is the deployment ceiling as a multiple of the template
       qty (the config's design qty): the default 1.0 caps each asset's
@@ -392,7 +423,7 @@ module Engine (M : Oracle_strategy.S) = struct
     let qty_cap =
       if qty_cap_mult > 0.0 then Some (M.design_qty cfg *. qty_cap_mult) else None
     in
-    let q_min = M.min_qty cfg in
+    let q_min = sizing_floor ~cfg in
     let lo = Float.min lo hi in
     let hi = Float.max lo hi in
     let empty_row parameter =
@@ -432,32 +463,21 @@ module Engine (M : Oracle_strategy.S) = struct
       ; row = empty_row hi
       }
     in
-    (* The sizing basis: the target-clearing governing drawdown when any
-       horizon can reach it, otherwise (immature assets / coverage gap on
-       every horizon) the deepest drawdown the asset's own history has
-       actually observed - the "raw" sizing, carrying a not-authoritative
-       caveat. Only when NO model has a single MFD window (history shorter
-       than warmup + horizon + 2 on every horizon) does the asset become
-       inactive: nothing can be computed. *)
-    let basis =
-      match governing_drawdown ~models ~target_survival with
-      | Some (d, h) -> `Target (d, h)
-      | None ->
-        (match deepest_observed_drawdown models with
-         | Some (d, h) -> `Fallback (d, h)
-         | None -> `None)
-    in
+    (* The sizing basis, via the shared [governing_basis] so the runtime's
+       allocation layer and this sizing always agree: the target-clearing
+       governing drawdown when any horizon can reach it, otherwise (immature
+       assets / coverage gap on every horizon) the deepest drawdown the
+       asset's own history has actually observed - the "raw" sizing, carrying
+       a not-authoritative caveat. Only when NO model has a single MFD window
+       (history shorter than warmup + horizon + 2 on every horizon) does the
+       asset become inactive: nothing can be computed. *)
+    let basis = governing_basis ~models ~target_survival in
     match basis with
-    | `None ->
+    | None ->
       inactive
         "no usable history: no MFD windows on any horizon (each horizon needs warmup + \
          horizon + 2 bars)"
-    | `Target (d_gov, governing_horizon) | `Fallback (d_gov, governing_horizon) ->
-      let fallback =
-        match basis with
-        | `Fallback _ -> true
-        | _ -> false
-      in
+    | Some (d_gov, governing_horizon, fallback) ->
       let evaluable_models =
         if fallback
         then

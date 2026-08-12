@@ -3,9 +3,7 @@ let bar date low : Dio_oracle.Oracle_types.bar =
 ;;
 
 let test_qualified_identity () =
-  let hl =
-    Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"BTC/USDC" ()
-  in
+  let hl = Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"BTC/USDC" () in
   let kr = Dio_oracle.Oracle_topology.key ~venue:"kraken" ~symbol:"BTC/USD" () in
   Alcotest.(check string) "hl quote" "USDC" hl.quote;
   Alcotest.(check string) "kraken quote" "USD" kr.quote;
@@ -29,12 +27,8 @@ let test_parse_and_validate () =
 ;;
 
 let test_reject_same_venue_transfer () =
-  let hl1 =
-    Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"BTC/USDC" ()
-  in
-  let hl2 =
-    Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"ETH/USDC" ()
-  in
+  let hl1 = Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"BTC/USDC" () in
+  let hl2 = Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"ETH/USDC" () in
   let definition =
     { Dio_oracle.Oracle_topology.positions =
         [ { key = hl1; capital = Some 1.0 }; { key = hl2; capital = Some 1.0 } ]
@@ -51,9 +45,7 @@ let test_reject_same_venue_transfer () =
 ;;
 
 let test_reject_cross_quote_transfer () =
-  let hl =
-    Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"BTC/USDC" ()
-  in
+  let hl = Dio_oracle.Oracle_topology.key ~venue:"hyperliquid" ~symbol:"BTC/USDC" () in
   let kr = Dio_oracle.Oracle_topology.key ~venue:"kraken" ~symbol:"ETH/USD" () in
   let definition =
     { Dio_oracle.Oracle_topology.positions =

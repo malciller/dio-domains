@@ -11,6 +11,15 @@
     "allocation_policy": 2,
     "major_heap_increment": 8388608
   },
+  "oracle": {
+    "qty_cap_mult": 0.0,
+    "target_survival": 0.95,
+    "fng_weight": 0.5,
+    "min_active_dsurv": 0.0,
+    "weight_by_sessions": true,
+    "no_deep_history": false,
+    "refresh_seconds": 300.0
+  },
   "classes": {
     "crypto_core": [
       "BTC/USD",
@@ -45,90 +54,6 @@
     ]
   },
   "trading": [
-    {
-      "symbol": "BTC/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.0005",
-      "grid_interval": [
-        0.25,
-        0.75
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        0.05,
-        2.00
-      ],
-      "strategy": "Grid",
-      "testnet": false,
-      "hedge": false,
-      "asset_class": "crypto_core"
-    },
-    {
-      "symbol": "HYPE/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.35",
-      "grid_interval": [
-        0.75,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "accumulation_buffer": [
-        0.05,
-        3.00
-      ],
-      "strategy": "Grid",
-      "testnet": false,
-      "hedge": false,
-      "asset_class": "crypto_alt"
-    },
-    {
-      "symbol": "ETH/USD",
-      "exchange": "kraken",
-      "qty": "0.008",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid",
-      "asset_class": "crypto_core"
-    },
-    {
-      "symbol": "SOL/USD",
-      "exchange": "kraken",
-      "qty": "0.15",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid",
-      "asset_class": "crypto_alt"
-    },
-    {
-      "symbol": "XMR/USD",
-      "exchange": "kraken",
-      "qty": "0.04",
-      "grid_interval": [
-        2.5,
-        5.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid",
-      "asset_class": "crypto_alt"
-    },
-    {
-      "symbol": "ADA/USD",
-      "exchange": "kraken",
-      "qty": "50.0",
-      "grid_interval": [
-        5.0,
-        10.0
-      ],
-      "sell_mult": "0.999",
-      "strategy": "Grid",
-      "asset_class": "crypto_alt"
-    },
     {
       "symbol": "SPCX",
       "exchange": "alpaca",

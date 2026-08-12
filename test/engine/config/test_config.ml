@@ -11,10 +11,7 @@ let test_parse_trading_config_valid () =
   Alcotest.(check string) "strategy" "market_maker" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee" (Some 0.001) config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee" (Some 0.002) config.taker_fee;
-  Alcotest.(check (option string))
-    "asset_class"
-    (Some "crypto_core")
-    config.asset_class
+  Alcotest.(check (option string)) "asset_class" (Some "crypto_core") config.asset_class
 ;;
 
 let test_parse_trading_config_defaults () =
@@ -132,6 +129,56 @@ let test_parse_classes_absent () =
        (Dio_engine.Config.parse_classes (Yojson.Basic.from_string {|{"trading": []}|})))
 ;;
 
+let test_parse_oracle_config_full () =
+  let json_str =
+    {|{"oracle": {"qty_cap_mult": 0.0, "poll_seconds": 5.0, "refresh_seconds": 60.0, "target_survival": 0.95, "max_capital": 1000.5, "horizons": [1, 7, 30]}}|}
+  in
+  let json = Yojson.Basic.from_string json_str in
+  match Dio_engine.Config.parse_oracle_config json with
+  | None -> Alcotest.fail "oracle section should parse to Some"
+  | Some c ->
+    Alcotest.(check (float 0.0001)) "qty_cap_mult" 0.0 c.qty_cap_mult;
+    Alcotest.(check (float 0.0001)) "poll_seconds" 5.0 c.poll_seconds;
+    Alcotest.(check (float 0.0001)) "refresh_seconds" 60.0 c.refresh_seconds;
+    Alcotest.(check (float 0.0001)) "target_survival" 0.95 c.target_survival;
+    Alcotest.(check (option (float 0.0001))) "max_capital" (Some 1000.5) c.max_capital;
+    Alcotest.(check (option (list int))) "horizons" (Some [ 1; 7; 30 ]) c.horizons
+;;
+
+let test_parse_oracle_config_partial_defaults () =
+  (* A partial section falls back to the runtime defaults for absent keys. *)
+  let json_str = {|{"oracle": {"qty_cap_mult": 0.0}}|} in
+  let json = Yojson.Basic.from_string json_str in
+  match Dio_engine.Config.parse_oracle_config json with
+  | None -> Alcotest.fail "oracle section should parse to Some"
+  | Some c ->
+    let d = Dio_oracle.Oracle_runtime.default_config () in
+    Alcotest.(check (float 0.0001)) "qty_cap_mult" 0.0 c.qty_cap_mult;
+    Alcotest.(check (float 0.0001)) "poll_seconds default" d.poll_seconds c.poll_seconds;
+    Alcotest.(check (float 0.0001))
+      "refresh_seconds default"
+      d.refresh_seconds
+      c.refresh_seconds;
+    Alcotest.(check bool) "no_deep_history default" d.no_deep_history c.no_deep_history;
+    Alcotest.(check (option (float 0.0001)))
+      "max_capital default"
+      d.max_capital
+      c.max_capital
+;;
+
+let test_parse_oracle_config_absent () =
+  let json = Yojson.Basic.from_string {|{"trading": []}|} in
+  match Dio_engine.Config.parse_oracle_config json with
+  | None -> ()
+  | Some _ -> Alcotest.fail "absent oracle section should parse to None"
+;;
+
+let test_parse_oracle_config_default_qty_cap_mult () =
+  (* The runtime default is uncapped (0.0) so the oracle can deploy the whole pool. *)
+  let d = Dio_oracle.Oracle_runtime.default_config () in
+  Alcotest.(check (float 0.0001)) "qty_cap_mult default uncapped" 0.0 d.qty_cap_mult
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -162,6 +209,21 @@ let () =
             `Quick
             test_parse_classes_extended_schema
         ; Alcotest.test_case "classes absent" `Quick test_parse_classes_absent
+        ] )
+    ; ( "oracle"
+      , [ Alcotest.test_case "parse full section" `Quick test_parse_oracle_config_full
+        ; Alcotest.test_case
+            "partial section uses defaults"
+            `Quick
+            test_parse_oracle_config_partial_defaults
+        ; Alcotest.test_case
+            "absent section is None"
+            `Quick
+            test_parse_oracle_config_absent
+        ; Alcotest.test_case
+            "qty_cap_mult default uncapped"
+            `Quick
+            test_parse_oracle_config_default_qty_cap_mult
         ] )
     ; ( "file_handling"
       , [ Alcotest.test_case "config defaults" `Quick test_read_config_defaults ] )

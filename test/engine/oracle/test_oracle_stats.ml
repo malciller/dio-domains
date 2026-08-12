@@ -26,8 +26,7 @@ let test_percentile_empty_raises () =
     ();
     (* Zero total weight is the same disease: no information to invert. *)
     (try
-       ignore
-         (Dio_oracle.Oracle_math.weighted_percentile [| 1.0, 0.0; 2.0, 0.0 |] 50.0);
+       ignore (Dio_oracle.Oracle_math.weighted_percentile [| 1.0, 0.0; 2.0, 0.0 |] 50.0);
        Alcotest.fail "weighted_percentile: expected Invalid_argument on zero weight"
      with
      | Invalid_argument _ -> ())
@@ -121,11 +120,7 @@ let test_blend () =
   (* F_blend = (n*F_a + kappa*F_c)/(n+kappa) *)
   near
     0.5
-    (Dio_oracle.Oracle_stats.blend
-       ~n_asset:100.0
-       ~asset_f:0.4
-       ~kappa:100.0
-       ~class_f:0.6);
+    (Dio_oracle.Oracle_stats.blend ~n_asset:100.0 ~asset_f:0.4 ~kappa:100.0 ~class_f:0.6);
   (* kappa -> infinity pulls toward class: (100*0.4 + 1e6*0.6)/(100+1e6). *)
   let expected = ((100.0 *. 0.4) +. (1e6 *. 0.6)) /. (100.0 +. 1e6) in
   near
@@ -168,13 +163,7 @@ let test_asset_regime_zero_sigma () =
   let closes = Array.init 200 (fun i -> 100.0 *. (1.01 ** float_of_int i)) in
   let lows = Array.map (fun c -> c *. 0.99) closes in
   let r =
-    Dio_oracle.Oracle_stats.asset_regime_of
-      ~closes
-      ~lows
-      ~horizon:30
-      ~w:60
-      ~warmup:60
-      ()
+    Dio_oracle.Oracle_stats.asset_regime_of ~closes ~lows ~horizon:30 ~w:60 ~warmup:60 ()
   in
   Alcotest.(check int) "start count" 110 r.n;
   Alcotest.(check bool)

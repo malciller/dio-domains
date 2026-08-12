@@ -116,8 +116,7 @@ let class_percentile_table
   let n_eff = Array.length p.samples in
   let rows =
     List.map
-      (fun pt ->
-         { percentile = pt; mfd = Oracle_math.weighted_percentile p.samples pt })
+      (fun pt -> { percentile = pt; mfd = Oracle_math.weighted_percentile p.samples pt })
       percentiles
   in
   { horizon_label = h.label; calendar_days = h.calendar_days; n_starts; n_eff; rows }
