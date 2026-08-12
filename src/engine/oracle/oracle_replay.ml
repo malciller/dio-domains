@@ -392,14 +392,14 @@ let drawdown_for_target ~(model : blend_model) ~(target_survival : float) =
 module Sizing (M : Oracle_strategy.S) = struct
   (** Inverse sizing: smallest [capital] whose static runway survives the
       drawdown d-star (the smallest d with F_blend(d) >= target). The
-      drawdown is ATH-anchored (see Oracle_math.ath_anchored_drawdown): the
-      runway funds the fall from the current price down to the absolute
-      target level ATH x (1 - d-star), so the recommendation is capped at an
-      absolute scale and collapses to the first buy once the price sits below
-      the target level. The CDF is monotone in d, and the runway cost
-      (floor-aware; see [cost_at]) is a monotone function of the fill count,
-      so this is well-defined even though path-replay D_surv is not monotone
-      in capital. Returns [reachable = false] when the required capital
+      drawdown is the largest ACTUAL peak-to-valley fall of the asset's
+      history (see Oracle_math.peak_to_valley_stats_of): the runway funds
+      the worst peak-to-valley drawdown the asset has really taken, from
+      wherever the price sits today - never a hypothetical fall from the
+      ATH. The CDF is monotone in d, and the runway cost (floor-aware; see
+      [cost_at]) is a monotone function of the fill count, so this is
+      well-defined even though path-replay D_surv is not monotone in
+      capital. Returns [reachable = false] when the required capital
       exceeds [hi] (or the target would need surviving the entire history
       with certainty). *)
   let find_min_capital
@@ -412,8 +412,8 @@ module Sizing (M : Oracle_strategy.S) = struct
     =
     let d = drawdown_for_target ~model ~target_survival in
     let d_cover =
-      match Oracle_math.range_stats_of model.asset with
-      | Some r -> Oracle_math.ath_anchored_drawdown ~d_gov:d r
+      match Oracle_math.peak_to_valley_stats_of model.asset with
+      | Some p -> p.Oracle_types.max_drawdown
       | None -> d
     in
     let n = M.fills_for_drawdown grid ~d:d_cover in
@@ -433,13 +433,8 @@ module Sizing (M : Oracle_strategy.S) = struct
          coverage still below target here means the target sits in a gap the
          blended history cannot reach (surviving the whole history is not
          achievable with certainty) - explicitly unreachable, not a capital
-         number. The ATH-anchored exception: when the price already sits at or
-         below the target level (d_cover = 0), the whole ATH-to-target span
-         has been traversed and the recommendation is the first buy - nothing
-         more to fund, so the sizing is reachable by construction. *)
-      if d_cover <= 0.0
-      then { parameter = "capital"; value = capital; d_surv; coverage; reachable = true }
-      else if coverage +. 1e-12 < target_survival
+         number. *)
+      if coverage +. 1e-12 < target_survival
       then
         { parameter = "capital"
         ; value = hi
@@ -480,7 +475,8 @@ module Sizing (M : Oracle_strategy.S) = struct
 
   (** Largest [qty] whose static runway (given the grid's [start_quote])
       survives the drawdown d-star (the smallest d with F_blend(d) >= target,
-      ATH-anchored as in [find_min_capital]).
+      sized on the largest actual peak-to-valley drawdown as in
+      [find_min_capital]).
       The runway cost is monotone non-decreasing in qty (the floor up-size
       term max(qty, ceil_lot(min_notional/level)) is), so the boundary is
       found by bisection over an exponentially grown upper bound - exact when
@@ -500,8 +496,8 @@ module Sizing (M : Oracle_strategy.S) = struct
     =
     let d = drawdown_for_target ~model ~target_survival in
     let d_cover =
-      match Oracle_math.range_stats_of model.asset with
-      | Some r -> Oracle_math.ath_anchored_drawdown ~d_gov:d r
+      match Oracle_math.peak_to_valley_stats_of model.asset with
+      | Some p -> p.Oracle_types.max_drawdown
       | None -> d
     in
     let n = M.fills_for_drawdown grid ~d:d_cover in

@@ -6,9 +6,10 @@
    returning 0.0: an empty distribution must never masquerade as "this asset
    never drew down" or feed false precision into a percentile table.
 
-   Also hosts the ATH-anchored drawdown sizing helpers ([range_stats_of],
-   [ath_anchored_drawdown]) so the deployment engine and the sizing
-   inversions share the same absolute scale cap without a dependency cycle. *)
+   Also hosts the peak-to-valley drawdown reference ([range_stats_of] for
+   display context, [peak_to_valley_stats_of] for the sizing drawdown) so the
+   deployment engine and the sizing inversions share the same reference
+   without a dependency cycle. *)
 
 open Oracle_types
 
@@ -106,9 +107,11 @@ let weighted_percentile (pairs : (float * float) array) p =
 
 (** Per-asset historical price-range reference from the (deepened) series:
     ATH = highest high, all-time low = lowest low, price = last close.
-    [None] on an empty history. This is the per-asset "potential price
-    range" the sizing and spacing use to reference how deep a fall from the
-    current level can go and how much of it has already happened. *)
+    [None] on an empty history. Informational context for the report: the
+    ATH-to-ATL span is NOT the sizing drawdown (a 1000x run-up makes it read
+    like a 99.9% drawdown even though no such fall ever took place); the
+    sizing reference is the largest actual peak-to-valley drawdown (see
+    [peak_to_valley_stats_of]). *)
 let range_stats_of (asset : series) : range_stats option =
   let n = Array.length asset.bars in
   if n = 0
@@ -130,22 +133,77 @@ let range_stats_of (asset : series) : range_stats option =
     Some { ath; all_time_low = low; price; d_from_ath; d_to_low; range_span })
 ;;
 
-(** ATH-anchored survival drawdown: the fall from the CURRENT price down to
-    the absolute target level ATH * (1 - d_gov) that the grid must fund.
+(** The largest drawdown the asset has ACTUALLY taken, peak to valley, over
+    its whole (deepened) history. Each bar's drawdown is measured from the
+    running peak of closes (the highest close seen so far) down to that bar's
+    low - a real peak-to-valley fall, so a 1000x run-up only registers the
+    falls that actually happened, never the ATH-to-ATL span. The maximum is
+    the sizing drawdown: the grid must fund the worst peak-to-valley fall the
+    asset has really experienced from wherever the price sits today.
 
-    [d_gov] is the target-quantile drawdown from the blend model (or the
-    deepest observed drawdown in fallback mode): the price is expected to
-    reach at worst ATH * (1 - d_gov). Anchoring the sizing at the ATH caps
-    the ladder's scale absolutely - the grid always covers down to the same
-    price level no matter where the price sits, so the scale never shrinks
-    endlessly as the market grinds down (and the deployed capital never grows
-    without bound as the price approaches the lows). Once the price is at or
-    below the target level (d_from_ath >= d_gov) the whole ATH-to-target span
-    has already been traversed: the required runway is zero, only the first
-    buy needs funding, and the model can be maximally aggressive. Clamped to
-    [0, 0.999999) so [fills_for_drawdown]'s log never saturates. *)
-let ath_anchored_drawdown ~(d_gov : float) (r : range_stats) : float =
-  let d_from_ath = Float.max 0.0 r.d_from_ath in
-  let d_cover = 1.0 -. ((1.0 -. d_gov) /. (1.0 -. d_from_ath)) in
-  Float.max 0.0 (Float.min 0.999999 d_cover)
+    The bars are sorted chronologically first (and de-duplicated by date) -
+    the same order every other consumer works in. This is not optional: the
+    venue feeds can return bars newest-first (the Hyperliquid pagination
+    reverses its pages), and a backwards series would fabricate "peak -> "
+    events whose valley PREDATES the peak (e.g. "peak 74.51 on 2026-06-03 ->
+    valley 2.00 on 2024-11-29").
+
+    Bars with non-finite or non-positive close/low are skipped (same guard as
+    the MFD windows). [None] when the history is empty or no drawdown ever
+    occurred (a strictly monotone rising series: every close is its own
+    peak). *)
+let peak_to_valley_stats_of (asset : series) : p2v_stats option =
+  let bars = Oracle_calendar.sort_bars asset.bars |> Oracle_calendar.dedup in
+  let n = Array.length bars in
+  if n = 0
+  then None
+  else (
+    let peak = ref 0.0 in
+    let peak_idx = ref 0 in
+    let best_dd = ref 0.0 in
+    let best_peak = ref 0.0 in
+    let best_peak_idx = ref 0 in
+    let best_peak_date = ref "" in
+    let best_valley = ref 0.0 in
+    let best_valley_idx = ref 0 in
+    let best_valley_date = ref "" in
+    Array.iteri
+      (fun i (b : bar) ->
+         if
+           Float.is_finite b.close
+           && b.close > 0.0
+           && Float.is_finite b.low
+           && b.low > 0.0
+         then (
+           (* The running peak of closes up to and including this bar: the
+              drawdown is measured from the highest close the market has
+              actually reached before this bar's low. *)
+           if b.close > !peak
+           then (
+             peak := b.close;
+             peak_idx := i);
+           let dd = 1.0 -. (b.low /. !peak) in
+           if dd > !best_dd
+           then (
+             best_dd := dd;
+             best_peak := !peak;
+             best_peak_idx := !peak_idx;
+             best_peak_date := bars.(!peak_idx).date;
+             best_valley := b.low;
+             best_valley_idx := i;
+             best_valley_date := b.date)))
+      bars;
+    if !best_dd <= 0.0
+    then None
+    else
+      Some
+        { max_drawdown = Float.min 0.999999 !best_dd
+        ; peak = !best_peak
+        ; peak_date = !best_peak_date
+        ; peak_idx = !best_peak_idx
+        ; valley = !best_valley
+        ; valley_date = !best_valley_date
+        ; valley_idx = !best_valley_idx
+        ; price = bars.(n - 1).close
+        })
 ;;

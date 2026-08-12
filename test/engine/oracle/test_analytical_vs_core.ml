@@ -174,9 +174,18 @@ let test_inverse_sizing_matches_closed_form () =
   (* coverage must clear the target *)
   Alcotest.(check bool) "capital coverage >= target" (cap_res.coverage >= target) true;
   Alcotest.(check bool) "qty coverage >= target" (qty_res.coverage >= target) true;
-  (* capital must be the exact static runway cost of the fill count *)
+  (* capital must be the exact static runway cost of the fill count. The
+     sizing drawdown is the largest ACTUAL peak-to-valley drawdown of the
+     series (the full 1%-per-bar crash: peak close ~100 -> trough low
+     ~44.75, ~55%), not the statistical d-star - mirroring
+     [find_min_capital]. *)
   let d = drawdown_for_target ~model ~target_survival:target in
-  let n = Dio_oracle.Oracle_strategy.Grid.fills_for_drawdown grid ~d in
+  let d_cover =
+    match Dio_oracle.Oracle_math.peak_to_valley_stats_of series with
+    | Some p -> p.max_drawdown
+    | None -> d
+  in
+  let n = Dio_oracle.Oracle_strategy.Grid.fills_for_drawdown grid ~d:d_cover in
   let expected =
     Dio_oracle.Oracle_strategy.Grid.cost_at
       grid
@@ -320,13 +329,12 @@ let test_empirical_matches_static_on_crash () =
      worst case the static bound prices. The tail stays flat at the crash
      bottom (no rise, so the ladder never re-anchors up).
 
-     The static inversion is ATH-anchored: the series ends ~55% below its
-     ATH, deeper than the target level ATH x (1 - d-star), so the ATH-anchored
-     runway is zero - the static recommendation collapses to the first buy
-     (the model's absolute cap). The empirical number (full path replay) is
-     the honest full-history survival cost and lands above it: the anchor is
-     a deliberate cap, and the difference is exactly the span the model
-     considers already traversed. *)
+     The sizing drawdown is the largest ACTUAL peak-to-valley fall of the
+     series (peak close ~100 -> trough low ~44.75, ~55%), so the static
+     recommendation funds the whole crash - it does NOT collapse to the
+     first buy as the old ATH-anchored model did (the price sits ~55% below
+     the ATH, which the anchor treated as "already traversed"). The
+     empirical number (full path replay) must land on the same runway. *)
   let gi = 1.0 in
   let fee = 0.0004 in
   let start_price = 100.0 in
@@ -400,18 +408,21 @@ let test_empirical_matches_static_on_crash () =
   let emp = S.empirical_min_capital ~grid ~model ~target_survival:target () in
   Alcotest.(check bool) "static reachable" true static.reachable;
   Alcotest.(check bool) "empirical reachable" true emp.reachable;
-  (* The ATH-anchored static recommendation is the first-buy cost (the price
-     sits below the target level ATH x (1 - d-star): the runway is spent). *)
+  (* The static recommendation funds the full actual peak-to-valley drawdown
+     of the series (the whole crash, ~55%): no ATH-anchor cap treats the fall
+     below the ATH as already paid. *)
   Alcotest.(check bool)
-    "static collapsed to the first buy (ATH-anchored cap)"
-    (static.value > 0.0 && static.value < 150.0)
+    "static funds the full actual drawdown (well beyond the first buy)"
+    (static.value > 150.0)
     true;
-  (* The empirical (full-path replay) number is the honest survival cost and
-     exceeds the anchored recommendation: surviving the whole crash needs the
-     full ladder funding. *)
+  (* The empirical (full-path replay) number is the target-coverage boundary
+     (the smallest capital whose replay clears the 80% blended target, i.e.
+     survives a ~26% drawdown) - a real funding need, but shallower than the
+     actual worst peak-to-valley fall the static recommendation funds. *)
+  Alcotest.(check bool) "empirical funds more than the first buy" (emp.value > 150.0) true;
   Alcotest.(check bool)
-    "empirical covers the full crash path (above the anchored cap)"
-    (emp.value > static.value)
+    "actual-worst sizing is more conservative than the target boundary"
+    (emp.value < static.value)
     true
 ;;
 

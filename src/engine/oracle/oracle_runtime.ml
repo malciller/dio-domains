@@ -75,14 +75,20 @@ type decision =
   ; d_surv : float (** Replayed D_surv at the recommended sizing. *)
   ; d_gov : float (** Governing drawdown across the reachable horizons. *)
   ; d_cover : float
-    (** ATH-anchored survival drawdown: the fall from the current price down
-        to the absolute target level ATH * (1 - d_gov) the grid must fund. *)
+    (** The sizing drawdown: the largest ACTUAL peak-to-valley drawdown of
+        the asset's history (the fall from the current price the grid must
+        fund). No ATH anchoring - a 1000x run-up never reads as a phantom
+        99.9% drawdown. *)
   ; governing_horizon : string (** The binding horizon. *)
   ; deployed : float (** Capital the ladder consumes at the recommended sizing. *)
   ; pool_share : float (** Capital this asset drew from the venue pool. *)
   ; remainder : float (** Pool share passed to the next asset. *)
   ; range : Oracle_types.range_stats option
-    (** Per-asset historical price-range reference (ATH / low / position). *)
+    (** Per-asset historical price-range reference (ATH / low / position).
+        Display context only. *)
+  ; p2v : Oracle_types.p2v_stats option
+    (** The largest actual peak-to-valley drawdown event (peak -> valley,
+        dates): where [d_cover] comes from. *)
   ; parameter_components : Oracle_types.parameter_components
     (** How the resolved grid interval was composed: the F&G side (crypto
         only), the survival-constrained parameter, the per-asset range side
@@ -543,7 +549,7 @@ let venue_pools (tasks : Oracle_tasks.task list)
 type reservation =
   { q_min : float (** sizing floor (venue lot / config qty) *)
   ; d_gov : float (** governing drawdown on the sizing basis *)
-  ; d_cover : float (** ATH-anchored survival drawdown (the sizing runway) *)
+  ; d_cover : float (** Actual peak-to-valley sizing drawdown (the runway) *)
   ; governing_horizon : string
   ; fallback : bool (** basis is the raw deepest-observed fallback *)
   ; n_fills : int (** ladder fills through [d_cover] at the tightest interval *)
@@ -718,13 +724,14 @@ let analyze_asset
       }
     | Some (d_gov, governing_horizon, fallback) ->
       let q_min = D.sizing_floor ~cfg:grid in
-      (* The reservation funds the ATH-anchored runway: the fall from the
-         current price down to the absolute target level ATH*(1 - d_gov), so
-         the reserve (and the whole sizing) is capped at an absolute scale
-         instead of shrinking endlessly as the price grinds down. *)
+      (* The reservation funds the largest ACTUAL peak-to-valley drawdown of
+         the asset's history (see Oracle_math.peak_to_valley_stats_of): the
+         fall the grid must fund from the current price. No ATH anchoring -
+         a 1000x run-up only registers the falls that actually took place,
+         never the ATH-to-ATL span. *)
       let d_cover =
-        match Oracle_math.range_stats_of asset with
-        | Some r -> Oracle_math.ath_anchored_drawdown ~d_gov r
+        match Oracle_math.peak_to_valley_stats_of asset with
+        | Some p -> p.Oracle_types.max_drawdown
         | None -> d_gov
       in
       let grid_lo = G.set_parameter grid gi_lo in
@@ -735,20 +742,18 @@ let analyze_asset
   in
   Logging.info_f
     ~section
-    "[%d/%d] %s/%s: reservation qty_min %.6g, first buy %.2f, min drawdown cost %.2f \
-     through d_gov %.1f%% (ATH-anchored %.1f%%) @ %s (%s) at gi_lo %.2f%%"
+    "[%d/%d] %s/%s reservation: min order %.6g, first buy $%.2f; the %.1f%% worst \
+     drawdown needs $%.2f at the tightest grid %.2f%% (%s)"
     index
     n_tasks
     exchange
     task.Oracle_tasks.symbol
     reservation.q_min
     reservation.first_buy
-    reservation.min_cost
-    (reservation.d_gov *. 100.0)
     (reservation.d_cover *. 100.0)
-    (if reservation.governing_horizon = "" then "-" else reservation.governing_horizon)
-    (if reservation.fallback then "raw/fallback" else "target")
-    gi_lo;
+    reservation.min_cost
+    gi_lo
+    (if reservation.fallback then "raw/fallback history" else "blend target");
   Lwt.return
     { exchange
     ; symbol = task.Oracle_tasks.symbol
@@ -765,11 +770,13 @@ let analyze_asset
 (** Size one analyzed asset against a budget: the pool share handed to it by
     the runtime's allocation (its own budget after reserving the lower-
     priority assets' minimum drawdown funding). Runs the deployment engine and
-    logs the decision. [index]/[n_tasks] are only for logging. *)
+    logs the decision. [index]/[n_tasks] are only for logging; [venue_pool]
+    is the account's total capital (for the log context). *)
 let size_asset
       (rc : runtime_config)
       (analysis : analysis)
       ~(pool : float)
+      ~(venue_pool : float)
       ~(fng : float option)
       ~(index : int)
       ~(n_tasks : int)
@@ -794,32 +801,96 @@ let size_asset
       ~scan_points:24
       ~qty_cap_mult:rc.qty_cap_mult
   in
-  Logging.info_f
-    ~section
-    "[%d/%d] %s/%s %s qty %.6g gi %.2f%% deployed %.2f / share %.2f remainder %.2f \
-     (D_surv %.1f%%, governing %.1f%% (ATH-anchored %.1f%%) @ %s)"
-    index
-    n_tasks
-    exchange
-    symbol
-    (if deployment.Oracle_types.active then "ACTIVE" else "INACTIVE")
-    deployment.Oracle_types.qty
-    deployment.Oracle_types.parameter
-    deployment.Oracle_types.deployed
-    deployment.Oracle_types.pool_share
-    deployment.Oracle_types.remainder
-    (deployment.Oracle_types.d_surv *. 100.0)
-    (deployment.Oracle_types.d_gov *. 100.0)
-    (deployment.Oracle_types.d_cover *. 100.0)
-    (if deployment.Oracle_types.governing_horizon = ""
-     then "-"
-     else deployment.Oracle_types.governing_horizon);
+  (* ===== Per-asset decision log (human-readable) =====
+     One block per asset: what the grid will do, with which capital, against
+     which drawdown - then the F&G blend diagnostics (crypto). *)
+  let base_of symbol =
+    match String.split_on_char '/' symbol with
+    | b :: _ -> b
+    | [] -> symbol
+  in
+  let horizon_lbl =
+    if deployment.Oracle_types.governing_horizon = ""
+    then "-"
+    else deployment.Oracle_types.governing_horizon
+  in
+  if deployment.Oracle_types.active
+  then (
+    Logging.info_f
+      ~section
+      "[%d/%d] %s/%s ACTIVE — buy %.6g %s on every %.2f%% price drop"
+      index
+      n_tasks
+      exchange
+      symbol
+      deployment.Oracle_types.qty
+      (base_of symbol)
+      deployment.Oracle_types.parameter;
+    Logging.info_f
+      ~section
+      "      capital: share $%.2f of the $%.2f venue pool · deployed $%.2f · passes \
+       $%.2f down"
+      deployment.Oracle_types.pool_share
+      venue_pool
+      deployment.Oracle_types.deployed
+      deployment.Oracle_types.remainder;
+    (* The sizing drawdown: the largest actual peak-to-valley event (with the
+       dates), and the statistical model's number for comparison. *)
+    (match deployment.Oracle_types.p2v with
+     | Some p ->
+       Logging.info_f
+         ~section
+         "      sizing drawdown %.1f%% — worst actual peak→valley: $%.2f (%s) → $%.2f \
+          (%s) · model %.1f%% @ %s"
+         (deployment.Oracle_types.d_cover *. 100.0)
+         p.Oracle_types.peak
+         p.Oracle_types.peak_date
+         p.Oracle_types.valley
+         p.Oracle_types.valley_date
+         (deployment.Oracle_types.d_gov *. 100.0)
+         horizon_lbl
+     | None ->
+       Logging.info_f
+         ~section
+         "      sizing drawdown %.1f%% — no actual drawdown in the history · model \
+          %.1f%% @ %s"
+         (deployment.Oracle_types.d_cover *. 100.0)
+         (deployment.Oracle_types.d_gov *. 100.0)
+         horizon_lbl);
+    (* The replayed survival: how deep a drop the capital actually funds
+       before the ladder runs dry - the honest gap to the target. *)
+    if deployment.Oracle_types.d_surv +. 1e-9 >= 1.0
+    then
+      Logging.info_f
+        ~section
+        "      survival: never exhausted on the replayed path (target %.0f%%)"
+        (rc.target_survival *. 100.0)
+    else
+      Logging.info_f
+        ~section
+        "      survival: capital runs out after a %.1f%% price drop (target %.0f%%)"
+        (deployment.Oracle_types.d_surv *. 100.0)
+        (rc.target_survival *. 100.0))
+  else (
+    Logging.info_f
+      ~section
+      "[%d/%d] %s/%s INACTIVE — %s"
+      index
+      n_tasks
+      exchange
+      symbol
+      deployment.Oracle_types.reason;
+    Logging.info_f
+      ~section
+      "      capital: pool share $%.2f · nothing deployed · $%.2f passes down"
+      deployment.Oracle_types.pool_share
+      deployment.Oracle_types.remainder);
+  (* ATH/ATL context (order-independent, display only). *)
   (match deployment.Oracle_types.range with
    | Some r ->
-     Logging.info_f
+     Logging.debug_f
        ~section
-       "[%d/%d] %s/%s range: ATH %.2f, low %.2f, price %.2f, d_from_ath %.1f%%, d_to_low \
-        %.1f%%, span %.1f%%"
+       "[%d/%d] %s/%s range context: ATH %.2f, low %.2f, price %.2f, span %.1f%%"
        index
        n_tasks
        exchange
@@ -827,25 +898,24 @@ let size_asset
        r.Oracle_types.ath
        r.Oracle_types.all_time_low
        r.Oracle_types.price
-       (r.Oracle_types.d_from_ath *. 100.0)
-       (r.Oracle_types.d_to_low *. 100.0)
        (r.Oracle_types.range_span *. 100.0)
    | None -> ());
-  (* The blend composition, logged for crypto assets so the F&G / range /
-     survival weighting is visible in the engine log - and the reader can see
-     exactly what the domain will adopt (and when a side was clamped away:
-     "survival binds"). Equities are pure oracle and skip this. *)
-  (match deployment.Oracle_types.parameter_components.Oracle_types.fng with
-   | None -> ()
-   | Some fng ->
-     let pc = deployment.Oracle_types.parameter_components in
+  (* The blend composition: how the resolved gi/qty were weighted. Crypto
+     blends the F&G side (fng_weight), the range side (range_weight) and the
+     survival side (the remainder); equities are pure oracle - the
+     survival-constrained parameter alone. *)
+  let pc = deployment.Oracle_types.parameter_components in
+  (match pc.Oracle_types.fng_parameter, pc.Oracle_types.fng with
+   | Some fp, Some fng ->
      let w_survival =
        Float.max 0.0 (1.0 -. pc.Oracle_types.fng_weight -. pc.Oracle_types.range_weight)
      in
      let sides, raw_blend =
-       match pc.Oracle_types.fng_parameter, pc.Oracle_types.range_parameter with
-       | Some fp, Some rp ->
-         let total = pc.fng_weight +. w_survival +. pc.range_weight in
+       match pc.Oracle_types.range_parameter with
+       | Some rp ->
+         let total =
+           pc.Oracle_types.fng_weight +. w_survival +. pc.Oracle_types.range_weight
+         in
          ( Printf.sprintf
              "fng %.2f -> %.4f%% (w %.2f) | range %.4f%% (w %.2f) | survival %.4f%% (w \
               %.2f)"
@@ -856,12 +926,12 @@ let size_asset
              pc.Oracle_types.range_weight
              pc.Oracle_types.survival_parameter
              w_survival
-         , ((pc.fng_weight *. fp)
+         , ((pc.Oracle_types.fng_weight *. fp)
             +. (w_survival *. pc.Oracle_types.survival_parameter)
             +. (pc.Oracle_types.range_weight *. rp))
            /. total )
-       | Some fp, None ->
-         let total = pc.fng_weight +. w_survival in
+       | None ->
+         let total = pc.Oracle_types.fng_weight +. w_survival in
          ( Printf.sprintf
              "fng %.2f -> %.4f%% (w %.2f) | survival %.4f%% (w %.2f)"
              fng
@@ -869,9 +939,9 @@ let size_asset
              pc.Oracle_types.fng_weight
              pc.Oracle_types.survival_parameter
              w_survival
-         , ((pc.fng_weight *. fp) +. (w_survival *. pc.Oracle_types.survival_parameter))
+         , ((pc.Oracle_types.fng_weight *. fp)
+            +. (w_survival *. pc.Oracle_types.survival_parameter))
            /. total )
-       | None, _ -> "", pc.Oracle_types.survival_parameter
      in
      let clamp_note =
        if raw_blend +. 1e-9 < pc.Oracle_types.survival_parameter
@@ -883,11 +953,7 @@ let size_asset
      in
      Logging.info_f
        ~section
-       "[%d/%d] %s/%s gi blend: %s -> resolved %.4f%%%s"
-       index
-       n_tasks
-       exchange
-       symbol
+       "      gi blend: %s -> resolved %.4f%%%s"
        sides
        pc.Oracle_types.resolved_parameter
        clamp_note;
@@ -901,16 +967,27 @@ let size_asset
      let headroom = deployment.Oracle_types.qty -. q_min > 1e-12 in
      Logging.info_f
        ~section
-       "[%d/%d] %s/%s qty blend: floor %.6g -> resolved %.6g (fng %.2f, k %.2f%s)"
-       index
-       n_tasks
-       exchange
-       symbol
+       "      qty blend: floor %.6g -> resolved %.6g (fng %.2f, k %.2f%s)"
        q_min
        deployment.Oracle_types.qty
        fng
        k
-       (if headroom then "" else "; no headroom: F&G qty contribution 0"));
+       (if headroom then "" else "; no headroom: F&G qty contribution 0")
+   | None, Some _ ->
+     (* Equity (pure oracle) or crypto without a live F&G side: no sentiment
+        blend on gi or qty - the survival-constrained values are adopted. *)
+     Logging.info_f
+       ~section
+       "      sizing: pure oracle — gi %.4f%% (survival-constrained) · qty %.6g \
+        (survival-max)"
+       pc.Oracle_types.survival_parameter
+       deployment.Oracle_types.qty
+   | None, None ->
+     Logging.info_f
+       ~section
+       "      sizing: no live Fear & Greed — model only (gi %.4f%%)"
+       pc.Oracle_types.survival_parameter
+   | Some _, None -> ());
   let warnings = deployment.Oracle_types.warnings in
   let warn_key = Printf.sprintf "%s/%s" exchange symbol in
   let warnings_changed =
@@ -940,6 +1017,7 @@ let size_asset
      ; pool_share = deployment.Oracle_types.pool_share
      ; remainder = deployment.Oracle_types.remainder
      ; range = deployment.Oracle_types.range
+     ; p2v = deployment.Oracle_types.p2v
      ; parameter_components = deployment.Oracle_types.parameter_components
      ; warnings = deployment.Oracle_types.warnings
      ; updated_at = Unix.gettimeofday ()
@@ -1023,7 +1101,7 @@ let run_pass
        minimum drawdown funding, so a priority asset only grows after the rest
        of the account can still fill their drawdowns at minimum qty - and an
        asset is disabled only when even its first buy cannot be funded. *)
-    let rec allocate pool = function
+    let rec allocate ~venue_pool pool = function
       | [] -> Lwt.return pool
       | analysis :: rest ->
         let reserve =
@@ -1041,6 +1119,7 @@ let run_pass
                config
                analysis
                ~pool:budget
+               ~venue_pool
                ~fng
                ~index:(List.length rest + 1)
                ~n_tasks:(List.length tasks)
@@ -1056,7 +1135,7 @@ let run_pass
                analysis.symbol
                (Printexc.to_string exn);
              Lwt.return pool)
-        >>= fun next -> allocate next rest
+        >>= fun next -> allocate ~venue_pool next rest
     in
     venue_pools tasks
     >>= fun pools ->
@@ -1072,7 +1151,7 @@ let run_pass
          | Some pool ->
            analyze_all [] account_tasks
            >>= fun analyses ->
-           allocate pool analyses
+           allocate ~venue_pool:pool pool analyses
            >|= fun surplus ->
            Logging.info_f
              ~section
