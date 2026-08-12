@@ -4,6 +4,19 @@
    paginated forward in day-windows. Pure [parse_*] functions are
    fixture-testable without network.
 
+   Source normalization. The candleSnapshot response is normalized here, at
+   the source, because it can contain rows that are not real market prints
+   and both corrupt the peak-to-valley drawdown and the ATH/floor references:
+   - placeholder candles for wrapped spot pairs before real trading started
+     (constant fabricated OHLC - e.g. 6,969,696 / 7,979,573 for UBTC/USDC on
+     2025-02-03..2025-02-13 - with zero or dust volume). A fabricated
+     $7.98M close read as a 99.3% drawdown; the market was never there.
+   - rows whose extreme prints never traded (e.g. open/high 240,000 on
+     2025-02-14 whose close was 97,578) - they fabricate an ATH/floor.
+   [normalize_bars] drops the first and folds the second into the row's
+   close, so the runtime, the CLI and the replay all consume one clean
+   series and never contradict each other.
+
    Spot vs perpetual resolution. The candleSnapshot endpoint serves:
    - perpetual candles under the bare coin name (e.g. "BTC");
    - spot candles under the pair's spotMeta universe "name" field: the
@@ -76,6 +89,10 @@ let spot_meta_ttl = 6.0 *. 3600.0
    (e.g. DOGE/USD), so every oracle pass would otherwise re-log the same
    warning on each refresh. Warn once, then debug. *)
 let warned_no_spot_history : (string, unit) Hashtbl.t = Hashtbl.create 32
+
+(* Symbols whose history was normalized (placeholder/outlier candles removed
+   or clamped) this run: report the counts once per pass, then debug. *)
+let warned_normalized : (string, unit) Hashtbl.t = Hashtbl.create 32
 
 (** Pure: extract (feed_symbol, candle_coin) mappings from a spotMeta
     response. [feed_symbol] replicates the instruments-feed spot key: the base
@@ -244,20 +261,124 @@ let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list) : Oracle_ty
   }
 ;;
 
-(** Order the fetched candle windows into ascending time (oldest -> newest,
-    de-duplicated, [dedup] keeps the LAST occurrence of a date). Each window
-    arrives internally ascending; windows are fetched oldest -> newest and
-    accumulated reversed (newest window first); the single final [List.rev]
-    restores global ascending order. The LAST bar must be the CURRENT close:
-    the grid start price and all ladder capital math read it, so a missing
-    final [List.rev] prices every ladder from the oldest fetched close
-    (regression: the pre-fix accumulation returned newest-first). *)
+(* ---- Source normalization (see the module doc) ---- *)
+
+let median_of (xs : float array) =
+  let n = Array.length xs in
+  if n = 0
+  then None
+  else (
+    let arr = Array.copy xs in
+    Array.sort Float.compare arr;
+    Some (if n mod 2 = 1 then arr.(n / 2) else (arr.((n / 2) - 1) +. arr.(n / 2)) /. 2.0))
+;;
+
+(** Normalize a candle list into the canonical clean series: ascending,
+    de-duplicated, fabricated rows dropped, absurd intra-row extremes folded
+    into the row's close. Returns the clean bars plus the counts of dropped
+    and clamped rows (for the once-per-symbol log).
+    - Pass 1 drops rows with non-finite/non-positive fields or an impossible
+      single-candle range (>10x between the row's extreme prints).
+    - Pass 2 folds rows whose extreme prints sit >2x away from the row's own
+      close into a flat close (liquid assets never trade a >2x daily span;
+      the close is the day's real level and is kept).
+    - Pass 3 drops rows whose close deviates >8x from the series' median
+      close (fabricated placeholder levels sit ~100x off the real market).
+      The median is computed over rows with real trading volume (>= 0.01)
+      so a long dead/placeholder run cannot drag the reference itself into
+      the gutter; no such rows falls back to all survivors, and no reference
+      at all keeps everything. *)
+let normalize_bars (bars : Oracle_types.bar list) : Oracle_types.bar array * int * int =
+  let arr = bars |> Array.of_list |> Oracle_calendar.sort_bars |> Oracle_calendar.dedup in
+  let n = Array.length arr in
+  let dropped = ref 0 in
+  let clamped = ref 0 in
+  let good = Array.make n false in
+  for i = 0 to n - 1 do
+    let b = arr.(i) in
+    let lo = Float.min b.open_ (Float.min b.high (Float.min b.low b.close)) in
+    let hi = Float.max b.open_ (Float.max b.high (Float.max b.low b.close)) in
+    let sane =
+      Float.is_finite b.open_
+      && Float.is_finite b.high
+      && Float.is_finite b.low
+      && Float.is_finite b.close
+      && b.open_ > 0.0
+      && b.high > 0.0
+      && b.low > 0.0
+      && b.close > 0.0
+      && hi /. lo <= 10.0
+    in
+    good.(i) <- sane;
+    if not sane then incr dropped
+  done;
+  for i = 0 to n - 1 do
+    if good.(i)
+    then (
+      let b = arr.(i) in
+      let lo = Float.min b.open_ (Float.min b.high (Float.min b.low b.close)) in
+      let hi = Float.max b.open_ (Float.max b.high (Float.max b.low b.close)) in
+      if hi > 2.0 *. b.close || lo < b.close /. 2.0
+      then (
+        arr.(i) <- { b with open_ = b.close; high = b.close; low = b.close };
+        incr clamped))
+  done;
+  let closes_of (predicate : int -> Oracle_types.bar -> bool) =
+    Array.to_list arr
+    |> List.mapi (fun i (b : Oracle_types.bar) -> i, b)
+    |> List.filter (fun (i, b) -> predicate i b)
+    |> List.map (fun (_, (b : Oracle_types.bar)) -> b.close)
+    |> Array.of_list
+  in
+  let ref_closes =
+    let with_volume = closes_of (fun i b -> good.(i) && b.volume >= 0.01) in
+    if Array.length with_volume > 0 then with_volume else closes_of (fun i _ -> good.(i))
+  in
+  (match median_of ref_closes with
+   | None -> ()
+   | Some m when m > 0.0 ->
+     for i = 0 to n - 1 do
+       if good.(i)
+       then (
+         let c = arr.(i).close in
+         if Float.max c m /. Float.min c m > 8.0
+         then (
+           good.(i) <- false;
+           incr dropped))
+     done
+   | Some _ -> ());
+  (* A series with no real trading at all (not one surviving row with volume
+     >= 0.01) is entirely fabricated: empty it rather than feed placeholder
+     candles into the drawdown/floor math. *)
+  let any_real = ref false in
+  for i = 0 to n - 1 do
+    if good.(i) && arr.(i).volume >= 0.01 then any_real := true
+  done;
+  if not !any_real
+  then
+    for i = 0 to n - 1 do
+      if good.(i)
+      then (
+        good.(i) <- false;
+        incr dropped)
+    done;
+  let out = ref [] in
+  for i = n - 1 downto 0 do
+    if good.(i) then out := arr.(i) :: !out
+  done;
+  Array.of_list !out, !dropped, !clamped
+;;
+
+(** Order the fetched candle windows into ascending time (oldest -> newest)
+    and normalize the whole series ([normalize_bars] sorts and de-duplicates,
+    so window boundary disorder and response-level order reversals are both
+    absorbed). The LAST bar must be the CURRENT close: the grid start price
+    and all ladder capital math read it, so an unordered series prices every
+    ladder from a stale close (regression: the pre-fix accumulation returned
+    newest-first). *)
 let windows_to_series (windows : Oracle_types.bar list list) : Oracle_types.bar list =
-  List.fold_left (fun acc bars -> List.rev_append bars acc) [] windows
-  |> List.rev
-  |> Array.of_list
-  |> Oracle_calendar.dedup
-  |> Array.to_list
+  let clean, _, _ = normalize_bars (List.concat windows) in
+  Array.to_list clean
 ;;
 
 (** Fetch daily candles forward from [start_ms] (unix ms), in day-windows.
@@ -349,5 +470,27 @@ let fetch_candles ?(start_ms = default_start_ms) ~(symbol : string) ()
                (List.length acc);
              Lwt.return acc))
     in
-    go start_ms [] max_windows >|= windows_to_series
+    go start_ms [] max_windows
+    >|= fun windows ->
+    let clean, dropped, clamped = normalize_bars (List.concat windows) in
+    if dropped > 0 || clamped > 0
+    then (
+      let first = not (Hashtbl.mem warned_normalized symbol) in
+      if first then Hashtbl.add warned_normalized symbol ();
+      if first
+      then
+        Logging.info_f
+          ~section
+          "Hyperliquid: normalized %s history at source: dropped %d placeholder/outlier \
+           candle(s), clamped %d absurd extreme print(s) (fabricated rows never enter \
+           the drawdown/floor math)"
+          symbol
+          dropped
+          clamped
+      else
+        Logging.debug_f
+          ~section
+          "Hyperliquid: normalized %s history (already reported this run)"
+          symbol);
+    Array.to_list clean
 ;;
