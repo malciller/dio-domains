@@ -148,6 +148,26 @@ type runtime_config =
         the strategy from placing/amending orders with un-blessed default
         sizing and then bouncing to the oracle values when the first decision
         lands. *)
+  ; assets : (string * asset_overrides) list
+    (** Per-asset override layer (config.json "oracle" -> "assets", keyed by
+        the trading-config symbol, case-insensitive): present keys replace
+        the global knobs for that asset's sizing/blend/history only. Capital
+        pooling stays venue-level. A "venue/symbol" key wins over "symbol". *)
+  }
+
+(** Partial per-asset knobs (all optional): merged onto the global
+    [runtime_config] by [resolve_for]. Only sizing/blend/history knobs are
+    overridable; cadence and wait machinery ([refresh_seconds], [poll_seconds],
+    [max_capital], [startup_wait_seconds]) stays global. *)
+and asset_overrides =
+  { target_survival : float option
+  ; fng_weight : float option
+  ; range_weight : float option
+  ; min_active_dsurv : float option
+  ; qty_cap_mult : float option
+  ; no_deep_history : bool option
+  ; weight_by_sessions : bool option
+  ; horizons : int list option
   }
 
 let default_config () =
@@ -163,7 +183,72 @@ let default_config () =
   ; horizons = None
   ; max_capital = None
   ; startup_wait_seconds = 60.0
+  ; assets = []
   }
+;;
+
+(** Human-readable list of the present knobs in a per-asset override, for the
+    startup summary. Only present (Some) knobs are listed; the all-None record
+    yields []. *)
+let override_fields (o : asset_overrides) : string list =
+  let fields = ref [] in
+  let push : 'a. 'a option -> ('a -> string) -> unit =
+    fun opt fmt ->
+    match opt with
+    | Some v -> fields := fmt v :: !fields
+    | None -> ()
+  in
+  push o.target_survival (Printf.sprintf "target_survival %.2f");
+  push o.fng_weight (Printf.sprintf "fng_weight %.2f");
+  push o.range_weight (Printf.sprintf "range_weight %.2f");
+  push o.min_active_dsurv (Printf.sprintf "min_active_dsurv %.2f");
+  push o.qty_cap_mult (Printf.sprintf "qty_cap_mult %.2f");
+  push o.no_deep_history (Printf.sprintf "deep_history %b");
+  push o.weight_by_sessions (Printf.sprintf "weight_by_sessions %b");
+  push o.horizons (fun hs ->
+    Printf.sprintf "horizons [%s]" (String.concat "," (List.map string_of_int hs)));
+  List.rev !fields
+;;
+
+(** Resolve the effective knobs for one asset: the global config with the
+    asset's overrides merged in (present keys only). Keys match the
+    trading-config symbol case-insensitively; a "venue/symbol" key ("venue"
+    from [exchange]) wins over the bare symbol. Unknown keys never match and
+    fall through to the global config. *)
+let resolve_for (config : runtime_config) ~(exchange : string) (symbol : string) =
+  let sym = String.lowercase_ascii symbol in
+  let keyed = String.lowercase_ascii (exchange ^ "/" ^ symbol) in
+  let find key =
+    List.find_map
+      (fun (k, o) -> if String.lowercase_ascii k = key then Some o else None)
+      config.assets
+  in
+  let merge (o : asset_overrides) =
+    { target_survival = Option.value o.target_survival ~default:config.target_survival
+    ; fng_weight = Option.value o.fng_weight ~default:config.fng_weight
+    ; range_weight = Option.value o.range_weight ~default:config.range_weight
+    ; min_active_dsurv = Option.value o.min_active_dsurv ~default:config.min_active_dsurv
+    ; qty_cap_mult = Option.value o.qty_cap_mult ~default:config.qty_cap_mult
+    ; no_deep_history = Option.value o.no_deep_history ~default:config.no_deep_history
+    ; weight_by_sessions =
+        Option.value o.weight_by_sessions ~default:config.weight_by_sessions
+    ; horizons =
+        (match o.horizons with
+         | Some h -> Some h
+         | None -> config.horizons)
+    ; max_capital = config.max_capital
+    ; refresh_seconds = config.refresh_seconds
+    ; poll_seconds = config.poll_seconds
+    ; startup_wait_seconds = config.startup_wait_seconds
+    ; assets = config.assets
+    }
+  in
+  match find keyed with
+  | Some o -> merge o
+  | None ->
+    (match find sym with
+     | Some o -> merge o
+     | None -> config)
 ;;
 
 (* Per-asset cache of the last deployment-warning set from [size_asset].
@@ -172,6 +257,10 @@ let default_config () =
    warn only when they first appear or change, otherwise keep them at debug
    so the log stays readable. *)
 let last_deployment_warnings : (string, string list) Hashtbl.t = Hashtbl.create 32
+
+(* Per-asset cache of the last detail-block text (drawdown event, blend
+   composition) so repeated detail is logged at debug, not every pass. *)
+let last_detail_lines : (string, string) Hashtbl.t = Hashtbl.create 32
 
 (** The sleep until the next pass. While every published decision is inactive
     (e.g. a fully deployed account with a ~zero available-quote pool, awaiting
@@ -511,21 +600,15 @@ let venue_pools (tasks : Oracle_tasks.task list)
                |> List.filter (fun (b : Oracle_balances.balance) ->
                  b.available > 0.0 || b.total > 0.0)
                |> List.map (fun (b : Oracle_balances.balance) ->
-                 Printf.sprintf
-                   "%s: avail %.6g / total %.6g (%s %s)"
-                   b.asset
-                   b.available
-                   b.total
-                   b.wallet_type
-                   b.wallet_id)
+                 if Float.abs (b.available -. b.total) < 1e-9
+                 then Printf.sprintf "%s %.6g" b.asset b.available
+                 else Printf.sprintf "%s %.6g/%.6g" b.asset b.available b.total)
              in
              Logging.info_f
                ~section
-               "venue %s balance snapshot (%s%s): %s -> pool %.2f"
+               "venue %s balance: %s -> pool $%.2f"
                (account_id account)
-               snapshot.exchange
-               (if snapshot.testnet then ", testnet" else "")
-               (String.concat "; " lines)
+               (String.concat " · " lines)
                pool;
              Some pool)
         (fun exn ->
@@ -571,6 +654,10 @@ type analysis =
   ; hi : float
   ; models : Oracle_replay.blend_model list
   ; reservation : reservation
+  ; rc : runtime_config
+    (** Effective knobs of the analyzed asset (global + per-asset overrides
+        resolved by [resolve_for]) - sizing consumes these, not the global
+        config. *)
   }
 
 let analyze_asset
@@ -584,6 +671,11 @@ let analyze_asset
   let exchange = task.Oracle_tasks.exchange in
   let calendar_kind = Oracle_tasks.calendar_kind_of_exchange exchange in
   let tc = task.Oracle_tasks.config in
+  (* The asset's own analysis runs on its resolved knobs (global + overrides);
+     class-member series stay on the global config - they are shared pool
+     inputs feeding the kappa blend, not per-asset decisions. *)
+  let global_rc = rc in
+  let rc = resolve_for global_rc ~exchange task.Oracle_tasks.symbol in
   let class_name =
     match tc.asset_class with
     | Some name -> name
@@ -600,7 +692,7 @@ let analyze_asset
   >>= fun asset ->
   deepen_series rc ~exchange asset
   >>= fun (asset, deep_bars) ->
-  load_members rc classes tc ~class_name asset
+  load_members global_rc classes tc ~class_name asset
   >>= fun members ->
   let start_price =
     if Array.length asset.bars = 0
@@ -667,8 +759,9 @@ let analyze_asset
       horizons
   in
   (* Analysis inputs of this pass, so the history/member/horizon basis each
-     decision was computed on is traceable in the engine log. *)
-  Logging.info_f
+     decision was computed on is traceable in the engine log (debug: it
+     repeats every pass unchanged). *)
+  Logging.debug_f
     ~section
     "[%d/%d] %s/%s: history %d bars (+%d deep), %d class member(s) [%s], warmup %d, \
      horizons [%s]"
@@ -740,7 +833,9 @@ let analyze_asset
       let first_buy = G.cost_at grid_lo ~qty:q_min ~n_fills:1 in
       { q_min; d_gov; d_cover; governing_horizon; fallback; n_fills; min_cost; first_buy }
   in
-  Logging.info_f
+  (* The reservation (allocation machinery detail) - debug: it repeats every
+     pass unchanged. *)
+  Logging.debug_f
     ~section
     "[%d/%d] %s/%s reservation: min order %.6g, first buy $%.2f; the %.1f%% worst \
      drawdown needs $%.2f at the tightest grid %.2f%% (%s)"
@@ -764,6 +859,7 @@ let analyze_asset
     ; hi = gi_hi
     ; models
     ; reservation
+    ; rc
     }
 ;;
 
@@ -801,9 +897,12 @@ let size_asset
       ~scan_points:24
       ~qty_cap_mult:rc.qty_cap_mult
   in
-  (* ===== Per-asset decision log (human-readable) =====
-     One block per asset: what the grid will do, with which capital, against
-     which drawdown - then the F&G blend diagnostics (crypto). *)
+  (* ===== Per-asset decision log =====
+     INFO: one scannable line per asset, every pass - the heartbeat of the
+     decision ("what is it doing, with how much, against which drawdown, is
+     it funded"). DEBUG / on-change: the detail block (drawdown event prices
+     and dates, model horizon, F&G blend composition) - repeated detail is
+     noise, so it is logged once and then only when it changes. *)
   let base_of symbol =
     match String.split_on_char '/' symbol with
     | b :: _ -> b
@@ -814,34 +913,70 @@ let size_asset
     then "-"
     else deployment.Oracle_types.governing_horizon
   in
+  let key = Printf.sprintf "%s/%s" exchange symbol in
+  let p2v_lbl =
+    match deployment.Oracle_types.p2v with
+    | Some p ->
+      Printf.sprintf
+        "%.1f%% (%s→%s)"
+        (deployment.Oracle_types.d_cover *. 100.0)
+        p.Oracle_types.peak_date
+        p.Oracle_types.valley_date
+    | None -> Printf.sprintf "%.1f%%" (deployment.Oracle_types.d_cover *. 100.0)
+  in
+  let health =
+    if not deployment.Oracle_types.active
+    then "inactive"
+    else if deployment.Oracle_types.row.passed
+    then "funded"
+    else "UNDER-FUNDED"
+  in
   if deployment.Oracle_types.active
-  then (
+  then
     Logging.info_f
       ~section
-      "[%d/%d] %s/%s ACTIVE — buy %.6g %s on every %.2f%% price drop"
+      "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | worst \
+       drop %s | survives %.1f%% | %s"
       index
       n_tasks
       exchange
       symbol
       deployment.Oracle_types.qty
       (base_of symbol)
-      deployment.Oracle_types.parameter;
-    Logging.info_f
-      ~section
-      "      capital: share $%.2f of the $%.2f venue pool · deployed $%.2f · passes \
-       $%.2f down"
+      deployment.Oracle_types.parameter
       deployment.Oracle_types.pool_share
       venue_pool
-      deployment.Oracle_types.deployed
+      p2v_lbl
+      (deployment.Oracle_types.d_surv *. 100.0)
+      health
+  else
+    Logging.info_f
+      ~section
+      "[%d/%d] %s/%s INACTIVE — %s | capital $%.2f passes down"
+      index
+      n_tasks
+      exchange
+      symbol
+      deployment.Oracle_types.reason
       deployment.Oracle_types.remainder;
-    (* The sizing drawdown: the largest actual peak-to-valley event (with the
-       dates), and the statistical model's number for comparison. *)
+  (* The detail block: event prices/dates, model horizon, and how the
+     resolved gi/qty were weighted (the F&G blend for crypto; pure oracle for
+     equities). *)
+  let detail = Buffer.create 256 in
+  let add fmt =
+    Printf.ksprintf
+      (fun s ->
+         Buffer.add_string detail s;
+         Buffer.add_char detail '\n')
+      fmt
+  in
+  if deployment.Oracle_types.active
+  then (
     (match deployment.Oracle_types.p2v with
      | Some p ->
-       Logging.info_f
-         ~section
-         "      sizing drawdown %.1f%% — worst actual peak→valley: $%.2f (%s) → $%.2f \
-          (%s) · model %.1f%% @ %s"
+       add
+         "      worst drop %.1f%% (peak $%.2f on %s → valley $%.2f on %s) · model %.1f%% \
+          @ %s"
          (deployment.Oracle_types.d_cover *. 100.0)
          p.Oracle_types.peak
          p.Oracle_types.peak_date
@@ -850,41 +985,103 @@ let size_asset
          (deployment.Oracle_types.d_gov *. 100.0)
          horizon_lbl
      | None ->
-       Logging.info_f
-         ~section
-         "      sizing drawdown %.1f%% — no actual drawdown in the history · model \
-          %.1f%% @ %s"
+       add
+         "      worst drop %.1f%% (no actual drawdown in the history) · model %.1f%% @ %s"
          (deployment.Oracle_types.d_cover *. 100.0)
          (deployment.Oracle_types.d_gov *. 100.0)
          horizon_lbl);
-    (* The replayed survival: how deep a drop the capital actually funds
-       before the ladder runs dry - the honest gap to the target. *)
-    if deployment.Oracle_types.d_surv +. 1e-9 >= 1.0
-    then
-      Logging.info_f
-        ~section
-        "      survival: never exhausted on the replayed path (target %.0f%%)"
-        (rc.target_survival *. 100.0)
-    else
-      Logging.info_f
-        ~section
-        "      survival: capital runs out after a %.1f%% price drop (target %.0f%%)"
-        (deployment.Oracle_types.d_surv *. 100.0)
-        (rc.target_survival *. 100.0))
-  else (
-    Logging.info_f
-      ~section
-      "[%d/%d] %s/%s INACTIVE — %s"
-      index
-      n_tasks
-      exchange
-      symbol
-      deployment.Oracle_types.reason;
-    Logging.info_f
-      ~section
-      "      capital: pool share $%.2f · nothing deployed · $%.2f passes down"
-      deployment.Oracle_types.pool_share
-      deployment.Oracle_types.remainder);
+    let pc = deployment.Oracle_types.parameter_components in
+    match pc.Oracle_types.fng_parameter, pc.Oracle_types.fng with
+    | Some fp, Some fng ->
+      let w_survival =
+        Float.max 0.0 (1.0 -. pc.Oracle_types.fng_weight -. pc.Oracle_types.range_weight)
+      in
+      let sides, raw_blend =
+        match pc.Oracle_types.range_parameter with
+        | Some rp ->
+          let total =
+            pc.Oracle_types.fng_weight +. w_survival +. pc.Oracle_types.range_weight
+          in
+          ( Printf.sprintf
+              "fng %.2f -> %.4f%% (w %.2f) | range %.4f%% (w %.2f) | survival %.4f%% (w \
+               %.2f)"
+              fng
+              fp
+              pc.Oracle_types.fng_weight
+              rp
+              pc.Oracle_types.range_weight
+              pc.Oracle_types.survival_parameter
+              w_survival
+          , ((pc.Oracle_types.fng_weight *. fp)
+             +. (w_survival *. pc.Oracle_types.survival_parameter)
+             +. (pc.Oracle_types.range_weight *. rp))
+            /. total )
+        | None ->
+          let total = pc.Oracle_types.fng_weight +. w_survival in
+          ( Printf.sprintf
+              "fng %.2f -> %.4f%% (w %.2f) | survival %.4f%% (w %.2f)"
+              fng
+              fp
+              pc.Oracle_types.fng_weight
+              pc.Oracle_types.survival_parameter
+              w_survival
+          , ((pc.Oracle_types.fng_weight *. fp)
+             +. (w_survival *. pc.Oracle_types.survival_parameter))
+            /. total )
+      in
+      let clamp_note =
+        if raw_blend +. 1e-9 < pc.Oracle_types.survival_parameter
+        then
+          Printf.sprintf
+            " (blend %.4f%% clamped: survival binds, F&G/range contribute 0)"
+            raw_blend
+        else ""
+      in
+      add
+        "      gi blend: %s -> resolved %.4f%%%s"
+        sides
+        pc.Oracle_types.resolved_parameter
+        clamp_note;
+      (* The qty channel of the same blend: fear up-sizes toward the
+         survival-max, greed pulls back toward the floor. When the survival-max
+         is the floor itself (under-funded pool) there is no headroom and the
+         F&G qty contribution is zero by construction - logged so it is visible
+         rather than silent. *)
+      let q_min = D.sizing_floor ~cfg:grid in
+      let k = 1.0 -. (Float.max 0.0 (Float.min 100.0 fng) /. 100.0) in
+      let headroom = deployment.Oracle_types.qty -. q_min > 1e-12 in
+      add
+        "      qty blend: floor %.6g -> resolved %.6g (fng %.2f, k %.2f%s)"
+        q_min
+        deployment.Oracle_types.qty
+        fng
+        k
+        (if headroom then "" else "; no headroom: F&G qty contribution 0")
+    | None, Some _ ->
+      (* Equity (pure oracle): no sentiment blend on gi or qty - the
+         survival-constrained values are adopted. *)
+      add
+        "      sizing: pure oracle — gi %.4f%% (survival-constrained) · qty %.6g \
+         (survival-max)"
+        pc.Oracle_types.survival_parameter
+        deployment.Oracle_types.qty
+    | None, None ->
+      add
+        "      sizing: no live Fear & Greed — model only (gi %.4f%%)"
+        pc.Oracle_types.survival_parameter
+    | Some _, None -> ());
+  let detail_str = Buffer.contents detail in
+  let detail_changed =
+    match Hashtbl.find_opt last_detail_lines key with
+    | Some prev -> prev <> detail_str
+    | None -> true
+  in
+  Hashtbl.replace last_detail_lines key detail_str;
+  if detail_str <> ""
+  then
+    if detail_changed
+    then Logging.info ~section detail_str
+    else Logging.debug ~section detail_str;
   (* ATH/ATL context (order-independent, display only). *)
   (match deployment.Oracle_types.range with
    | Some r ->
@@ -900,94 +1097,6 @@ let size_asset
        r.Oracle_types.price
        (r.Oracle_types.range_span *. 100.0)
    | None -> ());
-  (* The blend composition: how the resolved gi/qty were weighted. Crypto
-     blends the F&G side (fng_weight), the range side (range_weight) and the
-     survival side (the remainder); equities are pure oracle - the
-     survival-constrained parameter alone. *)
-  let pc = deployment.Oracle_types.parameter_components in
-  (match pc.Oracle_types.fng_parameter, pc.Oracle_types.fng with
-   | Some fp, Some fng ->
-     let w_survival =
-       Float.max 0.0 (1.0 -. pc.Oracle_types.fng_weight -. pc.Oracle_types.range_weight)
-     in
-     let sides, raw_blend =
-       match pc.Oracle_types.range_parameter with
-       | Some rp ->
-         let total =
-           pc.Oracle_types.fng_weight +. w_survival +. pc.Oracle_types.range_weight
-         in
-         ( Printf.sprintf
-             "fng %.2f -> %.4f%% (w %.2f) | range %.4f%% (w %.2f) | survival %.4f%% (w \
-              %.2f)"
-             fng
-             fp
-             pc.Oracle_types.fng_weight
-             rp
-             pc.Oracle_types.range_weight
-             pc.Oracle_types.survival_parameter
-             w_survival
-         , ((pc.Oracle_types.fng_weight *. fp)
-            +. (w_survival *. pc.Oracle_types.survival_parameter)
-            +. (pc.Oracle_types.range_weight *. rp))
-           /. total )
-       | None ->
-         let total = pc.Oracle_types.fng_weight +. w_survival in
-         ( Printf.sprintf
-             "fng %.2f -> %.4f%% (w %.2f) | survival %.4f%% (w %.2f)"
-             fng
-             fp
-             pc.Oracle_types.fng_weight
-             pc.Oracle_types.survival_parameter
-             w_survival
-         , ((pc.Oracle_types.fng_weight *. fp)
-            +. (w_survival *. pc.Oracle_types.survival_parameter))
-           /. total )
-     in
-     let clamp_note =
-       if raw_blend +. 1e-9 < pc.Oracle_types.survival_parameter
-       then
-         Printf.sprintf
-           " (blend %.4f%% clamped: survival binds, F&G/range contribute 0)"
-           raw_blend
-       else ""
-     in
-     Logging.info_f
-       ~section
-       "      gi blend: %s -> resolved %.4f%%%s"
-       sides
-       pc.Oracle_types.resolved_parameter
-       clamp_note;
-     (* The qty channel of the same blend: fear up-sizes toward the
-        survival-max, greed pulls back toward the floor. When the survival-max
-        is the floor itself (under-funded pool) there is no headroom and the
-        F&G qty contribution is zero by construction - logged so it is visible
-        rather than silent. *)
-     let q_min = D.sizing_floor ~cfg:grid in
-     let k = 1.0 -. (Float.max 0.0 (Float.min 100.0 fng) /. 100.0) in
-     let headroom = deployment.Oracle_types.qty -. q_min > 1e-12 in
-     Logging.info_f
-       ~section
-       "      qty blend: floor %.6g -> resolved %.6g (fng %.2f, k %.2f%s)"
-       q_min
-       deployment.Oracle_types.qty
-       fng
-       k
-       (if headroom then "" else "; no headroom: F&G qty contribution 0")
-   | None, Some _ ->
-     (* Equity (pure oracle) or crypto without a live F&G side: no sentiment
-        blend on gi or qty - the survival-constrained values are adopted. *)
-     Logging.info_f
-       ~section
-       "      sizing: pure oracle — gi %.4f%% (survival-constrained) · qty %.6g \
-        (survival-max)"
-       pc.Oracle_types.survival_parameter
-       deployment.Oracle_types.qty
-   | None, None ->
-     Logging.info_f
-       ~section
-       "      sizing: no live Fear & Greed — model only (gi %.4f%%)"
-       pc.Oracle_types.survival_parameter
-   | Some _, None -> ());
   let warnings = deployment.Oracle_types.warnings in
   let warn_key = Printf.sprintf "%s/%s" exchange symbol in
   let warnings_changed =
@@ -1116,7 +1225,7 @@ let run_pass
         Lwt.catch
           (fun () ->
              size_asset
-               config
+               analysis.rc
                analysis
                ~pool:budget
                ~venue_pool
@@ -1216,6 +1325,36 @@ let start
     (match config.horizons with
      | Some ns -> String.concat "," (List.map string_of_int ns)
      | None -> "default");
+  (* Per-asset override map: resolved at every pass for each task. A key that
+     matches no tracked symbol (checked against "symbol" and "venue/symbol")
+     is a config typo - surface it once at startup. *)
+  let known_key key =
+    List.exists
+      (fun (task : Oracle_tasks.task) ->
+         let sym = task.Oracle_tasks.symbol in
+         let keyed = task.Oracle_tasks.exchange ^ "/" ^ sym in
+         String.lowercase_ascii key = String.lowercase_ascii sym
+         || String.lowercase_ascii key = String.lowercase_ascii keyed)
+      tasks
+  in
+  if config.assets <> []
+  then
+    List.iter
+      (fun ((key, o) : string * asset_overrides) ->
+         let fields = override_fields o in
+         if not (known_key key)
+         then
+           Logging.warn_f
+             ~section
+             "asset override '%s' matches no tracked symbol (trading config); ignored - \
+              fix the key or remove it"
+             key;
+         Logging.info_f
+           ~section
+           "asset overrides %s: %s"
+           key
+           (if fields = [] then "(empty)" else String.concat ", " fields))
+      config.assets;
   List.iter
     (fun ((name, pool) : string * class_pool) ->
        Logging.info_f
