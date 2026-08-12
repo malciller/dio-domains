@@ -139,6 +139,13 @@ let default_config () =
   }
 ;;
 
+(* Per-asset cache of the last deployment-warning set from [size_asset].
+   The oracle runs a pass every refresh and re-derives the same warnings
+   (under-funded, parameter clamped, coverage gap) each time; log them at
+   warn only when they first appear or change, otherwise keep them at debug
+   so the log stays readable. *)
+let last_deployment_warnings : (string, string list) Hashtbl.t = Hashtbl.create 32
+
 (** The sleep until the next pass. While every published decision is inactive
     (e.g. a fully deployed account with a ~zero available-quote pool, awaiting
     sell fills to restore capital) the runtime polls at the fast [poll_seconds]
@@ -466,16 +473,17 @@ let venue_pools (tasks : Oracle_tasks.task list)
                  (Oracle_balances.available_quote snapshot ~quote:account.quote)
              in
              let lines =
-               List.map
-                 (fun (b : Oracle_balances.balance) ->
-                    Printf.sprintf
-                      "%s: avail %.6g / total %.6g (%s %s)"
-                      b.asset
-                      b.available
-                      b.total
-                      b.wallet_type
-                      b.wallet_id)
-                 snapshot.balances
+               snapshot.balances
+               |> List.filter (fun (b : Oracle_balances.balance) ->
+                 b.available > 0.0 || b.total > 0.0)
+               |> List.map (fun (b : Oracle_balances.balance) ->
+                 Printf.sprintf
+                   "%s: avail %.6g / total %.6g (%s %s)"
+                   b.asset
+                   b.available
+                   b.total
+                   b.wallet_type
+                   b.wallet_id)
              in
              Logging.info_f
                ~section
@@ -764,9 +772,20 @@ let size_asset
     (if deployment.Oracle_types.governing_horizon = ""
      then "-"
      else deployment.Oracle_types.governing_horizon);
+  let warnings = deployment.Oracle_types.warnings in
+  let warn_key = Printf.sprintf "%s/%s" exchange symbol in
+  let warnings_changed =
+    match Hashtbl.find_opt last_deployment_warnings warn_key with
+    | Some prev -> prev <> warnings
+    | None -> true
+  in
+  Hashtbl.replace last_deployment_warnings warn_key warnings;
   List.iter
-    (fun w -> Logging.warn_f ~section "%s/%s: %s" exchange symbol w)
-    deployment.Oracle_types.warnings;
+    (fun w ->
+       if warnings_changed
+       then Logging.warn_f ~section "%s/%s: %s" exchange symbol w
+       else Logging.debug_f ~section "%s/%s: %s (unchanged)" exchange symbol w)
+    warnings;
   Lwt.return
     ({ exchange
      ; symbol

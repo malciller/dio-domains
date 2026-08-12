@@ -72,6 +72,12 @@ let spot_meta_fetched_at : float ref = ref 0.0
 let spot_meta_mutex = Mutex.create ()
 let spot_meta_ttl = 6.0 *. 3600.0
 
+(* Symbols already reported as having no Hyperliquid spot pair this run.
+   These are expected for class members that never had a spot listing
+   (e.g. DOGE/USD), so every oracle pass would otherwise re-log the same
+   warning on each refresh. Warn once, then debug. *)
+let warned_no_spot_history : (string, unit) Hashtbl.t = Hashtbl.create 32
+
 (** Pure: extract (feed_symbol, candle_coin) mappings from a spotMeta
     response. [feed_symbol] replicates the instruments-feed spot key: the base
     token name canonicalized for the wrapped majors (UBTC/UETH/USOL) plus the
@@ -254,13 +260,22 @@ let fetch_candles ?(start_ms = default_start_ms) ~(symbol : string) ()
   Mutex.unlock spot_meta_mutex;
   match coin_of_symbol ~pairs symbol with
   | None ->
-    Logging.warn_f
-      ~section
-      "Hyperliquid: no spot history for %s (no matching Hyperliquid spot pair; \
-       spot-named symbols never use perpetual candles). Spot-only oracle leaves this \
-       asset without history -> INACTIVE. Use the bare coin name only for perpetual \
-       intent."
-      symbol;
+    let first = not (Hashtbl.mem warned_no_spot_history symbol) in
+    if first then Hashtbl.add warned_no_spot_history symbol ();
+    if first
+    then
+      Logging.warn_f
+        ~section
+        "Hyperliquid: no spot history for %s (no matching Hyperliquid spot pair; \
+         spot-named symbols never use perpetual candles). Spot-only oracle leaves this \
+         asset without history -> INACTIVE. Use the bare coin name only for perpetual \
+         intent."
+        symbol
+    else
+      Logging.debug_f
+        ~section
+        "Hyperliquid: no spot history for %s (already reported this run)"
+        symbol;
     Lwt.return []
   | Some coin ->
     let now_ms = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
