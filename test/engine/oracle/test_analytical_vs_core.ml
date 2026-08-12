@@ -126,7 +126,7 @@ let test_inverse_sizing_matches_closed_form () =
     ; bars =
         Array.mapi
           (fun i (b : Dio_strategies.Grid_core_types.bar) ->
-             { date = Printf.sprintf "2023-%02d" i
+             { date = Dio_oracle.Oracle_calendar.add_days "2023-01-01" i
              ; open_ = b.close
              ; high = b.high
              ; low = b.low
@@ -326,21 +326,21 @@ let test_empirical_matches_static_on_crash () =
   (* On a monotone geometric crash the path replay equals the closed-form
      static runway (one ladder fill per bar, no sells), so the empirical
      (path-replay) min capital must equal the static one: the crash IS the
-     worst case the static bound prices. The tail stays flat at the crash
-     bottom (no rise, so the ladder never re-anchors up).
-
-     The sizing drawdown is the largest ACTUAL peak-to-valley fall of the
-     series (peak close ~100 -> trough low ~44.75, ~55%), so the static
-     recommendation funds the whole crash - it does NOT collapse to the
-     first buy as the old ATH-anchored model did (the price sits ~55% below
-     the ATH, which the anchor treated as "already traversed"). The
-     empirical number (full path replay) must land on the same runway. *)
+     worst case the static bound prices. The crash fully RECOVERS (the price
+     retraces above its starting peak and flats out), so the asset is in the
+     mature ATH-scaled regime and the sizing reference is the full actual
+     peak-to-valley fall of the series (peak close ~100 -> trough low
+     ~44.75, ~55%): the static recommendation funds the whole crash, not the
+     first buy. The empirical number (full path replay) must land on the
+     same runway. (A crash that never recovered would be the outlier regime
+     - funded at the measured floor overshoot instead, by design.) *)
   let gi = 1.0 in
   let fee = 0.0004 in
   let start_price = 100.0 in
   let capital = 2_900.0 in
   let n_bars = 300 in
   let n_crash = 80 in
+  let n_recover = 165 in
   let level i = start_price *. (0.99 ** float_of_int i) in
   let mk i close =
     let lo = if i = 0 then level 1 *. 0.999999 else level (i + 1) *. 0.999999 in
@@ -351,10 +351,13 @@ let test_empirical_matches_static_on_crash () =
     Array.init n_bars (fun i ->
       if i < n_crash
       then mk i (level i)
+      else if i < n_crash + n_recover
+      then (
+        let c = level n_crash *. (1.005 ** float_of_int (i - n_crash)) in
+        Dio_strategies.Grid_core_types.{ high = c *. 1.001; low = c *. 0.999; close = c })
       else (
-        let bottom = level n_crash in
-        Dio_strategies.Grid_core_types.
-          { high = bottom *. 1.001; low = bottom *. 0.999; close = bottom }))
+        let c = level n_crash *. (1.005 ** float_of_int n_recover) in
+        Dio_strategies.Grid_core_types.{ high = c *. 1.001; low = c *. 0.999; close = c }))
   in
   let open Dio_oracle.Oracle_types in
   let series =
@@ -363,7 +366,7 @@ let test_empirical_matches_static_on_crash () =
     ; bars =
         Array.mapi
           (fun i (b : Dio_strategies.Grid_core_types.bar) ->
-             { date = Printf.sprintf "2023-%02d" i
+             { date = Dio_oracle.Oracle_calendar.add_days "2023-01-01" i
              ; open_ = b.close
              ; high = b.high
              ; low = b.low

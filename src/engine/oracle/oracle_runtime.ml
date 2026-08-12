@@ -817,14 +817,14 @@ let analyze_asset
       }
     | Some (d_gov, governing_horizon, fallback) ->
       let q_min = D.sizing_floor ~cfg:grid in
-      (* The reservation funds the largest ACTUAL peak-to-valley drawdown of
-         the asset's history (see Oracle_math.peak_to_valley_stats_of): the
-         fall the grid must fund from the current price. No ATH anchoring -
-         a 1000x run-up only registers the falls that actually took place,
-         never the ATH-to-ATL span. *)
+      (* The reservation funds the asset's sizing drawdown - the ATH-scaled
+         remaining drop to the expected floor for mature assets, the raw
+         largest ACTUAL peak-to-valley drawdown for immature fallback assets
+         (see Oracle_math.sizing_reference_of). No ATH-to-ATL anchoring: a
+         1000x run-up only registers the falls that actually took place. *)
       let d_cover =
-        match Oracle_math.peak_to_valley_stats_of asset with
-        | Some p -> p.Oracle_types.max_drawdown
+        match Oracle_math.sizing_reference_of ~fallback asset with
+        | Some r -> r.d_cover
         | None -> d_gov
       in
       let grid_lo = G.set_parameter grid gi_lo in
@@ -915,14 +915,35 @@ let size_asset
   in
   let key = Printf.sprintf "%s/%s" exchange symbol in
   let p2v_lbl =
-    match deployment.Oracle_types.p2v with
-    | Some p ->
+    match deployment.Oracle_types.p2v, deployment.Oracle_types.sizing with
+    | Some _, Some r when r.Oracle_types.outlier ->
+      (* No recovered anchor: the measured floor overshoot funds the asset. *)
       Printf.sprintf
-        "%.1f%% (%s→%s)"
+        "drop %.1f%% (floor overshoot)"
+        (deployment.Oracle_types.d_cover *. 100.0)
+    | Some _, Some r when r.Oracle_types.at_floor ->
+      (* Living at/below the expected floor: the remainder is exhausted, the
+         measured floor overshoot funds the asset. *)
+      Printf.sprintf
+        "drop %.1f%% (floor overshoot)"
+        (deployment.Oracle_types.d_cover *. 100.0)
+    | Some p, Some r when r.Oracle_types.d_cover +. 1e-9 < p.Oracle_types.max_drawdown ->
+      (* Partway down from the ATH: only the remaining fall to the expected
+         floor is funded (the worst-ever drop is context). *)
+      Printf.sprintf
+        "drop %.1f%% (worst %.1f%% %s→%s)"
+        (deployment.Oracle_types.d_cover *. 100.0)
+        (p.Oracle_types.max_drawdown *. 100.0)
+        p.Oracle_types.peak_date
+        p.Oracle_types.valley_date
+    | Some p, _ ->
+      (* At/near the ATH (or fallback raw sizing): the full event drawdown. *)
+      Printf.sprintf
+        "drop %.1f%% (%s→%s)"
         (deployment.Oracle_types.d_cover *. 100.0)
         p.Oracle_types.peak_date
         p.Oracle_types.valley_date
-    | None -> Printf.sprintf "%.1f%%" (deployment.Oracle_types.d_cover *. 100.0)
+    | None, _ -> Printf.sprintf "drop %.1f%%" (deployment.Oracle_types.d_cover *. 100.0)
   in
   let health =
     if not deployment.Oracle_types.active
@@ -935,8 +956,8 @@ let size_asset
   then
     Logging.info_f
       ~section
-      "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | worst \
-       drop %s | survives %.1f%% | %s"
+      "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | drop \
+       %s | survives %.1f%% | %s"
       index
       n_tasks
       exchange
@@ -977,7 +998,7 @@ let size_asset
        add
          "      worst drop %.1f%% (peak $%.2f on %s → valley $%.2f on %s) · model %.1f%% \
           @ %s"
-         (deployment.Oracle_types.d_cover *. 100.0)
+         (p.Oracle_types.max_drawdown *. 100.0)
          p.Oracle_types.peak
          p.Oracle_types.peak_date
          p.Oracle_types.valley
@@ -990,6 +1011,43 @@ let size_asset
          (deployment.Oracle_types.d_cover *. 100.0)
          (deployment.Oracle_types.d_gov *. 100.0)
          horizon_lbl);
+    (* The funding reference: where the funded drawdown comes from (the
+       ATH-scaled remainder to the expected floor, or the measured floor
+       overshoot when the remainder is exhausted / no recovered anchor). *)
+    (match deployment.Oracle_types.sizing with
+     | Some r when r.Oracle_types.outlier ->
+       add
+         "      funding: deepest drawdown not recovered — floor overshoot %.1f%%%s"
+         (deployment.Oracle_types.d_cover *. 100.0)
+         (if Option.is_none r.Oracle_types.overshoot_p90
+          then " (no floor-break history: 15% fallback)"
+          else " (90th pct)")
+     | Some r when r.Oracle_types.at_floor ->
+       (match r.Oracle_types.floor_ref with
+        | Some floor_ref ->
+          add
+            "      funding: at/below floor $%.2f — floor overshoot %.1f%%%s"
+            floor_ref
+            (deployment.Oracle_types.d_cover *. 100.0)
+            (if Option.is_none r.Oracle_types.overshoot_p90
+             then " (no floor-break history: 15% fallback)"
+             else " (90th pct)")
+        | None -> ())
+     | Some r ->
+       (match r.Oracle_types.floor_ref with
+        | Some floor_ref ->
+          add
+            "      funding: drop %.1f%% to floor $%.2f (ATH $%.2f − %.1f%% worst)"
+            (deployment.Oracle_types.d_cover *. 100.0)
+            floor_ref
+            (match deployment.Oracle_types.range with
+             | Some rg -> rg.Oracle_types.ath
+             | None -> r.Oracle_types.floor_ref |> Option.value ~default:0.0)
+            (match deployment.Oracle_types.p2v with
+             | Some p -> p.Oracle_types.max_drawdown *. 100.0
+             | None -> 0.0)
+        | None -> ())
+     | None -> ());
     let pc = deployment.Oracle_types.parameter_components in
     match pc.Oracle_types.fng_parameter, pc.Oracle_types.fng with
     | Some fp, Some fng ->

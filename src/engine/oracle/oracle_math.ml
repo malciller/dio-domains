@@ -138,8 +138,14 @@ let range_stats_of (asset : series) : range_stats option =
     running peak of closes (the highest close seen so far) down to that bar's
     low - a real peak-to-valley fall, so a 1000x run-up only registers the
     falls that actually happened, never the ATH-to-ATL span. The maximum is
-    the sizing drawdown: the grid must fund the worst peak-to-valley fall the
-    asset has really experienced from wherever the price sits today.
+    the anchor of the sizing drawdown: the grid must fund the fall the asset
+    has really experienced from wherever the price sits today (the funded
+    amount is the ATH-scaled remainder, see [sizing_reference_of]).
+
+    The event's [recovered] flag (a later close >= the peak) decides whether
+    it anchors the ATH-scaled survival reference at all: a downtrend that
+    never ended in recovery means the asset is still living in it and the
+    measured floor-overshoot policy funds it instead.
 
     The bars are sorted chronologically first (and de-duplicated by date) -
     the same order every other consumer works in. This is not optional: the
@@ -195,7 +201,13 @@ let peak_to_valley_stats_of (asset : series) : p2v_stats option =
       bars;
     if !best_dd <= 0.0
     then None
-    else
+    else (
+      (* Recovery: any later close at or above the peak - the downtrend ended
+         in a full retrace, not just a bounce. *)
+      let recovered =
+        let rec go i = i < n && (bars.(i).close >= !best_peak || go (i + 1)) in
+        go (!best_valley_idx + 1)
+      in
       Some
         { max_drawdown = Float.min 0.999999 !best_dd
         ; peak = !best_peak
@@ -205,5 +217,170 @@ let peak_to_valley_stats_of (asset : series) : p2v_stats option =
         ; valley_date = !best_valley_date
         ; valley_idx = !best_valley_idx
         ; price = bars.(n - 1).close
-        })
+        ; recovered
+        }))
+;;
+
+(** Measured floor overshoot: how far the price fell below an ESTABLISHED
+    floor before recovering. A floor is established when the price bottoms
+    (a new running-minimum low) and then bounces above that low; a floor
+    BREAK is a later low below the established floor, measured as
+    (floor - breach_low) / floor. Only breaks that were followed by a
+    recovery (a close back at or above the episode's peak) count - a floor
+    that broke and never recovered has no proof of recovery. The 90th
+    percentile of the breaks is the demonstrated "how much further can it
+    fall past the floor" reference that funds the at-floor / unrecovered
+    regimes (see [sizing_drawdown_of]).
+
+    A continuous fall never breaks a floor (no floor was established - there
+    was no bounce), so the deepest crash itself contributes nothing; the
+    distribution comes from floors that held, bounced, and were later broken
+    (e.g. the pre-crash dip floor that the crash broke through).
+
+    [None] when no recovered floor-break exists (or no floor ever held):
+    there is no floor-break evidence to measure - callers fund the 0.15
+    fallback constant. *)
+let floor_overshoot_p90_of (asset : series) : float option =
+  let bars = Oracle_calendar.sort_bars asset.bars |> Oracle_calendar.dedup in
+  let n = Array.length bars in
+  if n = 0
+  then None
+  else (
+    (* Pending floor-breaks of the in-progress episode, committed to the
+       distribution only when the episode recovers. *)
+    let pending = ref [] in
+    let breaks = ref [] in
+    let peak = ref 0.0 in
+    let run_min = ref max_float in
+    let run_min_close = ref 0.0 in
+    let floor = ref None in
+    let commit () =
+      breaks := List.rev_append !pending !breaks;
+      pending := []
+    in
+    let discard () = pending := [] in
+    Array.iter
+      (fun (b : bar) ->
+         if
+           Float.is_finite b.close
+           && b.close > 0.0
+           && Float.is_finite b.low
+           && b.low > 0.0
+         then
+           if !peak = 0.0
+           then peak := b.close
+           else if b.close >= !peak
+           then (
+             (* Recovery (a close back at the episode's peak): the episode's
+                breaks are proven - commit them. A new high also starts a
+                new episode from here. *)
+             commit ();
+             if b.close > !peak then peak := b.close)
+           else if b.low < !run_min
+           then (
+             (* A new running-minimum low: an established floor below is
+                broken (a pending break), otherwise this is the start of a
+                fresh fall. *)
+             (match !floor with
+              | Some f -> pending := ((f -. b.low) /. f) :: !pending
+              | None -> ());
+             run_min := b.low;
+             run_min_close := b.close;
+             floor := None)
+           else if b.close > !run_min_close && !run_min < max_float
+           then floor := Some !run_min
+           else ())
+      bars;
+    (* The series end is not a recovery: unproven breaks are discarded. *)
+    discard ();
+    match !breaks with
+    | [] -> None
+    | bs -> Some (percentile (Array.of_list bs) 90.0))
+;;
+
+(** The ATH-scaled sizing drawdown for one asset (mature / authoritative
+    assets). [ath] is the all-time high of the deepened history (see
+    [range_stats_of]); [p] the largest actual peak-to-valley event; [fallback]
+    is the immature-history flag - fallback assets keep the raw event
+    drawdown, the discount is a matured-regime feature. [overshoot_p90] is
+    [floor_overshoot_p90_of]'s measurement (None = nothing measured, the 0.15
+    fallback funds instead).
+
+    Regimes:
+    - fallback: [d_cover = max_drawdown] (raw, unchanged).
+    - deepest event never recovered ([outlier]): no recovered anchor - fund
+      the measured floor overshoot (0.15 when nothing was measured).
+    - recovered, price above [floor_ref = ATH * (1 - max_drawdown)]: fund the
+      remaining drop to the floor, (price - floor_ref) / price. This never
+      exceeds [max_drawdown] (price <= ATH), so the worst-ever drop is
+      automatically the cap - a maturing asset is not expected to repeat it.
+    - recovered, price at/below the floor ([at_floor], "living in the max
+      drawdown"): the remainder is exhausted - fund the measured floor
+      overshoot. *)
+let sizing_drawdown_of
+      ~(ath : float)
+      ~(fallback : bool)
+      ~(overshoot_p90 : float option)
+      (p : p2v_stats)
+  : sizing_reference
+  =
+  let overshoot = Option.value overshoot_p90 ~default:0.15 in
+  if fallback
+  then
+    { d_cover = p.max_drawdown
+    ; floor_ref = None
+    ; at_floor = false
+    ; outlier = false
+    ; overshoot_p90
+    }
+  else if not p.recovered
+  then
+    { d_cover = overshoot
+    ; floor_ref = None
+    ; at_floor = true
+    ; outlier = true
+    ; overshoot_p90
+    }
+  else (
+    let floor_ref = ath *. (1.0 -. p.max_drawdown) in
+    let at_floor =
+      not
+        (p.price > 0.0
+         && Float.is_finite p.price
+         && floor_ref > 0.0
+         && p.price > floor_ref)
+    in
+    if at_floor
+    then
+      { d_cover = overshoot
+      ; floor_ref = Some floor_ref
+      ; at_floor = true
+      ; outlier = false
+      ; overshoot_p90
+      }
+    else
+      { d_cover = (p.price -. floor_ref) /. p.price
+      ; floor_ref = Some floor_ref
+      ; at_floor = false
+      ; outlier = false
+      ; overshoot_p90
+      })
+;;
+
+(** Compose the ATH-scaled survival reference for an asset: the deepest
+    actual peak-to-valley event, the ATH and the measured floor overshoot,
+    fed through [sizing_drawdown_of]. [None] when the history never drew down
+    (monotone rising) - callers fall back to the statistical governing
+    drawdown. *)
+let sizing_reference_of ~(fallback : bool) (asset : series) : sizing_reference option =
+  match peak_to_valley_stats_of asset with
+  | None -> None
+  | Some p ->
+    let ath =
+      match range_stats_of asset with
+      | Some r -> r.ath
+      | None -> p.peak
+    in
+    let overshoot_p90 = floor_overshoot_p90_of asset in
+    Some (sizing_drawdown_of ~ath ~fallback ~overshoot_p90 p)
 ;;

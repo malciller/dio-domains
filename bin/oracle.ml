@@ -700,6 +700,31 @@ let deployment_block
       (pct d.d_gov)
       (pct d.d_surv)
       (pct d.min_quote_drawdown);
+    (match d.sizing with
+     | Some r ->
+       line
+         "    sizing reference: drop %s%s (floor $%.2f, ATH-anchored; worst event %s)"
+         (pct r.d_cover)
+         (if r.at_floor || r.outlier
+          then " [floor overshoot]"
+          else (
+            match r.floor_ref with
+            | Some _ -> ""
+            | None -> " [raw]"))
+         (match r.floor_ref with
+          | Some f -> f
+          | None -> 0.0)
+         (match d.p2v with
+          | Some p ->
+            Printf.sprintf
+              "%s (%s -> %s)%s"
+              (pct p.max_drawdown)
+              p.peak_date
+              p.valley_date
+              (if p.recovered then "" else " [not recovered]")
+          | None -> "none")
+     | None ->
+       line "    sizing reference: raw event drawdown (immature history or no drawdown)");
     (match d.p2v with
      | None -> line "    max drawdown (peak-to-valley): none (no drawdown in the history)"
      | Some p ->
