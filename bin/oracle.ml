@@ -283,25 +283,20 @@ let parse_args () =
            equities use the survival model alone)" )
       ; ( "--fng-weight"
         , Arg.Float (fun f -> fng_weight := f)
-        , " weight of the F&G side in the gi blend (default 0.5; the survival and range \
-           sides carry the rest)" )
+        , " kept for config compatibility; INERT in sizing (the grid interval and qty \
+           are survival-driven over the config ranges - no sentiment blend)" )
       ; ( "--range-weight"
         , Arg.Float (fun f -> range_weight := f)
-        , " weight of the per-asset historical range side in the gi blend (default \
-           0.25): anchored on the largest actual peak-to-valley drawdown - above its \
-           peak spacing widens (preserve runway), at its valley it tightens (aggressive \
-           accumulation); the blend is never tighter than the survival-constrained \
-           parameter" )
+        , " kept for config compatibility; INERT in sizing (see --fng-weight)" )
       ; ( "--min-active-dsurv"
         , Arg.Float (fun f -> min_active_dsurv := f)
         , " assets whose replayed D_surv stays below this are recommended inactive and \
            their capital passes down (default 0.0 = fundable means active)" )
       ; ( "--qty-cap-mult"
         , Arg.Float (fun f -> qty_cap_mult := f)
-        , " deployment ceiling as a multiple of the config qty (default 0.0 = uncapped: \
-           each asset grows its qty to deploy the whole pool share it is handed, bounded \
-           only by the survival replay; a value > 0 caps each asset's deployment at \
-           config qty * mult so surplus capital passes down the priority order)" )
+        , " the qty ceiling as a multiple of the config qty (default 0.0 = the qty never \
+           grows beyond the minimum): the order qty only grows - to deploy residual \
+           capital - while 100% replay survival holds, capped at config qty * mult" )
       ; ( "--no-deep-history"
         , Arg.Set no_deep_history
         , " disable the Yahoo deep-history extension (venue-feed bars only; the venue \
@@ -631,11 +626,7 @@ let deployment_block
       venue_pool
       account.quote
       (match d.Oracle_types.parameter_components.Oracle_types.fng with
-       | Some fng ->
-         Printf.sprintf
-           "   F&G: %.0f (gi weight %.2f)"
-           fng
-           d.parameter_components.fng_weight
+       | Some fng -> Printf.sprintf "   F&G: %.0f (display only)" fng
        | None -> "   (equity: oracle model only)");
     line "");
   line "  [%d/%d] %s" index n_tasks a.symbol;
@@ -646,54 +637,12 @@ let deployment_block
   if d.active
   then (
     let pc = d.parameter_components in
-    let w_survival = Float.max 0.0 (1.0 -. pc.fng_weight -. pc.range_weight) in
-    let gi_desc, raw_blend =
-      match pc.fng_parameter, pc.fng, pc.range_parameter with
-      | Some fng_parameter, Some fng, Some rp ->
-        let total = pc.fng_weight +. w_survival +. pc.range_weight in
-        ( Printf.sprintf
-            "fng %.0f -> %.2f%% | surv %.2f%% | range %.2f%% | w %.2f/%.2f/%.2f"
-            fng
-            fng_parameter
-            pc.survival_parameter
-            rp
-            pc.fng_weight
-            pc.range_weight
-            w_survival
-        , ((pc.fng_weight *. fng_parameter)
-           +. (w_survival *. pc.survival_parameter)
-           +. (pc.range_weight *. rp))
-          /. total )
-      | Some fng_parameter, Some fng, None ->
-        let total = pc.fng_weight +. w_survival in
-        ( Printf.sprintf
-            "fng %.0f -> %.2f%% | surv %.2f%% | w %.2f"
-            fng
-            fng_parameter
-            pc.survival_parameter
-            pc.fng_weight
-        , ((pc.fng_weight *. fng_parameter) +. (w_survival *. pc.survival_parameter))
-          /. total )
-      | None, _, Some rp ->
-        ( Printf.sprintf
-            "surv %.2f%% | range %.2f%% | w %.2f"
-            pc.survival_parameter
-            rp
-            pc.range_weight
-        , pc.survival_parameter )
-      | _ -> Printf.sprintf "surv %.2f%%" pc.survival_parameter, pc.survival_parameter
-    in
-    let clamp_note =
-      if raw_blend +. 1e-9 < pc.survival_parameter then "clamped: survival binds" else ""
-    in
     line
-      "    ACTIVE   qty %.4f   gi %.2f%%   (blend %.2f%% -> resolved %.2f%%%s | %s)"
+      "    ACTIVE   qty %.4f   gi %.2f%%   (%s | %s)"
       d.qty
       pc.resolved_parameter
-      raw_blend
-      pc.resolved_parameter
-      (if clamp_note = "" then "" else ", " ^ clamp_note)
-      gi_desc;
+      d.gi_reason
+      d.qty_reason;
     line
       "    governing %s   d_gov %s   D_surv %s (replay)   min quote DD %s"
       d.governing_horizon
@@ -771,7 +720,7 @@ let deployment_block
 
 (** The gi tuning surface for one asset: each candidate interval's deployment
     and whether it clears the target on the replayed path. *)
-let tuning_block (a : args) ~(deployment : Oracle_types.asset_deployment) (b : Buffer.t) =
+let tuning_block ~(deployment : Oracle_types.asset_deployment) (b : Buffer.t) =
   let line fmt =
     Printf.ksprintf
       (fun s ->
@@ -780,7 +729,7 @@ let tuning_block (a : args) ~(deployment : Oracle_types.asset_deployment) (b : B
       fmt
   in
   let d = deployment in
-  line "  Tuning surface (target blended survival %.1f%%):" (a.target_survival *. 100.0);
+  line "  Tuning surface (gi scan at the minimum order size; the 100%% survival target):";
   line
     "    %-7s %11s %12s %11s %11s %8s %9s"
     "gi"
@@ -842,7 +791,7 @@ let report_text
       fmt
   in
   deployment_block a ~account ~venue_pool ~deployment ~index ~n_tasks ~gi_lo ~gi_hi b;
-  if deployment.Oracle_types.active then tuning_block a ~deployment b;
+  if deployment.Oracle_types.active then tuning_block ~deployment b;
   line "Supporting analysis (asset-level):";
   line
     "Symbol: %s   Exchange: %s   Class: %s (%d members, kappa %d)"

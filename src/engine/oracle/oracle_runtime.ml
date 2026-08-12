@@ -14,29 +14,36 @@
    analyzes every asset first, computing each one's sizing reservation: the
    funding needed to reach its governing drawdown at the tightest config grid
    interval (minimum ladder cost at the sizing floor, plus the first-buy cost).
-   Phase B then sizes sequentially, highest priority first, against a budget
-   that is the remaining pool minus a reserve for the lower-priority assets'
-   minimum drawdown funding - so a priority asset only grows after the rest of
-   the account can still fill their drawdowns at minimum qty, and an asset is
-   disabled only when even its first buy cannot be funded. With enough capital
-   every active asset reaches its full drawdown runway; only under a genuine
-   capital shortage does the lowest-priority asset go inactive.
+   Phase B then sizes strictly in config (priority) order: each asset deploys
+   against the ENTIRE remaining pool - the priority asset is sized fully
+   before the next asset draws anything - and whatever a deployment does not
+   consume passes down the priority order. Nothing is reserved for
+   lower-priority assets, so a capital shortage never starves the priority
+   asset to its first buy and never lets the least-prioritized asset absorb
+   the pool; only a fully funded account idles surplus. Capital pooling is
+   venue-locked: every asset of an account draws from the one account pool,
+   and the pass-down guarantees pool resources are never double-counted (the
+   sizing budget of each asset is the pool MINUS everything the higher
+   priority assets consumed).
 
-   Deployment is target-driven: every asset is sized to meet the target
-   survival and nothing more. A normal (authoritative-history) asset grows its
-   order qty until the ladder's runway through the governing drawdown consumes
-   the budget it is handed, or the replayed path can no longer clear the
-   target survival (the sizing is then shrunk back to the largest surviving
-   qty and the excess passes to the next asset). An immature (fallback) asset
-   is pinned at the sizing floor - the observed drawdown is fully funded at
-   the floor and a larger qty would deploy more capital for zero additional
-   survival - so its deployment is exactly its reservation and the rest of the
-   pool passes down the priority order. The qty only ever respects the venue
-   floor (>= qty_min), the survival constraint and the optional qty_cap_mult
-   ceiling (config-only concentration limit; the runtime default 0.0 =
-   uncapped); the config qty remains the template/fallback, not a ceiling.
-
-   A fully deployed account shows a ~zero available-quote pool, so every asset
+   Deployment is survival-driven over the FULL config ranges (the sizing
+   rules): the grid interval is the most aggressive (tightest) value in the
+   config range [gi_min, gi_max] that reaches 100% replay survival at the
+   minimum order size - "first get 100% survivability at the most aggressive
+   grid_interval(min,max)" - and the order qty then grows, only while 100%
+   survival holds, to deploy the pool: the largest qty in
+   [qty_min, qty_min * qty_cap_mult] that still survives the whole replayed
+   history (qty_cap_mult is the cap, not a rule - the qty only grows to
+   deploy residual capital behind 100% survivability, and a value <= 0 means
+   the qty never grows). When NO grid interval reaches 100% survival, the
+   deployment stretches: the minimum qty at the grid interval MAXIMUM - the
+   widest spacing the config allows stretches the capital's survival as far
+   as possible (the order size is never increased in this mode). An asset
+   whose pool cannot fund even its first buy at the minimum order size is
+   inactive and its whole share passes down the priority order - so with the
+   stretch sizing a priority asset consumes only what its minimum-order
+   ladder needs and the next asset still funds its own first order. A fully
+   deployed account shows a ~zero available-quote pool, so every asset
    publishes inactive ("cannot fund the first buy") while it awaits sell fills
    to restore capital. This is a normal state, never a failure: when a fill
    returns quote to the account, the next pass re-sizes the assets in config
@@ -90,13 +97,16 @@ type decision =
     (** The largest actual peak-to-valley drawdown event (peak -> valley,
         dates): where [d_cover] comes from. *)
   ; parameter_components : Oracle_types.parameter_components
-    (** How the resolved grid interval was composed: the F&G side (crypto
-        only), the survival-constrained parameter, the per-asset range side
-        and the weights they carried in the blend. Consumers adopt
-        [resolved_parameter] (== [grid_interval]) and never recompute a
-        competing F&G-only value over the config range - the blend is the
+    (** How the resolved grid interval was chosen: the survival-driven value
+        (the tightest config parameter with 100% replay survival at the
+        minimum order size, or the grid maximum in stretch mode). Consumers
+        adopt [resolved_parameter] (== [grid_interval]) and never recompute a
+        competing F&G-only value over the config range - the sizing is the
         single source of truth for the grid interval while the oracle holds
-        a decision. *)
+        a decision. The F&G/range weights are carried for the record only;
+        they are inert in the sizing. *)
+  ; gi_reason : string (** Why the grid interval is what it is (observability). *)
+  ; qty_reason : string (** Why the order qty is what it is (observability). *)
   ; warnings : string list
   ; updated_at : float (** Unix time of the pass that produced this decision. *)
   }
@@ -112,24 +122,27 @@ type class_pool =
 (** Runtime knobs. Defaults mirror the CLI's defaults so the engine behaves
     exactly like `dio-oracle` unless configured. *)
 type runtime_config =
-  { target_survival : float (** Blended survival target for sizing (default 0.99). *)
-  ; fng_weight : float (** Weight of the F&G side in the gi blend (default 0.5). *)
+  { target_survival : float
+    (** Blended survival target for the governing-basis selection and the
+        warnings (default 0.99). The SIZING itself targets 100% replay
+        survival over the full config range; [target_survival] decides which
+        horizons reach the target (the governing drawdown) and when the
+        history is flagged immature. *)
+  ; fng_weight : float
+    (** Kept for config compatibility; INERT in sizing - the grid interval
+        and qty are survival-driven over the config ranges (no sentiment
+        blend). *)
   ; range_weight : float
-    (** Weight of the per-asset historical range side in the gi blend
-        (default 0.25): near the ATH the potential fall is the whole
-        historical span, so spacing widens (preserve runway); near the lows
-        the remaining downside is bounded, so spacing tightens (aggressive
-        accumulation zone). The survival side carries the remainder, and the
-        blend is never tighter than the survival-constrained parameter. *)
+    (** Kept for config compatibility; INERT in sizing (see [fng_weight]). *)
   ; min_active_dsurv : float
     (** Assets whose replayed D_surv stays below this are recommended inactive
         and their capital passes down (default 0.0 = fundable means active). *)
   ; qty_cap_mult : float
-    (** Deployment ceiling as a multiple of the config qty (default 0.0 =
-        uncapped: each asset grows its qty to deploy the whole pool share it
-        is handed, bounded only by the survival replay; a value > 0 caps each
-        asset's deployment at [config qty * mult] so surplus capital passes
-        down the priority order). *)
+    (** The qty ceiling as a multiple of the config qty: the order qty never
+        grows beyond [config qty * mult], and it only grows at all - to
+        deploy residual capital - while 100% replay survival holds (the cap
+        is a ceiling, not a rule; default 0.0 = the qty never grows beyond
+        the minimum). *)
   ; no_deep_history : bool (** Disable the Yahoo deep-history extension. *)
   ; weight_by_sessions : bool (** Weight class members by session count. *)
   ; refresh_seconds : float (** Cadence between analysis passes (default 300). *)
@@ -625,10 +638,9 @@ let venue_pools (tasks : Oracle_tasks.task list)
 
 (** One asset's sizing reservation: the funding it needs to reach its
     governing drawdown at the tightest config grid interval - the conservative
-    (worst-case) end of its range. Lower-priority assets reserve this minimum
-    before a higher-priority asset grows, so the joint budget guarantees every
-    active asset can fund its drawdown while there is enough capital, and an
-    asset is only disabled when even its first buy cannot be funded. *)
+    (worst-case) end of its range. Informational (logged per pass): the
+    allocation itself is strict priority order, each asset sizing against the
+    entire remaining pool. *)
 type reservation =
   { q_min : float (** sizing floor (venue lot / config qty) *)
   ; d_gov : float (** governing drawdown on the sizing basis *)
@@ -863,11 +875,12 @@ let analyze_asset
     }
 ;;
 
-(** Size one analyzed asset against a budget: the pool share handed to it by
-    the runtime's allocation (its own budget after reserving the lower-
-    priority assets' minimum drawdown funding). Runs the deployment engine and
-    logs the decision. [index]/[n_tasks] are only for logging; [venue_pool]
-    is the account's total capital (for the log context). *)
+(** Size one analyzed asset against a budget: the entire remaining venue
+    pool, handed down in strict priority order (the priority asset is sized
+    fully before the next asset draws anything). Runs the deployment engine
+    (survival-driven over the full gi/qty ranges - see Oracle_deploy) and
+    logs the decision. [index]/[n_tasks] are only for logging;
+    [venue_pool] is the account's total capital (for the log context). *)
 let size_asset
       (rc : runtime_config)
       (analysis : analysis)
@@ -965,7 +978,10 @@ let size_asset
       deployment.Oracle_types.qty
       (base_of symbol)
       deployment.Oracle_types.parameter
-      deployment.Oracle_types.pool_share
+      (* The capital this deployment actually consumes - the sizing no
+         longer models the priority asset against the whole venue pool; what
+         it does not consume passes down the priority order. *)
+      deployment.Oracle_types.deployed
       venue_pool
       p2v_lbl
       (deployment.Oracle_types.d_surv *. 100.0)
@@ -1048,86 +1064,19 @@ let size_asset
              | None -> 0.0)
         | None -> ())
      | None -> ());
-    let pc = deployment.Oracle_types.parameter_components in
-    match pc.Oracle_types.fng_parameter, pc.Oracle_types.fng with
-    | Some fp, Some fng ->
-      let w_survival =
-        Float.max 0.0 (1.0 -. pc.Oracle_types.fng_weight -. pc.Oracle_types.range_weight)
-      in
-      let sides, raw_blend =
-        match pc.Oracle_types.range_parameter with
-        | Some rp ->
-          let total =
-            pc.Oracle_types.fng_weight +. w_survival +. pc.Oracle_types.range_weight
-          in
-          ( Printf.sprintf
-              "fng %.2f -> %.4f%% (w %.2f) | range %.4f%% (w %.2f) | survival %.4f%% (w \
-               %.2f)"
-              fng
-              fp
-              pc.Oracle_types.fng_weight
-              rp
-              pc.Oracle_types.range_weight
-              pc.Oracle_types.survival_parameter
-              w_survival
-          , ((pc.Oracle_types.fng_weight *. fp)
-             +. (w_survival *. pc.Oracle_types.survival_parameter)
-             +. (pc.Oracle_types.range_weight *. rp))
-            /. total )
-        | None ->
-          let total = pc.Oracle_types.fng_weight +. w_survival in
-          ( Printf.sprintf
-              "fng %.2f -> %.4f%% (w %.2f) | survival %.4f%% (w %.2f)"
-              fng
-              fp
-              pc.Oracle_types.fng_weight
-              pc.Oracle_types.survival_parameter
-              w_survival
-          , ((pc.Oracle_types.fng_weight *. fp)
-             +. (w_survival *. pc.Oracle_types.survival_parameter))
-            /. total )
-      in
-      let clamp_note =
-        if raw_blend +. 1e-9 < pc.Oracle_types.survival_parameter
-        then
-          Printf.sprintf
-            " (blend %.4f%% clamped: survival binds, F&G/range contribute 0)"
-            raw_blend
-        else ""
-      in
-      add
-        "      gi blend: %s -> resolved %.4f%%%s"
-        sides
-        pc.Oracle_types.resolved_parameter
-        clamp_note;
-      (* The qty channel of the same blend: fear up-sizes toward the
-         survival-max, greed pulls back toward the floor. When the survival-max
-         is the floor itself (under-funded pool) there is no headroom and the
-         F&G qty contribution is zero by construction - logged so it is visible
-         rather than silent. *)
-      let q_min = D.sizing_floor ~cfg:grid in
-      let k = 1.0 -. (Float.max 0.0 (Float.min 100.0 fng) /. 100.0) in
-      let headroom = deployment.Oracle_types.qty -. q_min > 1e-12 in
-      add
-        "      qty blend: floor %.6g -> resolved %.6g (fng %.2f, k %.2f%s)"
-        q_min
-        deployment.Oracle_types.qty
-        fng
-        k
-        (if headroom then "" else "; no headroom: F&G qty contribution 0")
-    | None, Some _ ->
-      (* Equity (pure oracle): no sentiment blend on gi or qty - the
-         survival-constrained values are adopted. *)
-      add
-        "      sizing: pure oracle — gi %.4f%% (survival-constrained) · qty %.6g \
-         (survival-max)"
-        pc.Oracle_types.survival_parameter
-        deployment.Oracle_types.qty
-    | None, None ->
-      add
-        "      sizing: no live Fear & Greed — model only (gi %.4f%%)"
-        pc.Oracle_types.survival_parameter
-    | Some _, None -> ());
+    (* The sizing: how the gi and qty were chosen. The sizing is
+       survival-driven over the full config ranges - the gi is the tightest
+       value reaching 100% replay survival at the minimum order size (or the
+       grid maximum in stretch mode when 100% is unreachable), and the qty is
+       the minimum (stretch) or the largest value keeping 100% survival,
+       capped at qty * qty_cap_mult. The reasons are carried by the
+       deployment itself. *)
+    add
+      "      sizing: gi %.4f%% (%s) · qty %.6g (%s)"
+      deployment.Oracle_types.parameter
+      deployment.Oracle_types.gi_reason
+      deployment.Oracle_types.qty
+      deployment.Oracle_types.qty_reason);
   let detail_str = Buffer.contents detail in
   let detail_changed =
     match Hashtbl.find_opt last_detail_lines key with
@@ -1186,6 +1135,8 @@ let size_asset
      ; range = deployment.Oracle_types.range
      ; p2v = deployment.Oracle_types.p2v
      ; parameter_components = deployment.Oracle_types.parameter_components
+     ; gi_reason = deployment.Oracle_types.gi_reason
+     ; qty_reason = deployment.Oracle_types.qty_reason
      ; warnings = deployment.Oracle_types.warnings
      ; updated_at = Unix.gettimeofday ()
      }
@@ -1263,36 +1214,33 @@ let run_pass
              Lwt.return acc)
         >>= fun acc' -> analyze_all acc' rest
     in
-    (* Phase B: size sequentially, highest priority first. Each asset's budget
-       is the remaining pool minus a reserve for the lower-priority assets'
-       minimum drawdown funding, so a priority asset only grows after the rest
-       of the account can still fill their drawdowns at minimum qty - and an
-       asset is disabled only when even its first buy cannot be funded. *)
-    let rec allocate ~venue_pool pool = function
+    (* Phase B: size sequentially, highest priority first, each asset against
+       the ENTIRE remaining pool - the priority asset is sized fully before
+       the next asset draws anything. The sizing is survival-driven over the
+       full config ranges (the deployment grows qty, bounded by the qty_cap
+       and 100% replay survival, while its ladder runway consumes the budget;
+       in stretch mode - 100% unreachable - it deploys the minimum qty at the
+       grid maximum), and everything its deployment does not consume passes
+       down the priority order; only a fully funded account idles surplus.
+       The pool is venue-locked and the pass-down subtracts each deployment,
+       so pool resources are never double-counted across the account's
+       assets. *)
+    let rec size_all ~(venue_pool : float) (pool : float) = function
       | [] -> Lwt.return pool
       | analysis :: rest ->
-        let reserve =
-          Float.min
-            (List.fold_left
-               (fun acc (a : analysis) -> acc +. a.reservation.min_cost)
-               0.0
-               rest)
-            (Float.max 0.0 (pool -. analysis.reservation.first_buy))
-        in
-        let budget = pool -. reserve in
         Lwt.catch
           (fun () ->
              size_asset
                analysis.rc
                analysis
-               ~pool:budget
+               ~pool
                ~venue_pool
                ~fng
                ~index:(List.length rest + 1)
                ~n_tasks:(List.length tasks)
              >|= fun decision ->
              decisions := decision :: !decisions;
-             decision.remainder +. reserve)
+             decision.remainder)
           (fun exn ->
              Logging.warn_f
                ~section
@@ -1302,7 +1250,7 @@ let run_pass
                analysis.symbol
                (Printexc.to_string exn);
              Lwt.return pool)
-        >>= fun next -> allocate ~venue_pool next rest
+        >>= fun next -> size_all ~venue_pool next rest
     in
     venue_pools tasks
     >>= fun pools ->
@@ -1318,7 +1266,7 @@ let run_pass
          | Some pool ->
            analyze_all [] account_tasks
            >>= fun analyses ->
-           allocate ~venue_pool:pool pool analyses
+           size_all ~venue_pool:pool pool analyses
            >|= fun surplus ->
            Logging.info_f
              ~section

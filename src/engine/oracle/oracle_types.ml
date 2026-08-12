@@ -281,41 +281,32 @@ type deployment_row =
         (advisory tuning metric). *)
   }
 
-(** The two inputs that decide the resolved strategy parameter. Crypto blends
-    the Fear & Greed signal against the oracle's capital-constrained
-    tightness; equities use the oracle side alone. The per-asset historical
-    range position (ATH reference) joins the blend as a third side: near the
-    top of the range the potential fall is the whole span, so spacing widens
-    (preserve runway); near the lows the remaining downside is bounded, so
-    spacing tightens - an aggressive accumulator that works with the F&G
-    contrarian convention. *)
+(** How the resolved strategy parameter was chosen. The sizing is
+    survival-driven over the FULL config range (no sentiment blend): the
+    parameter is the most aggressive (tightest) value in [lo, hi] that
+    reaches 100% replay survival at the minimum order size, or the range
+    maximum when 100% is unreachable (stretch: the widest spacing the config
+    allows, stretching the capital's survival as far as possible). *)
 type parameter_components =
   { fng : float option (** Resolved Fear & Greed value (None for equities). *)
   ; fng_parameter : float option
-    (** lo + (hi-lo)*fng/100: the contrarian signal (fear tightens the
-        parameter, for the grid densifying levels and accumulating base at
-        depressed prices). *)
+    (** Always [None]: the F&G contrarian signal no longer joins the sizing
+        (the grid interval comes from the survival search over the config
+        range). Kept for record compatibility. *)
   ; survival_parameter : float
-    (** Tightest parameter in the config range whose deployment clears the
-        target survival on the replayed path (in fallback mode, whose static
-        ladder cost through the observed drawdown fits the pool). When no
-        parameter can clear the replay target, the tightest parameter whose
-        runway for the actual max drawdown (d_cover) the pool can fund at the
-        sizing floor - the density the available capital and the asset's
-        historical volatility can actually afford. *)
+    (** The resolved grid interval: the tightest parameter in [lo, hi] whose
+        deployment reaches 100% replay survival at the minimum order size
+        (the "most aggressive grid_interval(min,max)"), or [hi] when 100%
+        survival is unreachable at any parameter (stretch mode). *)
   ; resolved_parameter : float
-    (** Final parameter: the weighted blend of the fng / survival / range
-        sides, clamped to the range and never tighter than
-        [survival_parameter] (the runway wins over sentiment and range
-        aggression alike). *)
-  ; fng_weight : float (** The weight the F&G side carried in the blend (0.5 default). *)
+    (** The final parameter, equal to [survival_parameter]: the sizing is
+        survival-driven, there is no blend to resolve. *)
+  ; fng_weight : float (** Kept for record compatibility; inert in sizing. *)
   ; range_parameter : float option
-    (** lo + (1 - position) * (hi - lo) with position = (peak - price) /
-        (peak - valley) of the largest actual peak-to-valley event in [0, 1]:
-        above the event peak (position 0) spacing widens toward hi, at the
-        event valley (position 1) it tightens toward lo. *)
-  ; range_weight : float
-    (** The weight the range side carried in the blend (0.25 default). *)
+    (** Per-asset historical range position (context only): [None] when the
+        sizing is survival-driven and the range side no longer joins it.
+        The value is still computed for the record. *)
+  ; range_weight : float (** Kept for record compatibility; inert in sizing. *)
   }
 
 (** The engine's decision for one asset: the position size and strategy
@@ -344,6 +335,14 @@ type asset_deployment =
     (** The ATH-scaled survival reference behind [d_cover] (floor context for
         the logs). None for fallback (raw) sizing and monotone histories. *)
   ; parameter_components : parameter_components
+  ; gi_reason : string
+    (** Why the resolved grid interval is what it is (the tightest with 100%
+        replay survival at the minimum order size, or the range maximum in
+        stretch mode). Display/observability. *)
+  ; qty_reason : string
+    (** Why the resolved order qty is what it is (the minimum order size in
+        stretch mode; the largest qty that keeps 100% survival; capped at
+        qty * qty_cap_mult). Display/observability. *)
   ; qty : float
   ; parameter : float (** Resolved strategy parameter (grid: grid interval in %). *)
   ; d_surv : float (** Replayed D_surv at the recommended sizing. *)

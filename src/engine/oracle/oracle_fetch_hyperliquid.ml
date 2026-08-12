@@ -245,6 +245,22 @@ let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list) : Oracle_ty
   }
 ;;
 
+(** Order the fetched candle windows into ascending time (oldest -> newest,
+    de-duplicated, [dedup] keeps the LAST occurrence of a date). Each window
+    arrives internally ascending; windows are fetched oldest -> newest and
+    accumulated reversed (newest window first); the single final [List.rev]
+    restores global ascending order. The LAST bar must be the CURRENT close:
+    the grid start price and all ladder capital math read it, so a missing
+    final [List.rev] prices every ladder from the oldest fetched close
+    (regression: the pre-fix accumulation returned newest-first). *)
+let windows_to_series (windows : Oracle_types.bar list list) : Oracle_types.bar list =
+  List.fold_left (fun acc bars -> List.rev_append bars acc) [] windows
+  |> List.rev
+  |> Array.of_list
+  |> Oracle_calendar.dedup
+  |> Array.to_list
+;;
+
 (** Fetch daily candles forward from [start_ms] (unix ms), in day-windows.
     Spot symbols (containing "/") resolve through the feed-style mapping to
     the mapped spot asset's candle coin ("PURR/USDC" or "@N"); symbols
@@ -282,7 +298,7 @@ let fetch_candles ?(start_ms = default_start_ms) ~(symbol : string) ()
     let span = Int64.mul ms_per_day (Int64.of_int window_days) in
     let rec go from_ms acc windows =
       if windows = 0
-      then Lwt.return (List.rev acc)
+      then Lwt.return acc
       else (
         let to_ms = Int64.min (Int64.add from_ms span) now_ms in
         let payload =
@@ -321,8 +337,8 @@ let fetch_candles ?(start_ms = default_start_ms) ~(symbol : string) ()
             let json = Yojson.Safe.from_string body_str in
             let bars = parse_candles ~symbol json in
             if to_ms >= now_ms
-            then Lwt.return (List.rev_append bars acc)
-            else go to_ms (List.rev_append bars acc) (windows - 1))
+            then Lwt.return (bars :: acc)
+            else go to_ms (bars :: acc) (windows - 1))
         in
         Lwt.catch
           (fun () -> fetch)
@@ -332,7 +348,7 @@ let fetch_candles ?(start_ms = default_start_ms) ~(symbol : string) ()
                "Hyperliquid candle page failed (%s), returning %d bars so far"
                (Printexc.to_string exn)
                (List.length acc);
-             Lwt.return (List.rev acc)))
+             Lwt.return acc))
     in
-    go start_ms [] max_windows
+    go start_ms [] max_windows >|= windows_to_series
 ;;
