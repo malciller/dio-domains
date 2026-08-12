@@ -109,6 +109,22 @@ let known_oracle_keys =
   ; "horizons"
   ; "max_capital"
   ; "startup_wait_seconds"
+  ; "assets"
+  ]
+;;
+
+(** Keys accepted inside each "oracle" -> "assets" entry (the per-asset
+    override layer): the sizing/blend/history knobs only. Cadence/machinery
+    knobs stay global. *)
+let known_oracle_asset_keys =
+  [ "target_survival"
+  ; "fng_weight"
+  ; "range_weight"
+  ; "min_active_dsurv"
+  ; "qty_cap_mult"
+  ; "no_deep_history"
+  ; "weight_by_sessions"
+  ; "horizons"
   ]
 ;;
 
@@ -525,6 +541,35 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
           |> member "startup_wait_seconds"
           |> to_float_option
           |> Option.value ~default:defaults.startup_wait_seconds
+      ; assets =
+          (match oracle_json |> member "assets" with
+           | `Null -> defaults.assets
+           | assets_json ->
+             assets_json
+             |> to_assoc
+             |> List.map (fun (symbol, entry) ->
+               if
+                 validate_keys
+                   ~context:("oracle asset '" ^ symbol ^ "'")
+                   ~allowed:known_oracle_asset_keys
+                   entry
+               then exit 1;
+               let opt key parse = entry |> member key |> parse in
+               ( symbol
+               , ({ target_survival = opt "target_survival" to_float_option
+                  ; fng_weight = opt "fng_weight" to_float_option
+                  ; range_weight = opt "range_weight" to_float_option
+                  ; min_active_dsurv = opt "min_active_dsurv" to_float_option
+                  ; qty_cap_mult = opt "qty_cap_mult" to_float_option
+                  ; no_deep_history = opt "no_deep_history" to_bool_option
+                  ; weight_by_sessions = opt "weight_by_sessions" to_bool_option
+                  ; horizons =
+                      (match entry |> member "horizons" with
+                       | `Null -> None
+                       | horizons_json ->
+                         Some (horizons_json |> to_list |> List.map to_int))
+                  }
+                  : Dio_oracle.Oracle_runtime.asset_overrides) )))
       }
 ;;
 

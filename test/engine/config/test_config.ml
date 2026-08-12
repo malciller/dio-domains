@@ -184,6 +184,60 @@ let test_parse_oracle_config_default_qty_cap_mult () =
   Alcotest.(check (float 0.0001)) "qty_cap_mult default uncapped" 0.0 d.qty_cap_mult
 ;;
 
+let test_parse_oracle_config_assets () =
+  let json_str =
+    {|{"oracle": {"target_survival": 0.95, "assets": {
+       "HYPE/USDC": {"target_survival": 0.98, "qty_cap_mult": 3.0, "horizons": [90, 180]},
+       "QQQ": {"min_active_dsurv": 0.5}}}}|}
+  in
+  let json = Yojson.Basic.from_string json_str in
+  match Dio_engine.Config.parse_oracle_config json with
+  | None -> Alcotest.fail "oracle section should parse to Some"
+  | Some c ->
+    Alcotest.(check (float 0.0001)) "global target_survival" 0.95 c.target_survival;
+    Alcotest.(check int) "two overrides" 2 (List.length c.assets);
+    let hype = List.assoc "HYPE/USDC" c.assets in
+    let qqq = List.assoc "QQQ" c.assets in
+    Alcotest.(check (option (float 0.0001)))
+      "HYPE target_survival"
+      (Some 0.98)
+      hype.target_survival;
+    Alcotest.(check (option (float 0.0001)))
+      "HYPE qty_cap_mult"
+      (Some 3.0)
+      hype.qty_cap_mult;
+    Alcotest.(check (option (list int))) "HYPE horizons" (Some [ 90; 180 ]) hype.horizons;
+    Alcotest.(check (option (float 0.0001))) "HYPE fng_weight absent" None hype.fng_weight;
+    Alcotest.(check (option (float 0.0001)))
+      "QQQ min_active_dsurv"
+      (Some 0.5)
+      qqq.min_active_dsurv;
+    Alcotest.(check (option bool)) "QQQ deep_history absent" None qqq.no_deep_history
+;;
+
+let test_oracle_asset_keys_validation () =
+  (* The strict key validation for asset override entries accepts only the
+     sizing/blend/history knobs; cadence knobs stay global and are rejected. *)
+  let allowed = Dio_engine.Config.known_oracle_asset_keys in
+  let good =
+    Yojson.Basic.from_string {|{"target_survival": 0.98, "horizons": [90, 180]}|}
+  in
+  let bad = Yojson.Basic.from_string {|{"refresh_seconds": 60.0}|} in
+  let also_bad = Yojson.Basic.from_string {|{"no_such_knob": 1}|} in
+  Alcotest.(check bool)
+    "sizing knobs accepted"
+    false
+    (Dio_engine.Config.validate_keys ~context:"t" ~allowed good);
+  Alcotest.(check bool)
+    "cadence knob rejected"
+    true
+    (Dio_engine.Config.validate_keys ~context:"t" ~allowed bad);
+  Alcotest.(check bool)
+    "unknown knob rejected"
+    true
+    (Dio_engine.Config.validate_keys ~context:"t" ~allowed also_bad)
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -229,6 +283,14 @@ let () =
             "qty_cap_mult default uncapped"
             `Quick
             test_parse_oracle_config_default_qty_cap_mult
+        ; Alcotest.test_case
+            "per-asset override map parses"
+            `Quick
+            test_parse_oracle_config_assets
+        ; Alcotest.test_case
+            "asset override key validation"
+            `Quick
+            test_oracle_asset_keys_validation
         ] )
     ; ( "file_handling"
       , [ Alcotest.test_case "config defaults" `Quick test_read_config_defaults ] )

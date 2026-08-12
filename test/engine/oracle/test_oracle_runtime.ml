@@ -162,6 +162,198 @@ let test_trigger_is_one_shot () =
     true
 ;;
 
+let test_resolve_for_no_override () =
+  (* No overrides configured: the resolved config is the global one (sizing
+     knobs fall through untouched). *)
+  let config = { (default_config ()) with target_survival = 0.95 } in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001)) "target_survival global" 0.95 resolved.target_survival;
+  Alcotest.(check (float 0.0001)) "fng_weight global" 0.5 resolved.fng_weight;
+  Alcotest.(check (option (float 0.0001))) "max_capital global" None resolved.max_capital
+;;
+
+let test_resolve_for_merges_present_keys () =
+  (* A per-asset entry overrides only the present keys; everything else stays
+     on the global config. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "HYPE/USDC"
+          , { target_survival = Some 0.98
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = Some 3.0
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = Some [ 90; 180 ]
+            } )
+        ]
+    }
+  in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001))
+    "overridden target_survival"
+    0.98
+    resolved.target_survival;
+  Alcotest.(check (float 0.0001)) "inherited fng_weight" 0.5 resolved.fng_weight;
+  Alcotest.(check (float 0.0001)) "overridden qty_cap_mult" 3.0 resolved.qty_cap_mult;
+  Alcotest.(check (option (list int)))
+    "overridden horizons"
+    (Some [ 90; 180 ])
+    resolved.horizons;
+  Alcotest.(check (option (float 0.0001)))
+    "inherited max_capital"
+    None
+    resolved.max_capital
+;;
+
+let test_resolve_for_case_insensitive () =
+  (* Keys match the trading-config symbol case-insensitively. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "hype/usdc"
+          , { target_survival = Some 0.98
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ]
+    }
+  in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001))
+    "case-insensitive override"
+    0.98
+    resolved.target_survival
+;;
+
+let test_resolve_for_venue_key_wins () =
+  (* A "venue/symbol" key wins over the bare symbol for that venue; the bare
+     symbol still applies to other venues. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "HYPE/USDC"
+          , { target_survival = Some 0.98
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ; ( "hyperliquid/HYPE/USDC"
+          , { target_survival = Some 0.90
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ]
+    }
+  in
+  let on_hl =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  let on_kraken =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"kraken" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001))
+    "venue key wins on hyperliquid"
+    0.90
+    on_hl.target_survival;
+  Alcotest.(check (float 0.0001))
+    "bare key applies on kraken"
+    0.98
+    on_kraken.target_survival
+;;
+
+let test_resolve_for_unknown_key_global () =
+  (* An override key that matches no trading symbol never matches: the asset
+     runs on the global config. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "SOMEOTHER/USD"
+          , { target_survival = Some 0.10
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ]
+    }
+  in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001)) "no match keeps global" 0.95 resolved.target_survival
+;;
+
+let test_override_fields_all_none () =
+  (* Regression: the startup summary used to crash with
+     Invalid_argument("option is None") when every knob was absent (eager
+     Option.get on a None field). The all-None record must yield []. *)
+  let o : Dio_oracle.Oracle_runtime.asset_overrides =
+    { target_survival = None
+    ; fng_weight = None
+    ; range_weight = None
+    ; min_active_dsurv = None
+    ; qty_cap_mult = None
+    ; no_deep_history = None
+    ; weight_by_sessions = None
+    ; horizons = None
+    }
+  in
+  Alcotest.(check (list string)) "empty" [] (Dio_oracle.Oracle_runtime.override_fields o)
+;;
+
+let test_override_fields_present_only () =
+  (* Only Some knobs are listed, formatted for the startup summary line. *)
+  let o : Dio_oracle.Oracle_runtime.asset_overrides =
+    { target_survival = Some 0.98
+    ; fng_weight = None
+    ; range_weight = None
+    ; min_active_dsurv = None
+    ; qty_cap_mult = Some 3.0
+    ; no_deep_history = None
+    ; weight_by_sessions = Some false
+    ; horizons = Some [ 90; 180 ]
+    }
+  in
+  Alcotest.(check (list string))
+    "only present keys, in record order"
+    [ "target_survival 0.98"
+    ; "qty_cap_mult 3.00"
+    ; "weight_by_sessions false"
+    ; "horizons [90,180]"
+    ]
+    (Dio_oracle.Oracle_runtime.override_fields o)
+;;
+
 let () =
   Alcotest.run
     "Oracle_runtime"
@@ -182,6 +374,36 @@ let () =
             `Quick
             test_default_qty_cap_mult_uncapped
         ; Alcotest.test_case "jitter bounded" `Quick test_jitter_bounded
+        ] )
+    ; ( "per-asset overrides"
+      , [ Alcotest.test_case
+            "no override keeps global"
+            `Quick
+            test_resolve_for_no_override
+        ; Alcotest.test_case
+            "present keys merge, absent inherit"
+            `Quick
+            test_resolve_for_merges_present_keys
+        ; Alcotest.test_case
+            "case-insensitive key match"
+            `Quick
+            test_resolve_for_case_insensitive
+        ; Alcotest.test_case
+            "venue key wins over symbol"
+            `Quick
+            test_resolve_for_venue_key_wins
+        ; Alcotest.test_case
+            "unknown key falls through to global"
+            `Quick
+            test_resolve_for_unknown_key_global
+        ; Alcotest.test_case
+            "override summary with no knobs set"
+            `Quick
+            test_override_fields_all_none
+        ; Alcotest.test_case
+            "override summary lists only present knobs"
+            `Quick
+            test_override_fields_present_only
         ] )
     ; ( "startup-gate support"
       , [ Alcotest.test_case "tracks_asset" `Quick test_tracks_asset
