@@ -103,6 +103,134 @@ let dedup bars =
     Array.of_list (List.rev !out))
 ;;
 
+(* ---- Series normalization (one clean series for every consumer) ----
+   Venue feeds can return rows that are not real market prints; both corrupt
+   the peak-to-valley drawdown and the ATH/floor references:
+   - placeholder candles (e.g. Hyperliquid's fabricated pre-listing rows for
+     wrapped spot pairs - constant dummy OHLC like 6,969,696 / 7,979,573
+     with zero or dust volume - which read as a phantom 99.3% drawdown);
+   - rows whose extreme prints never traded (e.g. open/high 240,000 on a day
+     whose close was 97,578 - they fabricate an ATH/floor).
+   [normalize_bars] drops the first and folds the second into the row's
+   close. It is applied at every fetch source AND on every history-cache
+   read, so the runtime, the CLI and the replay always share one clean
+   series and never contradict each other. The judge is deliberately LOCAL
+   (each row vs its nearest real-trading neighbor), never a global median:
+   a series that genuinely 100x'd (BTC ~$1k in 2017 vs ~$40k now) must keep
+   its early cheap-era rows - only rows that deviate ~100x from the market
+   AROUND THEM (fabricated placeholder levels) are dropped. *)
+
+(** Normalize a candle list into the canonical clean series: ascending,
+    de-duplicated, fabricated rows dropped, absurd intra-row extremes folded
+    into the row's close. Returns the clean bars plus the counts of dropped
+    and clamped rows (for the once-per-symbol log).
+    - Pass 1 drops rows with non-finite/non-positive fields or an impossible
+      single-candle range (>10x between the row's extreme prints).
+    - Pass 2 folds rows whose extreme prints sit >2x away from the row's own
+      close into a flat close (a daily candle never trades a >2x span for
+      the oracle's assets; the close is the day's real level and is kept).
+    - Pass 3 drops rows whose close deviates >8x from the nearest REAL
+      trading neighbor (left first, else right; real = volume >= 0.01). A
+      fabricated placeholder level (zero/dust volume, ~100x off the market)
+      fails this; a genuine cheap-era row sits next to its own era's rows
+      and passes; a zero-volume carried price near the market also passes.
+      Rows with no real-trading neighbor at all are kept (cannot judge).
+    - A series with no real trading at all (not one surviving row with
+      volume >= 0.01) is entirely fabricated and normalizes to empty. *)
+let normalize_bars (bars : bar list) : bar array * int * int =
+  let arr = bars |> Array.of_list |> sort_bars |> dedup in
+  let n = Array.length arr in
+  let dropped = ref 0 in
+  let clamped = ref 0 in
+  let good = Array.make n false in
+  for i = 0 to n - 1 do
+    let b = arr.(i) in
+    let lo = Float.min b.open_ (Float.min b.high (Float.min b.low b.close)) in
+    let hi = Float.max b.open_ (Float.max b.high (Float.max b.low b.close)) in
+    let sane =
+      Float.is_finite b.open_
+      && Float.is_finite b.high
+      && Float.is_finite b.low
+      && Float.is_finite b.close
+      && b.open_ > 0.0
+      && b.high > 0.0
+      && b.low > 0.0
+      && b.close > 0.0
+      && hi /. lo <= 10.0
+    in
+    good.(i) <- sane;
+    if not sane then incr dropped
+  done;
+  for i = 0 to n - 1 do
+    if good.(i)
+    then (
+      let b = arr.(i) in
+      let lo = Float.min b.open_ (Float.min b.high (Float.min b.low b.close)) in
+      let hi = Float.max b.open_ (Float.max b.high (Float.max b.low b.close)) in
+      if hi > 2.0 *. b.close || lo < b.close /. 2.0
+      then (
+        arr.(i) <- { b with open_ = b.close; high = b.close; low = b.close };
+        incr clamped))
+  done;
+  (* Pass 3: local, volume-aware outlier guard (see the module doc). A
+     fabricated placeholder level (zero/dust volume, ~100x off the market
+     around it) is dropped; a genuine cheap-era row sits next to its own
+     era's rows and survives; a zero-volume carried price near the market
+     survives. *)
+  let is_real (b : bar) = b.volume >= 0.01 in
+  for i = 0 to n - 1 do
+    if good.(i)
+    then (
+      let ref_price =
+        let left = ref None in
+        let j = ref (i - 1) in
+        while !j >= 0 && !left = None do
+          if good.(!j) && is_real arr.(!j) then left := Some arr.(!j).close;
+          decr j
+        done;
+        match !left with
+        | Some c -> Some c
+        | None ->
+          let right = ref None in
+          let j = ref (i + 1) in
+          while !j < n && !right = None do
+            if good.(!j) && is_real arr.(!j) then right := Some arr.(!j).close;
+            incr j
+          done;
+          !right
+      in
+      match ref_price with
+      | Some c when c > 0.0 ->
+        let hi = Float.max arr.(i).close c in
+        let lo = Float.min arr.(i).close c in
+        if hi /. lo > 8.0
+        then (
+          good.(i) <- false;
+          incr dropped)
+      | _ -> ())
+  done;
+  (* A series with no real trading at all (not one surviving row with volume
+     >= 0.01) is entirely fabricated: empty it rather than feed placeholder
+     candles into the drawdown/floor math. *)
+  let any_real = ref false in
+  for i = 0 to n - 1 do
+    if good.(i) && arr.(i).volume >= 0.01 then any_real := true
+  done;
+  if not !any_real
+  then
+    for i = 0 to n - 1 do
+      if good.(i)
+      then (
+        good.(i) <- false;
+        incr dropped)
+    done;
+  let out = ref [] in
+  for i = n - 1 downto 0 do
+    if good.(i) then out := arr.(i) :: !out
+  done;
+  Array.of_list !out, !dropped, !clamped
+;;
+
 (** Expected sessions between the first and last bar date for a session
     predicate (e.g. US weekdays minus holidays). Ascending. *)
 let expected_sessions ~(is_session : string -> bool) (bars : bar array) =

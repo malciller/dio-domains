@@ -370,26 +370,64 @@ let parse_args () =
     e.g. ETH/USD is only downloaded once. *)
 let fetch_cache : (string * string, Oracle_types.series) Hashtbl.t = Hashtbl.create 32
 
-(** Fetch one symbol's daily series over the network (cached per run). *)
+(** Fetch one symbol's daily series (cached per run, and disk-cached via
+    Oracle_cache: full history on first use, one small delta request per
+    refresh after that). An explicit --start-date bypasses the cache so the
+    requested window is fetched exactly. *)
 let fetch_series_for (a : args) ~(exchange : string) (symbol : string)
   : Oracle_types.series Lwt.t
   =
   match Hashtbl.find_opt fetch_cache (exchange, symbol) with
   | Some s -> Lwt.return s
   | None ->
+    let offline =
+      Option.is_some a.from_csv
+      || Option.is_some a.from_json
+      || (exchange = "alpaca" && Option.is_some a.start_date)
+    in
     let fetch =
       match exchange with
       | "kraken" ->
-        Oracle_fetch_kraken.fetch_ohlc ~symbol ()
+        (if offline
+         then Oracle_fetch_kraken.fetch_ohlc ~symbol ()
+         else
+           Oracle_cache.with_delta
+             ~exchange
+             ~symbol
+             ~today:(today_iso ())
+             ~fetch:(fun boundary ->
+               let since = Option.map Oracle_cache.unix_of_iso boundary in
+               Oracle_fetch_kraken.fetch_ohlc ?since ~symbol ())
+             ())
         >|= Oracle_fetch_kraken.series_of_bars ~symbol
       | "hyperliquid" ->
-        Oracle_fetch_hyperliquid.fetch_candles ~symbol ()
+        (if offline
+         then Oracle_fetch_hyperliquid.fetch_candles ~symbol ()
+         else
+           Oracle_cache.with_delta
+             ~exchange
+             ~symbol
+             ~today:(today_iso ())
+             ~fetch:(fun boundary ->
+               let start_ms = Option.map Oracle_cache.ms_of_iso boundary in
+               Oracle_fetch_hyperliquid.fetch_candles ?start_ms ~symbol ())
+             ())
         >|= Oracle_fetch_hyperliquid.series_of_bars ~symbol
       | "alpaca" ->
         let start = Option.value a.start_date ~default:"2010-01-01" in
         let end_date = Option.value a.end_date ~default:(today_iso ()) in
         let feed = Option.value a.data_feed ~default:"iex" in
-        Oracle_fetch_alpaca.fetch_bars ~feed ~symbol ~start_date:start ~end_date ()
+        (if offline
+         then Oracle_fetch_alpaca.fetch_bars ~feed ~symbol ~start_date:start ~end_date ()
+         else
+           Oracle_cache.with_delta
+             ~exchange
+             ~symbol
+             ~today:(today_iso ())
+             ~fetch:(fun boundary ->
+               let start_date = Option.value boundary ~default:start in
+               Oracle_fetch_alpaca.fetch_bars ~feed ~symbol ~start_date ~end_date ())
+             ())
         >|= Oracle_fetch_alpaca.series_of_bars ~symbol
       | _ -> invalid_arg "unknown exchange"
     in
@@ -405,7 +443,9 @@ let fetch_series (a : args) (symbol : string) : Oracle_types.series Lwt.t =
 
 (** Extend a venue series backward with the Yahoo deep history for the same
     underlying asset (venue bars win on overlap; nothing is synthesized).
-    Returns the deepened series and the number of deep bars added. *)
+    The deep history is disk-cached and delta-fetched like the venue series,
+    so repeated CLI runs only pull the days they do not have yet. Returns
+    the deepened series and the number of deep bars added. *)
 let deepen_series (a : args) ~(exchange : string) (series : Oracle_types.series)
   : (Oracle_types.series * int) Lwt.t
   =
@@ -422,10 +462,14 @@ let deepen_series (a : args) ~(exchange : string) (series : Oracle_types.series)
     | Some yahoo_symbol ->
       let venue_first = venue_bars.(0).Oracle_types.date in
       let end_date = Oracle_calendar.add_days venue_first (-1) in
-      Oracle_fetch_yahoo.fetch_daily
-        ~start_date:"2015-01-01"
+      Oracle_cache.with_delta
+        ~exchange:"yahoo-deep"
         ~symbol:yahoo_symbol
-        ~end_date
+        ~today:(today_iso ())
+        ~complete_through:end_date
+        ~fetch:(fun boundary ->
+          let start_date = Option.value boundary ~default:"2015-01-01" in
+          Oracle_fetch_yahoo.fetch_daily ~start_date ~symbol:yahoo_symbol ~end_date ())
         ()
       >|= fun deep_bars ->
       let deep = Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol deep_bars in

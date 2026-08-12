@@ -487,7 +487,9 @@ let today_iso () =
 ;;
 
 (** Per-pass cache of fetched series, shared across assets and class members
-    so e.g. ETH/USD is only downloaded once per pass. *)
+    so e.g. ETH/USD is only downloaded once per pass. The durable cache lives
+    in Oracle_cache (disk-persisted, delta-fetched); this one just de-dupes
+    within one pass. *)
 let fetch_cache : (string * string, Oracle_types.series) Hashtbl.t = Hashtbl.create 32
 
 let fetch_series_for
@@ -502,18 +504,39 @@ let fetch_series_for
     let fetch =
       match exchange with
       | "kraken" ->
-        Oracle_fetch_kraken.fetch_ohlc ~symbol ()
+        Oracle_cache.with_delta
+          ~exchange
+          ~symbol
+          ~today:(today_iso ())
+          ~fetch:(fun boundary ->
+            let since = Option.map Oracle_cache.unix_of_iso boundary in
+            Oracle_fetch_kraken.fetch_ohlc ?since ~symbol ())
+          ()
         >|= Oracle_fetch_kraken.series_of_bars ~symbol
       | "hyperliquid" ->
-        Oracle_fetch_hyperliquid.fetch_candles ~symbol ()
+        Oracle_cache.with_delta
+          ~exchange
+          ~symbol
+          ~today:(today_iso ())
+          ~fetch:(fun boundary ->
+            let start_ms = Option.map Oracle_cache.ms_of_iso boundary in
+            Oracle_fetch_hyperliquid.fetch_candles ?start_ms ~symbol ())
+          ()
         >|= Oracle_fetch_hyperliquid.series_of_bars ~symbol
       | "alpaca" ->
         let feed = Option.value tc.data_feed ~default:"iex" in
-        Oracle_fetch_alpaca.fetch_bars
-          ~feed
+        Oracle_cache.with_delta
+          ~exchange
           ~symbol
-          ~start_date:"2010-01-01"
-          ~end_date:(today_iso ())
+          ~today:(today_iso ())
+          ~fetch:(fun boundary ->
+            let start_date = Option.value boundary ~default:"2010-01-01" in
+            Oracle_fetch_alpaca.fetch_bars
+              ~feed
+              ~symbol
+              ~start_date
+              ~end_date:(today_iso ())
+              ())
           ()
         >|= Oracle_fetch_alpaca.series_of_bars ~symbol
       | _ -> invalid_arg ("oracle_runtime: unknown exchange " ^ exchange)
@@ -526,7 +549,10 @@ let fetch_series_for
 
 (** Extend a venue series backward with the Yahoo deep history for the same
     underlying asset (venue bars win on overlap; nothing is synthesized).
-    Returns the deepened series and the number of deep bars added. *)
+    The deep history is disk-cached and delta-fetched like the venue series
+    (keyed on the resolved Yahoo symbol): once downloaded, a pass only
+    fetches the days the deep history does not cover yet. Returns the
+    deepened series and the number of deep bars added. *)
 let deepen_series
       (rc : runtime_config)
       ~(exchange : string)
@@ -542,10 +568,18 @@ let deepen_series
     | Some yahoo_symbol ->
       let venue_first = venue_bars.(0).Oracle_types.date in
       let end_date = Oracle_calendar.add_days venue_first (-1) in
-      Oracle_fetch_yahoo.fetch_daily
-        ~start_date:"2015-01-01"
+      (* The deep history is BOUNDED by [end_date] (the day before the venue
+         series starts): it is complete once its last bar reaches it - a
+         freshness check against "today" would re-fetch it (with start >
+         end) on every pass. *)
+      Oracle_cache.with_delta
+        ~exchange:"yahoo-deep"
         ~symbol:yahoo_symbol
-        ~end_date
+        ~today:(today_iso ())
+        ~complete_through:end_date
+        ~fetch:(fun boundary ->
+          let start_date = Option.value boundary ~default:"2015-01-01" in
+          Oracle_fetch_yahoo.fetch_daily ~start_date ~symbol:yahoo_symbol ~end_date ())
         ()
       >|= fun deep_bars ->
       let deep = Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol deep_bars in
@@ -1398,61 +1432,59 @@ let run_pass
        | Some f -> Printf.sprintf ", f&g %.2f" f
        | None -> ", f&g unavailable");
     let decisions = ref [] in
-    (* Phase A: analyze every asset in priority order FIRST, so each asset's
-       sizing reservation (minimum drawdown funding + first-buy cost) is known
-       before any capital is handed out. *)
+    (* Phase A: analyze every asset in parallel FIRST, so each asset's sizing
+       reservation (minimum drawdown funding + first-buy cost) is known before
+       any capital is handed out. Fetches now hit the disk-persisted history
+       cache (one small delta request per asset), and the assets run
+       concurrently instead of one-by-one - the cold-start 20-30s pass
+       (Kraken walking every pair's full history sequentially) becomes a
+       ~1s delta pass. *)
     (* One asset's analysis is bounded: a fetch (or a future fetch) that
        hangs cannot freeze the whole pass - the asset times out, keeps its
        last-known-good decision, and the pass continues. The fetch libraries
        carry their own timeouts; this is the belt-and-braces. *)
     let analysis_timeout = 60.0 in
-    let rec analyze_all acc = function
-      | [] -> Lwt.return (List.rev acc)
-      | task :: rest ->
-        Lwt.catch
-          (fun () ->
-             let t_asset = Mtime_clock.now_ns () in
-             Lwt.pick
-               [ (analyze_asset
-                    config
-                    classes
-                    task
-                    ~index:(List.length rest + 1)
-                    ~n_tasks:(List.length tasks)
-                  >|= fun analysis ->
-                  record_asset_latency
-                    task.Oracle_tasks.symbol
-                    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_asset))
-                    (fun () -> "fetch");
-                  touched_assets := task.Oracle_tasks.symbol :: !touched_assets;
-                  `Ok analysis)
-               ; (Lwt_unix.sleep analysis_timeout
-                  >|= fun () ->
-                  `Timeout
-                    (Printf.sprintf "analysis timed out after %.0fs" analysis_timeout))
-               ]
-             >|= function
-             | `Ok analysis -> analysis :: acc
-             | `Timeout why ->
-               Logging.warn_f
-                 ~section
-                 "capital-oracle analysis timed out for %s/%s (%s); \
-                  keeping                   last-known-good decision, capital stays in \
-                  the venue pool"
-                 task.Oracle_tasks.exchange
-                 task.Oracle_tasks.symbol
-                 why;
-               acc)
-          (fun exn ->
+    let analyze_one (task : Oracle_tasks.task) ~(index : int)
+      : (Oracle_tasks.task * analysis option) Lwt.t
+      =
+      Lwt.catch
+        (fun () ->
+           let t_asset = Mtime_clock.now_ns () in
+           Lwt.pick
+             [ (analyze_asset config classes task ~index ~n_tasks:(List.length tasks)
+                >|= fun analysis ->
+                record_asset_latency
+                  task.Oracle_tasks.symbol
+                  (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_asset))
+                  (fun () -> "fetch");
+                touched_assets := task.Oracle_tasks.symbol :: !touched_assets;
+                `Ok analysis)
+             ; (Lwt_unix.sleep analysis_timeout
+                >|= fun () ->
+                `Timeout
+                  (Printf.sprintf "analysis timed out after %.0fs" analysis_timeout))
+             ]
+           >|= function
+           | `Ok analysis -> Some analysis
+           | `Timeout why ->
              Logging.warn_f
                ~section
-               "capital-oracle analysis failed for %s/%s (%s); keeping last-known-good \
-                decision, capital stays in the venue pool"
+               "capital-oracle analysis timed out for %s/%s (%s); keeping \
+                last-known-good decision, capital stays in the venue pool"
                task.Oracle_tasks.exchange
                task.Oracle_tasks.symbol
-               (Printexc.to_string exn);
-             Lwt.return acc)
-        >>= fun acc' -> analyze_all acc' rest
+               why;
+             None)
+        (fun exn ->
+           Logging.warn_f
+             ~section
+             "capital-oracle analysis failed for %s/%s (%s); keeping last-known-good \
+              decision, capital stays in the venue pool"
+             task.Oracle_tasks.exchange
+             task.Oracle_tasks.symbol
+             (Printexc.to_string exn);
+           Lwt.return None)
+      >|= fun result -> task, result
     in
     (* Phase B: size sequentially, highest priority first, each asset against
        the ENTIRE remaining pool - the priority asset is sized fully before
@@ -1511,17 +1543,33 @@ let run_pass
       | Some (Some (pool, snapshot)) -> Some (pool, snapshot)
       | _ -> None
     in
+    (* Phase A: analyze every asset in parallel (independent fetches +
+       replays). Fetches are disk-cache delta hits; the assets no longer
+       wait on each other. *)
+    let t_fetch_all = Mtime_clock.now_ns () in
+    Lwt_list.map_p
+      (fun (index, task) -> analyze_one task ~index)
+      (List.mapi (fun i task -> i + 1, task) tasks)
+    >>= fun task_analyses ->
+    let task_analyses =
+      List.filter_map
+        (fun (task, result) -> Option.map (fun analysis -> task, analysis) result)
+        task_analyses
+    in
+    Latency_profiler.record engine_profs.prof_fetch (span_from t_fetch_all);
+    let analyses_for account =
+      List.filter_map
+        (fun (task, analysis) ->
+           if same_account account (account_of_task task) then Some analysis else None)
+        task_analyses
+    in
     Lwt_list.iter_s
-      (fun (account, account_tasks) ->
+      (fun (account, _account_tasks) ->
          match account_pool account with
          | None -> Lwt.return_unit
          | Some (pool, snapshot) ->
-           let t_fetch = Mtime_clock.now_ns () in
-           analyze_all [] account_tasks
-           >>= fun analyses ->
-           Latency_profiler.record engine_profs.prof_fetch (span_from t_fetch);
            let t_size = Mtime_clock.now_ns () in
-           size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool analyses
+           size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool (analyses_for account)
            >|= fun surplus ->
            Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
            Logging.info_f

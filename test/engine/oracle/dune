@@ -61,3 +61,7 @@
 (test
  (name test_oracle_fetch_hyperliquid)
  (libraries dio.oracle alcotest))
+
+(test
+ (name test_oracle_cache)
+ (libraries dio.oracle alcotest))
