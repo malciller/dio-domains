@@ -645,34 +645,54 @@ let deployment_block
   if d.active
   then (
     let pc = d.parameter_components in
-    let gi_desc =
+    let w_survival = Float.max 0.0 (1.0 -. pc.fng_weight -. pc.range_weight) in
+    let gi_desc, raw_blend =
       match pc.fng_parameter, pc.fng, pc.range_parameter with
       | Some fng_parameter, Some fng, Some rp ->
-        Printf.sprintf
-          "fng %.0f -> %.2f%% | surv %.2f%% | range %.2f%% | w %.2f/%.2f/%.2f"
-          fng
-          fng_parameter
-          pc.survival_parameter
-          rp
-          pc.fng_weight
-          pc.range_weight
-          (Float.max 0.0 (1.0 -. pc.fng_weight -. pc.range_weight))
+        let total = pc.fng_weight +. w_survival +. pc.range_weight in
+        ( Printf.sprintf
+            "fng %.0f -> %.2f%% | surv %.2f%% | range %.2f%% | w %.2f/%.2f/%.2f"
+            fng
+            fng_parameter
+            pc.survival_parameter
+            rp
+            pc.fng_weight
+            pc.range_weight
+            w_survival
+        , ((pc.fng_weight *. fng_parameter)
+           +. (w_survival *. pc.survival_parameter)
+           +. (pc.range_weight *. rp))
+          /. total )
       | Some fng_parameter, Some fng, None ->
-        Printf.sprintf
-          "fng %.0f -> %.2f%% | surv %.2f%% | w %.2f"
-          fng
-          fng_parameter
-          pc.survival_parameter
-          pc.fng_weight
+        let total = pc.fng_weight +. w_survival in
+        ( Printf.sprintf
+            "fng %.0f -> %.2f%% | surv %.2f%% | w %.2f"
+            fng
+            fng_parameter
+            pc.survival_parameter
+            pc.fng_weight
+        , ((pc.fng_weight *. fng_parameter) +. (w_survival *. pc.survival_parameter))
+          /. total )
       | None, _, Some rp ->
-        Printf.sprintf
-          "surv %.2f%% | range %.2f%% | w %.2f"
-          pc.survival_parameter
-          rp
-          pc.range_weight
-      | _ -> Printf.sprintf "surv %.2f%%" pc.survival_parameter
+        ( Printf.sprintf
+            "surv %.2f%% | range %.2f%% | w %.2f"
+            pc.survival_parameter
+            rp
+            pc.range_weight
+        , pc.survival_parameter )
+      | _ -> Printf.sprintf "surv %.2f%%" pc.survival_parameter, pc.survival_parameter
     in
-    line "    ACTIVE   qty %.4f   gi %.2f%%   (%s)" d.qty d.parameter gi_desc;
+    let clamp_note =
+      if raw_blend +. 1e-9 < pc.survival_parameter then "clamped: survival binds" else ""
+    in
+    line
+      "    ACTIVE   qty %.4f   gi %.2f%%   (blend %.2f%% -> resolved %.2f%%%s | %s)"
+      d.qty
+      pc.resolved_parameter
+      raw_blend
+      pc.resolved_parameter
+      (if clamp_note = "" then "" else ", " ^ clamp_note)
+      gi_desc;
     line
       "    governing %s   d_gov %s   D_surv %s (replay)   min quote DD %s"
       d.governing_horizon

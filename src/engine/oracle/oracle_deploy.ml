@@ -825,7 +825,7 @@ module Engine (M : Oracle_strategy.S) = struct
         then
           warnings
           := Printf.sprintf
-               "parameter clamped from %.2f to the survival-constrained %.2f (runway \
+               "parameter blend %.2f clamped to the survival-constrained %.2f (runway \
                 wins over sentiment)"
                resolved_parameter
                survival_parameter
