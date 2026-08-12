@@ -5,9 +5,10 @@
      floor),
    - governing_drawdown picks the deepest reachable horizon target and is
      None when no horizon can clear the target,
-   - the ATH-anchored survival drawdown d_cover caps the ladder's scale
-     absolutely: at the ATH d_cover = d_gov, below the target level
-     ATH*(1-d_gov) the required runway is zero (maximally aggressive),
+   - the sizing drawdown d_cover is the largest ACTUAL peak-to-valley
+     drawdown of the asset's history (the fall the grid must fund from the
+     current price) - never an ATH-anchored / ATH-to-ATL construction, so a
+     1000x run-up can never read as a phantom 99.9% drawdown,
    - the verification replay is funded with the asset's pool budget, so a
      well-funded asset passes (no false "under-funded" verdicts) and the
      sizing grows to the qty_cap,
@@ -19,7 +20,7 @@
    - under-funded active assets run at qty_min with the shortfall warned and
      keep their whole share (config-order priority),
    - fallback (immature-history) assets are sized on the deepest observed
-     drawdown, ATH-anchored; qty still grows up to the qty_cap while the
+     drawdown, peak-to-valley; qty still grows up to the qty_cap while the
      static funding check holds (volume-driven),
    - inactive when the pool cannot fund the first buy, no horizon clears the
      target, or the replayed D_surv stays below --min-active-dsurv. *)
@@ -434,9 +435,9 @@ let trough_series ~n =
 
 (** A series that crashes hard in the middle (bars 60-69, -5%/bar: ~40%
     drawdown) and then RECOVERS to near its peak: the price ends in the upper
-    part of its range (d_from_ath small), so the ATH-anchored runway is a
-    real positive fraction of the drawdown - the fallback parameter must
-    loosen until the pool funds that runway. *)
+    part of its range, so the sizing drawdown is the full actual
+    peak-to-valley fall of the crash - the fallback parameter must loosen
+    until the pool funds that runway. *)
 let recover_series ~n =
   let iso day = Oracle_calendar.add_days "2020-01-01" day in
   let price = ref 100.0 in
@@ -543,12 +544,12 @@ let test_deploy_fallback_immature () =
 
 let test_fallback_tunes_parameter_to_funding () =
   (* The fallback (immature-history) parameter must be tuned by the static
-     funding check against the ATH-anchored runway - not collapse onto
-     gi_lo. A replay-based fallback criterion is unusable on an immature
+     funding check against the actual peak-to-valley runway - not collapse
+     onto gi_lo. A replay-based fallback criterion is unusable on an immature
      history (the replay is not authoritative), so the criterion is the
-     static funding check: the pool must fund the ATH-anchored drawdown at
-     the floor qty at the chosen gi. The grid loosens until the pool can
-     fund it. *)
+     static funding check: the pool must fund the actual peak-to-valley
+     drawdown at the floor qty at the chosen gi. The grid loosens until the
+     pool can fund it. *)
   let recover = recover_series ~n:90 in
   let crash = crash_series ~n:200 in
   let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
@@ -574,11 +575,16 @@ let test_fallback_tunes_parameter_to_funding () =
   let lo, hi = 0.5, 2.0 in
   let sp = recover.bars.(Array.length recover.bars - 1).Oracle_types.close in
   let g = grid ~start_price:sp () in
-  let r = Option.get (Oracle_math.range_stats_of recover) in
-  let d_cover = Oracle_math.ath_anchored_drawdown ~d_gov r in
-  (* The recover series ends near its peak, so the ATH-anchored runway is a
-     real positive fraction of the observed drawdown (not collapsed to 0). *)
-  Alcotest.(check bool) "runway positive" (d_cover > 0.05 && d_cover < d_gov) true;
+  let d_cover =
+    let p = Option.get (Oracle_math.peak_to_valley_stats_of recover) in
+    p.Oracle_types.max_drawdown
+  in
+  (* The recover series ends near its peak, so the sizing drawdown is the
+     full actual peak-to-valley fall the crash produced - a real positive
+     fraction of the observed drawdown, at least as deep as the deepest MFD
+     window (the p2v measurement starts from the running peak, which is
+     >= every window start close). *)
+  Alcotest.(check bool) "runway positive" (d_cover > 0.05 && d_cover < 1.0) true;
   let q_min = D.sizing_floor ~cfg:g in
   let fills_at gi =
     let gi_frac = Float.min (gi /. 100.0) 0.99 in
@@ -622,7 +628,7 @@ let test_fallback_tunes_parameter_to_funding () =
     (d.parameter > lo +. 0.001)
     true;
   Alcotest.(check bool)
-    "the ATH-anchored runway is the sizing basis"
+    "the actual peak-to-valley drawdown is the sizing basis"
     (abs_float (d.d_cover -. d_cover) < 1e-9)
     true;
   Alcotest.(check bool) "deployed fits the pool" (d.deployed <= pool +. 1e-9) true;
@@ -633,7 +639,8 @@ let test_fallback_tunes_parameter_to_funding () =
 ;;
 
 let test_fallback_abundant_pool_squeezes_to_lo () =
-  (* With capital far beyond the ATH-anchored runway's worst-case cost, the
+  (* With capital far beyond the actual peak-to-valley runway's worst-case
+     cost, the
      static funding check funds even the tightest config grid: the squeeze
      onto gi_lo is a computed outcome of the observed drawdown + the pool,
      not the degenerate replay collapse. *)
@@ -675,11 +682,12 @@ let test_fallback_abundant_pool_squeezes_to_lo () =
 
 let test_fallback_grows_qty_while_funded () =
   (* An immature asset is volume driven too: the order qty grows up to the
-     qty_cap while the static funding check (the pool funds the ATH-anchored
-     drawdown at the sizing floor) holds. The trough asset ended below its
-     ATH-anchored target level (d_cover = 0), so only the first buy needs
-     funding and the qty squeezes to the cap; the excess passes down the
-     priority order. *)
+     qty_cap while the static funding check (the pool funds the actual
+     peak-to-valley drawdown at the sizing floor) holds. The trough asset
+     ended at the valley of its ~60% actual max drawdown - funding it at the
+     cap qty costs the full ladder through that drawdown (no "first buy
+     only" shortcut: the actual drawdown must be funded from the current
+     price), and the excess passes down the priority order. *)
   let trough = trough_series ~n:90 in
   let crash = crash_series ~n:200 in
   let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
@@ -698,6 +706,10 @@ let test_fallback_grows_qty_while_funded () =
   let sp = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
   let g = grid ~start_price:sp () in
   let q_min = D.sizing_floor ~cfg:g in
+  let d_cover =
+    let p = Option.get (Oracle_math.peak_to_valley_stats_of trough) in
+    p.Oracle_types.max_drawdown
+  in
   let d =
     deploy
       ~asset:trough
@@ -717,9 +729,26 @@ let test_fallback_grows_qty_while_funded () =
     "fallback qty grows to the cap while the funding check holds"
     (abs_float (d.qty -. (10.0 *. q_min)) < 1e-9)
     true;
+  (* Deployed = min(pool, floor-aware ladder cost through the actual max
+     drawdown at the cap qty) - the full peak-to-valley runway, not just the
+     first buy. *)
+  let n_fills =
+    Oracle_strategy.Grid.fills_for_drawdown { g with grid_interval_pct = 0.5 } ~d:d_cover
+  in
+  let cost_cap =
+    Oracle_mfd.floor_aware_runway_cost
+      ~qty:(10.0 *. q_min)
+      ~grid_interval_pct:0.5
+      ~fee:g.maker_fee
+      ~start_price:sp
+      ~min_notional:0.0
+      ~price_increment:0.01
+      ~qty_increment:0.01
+      ~n_fills
+  in
   Alcotest.(check bool)
-    "fallback deployed is the first-buy funding at the cap qty"
-    (d.deployed > q_min *. sp *. 0.5 && d.deployed < 10.0 *. q_min *. sp)
+    "fallback deployed funds the actual peak-to-valley drawdown at the cap qty"
+    (d.deployed > 0.9 *. cost_cap && d.deployed <= cost_cap +. 1e-6)
     true;
   Alcotest.(check bool)
     "the rest of the pool passes down"
@@ -884,32 +913,77 @@ let test_range_stats () =
     true
 ;;
 
+(** A flat series with a mid-history dip (~11% peak-to-valley) and a partial
+    recovery to a price strictly between the event valley and the event peak:
+    the range side must land strictly between lo and hi, on the formula
+    position = (peak - price) / (peak - valley). *)
+let dip_series ~n =
+  let iso day = Oracle_calendar.add_days "2020-01-01" day in
+  let price = ref 100.0 in
+  let bars =
+    Array.make
+      n
+      Oracle_types.{ date = ""; open_ = 0.; high = 0.; low = 0.; close = 0.; volume = 0. }
+  in
+  for i = 0 to n - 1 do
+    let mult =
+      if i < 40
+      then 1.0
+      else if i < 60
+      then 0.994 (* 20 x -0.6%: an ~11% peak-to-valley dip *)
+      else if i < 70
+      then 1.0069 (* partial recovery *)
+      else 1.0
+    in
+    price := !price *. mult;
+    let p = !price in
+    bars.(i)
+    <- { Oracle_types.date = iso i
+       ; open_ = p
+       ; high = p
+       ; low = p
+       ; close = p
+       ; volume = 1000.0
+       }
+  done;
+  { Oracle_types.symbol = "DIP"; calendar_kind = Oracle_types.Crypto; bars; gaps = [] }
+;;
+
 let test_range_parameter_direction () =
-  (* The range side of the blend widens spacing near the ATH (the whole
-     historical fall is still ahead: preserve runway) and tightens it near
-     the all-time low (bounded remaining downside: the aggressive
-     accumulation zone), working with the F&G contrarian convention. *)
+  (* The range side of the blend is anchored on the largest ACTUAL
+     peak-to-valley drawdown event, not the ATH/ATL span: above the event
+     peak the full max drawdown is still ahead (widen: preserve runway), at
+     the event valley the downside is bounded by what actually happened
+     (tighten: the aggressive accumulation zone), and a strictly monotone
+     series - which never drew down - carries no range information at all. *)
   let lo, hi = 0.5, 2.0 in
-  let r_ath =
-    match Oracle_math.range_stats_of (linear_series ~n:60 ~slope:0.02) with
-    | Some r -> r
-    | None -> Alcotest.fail "expected stats for the rising series"
+  (* Strictly rising: no drawdown ever -> no p2v event, so the range side is
+     absent (the strictly falling series below provides the bound cases). *)
+  (match Oracle_math.peak_to_valley_stats_of (linear_series ~n:60 ~slope:0.02) with
+   | Some _ -> Alcotest.fail "expected no p2v event on a monotone rising series"
+   | None -> ());
+  (* Strictly falling: the price sits at the event valley (position 1) -> lo. *)
+  let p_fall =
+    Option.get (Oracle_math.peak_to_valley_stats_of (linear_series ~n:60 ~slope:(-0.02)))
   in
-  let r_low =
-    match Oracle_math.range_stats_of (linear_series ~n:60 ~slope:(-0.02)) with
-    | Some r -> r
-    | None -> Alcotest.fail "expected stats for the falling series"
-  in
-  near r_ath.d_from_ath 0.0;
-  near r_low.d_from_ath r_low.range_span;
-  (* At the ATH (position 0) the range side is hi; at the low (position 1)
-     it is lo. *)
-  (match Oracle_deploy.range_parameter ~lo ~hi r_ath with
-   | Some p -> near p hi
-   | None -> Alcotest.fail "expected a range parameter at the ATH");
-  match Oracle_deploy.range_parameter ~lo ~hi r_low with
-  | Some p -> near p lo
-  | None -> Alcotest.fail "expected a range parameter at the low"
+  Alcotest.(check bool)
+    "falling series ends at the valley"
+    (p_fall.price = p_fall.valley)
+    true;
+  (match Oracle_deploy.range_parameter ~lo ~hi p_fall with
+   | Some p -> near p lo
+   | None -> Alcotest.fail "expected a range parameter at the event valley");
+  (* Mid-way between the event peak and valley: the formula position. *)
+  let dip = dip_series ~n:120 in
+  let p_dip = Option.get (Oracle_math.peak_to_valley_stats_of dip) in
+  Alcotest.(check bool)
+    "dip price strictly between valley and peak"
+    (p_dip.valley < p_dip.price && p_dip.price < p_dip.peak)
+    true;
+  let position = (p_dip.peak -. p_dip.price) /. (p_dip.peak -. p_dip.valley) in
+  match Oracle_deploy.range_parameter ~lo ~hi p_dip with
+  | Some p -> near p (lo +. ((1.0 -. position) *. (hi -. lo)))
+  | None -> Alcotest.fail "expected a range parameter for the dip"
 ;;
 
 let test_deploy_range_blend () =
@@ -992,46 +1066,74 @@ let test_deploy_range_equity () =
     true
 ;;
 
-let test_ath_anchored_drawdown () =
-  (* The ATH-anchored survival drawdown d_cover caps the ladder's scale
-     absolutely: the grid always covers down to the absolute target level
-     ATH*(1 - d_gov), so the scale never shrinks endlessly as the market
-     grinds down. *)
-  let mk ~ath ~low ~price =
-    { Oracle_types.ath
-    ; all_time_low = low
-    ; price
-    ; d_from_ath = (if ath > 0.0 then (ath -. price) /. ath else 0.0)
-    ; d_to_low = (if price > 0.0 then (price -. low) /. price else 0.0)
-    ; range_span = (if ath > 0.0 then (ath -. low) /. ath else 0.0)
-    }
+let test_peak_to_valley_stats () =
+  (* The sizing drawdown is the largest ACTUAL peak-to-valley drawdown of the
+     history: each bar's fall from the running peak of closes down to that
+     bar's low, maximized. A 1000x run-up only registers the falls that
+     actually happened - never the ATH-to-ATL span. *)
+  let stats asset_ =
+    match Oracle_math.peak_to_valley_stats_of asset_ with
+    | Some p -> p
+    | None -> Alcotest.fail "expected p2v stats"
   in
-  let d_gov = 0.5 in
-  (* At the ATH: the fall from the current price to ATH*(1-d_gov) is exactly
-     d_gov. *)
-  let r_ath = mk ~ath:100.0 ~low:10.0 ~price:100.0 in
-  near (Oracle_math.ath_anchored_drawdown ~d_gov r_ath) d_gov;
-  (* 20% below the ATH: part of the fall to the target level has already
-     happened, so the remaining runway is smaller than d_gov (but positive). *)
-  let r_mid = mk ~ath:100.0 ~low:10.0 ~price:80.0 in
-  let d_mid = Oracle_math.ath_anchored_drawdown ~d_gov r_mid in
-  Alcotest.(check bool) "middle runway in (0, d_gov)" (d_mid > 0.0 && d_mid < d_gov) true;
-  (* At or below the target level ATH*(1-d_gov) = 50: the whole span has been
-     traversed - the required runway is zero (only the first buy needs
-     funding), so the model can be maximally aggressive. *)
-  let r_deep = mk ~ath:100.0 ~low:10.0 ~price:50.0 in
-  near (Oracle_math.ath_anchored_drawdown ~d_gov r_deep) 0.0;
-  let r_below = mk ~ath:100.0 ~low:10.0 ~price:30.0 in
-  near (Oracle_math.ath_anchored_drawdown ~d_gov r_below) 0.0;
-  (* A new ATH (d_from_ath = 0 via the clamp) still sizes at d_gov. *)
-  let r_new = mk ~ath:110.0 ~low:10.0 ~price:115.0 in
-  near (Oracle_math.ath_anchored_drawdown ~d_gov r_new) d_gov;
-  (* Monotone: the deeper the price sits below the ATH, the smaller the
-     remaining runway. *)
+  (* The synth series: a ~33% crash after a gentle decline from its start
+     peak, then recovery. The max drawdown is measured from the running peak
+     (the first close, ~100) to the crash trough low. *)
+  let p_synth = stats asset in
   Alcotest.(check bool)
-    "monotone in d_from_ath"
-    (Oracle_math.ath_anchored_drawdown ~d_gov r_mid
-     > Oracle_math.ath_anchored_drawdown ~d_gov r_deep)
+    "synth p2v in (0.4, 0.46)"
+    (p_synth.max_drawdown > 0.4 && p_synth.max_drawdown < 0.46)
+    true;
+  Alcotest.(check bool)
+    "peak precedes valley"
+    (p_synth.peak_idx < p_synth.valley_idx)
+    true;
+  Alcotest.(check bool) "peak above valley" (p_synth.peak > p_synth.valley) true;
+  Alcotest.(check bool)
+    "price is the last close"
+    (p_synth.price = asset.bars.(Array.length asset.bars - 1).Oracle_types.close)
+    true;
+  Alcotest.(check bool)
+    "dates non-empty"
+    (p_synth.peak_date <> "" && p_synth.valley_date <> "")
+    true;
+  (* The crash series: a ~99.97% collapse registers as a ~99.97% drawdown -
+     the actual event, never inflated beyond what happened. *)
+  let p_crash = stats (crash_series ~n:200) in
+  Alcotest.(check bool) "crash p2v above 99%" (p_crash.max_drawdown > 0.99) true;
+  (* The trough series: ends at the valley of its ~60% crash. *)
+  let p_trough = stats (trough_series ~n:90) in
+  Alcotest.(check bool)
+    "trough p2v in (0.55, 0.65)"
+    (p_trough.max_drawdown > 0.55 && p_trough.max_drawdown < 0.65)
+    true;
+  Alcotest.(check bool)
+    "trough price sits at the valley (within the 0.1% bar low)"
+    (p_trough.price >= p_trough.valley
+     && p_trough.price -. p_trough.valley < p_trough.peak *. 0.01)
+    true;
+  (* The recover series: crash then recovery near the peak - the drawdown is
+     the crash itself, not the ATH-to-ATL span (which is tiny here). *)
+  let p_recover = stats (recover_series ~n:90) in
+  Alcotest.(check bool)
+    "recover p2v in (0.38, 0.43)"
+    (p_recover.max_drawdown > 0.38 && p_recover.max_drawdown < 0.43)
+    true;
+  (* A strictly monotone rising series never drew down -> None. *)
+  Alcotest.(check bool)
+    "monotone rising -> None"
+    (Oracle_math.peak_to_valley_stats_of (linear_series ~n:60 ~slope:0.02) = None)
+    true;
+  (* Empty history -> None. *)
+  Alcotest.(check bool)
+    "empty history -> None"
+    (Oracle_math.peak_to_valley_stats_of
+       { Oracle_types.symbol = "E"
+       ; calendar_kind = Oracle_types.Crypto
+       ; bars = [||]
+       ; gaps = []
+       }
+     = None)
     true
 ;;
 
@@ -1044,13 +1146,10 @@ let test_deploy_replay_pool_funded () =
      verdicts for deep-pooled assets like QQQ.) *)
   let g = grid ~start_price:100.0 () in
   let ms = models ~asset in
-  let d_gov, _ =
-    match Oracle_deploy.governing_drawdown ~models:ms ~target_survival:0.99 with
-    | Some x -> x
-    | None -> Alcotest.fail "governing drawdown unreachable"
+  let d_cover =
+    let p = Option.get (Oracle_math.peak_to_valley_stats_of asset) in
+    p.Oracle_types.max_drawdown
   in
-  let r = Option.get (Oracle_math.range_stats_of asset) in
-  let d_cover = Oracle_math.ath_anchored_drawdown ~d_gov r in
   let n_fills =
     Oracle_strategy.Grid.fills_for_drawdown { g with grid_interval_pct = 0.5 } ~d:d_cover
   in
@@ -1155,11 +1254,13 @@ let test_deploy_equity_ignores_fng () =
     true
 ;;
 
-let test_deploy_ath_cap_below_target () =
-  (* Once the price is at or below the ATH-anchored target level
-     ATH*(1-d_gov), the required runway is zero: only the first buy needs
-     funding, so a small pool keeps the asset active and the sizing is
-     maximally aggressive (gi_lo) instead of clamping to the widest grid. *)
+let test_deploy_valley_still_funds_drawdown () =
+  (* The p2v sizing has no "below the ATH-anchored target level -> zero
+     runway" rule: an asset sitting AT the valley of its largest actual
+     peak-to-valley drawdown still requires that drawdown to be funded from
+     the current price. A pool that only covers the first buy keeps the
+     asset active but under-funded - the full actual drawdown is the sizing
+     basis, not the ATH relationship. *)
   let trough = trough_series ~n:90 in
   let crash = crash_series ~n:200 in
   let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
@@ -1186,6 +1287,10 @@ let test_deploy_ath_cap_below_target () =
       ~qty_increment:0.01
       ~n_fills:1
   in
+  let d_cover =
+    let p = Option.get (Oracle_math.peak_to_valley_stats_of trough) in
+    p.Oracle_types.max_drawdown
+  in
   let d =
     deploy
       ~asset:trough
@@ -1201,14 +1306,110 @@ let test_deploy_ath_cap_below_target () =
   in
   Alcotest.(check bool) "active funded by the first buy alone" d.active true;
   Alcotest.(check bool)
-    "d_cover 0 (price below the ATH-anchored target level)"
-    (d.d_cover = 0.0)
+    "d_cover is the full actual peak-to-valley drawdown (not 0 at the valley)"
+    (abs_float (d.d_cover -. d_cover) < 1e-9)
     true;
   Alcotest.(check bool)
-    "gi squeezed to the tightest config value (max aggression)"
-    (abs_float (d.parameter -. 0.5) < 1e-9)
+    "gi loosened to the widest value (the pool cannot fund the actual drawdown)"
+    (abs_float (d.parameter -. 2.0) < 1e-9)
+    true;
+  Alcotest.(check bool)
+    "under-funded warning names the drawdown gap"
+    (List.exists (fun (w : string) -> contains w "drawdown") d.warnings)
     true;
   Alcotest.(check bool) "deployed fits the pool" (d.deployed <= d.pool_share +. 1e-9) true
+;;
+
+let test_peak_to_valley_1000x_runup () =
+  (* The user's exact complaint: a 1000x run-up must NOT make the sizing read
+     as a 99.9% drawdown. This series runs 0.01 -> 10 (1000x) then crashes
+     to 1.0: the ATH-to-ATL span is ~99.9%, but the largest ACTUAL
+     peak-to-valley fall is only the crash (~90%). The p2v stats must report
+     the real event - and the range side must see the price at the event
+     valley (position 1 -> tight, the aggressive accumulation zone). *)
+  let iso day = Oracle_calendar.add_days "2020-01-01" day in
+  let n = 260 in
+  let bars =
+    Array.init n (fun i ->
+      let p =
+        if i < 200
+        then
+          0.01 *. (1000.0 ** (float_of_int i /. 200.0)) (* 0.01 -> ~10: a 1000x run-up *)
+        else if i = 200
+        then 10.0 (* the peak close *)
+        else if i = 201
+        then 1.0 (* the crash to 1/10 of the peak: a ~90% actual drawdown *)
+        else 1.0
+      in
+      { Oracle_types.date = iso i
+      ; open_ = p
+      ; high = p *. 1.001
+      ; low = p *. 0.999
+      ; close = p
+      ; volume = 1000.0
+      })
+  in
+  let runup =
+    { Oracle_types.symbol = "RUNUP"
+    ; calendar_kind = Oracle_types.Crypto
+    ; bars
+    ; gaps = []
+    }
+  in
+  let p = Option.get (Oracle_math.peak_to_valley_stats_of runup) in
+  Alcotest.(check bool)
+    "actual p2v drawdown is the crash (~90%), not the 99.9% ATH-to-ATL span"
+    (p.max_drawdown > 0.89 && p.max_drawdown < 0.91)
+    true;
+  Alcotest.(check bool) "peak is the run-up top" (p.peak > 9.9 && p.peak < 10.1) true;
+  Alcotest.(check bool)
+    "valley is the crash bottom"
+    (p.valley > 0.99 && p.valley < 1.01)
+    true;
+  Alcotest.(check bool)
+    "range side: price at the event valley -> tight (near lo)"
+    (match Oracle_deploy.range_parameter ~lo:0.5 ~hi:2.0 p with
+     | Some rp -> rp < 0.6
+     | None -> false)
+    true;
+  (* The span context stays ~99.9% - but it is display context only. *)
+  let r = Option.get (Oracle_math.range_stats_of runup) in
+  Alcotest.(check bool)
+    "span context is ~99.9% (the phantom the p2v sizing rejects)"
+    (r.range_span > 0.99)
+    true
+;;
+
+let test_peak_to_valley_ordering () =
+  (* The venue feeds can return bars newest-first (the Hyperliquid
+     pagination reverses its pages; only the deepen step re-sorts). The p2v
+     computation must sort chronologically first - a backwards series would
+     fabricate a "peak -> valley" event whose valley PREDATES the peak. The
+     stats on the reversed series must be identical to the sorted one. *)
+  let ascending = recover_series ~n:90 in
+  let reversed =
+    Array.init (Array.length ascending.bars) (fun i ->
+      ascending.bars.(Array.length ascending.bars - 1 - i))
+  in
+  let descending = { ascending with Oracle_types.bars = reversed } in
+  let p_asc = Option.get (Oracle_math.peak_to_valley_stats_of ascending) in
+  let p_desc = Option.get (Oracle_math.peak_to_valley_stats_of descending) in
+  Alcotest.(check bool)
+    "identical max drawdown regardless of bar order"
+    (abs_float (p_asc.max_drawdown -. p_desc.max_drawdown) < 1e-12)
+    true;
+  Alcotest.(check bool)
+    "identical peak regardless of bar order"
+    (abs_float (p_asc.peak -. p_desc.peak) < 1e-9)
+    true;
+  Alcotest.(check bool)
+    "identical valley regardless of bar order"
+    (abs_float (p_asc.valley -. p_desc.valley) < 1e-9)
+    true;
+  Alcotest.(check bool)
+    "peak precedes valley in time (the bug this guards against)"
+    (p_asc.peak_date < p_asc.valley_date)
+    true
 ;;
 
 let () =
@@ -1226,8 +1427,16 @@ let () =
       )
     ; ( "governing_basis"
       , [ Alcotest.test_case "target vs fallback vs none" `Quick test_governing_basis ] )
-    ; ( "ath_anchored_drawdown"
-      , [ Alcotest.test_case "absolute cap on the scale" `Quick test_ath_anchored_drawdown
+    ; ( "peak_to_valley"
+      , [ Alcotest.test_case "actual max drawdown" `Quick test_peak_to_valley_stats
+        ; Alcotest.test_case
+            "1000x run-up reports the real crash"
+            `Quick
+            test_peak_to_valley_1000x_runup
+        ; Alcotest.test_case
+            "order-independent (newest-first feeds)"
+            `Quick
+            test_peak_to_valley_ordering
         ] )
     ; ( "deploy_asset"
       , [ Alcotest.test_case "fully funded" `Quick test_deploy_fully_funded
@@ -1247,9 +1456,9 @@ let () =
             `Quick
             test_deploy_equity_ignores_fng
         ; Alcotest.test_case
-            "ATH cap: below-target price runs at max aggression"
+            "valley still funds the actual drawdown"
             `Quick
-            test_deploy_ath_cap_below_target
+            test_deploy_valley_still_funds_drawdown
         ; Alcotest.test_case
             "immature fallback sizing"
             `Quick

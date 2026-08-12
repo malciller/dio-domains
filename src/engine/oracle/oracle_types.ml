@@ -166,9 +166,10 @@ type sizing_result =
 
 (** Per-asset historical price-range reference, computed from the (deepened)
     series: the all-time high, the all-time low and where the current price
-    sits within that span. This is the "potential price range" of the asset -
-    the reference the sizing and spacing use to know how deep a fall from the
-    current level can plausibly go and how much of it has already happened. *)
+    sits within that span. Informational context only - the ATH/ATL span is
+    NOT the sizing drawdown (a 1000x run-up makes it look like a 99.9%
+    drawdown was possible); the sizing reference is the largest actual
+    peak-to-valley drawdown (see [p2v_stats]). *)
 type range_stats =
   { ath : float (** Highest high over the whole history. *)
   ; all_time_low : float (** Lowest low over the whole history. *)
@@ -180,7 +181,32 @@ type range_stats =
     (** Remaining straight-line fall to the historical low:
         (price - low) / price. 0 at the low, bounded by [range_span]. *)
   ; range_span : float
-    (** Widest drawdown the history has actually spanned: (ath - low) / ath. *)
+    (** Widest price span the history has actually traversed:
+        (ath - low) / ath. Context only - not the sizing drawdown. *)
+  }
+
+(** The largest drawdown the asset has ACTUALLY experienced, measured peak to
+    valley: each bar's drawdown from the running peak of closes (the highest
+    close seen so far) down to that bar's low, and the maximum over the whole
+    (deepened) history. This is the sizing reference: the grid must fund the
+    worst peak-to-valley fall the asset has really taken, from wherever the
+    price sits today. A 1000x run-up followed by a pullback only registers as
+    the fall that actually happened from the running peak - never as the
+    ATH-to-ATL span. [None] when the history is empty or no drawdown ever
+    occurred (a strictly monotone rising series). *)
+type p2v_stats =
+  { max_drawdown : float
+    (** Largest actual peak-to-valley drawdown in [0, 0.999999): the sizing
+        drawdown the grid must fund from the current price. *)
+  ; peak : float (** The close the worst drawdown started from. *)
+  ; peak_date : string (** ISO date of [peak]. *)
+  ; peak_idx : int
+  ; valley : float (** The low the worst drawdown fell to. *)
+  ; valley_date : string (** ISO date of [valley]. *)
+  ; valley_idx : int
+  ; price : float
+    (** Last close: where the price sits within the worst event's
+        [peak, valley] band (the range-side position reference). *)
   }
 
 (* ---- Deployment sizing (the engine's core output) ---- *)
@@ -211,9 +237,10 @@ type deployment_row =
   ; coverage : deployment_coverage list
     (** Per-horizon blended coverage at the replayed D_surv. *)
   ; static_funded : bool
-    (** The ATH-anchored runway (d_cover) is fundable at the sizing floor:
-        cost at q_min through d_cover fits the pool. The survival floor for
-        the parameter scan when the replay cannot clear the target. *)
+    (** The actual peak-to-valley runway (d_cover) is fundable at the sizing
+        floor: cost at q_min through d_cover fits the pool. The survival
+        floor for the parameter scan when the replay cannot clear the
+        target. *)
   ; passed : bool (** Every horizon clears the target survival on the replayed path. *)
   ; profit_proxy : float
     (** Net profit of one strategy cycle per unit of deployed capital
@@ -239,9 +266,9 @@ type parameter_components =
         target survival on the replayed path (in fallback mode, whose static
         ladder cost through the observed drawdown fits the pool). When no
         parameter can clear the replay target, the tightest parameter whose
-        ATH-anchored runway (d_cover) the pool can fund at the sizing floor -
-        the density the available capital and the asset's historical
-        volatility can actually afford. *)
+        runway for the actual max drawdown (d_cover) the pool can fund at the
+        sizing floor - the density the available capital and the asset's
+        historical volatility can actually afford. *)
   ; resolved_parameter : float
     (** Final parameter: the weighted blend of the fng / survival / range
         sides, clamped to the range and never tighter than
@@ -249,9 +276,10 @@ type parameter_components =
         aggression alike). *)
   ; fng_weight : float (** The weight the F&G side carried in the blend (0.5 default). *)
   ; range_parameter : float option
-    (** lo + (1 - position) * (hi - lo) with position = d_from_ath /
-        range_span in [0, 1]: near the ATH (position 0) spacing widens toward
-        hi, near the all-time low (position 1) it tightens toward lo. *)
+    (** lo + (1 - position) * (hi - lo) with position = (peak - price) /
+        (peak - valley) of the largest actual peak-to-valley event in [0, 1]:
+        above the event peak (position 0) spacing widens toward hi, at the
+        event valley (position 1) it tightens toward lo. *)
   ; range_weight : float
     (** The weight the range side carried in the blend (0.25 default). *)
   }
@@ -272,12 +300,10 @@ type asset_deployment =
     (** The horizon whose target drawdown is the deepest (the binding one). *)
   ; d_gov : float (** Deepest drawdown with F_blend(d) >= target across the horizons. *)
   ; d_cover : float
-    (** ATH-anchored survival drawdown: the fall from the current price down
-        to the absolute target level ATH * (1 - d_gov) that the grid must
-        fund. Anchoring at the ATH caps the ladder's scale absolutely - the
-        grid always covers down to the same price level, so the scale never
-        shrinks endlessly as the market grinds down. 0 once the price is at
-        or below the target level (only the first buy needs funding). *)
+    (** The sizing drawdown: the largest ACTUAL peak-to-valley drawdown of
+        the asset's history - the fall from the current price the grid must
+        fund. No ATH anchoring: a 1000x run-up only registers the falls that
+        actually happened, never the ATH-to-ATL span. *)
   ; parameter_components : parameter_components
   ; qty : float
   ; parameter : float (** Resolved strategy parameter (grid: grid interval in %). *)
@@ -285,7 +311,11 @@ type asset_deployment =
   ; min_quote_drawdown : float
   ; range : range_stats option
     (** Per-asset historical price-range reference (ATH / low / position).
-        None only when the series is empty. *)
+        Context only. None only when the series is empty. *)
+  ; p2v : p2v_stats option
+    (** The largest ACTUAL peak-to-valley drawdown event of the asset's
+        history - the sizing drawdown (d_cover) the grid must fund from the
+        current price. None only when the series is empty or monotone. *)
   ; coverage : deployment_coverage list
   ; warnings : string list
   ; tuning_rows : deployment_row list

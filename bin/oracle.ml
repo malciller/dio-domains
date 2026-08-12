@@ -288,9 +288,10 @@ let parse_args () =
       ; ( "--range-weight"
         , Arg.Float (fun f -> range_weight := f)
         , " weight of the per-asset historical range side in the gi blend (default \
-           0.25): near the ATH spacing widens (preserve runway), near the all-time low \
-           it tightens (aggressive accumulation); the blend is never tighter than the \
-           survival-constrained parameter" )
+           0.25): anchored on the largest actual peak-to-valley drawdown - above its \
+           peak spacing widens (preserve runway), at its valley it tightens (aggressive \
+           accumulation); the blend is never tighter than the survival-constrained \
+           parameter" )
       ; ( "--min-active-dsurv"
         , Arg.Float (fun f -> min_active_dsurv := f)
         , " assets whose replayed D_surv stays below this are recommended inactive and \
@@ -699,12 +700,22 @@ let deployment_block
       (pct d.d_gov)
       (pct d.d_surv)
       (pct d.min_quote_drawdown);
+    (match d.p2v with
+     | None -> line "    max drawdown (peak-to-valley): none (no drawdown in the history)"
+     | Some p ->
+       line
+         "    max drawdown (peak-to-valley): %s (peak %.2f on %s -> valley %.2f on %s)"
+         (pct p.max_drawdown)
+         p.peak
+         p.peak_date
+         p.valley
+         p.valley_date);
     (match d.range with
      | None -> ()
      | Some r ->
        line
          "    range: ATH %.2f, low %.2f, price %.2f   d_from_ath %s   d_to_low %s   span \
-          %s"
+          %s   (context only)"
          r.ath
          r.all_time_low
          r.price
@@ -1083,6 +1094,17 @@ let report_json
               ; "d_from_ath", `Float r.d_from_ath
               ; "d_to_low", `Float r.d_to_low
               ; "range_span", `Float r.range_span
+              ] )
+      ; ( "max_drawdown_p2v"
+        , match d.p2v with
+          | None -> `Null
+          | Some p ->
+            `Assoc
+              [ "drawdown", `Float p.max_drawdown
+              ; "peak", `Float p.peak
+              ; "peak_date", `String p.peak_date
+              ; "valley", `Float p.valley
+              ; "valley_date", `String p.valley_date
               ] )
       ; "d_surv", `Float d.d_surv
       ; "min_quote_drawdown", `Float d.min_quote_drawdown

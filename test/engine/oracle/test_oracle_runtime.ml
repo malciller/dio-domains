@@ -20,6 +20,7 @@ let make_decision ~active =
   ; pool_share = 100.0
   ; remainder = 0.0
   ; range = None
+  ; p2v = None
   ; parameter_components =
       { Dio_oracle.Oracle_types.fng = Some 50.0
       ; fng_parameter = Some 1.0

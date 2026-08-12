@@ -8,25 +8,20 @@
      - the position size qty,
      - whether the asset should stay active at all.
 
-   Survival is anchored at the ALL-TIME HIGH. The governing drawdown d_gov
-   (the deepest horizon drawdown with F_blend(d) >= target) is measured from
-   the ATH: the grid must cover the fall from the current price down to the
-   absolute target level ATH * (1 - d_gov). Converting to the ATH-anchored
-   drawdown d_cover = 1 - (1 - d_gov) / (1 - d_from_ath) caps the ladder's
-   scale absolutely - the grid always covers down to the same price level no
-   matter where the price sits, so the scale never shrinks endlessly as the
-   market grinds down and the deployed capital never grows without bound as
-   the price approaches the lows. Once the price is at or below the target
-   level (d_from_ath >= d_gov) the whole ATH-to-target span has already been
-   traversed: the required runway is zero, only the first buy needs funding,
-   and the model can be maximally aggressive.
+   The sizing drawdown is the largest drawdown the asset has ACTUALLY
+   experienced, measured peak to valley over its whole (deepened) history
+   (see Oracle_math.peak_to_valley_stats_of): the grid must fund the worst
+   peak-to-valley fall that really took place, from wherever the price sits
+   today. A 1000x run-up only registers the falls that actually happened -
+   never the ATH-to-ATL span, which would read as a phantom 99.9% drawdown.
 
    The deployment is tuned to be AS AGGRESSIVE AS POSSIBLE within the
    confined constraints: the tightest grid interval and the largest order qty
-   (config qty .. qty * qty_cap_mult) that still fund d_cover and clear the
-   target survival on the replayed path. The strategy is volume driven - more
-   fills and larger sizes are the point - but it must survive volatile
-   markets, and survival is the constraint that bounds the aggression.
+   (config qty .. qty * qty_cap_mult) that still fund the actual max
+   drawdown and clear the target survival on the replayed path. The strategy
+   is volume driven - more fills and larger sizes are the point - but it must
+   survive volatile markets, and survival is the constraint that bounds the
+   aggression.
 
    The verification replay is funded with the asset's actual pool budget
    (the capital the allocation hands it), not the static ladder cost: the
@@ -38,20 +33,25 @@
 
    Resolution order:
      1. governing drawdown from the blend models (None -> inactive),
-     2. parameter scan over [lo, hi]: survival_parameter = tightest parameter
+     2. sizing drawdown d_cover: the largest ACTUAL peak-to-valley drawdown
+        of the asset's history - the fall the grid must fund from the
+        current price (no ATH anchoring: a 1000x run-up must not turn into
+        a phantom 99.9% drawdown; only falls that really happened count),
+     3. parameter scan over [lo, hi]: survival_parameter = tightest parameter
         that clears the target on the replayed path; when no parameter can
         clear the replay target (the pool cannot survive the whole history),
-        the tightest parameter whose ATH-anchored runway the pool can fund at
-        the sizing floor (fallback mode: the tightest parameter whose static
-        ladder cost through the observed drawdown fits the pool),
-     3. resolved_parameter: equities = pure oracle (survival_parameter);
+        the tightest parameter whose runway for the actual max drawdown the
+        pool can fund at the sizing floor (fallback mode: the tightest
+        parameter whose static ladder cost through the observed drawdown
+        fits the pool),
+     4. resolved_parameter: equities = pure oracle (survival_parameter);
         crypto = the weighted blend of the fng side (fng_weight), the range
         side (range_weight) and the survival side (the remainder),
         renormalized when a side does not apply; clamped to the range and
         never tighter than survival_parameter (runway wins over sentiment),
-     4. final row at the resolved parameter (verification down-sizes qty if
+     5. final row at the resolved parameter (verification down-sizes qty if
         needed),
-     5. resolved qty: equities = the survival-max qty; crypto = the qty
+     6. resolved qty: equities = the survival-max qty; crypto = the qty
         blended with the F&G contrarian signal (fear up-sizes toward the
         survival max, greed pulls back toward the floor), never above the
         survival-max.
@@ -59,8 +59,8 @@
    In fallback mode (immature history: no horizon can clear the target
    survival) the observed max drawdown is the only signal and the replay
    D_surv is not a usable tuning signal, so the static funding check drives
-   the grid: the pool must fund the observed drawdown (ATH-anchored) at the
-   sizing floor; qty then grows up to the qty_cap while the static check
+   the grid: the pool must fund the actual max drawdown (peak-to-valley) at
+   the sizing floor; qty then grows up to the qty_cap while the static check
    holds (volume-driven - the old "pin at the floor" rule is superseded).
 
    Everything here is pure (no IO) and strategy-generic: instantiate
@@ -159,23 +159,28 @@ let governing_basis ~(models : Oracle_replay.blend_model list) ~(target_survival
      | None -> None)
 ;;
 
-(* The range helpers ([range_stats_of], [ath_anchored_drawdown]) live in
-   Oracle_math (dependency-free) so the sizing inversions in Oracle_replay can
-   share the same ATH-anchored scale cap without a module cycle. *)
+(* The drawdown references ([range_stats_of], [peak_to_valley_stats_of])
+   live in Oracle_math (dependency-free) so the sizing inversions in
+   Oracle_replay can share the same actual peak-to-valley reference without a
+   module cycle. *)
 
 (** The range side of the parameter blend: [lo + (1 - position) * (hi - lo)]
-    with position = d_from_ath / range_span clamped to [0, 1]. Near the ATH
-    (position ~ 0) the potential fall is the whole historical span, so
-    spacing widens toward hi (preserve runway); near the all-time low
-    (position ~ 1) the remaining downside is bounded by the observed range,
-    so spacing tightens toward lo - an aggressive accumulator zone that works
-    with the F&G contrarian convention. [None] when the range carries no
-    information (empty history or zero span). *)
-let range_parameter ~(lo : float) ~(hi : float) (r : range_stats) : float option =
-  if r.range_span <= 0.0
+    with position = (peak - price) / (peak - valley) clamped to [0, 1],
+    where (peak, valley) is the largest ACTUAL peak-to-valley drawdown event
+    of the asset's history. Above the event peak (position ~ 0) a fall of the
+    full max drawdown is still possible, so spacing widens toward hi
+    (preserve runway); at the event valley (position ~ 1) the remaining
+    downside is bounded by what actually happened, so spacing tightens toward
+    lo - an aggressive accumulator zone that works with the F&G contrarian
+    convention. Anchoring on the real event instead of the ATH/ATL span means
+    a 1000x run-up never distorts the side into a phantom range. [None] when
+    the asset never actually drew down (strictly monotone history). *)
+let range_parameter ~(lo : float) ~(hi : float) (p : p2v_stats) : float option =
+  let span = p.peak -. p.valley in
+  if span <= 0.0
   then None
   else (
-    let position = Float.max 0.0 (Float.min 1.0 (r.d_from_ath /. r.range_span)) in
+    let position = Float.max 0.0 (Float.min 1.0 ((p.peak -. p.price) /. span)) in
     Some (lo +. ((1.0 -. position) *. (hi -. lo))))
 ;;
 
@@ -257,9 +262,9 @@ module Engine (M : Oracle_strategy.S) = struct
 
       The criterion is [fallback]-aware: in fallback (immature) mode the
       target survival is unattainable by construction, so the criterion
-      becomes the static funding check - the pool can fund the ATH-anchored
-      runway at this parameter and qty (the ladder cost through d_cover fits
-      the pool). The replay D_surv is deliberately not used there: on a
+      becomes the static funding check - the pool can fund the actual
+      peak-to-valley runway at this parameter and qty (the ladder cost
+      through d_cover fits the pool). The replay D_surv is deliberately not used there: on a
       short, quiet (or trough-ending) history the strategy never exhausts on
       the replayed path (d_surv = 1.0), so a replay criterion would pass at
       every parameter and collapse the tuning onto the tightest config value
@@ -368,13 +373,13 @@ module Engine (M : Oracle_strategy.S) = struct
   (** The deployment row for one candidate parameter: qty inverted from the
       pool (bounded by the qty_cap), then down-sized by the verification loop
       if the replayed path cannot clear the target. [deployed] is the
-      floor-aware cost through the ATH-anchored drawdown d_cover at the final
-      qty, capped at the pool. A row that does not pass keeps the largest
+      floor-aware cost through the actual peak-to-valley drawdown d_cover at
+      the final qty, capped at the pool. A row that does not pass keeps the largest
       qty that does (or the sizing floor when nothing clears).
 
-      [static_funded] is the survival floor: the ATH-anchored runway is
-      fundable at the sizing floor (cost at q_min through d_cover fits the
-      pool). Even when the replayed path cannot clear the target at any
+      [static_funded] is the survival floor: the actual peak-to-valley
+      runway is fundable at the sizing floor (cost at q_min through d_cover
+      fits the pool). Even when the replayed path cannot clear the target at any
       sizing (the pool cannot survive the whole history), a static-funded
       row is the most aggressive density the capital can actually afford and
       carries the parameter scan when nothing passes.
@@ -447,8 +452,8 @@ module Engine (M : Oracle_strategy.S) = struct
       if fallback
       then
         (* Immature history: the criterion is the static funding check - the
-           grid at this density can fund the ATH-anchored drawdown even at
-           the sizing floor (the binding qty). *)
+           grid at this density can fund the actual peak-to-valley drawdown
+           even at the sizing floor (the binding qty). *)
         static_funded
       else
         List.for_all
@@ -474,21 +479,20 @@ module Engine (M : Oracle_strategy.S) = struct
 
        Resolution order:
         1. governing drawdown from the blend models (None -> inactive),
-        2. ATH-anchored survival drawdown d_cover: the fall from the current
-          price down to the absolute target level ATH * (1 - d_gov). The
-          ladder always covers down to the same absolute price level, so the
-          scale is absolutely capped and never shrinks endlessly as the
-          market grinds down; once the price is at or below the target level
-          the required runway is zero (only the first buy needs funding).
+        2. sizing drawdown d_cover: the largest ACTUAL peak-to-valley
+          drawdown of the asset's history - the fall from the current price
+          the grid must fund. No ATH anchoring: a 1000x run-up only
+          registers the falls that actually happened, never the ATH-to-ATL
+          span (a phantom 99.9% drawdown).
         3. parameter scan over [lo, hi]: survival_parameter = tightest
           parameter that clears the target on the replayed path (in fallback
           mode: the tightest parameter whose static ladder cost through the
           observed drawdown fits the pool - the replay cannot tune on an
           immature history). When NO parameter can clear the replay target
           (the pool cannot survive the whole replayed history), the tightest
-          parameter whose ATH-anchored runway the pool can fund at the
-          sizing floor - as aggressive as the capital allows, with the
-          shortfall flagged in the warnings.
+          parameter whose runway for the actual max drawdown the pool can
+          fund at the sizing floor - as aggressive as the capital allows,
+          with the shortfall flagged in the warnings.
         4. resolved_parameter: equities = pure oracle, the survival
           parameter itself; crypto = the weighted blend of the fng side
           (fng_weight), the range side (range_weight: the per-asset
@@ -512,10 +516,10 @@ module Engine (M : Oracle_strategy.S) = struct
 
        In fallback mode (immature history) the observed max drawdown is the
        only signal: the criterion is the static funding check (the pool can
-       fund the ATH-anchored drawdown at the sizing floor), and the order qty
-       still grows up to the qty_cap while the check holds - the strategy is
-       volume driven, so an immature asset deploys as much as its observed
-       risk allows instead of being pinned at the floor.
+       fund the actual peak-to-valley drawdown at the sizing floor), and the
+       order qty still grows up to the qty_cap while the check holds - the
+       strategy is volume driven, so an immature asset deploys as much as its
+       observed risk allows instead of being pinned at the floor.
 
        [qty_cap_mult] is the deployment ceiling as a multiple of the template
        qty (the config's design qty): the default 1.0 caps each asset's
@@ -547,15 +551,21 @@ module Engine (M : Oracle_strategy.S) = struct
     let q_min = sizing_floor ~cfg in
     let lo = Float.min lo hi in
     let hi = Float.max lo hi in
-    (* Per-asset historical price-range reference (ATH -> all-time low) and
-       the range side of the parameter blend: near the ATH the potential fall
-       is the whole historical span, so spacing widens (preserve runway);
-       near the lows the remaining downside is bounded, so spacing tightens -
-       an aggressive accumulator working with the F&G contrarian signal. *)
+    (* Per-asset historical price-range reference (ATH -> all-time low,
+       display context) and the largest ACTUAL peak-to-valley drawdown event
+       (the sizing drawdown). The range side of the parameter blend uses the
+       p2v event: where the price sits within the worst drawdown's
+       [peak, valley] band. Above the event peak the full max drawdown is
+       still ahead, so spacing widens (preserve runway); at the event valley
+       the downside is bounded by what actually happened, so spacing tightens
+       - an aggressive accumulator working with the F&G contrarian signal.
+       A 1000x run-up only registers the falls that actually happened, never
+       the ATH-to-ATL span (which would read as a phantom 99.9% drawdown). *)
     let range = Oracle_math.range_stats_of asset in
+    let p2v = Oracle_math.peak_to_valley_stats_of asset in
     let range_parameter =
-      match range with
-      | Some r -> range_parameter ~lo ~hi r
+      match p2v with
+      | Some p -> range_parameter ~lo ~hi p
       | None -> None
     in
     let empty_row parameter =
@@ -594,6 +604,7 @@ module Engine (M : Oracle_strategy.S) = struct
       ; d_surv = 0.0
       ; min_quote_drawdown = 0.0
       ; range
+      ; p2v
       ; coverage = []
       ; warnings = []
       ; tuning_rows = []
@@ -615,12 +626,16 @@ module Engine (M : Oracle_strategy.S) = struct
         "no usable history: no MFD windows on any horizon (each horizon needs warmup + \
          horizon + 2 bars)"
     | Some (d_gov, governing_horizon, fallback) ->
-      (* ATH-anchored survival drawdown: the fall from the current price down
-         to the absolute target level ATH * (1 - d_gov) that the grid must
-         fund. The absolute cap on the ladder's scale. *)
+      (* Sizing drawdown: the largest drawdown the asset has ACTUALLY
+         experienced, peak to valley, over its whole (deepened) history -
+         the fall from the current price that the grid must fund. No ATH
+         anchoring: a 1000x run-up must not inflate the sizing into a phantom
+         99.9% drawdown; only falls that really took place count. Falls back
+         to the statistical governing drawdown when the series never drew
+         down (strictly monotone history). *)
       let d_cover =
-        match range with
-        | Some r -> Oracle_math.ath_anchored_drawdown ~d_gov r
+        match p2v with
+        | Some p -> p.Oracle_types.max_drawdown
         | None -> d_gov
       in
       let evaluable_models =
@@ -654,7 +669,7 @@ module Engine (M : Oracle_strategy.S) = struct
              cost_one)
       else (
         (* 1. parameter scan: tightest parameter clearing the target on the
-           replayed path (fallback: the static ATH-anchored funding check). *)
+           replayed path (fallback: the static peak-to-valley funding check). *)
         let candidates =
           Array.init param_steps (fun i ->
             lo +. ((hi -. lo) *. (float_of_int i /. float_of_int (param_steps - 1))))
@@ -679,9 +694,10 @@ module Engine (M : Oracle_strategy.S) = struct
         in
         let first_passing = List.find_opt (fun (r : deployment_row) -> r.passed) rows in
         (* When no parameter can clear the replay target, survival_parameter
-           falls back to the tightest parameter whose ATH-anchored runway the
-           pool can fund at the sizing floor - as aggressive as the capital
-           actually covers, with the shortfall flagged in the warnings. *)
+           falls back to the tightest parameter whose runway for the actual
+           max drawdown the pool can fund at the sizing floor - as aggressive
+           as the capital actually covers, with the shortfall flagged in the
+           warnings. *)
         let first_static_funded =
           List.find_opt (fun (r : deployment_row) -> r.static_funded) rows
         in
@@ -825,8 +841,8 @@ module Engine (M : Oracle_strategy.S) = struct
         then
           warnings
           := Printf.sprintf
-               "parameter blend %.2f clamped to the survival-constrained %.2f (runway \
-                wins over sentiment)"
+               "gi blend %.2f%% clamped up to the survival-constrained %.2f%% - the pool \
+                share can't fund the denser grid (runway wins over sentiment)"
                resolved_parameter
                survival_parameter
              :: !warnings;
@@ -834,10 +850,9 @@ module Engine (M : Oracle_strategy.S) = struct
         then
           warnings
           := Printf.sprintf
-               "cannot clear the %.0f%% target survival on the replayed path at any grid \
-                interval (D_surv %.1f%% at the floor); sized to the tightest \
-                ATH-anchored runway the pool funds - increase the pool or lower \
-                --target-survival to clear the target"
+               "%.0f%% survival target unreachable at any grid interval (best D_surv \
+                %.1f%% at minimum order size); sized to the tightest grid the pool share \
+                can fund - increase the pool or lower --target-survival"
                (target_survival *. 100.0)
                (row.d_surv_replay *. 100.0)
              :: !warnings;
@@ -849,17 +864,17 @@ module Engine (M : Oracle_strategy.S) = struct
                 let cfg_final = M.set_parameter cfg parameter_final in
                 let n_fills_final = M.fills_for_drawdown cfg_final ~d:d_cover in
                 Printf.sprintf
-                  "cannot fund the ATH-anchored drawdown %.1f%% at qty_min at gi %.2f%% \
-                   (ladder cost %.2f > pool %.2f); increase the pool or loosen the \
-                   grid_interval config"
+                  "under-funded: the %.1f%% drawdown needs $%.2f at minimum order size \
+                   but the pool share is $%.2f (grid %.2f%%); increase the pool or \
+                   loosen the grid_interval config"
                   (d_cover *. 100.0)
-                  parameter_final
                   (M.cost_at cfg_final ~qty:q_min ~n_fills:n_fills_final)
-                  pool)
+                  pool
+                  parameter_final)
               else
                 Printf.sprintf
-                  "under-funded: pool %.2f cannot fund the %.1f%% ATH-anchored drawdown \
-                   at qty_min (ladder cost %.2f > pool); increase the pool or lower \
+                  "under-funded: pool share $%.2f can't fund the %.1f%% drawdown - needs \
+                   $%.2f at minimum order size; increase the pool or lower \
                    --target-survival"
                   pool
                   (d_cover *. 100.0)
@@ -911,6 +926,7 @@ module Engine (M : Oracle_strategy.S) = struct
         ; d_surv = row.d_surv_replay
         ; min_quote_drawdown = row.min_quote_drawdown
         ; range
+        ; p2v
         ; coverage = row.coverage
         ; warnings = List.rev !warnings
         ; tuning_rows = rows
