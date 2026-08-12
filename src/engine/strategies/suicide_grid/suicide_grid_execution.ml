@@ -420,15 +420,37 @@ let evaluate_buy_leg
       in
       if is_our_strategy && side_str = "buy"
       then (
-        let cancel_order =
-          create_cancel_order order_id asset.symbol Grid asset.exchange
+        (* An amend on Alpaca is cancel+create under the hood: while it is in
+           flight the open-order scan transiently lists both the old id and
+           the replacement, which trips the ">1 buys" branch below. Cancelling
+           the old id then races the amend (the cancel is ignored or bounced),
+           so skip orders that are mid-amendment - the amend replaces them. *)
+        let is_mid_amend =
+          InFlightAmendments.is_in_flight order_id
+          || List.exists
+               (fun (id, _, _, _) ->
+                  String.starts_with ~prefix:"pending_amend_" id
+                  && String.length id > 14
+                  && String.sub id 14 (String.length id - 14) = order_id)
+               state.pending_orders
         in
-        ignore (push_order ~now ~state cancel_order);
-        Logging.info_f
-          ~section
-          "Cancelling excess buy order: %s for %s"
-          order_id
-          asset.symbol));
+        if is_mid_amend
+        then
+          Logging.info_f
+            ~section
+            "Skipping cancel of mid-amendment buy order %s for %s (amend will replace it)"
+            order_id
+            asset.symbol
+        else (
+          let cancel_order =
+            create_cancel_order order_id asset.symbol Grid asset.exchange
+          in
+          ignore (push_order ~now ~state cancel_order);
+          Logging.info_f
+            ~section
+            "Cancelling excess buy order: %s for %s"
+            order_id
+            asset.symbol)));
     state.last_buy_order_id <- None;
     state.last_buy_order_price <- None;
     state.last_cycle <- cycle)

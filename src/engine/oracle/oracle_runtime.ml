@@ -1017,8 +1017,8 @@ let size_asset
   then
     Logging.info_f
       ~section
-      "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | drop \
-       %s | survives %.1f%% | %s"
+      "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | %s | \
+       survives %.1f%% | %s"
       index
       n_tasks
       exchange
@@ -1238,6 +1238,11 @@ let run_pass
     Lwt.return_unit)
   else (
     Hashtbl.reset fetch_cache;
+    (* Balance snapshots must also refresh each pass: Oracle_balances caches
+       per (exchange, testnet) for the short-lived CLI oracle, but the engine
+       runs continuously - without this, venue pools stay frozen at the
+       startup snapshot forever. *)
+    Oracle_balances.clear_cache ();
     let fng = resolve_fng () in
     let grouped = group_by_account tasks in
     Logging.info_f
