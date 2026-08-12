@@ -22,13 +22,19 @@
    every active asset reaches its full drawdown runway; only under a genuine
    capital shortage does the lowest-priority asset go inactive.
 
-   Deployment is capital-maximizing (qty_cap_mult = 0 by default): each asset
-   grows its order qty until the ladder's runway through the governing drawdown
-   consumes the budget it is handed, or the replayed path can no longer clear
-   the target survival (the sizing is then shrunk back to the largest surviving
-   qty and the excess passes to the next asset). The qty only ever respects the
-   venue floor (>= qty_min) and the survival constraint; the config qty remains
-   the template/fallback, not a ceiling.
+   Deployment is target-driven: every asset is sized to meet the target
+   survival and nothing more. A normal (authoritative-history) asset grows its
+   order qty until the ladder's runway through the governing drawdown consumes
+   the budget it is handed, or the replayed path can no longer clear the
+   target survival (the sizing is then shrunk back to the largest surviving
+   qty and the excess passes to the next asset). An immature (fallback) asset
+   is pinned at the sizing floor - the observed drawdown is fully funded at
+   the floor and a larger qty would deploy more capital for zero additional
+   survival - so its deployment is exactly its reservation and the rest of the
+   pool passes down the priority order. The qty only ever respects the venue
+   floor (>= qty_min), the survival constraint and the optional qty_cap_mult
+   ceiling (config-only concentration limit; the runtime default 0.0 =
+   uncapped); the config qty remains the template/fallback, not a ceiling.
 
    A fully deployed account shows a ~zero available-quote pool, so every asset
    publishes inactive ("cannot fund the first buy") while it awaits sell fills

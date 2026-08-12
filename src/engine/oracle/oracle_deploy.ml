@@ -31,6 +31,15 @@
    bisection-refines the boundary cell, mirroring
    Oracle_replay.Sizing.empirical_min_capital.
 
+   In fallback mode (immature history: no horizon can clear the target
+   survival) survival_parameter is the tightest parameter whose static ladder
+   cost through the deepest drawdown the history has actually observed fits
+   the pool. The observed max drawdown is a real signal even when the
+   coverage curve is not authoritative, and the replay D_surv is not a usable
+   tuning signal on such a short history (the strategy can never exhaust on
+   it), so the static funding check drives the grid instead of collapsing
+   onto the tightest config value.
+
    Everything here is pure (no IO) and strategy-generic: instantiate
    [Engine] with an Oracle_strategy.S model (Oracle_strategy.Grid today) and
    the deployment, allocation and reserve semantics are shared as-is. The CLI
@@ -204,14 +213,20 @@ module Engine (M : Oracle_strategy.S) = struct
 
       The criterion is [fallback]-aware: in fallback (immature) mode the
       target survival is unattainable by construction, so the criterion
-      becomes "the replayed D_surv covers the governing drawdown" (the sizing
-      actually survives the deepest drawdown the history has observed);
-      otherwise it is the usual per-horizon target coverage. *)
+      becomes the static funding check - the pool can fund the deepest
+      drawdown the history has actually observed at this parameter and qty
+      (the ladder cost through the observed d_gov fits the pool). The replay
+      D_surv is deliberately not used there: on a short, quiet (or trough-
+      ending) history the strategy never exhausts on the replayed path
+      (d_surv = 1.0), so a replay criterion would pass at every parameter and
+      collapse the tuning onto the tightest config value for the wrong reason.
+      The static check is a real function of the limited history - its
+      observed max drawdown - and the pool; otherwise the criterion is the
+      usual per-horizon target coverage. *)
   let shrink_qty
         ~(cfg : M.config)
         ~(pool : float)
         ~(n_fills : int)
-        ~(d_gov : float)
         ~(fallback : bool)
         ~(asset : series)
         ~(models : Oracle_replay.blend_model list)
@@ -221,18 +236,17 @@ module Engine (M : Oracle_strategy.S) = struct
         ~(scan_points : int)
     : (M.config * M.outcome * deployment_coverage list * float) option
     =
-    let criterion_met out coverage =
-      if fallback
-      then out.M.d_surv +. 1e-9 >= d_gov
-      else
-        List.for_all
-          (fun (c : deployment_coverage) ->
-             c.blended_coverage +. 1e-12 >= target_survival)
-          coverage
+    let criterion_met coverage =
+      List.for_all
+        (fun (c : deployment_coverage) -> c.blended_coverage +. 1e-12 >= target_survival)
+        coverage
     in
     let passes qty =
-      let _, out, coverage = verify_at_qty ~cfg ~pool ~n_fills ~asset ~models ~qty in
-      criterion_met out coverage
+      if fallback
+      then M.cost_at cfg ~qty ~n_fills <= pool +. 1e-9
+      else (
+        let _, _, coverage = verify_at_qty ~cfg ~pool ~n_fills ~asset ~models ~qty in
+        criterion_met coverage)
     in
     if q_hi <= q_lo
     then
@@ -324,10 +338,22 @@ module Engine (M : Oracle_strategy.S) = struct
     let n_fills = M.fills_for_drawdown cfg ~d:d_gov in
     let q_min = sizing_floor ~cfg in
     let qty_full =
-      let qty = qty_for_pool ~cfg ~n_fills ~pool in
-      match qty_cap with
-      | Some cap when cap >= q_min -> Float.min qty cap
-      | _ -> qty
+      if fallback
+      then
+        (* Immature history: no survival signal justifies growing the order
+           qty beyond the floor. The observed drawdown is funded at the floor
+           (larger qtys fund the same drawdown at the same D_surv, so the
+           extra capital buys no survival), so the fallback deployment is
+           exactly the funding through the observed drawdown at the floor -
+           the asset's reservation - and the rest of the pool passes down the
+           priority order instead of being absorbed by an asset whose target
+           it cannot improve on. *)
+        q_min
+      else (
+        let qty = qty_for_pool ~cfg ~n_fills ~pool in
+        match qty_cap with
+        | Some cap when cap >= q_min -> Float.min qty cap
+        | _ -> qty)
     in
     let d_surv_static = M.drawdown_of_fills cfg ~n_fills in
     let out, coverage, qty =
@@ -336,7 +362,6 @@ module Engine (M : Oracle_strategy.S) = struct
           ~cfg
           ~pool
           ~n_fills
-          ~d_gov
           ~fallback
           ~asset
           ~models
@@ -347,8 +372,9 @@ module Engine (M : Oracle_strategy.S) = struct
       with
       | Some (_, out, coverage, qty) -> out, coverage, qty
       | None ->
-        (* min_qty cannot clear the survival criterion on the replayed path:
-           keep min_qty and report the shortfall. *)
+        (* min_qty cannot clear the survival criterion (target coverage on the
+           replayed path, or the fallback funding check): keep min_qty and
+           report the shortfall. *)
         let _, out, coverage =
           verify_at_qty ~cfg ~pool ~n_fills ~asset ~models ~qty:q_min
         in
@@ -357,7 +383,11 @@ module Engine (M : Oracle_strategy.S) = struct
     let deployed = Float.min pool (M.cost_at cfg ~qty ~n_fills) in
     let passed =
       if fallback
-      then out.M.d_surv +. 1e-9 >= d_gov
+      then
+        (* The grid at this density can fund the observed drawdown even at
+           the sizing floor (the binding qty): any larger qty only costs
+           more. *)
+        M.cost_at cfg ~qty:q_min ~n_fills <= pool +. 1e-9
       else
         List.for_all
           (fun (c : deployment_coverage) ->
@@ -380,9 +410,12 @@ module Engine (M : Oracle_strategy.S) = struct
       [asset], [models], [cfg] and the pool are resolved by the caller.
 
       Resolution order:
-      1. governing drawdown from the blend models (None -> inactive),
-      2. parameter scan over [lo, hi]: survival_parameter = tightest parameter
-         that clears the target on the replayed path,
+       1. governing drawdown from the blend models (None -> inactive),
+       2. parameter scan over [lo, hi]: survival_parameter = tightest parameter
+          that clears the target on the replayed path (in fallback mode: the
+          tightest parameter whose static ladder cost through the observed
+          drawdown fits the pool - the replay cannot tune on an immature
+          history),
       3. resolved_parameter = fng_weight * fng_parameter + (1 - fng_weight) *
          survival_parameter for crypto (use_fng), survival_parameter alone for
          equities; clamped to the range and never tighter than
@@ -390,19 +423,27 @@ module Engine (M : Oracle_strategy.S) = struct
       4. final row at the resolved parameter (verification down-sizes qty if
          needed).
 
-      Inactive reasons: no reachable horizon, a pool that cannot fund even the
-      first buy at the sizing floor (the venue lot or the config qty,
-      whichever is larger - sizing never drops below the configured qty), or a
-      replayed D_surv below [min_active_dsurv]. An under-funded ACTIVE asset
-      keeps its whole share (config-order priority) and runs at the floor with
-      the shortfall flagged in [warnings].
+       Inactive reasons: no reachable horizon, a pool that cannot fund even the
+       first buy at the sizing floor (the venue lot or the config qty,
+       whichever is larger - sizing never drops below the configured qty), or a
+       replayed D_surv below [min_active_dsurv]. An under-funded ACTIVE asset
+       keeps its whole share (config-order priority) and runs at the floor with
+       the shortfall flagged in [warnings].
 
-      [qty_cap_mult] is the deployment ceiling as a multiple of the template
-      qty (the config's design qty): the default 1.0 caps each asset's
-      deployment at its design capital so a surplus passes down the priority
-      order instead of letting the highest-priority asset absorb the whole
-      venue pool; 0.0 disables the cap (full deployment of whatever pool the
-      asset is handed). *)
+       In fallback mode (immature history) the order qty is pinned at the
+       sizing floor: the observed drawdown is the only signal, it is fully
+       funded at the floor, and any larger qty deploys more capital for zero
+       additional survival - so the fallback deployment is exactly the asset's
+       reservation and the rest of the pool passes down the priority order to
+       assets that can still use it to meet the target.
+
+       [qty_cap_mult] is the deployment ceiling as a multiple of the template
+       qty (the config's design qty): the default 1.0 caps each asset's
+       deployment at its design capital so a surplus passes down the priority
+       order instead of letting the highest-priority asset absorb the whole
+       venue pool; 0.0 disables the cap (full deployment of whatever pool the
+       asset is handed). The ceiling never applies in fallback mode (the floor
+       pin is stricter). *)
   let deploy_asset
         ~(asset : series)
         ~(cfg : M.config)
@@ -627,12 +668,17 @@ module Engine (M : Oracle_strategy.S) = struct
         then
           warnings
           := (if fallback
-              then
+              then (
+                let cfg_final = M.set_parameter cfg parameter_final in
+                let n_fills_final = M.fills_for_drawdown cfg_final ~d:d_gov in
                 Printf.sprintf
-                  "cannot fund the deepest observed drawdown %.1f%% at qty_min on the \
-                   replayed path (D_surv %.1f%%); increase the pool"
+                  "cannot fund the deepest observed drawdown %.1f%% at qty_min at gi \
+                   %.2f%% (ladder cost %.2f > pool %.2f); increase the pool or loosen \
+                   the grid_interval config"
                   (d_gov *. 100.0)
-                  (row.d_surv_replay *. 100.0)
+                  parameter_final
+                  (M.cost_at cfg_final ~qty:q_min ~n_fills:n_fills_final)
+                  pool)
               else
                 Printf.sprintf
                   "under-funded: pool %.2f cannot fund the %.1f%% target drawdown at \

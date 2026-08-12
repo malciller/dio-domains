@@ -155,38 +155,6 @@ let parse_hyperliquid_spot (json : Yojson.Safe.t) : (balance list, string) resul
   | _ -> Error "Hyperliquid spot response has no balances list"
 ;;
 
-let parse_hyperliquid_clearinghouse (json : Yojson.Safe.t) : (balance list, string) result
-  =
-  let json = unwrap_hyperliquid_data json in
-  let open Yojson.Safe.Util in
-  let margin =
-    match member "marginSummary" json with
-    | `Assoc _ as value -> value
-    | _ -> json
-  in
-  match field_float json "withdrawable", field_float margin "accountValue" with
-  | Some available, Some total when Float.is_finite available && Float.is_finite total ->
-    Ok
-      [ { asset = "USDC"
-        ; available = nonnegative available
-        ; total = nonnegative total
-        ; wallet_type = "perp"
-        ; wallet_id = "account"
-        }
-      ]
-  | Some available, None when Float.is_finite available ->
-    Ok
-      [ { asset = "USDC"
-        ; available = nonnegative available
-        ; total = nonnegative available
-        ; wallet_type = "perp"
-        ; wallet_id = "account"
-        }
-      ]
-  | None, _ -> Error "Hyperliquid clearinghouse response has no withdrawable balance"
-  | _ -> Error "Hyperliquid clearinghouse response contains malformed amounts"
-;;
-
 let parse_alpaca_account (json : Yojson.Safe.t) : (balance list, string) result =
   match field_float json "cash", field_float json "equity" with
   | Some cash, Some equity when Float.is_finite cash && Float.is_finite equity ->
@@ -349,28 +317,16 @@ let fetch_hyperliquid ~testnet () : (balance list, string) result Lwt.t =
   | None | Some "" -> Lwt.return (Error "HYPERLIQUID_WALLET_ADDRESS is not set")
   | Some wallet ->
     let base_url = hyperliquid_base_url testnet in
+    (* The suicide_grid strategy trades spot only, so the pool is the spot
+       wallet's USDC (and any other spot tokens) exclusively. The perpetual
+       clearinghouse balance is deliberately not included: it is margin
+       reserved for perp positions, not capital available to the spot grid. *)
     post_json
       ~url:(base_url ^ "/info")
       (`Assoc [ "type", `String "spotClearinghouseState"; "user", `String wallet ])
-    >>= (function
-     | Error error -> Lwt.return (Error ("Hyperliquid spot: " ^ error))
-     | Ok spot_json ->
-       (match parse_hyperliquid_spot spot_json with
-        | Error error -> Lwt.return (Error error)
-        | Ok spot ->
-          post_json
-            ~url:(base_url ^ "/info")
-            (`Assoc [ "type", `String "clearinghouseState"; "user", `String wallet ])
-          >>= fun perp_json ->
-          let perp =
-            match perp_json with
-            | Error _ -> []
-            | Ok json ->
-              Option.value
-                (Result.to_option (parse_hyperliquid_clearinghouse json))
-                ~default:[]
-          in
-          Lwt.return (Ok (merge_balances (spot @ perp)))))
+    >|= (function
+     | Error error -> Error ("Hyperliquid spot: " ^ error)
+     | Ok spot_json -> parse_hyperliquid_spot spot_json)
 ;;
 
 let fetch_alpaca ~testnet () : (balance list, string) result Lwt.t =

@@ -166,6 +166,19 @@ module Grid : S with type config = Dio_strategies.Grid_core.config = struct
       |> Array.map (fun (b : Oracle_types.bar) ->
         Dio_strategies.Grid_core_types.{ high = b.high; low = b.low; close = b.close })
     in
+    (* Anchor the ladder at the path's START (the earliest bar), not the last
+       close: the replay simulates the strategy as if it had been running
+       since the beginning of the available history, so the anchor and the
+       path are time-consistent. Anchoring at the last close (today's price)
+       would grind the ladder down through the whole historical range below
+       it on any net-uptrend history - buying hundreds of levels in the first
+       bars toward prices the strategy would never have seen - burning the
+       capital on a phantom drawdown (the Grid_core ladder trails the market
+       up, it never starts above it). The static funding math keeps the
+       config start_price (today's price); only the replay anchor changes. *)
+    let g =
+      if Array.length bars = 0 then g else { g with G.start_price = bars.(0).close }
+    in
     let r = G.replay g ~bars ~ordering:Dio_strategies.Grid_core_types.Buy_first in
     { d_surv = d_surv_of_result r
     ; exhausted = r.exhausted

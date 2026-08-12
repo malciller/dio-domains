@@ -371,6 +371,40 @@ let crash_series ~n =
   { Oracle_types.symbol = "CRASH"; calendar_kind = Oracle_types.Crypto; bars; gaps = [] }
 ;;
 
+(** A short series that ends at the trough of its own ~60% crash: with the
+    ladder anchored at the path's first close and trailing the market, the
+    replay now honestly realizes the crash (D_surv ~ the observed drawdown).
+    This is the SPCX-shaped immature asset: the observed max drawdown is the
+    only real signal. The gentle oscillation keeps the pre-crash segment
+    volatile so the MFD window is not excluded as flat data. *)
+let trough_series ~n =
+  let iso day = Oracle_calendar.add_days "2020-01-01" day in
+  let price = ref 100.0 in
+  let bars =
+    Array.make
+      n
+      Oracle_types.{ date = ""; open_ = 0.; high = 0.; low = 0.; close = 0.; volume = 0. }
+  in
+  for i = 0 to n - 1 do
+    (* 18 consecutive -5% bars ending the series: a ~60% crash that starts
+       inside the single MFD window (bars 61-81 at n=90, warmup 60) and ends
+       at the trough. *)
+    let osc = 0.003 *. sin (float_of_int i /. 9.0) in
+    let crash = if i >= n - 18 then 0.95 else 1.0 in
+    price := !price *. (1.0 +. osc) *. crash;
+    let p = !price in
+    bars.(i)
+    <- { Oracle_types.date = iso i
+       ; open_ = p
+       ; high = p *. 1.001
+       ; low = p *. 0.999
+       ; close = p
+       ; volume = 1000.0
+       }
+  done;
+  { Oracle_types.symbol = "TROUGH"; calendar_kind = Oracle_types.Crypto; bars; gaps = [] }
+;;
+
 let test_deepest_observed_drawdown () =
   let ms = models ~asset in
   let d, label =
@@ -441,6 +475,200 @@ let test_deploy_fallback_immature () =
      target is 0.99 and a normal class lets the raw sizing pass.) *)
   Alcotest.(check bool) "tuning surface present" (d.tuning_rows <> []) true;
   Alcotest.(check bool) "deployed fits the pool" (d.deployed <= 5_000.0 +. 1e-9) true
+;;
+
+let test_fallback_tunes_parameter_to_funding () =
+  (* The fallback (immature-history) parameter must be tuned by the static
+     funding check against the observed max drawdown - not collapse onto
+     gi_lo. A replay-based fallback criterion is unusable on an immature
+     history (the replay is not authoritative), so the criterion is the
+     static funding check: the pool must fund the observed drawdown at the
+     floor qty at the chosen gi. The grid loosens until the pool can fund
+     it. *)
+  let trough = trough_series ~n:90 in
+  let crash = crash_series ~n:200 in
+  let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
+  let m =
+    Oracle_replay.blend_model_of
+      ~horizon:h21
+      ~asset:trough
+      ~class_members:[ crash ]
+      ~kappa:10
+      ~warmup
+      ()
+  in
+  (* Fallback: the blend cannot clear the extreme target. *)
+  (match Oracle_deploy.governing_drawdown ~models:[ m ] ~target_survival:1.0 with
+   | Some _ -> Alcotest.fail "expected unreachable governing drawdown"
+   | None -> ());
+  let d_gov, _ =
+    match Oracle_deploy.deepest_observed_drawdown [ m ] with
+    | Some x -> x
+    | None -> Alcotest.fail "expected a deepest observed drawdown"
+  in
+  Alcotest.(check bool) "observed crash drawdown is real" (d_gov > 0.3) true;
+  let lo, hi = 0.5, 2.0 in
+  (* The oracle anchors the ladder at the last close - the trough - so the
+     crash sits entirely above the anchor and the path replay never buys,
+     let alone exhausts (the degenerate SPCX premise). *)
+  let sp = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
+  let g = grid ~start_price:sp () in
+  let q_min = D.sizing_floor ~cfg:g in
+  let fills_at gi =
+    let gi_frac = Float.min (gi /. 100.0) 0.99 in
+    max
+      1
+      (int_of_float (Float.ceil (Float.log (1.0 -. d_gov) /. Float.log (1.0 -. gi_frac))))
+  in
+  let cost_at gi =
+    Oracle_mfd.floor_aware_runway_cost
+      ~qty:q_min
+      ~grid_interval_pct:gi
+      ~fee:0.0004
+      ~start_price:sp
+      ~min_notional:0.0
+      ~price_increment:0.01
+      ~qty_increment:0.01
+      ~n_fills:(fills_at gi)
+  in
+  let cost_lo = cost_at lo in
+  let cost_hi = cost_at hi in
+  Alcotest.(check bool) "tighter grid costs more" (cost_lo > cost_hi) true;
+  (* Pool between the two: un-fundable at gi_lo, fundable at gi_hi. *)
+  let pool = (cost_lo +. cost_hi) /. 2.0 in
+  let d = deploy ~pool ~g ~lo ~hi ~fng:None ~use_fng:false ~target:1.0 ~models:[ m ] () in
+  Alcotest.(check bool) "fallback asset still active" d.active true;
+  Alcotest.(check bool)
+    "grid loosened to the fundable parameter (not gi_lo)"
+    (d.parameter > lo +. 0.001)
+    true;
+  Alcotest.(check bool)
+    "the replay honestly realizes the observed crash (D_surv ~ d_gov, not the degenerate \
+     100%)"
+    (d.d_surv > 0.3 && d.d_surv < 0.5)
+    true;
+  Alcotest.(check bool) "deployed fits the pool" (d.deployed <= pool +. 1e-9) true;
+  Alcotest.(check bool)
+    "fallback caveat warned"
+    (List.exists (fun (w : string) -> contains w "deepest observed") d.warnings)
+    true
+;;
+
+let test_fallback_abundant_pool_squeezes_to_lo () =
+  (* With capital far beyond the observed drawdown's worst-case cost, the
+     static funding check funds even the tightest config grid: the squeeze
+     onto gi_lo is a computed outcome of the observed drawdown + the pool,
+     not the degenerate replay collapse. *)
+  let trough = trough_series ~n:90 in
+  let crash = crash_series ~n:200 in
+  let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
+  let m =
+    Oracle_replay.blend_model_of
+      ~horizon:h21
+      ~asset:trough
+      ~class_members:[ crash ]
+      ~kappa:10
+      ~warmup
+      ()
+  in
+  (match Oracle_deploy.governing_drawdown ~models:[ m ] ~target_survival:1.0 with
+   | Some _ -> Alcotest.fail "expected unreachable governing drawdown"
+   | None -> ());
+  let d =
+    let trough_close = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
+    deploy
+      ~pool:1_000_000.0
+      ~g:(grid ~start_price:trough_close ())
+      ~lo:0.5
+      ~hi:2.0
+      ~fng:None
+      ~use_fng:false
+      ~target:1.0
+      ~models:[ m ]
+      ()
+  in
+  Alcotest.(check bool) "active with abundant capital" d.active true;
+  Alcotest.(check bool)
+    "tightest config grid funded by the observed drawdown"
+    (abs_float (d.parameter -. 0.5) < 1e-9)
+    true
+;;
+
+let test_fallback_deploys_at_floor () =
+  (* An immature asset never grows its order qty beyond the floor: the
+     observed drawdown is fully funded at the sizing floor, and a larger qty
+     would deploy more capital for zero additional survival - "allocate to
+     meet the target, never exceed it". The deployment is exactly the
+     reservation and the rest of the pool passes down the priority order,
+     regardless of qty_cap_mult. *)
+  let trough = trough_series ~n:90 in
+  let crash = crash_series ~n:200 in
+  let h21 = { Oracle_types.label = "21s"; sessions = 21; calendar_days = 21 } in
+  let m =
+    Oracle_replay.blend_model_of
+      ~horizon:h21
+      ~asset:trough
+      ~class_members:[ crash ]
+      ~kappa:10
+      ~warmup
+      ()
+  in
+  (match Oracle_deploy.governing_drawdown ~models:[ m ] ~target_survival:1.0 with
+   | Some _ -> Alcotest.fail "expected unreachable governing drawdown"
+   | None -> ());
+  let d_gov, _ =
+    match Oracle_deploy.deepest_observed_drawdown [ m ] with
+    | Some x -> x
+    | None -> Alcotest.fail "expected a deepest observed drawdown"
+  in
+  let sp = trough.bars.(Array.length trough.bars - 1).Oracle_types.close in
+  let g = grid ~start_price:sp () in
+  let q_min = D.sizing_floor ~cfg:g in
+  let n_fills =
+    let gi_frac = Float.min (0.5 /. 100.0) 0.99 in
+    max
+      1
+      (int_of_float (Float.ceil (Float.log (1.0 -. d_gov) /. Float.log (1.0 -. gi_frac))))
+  in
+  let reservation =
+    Oracle_mfd.floor_aware_runway_cost
+      ~qty:q_min
+      ~grid_interval_pct:0.5
+      ~fee:0.0004
+      ~start_price:sp
+      ~min_notional:0.0
+      ~price_increment:0.01
+      ~qty_increment:0.01
+      ~n_fills
+  in
+  (* Abundant pool and a permissive qty cap (10x design): the fallback
+     deployment must still be the floor qty = the reservation. *)
+  let d =
+    deploy
+      ~pool:1_000_000.0
+      ~g
+      ~lo:0.5
+      ~hi:2.0
+      ~fng:None
+      ~use_fng:false
+      ~target:1.0
+      ~qty_cap_mult:10.0
+      ~models:[ m ]
+      ()
+  in
+  Alcotest.(check bool) "fallback asset active" d.active true;
+  Alcotest.(check bool)
+    "fallback qty pinned at the sizing floor"
+    (abs_float (d.qty -. q_min) < 1e-9)
+    true;
+  Alcotest.(check bool)
+    "fallback deployment is the reservation (target need, not cap growth)"
+    (abs_float (d.deployed -. reservation) < 0.01)
+    true;
+  Alcotest.(check bool)
+    "the rest of the pool passes down"
+    (d.remainder > 0.9 *. d.pool_share)
+    true
 ;;
 
 let test_governing_basis () =
@@ -565,6 +793,18 @@ let () =
             "immature fallback sizing"
             `Quick
             test_deploy_fallback_immature
+        ; Alcotest.test_case
+            "fallback tunes parameter to funding"
+            `Quick
+            test_fallback_tunes_parameter_to_funding
+        ; Alcotest.test_case
+            "fallback abundant pool squeezes to lo"
+            `Quick
+            test_fallback_abundant_pool_squeezes_to_lo
+        ; Alcotest.test_case
+            "fallback deploys at the floor"
+            `Quick
+            test_fallback_deploys_at_floor
         ; Alcotest.test_case "inactive cases" `Quick test_deploy_inactive
         ; Alcotest.test_case "floor-aware down-sizing" `Quick test_floor_aware_shrink
         ] )

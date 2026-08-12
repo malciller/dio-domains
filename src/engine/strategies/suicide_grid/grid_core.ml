@@ -33,6 +33,15 @@
      fills).
    - capital_low (quote can't fund the next buy) pauses buying and clears when
      quote recovers; the FIRST occurrence is the survival event (halt_cause).
+   - the resting buy trails the market UP: when a bar's close rises above the
+     resting buy level, the ladder re-anchors to close * (1 - gi) (the live
+     trailing-amend). Without this a replay starting long before today's
+     anchor would grind the ladder down through hundreds of levels toward the
+     historical lows, burning capital on a phantom drawdown; with it the
+     ladder follows the market and only descends on real declines.
+   - the exhaustion drawdown (first_exhaustion_price_drawdown) is measured
+     from the highest market price the strategy was anchored at: max(start
+     price, peak close) - the same peak-to-trough basis the MFD windows use.
 
    Known simplifications (documented in the plan):
    - ref price = the triggering fill price (no live bid/ask at bar resolution),
@@ -311,6 +320,18 @@ let compute_sell_qty cfg ~state ~sell_price =
 let on_bar cfg ~state ~bar ~ordering =
   let fills = ref [] in
   let add f = fills := f :: !fills in
+  (* The live grid trails its buy order up as the market rises (the resting
+     buy amends toward the current price); without this the ladder strands at
+     its initial anchor on any net-uptrend history, and a replay that starts
+     long before the anchor would grind the ladder down through hundreds of
+     levels the strategy would never have crossed, burning capital on a
+     phantom drawdown. Re-anchor the resting buy to the bar's close when the
+     close has risen above it. *)
+  (match state.resting_buy with
+   | Some b ->
+     let target = buy_level cfg ~ref:bar.close in
+     if target > b then state.resting_buy <- Some target
+   | None -> ());
   (* Clear capital_low once quote recovers enough for the resting buy. *)
   if state.capital_low
   then (
@@ -432,8 +453,18 @@ let replay cfg ~bars ~ordering =
   let initial_quote = read_quote cfg state in
   let min_quote = ref initial_quote in
   let first_cl_session = ref None in
+  (* The D_surv reference: the highest market price seen - the strategy's
+     start price (the market when it began) or any higher close since (the
+     ladder re-anchors to the close on rises, so the exhaustion drawdown is
+     measured from the peak the strategy was anchored at - the same
+     peak-to-trough basis the MFD windows use). The reference is the running
+     peak AT the exhaustion event, never a later peak the ladder had not
+     reached yet (a post-exhaustion rally must not inflate the reference). *)
+  let peak_close = ref cfg.start_price in
+  let first_cl_dd = ref None in
   Array.iteri
     (fun i bar ->
+       peak_close := Float.max !peak_close bar.close;
        let start_q = read_quote cfg state in
        let fs = on_bar cfg ~state ~bar ~ordering in
        fills := List.rev_append fs !fills;
@@ -447,16 +478,16 @@ let replay cfg ~bars ~ordering =
        quote_series.(i) <- after_q;
        min_quote := Float.min !min_quote after_q;
        if state.ever_capital_low && !first_cl_session = None
-       then first_cl_session := Some i)
+       then (
+         first_cl_session := Some i;
+         first_cl_dd
+         := Option.map (fun b -> 1.0 -. (b /. !peak_close)) state.first_capital_low_buy))
     bars;
-  let first_cl_dd =
-    Option.map (fun b -> 1.0 -. (b /. cfg.start_price)) state.first_capital_low_buy
-  in
   { fills = List.rev !fills
   ; quote_by_session = quote_series
   ; min_quote = !min_quote
   ; min_quote_drawdown = 1.0 -. (!min_quote /. initial_quote)
-  ; first_exhaustion_price_drawdown = first_cl_dd
+  ; first_exhaustion_price_drawdown = !first_cl_dd
   ; first_capital_low_session = !first_cl_session
   ; halt_cause = state.first_halt_cause
   ; exhausted = state.ever_capital_low

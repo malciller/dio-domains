@@ -168,22 +168,44 @@ let test_calendar_kind () =
 ;;
 
 let test_coin_of_symbol () =
-  Alcotest.(check string)
-    "btc/usdc"
-    "BTC"
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol "BTC/USDC");
-  Alcotest.(check string)
-    "hype/usdc"
-    "HYPE"
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol "HYPE/USDC");
-  Alcotest.(check string)
-    "eth/usd"
-    "ETH"
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol "ETH/USD");
-  Alcotest.(check string)
-    "lowercase"
-    "BTC"
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol "btc/usdc")
+  (* Fixture feed-symbol -> candle coin mapping, mirroring spotMeta: the
+     canonical PURR/USDC pair and the wrapped BTC spot (@142 = UBTC/USDC). *)
+  let pairs = [ "PURR/USDC", "PURR/USDC"; "BTC/USDC", "@142" ] in
+  (* Bare coin names are perpetuals and pass through as-is. *)
+  Alcotest.(check (option string))
+    "bare coin is a perp"
+    (Some "BTC")
+    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "BTC");
+  (* Spot symbols resolve through the feed-style mapping to the mapped spot
+     asset's candle coin; USD quotes normalize to the USDC spot quote. *)
+  Alcotest.(check (option string))
+    "named spot pair"
+    (Some "PURR/USDC")
+    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "PURR/USDC");
+  Alcotest.(check (option string))
+    "USD quote normalized"
+    (Some "PURR/USDC")
+    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "PURR/USD");
+  (* Wrapped majors (BTC spot is UBTC/USDC, the "@142" pair) resolve to the
+     "@N" candle coin, so their spot history is used. *)
+  Alcotest.(check (option string))
+    "wrapped major -> @N"
+    (Some "@142")
+    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "BTC/USDC");
+  Alcotest.(check (option string))
+    "wrapped major USD quote -> @N"
+    (Some "@142")
+    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "BTC/USD");
+  (* Symbols that are not a Hyperliquid spot pair resolve to None - never to
+     a perpetual proxy. *)
+  Alcotest.(check (option string))
+    "eth/usd is not a spot pair"
+    None
+    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "ETH/USD");
+  Alcotest.(check (option string))
+    "lowercase perp"
+    (Some "BTC")
+    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "btc")
 ;;
 
 let test_parse_candles_sorts_and_dedups () =
