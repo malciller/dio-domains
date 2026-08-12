@@ -14,6 +14,7 @@ let make_decision ~active =
   ; grid_interval = 1.0
   ; d_surv = 0.99
   ; d_gov = 0.1
+  ; d_cover = 0.1
   ; governing_horizon = "1d"
   ; deployed = 100.0
   ; pool_share = 100.0

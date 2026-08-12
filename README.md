@@ -201,7 +201,7 @@ engine spawns an isolated domain per entry.
 | `symbol` | string | Trading pair (e.g. `"BTC/USD"`) or ticker (e.g. `"TQQQ"`, `"SPY"`) |
 | `exchange` | string | `"kraken"`, `"hyperliquid"`, `"lighter"`, `"ibkr"`, or `"alpaca"` |
 | `qty` | string | Order quantity per grid level |
-| `grid_interval` | [min, max] | Grid spacing as `%` of price. A constraint range, never a default: the capital oracle picks within it, or Fear & Greed resolves it when the oracle has no decision |
+| `grid_interval` | [min, max] | Grid spacing as `%` of price. A constraint range, never a default: the capital oracle picks within it (crypto blends Fear & Greed in; equities are pure oracle and use the survival-constrained value) |
 | `sell_mult` | string | Sell quantity multiplier (`qty × sell_mult`). Values < 1.0 trigger accumulation |
 | `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, Lighter, IBKR, Alpaca) |
 | `strategy` | string | `"Grid"` or `"MM"` |
@@ -220,16 +220,16 @@ knobs. Every key is optional; absent keys fall back to the runtime defaults
 
 Allocation is two-phase and joint across each venue account: every asset is
 analyzed first (each one computes its sizing reservation - the minimum funding
-needed to reach its governing drawdown at the tightest grid interval), then
-assets are sized in config priority order against a budget equal to the
-remaining pool minus the lower-priority assets' reserved minimum funding. A
-priority asset therefore only grows after the rest of the account can still
-fill their drawdowns at minimum qty, and an asset is disabled only when even
-its first buy cannot be funded.
+needed to reach its ATH-anchored survival runway at the tightest grid
+interval), then assets are sized in config priority order against a budget
+equal to the remaining pool minus the lower-priority assets' reserved minimum
+funding. A priority asset therefore only grows after the rest of the account
+can still fill their drawdowns at minimum qty, and an asset is disabled only
+when even its first buy cannot be funded.
 
 | Oracle key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `qty_cap_mult` | float | `0.0` | Deployment ceiling as a multiple of the config qty. `0.0` = uncapped: each asset grows its order qty until the ladder's runway through the governing drawdown consumes the budget it is handed (the pool minus the lower-priority assets' reserved minimum drawdown funding), bounded only by the venue floor (`>= qty_min`) and the survival replay; the config `qty` stays the template/fallback, not a ceiling. A value `> 0` caps each asset's deployment at `config qty × mult` so surplus capital passes down the config priority order |
+| `qty_cap_mult` | float | `0.0` | The qty search range ceiling as a multiple of the config qty: the model sizes the order qty within `[config qty, config qty × mult]` (volume-driven: it grows as large as the survival constraints allow). `0.0` = uncapped (bounded only by the survival replay and the venue floor). A value `> 0` also caps each asset's deployment at `config qty × mult` so surplus capital passes down the config priority order |
 | `target_survival` | float | `0.99` | Replay coverage required to accept a sizing (fraction of blended-history paths that must clear the drawdown) |
 | `fng_weight` | float | `0.5` | Sentiment weight of the Fear & Greed blend for the grid interval (crypto only): `gi = fng_weight·gi_fng + range_weight·gi_range + (1 − fng_weight − range_weight)·gi_survival`; `0.0` removes the F&G side |
 | `range_weight` | float | `0.25` | Weight of the per-asset historical range side in the gi blend. The range side reads the asset's position within its ATH → all-time-low span (the deepened history): near the ATH the potential fall is the whole span, so spacing widens toward `hi` (preserve runway); near the lows the remaining downside is bounded, so spacing tightens toward `lo` (aggressive accumulation zone, working with the F&G contrarian convention). The blend is never tighter than the survival-constrained parameter - runway wins over sentiment and range aggression alike |
@@ -242,22 +242,53 @@ its first buy cannot be funded.
 | `max_capital` | float | `None` | Upper bound of the sizing binary search (in quote currency) |
 
 Grid spacing and order size are dynamic, driven by the oracle's drawdown-survival
-output. The grid interval is a three-way blend of Fear & Greed (the contrarian
-accumulator: low F&G tightens the grid and accumulates base at depressed
-prices), the per-asset historical range position (ATH → all-time low over the
-deepened history: spacing widens near the top of the range to preserve runway
-for the potential fall, tightens near the lows to accumulate aggressively), and
-the survival-constrained tightness - clamped so the runway always wins. The
-order qty grows until the ladder's cost through the governing drawdown consumes
-the budget, bounded by the survival replay.
+output, and tuned to be AS AGGRESSIVE AS POSSIBLE within the confined
+constraints: the tightest grid interval and the largest order qty (within
+`[qty, qty × qty_cap_mult]`) that still fund the survival runway and clear the
+target survival on the replayed path. The strategy is volume driven - more
+fills and larger sizes are the point - but it must survive volatile markets,
+and survival is the constraint that bounds the aggression.
 
-Sizing signals are never fabricated. The grid domain's startup gate stays
-closed until at least ONE source is ready with real information: a
-capital-oracle decision for the asset, or a live Fear & Greed reading (the F&G
-cache holds genuinely fetched values only - a failed fetch is distinguishable
-from a neutral reading). With neither available the grid withholds orders
-entirely: it cannot profitably and accurately size them, so it does not create
-them. When only one source is active and the other failed, a one-shot warning
+Survival is anchored at the ALL-TIME HIGH. The model computes the governing
+drawdown (the deepest horizon drawdown with `F_blend(d) >= target`) and sizes
+the grid to cover the fall from the current price down to the absolute target
+level `ATH × (1 - d_gov)`. Anchoring at the ATH caps the ladder's scale
+absolutely: the grid always covers down to the same price level no matter
+where the price sits, so the scale never shrinks endlessly as the market
+grinds down (and the deployed capital never grows without bound as the price
+approaches the lows). Once the price is at or below the target level, the
+whole ATH-to-target span has already been traversed: the required runway is
+zero, only the first buy needs funding, and the model can be maximally
+aggressive.
+
+The verification replay is funded with the asset's actual pool budget (not the
+static ladder cost), so the survival verdict answers the honest question - can
+the strategy survive this history with the capital it is entitled to? - and a
+well-funded asset grows its qty to the survival boundary instead of being
+falsely branded under-funded.
+
+Crypto assets blend the Fear & Greed contrarian signal into the resolved
+sizing (fear tightens the grid and up-sizes the qty, greed loosens and pulls
+back - never breaking the survival constraint, which always bounds the
+aggression); the per-asset historical range position (ATH → all-time low over
+the deepened history) joins the grid blend as well. Equities are PURE ORACLE:
+no F&G side and no sentiment - the grid interval is exactly the
+survival-constrained value and the qty the survival-max, and a live Fear &
+Greed reading is never applied to an equity grid.
+
+Sizing signals are never fabricated. The grid domain's startup gate gives
+BOTH signals their chance at startup: it opens immediately on a
+capital-oracle decision for the asset, or once the oracle's first pass
+attempt has finished (or the startup window has elapsed) on a live Fear &
+Greed reading alone — one real signal suffices to proceed, but both are
+attempted first (event-driven wakeups carry the oracle pass completion; the
+F&G cache holds genuinely fetched values only, so a failed fetch is
+distinguishable from a neutral reading). Equities are the exception: their
+sizing is pure oracle, so a live F&G reading never opens an equity grid —
+the equity domain withholds orders until the capital oracle publishes a
+decision. With neither signal available the grid withholds orders entirely:
+it cannot profitably and accurately size them, so it does not create them.
+When only one source is active and the other failed, a one-shot warning
 names the failed one.
 
 The top-level `classes` object defines the member pools backing each risk
