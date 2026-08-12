@@ -55,6 +55,42 @@
   },
   "trading": [
     {
+      "symbol": "HYPE/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.35",
+      "grid_interval": [
+        0.75,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        3.00
+      ],
+      "strategy": "Grid",
+      "testnet": true,
+      "hedge": false,
+      "asset_class": "crypto_alt"
+    },
+    {
+      "symbol": "ETH/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.35",
+      "grid_interval": [
+        0.75,
+        5.0
+      ],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        3.00
+      ],
+      "strategy": "Grid",
+      "testnet": true,
+      "hedge": false,
+      "asset_class": "crypto_alt"
+    },
+    {
       "symbol": "SPCX",
       "exchange": "alpaca",
       "qty": "0.1",
