@@ -71,7 +71,13 @@ let snapshot_cache_str = ref ""
 
 let snapshot_cache_time = ref 0.0
 let snapshot_cache_max_age = 0.9
-let heartbeat_timeout = 3.0 (* seconds without pong before pruning *)
+
+(* A dashboard client is a render loop, not a health probe: its pong now
+   runs on a fixed 1s cadence independent of frame rendering, but a slow
+   frame, a big snapshot parse or a GC pause can still stretch a gap - 8s
+   gives the client generous margin before the server drops it (and with
+   it the whole dashboard state). *)
+let heartbeat_timeout = 8.0 (* seconds without pong before pruning *)
 let idle_read_timeout = 10.0 (* seconds waiting for a command before dropping client *)
 
 (** Close a client fd, ignoring errors if already closed. *)
@@ -128,7 +134,7 @@ let rec state_broadcaster () =
                    (fun () ->
                       Lwt.pick
                         [ (send_response entry.oc json_str >|= fun () -> Some entry)
-                        ; (let%lwt () = Lwt_unix.sleep 0.2 in
+                        ; (let%lwt () = Lwt_unix.sleep 1.0 in
                            Lwt.fail (Failure "write timeout"))
                         ])
                    (fun _ ->
