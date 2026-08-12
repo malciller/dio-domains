@@ -13,15 +13,12 @@ let test_kraken_parser () =
       (List.find (fun b -> b.Dio_oracle.Oracle_balances.asset = "BTC") balances).total;
     near
       100.5
-      (List.find (fun b -> b.Dio_oracle.Oracle_balances.asset = "USD") balances)
-        .available;
+      (List.find (fun b -> b.Dio_oracle.Oracle_balances.asset = "USD") balances).available;
     near
       1.5
       (List.fold_left
          (fun total b ->
-            if b.Dio_oracle.Oracle_balances.asset = "BTC"
-            then total +. b.total
-            else total)
+            if b.Dio_oracle.Oracle_balances.asset = "BTC" then total +. b.total else total)
          0.0
          balances)
 ;;
@@ -37,9 +34,7 @@ let test_hyperliquid_spot_parser () =
     let usdc =
       List.find (fun b -> b.Dio_oracle.Oracle_balances.asset = "USDC") balances
     in
-    let btc =
-      List.find (fun b -> b.Dio_oracle.Oracle_balances.asset = "BTC") balances
-    in
+    let btc = List.find (fun b -> b.Dio_oracle.Oracle_balances.asset = "BTC") balances in
     near 120.0 usdc.available;
     near 125.5 usdc.total;
     near 1.75 btc.available

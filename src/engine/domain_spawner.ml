@@ -465,6 +465,10 @@ let asset_domain_worker
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->
                  should_execute_strategy := true;
+                 (* A canceled/rejected/expired order changes the live pool and
+                    the strategy's open-order state: wake the capital oracle so
+                    it re-sizes (lock-free, ~50ms latency). *)
+                 Oracle_runtime.request_pass ();
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
@@ -492,6 +496,11 @@ let asset_domain_worker
                   | None -> ())
                | Types.Filled ->
                  should_execute_strategy := true;
+                 (* A fill returns/consumes quote: wake the capital oracle so
+                    it re-sizes the asset (and the rest of the account's
+                    priority order) as soon as the pool changes (lock-free,
+                    ~50ms latency). *)
+                 Oracle_runtime.request_pass ();
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy

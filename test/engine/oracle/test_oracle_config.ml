@@ -113,10 +113,7 @@ let test_unknown_symbol_uses_defaults () =
   let tasks, _ = resolve ~symbol:"FOO/BAR" ~exchange:"kraken" ~trading:[] () in
   Alcotest.(check int) "single task" 1 (List.length tasks);
   let t = List.hd tasks in
-  Alcotest.(check string)
-    "symbol preserved"
-    "FOO/BAR"
-    t.Dio_oracle.Oracle_tasks.symbol;
+  Alcotest.(check string) "symbol preserved" "FOO/BAR" t.Dio_oracle.Oracle_tasks.symbol;
   Alcotest.(check string)
     "exchange falls back to arg"
     "kraken"
@@ -196,9 +193,7 @@ let test_parse_candles_sorts_and_dedups () =
         , {"t":1700000000000,"o":"100.0","h":"101.0","l":"99.0","c":"100.5","v":"10.0","n":2}
         , {"t":1700000000000,"o":"100.0","h":"101.0","l":"99.0","c":"100.5","v":"10.0","n":2} ]|}
   in
-  let bars =
-    Dio_oracle.Oracle_fetch_hyperliquid.parse_candles ~symbol:"BTC/USDC" json
-  in
+  let bars = Dio_oracle.Oracle_fetch_hyperliquid.parse_candles ~symbol:"BTC/USDC" json in
   Alcotest.(check int) "two bars after dedup" 2 (List.length bars);
   let dates =
     List.map
@@ -220,8 +215,7 @@ let test_parse_candles_bad_shape () =
   Alcotest.check_raises
     "object body rejected"
     (Failure
-       "Oracle_fetch_hyperliquid.parse_candles: BTC/USDC expected array, got \
-        {\"oops\":1}")
+       "Oracle_fetch_hyperliquid.parse_candles: BTC/USDC expected array, got {\"oops\":1}")
     (fun () ->
        ignore
          (Dio_oracle.Oracle_fetch_hyperliquid.parse_candles

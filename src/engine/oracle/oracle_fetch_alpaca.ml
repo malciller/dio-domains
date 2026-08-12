@@ -97,12 +97,9 @@ let model_of_calendar_dates (calendar_dates : string list) : Oracle_sessions.mod
 
 (** Adapter over Alpaca_market_hours: its regular session is US Eastern
     weekdays; holidays are subtracted from the /v2/calendar feed. *)
-let regular_session_model () : Oracle_sessions.model =
-  Oracle_sessions.business_weekday
-;;
+let regular_session_model () : Oracle_sessions.model = Oracle_sessions.business_weekday
 
-let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list)
-  : Oracle_types.series
+let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list) : Oracle_types.series
   =
   { Oracle_types.symbol
   ; calendar_kind = Oracle_types.Equity

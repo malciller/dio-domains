@@ -137,7 +137,7 @@ let parse_args () =
   let fng = ref None in
   let fng_weight = ref 0.5 in
   let min_active_dsurv = ref 0.0 in
-  let qty_cap_mult = ref 1.0 in
+  let qty_cap_mult = ref 0.0 in
   let no_deep_history = ref false in
   let weight_by_sessions = ref true in
   let json = ref false in
@@ -289,9 +289,10 @@ let parse_args () =
            their capital passes down (default 0.0 = fundable means active)" )
       ; ( "--qty-cap-mult"
         , Arg.Float (fun f -> qty_cap_mult := f)
-        , " deployment ceiling as a multiple of the config qty (default 1.0: each \
-           asset's qty is capped at its config qty so surplus capital passes down the \
-           priority order; 0.0 = uncapped, the priority asset deploys the whole pool)" )
+        , " deployment ceiling as a multiple of the config qty (default 0.0 = uncapped: \
+           each asset grows its qty to deploy the whole pool share it is handed, bounded \
+           only by the survival replay; a value > 0 caps each asset's deployment at \
+           config qty * mult so surplus capital passes down the priority order)" )
       ; ( "--no-deep-history"
         , Arg.Set no_deep_history
         , " disable the Yahoo deep-history extension (venue-feed bars only; the venue \

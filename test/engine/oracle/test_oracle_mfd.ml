@@ -14,9 +14,7 @@ let test_mfd_basic () =
 let test_mfd_uses_only_lows () =
   let closes = [| 100.; 100.; 100.; 100. |] in
   let lows = [| 100.; 100.; 99.9; 100. |] in
-  near
-    0.001
-    (Option.get (Dio_oracle.Oracle_mfd.mfd ~closes ~lows ~start:0 ~horizon:3))
+  near 0.001 (Option.get (Dio_oracle.Oracle_mfd.mfd ~closes ~lows ~start:0 ~horizon:3))
 ;;
 
 let test_f_h_and_survival () =
@@ -29,13 +27,7 @@ let test_f_h_and_survival () =
     (Dio_oracle.Oracle_mfd.f_h ~closes ~lows ~horizon:3 ~threshold:0.05 ~warmup:0 ());
   near
     1.0
-    (Dio_oracle.Oracle_mfd.survival
-       ~closes
-       ~lows
-       ~horizon:3
-       ~threshold:0.05
-       ~warmup:0
-       ());
+    (Dio_oracle.Oracle_mfd.survival ~closes ~lows ~horizon:3 ~threshold:0.05 ~warmup:0 ());
   near
     1.0
     (Dio_oracle.Oracle_mfd.f_h ~closes ~lows ~horizon:3 ~threshold:0.10 ~warmup:0 ())
@@ -47,9 +39,7 @@ let test_surface () =
   for i = 0 to 119 do
     lows.(i) <- 100.0 -. (float_of_int i *. 0.01)
   done;
-  let h =
-    { Dio_oracle.Oracle_types.label = "30d"; sessions = 30; calendar_days = 30 }
-  in
+  let h = { Dio_oracle.Oracle_types.label = "30d"; sessions = 30; calendar_days = 30 } in
   let s : Dio_oracle.Oracle_types.survival_surface =
     Dio_oracle.Oracle_mfd.surface
       ~closes
@@ -81,18 +71,10 @@ let test_stride_sampling () =
   Alcotest.(check int)
     "stride 30 windows"
     2
-    (Dio_oracle.Oracle_mfd.n_starts
-       ~closes
-       ~lows
-       ~horizon:30
-       ~warmup:10
-       ~stride:30
-       ());
+    (Dio_oracle.Oracle_mfd.n_starts ~closes ~lows ~horizon:30 ~warmup:10 ~stride:30 ());
   (* Percentile tables estimate from the non-overlapping basis and report both
      the raw (overlapping) and effective window counts. *)
-  let h =
-    { Dio_oracle.Oracle_types.label = "30d"; sessions = 30; calendar_days = 30 }
-  in
+  let h = { Dio_oracle.Oracle_types.label = "30d"; sessions = 30; calendar_days = 30 } in
   let t : Dio_oracle.Oracle_types.percentile_table =
     Dio_oracle.Oracle_mfd.percentile_table
       ~closes
@@ -200,21 +182,13 @@ let test_f_h_raises_on_no_valid_starts () =
   let lows = Array.make 100 100.0 in
   (try
      ignore
-       (Dio_oracle.Oracle_mfd.f_h
-          ~closes
-          ~lows
-          ~horizon:90
-          ~threshold:0.1
-          ~warmup:100
-          ());
+       (Dio_oracle.Oracle_mfd.f_h ~closes ~lows ~horizon:90 ~threshold:0.1 ~warmup:100 ());
      Alcotest.fail "f_h: expected Invalid_argument"
    with
    | Invalid_argument _ -> ());
   (* The percentile table on the same short history raises too (its samples
      are empty). *)
-  let h =
-    { Dio_oracle.Oracle_types.label = "90d"; sessions = 90; calendar_days = 90 }
-  in
+  let h = { Dio_oracle.Oracle_types.label = "90d"; sessions = 90; calendar_days = 90 } in
   try
     ignore
       (Dio_oracle.Oracle_mfd.percentile_table

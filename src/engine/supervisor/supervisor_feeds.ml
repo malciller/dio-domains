@@ -108,7 +108,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
     |> List.sort_uniq Bool.compare
   in
   (match alpaca_testnet_values with
-   | [ _ ] -> ()
+   | [] | [ _ ] -> ()
    | _ ->
      Logging.critical_f
        ~section

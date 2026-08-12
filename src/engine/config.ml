@@ -52,6 +52,10 @@ type config =
         schema `"name": [syms]` parses with kappa = None; the extended schema
         `"name": {"members": [syms], "kappa": N}` carries a per-class blend
         weight. *)
+  ; oracle : Dio_oracle.Oracle_runtime.runtime_config option
+    (** Capital-oracle runtime knobs from the top-level "oracle" section;
+        [None] means the engine runs the oracle's built-in defaults (see
+        Oracle_runtime.default_config). *)
   ; fng_check_threshold : float
   ; latency_window_seconds : float
     (** Duration of each per-domain latency accumulation window before the
@@ -72,6 +76,7 @@ let known_top_level_keys =
   ; "trading"
   ; "gc"
   ; "classes"
+  ; "oracle"
   ; "fng_check_threshold"
   ]
 ;;
@@ -85,6 +90,23 @@ let known_gc_keys =
   ; "window_size"
   ; "allocation_policy"
   ; "major_heap_increment"
+  ]
+;;
+
+(** Permitted keys of the optional top-level "oracle" section (capital-oracle
+    runtime knobs). Every key is optional; absent keys fall back to
+    Oracle_runtime.default_config. *)
+let known_oracle_keys =
+  [ "target_survival"
+  ; "fng_weight"
+  ; "min_active_dsurv"
+  ; "qty_cap_mult"
+  ; "no_deep_history"
+  ; "weight_by_sessions"
+  ; "refresh_seconds"
+  ; "poll_seconds"
+  ; "horizons"
+  ; "max_capital"
   ]
 ;;
 
@@ -430,6 +452,70 @@ let parse_gc_config json : gc_config option =
       }
 ;;
 
+(** Parses the optional top-level "oracle" object into the capital-oracle
+    runtime knobs. Returns [None] when the key is absent (the engine then uses
+    Oracle_runtime.default_config). Exits on unknown sub-keys. Every value is
+    optional and falls back to the runtime defaults, so a minimal section like
+    {"qty_cap_mult": 0.0} is valid. *)
+let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
+  let open Yojson.Basic.Util in
+  match json |> member "oracle" with
+  | `Null -> None
+  | oracle_json ->
+    if validate_keys ~context:"oracle" ~allowed:known_oracle_keys oracle_json then exit 1;
+    let defaults = Dio_oracle.Oracle_runtime.default_config () in
+    Some
+      { target_survival =
+          oracle_json
+          |> member "target_survival"
+          |> to_float_option
+          |> Option.value ~default:defaults.target_survival
+      ; fng_weight =
+          oracle_json
+          |> member "fng_weight"
+          |> to_float_option
+          |> Option.value ~default:defaults.fng_weight
+      ; min_active_dsurv =
+          oracle_json
+          |> member "min_active_dsurv"
+          |> to_float_option
+          |> Option.value ~default:defaults.min_active_dsurv
+      ; qty_cap_mult =
+          oracle_json
+          |> member "qty_cap_mult"
+          |> to_float_option
+          |> Option.value ~default:defaults.qty_cap_mult
+      ; no_deep_history =
+          oracle_json
+          |> member "no_deep_history"
+          |> to_bool_option
+          |> Option.value ~default:defaults.no_deep_history
+      ; weight_by_sessions =
+          oracle_json
+          |> member "weight_by_sessions"
+          |> to_bool_option
+          |> Option.value ~default:defaults.weight_by_sessions
+      ; refresh_seconds =
+          oracle_json
+          |> member "refresh_seconds"
+          |> to_float_option
+          |> Option.value ~default:defaults.refresh_seconds
+      ; poll_seconds =
+          oracle_json
+          |> member "poll_seconds"
+          |> to_float_option
+          |> Option.value ~default:defaults.poll_seconds
+      ; horizons =
+          (match oracle_json |> member "horizons" with
+           | `Null -> defaults.horizons
+           | horizons_json -> Some (horizons_json |> to_list |> List.map to_int))
+      ; max_capital =
+          (match oracle_json |> member "max_capital" with
+           | `Null -> defaults.max_capital
+           | v -> to_float_option v)
+      }
+;;
+
 (** Reads config.json from the working directory and parses it into a [config] record.
     Performs strict key validation at each nesting level, exiting on schema violations
     or JSON parse errors. Falls back to defaults on filesystem errors. *)
@@ -450,6 +536,7 @@ let read_config () : config =
     in
     let logging = parse_logging_config json in
     let gc = parse_gc_config json in
+    let oracle = parse_oracle_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
     let classes = parse_classes json in
     let fng_check_threshold =
@@ -464,6 +551,7 @@ let read_config () : config =
     { cycle_mod
     ; logging
     ; gc
+    ; oracle
     ; trading
     ; classes
     ; fng_check_threshold
@@ -478,6 +566,7 @@ let read_config () : config =
     { cycle_mod = 10000
     ; logging = { level = Logging.INFO; sections = [] }
     ; gc = None
+    ; oracle = None
     ; trading = []
     ; classes = []
     ; fng_check_threshold = 1.5

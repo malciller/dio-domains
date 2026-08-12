@@ -11,8 +11,8 @@ let percentile xs p =
   if n = 0
   then
     invalid_arg
-      "Oracle_math.percentile: empty distribution (no samples); refusing to fabricate \
-       a percentile"
+      "Oracle_math.percentile: empty distribution (no samples); refusing to fabricate a \
+       percentile"
   else (
     let arr = Array.copy xs in
     Array.sort Float.compare arr;

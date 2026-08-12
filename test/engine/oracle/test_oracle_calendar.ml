@@ -62,9 +62,7 @@ let test_sort_dedup () =
     [| bar "2024-01-03"; bar "2024-01-01"; bar "2024-01-01"; bar "2024-01-02" |]
   in
   let sorted =
-    bars
-    |> Dio_oracle.Oracle_calendar.sort_bars
-    |> Dio_oracle.Oracle_calendar.dedup
+    bars |> Dio_oracle.Oracle_calendar.sort_bars |> Dio_oracle.Oracle_calendar.dedup
   in
   Alcotest.(check int) "len" 3 (Array.length sorted);
   Alcotest.(check string) "first" "2024-01-01" sorted.(0).date;
