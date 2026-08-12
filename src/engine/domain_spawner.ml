@@ -1195,69 +1195,23 @@ let asset_domain_worker
             in
             (match oracle_decision with
              | Some d when d.active ->
-               (* Oracle owns the sizing: log the blend it actually published
-                  (its F&G side + weight, and whether the survival constraint
-                  clamped the sentiment away) instead of an F&G-only value,
-                  and touch only the accumulation buffer. *)
-               let pc = d.parameter_components in
-               let w_survival =
-                 Float.max
-                   0.0
-                   (1.0 -. pc.Oracle_types.fng_weight -. pc.Oracle_types.range_weight)
-               in
-               let sides, raw_blend =
-                 match pc.Oracle_types.fng_parameter, pc.Oracle_types.range_parameter with
-                 | Some fp, Some rp ->
-                   let total =
-                     pc.Oracle_types.fng_weight
-                     +. w_survival
-                     +. pc.Oracle_types.range_weight
-                   in
-                   ( Printf.sprintf
-                       "fng-side %.4f%% (w %.2f) + range %.4f%% (w %.2f) + survival \
-                        %.4f%% (w %.2f)"
-                       fp
-                       pc.Oracle_types.fng_weight
-                       rp
-                       pc.Oracle_types.range_weight
-                       pc.Oracle_types.survival_parameter
-                       w_survival
-                   , ((pc.Oracle_types.fng_weight *. fp)
-                      +. (w_survival *. pc.Oracle_types.survival_parameter)
-                      +. (pc.Oracle_types.range_weight *. rp))
-                     /. total )
-                 | Some fp, None ->
-                   let total = pc.Oracle_types.fng_weight +. w_survival in
-                   ( Printf.sprintf
-                       "fng-side %.4f%% (w %.2f) + survival %.4f%% (w %.2f)"
-                       fp
-                       pc.Oracle_types.fng_weight
-                       pc.Oracle_types.survival_parameter
-                       w_survival
-                   , ((pc.Oracle_types.fng_weight *. fp)
-                      +. (w_survival *. pc.Oracle_types.survival_parameter))
-                     /. total )
-                 | None, _ ->
-                   ( Printf.sprintf "survival %.4f%%" pc.Oracle_types.survival_parameter
-                   , pc.Oracle_types.survival_parameter )
-               in
-               let clamp_note =
-                 if raw_blend +. 1e-9 < pc.Oracle_types.survival_parameter
-                 then
-                   Printf.sprintf
-                     " (blend %.4f%% clamped: survival binds, F&G/range contribute 0)"
-                     raw_blend
-                 else ""
-               in
+               (* Oracle owns the sizing: log the sizing it actually published
+                  (how the gi/qty were chosen - the survival-driven reasons
+                  carried by the decision - and the replayed D_surv) instead
+                  of an F&G-only value, and touch only the accumulation
+                  buffer. *)
                Logging.info_f
                  ~section
-                 "[%s/%s] Fear & Greed updated to %.2f: oracle gi blend (%s) -> %.4f%%%s"
+                 "[%s/%s] Fear & Greed updated to %.2f: oracle sizing gi %.4f%% (%s) · \
+                  qty %.6g (%s) · D_surv %.1f%%"
                  asset_with_fees.exchange
                  asset_with_fees.symbol
                  current_fng
-                 sides
                  d.grid_interval
-                 clamp_note;
+                 d.gi_reason
+                 d.qty
+                 d.qty_reason
+                 (d.d_surv *. 100.0);
                update_accumulation_buffer ()
              | Some _ ->
                (* Oracle decision exists but INACTIVE: the oracle owns the

@@ -234,79 +234,100 @@ let test_governing_drawdown () =
 ;;
 
 let test_deploy_fully_funded () =
+  (* Coverage mode with the qty cap at 0 (no growth): the sizing targets 100%
+     replay survival - the most aggressive (tightest) grid interval that
+     survives the whole replayed history at the minimum order size. The
+     order qty stays at the minimum (the cap is 0 = no growth), so the
+     deployment consumes only the minimum-order runway through d_cover and
+     the surplus passes down the priority order. *)
   let g = grid ~start_price:100.0 () in
   let ms = models ~asset in
-  (* Crypto, neutral F&G (50): the qty is blended toward the middle of
-     [q_min, survival-max], so roughly half the pool deploys; the row passes
-     (the replay, funded with the full pool budget, clears the target). *)
   let d = deploy ~pool:10_000.0 ~qty_cap_mult:0.0 ~g ~models:ms () in
   Alcotest.(check bool) "active" d.Oracle_types.active true;
   Alcotest.(check bool) "row passed" d.Oracle_types.row.passed true;
-  (* Every horizon clears the target at the replayed D_surv. *)
-  List.iter
-    (fun (c : Oracle_types.deployment_coverage) ->
-       Alcotest.(check bool)
-         (Printf.sprintf "coverage %s" c.horizon_label)
-         (c.blended_coverage +. 1e-9 >= 0.99)
-         true)
-    d.coverage;
-  (* D_surv covers the governing drawdown (the replay is pool-funded, so a
-     well-capitalized asset survives the whole path). *)
-  Alcotest.(check bool) "d_surv >= d_gov" (d.d_surv +. 0.02 >= d.d_gov) true;
-  (* gi is within the config range and never tighter than the survival side. *)
+  (* The sizing is survival-driven: 100% replay survival (the whole history
+     survived), gi = the tightest config parameter (0.5) that reaches it. *)
+  Alcotest.(check bool) "100% replay survival" (d.d_surv >= 1.0 -. 1e-9) true;
   Alcotest.(check bool)
-    "gi in range"
-    (d.parameter >= 0.5 -. 1e-9 && d.parameter <= 2.0 +. 1e-9)
+    "gi at the most aggressive config value with 100% survival"
+    (abs_float (d.parameter -. 0.5) < 1e-9)
     true;
   Alcotest.(check bool)
-    "gi >= gi_survival"
-    (d.parameter +. 1e-9 >= d.parameter_components.survival_parameter)
+    "resolved gi = the survival-driven gi (no blend)"
+    (d.parameter = d.parameter_components.resolved_parameter
+     && d.parameter = d.parameter_components.survival_parameter)
     true;
-  (* The synth asset is in the OUTLIER regime (its deepest crash never fully
-     retraced): the risk reference is the floor-overshoot fallback (15%), so
-     the qty ceiling is high and the replay verification bounds the qty. At
-     neutral F&G the qty blend sits partway up [q_min, survival-max] and
-     roughly a third of the pool deploys - the replay-funded verification,
-     not the small risk reference, is what keeps it under the pool. *)
+  (* qty cap 0 = the qty never grows: the minimum order size deploys. *)
+  let q_min = D.sizing_floor ~cfg:g in
+  Alcotest.(check bool) "qty at the minimum (cap 0 = no growth)" (d.qty = q_min) true;
+  (* The deployment consumes only the minimum-order runway through d_cover
+     (the synth asset's 15% floor-overshoot reference); the surplus passes
+     down the priority order - the priority asset does NOT model against
+     100% of the pool. *)
   Alcotest.(check bool)
-    "deployed stays below the pool at neutral F&G (replay-bounded)"
-    (d.deployed > 0.2 *. d.pool_share && d.deployed < 0.6 *. d.pool_share)
+    "deployed is the minimum-order runway, not the pool"
+    (d.deployed > 0.0 && d.deployed < 0.1 *. d.pool_share)
     true;
-  (* Equities are pure oracle: no F&G qty blend, so the survival-max qty
-     deploys (almost) the whole pool. *)
+  Alcotest.(check bool)
+    "surplus passes down the priority order"
+    (d.remainder > 0.9 *. d.pool_share)
+    true;
+  (* F&G is inert: the sizing is identical with or without it (the equity
+     variant produces the same sizing). *)
   let d_eq =
     deploy ~pool:10_000.0 ~qty_cap_mult:0.0 ~g ~fng:None ~use_fng:false ~models:ms ()
   in
-  Alcotest.(check bool) "equity active" d_eq.active true;
   Alcotest.(check bool)
-    "equity row passed"
-    (d_eq.row.passed || d_eq.d_surv +. 0.02 >= d_eq.d_gov)
-    true;
-  (* The outlier regime's small risk reference (15% fallback) caps the
-     runway cost below the pool; the qty is bounded by the replay
-     verification. *)
-  Alcotest.(check bool)
-    "equity deploys most of the pool (replay-bounded qty through the 15% reference)"
-    (d_eq.deployed > 0.5 *. d_eq.pool_share && d_eq.deployed < d_eq.pool_share)
+    "fng does not move the sizing"
+    (abs_float (d_eq.parameter -. d.parameter) < 1e-9 && d_eq.qty = d.qty)
     true
 ;;
 
-let test_deploy_gi_blend () =
+let test_deploy_gi_selection () =
+  (* The gi search over the FULL config range at the minimum order size: the
+     most aggressive (tightest) parameter with 100% replay survival. With a
+     huge pool every parameter survives, so the tightest config gi (0.5) is
+     chosen; with a tighter pool the tightest parameters stop surviving and
+     the search lands on the first passing one; with a pool so small that
+     nothing survives, the sizing stretches to the grid maximum. F&G never
+     moves the gi (the sizing is survival-driven, no blend). *)
   let g = grid ~start_price:100.0 () in
   let ms = models ~asset in
-  (* With a huge pool every gi passes, so the survival side allows the
-     tightest config gi; the blend is then 0.5 * gi_fng + 0.5 * gi_lo. *)
-  let d = deploy ~pool:100_000.0 ~g ~fng:(Some 50.0) ~fng_weight:0.5 ~models:ms () in
-  near d.parameter_components.survival_parameter 0.5;
-  near d.parameter 0.875;
-  (* Equities (use_fng = false): pure survival side, no F&G. *)
-  let d_eq = deploy ~pool:100_000.0 ~g ~fng:None ~use_fng:false ~models:ms () in
+  let d = deploy ~pool:100_000.0 ~g ~fng:(Some 50.0) ~models:ms () in
+  Alcotest.(check bool) "active" d.Oracle_types.active true;
+  near d.parameter 0.5;
+  (* The F&G contrarian signal is gone from the sizing: no fng side, the
+     survival-driven value is the resolved value. *)
   Alcotest.(check bool)
-    "equity gi_fng is None"
-    (d_eq.parameter_components.fng_parameter = None)
+    "fng_parameter is None (no sentiment blend)"
+    (d.parameter_components.fng_parameter = None)
     true;
-  near d_eq.parameter d_eq.parameter_components.survival_parameter;
-  near d_eq.parameter 0.5
+  Alcotest.(check bool)
+    "gi identical at max fear and max greed"
+    (abs_float (deploy ~pool:100_000.0 ~g ~fng:(Some 0.0) ~models:ms ()).parameter
+     -. d.parameter
+     < 1e-9)
+    true;
+  (* A tighter pool: 0.5 no longer survives the whole history, the search
+     lands on the tightest parameter that does (0.875). *)
+  let d300 = deploy ~pool:300.0 ~g ~models:ms () in
+  Alcotest.(check bool) "active at pool 300" d300.active true;
+  Alcotest.(check bool)
+    "100% survival at the selected gi"
+    (d300.d_surv >= 1.0 -. 1e-9)
+    true;
+  near d300.parameter 0.875;
+  (* A tiny pool (above the first-buy gate): no parameter survives the whole
+     history - the sizing stretches: gi = the grid maximum, qty = minimum. *)
+  let ds = deploy ~pool:15.0 ~g ~models:ms () in
+  Alcotest.(check bool) "active in stretch mode" ds.active true;
+  near ds.parameter 2.0;
+  Alcotest.(check bool) "stretch qty at the minimum" (ds.qty = D.sizing_floor ~cfg:g) true;
+  Alcotest.(check bool) "stretch cannot reach 100% survival" (ds.d_surv < 1.0) true;
+  Alcotest.(check bool)
+    "stretch mode warned"
+    (List.exists (fun (w : string) -> contains w "unreachable") ds.warnings)
+    true
 ;;
 
 let test_deploy_under_funded () =
@@ -1205,42 +1226,49 @@ let test_deploy_replay_pool_funded () =
     true
 ;;
 
-let test_deploy_crypto_qty_blend () =
-  (* Crypto blends BOTH the grid interval and the qty with the F&G
-     contrarian signal: max fear (fng 0) tightens the grid to the
-     survival-constrained lo and up-sizes the qty to the survival-max; max
-     greed (fng 100) loosens the grid and pulls the qty back toward the
-     floor. Neither may break the survival constraint. *)
+let test_deploy_qty_survival_scale () =
+  (* The qty scale-up rule: the order qty grows ONLY to deploy residual
+     capital BEHIND 100% survival, bounded by the qty_cap (qty_cap_mult is
+     the cap, not a rule). With a deep pool the largest qty keeping 100%
+     replay survival is the cap itself; with a tighter pool the replay
+     bounds it below the cap; with the cap at 0 the qty never grows. F&G is
+     inert - the sizing is identical at max fear and max greed. *)
   let g = grid ~start_price:100.0 () in
   let ms = models ~asset in
-  let d_fear =
-    deploy ~pool:100_000.0 ~g ~fng:(Some 0.0) ~qty_cap_mult:2.0 ~models:ms ()
-  in
-  let d_greed =
-    deploy ~pool:100_000.0 ~g ~fng:(Some 100.0) ~qty_cap_mult:2.0 ~models:ms ()
-  in
-  Alcotest.(check bool) "fear active" d_fear.active true;
-  Alcotest.(check bool) "greed active" d_greed.active true;
-  (* Fear: qty = survival-max = the cap (q_min * 2). *)
   let q_min = D.sizing_floor ~cfg:g in
+  (* Deep pool, cap 2x: the qty reaches the cap, 100% survival holds. *)
+  let d = deploy ~pool:100_000.0 ~g ~fng:(Some 0.0) ~qty_cap_mult:2.0 ~models:ms () in
+  Alcotest.(check bool) "active" d.active true;
   Alcotest.(check bool)
-    "fear qty at the survival-max (the cap)"
-    (abs_float (d_fear.qty -. (2.0 *. q_min)) < 1e-9)
+    "qty at the cap (the qty range ceiling)"
+    (abs_float (d.qty -. (2.0 *. q_min)) < 1e-9)
     true;
-  (* Greed: qty pulled back to the floor. *)
+  Alcotest.(check bool) "100% survival at the cap" (d.d_surv >= 1.0 -. 1e-9) true;
+  (* Tighter pool: the largest qty that still survives the whole history is
+     below the cap - the survival replay (funded with the pool) bounds the
+     "deploy all capital" scale-up. *)
+  let d800 = deploy ~pool:800.0 ~g ~qty_cap_mult:2.0 ~models:ms () in
+  Alcotest.(check bool) "active at pool 800" d800.active true;
   Alcotest.(check bool)
-    "greed qty at the floor"
-    (abs_float (d_greed.qty -. q_min) < 1e-9)
+    "qty bounded below the cap by 100% survival"
+    (d800.qty < 2.0 *. q_min && d800.qty > q_min)
     true;
-  (* Fear tightens the grid (fng side = lo), greed loosens it. *)
   Alcotest.(check bool)
-    "fear gi tighter than greed gi"
-    (d_fear.parameter < d_greed.parameter)
+    "100% survival at the bounded qty"
+    (d800.d_surv >= 1.0 -. 1e-9)
     true;
-  (* The qty blend never exceeds the survival-max. *)
+  (* The cap is a ceiling, not a rule: with the cap at 0 (no growth) the qty
+     stays at the minimum even with a deep pool. *)
+  let d0 = deploy ~pool:100_000.0 ~g ~qty_cap_mult:0.0 ~models:ms () in
   Alcotest.(check bool)
-    "blended qty bounded by the survival-max"
-    (d_fear.qty +. 1e-9 >= q_min && d_fear.qty <= (2.0 *. q_min) +. 1e-9)
+    "cap 0 = qty never grows"
+    (abs_float (d0.qty -. q_min) < 1e-9)
+    true;
+  (* F&G inert: identical sizing at max greed. *)
+  let dg = deploy ~pool:100_000.0 ~g ~fng:(Some 100.0) ~qty_cap_mult:2.0 ~models:ms () in
+  Alcotest.(check bool)
+    "fng does not move the qty"
+    (abs_float (dg.qty -. d.qty) < 1e-9 && abs_float (dg.parameter -. d.parameter) < 1e-9)
     true
 ;;
 
@@ -1690,8 +1718,14 @@ let () =
             test_deploy_sizing_reference
         ] )
     ; ( "deploy_asset"
-      , [ Alcotest.test_case "fully funded" `Quick test_deploy_fully_funded
-        ; Alcotest.test_case "gi blend and equity rule" `Quick test_deploy_gi_blend
+      , [ Alcotest.test_case
+            "fully funded (coverage mode, min qty)"
+            `Quick
+            test_deploy_fully_funded
+        ; Alcotest.test_case
+            "gi selection: tightest with 100% survival, else stretch"
+            `Quick
+            test_deploy_gi_selection
         ; Alcotest.test_case "under-funded priority" `Quick test_deploy_under_funded
         ; Alcotest.test_case "qty cap passes excess down" `Quick test_deploy_qty_cap
         ; Alcotest.test_case
@@ -1699,9 +1733,9 @@ let () =
             `Quick
             test_deploy_replay_pool_funded
         ; Alcotest.test_case
-            "crypto qty blended with F&G"
+            "qty scale-up bounded by 100% survival and the cap"
             `Quick
-            test_deploy_crypto_qty_blend
+            test_deploy_qty_survival_scale
         ; Alcotest.test_case
             "equity ignores F&G entirely"
             `Quick

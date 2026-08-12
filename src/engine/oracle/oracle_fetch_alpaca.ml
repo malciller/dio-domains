@@ -159,7 +159,7 @@ let fetch_bars
             | _ -> None
           in
           match next with
-          | None -> Lwt.return (List.rev_append bars acc)
+          | None -> Lwt.return (List.rev (List.rev_append bars acc))
           | Some t -> go (Some t) (List.rev_append bars acc) (pages - 1))
       in
       Lwt.catch

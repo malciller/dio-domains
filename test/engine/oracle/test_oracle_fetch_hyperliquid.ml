@@ -87,6 +87,28 @@ let test_coin_of_symbol_edge_cases () =
   Alcotest.(check (option string)) "lowercase wrapped major" (Some "@142") c
 ;;
 
+let test_windows_to_series_ascending () =
+  (* Regression: the window accumulation must restore ascending time order.
+     The LAST bar is the CURRENT close - the grid start price and all ladder
+     capital math read it, so a missing final List.rev prices every ladder
+     from the oldest fetched close (the bug that made HYPE/ETH rung costs
+     come from 2022-era prices). *)
+  let mk date close =
+    Dio_oracle.Oracle_types.
+      { date; open_ = close; high = close; low = close; close; volume = 0.0 }
+  in
+  let out =
+    Dio_oracle.Oracle_fetch_hyperliquid.windows_to_series
+      [ [ mk "2022-01-01" 1.0; mk "2022-01-02" 2.0 ]
+      ; [ mk "2022-01-03" 3.0; mk "2022-01-04" 4.0 ]
+      ]
+  in
+  Alcotest.(check (list (float 1e-9)))
+    "ascending closes, last = newest"
+    [ 1.0; 2.0; 3.0; 4.0 ]
+    (List.map (fun b -> b.Dio_oracle.Oracle_types.close) out)
+;;
+
 let () =
   Alcotest.run
     "oracle_fetch_hyperliquid"
@@ -102,6 +124,12 @@ let () =
             `Quick
             test_coin_of_symbol_no_spot_pair
         ; Alcotest.test_case "edge cases" `Quick test_coin_of_symbol_edge_cases
+        ] )
+    ; ( "window ordering"
+      , [ Alcotest.test_case
+            "windows accumulate ascending (last = current close)"
+            `Quick
+            test_windows_to_series_ascending
         ] )
     ]
 ;;

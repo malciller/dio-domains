@@ -134,6 +134,95 @@ let test_merge_series () =
   Alcotest.(check (float 1e-9)) "descending venue wins overlap" 2600.0 overlap3.close
 ;;
 
+let test_classify_error () =
+  (* Yahoo's pre-listing answer (HTTP 400, "Data doesn't exist for
+     startDate = ...") is an EMPTY RANGE, not a failure: the walk skips it
+     instead of aborting (the SPCX spam fix - a recently-listed asset must
+     not re-request the same doomed range on every pass). *)
+  Alcotest.(check bool)
+    "400 + data-doesn't-exist = missing data"
+    (Oracle_fetch_yahoo.classify_error
+       400
+       "{\"chart\":{\"result\":null,\"error\":{\"code\":\"Bad \
+        Request\",\"description\":\"Data doesn't exist for startDate = 1420088400, \
+        endDate = 1781150400\"}}}"
+     = `Missing_data)
+    true;
+  (* Case-insensitive match. *)
+  Alcotest.(check bool)
+    "lowercase body matches"
+    (Oracle_fetch_yahoo.classify_error
+       400
+       "{\"chart\":{\"result\":null,\"error\":{\"description\":\"data doesn't exist\"}}}"
+     = `Missing_data)
+    true;
+  (* Any other error is fatal. *)
+  Alcotest.(check bool)
+    "401 = fatal"
+    (Oracle_fetch_yahoo.classify_error 401 "{\"error\":\"Unauthorized\"}" = `Fatal)
+    true;
+  Alcotest.(check bool)
+    "400 without the marker = fatal"
+    (Oracle_fetch_yahoo.classify_error 400 "{\"error\":\"Invalid Crumb\"}" = `Fatal)
+    true;
+  Alcotest.(check bool)
+    "500 = fatal"
+    (Oracle_fetch_yahoo.classify_error 500 "oops" = `Fatal)
+    true
+;;
+
+let test_empty_prefix_cache () =
+  (* The confirmed-empty prefix is cached per symbol: a fetch whose whole
+     requested range sits before the known listing is answered locally with
+     zero bars and zero HTTP requests (the pre-listing dates are never
+     re-requested). *)
+  let symbol = "SPCX" in
+  (* Simulate the first pass: the walk recorded "no data before 2026-06-15". *)
+  Oracle_fetch_yahoo.remember_empty ~symbol "2026-06-15";
+  (match Oracle_fetch_yahoo.known_empty_before ~symbol with
+   | Some d -> Alcotest.(check string) "floor cached" "2026-06-15" d
+   | None -> Alcotest.fail "expected the cached empty prefix");
+  (* The prefix only grows forward: a later, deeper empty answer is kept. *)
+  Oracle_fetch_yahoo.remember_empty ~symbol "2026-06-01";
+  (match Oracle_fetch_yahoo.known_empty_before ~symbol with
+   | Some d -> Alcotest.(check string) "floor does not shrink" "2026-06-15" d
+   | None -> Alcotest.fail "expected the cached empty prefix");
+  Oracle_fetch_yahoo.remember_empty ~symbol "2026-08-01";
+  (match Oracle_fetch_yahoo.known_empty_before ~symbol with
+   | Some d -> Alcotest.(check string) "floor extends" "2026-08-01" d
+   | None -> Alcotest.fail "expected the cached empty prefix");
+  (* Symbols are independent. *)
+  Alcotest.(check bool)
+    "other symbols unaffected"
+    (Oracle_fetch_yahoo.known_empty_before ~symbol:"QQQ" = None)
+    true
+;;
+
+let test_classify_exn () =
+  (* The fetch wraps failures as "Oracle_fetch_yahoo: HTTP <status> for
+     <symbol> (<body>)"; classification must dig the status and body out. *)
+  Alcotest.(check bool)
+    "missing-data failure classified from the message"
+    (Oracle_fetch_yahoo.classify_exn
+       (Failure
+          "Oracle_fetch_yahoo: HTTP 400 for SPCX \
+           ({\"chart\":{\"result\":null,\"error\":{\"code\":\"Bad \
+           Request\",\"description\":\"Data doesn't exist for startDate = \
+           1420088400\"}}})")
+     = `Missing_data)
+    true;
+  Alcotest.(check bool)
+    "non-empty-range failure is fatal"
+    (Oracle_fetch_yahoo.classify_exn
+       (Failure "Oracle_fetch_yahoo: HTTP 503 for QQQ (boom)")
+     = `Fatal)
+    true;
+  Alcotest.(check bool)
+    "non-Failure exceptions are fatal"
+    (Oracle_fetch_yahoo.classify_exn (Invalid_argument "x") = `Fatal)
+    true
+;;
+
 let () =
   Alcotest.run
     "oracle_fetch_yahoo"
@@ -147,5 +236,19 @@ let () =
     ; ( "merge"
       , [ Alcotest.test_case "deep prepend, venue wins overlap" `Quick test_merge_series ]
       )
+    ; ( "pre-listing windows"
+      , [ Alcotest.test_case
+            "400 data-doesn't-exist classifies as empty"
+            `Quick
+            test_classify_error
+        ; Alcotest.test_case
+            "empty prefix cached per symbol (no re-request spam)"
+            `Quick
+            test_empty_prefix_cache
+        ; Alcotest.test_case
+            "fetch failure exceptions classify by status+body"
+            `Quick
+            test_classify_exn
+        ] )
     ]
 ;;
