@@ -164,6 +164,25 @@ type sizing_result =
   ; reachable : bool
   }
 
+(** Per-asset historical price-range reference, computed from the (deepened)
+    series: the all-time high, the all-time low and where the current price
+    sits within that span. This is the "potential price range" of the asset -
+    the reference the sizing and spacing use to know how deep a fall from the
+    current level can plausibly go and how much of it has already happened. *)
+type range_stats =
+  { ath : float (** Highest high over the whole history. *)
+  ; all_time_low : float (** Lowest low over the whole history. *)
+  ; price : float (** Last close. *)
+  ; d_from_ath : float
+    (** Drawdown already realized from the peak: (ath - price) / ath. 0 at
+        the ATH, [range_span] at the all-time low. *)
+  ; d_to_low : float
+    (** Remaining straight-line fall to the historical low:
+        (price - low) / price. 0 at the low, bounded by [range_span]. *)
+  ; range_span : float
+    (** Widest drawdown the history has actually spanned: (ath - low) / ath. *)
+  }
+
 (* ---- Deployment sizing (the engine's core output) ---- *)
 
 (** Blended coverage of one horizon at the deployment's D_surv. *)
@@ -199,7 +218,12 @@ type deployment_row =
 
 (** The two inputs that decide the resolved strategy parameter. Crypto blends
     the Fear & Greed signal against the oracle's capital-constrained
-    tightness; equities use the oracle side alone. *)
+    tightness; equities use the oracle side alone. The per-asset historical
+    range position (ATH reference) joins the blend as a third side: near the
+    top of the range the potential fall is the whole span, so spacing widens
+    (preserve runway); near the lows the remaining downside is bounded, so
+    spacing tightens - an aggressive accumulator that works with the F&G
+    contrarian convention. *)
 type parameter_components =
   { fng : float option (** Resolved Fear & Greed value (None for equities). *)
   ; fng_parameter : float option
@@ -211,11 +235,17 @@ type parameter_components =
         target survival on the replayed path: the density the available
         capital and the asset's historical volatility can actually afford. *)
   ; resolved_parameter : float
-    (** Final parameter: fng_weight * fng_parameter + (1-fng_weight) *
-        survival_parameter for crypto, survival_parameter for equities;
-        clamped to the range and never tighter than survival_parameter (the
-        runway wins over sentiment). *)
+    (** Final parameter: the weighted blend of the fng / survival / range
+        sides, clamped to the range and never tighter than
+        [survival_parameter] (the runway wins over sentiment and range
+        aggression alike). *)
   ; fng_weight : float (** The weight the F&G side carried in the blend (0.5 default). *)
+  ; range_parameter : float option
+    (** lo + (1 - position) * (hi - lo) with position = d_from_ath /
+        range_span in [0, 1]: near the ATH (position 0) spacing widens toward
+        hi, near the all-time low (position 1) it tightens toward lo. *)
+  ; range_weight : float
+    (** The weight the range side carried in the blend (0.25 default). *)
   }
 
 (** The engine's decision for one asset: the position size and strategy
@@ -238,6 +268,9 @@ type asset_deployment =
   ; parameter : float (** Resolved strategy parameter (grid: grid interval in %). *)
   ; d_surv : float (** Replayed D_surv at the recommended sizing. *)
   ; min_quote_drawdown : float
+  ; range : range_stats option
+    (** Per-asset historical price-range reference (ATH / low / position).
+        None only when the series is empty. *)
   ; coverage : deployment_coverage list
   ; warnings : string list
   ; tuning_rows : deployment_row list

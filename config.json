@@ -15,6 +15,7 @@
     "qty_cap_mult": 2.5,
     "target_survival": 0.95,
     "fng_weight": 0.5,
+    "range_weight": 0.25,
     "min_active_dsurv": 0.0,
     "weight_by_sessions": true,
     "no_deep_history": false,

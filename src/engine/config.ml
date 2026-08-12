@@ -99,6 +99,7 @@ let known_gc_keys =
 let known_oracle_keys =
   [ "target_survival"
   ; "fng_weight"
+  ; "range_weight"
   ; "min_active_dsurv"
   ; "qty_cap_mult"
   ; "no_deep_history"
@@ -476,6 +477,11 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
           |> member "fng_weight"
           |> to_float_option
           |> Option.value ~default:defaults.fng_weight
+      ; range_weight =
+          oracle_json
+          |> member "range_weight"
+          |> to_float_option
+          |> Option.value ~default:defaults.range_weight
       ; min_active_dsurv =
           oracle_json
           |> member "min_active_dsurv"

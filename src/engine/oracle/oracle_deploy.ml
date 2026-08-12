@@ -5,8 +5,10 @@
    range [lo, hi], qty gates, fees), it decides:
 
      - the tuned parameter (grid: the grid interval gi): a weighted blend of
-       the Fear & Greed contrarian signal (crypto only) and the oracle's
-       capital-constrained tightness,
+       the Fear & Greed contrarian signal (crypto only), the per-asset
+       historical range position (ATH reference: spacing widens near the top
+       of the range to preserve runway, tightens near the lows to accumulate
+       aggressively) and the oracle's capital-constrained tightness,
      - the position size qty: the largest lot-rounded quantity whose floor-
        aware cost through the governing drawdown d_gov fits the pool
        (deploy maximum capital, reserved for drawdowns),
@@ -134,6 +136,48 @@ let governing_basis ~(models : Oracle_replay.blend_model list) ~(target_survival
     (match deepest_observed_drawdown models with
      | Some (d, h) -> Some (d, h, true)
      | None -> None)
+;;
+
+(** Per-asset historical price-range reference from the (deepened) series:
+    ATH = highest high, all-time low = lowest low, price = last close.
+    [None] on an empty history. This is the per-asset "potential price
+    range" the sizing and spacing use to reference how deep a fall from the
+    current level can go and how much of it has already happened. *)
+let range_stats_of (asset : series) : range_stats option =
+  let n = Array.length asset.bars in
+  if n = 0
+  then None
+  else (
+    let ath = ref 0.0 in
+    let low = ref max_float in
+    Array.iter
+      (fun (b : bar) ->
+         ath := Float.max !ath b.high;
+         low := Float.min !low b.low)
+      asset.bars;
+    let ath = !ath in
+    let low = !low in
+    let price = asset.bars.(n - 1).close in
+    let range_span = if ath > 0.0 then (ath -. low) /. ath else 0.0 in
+    let d_from_ath = if ath > 0.0 then (ath -. price) /. ath else 0.0 in
+    let d_to_low = if price > 0.0 then (price -. low) /. price else 0.0 in
+    Some { ath; all_time_low = low; price; d_from_ath; d_to_low; range_span })
+;;
+
+(** The range side of the parameter blend: [lo + (1 - position) * (hi - lo)]
+    with position = d_from_ath / range_span clamped to [0, 1]. Near the ATH
+    (position ~ 0) the potential fall is the whole historical span, so
+    spacing widens toward hi (preserve runway); near the all-time low
+    (position ~ 1) the remaining downside is bounded by the observed range,
+    so spacing tightens toward lo - an aggressive accumulator zone that works
+    with the F&G contrarian convention. [None] when the range carries no
+    information (empty history or zero span). *)
+let range_parameter ~(lo : float) ~(hi : float) (r : range_stats) : float option =
+  if r.range_span <= 0.0
+  then None
+  else (
+    let position = Float.max 0.0 (Float.min 1.0 (r.d_from_ath /. r.range_span)) in
+    Some (lo +. ((1.0 -. position) *. (hi -. lo))))
 ;;
 
 (** The deployment engine, parameterized by a strategy model [M] (see
@@ -409,19 +453,22 @@ module Engine (M : Oracle_strategy.S) = struct
   (** The full deployment for one asset against its venue pool share. Pure:
       [asset], [models], [cfg] and the pool are resolved by the caller.
 
-      Resolution order:
-       1. governing drawdown from the blend models (None -> inactive),
-       2. parameter scan over [lo, hi]: survival_parameter = tightest parameter
+       Resolution order:
+        1. governing drawdown from the blend models (None -> inactive),
+        2. parameter scan over [lo, hi]: survival_parameter = tightest parameter
           that clears the target on the replayed path (in fallback mode: the
           tightest parameter whose static ladder cost through the observed
           drawdown fits the pool - the replay cannot tune on an immature
           history),
-      3. resolved_parameter = fng_weight * fng_parameter + (1 - fng_weight) *
-         survival_parameter for crypto (use_fng), survival_parameter alone for
-         equities; clamped to the range and never tighter than
-         survival_parameter (runway wins over sentiment),
-      4. final row at the resolved parameter (verification down-sizes qty if
-         needed).
+       3. resolved_parameter = the weighted blend of the fng side (crypto:
+          fng_weight), the range side (range_weight: the per-asset historical
+          range position) and the survival side (the remainder), renormalized
+          when a side does not apply (equities have no fng side; a degenerate
+          series has no range side); clamped to the range and never tighter
+          than survival_parameter (runway wins over sentiment and range
+          aggression alike),
+       4. final row at the resolved parameter (verification down-sizes qty if
+          needed).
 
        Inactive reasons: no reachable horizon, a pool that cannot fund even the
        first buy at the sizing floor (the venue lot or the config qty,
@@ -454,6 +501,7 @@ module Engine (M : Oracle_strategy.S) = struct
         ~(pool : float)
         ~(fng : float option)
         ~(fng_weight : float)
+        ~(range_weight : float)
         ~(min_active_dsurv : float)
         ~(use_fng : bool)
         ~(param_steps : int)
@@ -467,6 +515,17 @@ module Engine (M : Oracle_strategy.S) = struct
     let q_min = sizing_floor ~cfg in
     let lo = Float.min lo hi in
     let hi = Float.max lo hi in
+    (* Per-asset historical price-range reference (ATH -> all-time low) and
+       the range side of the parameter blend: near the ATH the potential fall
+       is the whole historical span, so spacing widens (preserve runway);
+       near the lows the remaining downside is bounded, so spacing tightens -
+       an aggressive accumulator working with the F&G contrarian signal. *)
+    let range = range_stats_of asset in
+    let range_parameter =
+      match range with
+      | Some r -> range_parameter ~lo ~hi r
+      | None -> None
+    in
     let empty_row parameter =
       { parameter
       ; qty = 0.0
@@ -493,11 +552,14 @@ module Engine (M : Oracle_strategy.S) = struct
           ; survival_parameter = hi
           ; resolved_parameter = hi
           ; fng_weight
+          ; range_parameter
+          ; range_weight
           }
       ; qty = 0.0
       ; parameter = hi
       ; d_surv = 0.0
       ; min_quote_drawdown = 0.0
+      ; range
       ; coverage = []
       ; warnings = []
       ; tuning_rows = []
@@ -578,15 +640,31 @@ module Engine (M : Oracle_strategy.S) = struct
           | Some r -> r.parameter
           | None -> hi
         in
-        (* 2. resolve the parameter: F&G blend for crypto, pure survival for
-           equity. *)
+        (* 2. resolve the parameter: the weighted blend of the F&G side
+           (crypto only), the range side (the per-asset historical ATH/low
+           position) and the survival side. The side weights always sum to 1;
+           when a side does not apply (equities have no F&G side, a degenerate
+           series has no range side) the remaining sides are renormalized over
+           their combined weight. *)
         let fng_parameter_opt =
           if use_fng then Option.map (fun f -> fng_parameter ~lo ~hi ~fng:f) fng else None
         in
+        let w_survival = Float.max 0.0 (1.0 -. fng_weight -. range_weight) in
+        let blend3 w1 v1 w2 v2 w3 v3 =
+          let total = w1 +. w2 +. w3 in
+          if total <= 0.0
+          then survival_parameter
+          else (w1 /. total *. v1) +. (w2 /. total *. v2) +. (w3 /. total *. v3)
+        in
         let blended =
-          match fng_parameter_opt with
-          | Some p -> (fng_weight *. p) +. ((1.0 -. fng_weight) *. survival_parameter)
-          | None -> survival_parameter
+          match fng_parameter_opt, range_parameter with
+          | Some p, Some rp ->
+            blend3 fng_weight p w_survival survival_parameter range_weight rp
+          | Some p, None ->
+            blend3 fng_weight p w_survival survival_parameter 0.0 survival_parameter
+          | None, Some rp ->
+            blend3 0.0 survival_parameter w_survival survival_parameter range_weight rp
+          | None, None -> survival_parameter
         in
         let resolved_parameter = Float.min (Float.max blended lo) hi in
         let clamped, warn_clamp =
@@ -719,11 +797,14 @@ module Engine (M : Oracle_strategy.S) = struct
             ; survival_parameter
             ; resolved_parameter = parameter_final
             ; fng_weight
+            ; range_parameter
+            ; range_weight
             }
         ; qty = row.qty
         ; parameter = parameter_final
         ; d_surv = row.d_surv_replay
         ; min_quote_drawdown = row.min_quote_drawdown
+        ; range
         ; coverage = row.coverage
         ; warnings = List.rev !warnings
         ; tuning_rows = rows
