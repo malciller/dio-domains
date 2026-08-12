@@ -12,6 +12,9 @@
   dio.cmc
   dio.strategies
   dio.dashboard
+  dio.engine
+  dio.oracle
+  dio.concurrency
   lwt
   supervisor
   mirage-crypto-rng.unix)
