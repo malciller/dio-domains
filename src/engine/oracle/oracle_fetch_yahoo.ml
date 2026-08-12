@@ -29,6 +29,11 @@ let endpoint = "https://query1.finance.yahoo.com/v8/finance/chart/%s"
 let window_seconds = 1_100_000_000L (* ~35 months: ~1050 daily points per request *)
 let day_seconds = 86_400L
 
+(* Yahoo throttles aggressive parallel clients (crumb/429). The oracle pass
+   now analyzes assets concurrently, so the deep-history fetches would fire
+   ~10 at once on a cold cache; serialize them - one Yahoo walk at a time. *)
+let yahoo_mutex = Lwt_mutex.create ()
+
 (* ------------------------------------------------------------------ *)
 (* Pre-listing window handling: Yahoo answers a request whose range sits
    entirely before the symbol's listing with HTTP 400 and
@@ -379,7 +384,9 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
           then Lwt.return (List.rev acc, skipped)
           else go (Int64.add to_ms day_seconds) acc ~skipped))
     in
-    go start_epoch [] ~skipped:0
+    (* One walk at a time (see [yahoo_mutex]): the pass fetches many symbols
+       concurrently and Yahoo throttles parallel bursts. *)
+    Lwt_mutex.with_lock yahoo_mutex (fun () -> go start_epoch [] ~skipped:0)
     >|= fun (bars, skipped) ->
     if skipped > 0
     then

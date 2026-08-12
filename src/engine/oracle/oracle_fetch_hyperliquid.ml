@@ -261,113 +261,12 @@ let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list) : Oracle_ty
   }
 ;;
 
-(* ---- Source normalization (see the module doc) ---- *)
+(* ---- Source normalization (see the module doc) ----
+   The canonical implementation lives in [Oracle_calendar.normalize_bars] so
+   every venue fetch and the history cache merge through ONE clean-series
+   path; this re-export keeps the Hyperliquid tests and callers stable. *)
 
-let median_of (xs : float array) =
-  let n = Array.length xs in
-  if n = 0
-  then None
-  else (
-    let arr = Array.copy xs in
-    Array.sort Float.compare arr;
-    Some (if n mod 2 = 1 then arr.(n / 2) else (arr.((n / 2) - 1) +. arr.(n / 2)) /. 2.0))
-;;
-
-(** Normalize a candle list into the canonical clean series: ascending,
-    de-duplicated, fabricated rows dropped, absurd intra-row extremes folded
-    into the row's close. Returns the clean bars plus the counts of dropped
-    and clamped rows (for the once-per-symbol log).
-    - Pass 1 drops rows with non-finite/non-positive fields or an impossible
-      single-candle range (>10x between the row's extreme prints).
-    - Pass 2 folds rows whose extreme prints sit >2x away from the row's own
-      close into a flat close (liquid assets never trade a >2x daily span;
-      the close is the day's real level and is kept).
-    - Pass 3 drops rows whose close deviates >8x from the series' median
-      close (fabricated placeholder levels sit ~100x off the real market).
-      The median is computed over rows with real trading volume (>= 0.01)
-      so a long dead/placeholder run cannot drag the reference itself into
-      the gutter; no such rows falls back to all survivors, and no reference
-      at all keeps everything. *)
-let normalize_bars (bars : Oracle_types.bar list) : Oracle_types.bar array * int * int =
-  let arr = bars |> Array.of_list |> Oracle_calendar.sort_bars |> Oracle_calendar.dedup in
-  let n = Array.length arr in
-  let dropped = ref 0 in
-  let clamped = ref 0 in
-  let good = Array.make n false in
-  for i = 0 to n - 1 do
-    let b = arr.(i) in
-    let lo = Float.min b.open_ (Float.min b.high (Float.min b.low b.close)) in
-    let hi = Float.max b.open_ (Float.max b.high (Float.max b.low b.close)) in
-    let sane =
-      Float.is_finite b.open_
-      && Float.is_finite b.high
-      && Float.is_finite b.low
-      && Float.is_finite b.close
-      && b.open_ > 0.0
-      && b.high > 0.0
-      && b.low > 0.0
-      && b.close > 0.0
-      && hi /. lo <= 10.0
-    in
-    good.(i) <- sane;
-    if not sane then incr dropped
-  done;
-  for i = 0 to n - 1 do
-    if good.(i)
-    then (
-      let b = arr.(i) in
-      let lo = Float.min b.open_ (Float.min b.high (Float.min b.low b.close)) in
-      let hi = Float.max b.open_ (Float.max b.high (Float.max b.low b.close)) in
-      if hi > 2.0 *. b.close || lo < b.close /. 2.0
-      then (
-        arr.(i) <- { b with open_ = b.close; high = b.close; low = b.close };
-        incr clamped))
-  done;
-  let closes_of (predicate : int -> Oracle_types.bar -> bool) =
-    Array.to_list arr
-    |> List.mapi (fun i (b : Oracle_types.bar) -> i, b)
-    |> List.filter (fun (i, b) -> predicate i b)
-    |> List.map (fun (_, (b : Oracle_types.bar)) -> b.close)
-    |> Array.of_list
-  in
-  let ref_closes =
-    let with_volume = closes_of (fun i b -> good.(i) && b.volume >= 0.01) in
-    if Array.length with_volume > 0 then with_volume else closes_of (fun i _ -> good.(i))
-  in
-  (match median_of ref_closes with
-   | None -> ()
-   | Some m when m > 0.0 ->
-     for i = 0 to n - 1 do
-       if good.(i)
-       then (
-         let c = arr.(i).close in
-         if Float.max c m /. Float.min c m > 8.0
-         then (
-           good.(i) <- false;
-           incr dropped))
-     done
-   | Some _ -> ());
-  (* A series with no real trading at all (not one surviving row with volume
-     >= 0.01) is entirely fabricated: empty it rather than feed placeholder
-     candles into the drawdown/floor math. *)
-  let any_real = ref false in
-  for i = 0 to n - 1 do
-    if good.(i) && arr.(i).volume >= 0.01 then any_real := true
-  done;
-  if not !any_real
-  then
-    for i = 0 to n - 1 do
-      if good.(i)
-      then (
-        good.(i) <- false;
-        incr dropped)
-    done;
-  let out = ref [] in
-  for i = n - 1 downto 0 do
-    if good.(i) then out := arr.(i) :: !out
-  done;
-  Array.of_list !out, !dropped, !clamped
-;;
+let normalize_bars = Oracle_calendar.normalize_bars
 
 (** Order the fetched candle windows into ascending time (oldest -> newest)
     and normalize the whole series ([normalize_bars] sorts and de-duplicates,

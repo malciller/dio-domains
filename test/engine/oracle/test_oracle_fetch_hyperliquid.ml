@@ -270,6 +270,44 @@ let test_normalize_real_series_untouched () =
   Alcotest.(check int) "all rows survive" 56 (Array.length clean)
 ;;
 
+let test_normalize_long_horizon_100x_kept () =
+  (* Regression: a series that genuinely appreciated ~8000x (BTC ~$1k in
+     2017 vs ~$40k+ median; ETH ~$90 in late 2018) must KEEP its early
+     cheap-era rows. The outlier judge is local (nearest real-trading
+     neighbor), never a global median - a global median would drop every
+     row >8x below it and fabricate the gaps the analyze stage refuses
+     (the prod bug: ETH/SOL/ADA/BTC all failed with session-gap errors). *)
+  let rows = ref [] in
+  for year = 2015 to 2026 do
+    for month = 1 to 12 do
+      let date = Printf.sprintf "%04d-%02d-15" year month in
+      let close =
+        0.5 *. Float.pow 2.0 (float_of_int (((year - 2015) * 12) + month - 1) /. 8.0)
+      in
+      rows
+      := mk_bar
+           ~date
+           ~open_:close
+           ~high:(close *. 1.02)
+           ~low:(close *. 0.98)
+           ~close
+           ~volume:100.0
+         :: !rows
+    done
+  done;
+  let clean, dropped, clamped =
+    Dio_oracle.Oracle_fetch_hyperliquid.normalize_bars (List.rev !rows)
+  in
+  (* ~$0.5 in 2015 to ~$4,000 in 2026: an 8000x appreciation. *)
+  Alcotest.(check int) "no cheap-era rows dropped" 0 dropped;
+  Alcotest.(check int) "no clamps" 0 clamped;
+  Alcotest.(check int) "all 144 rows survive" 144 (Array.length clean);
+  Alcotest.(check (float 1e-9))
+    "first bar is the 2015 cheap era"
+    0.5
+    clean.(0).Dio_oracle.Oracle_types.close
+;;
+
 let () =
   Alcotest.run
     "oracle_fetch_hyperliquid"
@@ -309,6 +347,10 @@ let () =
             "clean series passes through untouched"
             `Quick
             test_normalize_real_series_untouched
+        ; Alcotest.test_case
+            "100x long-horizon cheap era is kept"
+            `Quick
+            test_normalize_long_horizon_100x_kept
         ] )
     ]
 ;;
