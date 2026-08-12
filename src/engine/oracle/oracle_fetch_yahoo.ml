@@ -23,7 +23,6 @@
    are fixture-testable without network. *)
 
 open Lwt.Infix
-open Cohttp_lwt_unix
 
 let section = "oracle_yahoo"
 let endpoint = "https://query1.finance.yahoo.com/v8/finance/chart/%s"
@@ -322,7 +321,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
             Printf.sprintf "%s?period1=%Ld&period2=%Ld&interval=1d" base_url from_ms to_ms
           in
           let fetch =
-            Client.get ~headers (Uri.of_string url)
+            Oracle_http.get ~headers (Uri.of_string url)
             >>= fun (resp, body) ->
             Cohttp_lwt.Body.to_string body
             >>= fun body_str ->

@@ -11,6 +11,28 @@ type selectable_asset =
   ; data : Yojson.Basic.t
   }
 
+(** Whether the capital oracle's decision for this strategy entry says
+    INACTIVE - the oracle-paused state (the grid should not place new
+    orders). [false] when there is no oracle decision yet (before the first
+    pass) or when the entry is not a strategy entry. *)
+let oracle_inactive (data : Yojson.Basic.t) : bool =
+  match data |?> "oracle" with
+  | `Assoc _ as j ->
+    (match j |?> "active" with
+     | `Bool b -> not b
+     | _ -> false)
+  | _ -> false
+;;
+
+(** Paused = the capital oracle says INACTIVE, or the grid's own capital-low
+    flag is set (or the market is closed, judged at render time). *)
+let strategy_paused (data : Yojson.Basic.t) : bool =
+  let strat = data |?> "strategy" in
+  oracle_inactive data
+  || strat |?> "capital_low" |> to_bool_d false
+  || strat |?> "market_is_closed" |> to_bool_d false
+;;
+
 let get_selectable_assets json =
   let strats =
     match json |?> "strategies" with
@@ -19,11 +41,7 @@ let get_selectable_assets json =
   in
   let all_balances = json |?> "all_balances" |> to_list_d in
   let active_strats, paused_strats =
-    List.partition
-      (fun (_symbol, data) ->
-         let strat = data |?> "strategy" in
-         not (strat |?> "capital_low" |> to_bool_d false))
-      strats
+    List.partition (fun (_symbol, data) -> not (strategy_paused data)) strats
   in
   let strat_keys =
     List.map
@@ -184,7 +202,27 @@ let render_strategies ?(selected_index = None) w json =
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
     let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
     let hold_value = base_bal *. mid in
-    let buy_price = strat |?> "buy_price" |> to_float_d 0.0 in
+    (* The resting buy price: the strategy's tracked price first (it follows
+       amendments), falling back to the exchange's real open buy orders - a
+       committed buy stays visible even when the domain is halted by an
+       oracle INACTIVE decision and its state goes stale. *)
+    let buy_price =
+      let strat_price = strat |?> "buy_price" |> to_float_d 0.0 in
+      if strat_price > 0.0
+      then strat_price
+      else (
+        let open_buys =
+          market
+          |?> "buy_orders"
+          |> to_list_d
+          |> List.filter_map (fun o ->
+            let p = o |?> "price" |> to_float_d 0.0 in
+            if p > 0.0 then Some p else None)
+        in
+        match open_buys with
+        | [] -> 0.0
+        | prices -> List.fold_left min (List.hd prices) prices)
+    in
     let sell_count = strat |?> "sell_count" |> to_int_d 0 in
     let sell_orders =
       let strat_sells = strat |?> "sell_orders" |> to_list_d in
@@ -312,8 +350,9 @@ let render_strategies ?(selected_index = None) w json =
     in
     let gauge_img = render_proximity_slider 17 execution_proximity_opt in
     let market_is_closed = strat |?> "market_is_closed" |> to_bool_d false in
+    let oracle_paused = oracle_inactive data in
     let status_str, status_attr =
-      if cap_low || market_is_closed then "⏸", a_yellow else "▶", a_green
+      if oracle_paused || cap_low || market_is_closed then "⏸", a_yellow else "▶", a_green
     in
     let exch_tag = exch_tag_of exchange in
     let spread_str = format_spread_bps bid ask in
@@ -482,11 +521,7 @@ let render_strategies ?(selected_index = None) w json =
            ])
   in
   let active_rows_data, paused_rows_data =
-    List.partition
-      (fun (_symbol, data) ->
-         let strat = data |?> "strategy" in
-         not (strat |?> "capital_low" |> to_bool_d false))
-      strats
+    List.partition (fun (_symbol, data) -> not (strategy_paused data)) strats
   in
   let build_balance_row ?(is_selected = false) is_even bal_json img_is_quote =
     let exchange = bal_json |?> "exchange" |> to_string_d "?" in

@@ -77,8 +77,15 @@ module type S = sig
   (** Static drawdown survived by [n_fills] steps. *)
   val drawdown_of_fills : config -> n_fills:int -> float
 
-  (** Replay the strategy over a historical path (pessimistic ordering). *)
-  val replay : config -> Oracle_types.series -> outcome
+  (** Replay the strategy over a historical path (pessimistic ordering).
+      [seed] (optional) starts the grid from an existing account state
+      (held base, resting-sell reservations, accumulated profit) instead of
+      a fresh grid - the oracle models the strategy as it actually runs. *)
+  val replay
+    :  ?seed:Dio_strategies.Grid_core_types.seed
+    -> config
+    -> Oracle_types.series
+    -> outcome
 
   (** Net profit of one cycle per unit of deployed capital. Advisory tuning
       metric: the actual deployed capital is used so a binding floor's drag
@@ -158,7 +165,7 @@ module Grid : S with type config = Dio_strategies.Grid_core.config = struct
     | None -> 1.0
   ;;
 
-  let replay (g : config) (s : Oracle_types.series) : outcome =
+  let replay ?seed (g : config) (s : Oracle_types.series) : outcome =
     let bars =
       s.bars
       |> Oracle_calendar.sort_bars
@@ -175,11 +182,15 @@ module Grid : S with type config = Dio_strategies.Grid_core.config = struct
        bars toward prices the strategy would never have seen - burning the
        capital on a phantom drawdown (the Grid_core ladder trails the market
        up, it never starts above it). The static funding math keeps the
-       config start_price (today's price); only the replay anchor changes. *)
+       config start_price (today's price); only the replay anchor changes.
+       The optional [seed] starts the grid from the account's actual state
+       (held base / resting-sell reservations / accumulated profit) instead
+       of a fresh grid: the survival verdict then answers "can THIS grid, as
+       it runs, survive?" rather than "can a hypothetical fresh grid?". *)
     let g =
       if Array.length bars = 0 then g else { g with G.start_price = bars.(0).close }
     in
-    let r = G.replay g ~bars ~ordering:Dio_strategies.Grid_core_types.Buy_first in
+    let r = G.replay ?seed g ~bars ~ordering:Dio_strategies.Grid_core_types.Buy_first in
     { d_surv = d_surv_of_result r
     ; exhausted = r.exhausted
     ; halt_cause = r.halt_cause

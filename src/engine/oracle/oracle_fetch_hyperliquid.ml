@@ -23,7 +23,6 @@
    silently substituting perpetual candles. *)
 
 open Lwt.Infix
-open Cohttp_lwt_unix
 
 let section = "oracle_hyperliquid"
 let endpoint = "https://api.hyperliquid.xyz/info"
@@ -131,7 +130,7 @@ let refresh_spot_meta () : unit Lwt.t =
       (fun () ->
          let payload = `Assoc [ "type", `String "spotMeta" ] |> Yojson.Safe.to_string in
          let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-         Client.post
+         Oracle_http.post
            ~headers
            ~body:(Cohttp_lwt.Body.of_string payload)
            (Uri.of_string endpoint)
@@ -316,7 +315,7 @@ let fetch_candles ?(start_ms = default_start_ms) ~(symbol : string) ()
         in
         let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
         let fetch =
-          Client.post
+          Oracle_http.post
             ~headers
             ~body:(Cohttp_lwt.Body.of_string payload)
             (Uri.of_string endpoint)
