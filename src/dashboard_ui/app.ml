@@ -31,37 +31,14 @@ let discover_socket_candidates () =
     |> List.map (fun f -> "/tmp/" ^ f))
 ;;
 
-let read_exact fd buf off len =
-  let rec loop off remaining =
-    if remaining = 0
-    then ()
-    else (
-      let n = Unix.read fd buf off remaining in
-      if n = 0 then raise End_of_file;
-      loop (off + n) (remaining - n))
-  in
-  loop off len
-;;
-
-let read_message fd =
-  let header = Bytes.create 4 in
-  read_exact fd header 0 4;
-  let len =
-    (Bytes.get_uint8 header 0 lsl 24)
-    lor (Bytes.get_uint8 header 1 lsl 16)
-    lor (Bytes.get_uint8 header 2 lsl 8)
-    lor Bytes.get_uint8 header 3
-  in
-  if len > 10_000_000 then failwith "message too large";
-  let payload = Bytes.create len in
-  read_exact fd payload 0 len;
-  Bytes.to_string payload
-;;
-
 let connect_and_watch path =
   let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   try
     Unix.connect fd (Unix.ADDR_UNIX path);
+    (* Non-blocking: the render loop must never block mid-payload (a blocked
+       read stalls renders -> missed heartbeats -> the server prunes the
+       client and the dashboard blanks out every engine cycle). *)
+    Unix.set_nonblock fd;
     let _ = Unix.write_substring fd "W" 0 1 in
     fd
   with
@@ -122,6 +99,61 @@ let render_wait_screen w h msg =
     Buffer.add_string buf "\027[?2026l")
 ;;
 
+(** Incremental, non-blocking frame assembler for the UDS stream.
+    The engine pushes a full state snapshot every ~500 ms; those frames can
+    be large, and a blocking [read_exact] mid-payload would stall the render
+    loop (no pongs -> the server prunes the client -> blank dashboard +
+    reconnect flicker). The fd is non-blocking: whatever is available is
+    drained into [buf], complete length-prefixed frames are extracted, and
+    the loop never blocks on the socket. *)
+type frame_assembler = { buf : Buffer.t }
+
+let assem_create () = { buf = Buffer.create 65536 }
+
+let assem_drain fd (assem : frame_assembler) : [ `Data | `Eof | `Error ] =
+  let tmp = Bytes.create 8192 in
+  let rec loop () =
+    match Unix.read fd tmp 0 8192 with
+    | 0 -> `Eof
+    | n ->
+      Buffer.add_subbytes assem.buf tmp 0 n;
+      loop ()
+    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> `Data
+    | exception Unix.Unix_error _ -> `Error
+  in
+  loop ()
+;;
+
+(** Extract one complete length-prefixed frame if available. *)
+let assem_extract (assem : frame_assembler) : string option =
+  let buf = assem.buf in
+  let len = Buffer.length buf in
+  if len < 4
+  then None
+  else (
+    let header = Buffer.sub buf 0 4 in
+    let frame_len =
+      (Char.code header.[0] lsl 24)
+      lor (Char.code header.[1] lsl 16)
+      lor (Char.code header.[2] lsl 8)
+      lor Char.code header.[3]
+    in
+    if frame_len > 10_000_000
+    then (
+      (* Corrupt/oversized frame: drop the whole buffer and resync. *)
+      Buffer.clear buf;
+      None)
+    else if len < 4 + frame_len
+    then None
+    else (
+      let frame = Buffer.sub buf 4 frame_len in
+      (* Remove the consumed frame (keep any trailing partial bytes). *)
+      let rest = Buffer.sub buf (4 + frame_len) (len - 4 - frame_len) in
+      Buffer.clear buf;
+      Buffer.add_string buf rest;
+      Some frame))
+;;
+
 let run () =
   (* GC tuning for a lightweight single-domain render loop.
      Small minor heap enables frequent collections of short-lived
@@ -153,6 +185,7 @@ let run () =
     Printf.printf "\027[?25h\027[?1049l%!";
     Unix.tcsetattr Unix.stdin Unix.TCSAFLUSH saved_termios);
   let last_json = ref (`Assoc []) in
+  let has_cached_data = ref false in
   let quit = ref false in
   let input_buf = Bytes.create 64 in
   let view_mode_ref = ref `MainView in
@@ -224,7 +257,9 @@ let run () =
   in
   let disconnect fd =
     fd_ref := None;
-    last_json := `Assoc [];
+    (* Cache the last known state: never blank the dashboard on a dropped
+       connection - it keeps rendering the cached snapshot (with the engine
+       status frozen) until the reconnect delivers fresh data. *)
     (try
        let _ = Unix.write_substring fd "Q" 0 1 in
        ()
@@ -232,6 +267,74 @@ let run () =
      | _ -> ());
     try Unix.close fd with
     | _ -> ()
+  in
+  (* The frame draw is shared by the live loop and the reconnect path, so
+     the dashboard keeps showing the CACHED last snapshot while it waits
+     for the engine - it never blanks out. *)
+  let draw_frame w h =
+    let draw buf =
+      Buffer.add_string buf "\027[?2026h";
+      Buffer.add_string buf "\027[H";
+      let content_img =
+        match !view_mode_ref with
+        | `MainView ->
+          let uncropped =
+            I.vcat
+              [ Kpi_cards.render_kpi_cards w !last_json
+              ; Ticker_feed.render_ticker w !last_json
+              ; Holdings.render_strategies
+                  ~selected_index:(Some !selected_index_ref)
+                  w
+                  !last_json
+              ; Recent_fills_feed.render_fills w !last_json
+              ; Memory.render_memory w !last_json
+              ; Latencies.render_latencies w !last_json
+              ; Footer.render_footer w !last_json
+              ]
+          in
+          I.hsnap ~align:`Left w uncropped
+        | `DetailView asset_key ->
+          let detail_img = Asset_graph.render_asset_detail w h asset_key !last_json in
+          I.hsnap ~align:`Left w detail_img
+      in
+      let c_h = I.height content_img in
+      let c_w = I.width content_img in
+      let content_img =
+        if c_h < h
+        then I.vsnap ~align:`Middle h content_img
+        else I.vsnap ~align:`Top h content_img
+      in
+      let content_img =
+        if c_w < w
+        then I.hsnap ~align:`Middle w content_img
+        else I.hsnap ~align:`Left w content_img
+      in
+      let img = I.(content_img </> I.char A.(bg c_bg) ' ' w h) in
+      Render.to_buffer buf Cap.ansi (0, 0) (w, I.height img) img;
+      Buffer.add_string buf "\027[J";
+      Buffer.add_string buf "\027[?2026l"
+    in
+    render_to_stdout_safe ~timeout_s:2 draw
+  in
+  (* Render throttle: full frames on changes (~2/s), a keep-alive frame
+     every 2s when idle. A frame that exceeds the alarm timeout is SKIPPED,
+     not fatal - the loop continues and the next frame retries (the old
+     behavior killed the whole UI on a slow frame). *)
+  let render_if_due ~(now : float) ~(last_render : float ref) ~(dirty : bool) =
+    let interval = if dirty then 0.5 else 2.0 in
+    if now -. !last_render < interval
+    then `Not_due
+    else (
+      last_render := now;
+      if not (stdout_alive ())
+      then `Dead
+      else (
+        let w, h =
+          match Notty_unix.winsize Unix.stdout with
+          | Some (w, h) -> w, h
+          | None -> 80, 24
+        in
+        if draw_frame w h then `Ok else `Skipped))
   in
   let rec wait_for_engine () =
     if !quit
@@ -245,9 +348,14 @@ let run () =
           | Some (w, h) -> w, h
           | None -> 80, 24
         in
-        render_wait_screen w h "Waiting for engine...  (q to quit)";
+        (* Cached state: keep the last dashboard visible (stale but real)
+           while reconnecting; only a truly first run shows the wait
+           screen. *)
+        if !has_cached_data
+        then ignore (draw_frame w h)
+        else render_wait_screen w h "Waiting for engine...  (q to quit)";
         let ready, _, _ =
-          try Unix.select [ Unix.stdin ] [] [] 2.0 with
+          try Unix.select [ Unix.stdin ] [] [] 1.0 with
           | Unix.Unix_error _ -> [], [], []
         in
         if List.mem Unix.stdin ready
@@ -268,16 +376,27 @@ let run () =
   and run_event_loop fd =
     let lost_connection = ref false in
     let last_render_time = ref (Unix.gettimeofday ()) in
+    let last_pong_time = ref (Unix.gettimeofday ()) in
+    let dirty = ref true in
+    let assem = assem_create () in
     while (not !quit) && not !lost_connection do
       let now = Unix.gettimeofday () in
-      let time_since_render = now -. !last_render_time in
-      let target_frame_time = 0.05 in
-      (* ~20 FPS perfectly locked to scroll speed *)
-      let timeout =
-        if time_since_render >= target_frame_time
-        then 0.0
-        else target_frame_time -. time_since_render
-      in
+      (* Heartbeat on a FIXED cadence, decoupled from rendering: the server
+         prunes clients that miss pongs for ~3s, and a slow frame or a big
+         snapshot parse must never cost the connection (and with it the
+         whole dashboard state). *)
+      if now -. !last_pong_time >= 1.0
+      then (
+        last_pong_time := now;
+        try
+          let _ = Unix.write_substring fd "P" 0 1 in
+          ()
+        with
+        | _ -> ());
+      let render_interval = if !dirty then 0.5 else 2.0 in
+      let next_render = render_interval -. (now -. !last_render_time) in
+      let next_pong = 1.0 -. (now -. !last_pong_time) in
+      let timeout = max 0.0 (Float.min next_render next_pong) in
       let ready, _, _ =
         try Unix.select [ fd; Unix.stdin ] [] [] timeout with
         | Unix.Unix_error _ -> [], [], []
@@ -350,96 +469,51 @@ let run () =
                   | `Key_zoom_in -> Asset_graph.zoom_in curr_key
                   | `Key_zoom_out -> Asset_graph.zoom_out curr_key
                   | _ -> ()))
-            actions));
+            actions;
+          dirty := true));
       if List.mem fd ready && not !quit
       then (
-        try
-          let msg = read_message fd in
-          try
-            let new_json = Yojson.Basic.from_string msg in
-            last_json := new_json;
-            Asset_graph.record_all_prices new_json
-          with
-          | _ -> ()
-        with
-        | End_of_file ->
+        (* Non-blocking drain: complete frames are parsed, partial payloads
+           wait in the assembler - the loop is never blocked on the socket. *)
+        match assem_drain fd assem with
+        | `Eof ->
           disconnect fd;
           lost_connection := true
-        | Unix.Unix_error _ ->
+        | `Error ->
           disconnect fd;
           lost_connection := true
-        | _ -> ());
+        | `Data ->
+          let rec take_frames () =
+            match assem_extract assem with
+            | None -> ()
+            | Some msg ->
+              (try
+                 let new_json = Yojson.Basic.from_string msg in
+                 if new_json <> !last_json
+                 then (
+                   last_json := new_json;
+                   has_cached_data := true;
+                   Asset_graph.record_all_prices new_json;
+                   dirty := true)
+               with
+               | _ -> ());
+              take_frames ()
+          in
+          take_frames ());
       if (not !quit) && not !lost_connection
       then (
-        let now = Unix.gettimeofday () in
-        if now -. !last_render_time >= target_frame_time
-        then (
-          last_render_time := now;
-          if not (stdout_alive ())
-          then (
-            disconnect fd;
-            quit := true)
-          else (
-            let w, h =
-              match Notty_unix.winsize Unix.stdout with
-              | Some (w, h) -> w, h
-              | None -> 80, 24
-            in
-            let draw buf =
-              Buffer.add_string buf "\027[?2026h";
-              Buffer.add_string buf "\027[H";
-              let content_img =
-                match !view_mode_ref with
-                | `MainView ->
-                  let uncropped =
-                    I.vcat
-                      [ Kpi_cards.render_kpi_cards w !last_json
-                      ; Ticker_feed.render_ticker w !last_json
-                      ; Holdings.render_strategies
-                          ~selected_index:(Some !selected_index_ref)
-                          w
-                          !last_json
-                      ; Recent_fills_feed.render_fills w !last_json
-                      ; Memory.render_memory w !last_json
-                      ; Latencies.render_latencies w !last_json
-                      ; Footer.render_footer w !last_json
-                      ]
-                  in
-                  I.hsnap ~align:`Left w uncropped
-                | `DetailView asset_key ->
-                  let detail_img =
-                    Asset_graph.render_asset_detail w h asset_key !last_json
-                  in
-                  I.hsnap ~align:`Left w detail_img
-              in
-              let c_h = I.height content_img in
-              let c_w = I.width content_img in
-              let content_img =
-                if c_h < h
-                then I.vsnap ~align:`Middle h content_img
-                else I.vsnap ~align:`Top h content_img
-              in
-              let content_img =
-                if c_w < w
-                then I.hsnap ~align:`Middle w content_img
-                else I.hsnap ~align:`Left w content_img
-              in
-              let img = I.(content_img </> I.char A.(bg c_bg) ' ' w h) in
-              Render.to_buffer buf Cap.ansi (0, 0) (w, I.height img) img;
-              Buffer.add_string buf "\027[J";
-              Buffer.add_string buf "\027[?2026l"
-            in
-            let rendered = render_to_stdout_safe ~timeout_s:2 draw in
-            if not rendered
-            then (
-              disconnect fd;
-              quit := true)
-            else (
-              try
-                let _ = Unix.write_substring fd "P" 0 1 in
-                ()
-              with
-              | _ -> ()))))
+        match
+          render_if_due
+            ~now:(Unix.gettimeofday ())
+            ~last_render:last_render_time
+            ~dirty:!dirty
+        with
+        | `Dead ->
+          disconnect fd;
+          quit := true
+        | `Skipped -> dirty := false
+        | `Ok -> dirty := false
+        | `Not_due -> ())
     done;
     (match !fd_ref with
      | Some fd -> disconnect fd
