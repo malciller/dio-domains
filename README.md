@@ -121,6 +121,23 @@ engine spawns an isolated domain per entry.
     "allocation_policy": 2,
     "major_heap_increment": 100
   },
+  "oracle": {
+    "qty_cap_mult": 0.0,
+    "target_survival": 0.99,
+    "fng_weight": 0.5,
+    "range_weight": 0.25,
+    "min_active_dsurv": 0.0,
+    "weight_by_sessions": true,
+    "no_deep_history": false,
+    "refresh_seconds": 300.0,
+    "poll_seconds": 30.0
+  },
+  "classes": {
+    "crypto_core": ["BTC/USD", "ETH/USD"],
+    "crypto_alt": ["SOL/USD", "DOGE/USD", "ADA/USD"],
+    "equity_etf": ["SPY", "QQQ"],
+    "equity_momentum": ["NVDA", "AMD"]
+  },
   "trading": [
     {
       "symbol": "BTC/USD",
@@ -128,7 +145,8 @@ engine spawns an isolated domain per entry.
       "qty": "0.0002",
       "grid_interval": [0.25, 1.25],
       "sell_mult": "0.999",
-      "strategy": "Grid"
+      "strategy": "Grid",
+      "asset_class": "crypto_core"
     },
     {
       "symbol": "HYPE/USDC",
@@ -139,7 +157,8 @@ engine spawns an isolated domain per entry.
       "accumulation_buffer": [0.5, 5.0],
       "strategy": "Grid",
       "testnet": false,
-      "hedge": true
+      "hedge": true,
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "ETH/USDC",
@@ -168,7 +187,8 @@ engine spawns an isolated domain per entry.
       "accumulation_buffer": [10.0, 25.0],
       "strategy": "Grid",
       "testnet": true,
-      "data_feed": "iex"
+      "data_feed": "iex",
+      "asset_class": "equity_etf"
     }
   ]
 }
@@ -181,7 +201,7 @@ engine spawns an isolated domain per entry.
 | `symbol` | string | Trading pair (e.g. `"BTC/USD"`) or ticker (e.g. `"TQQQ"`, `"SPY"`) |
 | `exchange` | string | `"kraken"`, `"hyperliquid"`, `"lighter"`, `"ibkr"`, or `"alpaca"` |
 | `qty` | string | Order quantity per grid level |
-| `grid_interval` | [min, max] | Grid spacing as `%` of price, resolved via Fear & Greed |
+| `grid_interval` | [min, max] | Grid spacing as `%` of price. A constraint range, never a default: the capital oracle picks within it (crypto blends Fear & Greed in; equities are pure oracle and use the survival-constrained value) |
 | `sell_mult` | string | Sell quantity multiplier (`qty × sell_mult`). Values < 1.0 trigger accumulation |
 | `accumulation_buffer` | [min, max] | Profit threshold buffer before accumulation triggers (Hyperliquid, Lighter, IBKR, Alpaca) |
 | `strategy` | string | `"Grid"` or `"MM"` |
@@ -191,6 +211,148 @@ engine spawns an isolated domain per entry.
 | `hedge` | bool | Enable auto-hedge (Hyperliquid only) |
 | `data_feed` | string | Market data feed channel (`"iex"` or `"sip"`; Alpaca only) |
 | `maker_fee` / `taker_fee` | float | Override exchange fee rates |
+| `asset_class` | string | Risk class for capital-survival modeling (e.g. `"crypto_core"`); must match a key in the top-level `classes` map, required for `dio-oracle` runs |
+
+The optional top-level `oracle` object configures the capital-oracle runtime
+knobs. Every key is optional; absent keys fall back to the runtime defaults
+(`Oracle_runtime.default_config`), so a minimal section like
+`{"qty_cap_mult": 0.0}` is valid. Unknown keys are rejected at startup.
+
+Allocation is two-phase and joint across each venue account: every asset is
+analyzed first (each one computes its sizing reservation - the minimum funding
+needed to reach its ATH-anchored survival runway at the tightest grid
+interval), then assets are sized in config priority order against a budget
+equal to the remaining pool minus the lower-priority assets' reserved minimum
+funding. A priority asset therefore only grows after the rest of the account
+can still fill their drawdowns at minimum qty, and an asset is disabled only
+when even its first buy cannot be funded.
+
+| Oracle key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `qty_cap_mult` | float | `0.0` | The qty search range ceiling as a multiple of the config qty: the model sizes the order qty within `[config qty, config qty × mult]` (volume-driven: it grows as large as the survival constraints allow). `0.0` = uncapped (bounded only by the survival replay and the venue floor). A value `> 0` also caps each asset's deployment at `config qty × mult` so surplus capital passes down the config priority order |
+| `target_survival` | float | `0.99` | Replay coverage required to accept a sizing (fraction of blended-history paths that must clear the drawdown) |
+| `fng_weight` | float | `0.5` | Sentiment weight of the Fear & Greed blend for the grid interval (crypto only): `gi = fng_weight·gi_fng + range_weight·gi_range + (1 − fng_weight − range_weight)·gi_survival`; `0.0` removes the F&G side |
+| `range_weight` | float | `0.25` | Weight of the per-asset historical range side in the gi blend. The range side reads the asset's position within its ATH → all-time-low span (the deepened history): near the ATH the potential fall is the whole span, so spacing widens toward `hi` (preserve runway); near the lows the remaining downside is bounded, so spacing tightens toward `lo` (aggressive accumulation zone, working with the F&G contrarian convention). The blend is never tighter than the survival-constrained parameter - runway wins over sentiment and range aggression alike |
+| `min_active_dsurv` | float | `0.0` | Minimum achieved D_surv an asset must replay at to be published `active` (a threshold above the achievable runway marks under-funded assets inactive until capital returns) |
+| `weight_by_sessions` | bool | `true` | Weight class members by session count when blending class survival curves |
+| `no_deep_history` | bool | `false` | Disable the Yahoo deep-history extension |
+| `refresh_seconds` | float | `300.0` | Baseline cadence between analysis passes. Passes also wake early (within ~50ms) whenever the engine requests one on a fill or canceled/rejected/expired order, so this is the fallback rhythm, not the only one |
+| `poll_seconds` | float | `30.0` | Fast cadence while no asset is active - kept as a safety net: capital that becomes available on sell fills is normally recognized by the event-driven wake (fill → `request_pass`), but a slow poll guarantees a fresh pass even if an event is ever missed |
+| `horizons` | [int] | `None` | Session horizons in days (defaults per calendar kind) |
+| `max_capital` | float | `None` | Upper bound of the sizing binary search (in quote currency) |
+
+Grid spacing and order size are dynamic, driven by the oracle's drawdown-survival
+output, and tuned to be AS AGGRESSIVE AS POSSIBLE within the confined
+constraints: the tightest grid interval and the largest order qty (within
+`[qty, qty × qty_cap_mult]`) that still fund the survival runway and clear the
+target survival on the replayed path. The strategy is volume driven - more
+fills and larger sizes are the point - but it must survive volatile markets,
+and survival is the constraint that bounds the aggression.
+
+Survival is anchored at the ALL-TIME HIGH. The model computes the governing
+drawdown (the deepest horizon drawdown with `F_blend(d) >= target`) and sizes
+the grid to cover the fall from the current price down to the absolute target
+level `ATH × (1 - d_gov)`. Anchoring at the ATH caps the ladder's scale
+absolutely: the grid always covers down to the same price level no matter
+where the price sits, so the scale never shrinks endlessly as the market
+grinds down (and the deployed capital never grows without bound as the price
+approaches the lows). Once the price is at or below the target level, the
+whole ATH-to-target span has already been traversed: the required runway is
+zero, only the first buy needs funding, and the model can be maximally
+aggressive.
+
+The verification replay is funded with the asset's actual pool budget (not the
+static ladder cost), so the survival verdict answers the honest question - can
+the strategy survive this history with the capital it is entitled to? - and a
+well-funded asset grows its qty to the survival boundary instead of being
+falsely branded under-funded.
+
+Crypto assets blend the Fear & Greed contrarian signal into the resolved
+sizing (fear tightens the grid and up-sizes the qty, greed loosens and pulls
+back - never breaking the survival constraint, which always bounds the
+aggression); the per-asset historical range position (ATH → all-time low over
+the deepened history) joins the grid blend as well. Equities are PURE ORACLE:
+no F&G side and no sentiment - the grid interval is exactly the
+survival-constrained value and the qty the survival-max, and a live Fear &
+Greed reading is never applied to an equity grid.
+
+Sizing signals are never fabricated. The grid domain's startup gate gives
+BOTH signals their chance at startup: it opens immediately on a
+capital-oracle decision for the asset, or once the oracle's first pass
+attempt has finished (or the startup window has elapsed) on a live Fear &
+Greed reading alone — one real signal suffices to proceed, but both are
+attempted first (event-driven wakeups carry the oracle pass completion; the
+F&G cache holds genuinely fetched values only, so a failed fetch is
+distinguishable from a neutral reading). Equities are the exception: their
+sizing is pure oracle, so a live F&G reading never opens an equity grid —
+the equity domain withholds orders until the capital oracle publishes a
+decision. With neither signal available the grid withholds orders entirely:
+it cannot profitably and accurately size them, so it does not create them.
+When only one source is active and the other failed, a one-shot warning
+names the failed one.
+
+The top-level `classes` object defines the member pools backing each risk
+class's survival curve; `dio-oracle` fetches the listed symbols per venue
+(never from hardcoded code lists). Two schemas are accepted:
+
+```json
+"classes": {
+  "crypto_core": ["BTC/USD", "ETH/USD"],
+  "crypto_alt": { "members": ["SOL/USD", "DOGE/USD"], "kappa": 250 }
+}
+```
+
+- legacy: `"name": [member symbols]`
+- extended: `"name": {"members": [...], "kappa": N}` — per-class blend weight
+
+The survival blend pulls the asset's empirical drawdown coverage toward its
+class curve: `F_blend = (n_asset·F_asset + kappa·F_class)/(n_asset + kappa)`,
+where `kappa` is a pseudocount of class pseudo-sessions (default 200 ≈ 11% of
+the vote for a ~1600-session history, decaying as the asset's own history
+grows; `--kappa` overrides, config.json per-class kappa wins otherwise). The
+class contribution is volatility-normalized (`z = drawdown/(vol·√h)` pooled
+across members, then translated back through the asset's own trailing
+volatility), so a low-vol asset is not punished for a high-vol classmate's raw
+swing size. Percentile tables (asset/class/blended) are estimated from
+non-overlapping windows (one window per horizon block) so tail percentiles are
+not autocorrelation-dominated; `n_eff` reports the independent-window count
+next to the overlapping `n_starts` count. Inverse sizing reports both the
+safe closed-form static minimum capital (a straight-down worst case) and an
+advisory empirical minimum capital from actual path replay, whose
+static/empirical ratio shows the capital buffer the static sizing pays for.
+
+#### Portfolio Oracle
+
+Use `dio-oracle --portfolio` to replay multiple qualified instruments on a
+shared date timeline. The model's top level is the venue: capital is pooled per
+venue account (venue + quote + testnet), and every asset on the same venue
+draws its buy capital from that one pool — quote locked on an exchange cannot
+fund positions on another exchange, so each venue is an independent runway.
+`--total-capital` is split equally per venue; explicit funding uses repeated
+`--allocation VENUE/SYMBOL=AMOUNT` options (summed per venue). Manual quote
+transfers between venues use `--transfer SESSION:FROM->TO=AMOUNT`; transfers
+within one venue are rejected as no-ops and cross-quote transfers are rejected.
+A topology JSON file can define the same positions and transfers:
+
+```json
+{
+  "positions": [
+    { "venue": "hyperliquid", "symbol": "BTC/USDC", "capital": 1000.0 },
+    { "venue": "kraken", "symbol": "ETH/USD", "capital": 1000.0 },
+    { "venue": "alpaca", "symbol": "QQQ" }
+  ],
+  "transfers": [
+    { "session": 10, "from": "kraken/ETH/USD", "to": "alpaca/QQQ", "amount": 250.0 }
+  ]
+}
+```
+
+When `--capital` is omitted, online runs fetch each venue account's available
+quote balance and pool it per venue, splitting it across that venue's
+unspecified assets. `--positions-file` and `--save-positions` persist
+per-asset pool shares and base checkpoints separately from live strategy state
+(an asset's saved share is its venue pool divided by the venue's asset count,
+so the shares sum back to the venue pool).
 
 #### GC Tuning
 
@@ -400,7 +562,10 @@ Alpaca supports whole/fractional share equity trading and crypto pairs. DCA accu
 CoinMarketCap Fear & Greed index (0–100): fear resolves closer to
 `min` (accumulate faster), greed resolves closer to `max` (wait
 longer). Re-evaluated dynamically when price moves ≥3.5% from
-baseline. Applies to Hyperliquid, Lighter, IBKR, and Alpaca.
+baseline. Applies to Hyperliquid, Lighter, IBKR, and Alpaca. Only a
+live F&G reading resolves it - there is no midpoint default, and
+without a live F&G reading or a capital-oracle decision the grid does
+not place orders.
 
 ### MM (Adaptive Market Maker)
 

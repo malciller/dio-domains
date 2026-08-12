@@ -1,0 +1,422 @@
+(* Tests for Dio_oracle.Oracle_runtime: the fast-poll cadence used while no
+   asset is active (so a fully deployed account recognizes capital returns
+   quickly), the default runtime knobs, and the lock-free event trigger
+   ([request_pass] wakes [wait_until] early). *)
+
+let default_config () = Dio_oracle.Oracle_runtime.default_config ()
+
+let make_decision ~active =
+  { Dio_oracle.Oracle_runtime.exchange = "kraken"
+  ; symbol = "X/USD"
+  ; active
+  ; reason = "test"
+  ; qty = 1.0
+  ; grid_interval = 1.0
+  ; d_surv = 0.99
+  ; d_gov = 0.1
+  ; d_cover = 0.1
+  ; governing_horizon = "1d"
+  ; deployed = 100.0
+  ; pool_share = 100.0
+  ; remainder = 0.0
+  ; range = None
+  ; p2v = None
+  ; parameter_components =
+      { Dio_oracle.Oracle_types.fng = Some 50.0
+      ; fng_parameter = None
+      ; survival_parameter = 1.0
+      ; resolved_parameter = 1.0
+      ; fng_weight = 0.5
+      ; range_parameter = None
+      ; range_weight = 0.25
+      }
+  ; gi_reason = "test"
+  ; qty_reason = "test"
+  ; warnings = []
+  ; updated_at = 0.0
+  }
+;;
+
+let test_poll_while_all_inactive () =
+  (* A fully deployed account (every decision inactive, e.g. "cannot fund the
+     first buy" while awaiting sell fills) polls at the fast cadence. *)
+  let config = { (default_config ()) with poll_seconds = 5.0; refresh_seconds = 300.0 } in
+  let decisions = [ make_decision ~active:false; make_decision ~active:false ] in
+  Alcotest.(check (float 0.0001))
+    "fast poll while all inactive"
+    5.0
+    (Dio_oracle.Oracle_runtime.next_sleep ~config ~decisions)
+;;
+
+let test_normal_cadence_while_active () =
+  (* At least one active asset keeps the normal refresh cadence. *)
+  let config = { (default_config ()) with poll_seconds = 5.0; refresh_seconds = 300.0 } in
+  let decisions = [ make_decision ~active:true; make_decision ~active:false ] in
+  Alcotest.(check (float 0.0001))
+    "refresh cadence while active"
+    300.0
+    (Dio_oracle.Oracle_runtime.next_sleep ~config ~decisions)
+;;
+
+let test_normal_cadence_on_empty_snapshot () =
+  (* Nothing published yet: keep the normal cadence, do not spin. *)
+  let config = { (default_config ()) with poll_seconds = 5.0; refresh_seconds = 300.0 } in
+  Alcotest.(check (float 0.0001))
+    "refresh cadence on empty snapshot"
+    300.0
+    (Dio_oracle.Oracle_runtime.next_sleep ~config ~decisions:[])
+;;
+
+let test_default_qty_cap_mult_uncapped () =
+  (* Default 0.0 = uncapped: each asset grows its qty to deploy the whole pool
+     share it is handed (the user scenario: qty grows to survive max drawdown
+     with all capital deployed). *)
+  let d = default_config () in
+  Alcotest.(check (float 0.0001)) "qty_cap_mult default" 0.0 d.qty_cap_mult;
+  Alcotest.(check (float 0.0001)) "poll_seconds default" 30.0 d.poll_seconds;
+  Alcotest.(check (float 0.0001))
+    "startup_wait_seconds default"
+    60.0
+    d.startup_wait_seconds
+;;
+
+let test_tracks_asset () =
+  (* Only assets on the exchanges the runtime models (kraken, hyperliquid,
+     alpaca) get a published decision, so only they are startup-gated. *)
+  Alcotest.(check bool)
+    "kraken tracked"
+    true
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"kraken" ~symbol:"BTC/USD");
+  Alcotest.(check bool)
+    "hyperliquid tracked"
+    true
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"hyperliquid" ~symbol:"BTC");
+  Alcotest.(check bool)
+    "alpaca tracked"
+    true
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"alpaca" ~symbol:"QQQ");
+  Alcotest.(check bool)
+    "ibkr not tracked"
+    false
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"ibkr" ~symbol:"AAPL");
+  Alcotest.(check bool)
+    "lighter not tracked"
+    false
+    (Dio_oracle.Oracle_runtime.tracks_asset ~exchange:"lighter" ~symbol:"BTC")
+;;
+
+let test_first_pass_attempt_done_fresh () =
+  (* Fresh process, no runtime loop running: no pass attempt has finished, so
+     the flag is false (domains stay gated on the startup wait). *)
+  Alcotest.(check bool)
+    "first pass attempt not done"
+    false
+    (Dio_oracle.Oracle_runtime.first_pass_attempt_done ())
+;;
+
+let test_jitter_bounded () =
+  (* Jitter stays within [base, base + min(15, base/2)] and never goes below base. *)
+  let base = 10.0 in
+  List.iter
+    (fun _ ->
+       let v = Dio_oracle.Oracle_runtime.jittered base in
+       Alcotest.(check bool)
+         "jitter in range"
+         (v >= base && v <= base +. Float.min 15.0 (base /. 2.0))
+         true)
+    (List.init 200 (fun i -> i))
+;;
+
+let test_trigger_wakes_early () =
+  (* A [request_pass] (one lock-free Atomic increment) wakes [wait_until] on
+     the next slice instead of sleeping out the deadline: a fill or a
+     canceled/rejected/expired order re-sizes the asset within ~50ms. The
+     generation captured before the wait makes the wake one-shot. *)
+  let gen = Atomic.get Dio_oracle.Oracle_runtime.pass_requested in
+  let t0 = Unix.gettimeofday () in
+  let deadline = t0 +. 60.0 in
+  Dio_oracle.Oracle_runtime.request_pass ();
+  Lwt_main.run (Dio_oracle.Oracle_runtime.wait_until ~deadline ~generation:gen ());
+  let elapsed = Unix.gettimeofday () -. t0 in
+  Alcotest.(check bool) "woke well before the 60s deadline" (elapsed < 2.0) true
+;;
+
+let test_trigger_is_one_shot () =
+  (* The next wait captures the post-trigger generation: without a NEW
+     [request_pass] it holds to the deadline (no repeated pass on the same
+     event). *)
+  let gen = Atomic.get Dio_oracle.Oracle_runtime.pass_requested in
+  Dio_oracle.Oracle_runtime.request_pass ();
+  Lwt_main.run
+    (Dio_oracle.Oracle_runtime.wait_until
+       ~deadline:(Unix.gettimeofday () +. 60.0)
+       ~generation:gen
+       ());
+  let gen_after = Atomic.get Dio_oracle.Oracle_runtime.pass_requested in
+  Alcotest.(check int) "request incremented the generation" (gen + 1) gen_after;
+  let t0 = Unix.gettimeofday () in
+  let deadline = t0 +. 0.05 in
+  Lwt_main.run (Dio_oracle.Oracle_runtime.wait_until ~deadline ~generation:gen_after ());
+  let elapsed = Unix.gettimeofday () -. t0 in
+  Alcotest.(check bool)
+    "held to the deadline without a new trigger"
+    (elapsed >= 0.045)
+    true
+;;
+
+let test_resolve_for_no_override () =
+  (* No overrides configured: the resolved config is the global one (sizing
+     knobs fall through untouched). *)
+  let config = { (default_config ()) with target_survival = 0.95 } in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001)) "target_survival global" 0.95 resolved.target_survival;
+  Alcotest.(check (float 0.0001)) "fng_weight global" 0.5 resolved.fng_weight;
+  Alcotest.(check (option (float 0.0001))) "max_capital global" None resolved.max_capital
+;;
+
+let test_resolve_for_merges_present_keys () =
+  (* A per-asset entry overrides only the present keys; everything else stays
+     on the global config. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "HYPE/USDC"
+          , { target_survival = Some 0.98
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = Some 3.0
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = Some [ 90; 180 ]
+            } )
+        ]
+    }
+  in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001))
+    "overridden target_survival"
+    0.98
+    resolved.target_survival;
+  Alcotest.(check (float 0.0001)) "inherited fng_weight" 0.5 resolved.fng_weight;
+  Alcotest.(check (float 0.0001)) "overridden qty_cap_mult" 3.0 resolved.qty_cap_mult;
+  Alcotest.(check (option (list int)))
+    "overridden horizons"
+    (Some [ 90; 180 ])
+    resolved.horizons;
+  Alcotest.(check (option (float 0.0001)))
+    "inherited max_capital"
+    None
+    resolved.max_capital
+;;
+
+let test_resolve_for_case_insensitive () =
+  (* Keys match the trading-config symbol case-insensitively. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "hype/usdc"
+          , { target_survival = Some 0.98
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ]
+    }
+  in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001))
+    "case-insensitive override"
+    0.98
+    resolved.target_survival
+;;
+
+let test_resolve_for_venue_key_wins () =
+  (* A "venue/symbol" key wins over the bare symbol for that venue; the bare
+     symbol still applies to other venues. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "HYPE/USDC"
+          , { target_survival = Some 0.98
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ; ( "hyperliquid/HYPE/USDC"
+          , { target_survival = Some 0.90
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ]
+    }
+  in
+  let on_hl =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  let on_kraken =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"kraken" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001))
+    "venue key wins on hyperliquid"
+    0.90
+    on_hl.target_survival;
+  Alcotest.(check (float 0.0001))
+    "bare key applies on kraken"
+    0.98
+    on_kraken.target_survival
+;;
+
+let test_resolve_for_unknown_key_global () =
+  (* An override key that matches no trading symbol never matches: the asset
+     runs on the global config. *)
+  let config =
+    { (default_config ()) with
+      target_survival = 0.95
+    ; assets =
+        [ ( "SOMEOTHER/USD"
+          , { target_survival = Some 0.10
+            ; fng_weight = None
+            ; range_weight = None
+            ; min_active_dsurv = None
+            ; qty_cap_mult = None
+            ; no_deep_history = None
+            ; weight_by_sessions = None
+            ; horizons = None
+            } )
+        ]
+    }
+  in
+  let resolved =
+    Dio_oracle.Oracle_runtime.resolve_for config ~exchange:"hyperliquid" "HYPE/USDC"
+  in
+  Alcotest.(check (float 0.0001)) "no match keeps global" 0.95 resolved.target_survival
+;;
+
+let test_override_fields_all_none () =
+  (* Regression: the startup summary used to crash with
+     Invalid_argument("option is None") when every knob was absent (eager
+     Option.get on a None field). The all-None record must yield []. *)
+  let o : Dio_oracle.Oracle_runtime.asset_overrides =
+    { target_survival = None
+    ; fng_weight = None
+    ; range_weight = None
+    ; min_active_dsurv = None
+    ; qty_cap_mult = None
+    ; no_deep_history = None
+    ; weight_by_sessions = None
+    ; horizons = None
+    }
+  in
+  Alcotest.(check (list string)) "empty" [] (Dio_oracle.Oracle_runtime.override_fields o)
+;;
+
+let test_override_fields_present_only () =
+  (* Only Some knobs are listed, formatted for the startup summary line. *)
+  let o : Dio_oracle.Oracle_runtime.asset_overrides =
+    { target_survival = Some 0.98
+    ; fng_weight = None
+    ; range_weight = None
+    ; min_active_dsurv = None
+    ; qty_cap_mult = Some 3.0
+    ; no_deep_history = None
+    ; weight_by_sessions = Some false
+    ; horizons = Some [ 90; 180 ]
+    }
+  in
+  Alcotest.(check (list string))
+    "only present keys, in record order"
+    [ "target_survival 0.98"
+    ; "qty_cap_mult 3.00"
+    ; "weight_by_sessions false"
+    ; "horizons [90,180]"
+    ]
+    (Dio_oracle.Oracle_runtime.override_fields o)
+;;
+
+let () =
+  Alcotest.run
+    "Oracle_runtime"
+    [ ( "next_sleep"
+      , [ Alcotest.test_case "poll while all inactive" `Quick test_poll_while_all_inactive
+        ; Alcotest.test_case
+            "normal cadence while active"
+            `Quick
+            test_normal_cadence_while_active
+        ; Alcotest.test_case
+            "normal cadence on empty snapshot"
+            `Quick
+            test_normal_cadence_on_empty_snapshot
+        ] )
+    ; ( "defaults"
+      , [ Alcotest.test_case
+            "qty_cap_mult uncapped by default"
+            `Quick
+            test_default_qty_cap_mult_uncapped
+        ; Alcotest.test_case "jitter bounded" `Quick test_jitter_bounded
+        ] )
+    ; ( "per-asset overrides"
+      , [ Alcotest.test_case
+            "no override keeps global"
+            `Quick
+            test_resolve_for_no_override
+        ; Alcotest.test_case
+            "present keys merge, absent inherit"
+            `Quick
+            test_resolve_for_merges_present_keys
+        ; Alcotest.test_case
+            "case-insensitive key match"
+            `Quick
+            test_resolve_for_case_insensitive
+        ; Alcotest.test_case
+            "venue key wins over symbol"
+            `Quick
+            test_resolve_for_venue_key_wins
+        ; Alcotest.test_case
+            "unknown key falls through to global"
+            `Quick
+            test_resolve_for_unknown_key_global
+        ; Alcotest.test_case
+            "override summary with no knobs set"
+            `Quick
+            test_override_fields_all_none
+        ; Alcotest.test_case
+            "override summary lists only present knobs"
+            `Quick
+            test_override_fields_present_only
+        ] )
+    ; ( "startup-gate support"
+      , [ Alcotest.test_case "tracks_asset" `Quick test_tracks_asset
+        ; Alcotest.test_case
+            "first pass attempt not done fresh"
+            `Quick
+            test_first_pass_attempt_done_fresh
+        ] )
+    ; ( "trigger"
+      , [ Alcotest.test_case "request_pass wakes early" `Quick test_trigger_wakes_early
+        ; Alcotest.test_case "wake is one-shot" `Quick test_trigger_is_one_shot
+        ] )
+    ]
+;;

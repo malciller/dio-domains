@@ -1,0 +1,16 @@
+(library
+ (name dio_oracle)
+ (public_name dio.oracle)
+ (libraries
+  unix
+  yojson
+  lwt
+  cohttp-lwt-unix
+  dotenv
+  dio.logging
+  dio.strategies
+  dio.exchange
+  dio.cmc
+  dio.alpaca
+  dio.kraken
+  dio.hyperliquid))

@@ -11,6 +11,60 @@
     "allocation_policy": 2,
     "major_heap_increment": 8388608
   },
+  "oracle": {
+    "qty_cap_mult": 2.5,
+    "target_survival": 0.95,
+    "fng_weight": 0.5,
+    "range_weight": 0.25,
+    "min_active_dsurv": 0.0,
+    "weight_by_sessions": true,
+    "no_deep_history": false,
+    "refresh_seconds": 300.0,
+    "assets": {
+      "BTC/USDC": {
+        "target_survival": 0.95,
+        "fng_weight": 0.5,
+        "range_weight": 0.25,
+        "min_active_dsurv": 0.0,
+        "qty_cap_mult": 2.5,
+        "no_deep_history": false,
+        "weight_by_sessions": true
+      }
+    }
+  },
+  "classes": {
+    "crypto_core": [
+      "BTC/USD",
+      "ETH/USD"
+    ],
+    "crypto_alt": [
+      "SOL/USD",
+      "DOGE/USD",
+      "ADA/USD",
+      "HYPE/USD",
+      "XMR/USD",
+      "LINK/USD",
+      "AVAX/USD",
+      "DOT/USD",
+      "LTC/USD",
+      "XRP/USD",
+      "BNB/USD"
+    ],
+    "equity_etf": [
+      "SPY",
+      "QQQ",
+      "DIA",
+      "IWM",
+      "VTI"
+    ],
+    "equity_momentum": [
+      "NVDA",
+      "TSLA",
+      "AMD",
+      "META",
+      "NFLX"
+    ]
+  },
   "trading": [
     {
       "symbol": "BTC/USDC",
@@ -27,7 +81,8 @@
       ],
       "strategy": "Grid",
       "testnet": false,
-      "hedge": false
+      "hedge": false,
+      "asset_class": "crypto_core"
     },
     {
       "symbol": "HYPE/USDC",
@@ -44,7 +99,8 @@
       ],
       "strategy": "Grid",
       "testnet": false,
-      "hedge": false
+      "hedge": false,
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "ETH/USD",
@@ -55,7 +111,8 @@
         5.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid"
+      "strategy": "Grid",
+      "asset_class": "crypto_core"
     },
     {
       "symbol": "SOL/USD",
@@ -66,7 +123,8 @@
         5.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid"
+      "strategy": "Grid",
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "XMR/USD",
@@ -77,7 +135,8 @@
         5.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid"
+      "strategy": "Grid",
+      "asset_class": "crypto_alt"
     },
     {
       "symbol": "ADA/USD",
@@ -88,7 +147,36 @@
         10.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid"
+      "strategy": "Grid",
+      "asset_class": "crypto_alt"
+    },
+    {
+      "symbol": "SPCX",
+      "exchange": "alpaca",
+      "qty": "0.1",
+      "grid_interval": [
+        0.25,
+        0.75
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid",
+      "testnet": true,
+      "data_feed": "iex",
+      "asset_class": "equity_momentum"
+    },
+    {
+      "symbol": "QQQ",
+      "exchange": "alpaca",
+      "qty": "0.025",
+      "grid_interval": [
+        0.25,
+        0.75
+      ],
+      "sell_mult": "0.999",
+      "strategy": "Grid",
+      "testnet": true,
+      "data_feed": "iex",
+      "asset_class": "equity_etf"
     }
   ]
 }

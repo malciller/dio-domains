@@ -6,9 +6,13 @@
 
 (subdir engine/strategies)
 
+(subdir engine/oracle)
+
 (subdir engine/supervisor)
 
 (subdir engine/config)
+
+(subdir engine/dashboard)
 
 (subdir engine/domain_spawner)
 
