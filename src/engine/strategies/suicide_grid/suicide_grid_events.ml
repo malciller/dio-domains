@@ -515,9 +515,17 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
+       (* The tracking reset is deferred only when THIS order is the subject
+          of an in-flight amendment (the amend handler later re-keys the
+          tracking to the replacement id). [state.inflight_amend_buy] must
+          NOT be consulted here: it is a per-symbol flag that also covers
+          amends of other orders, so a cancel for a different order would be
+          swallowed and its reset lost forever. The registry and the
+          pending_amend_ entries are keyed by the amended (old) order id,
+          which is exactly the id the exchange's mid-amend cancel event
+          carries. *)
        let is_being_amended =
          InFlightAmendments.is_in_flight order_id
-         || state.inflight_amend_buy
          || List.exists
               (fun (pending_id, _, _, _) ->
                  String.starts_with ~prefix:"pending_amend_" pending_id
