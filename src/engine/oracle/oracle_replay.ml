@@ -392,11 +392,12 @@ let drawdown_for_target ~(model : blend_model) ~(target_survival : float) =
 module Sizing (M : Oracle_strategy.S) = struct
   (** Inverse sizing: smallest [capital] whose static runway survives the
       drawdown d-star (the smallest d with F_blend(d) >= target). The
-      drawdown is the largest ACTUAL peak-to-valley fall of the asset's
-      history (see Oracle_math.peak_to_valley_stats_of): the runway funds
-      the worst peak-to-valley drawdown the asset has really taken, from
-      wherever the price sits today - never a hypothetical fall from the
-      ATH. The CDF is monotone in d, and the runway cost (floor-aware; see
+      drawdown is the ATH-scaled survival reference of the asset's history
+      (see Oracle_math.sizing_reference_of): mature assets fund the remaining
+      fall to the expected floor from the current price (capped by the
+      deepest actual peak-to-valley drop, floored by the measured floor
+      overshoot) - never a hypothetical fall from the ATH. The CDF is
+      monotone in d, and the runway cost (floor-aware; see
       [cost_at]) is a monotone function of the fill count, so this is
       well-defined even though path-replay D_surv is not monotone in
       capital. Returns [reachable = false] when the required capital
@@ -412,8 +413,8 @@ module Sizing (M : Oracle_strategy.S) = struct
     =
     let d = drawdown_for_target ~model ~target_survival in
     let d_cover =
-      match Oracle_math.peak_to_valley_stats_of model.asset with
-      | Some p -> p.Oracle_types.max_drawdown
+      match Oracle_math.sizing_reference_of ~fallback:false model.asset with
+      | Some r -> r.d_cover
       | None -> d
     in
     let n = M.fills_for_drawdown grid ~d:d_cover in
@@ -475,8 +476,7 @@ module Sizing (M : Oracle_strategy.S) = struct
 
   (** Largest [qty] whose static runway (given the grid's [start_quote])
       survives the drawdown d-star (the smallest d with F_blend(d) >= target,
-      sized on the largest actual peak-to-valley drawdown as in
-      [find_min_capital]).
+      sized on the ATH-scaled survival reference as in [find_min_capital]).
       The runway cost is monotone non-decreasing in qty (the floor up-size
       term max(qty, ceil_lot(min_notional/level)) is), so the boundary is
       found by bisection over an exponentially grown upper bound - exact when
@@ -496,8 +496,8 @@ module Sizing (M : Oracle_strategy.S) = struct
     =
     let d = drawdown_for_target ~model ~target_survival in
     let d_cover =
-      match Oracle_math.peak_to_valley_stats_of model.asset with
-      | Some p -> p.Oracle_types.max_drawdown
+      match Oracle_math.sizing_reference_of ~fallback:false model.asset with
+      | Some r -> r.d_cover
       | None -> d
     in
     let n = M.fills_for_drawdown grid ~d:d_cover in

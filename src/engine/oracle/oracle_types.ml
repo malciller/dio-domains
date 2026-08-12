@@ -207,6 +207,40 @@ type p2v_stats =
   ; price : float
     (** Last close: where the price sits within the worst event's
         [peak, valley] band (the range-side position reference). *)
+  ; recovered : bool
+    (** A later close reached >= [peak] after the valley: the downtrend
+        actually ended in recovery. Only recovered events anchor the
+        ATH-scaled survival reference; an unrecovered deepest event means
+        the asset is still living in its worst drop (outlier policy). *)
+  }
+
+(** The ATH-scaled survival reference for one asset: the funded drawdown
+    [d_cover] and where the price sits relative to the expected floor
+    [floor_ref = ATH * (1 - max_drawdown)]. Produced by
+    [Oracle_math.sizing_reference_of] (mature / authoritative assets only;
+    immature fallback assets keep the raw event drawdown).
+
+    Regimes: with a recovered deepest event and the price above the scaled
+    floor, [d_cover] is the remaining fall to the floor (bounded by the
+    historical max drawdown, never below the measured floor overshoot). At or
+    below the scaled floor ([at_floor]) - or when the deepest event never
+    recovered ([outlier]) - [d_cover] is the measured 90th-percentile floor
+    overshoot: how far the price demonstrably dipped below each recovered
+    valley before recovering (0.15 fallback when no episode measured one). *)
+type sizing_reference =
+  { d_cover : float (** The funded drawdown for this asset. *)
+  ; floor_ref : float option
+    (** ATH * (1 - max_drawdown). None in the [outlier] regime (no recovered
+        anchor to scale from) and for fallback (raw) sizing. *)
+  ; at_floor : bool
+    (** Price at/below [floor_ref] ("living in the max drawdown": the fall
+        from the ATH already exceeds the worst-ever drop). *)
+  ; outlier : bool
+    (** Deepest event never recovered - no recovered anchor; the measured
+        floor overshoot funds the asset. *)
+  ; overshoot_p90 : float option
+    (** The measured 90th-pct floor overshoot used (None when nothing was
+        measured and the 0.15 fallback funded instead). *)
   }
 
 (* ---- Deployment sizing (the engine's core output) ---- *)
@@ -300,10 +334,15 @@ type asset_deployment =
     (** The horizon whose target drawdown is the deepest (the binding one). *)
   ; d_gov : float (** Deepest drawdown with F_blend(d) >= target across the horizons. *)
   ; d_cover : float
-    (** The sizing drawdown: the largest ACTUAL peak-to-valley drawdown of
-        the asset's history - the fall from the current price the grid must
-        fund. No ATH anchoring: a 1000x run-up only registers the falls that
-        actually happened, never the ATH-to-ATL span. *)
+    (** The sizing drawdown: the fall from the current price the grid must
+        fund. Mature (authoritative) assets fund the ATH-scaled remaining
+        drop to the expected floor (or the measured floor overshoot at/below
+        it); immature fallback assets fund the raw largest ACTUAL
+        peak-to-valley drawdown. No ATH-to-ATL anchoring: a 1000x run-up only
+        registers the falls that actually happened. *)
+  ; sizing : sizing_reference option
+    (** The ATH-scaled survival reference behind [d_cover] (floor context for
+        the logs). None for fallback (raw) sizing and monotone histories. *)
   ; parameter_components : parameter_components
   ; qty : float
   ; parameter : float (** Resolved strategy parameter (grid: grid interval in %). *)

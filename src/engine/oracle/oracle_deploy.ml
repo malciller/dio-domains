@@ -33,10 +33,13 @@
 
    Resolution order:
      1. governing drawdown from the blend models (None -> inactive),
-     2. sizing drawdown d_cover: the largest ACTUAL peak-to-valley drawdown
-        of the asset's history - the fall the grid must fund from the
-        current price (no ATH anchoring: a 1000x run-up must not turn into
-        a phantom 99.9% drawdown; only falls that really happened count),
+     2. sizing drawdown d_cover: mature assets fund the ATH-scaled remaining
+        drop to the expected floor (see Oracle_math.sizing_reference_of) -
+        the fall still ahead from the current price, capped by the worst-ever
+        drop and floored by the measured floor overshoot; immature fallback
+        assets keep the raw largest ACTUAL peak-to-valley drawdown (no ATH
+        anchoring: a 1000x run-up must not turn into a phantom 99.9%
+        drawdown; only falls that really happened count),
      3. parameter scan over [lo, hi]: survival_parameter = tightest parameter
         that clears the target on the replayed path; when no parameter can
         clear the replay target (the pool cannot survive the whole history),
@@ -590,6 +593,7 @@ module Engine (M : Oracle_strategy.S) = struct
       ; governing_horizon = ""
       ; d_gov = 0.0
       ; d_cover = 0.0
+      ; sizing = None
       ; parameter_components =
           { fng
           ; fng_parameter = None
@@ -626,16 +630,22 @@ module Engine (M : Oracle_strategy.S) = struct
         "no usable history: no MFD windows on any horizon (each horizon needs warmup + \
          horizon + 2 bars)"
     | Some (d_gov, governing_horizon, fallback) ->
-      (* Sizing drawdown: the largest drawdown the asset has ACTUALLY
-         experienced, peak to valley, over its whole (deepened) history -
-         the fall from the current price that the grid must fund. No ATH
-         anchoring: a 1000x run-up must not inflate the sizing into a phantom
-         99.9% drawdown; only falls that really took place count. Falls back
-         to the statistical governing drawdown when the series never drew
-         down (strictly monotone history). *)
+      (* Sizing drawdown: mature (authoritative) assets fund the ATH-scaled
+         remaining drop to the expected floor - the worst-ever drawdown
+         applied to the current regime's top, so an asset below its ATH only
+         funds the fall that is still ahead (see
+         Oracle_math.sizing_reference_of). Immature fallback assets keep the
+         raw largest ACTUAL peak-to-valley drawdown (the discount is a
+         matured-regime feature; a floor from a thin history is not a
+         meaningful support). No ATH-to-ATL anchoring: a 1000x run-up must
+         not inflate the sizing into a phantom 99.9% drawdown; only falls
+         that really took place count. Falls back to the statistical
+         governing drawdown when the series never drew down (strictly
+         monotone history). *)
+      let sizing_ref = Oracle_math.sizing_reference_of ~fallback asset in
       let d_cover =
-        match p2v with
-        | Some p -> p.Oracle_types.max_drawdown
+        match sizing_ref with
+        | Some r -> r.d_cover
         | None -> d_gov
       in
       let evaluable_models =
@@ -886,6 +896,67 @@ module Engine (M : Oracle_strategy.S) = struct
                           (M.set_parameter cfg parameter_final)
                           ~d:d_cover)))
              :: !warnings;
+        (* At/below the scaled floor, or no recovered anchor: the price
+           position cannot fund the fall (the remainder is exhausted / the
+           deepest event is still in progress) - the measured floor overshoot
+           funds the asset instead. *)
+        let p2v_dd =
+          match p2v with
+          | Some p -> p.max_drawdown
+          | None -> d_gov
+        in
+        let p2v_price =
+          match p2v with
+          | Some p -> p.price
+          | None -> 0.0
+        in
+        let p2v_ath =
+          match range with
+          | Some r -> r.ath
+          | None ->
+            (match p2v with
+             | Some p -> p.peak
+             | None -> 0.0)
+        in
+        let p2v_dates () =
+          match p2v with
+          | Some p -> Printf.sprintf "%s->%s" p.peak_date p.valley_date
+          | None -> "-"
+        in
+        let overshoot_tail (r : Oracle_types.sizing_reference) =
+          if Option.is_none r.overshoot_p90
+          then " (no floor-break history: 15% fallback)"
+          else ""
+        in
+        (match sizing_ref with
+         | Some r when r.outlier ->
+           warnings
+           := Printf.sprintf
+                "deepest drawdown (%.1f%% on %s) has not recovered - still living in it, \
+                 no recovered anchor; funding the measured 90th-pct floor overshoot \
+                 %.1f%%%s"
+                (p2v_dd *. 100.0)
+                (p2v_dates ())
+                (r.d_cover *. 100.0)
+                (overshoot_tail r)
+              :: !warnings
+         | Some r when r.at_floor ->
+           (match r.floor_ref with
+            | Some floor_ref ->
+              warnings
+              := Printf.sprintf
+                   "price $%.2f at/below the ATH-scaled floor $%.2f (ATH $%.2f - %.1f%% \
+                    worst): the remaining drop is exhausted - funding the measured \
+                    90th-pct floor overshoot %.1f%%%s"
+                   p2v_price
+                   floor_ref
+                   p2v_ath
+                   (p2v_dd *. 100.0)
+                   (r.d_cover *. 100.0)
+                   (overshoot_tail r)
+                 :: !warnings
+            | None -> ())
+         | _ -> ());
         let active, reason =
           if row.d_surv_replay +. 1e-9 < min_active_dsurv
           then
@@ -912,6 +983,7 @@ module Engine (M : Oracle_strategy.S) = struct
         ; governing_horizon
         ; d_gov
         ; d_cover
+        ; sizing = sizing_ref
         ; parameter_components =
             { fng
             ; fng_parameter = fng_parameter_opt

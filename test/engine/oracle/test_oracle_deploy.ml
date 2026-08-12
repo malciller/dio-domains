@@ -262,11 +262,15 @@ let test_deploy_fully_funded () =
     "gi >= gi_survival"
     (d.parameter +. 1e-9 >= d.parameter_components.survival_parameter)
     true;
-  (* At neutral F&G the qty blend sits in the middle of [q_min, survival-max]:
-     the deployed capital is roughly half the pool, not the whole pool. *)
+  (* The synth asset is in the OUTLIER regime (its deepest crash never fully
+     retraced): the risk reference is the floor-overshoot fallback (15%), so
+     the qty ceiling is high and the replay verification bounds the qty. At
+     neutral F&G the qty blend sits partway up [q_min, survival-max] and
+     roughly a third of the pool deploys - the replay-funded verification,
+     not the small risk reference, is what keeps it under the pool. *)
   Alcotest.(check bool)
-    "deployed ~ half the pool at neutral F&G"
-    (d.deployed > 0.4 *. d.pool_share && d.deployed < 0.6 *. d.pool_share)
+    "deployed stays below the pool at neutral F&G (replay-bounded)"
+    (d.deployed > 0.2 *. d.pool_share && d.deployed < 0.6 *. d.pool_share)
     true;
   (* Equities are pure oracle: no F&G qty blend, so the survival-max qty
      deploys (almost) the whole pool. *)
@@ -278,9 +282,12 @@ let test_deploy_fully_funded () =
     "equity row passed"
     (d_eq.row.passed || d_eq.d_surv +. 0.02 >= d_eq.d_gov)
     true;
+  (* The outlier regime's small risk reference (15% fallback) caps the
+     runway cost below the pool; the qty is bounded by the replay
+     verification. *)
   Alcotest.(check bool)
-    "equity deploys >= 99% of pool (pure oracle, no F&G blend)"
-    (d_eq.deployed >= 0.99 *. d_eq.pool_share)
+    "equity deploys most of the pool (replay-bounded qty through the 15% reference)"
+    (d_eq.deployed > 0.5 *. d_eq.pool_share && d_eq.deployed < d_eq.pool_share)
     true
 ;;
 
@@ -344,8 +351,18 @@ let test_deploy_under_funded () =
   in
   Alcotest.(check bool) "under-funded still active" d.active true;
   Alcotest.(check bool) "qty at qty_min" (d.qty <= q_min +. 1e-9) true;
-  Alcotest.(check bool) "deployed = whole pool" (d.deployed >= d.pool_share -. 1e-9) true;
-  Alcotest.(check bool) "remainder 0 (priority keeps the pool)" (d.remainder = 0.0) true;
+  (* The synth asset is in the OUTLIER regime: the risk reference is the 15%
+     floor-overshoot fallback, so the floor qty's runway through it costs
+     less than the share - the asset consumes most (but not all) of its
+     pool and the remainder passes down the priority order. *)
+  Alcotest.(check bool)
+    "deployed consumes most of the share (floor-qty runway through the 15% reference)"
+    (d.deployed > 0.5 *. d.pool_share && d.deployed < d.pool_share)
+    true;
+  Alcotest.(check bool)
+    "remainder passes down the priority order"
+    (d.remainder > 0.0 && abs_float (d.remainder -. (d.pool_share -. d.deployed)) < 1e-6)
+    true;
   Alcotest.(check bool) "under-funded warned" (d.warnings <> []) true;
   Alcotest.(check bool) "pool can still fund the first buy" (full *. 0.5 > cost_one) true
 ;;
@@ -1412,6 +1429,228 @@ let test_peak_to_valley_ordering () =
     true
 ;;
 
+(* A tiny hand-built series: (date, close, low) per day; high = close. *)
+let bars_of (rows : (string * float * float) list) : Oracle_types.series =
+  { Oracle_types.symbol = "HAND"
+  ; calendar_kind = Oracle_types.Crypto
+  ; bars =
+      Array.of_list
+        (List.map
+           (fun (date, c, l) ->
+              Oracle_types.
+                { date; open_ = c; high = c; low = l; close = c; volume = 1000.0 })
+           rows)
+  ; gaps = []
+  }
+;;
+
+let test_p2v_recovered_flag () =
+  (* A crash that fully retraced (a later close >= the peak) anchors the
+     ATH-scaled reference; a crash the asset is still inside does not - it
+     falls to the outlier policy. *)
+  let mk = bars_of in
+  let p =
+    Option.get
+      (Oracle_math.peak_to_valley_stats_of
+         (mk [ "d1", 100.0, 100.0; "d2", 40.0, 40.0; "d3", 110.0, 110.0 ]))
+  in
+  Alcotest.(check bool) "retraced crash recovered" p.recovered true;
+  let p2 =
+    Option.get
+      (Oracle_math.peak_to_valley_stats_of
+         (mk [ "d1", 100.0, 100.0; "d2", 40.0, 40.0; "d3", 60.0, 60.0 ]))
+  in
+  Alcotest.(check bool) "still-inside crash not recovered" (not p2.recovered) true;
+  (* The synth asset's crash retraced to ~99.6% of its peak but never closed
+     at or above it: strictly unrecovered (the recovered-only rule). *)
+  Alcotest.(check bool)
+    "synth asset not recovered (retrace stopped short of the peak)"
+    (not (Option.get (Oracle_math.peak_to_valley_stats_of asset)).recovered)
+    true;
+  Alcotest.(check bool)
+    "trough series not recovered (ends at its valley)"
+    (not
+       (Option.get (Oracle_math.peak_to_valley_stats_of (trough_series ~n:90))).recovered)
+    true
+;;
+
+let test_floor_overshoot_p90 () =
+  let mk = bars_of in
+  (* W-bottom: a floor at 80 is established (bounce to 85) and then broken
+     to 75 before the recovery - one 6.25% break. *)
+  let w =
+    mk
+      [ "d1", 100.0, 100.0
+      ; "d2", 80.0, 80.0
+      ; "d3", 85.0, 85.0
+      ; "d4", 75.0, 75.0
+      ; "d5", 100.0, 100.0
+      ]
+  in
+  Alcotest.(check (option (float 1e-9)))
+    "W-bottom break measured"
+    (Some 0.0625)
+    (Oracle_math.floor_overshoot_p90_of w);
+  (* Two breaks: the p90 is the deeper one. *)
+  let w2 =
+    mk
+      [ "d1", 100.0, 100.0
+      ; "d2", 80.0, 80.0
+      ; "d3", 85.0, 85.0
+      ; "d4", 75.0, 75.0
+      ; "d5", 100.0, 100.0
+      ; "d6", 90.0, 90.0
+      ; "d7", 95.0, 95.0
+      ; "d8", 70.0, 70.0
+      ; "d9", 100.0, 100.0
+      ]
+  in
+  Alcotest.(check (option (float 1e-9)))
+    "deeper break drives the p90"
+    (Some 0.06625)
+    (Oracle_math.floor_overshoot_p90_of w2);
+  (* A V-bottom: no floor was broken - nothing measured. *)
+  let v = mk [ "d1", 100.0, 100.0; "d2", 75.0, 75.0; "d3", 100.0, 100.0 ] in
+  Alcotest.(check bool)
+    "V-bottom: no break"
+    (Oracle_math.floor_overshoot_p90_of v = None)
+    true;
+  (* A continuous fall: no floor was ever established - nothing measured. *)
+  let fall =
+    mk
+      [ "d1", 100.0, 100.0
+      ; "d2", 90.0, 90.0
+      ; "d3", 80.0, 80.0
+      ; "d4", 70.0, 70.0
+      ; "d5", 100.0, 100.0
+      ]
+  in
+  Alcotest.(check bool)
+    "continuous fall: no floor established"
+    (Oracle_math.floor_overshoot_p90_of fall = None)
+    true;
+  (* A break that never recovered is discarded (no proof of recovery). *)
+  let unproven =
+    mk [ "d1", 100.0, 100.0; "d2", 80.0, 80.0; "d3", 85.0, 85.0; "d4", 75.0, 75.0 ]
+  in
+  Alcotest.(check bool)
+    "break without recovery discarded"
+    (Oracle_math.floor_overshoot_p90_of unproven = None)
+    true
+;;
+
+let test_sizing_reference () =
+  let mk = bars_of in
+  (* Recovered crash, price above the ATH-scaled floor: fund the remainder.
+     ATH 110, dd (100 -> 40) = 60% -> floor 44; price 80 -> (80-44)/80. *)
+  let a =
+    mk [ "d1", 100.0, 100.0; "d2", 40.0, 40.0; "d3", 110.0, 110.0; "d4", 80.0, 80.0 ]
+  in
+  let r = Option.get (Oracle_math.sizing_reference_of ~fallback:false a) in
+  Alcotest.(check bool) "recovered: not at the floor" (not r.at_floor) true;
+  Alcotest.(check bool) "recovered: not an outlier" (not r.outlier) true;
+  near r.d_cover 0.45;
+  (match r.floor_ref with
+   | Some f -> near f 44.0
+   | None -> Alcotest.fail "expected floor_ref");
+  (* Price at/below the floor ("living in the max drawdown"): the remainder
+     is exhausted - the 0.15 fallback funds it (nothing measured here). The
+     second drop lands exactly ON the scaled floor (44 = ATH 110 x 0.4), so
+     its drawdown ties the first crash and the recovered first crash stays
+     the anchor. *)
+  let b =
+    mk [ "d1", 100.0, 100.0; "d2", 40.0, 40.0; "d3", 110.0, 110.0; "d4", 44.0, 44.0 ]
+  in
+  let rb = Option.get (Oracle_math.sizing_reference_of ~fallback:false b) in
+  Alcotest.(check bool) "at the floor" rb.at_floor true;
+  Alcotest.(check bool) "at floor: not an outlier" (not rb.outlier) true;
+  near rb.d_cover 0.15;
+  (* Unrecovered deepest event: no recovered anchor - outlier policy. *)
+  let c = mk [ "d1", 100.0, 100.0; "d2", 40.0, 40.0; "d3", 60.0, 60.0 ] in
+  let rc = Option.get (Oracle_math.sizing_reference_of ~fallback:false c) in
+  Alcotest.(check bool) "outlier" rc.outlier true;
+  Alcotest.(check bool) "outlier: no floor anchor" (rc.floor_ref = None) true;
+  near rc.d_cover 0.15;
+  (* An unrecovered deepest event WITH measured floor-break history: the
+     measured overshoot funds it (not the fallback). *)
+  let e =
+    mk
+      [ "d1", 100.0, 100.0
+      ; "d2", 80.0, 80.0
+      ; "d3", 85.0, 85.0
+      ; "d4", 75.0, 75.0
+      ; "d5", 100.0, 100.0
+      ; "d6", 40.0, 40.0
+      ]
+  in
+  let re = Option.get (Oracle_math.sizing_reference_of ~fallback:false e) in
+  Alcotest.(check bool) "unrecovered with measured overshoot" re.outlier true;
+  near re.d_cover 0.0625;
+  (match re.overshoot_p90 with
+   | Some o -> near o 0.0625
+   | None -> Alcotest.fail "expected the measured overshoot");
+  (* Fallback (immature history) keeps the raw event drawdown regardless of
+     where the price sits - the discount is a matured-regime feature. *)
+  let rfa = Option.get (Oracle_math.sizing_reference_of ~fallback:true a) in
+  near rfa.d_cover 0.6;
+  Alcotest.(check bool) "fallback: raw, no floor context" (rfa.floor_ref = None) true
+;;
+
+(** A series whose deepest crash fully recovered (a later close exceeded the
+    peak) and that ends BELOW its ATH: the authoritative ATH-scaled remainder
+    regime. Crash 100 -> ~29 (30 bars x -4%), recovery +1%/bar past the peak
+    (~102), then a slow -0.15%/day decline to ~78. *)
+let recov_below_ath_series () =
+  let iso day = Oracle_calendar.add_days "2020-01-01" day in
+  let n = 330 in
+  let bars =
+    Array.make
+      n
+      Oracle_types.{ date = ""; open_ = 0.; high = 0.; low = 0.; close = 0.; volume = 0. }
+  in
+  let price = ref 100.0 in
+  for i = 0 to n - 1 do
+    let phase = if i < 30 then 0.96 else if i < 155 then 1.01 else 0.9985 in
+    price := !price *. phase;
+    let p = !price in
+    bars.(i)
+    <- { Oracle_types.date = iso i
+       ; open_ = p
+       ; high = p *. 1.002
+       ; low = p *. 0.998
+       ; close = p
+       ; volume = 1000.0
+       }
+  done;
+  { Oracle_types.symbol = "RECOV"; calendar_kind = Oracle_types.Crypto; bars; gaps = [] }
+;;
+
+let test_deploy_sizing_reference () =
+  (* A recovered crash with the price below the ATH: the authoritative
+     deployment funds the ATH-scaled remainder, not the full event. *)
+  let a = recov_below_ath_series () in
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset:a in
+  let d = deploy ~asset:a ~pool:100_000.0 ~g ~fng:None ~use_fng:false ~models:ms () in
+  let p = Option.get (Oracle_math.peak_to_valley_stats_of a) in
+  match d.Oracle_types.sizing with
+  | Some r ->
+    Alcotest.(check bool) "recovered anchor" (not r.Oracle_types.outlier) true;
+    Alcotest.(check bool) "not at the floor" (not r.Oracle_types.at_floor) true;
+    Alcotest.(check bool)
+      "remainder below the full event drawdown"
+      (d.Oracle_types.d_cover < p.Oracle_types.max_drawdown -. 0.01)
+      true;
+    (match r.Oracle_types.floor_ref with
+     | Some f ->
+       Alcotest.(check bool)
+         "floor between the valley and the peak"
+         (f > p.Oracle_types.valley && f < p.Oracle_types.peak)
+         true
+     | None -> Alcotest.fail "expected floor_ref")
+  | None -> Alcotest.fail "expected an ATH-scaled sizing reference"
+;;
+
 let () =
   Alcotest.run
     "oracle_deploy"
@@ -1437,6 +1676,18 @@ let () =
             "order-independent (newest-first feeds)"
             `Quick
             test_peak_to_valley_ordering
+        ; Alcotest.test_case "recovered flag" `Quick test_p2v_recovered_flag
+        ] )
+    ; ( "sizing reference"
+      , [ Alcotest.test_case "floor overshoot measurement" `Quick test_floor_overshoot_p90
+        ; Alcotest.test_case
+            "ATH-scaled regimes (remainder / at-floor / outlier / fallback)"
+            `Quick
+            test_sizing_reference
+        ; Alcotest.test_case
+            "deploy funds the ATH-scaled remainder"
+            `Quick
+            test_deploy_sizing_reference
         ] )
     ; ( "deploy_asset"
       , [ Alcotest.test_case "fully funded" `Quick test_deploy_fully_funded
