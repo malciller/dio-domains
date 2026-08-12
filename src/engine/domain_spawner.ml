@@ -851,6 +851,11 @@ let asset_domain_worker
          let st = Dio_strategies.Suicide_grid.get_strategy_state asset_with_fees.symbol in
          (try st.grid_qty <- float_of_string qty_str with
           | Failure _ -> ());
+         (* Re-anchor any already-resting buy to the decision's spacing: an
+            order injected from the exchange (or placed under an earlier
+            sizing) can sit closer to the market than the oracle's gi allows,
+            and the buy-trailing leg never moves a buy DOWN on its own. *)
+         st.force_buy_reanchor <- true;
          should_execute_strategy := true;
          Logging.info_f
            ~section
@@ -874,6 +879,11 @@ let asset_domain_worker
            let st = Dio_strategies.Suicide_grid.get_strategy_state asset.symbol in
            (try st.grid_qty <- float_of_string qty_str with
             | Failure _ -> ());
+           (* The sizing changed: force the resting buy to re-anchor to the
+              new qty/gi spacing (amend down included). Without this, a
+              widened grid interval leaves the buy - and the whole book - at
+              the old tighter spacing until the market happens to rise. *)
+           st.force_buy_reanchor <- true;
            should_execute_strategy := true;
            Logging.info_f
              ~section

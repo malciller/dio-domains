@@ -24,6 +24,7 @@ let identity_state () =
   ; capital_low_at_balance = 0.0
   ; resuming_after_balance_flag = false
   ; just_filled_buy = false
+  ; force_buy_reanchor = false
   ; reserved_quote = 0.0
   ; accumulated_profit = 0.0
   ; reserved_base = 0.0
