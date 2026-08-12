@@ -50,6 +50,27 @@ let pace () =
     Lwt.return_unit)
 ;;
 
+(* Yahoo soft-blocks hammered IPs by serving empty 200s ("result": null) for
+   a while instead of a 429. Without a memory of it, a blocked walk returns
+   [] every pass and the oracle re-attempts the whole history each refresh -
+   wasted work, and it is what keeps the block alive. On the all-empty
+   signature the symbol is remembered for [soft_block_backoff] seconds and
+   its requests are skipped entirely during that window. *)
+let soft_blocked_until : (string, float) Hashtbl.t = Hashtbl.create 64
+let soft_block_backoff = 300.0
+
+let remember_block ~(symbol : string) ~(windows : int) =
+  let until = Unix.gettimeofday () +. soft_block_backoff in
+  Hashtbl.replace soft_blocked_until symbol until;
+  Logging.warn_f
+    ~section
+    "Yahoo served %d empty response(s) for %s (soft-blocked/rate-limited IP); backing \
+     off %d seconds before trying again"
+    windows
+    symbol
+    (int_of_float soft_block_backoff)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Pre-listing window handling: Yahoo answers a request whose range sits
    entirely before the symbol's listing with HTTP 400 and
@@ -324,97 +345,135 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
       0;
     Lwt.return [])
   else (
-    let base_url =
-      Printf.sprintf
-        "https://query1.finance.yahoo.com/v8/finance/chart/%s"
-        (Uri.pct_encode symbol)
-    in
-    let headers = Cohttp.Header.of_list [ "User-Agent", "Mozilla/5.0 (dio-oracle)" ] in
-    let rec go from_ms acc ~(skipped : int) =
-      if Int64.compare from_ms end_epoch > 0
-      then Lwt.return (List.rev acc, skipped)
-      else (
-        let to_ms = Int64.min (Int64.add from_ms window_seconds) end_epoch in
-        if Int64.compare to_ms from_ms <= 0
-        then Lwt.return (List.rev acc, skipped)
-        else (
-          let url =
-            Printf.sprintf "%s?period1=%Ld&period2=%Ld&interval=1d" base_url from_ms to_ms
-          in
-          let fetch =
-            pace ()
-            >>= fun () ->
-            Oracle_http.get ~headers (Uri.of_string url)
-            >>= fun (resp, body) ->
-            Cohttp_lwt.Body.to_string body
-            >>= fun body_str ->
-            let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-            if status <> 200
-            then
-              Lwt.fail
-                (Failure
-                   (Printf.sprintf
-                      "Oracle_fetch_yahoo: HTTP %d for %s (%s)"
-                      status
-                      symbol
-                      body_str))
-            else (
-              let json = Yojson.Safe.from_string body_str in
-              let bars = parse_daily ~symbol json in
-              Lwt.return bars)
-          in
-          Lwt.catch
-            (fun () -> fetch >|= fun bars -> bars, skipped)
-            (fun exn ->
-               match classify_exn exn with
-               | `Missing_data ->
-                 (* The window sits entirely before the symbol's listing: no
-                    data exists in [from_ms, to_ms]. Record the confirmed
-                    empty prefix and skip the window instead of failing the
-                    whole walk (a recently-listed asset would otherwise spam
-                    the same doomed request on every pass). *)
-                 remember_empty ~symbol (unix_to_iso to_ms);
-                 Logging.debug_f
-                   ~section
-                   "Yahoo daily fetch for %s: no data before %s (pre-listing); skipping \
-                    this window"
-                   symbol
-                   (unix_to_iso to_ms);
-                 go (Int64.add from_ms window_seconds) acc ~skipped:(skipped + 1)
-               | `Fatal ->
-                 Logging.warn_f
-                   ~section
-                   "Yahoo daily fetch for %s stopped at %s (%s), returning %d bars"
-                   symbol
-                   (unix_to_iso from_ms)
-                   (Printexc.to_string exn)
-                   (List.length acc);
-                 Lwt.return (List.rev acc, skipped))
-          >>= fun (bars, skipped) ->
-          (* A successful window ends the empty prefix: from here on the
-               symbol has data, so a later fetch can start at this window's
-               beginning (the walk re-checks nothing before it). *)
-          if bars <> []
-          then
-            remember_empty ~symbol (Oracle_calendar.add_days (unix_to_iso from_ms) (-1));
-          let acc = List.rev_append bars acc in
-          if Int64.compare to_ms end_epoch >= 0
-          then Lwt.return (List.rev acc, skipped)
-          else go (Int64.add to_ms day_seconds) acc ~skipped))
-    in
-    (* One walk at a time (see [yahoo_mutex]): the pass fetches many symbols
-       concurrently and Yahoo throttles parallel bursts. *)
-    Lwt_mutex.with_lock yahoo_mutex (fun () -> go start_epoch [] ~skipped:0)
-    >|= fun (bars, skipped) ->
-    if skipped > 0
-    then
-      Logging.info_f
+    (* Soft-block memory (see [remember_block]): while the symbol is backed
+       off, do not even attempt its requests - the pass must not keep the
+       block alive, and an asset whose deep history is blocked keeps the
+       (empty) cached state instead of re-paying a doomed walk every pass. *)
+    match Hashtbl.find_opt soft_blocked_until symbol with
+    | Some until when Unix.gettimeofday () < until ->
+      Logging.debug_f
         ~section
-        "Yahoo daily fetch for %s: skipped %d pre-listing window(s) (no data before %s); \
-         %d bar(s) fetched"
+        "Yahoo soft-blocked for %s; backing off (%.0fs left)"
         symbol
-        skipped
-        (unix_to_iso start_epoch)
-        (List.length bars);
-    bars)
+        (until -. Unix.gettimeofday ());
+      Lwt.return []
+    | _ ->
+      let base_url =
+        Printf.sprintf
+          "https://query1.finance.yahoo.com/v8/finance/chart/%s"
+          (Uri.pct_encode symbol)
+      in
+      let headers = Cohttp.Header.of_list [ "User-Agent", "Mozilla/5.0 (dio-oracle)" ] in
+      let rec go from_ms acc ~(skipped : int) ~(empty_200 : int) =
+        if Int64.compare from_ms end_epoch > 0
+        then Lwt.return (List.rev acc, skipped, empty_200)
+        else (
+          let to_ms = Int64.min (Int64.add from_ms window_seconds) end_epoch in
+          if Int64.compare to_ms from_ms <= 0
+          then Lwt.return (List.rev acc, skipped, empty_200)
+          else (
+            let url =
+              Printf.sprintf
+                "%s?period1=%Ld&period2=%Ld&interval=1d"
+                base_url
+                from_ms
+                to_ms
+            in
+            let fetch =
+              pace ()
+              >>= fun () ->
+              Oracle_http.get ~headers (Uri.of_string url)
+              >>= fun (resp, body) ->
+              Cohttp_lwt.Body.to_string body
+              >>= fun body_str ->
+              let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+              if status <> 200
+              then
+                Lwt.fail
+                  (Failure
+                     (Printf.sprintf
+                        "Oracle_fetch_yahoo: HTTP %d for %s (%s)"
+                        status
+                        symbol
+                        body_str))
+              else (
+                let json = Yojson.Safe.from_string body_str in
+                let bars = parse_daily ~symbol json in
+                Lwt.return bars)
+            in
+            Lwt.catch
+              (fun () ->
+                 fetch
+                 >|= fun bars ->
+                 (* An empty 200 is the soft-block signature (Yahoo serves
+                    "result": null for blocked IPs instead of a 429). Count
+                    it; a walk that is ALL empty-200 (no pre-listing skips)
+                    records the block. *)
+                 bars, skipped, empty_200 + if bars = [] then 1 else 0)
+              (fun exn ->
+                 match classify_exn exn with
+                 | `Missing_data ->
+                   (* The window sits entirely before the symbol's listing: no
+                      data exists in [from_ms, to_ms]. Record the confirmed
+                      empty prefix and skip the window instead of failing the
+                      whole walk (a recently-listed asset would otherwise spam
+                      the same doomed request on every pass). *)
+                   remember_empty ~symbol (unix_to_iso to_ms);
+                   Logging.debug_f
+                     ~section
+                     "Yahoo daily fetch for %s: no data before %s (pre-listing); \
+                      skipping this window"
+                     symbol
+                     (unix_to_iso to_ms);
+                   go
+                     (Int64.add from_ms window_seconds)
+                     acc
+                     ~skipped:(skipped + 1)
+                     ~empty_200
+                 | `Fatal ->
+                   Logging.warn_f
+                     ~section
+                     "Yahoo daily fetch for %s stopped at %s (%s), returning %d bars"
+                     symbol
+                     (unix_to_iso from_ms)
+                     (Printexc.to_string exn)
+                     (List.length acc);
+                   Lwt.return (List.rev acc, skipped, empty_200))
+            >>= fun (bars, skipped, empty_200) ->
+            (* A successful window ends the empty prefix: from here on the
+                 symbol has data, so a later fetch can start at this window's
+                 beginning (the walk re-checks nothing before it). *)
+            if bars <> []
+            then
+              remember_empty ~symbol (Oracle_calendar.add_days (unix_to_iso from_ms) (-1));
+            let acc = List.rev_append bars acc in
+            if Int64.compare to_ms end_epoch >= 0
+            then Lwt.return (List.rev acc, skipped, empty_200)
+            else go (Int64.add to_ms day_seconds) acc ~skipped ~empty_200))
+      in
+      (* One walk at a time (see [yahoo_mutex]): the pass fetches many symbols
+         concurrently and Yahoo throttles parallel bursts. *)
+      Lwt_mutex.with_lock yahoo_mutex (fun () ->
+        go start_epoch [] ~skipped:0 ~empty_200:0)
+      >|= fun (bars, skipped, empty_200) ->
+      (* An all-empty-200 walk is the soft-block signature - BUT only when
+         the requested range spans more than a few days: a weekend/holiday
+         sliver at the deep-history boundary legitimately holds zero trading
+         days (equity venue_first - 1 often lands on a Sunday) and must not
+         be classified as a block. A blocked IP comes back empty over the
+         whole multi-month/year range. *)
+      let span_days = Int64.div (Int64.sub end_epoch start_epoch) day_seconds in
+      if bars = [] && empty_200 > 0 && skipped = 0 && span_days > 7L
+      then remember_block ~symbol ~windows:empty_200;
+      if skipped > 0
+      then
+        Logging.info_f
+          ~section
+          "Yahoo daily fetch for %s: skipped %d pre-listing window(s) (no data before \
+           %s); %d bar(s) fetched"
+          symbol
+          skipped
+          (unix_to_iso start_epoch)
+          (List.length bars);
+      bars)
 ;;

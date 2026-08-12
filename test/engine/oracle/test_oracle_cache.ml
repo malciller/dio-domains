@@ -269,11 +269,11 @@ let test_with_delta_complete_through () =
     in
     Alcotest.(check bool) "complete-through cache skips the network" false !called;
     Alcotest.(check int) "serves the cached bars" 2 (List.length result);
-    (* Incomplete cache: fetches the delta with the day AFTER the last bar
-         as the start boundary. *)
+    (* Incomplete cache (last bar far before the end date): fetches the
+       delta with the day AFTER the last bar as the start boundary. *)
     let called2 = ref false in
     let boundary2 = ref None in
-    let incomplete = [ mk_bar ~date:"2020-08-30" ~close:1.0 ~volume:1.0 ] in
+    let incomplete = [ mk_bar ~date:"2020-08-01" ~close:1.0 ~volume:1.0 ] in
     Dio_oracle.Oracle_cache.save_bars ~dir ~exchange:"yahoo-deep" ~symbol:"QQQ" incomplete;
     let result2 =
       Lwt_main.run
@@ -286,12 +286,41 @@ let test_with_delta_complete_through () =
            ~fetch:(fun boundary ->
              called2 := true;
              boundary2 := boundary;
-             Lwt.return [ mk_bar ~date:"2020-08-31" ~close:1.0 ~volume:1.0 ])
+             Lwt.return [ mk_bar ~date:"2020-08-02" ~close:1.0 ~volume:1.0 ])
            ())
     in
     Alcotest.(check bool) "incomplete cache fetches" true !called2;
-    Alcotest.(check (option string)) "delta boundary" (Some "2020-08-31") !boundary2;
+    Alcotest.(check (option string)) "delta boundary" (Some "2020-08-02") !boundary2;
     Alcotest.(check int) "merged" 2 (List.length result2))
+;;
+
+let test_with_delta_complete_through_weekend () =
+  (* Equity deep histories: the bounded end date is venue_first - 1, which
+     often lands on a weekend/holiday (venue starts Monday -> end Sunday),
+     and the last trading day is the Friday before. The cache must count as
+     complete there - an exact-date match would re-request a weekend-only
+     sliver (no trading days at all) on every pass forever. *)
+  with_tmp_dir (fun dir ->
+    (* Venue starts Tue 2020-09-01 -> deep end_date Mon 2020-08-31; the
+         last cached (trading) bar is Friday 2020-08-28. *)
+    let cached = [ mk_bar ~date:"2020-08-28" ~close:1.0 ~volume:1.0 ] in
+    Dio_oracle.Oracle_cache.save_bars ~dir ~exchange:"yahoo-deep" ~symbol:"QQQ" cached;
+    let called = ref false in
+    let result =
+      Lwt_main.run
+        (Dio_oracle.Oracle_cache.with_delta
+           ~dir
+           ~exchange:"yahoo-deep"
+           ~symbol:"QQQ"
+           ~today:"2026-08-12"
+           ~complete_through:"2020-08-31"
+           ~fetch:(fun _ ->
+             called := true;
+             Lwt.return [])
+           ())
+    in
+    Alcotest.(check bool) "weekend-bounded equity deep is complete" false !called;
+    Alcotest.(check int) "serves the cached bars" 1 (List.length result))
 ;;
 
 let test_with_delta_fetch_failure_falls_back () =
@@ -342,6 +371,10 @@ let () =
             "bounded cache completes through its end date"
             `Quick
             test_with_delta_complete_through
+        ; Alcotest.test_case
+            "weekend-bounded equity deep is complete"
+            `Quick
+            test_with_delta_complete_through_weekend
         ; Alcotest.test_case
             "served series is clean, file stores raw"
             `Quick
