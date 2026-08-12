@@ -12,7 +12,7 @@
     "major_heap_increment": 8388608
   },
   "oracle": {
-    "qty_cap_mult": 5.0,
+    "qty_cap_mult": 2.5,
     "target_survival": 0.95,
     "fng_weight": 0.5,
     "min_active_dsurv": 0.0,

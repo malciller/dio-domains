@@ -524,9 +524,12 @@ let test_scenario_extreme_multi_level_crash () =
 
 let test_scenario_insufficient_capital () =
   (* Capital below the first buy cost: exhaustion at the first level, zero
-     fills, D_surv = the grid interval. *)
+     fills, D_surv = the grid interval. The ladder anchors at the path's
+     first close (the strategy starts where the history starts), so the
+     second bar dips below the first rung and triggers the unaffordable
+     first buy. *)
   let c = cfg ~start_quote:50.0 () in
-  let bars = [| bar ~high:100.0 ~low:99.0 () |] in
+  let bars = [| bar ~high:100.0 ~low:99.0 (); bar ~high:98.5 ~low:95.0 () |] in
   let res = replay c bars in
   let out = Dio_oracle.Oracle_strategy.Grid.replay c (series_of ~symbol:"H" bars) in
   Alcotest.(check int) "no buys" 0 res.buy_fills;

@@ -317,12 +317,14 @@ let test_empirical_matches_static_on_crash () =
   (* On a monotone geometric crash the path replay equals the closed-form
      static runway (one ladder fill per bar, no sells), so the empirical
      (path-replay) min capital must equal the static one: the crash IS the
-     worst case the static bound prices. *)
+     worst case the static bound prices. The tail stays flat at the crash
+     bottom (no rise, so the ladder never re-anchors up). *)
   let gi = 1.0 in
   let fee = 0.0004 in
   let start_price = 100.0 in
   let capital = 2_900.0 in
   let n_bars = 300 in
+  let n_crash = 80 in
   let level i = start_price *. (0.99 ** float_of_int i) in
   let mk i close =
     let lo = if i = 0 then level 1 *. 0.999999 else level (i + 1) *. 0.999999 in
@@ -331,11 +333,12 @@ let test_empirical_matches_static_on_crash () =
   in
   let bars =
     Array.init n_bars (fun i ->
-      if i < 80
+      if i < n_crash
       then mk i (level i)
       else (
-        let b = mk 0 (level 0) in
-        { b with close = level 0 }))
+        let bottom = level n_crash in
+        Dio_strategies.Grid_core_types.
+          { high = bottom *. 1.001; low = bottom *. 0.999; close = bottom }))
   in
   let open Dio_oracle.Oracle_types in
   let series =
@@ -400,9 +403,13 @@ let test_empirical_matches_static_on_crash () =
 ;;
 
 let test_empirical_bounded_by_static_on_bounces () =
-  (* On a bouncy path sells free quote, so the actual historical capital limit
-     is never worse than the closed-form straight-down bound: empirical <=
-     static. *)
+  (* On a bouncy path the trailing ladder re-trades ranges (buys dips, sells
+     recoveries, re-buys on the next dip), so the actual historical capital
+     limit is at least the closed-form straight-down bound: the static runway
+     is the lower bound (one clean pass), and choppy paths cost fees + spread
+     per re-trade - empirical >= static. (Under the old non-trailing ladder
+     the bounce path was cheaper than straight-down; the trailing ladder
+     mirrors the live strategy's re-entry.) *)
   let series = mk_test_series ~sc:3.0 () in
   let closes = Array.map (fun (b : Dio_oracle.Oracle_types.bar) -> b.close) series.bars in
   let start_price = closes.(Array.length closes - 1) in
@@ -441,8 +448,8 @@ let test_empirical_bounded_by_static_on_bounces () =
   Alcotest.(check bool) "static reachable" true static.reachable;
   Alcotest.(check bool) "empirical reachable" true emp.reachable;
   Alcotest.(check bool)
-    "empirical never worse than static"
-    (emp.value <= static.value *. (1.0 +. 1e-9))
+    "empirical at least the static (re-trading drains fees)"
+    (emp.value >= static.value *. (1.0 -. 1e-9))
     true
 ;;
 
