@@ -83,6 +83,14 @@ type decision =
   ; remainder : float (** Pool share passed to the next asset. *)
   ; range : Oracle_types.range_stats option
     (** Per-asset historical price-range reference (ATH / low / position). *)
+  ; parameter_components : Oracle_types.parameter_components
+    (** How the resolved grid interval was composed: the F&G side (crypto
+        only), the survival-constrained parameter, the per-asset range side
+        and the weights they carried in the blend. Consumers adopt
+        [resolved_parameter] (== [grid_interval]) and never recompute a
+        competing F&G-only value over the config range - the blend is the
+        single source of truth for the grid interval while the oracle holds
+        a decision. *)
   ; warnings : string list
   ; updated_at : float (** Unix time of the pass that produced this decision. *)
   }
@@ -823,6 +831,86 @@ let size_asset
        (r.Oracle_types.d_to_low *. 100.0)
        (r.Oracle_types.range_span *. 100.0)
    | None -> ());
+  (* The blend composition, logged for crypto assets so the F&G / range /
+     survival weighting is visible in the engine log - and the reader can see
+     exactly what the domain will adopt (and when a side was clamped away:
+     "survival binds"). Equities are pure oracle and skip this. *)
+  (match deployment.Oracle_types.parameter_components.Oracle_types.fng with
+   | None -> ()
+   | Some fng ->
+     let pc = deployment.Oracle_types.parameter_components in
+     let w_survival =
+       Float.max 0.0 (1.0 -. pc.Oracle_types.fng_weight -. pc.Oracle_types.range_weight)
+     in
+     let sides, raw_blend =
+       match pc.Oracle_types.fng_parameter, pc.Oracle_types.range_parameter with
+       | Some fp, Some rp ->
+         let total = pc.fng_weight +. w_survival +. pc.range_weight in
+         ( Printf.sprintf
+             "fng %.2f -> %.4f%% (w %.2f) | range %.4f%% (w %.2f) | survival %.4f%% (w \
+              %.2f)"
+             fng
+             fp
+             pc.Oracle_types.fng_weight
+             rp
+             pc.Oracle_types.range_weight
+             pc.Oracle_types.survival_parameter
+             w_survival
+         , ((pc.fng_weight *. fp)
+            +. (w_survival *. pc.Oracle_types.survival_parameter)
+            +. (pc.Oracle_types.range_weight *. rp))
+           /. total )
+       | Some fp, None ->
+         let total = pc.fng_weight +. w_survival in
+         ( Printf.sprintf
+             "fng %.2f -> %.4f%% (w %.2f) | survival %.4f%% (w %.2f)"
+             fng
+             fp
+             pc.Oracle_types.fng_weight
+             pc.Oracle_types.survival_parameter
+             w_survival
+         , ((pc.fng_weight *. fp) +. (w_survival *. pc.Oracle_types.survival_parameter))
+           /. total )
+       | None, _ -> "", pc.Oracle_types.survival_parameter
+     in
+     let clamp_note =
+       if raw_blend +. 1e-9 < pc.Oracle_types.survival_parameter
+       then
+         Printf.sprintf
+           " (blend %.4f%% clamped: survival binds, F&G/range contribute 0)"
+           raw_blend
+       else ""
+     in
+     Logging.info_f
+       ~section
+       "[%d/%d] %s/%s gi blend: %s -> resolved %.4f%%%s"
+       index
+       n_tasks
+       exchange
+       symbol
+       sides
+       pc.Oracle_types.resolved_parameter
+       clamp_note;
+     (* The qty channel of the same blend: fear up-sizes toward the
+        survival-max, greed pulls back toward the floor. When the survival-max
+        is the floor itself (under-funded pool) there is no headroom and the
+        F&G qty contribution is zero by construction - logged so it is visible
+        rather than silent. *)
+     let q_min = D.sizing_floor ~cfg:grid in
+     let k = 1.0 -. (Float.max 0.0 (Float.min 100.0 fng) /. 100.0) in
+     let headroom = deployment.Oracle_types.qty -. q_min > 1e-12 in
+     Logging.info_f
+       ~section
+       "[%d/%d] %s/%s qty blend: floor %.6g -> resolved %.6g (fng %.2f, k %.2f%s)"
+       index
+       n_tasks
+       exchange
+       symbol
+       q_min
+       deployment.Oracle_types.qty
+       fng
+       k
+       (if headroom then "" else "; no headroom: F&G qty contribution 0"));
   let warnings = deployment.Oracle_types.warnings in
   let warn_key = Printf.sprintf "%s/%s" exchange symbol in
   let warnings_changed =
@@ -852,6 +940,7 @@ let size_asset
      ; pool_share = deployment.Oracle_types.pool_share
      ; remainder = deployment.Oracle_types.remainder
      ; range = deployment.Oracle_types.range
+     ; parameter_components = deployment.Oracle_types.parameter_components
      ; warnings = deployment.Oracle_types.warnings
      ; updated_at = Unix.gettimeofday ()
      }

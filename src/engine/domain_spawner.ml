@@ -4,6 +4,7 @@ module Fear_and_greed = Cmc.Fear_and_greed
 (* Capital-oracle runtime (wrapped library: explicit alias avoids opening the
    whole Dio_oracle namespace). *)
 module Oracle_runtime = Dio_oracle.Oracle_runtime
+module Oracle_types = Dio_oracle.Oracle_types
 
 (* Exchange interface and types *)
 module Exchange = Dio_exchange.Exchange_intf
@@ -110,7 +111,8 @@ let asset_domain_worker
 
   (* Fetch exchange fee schedule at domain startup *)
   let asset_with_fees = fee_fetcher asset in
-  (* Resolve grid_interval from the cached Fear & Greed index. There is no
+  (* Resolve grid_interval from the cached Fear & Greed index when the
+     capital oracle has no decision yet (fallback sizing). There is no
      midpoint default: the config range [lo, hi] is a constraint, not a
      fallback. F&G only applies when a REAL index value was fetched (the F&G
      cache holds genuinely fetched values only); when neither the capital
@@ -128,7 +130,7 @@ let asset_domain_worker
       let lo, hi = asset_with_fees.grid_interval in
       Logging.debug_f
         ~section
-        "Resolved grid_interval for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
+        "Resolved F&G fallback grid_interval for %s/%s: %.4f (F&G=%.2f, range %.4f-%.4f)"
         asset_with_fees.exchange
         asset_with_fees.symbol
         resolved
@@ -208,9 +210,11 @@ let asset_domain_worker
     let exec_ready_cycle = ref 0 in
     let open_orders_dirty = ref true in
     (* Initialize strategy configuration refs based on strategy type.
-       The capital-oracle runtime publishes a per-asset decision (qty,
-       grid_interval, active) to a lock-free snapshot; when a decision exists
-       and the asset is active, its qty/gi win over the F&G-resolved values. *)
+       The capital-oracle runtime publishes a per-asset decision (qty, the
+       blended grid_interval, active) to a lock-free snapshot; while a
+       decision exists the oracle's blended qty/gi win - F&G enters that blend
+       inside the oracle (parameter_components), it is never re-derived as a
+       competing value here. *)
     let baseline_price = ref None in
     (* None until a real F&G value is seen: a missing index means "no live F&G
        signal" and the per-cycle re-evaluation is skipped, not neutralized. *)
@@ -907,8 +911,8 @@ let asset_domain_worker
         | None ->
           Logging.info_f
             ~section
-            "[%s/%s] No capital-oracle decision; sizing reverts to Fear & Greed (orders \
-             withheld if no live F&G reading exists)"
+            "[%s/%s] No capital-oracle decision; sizing falls back to Fear & Greed alone \
+             (orders withheld if no live F&G reading exists)"
             asset.exchange
             asset.symbol);
       (* Oracle/signal startup gate (see the gate state initialized above).
@@ -1130,88 +1134,169 @@ let asset_domain_worker
               asset_with_fees.symbol
               current_fng
           | Some current_fng ->
-            (* The capital oracle owns the grid interval while it has an active
-             decision; the F&G re-evaluation must not clobber it (the oracle
-             re-applies its gi every cycle and would fight the F&G value,
-             flickering the grid). F&G still manages accumulation_buffer,
-             which the oracle does not size. *)
-            let oracle_governing =
-              match oracle_decision with
-              | Some d when d.active -> true
-              | _ -> false
-            in
+            (* One blend, one owner. The capital oracle computes the crypto
+               grid interval as a weighted blend of the F&G side, the
+               per-asset range side and the survival-constrained parameter,
+               and publishes the composition in the decision's
+               [parameter_components]. While the oracle holds a decision for
+               this asset (active or INACTIVE) that blended gi is the sizing:
+               re-evaluating a pure F&G value over the config range here
+               would fight the oracle's value every cycle (the oracle
+               re-applies its gi and the grid flickers between the two
+               systems). F&G still manages accumulation_buffer, which the
+               oracle does not size. Only when the oracle has NO decision for
+               this asset (not modeled, or analysis failed) does F&G-alone
+               sizing apply here - the fng side of the blend without the
+               survival/range constraint, explicitly labeled as the fallback
+               it is. *)
             let lo, hi = asset_with_fees.grid_interval in
-            let new_interval =
+            let fng_interval =
               Fear_and_greed.grid_value_for_fng
                 ~grid_interval:asset_with_fees.grid_interval
                 ~fear_and_greed:current_fng
             in
-            Logging.info_f
-              ~section
-              "[%s/%s] Fear & Greed updated to %.2f. Re-evaluated grid_interval to %.4f \
-               (range %.4f-%.4f)"
-              asset_with_fees.exchange
-              asset_with_fees.symbol
-              current_fng
-              new_interval
-              lo
-              hi;
-            (* Update accumulation_buffer for exchanges that use it *)
-            let exch_id =
-              Dio_exchange.Exchange_intf.Types.exchange_of_string asset_with_fees.exchange
-            in
-            let is_accumulation_exch =
-              match exch_id with
-              | Hyperliquid | Ibkr | Lighter -> true
-              | _ -> false
-            in
-            if is_accumulation_exch
-            then (
-              let ab_lo, ab_hi = asset_with_fees.accumulation_buffer in
-              let new_ab =
-                Fear_and_greed.grid_value_for_fng
-                  ~grid_interval:asset_with_fees.accumulation_buffer
-                  ~fear_and_greed:current_fng
+            (* F&G owns accumulation_buffer in every crypto case: the oracle
+               does not size it. *)
+            let update_accumulation_buffer () =
+              let exch_id =
+                Dio_exchange.Exchange_intf.Types.exchange_of_string
+                  asset_with_fees.exchange
               in
-              Logging.info_f
-                ~section
-                "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"
-                asset_with_fees.exchange
-                asset_with_fees.symbol
-                new_ab
-                ab_lo
-                ab_hi;
-              match !grid_strategy_asset_ref with
-              | Some asset when oracle_governing ->
-                (* Oracle owns the grid interval; refresh only the buffer. *)
-                let new_asset =
-                  { asset with Dio_strategies.Suicide_grid.accumulation_buffer = new_ab }
+              let is_accumulation_exch =
+                match exch_id with
+                | Hyperliquid | Ibkr | Lighter -> true
+                | _ -> false
+              in
+              if is_accumulation_exch
+              then (
+                let ab_lo, ab_hi = asset_with_fees.accumulation_buffer in
+                let new_ab =
+                  Fear_and_greed.grid_value_for_fng
+                    ~grid_interval:asset_with_fees.accumulation_buffer
+                    ~fear_and_greed:current_fng
                 in
-                grid_strategy_asset_ref := Some new_asset
-              | Some asset ->
-                let new_asset =
-                  { asset with
-                    Dio_strategies.Suicide_grid.grid_interval = new_interval
-                  ; Dio_strategies.Suicide_grid.accumulation_buffer = new_ab
-                  }
-                in
-                grid_strategy_asset_ref := Some new_asset
-              | None -> ())
-            else (
-              match !grid_strategy_asset_ref with
-              | Some _ when oracle_governing ->
-                Logging.debug_f
+                Logging.info_f
                   ~section
-                  "[%s/%s] F&G grid_interval re-evaluation skipped: capital oracle owns \
-                   sizing"
+                  "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"
                   asset_with_fees.exchange
                   asset_with_fees.symbol
-              | Some asset ->
-                let new_asset =
-                  { asset with Dio_strategies.Suicide_grid.grid_interval = new_interval }
-                in
-                grid_strategy_asset_ref := Some new_asset
-              | None -> ()));
+                  new_ab
+                  ab_lo
+                  ab_hi;
+                match !grid_strategy_asset_ref with
+                | Some asset ->
+                  let new_asset =
+                    { asset with
+                      Dio_strategies.Suicide_grid.accumulation_buffer = new_ab
+                    }
+                  in
+                  grid_strategy_asset_ref := Some new_asset
+                | None -> ())
+            in
+            (match oracle_decision with
+             | Some d when d.active ->
+               (* Oracle owns the sizing: log the blend it actually published
+                  (its F&G side + weight, and whether the survival constraint
+                  clamped the sentiment away) instead of an F&G-only value,
+                  and touch only the accumulation buffer. *)
+               let pc = d.parameter_components in
+               let w_survival =
+                 Float.max
+                   0.0
+                   (1.0 -. pc.Oracle_types.fng_weight -. pc.Oracle_types.range_weight)
+               in
+               let sides, raw_blend =
+                 match pc.Oracle_types.fng_parameter, pc.Oracle_types.range_parameter with
+                 | Some fp, Some rp ->
+                   let total =
+                     pc.Oracle_types.fng_weight
+                     +. w_survival
+                     +. pc.Oracle_types.range_weight
+                   in
+                   ( Printf.sprintf
+                       "fng-side %.4f%% (w %.2f) + range %.4f%% (w %.2f) + survival \
+                        %.4f%% (w %.2f)"
+                       fp
+                       pc.Oracle_types.fng_weight
+                       rp
+                       pc.Oracle_types.range_weight
+                       pc.Oracle_types.survival_parameter
+                       w_survival
+                   , ((pc.Oracle_types.fng_weight *. fp)
+                      +. (w_survival *. pc.Oracle_types.survival_parameter)
+                      +. (pc.Oracle_types.range_weight *. rp))
+                     /. total )
+                 | Some fp, None ->
+                   let total = pc.Oracle_types.fng_weight +. w_survival in
+                   ( Printf.sprintf
+                       "fng-side %.4f%% (w %.2f) + survival %.4f%% (w %.2f)"
+                       fp
+                       pc.Oracle_types.fng_weight
+                       pc.Oracle_types.survival_parameter
+                       w_survival
+                   , ((pc.Oracle_types.fng_weight *. fp)
+                      +. (w_survival *. pc.Oracle_types.survival_parameter))
+                     /. total )
+                 | None, _ ->
+                   ( Printf.sprintf "survival %.4f%%" pc.Oracle_types.survival_parameter
+                   , pc.Oracle_types.survival_parameter )
+               in
+               let clamp_note =
+                 if raw_blend +. 1e-9 < pc.Oracle_types.survival_parameter
+                 then
+                   Printf.sprintf
+                     " (blend %.4f%% clamped: survival binds, F&G/range contribute 0)"
+                     raw_blend
+                 else ""
+               in
+               Logging.info_f
+                 ~section
+                 "[%s/%s] Fear & Greed updated to %.2f: oracle gi blend (%s) -> %.4f%%%s"
+                 asset_with_fees.exchange
+                 asset_with_fees.symbol
+                 current_fng
+                 sides
+                 d.grid_interval
+                 clamp_note;
+               update_accumulation_buffer ()
+             | Some _ ->
+               (* Oracle decision exists but INACTIVE: the oracle owns the
+                  sizing and orders are withheld; no competing F&G value is
+                  applied (it would be adopted on re-activation only to be
+                  immediately replaced by the oracle's own gi). *)
+               Logging.debug_f
+                 ~section
+                 "[%s/%s] F&G gi re-evaluation skipped: capital-oracle decision INACTIVE \
+                  (orders withheld)"
+                 asset_with_fees.exchange
+                 asset_with_fees.symbol;
+               update_accumulation_buffer ()
+             | None ->
+               (* No capital-oracle decision: F&G-alone is the designed
+                  fallback. This is exactly the fng side the oracle would
+                  blend (same mapping over the same config range) minus the
+                  survival/range constraint only the oracle's analysis can
+                  compute - labeled as fallback so the two signals never read
+                  as fighting. *)
+               Logging.info_f
+                 ~section
+                 "[%s/%s] No capital-oracle decision; sizing grid_interval from Fear & \
+                  Greed only (fallback): %.4f%% (range %.4f-%.4f)"
+                 asset_with_fees.exchange
+                 asset_with_fees.symbol
+                 fng_interval
+                 lo
+                 hi;
+               update_accumulation_buffer ();
+               (match !grid_strategy_asset_ref with
+                | Some asset ->
+                  let new_asset =
+                    { asset with
+                      Dio_strategies.Suicide_grid.grid_interval = fng_interval
+                    }
+                  in
+                  grid_strategy_asset_ref := Some new_asset
+                | None -> ())));
         (* Compute wall-clock timestamp once per cycle for strategy use,
              eliminating Unix.time/gettimeofday syscalls inside the strategy. *)
         let now = Unix.gettimeofday () in
