@@ -163,10 +163,17 @@ let is_fresh ~(today : string) (bars : Oracle_types.bar list) =
 (** A bounded history (e.g. the Yahoo deep extension, which only covers up
     to the day before the venue series starts) is COMPLETE when its last bar
     reaches its end date - after that it never needs a fetch again, however
-    far today has moved on. *)
-let covers_through ~(date : string) (bars : Oracle_types.bar list) =
+    far today has moved on. [tolerance_days] absorbs non-trading days: the
+    deep boundary for an equity asset usually lands on a weekend/holiday
+    (venue_first - 1, e.g. a Sunday when the venue series starts Monday),
+    and the venue's last bar is then the Friday before - a weekend-only
+    sliver holds no data at all, so requiring an exact date match would
+    re-request the same empty range on every pass forever. 7 days covers
+    any weekend + holiday span. *)
+let covers_through ?(tolerance_days = 0) ~(date : string) (bars : Oracle_types.bar list) =
+  let floor = Oracle_calendar.add_days date (-tolerance_days) in
   match List.rev bars with
-  | b :: _ -> String.compare b.date date >= 0
+  | b :: _ -> String.compare b.date floor >= 0
   | [] -> false
 ;;
 
@@ -215,7 +222,7 @@ let with_delta
     is_fresh ~today cached
     ||
     match complete_through with
-    | Some end_date -> covers_through ~date:end_date cached
+    | Some end_date -> covers_through ~tolerance_days:7 ~date:end_date cached
     | None -> false
   in
   if current
