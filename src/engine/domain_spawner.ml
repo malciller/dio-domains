@@ -473,6 +473,15 @@ let asset_domain_worker
     let publish_windows () =
       ignore (Latency_profiler.snapshot_and_reset prof_ob);
       ignore (Latency_profiler.snapshot_and_reset prof_exec);
+      (* The strategy window's execution count is set to the number of order
+         actions this domain's strategy actually pushed in the window (place/
+         amend/cancel), so the dashboard's STRAT/S column reports real
+         executions per second instead of raw strategy-invocation cycles
+         (which for a fast feed are far higher than actual order activity). *)
+      Latency_profiler.set_executions
+        prof_strategy
+        (Dio_strategies.Strategy_common.Order_actions.snapshot_and_reset
+           asset_with_fees.symbol);
       ignore (Latency_profiler.snapshot_and_reset prof_strategy);
       ignore (Latency_profiler.snapshot_and_reset prof_cycle);
       (* Refresh the window-scoped GC sampling pair once per window. *)

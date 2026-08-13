@@ -29,7 +29,7 @@ let push_order order =
   match write_result with
   | None ->
     Logging.error_f ~section "Failed to write hedge order to ring buffer (buffer full)"
-  | Some () -> ()
+  | Some () -> Order_actions.incr order.symbol
 ;;
 
 (** Build a hedge order and push it to the ring buffer.

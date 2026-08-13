@@ -312,6 +312,7 @@ let push_order ~state ?(now = Unix.time ()) order =
          match write_result with
          | Some () ->
            Strategy_common.OrderSignal.broadcast ();
+           Strategy_common.Order_actions.incr order.symbol;
            (* Record cancel to prevent duplicate submissions *)
            Hashtbl.add state.pending_cancellations target_order_id now;
            true
@@ -345,6 +346,7 @@ let push_order ~state ?(now = Unix.time ()) order =
       match write_result with
       | Some () ->
         Strategy_common.OrderSignal.broadcast ();
+        Strategy_common.Order_actions.incr order.symbol;
         (* Update per-symbol strategy state *)
 
         (* Set inflight flags for Place operations *)

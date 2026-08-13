@@ -1063,8 +1063,22 @@ Structured, domain-safe logging with five severity levels: `DEBUG`,
 - **Per-section filtering** via `logging_sections` (comma-separated)
 - **Domain safety** — serialized through a shared mutex
 - **Zero-allocation fast path** — disabled levels skip formatting entirely
-- **ANSI color output** — distinct color per severity
-- **Millisecond timestamps** with per-second caching
+- **Scannable, aligned layout** — every line renders as
+  `HH:MM:SS.mmm LEVEL SECTION message` with fixed-width level and section
+  columns, so the message always starts at the same column:
+  ```
+  19:17:23.672 INFO  oracle_runtime   [2/8] hyperliquid/BTC/USDC ACTIVE — buy ...
+  19:17:23.672 INFO  oracle_runtime   worst drop 83.6% (peak $19497.40 on ...
+  19:17:23.672 INFO  oracle_runtime         funding: drop 67.4% to floor ...
+  19:17:23.672 WARN  oracle_replay    only 3 independent 180-session windows ...
+  ```
+- **Compact time-only timestamps** — the date is redundant when live-tailing
+  and is available via `docker logs --timestamps`
+- **Per-section colors** — each component gets a stable hue (the oracle family
+  is bright yellow, `suicide_grid` bright cyan, ...) so its lines can be
+  tracked down the screen; the level column is colored by severity
+- **Multi-line blocks** (e.g. capital-oracle decision reports) indent their
+  continuation lines to the message column, keeping each block grouped
 
 ### Error Handling
 

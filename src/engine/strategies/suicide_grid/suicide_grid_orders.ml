@@ -91,6 +91,7 @@ let push_order ~now ?state order =
        (match write_result with
         | Some () ->
           OrderSignal.broadcast ();
+          Order_actions.incr order.symbol;
           state.last_order_time <- now;
           if order.side = Buy then state.inflight_cancel_buy <- true;
           true
@@ -122,6 +123,7 @@ let push_order ~now ?state order =
       match write_result with
       | Some () ->
         OrderSignal.broadcast ();
+        Order_actions.incr order.symbol;
         let state =
           match state with
           | Some s -> s

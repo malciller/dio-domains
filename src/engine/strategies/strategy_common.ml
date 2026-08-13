@@ -96,6 +96,47 @@ let generate_duplicate_key symbol side quantity limit_price =
   | None -> symbol ^ "|" ^ side ^ "|" ^ q_str ^ "|market"
 ;;
 
+(** Per-symbol strategy order-action counters.
+
+    Incremented each time a strategy successfully pushes an order action
+    (place/amend/cancel) to a ring buffer; snapshot+reset once per latency
+    window by the domain worker so the dashboard's STRAT/S column reports
+    ACTUAL strategy executions per second — not raw strategy-invocation
+    cycles, which for a fast feed are far higher than the real number of
+    order actions the strategy takes. *)
+module Order_actions = struct
+  let counters : (string, int Atomic.t) Hashtbl.t = Hashtbl.create 16
+  let mutex = Mutex.create ()
+
+  let incr symbol =
+    Mutex.lock mutex;
+    let c =
+      match Hashtbl.find_opt counters symbol with
+      | Some c -> c
+      | None ->
+        let c = Atomic.make 0 in
+        Hashtbl.add counters symbol c;
+        c
+    in
+    Atomic.incr c;
+    Mutex.unlock mutex
+  ;;
+
+  (** Return and zero the count for [symbol] since the last reset. *)
+  let snapshot_and_reset symbol =
+    Mutex.lock mutex;
+    let n =
+      match Hashtbl.find_opt counters symbol with
+      | Some c ->
+        Hashtbl.remove counters symbol;
+        Atomic.get c
+      | None -> 0
+    in
+    Mutex.unlock mutex;
+    n
+  ;;
+end
+
 (** In-flight order cache for deduplication of pending place/cancel requests.
 
     Sharded (HFT_AUDIT.md H4): the registry used to be ONE Hashtbl behind ONE
