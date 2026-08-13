@@ -182,11 +182,15 @@ let epoch_of_iso date =
 ;;
 
 (** Yahoo symbol for an asset, or None when the symbol is not trusted for
-    deep history (see the module header: dead-token collisions). *)
-let symbol_of ~(exchange : string) (symbol : string) : string option =
-  match String.lowercase_ascii exchange with
-  | "alpaca" -> Some (String.uppercase_ascii symbol)
-  | _ ->
+    deep history (see the module header: dead-token collisions). Equity
+    assets map by identity (Yahoo QQQ is QQQ); crypto symbols only through
+    the whitelist of known-continuous pairs. *)
+let symbol_of ~(calendar_kind : Oracle_types.calendar_kind) (symbol : string)
+  : string option
+  =
+  match calendar_kind with
+  | Equity -> Some (String.uppercase_ascii symbol)
+  | Crypto ->
     let base =
       match String.split_on_char '/' symbol with
       | b :: _ when b <> "" -> String.uppercase_ascii b

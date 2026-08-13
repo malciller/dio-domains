@@ -146,6 +146,29 @@ module Types = struct
     ; backoff_factor : float
       (** Multiplicative factor applied to the delay after each attempt. *)
     }
+
+  (* ---- Oracle data-layer types ----
+     Shared with the capital oracle via [Oracle]; defined here so venue
+     libraries can implement [Oracle.S] without depending on the oracle
+     library. [Oracle_types] aliases these (see oracle_types.ml). *)
+
+  (** Historical daily OHLC bar (the oracle's data layer). One bar per
+      session/date. *)
+  type bar =
+    { date : string (** ISO date (YYYY-MM-DD). *)
+    ; open_ : float
+    ; high : float
+    ; low : float
+    ; close : float
+    ; volume : float
+    }
+
+  (** Calendar semantics of a venue for session accounting.
+      - [Crypto]: 24/7 markets; a session is a calendar day.
+      - [Equity]: market sessions only (weekdays minus holidays). *)
+  type calendar_kind =
+    | Crypto
+    | Equity
 end
 
 (** Module signature that every exchange backend must satisfy.
@@ -387,4 +410,93 @@ module Registry = struct
     Hashtbl.fold (fun name _ acc -> name :: acc) _exchanges []
     |> List.sort_uniq String.compare
   ;;
+end
+
+(** Oracle data-venue interface: the contract the capital oracle needs from
+    an exchange beyond live trading - historical daily bars, session
+    calendars, fees, account balances and instrument metadata.
+
+    Independent of the live-trading signature [S] above (which has no
+    historical-bars or calendar concept); a venue implements BOTH, or only
+    [S] if it does not participate in oracle modeling. The runtime registry
+    lives in [Oracle.Registry], mirroring [Registry] above.
+
+    Raw-bar contract: implementations return RAW source rows (any order);
+    the oracle sorts, de-duplicates and normalizes centrally
+    ([Oracle_calendar.normalize_bars] on every read, cache and direct fetch
+    alike), so a corrected normalization rule self-heals without a refetch
+    (same philosophy as the v2 history cache). Implementations may still
+    pre-clean (normalize is idempotent) when they need source-level logging. *)
+module Oracle = struct
+  module type S = sig
+    (** Human-readable venue name used as the registry key (e.g. "kraken"). *)
+    val name : string
+
+    (** Session calendar semantics: [Crypto] (session = day) or [Equity]
+        (market sessions). Drives gap detection and horizon labels. *)
+    val calendar_kind : Types.calendar_kind
+
+    (** Fetch historical daily bars for [symbol] starting at [from] (ISO date
+        of the first day to include; [None] = full history from the venue's
+        earliest available data). [feed] and [end_date] are Alpaca-only knobs
+        (IEX/SIP feed, request window end); other venues ignore them. Returns
+        raw source bars; the oracle normalizes centrally. *)
+    val fetch_bars
+      :  ?feed:string
+      -> ?end_date:string
+      -> from:string option
+      -> symbol:string
+      -> unit
+      -> Types.bar list Lwt.t
+
+    (** Fetch expected session dates over [start_date]..[end_date]. Equity
+        venues build their session model from this; crypto venues return []. *)
+    val fetch_calendar : start_date:string -> end_date:string -> string list Lwt.t
+
+    (** Fetch authoritative (maker, taker) fees for [symbol] from the venue.
+        The oracle falls back to [default_fees] on failure. *)
+    val fetch_fees : testnet:bool -> symbol:string -> (float * float) Lwt.t
+
+    (** Venue default (maker, taker) fees, used offline and as the failed-fetch
+        fallback. [symbol]-parameterized (Hyperliquid spot vs perp differ). *)
+    val default_fees : symbol:string -> float * float
+
+    (** One-shot account balance fetch returning already-normalized
+        (asset, available, total) triples (e.g. XXBT -> BTC, UBTC -> BTC).
+        The oracle wraps them into its own balance snapshot record. *)
+    val fetch_balances
+      :  testnet:bool
+      -> ((string * float * float) list, string) result Lwt.t
+
+    (** Populate instrument metadata (price tick / lot size) for [symbols] so
+        the live registry's [get_price_increment] / [get_qty_increment]
+        answer. No-op for venues with static ticks. *)
+    val init_instruments : testnet:bool -> symbols:string list -> unit Lwt.t
+  end
+
+  (** Dynamic registry mapping venue names to their [(module S)]
+      implementations, mirroring [Registry] above. A venue registers here
+      (typically from its own library at module load, see the
+      force-registration pattern in the oracle's [Oracle_venues]) to
+      participate in oracle modeling. [Hashtbl.replace] semantics: a later
+      registration overrides an earlier one under the same name. *)
+  module Registry = struct
+    (** Internal hash table storing registered oracle-venue modules, keyed by
+        [Oracle.S.name]. *)
+    let _venues : (string, (module S)) Hashtbl.t = Hashtbl.create 4
+
+    (** Register an oracle-venue module. Replaces any existing entry with the
+        same [name]. *)
+    let register (module V : S) = Hashtbl.replace _venues V.name (module V)
+
+    (** Look up a registered oracle-venue module by name. Returns [None] when
+        no module has been registered under that name. *)
+    let get name = Hashtbl.find_opt _venues name
+
+    (** Return all registered venue names, sorted. *)
+    let get_all_names () =
+      Hashtbl.fold (fun name _ acc -> name :: acc) _venues []
+      |> List.sort_uniq String.compare
+    ;;
+  end
 end

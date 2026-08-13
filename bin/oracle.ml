@@ -12,7 +12,6 @@
    the network and still requires a SYMBOL. Portfolio mode is enabled with
    --portfolio or any topology/allocation option. *)
 
-open Lwt.Infix
 open Dio_oracle
 
 (* The strategy model this CLI runs: the grid ladder (the only model today).
@@ -366,75 +365,26 @@ let parse_args () =
   }
 ;;
 
-(** Per-run cache of fetched series, shared across assets and class members so
-    e.g. ETH/USD is only downloaded once. *)
-let fetch_cache : (string * string, Oracle_types.series) Hashtbl.t = Hashtbl.create 32
-
-(** Fetch one symbol's daily series (cached per run, and disk-cached via
-    Oracle_cache: full history on first use, one small delta request per
-    refresh after that). An explicit --start-date bypasses the cache so the
+(** Fetch one symbol's daily series through the shared registry-driven
+    pipeline (Oracle_fetch: venue adapter dispatch, disk cache, clean-series
+    normalization). An explicit --start-date bypasses the cache so the
     requested window is fetched exactly. *)
 let fetch_series_for (a : args) ~(exchange : string) (symbol : string)
   : Oracle_types.series Lwt.t
   =
-  match Hashtbl.find_opt fetch_cache (exchange, symbol) with
-  | Some s -> Lwt.return s
-  | None ->
-    let offline =
-      Option.is_some a.from_csv
-      || Option.is_some a.from_json
-      || (exchange = "alpaca" && Option.is_some a.start_date)
-    in
-    let fetch =
-      match exchange with
-      | "kraken" ->
-        (if offline
-         then Oracle_fetch_kraken.fetch_ohlc ~symbol ()
-         else
-           Oracle_cache.with_delta
-             ~exchange
-             ~symbol
-             ~today:(today_iso ())
-             ~fetch:(fun boundary ->
-               let since = Option.map Oracle_cache.unix_of_iso boundary in
-               Oracle_fetch_kraken.fetch_ohlc ?since ~symbol ())
-             ())
-        >|= Oracle_fetch_kraken.series_of_bars ~symbol
-      | "hyperliquid" ->
-        (if offline
-         then Oracle_fetch_hyperliquid.fetch_candles ~symbol ()
-         else
-           Oracle_cache.with_delta
-             ~exchange
-             ~symbol
-             ~today:(today_iso ())
-             ~fetch:(fun boundary ->
-               let start_ms = Option.map Oracle_cache.ms_of_iso boundary in
-               Oracle_fetch_hyperliquid.fetch_candles ?start_ms ~symbol ())
-             ())
-        >|= Oracle_fetch_hyperliquid.series_of_bars ~symbol
-      | "alpaca" ->
-        let start = Option.value a.start_date ~default:"2010-01-01" in
-        let end_date = Option.value a.end_date ~default:(today_iso ()) in
-        let feed = Option.value a.data_feed ~default:"iex" in
-        (if offline
-         then Oracle_fetch_alpaca.fetch_bars ~feed ~symbol ~start_date:start ~end_date ()
-         else
-           Oracle_cache.with_delta
-             ~exchange
-             ~symbol
-             ~today:(today_iso ())
-             ~fetch:(fun boundary ->
-               let start_date = Option.value boundary ~default:start in
-               Oracle_fetch_alpaca.fetch_bars ~feed ~symbol ~start_date ~end_date ())
-             ())
-        >|= Oracle_fetch_alpaca.series_of_bars ~symbol
-      | _ -> invalid_arg "unknown exchange"
-    in
-    fetch
-    >|= fun series ->
-    Hashtbl.add fetch_cache (a.exchange, symbol) series;
-    series
+  let offline =
+    Option.is_some a.from_csv
+    || Option.is_some a.from_json
+    || (exchange = "alpaca" && Option.is_some a.start_date)
+  in
+  Dio_oracle.Oracle_fetch.fetch_series_for
+    ~offline
+    ~exchange
+    ~symbol
+    ?feed:a.data_feed
+    ?start_date:a.start_date
+    ?end_date:a.end_date
+    ()
 ;;
 
 let fetch_series (a : args) (symbol : string) : Oracle_types.series Lwt.t =
@@ -446,44 +396,19 @@ let fetch_series (a : args) (symbol : string) : Oracle_types.series Lwt.t =
     The deep history is disk-cached and delta-fetched like the venue series,
     so repeated CLI runs only pull the days they do not have yet. Returns
     the deepened series and the number of deep bars added. *)
-let deepen_series (a : args) ~(exchange : string) (series : Oracle_types.series)
+let deepen_series (a : args) (series : Oracle_types.series)
   : (Oracle_types.series * int) Lwt.t
   =
-  let venue_bars = series.bars in
-  if
-    a.no_deep_history
-    || Array.length venue_bars = 0
-    || Option.is_some a.from_csv
-    || Option.is_some a.from_json
-  then Lwt.return (series, 0)
-  else (
-    match Oracle_fetch_yahoo.symbol_of ~exchange series.symbol with
-    | None -> Lwt.return (series, 0)
-    | Some yahoo_symbol ->
-      let venue_first = venue_bars.(0).Oracle_types.date in
-      let end_date = Oracle_calendar.add_days venue_first (-1) in
-      Oracle_cache.with_delta
-        ~exchange:"yahoo-deep"
-        ~symbol:yahoo_symbol
-        ~today:(today_iso ())
-        ~complete_through:end_date
-        ~fetch:(fun boundary ->
-          let start_date = Option.value boundary ~default:"2015-01-01" in
-          Oracle_fetch_yahoo.fetch_daily ~start_date ~symbol:yahoo_symbol ~end_date ())
-        ()
-      >|= fun deep_bars ->
-      let deep = Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol deep_bars in
-      Oracle_fetch_yahoo.merge_series ~venue:series ~deep)
+  let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
+  Dio_oracle.Oracle_fetch.deepen_series ~no_deep_history:a.no_deep_history ~offline series
 ;;
 
 (** Load the class member pool: explicit --members when online, config.json
     "classes" members for the resolved class when online, otherwise the asset
-    alone (offline mode). The member that IS the active asset uses the
-    exchange (fetched + deepened like the asset); every other member gathers
-    its history PURELY from Yahoo (whitelisted, disk-cached, delta through
-    today) - the class surface is a blend input, never a decision subject,
-    so the exchange is not probed for alt coins it does not even list (the
-    old per-pass Hyperliquid "no spot history" warning spam). *)
+    alone (offline mode). Delegates to the shared pipeline (Oracle_fetch:
+    the member that IS the active asset uses the exchange; every other
+    member gathers its history PURELY from Yahoo - whitelisted, disk-cached,
+    delta through today). *)
 let load_members
       (a : args)
       (classes : (string * Dio_engine.Config.class_pool) list)
@@ -491,66 +416,20 @@ let load_members
       (asset : Oracle_types.series)
   : Oracle_types.series list Lwt.t
   =
-  let syms =
-    match a.members with
-    | Some ms when ms <> [] -> ms
-    | _ ->
-      (match List.assoc_opt class_name classes with
-       | Some pool when pool.members <> [] -> pool.members
-       | _ -> [])
+  let pool_members =
+    match List.assoc_opt class_name classes with
+    | Some pool when pool.members <> [] -> pool.members
+    | _ -> []
   in
-  if syms = []
-  then (
-    Printf.eprintf
-      "oracle: no class members known for '%s' (add a \"classes\" entry in config.json \
-       or pass --members); using asset alone\n"
-      class_name;
-    Lwt.return [ asset ])
-  else (
-    let rec go = function
-      | [] -> Lwt.return []
-      | s :: rest ->
-        (match
-           Dio_oracle.Oracle_runtime.class_member_source
-             ~exchange:a.exchange
-             ~asset_symbol:asset.Oracle_types.symbol
-             s
-         with
-         | `None -> go rest
-         | `Exchange ->
-           fetch_series a s
-           >>= fun series ->
-           go rest
-           >>= fun acc ->
-           if Array.length series.bars = 0
-           then Lwt.return acc
-           else
-             deepen_series a ~exchange:a.exchange series
-             >>= fun (series, _) -> Lwt.return (series :: acc)
-         | `Yahoo yahoo_symbol ->
-           Oracle_cache.with_delta
-             ~exchange:"yahoo-class"
-             ~symbol:yahoo_symbol
-             ~today:(today_iso ())
-             ~fetch:(fun boundary ->
-               let start_date = Option.value boundary ~default:"2015-01-01" in
-               Oracle_fetch_yahoo.fetch_daily
-                 ~start_date
-                 ~symbol:yahoo_symbol
-                 ~end_date:(today_iso ())
-                 ())
-             ()
-           >>= fun bars ->
-           go rest
-           >>= fun acc ->
-           if bars = []
-           then Lwt.return acc
-           else
-             Lwt.return
-               (Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol bars :: acc))
-    in
-    go syms
-    >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)
+  Dio_oracle.Oracle_fetch.load_members
+    ?explicit_members:a.members
+    ~no_deep_history:a.no_deep_history
+    ~offline:(Option.is_some a.from_csv || Option.is_some a.from_json)
+    ~exchange:a.exchange
+    pool_members
+    ~class_name
+    asset
+    ~fetch_series:(fun symbol -> fetch_series a symbol)
 ;;
 
 (** Per-run Fear & Greed: an explicit --fng wins; otherwise fetch the live
@@ -1293,7 +1172,7 @@ let run_one
     | _, Some path -> Oracle_loader.load_json_file ~symbol:a.symbol ~calendar_kind ~path
     | None, None -> Lwt_main.run (fetch_series a a.symbol)
   in
-  let asset, deep_bars = Lwt_main.run (deepen_series a ~exchange:a.exchange asset) in
+  let asset, deep_bars = Lwt_main.run (deepen_series a asset) in
   let members =
     if offline then [ asset ] else Lwt_main.run (load_members a classes ~class_name asset)
   in
@@ -1330,24 +1209,20 @@ let run_one
     }
   in
   let equity_sessions =
-    if a.exchange = "alpaca"
-    then (
-      let start = Option.value a.start_date ~default:"2010-01-01" in
-      let end_date = Option.value a.end_date ~default:(today_iso ()) in
-      try
-        let dates =
-          Lwt_main.run (Oracle_fetch_alpaca.fetch_calendar ~start_date:start ~end_date ())
-        in
-        if dates = []
-        then Some Oracle_sessions.business_weekday
-        else Some (Oracle_fetch_alpaca.model_of_calendar_dates dates)
-      with
-      | exn ->
-        Printf.eprintf
-          "oracle: calendar fetch failed (%s); using business weekdays\n"
-          (Printexc.to_string exn);
-        Some Oracle_sessions.business_weekday)
-    else None
+    (* Equity venues resolve their session calendar through the registry
+       (Oracle_fetch.fetch_calendar_model); crypto venues get None. *)
+    let start = Option.value a.start_date ~default:"2010-01-01" in
+    let end_date = Option.value a.end_date ~default:(today_iso ()) in
+    match
+      Lwt_main.run
+        (Dio_oracle.Oracle_fetch.fetch_calendar_model
+           ~exchange:a.exchange
+           ~start_date:start
+           ~end_date
+           ())
+    with
+    | Some (model, _) -> Some model
+    | None -> None
   in
   let horizons =
     match a.horizons with
