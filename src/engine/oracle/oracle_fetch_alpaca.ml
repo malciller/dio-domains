@@ -135,7 +135,7 @@ let fetch_bars
            | None -> "")
       in
       let fetch =
-        Oracle_http.get ~headers:(auth_headers ()) (Uri.of_string url)
+        Oracle_http.get ~venue:"alpaca" ~headers:(auth_headers ()) (Uri.of_string url)
         >>= fun (resp, body) ->
         Cohttp_lwt.Body.to_string body
         >>= fun body_str ->
@@ -181,7 +181,7 @@ let fetch_calendar ~(start_date : string) ~(end_date : string) () : string list 
   let url =
     Printf.sprintf "%s/v2/calendar?start=%s&end=%s" trading_base_url start_date end_date
   in
-  Oracle_http.get ~headers:(auth_headers ()) (Uri.of_string url)
+  Oracle_http.get ~venue:"alpaca" ~headers:(auth_headers ()) (Uri.of_string url)
   >>= fun (resp, body) ->
   Cohttp_lwt.Body.to_string body
   >>= fun body_str ->

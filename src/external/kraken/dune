@@ -12,8 +12,11 @@
   uri
   threads
   websocket-lwt-unix
+  mtime
+  mtime.clock.os
   concurrency
   dio.exchange
-  dio.error_handling)
+  dio.error_handling
+  dio.latency_profiling)
  (preprocess
   (pps lwt_ppx)))

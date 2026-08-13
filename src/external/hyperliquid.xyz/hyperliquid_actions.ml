@@ -169,10 +169,14 @@ let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
   in
   let body_str = Yojson.Safe.to_string req_body in
   let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+  let rest_start = Mtime_clock.now_ns () in
   Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string body_str) url
   >>= fun (resp, resp_body) ->
   Cohttp_lwt.Body.to_string resp_body
   >>= fun body_str ->
+  Network_latency.record_rest
+    "hyperliquid"
+    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
   let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
   if status >= 200 && status < 300
   then Lwt.return (Ok (Yojson.Safe.from_string body_str))

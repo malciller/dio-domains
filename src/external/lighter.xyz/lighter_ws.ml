@@ -249,12 +249,24 @@ let send_tx_ws ~tx_type ~tx_info =
   send_private_json json "Private"
 ;;
 
+(** Timestamp of the last market-data frame on the public connection, for the
+    ws_feed inter-message gap measurement. *)
+let last_feed_time = ref 0.0
+
 (** Parses and dispatches a single WebSocket frame payload based on the operation code and underlying business logic message type. *)
 let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
   | Websocket.Frame.Opcode.Text ->
     Concurrency.Tick_event_bus.publish_tick ();
     on_heartbeat ();
+    (* Feed cadence: gap since the previous market-data frame (public
+       connection only — the private stream carries account/order data). *)
+    if state != private_state
+    then (
+      let now = Unix.gettimeofday () in
+      if !last_feed_time > 0.0
+      then Network_latency.record_feed_s "lighter" (now -. !last_feed_time);
+      last_feed_time := now);
     (* Flag the private stream as confirmed functional upon receiving the first valid arbitrary text frame *)
     if state == private_state && not (Atomic.get private_stream_confirmed)
     then Atomic.set private_stream_confirmed true;
@@ -753,11 +765,16 @@ let send_ping ~req_id:_ ~timeout_ms =
            | None -> Lwt.return_unit)
          >>= fun () ->
          Lwt.pick
-           [ (Lwt_condition.wait state.pong_condition >>= fun () -> Lwt.return true)
+           [ (Lwt_condition.wait state.pong_condition
+              >>= fun () ->
+              Network_latency.record_ping_s "lighter" (Unix.gettimeofday () -. send_time);
+              Lwt.return true)
            ; (Lwt_unix.sleep timeout
               >>= fun () ->
               if !(state.last_pong_time) > send_time
-              then Lwt.return true
+              then (
+                Network_latency.record_ping_s "lighter" (Unix.gettimeofday () -. send_time);
+                Lwt.return true)
               else Lwt.return false)
            ])
       (fun _ -> Lwt.return false)

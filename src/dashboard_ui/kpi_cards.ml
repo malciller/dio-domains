@@ -60,34 +60,25 @@ let render_kpi_cards w json =
     | _ -> []
   in
   let all_balances = json |?> "all_balances" |> to_list_d in
-  let total_hold_strats, total_accum_strats =
+  let total_hold_strats =
     List.fold_left
-      (fun (hv_acc, av_acc) (_sym, data) ->
+      (fun hv_acc (_sym, data) ->
          let market = data |?> "market" in
          let bid = market |?> "bid" |> to_float_d 0.0 in
          let ask = market |?> "ask" |> to_float_d 0.0 in
          let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
          let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
-         let strat = data |?> "strategy" in
-         let sell_orders = strat |?> "sell_orders" |> to_list_d in
-         let pending_sell_qty =
-           List.fold_left
-             (fun q s -> q +. (s |?> "qty" |> to_float_d 0.0))
-             0.0
-             sell_orders
-         in
-         let accum_qty = max 0.0 (base_bal -. pending_sell_qty) in
-         hv_acc +. (base_bal *. mid), av_acc +. (accum_qty *. mid))
-      (0.0, 0.0)
+         hv_acc +. (base_bal *. mid))
+      0.0
       strats
   in
-  let total_hold_bals, total_accum_bals, total_quote_val =
+  let total_hold_bals, total_quote_val =
     List.fold_left
-      (fun (hv_acc, av_acc, q_acc) bal_json ->
+      (fun (hv_acc, q_acc) bal_json ->
          let balance = bal_json |?> "balance" |> to_float_d 0.0 in
          let asset = bal_json |?> "asset" |> to_string_d "?" in
          if balance <= 0.0
-         then hv_acc, av_acc, q_acc
+         then hv_acc, q_acc
          else (
            let is_quote =
              asset = "USD"
@@ -97,33 +88,26 @@ let render_kpi_cards w json =
              || asset = "USDe"
            in
            if is_quote
-           then hv_acc, av_acc, q_acc +. balance
+           then hv_acc, q_acc +. balance
            else (
              let bid = bal_json |?> "bid" |> to_float_d 0.0 in
              let ask = bal_json |?> "ask" |> to_float_d 0.0 in
              let mid =
                if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask
              in
-             let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
-             let pending_sell_qty =
-               List.fold_left
-                 (fun q s -> q +. (s |?> "qty" |> to_float_d 0.0))
-                 0.0
-                 sell_orders
-             in
-             let accum_qty = max 0.0 (balance -. pending_sell_qty) in
-             hv_acc +. (balance *. mid), av_acc +. (accum_qty *. mid), q_acc)))
-      (0.0, 0.0, 0.0)
+             hv_acc +. (balance *. mid), q_acc)))
+      (0.0, 0.0)
       all_balances
   in
   let total_hold_val = total_hold_strats +. total_hold_bals in
-  let total_accum_val = total_accum_strats +. total_accum_bals in
   let net_worth = total_hold_val +. total_quote_val in
   let c1_row1 =
     I.hcat [ col 10 a_dim "NET WORTH"; col_right 12 a_bright (format_usd net_worth) ]
   in
+  (* The PORTFOLIO card shows cash on the second line: accumulated value
+     already has its own slot in the HOLDINGS & STRATEGY summary bar. *)
   let c1_row2 =
-    I.hcat [ col 10 a_dim "ACCUM VAL"; col_right 12 a_cyan (format_usd total_accum_val) ]
+    I.hcat [ col 10 a_dim "CASH"; col_right 12 a_cyan (format_usd total_quote_val) ]
   in
   let card1 = "PORTFOLIO", c1_row1, c1_row2 in
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in

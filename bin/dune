@@ -15,6 +15,7 @@
   dio.engine
   dio.oracle
   dio.concurrency
+  dio.latency_profiling
   lwt
   supervisor
   mirage-crypto-rng.unix)

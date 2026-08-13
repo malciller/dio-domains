@@ -211,6 +211,7 @@ let sign_l1_action
       ~vault_address
       ()
   =
+  let start_ns = Mtime_clock.now_ns () in
   let pkey_clean =
     if String.starts_with ~prefix:"0x" private_key_hex
     then String.sub private_key_hex 2 (String.length private_key_hex - 2)
@@ -224,5 +225,9 @@ let sign_l1_action
   let chain_id = 1337 in
   let agent_hash = hash_agent ~source_str ~connection_id_raw:action_hash_raw in
   let msg_hash = eip712_digest ~chain_id ~hash_struct:agent_hash in
-  sign_hash ~private_key_raw ~msg_hash_raw:msg_hash
+  let out = sign_hash ~private_key_raw ~msg_hash_raw:msg_hash in
+  Network_latency.record_signer
+    "hyperliquid"
+    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) start_ns));
+  out
 ;;

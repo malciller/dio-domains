@@ -71,7 +71,7 @@ let render_footer w json =
   let fng_str = add_commas (Printf.sprintf "%.0f" fng) in
   let left_space = I.string A.(bg c_bg) "  " in
   let right_space = I.string A.(bg c_bg) " " in
-  let left_text = "q: quit  │  Diophant Solutions  │  " in
+  let left_text = "q: quit  │  ←/→ latency view  │  Diophant Solutions  │  " in
   let base_imgs =
     [ left_space
     ; I.string A.(bg c_panel) " "

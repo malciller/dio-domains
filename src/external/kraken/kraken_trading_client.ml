@@ -767,9 +767,15 @@ let get_connection () : Websocket_lwt_unix.conn Lwt.t =
 let send_ping ~req_id ~timeout_ms : Kraken_common_types.ws_response Lwt.t =
   get_connection ()
   >>= fun _ ->
+  let send_time = Mtime_clock.now_ns () in
   let message = `Assoc [ "method", `String "ping"; "req_id", `Int req_id ] in
   let message_str = json_to_string_precise None message in
   send_message ~message_str ~req_id ~expected_method:"ping" ~timeout_ms
+  >>= fun response ->
+  Network_latency.record_ping
+    "kraken"
+    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) send_time));
+  Lwt.return response
 ;;
 
 let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms

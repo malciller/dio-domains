@@ -502,6 +502,19 @@ let get_auth_token () =
 
 (* Cryptographic Transaction Signing Operational Implementations *)
 
+(** Times a signing operation and records it in the "lighter" signer
+    profiler. The signing path is local FFI work (hash + ECDSA over the
+    nonce), so this measures the local signing cost shown on the dashboard's
+    NETWORK page. *)
+let time_signer f =
+  let start_ns = Mtime_clock.now_ns () in
+  let r = f () in
+  Network_latency.record_signer
+    "lighter"
+    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) start_ns));
+  r
+;;
+
 let sign_create_order
       ~market_index
       ~client_order_index
@@ -515,21 +528,22 @@ let sign_create_order
   =
   let nonce = get_and_increment_nonce () in
   let result =
-    with_signer_lock (fun () ->
-      (Lazy.force sign_create_order_ffi)
-        ~market_index
-        ~client_order_index
-        ~base_amount
-        ~price:(Int64.to_int price)
-        ~is_ask:(if is_ask then 1 else 0)
-        ~order_type
-        ~tif
-        ~reduce_only:(if reduce_only then 1 else 0)
-        ~trigger_price:0
-        ~order_expiry:expiry
-        ~nonce
-        ~api_key_index:!api_key_index
-        ~account_index:!account_index)
+    time_signer (fun () ->
+      with_signer_lock (fun () ->
+        (Lazy.force sign_create_order_ffi)
+          ~market_index
+          ~client_order_index
+          ~base_amount
+          ~price:(Int64.to_int price)
+          ~is_ask:(if is_ask then 1 else 0)
+          ~order_type
+          ~tif
+          ~reduce_only:(if reduce_only then 1 else 0)
+          ~trigger_price:0
+          ~order_expiry:expiry
+          ~nonce
+          ~api_key_index:!api_key_index
+          ~account_index:!account_index))
   in
   Logging.debug_f
     ~section
@@ -546,13 +560,14 @@ let sign_create_order
 let sign_cancel_order ~market_index ~order_index =
   let nonce = get_and_increment_nonce () in
   let result =
-    with_signer_lock (fun () ->
-      (Lazy.force sign_cancel_order_ffi)
-        ~market_index
-        ~order_index
-        ~nonce
-        ~api_key_index:!api_key_index
-        ~account_index:!account_index)
+    time_signer (fun () ->
+      with_signer_lock (fun () ->
+        (Lazy.force sign_cancel_order_ffi)
+          ~market_index
+          ~order_index
+          ~nonce
+          ~api_key_index:!api_key_index
+          ~account_index:!account_index))
   in
   Logging.debug_f
     ~section
@@ -566,15 +581,16 @@ let sign_cancel_order ~market_index ~order_index =
 let sign_modify_order ~market_index ~order_index ~new_base_amount ~new_price =
   let nonce = get_and_increment_nonce () in
   let result =
-    with_signer_lock (fun () ->
-      (Lazy.force sign_modify_order_ffi)
-        ~market_index
-        ~order_index
-        ~new_base_amount
-        ~new_price
-        ~nonce
-        ~api_key_index:!api_key_index
-        ~account_index:!account_index)
+    time_signer (fun () ->
+      with_signer_lock (fun () ->
+        (Lazy.force sign_modify_order_ffi)
+          ~market_index
+          ~order_index
+          ~new_base_amount
+          ~new_price
+          ~nonce
+          ~api_key_index:!api_key_index
+          ~account_index:!account_index))
   in
   Logging.debug_f
     ~section
@@ -591,13 +607,14 @@ let sign_cancel_all_orders ~market_index =
   let nonce = get_and_increment_nonce () in
   let time = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
   let result =
-    with_signer_lock (fun () ->
-      (Lazy.force sign_cancel_all_orders_ffi)
-        ~tif:0
-        ~time
-        ~nonce
-        ~api_key_index:!api_key_index
-        ~account_index:!account_index)
+    time_signer (fun () ->
+      with_signer_lock (fun () ->
+        (Lazy.force sign_cancel_all_orders_ffi)
+          ~tif:0
+          ~time
+          ~nonce
+          ~api_key_index:!api_key_index
+          ~account_index:!account_index))
   in
   Logging.debug_f ~section "SignCancelAllOrders: market=%d nonce=%d" market_index nonce;
   result

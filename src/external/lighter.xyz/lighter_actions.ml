@@ -42,8 +42,12 @@ let send_tx ~tx_type ~tx_info =
            [ "Content-Type", content_type; "Accept", "application/json" ]
        in
        let body = Cohttp_lwt.Body.of_string body_str in
+       let rest_start = Mtime_clock.now_ns () in
        let%lwt resp, resp_body = Cohttp_lwt_unix.Client.post ~headers ~body uri in
        let%lwt resp_str = Cohttp_lwt.Body.to_string resp_body in
+       Network_latency.record_rest
+         "lighter"
+         (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
        let status = Cohttp.Response.status resp in
        if Cohttp.Code.is_success (Cohttp.Code.code_of_status status)
        then (

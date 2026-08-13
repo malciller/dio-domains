@@ -433,6 +433,8 @@ let run () =
                       let asset = List.nth assets idx in
                       view_mode_ref := `DetailView asset.key)
                   | `Key_back -> quit := true
+                  | `Key_left -> Latencies.prev_page ()
+                  | `Key_right -> Latencies.next_page ()
                   | _ -> ())
                | `DetailView curr_key ->
                  (match action with

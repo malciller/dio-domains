@@ -7,12 +7,15 @@
   lwt.unix
   cohttp-lwt-unix
   websocket-lwt-unix
+  mtime
+  mtime.clock.os
   dotenv
   logging
   uri
   threads
   concurrency
   dio.exchange
-  dio.error_handling)
+  dio.error_handling
+  dio.latency_profiling)
  (preprocess
   (pps lwt_ppx)))

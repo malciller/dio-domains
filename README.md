@@ -751,32 +751,39 @@ Engine-wide OCaml GC stats:
 
 #### Engine Latency
 
-Per-domain latency profiling, with the capital-oracle column replacing the
-old per-domain cycle column:
+Per-domain latency profiling, shown as a two-row-header table with
+**p50/p99/p999** (µs, sub-microsecond readings at ns resolution) plus a
+**trend** sparkline (EMA-smoothed p99 of the page's primary metric over the
+last 15 windows) and the strategy rate in **strat/s**. Columns are grouped
+into two pages switched with `←/→`:
 
-| Metric | What it measures | Thresholds (µs) |
-|--------|------------------|-----------------|
-| **ORACLE** | The capital-oracle per-asset pipeline for that domain's asset (history fetch + survival analysis + sizing), windowed per pass | 1,000,000 / 10,000,000 |
-| **OB** | Orderbook ring-buffer consumption | 10 / 30 |
-| **STRAT** | Grid/MM strategy execution | 30 / 75 |
-| **EXEC** | Execution event consumption | 50 / 150 |
+| Page | Metric | What it measures | Thresholds (µs) |
+|------|--------|------------------|-----------------|
+| CORE | **ORACLE** | The capital-oracle per-asset pipeline for that domain's asset (history fetch + survival analysis + sizing), windowed per pass | 1,000,000 / 10,000,000 |
+| CORE | **OB** | Orderbook ring-buffer consumption | 10 / 30 |
+| CORE | **STRAT** | Grid/MM strategy execution | 30 / 75 |
+| CORE | **EXEC** | Execution event consumption | 50 / 150 |
+| CORE | **CYCLE** | Full domain cycle span (wake → consume → strategy → exec) | 100 / 1,000 |
+| NETWORK | **PING** | Venue WebSocket ping/pong round trip | 20,000 / 100,000 |
+| NETWORK | **FEED** | Gap between consecutive venue market-data feed messages | 50,000 / 200,000 |
+| NETWORK | **REST** | Venue REST round trip (trading actions + oracle fetches) | 100,000 / 500,000 |
+| NETWORK | **SIGN** | Local signature generation time | 1,000 / 10,000 |
 
-Each row shows p50/p99/p999 in µs, a **trend** sparkline (EMA-smoothed
-oracle p99 over the last 15 windows), the **spike cause** tags for the
-window's max latency (`[fetch]`, `[sizing]`, plus the domain tags
-`[OB]`, `[STRAT]`, `[EXEC:n]`, `[GC:MAJ]`, `[GC:MIN]`, allocation words),
-and the strategy rate in **strat/s**.
-Idle windows render as `idle`; domains whose windows are stale (oracle
-windows age out beyond the pass horizon, ~10 min; the domain stages after
-15s) drop out of the list. The engine-global oracle pass latency also
+A metric with zero samples in the current window keeps showing its last
+measured value (dimmed) until a fresh window arrives, so short-lived
+measurements like the network metrics stay visible between windows; a metric
+that has never published renders `--`. Domains whose windows are stale
+(oracle windows age out beyond the pass horizon, ~10 min; the domain stages
+after 15s) drop out of the list. The engine-global oracle pass latency also
 appears in the LATENCY KPI card (p50/p99).
 
 > [!NOTE]
-> These measure **internal processing latency only** — the CPU time the
-> engine spends per stage. Time blocked waiting for exchange data
-> (`Exchange_wakeup.wait`) and network round-trips are excluded. The
-> `strat/s` column reflects how often the strategy actually ran per
-> window.
+> The CORE page measures **internal processing latency only** — the CPU time
+> the engine spends per stage; time blocked waiting for exchange data
+> (`Exchange_wakeup.wait`) is excluded. The NETWORK page measures the wire
+> itself: WS ping RTT, feed cadence, REST round trips, and signing cost,
+> collected per venue by the engine and attributed to each domain that
+> trades there.
 
 #### Footer
 

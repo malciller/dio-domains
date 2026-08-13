@@ -33,6 +33,9 @@ let make_headers () =
     ]
 ;;
 
+(** Records an Alpaca REST round trip in the "alpaca" venue profiler. *)
+let record_rest_span span = Network_latency.record_rest "alpaca" span
+
 let json_to_float = function
   | `Float f -> f
   | `Int i -> float_of_int i
@@ -215,6 +218,7 @@ let place_order
   retry_http_exceptions ~f:(fun () ->
     Lwt.catch
       (fun () ->
+         let rest_start = Mtime_clock.now_ns () in
          Cohttp_lwt_unix.Client.post
            ~headers
            ~body:(Cohttp_lwt.Body.of_string req_body)
@@ -223,6 +227,8 @@ let place_order
          let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
          Cohttp_lwt.Body.to_string body
          >>= fun body_str ->
+         record_rest_span
+           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
          if status_code >= 200 && status_code < 300
          then (
            try
@@ -298,6 +304,7 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
   retry_http_exceptions ~f:(fun () ->
     Lwt.catch
       (fun () ->
+         let rest_start = Mtime_clock.now_ns () in
          Cohttp_lwt_unix.Client.patch
            ~headers
            ~body:(Cohttp_lwt.Body.of_string req_body)
@@ -306,6 +313,8 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
          let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
          Cohttp_lwt.Body.to_string body
          >>= fun body_str ->
+         record_rest_span
+           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
          if status_code >= 200 && status_code < 300
          then (
            try
@@ -359,11 +368,14 @@ let cancel_order order_id =
   retry_http_exceptions ~f:(fun () ->
     Lwt.catch
       (fun () ->
+         let rest_start = Mtime_clock.now_ns () in
          Cohttp_lwt_unix.Client.delete ~headers url
          >>= fun (resp, body) ->
          let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
          Cohttp_lwt.Body.to_string body
          >>= fun body_str ->
+         record_rest_span
+           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
          if status_code >= 200 && status_code < 300
          then (
            Logging.debug_f ~section "Cancelled Alpaca order %s" order_id;
@@ -402,11 +414,14 @@ let get_open_orders () =
           uid
     in
     let url = Uri.of_string url_str in
+    let rest_start = Mtime_clock.now_ns () in
     Cohttp_lwt_unix.Client.get ~headers url
     >>= fun (resp, body) ->
     let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
     Cohttp_lwt.Body.to_string body
     >>= fun body_str ->
+    record_rest_span
+      (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
     if status_code >= 200 && status_code < 300
     then (
       try
@@ -460,11 +475,14 @@ let get_account () =
   let headers = make_headers () in
   Lwt.catch
     (fun () ->
+       let rest_start = Mtime_clock.now_ns () in
        Cohttp_lwt_unix.Client.get ~headers url
        >>= fun (resp, body) ->
        let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
        Cohttp_lwt.Body.to_string body
        >>= fun body_str ->
+       record_rest_span
+         (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
        if status_code >= 200 && status_code < 300
        then (
          try
@@ -510,11 +528,14 @@ let get_positions () =
   let headers = make_headers () in
   Lwt.catch
     (fun () ->
+       let rest_start = Mtime_clock.now_ns () in
        Cohttp_lwt_unix.Client.get ~headers url
        >>= fun (resp, body) ->
        let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
        Cohttp_lwt.Body.to_string body
        >>= fun body_str ->
+       record_rest_span
+         (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
        if status_code >= 200 && status_code < 300
        then (
          try
@@ -616,11 +637,14 @@ let get_snapshot ~symbol () =
         (Printf.sprintf "%s/v2/stocks/%s/snapshot?feed=%s" data_base_url symbol feed_name)
     in
     let headers = make_headers () in
+    let rest_start = Mtime_clock.now_ns () in
     Cohttp_lwt_unix.Client.get ~headers url
     >>= fun (resp, body) ->
     let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
     Cohttp_lwt.Body.to_string body
     >>= fun body_str ->
+    record_rest_span
+      (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
     if status_code >= 200 && status_code < 300
     then (
       try

@@ -108,7 +108,7 @@ let fetch_ohlc ?(since = 0L) ~(symbol : string) () : Oracle_types.bar list Lwt.t
           (Int64.to_string since)
       in
       let fetch =
-        Oracle_http.get (Uri.of_string url)
+        Oracle_http.get ~venue:"kraken" (Uri.of_string url)
         >>= fun (resp, body) ->
         Cohttp_lwt.Body.to_string body
         >>= fun body_str ->
