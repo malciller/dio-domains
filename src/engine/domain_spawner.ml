@@ -244,6 +244,11 @@ let asset_domain_worker
          | Some d -> not d.active
          | None -> false)
     in
+    (* Latch: the priority-reclamation cancel (a decision with
+       [reclaim_capital]) is issued once per reclaim transition; it re-arms
+       when the decision stops being a reclaim. Prevents cancel spam across
+       cycles while the cancel is in flight. *)
+    let reclaim_cancel_issued = ref false in
     (* One-shot warnings: the "only one sizing source active" cases (oracle
        decision without F&G, F&G without an oracle decision) and the "no
        signal at all" withhold case each fire once per domain. *)
@@ -979,6 +984,68 @@ let asset_domain_worker
              (orders withheld if no live F&G reading exists)"
             asset.exchange
             asset.symbol);
+      (* Priority reclamation: an INACTIVE-with-reclaim decision asks this
+         domain to cancel its own resting buy(s) so the committed capital
+         returns to the account pool for a higher-priority asset. Runs OUTSIDE
+         the execution gate on purpose: a halted asset must still release
+         capital. The cancel is a first-class Grid strategy order pushed
+         through the grid's order buffer into the established supervisor
+         pipeline (supervisor_orders dispatch_cancel -> Order_executor ->
+         dashboard/order tracking), guarded like the grid's own excess-buy
+         cancel (strategy mutex held, mid-amendment buys skipped - Hyperliquid
+         rejects canceling an order being amended). Latched so the cancel is
+         issued once per reclaim decision (re-armed when the decision stops
+         being a reclaim), and it wakes the capital oracle ([request_pass]) so
+         the released capital is recognized promptly even if the exchange's
+         WS cancel event is missed. *)
+      (match oracle_decision with
+       | Some d when d.reclaim_capital && not !reclaim_cancel_issued ->
+         let now = Unix.gettimeofday () in
+         let st = Dio_strategies.Suicide_grid.get_strategy_state asset_with_fees.symbol in
+         Mutex.lock st.mutex;
+         Fun.protect
+           ~finally:(fun () -> Mutex.unlock st.mutex)
+           (fun () ->
+              let n = ref 0 in
+              Ex.fold_open_orders
+                ~symbol:asset_with_fees.symbol
+                ~init:0
+                ~f:(fun acc (o : Types.open_order) ->
+                  if
+                    o.side = Types.Buy
+                    && o.remaining_qty > 0.0
+                    && not
+                         (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight
+                            o.order_id)
+                  then (
+                    let cancel =
+                      Dio_strategies.Suicide_grid.create_cancel_order
+                        o.order_id
+                        asset_with_fees.symbol
+                        Dio_strategies.Strategy_common.Grid
+                        asset_with_fees.exchange
+                    in
+                    ignore (Dio_strategies.Suicide_grid.push_order ~now cancel);
+                    incr n;
+                    acc + 1)
+                  else acc)
+              |> ignore;
+              reclaim_cancel_issued := true;
+              (* Wake the capital oracle so it re-sizes against the released
+                 capital as soon as it lands - the reclaim cycle is
+                 self-driving and does not depend on the exchange's WS
+                 cancel event reaching this domain. *)
+              Oracle_runtime.request_pass ();
+              Logging.warn_f
+                ~section
+                "[%s/%s] Capital oracle reclaim: canceling %d resting buy(s) to return \
+                 capital to %s"
+                asset_with_fees.exchange
+                asset_with_fees.symbol
+                !n
+                d.reclaim_target)
+       | Some d when d.reclaim_capital -> ()
+       | _ -> reclaim_cancel_issued := false);
       (* Oracle/signal startup gate (see the gate state initialized above).
          Opens - once, monotonically - when the startup window has given BOTH
          signals their chance: the first capital-oracle decision for this
@@ -1138,12 +1205,19 @@ let asset_domain_worker
                 asset_with_fees.exchange
                 asset_with_fees.symbol))
       else ();
+      (* The oracle-halt no longer gates the whole execution block: an
+         INACTIVE decision halts BUY placement inside the strategy (the
+         [~oracle_halted] flag passed to execute_strategy) but the SELL leg
+         still runs - a sell is the account's capital-recovery path (it needs
+         only inventory, not quote), so the sell for a just-filled buy is
+         placed even when capital is exhausted and the asset is halted.
+         Without this the last fill's inventory sits unreclaimable and the
+         pool never recovers. *)
       let should_execute =
         !exec_ready
         && !should_execute_strategy
         && has_exec_fn ()
         && (not equity_market_closed)
-        && (not oracle_halted)
         && !oracle_gate_open
       in
       if should_execute
@@ -1352,6 +1426,7 @@ let asset_domain_worker
            Dio_strategies.Suicide_grid.Strategy.execute
              ~cached_state:cs
              ~quote_balance_stale
+             ~oracle_halted
              ~now
              asset
              !current_price
@@ -1365,7 +1440,7 @@ let asset_domain_worker
              !cycle_count
          | _ -> ());
         match !mm_strategy_asset_ref, cached_mm_state with
-        | Some asset, Some cs ->
+        | Some asset, Some cs when not oracle_halted ->
           let mm_cp = if Float.is_nan !current_price then None else Some !current_price in
           let mm_tob =
             if Float.is_nan !tob_bid

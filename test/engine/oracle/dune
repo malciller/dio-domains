@@ -51,6 +51,10 @@
  (libraries dio.oracle dio.strategies alcotest))
 
 (test
+ (name test_oracle_reclaim)
+ (libraries dio.oracle dio.strategies alcotest))
+
+(test
  (name test_oracle_runtime)
  (libraries dio.oracle dio.strategies alcotest))
 

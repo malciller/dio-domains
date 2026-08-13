@@ -568,6 +568,19 @@ let evaluate_buy_leg
     let buy_price =
       if bid_price > 0.0 then min raw_buy_price bid_price else raw_buy_price
     in
+    (* A fresh buy must respect the same 2x-grid-interval spacing below the
+       closest resting sell that the trailing leg enforces via [exact_target]
+       (sell_price - 2*gi): without it a buy placed after a fill can sit too
+       close to the lowest sell (a ~1x rung the grid never allows when it
+       amends). Pull the buy down to sit at least 2*gi below the closest
+       sell. *)
+    let buy_price =
+      match closest_sell_order_initial with
+      | Some (_, sell_price) ->
+        let base = if bid_price > 0.0 then bid_price else sell_price in
+        min buy_price (sell_price -. (base *. (2.0 *. grid_interval /. 100.0)))
+      | None -> buy_price
+    in
     let buy_cooldown_key = "place_Buy" in
     let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
     let has_crossing_sell =
@@ -1321,10 +1334,19 @@ let evaluate_sell_leg
     staleness threshold: a stale snapshot is not authoritative, so an
     under-funded buy is still attempted (the exchange's verdict is the
     truth); a fresh snapshot that cannot fund the buy is skipped outright
-    instead of being sent to be rejected. *)
+    instead of being sent to be rejected.
+
+    [oracle_halted] (the capital oracle published this asset INACTIVE) gates
+    ONLY the buy leg - no new buy placement, no buy trailing/amending (a
+    halted asset must not commit more quote capital). The SELL leg always
+    runs: a sell needs only inventory, not quote, so the sell for a
+    just-filled buy is placed even when capital is exhausted and the asset is
+    halted - the account's capital-recovery path. Without this the last
+    fill's inventory would sit unreclaimable. *)
 let execute_strategy
       ?cached_state
       ?(quote_balance_stale = false)
+      ?(oracle_halted = false)
       ~now
       (asset : trading_config)
       (current_price : float)
@@ -1410,22 +1432,28 @@ let execute_strategy
            state.last_cycle <- cycle;
            ())
          else (
+           (* Oracle-halted: no buy placement, no buy trailing/amending - a
+               halted asset must not commit more quote capital. The sell leg
+               still runs (see the [oracle_halted] doc on execute_strategy). *)
            let buy_attempted =
-             evaluate_buy_leg
-               ~state
-               ~now
-               ~asset
-               ~bid_price
-               ~ask_price
-               ~quote_balance
-               ~quote_balance_stale
-               ~cycle
-               ~iter_open_orders
-               ~open_buy_count_from_scan
-               ~has_recent_amend_buy
-               ~locked_in_buys
-               ~closest_sell_order_initial:closest_sell_order
-               ~pending_buy_qty_from_scan
+             if oracle_halted
+             then false
+             else
+               evaluate_buy_leg
+                 ~state
+                 ~now
+                 ~asset
+                 ~bid_price
+                 ~ask_price
+                 ~quote_balance
+                 ~quote_balance_stale
+                 ~cycle
+                 ~iter_open_orders
+                 ~open_buy_count_from_scan
+                 ~has_recent_amend_buy
+                 ~locked_in_buys
+                 ~closest_sell_order_initial:closest_sell_order
+                 ~pending_buy_qty_from_scan
            in
            evaluate_sell_leg
              ~state

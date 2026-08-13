@@ -940,6 +940,135 @@ let test_virtual_gtc_sell_grid_maintenance () =
     (Option.is_none kraken_popped)
 ;;
 
+let test_halted_path_still_places_sell () =
+  (* Feature B: when the capital oracle halts an asset (INACTIVE), the
+     execute_strategy buy leg is skipped (buy_attempted = false), but the
+     sell for a just-filled buy is STILL placed - a sell needs only
+     inventory, not quote, and is the account's capital-recovery path.
+     Exercises evaluate_sell_leg with exactly the inputs the halted path
+     produces (buy_attempted:false + just_filled_buy) and asserts the sell
+     reaches the order buffer. *)
+  let symbol = "HALT_SELL/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.35;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.999;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  (* A buy filled right before capital ran out: the sell must still go out. *)
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 39.50;
+  state.last_buy_fill_qty <- Some 0.35;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.35"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  (* Drain any orders left in the shared buffer by prior tests. *)
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* The halted path: the buy leg was skipped, so buy_attempted = false. *)
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:39.50
+    ~ask_price:39.55
+    ~asset_balance:0.5
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let found =
+    List.exists
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  check bool "halted path still places the sell for a just-filled buy" true found
+;;
+
+let test_new_buy_respects_2x_gi_closest_sell () =
+  (* A fresh buy (no resting buy) placed after a fill must sit at least 2x the
+     grid interval below the closest resting sell - the same spacing the
+     trailing leg enforces via exact_target (sell_price - 2*gi). Without it a
+     new buy can land within a ~1x rung of the lowest sell. *)
+  let symbol = "SPACE_SELL/USD" in
+  let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  st.exchange_id <- "kraken";
+  st.grid_qty <- 1.0;
+  let grid_interval = 0.5 in
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval
+    ; sell_mult = "1.0"
+    ; strategy = "suicide_grid"
+    ; maker_fee = Some 0.001
+    ; taker_fee = Some 0.002
+    ; accumulation_buffer = 0.01
+    }
+  in
+  let iter_open_orders _ = () in
+  let now = Unix.gettimeofday () in
+  let drain () = ignore (Dio_strategies.Suicide_grid.get_pending_orders 100) in
+  drain ();
+  (* Closest sell at 100.40, bid 100.00, gi 0.5%: 2*gi = 1.0% of the bid =
+     1.00, so the buy must not sit above 100.40 - 1.00 = 99.40. The raw grid
+     buy (0.5% below the bid) would be 99.50 - above the cap, so the cap must
+     pull it down to 99.40. *)
+  ignore
+    (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~state:st
+       ~now
+       ~asset
+       ~bid_price:100.0
+       ~ask_price:100.0
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:1
+       ~iter_open_orders
+       ~open_buy_count_from_scan:0
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:(Some ("sell1", 100.40))
+       ~pending_buy_qty_from_scan:0.0);
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 10 in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      bool
+      "buy placed"
+      true
+      (o.operation = Dio_strategies.Strategy_common.Place
+       && o.side = Dio_strategies.Strategy_common.Buy);
+    (match o.price with
+     | Some p ->
+       let cap = 100.40 -. (100.0 *. (2.0 *. 0.5 /. 100.0)) in
+       check bool "buy respects the 2x gi closest-sell cap" true (p <= cap +. 1e-6)
+     | None -> failwith "buy missing price")
+  | _ -> failwith "expected exactly one buy order"
+;;
+
 let test_buy_placement_balance_guard () =
   (* Bug 2 regression: buy placement against an under-funded quote balance.
      - FRESH balance snapshot (authoritative): the order must NOT be sent
@@ -1224,6 +1353,14 @@ let () =
             "buy placement vs fresh/stale balance"
             `Quick
             test_buy_placement_balance_guard
+        ; test_case
+            "halted path still places the sell for a just-filled buy"
+            `Quick
+            test_halted_path_still_places_sell
+        ; test_case
+            "new buy respects the 2x gi closest-sell cap"
+            `Quick
+            test_new_buy_respects_2x_gi_closest_sell
         ] )
     ; ( "events"
       , [ test_case "order acknowledgment" `Quick test_order_acknowledgment
