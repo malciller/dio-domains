@@ -82,6 +82,7 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
           state.last_buy_order_price <- Some price;
           state.inflight_buy <- false;
           state.inflight_amend_buy <- false;
+          state.last_buy_attempted_insufficient <- false;
           ()
         | Sell ->
           state.inflight_sell <- false;
@@ -144,7 +145,20 @@ let handle_order_failed ~now asset_symbol side reason =
        let cooldown = if is_rate_limit || is_wash_trade then 10.0 else 2.0 in
        (match side with
         | Buy when is_insufficient_balance ->
-          if not state.capital_low
+          if state.last_buy_attempted_insufficient
+          then
+            (* The buy was knowingly placed against a stale, under-funded
+               balance snapshot: the rejection is foreordained, so latching
+               capital_low would pause buying on a snapshot that is about to
+               be replaced by the fresh balance. The fresh store value on the
+               next update governs (and the fresh-insufficient placement path
+               latches capital_low itself when the shortage is real). *)
+            Logging.info_f
+              ~section
+              "Exchange rejected buy for %s with insufficient funds (foreordained: stale \
+               balance snapshot) - not latching capital_low"
+              asset_symbol
+          else if not state.capital_low
           then (
             state.capital_low <- true;
             state.capital_low_logged <- true;
@@ -344,6 +358,16 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
              -> true
            | _ -> false
          in
+         (* A fill for the OLD id of a just-replaced order (Hyperliquid/Alpaca
+            cancel+create can fill the old order at the moment of
+            replacement): the fill is real and its accounting below stands,
+            but the RESTING buy is the replacement - clearing the buy
+            tracking here would make the grid place a second resting buy. *)
+         let is_superseded_old_fill =
+           side = Buy
+           && (not _was_tracked_buy)
+           && InFlightAmendments.is_superseded order_id
+         in
          if side = Buy
          then (
            state.last_buy_fill_price <- Some fill_price;
@@ -394,9 +418,19 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
            state.inflight_sell <- false;
            state.recently_injected_sells <- [];
            ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
-           state.last_buy_order_id <- None;
-           state.last_buy_order_price <- None;
-           if not state.startup_replay then state.just_filled_buy <- true);
+           state.last_buy_attempted_insufficient <- false;
+           if is_superseded_old_fill
+           then
+             Logging.info_f
+               ~section
+               "Buy fill for superseded order %s for %s (replaced by amendment); \
+                preserving resting buy tracking"
+               order_id
+               asset_symbol
+           else (
+             state.last_buy_order_id <- None;
+             state.last_buy_order_price <- None;
+             if not state.startup_replay then state.just_filled_buy <- true));
          if state.startup_replay
          then (
            let dominated =
@@ -523,9 +557,12 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
           swallowed and its reset lost forever. The registry and the
           pending_amend_ entries are keyed by the amended (old) order id,
           which is exactly the id the exchange's mid-amend cancel event
-          carries. *)
+          carries. [is_amend_lifecycle_active] also covers the window AFTER
+          the exchange confirmed a replace (Hyperliquid/Alpaca): the old
+          order's cancel event can arrive after the amend response, and it is
+          still the replace's side effect, not a real cancellation. *)
        let is_being_amended =
-         InFlightAmendments.is_in_flight order_id
+         InFlightAmendments.is_amend_lifecycle_active order_id
          || List.exists
               (fun (pending_id, _, _, _) ->
                  String.starts_with ~prefix:"pending_amend_" pending_id

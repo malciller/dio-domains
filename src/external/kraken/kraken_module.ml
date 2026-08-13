@@ -260,6 +260,15 @@ module Kraken_impl = struct
     fun () -> Kraken_balances_feed.BalanceStore.get_balance store
   ;;
 
+  (** Age of the balances-feed snapshot for [asset], or [None] before the
+      first update. *)
+  let get_balance_age_fast ~asset =
+    let store = Kraken_balances_feed.get_balance_store asset in
+    fun () ->
+      let last = Kraken_balances_feed.BalanceStore.get_last_updated store in
+      if last > 0.0 then Some (Unix.gettimeofday () -. last) else None
+  ;;
+
   let get_total_balance ~asset = Kraken_balances_feed.get_total_balance asset
 
   (** Return all assets with a positive balance as [(asset, balance)] pairs. *)

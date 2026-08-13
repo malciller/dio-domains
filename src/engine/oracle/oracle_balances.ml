@@ -14,10 +14,13 @@
       runtime when the live store is unavailable. Read-only snapshots with
       pure parsing functions for fixture tests.
 
-   Hyperliquid is always REST: the live balance store aggregates the perp
-   clearinghouse USDC into the same "USDC" entry as spot, while the oracle's
-   pool must count spot capital only (perp margin is not grid capital), so
-   the REST spotClearinghouseState path stays authoritative there. *)
+   Hyperliquid is always REST: the live balance store used to aggregate the
+   perp clearinghouse USDC into the same "USDC" entry as spot, while the
+   oracle's pool must count spot capital only (perp margin is not grid
+   capital), so the REST spotClearinghouseState path stays authoritative
+   there. (The engine's live store itself now tracks spot available = total -
+   hold and excludes perp/staking wallets from its tradeable figure, so the
+   two sources agree; REST remains the oracle's choice for its own pool.) *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf

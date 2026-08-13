@@ -218,6 +218,24 @@ let test_first_pass_attempt_done_fresh () =
     (Dio_oracle.Oracle_runtime.first_pass_attempt_done ())
 ;;
 
+let test_cold_start_pass_not_an_attempt () =
+  (* A pass that cannot reach the decision phase (no runnable tasks / no
+     materialized state yet) must NOT count as a pass attempt: if it did, the
+     domains' F&G-only fallback gate would open while the oracle's first real
+     decisions are still seconds away (cold start), letting capital-unaware
+     sizing place orders the first real pass immediately declares INACTIVE
+     (rejected by the exchanges for insufficient funds). *)
+  let was_done = Dio_oracle.Oracle_runtime.first_pass_attempt_done () in
+  let cfg = Dio_oracle.Oracle_runtime.default_config () in
+  ignore
+    (Lwt_main.run
+       (Dio_oracle.Oracle_runtime.run_pass ~trading:[] ~classes:[] ~config:cfg ()));
+  Alcotest.(check bool)
+    "cold-start pass does not count as an attempt"
+    was_done
+    (Dio_oracle.Oracle_runtime.first_pass_attempt_done ())
+;;
+
 let test_jitter_bounded () =
   (* Jitter stays within [base, base + min(15, base/2)] and never goes below base. *)
   let base = 10.0 in
@@ -774,6 +792,10 @@ let () =
             "first pass attempt not done fresh"
             `Quick
             test_first_pass_attempt_done_fresh
+        ; Alcotest.test_case
+            "cold-start pass not an attempt"
+            `Quick
+            test_cold_start_pass_not_an_attempt
         ; Alcotest.test_case "class member source policy" `Quick test_class_member_source
         ] )
     ; ( "trigger"

@@ -217,6 +217,9 @@ module Lighter_impl = struct
     fun () -> Lighter_balances.BalanceStore.get_balance store
   ;;
 
+  (* No freshness tracking: unknown age (treated as stale by strategies, which
+     preserves the previous attempt-anyway behavior). *)
+  let get_balance_age_fast ~asset:_ = fun () -> None
   let get_total_balance ~asset = Lighter_balances.get_balance asset
   let get_all_balances () = Lighter_balances.get_all_balances ()
 

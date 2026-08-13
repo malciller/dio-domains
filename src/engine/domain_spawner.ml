@@ -12,6 +12,13 @@ module Types = Exchange.Types
 
 let section = "domain_spawner"
 
+(** A quote-balance snapshot older than this is not authoritative: buy
+    placement against an under-funded stale snapshot is still attempted (the
+    exchange's verdict is the truth); a FRESH snapshot that cannot fund the
+    buy is skipped outright. Exchanges without freshness tracking report
+    unknown age, which is treated as stale (previous behavior). *)
+let stale_balance_age_seconds = 60.0
+
 (** Pure startup-gate decision for grid domains: the gate opens when the
     capital oracle published a decision for this asset, or when a live Fear &
     Greed reading exists AND the startup window has been given to both
@@ -999,24 +1006,38 @@ let asset_domain_worker
               | None -> ()));
           (* Only F&G is active: warn once if the oracle failed to produce a
              decision for an asset it models (pass finished without one, or
-             the startup window elapsed without a completed pass); plain info
-             otherwise. *)
-          if oracle_tracks_asset && Oracle_runtime.first_pass_attempt_done ()
-          then
-            Logging.warn_f
-              ~section
-              "[%s/%s] Capital-oracle produced no decision for this asset (analysis \
-               failed); sizing from Fear & Greed only"
-              asset_with_fees.exchange
-              asset_with_fees.symbol
-          else if oracle_tracks_asset
-          then
-            Logging.warn_f
-              ~section
-              "[%s/%s] Capital-oracle never completed a pass (startup window elapsed); \
-               sizing from Fear & Greed only"
-              asset_with_fees.exchange
-              asset_with_fees.symbol
+             the startup window elapsed); plain info otherwise. The messages
+             distinguish the three real causes:
+             - cold start: the gate opened on the startup deadline while the
+               oracle's first history refresh was still running (no
+               materialized state yet) - NOT an analysis failure;
+             - analysis failed: at least one real pass finished and this
+               asset still has no decision;
+             - startup window elapsed: no pass ever completed. *)
+          if oracle_tracks_asset
+          then (
+            match Oracle_runtime.materialized () with
+            | None ->
+              Logging.warn_f
+                ~section
+                "[%s/%s] Capital-oracle first history refresh still in progress; sizing \
+                 from Fear & Greed only (startup deadline elapsed)"
+                asset_with_fees.exchange
+                asset_with_fees.symbol
+            | Some _ when Oracle_runtime.first_pass_attempt_done () ->
+              Logging.warn_f
+                ~section
+                "[%s/%s] Capital-oracle produced no decision for this asset (analysis \
+                 failed); sizing from Fear & Greed only"
+                asset_with_fees.exchange
+                asset_with_fees.symbol
+            | Some _ ->
+              Logging.warn_f
+                ~section
+                "[%s/%s] Capital-oracle never completed a pass (startup window elapsed); \
+                 sizing from Fear & Greed only"
+                asset_with_fees.exchange
+                asset_with_fees.symbol)
           else
             Logging.info_f
               ~section
@@ -1099,6 +1120,17 @@ let asset_domain_worker
           match quote_balance_fn () with
           | bal -> bal
           | exception _ -> nan
+        in
+        (* Balance snapshot staleness: a fresh quote balance is authoritative
+           for the placement guard (an under-funded buy is skipped, not sent
+           to be rejected); a stale snapshot may be wrong, so the grid still
+           attempts and lets the exchange decide. Exchanges without
+           freshness tracking report None -> unknown -> treated as stale
+           (previous behavior). *)
+        let quote_balance_stale =
+          match Ex.get_balance_age_fast ~asset:quote_currency () with
+          | Some age -> age > stale_balance_age_seconds
+          | None -> true
         in
         (* Trigger async Fear & Greed refresh on significant price movement *)
         if not (Float.is_nan !current_price)
@@ -1272,6 +1304,7 @@ let asset_domain_worker
          | Some asset, Some cs ->
            Dio_strategies.Suicide_grid.Strategy.execute
              ~cached_state:cs
+             ~quote_balance_stale
              ~now
              asset
              !current_price

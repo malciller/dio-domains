@@ -7,6 +7,13 @@ let balances : (string, float) Hashtbl.t = Hashtbl.create 16
 let total_balances : (string, float) Hashtbl.t = Hashtbl.create 16
 let balances_mutex = Mutex.create ()
 let initial_data_received = ref false
+let last_update : float ref = ref 0.0 (* wall clock of the last successful poll *)
+
+(** Age (seconds) of the balance snapshot, or [None] before the first
+    successful poll. *)
+let get_balance_age () =
+  if !last_update > 0.0 then Some (Unix.gettimeofday () -. !last_update) else None
+;;
 
 let get_balance asset =
   Mutex.lock balances_mutex;
@@ -118,6 +125,7 @@ let update_balances () =
      | Error err ->
        Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err);
     initial_data_received := true;
+    last_update := Unix.time ();
     Mutex.unlock balances_mutex;
     Concurrency.Exchange_wakeup.signal_all ();
     Lwt.return_unit

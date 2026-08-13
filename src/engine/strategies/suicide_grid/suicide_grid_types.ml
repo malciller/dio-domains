@@ -87,6 +87,12 @@ type strategy_state =
   ; mutable capital_low_logged : bool (* suppresses repeated capital-low log warnings *)
   ; mutable capital_low_at_balance : float
     (* quote_bal snapshot when capital_low was set; clears only on balance increase; -1.0 = unstamped *)
+  ; mutable last_buy_attempted_insufficient : bool
+    (* true for the one cycle where a buy was placed despite a KNOWN local
+       balance shortfall (balance snapshot stale): the resulting exchange
+       rejection is foreordained, so it must not latch capital_low again -
+       the fresh balance on the next store update governs. Cleared when a buy
+       is placed against sufficient balance or the order acks/fills. *)
   ; mutable resuming_after_balance_flag : bool
     (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   ; mutable just_filled_buy : bool
@@ -215,6 +221,7 @@ let rec get_strategy_state asset_symbol =
       ; capital_low = false
       ; capital_low_logged = false
       ; capital_low_at_balance = 0.0
+      ; last_buy_attempted_insufficient = false
       ; resuming_after_balance_flag = false
       ; just_filled_buy = false
       ; force_buy_reanchor = false

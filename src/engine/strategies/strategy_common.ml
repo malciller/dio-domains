@@ -164,31 +164,89 @@ module InFlightOrders = struct
   ;;
 end
 
-(** In-flight amendment cache for deduplication of pending amend requests. *)
+(** In-flight amendment lifecycle registry: deduplication of pending amend
+    requests PLUS the exchange's mid-amend order-replacement events.
+
+    Exchanges implement amendments differently - Kraken modifies the order in
+    place (same id), Hyperliquid and Alpaca replace it under the hood (the old
+    order is cancelled and a new id is created). A replacement therefore emits
+    a cancel event for the OLD id, either while the amend request is pending or
+    shortly after it completes (event ordering on the wire). This registry
+    gives every exchange the same lifecycle so strategies react uniformly:
+
+    - [Pending] while the request is in flight: a cancel event for the old id
+      is the amend's side effect, not a real cancellation.
+    - [Replaced new_id] once the exchange confirms (old_id <> new_id): the
+      entry is retained for the cleanup window so a LATE cancel event for the
+      old id is still recognized as the amend's side effect and cannot reset
+      the replacement order's tracking.
+    - Same-id amends (Kraken) do not retain an entry: events for that id are
+      always real.
+    - [Failed]/[Skipped] are terminal: the entry is dropped so a follow-up
+      cancel event is handled as a real one (the failure path already
+      reconciled tracking). *)
 module InFlightAmendments = struct
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
+  type phase =
+    | Pending
+    | Replaced of string (* the replacement (new) order id *)
+    | Failed of string (* terminal: reason; entry dropped *)
+    | Skipped (* terminal: suppressed no-op; entry dropped *)
+
+  type entry =
+    { mutable phase : phase
+    ; mutable last : float
+    }
+
+  let registry : (string, entry) Hashtbl.t = Hashtbl.create 1024
   let mutex = Mutex.create ()
 
-  (** Atomically insert [order_id] if absent. Returns true on insertion,
-      false if already tracked. *)
+  (** Atomically insert [order_id] as [Pending] if absent. Returns true on
+      insertion, false if the id is already tracked (any phase - a replaced
+      id stays tracked for the cleanup window, so re-amending it is a
+      duplicate). *)
   let add_in_flight_amendment order_id =
     let now = Unix.gettimeofday () in
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry order_id in
-    if not exists then Hashtbl.replace registry order_id now;
+    if not exists then Hashtbl.replace registry order_id { phase = Pending; last = now };
     Mutex.unlock mutex;
     not exists
   ;;
 
-  (** Returns true if [order_id] has a pending amendment. *)
-  let is_in_flight order_id =
+  (** Read the phase of [order_id], or [None] when untracked. *)
+  let phase_of order_id =
     Mutex.lock mutex;
-    let exists = Hashtbl.mem registry order_id in
+    let phase =
+      match Hashtbl.find_opt registry order_id with
+      | Some (entry : entry) -> Some entry.phase
+      | None -> None
+    in
     Mutex.unlock mutex;
-    exists
+    phase
   ;;
 
-  (** Remove [order_id] from the cache. Returns true if it was present. *)
+  (** Returns true if [order_id] has a pending (unanswered) amendment. *)
+  let is_in_flight order_id = phase_of order_id = Some Pending
+
+  (** Returns true if [order_id] was just replaced by an amendment and its
+      old id is still in the recognition window. *)
+  let is_superseded order_id =
+    match phase_of order_id with
+    | Some (Replaced _) -> true
+    | _ -> false
+  ;;
+
+  (** True while the exchange may still deliver events for [order_id] as a
+      side effect of an amendment (request pending, or replacement just
+      completed): a cancel event in this state must not reset tracking. *)
+  let is_amend_lifecycle_active order_id =
+    match phase_of order_id with
+    | Some (Pending | Replaced _) -> true
+    | _ -> false
+  ;;
+
+  (** Remove [order_id] from the registry (terminal phases, cleanup).
+      Returns true if it was present. *)
   let remove_in_flight_amendment order_id =
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry order_id in
@@ -196,6 +254,32 @@ module InFlightAmendments = struct
     Mutex.unlock mutex;
     exists
   ;;
+
+  (** The exchange confirmed the amendment. A replace (old_id <> new_id)
+      keeps the old id registered as [Replaced] for the cleanup window so a
+      late cancel event for it is recognized as the amend's side effect; a
+      same-id amend (Kraken) drops the entry - its events are always real. *)
+  let note_amendment_succeeded ~old_id ~new_id =
+    if old_id = new_id
+    then ignore (remove_in_flight_amendment old_id)
+    else (
+      let now = Unix.gettimeofday () in
+      Mutex.lock mutex;
+      (match Hashtbl.find_opt registry old_id with
+       | Some (entry : entry) ->
+         entry.phase <- Replaced new_id;
+         entry.last <- now
+       | None -> Hashtbl.replace registry old_id { phase = Replaced new_id; last = now });
+      Mutex.unlock mutex)
+  ;;
+
+  (** The exchange rejected the amendment: terminal. The entry is dropped so
+      a follow-up cancel event for the old id is handled as a real one (the
+      amend-failure path has already reconciled tracking). *)
+  let note_amendment_failed ~old_id ~reason:_ = ignore (remove_in_flight_amendment old_id)
+
+  (** The amendment was suppressed as a no-op: terminal, entry dropped. *)
+  let note_amendment_skipped ~old_id = ignore (remove_in_flight_amendment old_id)
 
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
@@ -207,7 +291,9 @@ module InFlightAmendments = struct
 
   let last_cleanup = Atomic.make 0.0
 
-  (** Evict entries older than [max_age] seconds. Returns [(0, removed_count)]. *)
+  (** Evict entries older than [max_age] seconds (any phase - the Replaced
+      recognition window is bounded by this cleanup). Returns
+      [(0, removed_count)]. *)
   let cleanup ?(max_age = 60.0) () =
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
@@ -216,7 +302,8 @@ module InFlightAmendments = struct
       Mutex.lock mutex;
       let initial_size = Hashtbl.length registry in
       Hashtbl.filter_map_inplace
-        (fun _ timestamp -> if now -. timestamp <= max_age then Some timestamp else None)
+        (fun _ (entry : entry) ->
+           if now -. entry.last <= max_age then Some entry else None)
         registry;
       let final_size = Hashtbl.length registry in
       Mutex.unlock mutex;

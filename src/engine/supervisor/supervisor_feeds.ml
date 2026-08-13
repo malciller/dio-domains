@@ -848,7 +848,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
   in
   if not (executions_ready && hl_executions_ready)
   then Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
-  else Logging.info ~section "✓ Executions feed ready";
+  else Logging.info ~section "✓ All executions feeds ready (kraken + hyperliquid)";
   (* Balance readiness gate — run all exchanges in parallel since
      subscriptions are already in-flight. Sequential waits would
      accumulate timeouts and delay Lighter by 10-20s unnecessarily. *)
