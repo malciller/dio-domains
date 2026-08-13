@@ -4,4 +4,4 @@
 
 (test
  (name test_dashboard_holdings)
- (libraries dio.dashboard_ui alcotest))
+ (libraries dio.dashboard_ui dio.latency_profiling mtime alcotest))

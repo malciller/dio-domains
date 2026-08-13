@@ -367,6 +367,10 @@ let subscribe_to_feeds ~symbols ~wallet =
     symbols
 ;;
 
+(** Timestamp of the last text frame, for the ws_feed inter-message gap
+    measurement (recorded per venue in [Network_latency]). *)
+let last_frame_time = ref 0.0
+
 (** Processes a single WebSocket frame.
     Text frames are parsed as JSON, then either matched to a pending
     request via the response table or broadcast to all subscribers.
@@ -376,6 +380,11 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   | Websocket.Frame.Opcode.Text ->
     Concurrency.Tick_event_bus.publish_tick ();
     on_heartbeat ();
+    (* Feed cadence: gap since the previous frame on this venue. *)
+    let now = Unix.gettimeofday () in
+    if !last_frame_time > 0.0
+    then Network_latency.record_feed_s "hyperliquid" (now -. !last_frame_time);
+    last_frame_time := now;
     let content = frame.Websocket.Frame.content in
     if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
     then (
@@ -683,6 +692,7 @@ let send_ping ~req_id:_ ~timeout_ms =
             >>= fun () ->
             Logging.debug ~section "Pong received";
             reset_ping_failures ();
+            Network_latency.record_ping_s "hyperliquid" (Unix.gettimeofday () -. send_time);
             Lwt.return true)
          ; (Lwt_unix.sleep timeout
             >>= fun () ->
@@ -690,6 +700,9 @@ let send_ping ~req_id:_ ~timeout_ms =
             if !last_pong_time > send_time
             then (
               reset_ping_failures ();
+              Network_latency.record_ping_s
+                "hyperliquid"
+                (Unix.gettimeofday () -. send_time);
               Lwt.return true)
             else (
               Logging.warn ~section "Ping timed out (no pong received)";

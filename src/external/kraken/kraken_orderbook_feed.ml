@@ -920,6 +920,11 @@ let trigger_orderbook_cleanup ~reason () =
     Lwt.return_unit)
 ;;
 
+(** Timestamp of the last orderbook frame, for the ws_feed inter-message gap
+    measurement (recorded only on book data, so heartbeats don't mask a
+    stalled book feed). *)
+let last_book_time = ref 0.0
+
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   Lwt.catch
@@ -964,9 +969,17 @@ let handle_message message on_heartbeat =
               | None -> Lwt.return_unit)
           | None -> Lwt.return_unit)
        | Some "book", Some "snapshot", _ ->
+         let now = Unix.gettimeofday () in
+         if !last_book_time > 0.0
+         then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
+         last_book_time := now;
          ignore (process_orderbook_message ~reset:true json on_heartbeat);
          Lwt.return_unit
        | Some "book", Some "update", _ ->
+         let now = Unix.gettimeofday () in
+         if !last_book_time > 0.0
+         then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
+         last_book_time := now;
          ignore (process_orderbook_message ~reset:false json on_heartbeat);
          Lwt.return_unit
        | _, _, Some "subscribe" ->
@@ -1005,6 +1018,7 @@ let handle_message message on_heartbeat =
 ;;
 
 let send_ping ~req_id ~timeout_ms =
+  let send_time = Mtime_clock.now_ns () in
   Lwt_mutex.with_lock state.mutex (fun () -> Lwt.return state.active_conn)
   >>= function
   | None -> Lwt.fail (Failure "Orderbook WebSocket not connected")
@@ -1027,6 +1041,11 @@ let send_ping ~req_id ~timeout_ms =
            Lwt.return_unit)
          >>= fun () -> Lwt.fail (Failure "Ping timeout"))
       ]
+    >>= fun response ->
+    Network_latency.record_ping
+      "kraken"
+      (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) send_time));
+    Lwt.return response
 ;;
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =

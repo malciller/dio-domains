@@ -284,12 +284,13 @@ let load_dotenv () =
   | _ -> ()
 ;;
 
-let post_json ~url (payload : Yojson.Safe.t) : (Yojson.Safe.t, string) result Lwt.t =
+let post_json ~venue ~url (payload : Yojson.Safe.t) : (Yojson.Safe.t, string) result Lwt.t
+  =
   let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
   let body = Cohttp_lwt.Body.of_string (Yojson.Safe.to_string payload) in
   Lwt.catch
     (fun () ->
-       Oracle_http.post ~headers ~body (Uri.of_string url)
+       Oracle_http.post ~venue ~headers ~body (Uri.of_string url)
        >>= fun (response, response_body) ->
        Cohttp_lwt.Body.to_string response_body
        >|= fun body ->
@@ -322,6 +323,7 @@ let fetch_kraken ~testnet:_ () : (balance list, string) result Lwt.t =
            ]
        in
        Oracle_http.post
+         ~venue:"kraken"
          ~headers
          ~body:(Cohttp_lwt.Body.of_string body)
          (Uri.of_string ("https://api.kraken.com" ^ path))
@@ -353,6 +355,7 @@ let fetch_hyperliquid ~testnet () : (balance list, string) result Lwt.t =
        clearinghouse balance is deliberately not included: it is margin
        reserved for perp positions, not capital available to the spot grid. *)
     post_json
+      ~venue:"hyperliquid"
       ~url:(base_url ^ "/info")
       (`Assoc [ "type", `String "spotClearinghouseState"; "user", `String wallet ])
     >|= (function

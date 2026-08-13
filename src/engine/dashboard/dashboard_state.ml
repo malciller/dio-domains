@@ -369,6 +369,43 @@ let merge_oracle_asset_latencies latencies =
   Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
 ;;
 
+(** Merge the per-venue network latency windows into the per-domain latency
+    map under the NETWORK-page labels (ws_ping / ws_feed / rest_request /
+    signer), so the dashboard's ENGINE LATENCY rows show the network
+    characteristics of each domain's venue. Keys match the trading-config
+    symbols the domains are keyed by (case insensitive). Venues that never
+    had a network measurement are simply absent — the NETWORK page renders
+    "--" for them. *)
+let merge_network_latencies latencies =
+  let by_symbol = Hashtbl.create 16 in
+  List.iter
+    (fun (symbol, json) ->
+       Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
+    latencies;
+  let config = get_config () in
+  List.iter
+    (fun (tc : Dio_engine.Config.trading_config) ->
+       let key = String.lowercase_ascii tc.symbol in
+       let venue_snaps = Network_latency.snapshots tc.exchange in
+       if venue_snaps <> []
+       then (
+         match Hashtbl.find_opt by_symbol key with
+         | Some (orig, `Assoc l) ->
+           let network_entries =
+             List.filter_map
+               (fun (label, snap_opt) ->
+                  match snap_opt with
+                  | Some snap -> Some (label, json_of_latency_snapshot snap)
+                  | None -> None)
+               venue_snaps
+           in
+           if network_entries <> []
+           then Hashtbl.replace by_symbol key (orig, `Assoc (network_entries @ l))
+         | _ -> ()))
+    config.trading;
+  Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
+;;
+
 let json_of_domain_latencies () =
   let profilers = Dio_engine.Domain_spawner.get_domain_profiler_snapshots () in
   let latencies =
@@ -384,7 +421,7 @@ let json_of_domain_latencies () =
                 snaps) ))
       profilers
   in
-  `Assoc (merge_oracle_asset_latencies latencies)
+  `Assoc (merge_network_latencies (merge_oracle_asset_latencies latencies))
 ;;
 
 (** The engine-global capital-oracle latency windows (per-pass stages),

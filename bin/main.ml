@@ -574,6 +574,9 @@ let () =
   try
     let start_time = Unix.gettimeofday () in
     Lwt.async (fun () -> Dio_dashboard.Dashboard_server.start ~start_time);
+    (* Publish per-venue network latency windows (ws_ping / ws_feed /
+       rest_request / signer) for the dashboard's NETWORK page. *)
+    Network_latency.start_publisher ();
     (* Synchronous engine init: supervisor, domains, websocket feeds. *)
     Logging.info ~section:"main" "Initializing trading engine...";
     let _configs = init_trading_engine_sync config in

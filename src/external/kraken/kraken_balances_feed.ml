@@ -637,6 +637,7 @@ let poll_earn_allocations () =
              ; "Content-Type", "application/x-www-form-urlencoded"
              ]
          in
+         let rest_start = Mtime_clock.now_ns () in
          Lwt_unix.with_timeout 10.0 (fun () ->
            Cohttp_lwt_unix.Client.post
              ~headers
@@ -645,6 +646,9 @@ let poll_earn_allocations () =
          >>= fun (resp, body) ->
          Cohttp_lwt.Body.to_string body
          >>= fun body_str ->
+         Network_latency.record_rest
+           "kraken"
+           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
          let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
          if status <> 200
          then

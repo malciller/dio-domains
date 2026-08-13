@@ -148,6 +148,7 @@ let refresh_spot_meta () : unit Lwt.t =
          let payload = `Assoc [ "type", `String "spotMeta" ] |> Yojson.Safe.to_string in
          let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
          Oracle_http.post
+           ~venue:"hyperliquid"
            ~headers
            ~body:(Cohttp_lwt.Body.of_string payload)
            (Uri.of_string endpoint)
@@ -336,6 +337,7 @@ let fetch_candles ?(start_ms = default_start_ms) ~(symbol : string) ()
         let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
         let fetch =
           Oracle_http.post
+            ~venue:"hyperliquid"
             ~headers
             ~body:(Cohttp_lwt.Body.of_string payload)
             (Uri.of_string endpoint)
