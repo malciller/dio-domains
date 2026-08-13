@@ -6,7 +6,7 @@ open Lwt.Infix
 
 open Yojson.Safe
 
-(** Appends key value tuple to JSON association structure. *)
+(** Prepends a (key, value) pair to a JSON association list. *)
 let add_to_assoc (json : Yojson.Safe.t) (key_value_pair : string * Yojson.Safe.t)
   : Yojson.Safe.t
   =
@@ -19,7 +19,7 @@ let add_to_assoc (json : Yojson.Safe.t) (key_value_pair : string * Yojson.Safe.t
 
 let section = "kraken_actions"
 
-(** Clamps float value to instrument decimal precision limitations. *)
+(** Rounds a price to the instrument's configured decimal precision. *)
 let truncate_price_to_precision price symbol =
   match Kraken_instruments_feed.get_precision_info symbol with
   | Some (price_precision, qty_precision) ->
@@ -30,7 +30,7 @@ let truncate_price_to_precision price symbol =
       symbol
       price_precision
       qty_precision;
-    (* Rounds to absolute precision preventing truncation. *)
+    (* Round to the absolute precision first, preventing truncation errors. *)
     let multiplier = 10.0 ** float_of_int price_precision in
     let truncated_price = Float.round (price *. multiplier) /. multiplier in
     (* Reparses to eliminate floating point artifacts. *)
@@ -49,24 +49,24 @@ let truncate_price_to_precision price symbol =
     price
 ;;
 
-(** Evaluates string for substring presence.
-    Delegates to centralized [Error_handling.string_contains]. *)
+(** Returns true if the string contains the given substring.
+    Delegates to the centralized [Error_handling.string_contains]. *)
 let string_contains = Error_handling.string_contains
 
-(** Serializes JSON applying instrument specific float precision bounds. *)
+(** Serializes JSON to a string, applying instrument-specific float precision bounds. *)
 let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : string =
   match json with
   | `Null -> "null"
   | `Bool b -> if b then "true" else "false"
   | `Int i -> string_of_int i
   | `Float f ->
-    (* Selects precision bounds using field context. *)
+    (* Select the precision bounds based on the field name context. *)
     let precision =
       match symbol with
       | Some sym ->
         (match Kraken_instruments_feed.get_precision_info sym with
          | Some (price_precision, qty_precision) ->
-           (* Routes price limits to price parameters and quantity limits otherwise. *)
+           (* Use price precision for price fields and quantity precision otherwise. *)
            (match field_name with
             | Some name when string_contains name "price" -> price_precision
             | _ -> qty_precision)
@@ -109,15 +109,15 @@ let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : strin
   | `Variant _ -> failwith "json_to_string_precise: Variant not supported"
 ;;
 
-(** Generates sequential request identifier. *)
+(** Generates a sequential request identifier. *)
 let next_req_id =
   let counter = ref 0 in
   let ping_start_id = 1000000 in
-  (* Denotes ping ID reserved boundary. *)
+  (* Denotes the reserved ping ID boundary. *)
   fun () ->
     incr counter;
     let id = !counter in
-    (* Logs threshold warning approaching ping ID collision boundary. *)
+    (* Log a warning when the ID approaches the ping ID collision boundary. *)
     if id >= ping_start_id - 1000
     then
       Logging.warn_f
@@ -129,7 +129,7 @@ let next_req_id =
     id
 ;;
 
-(** Retry configuration — re-exported from centralized [Error_handling]. *)
+(** Retry configuration, re-exported from the centralized [Error_handling] module. *)
 type retry_config = Error_handling.retry_config =
   { max_attempts : int
   ; base_delay_ms : float
@@ -139,11 +139,11 @@ type retry_config = Error_handling.retry_config =
 
 let default_retry_config = Error_handling.default_retry_config
 
-(** Classifies error responses targeting transient network conditions.
-    Delegates to centralized [Error_handling.is_retriable_error]. *)
+(** Returns true for errors that indicate transient network conditions.
+    Delegates to the centralized [Error_handling.is_retriable_error]. *)
 let is_retriable_error = Error_handling.is_retriable_error
 
-(** Transmits order placement payload utilizing retry handler. *)
+(** Places an order by transmitting the order payload, utilizing the retry handler. *)
 let place_order
       ~token
       ~order_type
@@ -187,7 +187,7 @@ let place_order
            (int_of_float (Unix.gettimeofday () *. 1000.0)))
   in
   let place_order_once () =
-    (* Submits via REST enforcing sequence isolation constraints. *)
+    (* Submit the order request with a fresh request identifier. *)
     let req_id = next_req_id () in
     (* Appends core parameters. *)
     let params =
@@ -323,7 +323,7 @@ let place_order
   Error_handling.retry_with_backoff ~section ~config ~f:place_order_once ()
 ;;
 
-(** Transmits order modification payload utilizing retry handler. *)
+(** Amends an existing order by transmitting the modification payload, utilizing the retry handler. *)
 let amend_order
       ~token
       ~order_id
@@ -348,11 +348,10 @@ let amend_order
     | None -> default_retry_config
   in
   let amend_order_once () =
-    (* Assumes initialized singleton dependency. *)
     let req_id = next_req_id () in
     let symbol_str = Option.value symbol ~default:"" in
     if symbol_str = "" then failwith "Symbol required for price precision in amend_order";
-    (* Validates symbol configuration. *)
+    (* Fail if no symbol was supplied; price precision truncation requires it. *)
 
     (* Appends immutable parameters. *)
     let params = `Assoc [ "order_id", `String order_id; "token", `String token ] in
@@ -482,11 +481,11 @@ let amend_order
   Error_handling.retry_with_backoff ~section ~config ~f:amend_order_once ()
 ;;
 
-(** Transmits order cancellation payloads, one per order, utilizing retry handler.
-    Serializes individual cancels to avoid multi-frame response desync:
-    Kraken sends one response frame per order sharing the same req_id, but
-    resolve_response removes the waiter on the first frame, dropping subsequent
-    frames. Serializing gives each cancel its own req_id for correct correlation. *)
+(** Cancels orders by transmitting one cancellation request per order, utilizing the retry handler.
+    Requests are sent in parallel, each carrying its own req_id so responses
+    correlate per order. A single shared req_id would desync multi-frame
+    responses, since [resolve_response] removes the waiter on the first frame,
+    and Kraken does not offer a true batch cancel. *)
 let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
   : (Kraken_common_types.cancel_order_result list, string) result Lwt.t
   =
@@ -514,12 +513,12 @@ let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
     in
     from_order_ids @ from_cl_ord_ids @ from_userrefs
   in
-  (* Execute all cancels in PARALLEL (H8): each cancel carries its own req_id,
-     so response correlation is per-order — the shared-req_id desync concern
+  (* Execute all cancels in parallel (H8): each cancel carries its own req_id,
+     so response correlation is per-order; the shared-req_id desync concern
      only applies to a true batch cancel, which Kraken does not offer. The old
-     sequential pipeline turned N cancels into N × RTT on the domain's critical
-     path; parallel requests collapse it to ~1 RTT. Each failure is logged and
-     the remaining cancels still complete. *)
+     sequential pipeline turned N cancels into N times the RTT on the domain's
+     critical path, while parallel requests collapse it to roughly one RTT.
+     Each failure is logged and the remaining cancels still complete. *)
   let cancel_single (key, value) =
     let cancel_once () =
       let req_id = next_req_id () in

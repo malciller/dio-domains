@@ -1,4 +1,4 @@
-(* Hyperliquid_get_fee -- per-user fee rate retrieval for perpetual and spot markets.
+(** Hyperliquid_get_fee: per-user fee rate retrieval for perpetual and spot markets.
    Queries the Hyperliquid /info endpoint with the configured wallet address,
    parses account-specific and schedule-level rates, and falls back to
    hardcoded tier maximums when neither is available. *)

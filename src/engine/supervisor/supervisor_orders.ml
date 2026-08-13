@@ -283,7 +283,7 @@ let hedger_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err)
-  ; (* Hedger only supports Place — these should never fire *)
+  ; (* Hedger only supports Place; these should never fire *)
     on_amend_ok = (fun _order _target_id _new_id -> ())
   ; on_amend_skipped = (fun _order _target_id -> ())
   ; on_amend_fail = (fun _order _target_id _err -> ())
@@ -620,7 +620,7 @@ let order_processing_loop () =
               (process_single_order ~orders_placed ~order_mutex ~is_connected)
               pending_mm_orders;
           (* Process hedger orders; abort if shutdown raised after MM batch.
-               Hedger only supports Place — other operations log a warning. *)
+               Hedger only supports Place; other operations log a warning. *)
           if not (Atomic.get shutdown_requested)
           then
             List.iter

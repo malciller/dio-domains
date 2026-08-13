@@ -156,7 +156,7 @@ let compute_sell_qty
 ;;
 
 (** After [asset_low] or [capital_low] clears, a new sell must pass the accumulation
-    buffer gate — do not fall back to a blind 1:1 sell on the recovery cycle. *)
+    buffer gate; do not fall back to a blind 1:1 sell on the recovery cycle. *)
 let accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty =
   if (not state.resuming_after_balance_flag) || not ecfg.use_accumulation_sells
   then true

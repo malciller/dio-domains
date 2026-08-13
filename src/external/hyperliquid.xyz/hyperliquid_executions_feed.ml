@@ -105,12 +105,7 @@ let order_index_mutex = Mutex.create ()
     All access requires holding order_index_mutex. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
 (** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
-
-(** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-(** Adaptive capacity bound. Set to max_int (uncapped) during startup,
-    then locked to a bounded value after the initial snapshot completes. *)
-
 (** Adaptive capacity bound. Set to max_int (uncapped) during startup,
     then locked to a bounded value after the initial snapshot completes. *)
 let order_to_symbol_cap : int ref = ref max_int
@@ -245,7 +240,7 @@ let[@inline always] get_open_orders symbol =
 
 (** Fold over open orders. Snapshots the open-order list under the per-symbol
     mutex (hashtable walk without calling [f]), releases the lock, then runs
-    the per-order callback work on the snapshot — the WS feed writer never
+    the per-order callback work on the snapshot; the WS feed writer never
     queues behind the domain's scan callbacks (H6). *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
@@ -520,7 +515,7 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   else (
     (* Deferred global index action: computed under orders_mutex, applied
      after releasing it. Avoids holding orders_mutex while contending
-     for order_index_mutex — matching the Kraken architecture. *)
+     for order_index_mutex, matching the Kraken architecture. *)
     let index_action = ref `None in
     if is_terminal
     then (

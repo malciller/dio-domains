@@ -143,7 +143,7 @@ let handle_error fields =
     (* Market data subscription and operation mode notifications are expected conditions during simulated trading loops when realtime quote streaming is deactivated. *)
     Logging.info_f ~section "Market data info [%d] id=%d: %s" code id message
   else (
-    (* Evaluate bounds boundaries to serialize exact telemetry payload types. *)
+    (* Classify the error code range to emit the appropriate telemetry level. *)
     if code = 200
     then Logging.error_f ~section "Contract error [%d] id=%d: %s" code id message
     else if code >= 100 && code < 200

@@ -49,15 +49,14 @@
    that committed capital and draws NOTHING new from the available pool -
    its whole share passes down, letting a lower-priority asset fund its own
    first order instead of being starved by an under-funded priority grid
-   that cannot use the capital anyway. A fully
-    deployed account shows a ~zero available-quote pool, so every asset
-    publishes inactive ("cannot fund the first buy") while it awaits sell fills
-    to restore capital. This is a normal state, never a failure: when a fill
-    returns quote to the account, the next pass re-sizes the assets in config
-    priority order and the domains resume on the published decision. The runtime
-    polls at the fast [poll_seconds] cadence while no asset is active so a
-    capital return is recognized quickly instead of waiting for the full
-    refresh cadence.
+   that cannot use the capital anyway. A fully deployed account shows a
+   ~zero available-quote pool, so every asset publishes inactive ("cannot
+   fund the first buy") while it awaits sell fills to restore capital. This
+   is a normal state, never a failure: when a fill returns quote to the
+   account, the next pass re-sizes the assets in config priority order and
+   the domains resume on the published decision. The runtime polls at the
+   fast [poll_seconds] cadence while no asset is active so a capital return
+   is recognized quickly instead of waiting for the full refresh cadence.
 
    PRIORITY RECLAMATION: when a higher-priority asset fills its last buy and
    the available pool can no longer fund a replacement while a lower-priority
@@ -332,8 +331,9 @@ let decisions_ref : decision list Atomic.t = Atomic.make []
 
 (* H5: copy-on-write keyed lookup. The single writer (publish) builds a fresh
    Hashtbl with pre-lowercased "exchange/symbol" keys and swaps the reference;
-   readers do one [Atomic.get] + Hashtbl.find — no per-cycle lowercasing and
-   no O(N) scan. The table is never mutated after publication, so concurrent
+   readers do one [Atomic.get] + Hashtbl.find, with no per-cycle lowercasing
+   and no O(N) scan. The table is never mutated after publication, so
+   concurrent
    readers are safe under the OCaml 5 memory model. *)
 let decisions_map : (string, decision) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 16)
@@ -343,9 +343,9 @@ let key_of (d : decision) =
   String.lowercase_ascii d.exchange ^ "/" ^ String.lowercase_ascii d.symbol
 ;;
 
-(** Domain-safe lookup: exchange and symbol are lower-cased for the match so
-    config spelling (BTC/USD vs btc/usd) never matters. O(1) hashtable hit on
-    the per-cycle hot path (no list scan, no per-candidate lowercasing). *)
+(** The whole current decision snapshot: the atomically-swapped immutable
+    list, used by [on_publish] and the loop's cadence/reclaim logic. Readers
+    always see a consistent list, never a torn mid-swap state. *)
 let decisions () = Atomic.get decisions_ref
 
 (** Domain-safe lookup: exchange and symbol are lower-cased for the match so
@@ -1694,9 +1694,9 @@ let size_asset
         deployment.Oracle_types.reason
         deployment.Oracle_types.remainder
   in
-  (* The detail block: event prices/dates, model horizon, and how the
-     resolved gi/qty were weighted (the F&G blend for crypto; pure oracle for
-     equities). *)
+  (* The detail block: event prices/dates, model horizon, and the sizing
+     reasons behind the resolved gi/qty (survival-driven over the config
+     ranges; the F&G/range weights are inert in the sizing). *)
   let detail = Buffer.create 256 in
   let add fmt =
     Printf.ksprintf

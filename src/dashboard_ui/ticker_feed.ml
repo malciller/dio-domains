@@ -9,7 +9,8 @@ open Theme
     This primarily targets paused strategies or tracked tickers with zero balance.
 *)
 
-(** Reusable grouping table — cleared each render to avoid per-frame allocation. *)
+(** Reusable grouping table, cleared each render to avoid per-frame
+    allocation. *)
 let group_tbl : (string, (Notty.attr * string * float * float * float) list) Hashtbl.t =
   Hashtbl.create 16
 ;;
@@ -21,7 +22,7 @@ let render_ticker w json =
     | _ -> []
   in
   let all_balances = json |?> "all_balances" |> to_list_d in
-  (* Find all strategies *)
+  (* Gather all strategies that currently have a usable mid price. *)
   let all_strategies =
     List.filter_map
       (fun (symbol, data) ->
@@ -36,7 +37,7 @@ let render_ticker w json =
            Some (exchange, symbol, mid, bid, ask)))
       strats
   in
-  (* Find all non-quote balances from all_balances just in case the engine 
+  (* Also gather non-quote balances from all_balances in case the engine
      decides to push them in the future. *)
   let non_quote_bals =
     List.filter_map
@@ -107,7 +108,8 @@ let render_ticker w json =
         (fun g1 g2 -> String.compare (fst (List.hd g1)) (fst (List.hd g2)))
         combined_groups
     in
-    (* Build the ticker string chunks grouped by asset and dense-packed by pairs if single-venue *)
+    (* Build the ticker string chunks: each chunk groups the entries for one
+       asset, and single-entry groups are paired together to save space. *)
     let chunks_list =
       List.map
         (fun group ->
@@ -196,11 +198,13 @@ let render_ticker w json =
       done;
       !total_w <= max_w
     in
-    (* Find maximum columns that fit from n down to 1 *)
+    (* Find the maximum number of columns that fit, searching from n down
+       to 1. *)
     let rec find_cols c = if c <= 1 then 1 else if fits c then c else find_cols (c - 1) in
     let cols = if n = 0 then 1 else find_cols n in
     let col_widths = get_col_widths cols in
-    (* Cycle independently on clock *)
+    (* Cycle the visible items on the wall clock so the feed rotates
+       independently of the render loop. *)
     let cycle_time = 5.0 in
     let page = int_of_float (Unix.gettimeofday () /. cycle_time) in
     let slot_images =

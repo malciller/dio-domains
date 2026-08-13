@@ -101,7 +101,7 @@ let generate_duplicate_key symbol side quantity limit_price =
     Incremented each time a strategy successfully pushes an order action
     (place/amend/cancel) to a ring buffer; snapshot+reset once per latency
     window by the domain worker so the dashboard's STRAT/S column reports
-    ACTUAL strategy executions per second — not raw strategy-invocation
+    ACTUAL strategy executions per second, not raw strategy-invocation
     cycles, which for a fast feed are far higher than the real number of
     order actions the strategy takes. *)
 module Order_actions = struct
@@ -140,7 +140,7 @@ end
 (** In-flight order cache for deduplication of pending place/cancel requests.
 
     Sharded (HFT_AUDIT.md H4): the registry used to be ONE Hashtbl behind ONE
-    global mutex shared by every symbol and every domain — the single most
+    global mutex shared by every symbol and every domain, the single most
     cross-cutting lock in the engine. Now the table and its mutex are split
     across [num_shards] independent shards keyed by hash of the duplicate key
     (which embeds the symbol), so independent symbols/domains no longer
@@ -478,7 +478,7 @@ module LockFreeQueue = struct
   ;;
 
   (** Single consumer dequeue. Non-blocking: returns None if the slot is
-      empty, even if the tail index has been advanced by a producer. 
+      empty, even if the tail index has been advanced by a producer.
       This prevents the consumer from spinning if a producer is preempted. *)
   let read q =
     let h = Atomic.get q.head in
@@ -537,7 +537,7 @@ module OrderSignal = struct
   let pending = Atomic.make false
 
   (** Signal from any domain that new orders are available.
-      Safe to call from OCaml 5 domain workers — no Lwt internals are touched. *)
+      Safe to call from OCaml 5 domain workers, no Lwt internals are touched. *)
   let broadcast () =
     if not (Atomic.exchange pending true)
     then (

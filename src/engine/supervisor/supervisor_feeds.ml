@@ -137,7 +137,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
   (* Apply testnet flag to Hyperliquid module *)
   if has_hyperliquid
   then Hyperliquid.Module.Hyperliquid_impl.set_testnet hyperliquid_testnet;
-  (* Apply testnet flag to IBKR module — must happen before gateway connection *)
+  (* Apply testnet flag to IBKR module; must happen before gateway connection *)
   if has_ibkr then Ibkr.Module.Config.set_testnet ibkr_testnet;
   if has_alpaca
   then (
@@ -211,7 +211,6 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                >>= fun () ->
                Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet
                >>= fun () ->
-               (* Clear out logic replaced by reconciliation in inject_open_orders to emit proper status events *)
                Hyperliquid.Module.fetch_open_orders_ws ())
            in
            Hyperliquid.Ws.connect_and_monitor
@@ -239,7 +238,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
           (fun () ->
              let on_failure reason =
                set_state lt_ws_conn (Failed reason)
-               (* Do NOT call start_async here — connect_and_monitor has
+               (* Do NOT call start_async here; connect_and_monitor has
              self-healing reconnect loops that never exit. The failure
              callback is only invoked when both sides are simultaneously
              down; the internal loops will recover automatically.
@@ -601,7 +600,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
            Ibkr.Dispatcher.initialize conn;
            (* Register callback so openOrderEnd marks execution stores as ready.
            Must be set after initialize (which clears state) and before
-           request_open_orders fires — avoids dependency cycle in the lib. *)
+           request_open_orders fires; this avoids a dependency cycle in the lib. *)
            Ibkr.Dispatcher.on_open_orders_end := Some Ibkr.Executions_feed.mark_ready_all;
            Ibkr.Connection.start_reader
              conn
@@ -643,7 +642,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                    Logging.info_f
                      ~section
                      "[ibkr_gateway] Market closed, deferring reconnection"));
-           (* Do NOT set Connected yet — defer until contract resolution succeeds.
+           (* Do NOT set Connected yet; defer until contract resolution succeeds.
            Setting Connected here would reset reconnect_attempts to 0, defeating
            the backoff and circuit breaker when contract resolution keeps failing. *)
            Logging.info ~section "IBKR Gateway TCP connected, resolving contracts...";
@@ -663,9 +662,9 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
            Ibkr.Executions_feed.request_open_orders conn
            >>= fun () ->
            let is_paper = !Ibkr.Module.Config.trading_mode = "paper" in
-           (* Phase 1: Snapshot — seed an initial price immediately.
-           Paper: type 4 (delayed-frozen) — free, no live subscription needed.
-           Live:  type 2 (frozen) — last close from live subscription. *)
+           (* Phase 1: Snapshot; seed an initial price immediately.
+           Paper: type 4 (delayed-frozen); free, no live subscription needed.
+           Live:  type 2 (frozen); last close from the live subscription. *)
            let snapshot_type = if is_paper then "4" else "2" in
            Logging.info_f
              ~section
@@ -680,7 +679,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
              ]
            >>= fun () ->
            (* Resolve contracts once; reuse for both snapshot and streaming.
-           Catch contract resolution failures gracefully — IB Gateway may
+           Catch contract resolution failures gracefully; IB Gateway may
            reject symbol lookups when the market data farm is disconnected.
            Return normally with Failed state instead of re-raising to avoid
            resetting backoff and circuit breaker. *)
@@ -702,10 +701,10 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                 (* Brief pause to let the gateway deliver snapshot ticks *)
                 Lwt_unix.sleep 2.0
                 >>= fun () ->
-                (* Phase 2: Streaming — ongoing market data.
-             Paper: type 4 (delayed-frozen) — 15-min delayed during hours,
+                (* Phase 2: Streaming; ongoing market data.
+             Paper: type 4 (delayed-frozen); 15-min delayed during hours,
                     last known quote when closed. Never touches live data.
-             Live:  type 1 (live) — real-time streaming. *)
+             Live:  type 1 (live); real-time streaming. *)
                 let stream_type = if is_paper then "4" else "1" in
                 Logging.info_f
                   ~section
@@ -729,13 +728,13 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                   ~section
                   "IBKR subscribed to %d symbols (snapshot + streaming)"
                   (List.length ibkr_symbols);
-                (* Contract resolution succeeded — NOW mark as Connected.
+                (* Contract resolution succeeded; NOW mark as Connected.
              This is the correct place: reconnect_attempts resets to 0,
              circuit breaker resets, and backoff is cleared. *)
                 set_state ibkr_conn_sup Connected;
                 update_circuit_breaker ibkr_conn_sup true;
                 Logging.info ~section "✓ IBKR Gateway fully connected";
-                (* Block forever — reader loop runs in background *)
+                (* Block forever; the reader loop runs in the background *)
                 let wait_p, _wait_u = Lwt.wait () in
                 wait_p)
              (fun exn ->
@@ -747,7 +746,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                 Ibkr.Module.connection := None;
                 if not (Ibkr.Market_hours.is_market_open ())
                 then (
-                  (* Market is closed — don't escalate the circuit breaker.
+                  (* Market is closed; don't escalate the circuit breaker.
                Schedule a deferred reconnect at the next market open. *)
                   let sleep_secs = Ibkr.Market_hours.seconds_until_next_open () in
                   Logging.info_f
@@ -765,7 +764,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                   let%lwt () = Lwt_unix.sleep sleep_secs in
                   Lwt.return_unit)
                 else (
-                  (* Market is open but contract resolution still failed — genuine error.
+                  (* Market is open but contract resolution still failed; this is a genuine error.
                Escalate via circuit breaker as before. *)
                   Logging.error_f
                     ~section
@@ -849,7 +848,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
   if not (executions_ready && hl_executions_ready)
   then Logging.warn ~section "Timeout waiting for executions data, continuing anyway..."
   else Logging.info ~section "✓ All executions feeds ready (kraken + hyperliquid)";
-  (* Balance readiness gate — run all exchanges in parallel since
+  (* Balance readiness gate; run all exchanges in parallel since
      subscriptions are already in-flight. Sequential waits would
      accumulate timeouts and delay Lighter by 10-20s unnecessarily. *)
   let%lwt balances_ready =
@@ -1011,7 +1010,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
            US equities Fixed plan: $0.005/share all-in is a conservative estimate.
            Express as fraction of trade value for Fee_cache compatibility. *)
              let maker = 0.0005 in
-             (* 0.05% — conservative estimate for ETFs *)
+             (* 0.05%, a conservative estimate for ETFs *)
              let taker = 0.0005 in
              Dio_strategies.Fee_cache.store_fees
                ~exchange:"ibkr"
@@ -1027,7 +1026,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                }
            | Lighter ->
              (* Lighter fees are embedded in orderBookDetails and already cached
-           in the instruments feed — no separate fee endpoint needed. *)
+           in the instruments feed; no separate fee endpoint is needed. *)
              let fees =
                Lighter.Instruments_feed.lookup_info asset.Dio_engine.Config.symbol
              in

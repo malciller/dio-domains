@@ -57,8 +57,8 @@ let signal ~symbol =
     waking every waiting worker, such as shutdown or snapshot completion. 
     Acquires per-symbol mutexes sequentially, guaranteeing no cross-symbol contention. *)
 let signal_all () =
-  (* Snapshot syncs without locking registry_mutex is fine since Hashtbl is
-     append-only for our usage but let's be safe. *)
+  (* The syncs Hashtbl is append-only in practice, so the snapshot could be
+     read without the lock; registry_mutex is held anyway for safety. *)
   Mutex.lock registry_mutex;
   let all_syncs = Hashtbl.fold (fun _ sync acc -> sync :: acc) syncs [] in
   Mutex.unlock registry_mutex;

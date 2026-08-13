@@ -33,5 +33,5 @@ module Module = Hyperliquid_module
 (** Shared type definitions for Hyperliquid domain objects. *)
 module Types = Hyperliquid_types
 
-(** Persistent state — delegated to engine-level module. *)
+(** Persistent state, delegated to the engine-level module. *)
 module State_persistence = Dio_persistence.State_persistence

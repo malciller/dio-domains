@@ -93,7 +93,7 @@ module SymbolExecStore = struct
     t.buffer.(idx) <- e;
     Atomic.set t.write_pos (Atomic.get t.write_pos + 1);
     Atomic.set t.initial_data_received true;
-    (* Update open order store *)
+    (* Update the open order store under the mutex. *)
     Mutex.lock t.mutex;
     (match e.order_status with
      | New | Pending | PartiallyFilled | Unknown _ ->
@@ -189,7 +189,7 @@ let get_or_create_store symbol =
 
 let active_conn : Websocket_lwt_unix.conn option ref = ref None
 
-(* ── Ping/pong liveness tracking ────────────────────────────────────────────
+(* Ping/pong liveness tracking.
    The supervisor monitor loop calls [send_ping] on a 15s cadence and expects
    a [bool]; a Pong frame arriving in the read loop broadcasts [pong_condition]
    and stamps [last_pong_time] so the waiter can resolve. [last_pong_time] also
@@ -511,7 +511,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        >>= fun conn ->
        active_conn := Some conn;
        Logging.debug_f ~section "Connected to Alpaca Trading WS at %s" url_str;
-       (* Authenticate *)
+       (* Send the WebSocket authentication request. *)
        let auth_msg =
          `Assoc
            [ "action", `String "authenticate"
@@ -526,7 +526,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Logging.debug ~section "Sending Alpaca Trading WS authentication...";
        Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ())
        >>= fun () ->
-       (* Listen on trade_updates *)
+       (* Request the trade_updates stream from the server. *)
        let listen_msg =
          `Assoc
            [ "action", `String "listen"

@@ -23,7 +23,7 @@ module Kraken_impl = struct
       Populated once at startup by [initialize_fees]. *)
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 
-  (** Map unified [Types.order_type] to the Kraken API string representation. *)
+  (** Maps a unified [Types.order_type] to the Kraken API string representation. *)
   let string_of_order_type = function
     | Types.Limit -> "limit"
     | Types.Market -> "market"
@@ -35,20 +35,20 @@ module Kraken_impl = struct
     | Types.Other s -> s
   ;;
 
-  (** Map unified [Types.side] to Kraken API side string. *)
+  (** Maps a unified [Types.side] to a Kraken API side string. *)
   let string_of_side = function
     | Types.Buy -> "buy"
     | Types.Sell -> "sell"
   ;;
 
-  (** Map unified [Types.time_in_force] to Kraken API TIF string. *)
+  (** Maps a unified [Types.time_in_force] to a Kraken API TIF string. *)
   let string_of_time_in_force = function
     | Types.GTC -> "GTC"
     | Types.IOC -> "IOC"
     | Types.FOK -> "FOK"
   ;;
 
-  (** Convert Kraken execution feed order status to unified [Types] status. *)
+  (** Converts a Kraken execution feed order status to the unified [Types] status. *)
   let status_of_kraken_status = function
     | Kraken_executions_feed.PendingNewStatus -> Types.Pending
     | Kraken_executions_feed.NewStatus -> Types.New
@@ -60,13 +60,13 @@ module Kraken_impl = struct
     | Kraken_executions_feed.UnknownStatus s -> Types.Unknown s
   ;;
 
-  (** Convert Kraken execution feed side to unified [Types.side]. *)
+  (** Converts a Kraken execution feed side to the unified [Types.side]. *)
   let side_of_kraken_side = function
     | Kraken_executions_feed.Buy -> Types.Buy
     | Kraken_executions_feed.Sell -> Types.Sell
   ;;
 
-  (** Convert optional unified retry config to [Kraken_actions.retry_config]. *)
+  (** Converts an optional unified retry config to [Kraken_actions.retry_config]. *)
   let convert_retry_config (config : Types.retry_config option) =
     match config with
     | Some c ->
@@ -79,8 +79,8 @@ module Kraken_impl = struct
     | None -> None
   ;;
 
-  (** Submit a new order via [Kraken_actions.place_order].
-      Converts unified types to Kraken API strings, delegates the REST/WS call,
+  (** Submits a new order via [Kraken_actions.place_order].
+      Converts unified types to Kraken API strings, delegates the call,
       and maps the response back to [Types.place_order_result]. *)
   let place_order
         ~token
@@ -240,10 +240,12 @@ module Kraken_impl = struct
 
   (* -- Market data accessors ------------------------------------------- *)
 
-  (** Return best bid/ask as [(bid_price, bid_size, ask_price, ask_size)] floats.
-      Directly consumes float values provided by [Kraken_orderbook_feed.get_best_bid_ask]. *)
+  (** Subscribe to the orderbook feed for the given symbols.
+      Delegates to [Kraken_orderbook_feed.subscribe_symbols]. *)
   let subscribe_orderbook ~symbols = Kraken_orderbook_feed.subscribe_symbols symbols
 
+  (** Returns the best bid/ask as [(bid_price, bid_size, ask_price, ask_size)] floats.
+      Directly consumes float values provided by [Kraken_orderbook_feed.get_best_bid_ask]. *)
   let get_top_of_book ~symbol =
     match Kraken_orderbook_feed.get_best_bid_ask symbol with
     | Some (bp, bs, ap, as_val) -> Some (bp, bs, ap, as_val)
@@ -252,7 +254,7 @@ module Kraken_impl = struct
 
   let get_top_of_book_fast ~symbol = Kraken_orderbook_feed.get_best_bid_ask_fast symbol
 
-  (** Return the current tradeable balance for [asset] from the balances feed cache. *)
+  (** Returns the current tradeable balance for [asset] from the balances feed cache. *)
   let get_tradeable_balance ~asset = Kraken_balances_feed.get_balance asset
 
   let get_tradeable_balance_fast ~asset =
@@ -271,7 +273,7 @@ module Kraken_impl = struct
 
   let get_total_balance ~asset = Kraken_balances_feed.get_total_balance asset
 
-  (** Return all assets with a positive balance as [(asset, balance)] pairs. *)
+  (** Returns all assets with a positive balance as [(asset, balance)] pairs. *)
   let get_all_balances () =
     let assets = Kraken_balances_feed.get_all_assets () in
     List.filter_map
@@ -281,7 +283,7 @@ module Kraken_impl = struct
       assets
   ;;
 
-  (** Look up a single open order by symbol and order_id in the executions
+  (** Looks up a single open order by symbol and order_id in the executions
       feed cache. Returns a unified [Types.open_order option]. *)
   let get_open_order ~symbol ~order_id =
     match Kraken_executions_feed.get_open_order symbol order_id with
@@ -301,7 +303,7 @@ module Kraken_impl = struct
     | None -> None
   ;;
 
-  (** Return all open orders for [symbol] from the executions feed cache,
+  (** Returns all open orders for [symbol] from the executions feed cache,
       mapped to unified [Types.open_order] records. *)
   let get_open_orders ~symbol =
     let orders = Kraken_executions_feed.get_open_orders symbol in
@@ -328,7 +330,7 @@ module Kraken_impl = struct
     List.concat_map (fun symbol -> get_open_orders ~symbol) matching
   ;;
 
-  (** Return the current ring-buffer position for execution events on [symbol]. *)
+  (** Returns the current ring-buffer position for execution events on [symbol]. *)
   let get_execution_feed_position ~symbol =
     Kraken_executions_feed.get_current_position symbol
   ;;
@@ -337,7 +339,7 @@ module Kraken_impl = struct
     Kraken_executions_feed.get_current_position_fast symbol
   ;;
 
-  (** Return [true] once the initial execution snapshot has been ingested for [symbol]. *)
+  (** Returns [true] once the initial execution snapshot has been ingested for [symbol]. *)
   let has_execution_data ~symbol = Kraken_executions_feed.has_execution_data symbol
 
   let has_execution_data_fast ~symbol =
@@ -400,7 +402,7 @@ module Kraken_impl = struct
            })
   ;;
 
-  (** Return the current ring-buffer position for orderbook events on [symbol]. *)
+  (** Returns the current ring-buffer position for orderbook events on [symbol]. *)
   let get_orderbook_position ~symbol = Kraken_orderbook_feed.get_current_position symbol
 
   let get_orderbook_position_fast ~symbol =
@@ -501,16 +503,16 @@ module Kraken_impl = struct
 
   (* -- Instrument metadata accessors ----------------------------------- *)
 
-  (** Return the minimum price tick size for [symbol], or [None] if unknown. *)
+  (** Returns the minimum price tick size for [symbol], or [None] if unknown. *)
   let get_price_increment ~symbol = Kraken_instruments_feed.get_price_increment symbol
 
-  (** Return the minimum quantity step for [symbol], or [None] if unknown. *)
+  (** Returns the minimum quantity step for [symbol], or [None] if unknown. *)
   let get_qty_increment ~symbol = Kraken_instruments_feed.get_qty_increment symbol
 
-  (** Return the minimum order quantity for [symbol], or [None] if unknown. *)
+  (** Returns the minimum order quantity for [symbol], or [None] if unknown. *)
   let get_qty_min ~symbol = Kraken_instruments_feed.get_qty_min symbol
 
-  (** Round [price] to the nearest valid tick for [symbol].
+  (** Rounds [price] to the nearest valid tick for [symbol].
       Falls back to the original value if no price increment is known. *)
   let round_price ~symbol ~price =
     match Kraken_instruments_feed.get_price_increment symbol with
@@ -518,14 +520,14 @@ module Kraken_impl = struct
     | None -> price
   ;;
 
-  (** Return [(maker_fee option, taker_fee option)] from the local fee cache. *)
+  (** Returns [(maker_fee option, taker_fee option)] from the local fee cache. *)
   let get_fees ~symbol =
     match Hashtbl.find_opt fee_cache symbol with
     | Some f -> Some (fst f), Some (snd f)
     | None -> None, None
   ;;
 
-  (** Fetch fee schedules for [symbols] via [Kraken_get_fee] and populate
+  (** Fetches fee schedules for [symbols] via [Kraken_get_fee] and populates
       [fee_cache]. Intended to be called once at application startup. *)
   let initialize_fees symbols =
     Lwt_list.iter_p

@@ -2,7 +2,7 @@
   Fee Cache
 
   TTL-based in-memory cache for maker and taker fees, keyed by
-  (exchange, symbol). Uses lock-free Atomics for read paths to eliminate 
+  (exchange, symbol). Uses lock-free Atomics for read paths to eliminate
   hotpath contention across strategy domains.
 *)
 
@@ -43,6 +43,8 @@ let is_valid entry =
   now -. entry.timestamp < entry.ttl_seconds
 ;;
 
+(** Removes entries whose TTL has expired from [map] and returns the
+    filtered map. *)
 let evict_expired map =
   let now = Unix.time () in
   StringMap.filter (fun _ entry -> now -. entry.timestamp < entry.ttl_seconds) map

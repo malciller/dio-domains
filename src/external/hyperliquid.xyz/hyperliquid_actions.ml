@@ -29,8 +29,6 @@ let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force opt
   | _ -> Limit { tif }
 ;;
 
-(* Default fallback for unmatched order types *)
-
 (** Formats a float as a fixed-point string with at most 8 decimal places.
     Strips trailing zeros and the decimal point if unnecessary.
     Hyperliquid requires normalized numeric strings without trailing zeros. *)
@@ -100,8 +98,8 @@ type amend_order_result =
   ; order_id : int64
   }
 
-(** Cached credentials (M9): environment reads are hoisted to a lazy cache —
-    env vars are static for the process lifetime, so per-order [getenv_opt]
+(** Cached credentials (M9): environment reads are hoisted to a lazy cache.
+    Env vars are static for the process lifetime, so per-order [getenv_opt]
     calls are pure overhead. Lazy so modules can load (and tests can run)
     without the env vars set; the first real order resolves them. *)
 let cached_credentials : (string * string) Lazy.t =
@@ -187,7 +185,7 @@ let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
     Delegates to centralized [Error_handling.string_contains]. *)
 let string_contains = Error_handling.string_contains
 
-(** Retry configuration — re-exported from centralized [Error_handling]. *)
+(** Retry configuration, re-exported from centralized [Error_handling]. *)
 type retry_config = Error_handling.retry_config =
   { max_attempts : int
   ; base_delay_ms : float

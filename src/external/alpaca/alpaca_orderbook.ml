@@ -21,10 +21,11 @@ type trade =
   }
 
 module SymbolStore = struct
-  (* Single-writer atomic TOB cache (H2): the WS writer publishes a fresh
-     immutable record on every push; readers do one [Atomic.get] — no mutex.
-     Position + best-bid/ask + update-ts travel together so a reader can never
-     observe a torn (mixed-generation) snapshot. *)
+  (** Single-writer atomic TOB cache (H2): the WS writer publishes a fresh
+      immutable record on every push, and readers do a single [Atomic.get]
+      with no mutex. Position, best-bid/ask, and update-timestamp travel
+      together so a reader can never observe a torn (mixed-generation)
+      snapshot. *)
   type tob_cache =
     { pos : int
     ; bid_px : float
@@ -44,9 +45,9 @@ module SymbolStore = struct
     ; mutable write_pos : int
     ; mutable trades_write_pos : int
     ; tob : tob_cache Atomic.t
-      (* Serializes full ring-buffer reads only (read_events / iter_events /
-       get_recent_trades). The hot-path TOB/position reads are lock-free via
-       [tob]. *)
+      (** Serializes full ring-buffer reads only (read_events / iter_events /
+          get_recent_trades). The hot-path TOB/position reads are lock-free
+          via [tob]. *)
     ; mutex : Mutex.t
     }
 
@@ -203,7 +204,7 @@ let get_or_create_store symbol =
 let active_subscriptions : string list ref = ref []
 let active_conn : Websocket_lwt_unix.conn option ref = ref None
 
-(* ── Ping/pong liveness tracking ────────────────────────────────────────────
+(* Ping/pong liveness tracking.
    The supervisor monitor loop calls [send_ping] on a 15s cadence and expects
    a [bool]; a Pong frame arriving in the read loop broadcasts [pong_condition]
    and stamps [last_pong_time] so the waiter can resolve. [last_pong_time] also
@@ -570,7 +571,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        >>= fun conn ->
        active_conn := Some conn;
        Logging.debug_f ~section "Connected to Alpaca Market Data WS at %s" url_str;
-       (* Authenticate *)
+       (* Send the WebSocket authentication request. *)
        let auth_msg =
          `Assoc
            [ "action", `String "auth"
@@ -583,7 +584,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ())
        >>= fun () ->
        on_connected ();
-       (* Send pending subscriptions *)
+       (* Send any subscriptions requested before the connection was established. *)
        send_subscription !active_subscriptions
        >>= fun () ->
        let rec read_loop () =

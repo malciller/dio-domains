@@ -3,14 +3,15 @@
     Lock-free reads (HFT_AUDIT.md H2): the background refresher fiber is the
     single writer. It builds a fresh immutable balance table and publishes it
     with one [Atomic.set]; readers grab the reference with [Atomic.get] and
-    look up — no mutex on any read path. *)
+    look up without ever taking a mutex on the read path. *)
 
 open Lwt.Infix
 
 let section = "alpaca_balances"
 
-(* Published balance snapshots. Never mutated in place after publication. *)
+(** Published balance snapshots. Never mutated in place after publication. *)
 let balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+
 let total_balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 let initial_data_received = Atomic.make false
 let last_update = Atomic.make 0.0 (* wall clock of the last successful poll *)

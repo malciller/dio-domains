@@ -5,7 +5,7 @@
       HH:MM:SS.mmm LVL  SECTION         message
       19:17:23.672 INFO oracle_runtime  [2/8] hyperliquid/BTC/USDC ACTIVE ...
       19:17:23.672 INFO oracle_runtime        funding: drop 67.4% to floor ...
-    - Compact time-only timestamp (gray) — the date is available from
+    - Compact time-only timestamp (gray); the date is available from
       `docker logs --timestamps`; dropping it keeps the interesting content
       close to the left margin.
     - Level column is a fixed 5 chars, colored by severity.
@@ -25,7 +25,7 @@
     - The single background drain thread owns every write + flush, at ~50ms
       cadence (DEBUG/INFO) or ~1ms while a WARN/ERROR requests prompt flush.
     - A single log line costs roughly a microsecond and a handful of
-      allocations on the caller (timestamp, colored line, queue push) —
+      allocations on the caller (timestamp, colored line, queue push),
       independent of how many lines are already buffered. *)
 
 type level =
@@ -187,7 +187,7 @@ let will_log level section_name =
   && level_to_int level >= level_to_int !global_min_level
 ;;
 
-(* Formats the current wall-clock time as "HH:MM:SS.mmm" (time only — the date
+(* Formats the current wall-clock time as "HH:MM:SS.mmm" (time only; the date
    is redundant when live-tailing and is available from `docker logs
    --timestamps`). Caches the time prefix per second using Atomic for
    lock-free thread safety. *)
@@ -214,7 +214,7 @@ let format_timestamp () =
 
 (* ---- Column alignment ----
    The level column is a fixed width (5) and the section column is a fixed
-   width (20 — enough for every section that logs in practice, including
+   width (20, enough for every section that logs in practice, including
    dashboard_server / domain_supervisor / discord_notifier / hyperliquid_startup).
    Both are fixed so the message column NEVER shifts mid-stream: every message
    starts at the same column in every line, which is what makes the log
@@ -246,7 +246,7 @@ let reindent_continuations prefix_len message =
         (head :: List.map (fun line -> if line = "" then "" else pad ^ line) rest))
 ;;
 
-(* Render one log line. Pure: no I/O, no queue — callers (or tests) can use
+(* Render one log line. Pure: no I/O, no queue; callers (or tests) can use
    it directly. *)
 let format_line level section_name message =
   let timestamp = format_timestamp () in
@@ -276,13 +276,13 @@ let format_line level section_name message =
    Cost: ~50ns (mutex + Queue.push). Zero I/O, zero output_mutex contention.
 
    Background drain thread: takes all queued messages, writes each with
-   per-message flush to output_channel. The drain thread owns every flush —
+   per-message flush to output_channel. The drain thread owns every flush;
    no caller ever does I/O. The thread idles on a 50ms cadence but drops to
    ~1ms cadence while a WARN/ERROR has requested a prompt flush, so urgent
    lines still appear within ~ms without blocking the calling domain.
 
    CRITICAL: drains the async queue first (preserving order), then writes
-   synchronously with flush — the one emergency path allowed to block. *)
+   synchronously with flush; this is the one emergency path allowed to block. *)
 
 let async_queue : string Queue.t = Queue.create ()
 let async_mutex = Mutex.create ()
@@ -313,7 +313,7 @@ let drain_async_queue () =
   then Mutex.unlock async_mutex
   else (
     (* Transfer pending messages out of the async queue in O(1).
-       This minimizes async_mutex hold time — producers can push
+       This minimizes async_mutex hold time; producers can push
        immediately after we unlock. *)
     let batch = Queue.create () in
     Queue.transfer async_queue batch;
@@ -361,7 +361,7 @@ let start_async_drain () =
 ;;
 
 (* Core logging function. Domain-safe. All levels except CRITICAL are pushed
-   to the async queue — no synchronous I/O, no draining of the whole queue on
+   to the async queue; no synchronous I/O, no draining of the whole queue on
    the caller. CRITICAL is the single emergency path that drains the queue and
    writes + flushes synchronously for immediate visibility. *)
 let log_sync level section_name message =

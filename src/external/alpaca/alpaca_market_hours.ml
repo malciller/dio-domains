@@ -1,7 +1,7 @@
 (** Provides US equity market hours evaluation logic for the Alpaca connection manager and order router.
 
     This module evaluates whether US equity markets are currently operating within the
-    extended trading session (4:00 AM – 8:00 PM ET) or regular session (9:30 AM – 4:00 PM ET).
+    extended trading session (4:00 AM - 8:00 PM ET) or regular session (9:30 AM - 4:00 PM ET).
     It is used to handle after-hours order placement flags and market data management. *)
 
 let section = "alpaca_market_hours"
@@ -27,7 +27,7 @@ let us_eastern_offset_hours () =
   in
   let march_1_tm = Unix.gmtime march_1 in
   let march_1_wday = march_1_tm.Unix.tm_wday in
-  (* 0=Sun *)
+  (* tm_wday values start at 0 for Sunday. *)
   let first_sun = if march_1_wday = 0 then 1 else 8 - march_1_wday in
   let second_sun = first_sun + 7 in
   let dst_start =
@@ -94,7 +94,7 @@ let extended_close_min = 0
 
 (** Evaluates whether the current system time falls within Regular Trading Hours (9:30 AM - 4:00 PM ET).
     Cached with a 1s TTL (M4): the full evaluation does multiple gmtime/mktime DST
-    calculations (~10–100µs); the WS feed handler calls this on every trade
+    calculations (~10-100µs); the WS feed handler calls this on every trade
     message, so the cache keeps it off the per-tick path while still tracking
     the session boundary. *)
 let regular_open_cache : (float * bool) Atomic.t = Atomic.make (0.0, false)
@@ -181,7 +181,7 @@ let seconds_until_next_open () =
     Float.max delta 1.0)
 ;;
 
-(** Human readable representation of current Alpaca US equity market session status. *)
+(** Human-readable representation of the current Alpaca US equity market session status. *)
 let market_status_string () =
   let _wday, hour, min = current_eastern_time () in
   if not (is_market_open ())

@@ -196,7 +196,6 @@ let subscribe_public_orderbook ~symbols =
 (** Issues subscription commands routed appropriately between the public and private dual WebSocket connections.
     Caches the provided subscription parameters in module level references to facilitate autonomous channel restoral by the isolated reconnection loops without requiring supervisor coordination. *)
 let subscribe_to_feeds ~symbols ~account_index ~auth_token =
-  (* Cache subscription parameters internally for autonomous reconnection handlers *)
   subscribed_symbols := symbols;
   subscribed_account_index := account_index;
   subscribed_auth_token := auth_token;
@@ -260,7 +259,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
     Concurrency.Tick_event_bus.publish_tick ();
     on_heartbeat ();
     (* Feed cadence: gap since the previous market-data frame (public
-       connection only — the private stream carries account/order data). *)
+       connection only; the private stream carries account/order data). *)
     if state != private_state
     then (
       let now = Unix.gettimeofday () in

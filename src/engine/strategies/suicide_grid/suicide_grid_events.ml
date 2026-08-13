@@ -942,7 +942,7 @@ let cleanup_pending_cancellation _asset_symbol _order_id = ()
 (* H3: drain lifecycle events queued by the supervisor REST path and dispatch
    them to the handlers. Runs on the domain thread at the top of every cycle,
    so every handler invocation (REST- or WS-sourced) executes on the domain
-   thread — the strategy mutex is never shared across threads. *)
+   thread, so the strategy mutex is never shared across threads. *)
 let dispatch_event symbol (ev : lifecycle_event) =
   match ev with
   | Ack { now; order_id; side; price } ->

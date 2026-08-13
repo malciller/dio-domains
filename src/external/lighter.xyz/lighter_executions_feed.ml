@@ -75,15 +75,10 @@ let initialization_mutex = Mutex.create ()
     and chronological eviction policies. Operations modifying this index
     must acquire the initialization lock. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 64
-(** Chronological tracking structure enforcing first-in-first-out eviction
-    policies for the order-to-symbol global index. *)
 
 (** Chronological tracking structure enforcing first-in-first-out eviction
     policies for the order-to-symbol global index. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-(** Threshold capacity variable governing the maximum index size. Initially
-    uncapped to allow complete ingestion of startup payloads, subsequently
-    constrained based on observed baseline system volume. *)
 
 (** Threshold capacity variable governing the maximum index size. Initially
     uncapped to allow complete ingestion of startup payloads, subsequently
@@ -95,10 +90,6 @@ let order_to_symbol_startup_done = Atomic.make false
 (** Synchronization primitive indicating successful completion of the
     initial active orders ingestion sequence. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
-(** Freezes the adaptive capacity threshold following the completion of
-    the initial execution snapshot. Computes a localized limit based on
-    startup volume to constrain index memory allocation. Re-invocation
-    is safely ignored. *)
 
 (** Freezes the adaptive capacity threshold following the completion of
     the initial execution snapshot. Computes a localized limit based on

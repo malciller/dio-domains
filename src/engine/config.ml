@@ -345,7 +345,6 @@ let parse_config json =
               symbol)
          bad;
        exit 1));
-  (* testnet is valid for hyperliquid, ibkr, lighter, and alpaca *)
   (match exch_id with
    | Hyperliquid | Ibkr | Lighter | Alpaca -> ()
    | Kraken | Custom _ ->
@@ -580,9 +579,7 @@ let read_config () : config =
   try
     let json = Yojson.Basic.from_file "config.json" in
     let open Yojson.Basic.Util in
-    (* Reject unknown top-level keys. *)
     if validate_keys ~context:"top-level" ~allowed:known_top_level_keys json then exit 1;
-    (* Reject unknown keys in the optional "engine" sub-object. *)
     (match json |> member "engine" with
      | `Null -> ()
      | engine_json ->

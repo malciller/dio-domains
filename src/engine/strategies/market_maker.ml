@@ -149,8 +149,6 @@ let round_price price symbol exchange =
     Float.round price
 ;;
 
-(** Fallback: 0 decimal places *)
-
 (** Rounds [qty] down to the instrument lot size, clamped to [max_qty]. *)
 let round_qty qty symbol exchange ~max_qty =
   (* Floor to qty_increment; prevents exceeding available balance *)
@@ -347,8 +345,6 @@ let push_order ~state ?(now = Unix.time ()) order =
       | Some () ->
         Strategy_common.OrderSignal.broadcast ();
         Strategy_common.Order_actions.incr order.symbol;
-        (* Update per-symbol strategy state *)
-
         (* Set inflight flags for Place operations *)
         (match order.operation, order.side with
          | Place, Buy -> state.inflight_buy <- true
@@ -611,8 +607,6 @@ let execute_strategy
      safety, which is correct and sufficient. *)
     match current_price, top_of_book with
     | Some _, Some (bid, _bid_size, ask, _ask_size) ->
-      (* Log raw bid/ask for diagnostics *)
-
       (* Parse config values *)
       let qty = parse_config_float asset.qty "qty" 0.001 asset.exchange asset.symbol in
       let min_usd_balance_opt =
@@ -975,8 +969,6 @@ let execute_strategy
                 "Profitability guard failed for %s (fee=%.6f)"
                 asset.symbol
                 fee);
-          (* inflight_buy guard *)
-
           (* Defer further action to next event trigger *)
           state.last_cycle <- cycle)
         else (
@@ -1094,10 +1086,8 @@ let execute_strategy
     | _ -> state.last_cycle <- cycle)
 ;;
 
-(* capital_low guard *)
-
-(* Duplicate key generator for InFlightOrders. Key format must match
-   create_place_order and push_order usage. *)
+(** Duplicate key generator for InFlightOrders. The key format must match
+    the usage in [create_place_order] and [push_order]. *)
 let generate_side_duplicate_key asset_symbol side =
   Printf.sprintf "%s|%s|mm" asset_symbol (string_of_order_side side)
 ;;
@@ -1190,7 +1180,7 @@ let handle_order_failed ~now:_ asset_symbol side reason =
        in
        (* Set balance flags on insufficient funds.
        capital_low (buy) and asset_low (sell) halt further placement
-       until balance recovers. Recovery is event-driven, no timers.. *)
+       until balance recovers. Recovery is event-driven, no timers. *)
        (match side with
         | Buy when is_insufficient_balance ->
           if not state.capital_low
@@ -1266,8 +1256,8 @@ let handle_order_rejected ~now:_ asset_symbol side price =
 
 (* Buy rejections leave no active order; strategy re-evaluates on the next cycle *)
 
-(** Handles a full order fill. Clears all tracking (pending amends, sell orders,
-    buy order state) and releases in-flight guards. *)
+(** Returns true if [tracked] equals [order_id] or, when present, the
+    exchange-level client order id [cl_ord_id]. *)
 let order_or_client_matches tracked order_id cl_ord_id =
   tracked = order_id
   ||
@@ -1276,6 +1266,8 @@ let order_or_client_matches tracked order_id cl_ord_id =
   | None -> false
 ;;
 
+(** Handles a full order fill. Clears all tracking (pending amends, sell
+    orders, buy order state) and releases in-flight guards. *)
 let handle_order_filled
       ~now:_
       asset_symbol

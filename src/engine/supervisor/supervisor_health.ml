@@ -10,7 +10,8 @@ let section = "supervisor"
 
 (** Tick-driven health monitor. Subscribes to the tick event bus and checks
     all registered connections at most once per second. Implements:
-    - Linear backoff reconnection for Failed connections (2s..30s)
+    - Exponential backoff reconnection for Failed connections (0s..30s,
+       up to 300s for IBKR and Lighter)
     - Stale disconnect detection (60s idle in Disconnected state)
     - Stuck-connecting timeout (120s)
     - Active ping/pong liveness for authenticated WebSockets
@@ -56,7 +57,7 @@ let monitor_loop () =
                        handler will pick it up.  A forced restart here would
                        spawn a duplicate connect_fn, causing two concurrent TCP
                        connections to race against the gateway on the same
-                       clientId — resulting in interleaved End_of_file errors. *)
+                       clientId, resulting in interleaved End_of_file errors. *)
                 Logging.info_f
                   ~section
                   "Market status transitioned: %s. IBKR gateway is %s; existing \
@@ -101,7 +102,7 @@ let monitor_loop () =
                  if current_state <> Connecting
                  then
                    (* IBKR market hours gate: skip reconnection attempts
-                           outside US equity extended hours (4 AM – 8 PM ET).
+                           outside US equity extended hours (4 AM - 8 PM ET).
                            The connect_fn itself will sleep until the next
                            open window, so there's nothing for the monitor to do. *)
                    if
@@ -110,7 +111,7 @@ let monitor_loop () =
                      || ((String.equal conn.name "alpaca_data_ws"
                           || String.equal conn.name "alpaca_trading_ws")
                          && not (Alpaca.Market_hours.is_market_open ()))
-                   then () (* Market closed — suppress reconnection *)
+                   then () (* Market closed; suppress reconnection *)
                    else (
                      (* Exponential backoff: 0s, 2s, 4s, 8s, ... capped at 30s (300s for IBKR and Lighter) *)
                      let max_delay =
@@ -181,7 +182,7 @@ let monitor_loop () =
                    then (
                      set_state conn Disconnected;
                      (* IBKR market hours gate: don't restart against a
-                             closed gateway — let the monitor's Failed handler
+                             closed gateway; let the monitor's Failed handler
                              defer reconnection to the next market open. *)
                      if
                        (String.equal conn.name "ibkr_gateway"
