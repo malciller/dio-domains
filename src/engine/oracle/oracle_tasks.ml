@@ -1,7 +1,16 @@
 (* Oracle_tasks - resolve a CLI SYMBOL / --exchange into the list of analysis
    tasks to run: a single task for an explicit symbol, or one task per
    config.json "trading" entry when no symbol is given. Also maps an exchange
-   name to its calendar kind. Pure, so it is unit-testable without network. *)
+   name to its calendar kind. Pure, so it is unit-testable without network.
+
+   Venue recognition is REGISTRY-FIRST: an exchange participates in oracle
+   modeling by registering its [Exchange_intf.Oracle.S] adapter (see
+   Oracle_fetch / Oracle_venues). The static fallback below keeps the three
+   built-in venues recognizable in pure/offline/test contexts where the
+   venue libraries are not linked (and thus not registered); it is never the
+   authoritative source in a running binary. *)
+
+module Exchange = Dio_exchange.Exchange_intf
 
 type task =
   { symbol : string
@@ -30,18 +39,38 @@ let default_trading_config (exchange : string) (symbol : string)
   }
 ;;
 
-let calendar_kind_of_exchange = function
-  | "kraken" -> Oracle_types.Crypto
-  | "hyperliquid" -> Oracle_types.Crypto
-  | "alpaca" -> Oracle_types.Equity
-  | exchange ->
-    Printf.eprintf "oracle: unknown exchange '%s'; assuming crypto calendar\n" exchange;
-    Oracle_types.Crypto
-;;
-
-let known_exchange = function
+(* Static fallback for the built-in venues (see the module doc). *)
+let static_known_exchange = function
   | "kraken" | "hyperliquid" | "alpaca" -> true
   | _ -> false
+;;
+
+let static_calendar_kind = function
+  | "kraken" | "hyperliquid" -> Oracle_types.Crypto
+  | "alpaca" -> Oracle_types.Equity
+  | _ -> Oracle_types.Crypto
+;;
+
+(** A venue is known (produces oracle tasks) when its oracle adapter is
+    registered, or it is one of the built-in venues (static fallback). *)
+let known_exchange exchange =
+  match Exchange.Oracle.Registry.get exchange with
+  | Some _ -> true
+  | None -> static_known_exchange exchange
+;;
+
+(** Calendar kind of an exchange: the registered adapter's [calendar_kind]
+    when available, else the static fallback (unknown exchanges warn and
+    default to crypto). *)
+let calendar_kind_of_exchange exchange =
+  match Exchange.Oracle.Registry.get exchange with
+  | Some (module V) -> V.calendar_kind
+  | None ->
+    if static_known_exchange exchange
+    then static_calendar_kind exchange
+    else (
+      Printf.eprintf "oracle: unknown exchange '%s'; assuming crypto calendar\n" exchange;
+      Oracle_types.Crypto)
 ;;
 
 (** Resolve the tasks for this run. When [symbol] is empty (all-assets mode)

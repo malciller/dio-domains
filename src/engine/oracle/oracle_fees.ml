@@ -2,19 +2,26 @@
    them per asset, mirroring the live supervisor's fee enrichment.
 
    The grid path replay and inverse sizing depend on the maker fee. Instead of
-   a hardcoded flat rate, the CLI resolves each asset's fee from its exchange
-   (Kraken TradeVolume for the exact account tier, Hyperliquid /info userFees,
-   Alpaca is commission-free). Fees are cached per (exchange, symbol) for the
-   process lifetime and also stored in the shared Dio_strategies.Fee_cache, so
-   a fee fetched here is held per asset like the supervisor does.
+   a hardcoded flat rate, each asset's fee is resolved from its venue's oracle
+   adapter ([Exchange_intf.Oracle.S.fetch_fees], dispatched through
+   [Exchange_intf.Oracle.Registry]) - a new venue is plug-and-play here too.
+   Fees are cached per (exchange, symbol) for the process lifetime and also
+   stored in the shared Dio_strategies.Fee_cache, so a fee fetched here is
+   held per asset like the supervisor does. [default_fees] is the venue's own
+   offline / failed-fetch fallback.
 
    A maker fee explicitly set in config.json ("maker_fee") or passed via
    --fee always wins; fetching only happens when neither is present. *)
 
 open Lwt.Infix
+module Exchange = Dio_exchange.Exchange_intf
 
 let section = "oracle_fees"
 
+(* Last-resort static defaults, used ONLY when no oracle adapter is
+   registered for the venue (pure/offline/test contexts where the venue
+   libraries are not linked). Registered venues use their own
+   [Exchange_intf.Oracle.S.default_fees] instead. *)
 let fallback_maker_fee = function
   | "kraken" -> 0.0016
   | "hyperliquid" -> 0.0002
@@ -32,43 +39,22 @@ let fallback_taker_fee = function
 (** Per-process cache of resolved (maker, taker) fees per (exchange, symbol). *)
 let fee_cache : (string * string, float * float) Hashtbl.t = Hashtbl.create 16
 
-(** Fetch (maker, taker) from the real exchange for one asset. *)
+(** Venue default (maker, taker) for [exchange]/[symbol]: the registered
+    adapter's [default_fees] when available, else the static fallback. *)
+let venue_default_fees (exchange : string) (symbol : string) : float * float =
+  match Exchange.Oracle.Registry.get (String.lowercase_ascii exchange) with
+  | Some (module V) -> V.default_fees ~symbol
+  | None -> fallback_maker_fee exchange, fallback_taker_fee exchange
+;;
+
+(** Fetch (maker, taker) from the real exchange for one asset, through the
+    venue's oracle adapter. *)
 let fetch_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
   : (float * float) Lwt.t
   =
-  match exchange with
-  | "kraken" ->
-    Kraken.Kraken_get_fee.get_fee_info symbol
-    >|= fun info ->
-    (match info with
-     | Some f ->
-       ( Option.value
-           f.Kraken.Kraken_get_fee.maker_fee
-           ~default:(fallback_maker_fee exchange)
-       , Option.value
-           f.Kraken.Kraken_get_fee.taker_fee
-           ~default:(fallback_taker_fee exchange) )
-     | None -> fallback_maker_fee exchange, fallback_taker_fee exchange)
-  | "hyperliquid" ->
-    Hyperliquid.Get_fee.get_fee_info ~testnet ()
-    >|= fun info ->
-    let is_spot = String.contains symbol '/' in
-    (match info with
-     | Some f ->
-       let maker =
-         if is_spot
-         then Option.value f.Hyperliquid.Get_fee.spot_maker_fee ~default:0.0
-         else Option.value f.Hyperliquid.Get_fee.maker_fee ~default:0.0002
-       in
-       let taker =
-         if is_spot
-         then Option.value f.Hyperliquid.Get_fee.spot_taker_fee ~default:0.001
-         else Option.value f.Hyperliquid.Get_fee.taker_fee ~default:0.0005
-       in
-       maker, taker
-     | None -> (if is_spot then 0.0 else 0.0002), if is_spot then 0.001 else 0.0005)
-  | "alpaca" -> Lwt.return (0.0, 0.0)
-  | exchange ->
+  match Exchange.Oracle.Registry.get (String.lowercase_ascii exchange) with
+  | Some (module V) -> V.fetch_fees ~testnet ~symbol
+  | None ->
     Logging.warn_f
       ~section
       "no live fee endpoint for exchange '%s'; using venue default maker %.4f%%"
@@ -85,7 +71,8 @@ let load_dotenv () =
 ;;
 
 (** Resolve (maker, taker) for an asset, cached per (exchange, symbol). Falls
-    back to venue defaults when the exchange fee endpoint is unreachable. *)
+    back to the venue's [default_fees] when the exchange fee endpoint is
+    unreachable. *)
 let resolved_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
   : (float * float) Lwt.t
   =
@@ -102,8 +89,8 @@ let resolved_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
            exchange
            symbol
            (Printexc.to_string exn)
-           (fallback_maker_fee exchange *. 100.0);
-         Lwt.return (fallback_maker_fee exchange, fallback_taker_fee exchange))
+           (fst (venue_default_fees exchange symbol) *. 100.0);
+         Lwt.return (venue_default_fees exchange symbol))
     >|= fun fees ->
     Hashtbl.replace fee_cache (exchange, symbol) fees;
     fees
@@ -112,7 +99,7 @@ let resolved_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
 (** Enrich a trading_config with the real exchange maker/taker fee, holding the
     result per asset on the config itself and in the shared Fee_cache. Honors an
     explicit config.json "maker_fee"/"taker_fee". In offline mode no network is
-    used and the venue default is applied with a warning. *)
+    used and the venue's [default_fees] is applied with a warning. *)
 let enrich (tc : Dio_strategies.Strategy_common.trading_config) ~(offline : bool)
   : Dio_strategies.Strategy_common.trading_config Lwt.t
   =
@@ -127,8 +114,7 @@ let enrich (tc : Dio_strategies.Strategy_common.trading_config) ~(offline : bool
       ~ttl_seconds:600.0;
     Lwt.return { tc with taker_fee = Some taker }
   | None, _ when offline ->
-    let maker = fallback_maker_fee tc.exchange in
-    let taker = fallback_taker_fee tc.exchange in
+    let maker, taker = venue_default_fees tc.exchange tc.symbol in
     Logging.warn_f
       ~section
       "offline mode: not fetching live fees for %s/%s; using venue default maker %.4f%% \

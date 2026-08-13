@@ -8,31 +8,31 @@
 
 open Dio_oracle
 
-let check_symbol ~exchange symbol expected =
+let check_symbol ~calendar_kind symbol expected =
   Alcotest.(check (option string))
-    (Printf.sprintf "symbol_of %s/%s" exchange symbol)
+    (Printf.sprintf "symbol_of %s" symbol)
     expected
-    (Oracle_fetch_yahoo.symbol_of ~exchange symbol)
+    (Oracle_fetch_yahoo.symbol_of ~calendar_kind symbol)
 ;;
 
 let test_symbol_whitelist () =
-  check_symbol ~exchange:"kraken" "ETH/USD" (Some "ETH-USD");
-  check_symbol ~exchange:"hyperliquid" "BTC/USDC" (Some "BTC-USD");
-  check_symbol ~exchange:"kraken" "SOL/USD" (Some "SOL-USD");
-  check_symbol ~exchange:"kraken" "XMR/USD" (Some "XMR-USD");
-  check_symbol ~exchange:"kraken" "DOGE/USD" (Some "DOGE-USD");
-  check_symbol ~exchange:"hyperliquid" "ADA/USDC" (Some "ADA-USD");
-  check_symbol ~exchange:"kraken" "LTC/USD" (Some "LTC-USD");
-  check_symbol ~exchange:"kraken" "XRP/USD" (Some "XRP-USD");
-  check_symbol ~exchange:"kraken" "LINK/USD" (Some "LINK-USD");
-  check_symbol ~exchange:"kraken" "AVAX/USD" (Some "AVAX-USD");
-  check_symbol ~exchange:"kraken" "DOT/USD" (Some "DOT-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "ETH/USD" (Some "ETH-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "BTC/USDC" (Some "BTC-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "SOL/USD" (Some "SOL-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "XMR/USD" (Some "XMR-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "DOGE/USD" (Some "DOGE-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "ADA/USDC" (Some "ADA-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "LTC/USD" (Some "LTC-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "XRP/USD" (Some "XRP-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "LINK/USD" (Some "LINK-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "AVAX/USD" (Some "AVAX-USD");
+  check_symbol ~calendar_kind:Oracle_types.Crypto "DOT/USD" (Some "DOT-USD");
   (* The dead-token trap: HYPE/USDC must never be deepened from Yahoo. *)
-  check_symbol ~exchange:"hyperliquid" "HYPE/USDC" None;
+  check_symbol ~calendar_kind:Oracle_types.Crypto "HYPE/USDC" None;
   (* Equities map by identity (Yahoo QQQ is QQQ). *)
-  check_symbol ~exchange:"alpaca" "QQQ" (Some "QQQ");
-  check_symbol ~exchange:"alpaca" "SPCX" (Some "SPCX");
-  check_symbol ~exchange:"alpaca" "NVDA" (Some "NVDA")
+  check_symbol ~calendar_kind:Oracle_types.Equity "QQQ" (Some "QQQ");
+  check_symbol ~calendar_kind:Oracle_types.Equity "SPCX" (Some "SPCX");
+  check_symbol ~calendar_kind:Oracle_types.Equity "NVDA" (Some "NVDA")
 ;;
 
 (** Minimal chart fixture: two days of data with one null row dropped. *)

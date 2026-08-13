@@ -167,84 +167,6 @@ let test_calendar_kind () =
      = Dio_oracle.Oracle_types.Crypto)
 ;;
 
-let test_coin_of_symbol () =
-  (* Fixture feed-symbol -> candle coin mapping, mirroring spotMeta: the
-     canonical PURR/USDC pair and the wrapped BTC spot (@142 = UBTC/USDC). *)
-  let pairs = [ "PURR/USDC", "PURR/USDC"; "BTC/USDC", "@142" ] in
-  (* Bare coin names are perpetuals and pass through as-is. *)
-  Alcotest.(check (option string))
-    "bare coin is a perp"
-    (Some "BTC")
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "BTC");
-  (* Spot symbols resolve through the feed-style mapping to the mapped spot
-     asset's candle coin; USD quotes normalize to the USDC spot quote. *)
-  Alcotest.(check (option string))
-    "named spot pair"
-    (Some "PURR/USDC")
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "PURR/USDC");
-  Alcotest.(check (option string))
-    "USD quote normalized"
-    (Some "PURR/USDC")
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "PURR/USD");
-  (* Wrapped majors (BTC spot is UBTC/USDC, the "@142" pair) resolve to the
-     "@N" candle coin, so their spot history is used. *)
-  Alcotest.(check (option string))
-    "wrapped major -> @N"
-    (Some "@142")
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "BTC/USDC");
-  Alcotest.(check (option string))
-    "wrapped major USD quote -> @N"
-    (Some "@142")
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "BTC/USD");
-  (* Symbols that are not a Hyperliquid spot pair resolve to None - never to
-     a perpetual proxy. *)
-  Alcotest.(check (option string))
-    "eth/usd is not a spot pair"
-    None
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "ETH/USD");
-  Alcotest.(check (option string))
-    "lowercase perp"
-    (Some "BTC")
-    (Dio_oracle.Oracle_fetch_hyperliquid.coin_of_symbol ~pairs "btc")
-;;
-
-let test_parse_candles_sorts_and_dedups () =
-  let json =
-    Yojson.Safe.from_string
-      {|[ {"t":1705000000000,"o":"102.0","h":"103.0","l":"101.0","c":"102.5","v":"9.0","n":3}
-        , {"t":1700000000000,"o":"100.0","h":"101.0","l":"99.0","c":"100.5","v":"10.0","n":2}
-        , {"t":1700000000000,"o":"100.0","h":"101.0","l":"99.0","c":"100.5","v":"10.0","n":2} ]|}
-  in
-  let bars = Dio_oracle.Oracle_fetch_hyperliquid.parse_candles ~symbol:"BTC/USDC" json in
-  Alcotest.(check int) "two bars after dedup" 2 (List.length bars);
-  let dates =
-    List.map
-      (fun (b : Dio_oracle.Oracle_types.bar) -> b.Dio_oracle.Oracle_types.date)
-      bars
-  in
-  Alcotest.(check (list string)) "ascending dates" [ "2023-11-14"; "2024-01-11" ] dates;
-  Alcotest.(check (float 1e-9))
-    "first close"
-    100.5
-    (List.hd bars).Dio_oracle.Oracle_types.close;
-  Alcotest.(check (float 1e-9))
-    "second close"
-    102.5
-    (List.nth bars 1).Dio_oracle.Oracle_types.close
-;;
-
-let test_parse_candles_bad_shape () =
-  Alcotest.check_raises
-    "object body rejected"
-    (Failure
-       "Oracle_fetch_hyperliquid.parse_candles: BTC/USDC expected array, got {\"oops\":1}")
-    (fun () ->
-       ignore
-         (Dio_oracle.Oracle_fetch_hyperliquid.parse_candles
-            ~symbol:"BTC/USDC"
-            (`Assoc [ "oops", `Int 1 ])))
-;;
-
 let test_min_notional_defaults () =
   let open Dio_oracle.Grid_adapter in
   Alcotest.(check (float 1e-9))
@@ -304,11 +226,6 @@ let () =
         ; Alcotest.test_case "offline requires symbol" `Quick test_offline_requires_symbol
         ] )
     ; "calendar", [ Alcotest.test_case "exchange kinds" `Quick test_calendar_kind ]
-    ; ( "hyperliquid"
-      , [ Alcotest.test_case "coin mapping" `Quick test_coin_of_symbol
-        ; Alcotest.test_case "parse candles" `Quick test_parse_candles_sorts_and_dedups
-        ; Alcotest.test_case "reject bad shape" `Quick test_parse_candles_bad_shape
-        ] )
     ; ( "grid_adapter"
       , [ Alcotest.test_case
             "min_notional venue defaults"

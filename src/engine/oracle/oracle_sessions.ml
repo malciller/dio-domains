@@ -12,8 +12,9 @@
    - [missing_sessions] / [gaps_of_missing]: expected sessions skipped by a bar
      series, grouped into gap runs for Oracle_calendar.detect_gaps.
 
-   Pure math: no network, no Yojson. The Alpaca calendar adapter lives in
-   Oracle_fetch_alpaca and composes this module. *)
+   Pure math: no network, no Yojson. The Alpaca calendar adapter (fetching
+   /v2/calendar) lives in Alpaca_alpaca_oracle and composes this module via
+   Oracle_fetch.fetch_calendar_model. *)
 
 open Oracle_types
 

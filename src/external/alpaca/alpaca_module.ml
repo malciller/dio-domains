@@ -392,3 +392,7 @@ module Alpaca_impl = struct
 end
 
 let () = Exchange.Registry.register (module Alpaca_impl)
+
+(* Register the oracle data-venue adapter (historical bars, market calendar,
+   balances, fees for the capital oracle) at load time. *)
+let () = Exchange.Oracle.Registry.register (module Alpaca_oracle)

@@ -949,3 +949,7 @@ let fetch_open_orders_ws () =
 
 (* Register Hyperliquid_impl with the exchange registry at module load time *)
 let () = Exchange.Registry.register (module Hyperliquid_impl)
+
+(* Register the oracle data-venue adapter (historical candles, fees, spot
+   balances, instruments for the capital oracle) at load time. *)
+let () = Exchange.Oracle.Registry.register (module Hyperliquid_oracle)

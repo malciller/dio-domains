@@ -33,3 +33,7 @@
 (test
  (name test_kraken_trading_client)
  (libraries dio.kraken alcotest))
+
+(test
+ (name test_kraken_oracle)
+ (libraries dio.kraken alcotest))

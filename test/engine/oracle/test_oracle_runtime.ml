@@ -113,7 +113,7 @@ let test_class_member_source () =
      active asset on that exchange, which uses the exchange itself. Symbols
      with no trusted Yahoo mapping contribute nothing. *)
   let src exchange asset member =
-    Dio_oracle.Oracle_runtime.class_member_source ~exchange ~asset_symbol:asset member
+    Dio_oracle.Oracle_fetch.class_member_source ~exchange ~asset_symbol:asset member
   in
   (* The active asset itself -> the exchange, whatever the venue. *)
   Alcotest.(

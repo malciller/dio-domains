@@ -136,6 +136,39 @@ Strategies (e.g., `market_maker`, `suicide_grid`) operate generically over `Exch
 4. **Zero-Allocation Iteration**: Hot-path strategies use `iter_orderbook_events`, `iter_top_of_book_events`, `iter_execution_events`, `fold_open_orders`, and `iter_open_orders_fast` to avoid per-tick list allocations.
 5. **Dynamic Fear & Greed Re-evaluation**: Engine supervisors monitor price variations derived from orderbook top-of-book data. When price movement exceeds the dynamically configured `fng_check_threshold` (set in `config.json`), strategies trigger a Fear & Greed index recalculation. Timely orderbook feeds are essential for accurate threshold adherence.
 
+## Oracle Data-Venue Integration
+
+Beyond live trading, the capital oracle needs historical daily bars, session calendars, fees, account balances and instrument metadata from each venue. This is a second contract, `Exchange_intf.Oracle.S`, independent of the live-trading `S` above (which has no historical-bars or calendar concept). A venue that participates in oracle modeling implements BOTH; trading-only venues implement only `S`.
+
+The oracle's data layer (`src/engine/oracle/oracle_fetch.ml`) dispatches exclusively through `Exchange_intf.Oracle.Registry` — no hardcoded per-venue dispatch remains. The `bar` / `calendar_kind` types live in `Exchange_intf.Types` so venue libraries can implement the signature without depending on the oracle library.
+
+### The contract
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `name` | `string` | Registry key (e.g. `"kraken"`). |
+| `calendar_kind` | `Types.calendar_kind` | `Crypto` (session = day) or `Equity` (market sessions). Drives gap detection and horizon labels. |
+| `fetch_bars` | `?feed -> ?end_date -> from:string option -> symbol:string -> unit -> Types.bar list Lwt.t` | Historical daily bars from `from` (ISO date of the first day; `None` = full history). `feed`/`end_date` are Alpaca-only knobs; other venues ignore them. Returns RAW bars (any order); the oracle sorts, de-duplicates and normalizes centrally. |
+| `fetch_calendar` | `start_date:string -> end_date:string -> string list Lwt.t` | Expected session dates (equity venues build their session model from this); crypto venues return `[]`. |
+| `fetch_fees` | `testnet:bool -> symbol:string -> (float * float) Lwt.t` | Authoritative (maker, taker) fees; the oracle falls back to `default_fees` on failure. |
+| `default_fees` | `symbol:string -> float * float` | Offline / failed-fetch fallback (Hyperliquid spot vs perp differ, hence the symbol parameter). |
+| `fetch_balances` | `testnet:bool -> ((string * float * float) list, string) result Lwt.t` | One-shot account balance as already-normalized (asset, available, total) triples (XXBT -> BTC, UBTC -> BTC). |
+| `init_instruments` | `testnet:bool -> symbols:string list -> unit Lwt.t` | Populate price-tick / lot-size caches so `get_price_increment` / `get_qty_increment` answer. No-op for static-tick venues. |
+
+### Raw-bar contract
+
+`fetch_bars` returns RAW source rows (any order). The oracle applies its shared clean-series normalization (`Oracle_calendar.normalize_bars`) on every read — cache and direct fetch alike — so a corrected normalization rule self-heals without a refetch, and the placeholder/outlier filtering is identical across venues.
+
+### To add an oracle-data venue
+
+1. Create `<name>_oracle.ml` in the venue library implementing `Exchange_intf.Oracle.S` (reference adapters: `kraken_oracle.ml`, `hyperliquid_oracle.ml`, `alpaca_oracle.ml`).
+2. Register it at module load (see `kraken_module.ml`): `let () = Exchange.Oracle.Registry.register (module Kraken_oracle)`.
+3. Re-export the adapter from the library namespace file (e.g. `module Kraken_oracle = Kraken_oracle` in `kraken.ml`).
+4. Add the library to `src/engine/oracle/dune` and force-reference the adapter from `oracle_venues.ml` (OCaml dead-code elimination drops the registration side effects otherwise).
+5. No oracle dispatch edits: history, calendar kind, fees, balances and instrument metadata all resolve through the registry.
+
+Current oracle adapters: Kraken, Hyperliquid, Alpaca. (Lighter and IBKR implement live trading only today.)
+
 ## Order Handling Specification
 
 ### place_order Parameters

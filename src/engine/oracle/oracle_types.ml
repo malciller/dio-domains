@@ -1,14 +1,21 @@
 (* DIO Capital Oracle Engine - shared types.
 
    Naming (per the review): F_h(d) = P(MFD_h <= d) is a CDF -> "coverage";
-   S_h(d) = 1 - F_h(d) is the survival function. *)
+   S_h(d) = 1 - F_h(d) is the survival function.
 
-type calendar_kind =
-  | Crypto (* 24/7: a session is a calendar day; missing days are gaps. *)
+   [bar], [calendar_kind] and [balance] are aliases of
+   [Exchange_intf.Types] (the shared low-level definitions, so venue
+   libraries can implement [Exchange_intf.Oracle.S] without depending
+   on the oracle library). *)
+
+type calendar_kind = Dio_exchange.Exchange_intf.Types.calendar_kind =
+  | Crypto
   | Equity
-(* Market sessions only; calendar equivalence derived from session counts. *)
+(* [Crypto]: 24/7: a session is a calendar day; missing days are gaps.
+   [Equity]: market sessions only; calendar equivalence derived from session
+   counts. *)
 
-type bar =
+type bar = Dio_exchange.Exchange_intf.Types.bar =
   { date : string
   ; open_ : float
   ; high : float

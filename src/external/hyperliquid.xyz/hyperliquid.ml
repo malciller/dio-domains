@@ -35,3 +35,8 @@ module Types = Hyperliquid_types
 
 (** Persistent state, delegated to the engine-level module. *)
 module State_persistence = Dio_persistence.State_persistence
+
+(** Oracle data-venue adapter (historical candles, fees, spot balances,
+    instruments for the capital oracle; implements
+    [Exchange_intf.Oracle.S]). *)
+module Hyperliquid_oracle = Hyperliquid_oracle

@@ -545,3 +545,7 @@ end
 
 (* Register Kraken_impl into the global exchange registry at load time. *)
 let () = Exchange.Registry.register (module Kraken_impl)
+
+(* Register the oracle data-venue adapter (historical bars, fees, balances,
+   instruments for the capital oracle) at load time. *)
+let () = Exchange.Oracle.Registry.register (module Kraken_oracle)
