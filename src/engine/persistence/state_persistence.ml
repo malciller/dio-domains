@@ -34,6 +34,14 @@ let state_file () = Filename.concat state_dir "accumulated_state.json"
 (** Mutex guarding all file I/O for thread safety across domains. *)
 let file_mutex = Mutex.create ()
 
+(** In-memory mirror of the state file, guarded by [file_mutex]. Parsed lazily
+    on the first read/write and kept in sync on every save, so a save mutates
+    the cached tree and re-serializes it instead of re-reading the disk and
+    rebuilding the whole JSON tree (every symbol, every Alpaca sell level) on
+    every write. The background persistence domain's allocations used to
+    trigger major-GC stop-the-world pauses in the strategy domains. *)
+let file_tree : Yojson.Basic.t option ref = ref None
+
 (** Creates the state directory if it does not already exist. *)
 let ensure_dir () =
   if not (Sys.file_exists state_dir)
@@ -43,14 +51,22 @@ let ensure_dir () =
       Logging.warn_f ~section "Could not create state dir %s: %s" state_dir msg)
 ;;
 
-(** Reads and parses the state file. Returns an empty assoc on missing or corrupt files. *)
+(** Reads and parses the state file. Returns an empty assoc on missing or corrupt files.
+    Must be called under [file_mutex]. Caches the parsed tree in [file_tree] so
+    subsequent reads (and the saves built on top of it) skip the disk entirely. *)
 let read_state_file () : Yojson.Basic.t =
   let path = state_file () in
   if Sys.file_exists path
   then (
-    try Yojson.Basic.from_file path with
+    try
+      let tree = Yojson.Basic.from_file path in
+      file_tree := Some tree;
+      tree
+    with
     | Yojson.Json_error msg ->
       Logging.warn_f ~section "Corrupt state file %s: %s, starting fresh" path msg;
+      (* Deliberately NOT cached: a transient error must not pin an empty tree,
+         or the next save would clobber a good file with a partial one. *)
       `Assoc []
     | Sys_error msg ->
       Logging.warn_f ~section "Cannot read state file %s: %s" path msg;
@@ -126,8 +142,14 @@ let populate_cache_from_file_unsafe () =
            |> to_list
            |> List.filter_map (fun item ->
              try
-               let price = item |> member "price" |> to_float in
-               let qty = item |> member "qty" |> to_float in
+               let price, qty =
+                 match item with
+                 (* Compact form: [price, qty]. *)
+                 | `List [ p; q ] -> to_float p, to_float q
+                 (* Legacy form: {"price": p, "qty": q}. *)
+                 | _ ->
+                   item |> member "price" |> to_float, item |> member "qty" |> to_float
+               in
                Some (price, qty)
              with
              | _ -> None)
@@ -291,6 +313,67 @@ let load_persisted_sell_levels ~symbol =
   result
 ;;
 
+(** Builds the JSON entry (all persisted fields) for [state]. *)
+let symbol_entry_of_state state =
+  (* Construct required entry fields *)
+  let base_fields =
+    [ "reserved_base", `Float state.reserved_base
+    ; "accumulated_profit", `Float state.accumulated_profit
+    ]
+  in
+  (* Construct optional entry fields if present *)
+  let oid_field =
+    match state.last_fill_oid with
+    | Some oid -> [ "last_fill_oid", `String oid ]
+    | None -> []
+  in
+  let buy_price_field =
+    match state.last_buy_fill_price with
+    | Some price -> [ "last_buy_fill_price", `Float price ]
+    | None -> []
+  in
+  let sell_price_field =
+    match state.last_sell_fill_price with
+    | Some price -> [ "last_sell_fill_price", `Float price ]
+    | None -> []
+  in
+  let buy_qty_field =
+    match state.last_buy_fill_qty with
+    | Some qty -> [ "last_buy_fill_qty", `Float qty ]
+    | None -> []
+  in
+  let sell_qty_field =
+    match state.last_sell_fill_qty with
+    | Some qty -> [ "last_sell_fill_qty", `Float qty ]
+    | None -> []
+  in
+  let sell_levels_field =
+    if state.persisted_sell_levels <> []
+    then (
+      (* Compact form: [ [price, qty], ... ] (the reader also accepts the
+         legacy [ {"price": p, "qty": q}, ... ] form). Keeps the file small
+         and the per-save serialization fast for large Alpaca sell grids -
+         the verbose object form added two assoc objects + four strings per
+         level on every save. *)
+      let list_json =
+        `List
+          (List.map
+             (fun (price, qty) -> `List [ `Float price; `Float qty ])
+             state.persisted_sell_levels)
+      in
+      [ "sell_levels", list_json ])
+    else []
+  in
+  `Assoc
+    (base_fields
+     @ oid_field
+     @ buy_price_field
+     @ sell_price_field
+     @ buy_qty_field
+     @ sell_qty_field
+     @ sell_levels_field)
+;;
+
 (** Helper function that performs the actual read-modify-write cycle on disk under file_mutex. *)
 let write_to_disk ~symbol ~state () =
   Mutex.lock file_mutex;
@@ -299,67 +382,17 @@ let write_to_disk ~symbol ~state () =
     (fun () ->
        try
          ensure_dir ();
-         let existing = read_state_file () in
+         let tree =
+           match !file_tree with
+           | Some t -> t
+           | None -> read_state_file ()
+         in
          let open Yojson.Basic.Util in
          let entries =
-           try existing |> to_assoc with
+           try tree |> to_assoc with
            | _ -> []
          in
-         (* Construct required entry fields *)
-         let base_fields =
-           [ "reserved_base", `Float state.reserved_base
-           ; "accumulated_profit", `Float state.accumulated_profit
-           ]
-         in
-         (* Construct optional entry fields if present *)
-         let oid_field =
-           match state.last_fill_oid with
-           | Some oid -> [ "last_fill_oid", `String oid ]
-           | None -> []
-         in
-         let buy_price_field =
-           match state.last_buy_fill_price with
-           | Some price -> [ "last_buy_fill_price", `Float price ]
-           | None -> []
-         in
-         let sell_price_field =
-           match state.last_sell_fill_price with
-           | Some price -> [ "last_sell_fill_price", `Float price ]
-           | None -> []
-         in
-         let buy_qty_field =
-           match state.last_buy_fill_qty with
-           | Some qty -> [ "last_buy_fill_qty", `Float qty ]
-           | None -> []
-         in
-         let sell_qty_field =
-           match state.last_sell_fill_qty with
-           | Some qty -> [ "last_sell_fill_qty", `Float qty ]
-           | None -> []
-         in
-         let sell_levels_field =
-           if state.persisted_sell_levels <> []
-           then (
-             let list_json =
-               `List
-                 (List.map
-                    (fun (price, qty) ->
-                       `Assoc [ "price", `Float price; "qty", `Float qty ])
-                    state.persisted_sell_levels)
-             in
-             [ "sell_levels", list_json ])
-           else []
-         in
-         let new_entry =
-           `Assoc
-             (base_fields
-              @ oid_field
-              @ buy_price_field
-              @ sell_price_field
-              @ buy_qty_field
-              @ sell_qty_field
-              @ sell_levels_field)
-         in
+         let new_entry = symbol_entry_of_state state in
          let updated = List.filter (fun (k, _) -> k <> symbol) entries in
          let final = `Assoc ((symbol, new_entry) :: updated) in
          (* Atomic write via temp file and rename *)
@@ -371,7 +404,10 @@ let write_to_disk ~symbol ~state () =
            (fun () ->
               output_string oc (Yojson.Basic.pretty_to_string final);
               output_char oc '\n');
-         Sys.rename tmp path
+         Sys.rename tmp path;
+         (* Keep the in-memory mirror in sync: the next save serializes this
+            tree directly without re-reading the disk. *)
+         file_tree := Some final
        with
        | exn ->
          Logging.warn_f
@@ -422,18 +458,29 @@ let save
   write_to_disk ~symbol ~state:snapshot ()
 ;;
 
-let save_queue : (string * symbol_state) Queue.t = Queue.create ()
+(** Pending async saves keyed by symbol. Only the LATEST snapshot per symbol
+    matters (every snapshot carries the symbol's full state), so this is a
+    table that [save_async] overwrites; the background worker drains the whole
+    table and writes each symbol once. This collapses the redundant writes an
+    Alpaca grid produces when [persistence_dirty] stays set cycle after cycle:
+    a FIFO queue would otherwise enqueue one full-file rewrite per cycle per
+    symbol, and the worker would grind through them all. *)
+let save_queue : (string, symbol_state) Hashtbl.t = Hashtbl.create 16
+
 let save_queue_mutex = Mutex.create ()
 let save_cond = Condition.create ()
 
 let rec background_worker () =
   Mutex.lock save_queue_mutex;
-  while Queue.is_empty save_queue do
+  while Hashtbl.length save_queue = 0 do
     Condition.wait save_cond save_queue_mutex
   done;
-  let symbol, snapshot = Queue.pop save_queue in
+  (* Swap out the pending set while holding the lock; [save_async] keeps
+     enqueueing into the now-empty table while this domain does the I/O. *)
+  let pending = Hashtbl.copy save_queue in
+  Hashtbl.reset save_queue;
   Mutex.unlock save_queue_mutex;
-  write_to_disk ~symbol ~state:snapshot ();
+  Hashtbl.iter (fun symbol snapshot -> write_to_disk ~symbol ~state:snapshot ()) pending;
   background_worker ()
 ;;
 
@@ -475,7 +522,7 @@ let save_async
   in
   Mutex.unlock cache_mutex;
   Mutex.lock save_queue_mutex;
-  Queue.push (symbol, snapshot) save_queue;
+  Hashtbl.replace save_queue symbol snapshot;
   Condition.signal save_cond;
   Mutex.unlock save_queue_mutex
 ;;

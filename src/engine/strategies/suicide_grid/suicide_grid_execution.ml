@@ -6,6 +6,12 @@ open Suicide_grid_config
 open Suicide_grid_reservation
 open Suicide_grid_orders
 
+(** M16: price-key helper (rounded price*10000 as int) shared by the
+    persisted-sell matching in [sync_open_orders] and the reconcile threading
+    into [evaluate_sell_leg]. The int key keeps two within-tolerance prices in
+    the same (or an adjacent) bucket without allocating a string per lookup. *)
+let price_key p = int_of_float (Float.round (p *. 10000.0))
+
 (** Performs 1-to-1 multiset matching between persisted sell levels and open sell orders.
     Returns (open_levels, missing_levels).
     M15: the previous implementation was O(n·m); for each persisted level it
@@ -21,14 +27,18 @@ open Suicide_grid_orders
     with large sell grids (e.g. SPCX's 42 open sells). The rounded int keeps
     the same tolerance bucket (2 prices within the 1e-4 tolerance never span
     more than one rounded-decimal bucket), and the per-candidate tolerance
-    check below preserves the original matching semantics exactly. *)
+    check below preserves the original matching semantics exactly.
+
+    M16: this partition is now only the fallback for direct [evaluate_sell_leg]
+    callers; the strategy hot path builds the same open/missing split during
+    [sync_open_orders]' scan and threads it through, so the per-tick reconcile
+    is O(m) instead of this O(n+m) re-partition. *)
 let partition_persisted_sell_levels persisted open_orders =
   (* Index open orders by rounded price key -> list of (price, remaining
      count). The tolerance check is preserved per candidate. *)
   let by_price : (int, (float * int) list) Hashtbl.t =
     Hashtbl.create (List.length open_orders)
   in
-  let price_key p = int_of_float (Float.round (p *. 10000.0)) in
   List.iter
     (fun (_id, open_p, _open_q) ->
        let k = price_key open_p in
@@ -300,7 +310,13 @@ let sync_open_orders
      large sell grids like SPCX's 42 open sells. Buckets store
      (index, price, qty) so a 1-to-1 match consumes the entry and the
      original tolerance check and qty-update semantics are preserved. *)
-  let price_key p = int_of_float (Float.round (p *. 10000.0)) in
+  (* M16: matched persisted levels keyed by their price key -> count. Built
+     during the scan (each open sell consumes exactly one persisted level, so
+     a multiset of per-price counts accumulates), the open/missing split for
+     the virtual-GTC reconcile falls out in O(m) at the end of the scan
+     instead of re-partitioning the whole persisted-vs-open multiset
+     ([partition_persisted_sell_levels]) a second time per execution. *)
+  let matched_level_counts : (int, int) Hashtbl.t = Hashtbl.create 16 in
   let persisted_idx : (int, (int * float * float) list) Hashtbl.t = Hashtbl.create 16 in
   let build_persisted_idx () =
     Hashtbl.reset persisted_idx;
@@ -312,6 +328,12 @@ let sync_open_orders
       state.persisted_sell_levels
   in
   build_persisted_idx ();
+  let record_matched pk =
+    Hashtbl.replace
+      matched_level_counts
+      pk
+      (1 + Option.value (Hashtbl.find_opt matched_level_counts pk) ~default:0)
+  in
   iter_open_orders (fun oid price qty side_str userref_opt ->
     let is_our_strategy =
       match userref_opt with
@@ -382,6 +404,8 @@ let sync_open_orders
           | Some (bk, idx, _existing_p, existing_q, remaining_bucket) ->
             Hashtbl.add matched_persisted_indices idx ();
             Hashtbl.replace persisted_idx bk remaining_bucket;
+            (* M16: count the persisted level (keyed by ITS price) as matched. *)
+            record_matched (price_key _existing_p);
             if abs_float (existing_q -. qty) > 1e-6
             then (
               state.persisted_sell_levels
@@ -402,6 +426,10 @@ let sync_open_orders
                  (fun (p1, _) (p2, _) -> Float.compare p2 p1)
                  ((price, qty) :: state.persisted_sell_levels);
             state.persistence_dirty <- true;
+            (* M16: the adopted level was matched by this open sell by
+               construction - count it so the end-of-scan split keeps it on
+               the open side. *)
+            record_matched (price_key price);
             (* The list was re-sorted with a new level: rebuild the price
                index so later orders in this scan match against the current
                list (O(m), only on the rare adoption path). *)
@@ -463,12 +491,32 @@ let sync_open_orders
          in
          if not already_present then ())
       preserved_sells;
+  (* M16: split the final persisted list into open/missing by draining the
+     per-price-key match counts (multiset semantics - duplicate levels at the
+     same price each consume one count, exactly mirroring
+     [partition_persisted_sell_levels]' 1-to-1 matching). The result is what
+     [evaluate_sell_leg]'s reconcile used to re-derive with a full O(n+m)
+     partition over the open orders; here it is O(m) on data this scan already
+     touched. *)
+  let open_levels_acc = ref [] in
+  let missing_levels_acc = ref [] in
+  List.iter
+    (fun ((p, _) as level) ->
+       let k = price_key p in
+       match Hashtbl.find_opt matched_level_counts k with
+       | Some n when n > 0 ->
+         Hashtbl.replace matched_level_counts k (n - 1);
+         open_levels_acc := level :: !open_levels_acc
+       | _ -> missing_levels_acc := level :: !missing_levels_acc)
+    state.persisted_sell_levels;
   ( !open_buy_count_from_scan
   , !has_recent_amend_buy
   , !locked_in_buys
   , !locked_in_sells
   , !closest_sell_order
-  , !best_buy_qty )
+  , !best_buy_qty
+  , List.rev !open_levels_acc
+  , List.rev !missing_levels_acc )
 ;;
 
 let compute_buy_ref_price ~bid_price ~ask_price =
@@ -943,8 +991,13 @@ let evaluate_buy_leg
   !buy_attempted
 ;;
 
-(** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell placement leg. *)
+(** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell placement leg.
+    [persisted_reconcile] is the (open_levels, missing_levels) split that
+    [sync_open_orders] computed during its open-order scan (M16), so the
+    Alpaca virtual-GTC reconcile never re-partitions the persisted-vs-open
+    multiset a second time per execution. *)
 let evaluate_sell_leg
+      ~persisted_reconcile
       ~state
       ~now
       ~(asset : trading_config)
@@ -978,12 +1031,18 @@ let evaluate_sell_leg
      After the pruning below rebuilds [persisted_sell_levels] to
      [open_levels @ kept_missing], a re-partition against the same open
      orders yields exactly [kept_missing] as the missing set, so the later
-     branches reuse it instead of re-partitioning. *)
+     branches reuse it instead of re-partitioning.
+
+     M16: [sync_open_orders] (the strategy hot path) already computed this
+     exact (open_levels, missing_levels) split during its scan - each open
+     sell consumed one persisted level, so the missing set falls out in O(m)
+     instead of this O(n+m) partition. Only direct [evaluate_sell_leg]
+     callers (tests) fall back to the partition. *)
   let missing_after_reconcile = ref [] in
   let pruned_missing = ref [] in
   if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
   then (
-    let open_levels, missing_levels = reconcile_persisted_sell_levels ~state in
+    let open_levels, missing_levels = persisted_reconcile in
     if not (Float.is_nan asset_balance)
     then (
       let available_for_missing_sells =
@@ -1410,7 +1469,9 @@ let execute_strategy
              , locked_in_buys
              , locked_in_sells
              , closest_sell_order
-             , pending_buy_qty_from_scan )
+             , pending_buy_qty_from_scan
+             , open_persisted_levels
+             , missing_persisted_levels )
            =
            sync_open_orders ~state ~now ~asset ~bid_price ~lot_qty ~iter_open_orders ~ecfg
          in
@@ -1456,6 +1517,7 @@ let execute_strategy
                  ~pending_buy_qty_from_scan
            in
            evaluate_sell_leg
+             ~persisted_reconcile:(open_persisted_levels, missing_persisted_levels)
              ~state
              ~now
              ~asset

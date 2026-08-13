@@ -827,6 +827,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
   let ecfg_alpaca = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
   (* Run evaluate_sell_leg on Alpaca during a price drop to 90.0 (death spiral) *)
   Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset:asset_alpaca
@@ -867,6 +869,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
   state_offline.open_sell_orders <- [];
   let asset_offline = { asset_alpaca with symbol = "OFFLINE_TEST/USD" } in
   Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state:state_offline)
     ~state:state_offline
     ~now:100.0
     ~asset:asset_offline
@@ -923,6 +927,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
     false
     ecfg_kraken.remaintain_expired_sells;
   Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state:state_kraken)
     ~state:state_kraken
     ~now:100.0
     ~asset:asset_kraken
@@ -985,6 +991,8 @@ let test_halted_path_still_places_sell () =
   drain ();
   (* The halted path: the buy leg was skipped, so buy_attempted = false. *)
   Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -1314,6 +1322,93 @@ let test_sync_open_orders_price_keyed_index () =
   check bool "duplicate open sells matched 1-to-1" true (List.length matches = 2)
 ;;
 
+let test_sync_open_orders_reconcile_agreement () =
+  (* M16: sync_open_orders now computes the (open_levels, missing_levels)
+     split during its scan (O(m), by draining per-price-key match counts) and
+     threads it into evaluate_sell_leg, replacing the second O(n+m)
+     partition_persisted_sell_levels pass. Verify the threaded split agrees
+     EXACTLY with the reference partition over the same final persisted list
+     and open-sell set, across duplicates, boundary floats, adoptions and
+     qty updates. *)
+  let open Dio_strategies.Suicide_grid in
+  let ecfg = get_exchange_config "alpaca" in
+  let mk_asset symbol =
+    { exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let assert_split_matches name ~persisted ~sells =
+    let symbol = "AGREE_TEST_" ^ name ^ "/USD" in
+    let state = get_strategy_state symbol in
+    state.persisted_sell_levels <- persisted;
+    let iter_orders f = List.iter (fun (oid, p, q) -> f oid p q "sell" (Some 1)) sells in
+    let ( _open_buy_count
+        , _has_recent_amend_buy
+        , _locked_in_buys
+        , _locked_in_sells
+        , _closest_sell
+        , _pending_buy_qty
+        , open_levels
+        , missing_levels )
+      =
+      sync_open_orders
+        ~state
+        ~now:100.0
+        ~asset:(mk_asset symbol)
+        ~bid_price:100.0
+        ~lot_qty:1.0
+        ~iter_open_orders:iter_orders
+        ~ecfg
+    in
+    let ref_open, ref_missing = reconcile_persisted_sell_levels ~state in
+    let canon = List.sort (fun (p1, _) (p2, _) -> Float.compare p1 p2) in
+    check
+      bool
+      (name ^ ": threaded open_levels == reference partition")
+      true
+      (canon open_levels = canon ref_open);
+    check
+      bool
+      (name ^ ": threaded missing_levels == reference partition")
+      true
+      (canon missing_levels = canon ref_missing)
+  in
+  (* Duplicates at the same price (SPCX-style) with matching sells. *)
+  assert_split_matches
+    "duplicates"
+    ~persisted:[ 149.0, 0.25; 149.0, 0.25; 148.0, 0.25 ]
+    ~sells:[ "s1", 149.0, 0.25; "s2", 149.0, 0.25; "s3", 148.0, 0.25 ];
+  (* One duplicate unmatched: the second 149.0 level is missing. *)
+  assert_split_matches
+    "duplicate-missing"
+    ~persisted:[ 149.0, 0.25; 149.0, 0.25 ]
+    ~sells:[ "s1", 149.0, 0.25 ];
+  (* 4-decimal boundary float: 100.00005 open vs 100.00004 persisted. *)
+  assert_split_matches
+    "boundary"
+    ~persisted:[ 100.00004, 1.0 ]
+    ~sells:[ "s1", 100.00005, 1.0 ];
+  (* A genuinely missing level (nothing on the book at that price). *)
+  assert_split_matches
+    "missing"
+    ~persisted:[ 105.0, 1.0; 100.0, 1.0 ]
+    ~sells:[ "s1", 105.0, 1.0 ];
+  (* Adoption: no persisted levels, sells get adopted (all open, none missing). *)
+  assert_split_matches
+    "adoption"
+    ~persisted:[]
+    ~sells:[ "s1", 105.0, 1.0; "s2", 97.0, 1.0 ];
+  (* Qty update on a matched level. *)
+  assert_split_matches "qty-update" ~persisted:[ 100.0, 1.0 ] ~sells:[ "s1", 100.0, 1.5 ]
+;;
+
 let () =
   run
     "Suicide Grid"
@@ -1346,6 +1441,10 @@ let () =
             "reconcile cross-boundary tolerance"
             `Quick
             test_reconcile_cross_boundary_tolerance
+        ; test_case
+            "sync_open_orders reconcile agrees with partition"
+            `Quick
+            test_sync_open_orders_reconcile_agreement
         ] )
     ; "balance", [ test_case "balance checking" `Quick test_balance_checking ]
     ; ( "placement guard"
