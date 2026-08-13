@@ -280,12 +280,18 @@ let render_latencies w json =
         then 1 (* yellow *)
         else 0 (* green *))
     in
-    (* The active page's metric columns. The wide layout shows all of them,
-       roughly the same 179 columns as the five-metric CORE table; narrow
-       terminals show the first two so the section still fits. *)
-    let is_compact = w < 180 in
+    (* The active page's metric columns. The wide layout shows all of them;
+       narrow terminals show the first two so the section still fits. The
+       width the full set needs is fixed per page: the fixed columns
+       (domain + trend + exec rate, 45 total) plus n metric cells of 24
+       (each subsequent one has a 3-wide separator), i.e. 71 + 27*(n-1)
+       once the closing border is counted. The five-metric CORE table needs
+       ~179 columns but the four-metric NETWORK table only ~152, so compact
+       mode is gated on the active page's own width, not a global cutoff. *)
     let page = List.nth metric_pages (current_page_index ()) in
-    let page_cols = if is_compact then take_first 2 page.metrics else page.metrics in
+    let n_metrics = List.length page.metrics in
+    let full_page_w = 71 + (27 * (n_metrics - 1)) in
+    let page_cols = if w < full_page_w then take_first 2 page.metrics else page.metrics in
     let page_labels = List.map short_label page_cols in
     let metric_cell_w = 8 in
     (* Two-row header: metric names on the first row and p50/p99/p999
