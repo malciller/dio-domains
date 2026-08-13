@@ -220,6 +220,11 @@ let format_latency_us f =
   add_commas raw
 ;;
 
+(** True for a sub-microsecond latency value (a fraction of a microsecond,
+    rendered as nanoseconds) so callers can style nanosecond cells
+    distinctly from microsecond cells. *)
+let is_sub_us f = f > 0.0 && f < 1.0
+
 let utf8_len s =
   let len = ref 0 in
   for i = 0 to String.length s - 1 do
@@ -242,6 +247,7 @@ let c_label = A.rgb_888 ~r:86 ~g:95 ~b:137
 let c_text = A.rgb_888 ~r:169 ~g:177 ~b:214
 let c_bright = A.rgb_888 ~r:255 ~g:255 ~b:255
 let c_green = A.rgb_888 ~r:158 ~g:206 ~b:106
+let c_green_dark = A.rgb_888 ~r:82 ~g:136 ~b:89
 let c_red = A.rgb_888 ~r:247 ~g:118 ~b:142
 let c_yellow = A.rgb_888 ~r:224 ~g:175 ~b:104
 let c_cyan = A.rgb_888 ~r:125 ~g:207 ~b:255
@@ -270,6 +276,7 @@ let a_label = A.(fg c_label ++ bg c_bg)
 let a_text = A.(fg c_text ++ bg c_bg)
 let a_bright = A.(fg c_bright ++ bg c_bg ++ st bold)
 let a_green = A.(fg c_green ++ bg c_bg)
+let a_green_dark = A.(fg c_green_dark ++ bg c_bg)
 let a_red = A.(fg c_red ++ bg c_bg)
 let a_yellow = A.(fg c_yellow ++ bg c_bg)
 let a_cyan = A.(fg c_cyan ++ bg c_bg)

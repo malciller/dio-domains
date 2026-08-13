@@ -1064,6 +1064,127 @@ let test_buy_placement_balance_guard () =
   drain ()
 ;;
 
+let test_reconcile_cross_boundary_tolerance () =
+  (* The persisted-sell reconcile now buckets by an int price key
+     (price*10000 rounded) instead of a Printf "%.4f" string, with a
+     neighbor-bucket probe. Verify matching semantics are unchanged for
+     prices that straddle a 4-decimal bucket boundary: sync_open_orders
+     should match the persisted level rather than adopting a duplicate. *)
+  let open Dio_strategies.Suicide_grid in
+  let symbol = "BOUNDARY_TEST/USD" in
+  let state = get_strategy_state symbol in
+  (* 100.00004 vs the open order's 100.00005: within the 1e-4 tolerance but
+     straddles the 4-decimal bucket boundary. *)
+  state.persisted_sell_levels <- [ 100.00004, 1.0 ];
+  let asset_alpaca =
+    { exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = get_exchange_config "alpaca" in
+  let iter_orders f = f "oid_b" 100.00005 1.0 "sell" (Some 1) in
+  let _ =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset:asset_alpaca
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter_orders
+      ~ecfg
+  in
+  (* The persisted level should have been matched (no adoption of a second
+     near-100.0 level), so only one level remains around 100.0. *)
+  let near_100 =
+    List.filter (fun (p, _) -> abs_float (p -. 100.0) < 0.001) state.persisted_sell_levels
+  in
+  check
+    bool
+    "cross-boundary persisted level matched without duplicate adoption"
+    true
+    (List.length near_100 = 1)
+;;
+
+let test_sync_open_orders_price_keyed_index () =
+  (* sync_open_orders now indexes persisted sell levels by a price key
+     instead of rescanning the list per order (the O(n*m) hotpath). Verify
+     the observable behavior is preserved: qty update on a matching open
+     sell, adoption of a new sell, and 1-to-1 matching across duplicate
+     prices. *)
+  let open Dio_strategies.Suicide_grid in
+  let symbol = "IDX_MATCH/USD" in
+  let state = get_strategy_state symbol in
+  state.persisted_sell_levels <- [ 100.00, 1.0; 98.00, 1.0 ];
+  let asset_alpaca =
+    { exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = get_exchange_config "alpaca" in
+  (* Two open sells: one matches existing persisted level with a qty
+     difference (should update qty), one is a new price (should adopt). *)
+  let iter_orders f =
+    f "oid_1" 100.0 1.5 "sell" (Some 1);
+    f "oid_2" 97.0 1.0 "sell" (Some 1)
+  in
+  let _ =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset:asset_alpaca
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter_orders
+      ~ecfg
+  in
+  check
+    bool
+    "matched persisted level qty updated"
+    true
+    (List.exists (fun (p, q) -> p = 100.0 && q = 1.5) state.persisted_sell_levels);
+  check
+    bool
+    "new open sell adopted into persisted levels"
+    true
+    (List.exists (fun (p, q) -> p = 97.0 && q = 1.0) state.persisted_sell_levels);
+  check bool "adopted level persisted flag" true state.persistence_dirty;
+  (* Case 2: duplicate open sells at the same price must not both consume the
+     same persisted level (1-to-1 matching). *)
+  let state2 = get_strategy_state "IDX_MATCH2/USD" in
+  state2.persisted_sell_levels <- [ 105.00, 1.0 ];
+  let iter_orders2 f =
+    f "oid_a" 105.0 1.0 "sell" (Some 1);
+    f "oid_b" 105.0 1.0 "sell" (Some 1)
+  in
+  let _ =
+    sync_open_orders
+      ~state:state2
+      ~now:100.0
+      ~asset:{ asset_alpaca with symbol = "IDX_MATCH2/USD" }
+      ~bid_price:105.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter_orders2
+      ~ecfg
+  in
+  (* One level matches; the second sell adopts a new level. *)
+  let matches = List.filter (fun (p, _) -> p = 105.0) state2.persisted_sell_levels in
+  check bool "duplicate open sells matched 1-to-1" true (List.length matches = 2)
+;;
+
 let () =
   run
     "Suicide Grid"
@@ -1088,6 +1209,14 @@ let () =
             "virtual gtc sell grid maintenance"
             `Quick
             test_virtual_gtc_sell_grid_maintenance
+        ; test_case
+            "sync_open_orders price-keyed index"
+            `Quick
+            test_sync_open_orders_price_keyed_index
+        ; test_case
+            "reconcile cross-boundary tolerance"
+            `Quick
+            test_reconcile_cross_boundary_tolerance
         ] )
     ; "balance", [ test_case "balance checking" `Quick test_balance_checking ]
     ; ( "placement guard"
