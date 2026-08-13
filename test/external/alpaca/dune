@@ -1,3 +1,7 @@
 (test
  (name test_alpaca_types)
  (libraries dio.alpaca alcotest))
+
+(test
+ (name test_alpaca_ws)
+ (libraries dio.alpaca dio.latency_profiling lwt alcotest))

@@ -203,6 +203,8 @@ let monitor_loop () =
                    || String.equal conn.name "kraken_orderbook_ws"
                    || String.equal conn.name "hyperliquid_ws"
                    || String.equal conn.name "lighter_ws"
+                   || String.equal conn.name "alpaca_data_ws"
+                   || String.equal conn.name "alpaca_trading_ws"
                  then (
                    let should_ping =
                      match conn.last_ping_sent with
@@ -311,6 +313,60 @@ let monitor_loop () =
                          Lwt.catch
                            (fun () ->
                               Lighter.Ws.send_ping ~req_id ~timeout_ms:5000
+                              >>= fun success ->
+                              if success
+                              then (
+                                Atomic.set conn.ping_failures 0;
+                                update_data_heartbeat conn;
+                                Lwt.return_unit)
+                              else (
+                                Logging.warn_f
+                                  ~section
+                                  "[%s] Ping failed (req_id: %d)"
+                                  conn.name
+                                  req_id;
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit))
+                           (fun exn ->
+                              Logging.warn_f
+                                ~section
+                                "[%s] Ping exception: %s"
+                                conn.name
+                                (Printexc.to_string exn);
+                              Atomic.incr conn.ping_failures;
+                              Lwt.return_unit)
+                       else if String.equal conn.name "alpaca_data_ws"
+                       then
+                         Lwt.catch
+                           (fun () ->
+                              Alpaca.Orderbook.send_ping ~req_id ~timeout_ms:5000
+                              >>= fun success ->
+                              if success
+                              then (
+                                Atomic.set conn.ping_failures 0;
+                                update_data_heartbeat conn;
+                                Lwt.return_unit)
+                              else (
+                                Logging.warn_f
+                                  ~section
+                                  "[%s] Ping failed (req_id: %d)"
+                                  conn.name
+                                  req_id;
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit))
+                           (fun exn ->
+                              Logging.warn_f
+                                ~section
+                                "[%s] Ping exception: %s"
+                                conn.name
+                                (Printexc.to_string exn);
+                              Atomic.incr conn.ping_failures;
+                              Lwt.return_unit)
+                       else if String.equal conn.name "alpaca_trading_ws"
+                       then
+                         Lwt.catch
+                           (fun () ->
+                              Alpaca.Executions.send_ping ~req_id ~timeout_ms:5000
                               >>= fun success ->
                               if success
                               then (

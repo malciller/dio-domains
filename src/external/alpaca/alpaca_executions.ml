@@ -189,6 +189,14 @@ let get_or_create_store symbol =
 
 let active_conn : Websocket_lwt_unix.conn option ref = ref None
 
+(* ── Ping/pong liveness tracking ────────────────────────────────────────────
+   The supervisor monitor loop calls [send_ping] on a 15s cadence and expects
+   a [bool]; a Pong frame arriving in the read loop broadcasts [pong_condition]
+   and stamps [last_pong_time] so the waiter can resolve. [last_pong_time] also
+   closes the race where the Pong lands before [send_ping] starts waiting. *)
+let last_pong_time = ref 0.0
+let pong_condition = Lwt_condition.create ()
+
 let get_open_order symbol order_id =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
@@ -547,6 +555,11 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                 ()
             in
             Websocket_lwt_unix.write conn pong_frame
+          | Websocket.Frame.Opcode.Pong ->
+            (* Reply to our active [send_ping]; resolves any pending waiter. *)
+            last_pong_time := Unix.gettimeofday ();
+            Lwt_condition.broadcast pong_condition ();
+            Lwt.return_unit
           | Websocket.Frame.Opcode.Close ->
             Lwt.fail (Failure "Alpaca Trading WS received Close frame from server")
           | _ ->
@@ -562,4 +575,55 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Logging.error_f ~section "Alpaca trading WS disconnected: %s" err;
        on_failure err;
        Lwt.return_unit)
+;;
+
+(** Sends a protocol-level WebSocket Ping frame and waits for the matching
+    Pong within [timeout_ms]. Returns [true] when the Pong arrived, [false]
+    on timeout or send failure. Records the round trip in the "alpaca" venue
+    profiler (the dashboard's ws_ping column). *)
+let send_ping ~req_id ~timeout_ms : bool Lwt.t =
+  match !active_conn with
+  | None -> Lwt.return false
+  | Some conn ->
+    let send_time = Unix.gettimeofday () in
+    Lwt.catch
+      (fun () ->
+         let payload = Printf.sprintf "dio:%d:%.6f" req_id send_time in
+         Websocket_lwt_unix.write
+           conn
+           (Websocket.Frame.create
+              ~opcode:Websocket.Frame.Opcode.Ping
+              ~content:payload
+              ())
+         >>= fun () ->
+         let timeout = float_of_int timeout_ms /. 1000.0 in
+         Lwt.pick
+           [ (Lwt_condition.wait pong_condition
+              >>= fun () ->
+              (* Guard against a stale Pong from an earlier ping. *)
+              if !last_pong_time >= send_time
+              then (
+                Network_latency.record_ping_s "alpaca" (Unix.gettimeofday () -. send_time);
+                Lwt.return true)
+              else Lwt.return false)
+           ; (Lwt_unix.sleep timeout
+              >>= fun () ->
+              (* The Pong may have landed just before the timeout fired. *)
+              if !last_pong_time >= send_time
+              then (
+                Network_latency.record_ping_s "alpaca" (Unix.gettimeofday () -. send_time);
+                Lwt.return true)
+              else (
+                Logging.warn_f
+                  ~section
+                  "Alpaca trading WS ping timed out (req_id: %d)"
+                  req_id;
+                Lwt.return false))
+           ])
+      (fun exn ->
+         Logging.warn_f
+           ~section
+           "Alpaca trading WS ping send failed: %s"
+           (Printexc.to_string exn);
+         Lwt.return false)
 ;;
