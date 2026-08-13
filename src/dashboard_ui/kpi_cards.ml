@@ -219,16 +219,19 @@ let render_kpi_cards w json =
     then a_yellow
     else a_green
   in
+  (* Sub-microsecond readings render dark green (nanosecond-resolution);
+     everything else keeps the severity color. *)
+  let latency_cell_attr p = if is_sub_us p then a_green_dark else lat_attr p in
   let c3_row1 =
     I.hcat
       [ col 10 a_dim "ORACLE P50"
-      ; col_right 12 (lat_attr oracle_p50) (format_latency_us oracle_p50)
+      ; col_right 12 (latency_cell_attr oracle_p50) (format_latency_us oracle_p50)
       ]
   in
   let c3_row2 =
     I.hcat
       [ col 10 a_dim "ORACLE P99"
-      ; col_right 12 (lat_attr oracle_p99) (format_latency_us oracle_p99)
+      ; col_right 12 (latency_cell_attr oracle_p99) (format_latency_us oracle_p99)
       ]
   in
   let card3 = "LATENCY", c3_row1, c3_row2 in

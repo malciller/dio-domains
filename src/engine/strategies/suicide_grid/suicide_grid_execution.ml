@@ -12,14 +12,23 @@ open Suicide_grid_orders
     linearly rescanned the open-order list and allocated a match array. This
     version buckets open orders by a tolerance-rounded price key (Hashtbl) and
     verifies the original tolerance before consuming a candidate, so matching
-    is ~O(n+m) with identical semantics. *)
+    is ~O(n+m) with identical semantics.
+
+    The bucket key is an int (price scaled to 4 decimals and rounded), NOT a
+    [Printf.sprintf "%.4f"] string: the string key allocated a fresh string
+    for every open order and every persisted level on every strategy
+    execution, which dominated the Alpaca persisted-sell hotpath for assets
+    with large sell grids (e.g. SPCX's 42 open sells). The rounded int keeps
+    the same tolerance bucket (2 prices within the 1e-4 tolerance never span
+    more than one rounded-decimal bucket), and the per-candidate tolerance
+    check below preserves the original matching semantics exactly. *)
 let partition_persisted_sell_levels persisted open_orders =
   (* Index open orders by rounded price key -> list of (price, remaining
      count). The tolerance check is preserved per candidate. *)
-  let by_price : (string, (float * int) list) Hashtbl.t =
+  let by_price : (int, (float * int) list) Hashtbl.t =
     Hashtbl.create (List.length open_orders)
   in
-  let price_key p = Printf.sprintf "%.4f" p in
+  let price_key p = int_of_float (Float.round (p *. 10000.0)) in
   List.iter
     (fun (_id, open_p, _open_q) ->
        let k = price_key open_p in
@@ -36,24 +45,36 @@ let partition_persisted_sell_levels persisted open_orders =
   List.iter
     (fun ((target_p, _target_q) as level) ->
        let k = price_key target_p in
+       (* Probe the bucket and its neighbors: the old string key used
+          printf's %.4f rounding (half-even) while the int key uses
+          [Float.round] (half-away), so a price sitting exactly on a
+          4-decimal boundary can land in either adjacent bucket. The
+          per-candidate tolerance check below is the authoritative gate. *)
        let matched =
-         match Hashtbl.find_opt by_price k with
-         | Some bucket ->
-           (* Verify against the original tolerance, not just the bucket key. *)
-           let rec consume acc = function
-             | [] -> None
-             | (p, n) :: rest
-               when abs_float (p -. target_p) <= target_p *. 0.0001
-                    || abs_float (p -. target_p) <= 1e-4 ->
-               if n > 1 then Some (((p, n - 1) :: rest) @ acc) else Some (rest @ acc)
-             | item :: rest -> consume (item :: acc) rest
-           in
-           consume [] bucket
-         | None -> None
+         let rec try_buckets = function
+           | [] -> None
+           | bk :: rest ->
+             (match Hashtbl.find_opt by_price bk with
+              | Some bucket ->
+                (* Verify against the original tolerance, not just the bucket key. *)
+                let rec consume acc = function
+                  | [] -> None
+                  | (p, n) :: rest
+                    when abs_float (p -. target_p) <= target_p *. 0.0001
+                         || abs_float (p -. target_p) <= 1e-4 ->
+                    if n > 1 then Some (((p, n - 1) :: rest) @ acc) else Some (rest @ acc)
+                  | item :: rest -> consume (item :: acc) rest
+                in
+                (match consume [] bucket with
+                 | Some nbucket -> Some (bk, nbucket)
+                 | None -> try_buckets rest)
+              | None -> try_buckets rest)
+         in
+         try_buckets [ k - 1; k; k + 1 ]
        in
        match matched with
-       | Some bucket ->
-         Hashtbl.replace by_price k bucket;
+       | Some (bk, nbucket) ->
+         Hashtbl.replace by_price bk nbucket;
          open_acc := level :: !open_acc
        | None -> missing_acc := level :: !missing_acc)
     persisted;
@@ -272,6 +293,25 @@ let sync_open_orders
   let locked_in_sells = ref 0.0 in
   let closest_sell_order = ref None in
   let matched_persisted_indices = Hashtbl.create 16 in
+  (* M15: index the persisted sell levels by a rounded price key so each open
+     sell order's match lookup is O(1) instead of rescanning the whole list.
+     The previous [List.iteri] scan was O(n·m) per strategy execution (n open
+     sell orders x m persisted levels) — the dominant cost for assets with
+     large sell grids like SPCX's 42 open sells. Buckets store
+     (index, price, qty) so a 1-to-1 match consumes the entry and the
+     original tolerance check and qty-update semantics are preserved. *)
+  let price_key p = int_of_float (Float.round (p *. 10000.0)) in
+  let persisted_idx : (int, (int * float * float) list) Hashtbl.t = Hashtbl.create 16 in
+  let build_persisted_idx () =
+    Hashtbl.reset persisted_idx;
+    List.iteri
+      (fun idx (p, q) ->
+         let k = price_key p in
+         let bucket = Option.value (Hashtbl.find_opt persisted_idx k) ~default:[] in
+         Hashtbl.replace persisted_idx k ((idx, p, q) :: bucket))
+      state.persisted_sell_levels
+  in
+  build_persisted_idx ();
   iter_open_orders (fun oid price qty side_str userref_opt ->
     let is_our_strategy =
       match userref_opt with
@@ -298,20 +338,50 @@ let sync_open_orders
         locked_in_sells := !locked_in_sells +. qty;
         if ecfg.remaintain_expired_sells
         then (
-          let match_idx = ref None in
-          List.iteri
-            (fun idx (p, _q) ->
-               if !match_idx = None && not (Hashtbl.mem matched_persisted_indices idx)
-               then
-                 if
-                   abs_float (p -. price) <= price *. 0.0001
-                   || abs_float (p -. price) <= 1e-4
-                 then match_idx := Some idx)
-            state.persisted_sell_levels;
-          match !match_idx with
-          | Some idx ->
+          let k = price_key price in
+          let match_entry =
+            (* Probe the price's bucket and its immediate neighbors: the
+               original linear scan matched any persisted level within
+               tolerance, but grid levels are 0.25%+ apart while the
+               tolerance is 0.01% (price*0.0001) or 1e-4 absolute, so a
+               within-tolerance candidate is always the SAME grid level -
+               the neighbor probes only absorb float rounding at the
+               4-decimal bucket boundary. Pick the lowest-index candidate,
+               mirroring the original scan order. *)
+            let best = ref None in
+            let consider_bucket bk =
+              match Hashtbl.find_opt persisted_idx bk with
+              | None -> ()
+              | Some bucket ->
+                List.iter
+                  (fun (idx, p, _q) ->
+                     if
+                       (not (Hashtbl.mem matched_persisted_indices idx))
+                       && (abs_float (p -. price) <= price *. 0.0001
+                           || abs_float (p -. price) <= 1e-4)
+                     then (
+                       match !best with
+                       | None -> best := Some (bk, (idx, p, _q))
+                       | Some (_, (b_idx, _, _)) when idx < b_idx ->
+                         best := Some (bk, (idx, p, _q))
+                       | _ -> ()))
+                  bucket
+            in
+            List.iter consider_bucket [ k - 1; k; k + 1 ];
+            match !best with
+            | Some (bk, (idx, _p, _q)) ->
+              let remaining =
+                match Hashtbl.find_opt persisted_idx bk with
+                | Some b -> List.filter (fun (i, _, _) -> i <> idx) b
+                | None -> []
+              in
+              Some (bk, idx, _p, _q, remaining)
+            | None -> None
+          in
+          match match_entry with
+          | Some (bk, idx, _existing_p, existing_q, remaining_bucket) ->
             Hashtbl.add matched_persisted_indices idx ();
-            let _existing_p, existing_q = List.nth state.persisted_sell_levels idx in
+            Hashtbl.replace persisted_idx bk remaining_bucket;
             if abs_float (existing_q -. qty) > 1e-6
             then (
               state.persisted_sell_levels
@@ -332,6 +402,10 @@ let sync_open_orders
                  (fun (p1, _) (p2, _) -> Float.compare p2 p1)
                  ((price, qty) :: state.persisted_sell_levels);
             state.persistence_dirty <- true;
+            (* The list was re-sorted with a new level: rebuild the price
+               index so later orders in this scan match against the current
+               list (O(m), only on the rare adoption path). *)
+            build_persisted_idx ();
             Logging.info_f
               ~section
               "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into persistent \
@@ -882,51 +956,71 @@ let evaluate_sell_leg
       -. state.reserved_base
       -. locked_in_sells
   in
-  if
-    ecfg.remaintain_expired_sells
-    && state.persisted_sell_levels <> []
-    && not (Float.is_nan asset_balance)
+  (* M15: the persisted-sell grid is reconciled ONCE per execution and the
+     result is reused by the three persisted-sell branches below. The
+     previous code ran [reconcile_persisted_sell_levels] three times per
+     strategy tick — each an O(n+m) price-keyed partition with string-key
+     allocation — which dominated the Alpaca hotpath for assets with large
+     sell grids (e.g. SPCX's 42 open sells -> 292us STRAT p50 vs QQQ's 16us).
+     After the pruning below rebuilds [persisted_sell_levels] to
+     [open_levels @ kept_missing], a re-partition against the same open
+     orders yields exactly [kept_missing] as the missing set, so the later
+     branches reuse it instead of re-partitioning. *)
+  let missing_after_reconcile = ref [] in
+  let pruned_missing = ref [] in
+  if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
   then (
-    let available_for_missing_sells =
-      max
-        0.0
-        (asset_balance
-         +. state.anticipated_base_credit
-         -. state.reserved_base
-         -. locked_in_sells)
-    in
     let open_levels, missing_levels = reconcile_persisted_sell_levels ~state in
-    let missing_desc =
-      List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
-    in
-    let rem_avail = ref available_for_missing_sells in
-    let kept_missing = ref [] in
-    let pruned_missing = ref [] in
-    List.iter
-      (fun ((_target_p, target_q) as level) ->
-         if !rem_avail >= target_q -. 1e-6
-         then (
-           kept_missing := level :: !kept_missing;
-           rem_avail := max 0.0 (!rem_avail -. target_q))
-         else pruned_missing := level :: !pruned_missing)
-      missing_desc;
-    let new_persisted = open_levels @ List.rev !kept_missing in
-    state.persisted_sell_levels
-    <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) new_persisted;
-    if !pruned_missing <> []
+    if not (Float.is_nan asset_balance)
     then (
-      state.persistence_dirty <- true;
+      let available_for_missing_sells =
+        max
+          0.0
+          (asset_balance
+           +. state.anticipated_base_credit
+           -. state.reserved_base
+           -. locked_in_sells)
+      in
+      let missing_desc =
+        List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
+      in
+      let rem_avail = ref available_for_missing_sells in
+      let kept_missing = ref [] in
+      let pruned = ref [] in
       List.iter
-        (fun (p, q) ->
-           Logging.info_f
-             ~section
-             "Reconciled offline sell fill for %s @ %.4f (qty %.8f) - balance consumed \
-              while offline"
-             asset.symbol
-             p
-             q;
-           state.last_sell_fill_price <- Some p)
-        !pruned_missing));
+        (fun ((_target_p, target_q) as level) ->
+           if !rem_avail >= target_q -. 1e-6
+           then (
+             kept_missing := level :: !kept_missing;
+             rem_avail := max 0.0 (!rem_avail -. target_q))
+           else pruned := level :: !pruned)
+        missing_desc;
+      let new_persisted = open_levels @ List.rev !kept_missing in
+      state.persisted_sell_levels
+      <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) new_persisted;
+      (* After the rebuild the missing set is exactly the fundable
+         [kept_missing] subset (descending, as [missing_desc] was). *)
+      missing_after_reconcile := List.rev !kept_missing;
+      pruned_missing := !pruned)
+    else
+      (* Balance unknown: persisted list is left untouched, so the later
+         branches reconcile against it unchanged and see the full missing
+         set from this single partition. *)
+      missing_after_reconcile := missing_levels);
+  if !pruned_missing <> []
+  then (
+    state.persistence_dirty <- true;
+    List.iter
+      (fun (p, q) ->
+         Logging.info_f
+           ~section
+           "Reconciled offline sell fill for %s @ %.4f (qty %.8f) - balance consumed \
+            while offline"
+           asset.symbol
+           p
+           q;
+         state.last_sell_fill_price <- Some p)
+      !pruned_missing);
   let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
   let min_needed_base =
     if is_alpaca
@@ -936,7 +1030,7 @@ let evaluate_sell_leg
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells
     then (
-      let _, missing_lvl_check = reconcile_persisted_sell_levels ~state in
+      let missing_lvl_check = !missing_after_reconcile in
       (not (has_active_sell state))
       && available_base >= min_needed_base
       && (state.just_filled_buy
@@ -971,9 +1065,8 @@ let evaluate_sell_leg
     let target_sell_price_opt, target_sell_qty_override =
       if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
       then (
-        let _, missing_levels = reconcile_persisted_sell_levels ~state in
         let missing_sorted_desc =
-          List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
+          List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) !missing_after_reconcile
         in
         match missing_sorted_desc with
         | (tp, tq) :: _ -> Some tp, Some tq

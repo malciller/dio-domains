@@ -77,7 +77,14 @@ let test_latency_format () =
   Alcotest.(check string) "50us" "50µs" (Dashboard_ui.Theme.format_latency_us 50.0);
   Alcotest.(check string) "2.5ms" "2.5ms" (Dashboard_ui.Theme.format_latency_us 2500.0);
   Alcotest.(check string) "2.0s" "2.0s" (Dashboard_ui.Theme.format_latency_us 2_000_000.0);
-  Alcotest.(check string) "zero" "0µs" (Dashboard_ui.Theme.format_latency_us 0.0)
+  Alcotest.(check string) "zero" "0µs" (Dashboard_ui.Theme.format_latency_us 0.0);
+  (* The sub-microsecond predicate drives the dark-green ns styling: only
+     nonzero values below 1us count (zero reads as idle, not ns). *)
+  Alcotest.(check bool) "500ns is sub-us" true (Dashboard_ui.Theme.is_sub_us 0.5);
+  Alcotest.(check bool) "0.999us is sub-us" true (Dashboard_ui.Theme.is_sub_us 0.999);
+  Alcotest.(check bool) "1us is not sub-us" false (Dashboard_ui.Theme.is_sub_us 1.0);
+  Alcotest.(check bool) "2.5us is not sub-us" false (Dashboard_ui.Theme.is_sub_us 2.5);
+  Alcotest.(check bool) "zero is not sub-us" false (Dashboard_ui.Theme.is_sub_us 0.0)
 ;;
 
 let () =

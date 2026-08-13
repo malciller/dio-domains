@@ -193,6 +193,7 @@ let render_latencies w json =
            let bg_color = if i mod 2 = 1 then c_panel else c_bg in
            let a_text = A.(Theme.a_text ++ bg bg_color) in
            let a_green = A.(Theme.a_green ++ bg bg_color) in
+           let a_green_dark = A.(Theme.a_green_dark ++ bg bg_color) in
            let a_red = A.(Theme.a_red ++ bg bg_color) in
            let a_yellow = A.(Theme.a_yellow ++ bg bg_color) in
            let a_dim = A.(Theme.a_dim ++ bg bg_color) in
@@ -207,6 +208,12 @@ let render_latencies w json =
              | 1 -> a_yellow
              | 0 -> a_green
              | _ -> a_dim
+           in
+           (* Sub-microsecond cells (nanosecond-resolution readings) render
+              dark green so they stand apart from microsecond cells, which
+              keep the severity attribute. *)
+           let latency_cell_attr sev f =
+             if Theme.is_sub_us f then a_green_dark else sev
            in
            let col w attr s = I.string attr (Theme.pad_right w s) in
            let col_right w attr s = I.string attr (Theme.pad_left w s) in
@@ -279,15 +286,15 @@ let render_latencies w json =
                       I.hcat
                         [ col_right
                             metric_cell_w
-                            (attr_of_sev s50)
+                            (latency_cell_attr (attr_of_sev s50) p50)
                             (format_latency_us p50)
                         ; col_right
                             metric_cell_w
-                            (attr_of_sev s99)
+                            (latency_cell_attr (attr_of_sev s99) p99)
                             (format_latency_us p99)
                         ; col_right
                             metric_cell_w
-                            (attr_of_sev s999)
+                            (latency_cell_attr (attr_of_sev s999) p999)
                             (format_latency_us p999)
                         ])
                   in
@@ -297,11 +304,17 @@ let render_latencies w json =
            let _, oracle_p99, _, _ = find_metric "oracle" in
            let o_arr = update_oracle_hist symbol oracle_p99 in
            let o_smooth = ema_smooth o_arr ~alpha:0.5 in
-           (* Oracle sparkline full scale: 10s (fetches dominate the per-asset
-               pipeline; anything at the top of the scale is a degraded pass). *)
+           (* Oracle trend full scale: the per-asset profiler measures only
+                the analyze/sizing span (cache hits ~2-3us; the fetch phase
+                lives in the engine-global fetch profiler), so the old 10s
+                scale put every cell at ratio ~0 and rendered the trend
+                column blank. A 10us scale keeps the normal cache-hit trend
+                visible and a recompute spike (seconds) reads as a
+                full-height bar. Sub-microsecond readings use the same dark
+                green as the metric cells. *)
            let trend_spark =
-             render_sparkline_local 11 o_smooth 10_000_000.0 (fun v ->
-               attr_of_sev (severity "oracle" v 1))
+             render_sparkline_local 11 o_smooth 10.0 (fun v ->
+               latency_cell_attr (attr_of_sev (severity "oracle" v 1)) v)
            in
            let cycle_cause =
              match List.assoc_opt "oracle" mlist with
