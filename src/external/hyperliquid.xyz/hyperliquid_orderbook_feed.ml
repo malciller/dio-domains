@@ -24,21 +24,25 @@ module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 (** Mutable top-of-book cache. Updated atomically (single writer from the WS
     processing thread) and read lock-free from domain workers. Avoids the
     full ring-buffer read + array bounds check + record field extraction
-    pipeline on the latency-critical path. *)
+    pipeline on the latency-critical path.
+
+    L4: the cache is an IMMUTABLE snapshot record held in an [Atomic.t]. The
+    WS thread publishes a fresh record with one [Atomic.set] (all four fields
+    + validity travel together); readers do one [Atomic.get]. This eliminates
+    the torn-read data race that existed when the fields were written
+    separately under the OCaml 5 memory model. *)
 type tob_cache =
-  { mutable bid_px : float
-  ; mutable bid_sz : float
-  ; mutable ask_px : float
-  ; mutable ask_sz : float
-  ; mutable tob_valid : bool
+  { bid_px : float
+  ; bid_sz : float
+  ; ask_px : float
+  ; ask_sz : float
+  ; tob_valid : bool
   }
 
-(** Per-symbol store containing a ring buffer, readiness flag, and
-    zero-allocation top-of-book cache. *)
 type store =
-  { buffer : orderbook RingBuffer.t
+  { buffer : string RingBuffer.t
   ; ready : bool Atomic.t
-  ; tob : tob_cache
+  ; tob : tob_cache Atomic.t
   }
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
@@ -66,12 +70,13 @@ let ensure_store symbol =
           { buffer = RingBuffer.create ring_buffer_size
           ; ready = Atomic.make false
           ; tob =
-              { bid_px = 0.0
-              ; bid_sz = 0.0
-              ; ask_px = 0.0
-              ; ask_sz = 0.0
-              ; tob_valid = false
-              }
+              Atomic.make
+                { bid_px = 0.0
+                ; bid_sz = 0.0
+                ; ask_px = 0.0
+                ; ask_sz = 0.0
+                ; tob_valid = false
+                }
           }
         in
         Hashtbl.add stores symbol store;
@@ -330,21 +335,16 @@ let process_raw_market_data msg =
       | Some symbol ->
         (try
            let store = ensure_store symbol in
-           (* Zero-alloc depth-1 fast path: parse TOB directly into mutable cache *)
+           (* Zero-alloc depth-1 fast path: parse TOB, publish an immutable
+               snapshot record with one Atomic.set (L4 — no torn reads). *)
            let bid_px, bid_sz, ask_px, ask_sz, ok = parse_tob_fast msg in
            if ok
-           then (
-             store.tob.bid_px <- bid_px;
-             store.tob.bid_sz <- bid_sz;
-             store.tob.ask_px <- ask_px;
-             store.tob.ask_sz <- ask_sz;
-             store.tob.tob_valid <- true);
-           (* Still write full OB to ring buffer for non-hot-path consumers.
-               Timestamp is deferred — only set if someone actually reads the
-               ring buffer entry, which is not on the domain hot path. *)
-           let bids, asks = get_bids_asks msg in
-           let ob = { symbol; bids; asks; timestamp = 0.0 } in
-           RingBuffer.write store.buffer ob;
+           then Atomic.set store.tob { bid_px; bid_sz; ask_px; ask_sz; tob_valid = true };
+           (* Store the RAW message in the ring buffer. The full-book parse
+                (get_bids_asks) is deferred to read time (M3): the dashboard
+                parses on its 0.5s cadence; the domain TOB path never parses
+                the full book. *)
+           RingBuffer.write store.buffer msg;
            notify_ready store;
            Concurrency.Exchange_wakeup.signal ~symbol
          with
@@ -357,44 +357,64 @@ let process_raw_market_data msg =
       | None -> ()))
 ;;
 
+(** Parse a raw l2Book message into an [orderbook] on demand (M3: the full
+    book is parsed lazily, only when a consumer reads the ring buffer). *)
+let[@inline always] parse_orderbook symbol msg =
+  let bids, asks = get_bids_asks msg in
+  { symbol; bids; asks; timestamp = Unix.gettimeofday () }
+;;
+
 let[@inline always] get_latest_orderbook symbol =
   match Hashtbl.find_opt stores symbol with
-  | Some store -> RingBuffer.read_latest store.buffer
+  | Some store ->
+    (match RingBuffer.read_latest store.buffer with
+     | Some msg -> Some (parse_orderbook symbol msg)
+     | None -> None)
   | None -> None
 ;;
 
-(** Read top-of-book from the mutable cache (zero allocation). *)
+(** Read top-of-book from the atomic snapshot cache (zero allocation,
+    lock-free, torn-read-free — L4). *)
 let[@inline always] get_best_bid_ask symbol =
   match Hashtbl.find_opt stores symbol with
-  | Some store when store.tob.tob_valid ->
-    Some (store.tob.bid_px, store.tob.bid_sz, store.tob.ask_px, store.tob.ask_sz)
-  | _ -> None
+  | Some store ->
+    let t = Atomic.get store.tob in
+    if t.tob_valid then Some (t.bid_px, t.bid_sz, t.ask_px, t.ask_sz) else None
+  | None -> None
 ;;
 
-(** Returns a cached closure that reads top-of-book from the mutable TOB cache.
-    The closure itself allocates nothing — it reads 4 mutable floats and wraps
-    them in a Some tuple. The store pointer is captured at closure-creation time
-    so the domain hot loop never touches the stores Hashtbl. *)
+(** Returns a cached closure that reads top-of-book from the atomic TOB cache.
+    The closure itself allocates nothing — it reads one Atomic record and
+    wraps it in a Some tuple. The store pointer is captured at
+    closure-creation time so the domain hot loop never touches the stores
+    Hashtbl. *)
 let[@inline always] get_best_bid_ask_fast symbol =
   let store = ensure_store symbol in
   fun () ->
-    if store.tob.tob_valid
-    then Some (store.tob.bid_px, store.tob.bid_sz, store.tob.ask_px, store.tob.ask_sz)
-    else None
+    let t = Atomic.get store.tob in
+    if t.tob_valid then Some (t.bid_px, t.bid_sz, t.ask_px, t.ask_sz) else None
 ;;
 
-(** Returns all orderbook snapshots written since [last_pos]. *)
+(** Returns all orderbook snapshots written since [last_pos], parsing the
+    raw messages lazily on read (M3). *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
-  | Some store -> RingBuffer.read_since store.buffer last_pos
+  | Some store ->
+    List.map (parse_orderbook symbol) (RingBuffer.read_since store.buffer last_pos)
   | None -> []
 ;;
 
-(** Iterates [f] over orderbook snapshots since [last_pos] without list allocation.
+(** Iterates [f] over orderbook snapshots since [last_pos], parsing each raw
+    message lazily on read (M3) and without intermediate list allocation.
     Returns the new cursor position. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match Hashtbl.find_opt stores symbol with
-  | Some store -> RingBuffer.iter_since store.buffer last_pos f
+  | Some store ->
+    ignore
+      (RingBuffer.iter_since store.buffer last_pos (fun msg ->
+         let ob = parse_orderbook symbol msg in
+         f ob));
+    RingBuffer.get_position store.buffer
   | None -> last_pos
 ;;
 

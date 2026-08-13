@@ -31,46 +31,57 @@ let profilers : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
 
 let profilers_mutex = Mutex.create ()
 
+(* M10: memoize the last lookup so the common per-order path (same symbol +
+   operation repeated) skips the key sprintf and the profilers_mutex
+   acquisition entirely. *)
+let last_profiler_key = ref ""
+let last_profiler = ref None
+
 let get_profiler symbol operation =
   let key = Printf.sprintf "%s:%s" symbol operation in
-  Mutex.lock profilers_mutex;
-  let profiler =
-    match Hashtbl.find_opt profilers key with
-    | Some p -> p
-    | None ->
-      (* Evict the entry with the lowest sample count to keep table size
-           at most 64. Guards against unbounded growth from symbol churn. *)
-      if Hashtbl.length profilers >= 64
-      then (
-        let min_key =
-          Hashtbl.fold
-            (fun k p best ->
-               let count =
-                 match Latency_profiler.snapshot p with
-                 | Some snap -> snap.Latency_profiler.samples
-                 | None -> 0
-               in
-               match best with
-               | None -> Some (k, count)
-               | Some (_, s) when count < s -> Some (k, count)
-               | some -> some)
-            profilers
-            None
-        in
-        Option.iter
-          (fun (k, _) ->
-             Logging.warn_f
-               ~section
-               "profilers table at capacity (64); evicting stale entry '%s'"
-               k;
-             Hashtbl.remove profilers k)
-          min_key);
-      let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
-      Hashtbl.replace profilers key p;
-      p
-  in
-  Mutex.unlock profilers_mutex;
-  profiler
+  if key = !last_profiler_key
+  then Option.get !last_profiler
+  else (
+    Mutex.lock profilers_mutex;
+    let profiler =
+      match Hashtbl.find_opt profilers key with
+      | Some p -> p
+      | None ->
+        (* Evict the entry with the lowest sample count to keep table size
+             at most 64. Guards against unbounded growth from symbol churn. *)
+        if Hashtbl.length profilers >= 64
+        then (
+          let min_key =
+            Hashtbl.fold
+              (fun k p best ->
+                 let count =
+                   match Latency_profiler.snapshot p with
+                   | Some snap -> snap.Latency_profiler.samples
+                   | None -> 0
+                 in
+                 match best with
+                 | None -> Some (k, count)
+                 | Some (_, s) when count < s -> Some (k, count)
+                 | some -> some)
+              profilers
+              None
+          in
+          Option.iter
+            (fun (k, _) ->
+               Logging.warn_f
+                 ~section
+                 "profilers table at capacity (64); evicting stale entry '%s'"
+                 k;
+               Hashtbl.remove profilers k)
+            min_key);
+        let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
+        Hashtbl.replace profilers key p;
+        p
+    in
+    Mutex.unlock profilers_mutex;
+    last_profiler_key := key;
+    last_profiler := Some profiler;
+    profiler)
 ;;
 
 (* Exchange interface module and type aliases. *)
@@ -192,10 +203,12 @@ let is_connection_error exn_str =
   | _ -> false
 ;;
 
-(** Wraps [f] with exception handling. On connection errors (as classified by
-    [is_connection_error]), retries up to [max_retries] times with [retry_delay]
-    seconds between attempts. Non-connection errors return [Error] immediately. *)
-let with_error_handling ~operation_name ?(max_retries = 3) ?(retry_delay = 1.0) f =
+(** Wraps [f] with exception handling, converting raised exceptions into
+    [Error] results. Retries are NOT applied here (H7: single retry policy):
+    the executor already passes [retry_config] down to the exchange modules,
+    which own retries via [Error_handling.retry_with_backoff]. A second retry
+    layer here would double the sleep-on-error path (1s+2s twice). *)
+let with_error_handling ~operation_name ?(max_retries = 1) ?(retry_delay = 1.0) f =
   Error_handling.retry_with_backoff
     ~section
     ~config:

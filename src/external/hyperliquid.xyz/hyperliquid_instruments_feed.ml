@@ -17,6 +17,21 @@ type pair_info =
 
 let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 128
 let cache_mutex = Mutex.create ()
+
+(* M16: lock-free reads. [published_cache] is a copy-on-write snapshot: the
+   single writer (WS init / initialize / register_test_instrument, all cold
+   paths) mutates [pair_cache] under [cache_mutex] then republishes a fresh
+   table with one [Atomic.set]. [lookup_info] — called dozens of times per
+   tick from cached_round_price — does one [Atomic.get] + Hashtbl.find, no
+   mutex. The published table is never mutated after publication. *)
+let published_cache : (string, pair_info) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 128)
+;;
+
+(** Republish the current [pair_cache] as an immutable snapshot. Caller holds
+    [cache_mutex]. *)
+let publish_cache () = Atomic.set published_cache (Hashtbl.copy pair_cache)
+
 let is_ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
@@ -107,6 +122,7 @@ let process_meta_response payload_perp payload_spot =
                 (Printexc.to_string exn))
          universe_spot;
        Mutex.unlock cache_mutex;
+       publish_cache ();
        Logging.debug_f
          ~section
          "Initialized Hyperliquid instrument feed via WS payload with %d perps and %d \
@@ -138,6 +154,7 @@ let initialize symbols =
        Hashtbl.replace pair_cache symbol info)
     symbols;
   Mutex.unlock cache_mutex;
+  publish_cache ();
   Logging.debug_f
     ~section
     "Initialized Hyperliquid instruments feed with %d mock symbols"
@@ -158,27 +175,26 @@ let register_test_instrument ~symbol ~sz_decimals =
   (match String.split_on_char '/' symbol with
    | base :: _ when base <> symbol -> Hashtbl.replace pair_cache base info
    | _ -> ());
-  Mutex.unlock cache_mutex
+  Mutex.unlock cache_mutex;
+  publish_cache ()
 ;;
 
-(** Looks up instrument info by symbol. Falls back to stripping the
-    quote suffix (e.g. "BTC/USDC" to "BTC") to resolve perpetuals,
-    which are cached under their base name only. Spot pairs are stored
-    under their full "BASE/QUOTE" key (asset_index >= 10000). *)
+(** Looks up instrument info by symbol. Lock-free (M16): reads the published
+    copy-on-write snapshot — one [Atomic.get] + Hashtbl.find, no mutex on the
+    per-tick rounding path. Falls back to stripping the quote suffix (e.g.
+    "BTC/USDC" to "BTC") to resolve perpetuals, which are cached under their
+    base name only. Spot pairs are stored under their full "BASE/QUOTE" key
+    (asset_index >= 10000). *)
 let lookup_info symbol =
-  Mutex.lock cache_mutex;
-  let direct = Hashtbl.find_opt pair_cache symbol in
-  let result =
-    match direct with
-    | Some _ as r -> r
-    | None ->
-      (* Strip quote suffix and retry as perpetual base name. *)
-      (match String.split_on_char '/' symbol with
-       | base :: _ -> Hashtbl.find_opt pair_cache base
-       | [] -> None)
-  in
-  Mutex.unlock cache_mutex;
-  result
+  let cache = Atomic.get published_cache in
+  let direct = Hashtbl.find_opt cache symbol in
+  match direct with
+  | Some _ as r -> r
+  | None ->
+    (* Strip quote suffix and retry as perpetual base name. *)
+    (match String.split_on_char '/' symbol with
+     | base :: _ -> Hashtbl.find_opt cache base
+     | [] -> None)
 ;;
 
 (** Returns the venue price increment. Hyperliquid quotes prices to 2 decimal

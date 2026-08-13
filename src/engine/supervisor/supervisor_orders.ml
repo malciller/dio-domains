@@ -61,12 +61,11 @@ let grid_callbacks : strategy_callbacks =
           order_id;
         match order.price with
         | Some price ->
-          Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
-            ~now:(Unix.gettimeofday ())
+          (* H3: enqueue onto the per-symbol lifecycle queue; the domain thread
+             drains it, so the strategy mutex is never taken cross-thread. *)
+          Dio_strategies.Suicide_grid.Strategy.enqueue_event
             order.symbol
-            order_id
-            order.side
-            price
+            (Ack { now = Unix.gettimeofday (); order_id; side = order.side; price })
         | None -> ())
   ; on_place_fail =
       (fun order err ->
@@ -78,18 +77,14 @@ let grid_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
-        Dio_strategies.Suicide_grid.Strategy.handle_order_failed
-          ~now:(Unix.gettimeofday ())
+        Dio_strategies.Suicide_grid.Strategy.enqueue_event
           order.symbol
-          order.side
-          err;
+          (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
         match order.price with
         | Some price ->
-          Dio_strategies.Suicide_grid.Strategy.handle_order_rejected
-            ~now:(Unix.gettimeofday ())
+          Dio_strategies.Suicide_grid.Strategy.enqueue_event
             order.symbol
-            order.side
-            price
+            (Rejected { now = Unix.gettimeofday (); side = order.side; price })
         | None -> ())
   ; on_amend_ok =
       (fun order target_order_id new_order_id ->
@@ -103,13 +98,15 @@ let grid_callbacks : strategy_callbacks =
           new_order_id;
         match order.price with
         | Some price ->
-          Dio_strategies.Suicide_grid.Strategy.handle_order_amended
-            ~now:(Unix.gettimeofday ())
+          Dio_strategies.Suicide_grid.Strategy.enqueue_event
             order.symbol
-            target_order_id
-            new_order_id
-            order.side
-            price
+            (Amended
+               { now = Unix.gettimeofday ()
+               ; old_id = target_order_id
+               ; new_id = new_order_id
+               ; side = order.side
+               ; price
+               })
         | None ->
           Logging.warn_f
             ~section
@@ -119,12 +116,14 @@ let grid_callbacks : strategy_callbacks =
       (fun order target_order_id ->
         match order.price with
         | Some price ->
-          Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_skipped
-            ~now:(Unix.gettimeofday ())
+          Dio_strategies.Suicide_grid.Strategy.enqueue_event
             order.symbol
-            target_order_id
-            order.side
-            price
+            (Amendment_skipped
+               { now = Unix.gettimeofday ()
+               ; order_id = target_order_id
+               ; side = order.side
+               ; price
+               })
         | None ->
           Logging.warn_f
             ~section
@@ -139,12 +138,14 @@ let grid_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
-        Dio_strategies.Suicide_grid.Strategy.handle_order_amendment_failed
-          ~now:(Unix.gettimeofday ())
+        Dio_strategies.Suicide_grid.Strategy.enqueue_event
           order.symbol
-          target_order_id
-          order.side
-          err)
+          (Amendment_failed
+             { now = Unix.gettimeofday ()
+             ; order_id = target_order_id
+             ; side = order.side
+             ; reason = err
+             }))
   ; on_cancel_ok =
       (fun order target_order_id ->
         Logging.info_f ~section "✓ Cancelled order: %s" target_order_id;

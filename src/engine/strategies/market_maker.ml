@@ -60,6 +60,8 @@ type strategy_state =
     (** last observed balance; used to detect genuine recovery *)
   ; mutable startup_replay : bool
     (** true during startup; suppresses logging/metrics if needed *)
+  ; mutable cached_qty : float
+    (** parsed [asset.qty]; avoids float_of_string on every execution (M14) *)
   ; mutex : Mutex.t (** guards concurrent access from callback handlers *)
   }
 
@@ -91,6 +93,7 @@ let get_strategy_state asset_symbol =
         ; capital_low_logged = false
         ; last_seen_asset_balance = 0.0
         ; startup_replay = true
+        ; cached_qty = 0.0
         ; mutex = Mutex.create ()
         }
       in
@@ -466,6 +469,14 @@ let execute_strategy
     | Some s -> s
     | None -> get_strategy_state asset.symbol
   in
+  (* M14: parse asset.qty once per strategy lifetime; the config string is
+     immutable, so cached_qty replaces float_of_string on every cycle. *)
+  if state.cached_qty <= 0.0
+  then
+    state.cached_qty
+    <- (try float_of_string asset.qty with
+        | Failure _ -> 0.001);
+  let qty_f = state.cached_qty in
   (* Asset-low recovery: clear flag when asset balance recovers.
      Kraken: only clear when balance has genuinely increased (fill, deposit).
      Kraken "Insufficient funds" on sells may reflect USD collateral, not asset
@@ -473,10 +484,6 @@ let execute_strategy
      Hyperliquid: clear whenever available balance meets the threshold. *)
   (match asset_balance with
    | Some asset_bal ->
-     let qty_f =
-       try float_of_string asset.qty with
-       | Failure _ -> 0.001
-     in
      let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
      let is_hl = Exchange.Types.exchange_of_string asset.exchange = Hyperliquid in
      let should_clear =
@@ -503,10 +510,6 @@ let execute_strategy
      for a buy order. Clears flag and resumes when balance recovers. *)
   (match quote_balance, current_price with
    | Some quote_bal, Some price ->
-     let qty_f =
-       try float_of_string asset.qty with
-       | Failure _ -> 0.001
-     in
      let quote_needed_fast = price *. qty_f in
      if state.capital_low && quote_bal < quote_needed_fast
      then

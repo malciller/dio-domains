@@ -514,7 +514,12 @@ let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
     in
     from_order_ids @ from_cl_ord_ids @ from_userrefs
   in
-  (* Send each cancel as a separate request with its own req_id. *)
+  (* Execute all cancels in PARALLEL (H8): each cancel carries its own req_id,
+     so response correlation is per-order — the shared-req_id desync concern
+     only applies to a true batch cancel, which Kraken does not offer. The old
+     sequential pipeline turned N cancels into N × RTT on the domain's critical
+     path; parallel requests collapse it to ~1 RTT. Each failure is logged and
+     the remaining cancels still complete. *)
   let cancel_single (key, value) =
     let cancel_once () =
       let req_id = next_req_id () in
@@ -560,20 +565,14 @@ let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
     in
     Error_handling.retry_with_backoff ~section ~config ~f:cancel_once ()
   in
-  (* Execute all cancels sequentially and accumulate results. *)
-  let rec run_all acc = function
-    | [] -> Lwt.return (Ok (List.rev acc))
-    | cancel_params :: rest ->
-      cancel_single cancel_params
-      >>= (function
-       | Ok result -> run_all (result :: acc) rest
-       | Error err ->
-         (* Log and continue: don't abort remaining cancels on a single failure *)
-         Logging.warn_f
-           ~section
-           "Cancel failed for one order (%s), continuing with remaining"
-           err;
-         run_all acc rest)
+  Lwt_list.map_p cancel_single individual_cancels
+  >|= fun results ->
+  let results =
+    List.filter_map
+      (function
+        | Ok r -> Some r
+        | Error _ -> None)
+      results
   in
-  run_all [] individual_cancels
+  if results <> [] then Ok results else Error "Failed to cancel orders"
 ;;

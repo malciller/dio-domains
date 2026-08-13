@@ -100,6 +100,8 @@ let handle_order_amended = Suicide_grid_events.handle_order_amended
 let handle_order_amendment_skipped = Suicide_grid_events.handle_order_amendment_skipped
 let handle_order_amendment_failed = Suicide_grid_events.handle_order_amendment_failed
 let cleanup_pending_cancellation = Suicide_grid_events.cleanup_pending_cancellation
+let enqueue_event = Suicide_grid_events.enqueue_event
+let drain_events = Suicide_grid_events.drain_events
 
 (** Reads up to [max_orders] orders from the ringbuffer for processing. *)
 let get_pending_orders max_orders = LockFreeQueue.read_batch order_buffer max_orders
@@ -135,6 +137,46 @@ module Strategy = struct
   let cleanup_pending_cancellation = cleanup_pending_cancellation
   let cleanup_strategy_state = cleanup_strategy_state
   let init = init
+  let enqueue_event = enqueue_event
+  let drain_events = drain_events
+
+  (** Supervisor REST callbacks enqueue lifecycle events of this type. *)
+  type lifecycle_event = Suicide_grid_events.lifecycle_event =
+    | Ack of
+        { now : float
+        ; order_id : string
+        ; side : order_side
+        ; price : float
+        }
+    | Failed of
+        { now : float
+        ; side : order_side
+        ; reason : string
+        }
+    | Rejected of
+        { now : float
+        ; side : order_side
+        ; price : float
+        }
+    | Amended of
+        { now : float
+        ; old_id : string
+        ; new_id : string
+        ; side : order_side
+        ; price : float
+        }
+    | Amendment_skipped of
+        { now : float
+        ; order_id : string
+        ; side : order_side
+        ; price : float
+        }
+    | Amendment_failed of
+        { now : float
+        ; order_id : string
+        ; side : order_side
+        ; reason : string
+        }
 
   (** Clears the startup_replay flag so subsequent fills are processed normally. *)
   let set_startup_replay_done symbol =

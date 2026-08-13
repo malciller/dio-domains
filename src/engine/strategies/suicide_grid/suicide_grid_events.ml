@@ -6,6 +6,80 @@ open Suicide_grid_config
 open Suicide_grid_reservation
 open Suicide_grid_orders
 
+(* H3: per-symbol lock-free lifecycle event queue. The Lwt supervisor thread
+   (REST callbacks, supervisor_orders.ml) enqueues lifecycle events instead of
+   calling the handlers directly; the domain worker drains the queue at the
+   top of every cycle, so ALL handler execution happens on the domain thread.
+   The per-symbol state mutex is then never contended across threads (the
+   supervisor never blocks on it, the domain never blocks on a REST batch).
+   Each queue is single-consumer (its symbol's domain); LockFreeQueue is
+   MPSC-safe, and enqueue signals Exchange_wakeup so an idle domain wakes to
+   drain promptly. *)
+
+type lifecycle_event =
+  | Ack of
+      { now : float
+      ; order_id : string
+      ; side : order_side
+      ; price : float
+      }
+  | Failed of
+      { now : float
+      ; side : order_side
+      ; reason : string
+      }
+  | Rejected of
+      { now : float
+      ; side : order_side
+      ; price : float
+      }
+  | Amended of
+      { now : float
+      ; old_id : string
+      ; new_id : string
+      ; side : order_side
+      ; price : float
+      }
+  | Amendment_skipped of
+      { now : float
+      ; order_id : string
+      ; side : order_side
+      ; price : float
+      }
+  | Amendment_failed of
+      { now : float
+      ; order_id : string
+      ; side : order_side
+      ; reason : string
+      }
+
+let event_queues : (string, lifecycle_event LockFreeQueue.t) Hashtbl.t = Hashtbl.create 16
+let event_queues_mutex = Mutex.create ()
+
+let get_event_queue symbol =
+  match Hashtbl.find_opt event_queues symbol with
+  | Some q -> q
+  | None ->
+    Mutex.lock event_queues_mutex;
+    let q =
+      match Hashtbl.find_opt event_queues symbol with
+      | Some q -> q
+      | None ->
+        let q = LockFreeQueue.create () in
+        Hashtbl.replace event_queues symbol q;
+        q
+    in
+    Mutex.unlock event_queues_mutex;
+    q
+;;
+
+(** Enqueue a lifecycle event from any thread (supervisor REST path). Lock-free
+    push plus a per-symbol wakeup so the domain drains it promptly. *)
+let enqueue_event symbol (ev : lifecycle_event) =
+  ignore (LockFreeQueue.write (get_event_queue symbol) ev);
+  Concurrency.Exchange_wakeup.signal ~symbol
+;;
+
 (** Flushes deferred accumulation state to disk when the dirty flag is set. *)
 let flush_persistence asset_symbol =
   let state = get_strategy_state asset_symbol in
@@ -864,3 +938,33 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
 
 (** No-op shim for pending cancellation cleanup. *)
 let cleanup_pending_cancellation _asset_symbol _order_id = ()
+
+(* H3: drain lifecycle events queued by the supervisor REST path and dispatch
+   them to the handlers. Runs on the domain thread at the top of every cycle,
+   so every handler invocation (REST- or WS-sourced) executes on the domain
+   thread — the strategy mutex is never shared across threads. *)
+let dispatch_event symbol (ev : lifecycle_event) =
+  match ev with
+  | Ack { now; order_id; side; price } ->
+    handle_order_acknowledged ~now symbol order_id side price
+  | Failed { now; side; reason } -> handle_order_failed ~now symbol side reason
+  | Rejected { now; side; price } -> handle_order_rejected ~now symbol side price
+  | Amended { now; old_id; new_id; side; price } ->
+    handle_order_amended ~now symbol old_id new_id side price
+  | Amendment_skipped { now; order_id; side; price } ->
+    handle_order_amendment_skipped ~now symbol order_id side price
+  | Amendment_failed { now; order_id; side; reason } ->
+    handle_order_amendment_failed ~now symbol order_id side reason
+;;
+
+let drain_events symbol =
+  let q = get_event_queue symbol in
+  let rec loop () =
+    match LockFreeQueue.read q with
+    | Some ev ->
+      dispatch_event symbol ev;
+      loop ()
+    | None -> ()
+  in
+  loop ()
+;;

@@ -144,6 +144,32 @@ let percentile t p =
     float (!i * t.bucket_us))
 ;;
 
+(** [percentiles5 t] computes p50/p90/p95/p99/p999 in a SINGLE cumulative pass
+    over the histogram instead of five independent scans (M7: the oracle
+    profilers are 60k–100k buckets, so five scans cost ~0.5–5ms per window).
+    Each target is captured the moment its cumulative count is crossed. *)
+let percentiles5 t =
+  if t.samples = 0
+  then 0.0, 0.0, 0.0, 0.0, 0.0
+  else (
+    let fracs = [| 0.50; 0.90; 0.95; 0.99; 0.999 |] in
+    let vals = [| 0.0; 0.0; 0.0; 0.0; 0.0 |] in
+    let cumulative = ref 0 in
+    let i = ref 0 in
+    let remaining = ref 5 in
+    while !i < t.bucket_count && !remaining > 0 do
+      cumulative := !cumulative + t.buckets.(!i);
+      for k = 0 to 4 do
+        if vals.(k) = 0.0 && float !cumulative >= ceil (float t.samples *. fracs.(k))
+        then (
+          vals.(k) <- float (!i * t.bucket_us);
+          decr remaining)
+      done;
+      incr i
+    done;
+    vals.(0), vals.(1), vals.(2), vals.(3), vals.(4))
+;;
+
 (** [reset t] zeroes all histogram buckets and resets sample/overflow and
     activity counters. Does not touch [window_start]; callers that advance
     the window must set it explicitly. *)
@@ -184,13 +210,14 @@ let snapshot_and_reset t =
       ; window_start
       ; window_end = now
       }
-    else
+    else (
+      let p50, p90, p95, p99, p999 = percentiles5 t in
       { name = t.name
-      ; p50 = percentile t 0.50
-      ; p90 = percentile t 0.90
-      ; p95 = percentile t 0.95
-      ; p99 = percentile t 0.99
-      ; p999 = percentile t 0.999
+      ; p50
+      ; p90
+      ; p95
+      ; p99
+      ; p999
       ; samples = t.samples
       ; overflow = t.overflow
       ; max_cause = t.max_cause
@@ -198,7 +225,7 @@ let snapshot_and_reset t =
       ; last_exec_time = t.last_exec_time
       ; window_start
       ; window_end = now
-      }
+      })
   in
   Atomic.set t.published (Some snap);
   reset t;

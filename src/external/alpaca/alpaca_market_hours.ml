@@ -92,17 +92,32 @@ let extended_open_min = 0
 let extended_close_hour = 20
 let extended_close_min = 0
 
-(** Evaluates whether the current system time falls within Regular Trading Hours (9:30 AM - 4:00 PM ET). *)
+(** Evaluates whether the current system time falls within Regular Trading Hours (9:30 AM - 4:00 PM ET).
+    Cached with a 1s TTL (M4): the full evaluation does multiple gmtime/mktime DST
+    calculations (~10–100µs); the WS feed handler calls this on every trade
+    message, so the cache keeps it off the per-tick path while still tracking
+    the session boundary. *)
+let regular_open_cache : (float * bool) Atomic.t = Atomic.make (0.0, false)
+
 let is_regular_market_open () =
-  let wday, hour, min = current_eastern_time () in
-  let is_weekday = wday >= 1 && wday <= 5 in
-  if not is_weekday
-  then false
+  let now = Unix.gettimeofday () in
+  let last_t, last_v = Atomic.get regular_open_cache in
+  if now -. last_t < 1.0
+  then last_v
   else (
-    let time_mins = (hour * 60) + min in
-    let open_mins = (9 * 60) + 30 in
-    let close_mins = 16 * 60 in
-    time_mins >= open_mins && time_mins < close_mins)
+    let wday, hour, min = current_eastern_time () in
+    let is_weekday = wday >= 1 && wday <= 5 in
+    let v =
+      if not is_weekday
+      then false
+      else (
+        let time_mins = (hour * 60) + min in
+        let open_mins = (9 * 60) + 30 in
+        let close_mins = 16 * 60 in
+        time_mins >= open_mins && time_mins < close_mins)
+    in
+    Atomic.set regular_open_cache (now, v);
+    v)
 ;;
 
 (** Evaluates whether current system time is strictly within overnight trading hours (8:00 PM ET - 4:00 AM ET). *)
