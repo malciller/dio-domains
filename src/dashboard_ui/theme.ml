@@ -211,7 +211,11 @@ let format_latency_us f =
     then Printf.sprintf "%.1fs" (f /. 1_000_000.0)
     else if f >= 1000.0
     then Printf.sprintf "%.1fms" (f /. 1000.0)
-    else Printf.sprintf "%.0fµs" f
+    else if f >= 1.0
+    then Printf.sprintf "%.0fµs" f
+    else if f > 0.0
+    then Printf.sprintf "%.0fns" (f *. 1000.0)
+    else "0µs"
   in
   add_commas raw
 ;;
