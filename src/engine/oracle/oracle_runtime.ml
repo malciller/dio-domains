@@ -410,6 +410,163 @@ let asset_profiler_snapshots () =
     []
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Materialized oracle state + background refresh (microsecond        *)
+(* decision path).                                                     *)
+(*                                                                     *)
+(* The decision path (run_pass) never touches the network. A          *)
+(* background refresher owns every REST call (balances, history       *)
+(* deltas, deep history, class members, the Alpaca calendar) and      *)
+(* publishes an immutable materialized world state atomically.        *)
+(* Analyses are memoized on the physical identity of their inputs     *)
+(* (the refresher reuses bar arrays when nothing changed, so a        *)
+(* physical compare is the fast path), and account sizing is          *)
+(* memoized on (analysis ids, pool bucket, strategy state). A pass    *)
+(* with nothing changed is a fingerprint compare + publish:           *)
+(* microseconds.                                                       *)
+(* ------------------------------------------------------------------ *)
+
+(** One asset's materialized history: everything the analysis of that
+    asset reads, minus live in-process values (the top-of-book anchor is
+    re-read at sizing time). All arrays are immutable after publication. *)
+type asset_material =
+  { am_exchange : string
+  ; am_symbol : string
+  ; am_tc : Dio_strategies.Strategy_common.trading_config
+    (** Fee-enriched trading config (enrichment is network-once, done by
+        the refresher). *)
+  ; am_bars : Oracle_types.bar array
+    (** Merged venue + deep history (raw bars, sorted). *)
+  ; am_deep_bars : int
+  ; am_members : Oracle_types.series list
+    (** Class member series (the kappa blend inputs). *)
+  ; am_calendar : Oracle_sessions.model option (** Equity session model (Alpaca only). *)
+  ; am_calendar_fp : string
+    (** Fingerprint of the calendar dates the model was built from, so a
+        rebuilt model object with identical dates is not a change. *)
+  }
+
+(** The materialized world state the decision path consumes. Swapped
+    atomically as a whole by the refresher; the pass reads the current
+    record and never blocks on network. Hashtbls inside are private to
+    their record: filled before publication, immutable after. *)
+type materialized =
+  { m_assets : asset_material list
+  ; m_balances : (string, (float * Oracle_balances.snapshot) option) Hashtbl.t
+    (** Keyed by [account_id]: the account's available-quote pool and its
+        balance snapshot, or None when the venue reported nothing. *)
+  ; m_fng : float option
+  ; m_epoch : int
+    (** Refresh generation this record was published at (==
+        [refresh_generation]). *)
+  ; m_last_history_at : float
+    (** Wall clock of the last history phase (full histories are re-fetched
+        at the refresh cadence; balance-only cycles keep the arrays). *)
+  }
+
+let materialized_ref : materialized option Atomic.t = Atomic.make None
+let materialized () = Atomic.get materialized_ref
+
+(** The background refresher fiber of the current [run_loop] generation:
+    cancelled when the loop ends (shutdown) or restarts (supervisor
+    auto-restart), so two refreshers can never run at once. *)
+let refresh_fiber : unit Lwt.t option ref = ref None
+
+(** Refresh generations: bumped once per published cycle. The pass loop
+    wakes early when a cycle CHANGED analysis-relevant inputs
+    ([refresh_history_changed]); balance-only cycles never wake the pass
+    (the pass's own cadence and the bounded wait on fill events cover
+    balance freshness). *)
+let refresh_generation : int Atomic.t = Atomic.make 0
+
+let refresh_history_changed : bool Atomic.t = Atomic.make false
+
+(** Per-symbol fetch failure backoff (seconds since epoch): a failed
+    history fetch (timeout, venue error) is retried in the background at
+    [poll] cadence, but not before [retry_after] - a sick upstream cannot
+    make the refresher spin. Grows exponentially on repeated failures. *)
+let retry_after : (string, float) Hashtbl.t = Hashtbl.create 32
+
+let retry_backoff : (string, float) Hashtbl.t = Hashtbl.create 32
+
+(** Daily Alpaca calendar cache: keyed by exchange, holds (fetched_date,
+    model, fingerprint). Refetched at most once per day. *)
+let calendar_cache : (string, string * Oracle_sessions.model * string) Hashtbl.t =
+  Hashtbl.create 4
+;;
+
+(* --- Analysis memoization (types/caches live after the [analysis]      *)
+(*     record definition below, which they reference)                    *)
+
+(** Physical-or-structural equality of two bar arrays: the refresher keeps
+    the same array object while nothing changed (fast `==`); otherwise an
+    exact full compare (microsecond-class for a few thousand bars). Exact,
+    not sampled: a venue correction anywhere in the history must invalidate
+    the memoized analysis. *)
+let same_bars (a : Oracle_types.bar array) (b : Oracle_types.bar array) =
+  a == b
+  ||
+  let n = Array.length a in
+  n = Array.length b
+  &&
+  let rec go i =
+    if i >= n
+    then true
+    else (
+      let ba = a.(i) in
+      let bb = b.(i) in
+      ba.date = bb.date
+      && ba.open_ = bb.open_
+      && ba.high = bb.high
+      && ba.low = bb.low
+      && ba.close = bb.close
+      && ba.volume = bb.volume
+      && go (i + 1))
+  in
+  go 0
+;;
+
+let same_series (a : Oracle_types.series) (b : Oracle_types.series) =
+  a == b || (a.symbol = b.symbol && same_bars a.bars b.bars)
+;;
+
+let same_members (a : Oracle_types.series list) (b : Oracle_types.series list) =
+  a == b || (List.length a = List.length b && List.for_all2 same_series a b)
+;;
+
+let same_fng (a : float option) (b : float option) =
+  match a, b with
+  | None, None -> true
+  | Some x, Some y -> Float.abs (x -. y) < 1e-6
+  | _ -> false
+;;
+
+(** Whether a new materialized record changed any analysis-relevant input
+    versus the previous one: wakes the pass loop early. Balance-only
+    cycles return false. *)
+let history_changed (prev : materialized option) (cur : materialized) =
+  match prev with
+  | None -> true
+  | Some prev ->
+    (not (same_fng prev.m_fng cur.m_fng))
+    || List.length prev.m_assets <> List.length cur.m_assets
+    || List.exists
+         (fun (a : asset_material) ->
+            match
+              List.find_opt
+                (fun (b : asset_material) ->
+                   b.am_exchange = a.am_exchange && b.am_symbol = a.am_symbol)
+                prev.m_assets
+            with
+            | None -> true
+            | Some b ->
+              (not (same_bars a.am_bars b.am_bars))
+              || a.am_deep_bars <> b.am_deep_bars
+              || (not (same_members a.am_members b.am_members))
+              || a.am_calendar_fp <> b.am_calendar_fp)
+         cur.m_assets
+;;
+
 (** Completed pass attempts, successes and failures alike: incremented in the
     runtime loop right before [on_publish] wakes the domains, so by the time a
     domain wakes on the publish signal this counter already reflects the
@@ -455,14 +612,16 @@ let request_pass () = Atomic.incr pass_requested
 let min_trigger_gap = 2.0
 
 (** Sleep until [deadline], waking early when a [request_pass] arrives at
-    least [min_trigger_gap] after the last pass. Checked in 50ms slices: a
-    trigger is honored within ~50ms of [request_pass] (well inside a
-    market-event latency budget) while a plain sleep still holds the exact
-    cadence. *)
-let rec wait_until ~(deadline : float) ~(generation : int) () =
+    least [min_trigger_gap] after the last pass, or when the background
+    refresher published a cycle that changed analysis-relevant inputs
+    ([refresh_history_changed]). Checked in 50ms slices: a trigger is
+    honored within ~50ms (well inside a market-event latency budget) while
+    a plain sleep still holds the exact cadence. *)
+let rec wait_until ~(deadline : float) ~(generation : int) ~(refresh_gen : int) () =
   if
-    Atomic.get pass_requested <> generation
-    && Unix.gettimeofday () >= Atomic.get last_pass_at +. min_trigger_gap
+    (Atomic.get pass_requested <> generation
+     && Unix.gettimeofday () >= Atomic.get last_pass_at +. min_trigger_gap)
+    || (Atomic.get refresh_generation <> refresh_gen && Atomic.get refresh_history_changed)
   then Lwt.return_unit
   else (
     let now = Unix.gettimeofday () in
@@ -470,7 +629,19 @@ let rec wait_until ~(deadline : float) ~(generation : int) () =
     then Lwt.return_unit
     else
       Lwt_unix.sleep (Float.min 0.05 (deadline -. now))
-      >>= fun () -> wait_until ~deadline ~generation ())
+      >>= fun () -> wait_until ~deadline ~generation ~refresh_gen ())
+;;
+
+(** Bounded wait for the refresher's next published cycle (fresh balances):
+    used on event-triggered passes so a fill sizes against a balance
+    snapshot that already includes it. Never blocks the pass beyond
+    [max_wait] seconds - a sick upstream cannot hang the decision path. *)
+let rec wait_refresh_epoch ~(max_wait : float) ~(after : int) () =
+  if Atomic.get refresh_generation <> after || max_wait <= 0.0
+  then Lwt.return_unit
+  else
+    Lwt_unix.sleep 0.05
+    >>= fun () -> wait_refresh_epoch ~max_wait:(max_wait -. 0.05) ~after ()
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -768,7 +939,7 @@ let group_by_account (tasks : Oracle_tasks.task list) =
     the account's held base). [None] means the balance could not be fetched
     this pass - the caller skips the whole account rather than publish a
     decision based on a wrong pool. *)
-let venue_pools (tasks : Oracle_tasks.task list)
+let venue_pools ~(prev : (string * float) list) (tasks : Oracle_tasks.task list)
   : (Oracle_topology.instrument_key * (float * Oracle_balances.snapshot) option) list
       Lwt.t
   =
@@ -819,13 +990,26 @@ let venue_pools (tasks : Oracle_tasks.task list)
                  then Printf.sprintf "%s %.6g" b.asset b.available
                  else Printf.sprintf "%s %.6g/%.6g" b.asset b.available b.total)
              in
-             Logging.info_f
-               ~section
-               "venue %s balance (%s): %s -> pool $%.2f"
-               (account_id account)
-               source
-               (String.concat " · " lines)
-               pool;
+             (* The refresher polls balances at the fast cadence; the venue
+                line is INFO when the pool moved meaningfully (>=1%) or is
+                new, DEBUG otherwise - a quiet market does not flood the log
+                ten times per pass. *)
+             let loud =
+               match List.assoc_opt (account_id account) prev with
+               | None -> true
+               | Some prev_pool ->
+                 Float.abs (pool -. prev_pool) /. Float.max 1e-9 (Float.abs prev_pool)
+                 >= 0.01
+             in
+             let msg =
+               Printf.sprintf
+                 "venue %s balance (%s): %s -> pool $%.2f"
+                 (account_id account)
+                 source
+                 (String.concat " · " lines)
+                 pool
+             in
+             if loud then Logging.info ~section msg else Logging.debug ~section msg;
              Some (pool, snapshot))
         (fun exn ->
            Logging.warn_f
@@ -873,24 +1057,117 @@ type analysis =
     (** Effective knobs of the analyzed asset (global + per-asset overrides
         resolved by [resolve_for]) - sizing consumes these, not the global
         config. *)
+  ; tc : Dio_strategies.Strategy_common.trading_config
+    (** The fee-enriched trading config the grid was built from: sizing
+        rebuilds the grid with the live anchor at decision time, so a
+        memoized analysis never pins a stale price. *)
+  ; id : int
+    (** Monotone identity: memoized analyses keep their id, recomputed ones
+        get a fresh id - account-level sizing memoization fingerprints on
+        these. *)
   }
 
+(* --- Analysis memoization -------------------------------------------- *)
+
+(** Everything one asset's analysis depends on, in a fingerprint-able
+    form. The cache returns the SAME [analysis] record for an equal input
+    (physical identity of the arrays is the fast path), so downstream
+    identity compares (account sizing memoization) see "unchanged". *)
+type analysis_input =
+  { ai_bars : Oracle_types.bar array
+  ; ai_deep_bars : int
+  ; ai_members : Oracle_types.series list
+  ; ai_calendar : Oracle_sessions.model option
+  ; ai_fng : float option
+  ; ai_kappa : int
+  ; ai_warmup : int
+  ; ai_horizons : string
+  ; ai_rc : string (** Resolved per-asset knobs, rendered deterministically. *)
+  ; ai_tc : string (** Fee-enriched trading-config fields that reach the grid/sizing. *)
+  ; ai_kind : string
+  }
+
+let analysis_cache : (string, analysis_input * analysis) Hashtbl.t = Hashtbl.create 16
+let next_analysis_id = ref 0
+
+let same_input (a : analysis_input) (b : analysis_input) =
+  a == b
+  || (same_bars a.ai_bars b.ai_bars
+      && a.ai_deep_bars = b.ai_deep_bars
+      && same_members a.ai_members b.ai_members
+      && a.ai_calendar == b.ai_calendar
+      && same_fng a.ai_fng b.ai_fng
+      && a.ai_kappa = b.ai_kappa
+      && a.ai_warmup = b.ai_warmup
+      && a.ai_horizons = b.ai_horizons
+      && a.ai_rc = b.ai_rc
+      && a.ai_tc = b.ai_tc
+      && a.ai_kind = b.ai_kind)
+;;
+
+(* --- Account sizing memoization -------------------------------------- *)
+
+(** Account-level sizing fingerprint: sizing is sequential within an
+    account (pass-down), so it is memoized per account, not per asset.
+    The pool is bucketed (a <0.5% move cannot change the quantized qty/gi
+    verdict), the strategy state (accumulated profit / reserved base /
+    venue base) is exact so a fill of any size invalidates the cache, and
+    the analysis ids cover history/fng/knob changes. *)
+type account_fp =
+  { af_analyses : string list
+    (** Per-asset analysis ids in priority order ("none" = missing). *)
+  ; af_pool : float
+  ; af_fng : float option
+  ; af_state : string
+    (** Strategy-state tokens per asset (accumulated profit, reserved
+        base, venue base). *)
+  }
+
+let size_cache : (string, account_fp * decision list) Hashtbl.t = Hashtbl.create 8
+
+let account_fp_eq (a : account_fp) (b : account_fp) =
+  a.af_analyses = b.af_analyses
+  && a.af_state = b.af_state
+  && same_fng a.af_fng b.af_fng
+  && (a.af_pool = b.af_pool
+      || Float.abs (a.af_pool -. b.af_pool) /. Float.max 1e-9 (Float.abs b.af_pool)
+         < 0.005)
+;;
+
+(** Analyze one asset against its MATERIALIZED history (no network: the
+    refresher fetched and merged the venue series, the deep history, the
+    class members and the calendar; fees were enriched there too).
+    Memoized: when every analysis input is unchanged (physical compare of
+    the bar arrays - the refresher reuses array objects while nothing
+    changed - plus members, calendar, f&g, knobs), the SAME [analysis]
+    record is returned in microseconds and the heavy replay/blend is not
+    re-run. Returns ([analysis], [true]) on a memoization hit.
+
+    The live top-of-book anchor is deliberately NOT part of the
+    fingerprint: sizing rebuilds the grid from the fresh anchor at decision
+    time, so a memoized analysis never pins a stale price. *)
 let analyze_asset
       (rc : runtime_config)
       (classes : (string * class_pool) list)
       (task : Oracle_tasks.task)
       ~(index : int)
       ~(n_tasks : int)
-  : analysis Lwt.t
+      ~(am : asset_material)
+      ~(fng : float option)
+  : (analysis * bool) Lwt.t
   =
   let exchange = task.Oracle_tasks.exchange in
   let calendar_kind = Oracle_tasks.calendar_kind_of_exchange exchange in
-  let tc = task.Oracle_tasks.config in
-  (* The asset's own analysis runs on its resolved knobs (global + overrides);
-     class-member series stay on the global config - they are shared pool
-     inputs feeding the kappa blend, not per-asset decisions. *)
-  let global_rc = rc in
-  let rc = resolve_for global_rc ~exchange task.Oracle_tasks.symbol in
+  let tc = am.am_tc in
+  let asset =
+    { Oracle_types.symbol = task.Oracle_tasks.symbol
+    ; calendar_kind
+    ; bars = am.am_bars
+    ; gaps = []
+    }
+  in
+  let members = am.am_members in
+  let equity_sessions = am.am_calendar in
   let class_name =
     match tc.asset_class with
     | Some name -> name
@@ -901,78 +1178,10 @@ let analyze_asset
     | Some pool -> Option.value pool.kappa ~default:200
     | None -> 200
   in
-  Oracle_fees.enrich tc ~offline:false
-  >>= fun tc ->
-  fetch_series_for tc task.Oracle_tasks.symbol
-  >>= fun asset ->
-  deepen_series rc ~exchange asset
-  >>= fun (asset, deep_bars) ->
-  load_members global_rc classes tc ~class_name asset
-  >>= fun members ->
-  (* The grid ladder is anchored at the live top-of-book bid (the websocket
-     orderbook feed, not a standalone HTTP call) when the engine holds one -
-     the grid's first order is a resting buy and buys price off the bid -
-     with the history close as fallback. The mid is never used: the sizing
-     models the buy leg at the price a buy actually references. *)
-  let last_close =
-    if Array.length asset.bars = 0
-    then 0.0
-    else asset.bars.(Array.length asset.bars - 1).Oracle_types.close
-  in
-  let start_price =
-    live_buy_anchor ~exchange ~symbol:task.Oracle_tasks.symbol ~fallback:last_close
-  in
-  let live_anchor =
-    start_price > 0.0
-    && last_close > 0.0
-    && Float.abs (start_price -. last_close) /. last_close > 1e-6
-  in
-  Logging.debug_f
-    ~section
-    "[%d/%d] %s/%s start price %.6g (%s, history close %.6g)"
-    index
-    n_tasks
-    exchange
-    task.Oracle_tasks.symbol
-    start_price
-    (if live_anchor
-     then "live top-of-book bid"
-     else if start_price > 0.0
-     then "history close"
-     else "unavailable")
-    last_close;
-  let gi_lo, gi_hi = tc.grid_interval in
-  let grid =
-    Grid_adapter.of_trading_config
-      tc
-      ~start_price
-      ~start_quote:0.0
-      ~grid_interval_pct:gi_hi
-  in
-  let equity_sessions_promise =
-    if exchange = "alpaca"
-    then
-      Lwt.catch
-        (fun () ->
-           Oracle_fetch_alpaca.fetch_calendar
-             ~start_date:"2010-01-01"
-             ~end_date:(today_iso ())
-             ()
-           >|= fun dates ->
-           if dates = []
-           then Some Oracle_sessions.business_weekday
-           else Some (Oracle_fetch_alpaca.model_of_calendar_dates dates))
-        (fun exn ->
-           Logging.warn_f
-             ~section
-             "calendar fetch failed for %s (%s); using business weekdays"
-             task.Oracle_tasks.symbol
-             (Printexc.to_string exn);
-           Lwt.return (Some Oracle_sessions.business_weekday))
-    else Lwt.return_none
-  in
-  equity_sessions_promise
-  >>= fun equity_sessions ->
+  (* The asset's own analysis runs on its resolved knobs (global + overrides);
+     class-member series stay on the global config - they are shared pool
+     inputs feeding the kappa blend, not per-asset decisions. *)
+  let rc = resolve_for rc ~exchange task.Oracle_tasks.symbol in
   let horizons =
     match rc.horizons with
     | Some ns ->
@@ -1000,109 +1209,224 @@ let analyze_asset
       (fun (h : Oracle_types.horizon) -> n_bars >= warmup + h.sessions + 2)
       horizons
   in
-  (* Analysis inputs of this pass, so the history/member/horizon basis each
-     decision was computed on is traceable in the engine log (debug: it
-     repeats every pass unchanged). *)
-  Logging.debug_f
-    ~section
-    "[%d/%d] %s/%s: history %d bars (+%d deep), %d class member(s) [%s], warmup %d, \
-     horizons [%s]"
-    index
-    n_tasks
-    exchange
-    task.Oracle_tasks.symbol
-    n_bars
-    deep_bars
-    (List.length members)
-    (String.concat "," (List.map (fun (m : Oracle_types.series) -> m.symbol) members))
-    warmup
-    (String.concat "," (List.map (fun (h : Oracle_types.horizon) -> h.label) horizons));
-  if horizons = []
-  then
-    failwith
-      (Printf.sprintf
-         "history too short for the requested horizon/warmup (%d bars available)"
-         n_bars);
-  let cfg =
-    { Oracle.horizons
-    ; thresholds_pct = Oracle.default_thresholds_pct
-    ; percentiles = Oracle.default_percentiles
-    ; vol_window = warmup
-    ; gap_tolerance
-    ; classes = [ { Oracle.name = class_name; kappa; members } ]
-    ; equity_sessions
-    ; weight_by_sessions = rc.weight_by_sessions
+  let rc_key =
+    Printf.sprintf
+      "ts%.4g|fngw%.4g|rw%.4g|mad%.4g|qcm%.4g|ndh%b|wbs%b|h[%s]"
+      rc.target_survival
+      rc.fng_weight
+      rc.range_weight
+      rc.min_active_dsurv
+      rc.qty_cap_mult
+      rc.no_deep_history
+      rc.weight_by_sessions
+      (match rc.horizons with
+       | Some ns -> String.concat "," (List.map string_of_int ns)
+       | None -> "")
+  in
+  let tc_key =
+    Printf.sprintf
+      "%s/%s|gi%.4g-%.4g|qty%s|sm%s|mf%.6g|tf%.6g|ab%.6g|df%s|cls%s"
+      tc.exchange
+      tc.symbol
+      (fst tc.grid_interval)
+      (snd tc.grid_interval)
+      tc.qty
+      tc.sell_mult
+      (Option.value tc.maker_fee ~default:0.001)
+      (Option.value tc.taker_fee ~default:0.001)
+      (fst tc.accumulation_buffer)
+      (Option.value tc.data_feed ~default:"")
+      (Option.value tc.asset_class ~default:"")
+  in
+  let ai =
+    { ai_bars = am.am_bars
+    ; ai_deep_bars = am.am_deep_bars
+    ; ai_members = members
+    ; ai_calendar = equity_sessions
+    ; ai_fng = fng
+    ; ai_kappa = kappa
+    ; ai_warmup = warmup
+    ; ai_horizons =
+        String.concat "," (List.map (fun (h : Oracle_types.horizon) -> h.label) horizons)
+    ; ai_rc = rc_key
+    ; ai_tc = tc_key
+    ; ai_kind =
+        (match calendar_kind with
+         | Oracle_types.Crypto -> "crypto"
+         | Equity -> "equity")
     }
   in
-  let _r = Oracle.analyze asset cfg in
-  let model h =
-    Oracle_replay.blend_model_of
-      ~horizon:h
-      ~asset
-      ~class_members:members
-      ~kappa
-      ~warmup
-      ()
-  in
-  let models = List.map model horizons in
-  let reservation =
-    match Oracle_deploy.governing_basis ~models ~target_survival:rc.target_survival with
-    | None ->
-      { q_min = D.sizing_floor ~cfg:grid
-      ; d_gov = 0.0
-      ; d_cover = 0.0
-      ; governing_horizon = ""
-      ; fallback = false
-      ; n_fills = 0
-      ; min_cost = 0.0
-      ; first_buy = 0.0
+  let key = exchange ^ "/" ^ task.Oracle_tasks.symbol in
+  match Hashtbl.find_opt analysis_cache key with
+  | Some (prev, analysis) when same_input prev ai ->
+    Logging.debug_f
+      ~section
+      "[%d/%d] %s/%s: analysis reused (inputs unchanged: %d bars, %d member(s))"
+      index
+      n_tasks
+      exchange
+      task.Oracle_tasks.symbol
+      n_bars
+      (List.length members);
+    Lwt.return (analysis, true)
+  | _ ->
+    (* The grid ladder for the reservation is anchored at the live
+       top-of-book bid (the websocket orderbook feed, not a standalone HTTP
+       call) when the engine holds one, with the history close as fallback.
+       The mid is never used: the sizing models the buy leg at the price a
+       buy actually references. The reservation is informational; the
+       decision-time sizing rebuilds this grid from the fresh anchor. *)
+    let last_close =
+      if n_bars = 0 then 0.0 else asset.bars.(n_bars - 1).Oracle_types.close
+    in
+    let start_price =
+      live_buy_anchor ~exchange ~symbol:task.Oracle_tasks.symbol ~fallback:last_close
+    in
+    let live_anchor =
+      start_price > 0.0
+      && last_close > 0.0
+      && Float.abs (start_price -. last_close) /. last_close > 1e-6
+    in
+    Logging.debug_f
+      ~section
+      "[%d/%d] %s/%s start price %.6g (%s, history close %.6g)"
+      index
+      n_tasks
+      exchange
+      task.Oracle_tasks.symbol
+      start_price
+      (if live_anchor
+       then "live top-of-book bid"
+       else if start_price > 0.0
+       then "history close"
+       else "unavailable")
+      last_close;
+    let gi_lo, gi_hi = tc.grid_interval in
+    let grid =
+      Grid_adapter.of_trading_config
+        tc
+        ~start_price
+        ~start_quote:0.0
+        ~grid_interval_pct:gi_hi
+    in
+    (* Analysis inputs of this pass, so the history/member/horizon basis each
+       decision was computed on is traceable in the engine log (debug: it
+       repeats only when the inputs actually change). *)
+    Logging.debug_f
+      ~section
+      "[%d/%d] %s/%s: history %d bars (+%d deep), %d class member(s) [%s], warmup %d, \
+       horizons [%s]"
+      index
+      n_tasks
+      exchange
+      task.Oracle_tasks.symbol
+      n_bars
+      am.am_deep_bars
+      (List.length members)
+      (String.concat "," (List.map (fun (m : Oracle_types.series) -> m.symbol) members))
+      warmup
+      (String.concat "," (List.map (fun (h : Oracle_types.horizon) -> h.label) horizons));
+    if horizons = []
+    then
+      failwith
+        (Printf.sprintf
+           "history too short for the requested horizon/warmup (%d bars available)"
+           n_bars);
+    let cfg =
+      { Oracle.horizons
+      ; thresholds_pct = Oracle.default_thresholds_pct
+      ; percentiles = Oracle.default_percentiles
+      ; vol_window = warmup
+      ; gap_tolerance
+      ; classes = [ { Oracle.name = class_name; kappa; members } ]
+      ; equity_sessions
+      ; weight_by_sessions = rc.weight_by_sessions
       }
-    | Some (d_gov, governing_horizon, fallback) ->
-      let q_min = D.sizing_floor ~cfg:grid in
-      (* The reservation funds the asset's sizing drawdown - the ATH-scaled
-         remaining drop to the expected floor for mature assets, the raw
-         largest ACTUAL peak-to-valley drawdown for immature fallback assets
-         (see Oracle_math.sizing_reference_of). No ATH-to-ATL anchoring: a
-         1000x run-up only registers the falls that actually took place. *)
-      let d_cover =
-        match Oracle_math.sizing_reference_of ~fallback asset with
-        | Some r -> r.d_cover
-        | None -> d_gov
-      in
-      let grid_lo = G.set_parameter grid gi_lo in
-      let n_fills = G.fills_for_drawdown grid_lo ~d:d_cover in
-      let min_cost = G.cost_at grid_lo ~qty:q_min ~n_fills in
-      let first_buy = G.cost_at grid_lo ~qty:q_min ~n_fills:1 in
-      { q_min; d_gov; d_cover; governing_horizon; fallback; n_fills; min_cost; first_buy }
-  in
-  (* The reservation (allocation machinery detail) - debug: it repeats every
-     pass unchanged. *)
-  Logging.debug_f
-    ~section
-    "[%d/%d] %s/%s reservation: min order %.6g, first buy $%.2f; the %.1f%% worst \
-     drawdown needs $%.2f at the tightest grid %.2f%% (%s)"
-    index
-    n_tasks
-    exchange
-    task.Oracle_tasks.symbol
-    reservation.q_min
-    reservation.first_buy
-    (reservation.d_cover *. 100.0)
-    reservation.min_cost
-    gi_lo
-    (if reservation.fallback then "raw/fallback history" else "blend target");
-  Lwt.return
-    { exchange
-    ; symbol = task.Oracle_tasks.symbol
-    ; asset
-    ; calendar_kind
-    ; grid
-    ; lo = gi_lo
-    ; hi = gi_hi
-    ; models
-    ; reservation
-    ; rc
-    }
+    in
+    let _r = Oracle.analyze asset cfg in
+    let model h =
+      Oracle_replay.blend_model_of
+        ~horizon:h
+        ~asset
+        ~class_members:members
+        ~kappa
+        ~warmup
+        ()
+    in
+    let models = List.map model horizons in
+    let reservation =
+      match Oracle_deploy.governing_basis ~models ~target_survival:rc.target_survival with
+      | None ->
+        { q_min = D.sizing_floor ~cfg:grid
+        ; d_gov = 0.0
+        ; d_cover = 0.0
+        ; governing_horizon = ""
+        ; fallback = false
+        ; n_fills = 0
+        ; min_cost = 0.0
+        ; first_buy = 0.0
+        }
+      | Some (d_gov, governing_horizon, fallback) ->
+        let q_min = D.sizing_floor ~cfg:grid in
+        (* The reservation funds the asset's sizing drawdown - the ATH-scaled
+           remaining drop to the expected floor for mature assets, the raw
+           largest ACTUAL peak-to-valley drawdown for immature fallback assets
+           (see Oracle_math.sizing_reference_of). No ATH-to-ATL anchoring: a
+           1000x run-up only registers the falls that actually took place. *)
+        let d_cover =
+          match Oracle_math.sizing_reference_of ~fallback asset with
+          | Some r -> r.d_cover
+          | None -> d_gov
+        in
+        let grid_lo = G.set_parameter grid gi_lo in
+        let n_fills = G.fills_for_drawdown grid_lo ~d:d_cover in
+        let min_cost = G.cost_at grid_lo ~qty:q_min ~n_fills in
+        let first_buy = G.cost_at grid_lo ~qty:q_min ~n_fills:1 in
+        { q_min
+        ; d_gov
+        ; d_cover
+        ; governing_horizon
+        ; fallback
+        ; n_fills
+        ; min_cost
+        ; first_buy
+        }
+    in
+    (* The reservation (allocation machinery detail) - debug: it repeats only
+       on a recompute. *)
+    Logging.debug_f
+      ~section
+      "[%d/%d] %s/%s reservation: min order %.6g, first buy $%.2f; the %.1f%% worst \
+       drawdown needs $%.2f at the tightest grid %.2f%% (%s)"
+      index
+      n_tasks
+      exchange
+      task.Oracle_tasks.symbol
+      reservation.q_min
+      reservation.first_buy
+      (reservation.d_cover *. 100.0)
+      reservation.min_cost
+      gi_lo
+      (if reservation.fallback then "raw/fallback history" else "blend target");
+    let analysis =
+      { exchange
+      ; symbol = task.Oracle_tasks.symbol
+      ; asset
+      ; calendar_kind
+      ; grid
+      ; lo = gi_lo
+      ; hi = gi_hi
+      ; models
+      ; reservation
+      ; rc
+      ; tc
+      ; id =
+          (incr next_analysis_id;
+           !next_analysis_id)
+      }
+    in
+    Hashtbl.replace analysis_cache key (ai, analysis);
+    Lwt.return (analysis, false)
 ;;
 
 (** Size one analyzed asset against a budget: the entire remaining venue
@@ -1122,7 +1446,21 @@ let size_asset
       ~(n_tasks : int)
   : decision Lwt.t
   =
-  let { exchange; symbol; asset; calendar_kind; grid; lo; hi; models; _ } = analysis in
+  let { exchange; symbol; asset; calendar_kind; lo; hi; models; tc; _ } = analysis in
+  (* The ladder is anchored at the LIVE top-of-book bid at decision time -
+     never a price pinned by a memoized analysis. The grid's first order is
+     a resting buy and buys price off the bid (compute_buy_ref_price is
+     bid-first), so the sizing models the buy leg at the price a buy
+     actually references; the mid is never used. *)
+  let last_close =
+    if Array.length asset.bars = 0
+    then 0.0
+    else asset.bars.(Array.length asset.bars - 1).Oracle_types.close
+  in
+  let start_price = live_buy_anchor ~exchange ~symbol ~fallback:last_close in
+  let grid =
+    Grid_adapter.of_trading_config tc ~start_price ~start_quote:0.0 ~grid_interval_pct:hi
+  in
   (* The sizing replay starts from the account's ACTUAL grid state: the base
      it holds (available on the venue), the base locked in resting sells and
      the accumulated profit buffer (persisted + live - the strategy state
@@ -1429,9 +1767,267 @@ let size_asset
      : decision)
 ;;
 
-(** Run one full analysis pass over the trading assets and publish the
-    decisions. Tolerates every failure mode (fetch, analysis, balance); a
-    failed asset or account keeps its last-known-good decision. *)
+(* ------------------------------------------------------------------ *)
+(* Background refresher (all oracle network lives here).               *)
+(* ------------------------------------------------------------------ *)
+
+(** Resolve one asset's materialized history: fee enrichment (network
+    once per asset per process), the venue series (disk-cache delta), the
+    Yahoo deep extension, and the class member series. Runs entirely in
+    the background refresher - the decision path never calls this. A
+    failure (timeout, venue error) is retried at the poll cadence with
+    exponential backoff; the asset keeps its last-known-good history in
+    the materialized record meanwhile. *)
+let refresh_asset
+      (config : runtime_config)
+      (classes : (string * class_pool) list)
+      (task : Oracle_tasks.task)
+  : asset_material option Lwt.t
+  =
+  let exchange = task.Oracle_tasks.exchange in
+  let symbol = task.Oracle_tasks.symbol in
+  let key = exchange ^ "/" ^ symbol in
+  if Unix.gettimeofday () < Option.value (Hashtbl.find_opt retry_after key) ~default:0.0
+  then Lwt.return None
+  else
+    Lwt.catch
+      (fun () ->
+         let tc = task.Oracle_tasks.config in
+         Oracle_fees.enrich tc ~offline:false
+         >>= fun tc ->
+         fetch_series_for tc symbol
+         >>= fun series ->
+         deepen_series config ~exchange series
+         >>= fun (series, deep_bars) ->
+         let class_name =
+           match tc.asset_class with
+           | Some name -> name
+           | None -> "default"
+         in
+         load_members config classes tc ~class_name series
+         >>= fun members ->
+         (* Alpaca-only session calendar: refetched at most once per day;
+            the model object is reused while the fetched dates are
+            identical, so the analysis fingerprint stays stable. *)
+         (if exchange = "alpaca"
+          then (
+            let today = today_iso () in
+            match Hashtbl.find_opt calendar_cache exchange with
+            | Some (fetched, model, fp) when fetched = today -> Lwt.return (Some model, fp)
+            | _ ->
+              Lwt.catch
+                (fun () ->
+                   Oracle_fetch_alpaca.fetch_calendar
+                     ~start_date:"2010-01-01"
+                     ~end_date:today
+                     ()
+                   >|= fun dates ->
+                   let fp =
+                     match dates with
+                     | [] -> "empty"
+                     | d0 :: _ -> d0 ^ ".." ^ List.nth dates (List.length dates - 1)
+                   in
+                   let model =
+                     if dates = []
+                     then Oracle_sessions.business_weekday
+                     else Oracle_fetch_alpaca.model_of_calendar_dates dates
+                   in
+                   Hashtbl.replace calendar_cache exchange (today, model, fp);
+                   Some model, fp)
+                (fun exn ->
+                   Logging.warn_f
+                     ~section
+                     "calendar fetch failed for %s (%s); using business weekdays"
+                     symbol
+                     (Printexc.to_string exn);
+                   Lwt.return (Some Oracle_sessions.business_weekday, "weekday")))
+          else Lwt.return (None, "none"))
+         >>= fun (calendar, calendar_fp) ->
+         Hashtbl.remove retry_after key;
+         Hashtbl.remove retry_backoff key;
+         Lwt.return
+           (Some
+              { am_exchange = exchange
+              ; am_symbol = symbol
+              ; am_tc = tc
+              ; am_bars = series.Oracle_types.bars
+              ; am_deep_bars = deep_bars
+              ; am_members = members
+              ; am_calendar = calendar
+              ; am_calendar_fp = calendar_fp
+              }))
+      (fun exn ->
+         Logging.warn_f
+           ~section
+           "background history refresh failed for %s/%s (%s); keeping last-known-good \
+            history, retrying with backoff"
+           exchange
+           symbol
+           (Printexc.to_string exn);
+         let backoff =
+           let prev = Option.value (Hashtbl.find_opt retry_backoff key) ~default:0.0 in
+           let next = if prev = 0.0 then 30.0 else Float.min 300.0 (prev *. 2.0) in
+           Hashtbl.replace retry_backoff key next;
+           next
+         in
+         Hashtbl.replace retry_after key (Unix.gettimeofday () +. backoff);
+         Lwt.return None)
+;;
+
+(** One refresh cycle: fresh balances (all accounts, in parallel), full
+    history refresh when due (refresh cadence; cold start always), and the
+    fear & greed index - published as a new materialized record. Balance
+    fetches run every cycle (poll cadence, and on fill events); history
+    fetches run at the refresh cadence and keep the previous cycle's
+    arrays otherwise (stable analysis fingerprints). *)
+let refresh_cycle
+      ~(config : runtime_config)
+      ~(trading : Dio_strategies.Strategy_common.trading_config list)
+      ~(classes : (string * class_pool) list)
+  : unit Lwt.t
+  =
+  let prev = Atomic.get materialized_ref in
+  let now = Unix.gettimeofday () in
+  let history_due =
+    match prev with
+    | None -> true
+    | Some p -> now >= p.m_last_history_at +. config.refresh_seconds
+  in
+  let tasks, _ =
+    Oracle_tasks.resolve_tasks
+      ~symbol:""
+      ~exchange:"kraken"
+      ~exchange_explicit:false
+      ~trading
+      ~offline:false
+  in
+  Hashtbl.reset fetch_cache;
+  Oracle_balances.clear_cache ();
+  (* Balances: the refresher's per-cycle network, parallel per account. *)
+  let prev_pools =
+    match prev with
+    | None -> []
+    | Some p ->
+      Hashtbl.fold
+        (fun key v acc ->
+           match v with
+           | Some (pool, _) -> (key, pool) :: acc
+           | None -> acc)
+        p.m_balances
+        []
+  in
+  let balance_start = Mtime_clock.now_ns () in
+  venue_pools ~prev:prev_pools tasks
+  >>= fun pools ->
+  Latency_profiler.record
+    engine_profs.prof_balance
+    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) balance_start));
+  (* Histories (on the refresh cadence; cold start always). *)
+  let t_fetch_all = Mtime_clock.now_ns () in
+  (if history_due
+   then
+     Lwt_list.map_p (fun task -> refresh_asset config classes task) tasks
+     >|= List.filter_map Fun.id
+   else (
+     let assets =
+       match prev with
+       | None -> []
+       | Some p -> p.m_assets
+     in
+     Lwt.return assets))
+  >>= fun assets ->
+  Latency_profiler.record
+    engine_profs.prof_fetch
+    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_fetch_all));
+  let balances = Hashtbl.create 8 in
+  List.iter
+    (fun (account, pool) -> Hashtbl.replace balances (account_id account) pool)
+    pools;
+  let m =
+    { m_assets = assets
+    ; m_balances = balances
+    ; m_fng = resolve_fng ()
+    ; m_epoch = Atomic.get refresh_generation + 1
+    ; m_last_history_at =
+        (if history_due
+         then now
+         else (
+           match prev with
+           | Some p -> p.m_last_history_at
+           | None -> now))
+    }
+  in
+  let changed = history_changed prev m in
+  Atomic.set materialized_ref (Some m);
+  Atomic.incr refresh_generation;
+  if changed then Atomic.set refresh_history_changed true;
+  (* Publish the balance/fetch latency windows for the dashboard (the pass
+     publishes its own windows; the two never reset each other's
+     profilers). *)
+  let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_balance in
+  let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_fetch in
+  Logging.debug_f
+    ~section
+    "background refresh cycle complete: %d asset(s) materialized, history %s, epoch %d"
+    (List.length assets)
+    (if history_due then "refreshed" else "kept")
+    m.m_epoch;
+  Lwt.return_unit
+;;
+
+(** Sleep until [deadline], waking early when a [request_pass] arrives (a
+    fill or order event: balances should refresh promptly so the next pass
+    sizes against fresh pools). Checked in 50ms slices like the pass wait. *)
+let rec wait_until_refresh ~(deadline : float) ~(generation : int) () =
+  if
+    Atomic.get pass_requested <> generation
+    && Unix.gettimeofday () >= Atomic.get last_pass_at +. min_trigger_gap
+  then Lwt.return_unit
+  else (
+    let now = Unix.gettimeofday () in
+    if now >= deadline
+    then Lwt.return_unit
+    else
+      Lwt_unix.sleep (Float.min 0.05 (deadline -. now))
+      >>= fun () -> wait_until_refresh ~deadline ~generation ())
+;;
+
+(** The background refresher loop: cycles at the poll cadence (waking
+    early on fill events), publishing the materialized state each cycle.
+    Runs as its own fiber alongside the pass loop; both stop on shutdown. *)
+let rec refresh_loop
+          ~(config : runtime_config)
+          ~(trading : Dio_strategies.Strategy_common.trading_config list)
+          ~(classes : (string * class_pool) list)
+          ()
+  : unit Lwt.t
+  =
+  if Atomic.get shutdown_requested
+  then Lwt.return_unit
+  else
+    Lwt.catch
+      (fun () -> refresh_cycle ~config ~trading ~classes)
+      (fun exn ->
+         Logging.error_f
+           ~section
+           "background refresh cycle failed (%s); keeping last-known-good materialized \
+            state"
+           (Printexc.to_string exn);
+         Lwt.return_unit)
+    >>= fun () ->
+    let generation = Atomic.get pass_requested in
+    let deadline = Unix.gettimeofday () +. jittered config.poll_seconds in
+    wait_until_refresh ~deadline ~generation ()
+    >>= fun () -> refresh_loop ~config ~trading ~classes ()
+;;
+
+(** Run one decision pass over the materialized oracle state and publish
+    the decisions. NO network: balances, histories, members and the
+    calendar were materialized by the background refresher; analyses are
+    memoized on their inputs (microseconds when unchanged) and account
+    sizing is memoized on (analysis ids, pool bucket, strategy state).
+    Tolerates every failure mode; a failed asset or account keeps its
+    last-known-good decision. *)
 let run_pass
       ?(config = default_config ())
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
@@ -1461,204 +2057,297 @@ let run_pass
     Logging.info ~section "no runnable assets for the capital oracle this pass";
     Lwt.return_unit)
   else (
-    (* Engine latency window for this pass: each stage records its span into
-       the stage profiler; the per-asset profilers record the assets touched
-       this pass; everything is published (snapshot_and_reset) at the end. *)
+    (* Engine latency window for this pass: the decision path only - the
+       refresher records and publishes its own balance/fetch windows. *)
     let pass_start = Mtime_clock.now_ns () in
     let touched_assets = ref [] in
     let span_from t = Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t) in
-    Hashtbl.reset fetch_cache;
-    (* Balance snapshots must also refresh each pass: Oracle_balances caches
-       per (exchange, testnet) for the short-lived CLI oracle, but the engine
-       runs continuously - without this, venue pools stay frozen at the
-       startup snapshot forever. *)
-    Oracle_balances.clear_cache ();
-    let balance_start = Mtime_clock.now_ns () in
-    let fng = resolve_fng () in
-    let grouped = group_by_account tasks in
-    Logging.info_f
-      ~section
-      "capital-oracle pass #%d starting: %d asset(s) in %d account(s)%s"
-      (Atomic.get pass_count + 1)
-      (List.length tasks)
-      (List.length grouped)
-      (match fng with
-       | Some f -> Printf.sprintf ", f&g %.2f" f
-       | None -> ", f&g unavailable");
-    let decisions = ref [] in
-    (* Phase A: analyze every asset in parallel FIRST, so each asset's sizing
-       reservation (minimum drawdown funding + first-buy cost) is known before
-       any capital is handed out. Fetches now hit the disk-persisted history
-       cache (one small delta request per asset), and the assets run
-       concurrently instead of one-by-one - the cold-start 20-30s pass
-       (Kraken walking every pair's full history sequentially) becomes a
-       ~1s delta pass. *)
-    (* One asset's analysis is bounded: a fetch (or a future fetch) that
-       hangs cannot freeze the whole pass - the asset times out, keeps its
-       last-known-good decision, and the pass continues. The fetch libraries
-       carry their own timeouts; this is the belt-and-braces. *)
-    let analysis_timeout = 60.0 in
-    let analyze_one (task : Oracle_tasks.task) ~(index : int)
-      : (Oracle_tasks.task * analysis option) Lwt.t
-      =
-      Lwt.catch
-        (fun () ->
-           let t_asset = Mtime_clock.now_ns () in
-           Lwt.pick
-             [ (analyze_asset config classes task ~index ~n_tasks:(List.length tasks)
-                >|= fun analysis ->
-                record_asset_latency
-                  task.Oracle_tasks.symbol
-                  (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_asset))
-                  (fun () -> "fetch");
-                touched_assets := task.Oracle_tasks.symbol :: !touched_assets;
-                `Ok analysis)
-             ; (Lwt_unix.sleep analysis_timeout
-                >|= fun () ->
-                `Timeout
-                  (Printf.sprintf "analysis timed out after %.0fs" analysis_timeout))
-             ]
-           >|= function
-           | `Ok analysis -> Some analysis
-           | `Timeout why ->
-             Logging.warn_f
-               ~section
-               "capital-oracle analysis timed out for %s/%s (%s); keeping \
-                last-known-good decision, capital stays in the venue pool"
-               task.Oracle_tasks.exchange
-               task.Oracle_tasks.symbol
-               why;
-             None)
-        (fun exn ->
-           Logging.warn_f
-             ~section
-             "capital-oracle analysis failed for %s/%s (%s); keeping last-known-good \
-              decision, capital stays in the venue pool"
-             task.Oracle_tasks.exchange
-             task.Oracle_tasks.symbol
-             (Printexc.to_string exn);
-           Lwt.return None)
-      >|= fun result -> task, result
-    in
-    (* Phase B: size sequentially, highest priority first, each asset against
-       the ENTIRE remaining pool - the priority asset is sized fully before
-       the next asset draws anything. The sizing is survival-driven over the
-       full config ranges (the deployment grows qty, bounded by the qty_cap
-       and 100% replay survival, while its ladder runway consumes the budget;
-       in stretch mode - 100% unreachable - it deploys the minimum qty at the
-       grid maximum), and everything its deployment does not consume passes
-       down the priority order; only a fully funded account idles surplus.
-       The pool is venue-locked and the pass-down subtracts each deployment,
-       so pool resources are never double-counted across the account's
-       assets. *)
-    let rec size_all
-              ~(venue_pool : float)
-              ~(snapshot : Oracle_balances.snapshot option)
-              (pool : float)
-      = function
-      | [] -> Lwt.return pool
-      | analysis :: rest ->
+    let materialized = Atomic.get materialized_ref in
+    match materialized with
+    | None ->
+      (* Cold start: the refresher is still fetching the first histories in
+         the background; nothing to decide on yet. Domains keep their
+         startup gate (they wait for the first decision) exactly as they do
+         while the first pass fetched inline. *)
+      Logging.info
+        ~section
+        "capital-oracle pass: first background refresh still in progress; no decisions \
+         yet";
+      Latency_profiler.record engine_profs.prof_pass (span_from pass_start);
+      let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_pass in
+      Lwt.return_unit
+    | Some m ->
+      let fng = m.m_fng in
+      let grouped = group_by_account tasks in
+      Logging.info_f
+        ~section
+        "capital-oracle pass #%d starting: %d asset(s) in %d account(s)%s"
+        (Atomic.get pass_count + 1)
+        (List.length tasks)
+        (List.length grouped)
+        (match fng with
+         | Some f -> Printf.sprintf ", f&g %.2f" f
+         | None -> ", f&g unavailable");
+      let decisions = ref [] in
+      (* Phase A: analyze every asset in parallel. The analysis reads only
+         the materialized history (memoized: unchanged inputs return the
+         same record in microseconds); the only wall-clock cost is the
+         replay/blend recompute for assets whose inputs actually changed. *)
+      let analysis_timeout = 60.0 in
+      let analyze_one (task : Oracle_tasks.task) ~(index : int)
+        : (Oracle_tasks.task * analysis option) Lwt.t
+        =
         Lwt.catch
           (fun () ->
              let t_asset = Mtime_clock.now_ns () in
-             size_asset
-               analysis.rc
-               analysis
-               ~pool
-               ~venue_pool
-               ~snapshot
-               ~fng
-               ~index:(List.length rest + 1)
-               ~n_tasks:(List.length tasks)
-             >|= fun decision ->
-             record_asset_latency
-               analysis.symbol
-               (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_asset))
-               (fun () -> "sizing");
-             decisions := decision :: !decisions;
-             decision.remainder)
+             let key = task.Oracle_tasks.exchange ^ "/" ^ task.Oracle_tasks.symbol in
+             match
+               List.find_opt
+                 (fun (am : asset_material) ->
+                    am.am_exchange = task.Oracle_tasks.exchange
+                    && am.am_symbol = task.Oracle_tasks.symbol)
+                 m.m_assets
+             with
+             | None ->
+               Logging.debug_f
+                 ~section
+                 "no materialized history yet for %s; keeping last-known-good decision"
+                 key;
+               Lwt.return None
+             | Some am ->
+               Lwt.pick
+                 [ (analyze_asset
+                      config
+                      classes
+                      task
+                      ~index
+                      ~n_tasks:(List.length tasks)
+                      ~am
+                      ~fng
+                    >|= fun (analysis, reused) ->
+                    record_asset_latency
+                      task.Oracle_tasks.symbol
+                      (Mtime.Span.of_uint64_ns
+                         (Int64.sub (Mtime_clock.now_ns ()) t_asset))
+                      (fun () -> if reused then "cache-hit" else "analyze");
+                    touched_assets := task.Oracle_tasks.symbol :: !touched_assets;
+                    `Ok (Some analysis))
+                 ; (Lwt_unix.sleep analysis_timeout
+                    >|= fun () ->
+                    `Timeout
+                      (Printf.sprintf "analysis timed out after %.0fs" analysis_timeout))
+                 ]
+               >|= (function
+                | `Ok result -> result
+                | `Timeout why ->
+                  Logging.warn_f
+                    ~section
+                    "capital-oracle analysis timed out for %s (%s); keeping \
+                     last-known-good decision, capital stays in the venue pool"
+                    key
+                    why;
+                  None))
           (fun exn ->
              Logging.warn_f
                ~section
-               "capital-oracle sizing failed for %s/%s (%s); keeping last-known-good \
+               "capital-oracle analysis failed for %s (%s); keeping last-known-good \
                 decision, capital stays in the venue pool"
-               analysis.exchange
-               analysis.symbol
+               (task.Oracle_tasks.exchange ^ "/" ^ task.Oracle_tasks.symbol)
                (Printexc.to_string exn);
-             Lwt.return pool)
-        >>= fun next -> size_all ~venue_pool ~snapshot next rest
-    in
-    venue_pools tasks
-    >>= fun pools ->
-    let balance_span = span_from balance_start in
-    Latency_profiler.record engine_profs.prof_balance balance_span;
-    let account_pool account =
-      match List.assoc_opt account pools with
-      | Some (Some (pool, snapshot)) -> Some (pool, snapshot)
-      | _ -> None
-    in
-    (* Phase A: analyze every asset in parallel (independent fetches +
-       replays). Fetches are disk-cache delta hits; the assets no longer
-       wait on each other. *)
-    let t_fetch_all = Mtime_clock.now_ns () in
-    Lwt_list.map_p
-      (fun (index, task) -> analyze_one task ~index)
-      (List.mapi (fun i task -> i + 1, task) tasks)
-    >>= fun task_analyses ->
-    let task_analyses =
-      List.filter_map
-        (fun (task, result) -> Option.map (fun analysis -> task, analysis) result)
-        task_analyses
-    in
-    Latency_profiler.record engine_profs.prof_fetch (span_from t_fetch_all);
-    let analyses_for account =
-      List.filter_map
-        (fun (task, analysis) ->
-           if same_account account (account_of_task task) then Some analysis else None)
-        task_analyses
-    in
-    Lwt_list.iter_s
-      (fun (account, _account_tasks) ->
-         match account_pool account with
-         | None -> Lwt.return_unit
-         | Some (pool, snapshot) ->
-           let t_size = Mtime_clock.now_ns () in
-           size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool (analyses_for account)
-           >|= fun surplus ->
-           Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
-           Logging.info_f
-             ~section
-             "venue %s: pool %.2f, surplus %.2f (idle reserve)"
-             (account_id account)
-             pool
-             surplus)
-      grouped
-    >>= fun () ->
-    publish !decisions;
-    Atomic.incr pass_count;
-    Atomic.set last_pass_at (Unix.gettimeofday ());
-    Atomic.set last_pass_ok true;
-    (* Publish the latency window: the pass span and the stage spans, plus
-       the per-asset windows for the assets this pass actually processed
-       (assets that failed or timed out keep their previous snapshot so the
-       dashboard reads last-good instead of idle). *)
-    let pass_span = span_from pass_start in
-    Latency_profiler.record engine_profs.prof_pass pass_span;
-    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_pass in
-    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_balance in
-    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_fetch in
-    let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_sizing in
-    List.iter
-      (fun symbol ->
-         ignore (Latency_profiler.snapshot_and_reset (asset_profiler_of symbol)))
-      !touched_assets;
-    Logging.info_f
-      ~section
-      "capital-oracle pass complete: %d decision(s) published (pass #%d, pass %.1fs)"
-      (List.length !decisions)
-      (Atomic.get pass_count)
-      (Int64.to_float (Mtime.Span.to_uint64_ns pass_span) /. 1e9);
-    Lwt.return_unit)
+             Lwt.return None)
+        >|= fun result -> task, result
+      in
+      Lwt_list.map_p
+        (fun (index, task) -> analyze_one task ~index)
+        (List.mapi (fun i task -> i + 1, task) tasks)
+      >>= fun task_analyses ->
+      let task_analyses =
+        List.filter_map
+          (fun (task, result) -> Option.map (fun analysis -> task, analysis) result)
+          task_analyses
+      in
+      let analyses_for account =
+        List.filter_map
+          (fun (task, analysis) ->
+             if same_account account (account_of_task task) then Some analysis else None)
+          task_analyses
+      in
+      (* Phase B: size sequentially per account, highest priority first,
+         each asset against the ENTIRE remaining pool. Memoized per account
+         on (analysis ids, pool bucket, strategy state): an unchanged
+         account re-publishes its previous decisions instead of re-running
+         the deployment engine. *)
+      let state_token
+            (task : Oracle_tasks.task)
+            (snapshot : Oracle_balances.snapshot option)
+        =
+        let symbol = task.Oracle_tasks.symbol in
+        let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+        let base =
+          match snapshot with
+          | None -> 0.0
+          | Some snapshot ->
+            let base_asset =
+              match String.split_on_char '/' symbol with
+              | b :: _ -> b
+              | [] -> symbol
+            in
+            Oracle_balances.available_asset snapshot ~asset:base_asset
+        in
+        Printf.sprintf
+          "%s:%.6g:%.6g:%.6g"
+          symbol
+          st.accumulated_profit
+          st.reserved_base
+          base
+      in
+      let rec size_all
+                ~(venue_pool : float)
+                ~(snapshot : Oracle_balances.snapshot option)
+                (pool : float)
+        = function
+        | [] -> Lwt.return pool
+        | analysis :: rest ->
+          Lwt.catch
+            (fun () ->
+               let t_asset = Mtime_clock.now_ns () in
+               size_asset
+                 analysis.rc
+                 analysis
+                 ~pool
+                 ~venue_pool
+                 ~snapshot
+                 ~fng
+                 ~index:(List.length rest + 1)
+                 ~n_tasks:(List.length tasks)
+               >|= fun decision ->
+               record_asset_latency
+                 analysis.symbol
+                 (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_asset))
+                 (fun () -> "sizing");
+               decisions := decision :: !decisions;
+               decision.remainder)
+            (fun exn ->
+               Logging.warn_f
+                 ~section
+                 "capital-oracle sizing failed for %s/%s (%s); keeping last-known-good \
+                  decision, capital stays in the venue pool"
+                 analysis.exchange
+                 analysis.symbol
+                 (Printexc.to_string exn);
+               Lwt.return pool)
+          >>= fun next -> size_all ~venue_pool ~snapshot next rest
+      in
+      let reused_accounts = ref 0 in
+      let rec take n l =
+        if n <= 0
+        then []
+        else (
+          match l with
+          | [] -> []
+          | x :: rest -> x :: take (n - 1) rest)
+      in
+      Lwt_list.iter_s
+        (fun (account, account_tasks) ->
+           match Hashtbl.find_opt m.m_balances (account_id account) with
+           | None | Some None ->
+             (* No account entry, or the balance fetch failed: keep its
+                last-known-good decisions (publish merges). *)
+             Lwt.return_unit
+           | Some (Some (pool, snapshot)) ->
+             let analyses = analyses_for account in
+             let fp =
+               { af_analyses =
+                   List.map
+                     (fun task ->
+                        match
+                          List.find_opt
+                            (fun (a : analysis) ->
+                               a.exchange = task.Oracle_tasks.exchange
+                               && a.symbol = task.Oracle_tasks.symbol)
+                            analyses
+                        with
+                        | Some a -> string_of_int a.id
+                        | None -> "none")
+                     account_tasks
+               ; af_pool = pool
+               ; af_fng = fng
+               ; af_state =
+                   String.concat
+                     "|"
+                     (List.map
+                        (fun task -> state_token task (Some snapshot))
+                        account_tasks)
+               }
+             in
+             let t_size = Mtime_clock.now_ns () in
+             (match Hashtbl.find_opt size_cache (account_id account) with
+              | Some (prev_fp, prev_decisions) when account_fp_eq prev_fp fp ->
+                incr reused_accounts;
+                List.iter
+                  (fun (d : decision) ->
+                     record_asset_latency
+                       d.symbol
+                       (Mtime.Span.of_uint64_ns
+                          (Int64.sub (Mtime_clock.now_ns ()) t_size))
+                       (fun () -> "sizing-reuse"))
+                  prev_decisions;
+                Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
+                decisions := List.rev_append prev_decisions !decisions;
+                (match List.rev prev_decisions with
+                 | last :: _ ->
+                   Logging.info_f
+                     ~section
+                     "capital-oracle reuse: account %s sizing unchanged (pool $%.2f) - \
+                      %d decision(s) kept (surplus $%.2f)"
+                     (account_id account)
+                     pool
+                     (List.length prev_decisions)
+                     last.remainder
+                 | [] -> ());
+                Lwt.return_unit
+              | _ ->
+                let before = List.length !decisions in
+                size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool analyses
+                >|= fun surplus ->
+                let account_decisions =
+                  take (List.length !decisions - before) !decisions |> List.rev
+                in
+                Hashtbl.replace size_cache (account_id account) (fp, account_decisions);
+                Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
+                Logging.info_f
+                  ~section
+                  "venue %s: pool %.2f, surplus %.2f (idle reserve)"
+                  (account_id account)
+                  pool
+                  surplus))
+        grouped
+      >>= fun () ->
+      publish !decisions;
+      Atomic.incr pass_count;
+      Atomic.set last_pass_at (Unix.gettimeofday ());
+      Atomic.set last_pass_ok true;
+      (* The refresher records balance/fetch windows; the pass publishes its
+         own windows (pass + sizing) and the per-asset windows. *)
+      let pass_span = span_from pass_start in
+      Latency_profiler.record engine_profs.prof_pass pass_span;
+      let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_pass in
+      let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_sizing in
+      List.iter
+        (fun symbol ->
+           ignore (Latency_profiler.snapshot_and_reset (asset_profiler_of symbol)))
+        !touched_assets;
+      Atomic.set refresh_history_changed false;
+      Logging.info_f
+        ~section
+        "capital-oracle pass complete: %d decision(s) published (pass #%d, pass %.1fs%s)"
+        (List.length !decisions)
+        (Atomic.get pass_count)
+        (Int64.to_float (Mtime.Span.to_uint64_ns pass_span) /. 1e9)
+        (if !reused_accounts > 0
+         then Printf.sprintf ", %d account(s) reused" !reused_accounts
+         else "");
+      Lwt.return_unit)
 ;;
 
 (** Run the live oracle loop: initialize venue metadata once, run the first
@@ -1782,14 +2471,27 @@ let run_loop
       on_publish (decisions ());
       (* The next pass runs at the cadence deadline, or early when the engine
          requests one ([request_pass] on fills / canceled-rejected-expired
-         events): the wait captures the current generation, so only a NEW
-         request wakes it, and honors the request at the next 50ms slice
-         (coalescing bursts through [min_trigger_gap]). *)
+         events) or when the background refresher materialized a change
+         ([refresh_history_changed]): the wait captures both generations, so
+         only NEW events wake it (bursts coalesce through [min_trigger_gap]
+         and the 50ms slices). *)
       let generation = Atomic.get pass_requested in
+      let refresh_gen = Atomic.get refresh_generation in
       let deadline =
         Unix.gettimeofday () +. jittered (next_sleep ~config ~decisions:(decisions ()))
       in
-      wait_until ~deadline ~generation () >>= loop
+      wait_until ~deadline ~generation ~refresh_gen ()
+      >>= fun () ->
+      (* An event-triggered wake (fill/order event) sizes against fresh
+         balances: give the refresher (woken by the same event) a bounded
+         window to publish its next cycle, then proceed regardless - the
+         pass never hangs on the network. *)
+      (if Atomic.get pass_requested <> generation
+       then (
+         let after = Atomic.get refresh_generation in
+         wait_refresh_epoch ~max_wait:5.0 ~after ())
+       else Lwt.return_unit)
+      >>= fun () -> loop ()
   in
   (* Venue instrument metadata is initialized once here (idempotent; the
      supervisor keeps its own). *)
@@ -1801,7 +2503,25 @@ let run_loop
          "venue instrument metadata init failed (%s); increments fall back"
          (Printexc.to_string exn);
        Lwt.return_unit)
-  >>= fun () -> loop ()
+  >>= fun () ->
+  (* The background refresher owns every network call (balances, histories,
+     members, calendar). The pass loop and the refresher run as parallel
+     fibers and both stop on shutdown; the loop above is the decision
+     path, which never waits on network beyond the bounded fill-wait. A
+     supervisor auto-restart cancels any previous-generation refresher
+     first, so exactly one refresher runs per runtime generation. *)
+  Option.iter Lwt.cancel !refresh_fiber;
+  (* Lwt promises run eagerly: build the refresher promise directly (its
+      loop already swallows exceptions) and keep it for cancellation. *)
+  refresh_fiber
+  := Some
+       (Lwt.catch
+          (fun () -> refresh_loop ~config ~trading ~classes ())
+          (fun _ -> Lwt.return_unit));
+  loop ()
+  >>= fun () ->
+  Option.iter Lwt.cancel !refresh_fiber;
+  Lwt.return_unit
 ;;
 
 (** Start the runtime detached on the Lwt scheduler (fire-and-forget; the

@@ -240,7 +240,12 @@ let test_trigger_wakes_early () =
   let t0 = Unix.gettimeofday () in
   let deadline = t0 +. 60.0 in
   Dio_oracle.Oracle_runtime.request_pass ();
-  Lwt_main.run (Dio_oracle.Oracle_runtime.wait_until ~deadline ~generation:gen ());
+  Lwt_main.run
+    (Dio_oracle.Oracle_runtime.wait_until
+       ~deadline
+       ~generation:gen
+       ~refresh_gen:(Atomic.get Dio_oracle.Oracle_runtime.refresh_generation)
+       ());
   let elapsed = Unix.gettimeofday () -. t0 in
   Alcotest.(check bool) "woke well before the 60s deadline" (elapsed < 2.0) true
 ;;
@@ -255,12 +260,18 @@ let test_trigger_is_one_shot () =
     (Dio_oracle.Oracle_runtime.wait_until
        ~deadline:(Unix.gettimeofday () +. 60.0)
        ~generation:gen
+       ~refresh_gen:(Atomic.get Dio_oracle.Oracle_runtime.refresh_generation)
        ());
   let gen_after = Atomic.get Dio_oracle.Oracle_runtime.pass_requested in
   Alcotest.(check int) "request incremented the generation" (gen + 1) gen_after;
   let t0 = Unix.gettimeofday () in
   let deadline = t0 +. 0.05 in
-  Lwt_main.run (Dio_oracle.Oracle_runtime.wait_until ~deadline ~generation:gen_after ());
+  Lwt_main.run
+    (Dio_oracle.Oracle_runtime.wait_until
+       ~deadline
+       ~generation:gen_after
+       ~refresh_gen:(Atomic.get Dio_oracle.Oracle_runtime.refresh_generation)
+       ());
   let elapsed = Unix.gettimeofday () -. t0 in
   Alcotest.(check bool)
     "held to the deadline without a new trigger"
@@ -460,6 +471,252 @@ let test_override_fields_present_only () =
     (Dio_oracle.Oracle_runtime.override_fields o)
 ;;
 
+(* ================= Memoization / background-refresh support ============ *)
+
+let bar ~date ~close =
+  { Dio_oracle.Oracle_types.date
+  ; open_ = close
+  ; high = close
+  ; low = close
+  ; close
+  ; volume = 100.0
+  }
+;;
+
+let mk_bars n =
+  Array.init n (fun i ->
+    bar
+      ~date:(Dio_oracle.Oracle_calendar.add_days "2024-01-01" i)
+      ~close:(100.0 +. float_of_int i))
+;;
+
+let test_same_bars () =
+  let a = mk_bars 100 in
+  Alcotest.(check bool) "physical identity" true (Dio_oracle.Oracle_runtime.same_bars a a);
+  (* Equal content, different objects. *)
+  let b = Array.copy a in
+  Alcotest.(check bool)
+    "structural equality"
+    true
+    (Dio_oracle.Oracle_runtime.same_bars a b);
+  (* A delta append invalidates. *)
+  let c = Array.append a [| bar ~date:"2025-01-01" ~close:101.0 |] in
+  Alcotest.(check bool)
+    "append invalidates"
+    false
+    (Dio_oracle.Oracle_runtime.same_bars a c);
+  (* A deep-history prepend invalidates. *)
+  let d = Array.append [| bar ~date:"2019-01-01" ~close:50.0 |] a in
+  Alcotest.(check bool)
+    "prepend invalidates"
+    false
+    (Dio_oracle.Oracle_runtime.same_bars a d);
+  (* A middle correction invalidates (exact compare, not sampled). *)
+  let e = Array.copy a in
+  e.(50)
+  <- bar
+       ~date:e.(50).Dio_oracle.Oracle_types.date
+       ~close:(e.(50).Dio_oracle.Oracle_types.close +. 5.0);
+  Alcotest.(check bool)
+    "middle correction invalidates"
+    false
+    (Dio_oracle.Oracle_runtime.same_bars a e);
+  (* Different lengths invalidate. *)
+  Alcotest.(check bool)
+    "length differs"
+    false
+    (Dio_oracle.Oracle_runtime.same_bars a (mk_bars 99))
+;;
+
+let test_same_fng () =
+  Alcotest.(check bool) "none equal" true (Dio_oracle.Oracle_runtime.same_fng None None);
+  Alcotest.(check bool)
+    "some equal within tolerance"
+    true
+    (Dio_oracle.Oracle_runtime.same_fng (Some 37.0) (Some 37.0000001));
+  Alcotest.(check bool)
+    "different values differ"
+    false
+    (Dio_oracle.Oracle_runtime.same_fng (Some 37.0) (Some 38.0));
+  Alcotest.(check bool)
+    "none vs some differ"
+    false
+    (Dio_oracle.Oracle_runtime.same_fng None (Some 37.0))
+;;
+
+let test_account_fp_eq () =
+  let fp ~analyses ~pool ~fng ~state =
+    { Dio_oracle.Oracle_runtime.af_analyses = analyses
+    ; af_pool = pool
+    ; af_fng = fng
+    ; af_state = state
+    }
+  in
+  let base = fp ~analyses:[ "1"; "2" ] ~pool:1000.0 ~fng:(Some 37.0) ~state:"a:1:2:3" in
+  (* Identical -> equal. *)
+  Alcotest.(check bool)
+    "identical fingerprints equal"
+    true
+    (Dio_oracle.Oracle_runtime.account_fp_eq base base);
+  (* Sub-0.5% pool drift -> equal (quantized sizing cannot move). *)
+  Alcotest.(check bool)
+    "pool drift under bucket equal"
+    true
+    (Dio_oracle.Oracle_runtime.account_fp_eq
+       base
+       (fp ~analyses:[ "1"; "2" ] ~pool:1003.0 ~fng:(Some 37.0) ~state:"a:1:2:3"));
+  (* >0.5% pool drift -> re-size. *)
+  Alcotest.(check bool)
+    "pool drift over bucket differs"
+    false
+    (Dio_oracle.Oracle_runtime.account_fp_eq
+       base
+       (fp ~analyses:[ "1"; "2" ] ~pool:1010.0 ~fng:(Some 37.0) ~state:"a:1:2:3"));
+  (* A recomputed analysis (new id) -> re-size. *)
+  Alcotest.(check bool)
+    "analysis id change differs"
+    false
+    (Dio_oracle.Oracle_runtime.account_fp_eq
+       base
+       (fp ~analyses:[ "1"; "3" ] ~pool:1000.0 ~fng:(Some 37.0) ~state:"a:1:2:3"));
+  (* A fill (strategy state change) -> re-size even at the same pool. *)
+  Alcotest.(check bool)
+    "state change differs"
+    false
+    (Dio_oracle.Oracle_runtime.account_fp_eq
+       base
+       (fp ~analyses:[ "1"; "2" ] ~pool:1000.0 ~fng:(Some 37.0) ~state:"a:1.5:2:3"));
+  (* F&G change -> re-size. *)
+  Alcotest.(check bool)
+    "fng change differs"
+    false
+    (Dio_oracle.Oracle_runtime.account_fp_eq
+       base
+       (fp ~analyses:[ "1"; "2" ] ~pool:1000.0 ~fng:(Some 38.0) ~state:"a:1:2:3"))
+;;
+
+let empty_materialized ~fng ~assets =
+  let balances = Hashtbl.create 1 in
+  { Dio_oracle.Oracle_runtime.m_assets = assets
+  ; m_balances = balances
+  ; m_fng = fng
+  ; m_epoch = 0
+  ; m_last_history_at = 0.0
+  }
+;;
+
+let test_history_changed () =
+  let m = empty_materialized ~fng:(Some 37.0) ~assets:[] in
+  (* First cycle is always a change (cold start). *)
+  Alcotest.(check bool)
+    "cold start is a change"
+    true
+    (Dio_oracle.Oracle_runtime.history_changed None m);
+  (* A balance-only cycle (same fng, same assets) is NOT a change: the pass
+     loop must not wake for it. *)
+  Alcotest.(check bool)
+    "balance-only cycle unchanged"
+    false
+    (Dio_oracle.Oracle_runtime.history_changed
+       (Some m)
+       (empty_materialized ~fng:(Some 37.0) ~assets:[]));
+  (* A f&g move is a change. *)
+  Alcotest.(check bool)
+    "fng change is a change"
+    true
+    (Dio_oracle.Oracle_runtime.history_changed
+       (Some m)
+       (empty_materialized ~fng:(Some 38.0) ~assets:[]))
+;;
+
+let test_analysis_memoization_roundtrip () =
+  (* The same materialized inputs return the SAME analysis record (reused =
+     true), so the pass skips the replay entirely and account sizing sees
+     stable analysis ids; any input change recomputes (reused = false). *)
+  let tc = Dio_oracle.Oracle_tasks.default_trading_config "kraken" "TEST/USD" in
+  let bars = mk_bars 100 in
+  let series =
+    { Dio_oracle.Oracle_types.symbol = "TEST/USD"
+    ; calendar_kind = Dio_oracle.Oracle_types.Crypto
+    ; bars
+    ; gaps = []
+    }
+  in
+  let am =
+    { Dio_oracle.Oracle_runtime.am_exchange = "kraken"
+    ; am_symbol = "TEST/USD"
+    ; am_tc = tc
+    ; am_bars = bars
+    ; am_deep_bars = 0
+    ; am_members = [ series ]
+    ; am_calendar = None
+    ; am_calendar_fp = "none"
+    }
+  in
+  let task =
+    { Dio_oracle.Oracle_tasks.symbol = "TEST/USD"; exchange = "kraken"; config = tc }
+  in
+  let run () =
+    Lwt_main.run
+      (Dio_oracle.Oracle_runtime.analyze_asset
+         (Dio_oracle.Oracle_runtime.default_config ())
+         []
+         task
+         ~index:1
+         ~n_tasks:1
+         ~am
+         ~fng:(Some 37.0))
+  in
+  let first, reused1 = run () in
+  Alcotest.(check bool) "first analysis computes" false reused1;
+  let second, reused2 = run () in
+  Alcotest.(check bool) "second analysis reused" true reused2;
+  Alcotest.(check bool) "same record identity" (first == second) true;
+  Alcotest.(check int) "same analysis id" first.id second.id;
+  (* A changed input (new bar appended) recomputes. *)
+  let am2 =
+    { am with
+      am_bars =
+        Array.append
+          bars
+          [| bar ~date:(Dio_oracle.Oracle_calendar.add_days "2024-01-01" 100) ~close:101.0
+          |]
+    }
+  in
+  let third, reused3 =
+    Lwt_main.run
+      (Dio_oracle.Oracle_runtime.analyze_asset
+         (Dio_oracle.Oracle_runtime.default_config ())
+         []
+         task
+         ~index:1
+         ~n_tasks:1
+         ~am:am2
+         ~fng:(Some 37.0))
+  in
+  Alcotest.(check bool) "changed input recomputes" false reused3;
+  Alcotest.(check bool) "recomputed record differs" (first == third) false
+;;
+
+let test_wait_refresh_epoch_bounded () =
+  (* Returns immediately when a new epoch was already published since the
+     caller captured [after], and when the budget is exhausted - never
+     blocks the decision path for long. *)
+  let gen = Atomic.get Dio_oracle.Oracle_runtime.refresh_generation in
+  let t0 = Unix.gettimeofday () in
+  Lwt_main.run
+    (Dio_oracle.Oracle_runtime.wait_refresh_epoch ~max_wait:5.0 ~after:(gen - 1) ());
+  let elapsed = Unix.gettimeofday () -. t0 in
+  Alcotest.(check bool)
+    "new epoch already published returns immediately"
+    (elapsed < 0.1)
+    true;
+  let t0 = Unix.gettimeofday () in
+  Lwt_main.run (Dio_oracle.Oracle_runtime.wait_refresh_epoch ~max_wait:0.05 ~after:gen ());
+  let elapsed = Unix.gettimeofday () -. t0 in
+  Alcotest.(check bool) "budget exhausted returns" (elapsed >= 0.04 && elapsed < 1.0) true
+;;
+
 let () =
   Alcotest.run
     "Oracle_runtime"
@@ -522,6 +779,17 @@ let () =
     ; ( "trigger"
       , [ Alcotest.test_case "request_pass wakes early" `Quick test_trigger_wakes_early
         ; Alcotest.test_case "wake is one-shot" `Quick test_trigger_is_one_shot
+        ] )
+    ; ( "memoization"
+      , [ Alcotest.test_case "same_bars exact compare" `Quick test_same_bars
+        ; Alcotest.test_case "same_fng" `Quick test_same_fng
+        ; Alcotest.test_case "account sizing fingerprint" `Quick test_account_fp_eq
+        ; Alcotest.test_case "history_changed semantics" `Quick test_history_changed
+        ; Alcotest.test_case
+            "analysis memoization roundtrip"
+            `Quick
+            test_analysis_memoization_roundtrip
+        ; Alcotest.test_case "bounded fill-wait" `Quick test_wait_refresh_epoch_bounded
         ] )
     ]
 ;;
