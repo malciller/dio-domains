@@ -67,6 +67,19 @@ let test_strategy_paused () =
     false
 ;;
 
+let test_latency_format () =
+  (* Sub-microsecond latencies must render at nanosecond level. *)
+  Alcotest.(check string) "500ns" "500ns" (Dashboard_ui.Theme.format_latency_us 0.5);
+  Alcotest.(check string) "123ns" "123ns" (Dashboard_ui.Theme.format_latency_us 0.1234);
+  Alcotest.(check string) "1ns" "1ns" (Dashboard_ui.Theme.format_latency_us 0.001);
+  (* Microsecond and above keep their existing scales. *)
+  Alcotest.(check string) "2us" "2µs" (Dashboard_ui.Theme.format_latency_us 1.5);
+  Alcotest.(check string) "50us" "50µs" (Dashboard_ui.Theme.format_latency_us 50.0);
+  Alcotest.(check string) "2.5ms" "2.5ms" (Dashboard_ui.Theme.format_latency_us 2500.0);
+  Alcotest.(check string) "2.0s" "2.0s" (Dashboard_ui.Theme.format_latency_us 2_000_000.0);
+  Alcotest.(check string) "zero" "0µs" (Dashboard_ui.Theme.format_latency_us 0.0)
+;;
+
 let () =
   Alcotest.run
     "dashboard_holdings"
@@ -79,6 +92,12 @@ let () =
             "paused = oracle OR capital-low OR market closed"
             `Quick
             test_strategy_paused
+        ] )
+    ; ( "latency formatting"
+      , [ Alcotest.test_case
+            "sub-microsecond latencies display at ns level"
+            `Quick
+            test_latency_format
         ] )
     ]
 ;;

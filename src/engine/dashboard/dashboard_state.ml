@@ -329,6 +329,7 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
     ; "p99", `Float snap.p99
     ; "p999", `Float snap.p999
     ; "samples", `Int snap.samples
+    ; "sub_us_samples", `Int snap.sub_us_samples
     ; "overflow", `Int snap.overflow
     ; "executions", `Int snap.executions
     ; "executions_per_sec", `Float (float snap.executions /. window_s)
