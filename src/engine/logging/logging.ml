@@ -1,6 +1,24 @@
 (** Structured logging system with ANSI formatting, per-section level filtering,
     and domain-safe asynchronous output.
 
+    Line layout (scannable, aligned):
+      HH:MM:SS.mmm LVL  SECTION         message
+      19:17:23.672 INFO oracle_runtime  [2/8] hyperliquid/BTC/USDC ACTIVE ...
+      19:17:23.672 INFO oracle_runtime        funding: drop 67.4% to floor ...
+    - Compact time-only timestamp (gray) — the date is available from
+      `docker logs --timestamps`; dropping it keeps the interesting content
+      close to the left margin.
+    - Level column is a fixed 5 chars, colored by severity.
+    - Section column is a fixed 20 chars, so the message column is identical
+      on every line (it never shifts as longer section names appear), and it
+      is colored with a stable per-section hue, so a component's lines can be
+      tracked down the screen.
+    - Multi-line messages (e.g. the capital-oracle decision blocks) indent
+      their continuation lines to the message column, keeping each block
+      visually grouped instead of colliding with the line prefix.
+    - With colors disabled the layout (and alignment) is preserved, without
+      any ANSI escapes.
+
     Hot-path contract (see HFT_AUDIT.md H1/M1):
     - All levels except CRITICAL are formatted and pushed to an async queue;
       the caller performs zero I/O and never drains the queue.
@@ -52,6 +70,56 @@ let level_color = function
   | WARN -> "\027[33m"
   | ERROR -> "\027[31m"
   | CRITICAL -> "\027[1m\027[41m\027[37m"
+;;
+
+(* Timestamp rendered in gray so it recedes; the eye jumps straight to the
+   level and section columns. *)
+let timestamp_color = "\027[90m"
+let ansi code = "\027[" ^ string_of_int code ^ "m"
+
+(* Per-section identity colors: a curated mapping for the sections that log
+   most, so the heavily interleaved components (oracle_runtime, domain_spawner,
+   suicide_grid, order_processor, supervisor, main) are always mutually
+   distinct. The oracle_* family shares bright-yellow on purpose, so a block
+   of oracle lines reads as one subsystem. Any unlisted section falls back to
+   a stable hash into [section_color_palette]. *)
+let section_color_overrides =
+  let tbl = Hashtbl.create 16 in
+  List.iter
+    (fun (name, code) -> Hashtbl.replace tbl name code)
+    [ "main", 94 (* bright blue *)
+    ; "supervisor", 92 (* bright green *)
+    ; "domain_spawner", 36 (* cyan *)
+    ; "domain_supervisor", 95 (* bright magenta *)
+    ; "oracle_runtime", 93 (* bright yellow *)
+    ; "oracle_replay", 93
+    ; "oracle_yahoo", 93
+    ; "suicide_grid", 96 (* bright cyan *)
+    ; "order_processor", 34 (* blue *)
+    ; "dashboard_server", 35 (* magenta *)
+    ; "discord_notifier", 97 (* bright white *)
+    ; "market_maker", 90 (* gray *)
+    ; "config", 90
+    ; "memory", 90
+    ];
+  tbl
+;;
+
+(* Section palette deliberately excludes the severity colors (31 red, 32 green,
+   33 yellow) so the level column keeps its meaning. *)
+let section_color_palette = [| 34; 35; 36; 90; 92; 93; 94; 95; 96; 97 |]
+
+let hash_string s =
+  let h = ref 0 in
+  String.iter (fun c -> h := ((!h * 31) + Char.code c) land 0x7fffffff) s;
+  !h
+;;
+
+let section_color_code name =
+  match Hashtbl.find_opt section_color_overrides name with
+  | Some code -> code
+  | None ->
+    section_color_palette.(hash_string name mod Array.length section_color_palette)
 ;;
 
 (* Per-section log level configuration. *)
@@ -119,8 +187,10 @@ let will_log level section_name =
   && level_to_int level >= level_to_int !global_min_level
 ;;
 
-(* Formats the current wall-clock time as "YYYY-MM-DD HH:MM:SS.mmm".
-   Caches the date/time prefix per second using Atomic for lock-free thread safety. *)
+(* Formats the current wall-clock time as "HH:MM:SS.mmm" (time only — the date
+   is redundant when live-tailing and is available from `docker logs
+   --timestamps`). Caches the time prefix per second using Atomic for
+   lock-free thread safety. *)
 let timestamp_cache = Atomic.make (0.0, "")
 
 let format_timestamp () =
@@ -133,20 +203,72 @@ let format_timestamp () =
     then (
       let tm = Unix.localtime time in
       let new_ts =
-        Printf.sprintf
-          "%04d-%02d-%02d %02d:%02d:%02d"
-          (tm.Unix.tm_year + 1900)
-          (tm.Unix.tm_mon + 1)
-          tm.Unix.tm_mday
-          tm.Unix.tm_hour
-          tm.Unix.tm_min
-          tm.Unix.tm_sec
+        Printf.sprintf "%02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
       in
       ignore (Atomic.compare_and_set timestamp_cache (last_sec, ts) (sec, new_ts));
       new_ts)
     else ts
   in
   ts_prefix ^ Printf.sprintf ".%03d" ms
+;;
+
+(* ---- Column alignment ----
+   The level column is a fixed width (5) and the section column is a fixed
+   width (20 — enough for every section that logs in practice, including
+   dashboard_server / domain_supervisor / discord_notifier / hyperliquid_startup).
+   Both are fixed so the message column NEVER shifts mid-stream: every message
+   starts at the same column in every line, which is what makes the log
+   scannable. A fixed column is worth a little trailing whitespace after short
+   names like "main"; a section longer than 20 simply runs on (rare, and the
+   rest of the line still reads fine). Multi-line messages indent their
+   continuation lines to the message column. *)
+
+let level_width = 5
+let section_width = 20
+
+let pad_to n s =
+  let len = String.length s in
+  if len >= n then s else s ^ String.make (n - len) ' '
+;;
+
+(* Indent the continuation lines of a multi-line message to the message
+   column so the block reads as one unit. *)
+let reindent_continuations prefix_len message =
+  if not (String.contains message '\n')
+  then message
+  else (
+    let pad = String.make prefix_len ' ' in
+    match String.split_on_char '\n' message with
+    | [] -> message
+    | head :: rest ->
+      String.concat
+        "\n"
+        (head :: List.map (fun line -> if line = "" then "" else pad ^ line) rest))
+;;
+
+(* Render one log line. Pure: no I/O, no queue — callers (or tests) can use
+   it directly. *)
+let format_line level section_name message =
+  let timestamp = format_timestamp () in
+  let level_str = pad_to level_width (level_to_string level) in
+  let section_str = pad_to section_width section_name in
+  let prefix_len = String.length timestamp + 1 + level_width + 1 + section_width + 1 in
+  let message = reindent_continuations prefix_len message in
+  if !use_colors
+  then
+    Printf.sprintf
+      "%s%s%s %s%s%s %s%s%s %s"
+      timestamp_color
+      timestamp
+      reset
+      (level_color level)
+      level_str
+      reset
+      (ansi (section_color_code section_name))
+      section_str
+      reset
+      message
+  else Printf.sprintf "%s %s %s %s" timestamp level_str section_str message
 ;;
 
 (* ---- Async log drain (all levels; CRITICAL excepted) ----
@@ -252,21 +374,7 @@ let log_sync level section_name message =
   else if !quiet_mode
   then ()
   else (
-    let timestamp = format_timestamp () in
-    let level_str = level_to_string level in
-    let formatted =
-      if !use_colors
-      then
-        Printf.sprintf
-          "%s %s%s%s [%s] %s"
-          timestamp
-          (level_color level)
-          level_str
-          reset
-          section_name
-          message
-      else Printf.sprintf "%s %s [%s] %s" timestamp level_str section_name message
-    in
+    let formatted = format_line level section_name message in
     if level = CRITICAL
     then (
       (* Emergency path: drain async queue first to preserve ordering,

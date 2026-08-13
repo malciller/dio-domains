@@ -105,9 +105,9 @@ let metric_pages =
     }
   ; { page_label = "NETWORK"
     ; metrics = [ "ws_ping"; "ws_feed"; "rest_request"; "signer" ]
-    ; trend_metric = "ws_ping"
-    ; trend_label = "(PING P99)"
-    ; trend_max_us = 20_000.0
+    ; trend_metric = "ws_feed"
+    ; trend_label = "(FEED P99)"
+    ; trend_max_us = 50_000.0
     }
   ]
 ;;

@@ -175,6 +175,16 @@ let tick_exec t ~now =
   t.last_exec_time <- now
 ;;
 
+(** [set_executions t count] overwrites the current window's execution count
+    (e.g. the number of order actions the strategy actually pushed this
+    window, not raw strategy-invocation cycles) and refreshes [last_exec_time]
+    when the count is positive. Callers must invoke it before
+    [snapshot_and_reset] so the published snapshot carries the real count. *)
+let set_executions t count =
+  t.executions <- count;
+  if count > 0 then t.last_exec_time <- Unix.gettimeofday ()
+;;
+
 (** [percentile t p] computes the p-th percentile (0.0 to 1.0) from the
     histogram by performing a cumulative scan over the buckets. Returns the
     bucket boundary in microseconds — a sub-microsecond result is a fraction
