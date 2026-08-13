@@ -435,8 +435,8 @@ let amend_order ~token ?retry_config (request : amend_request) =
            in
            if should_skip_amendment
            then (
-             (* Clear in-flight entry; amendment was suppressed as a no-op. *)
-             let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
+             (* Amendment suppressed as a no-op: terminal lifecycle state. *)
+             InFlightAmendments.note_amendment_skipped ~old_id:request.order_id;
              (* Log at INFO so no-op suppression is visible: previously this
                  path was silent, making repeated suppressed amends look like
                  a hung order. *)
@@ -498,18 +498,32 @@ let amend_order ~token ?retry_config (request : amend_request) =
                     ?retry_config:ex_retry_config
                     ())
                (fun exn ->
-                  (* Clear in-flight entry on exception. *)
-                  let _ =
-                    InFlightAmendments.remove_in_flight_amendment request.order_id
-                  in
+                  (* Amend lifecycle failed: terminal (entry dropped). *)
+                  InFlightAmendments.note_amendment_failed
+                    ~old_id:request.order_id
+                    ~reason:(Printexc.to_string exn);
                   Lwt.fail exn)
              >>= fun result ->
              let stop_time = Mtime_clock.now_ns () in
              let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
              Latency_profiler.record profiler span;
              Latency_profiler.report ~sample_threshold:100 profiler;
-             (* Clear in-flight entry after successful exchange response. *)
-             let _ = InFlightAmendments.remove_in_flight_amendment request.order_id in
+             (* Resolve the amend lifecycle with the exchange's verdict: a
+                same-id amend (Kraken) drops the entry; a replace
+                (Hyperliquid/Alpaca cancel+create) keeps the OLD id registered
+                as [Replaced] for the cleanup window, so a late cancel event
+                for the old id - the replace's side effect - is recognized by
+                the strategies and cannot reset the replacement order's
+                tracking. *)
+             (match result with
+              | Ok r ->
+                InFlightAmendments.note_amendment_succeeded
+                  ~old_id:request.order_id
+                  ~new_id:r.Types.new_order_id
+              | Error err ->
+                InFlightAmendments.note_amendment_failed
+                  ~old_id:request.order_id
+                  ~reason:err);
              Lwt.return result))))
 ;;
 

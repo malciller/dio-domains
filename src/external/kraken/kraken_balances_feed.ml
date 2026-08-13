@@ -154,6 +154,10 @@ module BalanceStore = struct
   let get_balance store = Atomic.get store.trading_balance
   let get_total_balance store = Atomic.get store.total_balance
 
+  (* Returns the wall-clock timestamp of the last wallet update for this
+     asset (0.0 = never updated). Used for balance-snapshot staleness. *)
+  let get_last_updated store = Atomic.get store.last_updated
+
   let get_all store =
     { asset = ""
     ; (* Populated by the caller with the asset name. *)

@@ -567,14 +567,22 @@ let history_changed (prev : materialized option) (cur : materialized) =
          cur.m_assets
 ;;
 
-(** Completed pass attempts, successes and failures alike: incremented in the
-    runtime loop right before [on_publish] wakes the domains, so by the time a
-    domain wakes on the publish signal this counter already reflects the
-    attempt that just finished. Trading domains open their startup gate once
-    the FIRST attempt is done and no decision exists for their asset
-    (analysis failed, or the runtime could not complete a pass at all):
-    last-known-good is empty at fresh startup, so waiting longer only delays
-    the config/F&G fallback the engine intends. *)
+(** Completed REAL pass attempts: incremented in the runtime loop right
+    before [on_publish] wakes the domains, so by the time a domain wakes on
+    the publish signal this counter already reflects the attempt that just
+    finished. Trading domains open their startup gate once the FIRST attempt
+    is done and no decision exists for their asset (analysis failed, or the
+    runtime could not complete a pass at all): last-known-good is empty at
+    fresh startup, so waiting longer only delays the config/F&G fallback the
+    engine intends.
+
+    A pass only counts as an attempt when it actually reached the decision
+    phase - i.e. a materialized state existed to decide on. The cold-start
+    pass ("first background refresh still in progress") publishes nothing:
+    counting it would open the domains' F&G-only fallback gate while the
+    oracle's first real decisions are still seconds away, letting capital-
+    unaware F&G sizing place orders the oracle's first pass immediately
+    declares INACTIVE (rejected by the exchanges for insufficient funds). *)
 let pass_attempts : int Atomic.t = Atomic.make 0
 
 let first_pass_attempt_done () = Atomic.get pass_attempts >= 1
@@ -2027,13 +2035,21 @@ let rec refresh_loop
     memoized on their inputs (microseconds when unchanged) and account
     sizing is memoized on (analysis ids, pool bucket, strategy state).
     Tolerates every failure mode; a failed asset or account keeps its
-    last-known-good decision. *)
+    last-known-good decision.
+
+    Returns [true] when the pass actually reached the decision phase (a
+    materialized state existed to decide on), [false] when it could not (no
+    runnable assets, or the cold-start refresher has not published the first
+    materialized state yet). The runtime loop counts only [true] passes as
+    "attempts" for the domains' startup gate: a pass that published nothing
+    must not race the F&G-only fallback ahead of the oracle's first real
+    decisions. *)
 let run_pass
       ?(config = default_config ())
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
       ~(classes : (string * class_pool) list)
       ()
-  : unit Lwt.t
+  : bool Lwt.t
   =
   let tasks, unsupported =
     Oracle_tasks.resolve_tasks
@@ -2055,7 +2071,7 @@ let run_pass
   if tasks = []
   then (
     Logging.info ~section "no runnable assets for the capital oracle this pass";
-    Lwt.return_unit)
+    Lwt.return false)
   else (
     (* Engine latency window for this pass: the decision path only - the
        refresher records and publishes its own balance/fetch windows. *)
@@ -2068,14 +2084,16 @@ let run_pass
       (* Cold start: the refresher is still fetching the first histories in
          the background; nothing to decide on yet. Domains keep their
          startup gate (they wait for the first decision) exactly as they do
-         while the first pass fetched inline. *)
+         while the first pass fetched inline - and this pass does NOT count
+         as an attempt, so the F&G-only fallback cannot race the first real
+         decisions. *)
       Logging.info
         ~section
         "capital-oracle pass: first background refresh still in progress; no decisions \
          yet";
       Latency_profiler.record engine_profs.prof_pass (span_from pass_start);
       let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_pass in
-      Lwt.return_unit
+      Lwt.return false
     | Some m ->
       let fng = m.m_fng in
       let grouped = group_by_account tasks in
@@ -2347,7 +2365,7 @@ let run_pass
         (if !reused_accounts > 0
          then Printf.sprintf ", %d account(s) reused" !reused_accounts
          else "");
-      Lwt.return_unit)
+      Lwt.return true)
 ;;
 
 (** Run the live oracle loop: initialize venue metadata once, run the first
@@ -2463,11 +2481,15 @@ let run_loop
              ~section
              "capital-oracle pass failed (%s); keeping last-known-good decisions"
              (Printexc.to_string exn);
-           Lwt.return_unit)
-      >>= fun () ->
+           Lwt.return false)
+      >>= fun attempted ->
       (* Mark the attempt finished BEFORE waking the domains: a domain that
-         wakes on this publish signal must already see it in its gate check. *)
-      Atomic.incr pass_attempts;
+         wakes on this publish signal must already see it in its gate check.
+         Only a pass that actually reached the decision phase counts (see
+         run_pass): the cold-start pass publishes nothing, so counting it
+         would open the domains' F&G-only fallback gate while the oracle's
+         first real decisions are still seconds away. *)
+      if attempted then Atomic.incr pass_attempts;
       on_publish (decisions ());
       (* The next pass runs at the cadence deadline, or early when the engine
          requests one ([request_pass] on fills / canceled-rejected-expired

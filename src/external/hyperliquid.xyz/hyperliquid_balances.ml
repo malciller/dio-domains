@@ -23,6 +23,10 @@ type balance_data =
 module BalanceStore = struct
   type wallet_balance =
     { balance : float
+      (** Available balance: what can actually be spent/traded. For spot this
+          is [total -. hold] (hold = value locked in open orders); the spot
+          order book rejects anything beyond it. *)
+    ; total : float (** The wallet's full balance, holds included. *)
     ; wallet_type : string
     ; wallet_id : string
     ; last_updated : float
@@ -45,19 +49,33 @@ module BalanceStore = struct
     }
   ;;
 
-  let update_wallet store balance wallet_type wallet_id =
+  (** Wallet types whose funds are NOT spendable by the spot grid:
+      - "staking": delegated/locked HYPE (the grid cannot sell it);
+      - "perp": USDC margin in the perp clearinghouse (it is not spot
+        capital - the spot order book cannot spend it, and the capital
+        oracle's pool is spot-only too). Including either in the tradeable
+        figure overstates what the grid can buy, which lets buy placement
+        pass its balance guard with an order the exchange then rejects. *)
+  let is_excluded_wallet = function
+    | "staking" | "perp" -> true
+    | _ -> false
+  ;;
+
+  let update_wallet store ~available ~total wallet_type wallet_id =
     let wallet_key = wallet_type ^ "/" ^ wallet_id in
     let now = Unix.gettimeofday () in
-    let wallet_data = { balance; wallet_type; wallet_id; last_updated = now } in
+    let wallet_data =
+      { balance = available; total; wallet_type; wallet_id; last_updated = now }
+    in
     Mutex.lock store.mutex;
     Hashtbl.replace store.wallets wallet_key wallet_data;
     let total =
-      Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0
+      Hashtbl.fold (fun _ wallet acc -> acc +. wallet.total) store.wallets 0.0
     in
     let trading =
       Hashtbl.fold
         (fun _ wallet acc ->
-           if wallet.wallet_type = "staking" then acc else acc +. wallet.balance)
+           if is_excluded_wallet wallet.wallet_type then acc else acc +. wallet.balance)
         store.wallets
         0.0
     in
@@ -69,6 +87,10 @@ module BalanceStore = struct
 
   let get_balance store = Atomic.get store.trading_balance
   let get_total_balance store = Atomic.get store.total_balance
+
+  (* Wall-clock timestamp of the last wallet update for this asset
+     (0.0 = never updated). Used for balance-snapshot staleness. *)
+  let get_last_updated store = Atomic.get store.last_updated
 end
 
 (* Global mutable state: per-asset balance stores and readiness flag. *)
@@ -203,7 +225,12 @@ let process_market_data json =
           in
           let perp_value = if withdrawable > 0.0 then withdrawable else account_value in
           let store = get_balance_store "USDC" in
-          BalanceStore.update_wallet store perp_value "perp" "account";
+          BalanceStore.update_wallet
+            store
+            ~available:perp_value
+            ~total:perp_value
+            "perp"
+            "account";
           Logging.debug_f
             ~section
             "webData2 perp USDC: %.2f (withdrawable=%.2f, accountValue=%.2f, total=%.2f)"
@@ -227,15 +254,23 @@ let process_market_data json =
                let raw_coin = member "coin" item |> to_string in
                let coin = canonicalize_coin raw_coin in
                let total = parse_json_float (member "total" item) in
+               (* The spotState subscription reports [total] and [hold] per
+                  balance (hold = value locked in open orders). The grid can
+                  only spend [total -. hold] - using [total] overstates the
+                  tradeable balance and lets buy placement pass its guard
+                  with an order the exchange then rejects. *)
+               let hold = parse_json_float (member "hold" item) in
+               let available = max 0.0 (total -. hold) in
                let store = get_balance_store coin in
-               BalanceStore.update_wallet store total "spot" "account";
+               BalanceStore.update_wallet store ~available ~total "spot" "account";
                if coin = "USDC"
                then
                  Logging.debug_f
                    ~section
-                   "spotState USDC: %.2f (total: %.2f)"
+                   "spotState USDC: %.2f avail / %.2f total (hold %.2f)"
+                   available
                    total
-                   (BalanceStore.get_balance store)
+                   hold
              with
              | exn ->
                Logging.warn_f

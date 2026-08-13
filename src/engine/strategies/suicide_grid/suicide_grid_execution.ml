@@ -377,6 +377,7 @@ let evaluate_buy_leg
       ~bid_price
       ~ask_price
       ~quote_balance
+      ~quote_balance_stale
       ~cycle
       ~iter_open_orders
       ~open_buy_count_from_scan
@@ -499,6 +500,7 @@ let evaluate_buy_leg
         let balance_ok = available_quote_balance >= buy_price *. qty in
         if balance_ok
         then (
+          state.last_buy_attempted_insufficient <- false;
           let order =
             create_order
               state.duplicate_key_buy
@@ -525,29 +527,56 @@ let evaluate_buy_leg
         else (
           let cooldown_key = "place_Buy" in
           if not (Hashtbl.mem state.amend_cooldowns cooldown_key)
-          then (
-            Logging.warn_f
-              ~section
-              "Local balance low for %s buy (need %.2f, available %.2f) - attempting \
-               anyway, exchange will reject if truly insufficient"
-              asset.symbol
-              quote_needed
-              available_quote_balance;
-            Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
-            let order =
-              create_order
-                state.duplicate_key_buy
-                asset.symbol
-                Buy
-                qty
-                (Some buy_price)
-                true
-                asset.exchange
-            in
-            if push_order ~now ~state order
+          then
+            if quote_balance_stale
             then (
-              buy_attempted := true;
-              state.last_buy_order_price <- Some buy_price))))
+              (* The balance snapshot is stale: the local figure may be
+                 wrong, so the attempt is still worthwhile - the exchange's
+                 verdict is the truth. Mark the attempt as knowingly
+                 under-funded so the (expected) rejection does not latch
+                 capital_low on a foreordained outcome. *)
+              Logging.warn_f
+                ~section
+                "Local balance low for %s buy (need %.2f, available %.2f, balance \
+                 snapshot stale) - attempting anyway, exchange will reject if truly \
+                 insufficient"
+                asset.symbol
+                quote_needed
+                available_quote_balance;
+              state.last_buy_attempted_insufficient <- true;
+              Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0);
+              let order =
+                create_order
+                  state.duplicate_key_buy
+                  asset.symbol
+                  Buy
+                  qty
+                  (Some buy_price)
+                  true
+                  asset.exchange
+              in
+              if push_order ~now ~state order
+              then (
+                buy_attempted := true;
+                state.last_buy_order_price <- Some buy_price))
+            else (
+              (* Fresh balance, genuinely insufficient: do not send an order
+                 that is guaranteed to be rejected. Pause buying via
+                 capital_low until the quote balance recovers (the recovery
+                 path clears it on a balance increase). *)
+              if not state.capital_low
+              then (
+                state.capital_low <- true;
+                state.capital_low_logged <- true;
+                state.capital_low_at_balance <- -1.0;
+                Logging.warn_f
+                  ~section
+                  "Local balance insufficient for %s buy (need %.2f, available %.2f) - \
+                   skipping placement until balance recovers"
+                  asset.symbol
+                  quote_needed
+                  available_quote_balance);
+              Hashtbl.replace state.amend_cooldowns cooldown_key (now +. 2.0))))
     else
       Logging.warn_f
         ~section
@@ -1144,9 +1173,15 @@ let evaluate_sell_leg
   state.just_filled_buy <- false
 ;;
 
-(** Main strategy execution loop. *)
+(** Main strategy execution loop. [quote_balance_stale] is set by the caller
+    (domain worker) when the quote-balance snapshot is older than the
+    staleness threshold: a stale snapshot is not authoritative, so an
+    under-funded buy is still attempted (the exchange's verdict is the
+    truth); a fresh snapshot that cannot fund the buy is skipped outright
+    instead of being sent to be rejected. *)
 let execute_strategy
       ?cached_state
+      ?(quote_balance_stale = false)
       ~now
       (asset : trading_config)
       (current_price : float)
@@ -1240,6 +1275,7 @@ let execute_strategy
                ~bid_price
                ~ask_price
                ~quote_balance
+               ~quote_balance_stale
                ~cycle
                ~iter_open_orders
                ~open_buy_count_from_scan

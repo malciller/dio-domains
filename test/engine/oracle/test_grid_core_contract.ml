@@ -22,6 +22,7 @@ let identity_state () =
   ; capital_low = false
   ; capital_low_logged = false
   ; capital_low_at_balance = 0.0
+  ; last_buy_attempted_insufficient = false
   ; resuming_after_balance_flag = false
   ; just_filled_buy = false
   ; force_buy_reanchor = false

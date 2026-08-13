@@ -334,6 +334,15 @@ module Hyperliquid_impl = struct
     fun () -> Hyperliquid_balances.BalanceStore.get_balance store
   ;;
 
+  (** Age of the balance-store snapshot for [asset], or [None] before the
+      first update. *)
+  let get_balance_age_fast ~asset =
+    let store = Hyperliquid_balances.get_balance_store asset in
+    fun () ->
+      let last = Hyperliquid_balances.BalanceStore.get_last_updated store in
+      if last > 0.0 then Some (Unix.gettimeofday () -. last) else None
+  ;;
+
   let get_total_balance ~asset = Hyperliquid_balances.get_total_balance asset
 
   let get_all_balances () =
@@ -731,17 +740,20 @@ let poll_staking_balance () =
          let store = Hyperliquid_balances.get_balance_store "HYPE" in
          Hyperliquid_balances.BalanceStore.update_wallet
            store
-           delegated
+           ~available:delegated
+           ~total:delegated
            "staking"
            "delegated";
          Hyperliquid_balances.BalanceStore.update_wallet
            store
-           pending_withdrawal
+           ~available:pending_withdrawal
+           ~total:pending_withdrawal
            "staking"
            "pending_withdrawal";
          Hyperliquid_balances.BalanceStore.update_wallet
            store
-           withdrawable
+           ~available:withdrawable
+           ~total:withdrawable
            "staking"
            "withdrawable";
          Logging.debug_f
@@ -840,13 +852,23 @@ let fetch_spot_balances_ws () =
                   let raw_coin = member "coin" item |> to_string in
                   let coin = Hyperliquid_balances.canonicalize_coin raw_coin in
                   let total = parse_json_float (member "total" item) in
+                  (* Same available/total semantics as the spotState
+                     subscription: the grid can only spend total - hold. *)
+                  let hold = parse_json_float (member "hold" item) in
+                  let available = max 0.0 (total -. hold) in
                   let store = Hyperliquid_balances.get_balance_store coin in
                   Hyperliquid_balances.BalanceStore.update_wallet
                     store
-                    total
+                    ~available
+                    ~total
                     "spot"
                     "account";
-                  Logging.debug_f ~section "Initial Spot %s balance: %.6f" coin total
+                  Logging.debug_f
+                    ~section
+                    "Initial Spot %s balance: %.6f avail / %.6f total"
+                    coin
+                    available
+                    total
                 with
                 | exn ->
                   Logging.warn_f

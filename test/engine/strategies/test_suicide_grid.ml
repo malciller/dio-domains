@@ -940,6 +940,130 @@ let test_virtual_gtc_sell_grid_maintenance () =
     (Option.is_none kraken_popped)
 ;;
 
+let test_buy_placement_balance_guard () =
+  (* Bug 2 regression: buy placement against an under-funded quote balance.
+     - FRESH balance snapshot (authoritative): the order must NOT be sent
+       (it would be rejected by the exchange for insufficient funds); the
+       buy is paused via the capital_low latch instead.
+     - STALE balance snapshot (may be wrong): the order is still attempted
+       (the exchange's verdict is the truth) and the foreordained flag is
+       set so the expected rejection does not re-latch capital_low. *)
+  let symbol = "TESTBAL/USD" in
+  let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  st.exchange_id <- "kraken";
+  st.grid_qty <- 1.0;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 0.5
+    ; sell_mult = "1.0"
+    ; strategy = "suicide_grid"
+    ; maker_fee = Some 0.001
+    ; taker_fee = Some 0.002
+    ; accumulation_buffer = 0.01
+    }
+  in
+  let iter_open_orders
+    : (string -> float -> float -> string -> int option -> unit) -> unit
+    =
+    fun _ -> ()
+  in
+  let now = Unix.gettimeofday () in
+  let drain () = ignore (Dio_strategies.Suicide_grid.get_pending_orders 100) in
+  let pending_count () =
+    List.length (Dio_strategies.Suicide_grid.get_pending_orders 10)
+  in
+  drain ();
+  (* 1. Fresh balance, insufficient -> no order pushed, capital_low latched. *)
+  ignore
+    (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~state:st
+       ~now
+       ~asset
+       ~bid_price:100.0
+       ~ask_price:100.0
+       ~quote_balance:10.0
+       ~quote_balance_stale:false
+       ~cycle:1
+       ~iter_open_orders
+       ~open_buy_count_from_scan:0
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:None
+       ~pending_buy_qty_from_scan:0.0);
+  check bool "fresh insufficient: capital_low latched" true st.capital_low;
+  check int "fresh insufficient: no order pushed" 0 (pending_count ());
+  check
+    bool
+    "fresh insufficient: foreordained flag not set"
+    false
+    st.last_buy_attempted_insufficient;
+  drain ();
+  (* 2. Stale balance, insufficient -> order attempted, foreordained flag. *)
+  st.capital_low <- false;
+  st.capital_low_logged <- false;
+  st.capital_low_at_balance <- 0.0;
+  Hashtbl.remove st.amend_cooldowns "place_Buy";
+  ignore
+    (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~state:st
+       ~now:(now +. 1.0)
+       ~asset
+       ~bid_price:100.0
+       ~ask_price:100.0
+       ~quote_balance:10.0
+       ~quote_balance_stale:true
+       ~cycle:2
+       ~iter_open_orders
+       ~open_buy_count_from_scan:0
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:None
+       ~pending_buy_qty_from_scan:0.0);
+  check
+    bool
+    "stale insufficient: foreordained flag set"
+    true
+    st.last_buy_attempted_insufficient;
+  check int "stale insufficient: order attempted" 1 (pending_count ());
+  drain ();
+  (* 3. Fresh balance, SUFFICIENT -> order placed normally, flag cleared. *)
+  st.capital_low <- false;
+  st.capital_low_logged <- false;
+  st.capital_low_at_balance <- 0.0;
+  st.last_buy_attempted_insufficient <- true;
+  st.inflight_buy <- false;
+  st.pending_orders <- [];
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       st.duplicate_key_buy);
+  Hashtbl.remove st.amend_cooldowns "place_Buy";
+  ignore
+    (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~state:st
+       ~now:(now +. 2.0)
+       ~asset
+       ~bid_price:100.0
+       ~ask_price:100.0
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:3
+       ~iter_open_orders
+       ~open_buy_count_from_scan:0
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:None
+       ~pending_buy_qty_from_scan:0.0);
+  check
+    bool
+    "fresh sufficient: foreordained flag cleared"
+    false
+    st.last_buy_attempted_insufficient;
+  check int "fresh sufficient: order placed" 1 (pending_count ());
+  drain ()
+;;
+
 let () =
   run
     "Suicide Grid"
@@ -966,6 +1090,12 @@ let () =
             test_virtual_gtc_sell_grid_maintenance
         ] )
     ; "balance", [ test_case "balance checking" `Quick test_balance_checking ]
+    ; ( "placement guard"
+      , [ test_case
+            "buy placement vs fresh/stale balance"
+            `Quick
+            test_buy_placement_balance_guard
+        ] )
     ; ( "events"
       , [ test_case "order acknowledgment" `Quick test_order_acknowledgment
         ; test_case "order cancellation" `Quick test_order_cancellation

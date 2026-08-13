@@ -227,6 +227,14 @@ module type S = sig
   (** Return a fast path closure for fetching live tradeable balance of [asset] without lock acquisition overhead. *)
   val get_tradeable_balance_fast : asset:string -> unit -> float
 
+  (** Return a fast path closure yielding the age (seconds) of the cached
+      [asset] balance snapshot, or [None] when the exchange does not track
+      freshness. A fresh snapshot is authoritative: strategies that cannot
+      fund a buy against it skip placement. A stale (or unknown-age) snapshot
+      may be wrong, so strategies may still attempt and let the exchange
+      decide. *)
+  val get_balance_age_fast : asset:string -> unit -> float option
+
   (** Return the total balance for [asset] including staked/earn/vault balances. Returns [0.0] if unknown. *)
   val get_total_balance : asset:string -> float
 
