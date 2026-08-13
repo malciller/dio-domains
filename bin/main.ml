@@ -379,8 +379,6 @@ let setup_fatal_signal_handlers () =
     [ 11; 6; 7; 8; 10 ]
 ;;
 
-(* 11=SIGSEGV, 6=SIGABRT, 7=SIGBUS, 8=SIGFPE, 10=SIGBUS/SIGUSR1 *)
-
 (** Override Lwt.async_exception_hook to log unhandled async exceptions without terminating the process. *)
 let setup_lwt_exception_handler () =
   Lwt.async_exception_hook

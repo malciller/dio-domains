@@ -20,8 +20,9 @@ open Strategy_common
 
 let section = "auto_hedger"
 
-(* Ring buffer dedicated to hedging orders. *)
+(** Ring buffer dedicated to hedging orders. *)
 let order_buffer = LockFreeQueue.create ()
+
 let get_pending_orders limit = LockFreeQueue.read_batch order_buffer limit
 
 let push_order order =
@@ -129,8 +130,9 @@ let build_and_push_hedge testnet hedge_symbol hedge_side filled_qty fill_price p
     hedge_qty_final)
 ;;
 
-(* Mutable state tracking whether a hedge is open and its quantity. *)
+(** Mutable state tracking whether a hedge is open and its quantity. *)
 let hedge_open = ref false
+
 let hedge_qty = ref 0.0
 let hedge_mutex = Mutex.create ()
 

@@ -2,7 +2,7 @@
 
     Encodes outbound messages as length-prefixed, null-delimited field
     sequences and decodes inbound messages from the same format. Pure
-    functions — no IO, no state. 
+    functions: no IO, no state. 
 
     Wire format:
     {v
@@ -55,7 +55,6 @@ let encode_handshake ~min_ver ~max_ver : Bytes.t =
     terminating null. *)
 let decode_fields (payload : string) : string list =
   let parts = String.split_on_char '\x00' payload in
-  (* Drop the last element if it's empty (trailing null) *)
   match List.rev parts with
   | "" :: rest -> List.rev rest
   | _ -> parts

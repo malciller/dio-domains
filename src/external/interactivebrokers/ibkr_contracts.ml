@@ -133,6 +133,7 @@ let get_precision ~symbol =
       else 4
     in
     Some (price_dec, 0)
-    (* Zero decimal precision constraint bounded by fractional share inability for configured ETF processing *)
+    (* Quantity precision is zero because fractional shares are unsupported
+       for the ETF contracts this module routes. *)
   | None -> None
 ;;

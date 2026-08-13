@@ -319,7 +319,7 @@ let exch_tag_of = function
 let pad_right w s =
   let len = utf8_len s in
   if len >= w
-  then s (* return intact to prevent splitting utf8 bytes *)
+  then s (* Return the string intact to avoid splitting UTF-8 bytes. *)
   else s ^ String.make (w - len) ' '
 ;;
 
@@ -328,7 +328,7 @@ let col w attr s = I.string attr (pad_right w s)
 let pad_left w s =
   let len = utf8_len s in
   if len >= w
-  then s (* return intact to prevent splitting utf8 bytes *)
+  then s (* Return the string intact to avoid splitting UTF-8 bytes. *)
   else String.make (w - len) ' ' ^ s
 ;;
 
@@ -408,7 +408,7 @@ let section_title ?(title_attr = A.(fg c_title ++ bg c_bg ++ st bold)) w label =
   let lbl_img = I.string title_attr lbl in
   let len = I.width lbl_img in
   let pad_count = max 0 (w - len - 1) in
-  (* Extract direct RGB values for the gradient *)
+  (* Extract the direct RGB values used for the gradient fade. *)
   let left_rgb =
     187, 154, 247
     (* c_accent *)

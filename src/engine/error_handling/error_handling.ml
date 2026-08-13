@@ -96,7 +96,7 @@ let is_retriable_error (err : string) : bool = is_retriable (classify err)
 (* ---- Retry configuration ---- *)
 
 (** Parameters controlling exponential backoff retry behavior.
-    Canonical definition — re-exported by [Exchange_intf.Types]. *)
+    Canonical definition, re-exported by [Exchange_intf.Types]. *)
 type retry_config =
   { max_attempts : int (** Maximum number of attempts (including the initial). *)
   ; base_delay_ms : float (** Initial delay between retries, in milliseconds. *)

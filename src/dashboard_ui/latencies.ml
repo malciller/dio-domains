@@ -1,19 +1,20 @@
 open Notty
 open Theme
 
-(** ENGINE LATENCY — paginated metric table.
+(** ENGINE LATENCY, a paginated metric table.
 
     The section renders one row per domain, but instead of cramming every
     measurement into a fixed set of columns (which capped the old design at
-    4 metrics / ~170 columns), the columns are organized into PAGES. Each
-    page is a named group of metric columns; only the active page's columns
-    are rendered. The rows, trend sparkline and exec-rate columns adapt to
-    the active page.
+    4 metrics / about 170 columns), the columns are organized into PAGES.
+    Each page is a named group of metric columns; only the active page's
+    columns are rendered. The rows, trend sparkline, and exec-rate columns
+    adapt to the active page.
 
-    Adding a new latency measurement (e.g. a per-domain network/request
-    latency) is now just adding its label to a page in [metric_pages] — the
-    engine publishes it under the domain's latency map and it appears. No
-    layout math, no width crisis. Switch pages with ←/→ in the main view.
+    Adding a new latency measurement, for example a per-domain network or
+    request latency, is now just a matter of adding its label to a page in
+    [metric_pages]; the engine publishes it under the domain's latency map
+    and it appears. No layout math, no width crisis. Switch pages with
+    ←/→ in the main view.
 *)
 
 let history_len = 15
@@ -37,9 +38,9 @@ let ema_smooth (arr : float array) ~alpha =
 ;;
 
 (** Rolling p99 history keyed by (symbol, metric) so each latency page keeps
-    its own sparkline (switching pages never clobbers another page's trend).
-    Evicts everything when the table outgrows [hist_max] — sparklines
-    repopulate within seconds. *)
+    its own sparkline, and switching pages never clobbers another page's
+    trend. Evicts everything when the table outgrows [hist_max]; the
+    sparklines repopulate within seconds. *)
 let update_hist symbol metric p99 =
   if Hashtbl.length hist_tbl > hist_max then Hashtbl.clear hist_tbl;
   let key = symbol ^ "\x00" ^ metric in
@@ -58,12 +59,12 @@ let update_hist symbol metric p99 =
 ;;
 
 (** Last measured window values per (symbol, metric), persisted across idle
-    windows so short-lived measurements (e.g. signer, ws ping, rest request —
-    which only get samples when an event actually happens) keep showing their
-    last value instead of flipping back to "idle". Only refreshed by windows
-    with samples; a window with zero samples keeps the previous values
-    rendered dimmed until a fresh one arrives. Evicts everything when the
-    table outgrows [last_vals_max]. *)
+    windows so that short-lived measurements, such as signer, ws ping, or
+    rest request, which only get samples when an event actually happens,
+    keep showing their last value instead of flipping back to "idle". Only
+    refreshed by windows with samples; a window with zero samples keeps the
+    previous values rendered dimmed until a fresh one arrives. Evicts
+    everything when the table outgrows [last_vals_max]. *)
 let last_vals : (string, float * float * float) Hashtbl.t = Hashtbl.create 64
 
 let last_vals_max = 256
@@ -84,15 +85,15 @@ let freshness_tolerance = function
 type metric_group =
   { page_label : string
   ; metrics : string list
-  ; trend_metric : string (* label plotted in the trend column *)
-  ; trend_label : string (* header for the trend column *)
+  ; trend_metric : string (* metric label plotted in the trend column *)
+  ; trend_label : string (* header shown above the trend column *)
   ; trend_max_us : float (* full-scale value for the trend sparkline *)
   }
 
 (** The latency pages.
-    - CORE: the per-domain pipeline measurements — the oracle pass, orderbook
-      update, strategy run, execution broadcast, and the full cycle span
-      (wake -> consume -> strategy -> exec) — all in one table.
+    - CORE: the per-domain pipeline measurements, namely the oracle pass,
+      orderbook update, strategy run, execution broadcast, and the full
+      cycle span (wake -> consume -> strategy -> exec), all in one table.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed
       gap, REST round-trip, signer time). The engine does not publish these
       yet, so the cells render "--" until it does. *)
@@ -135,9 +136,9 @@ let page_trend_label i =
 ;;
 
 (** Width of the trend column (sparkline + header). The trend header label
-    and the sparkline must both stay within this width — a longer label would
-    silently overrun the column and shift every border to its right out of
-    alignment. Guarded by a test in test_dashboard_holdings. *)
+    and the sparkline must both stay within this width; a longer label
+    would silently overrun the column and shift every border to its right
+    out of alignment. Guarded by a test in test_dashboard_holdings. *)
 let trend_col_w = 12
 
 (** Short header label for a latency metric. *)
@@ -198,7 +199,7 @@ let render_latencies w json =
     | `Assoc l -> l
     | _ -> []
   in
-  (* Build symbol -> exchange lookup from strategies *)
+  (* Build a symbol -> exchange lookup table from the strategies. *)
   let sym_to_exch =
     match json |?> "strategies" with
     | `Assoc l ->
@@ -279,15 +280,16 @@ let render_latencies w json =
         then 1 (* yellow *)
         else 0 (* green *))
     in
-    (* Active page's metric columns. The wide layout shows all of them
-       (the same ~179 columns as the five-metric CORE table); narrow
+    (* The active page's metric columns. The wide layout shows all of them,
+       roughly the same 179 columns as the five-metric CORE table; narrow
        terminals show the first two so the section still fits. *)
     let is_compact = w < 180 in
     let page = List.nth metric_pages (current_page_index ()) in
     let page_cols = if is_compact then take_first 2 page.metrics else page.metrics in
     let page_labels = List.map short_label page_cols in
     let metric_cell_w = 8 in
-    (* Two-row header: metric names on row 1, p50/p99 sub-headers on row 2 *)
+    (* Two-row header: metric names on the first row and p50/p99/p999
+       sub-headers on the second. *)
     let header_row1 =
       I.hcat
         ([ I.string a_border " │  "
@@ -401,8 +403,8 @@ let render_latencies w json =
                p50, p99, p999, samples
              | None -> 0.0, 0.0, 0.0, 0
            in
-           (* Compute worst severity across the active page's metrics for the
-              health dot *)
+           (* Compute the worst severity across the active page's metrics
+               for the health dot. *)
            let worst_sev =
              List.fold_left
                (fun worst label ->

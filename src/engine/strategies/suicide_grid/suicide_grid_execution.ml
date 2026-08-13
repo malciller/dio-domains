@@ -8,7 +8,7 @@ open Suicide_grid_orders
 
 (** Performs 1-to-1 multiset matching between persisted sell levels and open sell orders.
     Returns (open_levels, missing_levels).
-    M15: the previous implementation was O(n·m) — for each persisted level it
+    M15: the previous implementation was O(n·m); for each persisted level it
     linearly rescanned the open-order list and allocated a match array. This
     version buckets open orders by a tolerance-rounded price key (Hashtbl) and
     verifies the original tolerance before consuming a candidate, so matching
@@ -296,7 +296,7 @@ let sync_open_orders
   (* M15: index the persisted sell levels by a rounded price key so each open
      sell order's match lookup is O(1) instead of rescanning the whole list.
      The previous [List.iteri] scan was O(n·m) per strategy execution (n open
-     sell orders x m persisted levels) — the dominant cost for assets with
+     sell orders x m persisted levels), the dominant cost for assets with
      large sell grids like SPCX's 42 open sells. Buckets store
      (index, price, qty) so a 1-to-1 match consumes the entry and the
      original tolerance check and qty-update semantics are preserved. *)
@@ -972,8 +972,8 @@ let evaluate_sell_leg
   (* M15: the persisted-sell grid is reconciled ONCE per execution and the
      result is reused by the three persisted-sell branches below. The
      previous code ran [reconcile_persisted_sell_levels] three times per
-     strategy tick — each an O(n+m) price-keyed partition with string-key
-     allocation — which dominated the Alpaca hotpath for assets with large
+     strategy tick, each an O(n+m) price-keyed partition with string-key
+     allocation, which dominated the Alpaca hotpath for assets with large
      sell grids (e.g. SPCX's 42 open sells -> 292us STRAT p50 vs QQQ's 16us).
      After the pruning below rebuilds [persisted_sell_levels] to
      [open_levels @ kept_missing], a re-partition against the same open

@@ -23,7 +23,7 @@ let section = "discord_notifier"
     messages readable (each fill uses ~5-6 fields). *)
 let max_fills_per_message = 10
 
-(* ---- Token Bucket Rate Limiter ---- *)
+(* Token bucket rate limiter. *)
 
 (** Token bucket state for rate limiting webhook POSTs.
     Discord enforces 5 requests per 2 seconds per webhook URL.
@@ -72,7 +72,7 @@ let acquire_token () =
   try_acquire ()
 ;;
 
-(* ---- Message Formatting ---- *)
+(* Message formatting. *)
 
 (** Format a fill event as a Discord embed field. *)
 let format_fill_field (fill : Concurrency.Fill_event_bus.fill_event) =
@@ -189,7 +189,7 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
     Some (`Assoc [ "embeds", `List [ embed ] ])
 ;;
 
-(* ---- Webhook HTTP Client ---- *)
+(* Webhook HTTP client. *)
 
 (** Send a JSON payload to the Discord webhook URL.
     Returns [Ok ()] on success, [Error msg] on failure.
@@ -259,7 +259,7 @@ let send_with_retry ~webhook_url payload =
   attempt 1
 ;;
 
-(* ---- Consumer Loop ---- *)
+(* Consumer loop. *)
 
 (** Main consumer loop. Drains the fill event ring buffer on each wakeup,
     batches fills into webhook payloads, and sends them with rate limiting. *)
@@ -326,7 +326,7 @@ let consumer_loop ~webhook_url () =
   loop ()
 ;;
 
-(* ---- Initialization ---- *)
+(* Initialization. *)
 
 (** Start the Discord notifier. Reads DISCORD_WEBHOOK_URL from environment.
     If not set, logs a warning and returns silently (no-op).

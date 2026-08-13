@@ -13,7 +13,7 @@
 
 let section = "ibkr_market_hours"
 
-(** When true, narrows [is_market_open] to regular trading hours (9:30 AM–4 PM)
+(** When true, narrows [is_market_open] to regular trading hours (9:30 AM to 4 PM)
     because IB Gateway in paper mode does not serve useful data during
     pre-market or after-hours. Set by [Ibkr_module.Config.set_testnet]. *)
 let paper_mode = ref false

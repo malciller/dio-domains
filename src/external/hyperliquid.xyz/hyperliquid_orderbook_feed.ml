@@ -336,7 +336,7 @@ let process_raw_market_data msg =
         (try
            let store = ensure_store symbol in
            (* Zero-alloc depth-1 fast path: parse TOB, publish an immutable
-               snapshot record with one Atomic.set (L4 — no torn reads). *)
+               snapshot record with one Atomic.set (L4, no torn reads). *)
            let bid_px, bid_sz, ask_px, ask_sz, ok = parse_tob_fast msg in
            if ok
            then Atomic.set store.tob { bid_px; bid_sz; ask_px; ask_sz; tob_valid = true };
@@ -374,7 +374,7 @@ let[@inline always] get_latest_orderbook symbol =
 ;;
 
 (** Read top-of-book from the atomic snapshot cache (zero allocation,
-    lock-free, torn-read-free — L4). *)
+    lock-free, and free of torn reads per L4). *)
 let[@inline always] get_best_bid_ask symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
@@ -384,7 +384,7 @@ let[@inline always] get_best_bid_ask symbol =
 ;;
 
 (** Returns a cached closure that reads top-of-book from the atomic TOB cache.
-    The closure itself allocates nothing — it reads one Atomic record and
+    The closure itself allocates nothing; it reads one Atomic record and
     wraps it in a Some tuple. The store pointer is captured at
     closure-creation time so the domain hot loop never touches the stores
     Hashtbl. *)

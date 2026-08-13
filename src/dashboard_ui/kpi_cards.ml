@@ -18,7 +18,8 @@ let render_card_row w cards =
     (fun i (title, r1, r2) ->
        let iw = card_inner_w i in
        let is_last = i = n - 1 in
-       (* Top bar piece *)
+       (* Build the top bar piece for this card, spanning the title and
+          the remaining dashes. *)
        let title_str = "── " ^ title ^ " " in
        let title_img = I.string A.(fg c_title ++ bg c_bg ++ st bold) title_str in
        let title_len = I.width title_img in
@@ -30,7 +31,7 @@ let render_card_row w cards =
        in
        let div_top = I.string A.(fg c_border ++ bg c_bg) (if is_last then "╮" else "┬") in
        top_imgs := !top_imgs @ [ title_img; dashes; div_top ];
-       (* Body rows *)
+       (* Build the two body rows for this card. *)
        let div_mid = I.string A.(fg c_border ++ bg c_bg) "│" in
        let c_r1 =
          I.hcat [ I.string A.(bg c_bg) " "; I.hsnap ~align:`Left iw r1; div_mid ]
@@ -40,7 +41,7 @@ let render_card_row w cards =
        in
        body_row1_imgs := !body_row1_imgs @ [ c_r1 ];
        body_row2_imgs := !body_row2_imgs @ [ c_r2 ];
-       (* Bottom bar piece *)
+       (* Build the bottom bar piece for this card. *)
        let bot_dashes =
          I.string
            A.(fg c_border ++ bg c_bg)
@@ -118,8 +119,9 @@ let render_kpi_cards w json =
     | _ -> []
   in
   let snapshot_ts = json |?> "timestamp" |> to_float_d 0.0 in
-  (* Strategy activity from consistent windows: active = ran this window,
-     idle = running (fresh cycle window) but executed nothing (S1/S2). *)
+  (* Classify strategy activity from consistent windows: a strategy is
+     active when it ran this window and idle when it is running with a
+     fresh cycle window but executed nothing (the S1/S2 states). *)
   let strat_active, strat_idle, exec_per_sec =
     List.fold_left
       (fun (a, i, e) (_sym, metrics) ->
@@ -167,10 +169,11 @@ let render_kpi_cards w json =
       ]
   in
   let card2 = "SYSTEM ENGINE", c2_row1, c2_row2 in
-  (* Capital-oracle engine latency from the oracle runtime's per-pass window
-     (replaces the old per-domain cycle column): the pass p50/p99 from the
-     most recently completed oracle pass. Fresh when a pass window exists
-     within the refresh horizon (the oracle re-analyzes every ~5 min). *)
+  (* Capital-oracle engine latency, taken from the oracle runtime's per-pass
+     window, replaces the old per-domain cycle column: it shows the p50/p99
+     of the most recently completed oracle pass. The reading is fresh when a
+     pass window exists within the refresh horizon, since the oracle
+     re-analyzes roughly every 5 minutes. *)
   let oracle_lat =
     match json |?> "oracle_latency" with
     | `Assoc l ->

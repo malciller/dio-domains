@@ -12,8 +12,8 @@
     dashboard merges these per-venue windows into the per-symbol latency map
     by looking up each configured symbol's exchange.
 
-    Windows are published (snapshot_and_reset) every ~10s by [start_publisher]
-    — well inside the dashboard's 15s freshness tolerance — so the NETWORK
+    Windows are published (snapshot_and_reset) every ~10s by [start_publisher],
+    well inside the dashboard's 15s freshness tolerance, so the NETWORK
     page always has a fresh window per metric, even when a venue is idle
     (which then reads as "idle", not "--"). *)
 

@@ -154,7 +154,6 @@ let handshake t =
     "Connected to IB Gateway: server_version=%d time=%s"
     server_version
     connection_time;
-  (* Dispatch the startApi payload *)
   let start_api_fields =
     [ string_of_int Ibkr_types.msg_start_api
     ; "2"

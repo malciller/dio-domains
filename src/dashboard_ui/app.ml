@@ -1,8 +1,9 @@
 open Notty
 open Theme
 
-(** Main App loop for the dashboard UI.
-    Connects to the UDS, processes the JSON stream, and loops the frame renderer. *)
+(** Main loop for the dashboard UI: it connects to the engine's Unix domain
+    socket, processes the JSON snapshot stream, and runs the frame renderer
+    on every cycle. *)
 
 let socket_path = ref ""
 
@@ -35,9 +36,10 @@ let connect_and_watch path =
   let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   try
     Unix.connect fd (Unix.ADDR_UNIX path);
-    (* Non-blocking: the render loop must never block mid-payload (a blocked
-       read stalls renders -> missed heartbeats -> the server prunes the
-       client and the dashboard blanks out every engine cycle). *)
+    (* The socket is set to non-blocking so the render loop never stalls
+       mid-payload: a blocked read delays renders, which causes missed
+       heartbeats, which in turn makes the server prune the client and
+       leaves the dashboard blank on every engine cycle. *)
     Unix.set_nonblock fd;
     let _ = Unix.write_substring fd "W" 0 1 in
     fd
@@ -48,8 +50,8 @@ let connect_and_watch path =
     raise exn
 ;;
 
-(** Reusable frame buffer — avoids per-frame allocation.
-    Cleared and refilled on each render cycle. *)
+(** Reusable frame buffer that avoids per-frame allocation.
+    It is cleared and refilled on each render cycle. *)
 let frame_buf = Buffer.create 65536
 
 let render_to_stdout_buf (draw : Buffer.t -> unit) =
@@ -140,14 +142,15 @@ let assem_extract (assem : frame_assembler) : string option =
     in
     if frame_len > 10_000_000
     then (
-      (* Corrupt/oversized frame: drop the whole buffer and resync. *)
+      (* A corrupt or oversized frame: drop the whole buffer so the stream
+         can resynchronize at the next frame boundary. *)
       Buffer.clear buf;
       None)
     else if len < 4 + frame_len
     then None
     else (
       let frame = Buffer.sub buf 4 frame_len in
-      (* Remove the consumed frame (keep any trailing partial bytes). *)
+      (* Remove the consumed frame, keeping any trailing partial bytes. *)
       let rest = Buffer.sub buf (4 + frame_len) (len - 4 - frame_len) in
       Buffer.clear buf;
       Buffer.add_string buf rest;
@@ -162,12 +165,12 @@ let run () =
   Gc.set
     { (Gc.get ()) with
       minor_heap_size = 32768
-    ; (* 256KB — fast minor collections *)
+    ; (* 256KB: fast minor collections *)
       space_overhead = 40
-    ; (* major GC targets 1.4x live data — override engine's o=2000 *)
+    ; (* major GC targets 1.4x live data, overriding the engine's o=2000 *)
       major_heap_increment = 65536
-    ; (* 512KB — grow major heap slowly *)
-      max_overhead = 500 (* compact when free > 5x live *)
+    ; (* 512KB: grow the major heap slowly *)
+      max_overhead = 500 (* compact when free space exceeds 5x live data *)
     };
   let saved_termios = Unix.tcgetattr Unix.stdin in
   let raw_termios =
@@ -257,9 +260,9 @@ let run () =
   in
   let disconnect fd =
     fd_ref := None;
-    (* Cache the last known state: never blank the dashboard on a dropped
-       connection - it keeps rendering the cached snapshot (with the engine
-       status frozen) until the reconnect delivers fresh data. *)
+    (* Cache the last known state so the dashboard never blanks on a dropped
+       connection: it keeps rendering the cached snapshot, with the engine
+       status frozen, until a reconnect delivers fresh data. *)
     (try
        let _ = Unix.write_substring fd "Q" 0 1 in
        ()
@@ -269,8 +272,8 @@ let run () =
     | _ -> ()
   in
   (* The frame draw is shared by the live loop and the reconnect path, so
-     the dashboard keeps showing the CACHED last snapshot while it waits
-     for the engine - it never blanks out. *)
+     the dashboard keeps showing the cached last snapshot while it waits
+     for the engine; it never blanks out. *)
   let draw_frame w h =
     let draw buf =
       Buffer.add_string buf "\027[?2026h";
@@ -316,10 +319,11 @@ let run () =
     in
     render_to_stdout_safe ~timeout_s:2 draw
   in
-  (* Render throttle: full frames on changes (~2/s), a keep-alive frame
-     every 2s when idle. A frame that exceeds the alarm timeout is SKIPPED,
-     not fatal - the loop continues and the next frame retries (the old
-     behavior killed the whole UI on a slow frame). *)
+  (* Render throttling: full frames are drawn on changes, about two per
+     second, plus a keep-alive frame every two seconds when idle. A frame
+     that exceeds the alarm timeout is skipped rather than treated as fatal;
+     the loop continues and the next frame retries. The old behavior killed
+     the whole UI on a slow frame. *)
   let render_if_due ~(now : float) ~(last_render : float ref) ~(dirty : bool) =
     let interval = if dirty then 0.5 else 2.0 in
     if now -. !last_render < interval
@@ -348,8 +352,8 @@ let run () =
           | Some (w, h) -> w, h
           | None -> 80, 24
         in
-        (* Cached state: keep the last dashboard visible (stale but real)
-           while reconnecting; only a truly first run shows the wait
+        (* With cached state, keep the last dashboard visible, stale but
+           real, while reconnecting; only a true first run shows the wait
            screen. *)
         if !has_cached_data
         then ignore (draw_frame w h)
@@ -381,10 +385,10 @@ let run () =
     let assem = assem_create () in
     while (not !quit) && not !lost_connection do
       let now = Unix.gettimeofday () in
-      (* Heartbeat on a FIXED cadence, decoupled from rendering: the server
-         prunes clients that miss pongs for ~3s, and a slow frame or a big
-         snapshot parse must never cost the connection (and with it the
-         whole dashboard state). *)
+      (* The heartbeat runs on a fixed cadence, decoupled from rendering:
+         the server prunes clients that miss pongs for about three seconds,
+         so a slow frame or a large snapshot parse must never cost the
+         connection, and with it the whole dashboard state. *)
       if now -. !last_pong_time >= 1.0
       then (
         last_pong_time := now;
@@ -475,8 +479,9 @@ let run () =
           dirty := true));
       if List.mem fd ready && not !quit
       then (
-        (* Non-blocking drain: complete frames are parsed, partial payloads
-           wait in the assembler - the loop is never blocked on the socket. *)
+        (* Non-blocking drain: complete frames are parsed immediately,
+           partial payloads wait in the assembler, and the loop is never
+           blocked on the socket. *)
         match assem_drain fd assem with
         | `Eof ->
           disconnect fd;

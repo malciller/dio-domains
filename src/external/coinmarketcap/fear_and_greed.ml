@@ -1,14 +1,15 @@
-(* Fear_and_greed -- CoinMarketCap Fear and Greed Index client.
-   Fetches the latest index value via the CMC Pro API, caches it atomically
-   for process lifetime, and provides a linear interpolation utility for
-   mapping the index to configurable grid intervals.
+(** CoinMarketCap Fear and Greed Index client.
 
-   Availability semantics: the cache holds ONLY genuinely fetched index
-   values. Fallback values (missing API key, timeout, HTTP error, parse
-   failure) are returned to the caller but never cached, so
-   [get_cached () = None] means "no live F&G signal" - never a neutral 50.
-   Callers that must not trade without a signal (the grid domains) use this
-   to withhold orders when neither the capital oracle nor F&G can size them. *)
+    Fetches the latest index value via the CMC Pro API, caches it atomically
+    for process lifetime, and provides a linear interpolation utility for
+    mapping the index to configurable grid intervals.
+
+    Availability semantics: the cache holds ONLY genuinely fetched index
+    values. Fallback values (missing API key, timeout, HTTP error, parse
+    failure) are returned to the caller but never cached, so
+    [get_cached () = None] means "no live F&G signal" - never a neutral 50.
+    Callers that must not trade without a signal (the grid domains) use this
+    to withhold orders when neither the capital oracle nor F&G can size them. *)
 
 open Lwt.Infix
 open Cohttp_lwt_unix
@@ -150,7 +151,8 @@ let force_fetch_async ?(fallback = 50.0) () =
   Atomic.set fetch_requested true
 ;;
 
-(* Linearly interpolates a grid value within [min_val, max_val] based on fear_and_greed clamped to [0, 100]. *)
+(** Linearly interpolates a grid value within [min_val, max_val] based on
+    the fear-and-greed index clamped to [0, 100]. *)
 let grid_value_for_fng ~grid_interval:(min_val, max_val) ~fear_and_greed =
   let fng = max 0.0 (min 100.0 fear_and_greed) in
   min_val +. (fng *. (max_val -. min_val) /. 100.0)

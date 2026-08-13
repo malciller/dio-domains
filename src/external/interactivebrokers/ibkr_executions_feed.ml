@@ -139,7 +139,6 @@ let update_open_orders symbol (event : execution_event) =
       ; oo_last_updated = event.timestamp
       });
   Mutex.unlock store.orders_mutex;
-  (* Write to ring buffer *)
   RingBuffer.write store.events_buffer event;
   notify_ready store;
   Concurrency.Exchange_wakeup.signal ~symbol
@@ -271,7 +270,8 @@ let handle_open_order fields =
   let _fa_profile, fields = Ibkr_codec.read_string fields in
   let _model_code, fields = Ibkr_codec.read_string fields in
   let _good_till_date, _fields = Ibkr_codec.read_string fields in
-  (* Internal telemetry requirements are satiated. The function legitimately terminates deserialization early and skips the tail parameters of the openOrder payload. *)
+  (* Only a subset of the openOrder payload is needed for telemetry, so deserialization
+     terminates early and skips the trailing parameters. *)
   ignore con_id;
   (* Bind the retrieved order identifier to the localized symbol within the global tracking registry. *)
   register_order ~order_id ~symbol;
@@ -422,7 +422,7 @@ let[@inline always] get_open_order symbol order_id =
 
 (** Fold over open orders. Snapshots the open-order list under the per-symbol
     mutex (hashtable walk without calling [f]), releases the lock, then runs
-    the per-order callback work on the snapshot — the WS feed writer never
+    the per-order callback work on the snapshot; the WS feed writer never
     queues behind the domain's scan callbacks (H6). *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in

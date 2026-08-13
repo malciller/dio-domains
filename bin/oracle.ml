@@ -658,17 +658,15 @@ let venue_pools (a : args) ~(offline : bool) (tasks : Oracle_tasks.task list)
   List.map (fun account -> account, pool_for account) accounts
 ;;
 
-(** Replay capital for the supporting analysis: the deployment's deployed
-    capital (the ladder's consumption through the governing drawdown). *)
-
+(** Per-horizon supporting analysis for one asset: the horizon, the
+    historical path coverage, the static minimum capital, the maximum
+    quantity, and the empirical minimum capital. *)
 type coverage_row =
   Oracle_types.horizon
   * Oracle_types.historical_path_coverage
   * Oracle_types.sizing_result
   * Oracle_types.sizing_result
   * Oracle_types.sizing_result
-(* horizon, path coverage, static min capital, max qty, empirical min
-     capital *)
 
 let horizon_label_of (c_ : Oracle_types.historical_path_coverage) =
   c_.Oracle_types.horizon.Oracle_types.label

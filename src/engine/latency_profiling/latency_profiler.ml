@@ -11,13 +11,13 @@
     Without the fine tier, a profiler configured with wide buckets (e.g.
     bucket_us=1000 for the oracle) would collapse every latency between 1us
     and 999us into bucket 0 and report 0us. Reported percentile values are
-    in microseconds as floats — a sub-microsecond percentile is a fraction
+    in microseconds as floats; a sub-microsecond percentile is a fraction
     (e.g. 0.5 = 500ns); consumers that need nanosecond display scale by 1000.
 
     Metrics are accumulated in a window and published atomically via
     [snapshot_and_reset] (typically once per window from the recording
     domain). Readers consume the immutable published snapshot through
-    [published_snapshot] — a lock-free [Atomic.get] — which removes the
+    [published_snapshot], a lock-free [Atomic.get], which removes the
     torn-read race between the histogram writer and the dashboard reader. *)
 
 open Mtime
@@ -187,13 +187,13 @@ let set_executions t count =
 
 (** [percentile t p] computes the p-th percentile (0.0 to 1.0) from the
     histogram by performing a cumulative scan over the buckets. Returns the
-    bucket boundary in microseconds — a sub-microsecond result is a fraction
+    bucket boundary in microseconds; a sub-microsecond result is a fraction
     (e.g. 0.5 = 500ns). Returns 0.0 when no samples exist.
     The sub-microsecond nanosecond tier is scanned first (0..999ns), then the
     fine one-microsecond tier ([1, bucket_us) us), then the coarse buckets,
     so percentiles below the coarse bucket width keep microsecond/nanosecond
     resolution regardless of [bucket_us]. Uses early exit to avoid scanning
-    the full bucket array once the target cumulative count is reached —
+    the full bucket array once the target cumulative count is reached;
     critical for large histograms (e.g. the cycle profiler with 100,000
     buckets). *)
 let percentile t p =
@@ -231,7 +231,7 @@ let percentile t p =
 
 (** [percentiles5 t] computes p50/p90/p95/p99/p999 in a SINGLE cumulative pass
     over the histogram instead of five independent scans (M7: the oracle
-    profilers are 60k–100k buckets, so five scans cost ~0.5–5ms per window).
+    profilers are 60k-100k buckets, so five scans cost ~0.5-5ms per window).
     The sub-microsecond nanosecond tier is scanned first, then the fine
     one-microsecond tier, then the coarse buckets; each target is captured
     the moment its cumulative count is crossed. Sub-microsecond percentiles

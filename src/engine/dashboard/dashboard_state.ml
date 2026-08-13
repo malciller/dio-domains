@@ -374,7 +374,7 @@ let merge_oracle_asset_latencies latencies =
     signer), so the dashboard's ENGINE LATENCY rows show the network
     characteristics of each domain's venue. Keys match the trading-config
     symbols the domains are keyed by (case insensitive). Venues that never
-    had a network measurement are simply absent — the NETWORK page renders
+    had a network measurement are simply absent; the NETWORK page renders
     "--" for them. *)
 let merge_network_latencies latencies =
   let by_symbol = Hashtbl.create 16 in

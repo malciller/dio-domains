@@ -167,8 +167,8 @@ let subscribe_balance_updates () =
   subscription.stream, subscription.close
 ;;
 
-(* Execution handlers for propagating balance mutations across the internal concurrent stores and outward to the subscription event bus. *)
-
+(* Execution handlers for propagating balance mutations across the internal
+   concurrent stores and outward to the subscription event bus. *)
 let publish_balance_update storage_key balance =
   let store = get_balance_store storage_key in
   BalanceStore.update_wallet store balance "spot" "account";
@@ -477,7 +477,6 @@ let request_balance_refresh () =
                in
                match accounts with
                | account :: _ ->
-                 (* Extract per-asset balances *)
                  let assets =
                    try member "assets" account |> to_list with
                    | _ -> []

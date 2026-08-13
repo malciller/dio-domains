@@ -41,7 +41,6 @@ let interruptible_sleep seconds =
 (** Global authentication token store. Single-writer (supervisor init),
     lock-free reads via Atomic snapshot. *)
 module Token_store = struct
-  (* Atomic ref: single writer at init, concurrent lock-free readers. *)
   let token : string option Atomic.t = Atomic.make None
   let set value = Atomic.set token value
   let get () = Atomic.get token
@@ -160,7 +159,7 @@ let set_state conn new_state =
        reason
        conn.reconnect_attempts);
   Mutex.unlock conn.mutex;
-  (* Log state transitions and propagate to cache *)
+  (* Propagate state transitions to the supervisor cache *)
   if old_state <> new_state
   then (
     (* Rate-limit cache updates to at most once per second.

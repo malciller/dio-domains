@@ -114,8 +114,6 @@ let asset_domain_worker
       (asset : trading_config)
   =
   Random.self_init ();
-  (* Seed PRNG for this domain *)
-
   (* Fetch exchange fee schedule at domain startup *)
   let asset_with_fees = fee_fetcher asset in
   (* Resolve grid_interval from the cached Fear & Greed index when the
@@ -185,7 +183,6 @@ let asset_domain_worker
     else None
   in
   let resolved_accumulation_buffer = fng_accumulation_buffer () in
-  (* Resolve exchange module from the registry *)
   match Exchange.Registry.get asset_with_fees.exchange with
   | None ->
     Logging.error_f
@@ -194,7 +191,6 @@ let asset_domain_worker
       asset_with_fees.exchange
       asset_with_fees.symbol
   | Some (module Ex) ->
-    (* Ring buffer read positions for this domain *)
     let exec_read_pos = ref 0 in
     let orderbook_read_pos = ref 0 in
     (* Latest market data derived from consumed ring buffer events *)
@@ -363,7 +359,7 @@ let asset_domain_worker
     (* Initialize exec read position: ALL exchanges start from position 0
          to replay snapshot events through handle_order_acknowledged, restoring
          last_buy_order_id and open sell tracking. This unifies the startup
-         path across Kraken, Hyperliquid, and IBKR — previously only
+         path across Kraken, Hyperliquid, and IBKR; previously only
          Hyperliquid replayed from 0, causing a race condition where Kraken
          domains could execute their first strategy cycle before the snapshot
          populated the open_orders Hashtbl. *)
@@ -539,7 +535,7 @@ let asset_domain_worker
       (* H3: drain lifecycle events queued by the supervisor REST path. All
          handler invocations (REST- and WS-sourced) now execute on THIS domain
          thread at the top of the cycle, so the strategy mutex is never
-         contended across threads. Runs unconditionally — the queue is empty
+         contended across threads. Runs unconditionally; the queue is empty
          on the common cycle and the read is a lock-free CAS. *)
       (match !grid_strategy_asset_ref with
        | Some _ ->
@@ -566,7 +562,6 @@ let asset_domain_worker
       let t2 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       if did_ob && latency_this_cycle
       then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
-      (* Consume pending execution events from the ring buffer *)
       let current_pos = get_exec_pos_fn () in
       let did_exec = current_pos <> !exec_read_pos in
       if did_exec
@@ -848,7 +843,7 @@ let asset_domain_worker
            the US equity market is closed. Without this, the strategy emits
            amendments against stale delayed data, the gateway rejects with
            error 354 (no market data), but our in-memory state already recorded
-           the amend as successful — causing an infinite amend spam loop. *)
+           the amend as successful, causing an infinite amend spam loop. *)
       let equity_market_closed =
         match asset_with_fees.exchange with
         | "ibkr" | "alpaca" ->
@@ -874,7 +869,7 @@ let asset_domain_worker
             never enters the execution block, so its re-activation must not
             depend on it. The oracle's qty/gi win over the F&G re-evaluation
             above (the oracle owns the sizing while it has a decision).
-            H5: the lookup is cached per generation — [decision_for] is only
+            H5: the lookup is cached per generation; [decision_for] is only
             re-invoked (with its lowercase+hashtable cost) when the runtime
             published a new pass, so idle cycles do zero decision work. *)
       let oracle_decision =
@@ -1232,8 +1227,6 @@ let asset_domain_worker
       if should_execute
       then (
         should_execute_strategy := false;
-        (* Clear event-driven trigger *)
-
         (* Single-pass open order scan: count by strategy AND collect
              grid buy/sell order lists. Eliminates a second iter_open_orders
              + orders_mutex acquisition inside the grid strategy. *)
@@ -1492,7 +1485,7 @@ let asset_domain_worker
       then (
         let cause_thunk () =
           let alloc_diff = Gc.minor_words () -. alloc_start in
-          (* M8: GC stats are window-scoped — the cause string uses the last
+          (* M8: GC stats are window-scoped; the cause string uses the last
              [publish_windows] pair, never a per-cycle [Gc.quick_stat]. *)
           let gc_str = Gc_monitor.diff_to_string !gc_start !gc_end in
           Printf.sprintf
@@ -1798,7 +1791,7 @@ let clear_domain_registry () =
     Safe to call from the dashboard; does not touch live profiler state.
 
     Reads the immutable snapshots published by each domain's rolling window
-    via [Latency_profiler.published_snapshot] — a lock-free [Atomic.get].
+    via [Latency_profiler.published_snapshot], a lock-free [Atomic.get].
     No percentile scan runs against a histogram that the domain thread is
     concurrently mutating, which eliminates the torn-read race between the
     dashboard and the domain writer (F4). *)

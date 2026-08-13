@@ -57,7 +57,7 @@ let publish_fill (event : fill_event) =
   Mutex.lock write_mutex;
   if Hashtbl.mem dedup_set key
   then Mutex.unlock write_mutex
-  (* Duplicate fill — already published, skip silently *)
+  (* Duplicate fill; already published, skip silently *)
   else (
     Hashtbl.replace dedup_set key ();
     Queue.push key dedup_queue;
@@ -71,7 +71,7 @@ let publish_fill (event : fill_event) =
     done;
     RingBuffer.write buffer event;
     Mutex.unlock write_mutex;
-    (* Broadcast is safe to call from any thread — Lwt_condition internally
+    (* Broadcast is safe to call from any thread; Lwt_condition internally
        handles cross-domain signaling via the Lwt scheduler. *)
     try Lwt_condition.broadcast fill_condition () with
     | _ -> ())

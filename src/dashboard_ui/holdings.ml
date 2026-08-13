@@ -146,7 +146,8 @@ let render_strategies ?(selected_index = None) w json =
   in
   let all_balances = json |?> "all_balances" |> to_list_d in
   let is_compact = w < 120 in
-  (* Column header row *)
+  (* Build the column header row, which differs between compact and wide
+     layouts. *)
   let header =
     close_row
       w
@@ -202,10 +203,10 @@ let render_strategies ?(selected_index = None) w json =
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
     let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
     let hold_value = base_bal *. mid in
-    (* The resting buy price: the strategy's tracked price first (it follows
-       amendments), falling back to the exchange's real open buy orders - a
-       committed buy stays visible even when the domain is halted by an
-       oracle INACTIVE decision and its state goes stale. *)
+    (* The resting buy price prefers the strategy's tracked price because it
+       follows amendments, then falls back to the exchange's real open buy
+       orders. This keeps a committed buy visible even when the domain is
+       halted by an oracle INACTIVE decision and its state goes stale. *)
     let buy_price =
       let strat_price = strat |?> "buy_price" |> to_float_d 0.0 in
       if strat_price > 0.0

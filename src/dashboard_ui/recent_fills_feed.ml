@@ -51,7 +51,7 @@ let render_fills w json =
   let fills = !local_fills in
   if fills = []
   then I.empty
-  else (* Build the ticker string chunks grouped by fill *)
+  else (* Build the ticker string chunks, one per fill. *)
     (
     let chunks =
       List.map
@@ -62,7 +62,8 @@ let render_fills w json =
            let amount = bal_json |?> "amount" |> to_float_d 0.0 in
            let price = bal_json |?> "fill_price" |> to_float_d 0.0 in
            let timestamp = bal_json |?> "timestamp" |> to_float_d 0.0 in
-           (* Format time difference *)
+           (* Format the time elapsed since the fill as a compact
+               duration. *)
            let now = Unix.gettimeofday () in
            let diff = max 0.0 (now -. timestamp) in
            let time_str =

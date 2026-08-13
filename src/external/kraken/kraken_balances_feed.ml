@@ -61,7 +61,7 @@ module BalanceStore = struct
     ; mutex : Mutex.t
     ; total_balance : float Atomic.t
       (* Cached sum of all wallet balances for this asset. *)
-    ; trading_balance : float Atomic.t (* Cached sum of trading wallets *)
+    ; trading_balance : float Atomic.t (* Cached sum of trading (non-earn) wallet balances. *)
     ; last_updated : float Atomic.t
     }
 
@@ -150,12 +150,12 @@ module BalanceStore = struct
     Mutex.unlock store.mutex
   ;;
 
-  (* Returns the trading balance for this asset. *)
+  (** Returns the trading balance for this asset. *)
   let get_balance store = Atomic.get store.trading_balance
   let get_total_balance store = Atomic.get store.total_balance
 
-  (* Returns the wall-clock timestamp of the last wallet update for this
-     asset (0.0 = never updated). Used for balance-snapshot staleness. *)
+  (** Returns the wall-clock timestamp of the last wallet update for this
+      asset (0.0 = never updated). Used for balance-snapshot staleness. *)
   let get_last_updated store = Atomic.get store.last_updated
 
   let get_all store =
@@ -247,7 +247,7 @@ let get_balance_store asset =
   store
 ;;
 
-(** Returns the aggregate balance for [asset]. Inlined for hot-path performance. *)
+(** Returns the tradeable balance for [asset]. Inlined for hot-path performance. *)
 let[@inline always] get_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_balance store
@@ -807,7 +807,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
     Must be called before the WebSocket feed begins producing messages. *)
 let initialize assets =
   Logging.debug_f ~section "Initializing balances feed for %d assets" (List.length assets);
-  (* Normalize all input assets first *)
+  (* Normalize all input assets first. *)
   let assets = List.map normalize_asset assets in
   (* Merge user-configured assets with default fiat currencies. *)
   let all_assets =

@@ -418,7 +418,7 @@ let amend_order ~token ?retry_config (request : amend_request) =
                      (* Quantity must ALSO be checked: a qty-only amendment
                         (e.g. grid re-sizing at an unchanged price) must not be
                         suppressed here, or the qty change is silently dropped
-                        while the strategy keeps re-pushing it every cycle —
+                        while the strategy keeps re-pushing it every cycle,
                         visible as an amend that "hangs" with no log output.
                         Compare against the order's original qty; an amend that
                         only differs in remaining/partial fill is still a change. *)

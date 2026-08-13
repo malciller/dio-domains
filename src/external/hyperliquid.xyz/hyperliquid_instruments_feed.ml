@@ -21,8 +21,8 @@ let cache_mutex = Mutex.create ()
 (* M16: lock-free reads. [published_cache] is a copy-on-write snapshot: the
    single writer (WS init / initialize / register_test_instrument, all cold
    paths) mutates [pair_cache] under [cache_mutex] then republishes a fresh
-   table with one [Atomic.set]. [lookup_info] — called dozens of times per
-   tick from cached_round_price — does one [Atomic.get] + Hashtbl.find, no
+   table with one [Atomic.set]. [lookup_info], called dozens of times per
+   tick from cached_round_price, does one [Atomic.get] + Hashtbl.find, no
    mutex. The published table is never mutated after publication. *)
 let published_cache : (string, pair_info) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 128)
@@ -180,7 +180,7 @@ let register_test_instrument ~symbol ~sz_decimals =
 ;;
 
 (** Looks up instrument info by symbol. Lock-free (M16): reads the published
-    copy-on-write snapshot — one [Atomic.get] + Hashtbl.find, no mutex on the
+    copy-on-write snapshot; one [Atomic.get] + Hashtbl.find, no mutex on the
     per-tick rounding path. Falls back to stripping the quote suffix (e.g.
     "BTC/USDC" to "BTC") to resolve perpetuals, which are cached under their
     base name only. Spot pairs are stored under their full "BASE/QUOTE" key

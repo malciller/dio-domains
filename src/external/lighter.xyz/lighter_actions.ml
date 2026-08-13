@@ -14,14 +14,13 @@ let next_client_order_index () =
 ;;
 
 (** Dispatches a signed transaction array over the REST protocol fallback.
-    This function construct a multipart form data payload that adheres to the Lighter API specification. It accepts the raw transaction information produced by the Go signer, similar to the behavior observed in the Python SDK implementation. The required form data fields are the transaction type represented as an integer and the transaction info represented as a JSON string. *)
+    This function constructs a multipart form data payload that adheres to the Lighter API specification. It accepts the raw transaction information produced by the Go signer, similar to the behavior observed in the Python SDK implementation. The required form data fields are the transaction type represented as an integer and the transaction info represented as a JSON string. *)
 let send_tx ~tx_type ~tx_info =
   let url = Lighter_proxy.api_base_url () ^ "/api/v1/sendTx" in
   Logging.debug_f ~section "Sending tx via REST (type=%d, tx_info=%s)" tx_type tx_info;
   Lwt.catch
     (fun () ->
        let uri = Uri.of_string url in
-       (* Build multipart/form-data body manually *)
        let boundary = Printf.sprintf "---dio-boundary-%d" (Random.int 1_000_000) in
        let body_parts =
          [ Printf.sprintf

@@ -10,7 +10,7 @@ module Lighter_impl = struct
   let name = "lighter"
   let section = "lighter_module"
 
-  (* Thread local cache storing fee structures per trading pair. The hashtable maps the string symbol identifier to a tuple representing the maker fee and taker fee coefficients. *)
+  (* Cache storing fee structures per trading pair. The hashtable maps the string symbol identifier to a tuple representing the maker fee and taker fee coefficients. *)
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 
   (* Utility functions for converting between Lighter specific internal representations and the agnostic Types representations. *)
@@ -580,7 +580,6 @@ let fetch_balances () =
            Logging.error_f ~section "Lighter account response has no accounts";
            Lwt.return_unit
          | account :: _ ->
-           (* Extract per-asset balances from the assets array *)
            let assets =
              try member "assets" account |> to_list with
              | _ -> []

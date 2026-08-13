@@ -100,7 +100,7 @@ type orderbook =
   ; timestamp : float
   }
 
-(** Return the first [n] elements of a list. Returns all elements if the list has fewer than [n]. *)
+(** Returns the first [n] elements of a list. Returns all elements if the list has fewer than [n]. *)
 let take n lst =
   let rec take_aux acc n = function
     | [] -> List.rev acc
@@ -146,7 +146,7 @@ let to_decimal_str ?(trim_trailing = true) ?dec json =
   | _ -> "0"
 ;;
 
-(** Parse price and quantity strings from JSON values for checksum input. *)
+(** Parses price and quantity strings from JSON values for checksum input. *)
 let parse_checksum_level price_json qty_json =
   let price_str = to_decimal_str ~trim_trailing:true price_json in
   let qty_str = to_decimal_str ~trim_trailing:true qty_json in
@@ -257,8 +257,8 @@ type store =
     (** Unix timestamp of the most recent data write. Used for staleness pruning. *)
   ; mutable checksum_tick : int
     (** Increments per book update; the per-tick checksum recompute (2 extra
-        fold+sort+array passes) runs only every [checksum_every_n] ticks —
-        M2. *)
+        fold+sort+array passes) runs only every [checksum_every_n] ticks;
+        see M2. *)
   }
 
 (** (pair_decimals, lot_decimals) precision tuple from AssetPairs API. *)
@@ -275,7 +275,7 @@ let resubscribe_symbol_ref : (string -> unit Lwt.t) option ref = ref None
     than the exchange's drift window needs. *)
 let checksum_every_n = 10
 
-(** Retrieve price and quantity precision from the instruments feed cache. Returns None on failure. *)
+(** Retrieves price and quantity precision from the instruments feed cache. Returns None on failure. *)
 let get_precision_from_instruments symbol =
   try Kraken_instruments_feed.get_precision_info symbol with
   | _ -> None
@@ -435,7 +435,7 @@ let parse_level symbol price_json size_json =
   Some { price = price_str; size = qty_str; price_float; size_float = qty_float }
 ;;
 
-(** Parse JSON levels and apply them directly to the store's Hashtbl to avoid intermediate list allocations. *)
+(** Parses JSON levels and applies them directly to the store's Hashtbl to avoid intermediate list allocations. *)
 let parse_and_apply_levels symbol tbl json =
   match json with
   | `List entries ->
@@ -466,7 +466,7 @@ let parse_and_apply_levels symbol tbl json =
   | _ -> ()
 ;;
 
-(** Convert a Hashtbl to a sorted level array truncated to [depth] entries.
+(** Converts a Hashtbl to a sorted level array truncated to [depth] entries.
     [sort_desc] controls descending (bids) vs ascending (asks) order. *)
 let levels_to_array ?(sort_desc = false) tbl depth =
   let levels_list = Hashtbl.fold (fun _ lvl acc -> lvl :: acc) tbl [] in
@@ -489,14 +489,14 @@ let levels_to_array ?(sort_desc = false) tbl depth =
   Array.of_list (take depth sorted_levels [])
 ;;
 
-(** Rebuild a Hashtbl containing only the top [max_levels] entries. Used to bound map size. *)
+(** Rebuilds a Hashtbl containing only the top [max_levels] entries. Used to bound map size. *)
 let truncate_hashtbl tbl sort_desc max_levels =
   let levels_array = levels_to_array ~sort_desc tbl max_levels in
   Hashtbl.clear tbl;
   Array.iter (fun lvl -> Hashtbl.replace tbl lvl.price lvl) levels_array
 ;;
 
-(** Construct an [orderbook] record from the current store state and the raw JSON entry metadata. *)
+(** Constructs an [orderbook] record from the current store state and the raw JSON entry metadata. *)
 let build_orderbook store symbol entry =
   let open Yojson.Safe.Util in
   let sequence =
@@ -524,7 +524,7 @@ let build_orderbook store symbol entry =
       | _ -> None)
     else None
   in
-  (* Construct arrays directly from Hashtbl by sorting *)
+  (* Constructs arrays directly from the Hashtbl by sorting. *)
   let bids = levels_to_array ~sort_desc:true store.bids orderbook_depth in
   let asks = levels_to_array ~sort_desc:false store.asks orderbook_depth in
   { symbol; bids; asks; sequence; checksum; timestamp = Unix.time () }
@@ -705,7 +705,7 @@ let process_orderbook_message ~reset json on_heartbeat =
             If the configured depth is < 10, checksum validation is bypassed because
             the stored map lacks the requisite levels to evaluate the CRC.
             M2: the checksum recompute (2 extra fold+sort+array passes) is throttled
-            to every [checksum_every_n] updates per symbol — the book is still built
+            to every [checksum_every_n] updates per symbol; the book is still built
             and written per tick, only the redundant CRC pass is slowed down. *)
            store.checksum_tick <- store.checksum_tick + 1;
            let checksum_valid =
@@ -808,7 +808,7 @@ let[@inline always] iter_orderbook_events symbol last_pos f =
   | None -> last_pos
 ;;
 
-(** Return the current ring buffer write position for the given symbol. Returns 0 if unknown. *)
+(** Returns the current ring buffer write position for the given symbol. Returns 0 if unknown. *)
 let[@inline always] get_current_position symbol =
   match store_opt symbol with
   | Some store -> RingBuffer.get_position store.buffer
@@ -838,7 +838,7 @@ let has_orderbook_data symbol =
   | _ -> false
 ;;
 
-(** Reset all per-symbol stores: clear bid/ask maps, replace ring buffers, and unset readiness flags.
+(** Resets all per-symbol stores: clears bid/ask maps, replaces ring buffers, and unsets readiness flags.
     Called on reconnection to ensure no stale data persists. *)
 let clear_all_stores () =
   Hashtbl.iter
@@ -854,7 +854,7 @@ let clear_all_stores () =
     stores
 ;;
 
-(** Remove stores inactive for over 30 minutes and trim oversized price maps to [max_price_levels].
+(** Removes stores inactive for over 30 minutes and trims oversized price maps to [max_price_levels].
     Prevents unbounded memory growth from abandoned subscriptions or accumulated levels. *)
 let prune_stale_data () =
   let now = Unix.gettimeofday () in
@@ -912,7 +912,7 @@ let prune_stale_data () =
       total_stores_after
 ;;
 
-(** Asynchronously trigger orderbook pruning. [reason] is logged for diagnostics. *)
+(** Asynchronously triggers orderbook pruning. [reason] is logged for diagnostics. *)
 let trigger_orderbook_cleanup ~reason () =
   Lwt.async (fun () ->
     Logging.debug_f ~section "Triggering orderbook cleanup (reason=%s)" reason;

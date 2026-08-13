@@ -127,8 +127,6 @@ let flush_to_ring store symbol =
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
-(** Processes an initial order book snapshot representing the fully synthesized dimensional state 
-    at the time of channel inception. *)
 let first_snapshot_logged = Atomic.make false
 
 let get_list_field ob_data key1 key2 =

@@ -149,8 +149,8 @@ type open_order =
   ; cum_cost : float
   ; order_status : order_status
   ; order_userref : int option
-    (* Optional numeric identifier for strategy-level filtering *)
-  ; cl_ord_id : string option (* Client order ID for supplementary tracking *)
+    (* Optional numeric identifier used for strategy-level filtering. *)
+  ; cl_ord_id : string option (* Client order ID used for supplementary tracking. *)
   ; last_updated : float
   }
 
@@ -175,11 +175,7 @@ let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 (** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires global_orders_mutex. *)
 let order_to_symbol : (string, string * side) Hashtbl.t = Hashtbl.create 16
 (** FIFO queue for O(1) oldest-entry eviction. *)
-
-(** FIFO queue for O(1) oldest-entry eviction. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-(** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
-
 (** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
 let order_to_symbol_cap : int ref = ref max_int
 
@@ -216,7 +212,7 @@ let lock_order_to_symbol_cap () =
       observed)
 ;;
 
-(** Mutex for symbol_stores table initialization. *)
+(** Mutex protecting the global order-to-symbol index. *)
 let global_orders_mutex = Mutex.create ()
 
 (** Mutex for symbol_stores table initialization. *)
@@ -309,7 +305,7 @@ let[@inline always] get_open_orders symbol =
 
 (** Fold over open orders for a symbol. Snapshots the open-order list under
     [orders_mutex] (an O(n) hashtable walk that does not call [f]), releases
-    the lock, then runs the per-order callback work on the snapshot — the WS
+    the lock, then runs the per-order callback work on the snapshot; the WS
     feed writer never queues behind the domain's scan callbacks (H6). *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
@@ -547,11 +543,11 @@ let update_open_orders store (event : execution_event) =
     then Hashtbl.remove store.open_orders event.order_id)
   else (
     (* Non-terminal: upsert into open orders.
-       CRITICAL: Kraken's execution feed snapshot replays all open orders as
-       exec_type=new/status=new but with MINIMAL data — limit_price is often
-       absent (None) and qty fields may be zero. When we already have a cached
-       entry with valid data, we must PRESERVE those fields rather than
-       blindly overwriting them with empty/zero values. *)
+       Note: Kraken's execution feed snapshot replays all open orders as
+       exec_type=new/status=new but with minimal data; limit_price is often
+       absent (None) and quantity fields may be zero. When a cached entry with
+       valid data already exists, preserve those fields rather than blindly
+       overwriting them with empty or zero values. *)
     let ( merged_limit_price
         , merged_order_qty
         , merged_remaining_qty
@@ -560,16 +556,16 @@ let update_open_orders store (event : execution_event) =
       =
       match Hashtbl.find_opt store.open_orders event.order_id with
       | Some prev ->
-        (* Preserve cached price if incoming is None or zero —
+        (* Preserve the cached price if the incoming value is None or zero;
              Kraken snapshot events arrive with limit_price = Some 0.0 *)
         let lp =
           match event.limit_price with
           | Some p when p > 1e-12 -> event.limit_price
           | _ -> prev.limit_price
         in
-        (* Preserve cached order_qty if incoming is zero *)
+        (* Preserve the cached order_qty if the incoming value is zero *)
         let oq = if event.order_qty > 1e-12 then event.order_qty else prev.order_qty in
-        (* Preserve cached remaining_qty if incoming is zero but previous wasn't *)
+        (* Preserve the cached remaining_qty if the incoming value is zero but the previous one was not *)
         let rq =
           if remaining_qty > 1e-12
           then remaining_qty
@@ -577,7 +573,7 @@ let update_open_orders store (event : execution_event) =
           then prev.remaining_qty
           else remaining_qty
         in
-        (* Preserve avg_price and cum_cost similarly *)
+        (* Preserve avg_price and cum_cost in the same way *)
         let ap = if event.avg_price > 1e-12 then event.avg_price else prev.avg_price in
         let cc = if event.cum_cost > 1e-12 then event.cum_cost else prev.cum_cost in
         lp, oq, rq, ap, cc
@@ -648,7 +644,7 @@ let update_open_orders store (event : execution_event) =
          prev_rq
          stored_rq
      else
-       (* Merge preserved existing data — snapshot replay was harmless *)
+       (* Merge preserved existing data; snapshot replay was harmless *)
        Logging.debug_f
          ~section
          "CACHE_MERGE_NOOP %s [%s] exec_type=%s (snapshot replay, cached data preserved)"
@@ -758,7 +754,7 @@ let parse_int64_opt = Kraken_common_types.parse_int64_opt
 (** Parses an optional int from JSON. Delegates to Kraken_common_types. *)
 let parse_int_opt = Kraken_common_types.parse_int_opt
 
-(** Helper to parse UTC RFC3339 string to float timestamp. *)
+(** Parses a UTC RFC3339 string into a float timestamp. *)
 let parse_rfc3339_utc s =
   try
     Scanf.sscanf s "%d-%d-%dT%d:%d:%f" (fun y m d h min s ->
@@ -934,7 +930,7 @@ let parse_execution_event json =
            | Some order -> order.cl_ord_id
            | None -> None)
       in
-      (* Extract accurate timestamp from payload instead of using wall-clock time *)
+      (* Extract the accurate timestamp from the payload instead of using wall-clock time. *)
       let timestamp =
         match member "last_update_time" json |> to_string_option with
         | Some s -> parse_rfc3339_utc s
@@ -1006,7 +1002,7 @@ let handle_snapshot json on_heartbeat =
            notify_ready store;
            (* Mark order ID as active in snapshot *)
            Hashtbl.replace snapshot_order_ids event.order_id ();
-           (* Update heartbeat *)
+           (* Update the heartbeat. *)
            on_heartbeat ()
          | None -> ())
       data;
@@ -1087,9 +1083,9 @@ let handle_update json on_heartbeat =
            Atomic.set store.last_event_time event.timestamp;
            notify_ready store;
            Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
-           (* Publish to order update event bus *)
+           (* Publish to the order update event bus. *)
            OrderUpdateEventBus.publish order_update_event_bus event;
-           (* Publish complete fills to centralized fill event bus for Discord notifications *)
+           (* Publish complete fills to the centralized fill event bus for Discord notifications. *)
            if event.order_status = FilledStatus
            then (
              let fill_value = event.cum_qty *. event.avg_price in
@@ -1117,7 +1113,7 @@ let handle_update json on_heartbeat =
                     | Some tid -> Int64.to_string tid
                     | None -> "")
                });
-           (* Update heartbeat *)
+           (* Update the heartbeat. *)
            on_heartbeat ()
          | None -> ())
       data
