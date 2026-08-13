@@ -319,8 +319,15 @@ type asset_deployment =
     (** Capital this asset drew from the venue pool (config-order priority). *)
   ; deployed : float
     (** Capital the ladder actually consumes at the recommended sizing
-        (<= pool_share; the under-funded case consumes the whole share). *)
-  ; remainder : float (** pool_share - deployed: capital passed to the next asset. *)
+        (<= pool_share; the under-funded case consumes the whole share).
+        EXCEPTION: an under-funded ACTIVE grid with a committed resting buy
+        draws 0 - it keeps running on its committed capital (whose cost is
+        locked in the account balance, not in this pool), so the whole share
+        passes down the priority order. *)
+  ; remainder : float
+    (** pool_share - deployed: capital passed to the next asset. The whole
+        share passes down for an inactive asset, and for an under-funded
+        ACTIVE grid with a committed resting buy. *)
   ; governing_horizon : string
     (** The horizon whose target drawdown is the deepest (the binding one). *)
   ; d_gov : float (** Deepest drawdown with F_blend(d) >= target across the horizons. *)

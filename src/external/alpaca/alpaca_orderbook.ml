@@ -21,6 +21,20 @@ type trade =
   }
 
 module SymbolStore = struct
+  (* Single-writer atomic TOB cache (H2): the WS writer publishes a fresh
+     immutable record on every push; readers do one [Atomic.get] — no mutex.
+     Position + best-bid/ask + update-ts travel together so a reader can never
+     observe a torn (mixed-generation) snapshot. *)
+  type tob_cache =
+    { pos : int
+    ; bid_px : float
+    ; bid_sz : float
+    ; ask_px : float
+    ; ask_sz : float
+    ; ts : float
+    ; valid : bool
+    }
+
   type t =
     { symbol : string
     ; buffer : quote array
@@ -29,8 +43,10 @@ module SymbolStore = struct
     ; trades_capacity : int
     ; mutable write_pos : int
     ; mutable trades_write_pos : int
-    ; mutable best_bid_ask : (float * float * float * float) option
-    ; mutable last_update_ts : float
+    ; tob : tob_cache Atomic.t
+      (* Serializes full ring-buffer reads only (read_events / iter_events /
+       get_recent_trades). The hot-path TOB/position reads are lock-free via
+       [tob]. *)
     ; mutex : Mutex.t
     }
 
@@ -51,30 +67,57 @@ module SymbolStore = struct
     ; trades_capacity = 100
     ; write_pos = 0
     ; trades_write_pos = 0
-    ; best_bid_ask = None
-    ; last_update_ts = 0.0
+    ; tob =
+        Atomic.make
+          { pos = 0
+          ; bid_px = 0.0
+          ; bid_sz = 0.0
+          ; ask_px = 0.0
+          ; ask_sz = 0.0
+          ; ts = 0.0
+          ; valid = false
+          }
     ; mutex = Mutex.create ()
     }
   ;;
 
   let push t (q : quote) =
-    Mutex.lock t.mutex;
-    let idx = t.write_pos mod t.capacity in
-    t.buffer.(idx) <- q;
-    t.write_pos <- t.write_pos + 1;
-    t.best_bid_ask <- Some (q.bid_price, q.bid_size, q.ask_price, q.ask_size);
-    t.last_update_ts <- Unix.gettimeofday ();
-    Mutex.unlock t.mutex;
+    let tob_cache =
+      Mutex.lock t.mutex;
+      let idx = t.write_pos mod t.capacity in
+      t.buffer.(idx) <- q;
+      t.write_pos <- t.write_pos + 1;
+      let now = Unix.gettimeofday () in
+      let cache =
+        { pos = t.write_pos
+        ; bid_px = q.bid_price
+        ; bid_sz = q.bid_size
+        ; ask_px = q.ask_price
+        ; ask_sz = q.ask_size
+        ; ts = now
+        ; valid = q.bid_price > 0.0 || q.ask_price > 0.0
+        }
+      in
+      Mutex.unlock t.mutex;
+      cache
+    in
+    Atomic.set t.tob tob_cache;
     Concurrency.Exchange_wakeup.signal_all ()
   ;;
 
   let push_trade t (tr : trade) =
-    Mutex.lock t.mutex;
-    let idx = t.trades_write_pos mod t.trades_capacity in
-    t.trades_buffer.(idx) <- tr;
-    t.trades_write_pos <- t.trades_write_pos + 1;
-    t.last_update_ts <- Unix.gettimeofday ();
-    Mutex.unlock t.mutex;
+    let now =
+      Mutex.lock t.mutex;
+      let idx = t.trades_write_pos mod t.trades_capacity in
+      t.trades_buffer.(idx) <- tr;
+      t.trades_write_pos <- t.trades_write_pos + 1;
+      let now = Unix.gettimeofday () in
+      Mutex.unlock t.mutex;
+      now
+    in
+    (* Trade updates bump the update timestamp without changing TOB prices. *)
+    let prev = Atomic.get t.tob in
+    Atomic.set t.tob { prev with ts = now };
     Concurrency.Exchange_wakeup.signal_all ()
   ;;
 
@@ -91,26 +134,14 @@ module SymbolStore = struct
     !trades
   ;;
 
-  let get_last_update_ts t =
-    Mutex.lock t.mutex;
-    let ts = t.last_update_ts in
-    Mutex.unlock t.mutex;
-    ts
-  ;;
+  let get_last_update_ts t = (Atomic.get t.tob).ts
 
   let get_best_bid_ask t =
-    Mutex.lock t.mutex;
-    let res = t.best_bid_ask in
-    Mutex.unlock t.mutex;
-    res
+    let c = Atomic.get t.tob in
+    if c.valid then Some (c.bid_px, c.bid_sz, c.ask_px, c.ask_sz) else None
   ;;
 
-  let get_current_position t =
-    Mutex.lock t.mutex;
-    let pos = t.write_pos in
-    Mutex.unlock t.mutex;
-    pos
-  ;;
+  let get_current_position t = (Atomic.get t.tob).pos
 
   let read_events t start_pos =
     Mutex.lock t.mutex;

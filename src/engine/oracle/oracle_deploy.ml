@@ -34,8 +34,15 @@
        the widest spacing the config allows stretches the capital's survival
        as far as possible. The order qty is never increased in this mode:
        growth is reserved for deploying residual capital behind 100% survival.
-     - An asset whose pool cannot fund its first buy at the minimum order
-       size is inactive and its whole share passes down the priority order.
+      - An asset whose pool cannot fund its first buy at the minimum order
+        size is inactive and its whole share passes down the priority order.
+      - EXCEPTION: a grid with a committed resting buy (its first buy is
+        already funded and locked in the account balance) keeps running on
+        that committed capital and, while the pool cannot fund its FULL
+        ladder, draws nothing new from the available pool - its whole share
+        passes down so a lower-priority asset can still fund its own first
+        order. Only a fully-funded committed grid consumes its ladder cost
+        from the pool (and passes the surplus down).
 
    The verification replay is funded with the asset's actual pool budget
    (the capital the allocation hands it), not the static ladder cost: the
@@ -410,7 +417,12 @@ module Engine (M : Oracle_strategy.S) = struct
        whichever is larger - sizing never drops below the configured qty), or a
        replayed D_surv below [min_active_dsurv]. An under-funded ACTIVE asset
        keeps its whole share (config-order priority) and runs at the floor with
-       the shortfall flagged in [warnings].
+       the shortfall flagged in [warnings]. EXCEPTION: an under-funded ACTIVE
+       grid that has a committed resting buy keeps running on that committed
+       capital and draws NOTHING new from the available pool (deployed = 0,
+       remainder = the whole pool): its first buy is already funded, so
+       hoarding the pool would starve every lower-priority asset of its own
+       first order.
 
        [qty_cap_mult] is the deployment ceiling as a multiple of the template
        qty (the config's design qty): the order qty never grows beyond
@@ -769,9 +781,23 @@ module Engine (M : Oracle_strategy.S) = struct
                 (min_active_dsurv *. 100.0) )
           else true, ""
         in
-        let deployed = if active then row.deployed else 0.0 in
+        (* A grid with a committed resting buy is already running on committed
+           capital: its first buy is funded and resting on the exchange, and
+           that cost is locked in the account balance - which is exactly why
+           the available pool reads low. While the pool cannot fund the grid's
+           full ladder (under-funded: [not row.passed]) the committed grid
+           draws NOTHING new from the available pool: the committed capital
+           keeps it running, so hoarding the whole pool (deployed = pool,
+           remainder = 0) would starve every lower-priority asset of its own
+           first order. Only a fully-funded committed grid consumes its ladder
+           cost from the pool and passes the surplus down; an under-funded
+           grid WITHOUT a committed buy keeps its whole share as before. *)
+        let committed_running = has_committed_buy && not row.passed in
+        let deployed = if active && not committed_running then row.deployed else 0.0 in
         let remainder =
           if not active
+          then pool
+          else if committed_running
           then pool
           else if row.deployed +. 1e-9 < pool
           then pool -. row.deployed

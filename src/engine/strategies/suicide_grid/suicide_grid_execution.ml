@@ -7,31 +7,63 @@ open Suicide_grid_reservation
 open Suicide_grid_orders
 
 (** Performs 1-to-1 multiset matching between persisted sell levels and open sell orders.
-    Returns (open_levels, missing_levels). *)
+    Returns (open_levels, missing_levels).
+    M15: the previous implementation was O(n·m) — for each persisted level it
+    linearly rescanned the open-order list and allocated a match array. This
+    version buckets open orders by a tolerance-rounded price key (Hashtbl) and
+    verifies the original tolerance before consuming a candidate, so matching
+    is ~O(n+m) with identical semantics. *)
 let partition_persisted_sell_levels persisted open_orders =
-  let open_matched = Array.make (List.length open_orders) false in
-  let open_orders_arr = Array.of_list open_orders in
+  (* Index open orders by rounded price key -> list of (price, remaining
+     count). The tolerance check is preserved per candidate. *)
+  let by_price : (string, (float * int) list) Hashtbl.t =
+    Hashtbl.create (List.length open_orders)
+  in
+  let price_key p = Printf.sprintf "%.4f" p in
+  List.iter
+    (fun (_id, open_p, _open_q) ->
+       let k = price_key open_p in
+       let bucket = Option.value (Hashtbl.find_opt by_price k) ~default:[] in
+       let rec bump acc = function
+         | [] -> (open_p, 1) :: acc
+         | (p, n) :: rest when p = open_p -> ((p, n + 1) :: rest) @ acc
+         | item :: rest -> item :: bump acc rest
+       in
+       Hashtbl.replace by_price k (bump [] bucket))
+    open_orders;
   let open_acc = ref [] in
   let missing_acc = ref [] in
   List.iter
     (fun ((target_p, _target_q) as level) ->
-       let found = ref None in
-       for i = 0 to Array.length open_orders_arr - 1 do
-         if !found = None && not open_matched.(i)
-         then (
-           let _, open_p, _open_q = open_orders_arr.(i) in
-           if
-             abs_float (open_p -. target_p) <= target_p *. 0.0001
-             || abs_float (open_p -. target_p) <= 1e-4
-           then found := Some i)
-       done;
-       match !found with
-       | Some idx ->
-         open_matched.(idx) <- true;
+       let k = price_key target_p in
+       let matched =
+         match Hashtbl.find_opt by_price k with
+         | Some bucket ->
+           (* Verify against the original tolerance, not just the bucket key. *)
+           let rec consume acc = function
+             | [] -> None
+             | (p, n) :: rest
+               when abs_float (p -. target_p) <= target_p *. 0.0001
+                    || abs_float (p -. target_p) <= 1e-4 ->
+               if n > 1 then Some (((p, n - 1) :: rest) @ acc) else Some (rest @ acc)
+             | item :: rest -> consume (item :: acc) rest
+           in
+           consume [] bucket
+         | None -> None
+       in
+       match matched with
+       | Some bucket ->
+         Hashtbl.replace by_price k bucket;
          open_acc := level :: !open_acc
        | None -> missing_acc := level :: !missing_acc)
     persisted;
   List.rev !open_acc, List.rev !missing_acc
+;;
+
+(** Reconciles the persisted-sell grid (Alpaca offline fill recovery). Computed
+    once per execution and reused by the three persisted-sell branches (M15). *)
+let reconcile_persisted_sell_levels ~state =
+  partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders
 ;;
 
 (** Evaluates asset balance recovery and clears asset_low when available balance is restored. *)
@@ -596,10 +628,19 @@ let evaluate_buy_leg
       state.pending_orders;
     let closest_sell_order_val = !closest_sell_ref in
     let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
+    (* A qty mismatch is judged with a RELATIVE tolerance (0.1% of the
+       config qty), not an absolute 1e-6: the capital oracle re-derives
+       the qty from the live pool every pass, and pool drift means
+       successive passes publish micro-different qtys (e.g. 0.03877239 ->
+       0.03877509 -> 0.03876709). An absolute 1e-6 tolerance treated each
+       micro change as a re-size and amended the resting buy every pass -
+       an Alpaca amend is a cancel+create, so this churned order ids and
+       raced fills/executions (stacking at grid levels). Only a material
+       (>0.1%) qty difference amends now; micro drift is left alone. *)
     let qty_mismatch =
       is_alpaca
       && pending_buy_qty_from_scan > 0.0
-      && abs_float (pending_buy_qty_from_scan -. qty) > 1e-6
+      && abs_float (pending_buy_qty_from_scan -. qty) > max (qty *. 0.001) 1e-6
     in
     if closest_sell_order_val <> None
     then (
@@ -661,9 +702,18 @@ let evaluate_buy_leg
           if allow
           then (
             let quote_bal = quote_balance in
+            (* An amend REPLACES the resting buy (cancel+create on Alpaca):
+               the capital already committed to that buy is released and
+               re-committed at the new price, so the affordability check
+               must add the committed notional (locked_in_buys, the sum of
+               price*qty over the open buys) back to the available balance.
+               Without this the grid falsely reports "Insufficient quote
+               balance" when trailing a funded buy up on committed capital
+               (e.g. HYPE pool $13.75 + committed $18.90 vs need $20.38). *)
+            let available_for_amend = quote_bal +. locked_in_buys in
             if
               (not (Float.is_nan quote_balance))
-              && can_place_buy_order qty quote_bal quote_needed
+              && can_place_buy_order qty available_for_amend quote_needed
             then (
               let order =
                 create_amend_order
@@ -695,13 +745,14 @@ let evaluate_buy_leg
             then
               Logging.warn_f
                 ~section
-                "Insufficient quote balance for %s trailing: need %.2f, have %.2f"
+                "Insufficient quote balance for %s trailing: need %.2f, have %.2f (incl. \
+                 committed %.2f)"
                 asset.symbol
                 quote_needed
-                quote_bal
-            else
-              Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
-              (* The re-anchor target is already where the buy sits (within the
+                available_for_amend
+                locked_in_buys
+            else Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
+            (* The re-anchor target is already where the buy sits (within the
              min-move threshold): nothing to amend, the sizing is applied. *))
           else if reanchor_buy && price_diff_rounded < min_move_threshold
           then state.force_buy_reanchor <- false)
@@ -750,9 +801,15 @@ let evaluate_buy_leg
           if allow
           then (
             let quote_bal = quote_balance in
+            (* See the with-sell branch: an amend releases the committed
+               capital of the resting buy it replaces, so that committed
+               notional is added back to the available balance before the
+               affordability check (fixes the false "insufficient quote
+               balance" warning when trailing a funded buy up). *)
+            let available_for_amend = quote_bal +. locked_in_buys in
             if
               (not (Float.is_nan quote_balance))
-              && can_place_buy_order qty quote_bal quote_needed
+              && can_place_buy_order qty available_for_amend quote_needed
             then (
               let order =
                 create_amend_order
@@ -784,12 +841,13 @@ let evaluate_buy_leg
             then
               Logging.warn_f
                 ~section
-                "Insufficient quote balance to trail buy: need %.2f, have %.2f"
+                "Insufficient quote balance to trail buy: need %.2f, have %.2f (incl. \
+                 committed %.2f)"
                 quote_needed
-                quote_bal
-            else
-              Logging.warn_f ~section "No quote balance for buy trailing"
-              (* The re-anchor target is already where the buy sits: done. *))
+                available_for_amend
+                locked_in_buys
+            else Logging.warn_f ~section "No quote balance for buy trailing"
+            (* The re-anchor target is already where the buy sits: done. *))
           else if reanchor_buy && price_diff_rounded < min_move_threshold
           then state.force_buy_reanchor <- false)
       | _ -> ());
@@ -837,9 +895,7 @@ let evaluate_sell_leg
          -. state.reserved_base
          -. locked_in_sells)
     in
-    let open_levels, missing_levels =
-      partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders
-    in
+    let open_levels, missing_levels = reconcile_persisted_sell_levels ~state in
     let missing_desc =
       List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
     in
@@ -880,9 +936,7 @@ let evaluate_sell_leg
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells
     then (
-      let _, missing_lvl_check =
-        partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders
-      in
+      let _, missing_lvl_check = reconcile_persisted_sell_levels ~state in
       (not (has_active_sell state))
       && available_base >= min_needed_base
       && (state.just_filled_buy
@@ -917,11 +971,7 @@ let evaluate_sell_leg
     let target_sell_price_opt, target_sell_qty_override =
       if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
       then (
-        let _, missing_levels =
-          partition_persisted_sell_levels
-            state.persisted_sell_levels
-            state.open_sell_orders
-        in
+        let _, missing_levels = reconcile_persisted_sell_levels ~state in
         let missing_sorted_desc =
           List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
         in

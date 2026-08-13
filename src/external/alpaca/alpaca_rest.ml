@@ -5,6 +5,23 @@ open Alpaca_types
 
 let section = "alpaca_rest"
 
+(** H7: Alpaca has no retry layer of its own (the executor now delegates all
+    retries to the exchange modules — a single policy). Connection-level HTTP
+    exceptions are retried here with a short backoff so transient network
+    failures don't fail the order; exchange-level rejections (HTTP 4xx) are
+    returned to the caller untouched. *)
+let retry_http_exceptions ~f =
+  Error_handling.retry_with_backoff
+    ~section
+    ~config:Error_handling.default_retry_config
+    ~f
+    ~is_retriable_override:(fun e ->
+      match Error_handling.classify e with
+      | Error_handling.Connection -> true
+      | _ -> false)
+    ()
+;;
+
 let make_headers () =
   let key = Config.api_key () in
   let secret = Config.api_secret () in
@@ -195,57 +212,65 @@ let place_order
      | None -> "MKT")
     tif_str
     (if mark_extended then ", extended_hours=true" else "");
-  Lwt.catch
-    (fun () ->
-       Cohttp_lwt_unix.Client.post ~headers ~body:(Cohttp_lwt.Body.of_string req_body) url
-       >>= fun (resp, body) ->
-       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-       Cohttp_lwt.Body.to_string body
-       >>= fun body_str ->
-       if status_code >= 200 && status_code < 300
-       then (
-         try
-           let json = Yojson.Safe.from_string body_str in
-           let ord = parse_order_json json in
-           Logging.debug_f
-             ~section
-             "Placed Alpaca order %s [%s %s %.6f]: status=%s"
-             ord.id
-             ord.symbol
-             ord.side_str
-             ord.qty
-             (string_of_status ord.status);
-           let userref =
-             match ord.client_order_id with
-             | Some cid ->
-               (try Some (int_of_string cid) with
-                | _ -> None)
-             | None -> None
-           in
-           Lwt.return
-             (Ok
-                { order_id = ord.id
-                ; cl_ord_id = ord.client_order_id
-                ; order_userref = userref
-                })
-         with
-         | exn ->
-           let err =
-             Printf.sprintf
-               "Failed to parse place_order response: %s"
-               (Printexc.to_string exn)
-           in
-           Logging.error_f ~section "%s (body: %s)" err body_str;
-           Lwt.return (Error err))
-       else (
-         Logging.error_f ~section "Place order failed HTTP %d: %s" status_code body_str;
-         Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
-    (fun exn ->
-       let err =
-         Printf.sprintf "Place order HTTP exception: %s" (Printexc.to_string exn)
-       in
-       Logging.error_f ~section "%s" err;
-       Lwt.return (Error err))
+  retry_http_exceptions ~f:(fun () ->
+    Lwt.catch
+      (fun () ->
+         Cohttp_lwt_unix.Client.post
+           ~headers
+           ~body:(Cohttp_lwt.Body.of_string req_body)
+           url
+         >>= fun (resp, body) ->
+         let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+         Cohttp_lwt.Body.to_string body
+         >>= fun body_str ->
+         if status_code >= 200 && status_code < 300
+         then (
+           try
+             let json = Yojson.Safe.from_string body_str in
+             let ord = parse_order_json json in
+             Logging.debug_f
+               ~section
+               "Placed Alpaca order %s [%s %s %.6f]: status=%s"
+               ord.id
+               ord.symbol
+               ord.side_str
+               ord.qty
+               (string_of_status ord.status);
+             let userref =
+               match ord.client_order_id with
+               | Some cid ->
+                 (try Some (int_of_string cid) with
+                  | _ -> None)
+               | None -> None
+             in
+             Lwt.return
+               (Ok
+                  { order_id = ord.id
+                  ; cl_ord_id = ord.client_order_id
+                  ; order_userref = userref
+                  })
+           with
+           | exn ->
+             let err =
+               Printf.sprintf
+                 "Failed to parse place_order response: %s"
+                 (Printexc.to_string exn)
+             in
+             Logging.error_f ~section "%s (body: %s)" err body_str;
+             Lwt.return (Error err))
+         else (
+           Logging.error_f ~section "Place order failed HTTP %d: %s" status_code body_str;
+           Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
+      (fun exn ->
+         (* Connection-class exceptions are re-raised so the retry layer
+              above handles them; anything else converts to an Error. *)
+         let exn_str = Printexc.to_string exn in
+         match Error_handling.classify exn_str with
+         | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
+         | _ ->
+           let err = Printf.sprintf "Place order HTTP exception: %s" exn_str in
+           Logging.error_f ~section "%s" err;
+           Lwt.return (Error err)))
 ;;
 
 let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
@@ -270,57 +295,60 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
   let req_body = `Assoc assoc |> Yojson.Safe.to_string in
   let headers = make_headers () in
   Logging.debug_f ~section "Amending Alpaca order %s" order_id;
-  Lwt.catch
-    (fun () ->
-       Cohttp_lwt_unix.Client.patch
-         ~headers
-         ~body:(Cohttp_lwt.Body.of_string req_body)
-         url
-       >>= fun (resp, body) ->
-       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-       Cohttp_lwt.Body.to_string body
-       >>= fun body_str ->
-       if status_code >= 200 && status_code < 300
-       then (
-         try
-           let json = Yojson.Safe.from_string body_str in
-           let ord = parse_order_json json in
-           Logging.debug_f
+  retry_http_exceptions ~f:(fun () ->
+    Lwt.catch
+      (fun () ->
+         Cohttp_lwt_unix.Client.patch
+           ~headers
+           ~body:(Cohttp_lwt.Body.of_string req_body)
+           url
+         >>= fun (resp, body) ->
+         let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+         Cohttp_lwt.Body.to_string body
+         >>= fun body_str ->
+         if status_code >= 200 && status_code < 300
+         then (
+           try
+             let json = Yojson.Safe.from_string body_str in
+             let ord = parse_order_json json in
+             Logging.debug_f
+               ~section
+               "Amended Alpaca order %s -> %s [%s]"
+               order_id
+               ord.id
+               ord.symbol;
+             Lwt.return
+               (Ok
+                  { original_order_id = order_id
+                  ; new_order_id = ord.id
+                  ; amend_id = Some ord.id
+                  ; cl_ord_id = ord.client_order_id
+                  })
+           with
+           | exn ->
+             let err =
+               Printf.sprintf
+                 "Failed to parse amend_order response: %s"
+                 (Printexc.to_string exn)
+             in
+             Logging.error_f ~section "%s (body: %s)" err body_str;
+             Lwt.return (Error err))
+         else (
+           Logging.error_f
              ~section
-             "Amended Alpaca order %s -> %s [%s]"
+             "Amend order failed HTTP %d for %s: %s"
+             status_code
              order_id
-             ord.id
-             ord.symbol;
-           Lwt.return
-             (Ok
-                { original_order_id = order_id
-                ; new_order_id = ord.id
-                ; amend_id = Some ord.id
-                ; cl_ord_id = ord.client_order_id
-                })
-         with
-         | exn ->
-           let err =
-             Printf.sprintf
-               "Failed to parse amend_order response: %s"
-               (Printexc.to_string exn)
-           in
-           Logging.error_f ~section "%s (body: %s)" err body_str;
-           Lwt.return (Error err))
-       else (
-         Logging.error_f
-           ~section
-           "Amend order failed HTTP %d for %s: %s"
-           status_code
-           order_id
-           body_str;
-         Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
-    (fun exn ->
-       let err =
-         Printf.sprintf "Amend order HTTP exception: %s" (Printexc.to_string exn)
-       in
-       Logging.error_f ~section "%s" err;
-       Lwt.return (Error err))
+             body_str;
+           Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
+      (fun exn ->
+         let exn_str = Printexc.to_string exn in
+         match Error_handling.classify exn_str with
+         | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
+         | _ ->
+           let err = Printf.sprintf "Amend order HTTP exception: %s" exn_str in
+           Logging.error_f ~section "%s" err;
+           Lwt.return (Error err)))
 ;;
 
 let cancel_order order_id =
@@ -328,33 +356,36 @@ let cancel_order order_id =
   let url = Uri.of_string (Printf.sprintf "%s/v2/orders/%s" base_url order_id) in
   let headers = make_headers () in
   Logging.debug_f ~section "Cancelling Alpaca order %s" order_id;
-  Lwt.catch
-    (fun () ->
-       Cohttp_lwt_unix.Client.delete ~headers url
-       >>= fun (resp, body) ->
-       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-       Cohttp_lwt.Body.to_string body
-       >>= fun body_str ->
-       if status_code >= 200 && status_code < 300
-       then (
-         Logging.debug_f ~section "Cancelled Alpaca order %s" order_id;
-         Lwt.return (Ok [ { order_id; cl_ord_id = None } ]))
-       else (
-         Logging.error_f
-           ~section
-           "Cancel order failed HTTP %d for %s: %s"
-           status_code
-           order_id
-           body_str;
-         Lwt.return
-           (Error
-              (Printf.sprintf "HTTP %d cancelling %s: %s" status_code order_id body_str))))
-    (fun exn ->
-       let err =
-         Printf.sprintf "Cancel order HTTP exception: %s" (Printexc.to_string exn)
-       in
-       Logging.error_f ~section "%s" err;
-       Lwt.return (Error err))
+  retry_http_exceptions ~f:(fun () ->
+    Lwt.catch
+      (fun () ->
+         Cohttp_lwt_unix.Client.delete ~headers url
+         >>= fun (resp, body) ->
+         let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+         Cohttp_lwt.Body.to_string body
+         >>= fun body_str ->
+         if status_code >= 200 && status_code < 300
+         then (
+           Logging.debug_f ~section "Cancelled Alpaca order %s" order_id;
+           Lwt.return (Ok [ { order_id; cl_ord_id = None } ]))
+         else (
+           Logging.error_f
+             ~section
+             "Cancel order failed HTTP %d for %s: %s"
+             status_code
+             order_id
+             body_str;
+           Lwt.return
+             (Error
+                (Printf.sprintf "HTTP %d cancelling %s: %s" status_code order_id body_str))))
+      (fun exn ->
+         let exn_str = Printexc.to_string exn in
+         match Error_handling.classify exn_str with
+         | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
+         | _ ->
+           let err = Printf.sprintf "Cancel order HTTP exception: %s" exn_str in
+           Logging.error_f ~section "%s" err;
+           Lwt.return (Error err)))
 ;;
 
 let get_open_orders () =

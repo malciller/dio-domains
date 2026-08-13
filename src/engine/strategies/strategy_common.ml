@@ -96,15 +96,31 @@ let generate_duplicate_key symbol side quantity limit_price =
   | None -> symbol ^ "|" ^ side ^ "|" ^ q_str ^ "|market"
 ;;
 
-(** In-flight order cache for deduplication of pending place/cancel requests. *)
+(** In-flight order cache for deduplication of pending place/cancel requests.
+
+    Sharded (HFT_AUDIT.md H4): the registry used to be ONE Hashtbl behind ONE
+    global mutex shared by every symbol and every domain — the single most
+    cross-cutting lock in the engine. Now the table and its mutex are split
+    across [num_shards] independent shards keyed by hash of the duplicate key
+    (which embeds the symbol), so independent symbols/domains no longer
+    serialize on one lock; the common case locks only the key's own shard. *)
 module InFlightOrders = struct
-  let registry : (string, float) Hashtbl.t = Hashtbl.create 1024
-  let mutex = Mutex.create ()
+  let num_shards = 64
+
+  let registries : (string, float) Hashtbl.t array =
+    Array.init num_shards (fun _ -> Hashtbl.create 128)
+  ;;
+
+  let shard_mutexes : Mutex.t array = Array.init num_shards (fun _ -> Mutex.create ())
+  let shard_of key = Hashtbl.hash key land (num_shards - 1)
 
   (** Atomically insert [duplicate_key] if absent. Returns true on insertion,
       false if the key was already present. *)
   let add_in_flight_order duplicate_key =
     let now = Unix.gettimeofday () in
+    let shard = shard_of duplicate_key in
+    let registry = registries.(shard) in
+    let mutex = shard_mutexes.(shard) in
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry duplicate_key in
     if not exists then Hashtbl.replace registry duplicate_key now;
@@ -114,6 +130,9 @@ module InFlightOrders = struct
 
   (** Remove [duplicate_key] from the cache. Returns true if it was present. *)
   let remove_in_flight_order duplicate_key =
+    let shard = shard_of duplicate_key in
+    let registry = registries.(shard) in
+    let mutex = shard_mutexes.(shard) in
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry duplicate_key in
     if exists then Hashtbl.remove registry duplicate_key;
@@ -123,6 +142,9 @@ module InFlightOrders = struct
 
   (** Check if [duplicate_key] is present in the cache. *)
   let is_in_flight duplicate_key =
+    let shard = shard_of duplicate_key in
+    let registry = registries.(shard) in
+    let mutex = shard_mutexes.(shard) in
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry duplicate_key in
     Mutex.unlock mutex;
@@ -131,10 +153,14 @@ module InFlightOrders = struct
 
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
-    Mutex.lock mutex;
-    let size = Hashtbl.length registry in
-    Mutex.unlock mutex;
-    size
+    let total = ref 0 in
+    for s = 0 to num_shards - 1 do
+      let mutex = shard_mutexes.(s) in
+      Mutex.lock mutex;
+      total := !total + Hashtbl.length registries.(s);
+      Mutex.unlock mutex
+    done;
+    !total
   ;;
 
   let last_cleanup = Atomic.make 0.0
@@ -145,14 +171,20 @@ module InFlightOrders = struct
     let last = Atomic.get last_cleanup in
     if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now
     then (
-      Mutex.lock mutex;
-      let initial_size = Hashtbl.length registry in
-      Hashtbl.filter_map_inplace
-        (fun _ timestamp -> if now -. timestamp <= max_age then Some timestamp else None)
-        registry;
-      let final_size = Hashtbl.length registry in
-      Mutex.unlock mutex;
-      0, initial_size - final_size)
+      let removed = ref 0 in
+      for s = 0 to num_shards - 1 do
+        let mutex = shard_mutexes.(s) in
+        Mutex.lock mutex;
+        let registry = registries.(s) in
+        let initial_size = Hashtbl.length registry in
+        Hashtbl.filter_map_inplace
+          (fun _ timestamp ->
+             if now -. timestamp <= max_age then Some timestamp else None)
+          registry;
+        removed := !removed + (initial_size - Hashtbl.length registry);
+        Mutex.unlock mutex
+      done;
+      0, !removed)
     else 0, 0
   ;;
 
@@ -197,8 +229,16 @@ module InFlightAmendments = struct
     ; mutable last : float
     }
 
-  let registry : (string, entry) Hashtbl.t = Hashtbl.create 1024
-  let mutex = Mutex.create ()
+  (* Sharded like InFlightOrders (HFT_AUDIT.md H4): no single global mutex
+     across all symbols/domains. Keyed by hash of the order id. *)
+  let num_shards = 64
+
+  let registries : (string, entry) Hashtbl.t array =
+    Array.init num_shards (fun _ -> Hashtbl.create 128)
+  ;;
+
+  let shard_mutexes : Mutex.t array = Array.init num_shards (fun _ -> Mutex.create ())
+  let shard_of key = Hashtbl.hash key land (num_shards - 1)
 
   (** Atomically insert [order_id] as [Pending] if absent. Returns true on
       insertion, false if the id is already tracked (any phase - a replaced
@@ -206,6 +246,9 @@ module InFlightAmendments = struct
       duplicate). *)
   let add_in_flight_amendment order_id =
     let now = Unix.gettimeofday () in
+    let shard = shard_of order_id in
+    let registry = registries.(shard) in
+    let mutex = shard_mutexes.(shard) in
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry order_id in
     if not exists then Hashtbl.replace registry order_id { phase = Pending; last = now };
@@ -215,6 +258,9 @@ module InFlightAmendments = struct
 
   (** Read the phase of [order_id], or [None] when untracked. *)
   let phase_of order_id =
+    let shard = shard_of order_id in
+    let registry = registries.(shard) in
+    let mutex = shard_mutexes.(shard) in
     Mutex.lock mutex;
     let phase =
       match Hashtbl.find_opt registry order_id with
@@ -248,6 +294,9 @@ module InFlightAmendments = struct
   (** Remove [order_id] from the registry (terminal phases, cleanup).
       Returns true if it was present. *)
   let remove_in_flight_amendment order_id =
+    let shard = shard_of order_id in
+    let registry = registries.(shard) in
+    let mutex = shard_mutexes.(shard) in
     Mutex.lock mutex;
     let exists = Hashtbl.mem registry order_id in
     if exists then Hashtbl.remove registry order_id;
@@ -264,6 +313,9 @@ module InFlightAmendments = struct
     then ignore (remove_in_flight_amendment old_id)
     else (
       let now = Unix.gettimeofday () in
+      let shard = shard_of old_id in
+      let registry = registries.(shard) in
+      let mutex = shard_mutexes.(shard) in
       Mutex.lock mutex;
       (match Hashtbl.find_opt registry old_id with
        | Some (entry : entry) ->
@@ -283,10 +335,14 @@ module InFlightAmendments = struct
 
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
-    Mutex.lock mutex;
-    let size = Hashtbl.length registry in
-    Mutex.unlock mutex;
-    size
+    let total = ref 0 in
+    for s = 0 to num_shards - 1 do
+      let mutex = shard_mutexes.(s) in
+      Mutex.lock mutex;
+      total := !total + Hashtbl.length registries.(s);
+      Mutex.unlock mutex
+    done;
+    !total
   ;;
 
   let last_cleanup = Atomic.make 0.0
@@ -299,15 +355,20 @@ module InFlightAmendments = struct
     let last = Atomic.get last_cleanup in
     if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now
     then (
-      Mutex.lock mutex;
-      let initial_size = Hashtbl.length registry in
-      Hashtbl.filter_map_inplace
-        (fun _ (entry : entry) ->
-           if now -. entry.last <= max_age then Some entry else None)
-        registry;
-      let final_size = Hashtbl.length registry in
-      Mutex.unlock mutex;
-      0, initial_size - final_size)
+      let removed = ref 0 in
+      for s = 0 to num_shards - 1 do
+        let mutex = shard_mutexes.(s) in
+        Mutex.lock mutex;
+        let registry = registries.(s) in
+        let initial_size = Hashtbl.length registry in
+        Hashtbl.filter_map_inplace
+          (fun _ (entry : entry) ->
+             if now -. entry.last <= max_age then Some entry else None)
+          registry;
+        removed := !removed + (initial_size - Hashtbl.length registry);
+        Mutex.unlock mutex
+      done;
+      0, !removed)
     else 0, 0
   ;;
 

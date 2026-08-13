@@ -1,5 +1,14 @@
 (** Structured logging system with ANSI formatting, per-section level filtering,
-    and domain-safe synchronous output. *)
+    and domain-safe asynchronous output.
+
+    Hot-path contract (see HFT_AUDIT.md H1/M1):
+    - All levels except CRITICAL are formatted and pushed to an async queue;
+      the caller performs zero I/O and never drains the queue.
+    - The single background drain thread owns every write + flush, at ~50ms
+      cadence (DEBUG/INFO) or ~1ms while a WARN/ERROR requests prompt flush.
+    - A single log line costs roughly a microsecond and a handful of
+      allocations on the caller (timestamp, colored line, queue push) —
+      independent of how many lines are already buffered. *)
 
 type level =
   | DEBUG
@@ -140,26 +149,38 @@ let format_timestamp () =
   ts_prefix ^ Printf.sprintf ".%03d" ms
 ;;
 
-(* ---- Async log drain for DEBUG/INFO ----
+(* ---- Async log drain (all levels; CRITICAL excepted) ----
    Hot path: format the message, push onto async_queue under async_mutex.
    Cost: ~50ns (mutex + Queue.push). Zero I/O, zero output_mutex contention.
 
-   Background drain thread: wakes every 50ms, takes all queued messages,
-   writes each with per-message flush to output_channel. Logs appear
-   promptly (~50ms latency) without blocking trading domains.
+   Background drain thread: takes all queued messages, writes each with
+   per-message flush to output_channel. The drain thread owns every flush —
+   no caller ever does I/O. The thread idles on a 50ms cadence but drops to
+   ~1ms cadence while a WARN/ERROR has requested a prompt flush, so urgent
+   lines still appear within ~ms without blocking the calling domain.
 
-   WARN+: drains the async queue first (preserving order), then writes
-   synchronously with flush for immediate visibility. *)
+   CRITICAL: drains the async queue first (preserving order), then writes
+   synchronously with flush — the one emergency path allowed to block. *)
 
 let async_queue : string Queue.t = Queue.create ()
 let async_mutex = Mutex.create ()
 let async_drain_started = Atomic.make false
+
+(* Set when a WARN/ERROR line has been queued and should be flushed promptly.
+   Read/cleared by the drain thread only; set by any domain. *)
+let flush_requested = Atomic.make false
 
 (** Push a pre-formatted log line onto the async queue. No I/O. *)
 let[@inline always] log_async formatted =
   Mutex.lock async_mutex;
   Queue.push formatted async_queue;
   Mutex.unlock async_mutex
+;;
+
+(** Push and flag the drain thread for a prompt flush (~1ms cadence). *)
+let[@inline always] log_async_urgent formatted =
+  log_async formatted;
+  Atomic.set flush_requested true
 ;;
 
 (** Drain all pending async messages to output_channel.
@@ -193,7 +214,10 @@ let drain_async_queue () =
 ;;
 
 (** Start the background drain thread. Called once; idempotent.
-    Uses Thread.create (not Domain.spawn) to avoid consuming a core. *)
+    Uses Thread.create (not Domain.spawn) to avoid consuming a core.
+    The drain thread owns ALL output flushing: no caller of any log level
+    performs I/O. While [flush_requested] is set it polls at ~1ms so WARN/
+    ERROR lines surface promptly; otherwise it idles at 50ms. *)
 let start_async_drain () =
   if Atomic.compare_and_set async_drain_started false true
   then (
@@ -201,18 +225,23 @@ let start_async_drain () =
       Thread.create
         (fun () ->
            while true do
-             Thread.delay 0.05;
-             (* 50ms drain interval *)
-             drain_async_queue ()
+             drain_async_queue ();
+             if Atomic.get flush_requested
+             then (
+               Atomic.set flush_requested false;
+               (* ~1ms cadence while an urgent line is pending. *)
+               Thread.delay 0.001)
+             else Thread.delay 0.05
            done)
         ()
     in
     ())
 ;;
 
-(* Core logging function. Domain-safe.
-   - DEBUG/INFO: pushed to async queue (no I/O on caller).
-   - WARN+: drains async queue first, then writes synchronously with flush. *)
+(* Core logging function. Domain-safe. All levels except CRITICAL are pushed
+   to the async queue — no synchronous I/O, no draining of the whole queue on
+   the caller. CRITICAL is the single emergency path that drains the queue and
+   writes + flushes synchronously for immediate visibility. *)
 let log_sync level section_name message =
   let section = get_section section_name in
   if
@@ -238,9 +267,9 @@ let log_sync level section_name message =
           message
       else Printf.sprintf "%s %s [%s] %s" timestamp level_str section_name message
     in
-    if level_to_int level >= level_to_int WARN
+    if level = CRITICAL
     then (
-      (* Synchronous path: drain async queue first to preserve ordering,
+      (* Emergency path: drain async queue first to preserve ordering,
          then write this message with immediate flush. *)
       drain_async_queue ();
       Mutex.lock output_mutex;
@@ -254,10 +283,13 @@ let log_sync level section_name message =
         Mutex.unlock output_mutex;
         ignore exn)
     else (
-      (* Async path: just buffer the formatted line. The drain thread
-         will write + flush it within ~50ms. *)
+      (* Async path for every other level (incl. WARN/ERROR): just buffer the
+         formatted line. The drain thread owns all flushing, within ~50ms
+         normally or ~1ms for WARN/ERROR via flush_requested. *)
       start_async_drain ();
-      log_async formatted))
+      if level_to_int level >= level_to_int WARN
+      then log_async_urgent formatted
+      else log_async formatted))
 ;;
 
 (* Lwt wrapper: delegates to [log_sync] then returns [Lwt.return_unit]. *)

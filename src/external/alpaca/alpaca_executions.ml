@@ -53,9 +53,13 @@ module SymbolExecStore = struct
     { symbol : string
     ; buffer : execution_event_internal array
     ; capacity : int
-    ; mutable write_pos : int
+      (* write_pos/initial_data_received live in atomics: the WS writer is the
+       single writer and the domain reads them lock-free via the _fast
+       closures (H2). The mutex still guards the open_orders Hashtbl and the
+       full ring-buffer reads. *)
+    ; write_pos : int Atomic.t
     ; open_orders : (string, open_order_internal) Hashtbl.t
-    ; mutable initial_data_received : bool
+    ; initial_data_received : bool Atomic.t
     ; mutex : Mutex.t
     }
 
@@ -77,20 +81,20 @@ module SymbolExecStore = struct
           ; cl_ord_id = None
           }
     ; capacity
-    ; write_pos = 0
+    ; write_pos = Atomic.make 0
     ; open_orders = Hashtbl.create 32
-    ; initial_data_received = false
+    ; initial_data_received = Atomic.make false
     ; mutex = Mutex.create ()
     }
   ;;
 
   let push_event t (e : execution_event_internal) =
-    Mutex.lock t.mutex;
-    let idx = t.write_pos mod t.capacity in
+    let idx = Atomic.get t.write_pos mod t.capacity in
     t.buffer.(idx) <- e;
-    t.write_pos <- t.write_pos + 1;
-    t.initial_data_received <- true;
+    Atomic.set t.write_pos (Atomic.get t.write_pos + 1);
+    Atomic.set t.initial_data_received true;
     (* Update open order store *)
+    Mutex.lock t.mutex;
     (match e.order_status with
      | New | Pending | PartiallyFilled | Unknown _ ->
        let existing_order = Hashtbl.find_opt t.open_orders e.order_id in
@@ -155,15 +159,13 @@ module SymbolExecStore = struct
          in
          Hashtbl.replace t.open_orders o.id oo)
       orders;
-    t.initial_data_received <- true;
     Mutex.unlock t.mutex;
+    Atomic.set t.initial_data_received true;
     Concurrency.Exchange_wakeup.signal_all ()
   ;;
 
   let mark_ready t =
-    Mutex.lock t.mutex;
-    t.initial_data_received <- true;
-    Mutex.unlock t.mutex;
+    Atomic.set t.initial_data_received true;
     Concurrency.Exchange_wakeup.signal_all ()
   ;;
 end
@@ -225,54 +227,36 @@ let get_all_symbols () =
 
 let get_current_position symbol =
   match Hashtbl.find_opt stores symbol with
-  | Some store ->
-    Mutex.lock store.mutex;
-    let pos = store.write_pos in
-    Mutex.unlock store.mutex;
-    pos
+  | Some store -> Atomic.get store.write_pos
   | None -> 0
 ;;
 
 let get_current_position_fast symbol =
   let store = get_or_create_store symbol in
-  fun () ->
-    Mutex.lock store.mutex;
-    let pos = store.write_pos in
-    Mutex.unlock store.mutex;
-    pos
+  fun () -> Atomic.get store.write_pos
 ;;
 
 let has_execution_data symbol =
   match Hashtbl.find_opt stores symbol with
-  | Some store ->
-    Mutex.lock store.mutex;
-    let res = store.initial_data_received in
-    Mutex.unlock store.mutex;
-    res
+  | Some store -> Atomic.get store.initial_data_received
   | None -> false
 ;;
 
 let has_execution_data_fast symbol =
   let store = get_or_create_store symbol in
-  fun () ->
-    Mutex.lock store.mutex;
-    let res = store.initial_data_received in
-    Mutex.unlock store.mutex;
-    res
+  fun () -> Atomic.get store.initial_data_received
 ;;
 
 let read_execution_events symbol start_pos =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
-    Mutex.lock store.mutex;
-    let current_pos = store.write_pos in
+    let current_pos = Atomic.get store.write_pos in
     let start_idx = max start_pos (current_pos - store.capacity) in
     let events = ref [] in
     for i = current_pos - 1 downto start_idx do
       let idx = i mod store.capacity in
       events := store.buffer.(idx) :: !events
     done;
-    Mutex.unlock store.mutex;
     !events
   | None -> []
 ;;
@@ -280,14 +264,12 @@ let read_execution_events symbol start_pos =
 let iter_execution_events symbol start_pos f =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
-    Mutex.lock store.mutex;
-    let current_pos = store.write_pos in
+    let current_pos = Atomic.get store.write_pos in
     let start_idx = max start_pos (current_pos - store.capacity) in
     for i = start_idx to current_pos - 1 do
       let idx = i mod store.capacity in
       f store.buffer.(idx)
     done;
-    Mutex.unlock store.mutex;
     current_pos
   | None -> start_pos
 ;;
@@ -295,10 +277,15 @@ let iter_execution_events symbol start_pos f =
 let fold_open_orders symbol ~init ~f =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
-    Mutex.lock store.mutex;
-    let res = Hashtbl.fold (fun _ o acc -> f acc o) store.open_orders init in
-    Mutex.unlock store.mutex;
-    res
+    (* Snapshot under the lock, process on the snapshot (H6): the WS writer
+       never queues behind the domain's per-order scan callbacks. *)
+    let snapshot =
+      Mutex.lock store.mutex;
+      let orders = Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [] in
+      Mutex.unlock store.mutex;
+      orders
+    in
+    List.fold_left (fun acc o -> f acc o) init snapshot
   | None -> init
 ;;
 

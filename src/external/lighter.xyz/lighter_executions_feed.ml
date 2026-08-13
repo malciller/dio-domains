@@ -286,10 +286,15 @@ let[@inline always] get_open_orders symbol =
 
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-    (fun () -> Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init)
+  (* Snapshot under the lock, process on the snapshot (H6): the WS writer
+     never queues behind the domain's per-order scan callbacks. *)
+  let snapshot =
+    Mutex.lock store.orders_mutex;
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+      (fun () -> Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [])
+  in
+  List.fold_left (fun acc order -> f acc order) init snapshot
 ;;
 
 let[@inline always] get_current_position symbol =

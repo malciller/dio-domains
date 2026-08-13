@@ -216,6 +216,10 @@ let asset_domain_worker
     let latency_active = ref false in
     let exec_ready_cycle = ref 0 in
     let open_orders_dirty = ref true in
+    (* H5: the per-cycle oracle decision lookup is cached against the publish
+       generation, so idle cycles (no new pass) do zero decision work. *)
+    let oracle_gen_cached = ref (-1) in
+    let oracle_decision_cached = ref None in
     (* Initialize strategy configuration refs based on strategy type.
        The capital-oracle runtime publishes a per-asset decision (qty, the
        blended grid_interval, active) to a lock-free snapshot; while a
@@ -453,11 +457,22 @@ let asset_domain_worker
        so the dashboard never scans a histogram being mutated by this domain. *)
     let latency_window_seconds = config.latency_window_seconds in
     let last_window_time = ref (Unix.gettimeofday ()) in
+    (* M8: GC stats are sampled once per latency window (inside
+       [publish_windows]) instead of twice per busy cycle. [Gc.quick_stat]
+       costs ~2µs; on the publish cadence it is negligible, per-cycle it
+       would tax every busy domain cycle once profiling warms up. *)
+    let gc_start =
+      ref { Gc_monitor.minor_collections = 0; major_collections = 0; compactions = 0 }
+    in
+    let gc_end = ref !gc_start in
     let publish_windows () =
       ignore (Latency_profiler.snapshot_and_reset prof_ob);
       ignore (Latency_profiler.snapshot_and_reset prof_exec);
       ignore (Latency_profiler.snapshot_and_reset prof_strategy);
-      ignore (Latency_profiler.snapshot_and_reset prof_cycle)
+      ignore (Latency_profiler.snapshot_and_reset prof_cycle);
+      (* Refresh the window-scoped GC sampling pair once per window. *)
+      gc_start := Gc_monitor.get_stats ();
+      gc_end := !gc_start
     in
     (* Publish an initial empty window so the dashboard renders this domain as
        idle immediately rather than after the first window elapses, and clears
@@ -504,11 +519,18 @@ let asset_domain_worker
       let cycle_events = ref 0 in
       let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
-      let gc_start =
-        if latency_this_cycle
-        then Gc_monitor.get_stats ()
-        else { minor_collections = 0; major_collections = 0; compactions = 0 }
-      in
+      (* M8: GC stats are window-scoped (sampled in [publish_windows]); the
+         per-cycle cause string reads the last window pair. No [Gc.quick_stat]
+         on the per-tick path. *)
+      (* H3: drain lifecycle events queued by the supervisor REST path. All
+         handler invocations (REST- and WS-sourced) now execute on THIS domain
+         thread at the top of the cycle, so the strategy mutex is never
+         contended across threads. Runs unconditionally — the queue is empty
+         on the common cycle and the read is a lock-free CAS. *)
+      (match !grid_strategy_asset_ref with
+       | Some _ ->
+         Dio_strategies.Suicide_grid.Strategy.drain_events asset_with_fees.symbol
+       | None -> ());
       (* === ORDERBOOK HOT PATH === *)
       let ob_pos = get_ob_pos_fn () in
       let did_ob =
@@ -837,11 +859,20 @@ let asset_domain_worker
             OUTSIDE the should_execute gate on purpose: an inactive asset
             never enters the execution block, so its re-activation must not
             depend on it. The oracle's qty/gi win over the F&G re-evaluation
-            above (the oracle owns the sizing while it has a decision). *)
+            above (the oracle owns the sizing while it has a decision).
+            H5: the lookup is cached per generation — [decision_for] is only
+            re-invoked (with its lowercase+hashtable cost) when the runtime
+            published a new pass, so idle cycles do zero decision work. *)
       let oracle_decision =
-        Oracle_runtime.decision_for
-          ~exchange:asset_with_fees.exchange
-          ~symbol:asset_with_fees.symbol
+        if !oracle_gen_cached <> Oracle_runtime.get_refresh_generation ()
+        then (
+          oracle_gen_cached := Oracle_runtime.get_refresh_generation ();
+          oracle_decision_cached
+          := Oracle_runtime.decision_for
+               ~exchange:asset_with_fees.exchange
+               ~symbol:asset_with_fees.symbol;
+          !oracle_decision_cached)
+        else !oracle_decision_cached
       in
       let oracle_halted =
         match oracle_decision with
@@ -874,11 +905,27 @@ let asset_domain_worker
            d.grid_interval
            (d.d_surv *. 100.0)
        | Some d, Some asset when d.active ->
-         let qty_str = Printf.sprintf "%.8g" d.qty in
-         let qty_changed = qty_str <> asset.qty in
+         (* The oracle re-derives the qty from the live pool every pass,
+             and the pool drifts with every balance/price update, so
+             successive passes publish micro-different qtys (e.g. QQQ
+             0.03877239 -> 0.03877509 -> 0.03876709). An exact string
+             comparison trips [qty_changed] on EVERY pass, which forces a
+             buy re-anchor -> an Alpaca amend (cancel+create) on every
+             pass -> the infinite amend loop (the grid and oracle fight
+             over the resting order's size). Judge the change numerically
+             with a relative deadband (0.1%) so only a material re-size
+             re-anchors; micro pool drift leaves the book untouched. *)
+         let qty_changed =
+           let current_qty =
+             try float_of_string asset.qty with
+             | Failure _ -> 0.0
+           in
+           abs_float (d.qty -. current_qty) > max (current_qty *. 0.001) 1e-9
+         in
          let gi_changed = abs_float (d.grid_interval -. asset.grid_interval) > 1e-12 in
          if qty_changed || gi_changed
          then (
+           let qty_str = Printf.sprintf "%.8g" d.qty in
            let new_asset =
              { asset with qty = qty_str; grid_interval = d.grid_interval }
            in
@@ -1359,10 +1406,11 @@ let asset_domain_worker
       let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
       if latency_this_cycle && cycle_busy
       then (
-        let gc_end = Gc_monitor.get_stats () in
         let cause_thunk () =
           let alloc_diff = Gc.minor_words () -. alloc_start in
-          let gc_str = Gc_monitor.diff_to_string gc_start gc_end in
+          (* M8: GC stats are window-scoped — the cause string uses the last
+             [publish_windows] pair, never a per-cycle [Gc.quick_stat]. *)
+          let gc_str = Gc_monitor.diff_to_string !gc_start !gc_end in
           Printf.sprintf
             "ob:%B ex:%d st:%B al:%.0fw%s"
             did_ob

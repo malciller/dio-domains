@@ -18,7 +18,10 @@
      signal on both gi and qty (fear tightens and up-sizes, greed loosens and
      pulls back) clamped to never break the survival constraint,
    - under-funded active assets run at qty_min with the shortfall warned and
-     keep their whole share (config-order priority),
+     keep their whole share (config-order priority) - EXCEPT a committed grid
+     (resting buy funded and locked in the account balance), which keeps
+     running on that committed capital and passes its whole share down so a
+     lower-priority asset can fund its own first order,
    - fallback (immature-history) assets are sized on the deepest observed
      drawdown, peak-to-valley; qty still grows up to the qty_cap while the
      static funding check holds (volume-driven),
@@ -551,6 +554,68 @@ let test_deploy_committed_buy_gate () =
   Alcotest.(check bool)
     "committed-buy gi within the config range"
     (dc.parameter >= 0.5 -. 1e-9 && dc.parameter <= 2.0 +. 1e-9)
+    true
+;;
+
+let test_deploy_committed_buy_passes_pool_down () =
+  (* The committed-grid allocation: an under-funded ACTIVE grid with a
+     committed resting buy keeps running on its committed capital and draws
+     NOTHING new from the available pool - its whole share passes down the
+     priority order so a lower-priority asset can fund its own first order.
+     A committed grid whose pool DOES fund the ladder still consumes its
+     ladder cost and passes only the surplus; and an under-funded grid
+     WITHOUT a committed buy keeps its whole share (unchanged). *)
+  let g = grid ~start_price:100.0 () in
+  let ms = models ~asset in
+  let q_min = D.sizing_floor ~cfg:g in
+  let cost_one =
+    Oracle_mfd.floor_aware_runway_cost
+      ~qty:q_min
+      ~grid_interval_pct:2.0
+      ~fee:g.maker_fee
+      ~start_price:g.start_price
+      ~min_notional:g.min_notional
+      ~price_increment:g.price_increment
+      ~qty_increment:g.qty_increment
+      ~n_fills:1
+  in
+  (* An under-funded pool: above the first-buy gate (so it would run without
+     a committed buy too) but far below the full ladder cost. *)
+  let pool = 1.5 *. cost_one in
+  (* Control, no committed buy: the under-funded asset keeps its whole share
+     (deployed = pool, nothing passes down). *)
+  let d0 = deploy ~pool ~g ~models:ms () in
+  Alcotest.(check bool) "under-funded (no committed) is active" d0.active true;
+  Alcotest.(check bool) "under-funded (no committed) not passed" (not d0.row.passed) true;
+  Alcotest.(check bool)
+    "under-funded (no committed) consumes the whole share"
+    (abs_float (d0.deployed -. pool) < 1e-6 && d0.remainder = 0.0)
+    true;
+  (* The committed grid on the SAME pool: still active, draws nothing, passes
+     the whole pool down. *)
+  let dc = deploy ~pool ~g ~has_committed_buy:true ~models:ms () in
+  Alcotest.(check bool) "committed under-funded stays active" dc.active true;
+  Alcotest.(check bool) "committed under-funded not passed" (not dc.row.passed) true;
+  Alcotest.(check bool)
+    "committed under-funded draws nothing from the pool"
+    (dc.deployed = 0.0)
+    true;
+  Alcotest.(check bool)
+    "committed under-funded passes the whole share down"
+    (abs_float (dc.remainder -. pool) < 1e-6)
+    true;
+  (* A funded committed grid (pool >> ladder) still consumes its ladder cost
+     and passes only the surplus - unchanged from before the fix. *)
+  let df = deploy ~pool:10_000.0 ~g ~has_committed_buy:true ~models:ms () in
+  Alcotest.(check bool) "committed funded stays active" df.active true;
+  Alcotest.(check bool) "committed funded row passed" df.row.passed true;
+  Alcotest.(check bool)
+    "committed funded consumes its ladder cost"
+    (df.deployed > 0.0 && df.deployed < 0.5 *. df.pool_share)
+    true;
+  Alcotest.(check bool)
+    "committed funded passes only the surplus"
+    (abs_float (df.remainder -. (df.pool_share -. df.deployed)) < 1e-6)
     true
 ;;
 
@@ -1840,6 +1905,10 @@ let () =
             "committed buy keeps a running grid alive"
             `Quick
             test_deploy_committed_buy_gate
+        ; Alcotest.test_case
+            "committed buy passes the pool down while under-funded"
+            `Quick
+            test_deploy_committed_buy_passes_pool_down
         ; Alcotest.test_case
             "seeded replay models the accumulated state"
             `Quick

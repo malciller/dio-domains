@@ -1,51 +1,48 @@
-(** Account collateral and position tracking module for Alpaca. *)
+(** Account collateral and position tracking module for Alpaca.
+
+    Lock-free reads (HFT_AUDIT.md H2): the background refresher fiber is the
+    single writer. It builds a fresh immutable balance table and publishes it
+    with one [Atomic.set]; readers grab the reference with [Atomic.get] and
+    look up — no mutex on any read path. *)
 
 open Lwt.Infix
 
 let section = "alpaca_balances"
-let balances : (string, float) Hashtbl.t = Hashtbl.create 16
-let total_balances : (string, float) Hashtbl.t = Hashtbl.create 16
-let balances_mutex = Mutex.create ()
-let initial_data_received = ref false
-let last_update : float ref = ref 0.0 (* wall clock of the last successful poll *)
+
+(* Published balance snapshots. Never mutated in place after publication. *)
+let balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+let total_balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+let initial_data_received = Atomic.make false
+let last_update = Atomic.make 0.0 (* wall clock of the last successful poll *)
 
 (** Age (seconds) of the balance snapshot, or [None] before the first
     successful poll. *)
 let get_balance_age () =
-  if !last_update > 0.0 then Some (Unix.gettimeofday () -. !last_update) else None
+  let lu = Atomic.get last_update in
+  if lu > 0.0 then Some (Unix.gettimeofday () -. lu) else None
 ;;
 
 let get_balance asset =
-  Mutex.lock balances_mutex;
+  let t = Atomic.get balances in
   let key = if asset = "USDC" then "USD" else asset in
-  let res =
-    try Hashtbl.find balances key with
-    | _ ->
-      (try Hashtbl.find balances asset with
-       | _ -> 0.0)
-  in
-  Mutex.unlock balances_mutex;
-  res
+  try Hashtbl.find t key with
+  | _ ->
+    (try Hashtbl.find t asset with
+     | _ -> 0.0)
 ;;
 
 let get_total_balance asset =
-  Mutex.lock balances_mutex;
+  let t = Atomic.get total_balances in
   let key = if asset = "USDC" then "USD" else asset in
-  let res =
-    try Hashtbl.find total_balances key with
-    | _ ->
-      (try Hashtbl.find total_balances asset with
-       | _ -> 0.0)
-  in
-  Mutex.unlock balances_mutex;
-  res
+  try Hashtbl.find t key with
+  | _ ->
+    (try Hashtbl.find t asset with
+     | _ -> 0.0)
 ;;
 
 let get_all_balances () =
-  Mutex.lock balances_mutex;
-  let res = Hashtbl.fold (fun k v acc -> (k, v) :: acc) total_balances [] in
-  Mutex.unlock balances_mutex;
-  res
+  let t = Atomic.get total_balances in
+  Hashtbl.fold (fun k v acc -> (k, v) :: acc) t []
 ;;
 
 let update_balances () =
@@ -54,11 +51,13 @@ let update_balances () =
   | Ok acc ->
     Alpaca_rest.get_positions ()
     >>= fun pos_res ->
-    Mutex.lock balances_mutex;
-    Hashtbl.replace balances "USD" acc.cash;
-    Hashtbl.replace total_balances "USD" acc.equity;
-    Hashtbl.replace balances "USDC" acc.cash;
-    Hashtbl.remove total_balances "USDC";
+    (* Build the new snapshots entirely before publishing, so readers never
+       observe a half-updated table. *)
+    let new_balances = Hashtbl.create 16 in
+    let new_total = Hashtbl.create 16 in
+    Hashtbl.replace new_balances "USD" acc.cash;
+    Hashtbl.replace new_total "USD" acc.equity;
+    Hashtbl.replace new_balances "USDC" acc.cash;
     Logging.debug_f
       ~section
       "Alpaca Account updated: buying_power=%.2f, cash=%.2f, equity=%.2f, \
@@ -75,27 +74,10 @@ let update_balances () =
            ~section
            "Alpaca loaded %d active position(s)"
            (List.length positions);
-       let pos_symbols =
-         List.map (fun (p : Alpaca_types.position_record) -> p.symbol) positions
-       in
-       let to_remove_b = ref [] in
-       Hashtbl.iter
-         (fun k _ ->
-            if k <> "USD" && k <> "USDC" && not (List.mem k pos_symbols)
-            then to_remove_b := k :: !to_remove_b)
-         balances;
-       List.iter (Hashtbl.remove balances) !to_remove_b;
-       let to_remove_tb = ref [] in
-       Hashtbl.iter
-         (fun k _ ->
-            if k <> "USD" && k <> "USDC" && not (List.mem k pos_symbols)
-            then to_remove_tb := k :: !to_remove_tb)
-         total_balances;
-       List.iter (Hashtbl.remove total_balances) !to_remove_tb;
        List.iter
          (fun (p : Alpaca_types.position_record) ->
-            Hashtbl.replace balances p.symbol p.qty;
-            Hashtbl.replace total_balances p.symbol p.qty;
+            Hashtbl.replace new_balances p.symbol p.qty;
+            Hashtbl.replace new_total p.symbol p.qty;
             if p.current_price > 0.0
             then (
               let store = Alpaca_orderbook.get_or_create_store p.symbol in
@@ -124,9 +106,10 @@ let update_balances () =
          positions
      | Error err ->
        Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err);
-    initial_data_received := true;
-    last_update := Unix.time ();
-    Mutex.unlock balances_mutex;
+    Atomic.set balances new_balances;
+    Atomic.set total_balances new_total;
+    Atomic.set initial_data_received true;
+    Atomic.set last_update (Unix.time ());
     Concurrency.Exchange_wakeup.signal_all ();
     Lwt.return_unit
   | Error err ->
@@ -145,7 +128,7 @@ let initialize () =
 
 let wait_until_ready () =
   let rec wait attempts =
-    if !initial_data_received
+    if Atomic.get initial_data_received
     then Lwt.return_true
     else if attempts <= 0
     then Lwt.return_false

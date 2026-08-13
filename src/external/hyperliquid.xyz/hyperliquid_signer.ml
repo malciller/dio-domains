@@ -148,8 +148,14 @@ let bs_sub_to_string bs ofs len =
   Bytes.to_string s
 ;;
 
+(** Hoisted signing context (M9): [Secp256k1.Context.create] is expensive;
+    create it once at module load and reuse it for every signature instead of
+    allocating a fresh context per order. All signing runs on the Lwt
+    scheduler, so the shared context is single-threaded in practice. *)
+let sign_ctx = Secp256k1.Context.create [ Secp256k1.Context.Sign ]
+
 let sign_hash ~private_key_raw ~msg_hash_raw =
-  let ctx = Secp256k1.Context.create [ Secp256k1.Context.Sign ] in
+  let ctx = sign_ctx in
   let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
   let msg = Secp256k1.Sign.msg_of_bytes_exn (bs_of_string msg_hash_raw) in
   let sig_rec = Secp256k1.Sign.sign_recoverable_exn ctx ~sk:seckey msg in
@@ -173,7 +179,7 @@ let address_of_private_key_hex ~private_key_hex =
     else private_key_hex
   in
   let private_key_raw = bytes_of_hex pkey_clean in
-  let ctx = Secp256k1.Context.create [ Secp256k1.Context.Sign ] in
+  let ctx = sign_ctx in
   let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
   let pubkey = Secp256k1.Key.neuterize_exn ctx seckey in
   (* Serialize uncompressed public key (65 bytes: 0x04 || x || y), hash with Keccak-256, take last 20 bytes. *)

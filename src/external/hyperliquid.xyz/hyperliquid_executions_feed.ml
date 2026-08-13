@@ -243,13 +243,16 @@ let[@inline always] get_open_orders symbol =
   orders
 ;;
 
-(** Fold over open orders under the per-symbol mutex. Avoids intermediate list allocation. *)
+(** Fold over open orders. Snapshots the open-order list under the per-symbol
+    mutex (hashtable walk without calling [f]), releases the lock, then runs
+    the per-order callback work on the snapshot — the WS feed writer never
+    queues behind the domain's scan callbacks (H6). *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
-  let result = Hashtbl.fold (fun _id order acc -> f acc order) store.open_orders init in
+  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Mutex.unlock store.orders_mutex;
-  result
+  List.fold_left (fun acc order -> f acc order) init snapshot
 ;;
 
 (** Remove a single open order by ID. Called after a successful cancel-replace

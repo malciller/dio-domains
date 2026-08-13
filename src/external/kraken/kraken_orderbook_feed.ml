@@ -212,13 +212,10 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
   let top_asks = take (min 10 (List.length sorted_asks)) sorted_asks in
   Logging.debug_f
     ~section
-    "Checksum input: symbol=%s bids=%d asks=%d"
+    "Checksum input: symbol=%s bids=%d asks=%d | levels used: bids=%d asks=%d"
     symbol
     (List.length bids_levels)
-    (List.length asks_levels);
-  Logging.debug_f
-    ~section
-    "Checksum levels used: bids=%d asks=%d"
+    (List.length asks_levels)
     (List.length top_bids)
     (List.length top_asks);
   let crc = ref 0xFFFFFFFFl in
@@ -258,6 +255,10 @@ type store =
     (** Last processed sequence number. Used for gap and rollback detection. *)
   ; mutable last_update : float
     (** Unix timestamp of the most recent data write. Used for staleness pruning. *)
+  ; mutable checksum_tick : int
+    (** Increments per book update; the per-tick checksum recompute (2 extra
+        fold+sort+array passes) runs only every [checksum_every_n] ticks —
+        M2. *)
   }
 
 (** (pair_decimals, lot_decimals) precision tuple from AssetPairs API. *)
@@ -267,6 +268,12 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
 let ready_condition = Lwt_condition.create ()
 let resubscribe_symbol_ref : (string -> unit Lwt.t) option ref = ref None
+
+(** M2: recompute the book checksum at most once per this many updates per
+    symbol. The checksum rebuild does 2 extra fold+sort+array passes per tick;
+    every 10th update still validates constantly-changing books far more often
+    than the exchange's drift window needs. *)
+let checksum_every_n = 10
 
 (** Retrieve price and quantity precision from the instruments feed cache. Returns None on failure. *)
 let get_precision_from_instruments symbol =
@@ -344,6 +351,7 @@ let ensure_store symbol =
       ; has_snapshot = Atomic.make false
       ; last_sequence = Atomic.make None
       ; last_update = Unix.time ()
+      ; checksum_tick = 0
       }
     in
     Hashtbl.add stores symbol store;
@@ -693,11 +701,15 @@ let process_orderbook_message ~reset json on_heartbeat =
              if Hashtbl.length store.asks > orderbook_depth * 2
              then truncate_hashtbl store.asks false orderbook_depth);
            let orderbook = build_orderbook store symbol entry in
-           (* Compute and verify CRC32 from current state using top 10 levels per side. 
-           If the configured depth is < 10, checksum validation is bypassed because 
-           the stored map lacks the requisite levels to evaluate the CRC. *)
+           (* Compute and verify CRC32 from current state using top 10 levels per side.
+            If the configured depth is < 10, checksum validation is bypassed because
+            the stored map lacks the requisite levels to evaluate the CRC.
+            M2: the checksum recompute (2 extra fold+sort+array passes) is throttled
+            to every [checksum_every_n] updates per symbol — the book is still built
+            and written per tick, only the redundant CRC pass is slowed down. *)
+           store.checksum_tick <- store.checksum_tick + 1;
            let checksum_valid =
-             if orderbook_depth >= 10
+             if orderbook_depth >= 10 && store.checksum_tick mod checksum_every_n = 0
              then (
                let calculated_checksum =
                  calculate_checksum

@@ -42,7 +42,14 @@
    whose pool cannot fund even its first buy at the minimum order size is
    inactive and its whole share passes down the priority order - so with the
    stretch sizing a priority asset consumes only what its minimum-order
-   ladder needs and the next asset still funds its own first order. A fully
+   ladder needs and the next asset still funds its own first order. An
+   under-funded ACTIVE grid that has a committed resting buy is the one
+   exception: its first buy is already funded (the cost is locked in the
+   account balance, which is why the pool reads low), so it keeps running on
+   that committed capital and draws NOTHING new from the available pool -
+   its whole share passes down, letting a lower-priority asset fund its own
+   first order instead of being starved by an under-funded priority grid
+   that cannot use the capital anyway. A fully
    deployed account shows a ~zero available-quote pool, so every asset
    publishes inactive ("cannot fund the first buy") while it awaits sell fills
    to restore capital. This is a normal state, never a failure: when a fill
@@ -298,18 +305,30 @@ let jittered base = base +. Random.float (Float.min 15.0 (base /. 2.0))
     the whole list in one Atomic.set, so readers never observe a torn state. *)
 let decisions_ref : decision list Atomic.t = Atomic.make []
 
+(* H5: copy-on-write keyed lookup. The single writer (publish) builds a fresh
+   Hashtbl with pre-lowercased "exchange/symbol" keys and swaps the reference;
+   readers do one [Atomic.get] + Hashtbl.find — no per-cycle lowercasing and
+   no O(N) scan. The table is never mutated after publication, so concurrent
+   readers are safe under the OCaml 5 memory model. *)
+let decisions_map : (string, decision) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 16)
+;;
+
+let key_of (d : decision) =
+  String.lowercase_ascii d.exchange ^ "/" ^ String.lowercase_ascii d.symbol
+;;
+
+(** Domain-safe lookup: exchange and symbol are lower-cased for the match so
+    config spelling (BTC/USD vs btc/usd) never matters. O(1) hashtable hit on
+    the per-cycle hot path (no list scan, no per-candidate lowercasing). *)
 let decisions () = Atomic.get decisions_ref
 
 (** Domain-safe lookup: exchange and symbol are lower-cased for the match so
-    config spelling (BTC/USD vs btc/usd) never matters. *)
+    config spelling (BTC/USD vs btc/usd) never matters. O(1) hashtable hit on
+    the per-cycle hot path (no list scan, no per-candidate lowercasing). *)
 let decision_for ~(exchange : string) ~(symbol : string) : decision option =
-  let exchange = String.lowercase_ascii exchange in
-  let symbol = String.lowercase_ascii symbol in
-  List.find_opt
-    (fun (d : decision) ->
-       String.lowercase_ascii d.exchange = exchange
-       && String.lowercase_ascii d.symbol = symbol)
-    (Atomic.get decisions_ref)
+  let key = String.lowercase_ascii exchange ^ "/" ^ String.lowercase_ascii symbol in
+  Hashtbl.find_opt (Atomic.get decisions_map) key
 ;;
 
 (** Merge [fresh] decisions over the current snapshot: assets absent from
@@ -318,16 +337,17 @@ let decision_for ~(exchange : string) ~(symbol : string) : decision option =
     halts trading on stale knowledge. Assets in [fresh] replace their old
     decision. *)
 let publish (fresh : decision list) =
-  let key (d : decision) =
-    String.lowercase_ascii d.exchange ^ "/" ^ String.lowercase_ascii d.symbol
-  in
-  let fresh_keys = List.map key fresh in
+  let fresh_keys = List.map key_of fresh in
   let kept =
     List.filter
-      (fun (d : decision) -> not (List.mem (key d) fresh_keys))
+      (fun (d : decision) -> not (List.mem (key_of d) fresh_keys))
       (Atomic.get decisions_ref)
   in
-  Atomic.set decisions_ref (kept @ fresh)
+  Atomic.set decisions_ref (kept @ fresh);
+  (* Rebuild the keyed map copy-on-write for the next readers. *)
+  let map = Hashtbl.create (List.length (kept @ fresh)) in
+  List.iter (fun (d : decision) -> Hashtbl.replace map (key_of d) d) (kept @ fresh);
+  Atomic.set decisions_map map
 ;;
 
 (** Pass counters for observability (logged, never read on a hot path). *)
@@ -478,6 +498,11 @@ let refresh_fiber : unit Lwt.t option ref = ref None
     (the pass's own cadence and the bounded wait on fill events cover
     balance freshness). *)
 let refresh_generation : int Atomic.t = Atomic.make 0
+
+(** Monotonic generation counter bumped after every published pass. Domain
+    workers cache their resolved decision and only re-look-up when this value
+    changes (H5 "changed-only" adoption). *)
+let get_refresh_generation () = Atomic.get refresh_generation
 
 let refresh_history_changed : bool Atomic.t = Atomic.make false
 
@@ -1498,15 +1523,18 @@ let size_asset
      its cost is locked in the account balance, which is why the available
      pool reads low) keeps the grid alive: the asset is never "cannot fund
      the first buy" while it has one. The grid's own capital gates pause it
-     when the pool cannot extend another rung. *)
+     when the pool cannot extend another rung. M12: uses the snapshot-based
+     fold (H6) instead of get_open_orders' list build, so the store mutex is
+     held only for the snapshot walk, never across the callback. *)
   let has_committed_buy =
     match Exchange.Registry.get exchange with
     | None -> false
     | Some (module Ex) ->
-      List.exists
-        (fun (o : Exchange.Types.open_order) ->
-           o.side = Exchange.Types.Buy && o.remaining_qty > 0.0)
-        (Ex.get_open_orders ~symbol)
+      Ex.fold_open_orders
+        ~symbol
+        ~init:false
+        ~f:(fun acc (o : Exchange.Types.open_order) ->
+          acc || (o.side = Exchange.Types.Buy && o.remaining_qty > 0.0))
   in
   let deployment =
     D.deploy_asset
@@ -1583,37 +1611,41 @@ let size_asset
     then "funded"
     else "UNDER-FUNDED"
   in
-  if deployment.Oracle_types.active
-  then
-    Logging.info_f
-      ~section
-      "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | %s | \
-       survives %.1f%% | %s"
-      index
-      n_tasks
-      exchange
-      symbol
-      deployment.Oracle_types.qty
-      (base_of symbol)
-      deployment.Oracle_types.parameter
-      (* The capital this deployment actually consumes - the sizing no
-         longer models the priority asset against the whole venue pool; what
-         it does not consume passes down the priority order. *)
-      deployment.Oracle_types.deployed
-      venue_pool
-      p2v_lbl
-      (deployment.Oracle_types.d_surv *. 100.0)
-      health
-  else
-    Logging.info_f
-      ~section
-      "[%d/%d] %s/%s INACTIVE — %s | capital $%.2f passes down"
-      index
-      n_tasks
-      exchange
-      symbol
-      deployment.Oracle_types.reason
-      deployment.Oracle_types.remainder;
+  (* The per-asset report: header + detail as ONE atomic message so the
+     decision lines never interleave with other domains' logs. Logged at INFO
+     when the report changed since the last pass, DEBUG otherwise (a still
+     market stays quiet between the per-pass latency summaries). *)
+  let header =
+    if deployment.Oracle_types.active
+    then
+      Printf.sprintf
+        "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | %s | \
+         survives %.1f%% | %s"
+        index
+        n_tasks
+        exchange
+        symbol
+        deployment.Oracle_types.qty
+        (base_of symbol)
+        deployment.Oracle_types.parameter
+        (* The capital this deployment actually consumes - the sizing no
+           longer models the priority asset against the whole venue pool;
+           what it does not consume passes down the priority order. *)
+        deployment.Oracle_types.deployed
+        venue_pool
+        p2v_lbl
+        (deployment.Oracle_types.d_surv *. 100.0)
+        health
+    else
+      Printf.sprintf
+        "[%d/%d] %s/%s INACTIVE — %s | capital $%.2f passes down"
+        index
+        n_tasks
+        exchange
+        symbol
+        deployment.Oracle_types.reason
+        deployment.Oracle_types.remainder
+  in
   (* The detail block: event prices/dates, model horizon, and how the
      resolved gi/qty were weighted (the F&G blend for crypto; pure oracle for
      equities). *)
@@ -1710,17 +1742,16 @@ let size_asset
     if has_committed_buy
     then add "      committed buy resting: the grid keeps running on committed capital");
   let detail_str = Buffer.contents detail in
-  let detail_changed =
+  let report =
+    if detail_str = "" then header else header ^ "\n" ^ String.trim detail_str
+  in
+  let report_changed =
     match Hashtbl.find_opt last_detail_lines key with
-    | Some prev -> prev <> detail_str
+    | Some prev -> prev <> report
     | None -> true
   in
-  Hashtbl.replace last_detail_lines key detail_str;
-  if detail_str <> ""
-  then
-    if detail_changed
-    then Logging.info ~section detail_str
-    else Logging.debug ~section detail_str;
+  Hashtbl.replace last_detail_lines key report;
+  if report_changed then Logging.info ~section report else Logging.debug ~section report;
   (* ATH/ATL context (order-independent, display only). *)
   (match deployment.Oracle_types.range with
    | Some r ->
@@ -1927,6 +1958,9 @@ let refresh_cycle
   let balance_start = Mtime_clock.now_ns () in
   venue_pools ~prev:prev_pools tasks
   >>= fun pools ->
+  let balance_ms =
+    Int64.to_float (Int64.sub (Mtime_clock.now_ns ()) balance_start) /. 1e6
+  in
   Latency_profiler.record
     engine_profs.prof_balance
     (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) balance_start));
@@ -1944,6 +1978,9 @@ let refresh_cycle
      in
      Lwt.return assets))
   >>= fun assets ->
+  let history_ms =
+    Int64.to_float (Int64.sub (Mtime_clock.now_ns ()) t_fetch_all) /. 1e6
+  in
   Latency_profiler.record
     engine_profs.prof_fetch
     (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t_fetch_all));
@@ -1974,12 +2011,23 @@ let refresh_cycle
      profilers). *)
   let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_balance in
   let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_fetch in
-  Logging.debug_f
-    ~section
-    "background refresh cycle complete: %d asset(s) materialized, history %s, epoch %d"
-    (List.length assets)
-    (if history_due then "refreshed" else "kept")
-    m.m_epoch;
+  if history_due
+  then
+    Logging.info_f
+      ~section
+      "refresh cycle complete: %d asset(s) history refreshed in %.1fs · balances %.1fms \
+       · epoch %d"
+      (List.length assets)
+      (history_ms /. 1000.0)
+      balance_ms
+      m.m_epoch
+  else
+    Logging.debug_f
+      ~section
+      "refresh cycle complete: %d asset(s), history kept · balances %.1fms · epoch %d"
+      (List.length assets)
+      balance_ms
+      m.m_epoch;
   Lwt.return_unit
 ;;
 
@@ -2097,7 +2145,7 @@ let run_pass
     | Some m ->
       let fng = m.m_fng in
       let grouped = group_by_account tasks in
-      Logging.info_f
+      Logging.debug_f
         ~section
         "capital-oracle pass #%d starting: %d asset(s) in %d account(s)%s"
         (Atomic.get pass_count + 1)
@@ -2107,6 +2155,9 @@ let run_pass
          | Some f -> Printf.sprintf ", f&g %.2f" f
          | None -> ", f&g unavailable");
       let decisions = ref [] in
+      (* Analysis work counts for the per-pass latency summary. *)
+      let n_recomputed = ref 0 in
+      let n_cached = ref 0 in
       (* Phase A: analyze every asset in parallel. The analysis reads only
          the materialized history (memoized: unchanged inputs return the
          same record in microseconds); the only wall-clock cost is the
@@ -2149,6 +2200,7 @@ let run_pass
                          (Int64.sub (Mtime_clock.now_ns ()) t_asset))
                       (fun () -> if reused then "cache-hit" else "analyze");
                     touched_assets := task.Oracle_tasks.symbol :: !touched_assets;
+                    if reused then incr n_cached else incr n_recomputed;
                     `Ok (Some analysis))
                  ; (Lwt_unix.sleep analysis_timeout
                     >|= fun () ->
@@ -2314,7 +2366,7 @@ let run_pass
                 decisions := List.rev_append prev_decisions !decisions;
                 (match List.rev prev_decisions with
                  | last :: _ ->
-                   Logging.info_f
+                   Logging.debug_f
                      ~section
                      "capital-oracle reuse: account %s sizing unchanged (pool $%.2f) - \
                       %d decision(s) kept (surplus $%.2f)"
@@ -2333,7 +2385,7 @@ let run_pass
                 in
                 Hashtbl.replace size_cache (account_id account) (fp, account_decisions);
                 Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
-                Logging.info_f
+                Logging.debug_f
                   ~section
                   "venue %s: pool %.2f, surplus %.2f (idle reserve)"
                   (account_id account)
@@ -2356,14 +2408,58 @@ let run_pass
            ignore (Latency_profiler.snapshot_and_reset (asset_profiler_of symbol)))
         !touched_assets;
       Atomic.set refresh_history_changed false;
+      (* One scannable latency summary per pass: the whole pass time plus the
+         phase breakdown (balance/fetch are the refresher's most recent cycle;
+         sizing and the per-asset analysis are this pass) so performance work
+         has a single line to track. *)
+      let n_decisions = List.length !decisions in
+      let n_active =
+        List.fold_left
+          (fun acc (d : decision) -> if d.active then acc + 1 else acc)
+          0
+          !decisions
+      in
+      let ms_of snap =
+        match snap with
+        | None -> "—"
+        | Some (s : Latency_profiler.snapshot) -> Printf.sprintf "%.1fms" (s.p50 /. 1000.0)
+      in
+      let worst_asset =
+        List.fold_left
+          (fun acc symbol ->
+             match Latency_profiler.published_snapshot (asset_profiler_of symbol) with
+             | Some (s : Latency_profiler.snapshot) when s.samples > 0 && s.p99 > 0.0 ->
+               (match acc with
+                | None -> Some (symbol, s)
+                | Some (_, best) when s.p99 > best.p99 -> Some (symbol, s)
+                | _ -> acc)
+             | _ -> acc)
+          None
+          !touched_assets
+      in
       Logging.info_f
         ~section
-        "capital-oracle pass complete: %d decision(s) published (pass #%d, pass %.1fs%s)"
-        (List.length !decisions)
+        "pass #%d complete: %d decisions (%d active) across %d account(s) in %.1fs · %s \
+         · balance %s · fetch %s · sizing %s · analysis %d recomputed + %d cached%s%s"
         (Atomic.get pass_count)
+        n_decisions
+        n_active
+        (List.length grouped)
         (Int64.to_float (Mtime.Span.to_uint64_ns pass_span) /. 1e9)
+        (match fng with
+         | Some f -> Printf.sprintf "f&g %.1f" f
+         | None -> "f&g n/a")
+        (ms_of (Latency_profiler.published_snapshot engine_profs.prof_balance))
+        (ms_of (Latency_profiler.published_snapshot engine_profs.prof_fetch))
+        (ms_of (Latency_profiler.published_snapshot engine_profs.prof_sizing))
+        !n_recomputed
+        !n_cached
+        (match worst_asset with
+         | Some (symbol, (s : Latency_profiler.snapshot)) ->
+           Printf.sprintf " · slowest %s p99 %.1fms" symbol (s.p99 /. 1000.0)
+         | None -> "")
         (if !reused_accounts > 0
-         then Printf.sprintf ", %d account(s) reused" !reused_accounts
+         then Printf.sprintf " · %d account(s) reused" !reused_accounts
          else "");
       Lwt.return true)
 ;;

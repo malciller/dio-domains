@@ -100,35 +100,42 @@ type amend_order_result =
   ; order_id : int64
   }
 
-let get_credentials () =
-  let pkey =
-    match Sys.getenv_opt "HYPERLIQUID_PRIVATE_KEY" |> Option.map String.trim with
-    | Some k -> k
-    | None -> failwith "Missing environment variable: HYPERLIQUID_PRIVATE_KEY"
-  in
-  let wallet =
-    match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
-    | Some w -> w
-    | None -> failwith "Missing environment variable: HYPERLIQUID_WALLET_ADDRESS"
-  in
-  pkey, wallet
+(** Cached credentials (M9): environment reads are hoisted to a lazy cache —
+    env vars are static for the process lifetime, so per-order [getenv_opt]
+    calls are pure overhead. Lazy so modules can load (and tests can run)
+    without the env vars set; the first real order resolves them. *)
+let cached_credentials : (string * string) Lazy.t =
+  lazy
+    (let pkey =
+       match Sys.getenv_opt "HYPERLIQUID_PRIVATE_KEY" |> Option.map String.trim with
+       | Some k -> k
+       | None -> failwith "Missing environment variable: HYPERLIQUID_PRIVATE_KEY"
+     in
+     let wallet =
+       match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+       | Some w -> w
+       | None -> failwith "Missing environment variable: HYPERLIQUID_WALLET_ADDRESS"
+     in
+     pkey, wallet)
 ;;
 
-(** Monotonically increasing nonce derived from wall-clock milliseconds.
-    Protected by a mutex to ensure uniqueness across concurrent callers. *)
-let last_nonce = ref 0L
+let get_credentials () = Lazy.force cached_credentials
 
-let nonce_mutex = Mutex.create ()
+(** Monotonically increasing nonce derived from wall-clock milliseconds.
+    Lock-free (M9): a CAS loop on an Atomic counter replaces the per-order
+    mutex; contention is a single compare-and-set retry. *)
+let last_nonce = Atomic.make 0L
 
 let get_next_nonce () =
-  Mutex.lock nonce_mutex;
-  let current_time_ms = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
-  let next_nonce =
-    if current_time_ms <= !last_nonce then Int64.add !last_nonce 1L else current_time_ms
+  let rec loop () =
+    let last = Atomic.get last_nonce in
+    let current_time_ms = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
+    let next_nonce =
+      if current_time_ms <= last then Int64.add last 1L else current_time_ms
+    in
+    if Atomic.compare_and_set last_nonce last next_nonce then next_nonce else loop ()
   in
-  last_nonce := next_nonce;
-  Mutex.unlock nonce_mutex;
-  next_nonce
+  loop ()
 ;;
 
 (** Submits a signed action to the Hyperliquid REST /exchange endpoint.
