@@ -239,6 +239,19 @@ funding. A priority asset therefore only grows after the rest of the account
 can still fill their drawdowns at minimum qty, and an asset is disabled only
 when even its first buy cannot be funded.
 
+Priority reclamation: when a higher-priority asset fills its last buy and the
+available pool can no longer fund a replacement while a lower-priority asset
+still holds committed buy capital, the oracle publishes the lowest-priority
+asset(s) INACTIVE-with-reclaim (canceling the FEWEST resting buys, lowest
+priority first, whose committed capital closes the gap) so their domains
+cancel the orders and the released capital returns to the pool — only when the
+deallocation actually funds the higher-priority first buy, otherwise the
+lower-priority asset stays active. Any lower-priority asset holding committed
+capital is eligible — committed capital always flows toward the highest-priority
+asset that needs it. A grid's sells are never gated on capital: a halted grid
+still places the sell for a just-filled buy (the account's capital-recovery
+path), so the last fill's inventory is never left unreclaimable.
+
 | Oracle key | Type | Default | Description |
 |------------|------|---------|-------------|
 | `qty_cap_mult` | float | `0.0` | The qty search range ceiling as a multiple of the config qty: the model sizes the order qty within `[config qty, config qty × mult]` (volume-driven: it grows as large as the survival constraints allow). `0.0` = uncapped (bounded only by the survival replay and the venue floor). A value `> 0` also caps each asset's deployment at `config qty × mult` so surplus capital passes down the config priority order |

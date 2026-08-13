@@ -445,6 +445,8 @@ let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
     ; "deployed", `Float d.deployed
     ; "pool_share", `Float d.pool_share
     ; "remainder", `Float d.remainder
+    ; "reclaim_capital", `Bool d.reclaim_capital
+    ; "reclaim_target", `String d.reclaim_target
     ; "updated_at", `Float d.updated_at
     ]
 ;;

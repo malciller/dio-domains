@@ -50,14 +50,32 @@
    its whole share passes down, letting a lower-priority asset fund its own
    first order instead of being starved by an under-funded priority grid
    that cannot use the capital anyway. A fully
-   deployed account shows a ~zero available-quote pool, so every asset
-   publishes inactive ("cannot fund the first buy") while it awaits sell fills
-   to restore capital. This is a normal state, never a failure: when a fill
-   returns quote to the account, the next pass re-sizes the assets in config
-   priority order and the domains resume on the published decision. The runtime
-   polls at the fast [poll_seconds] cadence while no asset is active so a
-   capital return is recognized quickly instead of waiting for the full
-   refresh cadence.
+    deployed account shows a ~zero available-quote pool, so every asset
+    publishes inactive ("cannot fund the first buy") while it awaits sell fills
+    to restore capital. This is a normal state, never a failure: when a fill
+    returns quote to the account, the next pass re-sizes the assets in config
+    priority order and the domains resume on the published decision. The runtime
+    polls at the fast [poll_seconds] cadence while no asset is active so a
+    capital return is recognized quickly instead of waiting for the full
+    refresh cadence.
+
+   PRIORITY RECLAMATION: when a higher-priority asset fills its last buy and
+   the available pool can no longer fund a replacement while a lower-priority
+   asset still holds committed buy capital, the account is under-deployed in
+   priority order. The runtime computes a reclamation plan per account every
+   pass (see Oracle_reclaim): it selects the FEWEST lower-priority resting
+   buys - lowest priority first - whose committed capital closes the funding
+   gap, and publishes those assets INACTIVE-with-reclaim (reclaim_capital) so
+   their domains cancel the resting buy(s). The released capital returns to
+   the account pool, the cancel event triggers the next pass, and the
+   higher-priority asset re-sizes ACTIVE and resumes. A lower-priority asset
+   is never reclaimed unless the deallocation actually funds a higher-priority
+   first buy - otherwise it stays active on its committed capital.
+
+   SELLS ARE NEVER CAPITAL-GATED: a grid whose buy placement is halted (pool
+   exhausted, or oracle INACTIVE) still places the sell for a just-filled buy
+   - the sell is the account's capital recovery path (it needs no quote, only
+   inventory), so inventory is never left unreclaimable.
 
    Passes are also event-driven: the engine calls [request_pass] (one lock-free
    Atomic increment, microsecond-scale, from the domain worker loop) on every
@@ -98,6 +116,13 @@ type decision =
   ; deployed : float (** Capital the ladder consumes at the recommended sizing. *)
   ; pool_share : float (** Capital this asset drew from the venue pool. *)
   ; remainder : float (** Pool share passed to the next asset. *)
+  ; reclaim_capital : bool
+    (** Priority reclamation: the domain must cancel this asset's resting
+        buy(s) so the committed capital returns to the account pool for a
+        higher-priority asset (see the reclamation pass). *)
+  ; reclaim_target : string
+    (** The higher-priority asset the reclaimed capital funds ("" when not
+        reclaiming). *)
   ; range : Oracle_types.range_stats option
     (** Per-asset historical price-range reference (ATH / low / position).
         Display context only. *)
@@ -1468,6 +1493,29 @@ let analyze_asset
     (survival-driven over the full gi/qty ranges - see Oracle_deploy) and
     logs the decision. [index]/[n_tasks] are only for logging;
     [venue_pool] is the account's total capital (for the log context). *)
+
+(** Capital locked by one asset's resting buy orders: the sum of
+    remaining_qty x limit price over its open buys. This is what a
+    cancellation returns to the account's available pool - the basis of the
+    priority-reclamation plan. Same snapshot-based fold (M12/H6) as
+    [has_committed_buy], so the store mutex is held only for the snapshot
+    walk. *)
+let committed_buy_value ~(exchange : string) ~(symbol : string) : float =
+  match Exchange.Registry.get exchange with
+  | None -> 0.0
+  | Some (module Ex) ->
+    Ex.fold_open_orders ~symbol ~init:0.0 ~f:(fun acc (o : Exchange.Types.open_order) ->
+      if o.side = Exchange.Types.Buy && o.remaining_qty > 0.0
+      then
+        acc
+        +. (o.remaining_qty
+            *.
+            match o.limit_price with
+            | Some p -> p
+            | None -> 0.0)
+      else acc)
+;;
+
 let size_asset
       (rc : runtime_config)
       (analysis : analysis)
@@ -1795,6 +1843,8 @@ let size_asset
      ; deployed = deployment.Oracle_types.deployed
      ; pool_share = deployment.Oracle_types.pool_share
      ; remainder = deployment.Oracle_types.remainder
+     ; reclaim_capital = false
+     ; reclaim_target = ""
      ; range = deployment.Oracle_types.range
      ; p2v = deployment.Oracle_types.p2v
      ; parameter_components = deployment.Oracle_types.parameter_components
@@ -1804,6 +1854,76 @@ let size_asset
      ; updated_at = Unix.gettimeofday ()
      }
      : decision)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Priority reclamation.                                               *)
+(* ------------------------------------------------------------------ *)
+
+(** The per-account reclamation plan: which lower-priority assets' resting
+    buys to cancel so a higher-priority asset that cannot fund its first buy
+    after a fill can resume (see Oracle_reclaim for the selection rules -
+    fewest cancellations, then lowest priority). The plan is computed FRESH
+    every pass (one open-order fold + arithmetic) and applied on top of the
+    memoized decisions, so a changed plan takes effect without busting the
+    account sizing cache. [assets] must be in account priority order. *)
+let reclaim_plan
+      ~(pool : float)
+      (account_tasks : Oracle_tasks.task list)
+      (analyses : analysis list)
+  : (string * string) list
+  =
+  let inputs =
+    List.filter_map
+      (fun (task : Oracle_tasks.task) ->
+         let exchange = task.Oracle_tasks.exchange in
+         let symbol = task.Oracle_tasks.symbol in
+         match
+           List.find_opt
+             (fun (a : analysis) -> a.exchange = exchange && a.symbol = symbol)
+             analyses
+         with
+         | None -> None
+         | Some a ->
+           let q_min = D.sizing_floor ~cfg:a.grid in
+           let cost_one = G.cost_at (G.set_parameter a.grid a.hi) ~qty:q_min ~n_fills:1 in
+           let committed = committed_buy_value ~exchange ~symbol in
+           (* Any asset holding committed buy capital is eligible to be
+              reclaimed - committed capital always flows toward the
+              highest-priority asset that needs it; the reclamation plan's
+              conservation objective (fewest cancellations, lowest priority
+              first) keeps disruption minimal. *)
+           Some
+             { Oracle_reclaim.symbol
+             ; first_buy_cost = cost_one
+             ; committed_value = committed
+             })
+      account_tasks
+  in
+  Oracle_reclaim.plan ~pool inputs
+;;
+
+(** Patch an account's decisions with the reclamation plan: a reclaimed asset
+    is published INACTIVE-with-reclaim so its domain cancels its resting buy
+    and the capital returns to the pool for the higher-priority target.
+    [remainder] is left untouched - both the committed-running and the
+    inactive deployments already pass the whole pool down, so the sequential
+    pass-down is unchanged. Idempotent and applied fresh each pass (on top of
+    the cached, unpatched decisions). *)
+let apply_reclaim ~(plan : (string * string) list) (ds : decision list) : decision list =
+  List.map
+    (fun (d : decision) ->
+       match List.assoc_opt d.symbol plan with
+       | None -> d
+       | Some target ->
+         { d with
+           active = false
+         ; reason = Printf.sprintf "capital reallocated to %s (higher priority)" target
+         ; reclaim_capital = true
+         ; reclaim_target = target
+         ; deployed = 0.0
+         })
+    ds
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -2317,6 +2437,14 @@ let run_pass
           | [] -> []
           | x :: rest -> x :: take (n - 1) rest)
       in
+      let rec drop n l =
+        if n <= 0
+        then l
+        else (
+          match l with
+          | [] -> []
+          | _ :: rest -> drop (n - 1) rest)
+      in
       Lwt_list.iter_s
         (fun (account, account_tasks) ->
            match Hashtbl.find_opt m.m_balances (account_id account) with
@@ -2326,6 +2454,24 @@ let run_pass
              Lwt.return_unit
            | Some (Some (pool, snapshot)) ->
              let analyses = analyses_for account in
+             (* Priority reclamation: which lower-priority resting buys to
+                cancel so an unfundable higher-priority asset can resume.
+                Computed fresh every pass (cheap) and applied on top of the
+                memoized decisions below, so a changed plan takes effect on
+                cache hits too (the plan is deliberately NOT part of the
+                sizing fingerprint - constant buy-amends must not bust it). *)
+             let reclaim = reclaim_plan ~pool account_tasks analyses in
+             if reclaim <> []
+             then
+               Logging.warn_f
+                 ~section
+                 "capital reclamation for %s: canceling %s to fund higher-priority \
+                  assets (pool $%.2f)"
+                 (account_id account)
+                 (String.concat
+                    ", "
+                    (List.map (fun (s, t) -> Printf.sprintf "%s for %s" s t) reclaim))
+                 pool;
              let fp =
                { af_analyses =
                    List.map
@@ -2363,8 +2509,9 @@ let run_pass
                        (fun () -> "sizing-reuse"))
                   prev_decisions;
                 Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
-                decisions := List.rev_append prev_decisions !decisions;
-                (match List.rev prev_decisions with
+                let patched = apply_reclaim ~plan:reclaim prev_decisions in
+                decisions := List.rev_append patched !decisions;
+                (match List.rev patched with
                  | last :: _ ->
                    Logging.debug_f
                      ~section
@@ -2380,10 +2527,13 @@ let run_pass
                 let before = List.length !decisions in
                 size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool analyses
                 >|= fun surplus ->
-                let account_decisions =
-                  take (List.length !decisions - before) !decisions |> List.rev
-                in
+                let n = List.length !decisions - before in
+                let account_decisions = take n !decisions |> List.rev in
                 Hashtbl.replace size_cache (account_id account) (fp, account_decisions);
+                (* Apply the reclaim plan: the account's decisions just came off
+                    the head of [!decisions]; swap them for the patched ones. *)
+                let patched = apply_reclaim ~plan:reclaim account_decisions in
+                decisions := List.rev_append patched (drop n !decisions);
                 Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
                 Logging.debug_f
                   ~section
@@ -2565,6 +2715,22 @@ let run_loop
           | Some c -> c
           | None -> "default"))
     tasks;
+  (* Priority reclamation is self-driving: a pass that publishes reclaim
+     decisions means the domains are canceling resting buys right now, which
+     releases capital back to the account pool. Re-run shortly (past the
+     min_trigger_gap, on a forced refresh) so the released capital is
+     recognized within seconds of the cancel - not on the next 30s poll. The
+     reclaim signature bounds the loop: it self-drives only when the reclaim
+     set CHANGED, so a reclaim that stalls (cancel stuck, no event) waits for
+     the domain's own [request_pass] / the poll cadence instead of spinning. *)
+  let last_reclaim_sig = ref "" in
+  let reclaim_signature () =
+    decisions ()
+    |> List.filter (fun (d : decision) -> d.reclaim_capital)
+    |> List.map (fun (d : decision) -> d.symbol ^ ">" ^ d.reclaim_target)
+    |> List.sort String.compare
+    |> String.concat ","
+  in
   let rec loop () =
     if Atomic.get shutdown_requested
     then Lwt.return_unit
@@ -2593,13 +2759,23 @@ let run_loop
          ([refresh_history_changed]): the wait captures both generations, so
          only NEW events wake it (bursts coalesce through [min_trigger_gap]
          and the 50ms slices). *)
+      let reclaim_now = reclaim_signature () in
+      let reclaim_cycle = reclaim_now <> "" && reclaim_now <> !last_reclaim_sig in
+      last_reclaim_sig := reclaim_now;
       let generation = Atomic.get pass_requested in
       let refresh_gen = Atomic.get refresh_generation in
       let deadline =
-        Unix.gettimeofday () +. jittered (next_sleep ~config ~decisions:(decisions ()))
+        if reclaim_cycle
+        then Unix.gettimeofday () +. 2.0
+        else
+          Unix.gettimeofday () +. jittered (next_sleep ~config ~decisions:(decisions ()))
       in
       wait_until ~deadline ~generation ~refresh_gen ()
       >>= fun () ->
+      (* A reclaim pass self-drives: fire the event trigger so BOTH loops wake
+         (past the min_trigger_gap) and the refresher publishes a fresh
+         balance for the follow-up pass. *)
+      if reclaim_cycle then request_pass () else ();
       (* An event-triggered wake (fill/order event) sizes against fresh
          balances: give the refresher (woken by the same event) a bounded
          window to publish its next cycle, then proceed regardless - the
