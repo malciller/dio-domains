@@ -1,7 +1,7 @@
 {
   "logging_level": "info",
   "logging_sections": "",
-  "logging_width": 120,
+  "logging_width": 175,
   "cycle_mod": 10000,
   "fng_check_threshold": 2.5,
   "gc": {

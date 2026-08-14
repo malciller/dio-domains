@@ -18,9 +18,11 @@
       instead of a repeated colored prefix, so each block reads as one unit
       of sub-details under its header rather than a pile of full lines.
     - Long lines are word-wrapped to the terminal width (auto-detected, or a
-      fixed `logging_width` override; default 120 when not a terminal), so
-      nothing overflows and the terminal never re-wraps mid-word. Wrapped
-      chunks stay under the same gutter.
+      fixed `logging_width` override). When the output is not a terminal
+      (pipes, `docker logs`) the width comes from the `COLUMNS` env var when
+      set, otherwise a generous default (200), so wrapped lines keep the ┆
+      gutter without being cramped at a narrow width. Wrapped chunks stay
+      under the same gutter.
     - With colors disabled the layout (and alignment) is preserved, without
       any ANSI escapes.
 
@@ -142,13 +144,20 @@ let enabled_sections = ref []
 let quiet_mode = ref false
 
 (* ---- Line width ----
-   [configured_width] overrides auto-detection (None = detect). Detection uses
-   [Notty_unix.winsize] on the output fd (notty is already a project
-   dependency), cached ~1s so terminal resizes are picked up without an ioctl
-   per line; non-terminals (pipes, docker logs) fall back to [default_width]. *)
-let default_width = 120
+   [configured_width] overrides everything (None = auto). In auto mode the
+   width is detected from the output fd via [Notty_unix.winsize] (notty is
+   already a project dependency), cached ~1s so terminal resizes are picked
+   up without an ioctl per line. When the output is not a terminal (pipes,
+   `docker logs`, files) we fall back to the `COLUMNS` env var when set, else
+   a generous [default_width] - wrapping still applies, just not cramped. *)
+
+let default_width = 200
 let configured_width : int option ref = ref None
-let width_cache : (float * int option) Atomic.t = Atomic.make (0.0, None)
+
+let width_cache : (float * Unix.file_descr * int option) Atomic.t =
+  Atomic.make (0.0, Unix.stdout, None)
+;;
+
 let width_ttl = 1.0
 
 let detect_terminal_width () =
@@ -161,23 +170,39 @@ let detect_terminal_width () =
   | _ -> None
 ;;
 
+(* Dynamic width hint for non-terminal output (e.g. `COLUMNS=200 app | less`).
+   Returns None when unset or malformed, so [default_width] applies. *)
+let env_width () =
+  match Sys.getenv_opt "COLUMNS" with
+  | Some s ->
+    (match int_of_string_opt s with
+     | Some n when n > 0 -> Some n
+     | _ -> None)
+  | None -> None
+;;
+
+(* Always Some in practice: [configured_width], a detected terminal, COLUMNS,
+   or [default_width]. Wrapping is always on. *)
 let current_width () =
   match !configured_width with
-  | Some w -> w
+  | Some w -> Some w
   | None ->
+    let fd = Unix.descr_of_out_channel !output_channel in
     let now = Unix.gettimeofday () in
-    let checked_at, cached = Atomic.get width_cache in
-    if now -. checked_at < width_ttl
-    then (
-      match cached with
-      | Some w -> w
-      | None -> default_width)
+    let checked_at, cached_fd, cached = Atomic.get width_cache in
+    if now -. checked_at < width_ttl && cached_fd = fd
+    then cached
     else (
-      let w = detect_terminal_width () in
-      Atomic.set width_cache (now, w);
-      match w with
-      | Some w -> w
-      | None -> default_width)
+      let w =
+        match detect_terminal_width () with
+        | Some _ as w -> w
+        | None ->
+          (match env_width () with
+           | Some _ as w -> w
+           | None -> Some default_width)
+      in
+      Atomic.set width_cache (now, fd, w);
+      w)
 ;;
 
 let set_width width = configured_width := width
@@ -323,24 +348,29 @@ let gutter_glyph = "┆"
    header; every following line is a detail/gutter line. Caller-embedded
    leading whitespace on continuation lines is stripped - the gutter replaces
    the manual indent callers used to hard-code. Each line is word-wrapped to
-   fit the terminal width; the header gets [width - prefix], continuation
-   lines a touch less (the gutter takes two columns). *)
+   fit the terminal width ([width] = None leaves lines unwrapped); the header
+   gets [width - prefix], continuation lines a touch less (the gutter takes
+   two columns). *)
 let render_message ~prefix_len ~width message =
-  let avail = max 16 (width - prefix_len - 1) in
-  let avail_cont = max 16 (width - prefix_len - 3) in
   let lines = String.split_on_char '\n' message in
   let head, rest =
     match lines with
     | [] -> "", []
     | h :: t -> h, t
   in
-  let head_lines = String.split_on_char '\n' (wrap_text ~width:avail head) in
+  let avail = Option.map (fun w -> max 16 (w - prefix_len - 1)) width in
+  let avail_cont = Option.map (fun w -> max 16 (w - prefix_len - 3)) width in
+  let wrap avail text =
+    match avail with
+    | None -> text
+    | Some a -> wrap_text ~width:a text
+  in
+  let head_lines = String.split_on_char '\n' (wrap avail head) in
   let cont_lines =
     rest
     |> List.map String.trim
     |> List.filter (( <> ) "")
-    |> List.concat_map (fun line ->
-      String.split_on_char '\n' (wrap_text ~width:avail_cont line))
+    |> List.concat_map (fun line -> String.split_on_char '\n' (wrap avail_cont line))
   in
   head_lines @ cont_lines
 ;;
