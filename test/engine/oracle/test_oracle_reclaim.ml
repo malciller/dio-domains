@@ -6,22 +6,31 @@
 
 open Alcotest
 
-let inp ~symbol ~cost ~committed =
-  { Dio_oracle.Oracle_reclaim.symbol; first_buy_cost = cost; committed_value = committed }
+let inp_full ~symbol ~cost ~committed ~pool ~capital_blocked =
+  { Dio_oracle.Oracle_reclaim.symbol
+  ; first_buy_cost = cost
+  ; committed_value = committed
+  ; pool
+  ; capital_blocked
+  }
 ;;
 
-let plan ~pool assets = Dio_oracle.Oracle_reclaim.plan ~pool assets
+let inp ~symbol ~cost ~committed ~pool =
+  inp_full ~symbol ~cost ~committed ~pool ~capital_blocked:true
+;;
+
+let plan assets = Dio_oracle.Oracle_reclaim.plan assets
 
 (* The user scenario: BTC/USDC (priority 1) filled and cannot fund a
    replacement from the pool; HYPE/USDC (priority 2) holds committed capital
    that - combined with the pool - funds BTC's first buy. *)
 let test_example_reclaims_lower_priority () =
   let assets =
-    [ inp ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
-    ; inp ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:19.73
+    [ inp ~pool:14.14 ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
+    ; inp ~pool:14.14 ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:19.73
     ]
   in
-  let p = plan ~pool:14.14 assets in
+  let p = plan assets in
   check
     (list (pair string string))
     "reclaim HYPE to fund BTC"
@@ -33,48 +42,48 @@ let test_insufficient_capital_keeps_lower_active () =
   (* HYPE's committed capital + pool cannot fund BTC's first buy: no
      deallocation - the lower-priority asset stays active. *)
   let assets =
-    [ inp ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
-    ; inp ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:10.0
+    [ inp ~pool:14.14 ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
+    ; inp ~pool:14.14 ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:10.0
     ]
   in
-  check (list (pair string string)) "no reclaim" [] (plan ~pool:14.14 assets)
+  check (list (pair string string)) "no reclaim" [] (plan assets)
 ;;
 
 let test_boundary_just_enough () =
   (* HYPE committed exactly closes the gap (with the 1e-9 tolerance). *)
   let gap = 31.54 -. 14.14 in
   let assets =
-    [ inp ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
-    ; inp ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:gap
+    [ inp ~pool:14.14 ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
+    ; inp ~pool:14.14 ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:gap
     ]
   in
   check
     (list (pair string string))
     "boundary committed capital reclaims"
     [ "HYPE/USDC", "BTC/USDC" ]
-    (plan ~pool:14.14 assets)
+    (plan assets)
 ;;
 
 let test_no_targets () =
   (* The pool already funds the priority asset's first buy: nothing to
      reclaim. *)
   let assets =
-    [ inp ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
-    ; inp ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:19.73
+    [ inp ~pool:40.0 ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
+    ; inp ~pool:40.0 ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:19.73
     ]
   in
-  check (list (pair string string)) "no reclaim when funded" [] (plan ~pool:40.0 assets)
+  check (list (pair string string)) "no reclaim when funded" [] (plan assets)
 ;;
 
 let test_target_with_committed_buy_not_a_target () =
   (* An asset holding its own committed buy is never a target (its first buy
      is already funded). *)
   let assets =
-    [ inp ~symbol:"BTC/USDC" ~cost:31.54 ~committed:5.0
-    ; inp ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:0.0
+    [ inp ~pool:10.0 ~symbol:"BTC/USDC" ~cost:31.54 ~committed:5.0
+    ; inp ~pool:10.0 ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:0.0
     ]
   in
-  check (list (pair string string)) "no reclaim" [] (plan ~pool:10.0 assets)
+  check (list (pair string string)) "no reclaim" [] (plan assets)
 ;;
 
 let test_min_cardinality_tie_breaks_lowest_priority () =
@@ -83,17 +92,17 @@ let test_min_cardinality_tie_breaks_lowest_priority () =
      and among 1-element sets the LOWEST priority (C, the one farther down
      the priority order). *)
   let assets =
-    [ inp ~symbol:"A" ~cost:30.0 ~committed:0.0
-    ; inp ~symbol:"B" ~cost:1.0 ~committed:25.0
-    ; inp ~symbol:"C" ~cost:1.0 ~committed:20.0
-    ; inp ~symbol:"D" ~cost:1.0 ~committed:15.0
+    [ inp ~pool:10.0 ~symbol:"A" ~cost:30.0 ~committed:0.0
+    ; inp ~pool:10.0 ~symbol:"B" ~cost:1.0 ~committed:25.0
+    ; inp ~pool:10.0 ~symbol:"C" ~cost:1.0 ~committed:20.0
+    ; inp ~pool:10.0 ~symbol:"D" ~cost:1.0 ~committed:15.0
     ]
   in
   check
     (list (pair string string))
     "cancel C for A (fewest, then lowest priority)"
     [ "C", "A" ]
-    (plan ~pool:10.0 assets)
+    (plan assets)
 ;;
 
 let test_multi_asset_cumulative () =
@@ -101,12 +110,12 @@ let test_multi_asset_cumulative () =
      alone covers, together they do. The plan cancels both (fewest covering
      set of size 2). *)
   let assets =
-    [ inp ~symbol:"A" ~cost:50.0 ~committed:0.0
-    ; inp ~symbol:"B" ~cost:1.0 ~committed:25.0
-    ; inp ~symbol:"C" ~cost:1.0 ~committed:20.0
+    [ inp ~pool:10.0 ~symbol:"A" ~cost:50.0 ~committed:0.0
+    ; inp ~pool:10.0 ~symbol:"B" ~cost:1.0 ~committed:25.0
+    ; inp ~pool:10.0 ~symbol:"C" ~cost:1.0 ~committed:20.0
     ]
   in
-  let p = plan ~pool:10.0 assets in
+  let p = plan assets in
   check bool "reclaims B" true (List.mem ("B", "A") p);
   check bool "reclaims C" true (List.mem ("C", "A") p);
   check int "exactly two reclaimed" 2 (List.length p)
@@ -118,15 +127,15 @@ let test_any_committed_lower_asset_reclaimed () =
      fully-funded running lower grid is not exempt (committed capital always
      flows toward the highest-priority asset that needs it). *)
   let assets =
-    [ inp ~symbol:"A" ~cost:50.0 ~committed:0.0
-    ; inp ~symbol:"B" ~cost:1.0 ~committed:100.0
+    [ inp ~pool:10.0 ~symbol:"A" ~cost:50.0 ~committed:0.0
+    ; inp ~pool:10.0 ~symbol:"B" ~cost:1.0 ~committed:100.0
     ]
   in
   check
     (list (pair string string))
     "fully-funded committed asset reclaimed"
     [ "B", "A" ]
-    (plan ~pool:10.0 assets)
+    (plan assets)
 ;;
 
 let test_multi_target_sequential_release () =
@@ -135,16 +144,60 @@ let test_multi_target_sequential_release () =
      reclaimed for B - released capital funds the highest priority target it
      actually covers. *)
   let assets =
-    [ inp ~symbol:"A" ~cost:50.0 ~committed:0.0
-    ; inp ~symbol:"B" ~cost:30.0 ~committed:0.0
-    ; inp ~symbol:"C" ~cost:1.0 ~committed:30.0
+    [ inp ~pool:10.0 ~symbol:"A" ~cost:50.0 ~committed:0.0
+    ; inp ~pool:10.0 ~symbol:"B" ~cost:30.0 ~committed:0.0
+    ; inp ~pool:10.0 ~symbol:"C" ~cost:1.0 ~committed:30.0
+    ]
+  in
+  check (list (pair string string)) "C reclaimed for B only" [ "C", "B" ] (plan assets)
+;;
+
+let test_pass_down_budget_targets_starved_asset () =
+  (* The reclaim gate uses each asset's PASS-DOWN budget, not the raw account
+     pool. Priority A is fully funded and consumes $40 of the $100 pool, so B
+     (priority 2) is sized against $60 and cannot fund its $70 first buy -
+     even though the raw pool ($100) reads above it. C (priority 3) holds
+     committed capital, so B must be reclaimed: without the pass-down budget
+     the old plan saw no target and B stayed parked while lower-priority C
+     kept trading. *)
+  let assets =
+    [ inp ~pool:100.0 ~symbol:"A" ~cost:40.0 ~committed:0.0
+    ; inp ~pool:60.0 ~symbol:"B" ~cost:70.0 ~committed:0.0
+    ; inp ~pool:60.0 ~symbol:"C" ~cost:1.0 ~committed:50.0
     ]
   in
   check
     (list (pair string string))
-    "C reclaimed for B only"
+    "C reclaimed to fund B's pass-down shortfall"
     [ "C", "B" ]
-    (plan ~pool:10.0 assets)
+    (plan assets)
+;;
+
+let test_non_capital_blocked_target_excluded () =
+  (* An asset INACTIVE for non-capital reasons (no usable history, D_surv
+     below the active floor) is never a target: reclaiming lower-priority
+     committed capital for it would cancel a running ladder for nothing. *)
+  let assets =
+    [ inp_full ~pool:10.0 ~capital_blocked:false ~symbol:"A" ~cost:50.0 ~committed:0.0
+    ; inp ~pool:10.0 ~symbol:"B" ~cost:1.0 ~committed:40.0
+    ]
+  in
+  check (list (pair string string)) "no reclaim for non-capital-blocked" [] (plan assets)
+;;
+
+let test_greedy_fallback_large_account () =
+  (* A candidate set at/above the exact-enumeration bound uses the greedy
+     fallback (largest committed values first) - it must still find a
+     covering and never silently no-op. 21 lower assets of $10 each cover a
+     $100 gap with exactly 10 of them. *)
+  let target = inp ~pool:0.0 ~symbol:"A" ~cost:100.0 ~committed:0.0 in
+  let lowers =
+    List.init 21 (fun i ->
+      inp ~pool:0.0 ~symbol:(Printf.sprintf "L%02d" i) ~cost:1.0 ~committed:10.0)
+  in
+  let p = plan (target :: lowers) in
+  check int "greedy covers the gap with 10 picks" 10 (List.length p);
+  List.iter (fun (_, t) -> check string "every pick reclaims for A" "A" t) p
 ;;
 
 (* The full reclaim lifecycle, driven exactly as the engine drives it:
@@ -160,8 +213,8 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
   let pool = ref 14.14 in
   let hype_committed = ref 19.73 in
   let assets () =
-    [ inp ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
-    ; inp ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:!hype_committed
+    [ inp ~pool:!pool ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
+    ; inp ~pool:!pool ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:!hype_committed
     ]
   in
   let step ~now ~issued ~issued_at ~eligible ~any_buy =
@@ -174,7 +227,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
       ~any_buy
   in
   (* Pass 1: the plan targets HYPE for BTC. *)
-  let p1 = plan ~pool:!pool (assets ()) in
+  let p1 = plan (assets ()) in
   check
     (list (pair string string))
     "pass 1 reclaims HYPE for BTC"
@@ -189,7 +242,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
      = Dio_strategies.Suicide_grid.Reclaim_cancel 1);
   (* Pass 2: nothing changed (the failed cancel left the store intact), so
      the plan persists and the decision stays reclaim. *)
-  let p2 = plan ~pool:!pool (assets ()) in
+  let p2 = plan (assets ()) in
   check
     (list (pair string string))
     "pass 2 plan persists after failed cancel"
@@ -220,7 +273,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
      = Dio_strategies.Suicide_grid.Reclaim_rearm);
   (* Pass 3: the plan clears (BTC is funded from the pool) and the priority
      asset re-activates - the account is no longer stuck. *)
-  let p3 = plan ~pool:!pool (assets ()) in
+  let p3 = plan (assets ()) in
   check (list (pair string string)) "pass 3 plan clears" [] p3
 ;;
 
@@ -264,7 +317,7 @@ let test_apply_reclaim_patches () =
   let hype = make_decision ~symbol:"HYPE/USDC" ~active:true in
   let patched =
     Dio_oracle.Oracle_runtime.apply_reclaim
-      ~plan:[ "HYPE/USDC", "BTC/USDC" ]
+      ~plan:[ "hyperliquid", "HYPE/USDC", "BTC/USDC" ]
       [ btc; hype ]
   in
   (* The non-reclaimed asset is untouched. *)
@@ -284,13 +337,29 @@ let test_apply_reclaim_patches () =
   check (float 1e-9) "HYPE remainder kept" 14.14 h.remainder
 ;;
 
+let test_apply_reclaim_keyed_by_exchange () =
+  (* A plan entry for the same symbol on a different exchange must not patch
+     this account's decision (decisions are keyed by exchange+symbol; a plan
+     for one account must never cross-patch another account's same-named
+     asset). *)
+  let d = make_decision ~symbol:"HYPE/USDC" ~active:true in
+  let patched =
+    Dio_oracle.Oracle_runtime.apply_reclaim
+      ~plan:[ "kraken", "HYPE/USDC", "BTC/USDC" ]
+      [ d ]
+  in
+  let h = List.nth patched 0 in
+  check bool "foreign-exchange reclaim ignored" false h.reclaim_capital;
+  check bool "decision stays active" true h.active
+;;
+
 let test_apply_reclaim_idempotent_and_reversible () =
   (* Applied fresh each pass on top of the unpatched cached decisions: the
      plan is never baked into the cache, so a plan change reverses cleanly. *)
   let btc = make_decision ~symbol:"BTC/USDC" ~active:false in
   let hype = make_decision ~symbol:"HYPE/USDC" ~active:true in
   let with_plan plan = Dio_oracle.Oracle_runtime.apply_reclaim ~plan [ btc; hype ] in
-  let patched = with_plan [ "HYPE/USDC", "BTC/USDC" ] in
+  let patched = with_plan [ "hyperliquid", "HYPE/USDC", "BTC/USDC" ] in
   check bool "patched inactive" false (List.nth patched 1).active;
   check
     bool
@@ -342,12 +411,28 @@ let () =
             `Quick
             test_multi_target_sequential_release
         ; Alcotest.test_case
+            "pass-down budget targets a starved asset"
+            `Quick
+            test_pass_down_budget_targets_starved_asset
+        ; Alcotest.test_case
+            "non-capital-blocked asset is never a target"
+            `Quick
+            test_non_capital_blocked_target_excluded
+        ; Alcotest.test_case
+            "greedy fallback covers a large account"
+            `Quick
+            test_greedy_fallback_large_account
+        ; Alcotest.test_case
             "lifecycle retries a failed cancel and resolves"
             `Quick
             test_reclaim_lifecycle_retries_failed_cancel
         ] )
     ; ( "apply_reclaim"
       , [ Alcotest.test_case "patches the decision" `Quick test_apply_reclaim_patches
+        ; Alcotest.test_case
+            "keyed by exchange, foreign-account entries ignored"
+            `Quick
+            test_apply_reclaim_keyed_by_exchange
         ; Alcotest.test_case
             "idempotent and reversible"
             `Quick

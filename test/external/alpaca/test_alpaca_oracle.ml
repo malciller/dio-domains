@@ -45,8 +45,8 @@ let test_venue_contract () =
   let open Alpaca.Alpaca_oracle in
   Alcotest.(check string) "default quote USD" "USD" default_quote;
   Alcotest.(check (float 1e-9))
-    "not notional-constrained"
-    0.0
+    "dollar notional floor of $1 (fractional minimum order value)"
+    1.0
     (min_notional ~symbol:"QQQ")
 ;;
 

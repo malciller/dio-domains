@@ -180,9 +180,26 @@ let round_qty qty symbol exchange =
   floor (qty *. inv) /. inv
 ;;
 
+(** Venue minimum accepted order QUANTITY for [symbol] in base-asset units,
+    resolved from the live venue module (e.g. 0.0005 BTC on Hyperliquid spot;
+    0.0 = unknown). This is the exchange's minimum - the floor every order
+    must clear - entirely separate from the grid's configured order [qty]. *)
 let get_qty_min_val symbol exchange =
   match get_exchange_module exchange with
   | Some (module Ex : Exchange.S) -> Option.value (Ex.get_qty_min ~symbol) ~default:0.0
+  | None -> 0.0
+;;
+
+(** Venue default minimum order notional in quote terms for [symbol]
+    (0.0 = not constrained), resolved through the venue's oracle adapter
+    ([Exchange_intf.Oracle.S.min_notional] - Hyperliquid's 10 USDC spot
+    floor, Alpaca's $1 fractional minimum; others 0.0 here). Unregistered
+    venues are not notional-constrained. Same resolution the oracle's
+    [Grid_adapter] uses, so the live grid and the replay agree on the
+    floor. *)
+let get_min_notional_val symbol exchange =
+  match Exchange.Oracle.Registry.get exchange with
+  | Some (module V) -> V.min_notional ~symbol
   | None -> 0.0
 ;;
 
@@ -196,7 +213,7 @@ let venue_lot_qty grid_qty exchange state =
         let inv = 1.0 /. state.cached_qty_increment in
         floor (grid_qty *. inv) /. inv
       in
-      if q > 0.0 then q else state.cached_qty_min)
+      if q > 0.0 then q else state.cached_venue_min_qty)
   | "lighter" ->
     if grid_qty <= 0.0
     then 0.0
@@ -205,7 +222,7 @@ let venue_lot_qty grid_qty exchange state =
         let inv = 1.0 /. state.cached_qty_increment in
         floor (grid_qty *. inv) /. inv
       in
-      if q > 0.0 then q else state.cached_qty_min)
+      if q > 0.0 then q else state.cached_venue_min_qty)
   | _ -> grid_qty
 ;;
 

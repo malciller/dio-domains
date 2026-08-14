@@ -96,7 +96,11 @@ type strategy_state =
   ; mutable resuming_after_balance_flag : bool
     (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   ; mutable just_filled_buy : bool
-    (* true when a buy order has filled; bypasses recovery gate on sell placement *)
+    (* true when a buy order has filled; the sell for the completed buy is
+       owed (retry-until-placed) until it is actually placed or verified
+       nothing-to-sell. Also armed on a buy placement whose sell could not be
+       placed, so the non-accrued inventory is sold as soon as the transient
+       blocker clears. *)
   ; mutable force_buy_reanchor : bool
     (* true when the sizing source (capital oracle) published a changed
        qty/grid_interval: the buy-trailing leg then re-anchors the resting
@@ -146,7 +150,17 @@ type strategy_state =
   ; mutable cached_round_price : float -> float
   ; mutable cached_price_increment : float
   ; mutable cached_qty_increment : float
-  ; mutable cached_qty_min : float
+  ; mutable cached_venue_min_qty : float
+    (* Venue MINIMUM accepted order quantity for [symbol] in base-asset units
+       (e.g. 0.0005 BTC on Hyperliquid). The floor every sell must clear. This
+       is the exchange's minimum - entirely separate from the grid's configured
+       order [qty]. Resolved from the live venue module at strategy init. *)
+  ; mutable cached_venue_min_notional : float
+    (* Venue MINIMUM accepted order notional in QUOTE terms (0.0 = not
+       constrained). Some venues (Alpaca) express their minimum as an order
+       VALUE in the quote currency ($1 fractional minimum; Hyperliquid's 10
+       USDC spot floor); resolved from the venue's oracle adapter at strategy
+       init. Gates sell placement alongside [cached_venue_min_qty]. *)
   ; mutable exchange_reserved_atomic : float Atomic.t option
   ; processed_fills : (string, unit) Hashtbl.t
   ; processed_fills_queue : string Queue.t
@@ -250,7 +264,8 @@ let rec get_strategy_state asset_symbol =
       ; cached_round_price = Float.round
       ; cached_price_increment = 0.01
       ; cached_qty_increment = 0.01
-      ; cached_qty_min = 1.0
+      ; cached_venue_min_qty = 1.0
+      ; cached_venue_min_notional = 0.0
       ; exchange_reserved_atomic = None
       ; processed_fills = Hashtbl.create 1024
       ; processed_fills_queue = Queue.create ()

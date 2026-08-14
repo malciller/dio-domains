@@ -218,6 +218,92 @@ let test_userref_generation () =
     (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 2)
 ;;
 
+let test_blocked_placement_sell_retries () =
+  (* A buy is placed (buy_attempted = true) but the placement-tick sell
+     attempt is blocked by a transient gate (sell cooldown). The sell for the
+     non-accrued inventory must stay OWED and be placed on a later tick even
+     though no further buy placement happens (buy_attempted = false) and no
+     buy filled - the startup case (BTC/USDC: free 0.00112536, reserved
+     0.0006248, sellable 0.00050056 > venue min 0.0005). *)
+  let symbol = "PLACE_RETRY/BTC/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.5;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.01;
+  state.reserved_base <- 0.5;
+  state.accumulated_profit <- 1.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- Some 62369.0;
+  state.last_buy_fill_qty <- Some 0.5;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.5"
+    ; grid_interval = 0.75
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  let run_leg buy_attempted =
+    Dio_strategies.Suicide_grid.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:62369.0
+      ~ask_price:62370.0
+      ~asset_balance:1.00112
+      ~buy_attempted
+      ~ecfg
+      ~locked_in_sells:0.0
+  in
+  (* Tick 1: a buy was placed this tick; the sell is on cooldown, so the
+     attempt is blocked - the sell must stay owed. *)
+  Hashtbl.replace state.amend_cooldowns "place_Sell" (Unix.gettimeofday () +. 10.0);
+  run_leg true;
+  check
+    bool
+    "no sell pushed while on cooldown"
+    true
+    (Dio_strategies.Suicide_grid.get_pending_orders 100 = []);
+  check
+    bool
+    "placement-triggered sell stays owed (latch armed)"
+    true
+    state.just_filled_buy;
+  (* Tick 2: cooldown expired; no buy placement, no fill, but the owed sell
+     retries and is placed. *)
+  Hashtbl.remove state.amend_cooldowns "place_Sell";
+  run_leg false;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let found =
+    List.exists
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  check bool "owed sell placed on retry (no buy placement or fill needed)" true found;
+  check bool "latch cleared after the sell is placed" false state.just_filled_buy
+;;
+
 let test_balance_checking () =
   (* Test balance checking logic *)
   check
@@ -961,6 +1047,7 @@ let test_halted_path_still_places_sell () =
   state.grid_qty <- 0.35;
   state.maker_fee <- 0.0004;
   state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.01;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
   state.open_sell_orders <- [];
@@ -1012,6 +1099,492 @@ let test_halted_path_still_places_sell () =
       pushed
   in
   check bool "halted path still places the sell for a just-filled buy" true found
+;;
+
+let test_sell_ack_releases_inflight_latch () =
+  (* A sell placement's in-flight marker must be released on ACK (not left
+     latched while the sell rests on the book): has_active_sell then means "a
+     sell placement is in flight" only, so a resting sell no longer gates the
+     next sell for new inventory behind a buy fill. *)
+  let symbol = "LATCH_TEST/USD" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.grid_qty <- 1.0;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.01;
+  state.cached_venue_min_notional <- 0.0;
+  (* A sell placement is in flight (dispatch added the key). *)
+  check
+    bool
+    "duplicate key added by dispatch"
+    true
+    (Dio_strategies.Strategy_common.InFlightOrders.add_in_flight_order
+       state.duplicate_key_sell);
+  check
+    bool
+    "has_active_sell true while the placement is in flight"
+    true
+    (Dio_strategies.Suicide_grid.has_active_sell state);
+  (* The placement acks: the key must be released. *)
+  Dio_strategies.Suicide_grid.Strategy.handle_order_acknowledged
+    ~now:100.0
+    symbol
+    "sell1"
+    Dio_strategies.Strategy_common.Sell
+    100.0;
+  check
+    bool
+    "duplicate key released on ack"
+    false
+    (Dio_strategies.Strategy_common.InFlightOrders.is_in_flight state.duplicate_key_sell);
+  check
+    bool
+    "has_active_sell false while a sell rests on the book"
+    false
+    (Dio_strategies.Suicide_grid.has_active_sell state);
+  (* A new buy fills while the first sell still rests: the sell for the new
+     inventory must be placed (1-buy x multi-sell ladder) - no longer gated
+     behind a buy fill clearing a stale latch. *)
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 99.0;
+  state.last_buy_fill_qty <- Some 1.0;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* The resting sell locks its inventory: pass its qty as locked_in_sells so
+     the new sell only consumes the new fill's inventory. *)
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:2.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:1.0;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let found =
+    List.exists
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  check
+    bool
+    "second sell placed while the first sell rests (multi-sell ladder)"
+    true
+    found;
+  check
+    bool
+    "just_filled_buy cleared after the sell is placed"
+    false
+    state.just_filled_buy
+;;
+
+let test_sell_retry_until_placed () =
+  (* A buy fills but the sell attempt is blocked by a transient gate (sell
+     cooldown after a rejection). The one-shot just_filled_buy trigger must
+     NOT be consumed: the leg retries the next tick and places the sell even
+     though no replacement buy was placed (capital exhausted / oracle-halted:
+     buy_attempted = false). *)
+  let symbol = "RETRY_TEST/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.35;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.01;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 39.50;
+  state.last_buy_fill_qty <- Some 0.35;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.35"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  let run_leg () =
+    Dio_strategies.Suicide_grid.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:39.50
+      ~ask_price:39.55
+      ~asset_balance:0.5
+      ~buy_attempted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+  in
+  (* Tick 1: the sell is on cooldown (a recent rejection latched it). *)
+  Hashtbl.replace state.amend_cooldowns "place_Sell" (Unix.gettimeofday () +. 10.0);
+  run_leg ();
+  check
+    bool
+    "no sell pushed while on cooldown"
+    true
+    (Dio_strategies.Suicide_grid.get_pending_orders 100 = []);
+  check bool "just_filled_buy survives the blocked attempt" true state.just_filled_buy;
+  (* Tick 2: cooldown expired; the buy leg still cannot place a replacement
+     (buy_attempted = false), but the sell must go out. *)
+  Hashtbl.remove state.amend_cooldowns "place_Sell";
+  run_leg ();
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let found =
+    List.exists
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  check
+    bool
+    "retried sell placed with buy_attempted=false (no replacement buy)"
+    true
+    found;
+  check
+    bool
+    "just_filled_buy cleared after the sell is placed"
+    false
+    state.just_filled_buy
+;;
+
+let test_accumulation_sells_non_accrued_inventory () =
+  (* Accumulation venues (Hyperliquid/Lighter/IBKR): the sell is sized PURELY
+     by the non-accrued inventory = available balance - reserved_base. The
+     venue's tradeable balance already nets the base held by resting sells
+     (Hyperliquid reports total - hold), so locked_in_sells must NOT be
+     subtracted again - subtracting it double-counted the resting-sell hold
+     and understated the inventory below the floor, which blocked the sell for
+     the startup case (BTC: free 0.00112536, reserved 0.0006248, sellable
+     0.00050056 > venue min 0.0005). *)
+  let symbol = "FLOOR_FALLBACK/BTC/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.5;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.01;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.5;
+  state.accumulated_profit <- 2.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 62369.0;
+  state.last_buy_fill_qty <- Some 0.5;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.5"
+    ; grid_interval = 0.75
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* A resting sell of 0.4 locks inventory; the venue's tradeable balance
+     (1.00112) already nets it, so the sellable must NOT be reduced by locked
+     again: sellable = 1.00112 - 0.5 = 0.50112 -> round 0.50 is pushed, not
+     the double-counted 0.10. *)
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:62369.0
+    ~ask_price:62370.0
+    ~asset_balance:1.00112
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.4;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let sell =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  (match sell with
+   | Some o ->
+     check
+       (float 1e-8)
+       "non-accrued inventory sold, resting-sell hold not double-counted"
+       0.5
+       o.qty
+   | None -> failwith "expected the non-accrued sell to be pushed");
+  check
+    bool
+    "reserved_base untouched (accrual never sold)"
+    true
+    (abs_float (state.reserved_base -. 0.5) < 1e-9);
+  check
+    bool
+    "just_filled_buy cleared after the sell is placed"
+    false
+    state.just_filled_buy
+;;
+
+let test_nothing_placeable_clears_latch () =
+  (* When the known balance holds no sellable inventory above the venue floor,
+     the leg verifies nothing can be sold and clears the latch - a later fill
+     re-arms it. No phantom order is pushed. *)
+  let symbol = "NOTHING_PLACEABLE/BTC/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:5;
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.0005;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.0005;
+  state.cached_venue_min_notional <- 10.0;
+  (* Balance is below the reserved accrual: no sellable inventory. *)
+  state.reserved_base <- 0.0006248;
+  state.accumulated_profit <- 2.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 62369.0;
+  state.last_buy_fill_qty <- Some 0.0005;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.0005"
+    ; grid_interval = 0.75
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:62369.0
+    ~ask_price:62370.0
+    ~asset_balance:0.0003
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0;
+  check
+    bool
+    "no sell pushed with no sellable inventory"
+    true
+    (Dio_strategies.Suicide_grid.get_pending_orders 100 = []);
+  check
+    bool
+    "just_filled_buy cleared (verified nothing placeable)"
+    false
+    state.just_filled_buy
+;;
+
+let test_kraken_partial_sell_clamp () =
+  (* Kraken (sell_mult, reserved-base guard): when available < sell_qty, the
+     leg sells the non-accrued inventory that actually exists (lot-rounded
+     down) instead of blocking the whole sell - "sell what inventory is not
+     accrued", freeing capital and keeping the ladder running. *)
+  let symbol = "KRAKEN_CLAMP/USD" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.grid_qty <- 1.0;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.01;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- 0.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 100.0;
+  state.last_buy_fill_qty <- Some 1.0;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:0.7
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let sell =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  match sell with
+  | Some o -> check (float 1e-8) "clamped to available (non-accrued inventory)" 0.7 o.qty
+  | None -> failwith "expected the clamped sell to be pushed"
+;;
+
+let test_alpaca_dollar_floor_gate () =
+  (* Alpaca's venue floor is a DOLLAR notional: a sell is only attempted when
+     the non-accrued inventory is worth at least the floor ($1). Below the
+     floor the leg withholds the order and keeps the latch (the gate re-checks
+     every tick); at/above it the sell is placed. *)
+  let symbol = "ALPACA_FLOOR/USD" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.grid_qty <- 0.25;
+  state.cached_sell_mult <- 1.0;
+  state.cached_venue_min_qty <- 0.000000001;
+  state.cached_venue_min_notional <- 1.0;
+  state.reserved_base <- 0.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 142.0;
+  state.last_buy_fill_qty <- Some 0.25;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "alpaca"
+    ; symbol
+    ; qty = "0.25"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* Below the dollar floor: 0.005 shares x 142 = 0.71 < $1. *)
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:142.0
+    ~ask_price:142.1
+    ~asset_balance:0.005
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0;
+  check
+    bool
+    "no sell below the dollar floor"
+    true
+    (Dio_strategies.Suicide_grid.get_pending_orders 100 = []);
+  (* At/above the floor: 0.5 shares x 142 = $71 >= $1. *)
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:142.0
+    ~ask_price:142.1
+    ~asset_balance:0.5
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let found =
+    List.exists
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  check bool "sell placed above the dollar floor" true found
 ;;
 
 let test_new_buy_respects_2x_gi_closest_sell () =
@@ -1563,6 +2136,34 @@ let () =
             "halted path still places the sell for a just-filled buy"
             `Quick
             test_halted_path_still_places_sell
+        ; test_case
+            "sell ack releases the in-flight latch (multi-sell ladder)"
+            `Quick
+            test_sell_ack_releases_inflight_latch
+        ; test_case
+            "blocked sell retries until placed (no replacement buy needed)"
+            `Quick
+            test_sell_retry_until_placed
+        ; test_case
+            "blocked placement-triggered sell retries on the next tick"
+            `Quick
+            test_blocked_placement_sell_retries
+        ; test_case
+            "accumulation sells non-accrued inventory (no locked double-count)"
+            `Quick
+            test_accumulation_sells_non_accrued_inventory
+        ; test_case
+            "nothing placeable clears the latch"
+            `Quick
+            test_nothing_placeable_clears_latch
+        ; test_case
+            "kraken partial inventory sells the clamp"
+            `Quick
+            test_kraken_partial_sell_clamp
+        ; test_case
+            "alpaca dollar notional floor gate"
+            `Quick
+            test_alpaca_dollar_floor_gate
         ; test_case
             "new buy respects the 2x gi closest-sell cap"
             `Quick
