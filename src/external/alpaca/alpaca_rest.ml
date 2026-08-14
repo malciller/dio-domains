@@ -706,12 +706,23 @@ let get_snapshot ~symbol () =
       Lwt.return
         (Error (Printf.sprintf "HTTP %d getting %s snapshot" status_code feed_name))
   in
-  let is_reg = Alpaca_market_hours.is_regular_market_open () in
+  let is_overnight = Alpaca_market_hours.is_overnight_hours () in
   let primary_feed = !Config.data_feed in
   Lwt.catch
     (fun () ->
-       if is_reg
-       then fetch primary_feed
+       (* Try the session-appropriate feed first: the derived overnight feed
+          during overnight hours (the iex/sip snapshot carries no overnight
+          data), the configured primary otherwise. Fall back to the other feed
+          on failure so a subscription mismatch never leaves the poll empty. *)
+       if is_overnight
+       then
+         fetch "overnight"
+         >>= function
+         | Ok res -> Lwt.return (Ok res)
+         | Error _ ->
+           if primary_feed <> "overnight"
+           then fetch primary_feed
+           else Lwt.return (Error "Overnight snapshot failed")
        else
          fetch primary_feed
          >>= function

@@ -9,3 +9,7 @@
 (test
  (name test_alpaca_oracle)
  (libraries dio.alpaca alcotest))
+
+(test
+ (name test_alpaca_orderbook)
+ (libraries dio.alpaca alcotest))
