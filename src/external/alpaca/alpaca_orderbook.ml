@@ -5,6 +5,12 @@ open Dio_exchange.Exchange_intf.Types
 
 let section = "alpaca_orderbook"
 
+(** A real quote older than this (arrival wall-clock) is considered stale:
+    the trade handler then falls back to single-price trade prints (clearly
+    labeled) until a fresh quote resumes. Matches the REST snapshot poll's
+    idle threshold. *)
+let stale_quote_seconds = 5.0
+
 type quote =
   { bid_price : float
   ; bid_size : float
@@ -33,6 +39,19 @@ module SymbolStore = struct
     ; ask_px : float
     ; ask_sz : float
     ; ts : float
+      (** Arrival wall-clock of the last update from ANY source (quote,
+            trade, nudge, fallback). Drives the REST snapshot poll's idle
+            detection. *)
+    ; quote_event_ts : float
+      (** Exchange event timestamp of the last REAL quote ("q" message), in
+            epoch seconds; [0.0] when no real quote has arrived or its
+            timestamp was unparseable. Used to reject out-of-order trades (a
+            stale print from a previous session must never move a fresher
+            quote). *)
+    ; quote_wall_ts : float
+      (** Arrival wall-clock of the last REAL quote ("q" message or REST
+            snapshot). When this ages past [stale_quote_seconds] the trade
+            handler switches to its single-price fallback mode. *)
     ; valid : bool
     }
 
@@ -44,6 +63,10 @@ module SymbolStore = struct
     ; trades_capacity : int
     ; mutable write_pos : int
     ; mutable trades_write_pos : int
+    ; mutable fallback_engaged : bool
+      (** True while the trade-price fallback is publishing bid/ask from
+            trade prints (no fresh real quote for [stale_quote_seconds]).
+            Cleared on the next real quote. Guarded by [mutex]. *)
     ; tob : tob_cache Atomic.t
       (** Serializes full ring-buffer reads only (read_events / iter_events /
           get_recent_trades). The hot-path TOB/position reads are lock-free
@@ -76,19 +99,23 @@ module SymbolStore = struct
           ; ask_px = 0.0
           ; ask_sz = 0.0
           ; ts = 0.0
+          ; quote_event_ts = 0.0
+          ; quote_wall_ts = 0.0
           ; valid = false
           }
+    ; fallback_engaged = false
     ; mutex = Mutex.create ()
     }
   ;;
 
-  let push t (q : quote) =
+  let push_internal t (q : quote) ~is_quote ~event_ts ~fallback =
     let tob_cache =
       Mutex.lock t.mutex;
       let idx = t.write_pos mod t.capacity in
       t.buffer.(idx) <- q;
       t.write_pos <- t.write_pos + 1;
       let now = Unix.gettimeofday () in
+      let prev = Atomic.get t.tob in
       let cache =
         { pos = t.write_pos
         ; bid_px = q.bid_price
@@ -96,15 +123,37 @@ module SymbolStore = struct
         ; ask_px = q.ask_price
         ; ask_sz = q.ask_size
         ; ts = now
+        ; quote_event_ts =
+            (if is_quote && event_ts > 0.0 then event_ts else prev.quote_event_ts)
+        ; quote_wall_ts = (if is_quote then now else prev.quote_wall_ts)
         ; valid = q.bid_price > 0.0 || q.ask_price > 0.0
         }
       in
+      if is_quote
+      then t.fallback_engaged <- false
+      else if fallback
+      then t.fallback_engaged <- true;
       Mutex.unlock t.mutex;
       cache
     in
     Atomic.set t.tob tob_cache;
     Concurrency.Exchange_wakeup.signal_all ()
   ;;
+
+  (** Plain push from a non-quote source (a single-side trade nudge or a
+      seed): does NOT advance the real-quote bookkeeping, so it can never
+      mask a stale quote. *)
+  let push t q = push_internal t q ~is_quote:false ~event_ts:0.0 ~fallback:false
+
+  (** Push a REAL quote (WS "q" message or REST snapshot): records the
+      exchange event time and marks the quote feed fresh. *)
+  let push_quote t q ~event_ts =
+    push_internal t q ~is_quote:true ~event_ts ~fallback:false
+  ;;
+
+  (** Push the trade-price stale fallback (bid = ask = last trade): engages
+      the fallback flag so the next real quote can log the recovery. *)
+  let push_fallback t q = push_internal t q ~is_quote:false ~event_ts:0.0 ~fallback:true
 
   let push_trade t (tr : trade) =
     let now =
@@ -136,6 +185,20 @@ module SymbolStore = struct
   ;;
 
   let get_last_update_ts t = (Atomic.get t.tob).ts
+
+  (** Arrival wall-clock of the last REAL quote; [0.0] before any quote. *)
+  let get_last_quote_wall t = (Atomic.get t.tob).quote_wall_ts
+
+  (** Exchange event time of the last REAL quote; [0.0] when unknown. *)
+  let get_last_quote_event_ts t = (Atomic.get t.tob).quote_event_ts
+
+  (** True while the trade-price stale fallback is the active TOB source. *)
+  let get_fallback_engaged t =
+    Mutex.lock t.mutex;
+    let f = t.fallback_engaged in
+    Mutex.unlock t.mutex;
+    f
+  ;;
 
   let get_best_bid_ask t =
     let c = Atomic.get t.tob in
@@ -183,6 +246,45 @@ module SymbolStore = struct
     current_pos
   ;;
 end
+
+(** Pure book-update rule for a trade print against the current top-of-book.
+    A trade is evidence of price, never a two-sided quote, so it must not
+    fabricate a bid/ask from a fill. Returns [Some (b, b_s, a, a_s)] when the
+    book should be re-published and [None] when the trade leaves it
+    untouched:
+    - no book yet: seed a single price so the domain has something to size on
+      (a real quote replaces it as soon as one arrives);
+    - [quote_stale] (no real quote for [stale_quote_seconds]): the trade price
+      serves as a single-price fallback until the quote feed resumes;
+    - the trade crossed the ask (price > ask): lift the ask to the trade
+      price, leaving the bid untouched;
+    - the trade crossed the bid (price < bid): drop the bid to the trade
+      price, leaving the ask untouched;
+    - otherwise (print inside the current spread): the book is unchanged.
+    [trade_newer] rejects prints whose exchange event time is older than the
+    current quote's - an out-of-order/stale print from a previous session
+    must never move a fresher quote (this is what killed the book during the
+    pre-market -> regular transition). *)
+let update_tob_from_trade
+      ~quote_stale
+      ~trade_newer
+      (prev : (float * float * float * float) option)
+      ~(price : float)
+      ~(size : float)
+  : (float * float * float * float) option
+  =
+  match prev with
+  | None -> Some (price, size, price, size)
+  | Some (prev_bp, prev_bs, prev_ap, prev_as) when trade_newer ->
+    if quote_stale
+    then Some (price, size, price, size)
+    else if prev_ap > 0.0 && price > prev_ap
+    then Some (prev_bp, prev_bs, price, size)
+    else if prev_bp > 0.0 && price < prev_bp
+    then Some (price, size, prev_ap, prev_as)
+    else None
+  | Some _ -> None
+;;
 
 let stores : (string, SymbolStore.t) Hashtbl.t = Hashtbl.create 16
 let stores_mutex = Mutex.create ()
@@ -312,14 +414,25 @@ let handle_message_str content =
                in
                if final_bp > 0.0 || final_ap > 0.0
                then (
-                 SymbolStore.push
+                 let was_fallback = SymbolStore.get_fallback_engaged store in
+                 SymbolStore.push_quote
                    store
+                   ~event_ts:(Alpaca_rest.parse_iso_timestamp ts_str)
                    { bid_price = final_bp
                    ; bid_size = final_bs
                    ; ask_price = final_ap
                    ; ask_size = final_as
                    ; timestamp = ts
                    };
+                 if was_fallback
+                 then
+                   Logging.info_f
+                     ~section
+                     "[%s] Real quote resumed after stale-price fallback: bid %.2f, ask \
+                      %.2f"
+                     symbol
+                     final_bp
+                     final_ap;
                  Logging.debug_f
                    ~section
                    "[%s] Quote update: bid %.2f (sz %.2f), ask %.2f (sz %.2f)"
@@ -354,42 +467,66 @@ let handle_message_str content =
                SymbolStore.push_trade
                  store
                  { price; size; timestamp = ts; side = side_str };
-               let is_non_regular = not (Alpaca_market_hours.is_regular_market_open ()) in
-               let b_p, b_s, a_p, a_s =
-                 match SymbolStore.get_best_bid_ask store with
-                 | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
-                   if is_non_regular
-                   then
-                     if
-                       prev_bp > 0.0
-                       && prev_ap > 0.0
-                       && prev_bp <= price
-                       && price <= prev_ap
-                     then prev_bp, prev_bs, prev_ap, prev_as
-                     else price, size, price, size
-                   else if
-                     abs_float (prev_bp -. price) > price *. 0.005
-                     || prev_bp <= 0.0
-                     || prev_ap <= 0.0
-                   then price, size, price, size
-                   else prev_bp, prev_bs, prev_ap, prev_as
-                 | None -> price, size, price, size
+               (* The book update is session-agnostic and event-ordered: a
+                   real quote is always the truth; a trade only ever nudges a
+                   single crossed side, and only when it is not older than the
+                   current quote (out-of-order prints from a previous session
+                   are ignored). With no fresh quote for
+                   [stale_quote_seconds], trade prices stand in as a clearly
+                   labeled single-price fallback. *)
+               let quote_stale =
+                 Unix.gettimeofday () -. SymbolStore.get_last_quote_wall store
+                 >= stale_quote_seconds
                in
-               SymbolStore.push
-                 store
-                 { bid_price = b_p
-                 ; bid_size = b_s
-                 ; ask_price = a_p
-                 ; ask_size = a_s
-                 ; timestamp = ts
-                 };
+               let trade_event_ts = Alpaca_rest.parse_iso_timestamp ts_str in
+               let quote_event_ts = SymbolStore.get_last_quote_event_ts store in
+               let trade_newer =
+                 trade_event_ts = 0.0
+                 || quote_event_ts = 0.0
+                 || trade_event_ts >= quote_event_ts
+               in
+               let book_update =
+                 update_tob_from_trade
+                   ~quote_stale
+                   ~trade_newer
+                   (SymbolStore.get_best_bid_ask store)
+                   ~price
+                   ~size
+               in
+               (match book_update with
+                | Some (b_p, b_s, a_p, a_s) when quote_stale ->
+                  if not (SymbolStore.get_fallback_engaged store)
+                  then
+                    Logging.info_f
+                      ~section
+                      "[%s] No fresh quote in %.0fs - using trade prices as a \
+                       single-price fallback until the quote feed resumes"
+                      symbol
+                      stale_quote_seconds;
+                  SymbolStore.push_fallback
+                    store
+                    { bid_price = b_p
+                    ; bid_size = b_s
+                    ; ask_price = a_p
+                    ; ask_size = a_s
+                    ; timestamp = ts
+                    }
+                | Some (b_p, b_s, a_p, a_s) ->
+                  SymbolStore.push
+                    store
+                    { bid_price = b_p
+                    ; bid_size = b_s
+                    ; ask_price = a_p
+                    ; ask_size = a_s
+                    ; timestamp = ts
+                    }
+                | None -> ());
                Logging.debug_f
                  ~section
-                 "[%s] Live trade update: price %.2f (sz %.2f)%s"
+                 "[%s] Live trade update: price %.2f (sz %.2f)"
                  symbol
                  price
-                 size
-                 (if is_non_regular then " [after_hours]" else ""))
+                 size)
            | "b" ->
              let symbol =
                j |> member "S" |> to_string_option |> Option.value ~default:""
@@ -476,28 +613,41 @@ let rec poll_snapshots_loop () =
   Lwt_list.iter_p
     (fun sym ->
        let store = get_or_create_store sym in
-       let last_ts = SymbolStore.get_last_update_ts store in
-       if now -. last_ts >= 5.0
+       (* Gate on the last REAL quote, not any update: a stream of trade
+          nudges/fallbacks must not mask a missing quote feed - the REST
+          snapshot is a genuine quote source that should take over. *)
+       let last_quote_ts = SymbolStore.get_last_quote_wall store in
+       if now -. last_quote_ts >= stale_quote_seconds
        then (
          Alpaca_rest.get_snapshot ~symbol:sym ()
          >>= function
          | Ok (bp, bs, ap, as_val) ->
            if bp > 0.0 || ap > 0.0
            then (
-             SymbolStore.push
+             let was_fallback = SymbolStore.get_fallback_engaged store in
+             SymbolStore.push_quote
                store
+               ~event_ts:0.0
                { bid_price = bp
                ; bid_size = bs
                ; ask_price = ap
                ; ask_size = as_val
                ; timestamp = now
                };
+             if was_fallback
+             then
+               Logging.info_f
+                 ~section
+                 "[%s] Real quote resumed after stale-price fallback (REST snapshot): \
+                  bid %.2f, ask %.2f"
+                 sym
+                 bp
+                 ap;
              Logging.debug_f
                ~section
-               "[%s] Refreshed after-hours price via REST snapshot (idle %.1fs): bid \
-                %.2f, ask %.2f"
+               "[%s] Refreshed price via REST snapshot (idle %.1fs): bid %.2f, ask %.2f"
                sym
-               (now -. last_ts)
+               (now -. last_quote_ts)
                bp
                ap);
            Lwt.return_unit
@@ -529,8 +679,9 @@ let subscribe_symbols symbols =
            >|= function
            | Ok (bp, bs, ap, as_val) ->
              let store = get_or_create_store sym in
-             SymbolStore.push
+             SymbolStore.push_quote
                store
+               ~event_ts:0.0
                { bid_price = bp
                ; bid_size = bs
                ; ask_price = ap
@@ -550,11 +701,38 @@ let subscribe_symbols symbols =
   else Lwt.return_unit
 ;;
 
-let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
-  let url_str = Alpaca_types.Config.data_ws_url () in
+(** Session-appropriate market-data feed URL: the derived Alpaca overnight
+    feed during overnight hours (8:00 PM - 4:00 AM ET, when the regular v2
+    stream carries nothing), the configured iex/sip stream otherwise. *)
+let session_data_ws_url () =
+  if Alpaca_market_hours.is_overnight_hours ()
+  then Alpaca_types.Config.overnight_ws_url ()
+  else Alpaca_types.Config.data_ws_url ()
+;;
+
+(** Monotone incarnation counter for data connections: each [connect_and_monitor]
+    invocation captures the current value and bumps it, so a session-watcher
+    spawned by a superseded incarnation stops itself instead of acting on a
+    connection that is no longer current. *)
+let conn_generation = ref 0
+
+(** How often the data connection re-evaluates which session feed it should
+    be on (5s: keeps the pre-market/after-hours <-> overnight switch within a
+    few seconds of the boundary; during the gap the REST snapshot poll holds
+    the price). *)
+let session_watch_seconds = 5.0
+
+let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
+  let url_str = session_data_ws_url () in
+  let is_overnight_feed = Alpaca_market_hours.is_overnight_hours () in
+  let my_gen = !conn_generation + 1 in
+  conn_generation := my_gen;
   let uri = Uri.of_string url_str in
   let host = Uri.host uri |> Option.value ~default:"stream.data.alpaca.markets" in
   let port = Uri.port uri |> Option.value ~default:443 in
+  (* Set by the session watcher when the required feed changes; the catch
+     handler then reconnects internally instead of reporting a failure. *)
+  let session_switch = ref false in
   Lwt.catch
     (fun () ->
        Lwt_unix.getaddrinfo host (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
@@ -570,7 +748,11 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Websocket_lwt_unix.connect ~ctx client uri
        >>= fun conn ->
        active_conn := Some conn;
-       Logging.debug_f ~section "Connected to Alpaca Market Data WS at %s" url_str;
+       Logging.info_f
+         ~section
+         "Connected to Alpaca Market Data WS at %s (%s feed)"
+         url_str
+         (if is_overnight_feed then "overnight" else "regular");
        (* Send the WebSocket authentication request. *)
        let auth_msg =
          `Assoc
@@ -620,13 +802,51 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
             Lwt.return_unit)
          >>= fun () -> read_loop ()
        in
+       (* Seamless session switching: while this incarnation is current, watch
+          for the market session boundary. When the required feed changes
+          (regular/pre-market/after-hours <-> overnight) close the socket so
+          this read loop unwinds and the catch handler reconnects on the other
+          feed - the REST snapshot poll and the stale trade fallback hold the
+          price during the sub-second gap, so the domain never sees a hole. *)
+       let rec session_watcher () =
+         Lwt_unix.sleep session_watch_seconds
+         >>= fun () ->
+         if !conn_generation <> my_gen
+         then Lwt.return_unit
+         else (
+           match !active_conn with
+           | Some c when c == conn ->
+             let want_overnight = Alpaca_market_hours.is_overnight_hours () in
+             if want_overnight <> is_overnight_feed
+             then (
+               session_switch := true;
+               Logging.info_f
+                 ~section
+                 "Alpaca market session changed: switching to the %s feed"
+                 (if want_overnight
+                  then "overnight (v1beta1/overnight)"
+                  else "regular (v2/" ^ !Alpaca_types.Config.data_feed ^ ")");
+               Websocket_lwt_unix.close_transport conn >>= fun () -> Lwt.return_unit)
+             else session_watcher ()
+           | _ -> Lwt.return_unit)
+       in
+       Lwt.async session_watcher;
        read_loop ())
     (fun exn ->
        active_conn := None;
-       let err = Printexc.to_string exn in
-       Logging.error_f ~section "Alpaca data WS disconnected: %s" err;
-       on_failure err;
-       Lwt.return_unit)
+       if !session_switch
+       then (
+         (* Controlled switch: reconnect immediately on the other feed. *)
+         Logging.info_f
+           ~section
+           "Alpaca data WS reconnecting to the %s feed"
+           (if Alpaca_market_hours.is_overnight_hours () then "overnight" else "regular");
+         connect_and_monitor ~on_failure ~on_connected ~on_heartbeat)
+       else (
+         let err = Printexc.to_string exn in
+         Logging.error_f ~section "Alpaca data WS disconnected: %s" err;
+         on_failure err;
+         Lwt.return_unit))
 ;;
 
 (** Sends a protocol-level WebSocket Ping frame and waits for the matching

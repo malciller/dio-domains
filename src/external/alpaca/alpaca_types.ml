@@ -46,6 +46,13 @@ module Config = struct
   ;;
 
   let data_ws_url () = Printf.sprintf "wss://stream.data.alpaca.markets/v2/%s" !data_feed
+
+  (** The derived Alpaca overnight feed (8:00 PM - 4:00 AM ET sessions). The
+      regular v2 stream delivers nothing overnight, so the data connection
+      switches to this URL while [Alpaca_market_hours.is_overnight_hours ()]
+      is true. *)
+  let overnight_ws_url () = "wss://stream.data.alpaca.markets/v1beta1/overnight"
+
   let data_rest_url () = "https://data.alpaca.markets"
 end
 

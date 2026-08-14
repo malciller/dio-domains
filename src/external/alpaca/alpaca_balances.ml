@@ -75,26 +75,19 @@ let update_balances () =
            ~section
            "Alpaca loaded %d active position(s)"
            (List.length positions);
+       (* NOTE: the positions-API [current_price] is deliberately NOT written
+          into the orderbook TOB store anymore. It is an account-API mark from
+          a different reference than the market-data feeds, and pushing it
+          unconditionally raced the WS quote/trade writers (a lagging or
+          cross-session price clobbered a fresh quote, which was the trigger
+          for the pre-market -> regular amendment loop). Real-time prices come
+          from the session-aware WS feed (regular + overnight); when that feed
+          is quiet the REST snapshot poll in Alpaca_orderbook takes over, so
+          nothing is lost. *)
        List.iter
          (fun (p : Alpaca_types.position_record) ->
             Hashtbl.replace new_balances p.symbol p.qty;
             Hashtbl.replace new_total p.symbol p.qty;
-            if p.current_price > 0.0
-            then (
-              let store = Alpaca_orderbook.get_or_create_store p.symbol in
-              Alpaca_orderbook.SymbolStore.push
-                store
-                { bid_price = p.current_price
-                ; bid_size = 1.0
-                ; ask_price = p.current_price
-                ; ask_size = 1.0
-                ; timestamp = Unix.time ()
-                };
-              Logging.debug_f
-                ~section
-                "Updated [%s] price from Alpaca positions API: %.2f"
-                p.symbol
-                p.current_price);
             Logging.debug_f
               ~section
               "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, current_price=%.2f, \
