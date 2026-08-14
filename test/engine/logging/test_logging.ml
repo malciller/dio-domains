@@ -298,6 +298,35 @@ let test_format_line_wrap () =
   Logging.set_width None
 ;;
 
+(* Non-terminal output (docker logs, pipes) still wraps - the width comes
+   from the COLUMNS env var when set (a TTY has no width to report). *)
+let test_format_line_non_tty_wrap () =
+  Logging.set_colors false;
+  Logging.set_width None;
+  let prev_cols =
+    try Some (Sys.getenv "COLUMNS") with
+    | Not_found -> None
+  in
+  Unix.putenv "COLUMNS" "90";
+  let tmp = Filename.temp_file "dio_log_test" ".txt" in
+  let oc = open_out tmp in
+  Logging.set_output oc;
+  let msg = String.concat " " (List.init 30 (fun i -> Printf.sprintf "word%02d" i)) in
+  let line = Logging.format_line Logging.INFO "oracle_runtime" msg in
+  let lines = String.split_on_char '\n' line in
+  Alcotest.(check bool) "non-tty long message wraps" true (List.length lines > 1);
+  List.iter
+    (fun l ->
+       Alcotest.(check bool) "wrapped within COLUMNS width" true (visual_len l <= 90))
+    lines;
+  close_out oc;
+  Logging.set_output stderr;
+  Logging.set_colors true;
+  match prev_cols with
+  | Some c -> Unix.putenv "COLUMNS" c
+  | None -> Unix.putenv "COLUMNS" ""
+;;
+
 (* In color mode the gutter is rendered dim (gray) and the block's header
    still carries the full colored prefix. *)
 let test_format_line_gutter_color () =
@@ -402,6 +431,7 @@ let () =
               `Quick
               test_format_line_multiline_blank_and_indent
           ; Alcotest.test_case "line wrapping" `Quick test_format_line_wrap
+          ; Alcotest.test_case "non-tty wrap" `Quick test_format_line_non_tty_wrap
           ; Alcotest.test_case "gutter color" `Quick test_format_line_gutter_color
           ; Alcotest.test_case "no-color layout" `Quick test_format_line_no_color
           ; Alcotest.test_case "colors enabled" `Quick test_format_line_colors

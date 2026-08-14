@@ -24,8 +24,9 @@ type logging_config =
   { level : Logging.level
   ; sections : string list
   ; width : int option
-    (** Optional fixed line width for log wrapping (None = auto-detect the
-        terminal; falls back to 120 when not a terminal). *)
+    (** Optional fixed line width for log wrapping. None = auto: the terminal
+        width when output is a TTY, else the `COLUMNS` env var when set, else
+        a generous default (200). *)
   }
 
 type gc_config =
