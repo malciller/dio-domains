@@ -930,11 +930,11 @@ let venue_pools ~(prev : (string * float) list) (tasks : Oracle_tasks.task list)
              in
              let msg =
                Printf.sprintf
-                 "venue %s balance (%s): %s -> pool $%.2f"
+                 "venue %s balance (%s) pool $%.2f: %s"
                  (account_id account)
                  source
-                 (String.concat " · " lines)
                  pool
+                 (String.concat " · " lines)
              in
              if loud then Logging.info ~section msg else Logging.debug ~section msg;
              Some (pool, snapshot))
@@ -1536,8 +1536,8 @@ let size_asset
     if deployment.Oracle_types.active
     then
       Printf.sprintf
-        "[%d/%d] %s/%s ACTIVE — buy %.6g %s every %.2f%% | capital $%.2f of $%.2f | %s | \
-         survives %.1f%% | %s"
+        "[%d/%d] %s/%s ACTIVE buy %.6g %s @ %.2f%% | cap $%.2f/$%.2f | %s | surv %.1f%% \
+         | %s"
         index
         n_tasks
         exchange
@@ -1555,7 +1555,7 @@ let size_asset
         health
     else
       Printf.sprintf
-        "[%d/%d] %s/%s INACTIVE — %s | capital $%.2f passes down"
+        "[%d/%d] %s/%s INACTIVE — %s | $%.2f passes down"
         index
         n_tasks
         exchange
@@ -1579,8 +1579,7 @@ let size_asset
     (match deployment.Oracle_types.p2v with
      | Some p ->
        add
-         "      worst drop %.1f%% (peak $%.2f on %s → valley $%.2f on %s) · model %.1f%% \
-          @ %s"
+         "worst drop %.1f%% (peak $%.2f on %s → valley $%.2f on %s) · model %.1f%% @ %s"
          (p.Oracle_types.max_drawdown *. 100.0)
          p.Oracle_types.peak
          p.Oracle_types.peak_date
@@ -1590,7 +1589,7 @@ let size_asset
          horizon_lbl
      | None ->
        add
-         "      worst drop %.1f%% (no actual drawdown in the history) · model %.1f%% @ %s"
+         "worst drop %.1f%% (no actual drawdown in the history) · model %.1f%% @ %s"
          (deployment.Oracle_types.d_cover *. 100.0)
          (deployment.Oracle_types.d_gov *. 100.0)
          horizon_lbl);
@@ -1600,7 +1599,7 @@ let size_asset
     (match deployment.Oracle_types.sizing with
      | Some r when r.Oracle_types.outlier ->
        add
-         "      funding: deepest drawdown not recovered — floor overshoot %.1f%%%s"
+         "funding: deepest drawdown not recovered — floor overshoot %.1f%%%s"
          (deployment.Oracle_types.d_cover *. 100.0)
          (if Option.is_none r.Oracle_types.overshoot_p90
           then " (no floor-break history: 15% fallback)"
@@ -1609,7 +1608,7 @@ let size_asset
        (match r.Oracle_types.floor_ref with
         | Some floor_ref ->
           add
-            "      funding: at/below floor $%.2f — floor overshoot %.1f%%%s"
+            "funding: at/below floor $%.2f — floor overshoot %.1f%%%s"
             floor_ref
             (deployment.Oracle_types.d_cover *. 100.0)
             (if Option.is_none r.Oracle_types.overshoot_p90
@@ -1620,7 +1619,7 @@ let size_asset
        (match r.Oracle_types.floor_ref with
         | Some floor_ref ->
           add
-            "      funding: drop %.1f%% to floor $%.2f (ATH $%.2f − %.1f%% worst)"
+            "funding: drop %.1f%% to floor $%.2f (ATH $%.2f − %.1f%% worst)"
             (deployment.Oracle_types.d_cover *. 100.0)
             floor_ref
             (match deployment.Oracle_types.range with
@@ -1639,7 +1638,7 @@ let size_asset
        capped at qty * qty_cap_mult. The reasons are carried by the
        deployment itself. *)
     add
-      "      sizing: gi %.4f%% (%s) · qty %.6g (%s)"
+      "sizing: gi %.4f%% (%s) · qty %.6g (%s)"
       deployment.Oracle_types.parameter
       deployment.Oracle_types.gi_reason
       deployment.Oracle_types.qty
@@ -1654,10 +1653,10 @@ let size_asset
          ; initial_accumulated_profit = p
          }
        when b > 0.0 || r > 0.0 || p > 0.0 ->
-       add "      seeded: base %.6g, reserved %.6g, accumulated profit %.6g" b r p
+       add "seeded: base %.6g, reserved %.6g, accumulated profit %.6g" b r p
      | _ -> ());
     if has_committed_buy
-    then add "      committed buy resting: the grid keeps running on committed capital");
+    then add "committed buy resting: the grid keeps running on committed capital");
   let detail_str = Buffer.contents detail in
   let report =
     if detail_str = "" then header else header ^ "\n" ^ String.trim detail_str
@@ -2440,8 +2439,8 @@ let run_pass
       in
       Logging.info_f
         ~section
-        "pass #%d complete: %d decisions (%d active) across %d account(s) in %.1fs · %s \
-         · balance %s · fetch %s · sizing %s · analysis %d recomputed + %d cached%s%s"
+        "pass #%d: %d decisions (%d active) %d account(s) %.1fs · %s · bal %s fetch %s \
+         sizing %s · %d recomputed + %d cached%s%s"
         (Atomic.get pass_count)
         n_decisions
         n_active

@@ -917,7 +917,7 @@ let asset_domain_worker
             and the buy-trailing leg never moves a buy DOWN on its own. *)
          st.force_buy_reanchor <- true;
          should_execute_strategy := true;
-         Logging.info_f
+         Logging.debug_f
            ~section
            "[%s/%s] Capital oracle decision materialized: qty %.8g gi %.4f%% (D_surv \
             %.1f%%)"
@@ -961,7 +961,7 @@ let asset_domain_worker
               the old tighter spacing until the market happens to rise. *)
            st.force_buy_reanchor <- true;
            should_execute_strategy := true;
-           Logging.info_f
+           Logging.debug_f
              ~section
              "[%s/%s] Capital oracle updated sizing: qty %.8g gi %.4f%% (D_surv %.1f%%)"
              asset.exchange
@@ -1158,7 +1158,7 @@ let asset_domain_worker
                oracle only"
               asset_with_fees.exchange
               asset_with_fees.symbol);
-          Logging.info_f
+          Logging.debug_f
             ~section
             "[%s/%s] Capital oracle first decision received (%s, qty %.8g gi %.4f%%, \
              D_surv %.1f%%); grid gate open"
