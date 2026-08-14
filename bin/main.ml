@@ -461,7 +461,16 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
                  ; Oracle_runtime.kappa = pool.kappa
                  } ))
             config.classes)
-       ~on_publish:(fun _ -> Concurrency.Exchange_wakeup.signal_all ())
+       ~on_publish:(fun changed_symbols _decisions ->
+         (* Per-symbol changed-only wakeups: signal only the domains whose
+            asset's decision changed this pass (the oracle exposes the changed
+            set). Each domain blocks on its own per-symbol condition, so an
+            unrelated asset's domain is never woken by a pass that did not
+            touch it. The lock-free decision read path (decision_for, cached
+            on publish_generation) is unchanged. *)
+         List.iter
+           (fun symbol -> Concurrency.Exchange_wakeup.signal ~symbol)
+           changed_symbols)
        ();
      Logging.info ~section:"main" "Capital oracle runtime started (supervised)"
    with

@@ -307,7 +307,8 @@ let asset_domain_worker
     (* Oracle/signal startup gate: grid strategies withhold strategy
        execution until the startup window has given BOTH sizing sources their
        chance - the capital-oracle's first pass attempt (event-driven: its
-       on_publish hook wakes the domains via Exchange_wakeup.signal_all) and
+       on_publish hook wakes the changed domains via Exchange_wakeup.signal
+       ~symbol) and
        the Fear & Greed fetch (startup fetch in main.ml, retried on every
        oracle pass, plus async refresh on price moves). The gate opens on the
        oracle's first decision for this asset at any time; otherwise, once
@@ -593,9 +594,17 @@ let asset_domain_worker
                | Types.Canceled | Types.Rejected | Types.Expired ->
                  should_execute_strategy := true;
                  (* A canceled/rejected/expired order changes the live pool and
-                    the strategy's open-order state: wake the capital oracle so
-                    it re-sizes (lock-free, ~50ms latency). *)
-                 Oracle_runtime.request_pass ();
+                    the strategy's open-order state: notify the capital oracle
+                    with the released committed capital (a canceled BUY returns
+                    remaining_qty x limit price) so it re-sizes immediately -
+                    the delta is applied in-process, no network wait. *)
+                 Oracle_runtime.notify_order_cancel
+                   ~exchange:asset_with_fees.exchange
+                   ~symbol:asset_with_fees.symbol
+                   ~testnet:asset_with_fees.testnet
+                   ~side:event.side
+                   ~value:
+                     (event.remaining_qty *. Option.value event.limit_price ~default:0.0);
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
@@ -623,11 +632,22 @@ let asset_domain_worker
                   | None -> ())
                | Types.Filled ->
                  should_execute_strategy := true;
-                 (* A fill returns/consumes quote: wake the capital oracle so
-                    it re-sizes the asset (and the rest of the account's
-                    priority order) as soon as the pool changes (lock-free,
-                    ~50ms latency). *)
-                 Oracle_runtime.request_pass ();
+                 (* A fill returns/consumes quote: notify the capital oracle
+                    with the pool delta so it re-sizes the asset (and the rest
+                    of the account's priority order) immediately - the delta
+                    is applied in-process, so the decision never waits on a
+                    network balance refresh (lock-free, microsecond wake). *)
+                 Oracle_runtime.notify_fill
+                   ~exchange:asset_with_fees.exchange
+                   ~symbol:asset_with_fees.symbol
+                   ~testnet:asset_with_fees.testnet
+                   ~side:event.side
+                   ~filled_qty:event.filled_qty
+                   ~avg_price:event.avg_price
+                   ~fee:
+                     (Option.value asset_with_fees.maker_fee ~default:0.001
+                      *. event.filled_qty
+                      *. event.avg_price);
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy

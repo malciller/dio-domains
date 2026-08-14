@@ -76,13 +76,17 @@
    - the sell is the account's capital recovery path (it needs no quote, only
    inventory), so inventory is never left unreclaimable.
 
-   Passes are also event-driven: the engine calls [request_pass] (one lock-free
-   Atomic increment, microsecond-scale, from the domain worker loop) on every
-   fill and canceled/rejected/expired order, and the runtime wakes within ~50ms
-   instead of sleeping out the cadence - so a decision that may change with the
-   parameters (pool, sizing, survival) is recomputed and re-published as soon
-   as the market state that could change it moves, without busy-waiting.
-   Bursts of events coalesce into a single pass through [min_trigger_gap].
+   Passes are fully event-driven: the engine calls [request_pass] (a lock-free
+   Atomic increment plus an [Lwt_condition] broadcast, microsecond-scale, from
+   the domain worker loop) on every fill and canceled/rejected/expired order,
+   and the loops wake immediately on the condition - no polling slices, no
+   minimum-trigger gap. A fill/cancel also enqueues its pool delta
+   ([notify_fill] / [notify_order_cancel]), which the pass applies to the
+   account pool IN PROCESS - the decision path never waits on a network
+   balance refresh; the background refresher reconciles the authoritative
+   value afterwards. Bursts of events coalesce naturally: one drain consumes
+   the whole queue per pass, and the account-sizing memo cache turns an
+   unchanged account into a microsecond re-publish.
 
    Failures are last-known-good: an asset whose analysis fails this pass keeps
    its previous decision, an account whose balance cannot be fetched is skipped
@@ -177,12 +181,17 @@ type runtime_config =
         the minimum). *)
   ; no_deep_history : bool (** Disable the Yahoo deep-history extension. *)
   ; weight_by_sessions : bool (** Weight class members by session count. *)
-  ; refresh_seconds : float (** Cadence between analysis passes (default 300). *)
+  ; refresh_seconds : float
+    (** Cadence of full history refresh (default 300): new bars / class
+        members / deep history. Also the pass loop's safety-net deadline (the
+        decision path is event-driven; this only bounds conditions that emit
+        no event). *)
   ; poll_seconds : float
-    (** Fast cadence used while no asset is active (default 30): a fully
-        deployed account with a ~zero pool polls at this rate so capital that
-        becomes available on sell fills is recognized (and trading resumed in
-        config priority order) quickly. *)
+    (** Cadence of the background refresher's authoritative balance
+        reconciliation (default 30). The decision path is event-driven and
+        never waits on this - fills/cancels apply their pool deltas locally at
+        event time ([notify_fill] / [notify_order_cancel]); this timer keeps
+        the materialized venue pools honest against drift and missed events. *)
   ; horizons : int list option (** Session horizons (default per calendar kind). *)
   ; max_capital : float option (** Upper bound of the sizing binary search. *)
   ; startup_wait_seconds : float
@@ -307,17 +316,17 @@ let last_deployment_warnings : (string, string list) Hashtbl.t = Hashtbl.create 
    composition) so repeated detail is logged at debug, not every pass. *)
 let last_detail_lines : (string, string) Hashtbl.t = Hashtbl.create 32
 
-(** The sleep until the next pass. While every published decision is inactive
-    (e.g. a fully deployed account with a ~zero available-quote pool, awaiting
-    sell fills to restore capital) the runtime polls at the fast [poll_seconds]
-    cadence so a capital return is recognized quickly; otherwise it keeps the
-    normal [refresh_seconds] cadence. An empty snapshot (nothing has published
-    yet) keeps the normal cadence. *)
+(** The safety-net sleep until the next pass. The decision path is
+    event-driven - fills, order events, and refresher publishes wake it via
+    [wake_condition] - so this cadence is only a bound for conditions that
+    emit no event (e.g. drift in the live top-of-book anchor the sizing
+    re-reads at decision time). It is always the refresh cadence: the fast
+    poll cadence previously used while nothing was active existed to
+    recognize capital returns quickly, which the local pool deltas now do at
+    event time. *)
 let next_sleep ~(config : runtime_config) ~(decisions : decision list) =
-  let any_active = List.exists (fun (d : decision) -> d.active) decisions in
-  if decisions <> [] && not any_active
-  then config.poll_seconds
-  else config.refresh_seconds
+  ignore decisions;
+  config.refresh_seconds
 ;;
 
 (** Refresh/poll cadence with a small random jitter so passes from multiple
@@ -356,6 +365,13 @@ let publish_generation : int Atomic.t = Atomic.make 0
 
 let get_publish_generation () = Atomic.get publish_generation
 
+(** Symbols whose decision changed on the most recent [publish] (appeared,
+    changed value, or changed reclaim state). Consumed by the engine's
+    per-symbol domain wakeups so an unrelated asset's domain never wakes on a
+    pass that did not touch it. Written by [publish], read by [run_loop] on
+    the same Lwt scheduler thread - no locking needed. *)
+let last_changed_symbols : string list ref = ref []
+
 (** The whole current decision snapshot: the atomically-swapped immutable
     list, used by [on_publish] and the loop's cadence/reclaim logic. Readers
     always see a consistent list, never a torn mid-swap state. *)
@@ -375,11 +391,10 @@ let decision_for ~(exchange : string) ~(symbol : string) : decision option =
     halts trading on stale knowledge. Assets in [fresh] replace their old
     decision. *)
 let publish (fresh : decision list) =
+  let prev = Atomic.get decisions_ref in
   let fresh_keys = List.map key_of fresh in
   let kept =
-    List.filter
-      (fun (d : decision) -> not (List.mem (key_of d) fresh_keys))
-      (Atomic.get decisions_ref)
+    List.filter (fun (d : decision) -> not (List.mem (key_of d) fresh_keys)) prev
   in
   Atomic.set decisions_ref (kept @ fresh);
   (* Rebuild the keyed map copy-on-write for the next readers. *)
@@ -389,7 +404,29 @@ let publish (fresh : decision list) =
   (* Domains keyed on [get_publish_generation] re-read their decision on the
      next cycle: a new pass (a new reclaim, a re-activation) is adopted
      immediately, not at the next background-refresh cycle. *)
-  Atomic.incr publish_generation
+  Atomic.incr publish_generation;
+  (* Changed-only wakeup set: symbols whose decision appeared, changed, or was
+     removed this pass. The engine signals only those domains (per-symbol),
+     so an unrelated asset's domain never wakes on a pass that did not touch
+     it. *)
+  let changed =
+    List.filter_map
+      (fun (d : decision) ->
+         let key = key_of d in
+         let changed =
+           match List.find_opt (fun (p : decision) -> key_of p = key) prev with
+           | None -> true
+           | Some p ->
+             p.active <> d.active
+             || p.qty <> d.qty
+             || p.grid_interval <> d.grid_interval
+             || p.reclaim_capital <> d.reclaim_capital
+             || p.reason <> d.reason
+         in
+         if changed then Some d.symbol else None)
+      (kept @ fresh)
+  in
+  last_changed_symbols := changed
 ;;
 
 (** Pass counters for observability (logged, never read on a hot path). *)
@@ -666,57 +703,64 @@ let tracks_asset ~(exchange : string) ~(symbol : string) : bool =
   Oracle_tasks.known_exchange exchange
 ;;
 
-let last_pass_at : float Atomic.t = Atomic.make 0.0
-let last_pass_ok : bool Atomic.t = Atomic.make true
 let shutdown_requested = Atomic.make false
 
 (** Event-driven trigger: the engine calls [request_pass] (a single Atomic
-    increment - lock-free, no allocation, no scheduler handoff) whenever a
-    fill or a canceled/rejected/expired order could change an asset's pool or
-    sizing, and the loop honors it at the next [wait_until] slice instead of
-    sleeping out the full cadence. The generation counter makes each wake
-    one-shot: [wait_until] captures the value before sleeping, so only a NEW
-    [request_pass] (another increment) wakes the next wait. *)
+    increment plus a broadcast of [wake_condition] - lock-free, no syscall)
+    whenever a fill or a canceled/rejected/expired order could change an
+    asset's pool or sizing, and the loops wake immediately on the condition
+    instead of sleeping out the cadence or polling in slices. The generation
+    counter makes each wake one-shot: the wait captures the value before
+    sleeping, so only a NEW [request_pass] (another increment + broadcast)
+    wakes the next wait. *)
 let pass_requested : int Atomic.t = Atomic.make 0
 
-let request_pass () = Atomic.incr pass_requested
+(** Cross-domain wake channel. [request_pass] is called from OCaml domain
+    workers (each trading domain runs on its own OCaml 5 domain), so the wait
+    must be a real wakeup, not a polled flag. Broadcasting an [Lwt_condition]
+    from a foreign domain is safe - the same pattern [fill_event_bus] already
+    relies on - and the register-then-recheck idiom in [wait_until] closes the
+    lost-wakeup race. *)
+let wake_condition : unit Lwt_condition.t = Lwt_condition.create ()
 
-(** Minimum gap between event-triggered passes (seconds): a burst of events
-    (e.g. the engine ingesting the startup execution snapshot) coalesces into
-    one pass instead of one pass per event. *)
-let min_trigger_gap = 2.0
+let request_pass () =
+  Atomic.incr pass_requested;
+  Lwt_condition.broadcast wake_condition ()
+;;
 
-(** Sleep until [deadline], waking early when a [request_pass] arrives at
-    least [min_trigger_gap] after the last pass, or when the background
-    refresher published a cycle that changed analysis-relevant inputs
-    ([refresh_history_changed]). Checked in 50ms slices: a trigger is
-    honored within ~50ms (well inside a market-event latency budget) while
-    a plain sleep still holds the exact cadence. *)
+(** Whether a [request_pass] arrived after the captured generation. *)
+let pass_requested_changed generation = Atomic.get pass_requested <> generation
+
+(** Whether the refresher published a cycle that changed analysis-relevant
+    inputs ([refresh_history_changed]): an f&g move, new bars, a member or
+    calendar change. Balance-only cycles never wake the pass. *)
+let refresh_inputs_changed refresh_gen =
+  Atomic.get refresh_generation <> refresh_gen && Atomic.get refresh_history_changed
+;;
+
+(** Sleep until [deadline], waking immediately on a new [request_pass] or a
+    refresher cycle that changed analysis inputs. The only timer is the
+    cadence deadline; events wake the wait directly via [wake_condition]
+    (microsecond-class), not by polling in 50ms slices. Register-then-recheck
+    closes the lost-wakeup race: an event that lands between the predicate
+    check and the wait registration is caught by the self-broadcast, since
+    the waiter is already registered by then. *)
 let rec wait_until ~(deadline : float) ~(generation : int) ~(refresh_gen : int) () =
-  if
-    (Atomic.get pass_requested <> generation
-     && Unix.gettimeofday () >= Atomic.get last_pass_at +. min_trigger_gap)
-    || (Atomic.get refresh_generation <> refresh_gen && Atomic.get refresh_history_changed)
+  if pass_requested_changed generation || refresh_inputs_changed refresh_gen
   then Lwt.return_unit
   else (
     let now = Unix.gettimeofday () in
     if now >= deadline
     then Lwt.return_unit
-    else
-      Lwt_unix.sleep (Float.min 0.05 (deadline -. now))
-      >>= fun () -> wait_until ~deadline ~generation ~refresh_gen ())
-;;
-
-(** Bounded wait for the refresher's next published cycle (fresh balances):
-    used on event-triggered passes so a fill sizes against a balance
-    snapshot that already includes it. Never blocks the pass beyond
-    [max_wait] seconds - a sick upstream cannot hang the decision path. *)
-let rec wait_refresh_epoch ~(max_wait : float) ~(after : int) () =
-  if Atomic.get refresh_generation <> after || max_wait <= 0.0
-  then Lwt.return_unit
-  else
-    Lwt_unix.sleep 0.05
-    >>= fun () -> wait_refresh_epoch ~max_wait:(max_wait -. 0.05) ~after ()
+    else (
+      let w = Lwt_condition.wait wake_condition in
+      if pass_requested_changed generation || refresh_inputs_changed refresh_gen
+      then Lwt_condition.broadcast wake_condition ();
+      Lwt.pick
+        [ (w >|= fun () -> ())
+        ; (Lwt_unix.sleep (max 0.0 (deadline -. now)) >|= fun () -> ())
+        ]
+      >>= fun () -> wait_until ~deadline ~generation ~refresh_gen ()))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -839,6 +883,182 @@ let account_id (account : Oracle_topology.instrument_key) =
     account.venue
     account.quote
     (if account.testnet then "@testnet" else "")
+;;
+
+(** Account key of a trading asset (venue/quote@testnet), matching
+    [account_of_task] so an event from a trading domain lands on the same
+    account the runtime sizes. *)
+let account_key_of ~(exchange : string) ~(symbol : string) ~(testnet : bool) =
+  account_id (Oracle_topology.key ~venue:exchange ~symbol ~testnet ())
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Pool-delta event channel (network-independent decision path).      *)
+(*                                                                     *)
+(* A fill/cancel on a trading domain changes the venue pool. The       *)
+(* domain notifies the runtime with the quote delta and the pass       *)
+(* applies it to the account pool IN PROCESS - the decision path never *)
+(* waits on a network balance refresh. The background refresher        *)
+(* reconciles the authoritative venue value afterwards and its         *)
+(* published record supersedes the deltas (see [resolve_account_pool]).*)
+(* ------------------------------------------------------------------ *)
+
+(** One pool-delta event enqueued by a trading domain: the account whose pool
+    moved and the quote delta (a buy fill consumes value+fee, a sell fill
+    returns value-fee, a canceled buy returns its remaining committed value).
+    [baseline] is the refresh generation the delta is applied against; the
+    pass applies a delta only when its baseline equals the materialized
+    record's epoch, so a fresher authoritative pool (fetched after the event)
+    that already includes it is never double-counted. *)
+type pool_event =
+  { account : string
+  ; delta : float
+  ; baseline : int
+  ; cause : string
+  }
+
+(** Cross-domain writers (one per trading domain), single scheduler-thread
+    consumer (the pass loop) - so the queue needs only an OCaml mutex, not an
+    Lwt mutex. *)
+let event_mutex = Mutex.create ()
+
+(** Bounded queue cap: under a pathological fill flood faster than the
+    scheduler can drain, older deltas are dropped rather than growing
+    unboundedly - the next authoritative refresh reconciles them. *)
+let event_queue_cap = 16_384
+
+let event_queue : pool_event Queue.t = Queue.create ()
+
+(** Scheduler-thread-owned pending pool deltas, keyed by account_id: the
+    events drained since the last pass, applied to the materialized pool by
+    [resolve_account_pool]. Cleared at the start of each pass (deltas the
+    previous pass consumed have a stale baseline and are filtered anyway);
+    never touched by domain threads. *)
+let pending_pool_adjustments : (string, (float * int) list) Hashtbl.t = Hashtbl.create 8
+
+let enqueue_pool_event account delta cause =
+  Mutex.lock event_mutex;
+  if Queue.length event_queue >= event_queue_cap
+  then
+    Logging.debug_f
+      ~section
+      "pool-event queue full (%d); dropping delta for %s (%s) - the next balance refresh \
+       reconciles"
+      event_queue_cap
+      account
+      cause
+  else
+    Queue.push
+      { account; delta; baseline = Atomic.get refresh_generation; cause }
+      event_queue;
+  Mutex.unlock event_mutex
+;;
+
+(** Drain the queued trading events into [pending_pool_adjustments]. Called
+    once per pass on the scheduler thread. *)
+let drain_pool_events () =
+  Hashtbl.clear pending_pool_adjustments;
+  let events = ref [] in
+  Mutex.lock event_mutex;
+  (try
+     while true do
+       events := Queue.pop event_queue :: !events
+     done
+   with
+   | Queue.Empty -> ());
+  Mutex.unlock event_mutex;
+  List.iter
+    (fun (e : pool_event) ->
+       let cur =
+         Option.value (Hashtbl.find_opt pending_pool_adjustments e.account) ~default:[]
+       in
+       Hashtbl.replace pending_pool_adjustments e.account ((e.delta, e.baseline) :: cur))
+    !events
+;;
+
+(** A fill changed the venue pool: enqueue the quote delta (a buy consumes
+    value+fee, a sell returns value-fee) and wake the runtime. The decision
+    path applies it to the materialized pool immediately - never waiting on a
+    network balance refresh; the background refresher reconciles the
+    authoritative value afterwards. [fee] is the estimated absolute fee in
+    quote terms. *)
+let notify_fill
+      ~(exchange : string)
+      ~(symbol : string)
+      ~(testnet : bool)
+      ~(side : Exchange.Types.order_side)
+      ~(filled_qty : float)
+      ~(avg_price : float)
+      ~(fee : float)
+  =
+  let value = filled_qty *. avg_price in
+  let delta =
+    match side with
+    | Exchange.Types.Buy -> -.(value +. Float.max 0.0 fee)
+    | Exchange.Types.Sell -> value -. Float.max 0.0 fee
+  in
+  enqueue_pool_event (account_key_of ~exchange ~symbol ~testnet) delta "fill";
+  request_pass ()
+;;
+
+(** A canceled/rejected/expired order released committed capital: enqueue the
+    returned quote (a canceled BUY returns its remaining committed value -
+    remaining_qty x limit price) and wake the runtime, so the account's pool
+    recovers at event time instead of at the next balance refresh. A canceled
+    sell releases base inventory, not quote, so it never touches the pool. *)
+let notify_order_cancel
+      ~(exchange : string)
+      ~(symbol : string)
+      ~(testnet : bool)
+      ~(side : Exchange.Types.order_side)
+      ~(value : float)
+  =
+  if side = Exchange.Types.Buy
+  then
+    enqueue_pool_event
+      (account_key_of ~exchange ~symbol ~testnet)
+      (Float.max 0.0 value)
+      "order_cancel";
+  request_pass ()
+;;
+
+(** Decision-time account pool: the in-process single source of truth when the
+    venue has a live balance store (the websocket-fed store is updated by the
+    venue's own fill/balance feed - no network, no waiting), otherwise the
+    materialized REST pool plus the local pool deltas from trading events
+    ([pending_pool_adjustments]). Deltas are applied only when their baseline
+    refresh generation matches the materialized record being consumed - a
+    fresher authoritative pool (fetched after the event) already includes the
+    event and is never double-counted. The decision path never blocks on a
+    network balance fetch. *)
+let resolve_account_pool ~(m : materialized) (account : Oracle_topology.instrument_key)
+  : (float * Oracle_balances.snapshot) option
+  =
+  match
+    Oracle_balances.snapshot_of_live_store
+      ~exchange:account.venue
+      ~testnet:account.testnet
+      ()
+  with
+  | Some snap ->
+    let pool =
+      Float.max 0.0 (Oracle_balances.available_quote snap ~quote:account.quote)
+    in
+    Some (pool, snap)
+  | None ->
+    (match Hashtbl.find_opt m.m_balances (account_id account) with
+     | None | Some None -> None
+     | Some (Some (base, snap)) ->
+       let pending =
+         match Hashtbl.find_opt pending_pool_adjustments (account_id account) with
+         | None -> 0.0
+         | Some deltas ->
+           List.fold_left
+             (fun acc (d, baseline) -> if baseline = m.m_epoch then acc +. d else acc)
+             0.0
+             deltas
+       in
+       Some (Float.max 0.0 (base +. pending), snap))
 ;;
 
 (** Tasks grouped by venue account, preserving config.json order (priority
@@ -2123,6 +2343,10 @@ let refresh_cycle
   Atomic.set materialized_ref (Some m);
   Atomic.incr refresh_generation;
   if changed then Atomic.set refresh_history_changed true;
+  (* Wake the pass loop: it re-checks [refresh_inputs_changed] and only runs a
+     pass when a cycle changed analysis-relevant inputs (f&g move, new bars,
+     member/calendar change); balance-only cycles fall back to sleep. *)
+  Lwt_condition.broadcast wake_condition ();
   (* Publish the balance/fetch latency windows for the dashboard (the pass
      publishes its own windows; the two never reset each other's
      profilers). *)
@@ -2148,26 +2372,31 @@ let refresh_cycle
   Lwt.return_unit
 ;;
 
-(** Sleep until [deadline], waking early when a [request_pass] arrives (a
-    fill or order event: balances should refresh promptly so the next pass
-    sizes against fresh pools). Checked in 50ms slices like the pass wait. *)
+(** Sleep until [deadline], waking immediately when a [request_pass] arrives
+    (a fill or order event: balances should refresh promptly so the next pass
+    sizes against fresh pools). Same event-driven wait as [wait_until] - the
+    only timer is the cadence deadline. *)
 let rec wait_until_refresh ~(deadline : float) ~(generation : int) () =
-  if
-    Atomic.get pass_requested <> generation
-    && Unix.gettimeofday () >= Atomic.get last_pass_at +. min_trigger_gap
+  if pass_requested_changed generation
   then Lwt.return_unit
   else (
     let now = Unix.gettimeofday () in
     if now >= deadline
     then Lwt.return_unit
-    else
-      Lwt_unix.sleep (Float.min 0.05 (deadline -. now))
-      >>= fun () -> wait_until_refresh ~deadline ~generation ())
+    else (
+      let w = Lwt_condition.wait wake_condition in
+      if pass_requested_changed generation then Lwt_condition.broadcast wake_condition ();
+      Lwt.pick
+        [ (w >|= fun () -> ())
+        ; (Lwt_unix.sleep (max 0.0 (deadline -. now)) >|= fun () -> ())
+        ]
+      >>= fun () -> wait_until_refresh ~deadline ~generation ()))
 ;;
 
-(** The background refresher loop: cycles at the poll cadence (waking
-    early on fill events), publishing the materialized state each cycle.
-    Runs as its own fiber alongside the pass loop; both stop on shutdown. *)
+(** The background refresher loop: cycles at the [poll_seconds] balance-
+    reconciliation cadence (waking immediately on fill/order events),
+    publishing the materialized state each cycle. Runs as its own fiber
+    alongside the pass loop; both stop on shutdown. *)
 let rec refresh_loop
           ~(config : runtime_config)
           ~(trading : Dio_strategies.Strategy_common.trading_config list)
@@ -2260,6 +2489,11 @@ let run_pass
       let _ = Latency_profiler.snapshot_and_reset engine_profs.prof_pass in
       Lwt.return false
     | Some m ->
+      (* Drain the trading-domain pool events enqueued since the last pass and
+         apply them to the materialized pools at account resolution time
+         ([resolve_account_pool]) - the decision path never waits on a network
+         balance refresh. *)
+      drain_pool_events ();
       let fng = m.m_fng in
       let grouped = group_by_account tasks in
       Logging.debug_f
@@ -2444,12 +2678,13 @@ let run_pass
       in
       Lwt_list.iter_s
         (fun (account, account_tasks) ->
-           match Hashtbl.find_opt m.m_balances (account_id account) with
-           | None | Some None ->
-             (* No account entry, or the balance fetch failed: keep its
+           match resolve_account_pool ~m account with
+           | None ->
+             (* No pool source for this account (no live store, no materialized
+                balance, and no baseline to apply deltas to): keep its
                 last-known-good decisions (publish merges). *)
              Lwt.return_unit
-           | Some (Some (pool, snapshot)) ->
+           | Some (pool, snapshot) ->
              let analyses = analyses_for account in
              let fp =
                { af_analyses =
@@ -2583,8 +2818,6 @@ let run_pass
       >>= fun () ->
       publish !decisions;
       Atomic.incr pass_count;
-      Atomic.set last_pass_at (Unix.gettimeofday ());
-      Atomic.set last_pass_ok true;
       (* The refresher records balance/fetch windows; the pass publishes its
          own windows (pass + sizing) and the per-asset windows. *)
       let pass_span = span_from pass_start in
@@ -2656,8 +2889,9 @@ let run_pass
     pass immediately, then refresh on the configured cadence. Runs on the Lwt
     scheduler; the engine's domains pick up each published snapshot on their
     next cycle. [on_publish] (optional) is invoked after each pass with the
-    full snapshot - the engine uses it to wake domains so a new decision
-    applies immediately instead of on the next market event.
+    symbols whose decision changed this pass and the full snapshot - the
+    engine uses it to wake those domains so a new decision applies immediately
+    instead of on the next market event.
 
     Resolves when [shutdown] is requested or the loop ends. The supervisor
     runs this as the oracle's supervised connect_fn so the runtime is managed
@@ -2666,7 +2900,7 @@ let run_loop
       ?(config = default_config ())
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
       ~(classes : (string * class_pool) list)
-      ?(on_publish : decision list -> unit = fun _ -> ())
+      ?(on_publish : string list -> decision list -> unit = fun _ _ -> ())
       ()
   : unit Lwt.t
   =
@@ -2755,9 +2989,10 @@ let run_loop
     tasks;
   (* Priority reclamation is self-driving: a pass that publishes reclaim
      decisions means the domains are canceling resting buys right now, which
-     releases capital back to the account pool. Re-run shortly (past the
-     min_trigger_gap, on a forced refresh) so the released capital is
-     recognized within seconds of the cancel - not on the next 30s poll. The
+     releases capital back to the account pool. Re-run immediately (an event
+     trigger wakes both loops, past the one-shot wait) so the released capital
+     is recognized within moments of the cancel - the pool delta from the
+     cancel's [notify_order_cancel] re-sizes without a network wait. The
      reclaim signature bounds the loop: it self-drives only when the reclaim
      set CHANGED, so a reclaim that stalls (cancel stuck, no event) waits for
      the domain's own [request_pass] / the poll cadence instead of spinning. *)
@@ -2776,7 +3011,6 @@ let run_loop
       Lwt.catch
         (fun () -> run_pass ~config ~trading ~classes ())
         (fun exn ->
-           Atomic.set last_pass_ok false;
            Logging.error_f
              ~section
              "capital-oracle pass failed (%s); keeping last-known-good decisions"
@@ -2790,40 +3024,28 @@ let run_loop
          would open the domains' F&G-only fallback gate while the oracle's
          first real decisions are still seconds away. *)
       if attempted then Atomic.incr pass_attempts;
-      on_publish (decisions ());
+      on_publish !last_changed_symbols (decisions ());
       (* The next pass runs at the cadence deadline, or early when the engine
          requests one ([request_pass] on fills / canceled-rejected-expired
          events) or when the background refresher materialized a change
          ([refresh_history_changed]): the wait captures both generations, so
-         only NEW events wake it (bursts coalesce through [min_trigger_gap]
-         and the 50ms slices). *)
+         only NEW events wake it (each wait is one-shot; bursts coalesce
+         through the single queue drain per pass and the account sizing
+         memo cache). *)
       let reclaim_now = reclaim_signature () in
       let reclaim_cycle = reclaim_now <> "" && reclaim_now <> !last_reclaim_sig in
       last_reclaim_sig := reclaim_now;
+      (* A reclaim pass self-drives: fire the event trigger so both loops wake
+         immediately (the wait below captures the post-trigger generation, so
+         this wake is one-shot) and the refresher publishes fresh balances for
+         the follow-up pass. *)
+      if reclaim_cycle then request_pass () else ();
       let generation = Atomic.get pass_requested in
       let refresh_gen = Atomic.get refresh_generation in
       let deadline =
-        if reclaim_cycle
-        then Unix.gettimeofday () +. 2.0
-        else
-          Unix.gettimeofday () +. jittered (next_sleep ~config ~decisions:(decisions ()))
+        Unix.gettimeofday () +. jittered (next_sleep ~config ~decisions:(decisions ()))
       in
-      wait_until ~deadline ~generation ~refresh_gen ()
-      >>= fun () ->
-      (* A reclaim pass self-drives: fire the event trigger so BOTH loops wake
-         (past the min_trigger_gap) and the refresher publishes a fresh
-         balance for the follow-up pass. *)
-      if reclaim_cycle then request_pass () else ();
-      (* An event-triggered wake (fill/order event) sizes against fresh
-         balances: give the refresher (woken by the same event) a bounded
-         window to publish its next cycle, then proceed regardless - the
-         pass never hangs on the network. *)
-      (if Atomic.get pass_requested <> generation
-       then (
-         let after = Atomic.get refresh_generation in
-         wait_refresh_epoch ~max_wait:5.0 ~after ())
-       else Lwt.return_unit)
-      >>= fun () -> loop ()
+      wait_until ~deadline ~generation ~refresh_gen () >>= fun () -> loop ()
   in
   (* Venue instrument metadata is initialized once here (idempotent; the
      supervisor keeps its own). *)
@@ -2864,7 +3086,7 @@ let start
       ?(config = default_config ())
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
       ~(classes : (string * class_pool) list)
-      ?(on_publish : decision list -> unit = fun _ -> ())
+      ?(on_publish : string list -> decision list -> unit = fun _ _ -> ())
       ()
   =
   Lwt.async (fun () ->

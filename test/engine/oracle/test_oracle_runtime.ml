@@ -1,7 +1,10 @@
-(* Tests for Dio_oracle.Oracle_runtime: the fast-poll cadence used while no
-   asset is active (so a fully deployed account recognizes capital returns
-   quickly), the default runtime knobs, and the lock-free event trigger
-   ([request_pass] wakes [wait_until] early). *)
+(* Tests for Dio_oracle.Oracle_runtime: the event-driven decision path - the
+   cadence is only a safety net ([next_sleep] is always the refresh cadence
+   because fills/cancels apply their pool deltas at event time), the lock-free
+   event trigger ([request_pass] wakes [wait_until] immediately), the
+   in-process pool-delta channel ([notify_fill] / [notify_order_cancel] feed
+   [resolve_account_pool] without a network wait), and the changed-only
+   per-symbol publish set. *)
 
 let default_config () = Dio_oracle.Oracle_runtime.default_config ()
 
@@ -39,14 +42,16 @@ let make_decision ~active =
   }
 ;;
 
-let test_poll_while_all_inactive () =
-  (* A fully deployed account (every decision inactive, e.g. "cannot fund the
-     first buy" while awaiting sell fills) polls at the fast cadence. *)
+let test_next_sleep_is_refresh_cadence () =
+  (* The decision path is event-driven: fills/cancels apply their pool deltas
+     at event time, so [next_sleep] is always the refresh cadence (a safety
+     net for conditions that emit no event), regardless of how many assets are
+     active - the fast poll cadence no longer gates decisions. *)
   let config = { (default_config ()) with poll_seconds = 5.0; refresh_seconds = 300.0 } in
   let decisions = [ make_decision ~active:false; make_decision ~active:false ] in
   Alcotest.(check (float 0.0001))
-    "fast poll while all inactive"
-    5.0
+    "refresh cadence even while all inactive"
+    300.0
     (Dio_oracle.Oracle_runtime.next_sleep ~config ~decisions)
 ;;
 
@@ -791,30 +796,143 @@ let test_publish_generation_bumps_per_pass () =
   Alcotest.(check int) "second publish bumps again" (after_one + 1) after_two
 ;;
 
-let test_wait_refresh_epoch_bounded () =
-  (* Returns immediately when a new epoch was already published since the
-     caller captured [after], and when the budget is exhausted - never
-     blocks the decision path for long. *)
+(* ---- Pool-delta channel (network-independent decision path) ----------- *)
+
+let kraken_account () = Dio_oracle.Oracle_topology.key ~venue:"kraken" ~symbol:"X/USD" ()
+
+let pool_materialized ~epoch ~pool =
+  let account = kraken_account () in
+  let aid = Dio_oracle.Oracle_runtime.account_id account in
+  let balances = Hashtbl.create 1 in
+  let snapshot =
+    { Dio_oracle.Oracle_balances.exchange = "kraken"
+    ; testnet = false
+    ; balances =
+        [ { Dio_oracle.Oracle_balances.asset = "USD"
+          ; available = pool
+          ; total = pool
+          ; wallet_type = "rest"
+          ; wallet_id = "account"
+          }
+        ]
+    ; fetched_at = 0.0
+    }
+  in
+  Hashtbl.replace balances aid (Some (pool, snapshot));
+  { Dio_oracle.Oracle_runtime.m_assets = []
+  ; m_balances = balances
+  ; m_fng = None
+  ; m_epoch = epoch
+  ; m_last_history_at = 0.0
+  }
+;;
+
+let test_pool_delta_fill_applied () =
+  (* A buy fill consumes value+fee from the materialized pool at decision
+     time - the decision path never waits on a network balance refresh. *)
   let gen = Atomic.get Dio_oracle.Oracle_runtime.refresh_generation in
-  let t0 = Unix.gettimeofday () in
-  Lwt_main.run
-    (Dio_oracle.Oracle_runtime.wait_refresh_epoch ~max_wait:5.0 ~after:(gen - 1) ());
-  let elapsed = Unix.gettimeofday () -. t0 in
-  Alcotest.(check bool)
-    "new epoch already published returns immediately"
-    (elapsed < 0.1)
-    true;
-  let t0 = Unix.gettimeofday () in
-  Lwt_main.run (Dio_oracle.Oracle_runtime.wait_refresh_epoch ~max_wait:0.05 ~after:gen ());
-  let elapsed = Unix.gettimeofday () -. t0 in
-  Alcotest.(check bool) "budget exhausted returns" (elapsed >= 0.04 && elapsed < 1.0) true
+  Dio_oracle.Oracle_runtime.notify_fill
+    ~exchange:"kraken"
+    ~symbol:"X/USD"
+    ~testnet:false
+    ~side:Dio_exchange.Exchange_intf.Types.Buy
+    ~filled_qty:10.0
+    ~avg_price:5.0
+    ~fee:0.05;
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  let m = pool_materialized ~epoch:gen ~pool:1000.0 in
+  match Dio_oracle.Oracle_runtime.resolve_account_pool ~m (kraken_account ()) with
+  | Some (pool, _) ->
+    (* 10 x 5 = 50 value + 0.05 fee consumed: 1000 - 50.05 = 949.95 *)
+    Alcotest.(check (float 0.01)) "fill delta applied" 949.95 pool
+  | None -> Alcotest.fail "expected a resolved pool"
+;;
+
+let test_pool_delta_cancel_applied () =
+  (* A canceled BUY returns its remaining committed value to the pool. *)
+  let gen = Atomic.get Dio_oracle.Oracle_runtime.refresh_generation in
+  Dio_oracle.Oracle_runtime.notify_order_cancel
+    ~exchange:"kraken"
+    ~symbol:"X/USD"
+    ~testnet:false
+    ~side:Dio_exchange.Exchange_intf.Types.Buy
+    ~value:50.0;
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  let m = pool_materialized ~epoch:gen ~pool:1000.0 in
+  match Dio_oracle.Oracle_runtime.resolve_account_pool ~m (kraken_account ()) with
+  | Some (pool, _) -> Alcotest.(check (float 0.01)) "cancel delta applied" 1050.0 pool
+  | None -> Alcotest.fail "expected a resolved pool"
+;;
+
+let test_pool_delta_sell_cancel_ignored () =
+  (* A canceled SELL releases base inventory, not quote: the pool is
+     untouched. *)
+  let gen = Atomic.get Dio_oracle.Oracle_runtime.refresh_generation in
+  Dio_oracle.Oracle_runtime.notify_order_cancel
+    ~exchange:"kraken"
+    ~symbol:"X/USD"
+    ~testnet:false
+    ~side:Dio_exchange.Exchange_intf.Types.Sell
+    ~value:500.0;
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  let m = pool_materialized ~epoch:gen ~pool:1000.0 in
+  match Dio_oracle.Oracle_runtime.resolve_account_pool ~m (kraken_account ()) with
+  | Some (pool, _) -> Alcotest.(check (float 0.01)) "sell cancel ignored" 1000.0 pool
+  | None -> Alcotest.fail "expected a resolved pool"
+;;
+
+let test_pool_delta_superseded_by_newer_epoch () =
+  (* A delta whose baseline does not match the consumed materialized epoch is
+     dropped: a fresher authoritative pool (fetched after the event) already
+     includes it, so applying it again would double-count. *)
+  let gen = Atomic.get Dio_oracle.Oracle_runtime.refresh_generation in
+  Dio_oracle.Oracle_runtime.notify_fill
+    ~exchange:"kraken"
+    ~symbol:"X/USD"
+    ~testnet:false
+    ~side:Dio_exchange.Exchange_intf.Types.Buy
+    ~filled_qty:10.0
+    ~avg_price:5.0
+    ~fee:0.0;
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  (* The materialized record was published AFTER the fill (epoch advanced):
+     its pool already reflects the fill. *)
+  let m = pool_materialized ~epoch:(gen + 1) ~pool:949.0 in
+  match Dio_oracle.Oracle_runtime.resolve_account_pool ~m (kraken_account ()) with
+  | Some (pool, _) -> Alcotest.(check (float 0.01)) "delta superseded" 949.0 pool
+  | None -> Alcotest.fail "expected a resolved pool"
+;;
+
+let test_publish_changed_symbols () =
+  (* [publish] exposes the symbols whose decision changed this pass, so the
+     engine wakes only those domains (per-symbol) instead of broadcasting. *)
+  Dio_oracle.Oracle_runtime.publish [ make_decision ~active:true ];
+  Alcotest.(check (list string))
+    "first publish changes the symbol"
+    [ "X/USD" ]
+    !Dio_oracle.Oracle_runtime.last_changed_symbols;
+  (* Re-publishing an identical decision changes nothing. *)
+  Dio_oracle.Oracle_runtime.publish [ make_decision ~active:true ];
+  Alcotest.(check (list string))
+    "identical re-publish changes nothing"
+    []
+    !Dio_oracle.Oracle_runtime.last_changed_symbols;
+  (* A flipped decision changes it again. *)
+  Dio_oracle.Oracle_runtime.publish [ make_decision ~active:false ];
+  Alcotest.(check (list string))
+    "flipped decision changes the symbol"
+    [ "X/USD" ]
+    !Dio_oracle.Oracle_runtime.last_changed_symbols
 ;;
 
 let () =
   Alcotest.run
     "Oracle_runtime"
     [ ( "next_sleep"
-      , [ Alcotest.test_case "poll while all inactive" `Quick test_poll_while_all_inactive
+      , [ Alcotest.test_case
+            "refresh cadence regardless of activity"
+            `Quick
+            test_next_sleep_is_refresh_cadence
         ; Alcotest.test_case
             "normal cadence while active"
             `Quick
@@ -886,11 +1004,32 @@ let () =
             "analysis memoization roundtrip"
             `Quick
             test_analysis_memoization_roundtrip
-        ; Alcotest.test_case "bounded fill-wait" `Quick test_wait_refresh_epoch_bounded
         ; Alcotest.test_case
             "publish generation bumps per pass"
             `Quick
             test_publish_generation_bumps_per_pass
+        ] )
+    ; ( "pool-delta channel"
+      , [ Alcotest.test_case
+            "fill delta applied in process"
+            `Quick
+            test_pool_delta_fill_applied
+        ; Alcotest.test_case
+            "buy cancel delta applied"
+            `Quick
+            test_pool_delta_cancel_applied
+        ; Alcotest.test_case
+            "sell cancel ignored"
+            `Quick
+            test_pool_delta_sell_cancel_ignored
+        ; Alcotest.test_case
+            "delta superseded by newer epoch"
+            `Quick
+            test_pool_delta_superseded_by_newer_epoch
+        ; Alcotest.test_case
+            "publish changed-only symbols"
+            `Quick
+            test_publish_changed_symbols
         ] )
     ; ( "capital-gate"
       , [ Alcotest.test_case
