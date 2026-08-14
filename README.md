@@ -2,7 +2,7 @@
 
 DIO is an OCaml trading engine for market making, grid trading, and capital management. It runs grid or market-making strategies on Kraken, Hyperliquid, Lighter, Interactive Brokers, and Alpaca from a single `config.json`, sizes every position with a capital-survival oracle, and exposes a live TUI dashboard over a Unix domain socket.
 
-The engine is organized as one OCaml domain per trading asset, a supervisor that owns connection lifecycle and health, a lock-free order executor, and a supervised oracle that re-sizes positions every few minutes.
+The engine is organized as one OCaml domain per trading asset, a supervisor that owns connection lifecycle and health, a lock-free order executor, and a supervised event-driven oracle that re-sizes positions on every fill/cancel (microsecond decision path, no network wait).
 
 > **Warning:** the auto-hedge strategy (Hyperliquid perp shorts) is experimental. Review `auto_hedger.ml` and test on testnet before risking real capital.
 
@@ -148,8 +148,8 @@ The runtime oracle runs inside the engine as a supervised module. Keys:
 | `qty_cap_mult` | `0.0` | Cap order size as a multiple of what the oracle would size; `0.0` disables |
 | `no_deep_history` | `false` | Skip the Yahoo deep-history extension |
 | `weight_by_sessions` | `true` | Weight blended statistics by number of sessions per asset |
-| `refresh_seconds` | `300.0` | How often the runtime re-analyzes each asset |
-| `poll_seconds` | `30.0` | How often the runtime checks for new decisions |
+| `refresh_seconds` | `300.0` | Full history-refresh cadence and the pass loop's safety-net deadline (decisions are event-driven: fills/cancels re-size immediately) |
+| `poll_seconds` | `30.0` | Background refresher's authoritative balance-reconciliation cadence (the decision path never waits on it) |
 | `startup_wait_seconds` | `60.0` | Delay before the first analysis pass (lets feeds warm up) |
 | `horizons` | venue default | `[30; 90; 180; 365]` for crypto, `[21; 63; 126; 252]` for equities |
 | `max_capital` | unset | Cap on total capital the oracle will deploy |
@@ -253,7 +253,7 @@ Supervisor ── health monitor / circuit breaker / connection registry
    |      strategies -> order executor -> exchange action
    |      exchange feeds -> ring buffers -> strategy loop
    |
-   +-- Oracle (supervised runtime, re-sizes every refresh_seconds)
+   +-- Oracle (supervised, event-driven: re-sizes on fills/cancels, no network wait)
    |
    +-- Order executor (MPSC lock-free queue, in-flight tracking)
    |
@@ -311,6 +311,8 @@ Mechanics (see `test/engine/oracle/oracle.md` for the full design):
 ### Runtime behavior
 
 Inside the engine the oracle is a supervised module (`supervisor.ml` starts it like any other connection, registered as `oracle`). It heartbeats on every published pass plus a 10-second liveness ticker and auto-restarts if its loop dies. Each asset's analysis is bounded at 60 seconds and falls back to last-known-good. Decisions publish as: `active`, `qty`, `grid_interval` (`gi`), `d_surv`, `reason`, `reclaim_capital`, and the blend components. Capital is allocated in two phases across the venue account pool, with priority reclamation of capital from shrinking assets.
+
+The decision path is event-driven and network-free: a fill or cancel on any trading domain wakes the oracle immediately (one Atomic increment plus an Lwt-condition broadcast) and enqueues its pool delta (`notify_fill` / `notify_order_cancel`), which the pass applies to the account pool in process — decisions re-size in microseconds and never wait on a venue balance round-trip; the background refresher reconciles the authoritative balance on its own cadence. Only the affected domains are woken per pass (changed-only, per-symbol). On publish, domains adopt the new qty/gi via the lock-free snapshot.
 
 Dynamic re-evaluation: when the price moves more than `fng_check_threshold` percent from the grid baseline, the oracle re-checks the Fear-and-Greed signal and can shrink or grow the grid before the next scheduled pass. Equities are pure oracle; Fear-and-Greed applies only to crypto.
 
