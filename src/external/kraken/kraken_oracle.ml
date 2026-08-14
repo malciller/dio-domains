@@ -10,7 +10,7 @@
     [fetch_bars] returns RAW bars (any order); the oracle sorts, de-duplicates
     and normalizes centrally (normalize is idempotent, so this contract is
     safe). HTTP calls are timeout-bounded so a blackholed upstream cannot
-    freeze the oracle pass (mirrors the oracle's own [Oracle_http] wrapper,
+    freeze the oracle pass (mirrors the oracle's HTTP timeout pattern,
     which is not reachable from the venue library). *)
 
 open Lwt.Infix
@@ -330,6 +330,33 @@ let fetch_balances ~testnet:_ : ((string * float * float) list, string) result L
              (Printf.sprintf "Kraken response parse failed: %s" (Printexc.to_string exn))))
     (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
 ;;
+
+(** Live websocket-fed balance snapshot: the authenticated balances WS feed
+    (the engine supervisor's live store) tracks the account's wallets, with
+    tradeable = the store's spendable balance. Returns [Some] triples when the
+    store holds data (the oracle runtime prefers this over the REST one-shot
+    [fetch_balances]), [None] when the store is empty/unregistered. *)
+let live_balances () : (string * float * float) list option =
+  match Exchange.Registry.get "kraken" with
+  | None -> None
+  | Some (module Ex) ->
+    let balances = Ex.get_all_balances () in
+    if balances = []
+    then None
+    else
+      Some
+        (List.map
+           (fun (asset, total) ->
+              let available =
+                try Ex.get_tradeable_balance ~asset with
+                | _ -> 0.0
+              in
+              asset, available, total)
+           balances)
+;;
+
+let default_quote = "USD"
+let min_notional ~symbol:_ = 0.0
 
 (* ---- Instrument metadata ---- *)
 

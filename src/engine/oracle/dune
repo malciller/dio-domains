@@ -5,13 +5,11 @@
   unix
   yojson
   lwt
-  cohttp-lwt-unix
   dotenv
+  mtime
+  mtime.clock.os
   dio.logging
   dio.strategies
   dio.exchange
   dio.cmc
-  dio.alpaca
-  dio.kraken
-  dio.hyperliquid
-  dio.latency_profiling))
+  dio.yahoo))

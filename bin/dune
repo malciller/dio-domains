@@ -34,4 +34,14 @@
  (public_name dio-oracle)
  (name oracle)
  (modes exe)
- (libraries unix yojson lwt dio.oracle dio.engine dio.strategies dio.cmc))
+ (libraries
+  unix
+  yojson
+  lwt
+  dio.oracle
+  dio.engine
+  dio.strategies
+  dio.cmc
+  dio.kraken
+  dio.hyperliquid
+  dio.alpaca))

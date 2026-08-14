@@ -21,6 +21,16 @@ module G = Oracle_strategy.Grid
 module D = Oracle_deploy.Engine (G)
 module S = Oracle_replay.Sizing (G)
 
+(* Force venue module initialization to trigger the top-level registration
+   side effects: the impl modules register BOTH the live-trading modules
+   (Exchange_intf.Registry) and the oracle data-venue adapters
+   (Exchange_intf.Oracle.Registry) - the same pattern as bin/main.ml, and the
+   reason this CLI (unlike the pure/offline test binaries) links the venue
+   libraries. Without it, OCaml's unit-level dead-code elimination would drop
+   the registrations and online mode would hit empty registries. *)
+let () = ignore Kraken.Kraken_module.Kraken_impl.name
+let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
+let () = ignore Alpaca.Module.Alpaca_impl.name
 let pct f = Printf.sprintf "%6.1f%%" (f *. 100.0)
 
 let string_contains haystack needle =

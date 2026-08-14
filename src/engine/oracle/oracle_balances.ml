@@ -154,51 +154,34 @@ let fetch_account ~exchange ~testnet () : (snapshot, string) result Lwt.t =
 
 (** Build a balance snapshot from the live exchange registry stores - the
     websocket-fed caches owned by the engine supervisor - instead of a
-    standalone REST call. Returns [None] when the exchange is not registered
-    (standalone CLI runs, unknown venue) or its store is empty (no websocket
-    snapshot received yet), so callers fall back to the REST fetch.
+    standalone REST call. Returns [None] when the venue's oracle adapter has
+    no live store semantics ([Oracle.S.live_balances], e.g. Hyperliquid: its
+    live "USDC" store aggregates perp margin with spot, so the oracle keeps
+    REST authoritative there), when the exchange is not registered (standalone
+    CLI runs, unknown venue), or when its store is empty (no websocket
+    snapshot received yet); callers then fall back to the REST fetch.
 
-    Live stores only, and only where the store's semantics match the oracle's
-    REST path:
-    - Kraken: the authenticated balances WS feed tracks the account's wallets;
-      tradeable = the WS store's spendable balance.
-    - Alpaca: the account feed holds cash (available) / equity (total) plus
-      per-symbol positions, mirroring the REST account+positions fetch.
-    - Hyperliquid is deliberately excluded: the live "USDC" store aggregates
-      the perp clearinghouse USDC with the spot wallet, while the oracle pool
-      counts spot only (margin is not grid capital). REST
-      spotClearinghouseState stays authoritative there. *)
+    Which venues have a WS-fed live store - and whether its semantics match
+    the oracle's REST balance view - is the venue's own answer, not this
+    module's. *)
 let snapshot_of_live_store ~(exchange : string) ~(testnet : bool) () : snapshot option =
   let exchange = String.lowercase_ascii exchange in
-  match exchange with
-  | "kraken" | "alpaca" ->
-    (match Exchange.Registry.get exchange with
-     | None -> None
-     | Some (module Ex) ->
-       let balances = Ex.get_all_balances () in
-       if balances = []
-       then None
-       else
-         Some
-           { exchange
-           ; testnet
-           ; balances =
-               List.map
-                 (fun (asset, total) ->
-                    let available =
-                      try Ex.get_tradeable_balance ~asset with
-                      | _ -> 0.0
-                    in
-                    { asset
-                    ; available
-                    ; total
-                    ; wallet_type = "live"
-                    ; wallet_id = "engine"
-                    })
-                 balances
-           ; fetched_at = Unix.gettimeofday ()
-           })
-  | _ -> None
+  match Exchange.Oracle.Registry.get exchange with
+  | Some (module V) ->
+    (match V.live_balances () with
+     | Some triples ->
+       Some
+         { exchange
+         ; testnet
+         ; balances =
+             List.map
+               (fun (asset, available, total) ->
+                  { asset; available; total; wallet_type = "live"; wallet_id = "engine" })
+               triples
+         ; fetched_at = Unix.gettimeofday ()
+         }
+     | None -> None)
+  | None -> None
 ;;
 
 (** Fetch an account balance snapshot, preferring the live websocket-fed

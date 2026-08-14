@@ -497,6 +497,23 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
      | Ok spot_json -> parse_spot_balances spot_json)
 ;;
 
+(** Hyperliquid deliberately has no live balance snapshot for the oracle:
+    the live websocket-fed "USDC" store aggregates the perp clearinghouse
+    USDC with the spot wallet, while the oracle pool counts spot capital only
+    (perp margin is not grid capital). REST spotClearinghouseState stays
+    authoritative there, so this always returns [None] and the oracle runtime
+    falls back to [fetch_balances]. Revisit only if a WS spot-only balance
+    semantics is proven equivalent to the REST spot view. *)
+let live_balances () : (string * float * float) list option = None
+
+let default_quote = "USDC"
+
+(** Hyperliquid spot enforces a 10 USDC MinTradeSpotNtl floor on order
+    notional; perp and equity-quoted symbols are not notional-constrained in
+    this model. [symbol] carries a '/' for spot pairs (e.g. "BTC/USDC");
+    slash-less symbols are perp/futures. *)
+let min_notional ~symbol = if String.contains symbol '/' then 10.0 else 0.0
+
 (* ---- Instrument metadata ---- *)
 
 let init_instruments ~testnet ~symbols:_ : unit Lwt.t =

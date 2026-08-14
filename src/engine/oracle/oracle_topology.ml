@@ -5,6 +5,8 @@
    owns that identity, validates explicit allocations/transfers, and aligns
    histories on a shared ISO-date timeline without forward-filling gaps. *)
 
+module Exchange = Dio_exchange.Exchange_intf
+
 type instrument_key =
   { venue : string
   ; symbol : string
@@ -42,10 +44,21 @@ let map_result result f =
   | Error error -> Error error
 ;;
 
+(** Default quote asset for a venue's symbols written without an explicit
+    quote (e.g. "BTC" -> USDC on Hyperliquid, USD on Kraken/Alpaca).
+    Registry-first: the venue's oracle adapter ([Exchange_intf.Oracle.S.
+    default_quote]) owns the answer. The static fallback preserves the
+    pre-adapter behavior for venues with no oracle adapter linked yet
+    (e.g. portfolio-mode lighter symbols), and is otherwise unreachable in
+    linked production binaries. *)
 let default_quote venue =
-  match String.lowercase_ascii venue with
-  | "hyperliquid" | "lighter" -> "USDC"
-  | _ -> "USD"
+  let venue = String.lowercase_ascii venue in
+  match Exchange.Oracle.Registry.get venue with
+  | Some (module V) -> V.default_quote
+  | None ->
+    (match venue with
+     | "hyperliquid" | "lighter" -> "USDC"
+     | _ -> "USD")
 ;;
 
 let split_symbol ~venue symbol =

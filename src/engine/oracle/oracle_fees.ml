@@ -18,33 +18,23 @@ module Exchange = Dio_exchange.Exchange_intf
 
 let section = "oracle_fees"
 
-(* Last-resort static defaults, used ONLY when no oracle adapter is
-   registered for the venue (pure/offline/test contexts where the venue
-   libraries are not linked). Registered venues use their own
-   [Exchange_intf.Oracle.S.default_fees] instead. *)
-let fallback_maker_fee = function
-  | "kraken" -> 0.0016
-  | "hyperliquid" -> 0.0002
-  | "alpaca" -> 0.0
-  | _ -> 0.0016
-;;
-
-let fallback_taker_fee = function
-  | "kraken" -> 0.0026
-  | "hyperliquid" -> 0.0005
-  | "alpaca" -> 0.0
-  | _ -> 0.0026
-;;
+(* Last-resort generic fee, used ONLY when no oracle adapter is registered
+   for the venue (pure/offline/test contexts where the venue libraries are
+   not linked). Registered venues use their own
+   [Exchange_intf.Oracle.S.default_fees] instead - venue-specific fee data
+   lives in the venue's adapter, never here. *)
+let fallback_maker_fee = 0.0016
+let fallback_taker_fee = 0.0026
 
 (** Per-process cache of resolved (maker, taker) fees per (exchange, symbol). *)
 let fee_cache : (string * string, float * float) Hashtbl.t = Hashtbl.create 16
 
 (** Venue default (maker, taker) for [exchange]/[symbol]: the registered
-    adapter's [default_fees] when available, else the static fallback. *)
+    adapter's [default_fees] when available, else the generic fallback. *)
 let venue_default_fees (exchange : string) (symbol : string) : float * float =
   match Exchange.Oracle.Registry.get (String.lowercase_ascii exchange) with
   | Some (module V) -> V.default_fees ~symbol
-  | None -> fallback_maker_fee exchange, fallback_taker_fee exchange
+  | None -> fallback_maker_fee, fallback_taker_fee
 ;;
 
 (** Fetch (maker, taker) from the real exchange for one asset, through the
@@ -59,8 +49,8 @@ let fetch_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
       ~section
       "no live fee endpoint for exchange '%s'; using venue default maker %.4f%%"
       exchange
-      (fallback_maker_fee exchange *. 100.0);
-    Lwt.return (fallback_maker_fee exchange, fallback_taker_fee exchange)
+      (fallback_maker_fee *. 100.0);
+    Lwt.return (fallback_maker_fee, fallback_taker_fee)
 ;;
 
 (** Load .env (KRAKEN/HYPERLIQUID/ALPACA credentials) into the process env, if
