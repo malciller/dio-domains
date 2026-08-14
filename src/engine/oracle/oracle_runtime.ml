@@ -343,6 +343,19 @@ let key_of (d : decision) =
   String.lowercase_ascii d.exchange ^ "/" ^ String.lowercase_ascii d.symbol
 ;;
 
+(** Pass publication generation: bumped once per [publish], so trading
+    domains keyed on it re-read their decision the moment a new pass
+    publishes. The refresher's [refresh_generation] only changes on
+    background-refresh cycles; keying the domains' decision cache on that
+    would leave a decision that changed on a PASS invisible until the next
+    refresh cycle - exactly the stall that breaks priority reclamation: the
+    INACTIVE-with-reclaim decision (and the later re-activation) must reach
+    the domain promptly or the cancelled buy is never released and the
+    priority asset never resumes. *)
+let publish_generation : int Atomic.t = Atomic.make 0
+
+let get_publish_generation () = Atomic.get publish_generation
+
 (** The whole current decision snapshot: the atomically-swapped immutable
     list, used by [on_publish] and the loop's cadence/reclaim logic. Readers
     always see a consistent list, never a torn mid-swap state. *)
@@ -372,7 +385,11 @@ let publish (fresh : decision list) =
   (* Rebuild the keyed map copy-on-write for the next readers. *)
   let map = Hashtbl.create (List.length (kept @ fresh)) in
   List.iter (fun (d : decision) -> Hashtbl.replace map (key_of d) d) (kept @ fresh);
-  Atomic.set decisions_map map
+  Atomic.set decisions_map map;
+  (* Domains keyed on [get_publish_generation] re-read their decision on the
+     next cycle: a new pass (a new reclaim, a re-activation) is adopted
+     immediately, not at the next background-refresh cycle. *)
+  Atomic.incr publish_generation
 ;;
 
 (** Pass counters for observability (logged, never read on a hot path). *)

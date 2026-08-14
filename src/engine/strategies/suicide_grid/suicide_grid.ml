@@ -95,6 +95,63 @@ let reconcile_persisted_sell_levels =
 
 let evaluate_sell_leg = Suicide_grid_execution.evaluate_sell_leg
 let execute_strategy = Suicide_grid_execution.execute_strategy
+
+(* ------------------------------------------------------------------ *)
+(* Priority-reclamation step (pure decision).                          *)
+(*                                                                     *)
+(* The capital oracle's reclamation pass asks a domain to cancel its    *)
+(* resting buy(s) (decision.reclaim_capital) so the committed capital  *)
+(* returns to the account pool for a higher-priority asset. The domain *)
+(* issues the cancel through the normal order pipeline. A cancel is a  *)
+(* one-shot network op that can fail silently (dispatch dropped while  *)
+(* the exchange connection flapped, the exchange rejected it, the ring *)
+(* buffer was full): the cancellation is latched here so it is NOT     *)
+(* re-issued every cycle, but it MUST be retried while the reclaim     *)
+(* decision persists and eligible buys still sit in the store -        *)
+(* otherwise a single failed attempt leaves the account permanently    *)
+(* stuck: the reclaimed asset stays paused (the decision only clears   *)
+(* once the store's committed value drops to zero) and the priority    *)
+(* asset never resumes on capital that was never actually released.    *)
+(* ------------------------------------------------------------------ *)
+
+(** The domain's per-cycle reclaim action, decided purely from the latch
+    state and the exchange store's buy orders:
+    - [Reclaim_rearm]: no buy at all remains in the store - the cancel landed
+      (or never needed). The domain re-arms its latch so a later reclaim
+      decision re-triggers cleanly, and the capital oracle is woken to
+      re-size with the released capital.
+    - [Reclaim_cancel n]: [n] cancellable buys remain and the cancel may be
+      issued (none is in flight, or the retry interval elapsed after a failed
+      attempt). The domain pushes cancels for every eligible buy and re-arms
+      the latch.
+    - [Reclaim_deferred]: a cancel is already in flight (issued within the
+      retry interval) or the only remaining buys are mid-amendment (the
+      exchange rejects canceling an order being amended) - wait, do not spam
+      the exchange. *)
+type reclaim_step =
+  | Reclaim_rearm
+  | Reclaim_cancel of int
+  | Reclaim_deferred
+
+let reclaim_step
+      ~(now : float)
+      ~(retry_seconds : float)
+      ~(issued : bool)
+      ~(issued_at : float)
+      ~(eligible : int)
+      ~(any_buy : bool)
+  : reclaim_step
+  =
+  if eligible > 0
+  then
+    if (not issued) || now -. issued_at > retry_seconds
+    then Reclaim_cancel eligible
+    else Reclaim_deferred
+  else if any_buy
+  then Reclaim_deferred (* only mid-amendment buys remain: wait for the amend *)
+  else Reclaim_rearm
+;;
+
 let flush_persistence = Suicide_grid_events.flush_persistence
 let handle_order_acknowledged = Suicide_grid_events.handle_order_acknowledged
 let handle_order_failed = Suicide_grid_events.handle_order_failed

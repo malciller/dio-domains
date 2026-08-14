@@ -1077,6 +1077,113 @@ let test_new_buy_respects_2x_gi_closest_sell () =
   | _ -> failwith "expected exactly one buy order"
 ;;
 
+let test_reclaim_step_cancels_when_not_issued () =
+  (* Reclaim self-healing: the FIRST cycle with a reclaim decision and an
+     eligible resting buy issues the cancel (arm the latch). *)
+  let step =
+    Dio_strategies.Suicide_grid.reclaim_step
+      ~now:100.0
+      ~retry_seconds:15.0
+      ~issued:false
+      ~issued_at:0.0
+      ~eligible:1
+      ~any_buy:true
+  in
+  check
+    bool
+    "first reclaim issues the cancel"
+    true
+    (step = Dio_strategies.Suicide_grid.Reclaim_cancel 1)
+;;
+
+let test_reclaim_step_throttles_in_flight_cancel () =
+  (* A cancel issued 5s ago is still in flight (retry window 15s): do NOT
+     re-issue - avoids cancel spam against a cancel that is dispatching. *)
+  let step =
+    Dio_strategies.Suicide_grid.reclaim_step
+      ~now:105.0
+      ~retry_seconds:15.0
+      ~issued:true
+      ~issued_at:100.0
+      ~eligible:1
+      ~any_buy:true
+  in
+  check
+    bool
+    "in-flight cancel deferred"
+    true
+    (step = Dio_strategies.Suicide_grid.Reclaim_deferred)
+;;
+
+let test_reclaim_step_retries_failed_cancel () =
+  (* THE STUCK-STATE REGRESSION: the reclaim cancel is a one-shot network op
+     that can fail silently (dispatch dropped on a connection flap, exchange
+     rejection, ring-buffer full). If the latch never re-arms, the account is
+     permanently stuck - the reclaimed asset stays paused (the oracle's plan
+     only clears once the store's committed value drops to zero) and the
+     priority asset never resumes on capital that was never released. The
+     fix: once the retry interval elapses with the eligible buy still in the
+     store, the cancel MUST be re-issued. *)
+  let step =
+    Dio_strategies.Suicide_grid.reclaim_step
+      ~now:116.0
+      ~retry_seconds:15.0
+      ~issued:true
+      ~issued_at:100.0
+      ~eligible:1
+      ~any_buy:true
+  in
+  check
+    bool
+    "stale failed cancel is retried"
+    true
+    (step = Dio_strategies.Suicide_grid.Reclaim_cancel 1)
+;;
+
+let test_reclaim_step_rearms_when_store_clean () =
+  (* The cancel landed (or never needed): the store no longer shows ANY buy.
+     The latch re-arms so a later reclaim decision re-triggers cleanly - and
+     the released capital is recognized by the next oracle pass (the
+     committed value it reads is zero). *)
+  let step =
+    Dio_strategies.Suicide_grid.reclaim_step
+      ~now:100.0
+      ~retry_seconds:15.0
+      ~issued:true
+      ~issued_at:99.0
+      ~eligible:0
+      ~any_buy:false
+  in
+  check
+    bool
+    "clean store re-arms the latch"
+    true
+    (step = Dio_strategies.Suicide_grid.Reclaim_rearm)
+;;
+
+let test_reclaim_step_waits_for_mid_amend_buy () =
+  (* The domain only cancels buys that are not mid-amendment (Hyperliquid
+     rejects canceling an order being amended). An in-flight-amend buy is not
+     cancellable: the step waits for the amend to resolve into a cancellable
+     replacement instead of spamming the exchange (and instead of re-arming
+     - the capital is still committed, so the reclaim decision is still
+     correct). *)
+  let step =
+    Dio_strategies.Suicide_grid.reclaim_step
+      ~now:100.0
+      ~retry_seconds:15.0
+      ~issued:false
+      ~issued_at:0.0
+      ~eligible:0
+      ~any_buy:true
+  in
+  check
+    bool
+    "mid-amend buy defers the cancel"
+    true
+    (step = Dio_strategies.Suicide_grid.Reclaim_deferred)
+;;
+
 let test_buy_placement_balance_guard () =
   (* Bug 2 regression: buy placement against an under-funded quote balance.
      - FRESH balance snapshot (authoritative): the order must NOT be sent
@@ -1460,6 +1567,28 @@ let () =
             "new buy respects the 2x gi closest-sell cap"
             `Quick
             test_new_buy_respects_2x_gi_closest_sell
+        ] )
+    ; ( "reclaim"
+      , [ test_case
+            "first reclaim decision issues the cancel"
+            `Quick
+            test_reclaim_step_cancels_when_not_issued
+        ; test_case
+            "in-flight cancel is deferred (no spam)"
+            `Quick
+            test_reclaim_step_throttles_in_flight_cancel
+        ; test_case
+            "failed cancel is retried after the interval"
+            `Quick
+            test_reclaim_step_retries_failed_cancel
+        ; test_case
+            "clean store re-arms the latch"
+            `Quick
+            test_reclaim_step_rearms_when_store_clean
+        ; test_case
+            "mid-amend buy defers the cancel"
+            `Quick
+            test_reclaim_step_waits_for_mid_amend_buy
         ] )
     ; ( "events"
       , [ test_case "order acknowledgment" `Quick test_order_acknowledgment
