@@ -124,11 +124,9 @@ let test_trail_buy_matches_live () =
 ;;
 
 let test_min_move_matches_live () =
-  let st = identity_state () in
   let open Dio_strategies in
-  let price = 100.0 in
-  let live = Suicide_grid_config.get_min_move_threshold price 1.0 st in
-  let core = Grid_core.min_move_threshold (cfg ~price_increment:0.01 ()) price in
+  let live = Suicide_grid_config.get_min_move_threshold 0.01 in
+  let core = Grid_core.min_move_threshold (cfg ~price_increment:0.01 ()) 100.0 in
   near live core
 ;;
 

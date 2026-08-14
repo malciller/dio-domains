@@ -618,15 +618,18 @@ let evaluate_buy_leg
     in
     (* A fresh buy must respect the same 2x-grid-interval spacing below the
        closest resting sell that the trailing leg enforces via [exact_target]
-       (sell_price - 2*gi): without it a buy placed after a fill can sit too
-       close to the lowest sell (a ~1x rung the grid never allows when it
-       amends). Pull the buy down to sit at least 2*gi below the closest
-       sell. *)
+       (sell_price - 2*gi of the SELL): without it a buy placed after a fill
+       can sit too close to the lowest sell (a ~1x rung the grid never allows
+       when it amends). As in the trailing leg, the clamp only applies when
+       that sell is strictly ABOVE the top of book (a valid bracket around
+       the market); a sell at/below the top of book is the next fill target
+       and must not drag the fresh buy down to 2*gi below the market. *)
     let buy_price =
       match closest_sell_order_initial with
       | Some (_, sell_price) ->
-        let base = if bid_price > 0.0 then bid_price else sell_price in
-        min buy_price (sell_price -. (base *. (2.0 *. grid_interval /. 100.0)))
+        if sell_price > bid_price
+        then min buy_price (sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0)))
+        else buy_price
       | None -> buy_price
     in
     let buy_cooldown_key = "place_Buy" in
@@ -783,7 +786,19 @@ let evaluate_buy_leg
         closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id
       with
       | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
-        let double_grid_interval = bid_price *. (2.0 *. grid_interval /. 100.0) in
+        (* The 2*gi separation is anchored on the SELL order, not on the
+           current price - but ONLY when that sell forms a valid bracket around
+           the market, i.e. when it sits strictly ABOVE the top of book. In
+           that geometry the resting buy trails the top of book at the grid
+           interval and stops exactly 2*gi below the closest sell, so ladder
+           rungs stay equidistant at the grid interval. A sell at or below the
+           top of book (a resting sell that has become the ask / next fill
+           target) cannot make a valid clamp: pinning the buy to it dragged
+           the buy to 2*gi below the top of book instead of trailing the
+           market at 1*gi (the observed SPCX behavior). ([sell_price] is
+           always a positive resting-order price, so there is no
+           zero-reference hazard.) *)
+        let double_grid_interval = sell_price *. (2.0 *. grid_interval /. 100.0) in
         let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
         let grid_buy_from_ref =
           calculate_grid_price ref_price grid_interval false state
@@ -795,23 +810,45 @@ let evaluate_buy_leg
           state.cached_round_price (sell_price -. double_grid_interval)
         in
         let proposed_buy_price = grid_buy_capped in
-        let target_buy_price = min proposed_buy_price exact_target in
-        let current_buy_price_rounded = state.cached_round_price current_buy_price in
-        let price_diff_rounded =
-          state.cached_round_price
-            (abs_float (target_buy_price -. current_buy_price_rounded))
+        let target_buy_price =
+          if sell_price > bid_price
+          then min proposed_buy_price exact_target
+          else proposed_buy_price
         in
-        let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
-        (* A sizing re-anchor (the capital oracle published a changed qty/gi -
-           flagged by the domain worker on [force_buy_reanchor]) amends the
-           resting buy to the new sizing target in BOTH directions. Normal
-           trailing only moves the buy UP, so a widened grid interval would
-           otherwise leave the book running at the old, tighter spacing (buy
-           too close to the market, rungs not 2*gi apart) until the market
-           happens to rise. *)
+        let current_buy_price_rounded = state.cached_round_price current_buy_price in
+        let min_move_threshold = get_min_move_threshold state.cached_price_increment in
+        (* A sizing re-anchor (the capital oracle published a changed grid
+           interval - flagged by the domain worker on [force_buy_reanchor])
+           amends the resting buy to the new spacing in BOTH directions.
+           Normal trailing only moves the buy UP, so a widened grid interval
+           would otherwise leave the book running at the old, tighter spacing
+           (buy too close to the market, rungs not 2*gi apart) until the
+           market happens to rise. A qty-only oracle change does NOT re-anchor
+           the price: the grid adopts the new size (Alpaca qty mismatch
+           amend) or on the next placement, and the resting price only trails
+           up. *)
         let reanchor_buy = state.force_buy_reanchor in
         if target_buy_price > current_buy_price || qty_mismatch || reanchor_buy
         then (
+          (* A qty-only mismatch (the oracle re-derived the size from a
+             churning pool; the spacing is unchanged) corrects the QTY and
+             keeps the resting PRICE - the buy only ever trails up, exactly
+             like normal trailing. Only a target above the resting price (a
+             genuine trail-up) or a real gi re-anchor moves the price, and the
+             min-move deadband still applies. This stops the grid and the
+             oracle from fighting over the resting buy every pass (cancel+
+             create churn on Alpaca). *)
+          let effective_amend_price =
+            if qty_mismatch && not reanchor_buy
+            then Float.max current_buy_price target_buy_price
+            else target_buy_price
+          in
+          let effective_price_rounded = state.cached_round_price effective_amend_price in
+          let effective_price_diff =
+            state.cached_round_price
+              (abs_float (effective_amend_price -. current_buy_price_rounded))
+          in
+          let price_moves = effective_price_rounded <> current_buy_price_rounded in
           let allow =
             if qty_mismatch
             then (
@@ -824,14 +861,20 @@ let evaluate_buy_leg
               in
               let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
               let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
-              (not is_being_amended) && (not is_in_flight) && not is_on_cooldown)
+              (* A pure qty correction (price unchanged) is always worth
+                 sending; a qty correction that also trails the price up
+                 respects the min-move deadband like normal trailing. *)
+              (not is_being_amended)
+              && (not is_in_flight)
+              && (not is_on_cooldown)
+              && ((not price_moves) || effective_price_diff >= min_move_threshold))
             else
               amend_allowed
                 ~state
                 ~order_id:buy_order_id
-                ~target_price:target_buy_price
+                ~target_price:effective_amend_price
                 ~current_price_rounded:current_buy_price_rounded
-                ~price_diff:price_diff_rounded
+                ~price_diff:effective_price_diff
                 ~min_move_threshold
           in
           if allow
@@ -856,25 +899,28 @@ let evaluate_buy_leg
                   asset.symbol
                   Buy
                   qty
-                  (Some target_buy_price)
+                  (Some effective_amend_price)
                   true
                   Grid
                   asset.exchange
               in
               ignore (push_order ~now ~state order);
-              state.last_buy_order_price <- Some target_buy_price;
+              state.last_buy_order_price <- Some effective_amend_price;
               state.force_buy_reanchor <- false;
               if qty_mismatch
               then
                 Logging.info_f
                   ~section
                   "Alpaca pending buy order %s qty (%.8f) differs from config (%.8f) - \
-                   amending price to config target %.4f and qty to %.8f"
+                   amending to qty %.8f%s"
                   buy_order_id
                   pending_buy_qty_from_scan
                   qty
-                  target_buy_price
-                  qty;
+                  qty
+                  (if price_moves
+                   then
+                     Printf.sprintf " and trailing price up to %.4f" effective_amend_price
+                   else " (price unchanged)");
               ())
             else if not (Float.is_nan quote_balance)
             then
@@ -889,7 +935,7 @@ let evaluate_buy_leg
             else Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
             (* The re-anchor target is already where the buy sits (within the
              min-move threshold): nothing to amend, the sizing is applied. *))
-          else if reanchor_buy && price_diff_rounded < min_move_threshold
+          else if reanchor_buy && effective_price_diff < min_move_threshold
           then state.force_buy_reanchor <- false)
       | _ -> ())
     else (
@@ -900,17 +946,29 @@ let evaluate_buy_leg
         let target_buy_price =
           if bid_price > 0.0 then min raw_target bid_price else raw_target
         in
-        let min_move_threshold = get_min_move_threshold bid_price grid_interval state in
+        let min_move_threshold = get_min_move_threshold state.cached_price_increment in
         let current_buy_price_rounded = state.cached_round_price current_buy_price in
-        let price_diff_rounded =
-          state.cached_round_price
-            (abs_float (target_buy_price -. current_buy_price_rounded))
-        in
         (* Sizing re-anchor (see the with-sell branch): amend the resting buy
            to the oracle's target in both directions. *)
         let reanchor_buy = state.force_buy_reanchor in
         if target_buy_price > current_buy_price || qty_mismatch || reanchor_buy
         then (
+          (* A qty-only mismatch corrects the QTY and keeps the resting PRICE
+             (the buy only ever trails up, like normal trailing); only a
+             target above the resting price or a real gi re-anchor moves the
+             price, and the min-move deadband still applies (see the with-sell
+             branch). *)
+          let effective_amend_price =
+            if qty_mismatch && not reanchor_buy
+            then Float.max current_buy_price target_buy_price
+            else target_buy_price
+          in
+          let effective_price_rounded = state.cached_round_price effective_amend_price in
+          let effective_price_diff =
+            state.cached_round_price
+              (abs_float (effective_amend_price -. current_buy_price_rounded))
+          in
+          let price_moves = effective_price_rounded <> current_buy_price_rounded in
           let allow =
             if qty_mismatch
             then (
@@ -923,14 +981,20 @@ let evaluate_buy_leg
               in
               let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
               let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
-              (not is_being_amended) && (not is_in_flight) && not is_on_cooldown)
+              (* A pure qty correction (price unchanged) is always worth
+                 sending; a qty correction that also trails the price up
+                 respects the min-move deadband like normal trailing. *)
+              (not is_being_amended)
+              && (not is_in_flight)
+              && (not is_on_cooldown)
+              && ((not price_moves) || effective_price_diff >= min_move_threshold))
             else
               amend_allowed
                 ~state
                 ~order_id:buy_order_id
-                ~target_price:target_buy_price
+                ~target_price:effective_amend_price
                 ~current_price_rounded:current_buy_price_rounded
-                ~price_diff:price_diff_rounded
+                ~price_diff:effective_price_diff
                 ~min_move_threshold
           in
           if allow
@@ -952,25 +1016,28 @@ let evaluate_buy_leg
                   asset.symbol
                   Buy
                   qty
-                  (Some target_buy_price)
+                  (Some effective_amend_price)
                   true
                   Grid
                   asset.exchange
               in
               ignore (push_order ~now ~state order);
-              state.last_buy_order_price <- Some target_buy_price;
+              state.last_buy_order_price <- Some effective_amend_price;
               state.force_buy_reanchor <- false;
               if qty_mismatch
               then
                 Logging.info_f
                   ~section
                   "Alpaca pending buy order %s qty (%.8f) differs from config (%.8f) - \
-                   amending price to config target %.4f and qty to %.8f"
+                   amending to qty %.8f%s"
                   buy_order_id
                   pending_buy_qty_from_scan
                   qty
-                  target_buy_price
-                  qty;
+                  qty
+                  (if price_moves
+                   then
+                     Printf.sprintf " and trailing price up to %.4f" effective_amend_price
+                   else " (price unchanged)");
               ())
             else if not (Float.is_nan quote_balance)
             then
@@ -983,7 +1050,7 @@ let evaluate_buy_leg
                 locked_in_buys
             else Logging.warn_f ~section "No quote balance for buy trailing"
             (* The re-anchor target is already where the buy sits: done. *))
-          else if reanchor_buy && price_diff_rounded < min_move_threshold
+          else if reanchor_buy && effective_price_diff < min_move_threshold
           then state.force_buy_reanchor <- false)
       | _ -> ());
     state.last_cycle <- cycle)
@@ -1220,7 +1287,22 @@ let evaluate_sell_leg
         let raw_sell_price =
           calculate_grid_price base_price_for_sell grid_interval true state
         in
-        if ask_price > 0.0 then max raw_sell_price ask_price else raw_sell_price
+        if is_alpaca
+        then
+          (* Alpaca: the sell is anchored on the fill + gi - it must NOT be
+             pushed up to the current ask. Clamping to the ask made every new
+             sell land on the same price while the market bounced (SPCX sells
+             stacking at 138.50) instead of laddering down as the price moved
+             down. With the fill anchor the sell rungs descend with the fills
+             (equidistant at the grid interval), the current price stays
+             inside the pair's 2*gi bracket, and the sell can never be below
+             fill + gi, so the fill-anchored profitability is preserved. When
+             the market is above the sell, the resting sell simply fills at
+             the better market price (Alpaca ignores post-only). *)
+          raw_sell_price
+        else if ask_price > 0.0
+        then max raw_sell_price ask_price
+        else raw_sell_price
     in
     let sell_qty, _is_accumulation_sell, _required_profit =
       match target_sell_qty_override with
