@@ -1,20 +1,14 @@
 (* Tests for the Alpaca orderbook TOB semantics:
-   - [update_tob_from_trade]: a trade print is evidence of price, never a
-     two-sided quote - it must not fabricate a bid/ask from a fill. It only
-     nudges a single crossed side, is ignored when out-of-order relative to
-     the current quote, and only serves as a labeled single-price fallback
-     when no real quote has arrived for [stale_quote_seconds].
-   - WS "q"/"t" handler integration: real quotes win, crossing trades nudge a
-     single side, older prints never move a fresher quote. *)
+   - The top-of-book comes ONLY from the WebSocket quote stream ("q"
+     messages) - the single data source, matching every other exchange in
+     this codebase. No REST snapshot polling, no ticker fallback.
+   - Trade prints ("t" messages) are recorded for analytics but NEVER publish
+     a bid/ask - no single-price seed before a quote, no crossing-side nudge,
+     no stale-quote fallback. A fabricated bid = ask = last trade showed raw
+     print volatility that is not a real market. *)
 
 let () = Random.self_init ()
 
-(* ---- update_tob_from_trade (pure) -------------------------------------- *)
-
-let book = Some (140.0, 10.0, 141.0, 10.0)
-
-(** Alcotest 1.9 has [pair]/[triple] but no [quad]: compare a 4-tuple option
-    through a nested pair. *)
 let check_tob expected got =
   let to_nested = function
     | Some (a, b, c, d) -> Some ((a, b), (c, d))
@@ -25,96 +19,6 @@ let check_tob expected got =
   let p4 = Alcotest.pair p2 p2 in
   Alcotest.check (Alcotest.option p4) "top-of-book" (to_nested expected) (to_nested got)
 ;;
-
-let test_no_book_seeds_single_price () =
-  let r =
-    Alpaca.Orderbook.update_tob_from_trade
-      ~quote_stale:false
-      ~trade_newer:true
-      None
-      ~price:140.5
-      ~size:4.0
-  in
-  check_tob (Some (140.5, 4.0, 140.5, 4.0)) r
-;;
-
-let test_print_inside_spread_leaves_book_unchanged () =
-  let r =
-    Alpaca.Orderbook.update_tob_from_trade
-      ~quote_stale:false
-      ~trade_newer:true
-      book
-      ~price:140.5
-      ~size:4.0
-  in
-  check_tob None r
-;;
-
-let test_print_at_ask_leaves_book_unchanged () =
-  (* A fill AT the ask confirms the quote; it must not churn the book. *)
-  let r =
-    Alpaca.Orderbook.update_tob_from_trade
-      ~quote_stale:false
-      ~trade_newer:true
-      book
-      ~price:141.0
-      ~size:4.0
-  in
-  check_tob None r
-;;
-
-let test_print_above_ask_lifts_ask_only () =
-  let r =
-    Alpaca.Orderbook.update_tob_from_trade
-      ~quote_stale:false
-      ~trade_newer:true
-      book
-      ~price:142.0
-      ~size:5.0
-  in
-  check_tob (Some (140.0, 10.0, 142.0, 5.0)) r
-;;
-
-let test_print_below_bid_drops_bid_only () =
-  let r =
-    Alpaca.Orderbook.update_tob_from_trade
-      ~quote_stale:false
-      ~trade_newer:true
-      book
-      ~price:139.0
-      ~size:5.0
-  in
-  check_tob (Some (139.0, 5.0, 141.0, 10.0)) r
-;;
-
-let test_stale_quote_uses_single_price_fallback () =
-  let r =
-    Alpaca.Orderbook.update_tob_from_trade
-      ~quote_stale:true
-      ~trade_newer:true
-      book
-      ~price:138.0
-      ~size:6.0
-  in
-  check_tob (Some (138.0, 6.0, 138.0, 6.0)) r
-;;
-
-let test_out_of_order_print_never_moves_fresher_quote () =
-  (* A stale print from a previous session (older event time than the current
-     quote) must never move the book - this was the pre-market -> regular
-     oscillation trigger. *)
-  let r =
-    Alpaca.Orderbook.update_tob_from_trade
-      ~quote_stale:false
-      ~trade_newer:false
-      book
-      ~price:130.0
-      ~size:6.0
-  in
-  check_tob None r
-;;
-
-(* ---- WS "q"/"t" handler integration ------------------------------------ *)
 
 let handle raw = Alpaca.Orderbook.handle_message_str raw
 
@@ -140,90 +44,100 @@ let check_book symbol expected =
   check_tob expected got
 ;;
 
-let test_quote_then_crossing_trade_lifts_ask_only () =
-  let sym = "TQ_A" in
-  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* Newer print above the ask: lifts the ask, bid preserved. *)
-  handle (trade_msg sym 142.0 "2026-01-02T15:00:01Z");
-  check_book sym (Some (140.0, 10.0, 142.0, 5.0))
-;;
+(* ---- Trade prints never publish TOB ------------------------------------- *)
 
-let test_quote_then_older_trade_leaves_book_unchanged () =
-  let sym = "TQ_B" in
-  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* Print from BEFORE the quote's event time: ignored entirely. *)
-  handle (trade_msg sym 135.0 "2026-01-02T14:59:00Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0))
-;;
-
-let test_quote_then_inside_spread_trade_leaves_book_unchanged () =
-  let sym = "TQ_C" in
-  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  handle (trade_msg sym 140.5 "2026-01-02T15:00:01Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0))
-;;
-
-let test_trade_before_any_quote_seeds_single_price () =
-  let sym = "TQ_D" in
+let test_trade_before_any_quote_publishes_nothing () =
+  (* No real quote has ever arrived: the trade must NOT seed a single price.
+     The store simply has no valid TOB until a real quote (WS or REST) lands. *)
+  let sym = "T_NOSEED" in
   handle (trade_msg sym 138.5 "2026-01-02T15:00:01Z");
-  (* No quote has ever arrived for this symbol (quote_wall_ts = 0): the trade
-     seeds a single price until the quote feed catches up. *)
-  check_book sym (Some (138.5, 5.0, 138.5, 5.0))
+  check_book sym None
+;;
+
+let test_trade_after_quote_never_moves_book () =
+  let sym = "T_NOMOVE" in
+  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  (* A print ABOVE the ask (would have "lifted the ask" before): the book must
+     not move - a single print is not a two-sided quote. *)
+  handle (trade_msg sym 142.0 "2026-01-02T15:00:01Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  (* A print BELOW the bid: still no movement. *)
+  handle (trade_msg sym 138.0 "2026-01-02T15:00:02Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  (* A print inside the spread: no movement. *)
+  handle (trade_msg sym 140.5 "2026-01-02T15:00:03Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  (* An out-of-order print from a previous session: no movement. *)
+  handle (trade_msg sym 130.0 "2026-01-02T14:59:00Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0))
+;;
+
+let test_trade_after_stale_quote_never_publishes_fallback () =
+  (* Even with no fresh quote for a long stretch, trade prints must never
+     fabricate a bid = ask = last trade. The book holds the last real quote
+     while the REST snapshot poll refreshes it. We prove the invariant
+     directly: a trade with a NEWER event time than the quote cannot change
+     the published TOB. *)
+  let sym = "T_NOSTALE" in
+  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  handle (trade_msg sym 130.0 "2026-01-02T18:00:00Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0))
+;;
+
+(* ---- Real quotes publish TOB -------------------------------------------- *)
+
+let test_quote_publishes_bid_ask () =
+  let sym = "Q_OK" in
+  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0))
+;;
+
+let test_later_quote_updates_book () =
+  let sym = "Q_MOVE" in
+  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  handle (quote_msg sym 140.5 141.5 "2026-01-02T15:00:01Z");
+  check_book sym (Some (140.5, 10.0, 141.5, 10.0))
+;;
+
+let test_one_sided_quote_merges_previous_side () =
+  (* A "q" message with only one side fills in the other from the previous
+     real quote (WS frames can carry a single-side update). *)
+  let sym = "Q_ONESIDE" in
+  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
+  handle (quote_msg sym 140.1 0.0 "2026-01-02T15:00:01Z");
+  check_book sym (Some (140.1, 10.0, 141.0, 10.0))
 ;;
 
 let () =
   Alcotest.run
     "alpaca_orderbook"
-    [ ( "update_tob_from_trade"
+    [ ( "trade_never_publishes_tob"
       , [ Alcotest.test_case
-            "no book seeds single price"
+            "trade before any quote publishes nothing"
             `Quick
-            test_no_book_seeds_single_price
+            test_trade_before_any_quote_publishes_nothing
         ; Alcotest.test_case
-            "print inside spread leaves book unchanged"
+            "trade after quote never moves the book"
             `Quick
-            test_print_inside_spread_leaves_book_unchanged
+            test_trade_after_quote_never_moves_book
         ; Alcotest.test_case
-            "print at ask leaves book unchanged"
+            "trade after stale quote never publishes a fallback"
             `Quick
-            test_print_at_ask_leaves_book_unchanged
-        ; Alcotest.test_case
-            "print above ask lifts ask only"
-            `Quick
-            test_print_above_ask_lifts_ask_only
-        ; Alcotest.test_case
-            "print below bid drops bid only"
-            `Quick
-            test_print_below_bid_drops_bid_only
-        ; Alcotest.test_case
-            "stale quote uses single-price fallback"
-            `Quick
-            test_stale_quote_uses_single_price_fallback
-        ; Alcotest.test_case
-            "out-of-order print never moves fresher quote"
-            `Quick
-            test_out_of_order_print_never_moves_fresher_quote
+            test_trade_after_stale_quote_never_publishes_fallback
         ] )
-    ; ( "ws_handlers"
-      , [ Alcotest.test_case
-            "quote then crossing trade lifts ask only"
-            `Quick
-            test_quote_then_crossing_trade_lifts_ask_only
+    ; ( "quote_publishes_tob"
+      , [ Alcotest.test_case "quote publishes bid/ask" `Quick test_quote_publishes_bid_ask
         ; Alcotest.test_case
-            "quote then older trade leaves book unchanged"
+            "later quote updates the book"
             `Quick
-            test_quote_then_older_trade_leaves_book_unchanged
+            test_later_quote_updates_book
         ; Alcotest.test_case
-            "quote then inside-spread trade leaves book unchanged"
+            "one-sided quote merges the previous side"
             `Quick
-            test_quote_then_inside_spread_trade_leaves_book_unchanged
-        ; Alcotest.test_case
-            "trade before any quote seeds single price"
-            `Quick
-            test_trade_before_any_quote_seeds_single_price
+            test_one_sided_quote_merges_previous_side
         ] )
     ]
 ;;
