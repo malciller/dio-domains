@@ -90,6 +90,7 @@ let monitor_loop () =
                let attempts = conn.reconnect_attempts in
                let last_disconnected = conn.last_disconnected in
                let last_connecting = conn.last_connecting in
+               let last_data_received = conn.last_data_received in
                let has_connect_fn = Option.is_some conn.connect_fn in
                Mutex.unlock conn.mutex;
                (* Health check and backup reconnection logic *)
@@ -198,6 +199,18 @@ let monitor_loop () =
                        set_state conn (Failed "Market closed"))
                      else start_async conn))
                | Connected, _ ->
+                 (* Whether the connection is demonstrably alive: it has
+                     produced data (feed frames / app heartbeats) or a
+                     successful ping within the silence threshold. A feed whose
+                     ping probe is broken (e.g. Kraken's public orderbook feed
+                     not echoing pongs) but which is still streaming data is
+                     HEALTHY and must not be torn down on ping failures alone -
+                     the passive data-heartbeat backstop below governs. *)
+                 let data_fresh =
+                   match last_data_received with
+                   | Some t -> current_time -. t <= 60.0
+                   | None -> false
+                 in
                  (* Active ping/pong liveness for authenticated connections and Kraken orderbook *)
                  if
                    String.equal conn.name "kraken_auth_ws"
@@ -394,27 +407,49 @@ let monitor_loop () =
                    (* Check ping failures outside async to avoid mutex deadlock *)
                    let ping_failures = Atomic.get conn.ping_failures in
                    if ping_failures >= 3
-                   then (
-                     Logging.error_f
-                       ~section
-                       "[%s] Ping failed %d times, marking connection as failed"
-                       conn.name
-                       ping_failures;
-                     set_state conn (Failed "ping timeout")))
-                 else (
-                   (* Passive heartbeat monitoring for market data feeds *)
-                   match conn.last_data_received with
-                   | Some last_data when current_time -. last_data > 60.0 ->
-                     (* 60s data silence threshold *)
-                     if not (String.equal conn.name "ibkr_gateway")
+                   then
+                     if data_fresh
                      then (
-                       Logging.warn_f
+                       (* Ping probe is broken but the connection is
+                           demonstrably alive (recent data / heartbeats):
+                           tolerate the failed pings and keep the feed - tearing
+                           it down would churn a healthy connection (e.g. the
+                           Kraken public orderbook feed not echoing pongs while
+                           still streaming orderbook data). Reset the counter so
+                           the failure only re-asserts if the feed goes quiet
+                           too. *)
+                       Atomic.set conn.ping_failures 0;
+                       Logging.debug_f
                          ~section
-                         "[%s] No data received for %.0fs, marking connection as failed"
+                         "[%s] %d consecutive ping failures but data is flowing; keeping \
+                          the connection (broken ping probe tolerated)"
                          conn.name
-                         (current_time -. last_data);
-                       set_state conn (Failed "data timeout"))
-                   | _ -> ())
+                         ping_failures)
+                     else (
+                       Logging.error_f
+                         ~section
+                         "[%s] Ping failed %d times and no data received, marking \
+                          connection as failed"
+                         conn.name
+                         ping_failures;
+                       set_state conn (Failed "ping timeout")));
+                 (* Passive data-heartbeat backstop for ALL connected
+                     connections: a feed that stops producing data (regardless
+                     of ping-probe health) is failed after the silence
+                     threshold. For ping-healthy feeds the successful pings keep
+                     [last_data_received] fresh; for a feed with a broken probe
+                     this is what catches a genuinely dead connection. *)
+                 (match last_data_received with
+                  | Some last_data when current_time -. last_data > 60.0 ->
+                    if not (String.equal conn.name "ibkr_gateway")
+                    then (
+                      Logging.warn_f
+                        ~section
+                        "[%s] No data received for %.0fs, marking connection as failed"
+                        conn.name
+                        (current_time -. last_data);
+                      set_state conn (Failed "data timeout"))
+                  | _ -> ())
                | _ -> ())
             conn_list;
           (* Spawn next iteration independently to sever Forward chain. *)
