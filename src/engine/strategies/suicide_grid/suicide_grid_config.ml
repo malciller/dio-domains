@@ -240,10 +240,14 @@ let parse_config_float config value_name default exchange symbol =
     default
 ;;
 
-let get_min_move_threshold price grid_interval_pct state =
-  let base_increment = state.cached_price_increment in
-  let pct_based = price *. (grid_interval_pct *. 0.05 /. 100.0) in
-  max (base_increment *. 10.0) pct_based
+let get_min_move_threshold price_increment =
+  (* The exchange's minimum price move: one tick ([price_increment], e.g.
+     $0.01 on Alpaca/Hyperliquid). An amendment to any price one tick away is
+     a valid resting-order price, so the trailing leg re-anchors on every
+     valid price step and the buy tracks price action smoothly. This replaces
+     the old magic deadband (max of 10 ticks and 5% of the grid interval)
+     which made the book jump in large, delayed steps instead of trailing. *)
+  price_increment
 ;;
 
 let calculate_grid_price current_price grid_interval_pct is_above state =

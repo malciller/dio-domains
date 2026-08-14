@@ -1587,6 +1587,73 @@ let test_alpaca_dollar_floor_gate () =
   check bool "sell placed above the dollar floor" true found
 ;;
 
+let test_alpaca_sell_anchors_on_fill_not_ask () =
+  (* Alpaca sell placement is anchored on the fill (fill + gi), NOT pushed up
+     to the current ask. Clamping to the ask stacked every new sell on the
+     same price as the market bounced (SPCX sells piling at 138.50) instead of
+     laddering down as the price moved down. The fill anchor keeps the rungs
+     equidistant and can never place the sell below fill + gi, so the
+     fill-anchored profitability is preserved. *)
+  let symbol = "ALPACA_ANCHOR/USD" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.grid_qty <- 1.0;
+  state.cached_sell_mult <- 1.0;
+  state.cached_venue_min_qty <- 0.000000001;
+  state.cached_venue_min_notional <- 1.0;
+  state.reserved_base <- 0.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 100.0;
+  state.last_buy_fill_qty <- Some 1.0;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* Market well ABOVE fill + gi: fill 100.00 + gi 1% = 101.00, ask 105.00.
+     The sell must land at 101.00 (fill-anchored), not 105.00 (ask-pinned). *)
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:105.0
+    ~asset_balance:1.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      bool
+      "sell anchored on fill"
+      true
+      (o.operation = Dio_strategies.Strategy_common.Place
+       && o.side = Dio_strategies.Strategy_common.Sell
+       && o.symbol = symbol);
+    check (option (float 0.)) "sell at fill + gi, not the ask" (Some 101.0) o.price
+  | _ -> failwith "expected exactly one sell order"
+;;
+
 let test_new_buy_respects_2x_gi_closest_sell () =
   (* A fresh buy (no resting buy) placed after a fill must sit at least 2x the
      grid interval below the closest resting sell - the same spacing the
@@ -1613,10 +1680,10 @@ let test_new_buy_respects_2x_gi_closest_sell () =
   let now = Unix.gettimeofday () in
   let drain () = ignore (Dio_strategies.Suicide_grid.get_pending_orders 100) in
   drain ();
-  (* Closest sell at 100.40, bid 100.00, gi 0.5%: 2*gi = 1.0% of the bid =
-     1.00, so the buy must not sit above 100.40 - 1.00 = 99.40. The raw grid
-     buy (0.5% below the bid) would be 99.50 - above the cap, so the cap must
-     pull it down to 99.40. *)
+  (* Closest sell at 100.40, bid 100.00, gi 0.5%: the 2*gi cap is anchored on
+     the SELL price, so the buy must not sit above 100.40 - 2*gi(100.40) =
+     100.40 - 1.004 = 99.396. The raw grid buy (0.5% below the bid) would be
+     99.50 - above the cap, so the cap must pull it down to 99.396. *)
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
        ~state:st
@@ -1644,8 +1711,12 @@ let test_new_buy_respects_2x_gi_closest_sell () =
        && o.side = Dio_strategies.Strategy_common.Buy);
     (match o.price with
      | Some p ->
-       let cap = 100.40 -. (100.0 *. (2.0 *. 0.5 /. 100.0)) in
-       check bool "buy respects the 2x gi closest-sell cap" true (p <= cap +. 1e-6)
+       let cap = 100.40 -. (100.40 *. (2.0 *. 0.5 /. 100.0)) in
+       check
+         bool
+         "buy respects the sell-anchored 2x gi closest-sell cap"
+         true
+         (p <= cap +. 1e-6)
      | None -> failwith "buy missing price")
   | _ -> failwith "expected exactly one buy order"
 ;;
@@ -2089,6 +2160,315 @@ let test_sync_open_orders_reconcile_agreement () =
   assert_split_matches "qty-update" ~persisted:[ 100.0, 1.0 ] ~sells:[ "s1", 100.0, 1.5 ]
 ;;
 
+(* ---- Buy-trailing: qty-only oracle re-sizes must honor the trailing rules - *)
+
+let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty ~sell_opt =
+  let buy_id = symbol ^ "_buy" in
+  let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  st.exchange_id <- "alpaca";
+  st.grid_qty <- grid_qty;
+  st.last_buy_order_id <- Some buy_id;
+  st.last_buy_order_price <- Some resting_price;
+  st.pending_orders <- [];
+  st.inflight_amend_buy <- false;
+  (* The in-flight amendment registry and cooldowns are global, keyed by
+     order id: clear any leftovers so each test starts clean. *)
+  ignore
+    (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment buy_id);
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "alpaca"
+    ; symbol
+    ; qty = Printf.sprintf "%.8g" grid_qty
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "suicide_grid"
+    ; maker_fee = Some 0.0
+    ; taker_fee = Some 0.0
+    ; accumulation_buffer = 0.01
+    }
+  in
+  let iter_open_orders _ = () in
+  let now = Unix.gettimeofday () in
+  ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
+  ignore
+    (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~state:st
+       ~now
+       ~asset
+       ~bid_price:bid
+       ~ask_price:ask
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:1
+       ~iter_open_orders
+       ~open_buy_count_from_scan:1
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:sell_opt
+       ~pending_buy_qty_from_scan:resting_qty);
+  Dio_strategies.Suicide_grid.get_pending_orders 10
+;;
+
+let test_qty_mismatch_keeps_resting_price_when_target_below () =
+  (* Alpaca qty-only re-size (oracle re-derived the size from a churning
+     pool; spacing unchanged) with the grid target BELOW the resting buy
+     (flat/falling market): the amend must fix the QTY and keep the resting
+     PRICE - the buy only ever trails up, so it must NOT be dragged down to
+     the grid target. *)
+  let pushed =
+    eval_buy_trail
+      ~symbol:"QTY_HOLD/USD"
+      ~grid_qty:2.0
+      ~bid:100.0
+      ~ask:100.5
+      ~resting_price:100.0
+      ~resting_qty:1.0
+      ~sell_opt:(Some ("sell1", 105.0))
+  in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      bool
+      "qty-only amend pushed"
+      true
+      (o.operation = Dio_strategies.Strategy_common.Amend
+       && o.side = Dio_strategies.Strategy_common.Buy);
+    check (float 0.) "qty corrected to config" 2.0 o.qty;
+    check (option (float 0.)) "price kept at the resting price" (Some 100.0) o.price
+  | _ -> failwith "expected exactly one buy amend"
+;;
+
+let test_qty_mismatch_trails_price_up_when_target_above () =
+  (* Alpaca qty-only re-size where the grid target (bid - gi) is ABOVE the
+     resting buy: the amend trails the price up to the target AND applies the
+     new qty - identical to normal trailing. *)
+  let pushed =
+    eval_buy_trail
+      ~symbol:"QTY_TRAIL/USD"
+      ~grid_qty:2.0
+      ~bid:101.0
+      ~ask:101.5
+      ~resting_price:99.0
+      ~resting_qty:1.0
+      ~sell_opt:(Some ("sell1", 105.0))
+  in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      bool
+      "trail-up amend pushed"
+      true
+      (o.operation = Dio_strategies.Strategy_common.Amend
+       && o.side = Dio_strategies.Strategy_common.Buy);
+    check (float 0.) "qty corrected to config" 2.0 o.qty;
+    check (option (float 0.)) "price trailed up to the grid target" (Some 100.0) o.price
+  | _ -> failwith "expected exactly one buy amend"
+;;
+
+let test_pure_trailing_no_amend_when_target_below () =
+  (* No qty mismatch, market flat relative to the resting buy: the trailing
+     rules say the buy sits - no amend may be emitted. *)
+  let pushed =
+    eval_buy_trail
+      ~symbol:"QTY_NONE/USD"
+      ~grid_qty:2.0
+      ~bid:100.0
+      ~ask:100.5
+      ~resting_price:100.0
+      ~resting_qty:2.0
+      ~sell_opt:(Some ("sell1", 105.0))
+  in
+  check int "flat/falling market emits no amend" 0 (List.length pushed)
+;;
+
+let test_buy_trail_fires_on_single_tick_move () =
+  (* The amend deadband is the exchange's minimum price move (one tick,
+     cached_price_increment = 0.01): a small trail-up fires immediately. A
+     5-cent move (bid 97.02 -> grid buy 96.05 vs resting 96.00) is above the
+     1-tick threshold, so the amend fires - the old 10-tick/5%-of-grid buffer
+     would have swallowed this and made trailing jumpy. *)
+  let symbol = "TRAIL_TICK/USD" in
+  let buy_id = symbol ^ "_buy" in
+  let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  st.exchange_id <- "alpaca";
+  st.grid_qty <- 1.0;
+  st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  st.last_buy_order_id <- Some buy_id;
+  st.last_buy_order_price <- Some 96.0;
+  st.pending_orders <- [];
+  st.inflight_amend_buy <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment buy_id);
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "suicide_grid"
+    ; maker_fee = Some 0.0
+    ; taker_fee = Some 0.0
+    ; accumulation_buffer = 0.01
+    }
+  in
+  let iter_open_orders _ = () in
+  let now = Unix.gettimeofday () in
+  ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
+  ignore
+    (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~state:st
+       ~now
+       ~asset
+       ~bid_price:97.02
+       ~ask_price:97.52
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:1
+       ~iter_open_orders
+       ~open_buy_count_from_scan:1
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:(Some ("sell1", 105.0))
+       ~pending_buy_qty_from_scan:1.0);
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 10 in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      (option (float 0.))
+      "buy trails up on a 5-cent move (above the 1-tick deadband)"
+      (Some 96.05)
+      o.price
+  | _ -> failwith "expected exactly one buy amend"
+;;
+
+let test_buy_trail_2xgi_anchored_on_sell () =
+  (* The trailing clamp's 2*gi separation is anchored on the SELL price and
+     applies when the sell is strictly ABOVE the top of book (a valid bracket
+     around the market). Sell at 103.50, bid at 103.00, gi 1.0%: the buy must
+     stop at 101.43 (= 103.50 - 2*gi of the sell, which binds) - not 101.97
+     (bid - gi) and not 101.44 (= 103.50 - 2*gi of the bid). *)
+  let symbol = "TRAIL_SELL_ANCHOR/USD" in
+  let buy_id = symbol ^ "_buy" in
+  let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  st.exchange_id <- "alpaca";
+  st.grid_qty <- 1.0;
+  st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  st.last_buy_order_id <- Some buy_id;
+  st.last_buy_order_price <- Some 96.0;
+  st.pending_orders <- [];
+  st.inflight_amend_buy <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment buy_id);
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "suicide_grid"
+    ; maker_fee = Some 0.0
+    ; taker_fee = Some 0.0
+    ; accumulation_buffer = 0.01
+    }
+  in
+  let iter_open_orders _ = () in
+  let now = Unix.gettimeofday () in
+  ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
+  ignore
+    (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~state:st
+       ~now
+       ~asset
+       ~bid_price:103.0
+       ~ask_price:103.5
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:1
+       ~iter_open_orders
+       ~open_buy_count_from_scan:1
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:(Some ("sell1", 103.50))
+       ~pending_buy_qty_from_scan:1.0);
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 10 in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      (option (float 0.))
+      "buy anchored exactly 2*gi below the sell above the book"
+      (Some 101.43)
+      o.price
+  | _ -> failwith "expected exactly one buy amend"
+;;
+
+let test_buy_trail_no_clamp_when_sell_at_top_of_book () =
+  (* A sell AT or BELOW the top of book (a resting sell that has become the
+     ask / next fill target) cannot form a valid 2*gi bracket around the
+     market, so the buy must NOT be pinned 2*gi below it - it trails the top
+     of book at the grid interval instead. Sell 100.00 at the bid 100.00,
+     gi 1%: the buy trails to 99.00 (bid - gi), NOT 98.00 (sell - 2*gi, which
+     is 2*gi below the top of book - the SPCX behavior). *)
+  let run_case ~symbol ~sell_price =
+    let buy_id = symbol ^ "_buy" in
+    let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+    st.exchange_id <- "alpaca";
+    st.grid_qty <- 1.0;
+    st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+    st.last_buy_order_id <- Some buy_id;
+    st.last_buy_order_price <- Some 96.0;
+    st.pending_orders <- [];
+    st.inflight_amend_buy <- false;
+    ignore
+      (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment
+         buy_id);
+    let asset =
+      { Dio_strategies.Suicide_grid.exchange = "alpaca"
+      ; symbol
+      ; qty = "1.0"
+      ; grid_interval = 1.0
+      ; sell_mult = "1.0"
+      ; strategy = "suicide_grid"
+      ; maker_fee = Some 0.0
+      ; taker_fee = Some 0.0
+      ; accumulation_buffer = 0.01
+      }
+    in
+    let iter_open_orders _ = () in
+    let now = Unix.gettimeofday () in
+    ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
+    ignore
+      (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+         ~state:st
+         ~now
+         ~asset
+         ~bid_price:100.0
+         ~ask_price:100.5
+         ~quote_balance:1000.0
+         ~quote_balance_stale:false
+         ~cycle:1
+         ~iter_open_orders
+         ~open_buy_count_from_scan:1
+         ~has_recent_amend_buy:false
+         ~locked_in_buys:0.0
+         ~closest_sell_order_initial:(Some ("sell1", sell_price))
+         ~pending_buy_qty_from_scan:1.0);
+    let pushed = Dio_strategies.Suicide_grid.get_pending_orders 10 in
+    match pushed with
+    | [ (o : Dio_strategies.Strategy_common.strategy_order) ] -> o.price
+    | _ -> failwith "expected exactly one buy amend"
+  in
+  check
+    (option (float 0.))
+    "sell at the top of book: buy trails at grid interval, not 2*gi below the book"
+    (Some 99.0)
+    (run_case ~symbol:"TRAIL_NO_CLAMP_AT/USD" ~sell_price:100.0);
+  check
+    (option (float 0.))
+    "sell below the top of book: buy trails at grid interval"
+    (Some 99.0)
+    (run_case ~symbol:"TRAIL_NO_CLAMP_BELOW/USD" ~sell_price:99.0)
+;;
+
 let () =
   run
     "Suicide Grid"
@@ -2099,6 +2479,32 @@ let () =
         ; test_case "cancel order" `Quick test_order_creation_cancel
         ; test_case "legacy order" `Quick test_legacy_order_creation
         ; test_case "duplicate key per side" `Quick test_duplicate_key_per_side
+        ] )
+    ; ( "buy trailing"
+      , [ test_case
+            "qty mismatch keeps resting price when target below"
+            `Quick
+            test_qty_mismatch_keeps_resting_price_when_target_below
+        ; test_case
+            "qty mismatch trails price up when target above"
+            `Quick
+            test_qty_mismatch_trails_price_up_when_target_above
+        ; test_case
+            "pure trailing emits no amend when target below"
+            `Quick
+            test_pure_trailing_no_amend_when_target_below
+        ; test_case
+            "trailing 2x gi clamp anchored on the sell price"
+            `Quick
+            test_buy_trail_2xgi_anchored_on_sell
+        ; test_case
+            "no 2x gi clamp when the sell is at/below the top of book"
+            `Quick
+            test_buy_trail_no_clamp_when_sell_at_top_of_book
+        ; test_case
+            "trailing fires on a single tick move"
+            `Quick
+            test_buy_trail_fires_on_single_tick_move
         ] )
     ; ( "config"
       , [ test_case "config parsing" `Quick test_config_parsing
@@ -2164,6 +2570,10 @@ let () =
             "alpaca dollar notional floor gate"
             `Quick
             test_alpaca_dollar_floor_gate
+        ; test_case
+            "alpaca sell anchors on fill, not the ask"
+            `Quick
+            test_alpaca_sell_anchors_on_fill_not_ask
         ; test_case
             "new buy respects the 2x gi closest-sell cap"
             `Quick

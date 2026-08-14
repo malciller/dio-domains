@@ -193,12 +193,11 @@ let trail_buy_level cfg ~bid ~sell =
   Float.min grid_buy exact
 ;;
 
-(** Minimum price move required before trailing an amendment. Mirrors
-    Suicide_grid_config.get_min_move_threshold. *)
-let min_move_threshold cfg price =
-  Float.max
-    (cfg.price_increment *. 10.0)
-    (price *. (cfg.grid_interval_pct *. 0.05 /. 100.0))
+(** Minimum price move required before trailing an amendment. Delegates to
+    the live [Suicide_grid_config.get_min_move_threshold] so the threshold
+    has a single source of truth (the exchange tick) - no duplicated formula. *)
+let min_move_threshold cfg _price =
+  Suicide_grid_config.get_min_move_threshold cfg.price_increment
 ;;
 
 (** Dynamic buy quantity at [price]: the base qty, up-sized (ceiling lot) so
