@@ -1,6 +1,6 @@
 (library
  (name logging)
  (public_name dio.logging)
- (libraries lwt.unix unix)
+ (libraries lwt.unix unix notty.unix)
  (preprocess
   (pps lwt_ppx)))

@@ -492,6 +492,7 @@ let () =
   (* Apply log level and section filters from configuration. *)
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
+  Logging.set_width config.logging.width;
   (* Apply GC tuning parameters from config if specified. *)
   (match config.gc with
    | Some gc_cfg ->

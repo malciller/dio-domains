@@ -161,6 +161,39 @@ let test_section_management () =
 
 let msg_col = 40
 
+(* The ┆ gutter is multi-byte UTF-8, so check it as a substring. *)
+let gutter_bytes = "\226\148\134"
+
+let contains_substring haystack needle =
+  let h = String.length haystack
+  and n = String.length needle in
+  let rec go i = i + n <= h && (String.sub haystack i n = needle || go (i + 1)) in
+  n = 0 || go 0
+;;
+
+(* Display width: count each UTF-8 sequence as one column (ASCII = 1 byte).
+   Used for wrap assertions since the ┆ gutter is 3 bytes / 1 column. *)
+let visual_len s =
+  let n = String.length s in
+  let rec go i acc =
+    if i >= n
+    then acc
+    else (
+      let c = Char.code s.[i] in
+      let bytes =
+        if c < 0x80
+        then 1
+        else if c land 0xE0 = 0xC0
+        then 2
+        else if c land 0xF0 = 0xE0
+        then 3
+        else 4
+      in
+      go (i + bytes) (acc + 1))
+  in
+  go 0 0
+;;
+
 let test_format_line_no_full_date () =
   Logging.set_colors false;
   let line = Logging.format_line Logging.INFO "main" "hello" in
@@ -208,17 +241,75 @@ let test_format_line_multiline () =
   let lines = String.split_on_char '\n' line in
   Alcotest.(check int) "two lines rendered" 2 (List.length lines);
   match lines with
-  | [ _; cont ] ->
-    (* Continuation is indented to the message column (where the header's
-       message starts) plus the message's own 6-space relative indent. *)
-    let head_msg_col = String.index line 'h' in
-    let cont_first = String.index cont 'f' in
+  | [ head; cont ] ->
+    let head_msg_col = String.index head 'h' in
     Alcotest.(check int) "header starts at message column" msg_col head_msg_col;
+    (* Continuation is rendered under a gutter at the message column; the
+       caller's 6-space indent is replaced by the gutter + one space. Byte
+       offset is msg_col + 4 because the ┆ gutter is 3 bytes + 1 space. *)
+    Alcotest.(check bool) "gutter glyph" true (contains_substring cont gutter_bytes);
     Alcotest.(check int)
-      "continuation indented to message column"
-      (head_msg_col + 6)
-      cont_first
+      "detail text starts after the gutter"
+      (msg_col + 4)
+      (String.index cont 'f')
   | _ -> Alcotest.fail "expected two lines"
+;;
+
+(* Regression: blank continuation lines are dropped (no stray gutter-only
+   lines) and leading whitespace is normalized away by the gutter. *)
+let test_format_line_multiline_blank_and_indent () =
+  Logging.set_colors false;
+  let line =
+    Logging.format_line Logging.INFO "oracle_runtime" "head\n   \n      second detail"
+  in
+  let lines = String.split_on_char '\n' line in
+  Alcotest.(check int) "blank continuation dropped" 2 (List.length lines);
+  match lines with
+  | [ _; cont ] ->
+    Alcotest.(check bool) "gutter glyph" true (contains_substring cont gutter_bytes);
+    Alcotest.(check int)
+      "second detail after gutter"
+      (msg_col + 4)
+      (String.index cont 's')
+  | _ -> Alcotest.fail "expected two lines"
+;;
+
+(* Long lines wrap at word boundaries to the configured width; the prefix
+   stays on the first line and every wrapped chunk fits inside the width. *)
+let test_format_line_wrap () =
+  Logging.set_colors false;
+  Logging.set_width (Some 60);
+  let msg =
+    "pass #1 complete: 8 decisions (3 active) across 3 account(s) in 3.3s · balance \
+     197.0ms · fetch 1080.0ms · sizing 38.2ms · analysis 8 recomputed + 0 cached"
+  in
+  let line = Logging.format_line Logging.INFO "oracle_runtime" msg in
+  let lines = String.split_on_char '\n' line in
+  Alcotest.(check bool) "long message wrapped" true (List.length lines > 1);
+  List.iter
+    (fun l -> Alcotest.(check bool) "wrapped line fits width" true (visual_len l <= 60))
+    lines;
+  (* A short message stays on one line. *)
+  let short = Logging.format_line Logging.INFO "oracle_runtime" "brief" in
+  Alcotest.(check int)
+    "short message single line"
+    1
+    (List.length (String.split_on_char '\n' short));
+  Logging.set_width None
+;;
+
+(* In color mode the gutter is rendered dim (gray) and the block's header
+   still carries the full colored prefix. *)
+let test_format_line_gutter_color () =
+  Logging.set_colors true;
+  let line = Logging.format_line Logging.INFO "oracle_runtime" "head\n      sub detail" in
+  Alcotest.(check bool) "gutter present" true (contains_substring line gutter_bytes);
+  Alcotest.(check bool)
+    "gutter dim-colored"
+    true
+    (contains_substring line ("\027[90m" ^ gutter_bytes));
+  Alcotest.(check bool) "section color on header" true (String.contains line '\027');
+  Logging.set_colors false
 ;;
 
 let test_format_line_no_color () =
@@ -246,10 +337,12 @@ let demo_format () =
     ; Logging.INFO, "domain_spawner", "Domain kraken/ETH/USD started successfully"
     ; ( Logging.INFO
       , "oracle_runtime"
-      , "[2/8] hyperliquid/BTC/USDC ACTIVE — buy 0.0005 BTC every 0.75%\n\
-         worst drop 83.6% (peak $19497.40 on 2017-12-16 → valley $3191.30 on 2018-12-15)\n\
-        \      funding: drop 67.4% to floor $20688.95 (ATH $126400.00 − 83.6% worst)\n\
-        \      sizing: gi 0.7500% (grid max 0.75%) · qty 0.0005 (minimum qty 0.0005)" )
+      , "[2/8] hyperliquid/BTC/USDC ACTIVE buy 0.0005 BTC @ 0.75% | cap $33.29/$33.29 | \
+         surv 3.0% | UNDER-FUNDED\n\
+         worst drop 83.6% (peak $19497.40 on 2017-12-16 → valley $3191.30 on 2018-12-15) \
+         · model 96.5% @ 365d\n\
+         funding: drop 67.4% to floor $20688.95 (ATH $126400.00 − 83.6% worst)\n\
+         sizing: gi 0.7500% (grid max 0.75%) · qty 0.0005 (minimum qty 0.0005)" )
     ; ( Logging.WARN
       , "oracle_replay"
       , "only 3 independent 180-session windows for HYPE/USDC" )
@@ -259,6 +352,11 @@ let demo_format () =
     ; ( Logging.INFO
       , "order_processor"
       , "✓ Order amended successfully: buy QQQ 0.03879045 @ 730.99" )
+    ; ( Logging.INFO
+      , "oracle_runtime"
+      , "pass #1: 8 decisions (3 active) 3 account(s) 3.3s · f&g 36.0 · bal 197.0ms \
+         fetch 1080.0ms sizing 38.2ms · 8 recomputed + 0 cached · slowest ADA/USD p99 \
+         563.0ms · 2 account(s) reused" )
     ]
   in
   List.iter
@@ -299,6 +397,12 @@ let () =
           ; Alcotest.test_case "column alignment" `Quick test_format_line_alignment
           ; Alcotest.test_case "stable column" `Quick test_format_line_stable_column
           ; Alcotest.test_case "multi-line indent" `Quick test_format_line_multiline
+          ; Alcotest.test_case
+              "multi-line blank/indent"
+              `Quick
+              test_format_line_multiline_blank_and_indent
+          ; Alcotest.test_case "line wrapping" `Quick test_format_line_wrap
+          ; Alcotest.test_case "gutter color" `Quick test_format_line_gutter_color
           ; Alcotest.test_case "no-color layout" `Quick test_format_line_no_color
           ; Alcotest.test_case "colors enabled" `Quick test_format_line_colors
           ] )

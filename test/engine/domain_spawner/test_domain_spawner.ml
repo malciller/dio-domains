@@ -45,7 +45,7 @@ let test_spawn_domains_basic () =
   (* Spawn domains for the assets *)
   let config =
     { Dio_engine.Config.cycle_mod = 10000
-    ; logging = { level = Logging.INFO; sections = [] }
+    ; logging = { level = Logging.INFO; sections = []; width = None }
     ; gc = None
     ; oracle = None
     ; trading = assets
@@ -74,7 +74,7 @@ let test_spawn_domains_empty () =
   Dio_engine.Domain_spawner.clear_domain_registry ();
   let config =
     { Dio_engine.Config.cycle_mod = 10000
-    ; logging = { level = Logging.INFO; sections = [] }
+    ; logging = { level = Logging.INFO; sections = []; width = None }
     ; gc = None
     ; oracle = None
     ; trading = []
@@ -162,7 +162,7 @@ let test_domain_error_handling () =
   (* This should not crash the test runner, domains should handle errors internally *)
   let config =
     { Dio_engine.Config.cycle_mod = 10000
-    ; logging = { level = Logging.INFO; sections = [] }
+    ; logging = { level = Logging.INFO; sections = []; width = None }
     ; gc = None
     ; oracle = None
     ; trading = [ failing_asset ]

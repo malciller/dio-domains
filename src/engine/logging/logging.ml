@@ -4,7 +4,7 @@
     Line layout (scannable, aligned):
       HH:MM:SS.mmm LVL  SECTION         message
       19:17:23.672 INFO oracle_runtime  [2/8] hyperliquid/BTC/USDC ACTIVE ...
-      19:17:23.672 INFO oracle_runtime        funding: drop 67.4% to floor ...
+      19:17:23.672 INFO oracle_runtime   ┆ worst drop 83.6% (peak $19497.40 ...
     - Compact time-only timestamp (gray); the date is available from
       `docker logs --timestamps`; dropping it keeps the interesting content
       close to the left margin.
@@ -13,9 +13,14 @@
       on every line (it never shifts as longer section names appear), and it
       is colored with a stable per-section hue, so a component's lines can be
       tracked down the screen.
-    - Multi-line messages (e.g. the capital-oracle decision blocks) indent
-      their continuation lines to the message column, keeping each block
-      visually grouped instead of colliding with the line prefix.
+    - Multi-line messages (e.g. the capital-oracle decision blocks) render
+      their continuation lines under a dim ┆ gutter at the message column
+      instead of a repeated colored prefix, so each block reads as one unit
+      of sub-details under its header rather than a pile of full lines.
+    - Long lines are word-wrapped to the terminal width (auto-detected, or a
+      fixed `logging_width` override; default 120 when not a terminal), so
+      nothing overflows and the terminal never re-wraps mid-word. Wrapped
+      chunks stay under the same gutter.
     - With colors disabled the layout (and alignment) is preserved, without
       any ANSI escapes.
 
@@ -136,6 +141,47 @@ let output_channel = ref stderr
 let enabled_sections = ref []
 let quiet_mode = ref false
 
+(* ---- Line width ----
+   [configured_width] overrides auto-detection (None = detect). Detection uses
+   [Notty_unix.winsize] on the output fd (notty is already a project
+   dependency), cached ~1s so terminal resizes are picked up without an ioctl
+   per line; non-terminals (pipes, docker logs) fall back to [default_width]. *)
+let default_width = 120
+let configured_width : int option ref = ref None
+let width_cache : (float * int option) Atomic.t = Atomic.make (0.0, None)
+let width_ttl = 1.0
+
+let detect_terminal_width () =
+  try
+    let fd = Unix.descr_of_out_channel !output_channel in
+    match Notty_unix.winsize fd with
+    | Some (w, _) when w > 0 -> Some w
+    | _ -> None
+  with
+  | _ -> None
+;;
+
+let current_width () =
+  match !configured_width with
+  | Some w -> w
+  | None ->
+    let now = Unix.gettimeofday () in
+    let checked_at, cached = Atomic.get width_cache in
+    if now -. checked_at < width_ttl
+    then (
+      match cached with
+      | Some w -> w
+      | None -> default_width)
+    else (
+      let w = detect_terminal_width () in
+      Atomic.set width_cache (now, w);
+      match w with
+      | Some w -> w
+      | None -> default_width)
+;;
+
+let set_width width = configured_width := width
+
 let log_callback : (level -> string -> string -> unit Lwt.t) ref =
   ref (fun _level _section _message -> Lwt.return_unit)
 ;;
@@ -220,8 +266,9 @@ let format_timestamp () =
    starts at the same column in every line, which is what makes the log
    scannable. A fixed column is worth a little trailing whitespace after short
    names like "main"; a section longer than 20 simply runs on (rare, and the
-   rest of the line still reads fine). Multi-line messages indent their
-   continuation lines to the message column. *)
+   rest of the line still reads fine). Multi-line messages render their
+   continuation lines under a dim ┆ gutter at the message column (see
+   [render_message]) so each block reads as one unit. *)
 
 let level_width = 5
 let section_width = 20
@@ -231,19 +278,71 @@ let pad_to n s =
   if len >= n then s else s ^ String.make (n - len) ' '
 ;;
 
-(* Indent the continuation lines of a multi-line message to the message
-   column so the block reads as one unit. *)
-let reindent_continuations prefix_len message =
-  if not (String.contains message '\n')
-  then message
+(* ---- Word wrapping ----
+   Wraps [text] at word boundaries so no physical line exceeds [width]
+   columns. Multi-space runs are collapsed; an over-long word is emitted on
+   its own line rather than lost. *)
+let wrap_text ~width text =
+  let width = max 16 width in
+  if String.length text <= width
+  then text
   else (
-    let pad = String.make prefix_len ' ' in
-    match String.split_on_char '\n' message with
-    | [] -> message
-    | head :: rest ->
-      String.concat
-        "\n"
-        (head :: List.map (fun line -> if line = "" then "" else pad ^ line) rest))
+    let words = text |> String.split_on_char ' ' |> List.filter (( <> ) "") in
+    let buf = Buffer.create (String.length text + 32) in
+    let line = Buffer.create 64 in
+    let flush () =
+      if Buffer.length line > 0
+      then (
+        Buffer.add_string buf (Buffer.contents line);
+        Buffer.add_char buf '\n';
+        Buffer.clear line)
+    in
+    List.iter
+      (fun w ->
+         let wlen = String.length w in
+         if Buffer.length line = 0
+         then Buffer.add_string line w
+         else if Buffer.length line + 1 + wlen <= width
+         then (
+           Buffer.add_char line ' ';
+           Buffer.add_string line w)
+         else (
+           flush ();
+           Buffer.add_string line w))
+      words;
+    flush ();
+    let s = Buffer.contents buf in
+    String.sub s 0 (String.length s - 1))
+;;
+
+(* The gutter glyph marking continuation lines of a multi-line message.
+   Rendered dim so it recedes; blank lines in a block are dropped. *)
+let gutter_glyph = "┆"
+
+(* Splits a message into the physical lines to render. The first line is the
+   header; every following line is a detail/gutter line. Caller-embedded
+   leading whitespace on continuation lines is stripped - the gutter replaces
+   the manual indent callers used to hard-code. Each line is word-wrapped to
+   fit the terminal width; the header gets [width - prefix], continuation
+   lines a touch less (the gutter takes two columns). *)
+let render_message ~prefix_len ~width message =
+  let avail = max 16 (width - prefix_len - 1) in
+  let avail_cont = max 16 (width - prefix_len - 3) in
+  let lines = String.split_on_char '\n' message in
+  let head, rest =
+    match lines with
+    | [] -> "", []
+    | h :: t -> h, t
+  in
+  let head_lines = String.split_on_char '\n' (wrap_text ~width:avail head) in
+  let cont_lines =
+    rest
+    |> List.map String.trim
+    |> List.filter (( <> ) "")
+    |> List.concat_map (fun line ->
+      String.split_on_char '\n' (wrap_text ~width:avail_cont line))
+  in
+  head_lines @ cont_lines
 ;;
 
 (* Render one log line. Pure: no I/O, no queue; callers (or tests) can use
@@ -253,22 +352,50 @@ let format_line level section_name message =
   let level_str = pad_to level_width (level_to_string level) in
   let section_str = pad_to section_width section_name in
   let prefix_len = String.length timestamp + 1 + level_width + 1 + section_width + 1 in
-  let message = reindent_continuations prefix_len message in
+  let width = current_width () in
+  let lines = render_message ~prefix_len ~width message in
+  let head, cont =
+    match lines with
+    | [] -> "", []
+    | h :: t -> h, t
+  in
+  let buf = Buffer.create (String.length message + 64) in
   if !use_colors
-  then
-    Printf.sprintf
-      "%s%s%s %s%s%s %s%s%s %s"
-      timestamp_color
-      timestamp
-      reset
-      (level_color level)
-      level_str
-      reset
-      (ansi (section_color_code section_name))
-      section_str
-      reset
-      message
-  else Printf.sprintf "%s %s %s %s" timestamp level_str section_str message
+  then (
+    Buffer.add_string buf timestamp_color;
+    Buffer.add_string buf timestamp;
+    Buffer.add_string buf reset;
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf (level_color level);
+    Buffer.add_string buf level_str;
+    Buffer.add_string buf reset;
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf (ansi (section_color_code section_name));
+    Buffer.add_string buf section_str;
+    Buffer.add_string buf reset;
+    Buffer.add_char buf ' ')
+  else (
+    Buffer.add_string buf timestamp;
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf level_str;
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf section_str;
+    Buffer.add_char buf ' ');
+  Buffer.add_string buf head;
+  List.iter
+    (fun line ->
+       Buffer.add_char buf '\n';
+       Buffer.add_string buf (String.make prefix_len ' ');
+       if !use_colors
+       then (
+         Buffer.add_string buf timestamp_color;
+         Buffer.add_string buf gutter_glyph;
+         Buffer.add_string buf reset)
+       else Buffer.add_string buf gutter_glyph;
+       Buffer.add_char buf ' ';
+       Buffer.add_string buf line)
+    cont;
+  Buffer.contents buf
 ;;
 
 (* ---- Async log drain (all levels; CRITICAL excepted) ----

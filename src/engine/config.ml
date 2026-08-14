@@ -23,6 +23,9 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
 type logging_config =
   { level : Logging.level
   ; sections : string list
+  ; width : int option
+    (** Optional fixed line width for log wrapping (None = auto-detect the
+        terminal; falls back to 120 when not a terminal). *)
   }
 
 type gc_config =
@@ -70,6 +73,7 @@ let section = "config"
 let known_top_level_keys =
   [ "logging_level"
   ; "logging_sections"
+  ; "logging_width"
   ; "cycle_mod"
   ; "latency_window_seconds"
   ; "engine"
@@ -424,7 +428,8 @@ let parse_logging_config json : logging_config =
     |> List.map String.trim
     |> List.filter (( <> ) "")
   in
-  { level; sections }
+  let width = json |> member "logging_width" |> to_int_option in
+  { level; sections; width }
 ;;
 
 (** Parses the optional "gc" object into OCaml GC tuning parameters.
@@ -618,7 +623,7 @@ let read_config () : config =
   | Sys_error msg ->
     Logging.warn_f ~section "Cannot read config.json: %s, using defaults" msg;
     { cycle_mod = 10000
-    ; logging = { level = Logging.INFO; sections = [] }
+    ; logging = { level = Logging.INFO; sections = []; width = None }
     ; gc = None
     ; oracle = None
     ; trading = []
