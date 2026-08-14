@@ -523,7 +523,7 @@ let asset_domain_worker
         <- Option.value
              (Ex.get_qty_increment ~symbol:asset_with_fees.symbol)
              ~default:0.01;
-        st.cached_qty_min
+        st.cached_venue_min_qty
         <- Option.value (Ex.get_qty_min ~symbol:asset_with_fees.symbol) ~default:0.01;
         Some st
       | None -> None

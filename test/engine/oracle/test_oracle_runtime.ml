@@ -564,6 +564,65 @@ let test_same_fng () =
     (Dio_oracle.Oracle_runtime.same_fng None (Some 37.0))
 ;;
 
+let mk_gi ~symbol ~first_buy ~has_committed =
+  { Dio_oracle.Oracle_runtime.g_exchange = "kraken"
+  ; g_symbol = symbol
+  ; g_first_buy = first_buy
+  ; g_committed = 0.0
+  ; g_has_committed_buy = has_committed
+  ; g_pool = 0.0
+  ; g_capital_blocked = true
+  }
+;;
+
+let test_account_gate_token_flip () =
+  (* A pool move inside the sizing-cache bucket can still cross an asset's
+     first-buy gate: 99.9 vs 100.1 on a 100.0 gate is a 0.2% relative move -
+     well inside the 0.5% fingerprint bucket. The token must flip, so the
+     cache bypass re-sizes instead of reusing a stale INACTIVE decision (the
+     "capital returned but the strategy did not resume" stall). *)
+  let inputs = [ mk_gi ~symbol:"A" ~first_buy:100.0 ~has_committed:false ] in
+  Alcotest.(check (list bool))
+    "not fundable at 99.9"
+    [ false ]
+    (Dio_oracle.Oracle_runtime.account_gate_token ~pool:99.9 inputs ~deployed_of:(fun _ ->
+       0.0));
+  Alcotest.(check (list bool))
+    "fundable at 100.1"
+    [ true ]
+    (Dio_oracle.Oracle_runtime.account_gate_token
+       ~pool:100.1
+       inputs
+       ~deployed_of:(fun _ -> 0.0))
+;;
+
+let test_account_gate_token_respects_pass_down () =
+  (* A fully-funded priority asset consumes its deployed share before the
+     next asset's gate is evaluated: with A deployed 40 of a 100 pool, B is
+     sized against the 60 remainder and cannot fund a 70 first buy - even
+     though the raw pool reads above it. This is the pass-down budget the
+     reclaim plan's target test uses. *)
+  let a = mk_gi ~symbol:"A" ~first_buy:40.0 ~has_committed:false in
+  let b = mk_gi ~symbol:"B" ~first_buy:70.0 ~has_committed:false in
+  let deployed_of s = if s = "A" then 40.0 else 0.0 in
+  Alcotest.(check (list bool))
+    "B starved by A's deployment"
+    [ true; false ]
+    (Dio_oracle.Oracle_runtime.account_gate_token ~pool:100.0 [ a; b ] ~deployed_of)
+;;
+
+let test_account_gate_token_committed_buy_exempt () =
+  (* A committed resting buy exempts the asset from the first-buy gate even
+     when the pass-down budget cannot fund a fresh one - its first buy is
+     already funded and locked in the account balance. *)
+  let a = mk_gi ~symbol:"A" ~first_buy:100.0 ~has_committed:true in
+  Alcotest.(check (list bool))
+    "committed buy fundable despite the budget"
+    [ true ]
+    (Dio_oracle.Oracle_runtime.account_gate_token ~pool:10.0 [ a ] ~deployed_of:(fun _ ->
+       0.0))
+;;
+
 let test_account_fp_eq () =
   let fp ~analyses ~pool ~fng ~state =
     { Dio_oracle.Oracle_runtime.af_analyses = analyses
@@ -832,6 +891,20 @@ let () =
             "publish generation bumps per pass"
             `Quick
             test_publish_generation_bumps_per_pass
+        ] )
+    ; ( "capital-gate"
+      , [ Alcotest.test_case
+            "gate flips within the pool bucket"
+            `Quick
+            test_account_gate_token_flip
+        ; Alcotest.test_case
+            "gate respects the pass-down budget"
+            `Quick
+            test_account_gate_token_respects_pass_down
+        ; Alcotest.test_case
+            "committed buy exempts the gate"
+            `Quick
+            test_account_gate_token_committed_buy_exempt
         ] )
     ]
 ;;

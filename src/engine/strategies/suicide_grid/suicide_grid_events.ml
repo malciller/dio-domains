@@ -160,6 +160,17 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
           ()
         | Sell ->
           state.inflight_sell <- false;
+          (* Release the in-flight marker when the placement completes. The
+             key is added by [push_order] at dispatch and must be removed here
+             (the placement is acknowledged), not left latched until a fill/
+             cancel/failure: while it stayed set, [has_active_sell] reported
+             true for the entire time a sell rested on the book, which gated
+             every later sell attempt behind a buy fill (the only event that
+             force-cleared it). The marker now means "a sell placement is in
+             flight", so a resting sell no longer blocks the next sell for new
+             inventory - the inventory gate (available >= sell qty) is what
+             prevents duplicates. *)
+          ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
           state.recently_injected_sells
           <- (order_id, price, now) :: state.recently_injected_sells;
           let replaced = ref false in
@@ -489,9 +500,13 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                acc_qty
                state.anticipated_base_credit
                order_id);
-           state.inflight_sell <- false;
-           state.recently_injected_sells <- [];
-           ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
+           (* A buy fill does not complete a sell placement: the sell's own
+               ack/fill/cancel events own the sell in-flight lifecycle, so the
+               sell markers ([inflight_sell], the duplicate-key latch, the
+               recently-injected debounce) are left untouched here. Clearing
+               them on buy fills was a workaround for the sell-ack latch leak
+               (see handle_order_acknowledged) and let a fill tick push a new
+               sell while the previous sell placement was still in flight. *)
            state.last_buy_attempted_insufficient <- false;
            if is_superseded_old_fill
            then

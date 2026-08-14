@@ -167,9 +167,14 @@ let accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~se
   else false
 ;;
 
-(** Returns true if a sell order placement is currently in-flight or registered in InFlightOrders. *)
+(** Returns true if a sell order placement is currently in-flight or registered
+    in InFlightOrders. The marker now means exactly "a sell placement is in
+    flight": [handle_order_acknowledged] releases the duplicate key when the
+    placement completes, so a RESTING sell no longer reports as active here -
+    the inventory gate (sellable base >= sell qty) is what prevents duplicate
+    sells, and the sell for a new fill is placed while earlier sells rest (the
+    1-buy x multi-sell ladder). The old [just_filled_buy] bypass existed to
+    defeat the latch leak and is gone with it. *)
 let has_active_sell state =
-  if state.just_filled_buy
-  then false
-  else state.inflight_sell || InFlightOrders.is_in_flight state.duplicate_key_sell
+  state.inflight_sell || InFlightOrders.is_in_flight state.duplicate_key_sell
 ;;

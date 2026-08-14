@@ -17,8 +17,11 @@
       q_s >= qty_min. Dynamic sell sizing: non-accumulation venues (Kraken
       sell_mult, Alpaca 1:1) up-size the sell qty to ceil_lot(min_notional /
       price) so the grid recovers safely; accumulation venues (HL/Lighter/IBKR)
-      keep the resting sell (accumulate) until the reduced sell clears the floor,
-      mirroring live order rejection.
+      keep the resting sell (accumulate) while the reduced sell clears the
+      floor, and fall back to the FULL fill qty (no retention that cycle) when
+      the reduced sell sits below the floor - mirroring the live grid's
+      below-floor rejection and full-qty fallback, so inventory is never
+      stranded below the venue minimum.
     - sell inventory  = sell-side base is NOT required to run the strategy:
       the grid needs only quote capital to place a buy order, and a sell order
       is only placed (and only fills) if the sellable inventory
@@ -26,8 +29,9 @@
       inventory cannot cover is skipped - never filled with phantom base - so
       quote is reconciled (recovered) exactly on valid sell fills.
    - sell qty per venue: Kraken qty*sell_mult; HL/Lighter/IBKR accumulation
-     sells once accumulated_profit >= rounding_diff*sell_price + buffer;
-     Alpaca 1:1.
+     sells once accumulated_profit >= rounding_diff*sell_price + buffer (and,
+     when the reduced sell is below the venue floor, the full fill qty - no
+     accrual that cycle); Alpaca 1:1.
    - at most one sell per bar; buys may ladder down as far as the bar low,
      quote and the (dynamically sized) buy cost allow (worst-case intraday
      fills).
@@ -402,13 +406,31 @@ let on_bar cfg ~state ~bar ~ordering =
   let process_sell () =
     match state.resting_sell with
     | Some s when bar.high >= s ->
-      let q_s, required = compute_sell_qty cfg ~state ~sell_price:s in
+      let q_s0, required0 = compute_sell_qty cfg ~state ~sell_price:s in
       let available = Float.max 0.0 (state.base -. state.reserved_base) in
-      (* Clamp to the sellable inventory AFTER up-sizing: an up-sized quantity
-         is only an order if the inventory covers it, so a floor up-size can
-         never sell phantom base. With no sellable inventory the order is
-         skipped (q_s = 0) and quote is only ever reconciled on valid fills. *)
-      let q_s = Float.min (upsell_to_notional cfg ~price:s ~qty:q_s) available in
+      (* Venue-floor fallback (mirrors the live grid, which rejects below-floor
+         orders): on accumulation venues the reduced sell
+         (round(qty * sell_mult)) can land below the venue floor (qty_min /
+         min_notional) while the FULL fill qty clears it. The live grid then
+         sells the full qty - sell the inventory that was not deemed accrued,
+         sized to the venue floor, so the fill's capital is recovered instead
+         of stranding the share (no retention that cycle). *)
+      let q_s0, required0 =
+        if
+          use_accumulation_sells cfg
+          && required0 > 0.0
+          && (q_s0 < cfg.qty_min || q_s0 *. s < cfg.min_notional -. 1e-9)
+          && cfg.qty >= cfg.qty_min
+          && cfg.qty *. s >= cfg.min_notional -. 1e-9
+        then cfg.qty, 0.0
+        else q_s0, required0
+      in
+      (* Clamp to the sellable inventory AFTER up-sizing/fallback: an up-sized
+         quantity is only an order if the inventory covers it, so a floor
+         up-size can never sell phantom base. With no sellable inventory the
+         order is skipped (q_s = 0) and quote is only ever reconciled on
+         valid fills. *)
+      let q_s = Float.min (upsell_to_notional cfg ~price:s ~qty:q_s0) available in
       if q_s > 0.0 && q_s >= cfg.qty_min && q_s *. s >= cfg.min_notional -. 1e-9
       then (
         state.resting_sell <- None;
@@ -418,9 +440,9 @@ let on_bar cfg ~state ~bar ~ordering =
         recover_quote cfg state proceeds;
         state.base <- Float.max 0.0 (state.base -. q_s);
         state.sell_fills <- state.sell_fills + 1;
-        if required > 0.0
+        if required0 > 0.0
         then (
-          state.accumulated_profit <- state.accumulated_profit -. required;
+          state.accumulated_profit <- state.accumulated_profit -. required0;
           let inc = cfg.qty -. q_s in
           if inc > 0.0 then state.reserved_base <- state.reserved_base +. inc)
         else (

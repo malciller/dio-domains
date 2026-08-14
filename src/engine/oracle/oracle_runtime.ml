@@ -1728,62 +1728,209 @@ let size_asset
 (* Priority reclamation.                                               *)
 (* ------------------------------------------------------------------ *)
 
-(** The per-account reclamation plan: which lower-priority assets' resting
-    buys to cancel so a higher-priority asset that cannot fund its first buy
-    after a fill can resume (see Oracle_reclaim for the selection rules -
-    fewest cancellations, then lowest priority). The plan is computed FRESH
-    every pass (one open-order fold + arithmetic) and applied on top of the
-    memoized decisions, so a changed plan takes effect without busting the
-    account sizing cache. [assets] must be in account priority order. *)
-let reclaim_plan
-      ~(pool : float)
+(** Case-sensitive substring search (no dependency on the strategy module's
+    helper). *)
+let contains_substring s fragment =
+  let sl = String.length s
+  and fl = String.length fragment in
+  let rec go i = i + fl <= sl && (String.sub s i fl = fragment || go (i + 1)) in
+  go 0
+;;
+
+(** One asset's capital-gate inputs for an account, in account priority
+    order. Built once per account per pass and shared by the first-buy-gate
+    cache check (Oracle_reclaim) and the reclamation plan. *)
+type gate_input =
+  { g_exchange : string
+  ; g_symbol : string
+  ; g_first_buy : float
+    (** Cost of the first buy at the minimum order size, from the SAME
+        live-anchored grid the sizing rebuilds at decision time - the
+        memoized analysis grid can pin a stale anchor price, which would
+        mis-size the gate and the reclaim gap after a price move. *)
+  ; g_committed : float
+    (** Capital locked by this asset's resting buys (what a cancel returns
+        to the pool). *)
+  ; g_has_committed_buy : bool
+    (** A committed resting buy exempts the asset from the first-buy gate
+        (its first buy is already funded). *)
+  ; g_pool : float
+    (** The pass-down budget the asset was sized against (its decision's
+        [pool_share]) - the pool remaining after higher-priority assets
+        consumed their share. *)
+  ; g_capital_blocked : bool
+    (** INACTIVE for capital reasons only (first-buy gate failed) - a valid
+        reclaim target. *)
+  }
+
+(** Build the capital-gate inputs for one account from its tasks, analyses
+    and the account's decisions (the same decisions the reclaim plan patches
+    and the gate check compares). Assets whose analysis is missing this pass
+    are dropped - they are neither targets nor candidates. *)
+let account_gate_inputs
       (account_tasks : Oracle_tasks.task list)
       (analyses : analysis list)
-  : (string * string) list
+      ~(decisions : decision list)
+  : gate_input list
   =
-  let inputs =
-    List.filter_map
-      (fun (task : Oracle_tasks.task) ->
-         let exchange = task.Oracle_tasks.exchange in
-         let symbol = task.Oracle_tasks.symbol in
-         match
-           List.find_opt
-             (fun (a : analysis) -> a.exchange = exchange && a.symbol = symbol)
-             analyses
-         with
-         | None -> None
-         | Some a ->
-           let q_min = D.sizing_floor ~cfg:a.grid in
-           let cost_one = G.cost_at (G.set_parameter a.grid a.hi) ~qty:q_min ~n_fills:1 in
-           let committed = committed_buy_value ~exchange ~symbol in
-           (* Any asset holding committed buy capital is eligible to be
-              reclaimed - committed capital always flows toward the
-              highest-priority asset that needs it; the reclamation plan's
-              conservation objective (fewest cancellations, lowest priority
-              first) keeps disruption minimal. *)
-           Some
-             { Oracle_reclaim.symbol
-             ; first_buy_cost = cost_one
-             ; committed_value = committed
-             })
-      account_tasks
+  let decision_of (exchange : string) (symbol : string) =
+    List.find_opt
+      (fun (d : decision) -> d.exchange = exchange && d.symbol = symbol)
+      decisions
   in
-  Oracle_reclaim.plan ~pool inputs
+  List.filter_map
+    (fun (task : Oracle_tasks.task) ->
+       let exchange = task.Oracle_tasks.exchange in
+       let symbol = task.Oracle_tasks.symbol in
+       match
+         List.find_opt
+           (fun (a : analysis) -> a.exchange = exchange && a.symbol = symbol)
+           analyses
+       with
+       | None -> None
+       | Some a ->
+         let last_close =
+           if Array.length a.asset.Oracle_types.bars = 0
+           then 0.0
+           else
+             a.asset.Oracle_types.bars.(Array.length a.asset.Oracle_types.bars - 1)
+               .Oracle_types.close
+         in
+         let start_price = live_buy_anchor ~exchange ~symbol ~fallback:last_close in
+         let grid =
+           Grid_adapter.of_trading_config
+             a.tc
+             ~start_price
+             ~start_quote:0.0
+             ~grid_interval_pct:a.hi
+         in
+         let q_min = D.sizing_floor ~cfg:grid in
+         let first_buy = G.cost_at (G.set_parameter grid a.hi) ~qty:q_min ~n_fills:1 in
+         let committed = committed_buy_value ~exchange ~symbol in
+         let has_committed_buy =
+           match Exchange.Registry.get exchange with
+           | None -> false
+           | Some (module Ex) ->
+             Ex.fold_open_orders
+               ~symbol
+               ~init:false
+               ~f:(fun acc (o : Exchange.Types.open_order) ->
+                 acc || (o.side = Exchange.Types.Buy && o.remaining_qty > 0.0))
+         in
+         let d = decision_of exchange symbol in
+         (* A valid reclaim target is INACTIVE for capital reasons ONLY: an
+            asset that would stay inactive once funded (no usable history,
+            D_surv below the active floor) must not have lower-priority
+            ladders canceled for nothing. *)
+         let capital_blocked =
+           match d with
+           | Some d ->
+             (not d.active) && contains_substring d.reason "cannot fund the first buy"
+           | None -> false
+         in
+         Some
+           { g_exchange = exchange
+           ; g_symbol = symbol
+           ; g_first_buy = first_buy
+           ; g_committed = committed
+           ; g_has_committed_buy = has_committed_buy
+           ; g_pool =
+               (match d with
+                | Some d -> d.pool_share
+                | None -> 0.0)
+           ; g_capital_blocked = capital_blocked
+           })
+    account_tasks
+;;
+
+(** The first-buy gate outcome for each of an account's assets under a pool:
+    folds the assets in priority order, each consuming its sized [deployed]
+    share (the pass-down), and reports whether each asset's first buy is
+    fundable from its remaining budget. A committed resting buy exempts the
+    asset. Compared across two pool values (the cache's stored pool vs the
+    fresh pool) to detect a gate that flips within the sizing-cache pool
+    bucket: a flip must bypass the cache or the asset keeps a stale
+    ACTIVE/INACTIVE decision - the "capital returned but the strategy did not
+    resume" stall. *)
+let account_gate_token
+      ~(pool : float)
+      (gate_inputs : gate_input list)
+      ~(deployed_of : string -> float)
+  : bool list
+  =
+  let rec go budget inputs acc =
+    match inputs with
+    | [] -> List.rev acc
+    | gi :: rest ->
+      let fundable = gi.g_has_committed_buy || budget +. 1e-9 >= gi.g_first_buy in
+      go (budget -. deployed_of gi.g_symbol) rest (fundable :: acc)
+  in
+  go pool gate_inputs []
+;;
+
+(** The per-account reclamation plan from the account's gate inputs: which
+    lower-priority resting buys to cancel so a higher-priority, capital-
+    blocked asset that cannot fund its first buy from its pass-down budget
+    can resume (see Oracle_reclaim for the selection rules - fewest
+    cancellations, then lowest priority). Computed FRESH every pass on the
+    current decisions and applied on top of them, so a changed plan takes
+    effect without busting the account sizing cache. Returns
+    [(exchange, symbol, target)] reclaim entries, keyed by exchange+symbol so
+    duplicate symbols across accounts can never cross-patch. *)
+let reclaim_plan (gate_inputs : gate_input list) : (string * string * string) list =
+  let inputs =
+    List.map
+      (fun (gi : gate_input) ->
+         { Oracle_reclaim.symbol = gi.g_symbol
+         ; first_buy_cost = gi.g_first_buy
+         ; committed_value = gi.g_committed
+         ; pool = gi.g_pool
+         ; capital_blocked = gi.g_capital_blocked
+         })
+      gate_inputs
+  in
+  (* The pure planner enumerates exactly while the candidate set stays under
+     20 and falls back to a greedy cover above it (never a silent no-op).
+     Surface the fallback once per pass for an account that large so the
+     degraded "fewest cancellations" guarantee is visible in the log. *)
+  let n_candidates =
+    List.length (List.filter (fun (gi : gate_input) -> gi.g_committed > 0.0) gate_inputs)
+  in
+  if n_candidates >= 20
+  then
+    Logging.debug_f
+      ~section
+      "reclamation for an account with %d committed candidates: exact \
+       fewest-cancellation selection skipped (greedy cover used)"
+      n_candidates;
+  let exchange_of symbol =
+    match List.find_opt (fun (gi : gate_input) -> gi.g_symbol = symbol) gate_inputs with
+    | Some gi -> gi.g_exchange
+    | None -> ""
+  in
+  List.map (fun (s, t) -> exchange_of s, s, t) (Oracle_reclaim.plan inputs)
 ;;
 
 (** Patch an account's decisions with the reclamation plan: a reclaimed asset
     is published INACTIVE-with-reclaim so its domain cancels its resting buy
     and the capital returns to the pool for the higher-priority target.
-    [remainder] is left untouched - both the committed-running and the
-    inactive deployments already pass the whole pool down, so the sequential
-    pass-down is unchanged. Idempotent and applied fresh each pass (on top of
-    the cached, unpatched decisions). *)
-let apply_reclaim ~(plan : (string * string) list) (ds : decision list) : decision list =
+    Matched on exchange+symbol so a plan for one account can never patch
+    another account's decision for the same symbol. [remainder] is left
+    untouched - both the committed-running and the inactive deployments
+    already pass the whole pool down, so the sequential pass-down is
+    unchanged. Idempotent and applied fresh each pass (on top of the cached,
+    unpatched decisions). *)
+let apply_reclaim ~(plan : (string * string * string) list) (ds : decision list)
+  : decision list
+  =
+  let plan_of (d : decision) =
+    List.find_opt (fun (e, s, _) -> e = d.exchange && s = d.symbol) plan
+  in
   List.map
     (fun (d : decision) ->
-       match List.assoc_opt d.symbol plan with
+       match plan_of d with
        | None -> d
-       | Some target ->
+       | Some (_, _, target) ->
          { d with
            active = false
          ; reason = Printf.sprintf "capital reallocated to %s (higher priority)" target
@@ -2304,24 +2451,6 @@ let run_pass
              Lwt.return_unit
            | Some (Some (pool, snapshot)) ->
              let analyses = analyses_for account in
-             (* Priority reclamation: which lower-priority resting buys to
-                cancel so an unfundable higher-priority asset can resume.
-                Computed fresh every pass (cheap) and applied on top of the
-                memoized decisions below, so a changed plan takes effect on
-                cache hits too (the plan is deliberately NOT part of the
-                sizing fingerprint - constant buy-amends must not bust it). *)
-             let reclaim = reclaim_plan ~pool account_tasks analyses in
-             if reclaim <> []
-             then
-               Logging.warn_f
-                 ~section
-                 "capital reclamation for %s: canceling %s to fund higher-priority \
-                  assets (pool $%.2f)"
-                 (account_id account)
-                 (String.concat
-                    ", "
-                    (List.map (fun (s, t) -> Printf.sprintf "%s for %s" s t) reclaim))
-                 pool;
              let fp =
                { af_analyses =
                    List.map
@@ -2347,8 +2476,58 @@ let run_pass
                }
              in
              let t_size = Mtime_clock.now_ns () in
-             (match Hashtbl.find_opt size_cache (account_id account) with
-              | Some (prev_fp, prev_decisions) when account_fp_eq prev_fp fp ->
+             (* Priority reclamation: which lower-priority resting buys to
+                cancel so an unfundable higher-priority asset can resume.
+                Computed fresh every pass (cheap) and applied on top of the
+                memoized decisions below, so a changed plan takes effect on
+                cache hits too (the plan is deliberately NOT part of the
+                sizing fingerprint - constant buy-amends must not bust it).
+                The plan is computed from the account's gate inputs on the
+                decisions it will patch (see below). *)
+             let log_reclaim reclaim =
+               if reclaim <> []
+               then
+                 Logging.warn_f
+                   ~section
+                   "capital reclamation for %s: canceling %s to fund higher-priority \
+                    assets (pool $%.2f)"
+                   (account_id account)
+                   (String.concat
+                      ", "
+                      (List.map (fun (_, s, t) -> Printf.sprintf "%s for %s" s t) reclaim))
+                   pool
+             in
+             (* Cache reuse is gate-aware: reuse the cached decisions only
+                when no asset's first-buy gate flips between the pool they
+                were sized at and the current pool. A pool move inside the
+                0.5% fingerprint bucket can still cross an asset's first-buy
+                gate (a small capital return - a reclaim cancel, a deposit, a
+                sweep - that makes a parked priority asset fundable); reusing
+                the stale INACTIVE decision would leave the strategy paused on
+                available capital, which is exactly the "capital returned but
+                the strategy did not resume in priority order" stall. *)
+             let reuse_entry =
+               match Hashtbl.find_opt size_cache (account_id account) with
+               | Some (prev_fp, prev_decisions) when account_fp_eq prev_fp fp ->
+                 let deployed_of =
+                   let m = Hashtbl.create 8 in
+                   List.iter
+                     (fun (d : decision) -> Hashtbl.replace m d.symbol d.deployed)
+                     prev_decisions;
+                   fun s -> Option.value (Hashtbl.find_opt m s) ~default:0.0
+                 in
+                 let gate_inputs =
+                   account_gate_inputs account_tasks analyses ~decisions:prev_decisions
+                 in
+                 let same_gate =
+                   account_gate_token ~pool:prev_fp.af_pool gate_inputs ~deployed_of
+                   = account_gate_token ~pool gate_inputs ~deployed_of
+                 in
+                 Some (prev_fp, prev_decisions, gate_inputs, same_gate)
+               | _ -> None
+             in
+             (match reuse_entry with
+              | Some (_, prev_decisions, gate_inputs, true) ->
                 incr reused_accounts;
                 List.iter
                   (fun (d : decision) ->
@@ -2359,6 +2538,8 @@ let run_pass
                        (fun () -> "sizing-reuse"))
                   prev_decisions;
                 Latency_profiler.record engine_profs.prof_sizing (span_from t_size);
+                let reclaim = reclaim_plan gate_inputs in
+                log_reclaim reclaim;
                 let patched = apply_reclaim ~plan:reclaim prev_decisions in
                 decisions := List.rev_append patched !decisions;
                 (match List.rev patched with
@@ -2374,6 +2555,8 @@ let run_pass
                  | [] -> ());
                 Lwt.return_unit
               | _ ->
+                (* No cache entry, the fingerprint moved, or a first-buy gate
+                   flipped inside the bucket: re-size this account fresh. *)
                 let before = List.length !decisions in
                 size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool analyses
                 >|= fun surplus ->
@@ -2382,6 +2565,11 @@ let run_pass
                 Hashtbl.replace size_cache (account_id account) (fp, account_decisions);
                 (* Apply the reclaim plan: the account's decisions just came off
                     the head of [!decisions]; swap them for the patched ones. *)
+                let gate_inputs =
+                  account_gate_inputs account_tasks analyses ~decisions:account_decisions
+                in
+                let reclaim = reclaim_plan gate_inputs in
+                log_reclaim reclaim;
                 let patched = apply_reclaim ~plan:reclaim account_decisions in
                 decisions := List.rev_append patched (drop n !decisions);
                 Latency_profiler.record engine_profs.prof_sizing (span_from t_size);

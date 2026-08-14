@@ -254,7 +254,13 @@ let live_balances () : (string * float * float) list option =
 ;;
 
 let default_quote = "USD"
-let min_notional ~symbol:_ = 0.0
+
+(** Alpaca's venue floor is a DOLLAR order notional, not a base quantity: the
+    API requires at least $1 in order value (the minimum for fractional-share
+    orders). The live grid's sell-leg inventory gate and the replay floor both
+    consume this, so a sell is only attempted when the non-accrued inventory
+    is worth at least this floor. *)
+let min_notional ~symbol:_ = 1.0
 
 (* ---- Instrument metadata (static 0.01 tick, fractional lots) ---- *)
 

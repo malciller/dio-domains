@@ -991,11 +991,35 @@ let evaluate_buy_leg
   !buy_attempted
 ;;
 
-(** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell placement leg.
+(** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell
+    placement leg.
     [persisted_reconcile] is the (open_levels, missing_levels) split that
     [sync_open_orders] computed during its open-order scan (M16), so the
     Alpaca virtual-GTC reconcile never re-partitions the persisted-vs-open
-    multiset a second time per execution. *)
+    multiset a second time per execution.
+
+    Sell trigger semantics: a sell is attempted when a buy is placed
+    ([buy_attempted]) or filled ([just_filled_buy] - the 1-buy x multi-sell
+    ladder), and the trigger is OWED until the sell is actually placed. Only a
+    placed sell or a verified nothing-to-sell (known balance below the venue
+    floor) consumes the trigger - transient blockers (cooldown, asset_low, a
+    NaN balance snapshot, an in-flight sell placement) do not, so the sell
+    retries every tick even when there is no capital to replace the buy
+    (capital exhausted / oracle-halted) and even when the buy placement tick
+    itself was blocked.
+
+    Sell sizing: accumulation venues (Hyperliquid/Lighter/IBKR) size the sell
+    PURELY by the non-accrued inventory = available balance - reserved_base.
+    The venue's available balance is tradeable (total - hold from open
+    orders), so resting-sell holds are already netted and locked_in_sells is
+    NOT subtracted again - subtracting it double-counted the hold and
+    understated the inventory below the floor, blocking the sell. Non-
+    accumulation venues size by qty * sell_mult (Kraken), clamped to the
+    sellable inventory. The result must clear the VENUE MINIMUM
+    ([cached_venue_min_qty] and [cached_venue_min_notional]; Alpaca's minimum
+    is a dollar notional). The venue minimum is the exchange's minimum
+    accepted order size - entirely separate from the grid's configured order
+    [qty]. *)
 let evaluate_sell_leg
       ~persisted_reconcile
       ~state
@@ -1008,11 +1032,6 @@ let evaluate_sell_leg
       ~ecfg
       ~locked_in_sells
   =
-  let qty =
-    match state.last_buy_fill_qty with
-    | Some q when q > 0.0 -> q
-    | _ -> venue_lot_qty state.grid_qty asset.exchange state
-  in
   let available_base =
     if Float.is_nan asset_balance
     then 0.0
@@ -1094,17 +1113,35 @@ let evaluate_sell_leg
          state.last_sell_fill_price <- Some p)
       !pruned_missing);
   let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
-  let min_needed_base =
+  (* Inventory gate for sell placement: available non-accrued inventory must
+     cover the VENUE MINIMUM accepted order size. The venue minimum is the
+     exchange's floor - entirely separate from the grid's configured order
+     [qty]. Venues express it two ways:
+       - quote-notional venues (Alpaca) enforce a DOLLAR minimum order value
+         ([cached_venue_min_notional] = $1): the available base must be worth
+         at least that in the quote currency, so the comparison is in VALUE.
+       - base-quantity venues enforce a base-amount floor
+         ([cached_venue_min_qty]). *)
+  let base_ref_price =
+    if bid_price > 0.0
+    then bid_price
+    else (
+      match state.last_buy_fill_price with
+      | Some p when p > 0.0 -> p
+      | Some _ -> ask_price
+      | None -> ask_price)
+  in
+  let inventory_ok =
     if is_alpaca
-    then round_qty (qty *. state.cached_sell_mult) asset.symbol asset.exchange
-    else qty
+    then available_base *. base_ref_price >= state.cached_venue_min_notional -. 1e-9
+    else available_base >= state.cached_venue_min_qty -. 1e-9
   in
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells
     then (
       let missing_lvl_check = !missing_after_reconcile in
       (not (has_active_sell state))
-      && available_base >= min_needed_base
+      && inventory_ok
       && (state.just_filled_buy
           || buy_attempted
           || state.resuming_after_balance_flag
@@ -1118,6 +1155,11 @@ let evaluate_sell_leg
     else state.just_filled_buy || buy_attempted
   in
   let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
+  (* Hoisted outside the gated block so a placement-tick sell attempt that is
+     blocked by a transient gate (cooldown / asset_low / NaN balance / an
+     in-flight sell placement) can still arm the retry latch below. *)
+  let sell_pushed = ref false in
+  let nothing_placeable = ref false in
   if
     should_trigger_sell
     && (not (Float.is_nan asset_balance))
@@ -1180,7 +1222,7 @@ let evaluate_sell_leg
         in
         if ask_price > 0.0 then max raw_sell_price ask_price else raw_sell_price
     in
-    let sell_qty, is_accumulation_sell, required_profit =
+    let sell_qty, _is_accumulation_sell, _required_profit =
       match target_sell_qty_override with
       | Some tq when ecfg.remaintain_expired_sells ->
         let target_q =
@@ -1200,25 +1242,28 @@ let evaluate_sell_leg
           ~symbol:asset.symbol
           ~exchange:asset.exchange
     in
-    let accumulation_ok_on_recovery =
-      accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty
-    in
-    if not accumulation_ok_on_recovery
-    then
-      Logging.info_f
-        ~section
-        "Sell deferred for %s on balance recovery: accumulated_profit %.4f < required \
-         %.4f (buffer %.4f)"
-        asset.symbol
-        state.accumulated_profit
-        required_profit
-        asset.accumulation_buffer;
-    let locked_in_sells_local = locked_in_sells in
+    (* Non-accrued sellable inventory (the amount not accrued into
+       reserved_base). On accumulation venues (Hyperliquid/Lighter/IBKR) the
+       venue's available balance is tradeable - total minus the hold from open
+       orders (see Hyperliquid_balances.BalanceStore) - so base held by
+       resting sells is ALREADY netted out of [asset_balance]; subtracting
+       [locked_in_sells] again double-counted the resting-sell hold and
+       understated the inventory below the floor, which blocked the sell. Per
+       the sizing directive, accumulation venues size the sell PURELY by this
+       non-accrued inventory. Non-accumulation venues (Alpaca, Kraken) report
+       full balances, so resting sells are subtracted explicitly. *)
+    let is_accumulation = ecfg.use_accumulation_sells in
     let available =
-      asset_bal
-      +. state.anticipated_base_credit
-      -. state.reserved_base
-      -. locked_in_sells_local
+      if is_accumulation
+      then
+        Float.max 0.0 (asset_bal +. state.anticipated_base_credit -. state.reserved_base)
+      else
+        Float.max
+          0.0
+          (asset_bal
+           +. state.anticipated_base_credit
+           -. state.reserved_base
+           -. locked_in_sells)
     in
     let effective_sell_qty, balance_ok =
       if is_alpaca
@@ -1237,8 +1282,7 @@ let evaluate_sell_leg
               rounded_tq;
             0.0, false)
         | None ->
-          let avail_rounded = round_qty available asset.symbol asset.exchange in
-          let sell_q = avail_rounded in
+          let sell_q = round_qty available asset.symbol asset.exchange in
           if sell_q > 0.0
           then sell_q, true
           else (
@@ -1251,11 +1295,34 @@ let evaluate_sell_leg
               asset_bal
               state.anticipated_base_credit
               state.reserved_base
-              locked_in_sells_local;
+              locked_in_sells;
             0.0, false))
-      else if ecfg.use_accumulation_sells && ecfg.use_reserved_base_guard
+      else if is_accumulation
+      then (
+        (* Accumulation venues: size the sell PURELY by the non-accrued
+           inventory (available balance - reserved_base), not by
+           round(qty * sell_mult). Sell all of it (lot-rounded down); the
+           venue-floor gate below decides whether the result is placeable. *)
+        let rounded = round_qty available asset.symbol asset.exchange in
+        if rounded > 0.0
+        then rounded, true
+        else (
+          Logging.debug_f
+            ~section
+            "Sell order blocked for %s: non-accrued inventory %.8f (bal %.8f + \
+             anticipated %.8f - reserved %.8f) rounds below one lot"
+            asset.symbol
+            available
+            asset_bal
+            state.anticipated_base_credit
+            state.reserved_base;
+          0.0, false))
+      else if ecfg.use_reserved_base_guard
       then
-        if available >= sell_qty
+        if
+          (* Kraken: size strictly by qty * sell_mult, clamped to the sellable
+           inventory when short (partial fills / residual base). *)
+          available >= sell_qty
         then sell_qty, true
         else if available > 0.0
         then (
@@ -1272,7 +1339,7 @@ let evaluate_sell_leg
               asset_bal
               state.anticipated_base_credit
               state.reserved_base
-              locked_in_sells_local
+              locked_in_sells
               sell_qty;
             0.0, false))
         else (
@@ -1285,107 +1352,78 @@ let evaluate_sell_leg
             asset_bal
             state.anticipated_base_credit
             state.reserved_base
-            locked_in_sells_local
-            sell_qty;
-          0.0, false)
-      else if ecfg.use_reserved_base_guard
-      then
-        if available >= sell_qty
-        then sell_qty, true
-        else (
-          Logging.debug_f
-            ~section
-            "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
-             reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
-            asset.symbol
-            available
-            asset_bal
-            state.anticipated_base_credit
-            state.reserved_base
-            locked_in_sells_local
+            locked_in_sells
             sell_qty;
           0.0, false)
       else sell_qty, true
     in
-    if accumulation_ok_on_recovery && sell_qty = 0.0 && is_accumulation_sell
+    if balance_ok
     then (
-      let actual_cost = qty *. sell_price in
-      state.accumulated_profit <- state.accumulated_profit -. actual_cost;
-      state.reserved_base <- state.reserved_base +. qty;
-      state.persistence_dirty <- true;
-      Logging.info_f
-        ~section
-        "Retained full share of %s (profit %.4f covered cost %.4f, reserved_base now \
-         %.0f)"
-        asset.symbol
-        (state.accumulated_profit +. actual_cost)
-        actual_cost
-        state.reserved_base)
-    else if accumulation_ok_on_recovery && balance_ok
-    then (
-      let sell_order =
-        create_order
-          state.duplicate_key_sell
-          asset.symbol
-          Sell
-          effective_sell_qty
-          (Some sell_price)
-          true
-          asset.exchange
+      (* The VENUE-MINIMUM gate: the sell must clear the venue's minimum
+         accepted order size - the base-quantity floor [cached_venue_min_qty]
+         and (for quote-notional venues such as Alpaca/Hyperliquid) the
+         notional floor [cached_venue_min_notional]. The same gates the replay
+         enforces (grid_core). This is the exchange's minimum, NOT the grid's
+         configured order [qty]. *)
+      let venue_min_ok q =
+        q >= state.cached_venue_min_qty -. 1e-9
+        && q *. sell_price >= state.cached_venue_min_notional -. 1e-9
       in
-      if push_order ~now ~state sell_order
+      if venue_min_ok effective_sell_qty
       then (
-        state.asset_low <- false;
-        if ecfg.remaintain_expired_sells && target_sell_price_opt = None
+        let sell_order =
+          create_order
+            state.duplicate_key_sell
+            asset.symbol
+            Sell
+            effective_sell_qty
+            (Some sell_price)
+            true
+            asset.exchange
+        in
+        if push_order ~now ~state sell_order
         then (
-          state.persisted_sell_levels
-          <- List.sort
-               (fun (p1, _) (p2, _) -> Float.compare p2 p1)
-               ((sell_price, effective_sell_qty) :: state.persisted_sell_levels);
-          state.persistence_dirty <- true);
-        if is_accumulation_sell
-        then (
-          let rounded_sell = effective_sell_qty in
-          let rounding_diff = qty -. rounded_sell in
-          let actual_cost = rounding_diff *. sell_price in
-          state.accumulated_profit <- state.accumulated_profit -. actual_cost;
-          let base_increment = qty -. rounded_sell in
-          state.reserved_base <- state.reserved_base +. base_increment;
-          state.persistence_dirty <- true;
+          sell_pushed := true;
+          state.asset_low <- false;
+          if ecfg.remaintain_expired_sells && target_sell_price_opt = None
+          then (
+            state.persisted_sell_levels
+            <- List.sort
+                 (fun (p1, _) (p2, _) -> Float.compare p2 p1)
+                 ((sell_price, effective_sell_qty) :: state.persisted_sell_levels);
+            state.persistence_dirty <- true);
           Logging.info_f
             ~section
-            "Accumulation sell for %s: %.8f (sell_mult, profit %.4f covered cost %.4f, \
-             reserved_base now %.8f)"
+            "Placed sell order for %s: %.8f @ %.4f"
             asset.symbol
-            rounded_sell
-            (state.accumulated_profit +. actual_cost)
-            actual_cost
-            state.reserved_base)
-        else if ecfg.sell_uses_mult && persistence_accumulation_exchange state.exchange_id
-        then
-          if target_sell_qty_override = None
-          then (
-            let base_increment = qty -. effective_sell_qty in
-            if base_increment > 0.0
-            then (
-              state.reserved_base <- state.reserved_base +. base_increment;
-              state.persistence_dirty <- true;
-              Logging.info_f
-                ~section
-                "Reserving base for %s: +%.8f (sell_mult %.4f, total reserved_base now \
-                 %.8f)"
-                asset.symbol
-                base_increment
-                sell_mult
-                state.reserved_base));
-        Logging.info_f
+            effective_sell_qty
+            sell_price))
+      else (
+        Logging.debug_f
           ~section
-          "Placed sell order for %s: %.8f @ %.4f"
+          "Sell order blocked for %s: no sellable inventory clears the venue minimum \
+           (venue_min_qty %.8f, venue_min_notional %.4f, sell_price %.4f, sellable %.8f)"
           asset.symbol
-          effective_sell_qty
-          sell_price)));
-  state.resuming_after_balance_flag <- false;
-  state.just_filled_buy <- false
+          state.cached_venue_min_qty
+          state.cached_venue_min_notional
+          sell_price
+          available;
+        nothing_placeable := true))
+    else nothing_placeable := true);
+  (* Retry semantics: the sell for a completed buy (or a buy placement) is
+     OWED until it is actually placed. Transient blockers (sell cooldown,
+     asset_low, a NaN balance snapshot, an in-flight sell placement) do NOT
+     consume the trigger, so the leg retries on the next tick - with or
+     without a replacement buy (capital exhausted / oracle-halted). Only a
+     placed sell or a verified nothing-to-sell (known balance below the
+     venue floor) clears the latch; a later fill or placement re-arms it.
+     This is what keeps the last filled buy's inventory sellable when there
+     is no capital to replace the buy. *)
+  if !sell_pushed || !nothing_placeable
+  then state.just_filled_buy <- false
+  else if buy_attempted && not state.just_filled_buy
+  then state.just_filled_buy <- true;
+  state.resuming_after_balance_flag <- false
 ;;
 
 (** Main strategy execution loop. [quote_balance_stale] is set by the caller
@@ -1431,11 +1469,16 @@ let execute_strategy
     state.cached_round_price <- get_round_price_fn asset.symbol asset.exchange;
     state.cached_price_increment <- get_price_increment asset.symbol asset.exchange;
     state.cached_qty_increment <- get_qty_increment_val asset.symbol asset.exchange;
-    state.cached_qty_min
+    (* Venue minimums (the exchange's minimum accepted order size), resolved
+       once at init: the base-quantity floor [cached_venue_min_qty] and the
+       quote-notional floor [cached_venue_min_notional]. These are the floors
+       every order must clear - separate from the grid's configured [qty]. *)
+    state.cached_venue_min_qty
     <- (match get_exchange_module asset.exchange with
         | Some (module Ex : Exchange.S) ->
           Option.value (Ex.get_qty_min ~symbol:asset.symbol) ~default:1.0
         | None -> 1.0);
+    state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;
     state.exchange_reserved_atomic <- Some (get_exchange_reserved_atomic asset.exchange));
   let ecfg = state.cached_ecfg in
   Mutex.lock state.mutex;
