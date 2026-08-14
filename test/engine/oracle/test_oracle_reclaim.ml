@@ -147,8 +147,84 @@ let test_multi_target_sequential_release () =
     (plan ~pool:10.0 assets)
 ;;
 
-(* ================= apply_reclaim (runtime patch) ==================== *)
+(* The full reclaim lifecycle, driven exactly as the engine drives it:
+   pass -> plan (oracle) interleaved with the domain's cancel step
+   (Dio_strategies.Suicide_grid.reclaim_step). This is the regression for
+   the stuck state: a single failed cancel used to leave the account
+   permanently halted - the reclaimed asset stayed paused (the plan only
+   cleared once the store's committed value dropped to zero) and the
+   priority asset never resumed on capital that was never released. With the
+   retry, a failed cancel is re-issued after the retry interval and the
+   account resolves. *)
+let test_reclaim_lifecycle_retries_failed_cancel () =
+  let pool = ref 14.14 in
+  let hype_committed = ref 19.73 in
+  let assets () =
+    [ inp ~symbol:"BTC/USDC" ~cost:31.54 ~committed:0.0
+    ; inp ~symbol:"HYPE/USDC" ~cost:19.73 ~committed:!hype_committed
+    ]
+  in
+  let step ~now ~issued ~issued_at ~eligible ~any_buy =
+    Dio_strategies.Suicide_grid.reclaim_step
+      ~now
+      ~retry_seconds:15.0
+      ~issued
+      ~issued_at
+      ~eligible
+      ~any_buy
+  in
+  (* Pass 1: the plan targets HYPE for BTC. *)
+  let p1 = plan ~pool:!pool (assets ()) in
+  check
+    (list (pair string string))
+    "pass 1 reclaims HYPE for BTC"
+    [ "HYPE/USDC", "BTC/USDC" ]
+    p1;
+  (* Domain sees the reclaim; first cancel attempt FAILS (store unchanged). *)
+  check
+    bool
+    "first attempt issues the cancel"
+    true
+    (step ~now:100.0 ~issued:false ~issued_at:0.0 ~eligible:1 ~any_buy:true
+     = Dio_strategies.Suicide_grid.Reclaim_cancel 1);
+  (* Pass 2: nothing changed (the failed cancel left the store intact), so
+     the plan persists and the decision stays reclaim. *)
+  let p2 = plan ~pool:!pool (assets ()) in
+  check
+    (list (pair string string))
+    "pass 2 plan persists after failed cancel"
+    [ "HYPE/USDC", "BTC/USDC" ]
+    p2;
+  (* The domain stays latched through the retry window (no cancel spam)... *)
+  check
+    bool
+    "in-flight cancel deferred"
+    true
+    (step ~now:105.0 ~issued:true ~issued_at:100.0 ~eligible:1 ~any_buy:true
+     = Dio_strategies.Suicide_grid.Reclaim_deferred);
+  (* ...but after the interval the cancel is RETRIED, and this time it lands:
+     the store clears and the pool reflects the released capital. *)
+  check
+    bool
+    "stale failed cancel is retried"
+    true
+    (step ~now:116.0 ~issued:true ~issued_at:100.0 ~eligible:1 ~any_buy:true
+     = Dio_strategies.Suicide_grid.Reclaim_cancel 1);
+  hype_committed := 0.0;
+  pool := 33.87;
+  check
+    bool
+    "clean store re-arms the latch"
+    true
+    (step ~now:116.5 ~issued:true ~issued_at:116.0 ~eligible:0 ~any_buy:false
+     = Dio_strategies.Suicide_grid.Reclaim_rearm);
+  (* Pass 3: the plan clears (BTC is funded from the pool) and the priority
+     asset re-activates - the account is no longer stuck. *)
+  let p3 = plan ~pool:!pool (assets ()) in
+  check (list (pair string string)) "pass 3 plan clears" [] p3
+;;
 
+(* ================= apply_reclaim (runtime patch) ==================== *)
 let make_decision ~symbol ~active =
   { Dio_oracle.Oracle_runtime.exchange = "hyperliquid"
   ; symbol
@@ -265,6 +341,10 @@ let () =
             "multi-target sequential release"
             `Quick
             test_multi_target_sequential_release
+        ; Alcotest.test_case
+            "lifecycle retries a failed cancel and resolves"
+            `Quick
+            test_reclaim_lifecycle_retries_failed_cancel
         ] )
     ; ( "apply_reclaim"
       , [ Alcotest.test_case "patches the decision" `Quick test_apply_reclaim_patches

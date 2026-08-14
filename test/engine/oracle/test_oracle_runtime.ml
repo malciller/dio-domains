@@ -718,6 +718,20 @@ let test_analysis_memoization_roundtrip () =
   Alcotest.(check bool) "recomputed record differs" (first == third) false
 ;;
 
+let test_publish_generation_bumps_per_pass () =
+  (* The domain decision cache keys on [get_publish_generation], so a new
+     pass's decisions are adopted on the domain's next cycle - the reclaim
+     decision (and the later re-activation) must reach the domain promptly,
+     not at the next background-refresh cycle. Every publish bumps it. *)
+  let before = Dio_oracle.Oracle_runtime.get_publish_generation () in
+  Dio_oracle.Oracle_runtime.publish [ make_decision ~active:true ];
+  let after_one = Dio_oracle.Oracle_runtime.get_publish_generation () in
+  Dio_oracle.Oracle_runtime.publish [ make_decision ~active:false ];
+  let after_two = Dio_oracle.Oracle_runtime.get_publish_generation () in
+  Alcotest.(check int) "first publish bumps" (before + 1) after_one;
+  Alcotest.(check int) "second publish bumps again" (after_one + 1) after_two
+;;
+
 let test_wait_refresh_epoch_bounded () =
   (* Returns immediately when a new epoch was already published since the
      caller captured [after], and when the budget is exhausted - never
@@ -814,6 +828,10 @@ let () =
             `Quick
             test_analysis_memoization_roundtrip
         ; Alcotest.test_case "bounded fill-wait" `Quick test_wait_refresh_epoch_bounded
+        ; Alcotest.test_case
+            "publish generation bumps per pass"
+            `Quick
+            test_publish_generation_bumps_per_pass
         ] )
     ]
 ;;
