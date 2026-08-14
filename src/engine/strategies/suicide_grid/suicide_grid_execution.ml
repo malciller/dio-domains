@@ -620,16 +620,14 @@ let evaluate_buy_leg
        closest resting sell that the trailing leg enforces via [exact_target]
        (sell_price - 2*gi of the SELL): without it a buy placed after a fill
        can sit too close to the lowest sell (a ~1x rung the grid never allows
-       when it amends). As in the trailing leg, the clamp only applies when
-       that sell is strictly ABOVE the top of book (a valid bracket around
-       the market); a sell at/below the top of book is the next fill target
-       and must not drag the fresh buy down to 2*gi below the market. *)
+       when it amends). As in the trailing leg the clamp is PRICE-INDEPENDENT:
+       while a sell is tracked by order management the fresh buy is kept at
+       least 2*gi below it; the clamp is released only when the sell is
+       removed from tracking. *)
     let buy_price =
       match closest_sell_order_initial with
       | Some (_, sell_price) ->
-        if sell_price > bid_price
-        then min buy_price (sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0)))
-        else buy_price
+        min buy_price (sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0)))
       | None -> buy_price
     in
     let buy_cooldown_key = "place_Buy" in
@@ -786,18 +784,17 @@ let evaluate_buy_leg
         closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id
       with
       | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
-        (* The 2*gi separation is anchored on the SELL order, not on the
-           current price - but ONLY when that sell forms a valid bracket around
-           the market, i.e. when it sits strictly ABOVE the top of book. In
-           that geometry the resting buy trails the top of book at the grid
-           interval and stops exactly 2*gi below the closest sell, so ladder
-           rungs stay equidistant at the grid interval. A sell at or below the
-           top of book (a resting sell that has become the ask / next fill
-           target) cannot make a valid clamp: pinning the buy to it dragged
-           the buy to 2*gi below the top of book instead of trailing the
-           market at 1*gi (the observed SPCX behavior). ([sell_price] is
-           always a positive resting-order price, so there is no
-           zero-reference hazard.) *)
+        (* The 2*gi separation from the closest sell is anchored on the SELL
+           order and is PRICE-INDEPENDENT: while a sell is tracked by order
+           management, the buy never trails above sell - 2*gi (it never enters
+           the restricted zone below that sell), no matter where the perceived
+           top of book sits. The price can dislocate randomly above a resting
+           sell without filling it - the ladder must not let the buy cross a
+           sell that still exists. The clamp is released only when the sell is
+           removed from tracking (an order-management fill/cancel/expiry);
+           only then does the buy trail the top of book at the grid interval.
+           ([sell_price] is always a positive resting-order price, so there is
+           no zero-reference hazard.) *)
         let double_grid_interval = sell_price *. (2.0 *. grid_interval /. 100.0) in
         let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
         let grid_buy_from_ref =
@@ -810,11 +807,7 @@ let evaluate_buy_leg
           state.cached_round_price (sell_price -. double_grid_interval)
         in
         let proposed_buy_price = grid_buy_capped in
-        let target_buy_price =
-          if sell_price > bid_price
-          then min proposed_buy_price exact_target
-          else proposed_buy_price
-        in
+        let target_buy_price = min proposed_buy_price exact_target in
         let current_buy_price_rounded = state.cached_round_price current_buy_price in
         let min_move_threshold = get_min_move_threshold state.cached_price_increment in
         (* A sizing re-anchor (the capital oracle published a changed grid

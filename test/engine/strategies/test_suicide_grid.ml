@@ -2401,14 +2401,15 @@ let test_buy_trail_2xgi_anchored_on_sell () =
   | _ -> failwith "expected exactly one buy amend"
 ;;
 
-let test_buy_trail_no_clamp_when_sell_at_top_of_book () =
-  (* A sell AT or BELOW the top of book (a resting sell that has become the
-     ask / next fill target) cannot form a valid 2*gi bracket around the
-     market, so the buy must NOT be pinned 2*gi below it - it trails the top
-     of book at the grid interval instead. Sell 100.00 at the bid 100.00,
-     gi 1%: the buy trails to 99.00 (bid - gi), NOT 98.00 (sell - 2*gi, which
-     is 2*gi below the top of book - the SPCX behavior). *)
-  let run_case ~symbol ~sell_price =
+let test_buy_trail_respects_sell_zone_while_tracked () =
+  (* The 2*gi-from-closest-sell clamp is PRICE-INDEPENDENT and stays active
+     while the sell is tracked by order management. A sell AT the book
+     (100.00 = bid) still holds the buy at sell - 2*gi = 98.00 - it does NOT
+     trail to bid - gi = 99.00 (which would be inside the sell's zone). A sell
+     BELOW the book (99.00 < bid 100.00) still holds the buy at
+     sell - 2*gi = 97.02. The buy trails at bid - gi = 99.00 only when NO
+     sell is tracked at all (removed by order management). *)
+  let run_case ~symbol ~sell_opt =
     let buy_id = symbol ^ "_buy" in
     let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
     st.exchange_id <- "alpaca";
@@ -2450,7 +2451,7 @@ let test_buy_trail_no_clamp_when_sell_at_top_of_book () =
          ~open_buy_count_from_scan:1
          ~has_recent_amend_buy:false
          ~locked_in_buys:0.0
-         ~closest_sell_order_initial:(Some ("sell1", sell_price))
+         ~closest_sell_order_initial:sell_opt
          ~pending_buy_qty_from_scan:1.0);
     let pushed = Dio_strategies.Suicide_grid.get_pending_orders 10 in
     match pushed with
@@ -2459,14 +2460,117 @@ let test_buy_trail_no_clamp_when_sell_at_top_of_book () =
   in
   check
     (option (float 0.))
-    "sell at the top of book: buy trails at grid interval, not 2*gi below the book"
-    (Some 99.0)
-    (run_case ~symbol:"TRAIL_NO_CLAMP_AT/USD" ~sell_price:100.0);
+    "sell at the book: buy stays 2*gi below the tracked sell"
+    (Some 98.0)
+    (run_case ~symbol:"TRAIL_ZONE_AT/USD" ~sell_opt:(Some ("sell1", 100.0)));
   check
     (option (float 0.))
-    "sell below the top of book: buy trails at grid interval"
+    "sell below the book: buy stays 2*gi below the tracked sell"
+    (Some 97.02)
+    (run_case ~symbol:"TRAIL_ZONE_BELOW/USD" ~sell_opt:(Some ("sell1", 99.0)));
+  check
+    (option (float 0.))
+    "no sell tracked: buy trails at bid - gi"
     (Some 99.0)
-    (run_case ~symbol:"TRAIL_NO_CLAMP_BELOW/USD" ~sell_price:99.0)
+    (run_case ~symbol:"TRAIL_ZONE_NONE/USD" ~sell_opt:None)
+;;
+
+let test_buy_trail_never_enters_sell_zone_until_removed () =
+  (* PROOF of the ladder-respecting property: while a sell is tracked, the
+     buy trails up toward it but stops exactly 2*gi below it (sell - 2*gi)
+     and NEVER goes above that boundary - not even when the perceived bid
+     dislocates ABOVE the resting sell without filling it. The zone is
+     released only when the sell is removed from tracking (order
+     management), after which the buy resumes trailing at bid - gi. *)
+  let symbol = "TRAIL_ZONE_PROOF/USD" in
+  let buy_id = symbol ^ "_buy" in
+  let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  st.exchange_id <- "alpaca";
+  st.grid_qty <- 1.0;
+  st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  st.last_buy_order_id <- Some buy_id;
+  st.last_buy_order_price <- Some 96.0;
+  st.pending_orders <- [];
+  st.inflight_amend_buy <- false;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "suicide_grid"
+    ; maker_fee = Some 0.0
+    ; taker_fee = Some 0.0
+    ; accumulation_buffer = 0.01
+    }
+  in
+  let iter_open_orders _ = () in
+  let now = Unix.gettimeofday () in
+  let eval_step ~bid ~sell_opt =
+    ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
+    (* Each push_order for an amend leaves a pending_amend entry, the in-flight
+       amendment latch and the inflight_amend_buy flag: clear all three so the
+       next step trails from the freshly amended resting price. *)
+    st.pending_orders <- [];
+    st.inflight_amend_buy <- false;
+    ignore
+      (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment
+         buy_id);
+    ignore
+      (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+         ~state:st
+         ~now
+         ~asset
+         ~bid_price:bid
+         ~ask_price:(bid +. 0.5)
+         ~quote_balance:1000.0
+         ~quote_balance_stale:false
+         ~cycle:1
+         ~iter_open_orders
+         ~open_buy_count_from_scan:1
+         ~has_recent_amend_buy:false
+         ~locked_in_buys:0.0
+         ~closest_sell_order_initial:sell_opt
+         ~pending_buy_qty_from_scan:1.0);
+    Dio_strategies.Suicide_grid.get_pending_orders 10
+  in
+  (* 1. Bid 101.50, sell 103.00 tracked: buy trails to bid - gi = 100.49,
+        below the zone boundary sell - 2*gi = 100.94. *)
+  (match eval_step ~bid:101.5 ~sell_opt:(Some ("sell1", 103.0)) with
+   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+     check
+       (option (float 0.))
+       "trails toward the sell, below its zone"
+       (Some 100.49)
+       o.price
+   | _ -> failwith "expected a trail amend");
+  (* 2. Bid 102.50: the buy reaches exactly sell - 2*gi = 100.94 and stops. *)
+  (match eval_step ~bid:102.5 ~sell_opt:(Some ("sell1", 103.0)) with
+   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+     check
+       (option (float 0.))
+       "stops exactly at sell - 2*gi (zone boundary)"
+       (Some 100.94)
+       o.price
+   | _ -> failwith "expected a stop amend");
+  (* 3. Bid dislocates ABOVE the sell (104.00) but the sell is still tracked
+        and unfilled: the buy MUST NOT move - it stays at 100.94, never
+        entering the zone and never crossing the resting sell. *)
+  check
+    int
+    "no trail past the sell while it is tracked (price dislocation)"
+    0
+    (List.length (eval_step ~bid:104.0 ~sell_opt:(Some ("sell1", 103.0))));
+  (* 4. The sell is removed from tracking (order management): the buy resumes
+        trailing at bid - gi = 102.96. *)
+  match eval_step ~bid:104.0 ~sell_opt:None with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      (option (float 0.))
+      "resumes trailing at bid - gi after the sell is removed"
+      (Some 102.96)
+      o.price
+  | _ -> failwith "expected a resume amend"
 ;;
 
 let () =
@@ -2500,7 +2604,11 @@ let () =
         ; test_case
             "no 2x gi clamp when the sell is at/below the top of book"
             `Quick
-            test_buy_trail_no_clamp_when_sell_at_top_of_book
+            test_buy_trail_respects_sell_zone_while_tracked
+        ; test_case
+            "buy never enters the sell zone until the sell is removed"
+            `Quick
+            test_buy_trail_never_enters_sell_zone_until_removed
         ; test_case
             "trailing fires on a single tick move"
             `Quick
