@@ -1,228 +1,217 @@
-# Exchange Integration Guide
+# DIO Exchange Integration (`dio.exchange`)
 
-This document describes the architecture and requirements for integrating a new exchange into the trading system. All exchange-specific types, the canonical module signature, and the runtime registry are defined in `src/external/exchange_intf.ml`.
+This library defines the interface every exchange must implement for the engine to trade on it. It contains the shared interface (`exchange_intf.ml`), the venue implementations, and the shared API clients (Yahoo, CoinMarketCap, Discord). It has no dependency on the engine: the engine consumes `dio.exchange`, never the reverse.
 
-## Architecture
+Library layout:
 
-The trading engine uses a modular architecture where exchanges are implemented as first-class modules satisfying the `Exchange_intf.S` module type. The `order_executor.ml` component dispatches strategy-generated order intents to the appropriate exchange module, which is resolved at runtime through `Exchange_intf.Registry`.
-
-### Directory Structure
-
-- **Interface**: `src/external/exchange_intf.ml`
-- **Implementations**: `src/external/<exchange_name>/` (e.g., `src/external/kraken/`, `src/external/hyperliquid/`)
-- **Shared data clients**: `src/external/yahoo/` (deep-history OHLC, `dio.yahoo`), `src/external/coinmarketcap/` (Fear & Greed, `dio.cmc`)
-
-### Current Implementations
-
-Both exchange modules follow the same concurrency and safety patterns:
-
-| Pattern | Description |
-|---------|-------------|
-| **Ring Buffers** | Lock-free `Concurrency.Ring_buffer.RingBuffer` for all feed data (orderbook, executions) |
-| **Global Order Index** | `order_to_symbol` Hashtbl for O(1) order lookups across symbols |
-| **Double-Checked Locking** | Mutex-protected store initialization to prevent TOCTOU races |
-| **Atomic Flags** | `Atomic.t` for all shared boolean/float state (readiness, timestamps, config) |
-| **Retry with Backoff** | Exponential backoff on transient API errors (timeouts, 5xx, rate limits), configured via `Types.retry_config` |
-| **Crash Recovery** | Self-restarting processor tasks with backoff on failure |
-| **Stale Order Cleanup** | Periodic removal of orders older than 24h to prevent unbounded growth |
-| **Event Bus** | `Concurrency.Event_bus` for publishing order/balance updates |
-| **Inline Hot Paths** | `[@inline always]` on all frequently-called accessor functions |
-
-## Shared Types (`Exchange_intf.Types`)
-
-The `Types` submodule defines all records and variants shared across exchange implementations:
-
-| Type | Purpose |
-|------|---------|
-| `order_type` | Limit, Market, StopLoss, TakeProfit, StopLossLimit, TakeProfitLimit, SettlPosition, Other |
-| `order_side` | Buy, Sell |
-| `time_in_force` | GTC, IOC, FOK |
-| `order_status` | Pending, New, PartiallyFilled, Filled, Canceled, Expired, Rejected, Unknown |
-| `add_order_result` | Acknowledgment after order placement (order_id, cl_ord_id, order_userref) |
-| `amend_order_result` | Acknowledgment after amendment (original_order_id, new_order_id, amend_id, cl_ord_id) |
-| `cancel_order_result` | Acknowledgment after cancellation (order_id, cl_ord_id) |
-| `open_order` | Snapshot of a live order including fill progress and optional client identifiers |
-| `orderbook_event` | Depth snapshot: arrays of (price, size) bid/ask levels, timestamp |
-| `execution_event` | Order state change report: status, fills, remaining qty, avg price |
-| `retry_config` | Exponential backoff parameters: max_attempts, base_delay_ms, max_delay_ms, backoff_factor |
-
-## Requirements for New Exchanges
-
-To add a new exchange, implement the `Exchange_intf.S` module type.
-
-### 1. Module Signature
-
-Your module must provide all values specified in module type `S`. The interface is grouped into four categories:
-
-#### Order Lifecycle
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `place_order` | `token -> order_type -> side -> qty -> symbol -> ... -> (add_order_result, string) result Lwt.t` | Submit a new order. Required params: token, order_type, side, qty, symbol. Optional: limit_price, time_in_force, post_only, reduce_only, order_userref, cl_ord_id, trigger_price, display_qty, retry_config. |
-| `amend_order` | `token -> order_id -> ... -> (amend_order_result, string) result Lwt.t` | Modify an existing order. Required: token, order_id. Optional: cl_ord_id, qty, limit_price, post_only, trigger_price, display_qty, symbol, retry_config. |
-| `cancel_orders` | `token -> ... -> (cancel_order_result list, string) result Lwt.t` | Cancel orders by order_id, cl_ord_id, or order_userref. At least one identifier list must be non-empty. |
-
-#### Market Data Accessors
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `get_top_of_book` | `symbol -> (float * float * float * float) option` | Return (bid_price, bid_size, ask_price, ask_size) derived from the orderbook, or None if unavailable. |
-| `get_balance` | `asset -> float` | Return the current balance for an asset. Returns 0.0 if unknown. |
-| `get_all_balances` | `unit -> (string * float) list` | Return all cached (asset_name, balance) pairs. |
-| `get_open_order` | `symbol -> order_id -> open_order option` | Look up a specific open order by symbol and order_id. |
-| `get_open_orders` | `symbol -> open_order list` | Return all open orders for a symbol. |
-
-#### Ring Buffer Event Feed Consumption
-
-Each feed type (orderbook, execution) exposes three functions: a position query, a list-returning reader, and a zero-allocation iterator.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `get_orderbook_position` | `symbol -> int` | Current write position of the orderbook ring buffer. |
-| `read_orderbook_events` | `symbol -> start_pos -> orderbook_event list` | Read orderbook events from start_pos to the current position. Allocates a list. |
-| `iter_orderbook_events` | `symbol -> start_pos -> (orderbook_event -> unit) -> int` | Iterate over orderbook events without allocation. Returns new read position. |
-| `iter_top_of_book_events` | `symbol -> start_pos -> (float -> float -> float -> float -> unit) -> int` | Iterate over orderbook events extracting only top-of-book (bid_price, bid_size, ask_price, ask_size) without allocating converted arrays. Returns new read position. |
-| `get_execution_feed_position` | `symbol -> int` | Current write position of the execution ring buffer. |
-| `has_execution_data` | `symbol -> bool` | Return true if the execution feed has received its initial data snapshot for the symbol. Used to gate strategy execution until open order state is populated. |
-| `read_execution_events` | `symbol -> start_pos -> execution_event list` | Read execution events from start_pos. Allocates a list. |
-| `iter_execution_events` | `symbol -> start_pos -> (execution_event -> unit) -> int` | Iterate over execution events without allocation. Returns new read position. |
-| `fold_open_orders` | `symbol -> init -> f -> 'a` | Fold over open orders without allocating an intermediate list. |
-| `iter_open_orders_fast` | `symbol -> (string -> float -> float -> string -> int option -> unit) -> unit` | Fast path iterator that avoids creating `Types.open_order` intermediate records. Yields primitive order values directly to the callback. |
-
-#### Instrument Metadata
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `get_price_increment` | `symbol -> float option` | Minimum price increment (tick size). None if metadata unavailable. |
-| `get_qty_increment` | `symbol -> float option` | Minimum quantity increment (lot step). None if metadata unavailable. |
-| `get_qty_min` | `symbol -> float option` | Minimum order quantity. None if metadata unavailable. |
-| `round_price` | `symbol -> price -> float` | Round price to exchange-valid precision. Hyperliquid: 5 significant figures capped at (MAX_DECIMALS - szDecimals) decimals. Kraken: nearest price_increment tick. |
-| `get_fees` | `symbol -> (float option * float option)` | Return cached (maker_fee, taker_fee). Each is None if not yet fetched. |
-
-### 2. Concurrency Requirements
-
-New integrations must follow the established patterns:
-
-- Use `Mutex.t` (not `Lwt_mutex`) for protecting shared data structures accessed from multiple domains.
-- Use `Atomic.t` for all shared flags and scalar state. Never use bare `ref`.
-- Use double-checked locking for lazy store initialization (`ensure_store` / `get_symbol_store`).
-- Hold locks for the entire read-modify-write cycle. Never release between read and write.
-- Use `Lwt_list.fold_left_s` or sequential processing for accumulating results. Never share mutable `ref` across concurrent Lwt promises.
-- Implement retry with exponential backoff on all REST API operations, parameterized by `Types.retry_config`.
-- Processor tasks must self-restart on crash (re-subscribe and resume after delay).
-
-### 3. Registration
-
-Register your exchange module via `Exchange_intf.Registry` at startup (typically in your module's initialization or `bin/main.ml`). The registry uses `Hashtbl.replace`, so re-registration overwrites any prior entry with the same name.
-
-```ocaml
-let () = Exchange_intf.Registry.register (module MyNewExchange)
+```
+src/external/
+  dune                     (library dio_exchange, public name dio.exchange)
+  exchange_intf.ml         (types, module type S, registries)
+  kraken/                  (Kraken spot)
+  hyperliquid.xyz/         (Hyperliquid spot + perps)
+  lighter.xyz/             (Lighter perps)
+  interactivebrokers/      (IBKR US equities)
+  alpaca/                  (Alpaca US equities)
+  yahoo/                   (deep-history client, dio.yahoo)
+  coinmarketcap/           (Fear-and-Greed client, dio.cmc)
+  discord/                 (Discord webhook notifier)
 ```
 
-Lookup at runtime:
+---
+
+## The Interface (`Exchange_intf.S`)
+
+Every exchange implements one module type. The engine reaches exchanges only through it. The signature in `exchange_intf.ml` is the source of truth; the highlights below are accurate as of the current tree.
+
+### Core data types
+
+- `order_type`: `Limit`, `Market`, `StopLoss`, `TakeProfit`, `StopLossLimit`, `TakeProfitLimit`, `SettlPosition`, `Other`.
+- `time_in_force`: `GTC`, `IOC`, `FOK`.
+- `exchange_id`: `Hyperliquid`, `Kraken`, `Lighter`, `Ibkr`, `Alpaca`, `Custom`.
+- `venue_config`: `{ testnet : bool; symbol : string; quote_currency : string }`.
+- `order_req`: a place-order request. Required fields: `symbol`, `token`, `order_type`, `side`, `qty`. Optional: `limit_price`, `time_in_force`, `post_only`, `reduce_only`, `order_userref`, `cl_ord_id`, `trigger_price`, `display_qty`, `retry_config`.
+- `amend_order`: `token:string -> order_id:string -> ?cl_ord_id -> ?qty -> ?limit_price -> ?post_only -> ?trigger_price -> ?display_qty -> ?symbol -> ?retry_config -> unit -> (amend_order_result, string) result Lwt.t`. All mutable order fields are optional; amend only what changes.
+- `retry_config` (from `error_handling.ml`, re-exported): `{ max_attempts; base_delay_ms; max_delay_ms; backoff_factor }`.
+
+### Query functions
+
+The interface no longer has a single `get_balance`. Balance queries come in several forms:
+
+| Function | Purpose |
+| --- | --- |
+| `get_tradeable_balance` | The balance that can be used for new orders (free balance). |
+| `get_total_balance` | Total balance including open-order reserves. |
+| `get_tradeable_balance_fast` | Non-blocking cached read (see fast paths below). |
+| `get_balance_age_fast` | Seconds since the balance store was last refreshed, or `None` when the exchange does not track freshness. |
+| `get_all_orders_for_asset` | Full order list for one symbol. |
+| `fold_open_orders` | Fold over all open orders for one symbol. |
+| `iter_open_orders_fast` | Non-blocking iteration over the locally cached open-order set. |
+| `subscribe_orderbook` | Subscribe the venue websocket to order book updates for a set of symbols. |
+| `get_orderbook_position_fast` | Index of the best bid/ask in the locally cached book. |
+| `get_top_of_book_fast` | `(bid_price, bid_size, ask_price, ask_size) option` from the cached book. |
+| `get_execution_feed_position_fast` | Execution-feed position used to detect missed events across restarts. |
+| `has_execution_data_fast` | Whether the execution store has data for a symbol yet. |
+
+### Feeds
+
+- `subscribe_orderbook ~symbols` (above).
+- Order book events arrive through `iter_top_of_book_events`, called with `(bid_price, bid_size, ask_price, ask_size)`. The loop runs as a blocking callback on the engine side.
+- Execution events (`Order_filled` / `Order_canceled`) arrive through the execution feed.
+- The engine consumes order book state through ring buffers sized by `get_orderbook_position_fast`, so a feed can be behind a strategy without stalling it.
+
+### Fees
+
+- `fetch_fees ~testnet ~symbol : (float * float) Lwt.t` returns live `(maker, taker)` fees, e.g. Kraken volume tiers, Hyperliquid user fees.
+- `default_fees ~symbol : float * float` returns the venue's built-in fallback.
+- `min_notional ~symbol : float` returns the minimum order notional; `0.0` means unconstrained.
+
+### Oracle support
+
+Exchanges that can supply historical data implement the `Oracle.S` module type (see below). Venues that cannot (Lighter, IBKR) are trading-only and are omitted from the oracle registry.
+
+---
+
+## Registration
+
+The engine discovers implementations through two registries. Both live in `exchange_intf.ml` and both are keyed by exchange name:
+
+- `Exchange_intf.Registry` maps `string -> (module S)`.
+- `Exchange_intf.Oracle.Registry` maps `string -> (module Oracle.S)`.
+
+Registration happens as a load-time side effect of each venue module. A module referenced anywhere in the binary registers itself:
 
 ```ocaml
-match Exchange_intf.Registry.get "my_exchange" with
-| Some (module E : Exchange_intf.S) -> (* use E *)
-| None -> failwith "exchange not registered"
+(* kraken/kraken_module.ml, line ~547 *)
+let () = Exchange_intf.Registry.register (module Kraken_impl)
+(* and in the same file's oracle adapter: *)
+let () = Exchange_intf.Oracle.Registry.register (module Kraken_oracle)
 ```
 
-## Strategy Interaction
+Because OCaml dead-code elimination would otherwise drop unreferenced modules, the binaries force-reference every venue explicitly:
 
-Strategies (e.g., `market_maker`, `suicide_grid`) operate generically over `Exchange_intf.S` modules. Key dependencies:
+```ocaml
+(* bin/main.ml and bin/oracle.ml *)
+let () = ignore Kraken.Kraken_module.Kraken_impl.name
+```
 
-1. **Precision Handling**: Strategies call `get_price_increment`, `get_qty_increment`, and `round_price` to format prices and quantities before submitting orders. Inaccurate metadata causes `INVALID_ARGS` rejections.
-2. **Order Tracking**: Strategies track orders via `cl_ord_id` or `order_userref`. Implementations must store and return these identifiers in `add_order_result` and propagate them through execution events.
-3. **Balance Checks**: Strategies pause when `get_balance` returns insufficient funds. This value must stay current via WebSocket or periodic REST polling.
-4. **Zero-Allocation Iteration**: Hot-path strategies use `iter_orderbook_events`, `iter_top_of_book_events`, `iter_execution_events`, `fold_open_orders`, and `iter_open_orders_fast` to avoid per-tick list allocations.
-5. **Dynamic Fear & Greed Re-evaluation**: Engine supervisors monitor price variations derived from orderbook top-of-book data. When price movement exceeds the dynamically configured `fng_check_threshold` (set in `config.json`), strategies trigger a Fear & Greed index recalculation. Timely orderbook feeds are essential for accurate threshold adherence.
+Add the same `ignore` line in `bin/main.ml` (and `bin/oracle.ml` if the venue has an oracle adapter) when adding a new exchange.
 
-## Oracle Data-Venue Integration
+---
 
-Beyond live trading, the capital oracle needs historical daily bars, session calendars, fees, account balances and instrument metadata from each venue. This is a second contract, `Exchange_intf.Oracle.S`, independent of the live-trading `S` above (which has no historical-bars or calendar concept). A venue that participates in oracle modeling implements BOTH; trading-only venues implement only `S`.
+## Current Implementations
 
-The oracle's data layer (`src/engine/oracle/oracle_fetch.ml`) dispatches exclusively through `Exchange_intf.Oracle.Registry` — no hardcoded per-venue dispatch remains. The `bar` / `calendar_kind` types live in `Exchange_intf.Types` so venue libraries can implement the signature without depending on the oracle library.
+### Kraken (`kraken/`)
 
-### The contract
+- Live and public REST (`/0/public`, `/0/private`) + websockets.
+- Balance via the authenticated websocket store (`get_tradeable_balance_fast` reads the store).
+- `default_fees`: `0.0016` maker / `0.0026` taker; live fees via the TradeVolume endpoint.
+- `default_quote`: `USD`. `min_notional`: `0.0`.
+- Oracle adapter: public OHLC history (daily interval), paginated on the `since` cursor back to pair inception, bounded at 60 pages.
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `name` | `string` | Registry key (e.g. `"kraken"`). |
-| `calendar_kind` | `Types.calendar_kind` | `Crypto` (session = day) or `Equity` (market sessions). Drives gap detection and horizon labels. |
-| `fetch_bars` | `?feed -> ?end_date -> from:string option -> symbol:string -> unit -> Types.bar list Lwt.t` | Historical daily bars from `from` (ISO date of the first day; `None` = full history). `feed`/`end_date` are Alpaca-only knobs; other venues ignore them. Returns RAW bars (any order); the oracle sorts, de-duplicates and normalizes centrally. |
-| `fetch_calendar` | `start_date:string -> end_date:string -> string list Lwt.t` | Expected session dates (equity venues build their session model from this); crypto venues return `[]`. |
-| `fetch_fees` | `testnet:bool -> symbol:string -> (float * float) Lwt.t` | Authoritative (maker, taker) fees; the oracle falls back to `default_fees` on failure. |
-| `default_fees` | `symbol:string -> float * float` | Offline / failed-fetch fallback (Hyperliquid spot vs perp differ, hence the symbol parameter). |
-| `fetch_balances` | `testnet:bool -> ((string * float * float) list, string) result Lwt.t` | One-shot account balance as already-normalized (asset, available, total) triples (XXBT -> BTC, UBTC -> BTC). |
-| `live_balances` | `unit -> (string * float * float) list option` | Snapshot of the venue's LIVE websocket-fed balance store, or `None` when the venue has no live store or its semantics do not match the oracle's REST balance view (Hyperliquid: its live "USDC" aggregates perp margin into spot, so the oracle keeps REST authoritative). The runtime prefers this over `fetch_balances`. |
-| `default_quote` | `string` | Default quote asset for symbols without an explicit quote ("USDC" Hyperliquid, "USD" Kraken/Alpaca). Used by portfolio topology resolution. |
-| `min_notional` | `symbol:string -> float` | Default minimum order notional in quote terms (0.0 = unconstrained; Hyperliquid spot enforces a 10 USDC MinTradeSpotNtl floor). |
-| `init_instruments` | `testnet:bool -> symbols:string list -> unit Lwt.t` | Populate price-tick / lot-size caches so `get_price_increment` / `get_qty_increment` answer. No-op for static-tick venues. |
+### Hyperliquid (`hyperliquid.xyz/`)
 
-### Raw-bar contract
+- Spot + perpetuals, EIP-712 signed requests.
+- Balance via REST (`spotClearinghouseState`); the live store is deliberately not used for oracle balance because it merges perp and spot USDC.
+- `default_fees`: spot symbols (containing `/`) `0.0` maker / `0.001` taker; perps `0.0002` / `0.0005`. Live fees via `userFees`.
+- `default_quote`: `USDC`. `min_notional`: `10.0` for spot symbols containing `/`, else `0.0`.
+- Oracle adapter: `candleSnapshot`, resolving spot vs perp through `spotMeta`; spot-named symbols with no matching pair get no bars (inactive) rather than silent perp substitution.
+- `order_to_symbol`: the executions feed maintains an order-id-to-symbol hashtable (with a bounded queue) so fills can be routed even when the venue does not return the symbol.
 
-`fetch_bars` returns RAW source rows (any order). The oracle applies its shared clean-series normalization (`Oracle_calendar.normalize_bars`) on every read — cache and direct fetch alike — so a corrected normalization rule self-heals without a refetch, and the placeholder/outlier filtering is identical across venues.
+### Lighter (`lighter.xyz/`)
 
-### To add an oracle-data venue
+- Perp DEX, signed by the native Lighter signer library.
+- `LIGHTER_SIGNER_LIB_PATH` must point at the shared library. Requests are signed locally and sent either directly or through a relay proxy (`LIGHTER_PROXY_URL`, comma-separated pool).
+- Orders are time-limited (about 28 days) and a renewal daemon cancel-and-replaces them to approximate GTC.
+- `min_notional`: `0.0`. No oracle adapter (trading-only).
+- Account selection via `LIGHTER_API_KEY_INDEX` / `LIGHTER_ACCOUNT_INDEX`.
 
-1. Create `<name>_oracle.ml` in the venue library implementing `Exchange_intf.Oracle.S` (reference adapters: `kraken_oracle.ml`, `hyperliquid_oracle.ml`, `alpaca_oracle.ml`).
-2. Register it at module load (see `kraken_module.ml`): `let () = Exchange.Oracle.Registry.register (module Kraken_oracle)`.
-3. Re-export the adapter from the library namespace file (e.g. `module Kraken_oracle = Kraken_oracle` in `kraken.ml`).
-4. Link the library into the binaries that need it (`bin/dune` — `main` and/or `oracle` executables) and force-reference the adapter's impl module there (see `bin/main.ml` / `bin/oracle.ml` force-ref blocks; OCaml dead-code elimination drops the registration side effects otherwise). `dio.oracle` itself is a pure consumer and links no venue libraries.
-5. No oracle dispatch edits: history, calendar kind, fees, balances, live balances, instrument metadata, default quote and min-notional all resolve through the registry.
+### Interactive Brokers (`interactivebrokers/`)
 
-Current oracle adapters: Kraken, Hyperliquid, Alpaca. (Lighter and IBKR implement live trading only today.)
+- TCP connection to an IB Gateway (port 4002 paper, 4001 live).
+- Live trading is limit-only; quantities are floored to whole shares.
+- Executions arrive as gateway messages (`orderStatus`, `openOrder`, `execDetails`), tracked in a per-symbol store like the other venues.
+- No oracle adapter (trading-only).
 
-### WebSocket vs REST (the oracle data path)
+### Alpaca (`alpaca/`)
 
-The oracle moves from REST to websocket "where able" — and that decision is the venue's own, declared through the contract:
+- US equities, paper or live, `iex` or `sip` data feed.
+- Balance and positions via websocket stores (`get_tradeable_balance_fast` reads the store).
+- Respects extended hours (4 AM to 8 PM ET) and overnight sessions; `day` TIF with extended-hours flag.
+- `default_fees`: `0.0` / `0.0`. `default_quote`: `USD`. `min_notional`: `1.0`.
+- Oracle adapter: `/v2/stocks/{symbol}/bars` (IEX/SIP) + `/v2/calendar` for session dates.
 
-| Surface | Kraken | Hyperliquid | Alpaca | Yahoo |
-|---|---|---|---|---|
-| Daily bars / history | REST (delta-cached) | REST | REST | REST |
-| Balances | **WS live store** | REST (the WS store's perp-mixing semantics are excluded — documented in the adapter) | **WS live store** | n/a |
-| Current price (runtime anchor) | **WS top-of-book** | **WS top-of-book** | **WS top-of-book** | n/a |
-| Fees | REST + `default_fees` | REST + `default_fees` | REST + `default_fees` | n/a |
-| Calendar / instruments | REST | REST/static | REST | n/a |
+---
 
-REST remains where websocket cannot serve the data: historical bars (WS has no history; the delta cache minimizes per-pass requests), Yahoo (no public WS), fee discovery, calendars and instrument tables. The standalone CLI (`bin/oracle.ml`) has no supervisor, so it uses the REST one-shot paths; the live runtime prefers the WS-fed stores.
+## The Oracle Contract (`Oracle.S`)
 
-## Order Handling Specification
+```ocaml
+module type S = sig
+  val name : string                       (* human-readable venue name, also the Registry key *)
+  val calendar_kind : Types.calendar_kind (* Crypto (session = day) or Equity (market sessions) *)
+  val fetch_bars
+    :  ?feed:string                      (* Alpaca IEX/SIP; others ignore *)
+    -> ?end_date:string                  (* Alpaca-only request-window end *)
+    -> from:string option                (* first day to include; None = full history *)
+    -> symbol:string
+    -> unit
+    -> Types.bar list Lwt.t
+  val fetch_calendar : start_date:string -> end_date:string -> string list Lwt.t
+  val fetch_fees : testnet:bool -> symbol:string -> (float * float) Lwt.t
+  val default_fees : symbol:string -> float * float
+  val fetch_balances : testnet:bool -> ((string * float * float) list, string) result Lwt.t
+  val init_instruments : testnet:bool -> symbols:string list -> unit Lwt.t
+  val live_balances : unit -> (string * float * float) list option
+  val default_quote : string
+  val min_notional : symbol:string -> float
+end
+```
 
-### place_order Parameters
+Implementation notes:
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `token` | `string` | Yes | Auth token or API key identifier (implementation-specific). |
-| `order_type` | `Types.order_type` | Yes | Limit, Market, StopLoss, etc. |
-| `side` | `Types.order_side` | Yes | Buy or Sell. |
-| `qty` | `float` | Yes | Order quantity. |
-| `symbol` | `string` | Yes | Trading pair (e.g., "BTC/USD"). |
-| `limit_price` | `float` | No | Required for Limit orders. |
-| `time_in_force` | `Types.time_in_force` | No | GTC (default), IOC, or FOK. |
-| `post_only` | `bool` | No | If true, order must be maker-only. |
-| `reduce_only` | `bool` | No | If true, order only reduces an existing position. |
-| `order_userref` | `int` | No | User-defined integer reference for tracking. |
-| `cl_ord_id` | `string` | No | Client-side UUID for tracking. |
-| `trigger_price` | `float` | No | Trigger price for conditional order types (StopLoss, TakeProfit). |
-| `display_qty` | `float` | No | Visible quantity for iceberg orders. |
-| `retry_config` | `Types.retry_config` | No | Override default retry/backoff behavior. |
+- `fetch_bars` must return clean, ascending daily bars with real volume. The oracle normalizes everything (`Oracle_calendar.normalize_bars`) on every fetch and cache read, so a source emitting placeholder rows (e.g. fabricated pre-listing candles) produces an inactive asset, never a garbage decision.
+- `live_balances` is the venue's answer to "is your websocket-fed balance store equivalent to REST for oracle sizing?" Kraken and Alpaca return their stores; Hyperliquid returns `None` (REST spot balance is authoritative).
+- `calendar_kind` drives gap detection: crypto gaps are missing calendar days; equity gaps are weekdays missing from the venue calendar (holidays).
 
-### amend_order Notes
+Three reference adapters exist: `kraken_oracle.ml`, `hyperliquid_oracle.ml`, `alpaca_oracle.ml`. The shared fetch pipeline (`oracle_fetch.ml` in the engine) dispatches purely through `Exchange_intf.Oracle.Registry`; there is no hardcoded venue dispatch. Deep-history extension runs through the Yahoo client with a per-symbol whitelist.
 
-- Requires `token` and `order_id`. All other fields are optional.
-- `symbol` may be required by certain exchange APIs (e.g., Kraken uses it to look up precision metadata for price/qty formatting).
-- The exchange implementation is responsible for final wire-format truncation using internal instrument metadata.
+---
 
-## Implementation Checklist
+## WebSocket vs REST
 
-- [ ] Create `src/external/<name>/` directory
-- [ ] Create `<name>_actions.ml` implementing REST/WS calls with retry logic
-- [ ] Create `<name>_module.ml` implementing the `Exchange_intf.S` module type
-- [ ] Create feed modules (`_executions_feed.ml`, `_orderbook_feed.ml`) with ring buffers, double-checked locking, and crash recovery
-- [ ] Implement `iter_orderbook_events`, `iter_top_of_book_events`, `iter_execution_events`, `fold_open_orders`, and `iter_open_orders_fast` for zero-allocation hot paths
-- [ ] Implement `round_price` with exchange-specific precision rules
-- [ ] Ensure `amend_order` respects precision rules for the target API
-- [ ] Use `Atomic.t` for shared flags, `Mutex.t` for shared data structures
-- [ ] Add self-restarting processor tasks with backoff
-- [ ] Register the module in the main entry point
+| Data | Kraken | Hyperliquid | Alpaca |
+| --- | --- | --- | --- |
+| Order book | WS (public) | WS (public) | WS (public) |
+| Execution feed | WS (auth) | WS (auth) | WS (auth) |
+| Balance / positions | WS (auth store) | REST | WS (auth store) |
+| Fees | REST + `default_fees` | REST + `default_fees` | static `default_fees` |
+| Daily bars (oracle) | REST OHLC | REST candleSnapshot | REST bars + calendar |
+| Deep history | Yahoo | Yahoo | Yahoo |
+
+Lighter and IBKR are REST/WS hybrids without oracle data: Lighter streams its own WS events and the IBKR gateway is polled.
+
+---
+
+## Concurrency Patterns
+
+These patterns appear across the implementations and are worth copying when writing a new one.
+
+- **Per-symbol stores with double-checked locking.** `get_symbol_store` creates a store under `initialization_mutex` the first time a symbol is seen, then returns it lock-free. This is the pattern in `kraken_executions_feed.ml` and `hyperliquid_executions_feed.ml`. A separate `global_orders_mutex` protects the cross-symbol open-order index.
+- **`order_to_symbol` hashtable + bounded queue.** Execution feeds must route an order-id back to its symbol; the symbol is unknown at fill time on some venues. A hashtable with a FIFO queue and an adaptive cap evicts oldest entries under pressure (`lighter_executions_feed.ml`).
+- **Atomic flags for one-time startup.** `Atomic.make false` + `Atomic.exchange` guards one-shot feed initialization so only the first caller runs it.
+- **Fast-path closures.** Every `_fast` function is a plain read of an `Atomic.t` or mutex-guarded store; nothing blocking.
+- **Inline hot paths.** Order book read paths are annotated `[@inline always]`; keep the read side allocation-free.
+- **Self-restarting stream processors.** Feed loops catch their own exceptions and re-subscribe with backoff (from `error_handling.ml`), so a dropped websocket heals without engine involvement.
+- **Stale-order cleanup.** `hyperliquid_executions_feed.ml` prunes orders older than 24 hours, expired amendment blacklist entries after 30 seconds, and processed trade IDs after 10 minutes, so the store cannot grow without bound.
+
+---
+
+## Adding a New Exchange
+
+1. Create `src/external/<name>/` with a library (`dune`) exposing a module, e.g. `Foo.Foo_module`.
+2. Implement `Exchange_intf.S` in `<name>_module.ml`, using `<name>_actions.ml` for REST calls, `<name>_executions_feed.ml` / `<name>_orderbook_feed.ml` for websocket feeds, and `<name>_balances.ml` when the venue has a live balance store.
+3. Register in `Exchange_intf.Registry` at module load: `let () = Exchange_intf.Registry.register (module Foo_impl)`.
+4. If the venue can serve historical bars, add an oracle adapter (`Foo_oracle.ml`) implementing `Oracle.S`, register it in `Exchange_intf.Oracle.Registry`, and reference both modules in `bin/main.ml` (and `bin/oracle.ml`).
+5. Add the library to the engine's `dune` dependencies and add the venue to `Config.exchange` validation.
+6. Wire the venue into the supervisor connection registry and `domain_spawner.ml` so domains can be spawned for it.
+7. Add tests under `test/`; the oracle fixture tests (`test/engine/oracle/`) are a good template for adapter correctness.
