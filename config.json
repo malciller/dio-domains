@@ -156,8 +156,8 @@
       "exchange": "alpaca",
       "qty": "0.1",
       "grid_interval": [
-        0.25,
-        0.75
+        0.5,
+        2.5
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
