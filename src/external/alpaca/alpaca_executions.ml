@@ -306,7 +306,12 @@ let initialize symbols =
 ;;
 
 let bootstrap_open_orders () =
-  Alpaca_rest.get_open_orders ()
+  Error_handling.retry_with_backoff
+    ~section
+    ~config:Error_handling.default_retry_config
+    ~f:(fun () -> Alpaca_rest.get_open_orders ())
+    ~is_retriable_override:(fun _ -> true)
+    ()
   >>= function
   | Ok orders ->
     let grouped = Hashtbl.create 8 in
@@ -540,8 +545,9 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:listen_msg ())
        >>= fun () ->
        on_connected ();
-       bootstrap_open_orders ()
-       >>= fun () ->
+       ignore
+         (Lwt.async (fun () ->
+            Lwt.catch (fun () -> bootstrap_open_orders ()) (fun _ -> Lwt.return_unit)));
        let rec read_loop () =
          Websocket_lwt_unix.read conn
          >>= fun frame ->

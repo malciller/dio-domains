@@ -111,6 +111,10 @@ Each element of `trading` configures one symbol on one exchange:
 | `hedge` | Hyperliquid only | Enable the experimental perp short auto-hedge. Rejected elsewhere |
 | `accumulation_buffer` | HL, Lighter, IBKR, Alpaca | `[min, max]` bounds on base reserved for accumulation. Rejected for Kraken |
 | `data_feed` | Alpaca | `iex` (free, delayed) or `sip` (paid, real-time) |
+| `finnhub_fallback` | Alpaca | Finnhub fallback price source: when the Alpaca quote stream goes stale, a synthetic quote is published around the freshest Finnhub mark. **Enabled by default for Alpaca entries**; set `false` to disable (requires `FINNHUB_API_KEY` to have any effect). Rejected for other venues |
+| `stale_after_seconds` | Alpaca | Seconds without a real quote before the fallback engages (default `30`) |
+| `fallback_half_spread` | Alpaca | Half-spread applied around the Finnhub mark for the synthetic quote when no recent real spread exists (default `0.001`) |
+| `fallback_max_divergence` | Alpaca | Maximum fractional difference between the Finnhub mark and the last real mid for the fallback to inject (default `0.10`) |
 | `asset_class` | all | Must name a key in `classes` when the oracle is in use |
 
 Venue-specific restrictions are enforced at startup:
@@ -118,6 +122,7 @@ Venue-specific restrictions are enforced at startup:
 - `testnet`, `hedge`, `accumulation_buffer`, and `data_feed` are rejected for Kraken.
 - `hedge` is Hyperliquid-only.
 - `grid_interval` is only meaningful for the Grid strategy.
+- `finnhub_fallback`, `stale_after_seconds`, `fallback_half_spread`, and `fallback_max_divergence` are Alpaca-only.
 
 ### Classes
 
@@ -174,6 +179,7 @@ Credentials and one-off knobs live in the environment. The engine loads `.env` i
 | `IBKR_ACCOUNT_ID` | IBKR | Optional; auto-detected when unset |
 | `ALPACA_API_KEY` | Alpaca | |
 | `ALPACA_API_SECRET` | Alpaca | |
+| `FINNHUB_API_KEY` | Alpaca (fallback) | Finnhub price feed for the default Alpaca fallback; without it the fallback is skipped (logged warning) |
 | `LIGHTER_API_PRIVATE_KEY` | Lighter | |
 | `LIGHTER_API_KEY_INDEX` | Lighter | |
 | `LIGHTER_ACCOUNT_INDEX` | Lighter | |
@@ -210,6 +216,8 @@ Connects to an IB Gateway (e.g. `gnzsnz/ib-gateway-docker`) over TCP. `testnet` 
 ### Alpaca
 
 US equities, paper or live. `data_feed` selects `iex` (free, 15-minute delayed bars) or `sip` (paid, real-time). The engine respects extended trading hours (pre-market 4 AM to 9:30 AM, after-hours 4 PM to 8 PM, overnight 8 PM to 4 AM ET) and uses `day` TIF with the extended-hours flag when needed. Alpaca pairs are 1:1 (no accumulation up-sizing) and fees default to zero.
+
+**Finnhub fallback price source** (enabled by default for Alpaca entries; disable with `finnhub_fallback: false`): the free Alpaca tier streams real-time quotes only from IEX (~2-3% of US volume), which goes stale and rough in extended hours. With `FINNHUB_API_KEY` set, the engine polls the Finnhub `quote` endpoint per Alpaca symbol on a rate-limited cadence (one refresh per N seconds for N symbols, staying within the free-tier 60 calls/min) and, if no real Alpaca quote has arrived within `stale_after_seconds`, publishes a synthetic bid/ask around the freshest Finnhub price so the grid keeps acting on a current price. The synthetic quote is tagged (see `get_fallback_active` on the exchange interface), sanity-gated against `fallback_max_divergence`, and instantly replaced the moment a real quote resumes. Execution remains fill-driven: the fallback only moves the price context, never order placement against synthetic levels assumed to be real NBBO.
 
 ---
 
@@ -266,7 +274,7 @@ Supervisor ── health monitor / circuit breaker / connection registry
 
 `supervisor.ml` is a thin orchestrator. `start_monitoring` starts the health monitor loop, a monitor for non-active assets, and the order-processing loop, then initializes feeds synchronously and returns the fee-augmented trading configs to the domain spawner.
 
-Connections in the registry: `hyperliquid_ws`, `lighter_ws`, `kraken_orderbook_ws`, `kraken_auth_ws`, `alpaca_data_ws`, `alpaca_trading_ws`, `ibkr_gateway`, `oracle`. The order executor is deliberately not in the registry; it never blocks on network I/O.
+Connections in the registry: `hyperliquid_ws`, `lighter_ws`, `kraken_orderbook_ws`, `kraken_auth_ws`, `alpaca_data_ws`, `alpaca_trading_ws`, `finnhub_poller`, `finnhub_fallback`, `ibkr_gateway`, `oracle`. The order executor is deliberately not in the registry; it never blocks on network I/O.
 
 Health rules:
 
@@ -429,6 +437,7 @@ Where things live:
 | `src/dashboard_ui/` | Notty TUI: ticker, holdings, KPI cards, latency pages, fills feed |
 | `src/external/exchange_intf.ml` | The exchange integration interface |
 | `src/external/kraken/`, `hyperliquid.xyz/`, `lighter.xyz/`, `interactivebrokers/`, `alpaca/` | Venue implementations |
+| `src/external/finnhub/` | Finnhub price feed client (REST quote polling; fallback mark source for Alpaca equities) |
 | `src/external/yahoo/`, `coinmarketcap/`, `discord/` | Shared clients (deep history, Fear-and-Greed, notifications) |
 | `test/` | Unit tests, oracle fixtures and design doc |
 | `proxy/cloudflare/` | Lighter relay worker |

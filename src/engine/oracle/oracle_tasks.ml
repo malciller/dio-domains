@@ -35,6 +35,7 @@ let default_trading_config (exchange : string) (symbol : string)
   ; hedge = false
   ; accumulation_buffer = 0.01, 0.01
   ; data_feed = None
+  ; finnhub = None
   ; asset_class = None
   }
 ;;
