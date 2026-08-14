@@ -1,5 +1,5 @@
-(* Oracle_fetch_yahoo - deep-history daily OHLC via the Yahoo Finance chart
-   API (no auth, browser-ish User-Agent).
+(* Yahoo - deep-history daily OHLC via the Yahoo Finance chart API (no auth,
+   browser-ish User-Agent).
 
    Some venue feeds cannot supply deep history: Kraken's public OHLC is
    hard-capped at the most recent ~720 daily candles, and Alpaca's IEX feed
@@ -20,12 +20,17 @@
 
    The API caps a request at ~2000 points, so the history is walked forward
    in ~35-month windows from the requested start. Pure [parse_*] functions
-   are fixture-testable without network. *)
+   are fixture-testable without network.
+
+   This library lives in [dio.yahoo] (src/external/yahoo/): it is a leaf
+   data client (shared bar/date helpers come from [Exchange_intf.Types]),
+   consumed by the capital oracle's deep-history pipeline in
+   [oracle_fetch.ml]. *)
 
 open Lwt.Infix
+module Exchange = Dio_exchange.Exchange_intf
 
-let section = "oracle_yahoo"
-let endpoint = "https://query1.finance.yahoo.com/v8/finance/chart/%s"
+let section = "yahoo"
 let window_seconds = 1_100_000_000L (* ~35 months: ~1050 daily points per request *)
 let day_seconds = 86_400L
 
@@ -185,12 +190,12 @@ let epoch_of_iso date =
     deep history (see the module header: dead-token collisions). Equity
     assets map by identity (Yahoo QQQ is QQQ); crypto symbols only through
     the whitelist of known-continuous pairs. *)
-let symbol_of ~(calendar_kind : Oracle_types.calendar_kind) (symbol : string)
+let symbol_of ~(calendar_kind : Exchange.Types.calendar_kind) (symbol : string)
   : string option
   =
   match calendar_kind with
-  | Equity -> Some (String.uppercase_ascii symbol)
-  | Crypto ->
+  | Exchange.Types.Equity -> Some (String.uppercase_ascii symbol)
+  | Exchange.Types.Crypto ->
     let base =
       match String.split_on_char '/' symbol with
       | b :: _ when b <> "" -> String.uppercase_ascii b
@@ -213,7 +218,7 @@ let symbol_of ~(calendar_kind : Oracle_types.calendar_kind) (symbol : string)
 
 (** Parse one chart response into ascending daily bars. Rows with any null
     field are dropped (the API fills sparse rows with nulls). *)
-let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Oracle_types.bar list =
+let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Exchange.Types.bar list =
   let open Yojson.Safe.Util in
   try
     let result = json |> member "chart" |> member "result" |> to_list in
@@ -247,7 +252,7 @@ let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Oracle_types.bar lis
                | None -> 0.0
              in
              rows
-             := { Oracle_types.date = unix_to_iso (Int64.of_float (List.nth ts i))
+             := { Exchange.Types.date = unix_to_iso (Int64.of_float (List.nth ts i))
                 ; open_ = o
                 ; high = h
                 ; low = l
@@ -260,8 +265,8 @@ let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Oracle_types.bar lis
          let bars = List.rev !rows in
          bars
          |> Array.of_list
-         |> Oracle_calendar.sort_bars
-         |> Oracle_calendar.dedup
+         |> Exchange.Types.sort_bars
+         |> Exchange.Types.dedup
          |> Array.to_list)
   with
   | _ ->
@@ -269,48 +274,16 @@ let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Oracle_types.bar lis
     []
 ;;
 
-let series_of_bars ~(symbol : string) (bars : Oracle_types.bar list) : Oracle_types.series
-  =
-  { Oracle_types.symbol
-  ; calendar_kind = Oracle_types.Crypto
-  ; bars = Array.of_list bars
-  ; gaps = []
-  }
-;;
+(** HTTP GET with a timeout (mirrors the oracle's own timeout wrapper): a
+    request that the upstream blackholes must not freeze a fetch forever.
+    Raises on timeout/transport errors like Cohttp does. *)
+let default_timeout = 10.0
 
-(** Merge a deep-history series into the venue's own series: the deep bars
-    (strictly before the venue's first bar) are prepended, the venue's bars
-    win on any overlap, and the result is sorted and de-duplicated by date.
-    Returns the number of deep bars actually added. The venue's earliest bar
-    is taken as the minimum date over its bars (venue feeds must not be
-    assumed ascending). *)
-let merge_series ~(venue : Oracle_types.series) ~(deep : Oracle_types.series)
-  : Oracle_types.series * int
+let get ?(headers = Cohttp.Header.init ()) (uri : Uri.t)
+  : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
   =
-  let venue_bars = venue.bars in
-  let deep_bars = deep.bars in
-  if Array.length venue_bars = 0
-  then venue, 0
-  else (
-    let venue_first =
-      Array.fold_left
-        (fun acc (b : Oracle_types.bar) -> if b.date < acc then b.date else acc)
-        venue_bars.(0).Oracle_types.date
-        venue_bars
-    in
-    let added =
-      Array.to_list deep_bars
-      |> List.filter (fun (b : Oracle_types.bar) -> b.date < venue_first)
-    in
-    if added = []
-    then venue, 0
-    else (
-      let merged =
-        Array.of_list (added @ Array.to_list venue_bars)
-        |> Oracle_calendar.sort_bars
-        |> Oracle_calendar.dedup
-      in
-      { venue with bars = merged }, List.length added))
+  Lwt_unix.with_timeout default_timeout (fun () ->
+    Cohttp_lwt_unix.Client.get ~headers uri)
 ;;
 
 (** Fetch daily bars for the Yahoo [symbol] from [start_date] to [end_date]
@@ -323,7 +296,7 @@ let merge_series ~(venue : Oracle_types.series) ~(deep : Oracle_types.series)
     (non-empty-range) failure logs a warning and stops the walk with what it
     has. *)
 let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : string) ()
-  : Oracle_types.bar list Lwt.t
+  : Exchange.Types.bar list Lwt.t
   =
   let start_epoch = epoch_of_iso start_date in
   let end_epoch = epoch_of_iso end_date in
@@ -386,7 +359,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
             let fetch =
               pace ()
               >>= fun () ->
-              Oracle_http.get ~headers (Uri.of_string url)
+              get ~headers (Uri.of_string url)
               >>= fun (resp, body) ->
               Cohttp_lwt.Body.to_string body
               >>= fun body_str ->
@@ -395,11 +368,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
               then
                 Lwt.fail
                   (Failure
-                     (Printf.sprintf
-                        "Oracle_fetch_yahoo: HTTP %d for %s (%s)"
-                        status
-                        symbol
-                        body_str))
+                     (Printf.sprintf "Yahoo: HTTP %d for %s (%s)" status symbol body_str))
               else (
                 let json = Yojson.Safe.from_string body_str in
                 let bars = parse_daily ~symbol json in
@@ -449,7 +418,9 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                  beginning (the walk re-checks nothing before it). *)
             if bars <> []
             then
-              remember_empty ~symbol (Oracle_calendar.add_days (unix_to_iso from_ms) (-1));
+              remember_empty
+                ~symbol
+                (Exchange.Types.add_days (unix_to_iso from_ms) (-1));
             let acc = List.rev_append bars acc in
             if Int64.compare to_ms end_epoch >= 0
             then Lwt.return (List.rev acc, skipped, empty_200)

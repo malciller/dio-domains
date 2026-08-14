@@ -10,6 +10,7 @@ The trading engine uses a modular architecture where exchanges are implemented a
 
 - **Interface**: `src/external/exchange_intf.ml`
 - **Implementations**: `src/external/<exchange_name>/` (e.g., `src/external/kraken/`, `src/external/hyperliquid/`)
+- **Shared data clients**: `src/external/yahoo/` (deep-history OHLC, `dio.yahoo`), `src/external/coinmarketcap/` (Fear & Greed, `dio.cmc`)
 
 ### Current Implementations
 
@@ -153,6 +154,9 @@ The oracle's data layer (`src/engine/oracle/oracle_fetch.ml`) dispatches exclusi
 | `fetch_fees` | `testnet:bool -> symbol:string -> (float * float) Lwt.t` | Authoritative (maker, taker) fees; the oracle falls back to `default_fees` on failure. |
 | `default_fees` | `symbol:string -> float * float` | Offline / failed-fetch fallback (Hyperliquid spot vs perp differ, hence the symbol parameter). |
 | `fetch_balances` | `testnet:bool -> ((string * float * float) list, string) result Lwt.t` | One-shot account balance as already-normalized (asset, available, total) triples (XXBT -> BTC, UBTC -> BTC). |
+| `live_balances` | `unit -> (string * float * float) list option` | Snapshot of the venue's LIVE websocket-fed balance store, or `None` when the venue has no live store or its semantics do not match the oracle's REST balance view (Hyperliquid: its live "USDC" aggregates perp margin into spot, so the oracle keeps REST authoritative). The runtime prefers this over `fetch_balances`. |
+| `default_quote` | `string` | Default quote asset for symbols without an explicit quote ("USDC" Hyperliquid, "USD" Kraken/Alpaca). Used by portfolio topology resolution. |
+| `min_notional` | `symbol:string -> float` | Default minimum order notional in quote terms (0.0 = unconstrained; Hyperliquid spot enforces a 10 USDC MinTradeSpotNtl floor). |
 | `init_instruments` | `testnet:bool -> symbols:string list -> unit Lwt.t` | Populate price-tick / lot-size caches so `get_price_increment` / `get_qty_increment` answer. No-op for static-tick venues. |
 
 ### Raw-bar contract
@@ -164,10 +168,24 @@ The oracle's data layer (`src/engine/oracle/oracle_fetch.ml`) dispatches exclusi
 1. Create `<name>_oracle.ml` in the venue library implementing `Exchange_intf.Oracle.S` (reference adapters: `kraken_oracle.ml`, `hyperliquid_oracle.ml`, `alpaca_oracle.ml`).
 2. Register it at module load (see `kraken_module.ml`): `let () = Exchange.Oracle.Registry.register (module Kraken_oracle)`.
 3. Re-export the adapter from the library namespace file (e.g. `module Kraken_oracle = Kraken_oracle` in `kraken.ml`).
-4. Add the library to `src/engine/oracle/dune` and force-reference the adapter from `oracle_venues.ml` (OCaml dead-code elimination drops the registration side effects otherwise).
-5. No oracle dispatch edits: history, calendar kind, fees, balances and instrument metadata all resolve through the registry.
+4. Link the library into the binaries that need it (`bin/dune` — `main` and/or `oracle` executables) and force-reference the adapter's impl module there (see `bin/main.ml` / `bin/oracle.ml` force-ref blocks; OCaml dead-code elimination drops the registration side effects otherwise). `dio.oracle` itself is a pure consumer and links no venue libraries.
+5. No oracle dispatch edits: history, calendar kind, fees, balances, live balances, instrument metadata, default quote and min-notional all resolve through the registry.
 
 Current oracle adapters: Kraken, Hyperliquid, Alpaca. (Lighter and IBKR implement live trading only today.)
+
+### WebSocket vs REST (the oracle data path)
+
+The oracle moves from REST to websocket "where able" — and that decision is the venue's own, declared through the contract:
+
+| Surface | Kraken | Hyperliquid | Alpaca | Yahoo |
+|---|---|---|---|---|
+| Daily bars / history | REST (delta-cached) | REST | REST | REST |
+| Balances | **WS live store** | REST (the WS store's perp-mixing semantics are excluded — documented in the adapter) | **WS live store** | n/a |
+| Current price (runtime anchor) | **WS top-of-book** | **WS top-of-book** | **WS top-of-book** | n/a |
+| Fees | REST + `default_fees` | REST + `default_fees` | REST + `default_fees` | n/a |
+| Calendar / instruments | REST | REST/static | REST | n/a |
+
+REST remains where websocket cannot serve the data: historical bars (WS has no history; the delta cache minimizes per-pass requests), Yahoo (no public WS), fee discovery, calendars and instrument tables. The standalone CLI (`bin/oracle.ml`) has no supervisor, so it uses the REST one-shot paths; the live runtime prefers the WS-fed stores.
 
 ## Order Handling Specification
 

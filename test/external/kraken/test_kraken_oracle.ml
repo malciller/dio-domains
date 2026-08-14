@@ -33,6 +33,15 @@ let test_parse_balances_api_error () =
   | Ok _ -> Alcotest.fail "expected an API error"
 ;;
 
+let test_venue_contract () =
+  let open Kraken.Kraken_oracle in
+  Alcotest.(check string) "default quote USD" "USD" default_quote;
+  Alcotest.(check (float 1e-9))
+    "not notional-constrained"
+    0.0
+    (min_notional ~symbol:"BTC/USD")
+;;
+
 let () =
   Alcotest.run
     "kraken_oracle"
@@ -43,5 +52,7 @@ let () =
             test_parse_balances_normalizes_assets
         ; Alcotest.test_case "API error surfaced" `Quick test_parse_balances_api_error
         ] )
+    ; ( "venue contract"
+      , [ Alcotest.test_case "default_quote / min_notional" `Quick test_venue_contract ] )
     ]
 ;;

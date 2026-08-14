@@ -169,6 +169,79 @@ module Types = struct
   type calendar_kind =
     | Crypto
     | Equity
+
+  (* ---- Bar/date helpers ----
+     Shared with the oracle and external data clients (e.g. the Yahoo deep
+     history library) that must not depend on the oracle library. The oracle's
+     [Oracle_calendar] re-exports these, so its call sites are unchanged. *)
+
+  (** Parse an ISO date (YYYY-MM-DD) into (year, month, day). *)
+  let iso_ymd s =
+    if String.length s < 10 then invalid_arg ("Exchange_intf.iso_ymd: bad date " ^ s);
+    let y = int_of_string (String.sub s 0 4) in
+    let m = int_of_string (String.sub s 5 2) in
+    let d = int_of_string (String.sub s 8 2) in
+    y, m, d
+  ;;
+
+  (** Days since 1970-01-01 of a civil (y, m, d) date. Exact integer arithmetic;
+      independent of timezone, DST and Unix.mktime. Valid for the proleptic
+      Gregorian calendar (all dates in use here are >= 1970). *)
+  let days_from_civil y m d =
+    let y = if m <= 2 then y - 1 else y in
+    let era = (if y >= 0 then y else y - 399) / 400 in
+    let yoe = y - (era * 400) in
+    let doy = (((153 * if m > 2 then m - 3 else m + 9) + 2) / 5) + d - 1 in
+    let doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy in
+    (era * 146097) + doe - 719468
+  ;;
+
+  (** Inverse of [days_from_civil]: the civil (y, m, d) date of a day count. *)
+  let civil_from_days z =
+    let z = z + 719468 in
+    let era = (if z >= 0 then z else z - 146096) / 146097 in
+    let doe = z - (era * 146097) in
+    let yoe = (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365 in
+    let y = yoe + (era * 400) in
+    let doy = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100)) in
+    let mp = ((5 * doy) + 2) / 153 in
+    let d = doy - (((153 * mp) + 2) / 5) + 1 in
+    let m = if mp < 10 then mp + 3 else mp - 9 in
+    (y + if m <= 2 then 1 else 0), m, d
+  ;;
+
+  (** ISO date [n] calendar days after [d]. *)
+  let add_days d n =
+    let y, m, d = iso_ymd d in
+    let y, m, d = civil_from_days (days_from_civil y m d + n) in
+    Printf.sprintf "%04d-%02d-%02d" y m d
+  ;;
+
+  (** Sort bars ascending by ISO date (non-mutating). *)
+  let sort_bars (bars : bar array) =
+    let arr = Array.copy bars in
+    Array.sort (fun a b -> String.compare a.date b.date) arr;
+    arr
+  ;;
+
+  (** De-duplicate an ascending bar array by date (first occurrence wins).
+      The input must already be sorted ascending; the array is copied. *)
+  let dedup (bars : bar array) =
+    let n = Array.length bars in
+    if n = 0
+    then bars
+    else (
+      let out = ref [ bars.(0) ] in
+      let prev = ref bars.(0).date in
+      Array.iteri
+        (fun i b ->
+           if i > 0 && b.date <> !prev
+           then (
+             out := b :: !out;
+             prev := b.date))
+        bars;
+      Array.of_list (List.rev !out))
+  ;;
 end
 
 (** Module signature that every exchange backend must satisfy.
@@ -472,6 +545,30 @@ module Oracle = struct
         the live registry's [get_price_increment] / [get_qty_increment]
         answer. No-op for venues with static ticks. *)
     val init_instruments : testnet:bool -> symbols:string list -> unit Lwt.t
+
+    (** One-shot snapshot from the venue's LIVE websocket-fed balance store as
+        (asset, available, total) triples, or [None] when the venue has no
+        live store or its store semantics do not match the oracle's REST
+        balance view. The oracle runtime prefers this (in-process websocket
+        data, no standalone HTTP round-trip) and falls back to
+        [fetch_balances] when it returns [None].
+
+        Hyperliquid deliberately returns [None]: its live "USDC" store
+        aggregates the perp clearinghouse USDC with the spot wallet, while the
+        oracle pool counts spot capital only (perp margin is not grid
+        capital). REST spotClearinghouseState stays authoritative there. *)
+    val live_balances : unit -> (string * float * float) list option
+
+    (** Default quote asset for symbols written without an explicit quote
+        (e.g. "BTC" -> USDC on Hyperliquid, USD on Kraken/Alpaca). Used by
+        the portfolio topology resolution. *)
+    val default_quote : string
+
+    (** Default minimum order notional in quote terms for [symbol]
+        (0.0 = not constrained). Hyperliquid spot enforces a 10 USDC
+        MinTradeSpotNtl floor; perp/equity venues are not
+        notional-constrained in this model. *)
+    val min_notional : symbol:string -> float
   end
 
   (** Dynamic registry mapping venue names to their [(module S)]

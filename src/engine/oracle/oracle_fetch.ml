@@ -16,7 +16,8 @@
    - the shared clean-series normalization (Oracle_calendar.normalize_bars,
      applied on every read so cache and direct fetches agree and a corrected
      rule self-heals without a refetch);
-   - Yahoo deep history (Oracle_fetch_yahoo) for the same underlying asset;
+   - Yahoo deep history (the [Yahoo] client in src/external/yahoo/) for the
+     same underlying asset;
    - the equity session-calendar model. *)
 
 open Lwt.Infix
@@ -24,6 +25,10 @@ open Lwt.Infix
 let section = "oracle_fetch"
 
 module Exchange = Dio_exchange.Exchange_intf
+
+(* The Yahoo deep-history client (src/external/yahoo/, [dio.yahoo]); the
+   wrapper module [Yahoo] re-exports the [Yahoo_deep_history] module. *)
+module Yahoo_deep_history = Yahoo.Yahoo_deep_history
 
 let today_iso () =
   let tm = Unix.localtime (Unix.time ()) in
@@ -70,16 +75,16 @@ let clean_bars ~(exchange : string) ~(symbol : string) (bars : Oracle_types.bar 
 ;;
 
 (** Build a [series] from (already clean) bars, using the venue's calendar
-    kind from the registry (crypto fallback when the venue is unregistered). *)
+    kind from the registry (static known-exchange fallback for pure/offline/
+    test contexts; unknown exchanges default to crypto). *)
 let series_of_bars ~(exchange : string) ~(symbol : string) (bars : Oracle_types.bar list)
   : Oracle_types.series
   =
-  let calendar_kind =
-    match Exchange.Oracle.Registry.get exchange with
-    | Some (module V) -> V.calendar_kind
-    | None -> Oracle_types.Crypto
-  in
-  { Oracle_types.symbol; calendar_kind; bars = Array.of_list bars; gaps = [] }
+  { Oracle_types.symbol
+  ; calendar_kind = Oracle_tasks.calendar_kind_of_exchange exchange
+  ; bars = Array.of_list bars
+  ; gaps = []
+  }
 ;;
 
 (** Per-pass cache of fetched series, shared across assets and class members
@@ -92,6 +97,54 @@ let fetch_cache : (string * string, Oracle_types.series) Hashtbl.t = Hashtbl.cre
     refresh cycles so a new pass re-fetches rather than reusing last
     cycle's series objects). *)
 let clear_cache () = Hashtbl.clear fetch_cache
+
+(** Build a deep-history [series] from (already clean) Yahoo bars, using the
+    venue's calendar kind. The deep merge itself only consumes [bars] (the
+    result keeps the venue series' kind), but class members analyzed purely
+    from Yahoo need the right kind for their own labels/gap semantics. *)
+let deep_series_of_bars
+      ~(calendar_kind : Oracle_types.calendar_kind)
+      ~(symbol : string)
+      (bars : Oracle_types.bar list)
+  : Oracle_types.series
+  =
+  { Oracle_types.symbol; calendar_kind; bars = Array.of_list bars; gaps = [] }
+;;
+
+(** Merge a deep-history series into the venue's own series: the deep bars
+    (strictly before the venue's first bar) are prepended, the venue's bars
+    win on any overlap, and the result is sorted and de-duplicated by date.
+    Returns the number of deep bars actually added. The venue's earliest bar
+    is taken as the minimum date over its bars (venue feeds must not be
+    assumed ascending). *)
+let merge_series ~(venue : Oracle_types.series) ~(deep : Oracle_types.series)
+  : Oracle_types.series * int
+  =
+  let venue_bars = venue.bars in
+  let deep_bars = deep.bars in
+  if Array.length venue_bars = 0
+  then venue, 0
+  else (
+    let venue_first =
+      Array.fold_left
+        (fun acc (b : Oracle_types.bar) -> if b.date < acc then b.date else acc)
+        venue_bars.(0).Oracle_types.date
+        venue_bars
+    in
+    let added =
+      Array.to_list deep_bars
+      |> List.filter (fun (b : Oracle_types.bar) -> b.date < venue_first)
+    in
+    if added = []
+    then venue, 0
+    else (
+      let merged =
+        Array.of_list (added @ Array.to_list venue_bars)
+        |> Oracle_calendar.sort_bars
+        |> Oracle_calendar.dedup
+      in
+      { venue with bars = merged }, List.length added))
+;;
 
 (** Fetch one symbol's daily series through the registry (cached per run,
     and disk-cached via Oracle_cache: full history on first use, one small
@@ -151,7 +204,7 @@ let deepen_series
   then Lwt.return (series, 0)
   else (
     match
-      Oracle_fetch_yahoo.symbol_of ~calendar_kind:series.calendar_kind series.symbol
+      Yahoo_deep_history.symbol_of ~calendar_kind:series.calendar_kind series.symbol
     with
     | None -> Lwt.return (series, 0)
     | Some yahoo_symbol ->
@@ -168,17 +221,22 @@ let deepen_series
         ~complete_through:end_date
         ~fetch:(fun boundary ->
           let start_date = Option.value boundary ~default:"2015-01-01" in
-          Oracle_fetch_yahoo.fetch_daily ~start_date ~symbol:yahoo_symbol ~end_date ())
+          Yahoo_deep_history.fetch_daily ~start_date ~symbol:yahoo_symbol ~end_date ())
         ()
       >|= fun deep_bars ->
-      let deep = Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol deep_bars in
-      Oracle_fetch_yahoo.merge_series ~venue:series ~deep)
+      let deep =
+        deep_series_of_bars
+          ~calendar_kind:series.calendar_kind
+          ~symbol:yahoo_symbol
+          deep_bars
+      in
+      merge_series ~venue:series ~deep)
 ;;
 
 (** Pure: the source of one class member's price history. The class surface
     is a blend input, never a decision subject - members gather their
     history PURELY from Yahoo (whitelisted symbols only, see
-    [Oracle_fetch_yahoo.symbol_of]) UNLESS the member IS the active asset on
+    [Yahoo_deep_history.symbol_of]) UNLESS the member IS the active asset on
     this exchange, which uses the exchange's own history (it is the decision
     subject and needs venue data). A symbol with no trusted Yahoo mapping
     ([`None]) contributes nothing to the class. *)
@@ -190,12 +248,11 @@ let class_member_source
   if String.lowercase_ascii member_symbol = String.lowercase_ascii asset_symbol
   then `Exchange
   else (
-    let calendar_kind =
-      match Exchange.Oracle.Registry.get exchange with
-      | Some (module V) -> V.calendar_kind
-      | None -> Oracle_types.Crypto
-    in
-    match Oracle_fetch_yahoo.symbol_of ~calendar_kind member_symbol with
+    match
+      Yahoo_deep_history.symbol_of
+        ~calendar_kind:(Oracle_tasks.calendar_kind_of_exchange exchange)
+        member_symbol
+    with
     | Some yahoo_symbol -> `Yahoo yahoo_symbol
     | None -> `None)
 ;;
@@ -252,13 +309,14 @@ let load_members
          | `Yahoo yahoo_symbol ->
            (* Any other member: purely Yahoo, disk-cached, delta through
               today - the exchange never sees it. *)
+           let calendar_kind = Oracle_tasks.calendar_kind_of_exchange exchange in
            Oracle_cache.with_delta
              ~exchange:"yahoo-class"
              ~symbol:yahoo_symbol
              ~today:(today_iso ())
              ~fetch:(fun boundary ->
                let start_date = Option.value boundary ~default:"2015-01-01" in
-               Oracle_fetch_yahoo.fetch_daily
+               Yahoo_deep_history.fetch_daily
                  ~start_date
                  ~symbol:yahoo_symbol
                  ~end_date:(today_iso ())
@@ -271,7 +329,7 @@ let load_members
            then Lwt.return acc
            else
              Lwt.return
-               (Oracle_fetch_yahoo.series_of_bars ~symbol:yahoo_symbol bars :: acc))
+               (deep_series_of_bars ~calendar_kind ~symbol:yahoo_symbol bars :: acc))
     in
     go syms
     >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)

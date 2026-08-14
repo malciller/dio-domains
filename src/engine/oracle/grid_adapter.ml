@@ -10,10 +10,11 @@
    the caller (quote capital is the inverse-sizing variable).
 
    Order-placeability floors: qty_min comes from the live venue registry
-   (get_qty_min_val; 0.0 = unknown). min_notional defaults to the venue's
-   documented minimum order notional (Hyperliquid's 10 USDC spot floor;
-   Kraken/others are notional-unconstrained here - their qty_min governs), and
-   both can be overridden from the CLI. *)
+   (get_qty_min_val; 0.0 = unknown). min_notional resolves through the venue's
+   oracle adapter ([Exchange_intf.Oracle.S.min_notional] - Hyperliquid's
+   10 USDC spot floor; Kraken/others are notional-unconstrained here, 0.0),
+   with a generic 0.0 fallback when no adapter is linked (pure/offline/test),
+   and can be overridden from the CLI. *)
 
 open Dio_strategies
 
@@ -21,18 +22,6 @@ let default_price_increment = 0.01
 let default_qty_increment = 0.01
 let default_maker_fee = 0.001
 let exchange_model_of_string = Grid_core.exchange_model_of_string
-
-(** Venue default minimum order notional (quote). Hyperliquid spot enforces
-    MinTradeSpotNtl = 10 USDC; the perp/equity venues below are not
-    notional-constrained in this model. *)
-let default_min_notional exchange_model =
-  match exchange_model with
-  | Grid_core_types.Hyperliquid -> 10.0
-  | Grid_core_types.Kraken
-  | Grid_core_types.Lighter
-  | Grid_core_types.Ibkr
-  | Grid_core_types.Alpaca -> 0.0
-;;
 
 let price_increment_of (tc : Strategy_common.trading_config) =
   try Suicide_grid_config.get_price_increment tc.symbol tc.exchange with
@@ -49,12 +38,23 @@ let qty_min_of (tc : Strategy_common.trading_config) =
   | _ -> 0.0
 ;;
 
+(** Venue default minimum order notional (quote) for [tc], through the
+    venue's oracle adapter. Hyperliquid spot enforces MinTradeSpotNtl =
+    10 USDC (the adapter answers per symbol); unregistered venues (pure/
+    offline/test) are not notional-constrained, 0.0. *)
+let min_notional_of (tc : Strategy_common.trading_config) =
+  match Dio_exchange.Exchange_intf.Oracle.Registry.get tc.exchange with
+  | Some (module V) -> V.min_notional ~symbol:tc.symbol
+  | None -> 0.0
+;;
+
 let float_of_string_opt def s =
   try float_of_string s with
   | _ -> def
 ;;
 
 let of_trading_config
+      ?min_notional
       (tc : Strategy_common.trading_config)
       ~start_price
       ~start_quote
@@ -75,7 +75,7 @@ let of_trading_config
   ; price_increment = price_increment_of tc
   ; qty_increment = qty_increment_of tc
   ; qty_min = qty_min_of tc
-  ; min_notional = default_min_notional exchange_model
+  ; min_notional = Option.value min_notional ~default:(min_notional_of tc)
   ; exchange_model
   ; start_price
   ; start_quote

@@ -229,6 +229,33 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
     (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
 ;;
 
+(** Live websocket-fed balance snapshot: the engine supervisor's account feed
+    holds cash (available) / equity (total) plus per-symbol positions,
+    mirroring the REST account+positions fetch ([fetch_balances]). Returns
+    [Some] triples when the store holds data, [None] otherwise (the oracle
+    runtime then falls back to the REST one-shot). *)
+let live_balances () : (string * float * float) list option =
+  match Exchange.Registry.get "alpaca" with
+  | None -> None
+  | Some (module Ex) ->
+    let balances = Ex.get_all_balances () in
+    if balances = []
+    then None
+    else
+      Some
+        (List.map
+           (fun (asset, total) ->
+              let available =
+                try Ex.get_tradeable_balance ~asset with
+                | _ -> 0.0
+              in
+              asset, available, total)
+           balances)
+;;
+
+let default_quote = "USD"
+let min_notional ~symbol:_ = 0.0
+
 (* ---- Instrument metadata (static 0.01 tick, fractional lots) ---- *)
 
 let init_instruments ~testnet:_ ~symbols:_ : unit Lwt.t = Lwt.return_unit

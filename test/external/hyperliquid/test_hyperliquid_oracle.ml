@@ -158,6 +158,24 @@ let test_windows_to_series_ascending () =
     (List.map (fun b -> b.Dio_exchange.Exchange_intf.Types.close) out)
 ;;
 
+let test_venue_contract () =
+  let open Hyperliquid.Hyperliquid_oracle in
+  (* Hyperliquid spot enforces MinTradeSpotNtl = 10 USDC; perp/venus coins
+     (slash-less symbols) are not notional-constrained. *)
+  Alcotest.(check (float 1e-9))
+    "spot min_notional = 10 USDC"
+    10.0
+    (min_notional ~symbol:"BTC/USDC");
+  Alcotest.(check (float 1e-9)) "perp min_notional = 0" 0.0 (min_notional ~symbol:"BTC");
+  Alcotest.(check string) "default quote USDC" "USDC" default_quote;
+  (* The live WS "USDC" store mixes perp margin with spot; the oracle pool
+     counts spot only, so the adapter deliberately has no live snapshot. *)
+  Alcotest.(check bool)
+    "no live balance snapshot (REST spot authoritative)"
+    true
+    (live_balances () = None)
+;;
+
 let () =
   Alcotest.run
     "hyperliquid_oracle"
@@ -183,6 +201,12 @@ let () =
             "windows accumulate ascending (last = current close)"
             `Quick
             test_windows_to_series_ascending
+        ] )
+    ; ( "venue contract"
+      , [ Alcotest.test_case
+            "min_notional / default_quote / live_balances"
+            `Quick
+            test_venue_contract
         ] )
     ]
 ;;

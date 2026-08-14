@@ -167,27 +167,15 @@ let test_calendar_kind () =
      = Dio_oracle.Oracle_types.Crypto)
 ;;
 
-let test_min_notional_defaults () =
-  let open Dio_oracle.Grid_adapter in
-  Alcotest.(check (float 1e-9))
-    "hyperliquid spot floor = 10 USDC"
-    10.0
-    (default_min_notional Dio_strategies.Grid_core_types.Hyperliquid);
-  Alcotest.(check (float 1e-9))
-    "kraken not notional-constrained"
-    0.0
-    (default_min_notional Dio_strategies.Grid_core_types.Kraken);
-  Alcotest.(check (float 1e-9))
-    "alpaca not notional-constrained"
-    0.0
-    (default_min_notional Dio_strategies.Grid_core_types.Alpaca)
-;;
-
-let test_adapter_min_notional_flows_into_config () =
-  (* The venue default must reach the Grid_core.config the adapter builds. *)
+let test_min_notional_flows_into_config () =
+  (* The venue's min-notional default resolves through the oracle adapter
+     registry (tested per-venue in the adapter tests, e.g.
+     test/external/hyperliquid); here we verify the plumbing: an explicit
+     override reaches the Grid_core.config the adapter builds. *)
   let tc = trading_config ~exchange:"hyperliquid" ~symbol:"BTC/USDC" () in
   let grid =
     Dio_oracle.Grid_adapter.of_trading_config
+      ~min_notional:10.0
       tc
       ~start_price:100.0
       ~start_quote:1000.0
@@ -228,13 +216,9 @@ let () =
     ; "calendar", [ Alcotest.test_case "exchange kinds" `Quick test_calendar_kind ]
     ; ( "grid_adapter"
       , [ Alcotest.test_case
-            "min_notional venue defaults"
-            `Quick
-            test_min_notional_defaults
-        ; Alcotest.test_case
             "min_notional flows into config"
             `Quick
-            test_adapter_min_notional_flows_into_config
+            test_min_notional_flows_into_config
         ] )
     ]
 ;;

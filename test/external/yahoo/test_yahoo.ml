@@ -1,38 +1,41 @@
-(* Oracle_fetch_yahoo tests: deep-history symbol whitelist, chart parsing,
-   and venue/deep merge.
+(* Yahoo deep-history client tests: symbol whitelist, chart parsing, and
+   pre-listing window classification.
 
    The whitelist is the safety-critical part: Yahoo's crypto symbol space
    carries dead-token collisions (HYPE-USD still serves a dead 2021 token's
    prices), so only known-continuous pairs may be deepened. Equities are
    unambiguous and map by identity. *)
 
-open Dio_oracle
+module Exchange = Dio_exchange.Exchange_intf
+
+(* The library [dio.yahoo] wraps its module under the library name [Yahoo]. *)
+module Yahoo_deep_history = Yahoo.Yahoo_deep_history
 
 let check_symbol ~calendar_kind symbol expected =
   Alcotest.(check (option string))
     (Printf.sprintf "symbol_of %s" symbol)
     expected
-    (Oracle_fetch_yahoo.symbol_of ~calendar_kind symbol)
+    (Yahoo_deep_history.symbol_of ~calendar_kind symbol)
 ;;
 
 let test_symbol_whitelist () =
-  check_symbol ~calendar_kind:Oracle_types.Crypto "ETH/USD" (Some "ETH-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "BTC/USDC" (Some "BTC-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "SOL/USD" (Some "SOL-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "XMR/USD" (Some "XMR-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "DOGE/USD" (Some "DOGE-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "ADA/USDC" (Some "ADA-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "LTC/USD" (Some "LTC-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "XRP/USD" (Some "XRP-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "LINK/USD" (Some "LINK-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "AVAX/USD" (Some "AVAX-USD");
-  check_symbol ~calendar_kind:Oracle_types.Crypto "DOT/USD" (Some "DOT-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "ETH/USD" (Some "ETH-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "BTC/USDC" (Some "BTC-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "SOL/USD" (Some "SOL-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "XMR/USD" (Some "XMR-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "DOGE/USD" (Some "DOGE-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "ADA/USDC" (Some "ADA-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "LTC/USD" (Some "LTC-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "XRP/USD" (Some "XRP-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "LINK/USD" (Some "LINK-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "AVAX/USD" (Some "AVAX-USD");
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "DOT/USD" (Some "DOT-USD");
   (* The dead-token trap: HYPE/USDC must never be deepened from Yahoo. *)
-  check_symbol ~calendar_kind:Oracle_types.Crypto "HYPE/USDC" None;
+  check_symbol ~calendar_kind:Exchange.Types.Crypto "HYPE/USDC" None;
   (* Equities map by identity (Yahoo QQQ is QQQ). *)
-  check_symbol ~calendar_kind:Oracle_types.Equity "QQQ" (Some "QQQ");
-  check_symbol ~calendar_kind:Oracle_types.Equity "SPCX" (Some "SPCX");
-  check_symbol ~calendar_kind:Oracle_types.Equity "NVDA" (Some "NVDA")
+  check_symbol ~calendar_kind:Exchange.Types.Equity "QQQ" (Some "QQQ");
+  check_symbol ~calendar_kind:Exchange.Types.Equity "SPCX" (Some "SPCX");
+  check_symbol ~calendar_kind:Exchange.Types.Equity "NVDA" (Some "NVDA")
 ;;
 
 (** Minimal chart fixture: two days of data with one null row dropped. *)
@@ -66,72 +69,17 @@ let fixture_json =
 ;;
 
 let test_parse_daily () =
-  let bars = Oracle_fetch_yahoo.parse_daily ~symbol:"ETH-USD" fixture_json in
+  let bars = Yahoo_deep_history.parse_daily ~symbol:"ETH-USD" fixture_json in
   Alcotest.(check int) "null rows dropped" 2 (List.length bars);
   match bars with
   | [ first; second ] ->
     Alcotest.(check bool)
       "ascending"
-      (first.Oracle_types.date < second.Oracle_types.date)
+      (first.Exchange.Types.date < second.Exchange.Types.date)
       true;
     Alcotest.(check bool) "has high/low/close" (first.high >= first.low) true;
     Alcotest.(check (float 1e-9)) "volume kept" 1000.0 first.volume
   | _ -> Alcotest.fail "expected two bars"
-;;
-
-let bar ~date ~close =
-  { Oracle_types.date; open_ = close; high = close; low = close; close; volume = 0.0 }
-;;
-
-let test_merge_series () =
-  let venue =
-    { Oracle_types.symbol = "ETH/USD"
-    ; calendar_kind = Oracle_types.Crypto
-    ; bars =
-        [| bar ~date:"2024-08-21" ~close:2600.0; bar ~date:"2024-08-22" ~close:2650.0 |]
-    ; gaps = []
-    }
-  in
-  (* Deep bars strictly before the venue start are prepended; an overlapping
-     date stays with the venue. *)
-  let deep =
-    { Oracle_types.symbol = "ETH-USD"
-    ; calendar_kind = Oracle_types.Crypto
-    ; bars =
-        [| bar ~date:"2024-08-19" ~close:2550.0
-         ; bar ~date:"2024-08-20" ~close:2570.0
-         ; bar ~date:"2024-08-21" ~close:9999.0
-        |]
-    ; gaps = []
-    }
-  in
-  let merged, added = Oracle_fetch_yahoo.merge_series ~venue ~deep in
-  Alcotest.(check int) "two deep bars added" 2 added;
-  Alcotest.(check int) "merged length" 4 (Array.length merged.bars);
-  (* Venue bar wins on the overlap date. *)
-  let overlap =
-    Array.to_list merged.bars
-    |> List.find (fun (b : Oracle_types.bar) -> b.date = "2024-08-21")
-  in
-  Alcotest.(check (float 1e-9)) "venue wins overlap" 2600.0 overlap.close;
-  (* No deep bars before the venue start -> unchanged. *)
-  let empty_deep = { deep with bars = [||] } in
-  let merged2, added2 = Oracle_fetch_yahoo.merge_series ~venue ~deep:empty_deep in
-  Alcotest.(check int) "no deep bars" 0 added2;
-  Alcotest.(check int) "unchanged" 2 (Array.length merged2.bars);
-  (* A DESCENDING venue series (some venue feeds return newest-first) must
-     merge the same way: the venue start is its minimum date. *)
-  let desc_venue =
-    { venue with bars = Array.of_list (Array.to_list venue.bars |> List.rev) }
-  in
-  let merged3, added3 = Oracle_fetch_yahoo.merge_series ~venue:desc_venue ~deep in
-  Alcotest.(check int) "descending venue adds same deep bars" 2 added3;
-  Alcotest.(check int) "descending venue merged length" 4 (Array.length merged3.bars);
-  let overlap3 =
-    Array.to_list merged3.bars
-    |> List.find (fun (b : Oracle_types.bar) -> b.date = "2024-08-21")
-  in
-  Alcotest.(check (float 1e-9)) "descending venue wins overlap" 2600.0 overlap3.close
 ;;
 
 let test_classify_error () =
@@ -141,7 +89,7 @@ let test_classify_error () =
      not re-request the same doomed range on every pass). *)
   Alcotest.(check bool)
     "400 + data-doesn't-exist = missing data"
-    (Oracle_fetch_yahoo.classify_error
+    (Yahoo_deep_history.classify_error
        400
        "{\"chart\":{\"result\":null,\"error\":{\"code\":\"Bad \
         Request\",\"description\":\"Data doesn't exist for startDate = 1420088400, \
@@ -151,7 +99,7 @@ let test_classify_error () =
   (* Case-insensitive match. *)
   Alcotest.(check bool)
     "lowercase body matches"
-    (Oracle_fetch_yahoo.classify_error
+    (Yahoo_deep_history.classify_error
        400
        "{\"chart\":{\"result\":null,\"error\":{\"description\":\"data doesn't exist\"}}}"
      = `Missing_data)
@@ -159,15 +107,15 @@ let test_classify_error () =
   (* Any other error is fatal. *)
   Alcotest.(check bool)
     "401 = fatal"
-    (Oracle_fetch_yahoo.classify_error 401 "{\"error\":\"Unauthorized\"}" = `Fatal)
+    (Yahoo_deep_history.classify_error 401 "{\"error\":\"Unauthorized\"}" = `Fatal)
     true;
   Alcotest.(check bool)
     "400 without the marker = fatal"
-    (Oracle_fetch_yahoo.classify_error 400 "{\"error\":\"Invalid Crumb\"}" = `Fatal)
+    (Yahoo_deep_history.classify_error 400 "{\"error\":\"Invalid Crumb\"}" = `Fatal)
     true;
   Alcotest.(check bool)
     "500 = fatal"
-    (Oracle_fetch_yahoo.classify_error 500 "oops" = `Fatal)
+    (Yahoo_deep_history.classify_error 500 "oops" = `Fatal)
     true
 ;;
 
@@ -178,34 +126,34 @@ let test_empty_prefix_cache () =
      re-requested). *)
   let symbol = "SPCX" in
   (* Simulate the first pass: the walk recorded "no data before 2026-06-15". *)
-  Oracle_fetch_yahoo.remember_empty ~symbol "2026-06-15";
-  (match Oracle_fetch_yahoo.known_empty_before ~symbol with
+  Yahoo_deep_history.remember_empty ~symbol "2026-06-15";
+  (match Yahoo_deep_history.known_empty_before ~symbol with
    | Some d -> Alcotest.(check string) "floor cached" "2026-06-15" d
    | None -> Alcotest.fail "expected the cached empty prefix");
   (* The prefix only grows forward: a later, deeper empty answer is kept. *)
-  Oracle_fetch_yahoo.remember_empty ~symbol "2026-06-01";
-  (match Oracle_fetch_yahoo.known_empty_before ~symbol with
+  Yahoo_deep_history.remember_empty ~symbol "2026-06-01";
+  (match Yahoo_deep_history.known_empty_before ~symbol with
    | Some d -> Alcotest.(check string) "floor does not shrink" "2026-06-15" d
    | None -> Alcotest.fail "expected the cached empty prefix");
-  Oracle_fetch_yahoo.remember_empty ~symbol "2026-08-01";
-  (match Oracle_fetch_yahoo.known_empty_before ~symbol with
+  Yahoo_deep_history.remember_empty ~symbol "2026-08-01";
+  (match Yahoo_deep_history.known_empty_before ~symbol with
    | Some d -> Alcotest.(check string) "floor extends" "2026-08-01" d
    | None -> Alcotest.fail "expected the cached empty prefix");
   (* Symbols are independent. *)
   Alcotest.(check bool)
     "other symbols unaffected"
-    (Oracle_fetch_yahoo.known_empty_before ~symbol:"QQQ" = None)
+    (Yahoo_deep_history.known_empty_before ~symbol:"QQQ" = None)
     true
 ;;
 
 let test_classify_exn () =
-  (* The fetch wraps failures as "Oracle_fetch_yahoo: HTTP <status> for
-     <symbol> (<body>)"; classification must dig the status and body out. *)
+  (* The fetch wraps failures as "Yahoo: HTTP <status> for <symbol> (<body>)";
+     classification must dig the status and body out. *)
   Alcotest.(check bool)
     "missing-data failure classified from the message"
-    (Oracle_fetch_yahoo.classify_exn
+    (Yahoo_deep_history.classify_exn
        (Failure
-          "Oracle_fetch_yahoo: HTTP 400 for SPCX \
+          "Yahoo: HTTP 400 for SPCX \
            ({\"chart\":{\"result\":null,\"error\":{\"code\":\"Bad \
            Request\",\"description\":\"Data doesn't exist for startDate = \
            1420088400\"}}})")
@@ -213,19 +161,17 @@ let test_classify_exn () =
     true;
   Alcotest.(check bool)
     "non-empty-range failure is fatal"
-    (Oracle_fetch_yahoo.classify_exn
-       (Failure "Oracle_fetch_yahoo: HTTP 503 for QQQ (boom)")
-     = `Fatal)
+    (Yahoo_deep_history.classify_exn (Failure "Yahoo: HTTP 503 for QQQ (boom)") = `Fatal)
     true;
   Alcotest.(check bool)
     "non-Failure exceptions are fatal"
-    (Oracle_fetch_yahoo.classify_exn (Invalid_argument "x") = `Fatal)
+    (Yahoo_deep_history.classify_exn (Invalid_argument "x") = `Fatal)
     true
 ;;
 
 let () =
   Alcotest.run
-    "oracle_fetch_yahoo"
+    "yahoo"
     [ ( "symbol whitelist"
       , [ Alcotest.test_case
             "known pairs map, dead tokens do not"
@@ -233,9 +179,6 @@ let () =
             test_symbol_whitelist
         ] )
     ; "parse", [ Alcotest.test_case "chart fixture with nulls" `Quick test_parse_daily ]
-    ; ( "merge"
-      , [ Alcotest.test_case "deep prepend, venue wins overlap" `Quick test_merge_series ]
-      )
     ; ( "pre-listing windows"
       , [ Alcotest.test_case
             "400 data-doesn't-exist classifies as empty"

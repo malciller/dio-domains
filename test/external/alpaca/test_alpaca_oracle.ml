@@ -41,6 +41,15 @@ let test_parse_calendar () =
     dates
 ;;
 
+let test_venue_contract () =
+  let open Alpaca.Alpaca_oracle in
+  Alcotest.(check string) "default quote USD" "USD" default_quote;
+  Alcotest.(check (float 1e-9))
+    "not notional-constrained"
+    0.0
+    (min_notional ~symbol:"QQQ")
+;;
+
 let () =
   Alcotest.run
     "alpaca_oracle"
@@ -49,5 +58,7 @@ let () =
         ; Alcotest.test_case "empty bars tolerated" `Quick test_parse_bars_empty
         ; Alcotest.test_case "parse calendar" `Quick test_parse_calendar
         ] )
+    ; ( "venue contract"
+      , [ Alcotest.test_case "default_quote / min_notional" `Quick test_venue_contract ] )
     ]
 ;;
