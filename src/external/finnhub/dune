@@ -1,0 +1,16 @@
+(library
+ (name finnhub)
+ (public_name dio.finnhub)
+ (libraries
+  yojson
+  lwt
+  lwt.unix
+  cohttp-lwt-unix
+  dotenv
+  logging
+  uri
+  unix
+  dio.error_handling
+  dio.latency_profiling)
+ (preprocess
+  (pps lwt_ppx)))

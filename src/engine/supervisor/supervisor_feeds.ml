@@ -210,8 +210,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                Hyperliquid.Instruments_feed.wait_until_ready ()
                >>= fun () ->
                Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet
-               >>= fun () ->
-               Hyperliquid.Module.fetch_open_orders_ws ())
+               >>= fun () -> Hyperliquid.Module.fetch_open_orders_ws ())
            in
            Hyperliquid.Ws.connect_and_monitor
              ~testnet:hyperliquid_testnet
@@ -390,20 +389,34 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
       Lwt.return_unit
   in
   let%lwt () =
-    let open_orders_p =
-      if has_alpaca
-      then
-        Lwt.pick
-          [ (Alpaca.Executions.bootstrap_open_orders () >|= fun () -> `Ok)
-          ; (Lwt_unix.sleep 10.0 >|= fun () -> `Timed_out)
-          ]
-      else Lwt.return `Ok
-    in
-    match%lwt open_orders_p with
-    | `Ok -> Lwt.return_unit
-    | `Timed_out ->
-      Logging.warn_f ~section "Alpaca open-orders bootstrap timed out after 10s";
-      Lwt.return_unit
+    if has_alpaca
+    then (
+      let done_flag = Atomic.make false in
+      (* Run the bootstrap to completion independently of the startup gate: a
+         Lwt.pick timeout would CANCEL the REST fetch mid-flight, leaving open
+         orders unpopulated (empty dashboard) until the trading WS happens to
+         reconnect. The gate below only waits, it never cancels the work. *)
+      ignore
+        (Lwt.async (fun () ->
+           Lwt.catch
+             (fun () ->
+                Alpaca.Executions.bootstrap_open_orders ()
+                >|= fun () -> Atomic.set done_flag true)
+             (fun _ -> Lwt.return_unit)));
+      let deadline = Unix.gettimeofday () +. 10.0 in
+      let rec wait () =
+        if Atomic.get done_flag || Unix.gettimeofday () >= deadline
+        then Lwt.return_unit
+        else Lwt_unix.sleep 0.2 >>= wait
+      in
+      wait ()
+      >>= fun () ->
+      if Atomic.get done_flag
+      then Lwt.return_unit
+      else (
+        Logging.warn_f ~section "Alpaca open-orders bootstrap still running after 10s";
+        Lwt.return_unit))
+    else Lwt.return_unit
   in
   (* Step 7: Register and start remaining supervised WebSocket connections *)
   Logging.info ~section "Step 7: Starting Kraken websocket connections...";
@@ -540,6 +553,79 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
     in
     set_connect_fn alpaca_trading_conn (Some alpaca_trading_connect_fn);
     start_async alpaca_trading_conn);
+  (* Finnhub fallback price source for Alpaca equities *)
+  if has_alpaca
+  then (
+    let finnhub_configs =
+      alpaca_configs
+      |> List.filter (fun (cfg : Dio_engine.Config.trading_config) ->
+        cfg.Dio_engine.Config.finnhub <> None)
+    in
+    let finnhub_symbols =
+      finnhub_configs
+      |> List.map (fun (cfg : Dio_engine.Config.trading_config) -> cfg.symbol)
+      |> List.sort_uniq String.compare
+    in
+    if finnhub_symbols <> []
+    then
+      if Finnhub.Types.Config.api_key () = ""
+      then
+        Logging.warn
+          ~section
+          "finnhub_fallback enabled but FINNHUB_API_KEY is not set; skipping Finnhub feed"
+      else (
+        List.iter
+          (fun (cfg : Dio_engine.Config.trading_config) ->
+             match cfg.Dio_engine.Config.finnhub with
+             | None -> ()
+             | Some fb ->
+               Alpaca.Fallback.set_params
+                 cfg.symbol
+                 { Alpaca.Fallback.stale_after = fb.stale_after_seconds
+                 ; half_spread = fb.half_spread
+                 ; max_divergence = fb.max_divergence
+                 })
+          finnhub_configs;
+        Logging.info_f
+          ~section
+          "Starting Finnhub fallback feed for %d Alpaca symbol(s)"
+          (List.length finnhub_symbols);
+        let finnhub_poller_conn = register ~name:"finnhub_poller" ~connect_fn:None in
+        let finnhub_poller_connect_fn () =
+          Lwt.catch
+            (fun () ->
+               set_state finnhub_poller_conn Connected;
+               let on_heartbeat () = update_data_heartbeat finnhub_poller_conn in
+               Finnhub.Poller.run_loop
+                 ~symbols:finnhub_symbols
+                 ~should_stop:(fun () -> Atomic.get shutdown_requested)
+                 ~on_heartbeat
+                 ())
+            (fun exn ->
+               let msg = Printexc.to_string exn in
+               set_state finnhub_poller_conn (Failed msg);
+               Lwt.return_unit)
+        in
+        set_connect_fn finnhub_poller_conn (Some finnhub_poller_connect_fn);
+        start_async finnhub_poller_conn;
+        let finnhub_fallback_conn = register ~name:"finnhub_fallback" ~connect_fn:None in
+        let finnhub_fallback_connect_fn () =
+          Lwt.catch
+            (fun () ->
+               set_state finnhub_fallback_conn Connected;
+               let on_heartbeat () = update_data_heartbeat finnhub_fallback_conn in
+               Alpaca.Fallback.run_loop
+                 ~symbols:finnhub_symbols
+                 ~should_stop:(fun () -> Atomic.get shutdown_requested)
+                 ~on_heartbeat
+                 ())
+            (fun exn ->
+               let msg = Printexc.to_string exn in
+               set_state finnhub_fallback_conn (Failed msg);
+               Lwt.return_unit)
+        in
+        set_connect_fn finnhub_fallback_conn (Some finnhub_fallback_connect_fn);
+        start_async finnhub_fallback_conn));
   (* IBKR Gateway TCP connection *)
   if has_ibkr
   then (

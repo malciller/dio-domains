@@ -271,6 +271,8 @@ module Kraken_impl = struct
       if last > 0.0 then Some (Unix.gettimeofday () -. last) else None
   ;;
 
+  let get_quote_age_fast ~symbol:_ = fun () -> None
+  let get_fallback_active ~symbol:_ = false
   let get_total_balance ~asset = Kraken_balances_feed.get_total_balance asset
 
   (** Returns all assets with a positive balance as [(asset, balance)] pairs. *)

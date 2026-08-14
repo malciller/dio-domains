@@ -50,6 +50,14 @@ module SymbolStore = struct
     ; trades_capacity : int
     ; mutable write_pos : int
     ; mutable trades_write_pos : int
+    ; real_ts : float ref
+      (** Arrival time of the last REAL quote (updated only by the "q"
+          handler). Synthetic fallback quotes injected by
+          [inject_fallback_quote] never touch this, so staleness detection
+          keeps firing while only fallback data is flowing. *)
+    ; fallback : bool Atomic.t
+      (** True while the published TOB is a synthetic Finnhub fallback quote;
+          cleared the moment a real quote arrives. *)
     ; tob : tob_cache Atomic.t
       (** Serializes full ring-buffer reads only (read_events / iter_events /
           get_recent_trades). The hot-path TOB/position reads are lock-free
@@ -74,6 +82,8 @@ module SymbolStore = struct
     ; trades_capacity = 100
     ; write_pos = 0
     ; trades_write_pos = 0
+    ; real_ts = ref 0.0
+    ; fallback = Atomic.make false
     ; tob =
         Atomic.make
           { pos = 0
@@ -108,6 +118,30 @@ module SymbolStore = struct
     Atomic.set t.tob tob_cache;
     Concurrency.Exchange_wakeup.signal_all ()
   ;;
+
+  (** Push a REAL quote: stamps [real_ts] and clears the fallback flag so the
+      store immediately reports real market data again. *)
+  let push_real t (q : quote) =
+    push t q;
+    t.real_ts := Unix.gettimeofday ();
+    Atomic.set t.fallback false
+  ;;
+
+  (** Push a synthetic fallback quote and mark the store as fallback-active.
+      Does not touch [real_ts], so quote-age-based staleness detection is
+      unaffected by the synthetic quote. *)
+  let inject t (q : quote) =
+    push t q;
+    Atomic.set t.fallback true
+  ;;
+
+  let get_real_quote_age t =
+    let ts = !(t.real_ts) in
+    if ts > 0.0 then Some (Unix.gettimeofday () -. ts) else None
+  ;;
+
+  let get_fallback t = Atomic.get t.fallback
+  let set_fallback t b = Atomic.set t.fallback b
 
   let push_trade t (tr : trade) =
     Mutex.lock t.mutex;
@@ -221,6 +255,44 @@ let get_best_bid_ask_fast symbol =
   fun () -> SymbolStore.get_best_bid_ask store
 ;;
 
+let get_quote_age symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> SymbolStore.get_real_quote_age store
+  | None -> None
+;;
+
+let get_fallback_active symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> SymbolStore.get_fallback store
+  | None -> false
+;;
+
+let set_fallback_active symbol b =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> SymbolStore.set_fallback store b
+  | None -> ()
+;;
+
+let inject_fallback_quote symbol ~bid_price ~ask_price =
+  let store = get_or_create_store symbol in
+  if bid_price > 0.0 || ask_price > 0.0
+  then (
+    SymbolStore.inject
+      store
+      { bid_price
+      ; bid_size = 0.0
+      ; ask_price
+      ; ask_size = 0.0
+      ; timestamp = Unix.gettimeofday ()
+      };
+    Logging.debug_f
+      ~section
+      "Injected Finnhub fallback quote for %s (bid %.4f ask %.4f)"
+      symbol
+      bid_price
+      ask_price)
+;;
+
 let get_current_position symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> SymbolStore.get_current_position store
@@ -306,7 +378,7 @@ let handle_message_str content =
                in
                if final_bp > 0.0 || final_ap > 0.0
                then (
-                 SymbolStore.push
+                 SymbolStore.push_real
                    store
                    { bid_price = final_bp
                    ; bid_size = final_bs

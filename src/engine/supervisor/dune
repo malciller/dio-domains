@@ -17,11 +17,12 @@
   dio.engine
   dio.oracle
   dio.strategies
-  dio.kraken
-  dio.hyperliquid
-  dio.ibkr
-  dio.lighter
-  dio.alpaca
-  dio.concurrency)
+   dio.kraken
+   dio.hyperliquid
+   dio.ibkr
+   dio.lighter
+   dio.alpaca
+   dio.finnhub
+   dio.concurrency)
  (preprocess
   (pps lwt_ppx)))

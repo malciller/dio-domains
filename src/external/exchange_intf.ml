@@ -331,6 +331,15 @@ module type S = sig
       decide. *)
   val get_balance_age_fast : asset:string -> unit -> float option
 
+  (** Return a fast path closure yielding the age (seconds) of the cached
+      [symbol] quote snapshot (last REAL quote arrival), or [None] when the
+      venue does not track quote freshness or no real quote has arrived yet. *)
+  val get_quote_age_fast : symbol:string -> unit -> float option
+
+  (** Return [true] while the published top-of-book for [symbol] is a
+      synthetic fallback quote rather than venue-sourced real market data. *)
+  val get_fallback_active : symbol:string -> bool
+
   (** Return the total balance for [asset] including staked/earn/vault balances. Returns [0.0] if unknown. *)
   val get_total_balance : asset:string -> float
 
