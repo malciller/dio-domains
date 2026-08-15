@@ -228,6 +228,7 @@ module Alpaca_impl = struct
   let get_quote_age_fast ~symbol = fun () -> Alpaca_orderbook.get_quote_age symbol
   let get_fallback_active ~symbol = Alpaca_orderbook.get_fallback_active symbol
   let get_total_balance ~asset = Alpaca_balances.get_total_balance asset
+  let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Alpaca_balances.get_all_balances ()
 
   let get_open_order ~symbol ~order_id =
