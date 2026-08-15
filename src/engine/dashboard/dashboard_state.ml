@@ -86,7 +86,12 @@ let json_of_grid_strategy exchange symbol =
   let market_is_closed =
     match exch with
     | Ibkr -> not (Ibkr.Market_hours.is_regular_market_open ())
-    | Alpaca -> not (Alpaca.Market_hours.is_market_open ())
+    | Alpaca ->
+      (* Display-side session window: the 24/5 schedule Alpaca trades on,
+         independent of paper mode (paper accepts orders 24/7 operationally,
+         but the dashboard status must still flip to paused outside the
+         session window). *)
+      not (Alpaca.Market_hours.is_schedule_open ())
     | _ -> false
   in
   `Assoc
@@ -125,7 +130,9 @@ let json_of_mm_strategy exchange symbol =
   let market_is_closed =
     match exch with
     | Ibkr -> not (Ibkr.Market_hours.is_regular_market_open ())
-    | Alpaca -> not (Alpaca.Market_hours.is_market_open ())
+    | Alpaca ->
+      (* Display-side session window: see json_of_grid_strategy. *)
+      not (Alpaca.Market_hours.is_schedule_open ())
     | _ -> false
   in
   `Assoc
@@ -170,6 +177,14 @@ let json_of_market_data exchange symbol base_asset quote_currency =
     let tob = Ex.get_top_of_book ~symbol in
     let base_balance =
       try Ex.get_total_balance ~asset:base_asset with
+      | _ -> 0.0
+    in
+    let staked_balance =
+      try Ex.get_staked_balance ~asset:base_asset with
+      | _ -> 0.0
+    in
+    let tradeable_balance =
+      try Ex.get_tradeable_balance ~asset:base_asset with
       | _ -> 0.0
     in
     let quote_balance =
@@ -309,6 +324,8 @@ let json_of_market_data exchange symbol base_asset quote_currency =
       ; "base_asset", `String base_asset
       ; "quote_currency", `String quote_currency
       ; "base_balance", `Float base_balance
+      ; "staked_balance", `Float staked_balance
+      ; "tradeable_balance", `Float tradeable_balance
       ; "quote_balance", `Float quote_balance
       ; "bids", bids_json
       ; "asks", asks_json
@@ -640,6 +657,14 @@ let build_snapshot () =
                     | Some (b, _, a, _) -> `Float b, `Float a
                     | None -> if is_quote then `Float 1.0, `Float 1.0 else `Null, `Null
                   in
+                  let staked_balance =
+                    try Ex.get_staked_balance ~asset with
+                    | _ -> 0.0
+                  in
+                  let tradeable_balance =
+                    try Ex.get_tradeable_balance ~asset with
+                    | _ -> bal
+                  in
                   (* Retrieve open sell orders for this symbol.
                Also query across all symbol stores for this asset to catch
                orders stored under alternative symbol keys. *)
@@ -724,6 +749,8 @@ let build_snapshot () =
                         ; "asset", `String asset
                         ; "symbol", `String symbol
                         ; "balance", `Float bal
+                        ; "staked_balance", `Float staked_balance
+                        ; "tradeable_balance", `Float tradeable_balance
                         ; "bid", bid_json
                         ; "ask", ask_json
                         ; "bids", bids_json

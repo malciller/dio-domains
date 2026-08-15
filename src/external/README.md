@@ -41,7 +41,8 @@ The interface no longer has a single `get_balance`. Balance queries come in seve
 | Function | Purpose |
 | --- | --- |
 | `get_tradeable_balance` | The balance that can be used for new orders (free balance). |
-| `get_total_balance` | Total balance including open-order reserves. |
+| `get_total_balance` | Total balance including open-order reserves AND staked/locked balances (e.g. delegated HYPE). The dashboard's accum/hold figures are computed from this. |
+| `get_staked_balance` | The portion of `get_total_balance` that is staked/locked and therefore NOT tradeable (e.g. delegated HYPE). Strategies never see it via `get_tradeable_balance`. |
 | `get_tradeable_balance_fast` | Non-blocking cached read (see fast paths below). |
 | `get_balance_age_fast` | Seconds since the balance store was last refreshed, or `None` when the exchange does not track freshness. |
 | `get_all_orders_for_asset` | Full order list for one symbol. |

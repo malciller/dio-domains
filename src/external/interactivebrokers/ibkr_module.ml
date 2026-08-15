@@ -366,6 +366,7 @@ module Ibkr_impl = struct
   let get_quote_age_fast ~symbol:_ = fun () -> None
   let get_fallback_active ~symbol:_ = false
   let get_total_balance ~asset = Ibkr_balances.get_balance ~asset
+  let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Ibkr_balances.get_all_balances ()
 
   let get_open_order ~symbol ~order_id =

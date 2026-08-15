@@ -343,6 +343,10 @@ module type S = sig
   (** Return the total balance for [asset] including staked/earn/vault balances. Returns [0.0] if unknown. *)
   val get_total_balance : asset:string -> float
 
+  (** Return the staked/locked balance for [asset] that is part of the total
+      but NOT tradeable (e.g. delegated HYPE). Returns [0.0] if unknown. *)
+  val get_staked_balance : asset:string -> float
+
   (** Return all cached asset balances as [(asset_name, balance)] pairs. *)
   val get_all_balances : unit -> (string * float) list
 

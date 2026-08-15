@@ -218,7 +218,17 @@ let render_asset_detail w h asset_key json =
     let pending_sell_qty =
       List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 sell_orders
     in
-    let accum_qty = Float.max 0.0 (base_bal -. pending_sell_qty) in
+    let staked_bal =
+      if a.is_strategy
+      then market |?> "staked_balance" |> to_float_d 0.0
+      else a.data |?> "staked_balance" |> to_float_d 0.0
+    in
+    (* Staked HYPE is part of [base_bal] but can never be covered by a
+       resting sell (it is not tradeable), so it is never reduced by the
+       pending sell quantity. *)
+    let accum_qty =
+      staked_bal +. Float.max 0.0 (base_bal -. staked_bal -. pending_sell_qty)
+    in
     let accum_val = accum_qty *. mid in
     (* Collect the buy orders and distinguish real exchange orders from
        synthetic strategy targets. *)
@@ -311,6 +321,11 @@ let render_asset_detail w h asset_key json =
           ; I.string a_dim " │ "
           ; I.string a_label "Accum Qty: "
           ; I.string a_cyan (format_qty accum_qty ^ " " ^ a.asset)
+          ; I.string
+              a_dim
+              (if staked_bal > 0.0
+               then " (incl " ^ format_qty staked_bal ^ " staked)"
+               else "")
           ; I.string a_dim " ("
           ; I.string a_cyan (format_usd accum_val)
           ; I.string a_dim ")"

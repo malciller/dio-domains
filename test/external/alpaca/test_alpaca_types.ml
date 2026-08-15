@@ -91,6 +91,48 @@ let test_paper_seconds_until_next_open_zero () =
   restore_defaults ()
 ;;
 
+(* ── 24/5 schedule predicate (display-side session window) ────────────────── *)
+
+(** The 24/5 schedule (Sun 8:00 PM ET - Fri 8:00 PM ET) must hold regardless
+    of paper mode: a paper account accepts orders 24/7, but the dashboard's
+    paused status has to follow the equity market's session window. *)
+let test_schedule_boundaries () =
+  let open Alpaca.Market_hours in
+  let check_at desc wday hour expected =
+    Alcotest.(check bool) desc expected (is_schedule_open_at wday hour)
+  in
+  (* Sunday: closed before 8 PM ET, open from 8 PM ET. *)
+  check_at "Sun 6pm closed" 0 18 false;
+  check_at "Sun 7pm closed" 0 19 false;
+  check_at "Sun 8pm open" 0 20 true;
+  check_at "Sun 11pm open" 0 23 true;
+  (* Mon-Thu: open all day. *)
+  check_at "Mon 2am open" 1 2 true;
+  check_at "Mon 10am open" 1 10 true;
+  check_at "Tue 5pm open" 2 17 true;
+  check_at "Wed 3pm open" 3 15 true;
+  check_at "Thu 1pm open" 4 13 true;
+  (* Friday: open before 8 PM ET, closed at/after 8 PM ET. *)
+  check_at "Fri 7pm open" 5 19 true;
+  check_at "Fri 8pm closed" 5 20 false;
+  check_at "Fri 11pm closed" 5 23 false;
+  (* Saturday: closed all day. *)
+  check_at "Sat midnight closed" 6 0 false;
+  check_at "Sat noon closed" 6 12 false;
+  check_at "Sat 11pm closed" 6 23 false
+;;
+
+let test_schedule_matches_live_market_open () =
+  (* In live mode the operational gate and the session window agree; the two
+     only diverge in paper mode (where the gate is forced open 24/7). *)
+  Alpaca.Module.Config.set_testnet false;
+  Alcotest.(check bool)
+    "live market open follows schedule"
+    (Alpaca.Market_hours.is_market_open ())
+    (Alpaca.Market_hours.is_schedule_open ());
+  restore_defaults ()
+;;
+
 (* ── effective_tif_and_extended (session-aware TIF) ──────────────────────── *)
 
 let tif
@@ -232,6 +274,16 @@ let () =
             "paper mode never waits for open"
             `Quick
             test_paper_seconds_until_next_open_zero
+        ] )
+    ; ( "24/5 schedule"
+      , [ Alcotest.test_case
+            "schedule boundaries (Sun 8pm - Fri 8pm)"
+            `Quick
+            test_schedule_boundaries
+        ; Alcotest.test_case
+            "live market open follows schedule"
+            `Quick
+            test_schedule_matches_live_market_open
         ] )
     ; ( "session TIF"
       , [ Alcotest.test_case "regular GTC" `Quick test_regular_session_gtc

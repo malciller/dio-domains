@@ -33,6 +33,14 @@ let strategy_paused (data : Yojson.Basic.t) : bool =
   || strat |?> "market_is_closed" |> to_bool_d false
 ;;
 
+(** Accumulated quantity: the inventory held that is not committed to a
+    resting sell. [staked] is part of [base] but can never be covered by a
+    pending sell (it is not tradeable), so it is never reduced by
+    [pending_sell_qty]. *)
+let accum_qty_of ~staked ~pending base =
+  staked +. Float.max 0.0 (base -. staked -. pending)
+;;
+
 let get_selectable_assets json =
   let strats =
     match json |?> "strategies" with
@@ -202,6 +210,7 @@ let render_strategies ?(selected_index = None) w json =
     let ask = market |?> "ask" |> to_float_d 0.0 in
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
     let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
+    let staked_bal = market |?> "staked_balance" |> to_float_d 0.0 in
     let hold_value = base_bal *. mid in
     (* The resting buy price prefers the strategy's tracked price because it
        follows amendments, then falls back to the exchange's real open buy
@@ -240,7 +249,9 @@ let render_strategies ?(selected_index = None) w json =
     in
     let accum_holding =
       let res_base = strat |?> "reserved_base" |> to_float_d 0.0 in
-      if res_base > 0.0 then res_base else max 0.0 (base_bal -. pending_sell_qty)
+      if res_base > 0.0
+      then res_base +. staked_bal
+      else accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
     in
     let accum_hold_value = accum_holding *. mid in
     let buy_dist_pct =
@@ -545,7 +556,12 @@ let render_strategies ?(selected_index = None) w json =
         sell_orders
     in
     let is_quote = img_is_quote in
-    let accum_holding = if is_quote then 0.0 else max 0.0 (balance -. pending_sell_qty) in
+    let staked_bal = bal_json |?> "staked_balance" |> to_float_d 0.0 in
+    let accum_holding =
+      if is_quote
+      then 0.0
+      else accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty balance
+    in
     let accum_hold_value = accum_holding *. mid in
     let closest_sell_dist_pct =
       let sell_prices =
@@ -877,6 +893,7 @@ let render_strategies ?(selected_index = None) w json =
          let ask = market |?> "ask" |> to_float_d 0.0 in
          let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
          let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
+         let staked_bal = market |?> "staked_balance" |> to_float_d 0.0 in
          let sell_orders = strat |?> "sell_orders" |> to_list_d in
          let strat_up, pending_sell_qty =
            List.fold_left
@@ -887,7 +904,9 @@ let render_strategies ?(selected_index = None) w json =
              (0.0, 0.0)
              sell_orders
          in
-         let accum_holding = max 0.0 (base_bal -. pending_sell_qty) in
+         let accum_holding =
+           accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
+         in
          let accum_hold_value = accum_holding *. mid in
          ( up_acc +. strat_up
          , hold_acc +. (base_bal *. mid)
@@ -926,7 +945,13 @@ let render_strategies ?(selected_index = None) w json =
                sell_orders
            in
            let accum_holding =
-             if is_quote then 0.0 else max 0.0 (balance -. pending_sell_qty)
+             if is_quote
+             then 0.0
+             else
+               accum_qty_of
+                 ~staked:(bal_json |?> "staked_balance" |> to_float_d 0.0)
+                 ~pending:pending_sell_qty
+                 balance
            in
            let accum_hold_value = accum_holding *. mid in
            ( up_acc +. bal_up
