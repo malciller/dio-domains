@@ -614,7 +614,10 @@ let evaluate_buy_leg
     let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
     let raw_buy_price = calculate_grid_price ref_price grid_interval false state in
     let buy_price =
-      if bid_price > 0.0 then min raw_buy_price bid_price else raw_buy_price
+      let price =
+        if bid_price > 0.0 then min raw_buy_price bid_price else raw_buy_price
+      in
+      state.cached_round_price price
     in
     (* A fresh buy must respect the same 2x-grid-interval spacing below the
        closest resting sell that the trailing leg enforces via [exact_target]
@@ -627,7 +630,8 @@ let evaluate_buy_leg
     let buy_price =
       match closest_sell_order_initial with
       | Some (_, sell_price) ->
-        min buy_price (sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0)))
+        state.cached_round_price
+          (min buy_price (sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0))))
       | None -> buy_price
     in
     let buy_cooldown_key = "place_Buy" in
@@ -892,13 +896,13 @@ let evaluate_buy_leg
                   asset.symbol
                   Buy
                   qty
-                  (Some effective_amend_price)
+                  (Some effective_price_rounded)
                   true
                   Grid
                   asset.exchange
               in
               ignore (push_order ~now ~state order);
-              state.last_buy_order_price <- Some effective_amend_price;
+              state.last_buy_order_price <- Some effective_price_rounded;
               state.force_buy_reanchor <- false;
               if qty_mismatch
               then
@@ -912,7 +916,9 @@ let evaluate_buy_leg
                   qty
                   (if price_moves
                    then
-                     Printf.sprintf " and trailing price up to %.4f" effective_amend_price
+                     Printf.sprintf
+                       " and trailing price up to %.4f"
+                       effective_price_rounded
                    else " (price unchanged)");
               ())
             else if not (Float.is_nan quote_balance)
@@ -1009,13 +1015,13 @@ let evaluate_buy_leg
                   asset.symbol
                   Buy
                   qty
-                  (Some effective_amend_price)
+                  (Some effective_price_rounded)
                   true
                   Grid
                   asset.exchange
               in
               ignore (push_order ~now ~state order);
-              state.last_buy_order_price <- Some effective_amend_price;
+              state.last_buy_order_price <- Some effective_price_rounded;
               state.force_buy_reanchor <- false;
               if qty_mismatch
               then
@@ -1029,7 +1035,9 @@ let evaluate_buy_leg
                   qty
                   (if price_moves
                    then
-                     Printf.sprintf " and trailing price up to %.4f" effective_amend_price
+                     Printf.sprintf
+                       " and trailing price up to %.4f"
+                       effective_price_rounded
                    else " (price unchanged)");
               ())
             else if not (Float.is_nan quote_balance)
