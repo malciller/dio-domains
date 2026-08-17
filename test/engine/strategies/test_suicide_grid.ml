@@ -1686,6 +1686,10 @@ let test_new_buy_respects_2x_gi_closest_sell () =
      99.50 - above the cap, so the cap must pull it down to 99.396. *)
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~persisted_reconcile:([], [])
+       ~asset_balance:nan
+       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
+       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -1866,6 +1870,10 @@ let test_buy_placement_balance_guard () =
   (* 1. Fresh balance, insufficient -> no order pushed, capital_low latched. *)
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~persisted_reconcile:([], [])
+       ~asset_balance:nan
+       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
+       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -1895,6 +1903,10 @@ let test_buy_placement_balance_guard () =
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~persisted_reconcile:([], [])
+       ~asset_balance:nan
+       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
+       ~locked_in_sells:0.0
        ~state:st
        ~now:(now +. 1.0)
        ~asset
@@ -1929,6 +1941,10 @@ let test_buy_placement_balance_guard () =
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~persisted_reconcile:([], [])
+       ~asset_balance:nan
+       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
+       ~locked_in_sells:0.0
        ~state:st
        ~now:(now +. 2.0)
        ~asset
@@ -2192,6 +2208,10 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty ~sell
   ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~persisted_reconcile:([], [])
+       ~asset_balance:nan
+       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
+       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -2316,6 +2336,10 @@ let test_buy_trail_fires_on_single_tick_move () =
   ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~persisted_reconcile:([], [])
+       ~asset_balance:nan
+       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
+       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -2376,6 +2400,10 @@ let test_buy_trail_2xgi_anchored_on_sell () =
   ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+       ~persisted_reconcile:([], [])
+       ~asset_balance:nan
+       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
+       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -2439,6 +2467,10 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
     ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
     ignore
       (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+         ~persisted_reconcile:([], [])
+         ~asset_balance:nan
+         ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
+         ~locked_in_sells:0.0
          ~state:st
          ~now
          ~asset
@@ -2518,6 +2550,10 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
          buy_id);
     ignore
       (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
+         ~persisted_reconcile:([], [])
+         ~asset_balance:nan
+         ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
+         ~locked_in_sells:0.0
          ~state:st
          ~now
          ~asset
