@@ -378,6 +378,26 @@ let handle_trade_update json =
        with _ -> ord.filled_qty)
     | _ -> ord.filled_qty
   in
+  (* Extract the incremental fill quantity from the event-level "qty" field.
+     This is the per-execution fill amount (not cumulative ord.filled_qty),
+     used for the WS-derived balance delta. Only set for fill/partial_fill
+     events where the event-level qty is explicitly present; None when the
+     field is absent or ambiguous (falls back to REST + anticipated_base_credit). *)
+  let fill_delta_qty =
+    if event = "fill" || event = "partial_fill"
+    then
+      match json |> member "qty" with
+      | `Float f when f > 0.0 -> Some f
+      | `Int i when i > 0 -> Some (float_of_int i)
+      | `String s ->
+        (try
+           let q = float_of_string s in
+           if q > 0.0 then Some q else None
+         with
+         | _ -> None)
+      | _ -> None
+    else None
+  in
   let order_status =
     match event with
     | "fill" -> Filled
@@ -416,6 +436,21 @@ let handle_trade_update json =
     price
     filled_qty
     exec_event.remaining_qty;
+  (* Apply WS-derived fill delta to balance immediately (primary source of
+     truth). Only applied when the event-level qty is explicitly present
+     (incremental fill), not the cumulative ord.filled_qty fallback, to
+     prevent over-counting on subsequent partial fills. REST polling +
+     anticipated_base_credit serve as reconciliation fallback. *)
+  (match fill_delta_qty with
+   | Some delta_qty ->
+     Alpaca_balances.apply_fill_delta
+       ~symbol:ord.symbol
+       ~side:(match side with
+              | Buy -> "buy"
+              | Sell -> "sell")
+       ~qty:delta_qty
+       ~price
+   | None -> ());
   let store = get_or_create_store ord.symbol in
   SymbolExecStore.push_event store exec_event;
   (* Publish to centralized fill event bus for Discord notifications if live trading is enabled *)
