@@ -974,12 +974,12 @@ let dispatch_event symbol (ev : lifecycle_event) =
 
 let drain_events symbol =
   let q = get_event_queue symbol in
-  let rec loop () =
+  let rec loop acc =
     match LockFreeQueue.read q with
     | Some ev ->
       dispatch_event symbol ev;
-      loop ()
-    | None -> ()
+      loop true
+    | None -> acc
   in
-  loop ()
+  loop false
 ;;

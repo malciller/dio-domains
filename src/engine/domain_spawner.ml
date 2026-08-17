@@ -553,7 +553,8 @@ let asset_domain_worker
          on the common cycle and the read is a lock-free CAS. *)
       (match !grid_strategy_asset_ref with
        | Some _ ->
-         Dio_strategies.Suicide_grid.Strategy.drain_events asset_with_fees.symbol
+         if Dio_strategies.Suicide_grid.Strategy.drain_events asset_with_fees.symbol
+         then should_execute_strategy := true
        | None -> ());
       (* === ORDERBOOK HOT PATH === *)
       let ob_pos = get_ob_pos_fn () in

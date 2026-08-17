@@ -150,7 +150,12 @@ let populate_cache_from_file_unsafe () =
                  | _ ->
                    item |> member "price" |> to_float, item |> member "qty" |> to_float
                in
-               Some (price, qty)
+               if (not (Float.is_nan price))
+                  && price > 0.0
+                  && (not (Float.is_nan qty))
+                  && qty >= 1e-5
+               then Some (price, qty)
+               else None
              with
              | _ -> None)
          with
