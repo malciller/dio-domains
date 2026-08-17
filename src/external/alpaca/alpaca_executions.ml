@@ -513,7 +513,7 @@ let handle_message_str ?(send_listen = fun () -> Lwt.return_unit) ?(on_connected
              let action =
                data |> member "action" |> to_string_option |> Option.value ~default:""
              in
-             Logging.info_f
+             Logging.debug_f
                ~section
                "Alpaca Trading WS authorization status: %s (action: %s)"
                status
@@ -536,7 +536,7 @@ let handle_message_str ?(send_listen = fun () -> Lwt.return_unit) ?(on_connected
              let streams =
                data |> member "streams" |> to_list |> List.filter_map to_string_option
              in
-             Logging.info_f
+             Logging.debug_f
                ~section
                "Alpaca Trading WS listening on streams: [%s]"
                (String.concat ", " streams)
@@ -585,7 +585,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Websocket_lwt_unix.connect ~ctx client uri
        >>= fun conn ->
        active_conn := Some conn;
-       Logging.info_f ~section "Connected to Alpaca Trading WS at %s" url_str;
+       Logging.debug_f ~section "Connected to Alpaca Trading WS at %s" url_str;
        (* Send the WebSocket authentication request. *)
        let auth_msg =
          `Assoc
@@ -609,7 +609,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
              ]
            |> Yojson.Safe.to_string
          in
-         Logging.info ~section "Sending Alpaca Trading WS listen request for trade_updates...";
+         Logging.debug ~section "Sending Alpaca Trading WS listen request for trade_updates...";
          Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:listen_msg ())
        in
        let rec read_loop () =
