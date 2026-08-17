@@ -281,7 +281,7 @@ let sync_open_orders
   let needs_sells_cleanup =
     let rec check_injected count = function
       | [] -> count > 20
-      | (_, _, ts) :: rest ->
+      | (_, _, _, ts) :: rest ->
         if now_time -. ts >= 10.0 then true else check_injected (count + 1) rest
     in
     check_injected 0 state.recently_injected_sells
@@ -289,7 +289,7 @@ let sync_open_orders
   if needs_sells_cleanup
   then (
     state.recently_injected_sells
-    <- List.filter (fun (_, _, ts) -> now_time -. ts < 10.0) state.recently_injected_sells;
+    <- List.filter (fun (_, _, _, ts) -> now_time -. ts < 10.0) state.recently_injected_sells;
     if List.length state.recently_injected_sells > 20
     then state.recently_injected_sells <- take 20 state.recently_injected_sells);
   let preserved_sells = state.recently_injected_sells in
@@ -485,11 +485,19 @@ let sync_open_orders
   if ecfg.merge_preserved_sells
   then
     List.iter
-      (fun (preserved_id, _preserved_price, _) ->
+      (fun (preserved_id, preserved_price, preserved_qty, _) ->
          let already_present =
            List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders
          in
-         if not already_present then ())
+         if not already_present
+         then (
+           state.open_sell_orders
+           <- (preserved_id, preserved_price, preserved_qty) :: state.open_sell_orders;
+           locked_in_sells := !locked_in_sells +. preserved_qty;
+           if ecfg.remaintain_expired_sells
+           then (
+             let k = price_key preserved_price in
+             record_matched k)))
       preserved_sells;
   (* M16: split the final persisted list into open/missing by draining the
      per-price-key match counts (multiset semantics - duplicate levels at the
