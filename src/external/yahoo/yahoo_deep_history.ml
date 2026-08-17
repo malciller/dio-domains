@@ -31,19 +31,27 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 
 let section = "yahoo"
-let window_seconds = 1_100_000_000L (* ~35 months: ~1050 daily points per request *)
+let window_seconds = 90_720_000L (* ~35 months: ~1050 daily points per request *)
 let day_seconds = 86_400L
 
+let default_headers =
+  Cohttp.Header.of_list
+    [ ( "User-Agent"
+      , "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like \
+         Gecko) Chrome/122.0.0.0 Safari/537.36" )
+    ; ( "Accept"
+      , "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+      )
+    ]
+;;
+
 (* Yahoo throttles sustained bursts (and the crumbless chart API degrades to
-   empty 200s when hammered - the "unexpected ... (no bars)" symptom). The
-   oracle pass now analyzes assets concurrently, so the deep/class fetches
-   would fire many at once. Two guards: [yahoo_mutex] serializes the walks
-   (one at a time), and [pace] keeps a global minimum gap between individual
-   requests (~2/s - the pre-cache sequential engine stayed below Yahoo's
-   tolerance and never hit this). *)
+   empty 200s or 429s when hammered). Two guards: [yahoo_mutex] serializes
+   the walks (one at a time), and [pace] keeps a global minimum gap between
+   individual requests (1.0s to respect Yahoo's edge rate limits). *)
 let yahoo_mutex = Lwt_mutex.create ()
 let last_request_at : float ref = ref 0.0
-let min_request_gap = 0.5
+let min_request_gap = 1.0
 
 let pace () =
   let now = Unix.gettimeofday () in
@@ -54,6 +62,25 @@ let pace () =
     last_request_at := now;
     Lwt.return_unit)
 ;;
+
+(* Global rate-limit / 429 backoff: when Yahoo rate-limits an IP (429,
+   "Too Many Requests", or edge block), it throttles the entire IP, not
+   just one symbol. Back off ALL Yahoo requests globally for
+   [global_block_backoff] seconds so we don't keep hammering a blocked IP. *)
+let global_blocked_until : float ref = ref 0.0
+let global_block_backoff = 120.0
+
+let remember_global_block ?(seconds = global_block_backoff) reason =
+  let until = Unix.gettimeofday () +. seconds in
+  global_blocked_until := until;
+  Logging.warn_f
+    ~section
+    "Yahoo rate-limited / throttled (%s); backing off ALL Yahoo requests for %ds"
+    reason
+    (int_of_float seconds)
+;;
+
+let is_globally_blocked () = Unix.gettimeofday () < !global_blocked_until
 
 (* Yahoo soft-blocks hammered IPs by serving empty 200s ("result": null) for
    a while instead of a 429. Without a memory of it, a blocked walk returns
@@ -87,12 +114,21 @@ let remember_block ~(symbol : string) ~(windows : int) =
    past it (zero requests for the empty range). *)
 
 (** Classify a failed window request: a Yahoo "data doesn't exist" answer is
-    an empty range (skip it), anything else is a real failure (stop). *)
+    an empty range (skip it), anything else is a real failure (stop).
+    Rate limit errors (429, 403, "Too Many Requests") trigger a global backoff. *)
 let classify_error (status : int) (body : string) : [ `Missing_data | `Fatal ] =
+  let b = String.lowercase_ascii body in
   if
+    status = 429
+    || status = 403
+    || String.starts_with ~prefix:"edge: too many requests" b
+    || b = "too many requests"
+  then (
+    remember_global_block (Printf.sprintf "HTTP %d (%s)" status (String.trim body));
+    `Fatal)
+  else if
     status = 400
     &&
-    let b = String.lowercase_ascii body in
     let needle = "data doesn't exist" in
     let nl = String.length needle in
     let hl = String.length b in
@@ -220,58 +256,124 @@ let symbol_of ~(calendar_kind : Exchange.Types.calendar_kind) (symbol : string)
     field are dropped (the API fills sparse rows with nulls). *)
 let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Exchange.Types.bar list =
   let open Yojson.Safe.Util in
-  try
-    let result = json |> member "chart" |> member "result" |> to_list in
-    match result with
-    | [] -> []
-    | head :: _ ->
-      let ts = head |> member "timestamp" |> to_list |> List.filter_map number_of_json in
-      let quote = head |> member "indicators" |> member "quote" |> to_list in
-      (match quote with
-       | [] -> []
-       | q :: _ ->
-         let f key = q |> member key |> to_list |> List.map number_of_json in
-         let opens = f "open" in
-         let highs = f "high" in
-         let lows = f "low" in
-         let closes = f "close" in
-         let volumes = f "volume" in
-         let n = List.length ts in
-         let rows = ref [] in
-         for i = 0 to n - 1 do
-           let num arr =
-             match List.nth_opt arr i with
-             | Some (Some v) when Float.is_finite v -> Some v
-             | _ -> None
-           in
-           match num opens, num highs, num lows, num closes with
-           | Some o, Some h, Some l, Some c when h >= l && c > 0.0 ->
-             let volume =
-               match num volumes with
-               | Some v -> v
-               | None -> 0.0
-             in
-             rows
-             := { Exchange.Types.date = unix_to_iso (Int64.of_float (List.nth ts i))
-                ; open_ = o
-                ; high = h
-                ; low = l
-                ; close = c
-                ; volume
-                }
-                :: !rows
-           | _ -> ()
-         done;
-         let bars = List.rev !rows in
-         bars
-         |> Array.of_list
-         |> Exchange.Types.sort_bars
-         |> Exchange.Types.dedup
-         |> Array.to_list)
-  with
-  | _ ->
-    Logging.warn_f ~section "unexpected Yahoo chart response for %s (no bars)" symbol;
+  let chart =
+    match json with
+    | `Assoc _ -> member "chart" json
+    | _ -> `Null
+  in
+  let error =
+    match chart with
+    | `Assoc _ ->
+      (match member "error" chart with
+       | `Assoc _ as err -> Some err
+       | _ -> None)
+    | _ ->
+      (match member "finance" json with
+       | `Assoc _ as fin ->
+         (match member "error" fin with
+          | `Assoc _ as err -> Some err
+          | _ -> None)
+       | _ -> None)
+  in
+  match error with
+  | Some err ->
+    let code = member "code" err |> to_string_option |> Option.value ~default:"unknown" in
+    let desc = member "description" err |> to_string_option |> Option.value ~default:"" in
+    if code = "Too Many Requests" || desc = "Too Many Requests"
+    then remember_global_block "Yahoo API returned Too Many Requests"
+    else Logging.warn_f ~section "Yahoo chart API error for %s: %s (%s)" symbol code desc;
     []
+  | None ->
+    (try
+       let result =
+         match chart with
+         | `Assoc _ ->
+           (match member "result" chart with
+            | `List l -> l
+            | _ -> [])
+         | _ -> []
+       in
+       match result with
+       | [] -> []
+       | head :: _ ->
+         let ts =
+           match head with
+           | `Assoc _ ->
+             (match member "timestamp" head with
+              | `List l -> List.filter_map number_of_json l
+              | _ -> [])
+           | _ -> []
+         in
+         if ts = []
+         then []
+         else (
+           let quote =
+             match head with
+             | `Assoc _ ->
+               (match member "indicators" head with
+                | `Assoc _ as ind ->
+                  (match member "quote" ind with
+                   | `List l -> l
+                   | _ -> [])
+                | _ -> [])
+             | _ -> []
+           in
+           match quote with
+           | [] -> []
+           | q :: _ ->
+             let f key =
+               match q with
+               | `Assoc _ ->
+                 (match member key q with
+                  | `List l -> List.map number_of_json l
+                  | _ -> [])
+               | _ -> []
+             in
+             let opens = f "open" in
+             let highs = f "high" in
+             let lows = f "low" in
+             let closes = f "close" in
+             let volumes = f "volume" in
+             let n = List.length ts in
+             let rows = ref [] in
+             for i = 0 to n - 1 do
+               let num arr =
+                 match List.nth_opt arr i with
+                 | Some (Some v) when Float.is_finite v -> Some v
+                 | _ -> None
+               in
+               match num opens, num highs, num lows, num closes with
+               | Some o, Some h, Some l, Some c when h >= l && c > 0.0 ->
+                 let volume =
+                   match num volumes with
+                   | Some v -> v
+                   | None -> 0.0
+                 in
+                 rows
+                 := { Exchange.Types.date = unix_to_iso (Int64.of_float (List.nth ts i))
+                    ; open_ = o
+                    ; high = h
+                    ; low = l
+                    ; close = c
+                    ; volume
+                    }
+                    :: !rows
+               | _ -> ()
+             done;
+             let bars = List.rev !rows in
+             bars
+             |> Array.of_list
+             |> Exchange.Types.sort_bars
+             |> Exchange.Types.dedup
+             |> Array.to_list)
+     with
+     | exn ->
+       Logging.warn_f
+         ~section
+         "unexpected Yahoo chart response for %s: %s"
+         symbol
+         (Printexc.to_string exn);
+       [])
 ;;
 
 (** HTTP GET with a timeout (mirrors the oracle's own timeout wrapper): a
@@ -279,7 +381,7 @@ let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Exchange.Types.bar l
     Raises on timeout/transport errors like Cohttp does. *)
 let default_timeout = 10.0
 
-let get ?(headers = Cohttp.Header.init ()) (uri : Uri.t)
+let get ?(headers = default_headers) (uri : Uri.t)
   : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
   =
   Lwt_unix.with_timeout default_timeout (fun () ->
@@ -321,6 +423,14 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
       (unix_to_iso end_epoch)
       0;
     Lwt.return [])
+  else if is_globally_blocked ()
+  then (
+    Logging.debug_f
+      ~section
+      "Yahoo rate-limited globally; skipping fetch for %s (%.0fs left)"
+      symbol
+      (!global_blocked_until -. Unix.gettimeofday ());
+    Lwt.return [])
   else (
     (* Soft-block memory (see [remember_block]): while the symbol is backed
        off, do not even attempt its requests - the pass must not keep the
@@ -340,7 +450,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
           "https://query1.finance.yahoo.com/v8/finance/chart/%s"
           (Uri.pct_encode symbol)
       in
-      let headers = Cohttp.Header.of_list [ "User-Agent", "Mozilla/5.0 (dio-oracle)" ] in
+      let headers = default_headers in
       let rec go from_ms acc ~(skipped : int) ~(empty_200 : int) =
         if Int64.compare from_ms end_epoch > 0
         then Lwt.return (List.rev acc, skipped, empty_200)

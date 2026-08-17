@@ -169,14 +169,16 @@ let fetch_series_for
       | Some (module V) ->
         if offline
         then V.fetch_bars ?feed ?end_date ~from:start_date ~symbol ()
-        else
+        else (
+          let calendar_kind = Oracle_tasks.calendar_kind_of_exchange exchange in
           Oracle_cache.with_delta
             ~exchange
             ~symbol
+            ~calendar_kind
             ~today:(today_iso ())
             ~fetch:(fun boundary ->
               V.fetch_bars ?feed ?end_date ~from:boundary ~symbol ())
-            ()
+            ())
       | None -> invalid_arg ("oracle_fetch: unknown exchange " ^ exchange)
     in
     fetch
@@ -217,6 +219,7 @@ let deepen_series
       Oracle_cache.with_delta
         ~exchange:"yahoo-deep"
         ~symbol:yahoo_symbol
+        ~calendar_kind:series.calendar_kind
         ~today:(today_iso ())
         ~complete_through:end_date
         ~fetch:(fun boundary ->
@@ -308,28 +311,37 @@ let load_members
              >>= fun (series, _) -> Lwt.return (series :: acc)
          | `Yahoo yahoo_symbol ->
            (* Any other member: purely Yahoo, disk-cached, delta through
-              today - the exchange never sees it. *)
+              today - the exchange never sees it. De-duplicated in-memory
+              across all assets sharing this class pool within the same pass. *)
            let calendar_kind = Oracle_tasks.calendar_kind_of_exchange exchange in
-           Oracle_cache.with_delta
-             ~exchange:"yahoo-class"
-             ~symbol:yahoo_symbol
-             ~today:(today_iso ())
-             ~fetch:(fun boundary ->
-               let start_date = Option.value boundary ~default:"2015-01-01" in
-               Yahoo_deep_history.fetch_daily
-                 ~start_date
-                 ~symbol:yahoo_symbol
-                 ~end_date:(today_iso ())
-                 ())
-             ()
-           >>= fun bars ->
+           (match Hashtbl.find_opt fetch_cache ("yahoo-class", yahoo_symbol) with
+            | Some cached_series -> Lwt.return cached_series
+            | None ->
+              Oracle_cache.with_delta
+                ~exchange:"yahoo-class"
+                ~symbol:yahoo_symbol
+                ~calendar_kind
+                ~today:(today_iso ())
+                ~fetch:(fun boundary ->
+                  let start_date = Option.value boundary ~default:"2015-01-01" in
+                  Yahoo_deep_history.fetch_daily
+                    ~start_date
+                    ~symbol:yahoo_symbol
+                    ~end_date:(today_iso ())
+                    ())
+                ()
+              >|= fun bars ->
+              let series =
+                deep_series_of_bars ~calendar_kind ~symbol:yahoo_symbol bars
+              in
+              Hashtbl.replace fetch_cache ("yahoo-class", yahoo_symbol) series;
+              series)
+           >>= fun series ->
            go rest
            >>= fun acc ->
-           if bars = []
+           if Array.length series.bars = 0
            then Lwt.return acc
-           else
-             Lwt.return
-               (deep_series_of_bars ~calendar_kind ~symbol:yahoo_symbol bars :: acc))
+           else Lwt.return (series :: acc))
     in
     go syms
     >>= fun members -> if members = [] then Lwt.return [ asset ] else Lwt.return members)

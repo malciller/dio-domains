@@ -626,7 +626,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                  let synthetic_buy = best_p /. (1.0 +. 0.005) in
                  state.last_buy_fill_price <- Some synthetic_buy);
                if persistence_accumulation_exchange state.exchange_id
-               then state.persistence_dirty <- true)
+               then state.persistence_dirty <- true
              | _ -> ())
           | Buy -> ());
           let should_update_oid =
