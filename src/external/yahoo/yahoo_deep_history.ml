@@ -31,7 +31,7 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 
 let section = "yahoo"
-let window_seconds = 90_720_000L (* ~35 months: ~1050 daily points per request *)
+let window_seconds = 315_360_000L (* ~10 years: fetch historical range in 1-2 requests *)
 let day_seconds = 86_400L
 
 let default_headers =
@@ -48,10 +48,10 @@ let default_headers =
 (* Yahoo throttles sustained bursts (and the crumbless chart API degrades to
    empty 200s or 429s when hammered). Two guards: [yahoo_mutex] serializes
    the walks (one at a time), and [pace] keeps a global minimum gap between
-   individual requests (1.0s to respect Yahoo's edge rate limits). *)
+   individual requests (1.5s to respect Yahoo's edge rate limits). *)
 let yahoo_mutex = Lwt_mutex.create ()
 let last_request_at : float ref = ref 0.0
-let min_request_gap = 1.0
+let min_request_gap = 1.5
 
 let pace () =
   let now = Unix.gettimeofday () in
@@ -452,7 +452,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
       in
       let headers = default_headers in
       let rec go from_ms acc ~(skipped : int) ~(empty_200 : int) =
-        if Int64.compare from_ms end_epoch > 0
+        if Int64.compare from_ms end_epoch > 0 || is_globally_blocked ()
         then Lwt.return (List.rev acc, skipped, empty_200)
         else (
           let to_ms = Int64.min (Int64.add from_ms window_seconds) end_epoch in
@@ -469,38 +469,41 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
             let fetch =
               pace ()
               >>= fun () ->
-              get ~headers (Uri.of_string url)
-              >>= fun (resp, body) ->
-              Cohttp_lwt.Body.to_string body
-              >>= fun body_str ->
-              let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-              if status <> 200
-              then
-                Lwt.fail
-                  (Failure
-                     (Printf.sprintf "Yahoo: HTTP %d for %s (%s)" status symbol body_str))
-              else (
-                let json = Yojson.Safe.from_string body_str in
-                let bars = parse_daily ~symbol json in
-                Lwt.return bars)
+              if is_globally_blocked ()
+              then Lwt.return []
+              else
+                get ~headers (Uri.of_string url)
+                >>= fun (resp, body) ->
+                Cohttp_lwt.Body.to_string body
+                >>= fun body_str ->
+                let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+                if status <> 200
+                then
+                  Lwt.fail
+                    (Failure
+                       (Printf.sprintf "Yahoo: HTTP %d for %s (%s)" status symbol body_str))
+                else (
+                  let json = Yojson.Safe.from_string body_str in
+                  let bars = parse_daily ~symbol json in
+                  Lwt.return bars)
             in
             Lwt.catch
               (fun () ->
                  fetch
-                 >|= fun bars ->
-                 (* An empty 200 is the soft-block signature (Yahoo serves
-                    "result": null for blocked IPs instead of a 429). Count
-                    it; a walk that is ALL empty-200 (no pre-listing skips)
-                    records the block. *)
-                 bars, skipped, empty_200 + if bars = [] then 1 else 0)
+                 >>= fun bars ->
+                 if bars <> []
+                 then
+                   remember_empty
+                     ~symbol
+                     (Exchange.Types.add_days (unix_to_iso from_ms) (-1));
+                 let new_empty_200 = empty_200 + if bars = [] then 1 else 0 in
+                 let acc = List.rev_append bars acc in
+                 if Int64.compare to_ms end_epoch >= 0 || is_globally_blocked ()
+                 then Lwt.return (List.rev acc, skipped, new_empty_200)
+                 else go (Int64.add to_ms day_seconds) acc ~skipped ~empty_200:new_empty_200)
               (fun exn ->
                  match classify_exn exn with
                  | `Missing_data ->
-                   (* The window sits entirely before the symbol's listing: no
-                      data exists in [from_ms, to_ms]. Record the confirmed
-                      empty prefix and skip the window instead of failing the
-                      whole walk (a recently-listed asset would otherwise spam
-                      the same doomed request on every pass). *)
                    remember_empty ~symbol (unix_to_iso to_ms);
                    Logging.debug_f
                      ~section
@@ -508,11 +511,14 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                       skipping this window"
                      symbol
                      (unix_to_iso to_ms);
-                   go
-                     (Int64.add from_ms window_seconds)
-                     acc
-                     ~skipped:(skipped + 1)
-                     ~empty_200
+                   if Int64.compare to_ms end_epoch >= 0 || is_globally_blocked ()
+                   then Lwt.return (List.rev acc, skipped + 1, empty_200)
+                   else
+                     go
+                       (Int64.add from_ms window_seconds)
+                       acc
+                       ~skipped:(skipped + 1)
+                       ~empty_200
                  | `Fatal ->
                    Logging.warn_f
                      ~section
@@ -521,20 +527,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                      (unix_to_iso from_ms)
                      (Printexc.to_string exn)
                      (List.length acc);
-                   Lwt.return (List.rev acc, skipped, empty_200))
-            >>= fun (bars, skipped, empty_200) ->
-            (* A successful window ends the empty prefix: from here on the
-                 symbol has data, so a later fetch can start at this window's
-                 beginning (the walk re-checks nothing before it). *)
-            if bars <> []
-            then
-              remember_empty
-                ~symbol
-                (Exchange.Types.add_days (unix_to_iso from_ms) (-1));
-            let acc = List.rev_append bars acc in
-            if Int64.compare to_ms end_epoch >= 0
-            then Lwt.return (List.rev acc, skipped, empty_200)
-            else go (Int64.add to_ms day_seconds) acc ~skipped ~empty_200))
+                   Lwt.return (List.rev acc, skipped, empty_200))))
       in
       (* One walk at a time (see [yahoo_mutex]): the pass fetches many symbols
          concurrently and Yahoo throttles parallel bursts. *)
