@@ -171,8 +171,7 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
              inventory - the inventory gate (available >= sell qty) is what
              prevents duplicates. *)
           ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
-          state.recently_injected_sells
-          <- (order_id, price, now) :: state.recently_injected_sells;
+          let matched_qty = ref 0.0 in
           let replaced = ref false in
           state.open_sell_orders
           <- List.map
@@ -183,9 +182,18 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
                     && abs_float (p -. price) < price *. 0.01
                   then (
                     replaced := true;
+                    matched_qty := q;
                     order_id, p, q)
                   else oid, p, q)
                state.open_sell_orders;
+          let preserved_qty =
+            if !matched_qty > 0.0
+            then !matched_qty
+            else venue_lot_qty state.grid_qty state.exchange_id state
+          in
+          state.recently_injected_sells
+          <- (order_id, price, preserved_qty, now)
+             :: List.filter (fun (id, _, _, _) -> id <> order_id) state.recently_injected_sells;
           ());
        ())
 ;;
@@ -208,7 +216,11 @@ let handle_order_failed ~now asset_symbol side reason =
           state.open_sell_orders
           <- List.filter
                (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
-               state.open_sell_orders);
+               state.open_sell_orders;
+          state.recently_injected_sells
+          <- List.filter
+               (fun (oid, _, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
+               state.recently_injected_sells);
        let duplicate_key =
          match side with
          | Buy -> state.duplicate_key_buy
@@ -534,6 +546,8 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
            if dominated then state.highest_startup_oid <- Some order_id);
          (match side with
           | Sell ->
+            state.recently_injected_sells
+            <- List.filter (fun (id, _, _, _) -> id <> order_id) state.recently_injected_sells;
             if state.persisted_sell_levels <> []
             then (
               let rec remove_one acc found = function
@@ -598,20 +612,32 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                state.last_sell_fill_price <- Some sell_fill_price;
                if state.open_sell_orders = [] && state.persisted_sell_levels = []
                then state.last_buy_fill_price <- None
-             | _ ->
-               state.last_sell_fill_price <- Some sell_fill_price;
-               if state.open_sell_orders = [] && state.persisted_sell_levels = []
-               then state.last_buy_fill_price <- None)
+               else if
+                 state.exchange_id = "kraken"
+                 && state.open_sell_orders = []
+                 && state.persisted_sell_levels <> []
+               then (
+                 let best_p =
+                   List.fold_left
+                     (fun acc (p, _) -> if p < acc then p else acc)
+                     infinity
+                     state.persisted_sell_levels
+                 in
+                 let synthetic_buy = best_p /. (1.0 +. 0.005) in
+                 state.last_buy_fill_price <- Some synthetic_buy);
+               if persistence_accumulation_exchange state.exchange_id
+               then state.persistence_dirty <- true)
+             | _ -> ())
           | Buy -> ());
-         let should_update_oid =
-           match state.last_fill_oid with
-           | Some prev_oid ->
-             (try
-                Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
-              with
-              | _ -> order_id <> prev_oid)
-           | None -> true
-         in
+          let should_update_oid =
+            match state.last_fill_oid with
+            | Some prev_oid ->
+              (try
+                 Int64.compare (Int64.of_string order_id) (Int64.of_string prev_oid) > 0
+               with
+               | _ -> order_id <> prev_oid)
+            | None -> true
+          in
          if should_update_oid then state.last_fill_oid <- Some order_id;
          if persistence_accumulation_exchange state.exchange_id
          then state.persistence_dirty <- true;
@@ -697,6 +723,10 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
          <- List.filter
               (fun (sell_id, _, _) -> sell_id <> order_id)
               state.open_sell_orders;
+         state.recently_injected_sells
+         <- List.filter
+              (fun (sell_id, _, _, _) -> sell_id <> order_id)
+              state.recently_injected_sells;
          (match cancelled_side with
           | Buy -> state.inflight_buy <- false
           | Sell -> state.inflight_sell <- false);
@@ -779,7 +809,10 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
                   (fun (sell_id, _, _) -> sell_id <> old_order_id)
                   state.open_sell_orders;
           state.recently_injected_sells
-          <- (new_order_id, price, now) :: state.recently_injected_sells;
+          <- (new_order_id, price, old_qty, now)
+             :: List.filter
+                  (fun (id, _, _, _) -> id <> old_order_id && id <> new_order_id)
+                  state.recently_injected_sells;
           (match old_entry with
            | Some (_, old_p, _) when state.persisted_sell_levels <> [] ->
              let rec remove_one acc found = function
