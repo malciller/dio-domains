@@ -226,6 +226,7 @@ module Alpaca_impl = struct
   let get_tradeable_balance_fast ~asset = fun () -> Alpaca_balances.get_balance asset
   let get_balance_age_fast ~asset:_ = fun () -> Alpaca_balances.get_balance_age ()
   let get_total_balance ~asset = Alpaca_balances.get_total_balance asset
+  let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Alpaca_balances.get_all_balances ()
 
   let get_open_order ~symbol ~order_id =

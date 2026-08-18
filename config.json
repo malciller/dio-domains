@@ -23,11 +23,20 @@
     "refresh_seconds": 300.0,
     "assets": {
       "BTC/USDC": {
-        "target_survival": 0.95,
+        "target_survival": 0.85,
         "fng_weight": 0.5,
         "range_weight": 0.25,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 2.5,
+        "qty_cap_mult": 3.0,
+        "no_deep_history": false,
+        "weight_by_sessions": true
+      },
+      "HYPE/USDC": {
+        "target_survival": 0.75,
+        "fng_weight": 0.5,
+        "range_weight": 0.25,
+        "min_active_dsurv": 0.0,
+        "qty_cap_mult": 1.5,
         "no_deep_history": false,
         "weight_by_sessions": true
       }

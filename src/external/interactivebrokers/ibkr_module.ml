@@ -364,6 +364,7 @@ module Ibkr_impl = struct
      preserves the previous attempt-anyway behavior). *)
   let get_balance_age_fast ~asset:_ = fun () -> None
   let get_total_balance ~asset = Ibkr_balances.get_balance ~asset
+  let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Ibkr_balances.get_all_balances ()
 
   let get_open_order ~symbol ~order_id =
