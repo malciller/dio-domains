@@ -289,7 +289,9 @@ let sync_open_orders
   if needs_sells_cleanup
   then (
     state.recently_injected_sells
-    <- List.filter (fun (_, _, _, ts) -> now_time -. ts < 10.0) state.recently_injected_sells;
+    <- List.filter
+         (fun (_, _, _, ts) -> now_time -. ts < 10.0)
+         state.recently_injected_sells;
     if List.length state.recently_injected_sells > 20
     then state.recently_injected_sells <- take 20 state.recently_injected_sells);
   let preserved_sells = state.recently_injected_sells in
@@ -514,12 +516,12 @@ let sync_open_orders
        let rounded_q = round_qty q asset.symbol asset.exchange in
        if rounded_q <= 0.0
        then ()
-       else
+       else (
          match Hashtbl.find_opt matched_level_counts k with
          | Some n when n > 0 ->
            Hashtbl.replace matched_level_counts k (n - 1);
            open_levels_acc := level :: !open_levels_acc
-         | _ -> missing_levels_acc := level :: !missing_levels_acc)
+         | _ -> missing_levels_acc := level :: !missing_levels_acc))
     state.persisted_sell_levels;
   ( !open_buy_count_from_scan
   , !has_recent_amend_buy
@@ -611,8 +613,7 @@ let evaluate_sell_leg
       <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) new_persisted;
       missing_after_reconcile := List.rev !kept_missing;
       pruned_missing := !pruned)
-    else
-      missing_after_reconcile := missing_levels);
+    else missing_after_reconcile := missing_levels);
   if !pruned_missing <> []
   then (
     state.persistence_dirty <- true;
@@ -663,13 +664,13 @@ let evaluate_sell_leg
         (Option.is_some state.last_buy_fill_price))
   else if Float.is_nan asset_balance
   then
-    Logging.info_f
+    Logging.debug_f
       ~section
       "Sell placement skipped for %s: asset_balance is NaN"
       asset.symbol
   else if active_sell
   then
-    Logging.info_f
+    Logging.debug_f
       ~section
       "Sell placement skipped for %s: active sell in flight (inflight_sell=%B, \
        in_flight_orders=%B)"
@@ -678,13 +679,13 @@ let evaluate_sell_leg
       (InFlightOrders.is_in_flight state.duplicate_key_sell)
   else if state.asset_low
   then
-    Logging.info_f
+    Logging.debug_f
       ~section
       "Sell placement skipped for %s: asset_low is true"
       asset.symbol
   else if is_sell_on_cooldown
   then
-    Logging.info_f
+    Logging.debug_f
       ~section
       "Sell placement skipped for %s: place_Sell is on cooldown"
       asset.symbol
@@ -703,9 +704,7 @@ let evaluate_sell_leg
         match missing_sorted_desc with
         | (tp, tq) :: _ ->
           let rounded_tq = round_qty tq asset.symbol asset.exchange in
-          if rounded_tq > 0.0
-          then Some tp, Some tq
-          else None, None
+          if rounded_tq > 0.0 then Some tp, Some tq else None, None
         | [] -> None, None)
       else None, None
     in
@@ -719,11 +718,6 @@ let evaluate_sell_leg
           | None -> bid_price
         in
         calculate_grid_price base_price_for_sell grid_interval true state
-    in
-    let is_accumulated_venue =
-      persistence_accumulation_exchange asset.exchange
-      || ecfg.use_accumulation_sells
-      || ecfg.remaintain_expired_sells
     in
     let available =
       if ecfg.use_accumulation_sells
@@ -742,7 +736,8 @@ let evaluate_sell_leg
       | Some tq when tq > 0.0 ->
         let target_q =
           if ecfg.sell_uses_mult
-          then Float.min tq (round_qty (oracle_qty *. sell_mult) asset.symbol asset.exchange)
+          then
+            Float.min tq (round_qty (oracle_qty *. sell_mult) asset.symbol asset.exchange)
           else tq
         in
         let rounded_tq = round_qty target_q asset.symbol asset.exchange in
@@ -761,7 +756,22 @@ let evaluate_sell_leg
             locked_in_sells;
           0.0, false)
       | _ ->
-        if is_accumulated_venue
+        (* Only genuine accumulation venues (Hyperliquid/Lighter/IBKR,
+           [use_accumulation_sells]) size the sell to the ENTIRE remaining
+           non-accrued inventory - that is the accumulation-ladder rung and it
+           is bounded by the venue's tradeable balance (already net of holds)
+           minus [reserved_base].
+
+           Alpaca (and other non-accumulation venues) must NOT take this path:
+           Alpaca is a 1:1 venue ([sell_uses_mult] false, no sell_mult
+           retention), and treating it as an accumulation venue sized the sell
+           to the whole non-accrued inventory here, placing a stack of
+           full-position sell orders (one per buy fill) that together
+           represented the ENTIRE holding, leaving only [reserved_base] - i.e.
+           it "sold the entire holdings" instead of one grid lot.
+           Non-accumulation venues size to one grid lot (Alpaca 1:1, Kraken
+           qty*sell_mult), clamped to the sellable inventory. *)
+        if ecfg.use_accumulation_sells
         then (
           let rounded = round_qty available asset.symbol asset.exchange in
           if rounded > 0.0
@@ -779,7 +789,9 @@ let evaluate_sell_leg
             0.0, false))
         else (
           let desired_qty =
-            round_qty (oracle_qty *. sell_mult) asset.symbol asset.exchange
+            if ecfg.sell_uses_mult
+            then round_qty (oracle_qty *. sell_mult) asset.symbol asset.exchange
+            else round_qty oracle_qty asset.symbol asset.exchange
           in
           if available >= desired_qty -. 1e-6 && desired_qty > 0.0
           then desired_qty, true
@@ -852,7 +864,8 @@ let evaluate_sell_leg
         Logging.info_f
           ~section
           "Sell order blocked for %s: no sellable inventory clears the venue minimum \
-           (venue_min_qty %.8f, venue_min_notional %.4f, sell_price %.4f, effective_sell_qty %.8f, available %.8f)"
+           (venue_min_qty %.8f, venue_min_notional %.4f, sell_price %.4f, \
+           effective_sell_qty %.8f, available %.8f)"
           asset.symbol
           state.cached_venue_min_qty
           state.cached_venue_min_notional
@@ -1483,7 +1496,9 @@ let execute_strategy
           Option.value (Ex.get_qty_min ~symbol:asset.symbol) ~default:1.0
         | None -> 1.0);
     state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;
-    state.cached_sell_mult <- (try float_of_string asset.sell_mult with _ -> 1.0);
+    state.cached_sell_mult
+    <- (try float_of_string asset.sell_mult with
+        | _ -> 1.0);
     state.exchange_reserved_atomic <- Some (get_exchange_reserved_atomic asset.exchange));
   let ecfg = state.cached_ecfg in
   Mutex.lock state.mutex;
