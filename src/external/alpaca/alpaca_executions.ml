@@ -375,7 +375,8 @@ let handle_trade_update json =
       (try
          let q = float_of_string s in
          if q > 0.0 then q else ord.filled_qty
-       with _ -> ord.filled_qty)
+       with
+       | _ -> ord.filled_qty)
     | _ -> ord.filled_qty
   in
   (* Extract the incremental fill quantity from the event-level "qty" field.
@@ -385,7 +386,7 @@ let handle_trade_update json =
      field is absent or ambiguous (falls back to REST + anticipated_base_credit). *)
   let fill_delta_qty =
     if event = "fill" || event = "partial_fill"
-    then
+    then (
       match json |> member "qty" with
       | `Float f when f > 0.0 -> Some f
       | `Int i when i > 0 -> Some (float_of_int i)
@@ -395,7 +396,7 @@ let handle_trade_update json =
            if q > 0.0 then Some q else None
          with
          | _ -> None)
-      | _ -> None
+      | _ -> None)
     else None
   in
   let order_status =
@@ -423,7 +424,7 @@ let handle_trade_update json =
     ; cl_ord_id = ord.client_order_id
     }
   in
-  Logging.info_f
+  Logging.debug_f
     ~section
     "Trade update [%s]: order %s %s %s %.4f @ %.4f (filled: %.4f, remaining: %.4f)"
     event
@@ -445,9 +446,10 @@ let handle_trade_update json =
    | Some delta_qty ->
      Alpaca_balances.apply_fill_delta
        ~symbol:ord.symbol
-       ~side:(match side with
-              | Buy -> "buy"
-              | Sell -> "sell")
+       ~side:
+         (match side with
+          | Buy -> "buy"
+          | Sell -> "sell")
        ~qty:delta_qty
        ~price
    | None -> ());
@@ -484,7 +486,11 @@ let handle_trade_update json =
   then Lwt.async (fun () -> Alpaca_balances.update_balances ())
 ;;
 
-let handle_message_str ?(send_listen = fun () -> Lwt.return_unit) ?(on_connected = fun () -> ()) content =
+let handle_message_str
+      ?(send_listen = fun () -> Lwt.return_unit)
+      ?(on_connected = fun () -> ())
+      content
+  =
   let trimmed = String.trim content in
   if trimmed <> ""
   then (
@@ -524,7 +530,9 @@ let handle_message_str ?(send_listen = fun () -> Lwt.return_unit) ?(on_connected
                ignore (send_listen ());
                ignore
                  (Lwt.async (fun () ->
-                    Lwt.catch (fun () -> bootstrap_open_orders ()) (fun _ -> Lwt.return_unit))))
+                    Lwt.catch
+                      (fun () -> bootstrap_open_orders ())
+                      (fun _ -> Lwt.return_unit))))
              else if String.equal status "unauthorized"
              then
                Logging.error_f
@@ -609,7 +617,9 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
              ]
            |> Yojson.Safe.to_string
          in
-         Logging.debug ~section "Sending Alpaca Trading WS listen request for trade_updates...";
+         Logging.debug
+           ~section
+           "Sending Alpaca Trading WS listen request for trade_updates...";
          Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:listen_msg ())
        in
        let rec read_loop () =
