@@ -65,22 +65,94 @@ let pace () =
 
 (* Global rate-limit / 429 backoff: when Yahoo rate-limits an IP (429,
    "Too Many Requests", or edge block), it throttles the entire IP, not
-   just one symbol. Back off ALL Yahoo requests globally for
-   [global_block_backoff] seconds so we don't keep hammering a blocked IP. *)
+   just one symbol. Back off ALL Yahoo requests globally using exponential
+   backoff (120s → 240s → 480s → … → 3600s cap) so we don't keep
+   hammering a blocked IP. State is persisted to disk so restarts don't
+   reset the backoff and immediately re-trigger Yahoo's rate limit. *)
 let global_blocked_until : float ref = ref 0.0
-let global_block_backoff = 120.0
+let global_block_count : int ref = ref 0
+let global_backoff_base = 120.0
+let global_backoff_cap = 3600.0
 
-let remember_global_block ?(seconds = global_block_backoff) reason =
-  let until = Unix.gettimeofday () +. seconds in
+let backoff_file =
+  let dir =
+    try Sys.getenv "ORACLE_DATA_DIR" with
+    | Not_found -> Filename.concat (Sys.getenv "HOME") ".config/dio"
+  in
+  Filename.concat dir "yahoo_backoff.json"
+;;
+
+let load_global_backoff () =
+  try
+    if Sys.file_exists backoff_file
+    then (
+      let ic = open_in backoff_file in
+      let json = Yojson.Safe.from_channel ic in
+      close_in ic;
+      let open Yojson.Safe.Util in
+      let until = json |> member "blocked_until" |> to_float in
+      let count = json |> member "block_count" |> to_int in
+      let now = Unix.gettimeofday () in
+      if until > now
+      then (
+        global_blocked_until := until;
+        global_block_count := count;
+        Logging.info_f
+          ~section
+          "Yahoo backoff state loaded from disk: blocked for %.0fs more (consecutive \
+           block #%d)"
+          (until -. now)
+          count))
+  with
+  | _ -> ()
+;;
+
+let save_global_backoff () =
+  try
+    let dir = Filename.dirname backoff_file in
+    if not (Sys.file_exists dir) then Unix.mkdir dir 0o755;
+    let json =
+      `Assoc
+        [ "blocked_until", `Float !global_blocked_until
+        ; "block_count", `Int !global_block_count
+        ]
+    in
+    let oc = open_out backoff_file in
+    Yojson.Safe.pretty_to_string json |> output_string oc;
+    close_out oc
+  with
+  | _ -> ()
+;;
+
+let () = load_global_backoff ()
+
+let remember_global_block reason =
+  let count = !global_block_count in
+  global_block_count := count + 1;
+  let duration =
+    Float.min global_backoff_cap (global_backoff_base *. (2.0 ** float_of_int count))
+  in
+  let until = Unix.gettimeofday () +. duration in
   global_blocked_until := until;
+  save_global_backoff ();
   Logging.warn_f
     ~section
-    "Yahoo rate-limited / throttled (%s); backing off ALL Yahoo requests for %ds"
+    "Yahoo rate-limited / throttled (%s); backing off ALL Yahoo requests for %ds \
+     (exponential backoff, consecutive block #%d)"
     reason
-    (int_of_float seconds)
+    (int_of_float duration)
+    (count + 1)
 ;;
 
 let is_globally_blocked () = Unix.gettimeofday () < !global_blocked_until
+
+(* Walk pacing: when multiple assets are refreshed concurrently via
+   Lwt_list.map_p, they all queue on yahoo_mutex. When the mutex releases,
+   the next walk fires immediately — creating a burst of back-to-back walks
+   that can re-trigger Yahoo's rate limit. Enforce a minimum gap between
+   consecutive walk completions so the queue drains gradually. *)
+let last_walk_finished : float ref = ref 0.0
+let min_walk_gap = 5.0
 
 (* Yahoo soft-blocks hammered IPs by serving empty 200s ("result": null) for
    a while instead of a 429. Without a memory of it, a blocked walk returns
@@ -432,6 +504,14 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
       (!global_blocked_until -. Unix.gettimeofday ());
     Lwt.return [])
   else (
+    (* Walk pacing: prevent bursts when multiple Yahoo walks are queued on
+       yahoo_mutex. If the previous walk finished less than [min_walk_gap]
+       seconds ago, wait so the queue drains gradually instead of firing
+       back-to-back walks that re-trigger Yahoo's rate limit. *)
+    let now = Unix.gettimeofday () in
+    let walk_wait = !last_walk_finished +. min_walk_gap -. now in
+    (if walk_wait > 0.0 then Lwt_unix.sleep walk_wait else Lwt.return_unit)
+    >>= fun () ->
     (* Soft-block memory (see [remember_block]): while the symbol is backed
        off, do not even attempt its requests - the pass must not keep the
        block alive, and an asset whose deep history is blocked keeps the
@@ -451,7 +531,19 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
           (Uri.pct_encode symbol)
       in
       let headers = default_headers in
-      let rec go from_ms acc ~(skipped : int) ~(empty_200 : int) =
+      (* [consecutive_empty] tracks windows that returned HTTP 200 with no
+          bars in a row (Yahoo soft-block signature). When 3+ consecutive
+          windows come back empty with no skipped (pre-listing) windows,
+          abort the walk early — Yahoo is serving empty 200s because the
+          IP is rate-limited, and continuing only wastes requests and
+          keeps the block alive. *)
+      let rec go
+                from_ms
+                acc
+                ~(skipped : int)
+                ~(empty_200 : int)
+                ~(consecutive_empty : int)
+        =
         if Int64.compare from_ms end_epoch > 0 || is_globally_blocked ()
         then Lwt.return (List.rev acc, skipped, empty_200)
         else (
@@ -481,7 +573,11 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                 then
                   Lwt.fail
                     (Failure
-                       (Printf.sprintf "Yahoo: HTTP %d for %s (%s)" status symbol body_str))
+                       (Printf.sprintf
+                          "Yahoo: HTTP %d for %s (%s)"
+                          status
+                          symbol
+                          body_str))
                 else (
                   let json = Yojson.Safe.from_string body_str in
                   let bars = parse_daily ~symbol json in
@@ -497,10 +593,32 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                      ~symbol
                      (Exchange.Types.add_days (unix_to_iso from_ms) (-1));
                  let new_empty_200 = empty_200 + if bars = [] then 1 else 0 in
-                 let acc = List.rev_append bars acc in
-                 if Int64.compare to_ms end_epoch >= 0 || is_globally_blocked ()
-                 then Lwt.return (List.rev acc, skipped, new_empty_200)
-                 else go (Int64.add to_ms day_seconds) acc ~skipped ~empty_200:new_empty_200)
+                 let new_consecutive =
+                   if bars = [] && skipped = 0 then consecutive_empty + 1 else 0
+                 in
+                 (* Early exit: 3+ consecutive empty-200 windows with no
+                     pre-listing skips means Yahoo is blocking this IP.
+                     Stop hammering — the walk is doomed. *)
+                 if new_consecutive >= 3
+                 then (
+                   remember_global_block
+                     (Printf.sprintf
+                        "%d consecutive empty responses for %s (soft-block detected \
+                         mid-walk)"
+                        new_consecutive
+                        symbol);
+                   Lwt.return (List.rev acc, skipped, new_empty_200))
+                 else (
+                   let acc = List.rev_append bars acc in
+                   if Int64.compare to_ms end_epoch >= 0 || is_globally_blocked ()
+                   then Lwt.return (List.rev acc, skipped, new_empty_200)
+                   else
+                     go
+                       (Int64.add to_ms day_seconds)
+                       acc
+                       ~skipped
+                       ~empty_200:new_empty_200
+                       ~consecutive_empty:new_consecutive))
               (fun exn ->
                  match classify_exn exn with
                  | `Missing_data ->
@@ -519,6 +637,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                        acc
                        ~skipped:(skipped + 1)
                        ~empty_200
+                       ~consecutive_empty:0
                  | `Fatal ->
                    Logging.warn_f
                      ~section
@@ -532,8 +651,17 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
       (* One walk at a time (see [yahoo_mutex]): the pass fetches many symbols
          concurrently and Yahoo throttles parallel bursts. *)
       Lwt_mutex.with_lock yahoo_mutex (fun () ->
-        go start_epoch [] ~skipped:0 ~empty_200:0)
+        go start_epoch [] ~skipped:0 ~empty_200:0 ~consecutive_empty:0
+        >|= fun result ->
+        last_walk_finished := Unix.gettimeofday ();
+        result)
       >|= fun (bars, skipped, empty_200) ->
+      (* Successful fetch: reset exponential backoff counter so the next
+         block starts at the base duration again. *)
+      if bars <> []
+      then (
+        global_block_count := 0;
+        save_global_backoff ());
       (* An all-empty-200 walk is the soft-block signature - BUT only when
          the requested range spans more than a few days: a weekend/holiday
          sliver at the deep-history boundary legitimately holds zero trading
