@@ -1380,87 +1380,6 @@ let test_accumulation_sells_non_accrued_inventory () =
     state.just_filled_buy
 ;;
 
-let test_alpaca_sell_capped_at_one_lot_not_entire_holdings () =
-  (* Regression: the guard must NOT let an Alpaca sell carry the ENTIRE
-     non-accrued inventory. Alpaca is a 1:1 venue (sell_uses_mult false, no
-     sell_mult retention), so a fresh sell (no persisted levels / no target
-     override) must be ONE grid lot, NOT round(available) - the latter placed a
-     stack of full-position sell orders that together represented the whole
-     holding (only reserved_base left behind). *)
-  let symbol = "ALPACA_GUARD/USD" in
-  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
-  state.exchange_id <- "alpaca";
-  state.grid_qty <- 0.1;
-  state.maker_fee <- 0.0004;
-  state.cached_sell_mult <- 0.999;
-  state.cached_venue_min_qty <- 0.0;
-  state.cached_venue_min_notional <- 1.0;
-  state.reserved_base <- 0.309;
-  state.accumulated_profit <- 2.0;
-  state.open_sell_orders <- [];
-  state.persisted_sell_levels <- [];
-  state.just_filled_buy <- true;
-  state.last_buy_fill_price <- Some 150.0;
-  state.last_buy_fill_qty <- Some 0.1;
-  let asset =
-    { Dio_strategies.Suicide_grid.exchange = "alpaca"
-    ; symbol
-    ; qty = "0.1"
-    ; grid_interval = 1.0
-    ; sell_mult = "0.999"
-    ; strategy = "Grid"
-    ; maker_fee = Some 0.0004
-    ; taker_fee = None
-    ; accumulation_buffer = 0.05
-    }
-  in
-  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
-  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
-  let rec drain () =
-    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
-    | Some _ -> drain ()
-    | None -> ()
-  in
-  drain ();
-  (* A large position (7.4) vs reserved 0.309: non-accrued inventory is huge.
-     With the bug the sell was sized to the whole inventory (~7.1); the fix
-     caps it to one 0.1 lot. *)
-  Dio_strategies.Suicide_grid.evaluate_sell_leg
-    ~persisted_reconcile:
-      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
-    ~state
-    ~now:100.0
-    ~asset
-    ~bid_price:150.0
-    ~ask_price:150.1
-    ~asset_balance:7.4
-    ~buy_attempted:false
-    ~ecfg
-    ~locked_in_sells:0.0;
-  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
-  let sell =
-    List.find_opt
-      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
-         o.operation = Dio_strategies.Strategy_common.Place
-         && o.side = Dio_strategies.Strategy_common.Sell
-         && o.symbol = symbol)
-      pushed
-  in
-  (match sell with
-   | Some o ->
-     check
-       (float 1e-8)
-       "Alpaca sell sized to one grid lot, not the entire holdings"
-       0.1
-       o.qty
-   | None -> failwith "expected the Alpaca 1:1 sell to be pushed");
-  check
-    bool
-    "just_filled_buy cleared after the sell is placed"
-    false
-    state.just_filled_buy
-;;
-
 let test_nothing_placeable_clears_latch () =
   (* When the known balance holds no sellable inventory above the venue floor,
      the leg verifies nothing can be sold and clears the latch - a later fill
@@ -1767,10 +1686,6 @@ let test_new_buy_respects_2x_gi_closest_sell () =
      99.50 - above the cap, so the cap must pull it down to 99.396. *)
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-       ~persisted_reconcile:([], [])
-       ~asset_balance:nan
-       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
-       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -1951,10 +1866,6 @@ let test_buy_placement_balance_guard () =
   (* 1. Fresh balance, insufficient -> no order pushed, capital_low latched. *)
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-       ~persisted_reconcile:([], [])
-       ~asset_balance:nan
-       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
-       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -1984,10 +1895,6 @@ let test_buy_placement_balance_guard () =
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-       ~persisted_reconcile:([], [])
-       ~asset_balance:nan
-       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
-       ~locked_in_sells:0.0
        ~state:st
        ~now:(now +. 1.0)
        ~asset
@@ -2022,10 +1929,6 @@ let test_buy_placement_balance_guard () =
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-       ~persisted_reconcile:([], [])
-       ~asset_balance:nan
-       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "kraken")
-       ~locked_in_sells:0.0
        ~state:st
        ~now:(now +. 2.0)
        ~asset
@@ -2289,10 +2192,6 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty ~sell
   ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-       ~persisted_reconcile:([], [])
-       ~asset_balance:nan
-       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
-       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -2417,10 +2316,6 @@ let test_buy_trail_fires_on_single_tick_move () =
   ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-       ~persisted_reconcile:([], [])
-       ~asset_balance:nan
-       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
-       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -2481,10 +2376,6 @@ let test_buy_trail_2xgi_anchored_on_sell () =
   ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
   ignore
     (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-       ~persisted_reconcile:([], [])
-       ~asset_balance:nan
-       ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
-       ~locked_in_sells:0.0
        ~state:st
        ~now
        ~asset
@@ -2548,10 +2439,6 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
     ignore (Dio_strategies.Suicide_grid.get_pending_orders 100);
     ignore
       (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-         ~persisted_reconcile:([], [])
-         ~asset_balance:nan
-         ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
-         ~locked_in_sells:0.0
          ~state:st
          ~now
          ~asset
@@ -2631,10 +2518,6 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
          buy_id);
     ignore
       (Dio_strategies.Suicide_grid_execution.evaluate_buy_leg
-         ~persisted_reconcile:([], [])
-         ~asset_balance:nan
-         ~ecfg:(Dio_strategies.Suicide_grid.get_exchange_config "alpaca")
-         ~locked_in_sells:0.0
          ~state:st
          ~now
          ~asset
@@ -2783,10 +2666,6 @@ let () =
             "accumulation sells non-accrued inventory (no locked double-count)"
             `Quick
             test_accumulation_sells_non_accrued_inventory
-        ; test_case
-            "alpaca sell capped at one lot, not the entire holdings"
-            `Quick
-            test_alpaca_sell_capped_at_one_lot_not_entire_holdings
         ; test_case
             "nothing placeable clears the latch"
             `Quick

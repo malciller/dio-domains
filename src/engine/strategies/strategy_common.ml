@@ -5,20 +5,6 @@
 open Lwt.Infix
 module StringMap = Map.Make (String)
 
-(** Per-symbol Finnhub fallback knobs for Alpaca equities. [Some cfg] enables
-    the fallback: when the real Alpaca quote stream goes stale, a synthetic
-    quote is published around the freshest Finnhub mark price. *)
-type finnhub_fallback_config =
-  { stale_after_seconds : float
-    (** Seconds without a real quote before the fallback engages. *)
-  ; half_spread : float
-    (** Half-spread applied around the Finnhub mark for the synthetic
-            quote when no recent real spread is available. *)
-  ; max_divergence : float
-    (** Maximum fractional difference between the Finnhub mark and the
-            last real mid for the fallback to inject. *)
-  }
-
 (** Per-symbol trading parameters parsed from config.json. *)
 type trading_config =
   { exchange : string
@@ -37,8 +23,6 @@ type trading_config =
   ; accumulation_buffer : float * float
     (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
-  ; finnhub : finnhub_fallback_config option
-    (** Finnhub fallback price source config; [None] disables it. *)
   ; asset_class : string option
     (** Risk class for capital-oracle modeling (explicit from config.json;
         required for dio-oracle runs). *)

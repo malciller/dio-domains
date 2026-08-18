@@ -14,9 +14,8 @@
   uri
   threads
   concurrency
-   dio.exchange
-   dio.error_handling
-   dio.latency_profiling
-   dio.finnhub)
+  dio.exchange
+  dio.error_handling
+  dio.latency_profiling)
  (preprocess
   (pps lwt_ppx)))

@@ -63,8 +63,8 @@ type strategy_state =
   ; mutable open_sell_orders : (string * float * float) list (* (order_id, price, qty) *)
   ; mutable persisted_sell_levels : (float * float) list
     (* (target_price, qty) stack for Alpaca GTC *)
-  ; mutable recently_injected_sells : (string * float * float * float) list
-    (* (order_id, price, qty, timestamp) *)
+  ; mutable recently_injected_sells : (string * float * float) list
+    (* (order_id, price, timestamp) *)
   ; mutable pending_orders : (string * order_side * float * float) list
     (* (order_id, side, price, timestamp) *)
   ; mutable last_cycle : int

@@ -306,12 +306,7 @@ let initialize symbols =
 ;;
 
 let bootstrap_open_orders () =
-  Error_handling.retry_with_backoff
-    ~section
-    ~config:Error_handling.default_retry_config
-    ~f:(fun () -> Alpaca_rest.get_open_orders ())
-    ~is_retriable_override:(fun _ -> true)
-    ()
+  Alpaca_rest.get_open_orders ()
   >>= function
   | Ok orders ->
     let grouped = Hashtbl.create 8 in
@@ -357,7 +352,7 @@ let handle_trade_update json =
     | Alpaca_types.Buy -> Buy
     | Sell -> Sell
   in
-  let is_amended = event = "replaced" in
+  let is_amended = false in
   let price =
     match json |> member "price" with
     | `Float f -> f
@@ -367,57 +362,14 @@ let handle_trade_update json =
        | _ -> Option.value ord.limit_price ~default:0.0)
     | _ -> Option.value ord.limit_price ~default:0.0
   in
-  let filled_qty =
-    match json |> member "qty" with
-    | `Float f when f > 0.0 -> f
-    | `Int i when i > 0 -> float_of_int i
-    | `String s ->
-      (try
-         let q = float_of_string s in
-         if q > 0.0 then q else ord.filled_qty
-       with
-       | _ -> ord.filled_qty)
-    | _ -> ord.filled_qty
-  in
-  (* Extract the incremental fill quantity from the event-level "qty" field.
-     This is the per-execution fill amount (not cumulative ord.filled_qty),
-     used for the WS-derived balance delta. Only set for fill/partial_fill
-     events where the event-level qty is explicitly present; None when the
-     field is absent or ambiguous (falls back to REST + anticipated_base_credit). *)
-  let fill_delta_qty =
-    if event = "fill" || event = "partial_fill"
-    then (
-      match json |> member "qty" with
-      | `Float f when f > 0.0 -> Some f
-      | `Int i when i > 0 -> Some (float_of_int i)
-      | `String s ->
-        (try
-           let q = float_of_string s in
-           if q > 0.0 then Some q else None
-         with
-         | _ -> None)
-      | _ -> None)
-    else None
-  in
-  let order_status =
-    match event with
-    | "fill" -> Filled
-    | "partial_fill" -> PartiallyFilled
-    | "canceled" -> Canceled
-    | "expired" -> Expired
-    | "rejected" -> Rejected
-    | "new" -> New
-    | "replaced" -> Canceled
-    | _ -> status_of_alpaca_status ord.status
-  in
   let exec_event =
     { order_id = ord.id
     ; symbol = ord.symbol
-    ; order_status
+    ; order_status = status_of_alpaca_status ord.status
     ; limit_price = ord.limit_price
     ; side
     ; remaining_qty = max 0.0 (ord.qty -. ord.filled_qty)
-    ; filled_qty
+    ; filled_qty = ord.filled_qty
     ; avg_price = price
     ; timestamp = Unix.time ()
     ; is_amended
@@ -435,24 +387,8 @@ let handle_trade_update json =
      | Sell -> "SELL")
     ord.qty
     price
-    filled_qty
+    ord.filled_qty
     exec_event.remaining_qty;
-  (* Apply WS-derived fill delta to balance immediately (primary source of
-     truth). Only applied when the event-level qty is explicitly present
-     (incremental fill), not the cumulative ord.filled_qty fallback, to
-     prevent over-counting on subsequent partial fills. REST polling +
-     anticipated_base_credit serve as reconciliation fallback. *)
-  (match fill_delta_qty with
-   | Some delta_qty ->
-     Alpaca_balances.apply_fill_delta
-       ~symbol:ord.symbol
-       ~side:
-         (match side with
-          | Buy -> "buy"
-          | Sell -> "sell")
-       ~qty:delta_qty
-       ~price
-   | None -> ());
   let store = get_or_create_store ord.symbol in
   SymbolExecStore.push_event store exec_event;
   (* Publish to centralized fill event bus for Discord notifications if live trading is enabled *)
@@ -460,7 +396,7 @@ let handle_trade_update json =
     (not !Alpaca_types.Config.is_paper)
     && (event = "fill" || exec_event.order_status = Filled)
   then (
-    let fill_value = filled_qty *. price in
+    let fill_value = ord.filled_qty *. price in
     let maker_fee_rate =
       match Dio_exchange.Exchange_intf.Registry.get "alpaca" with
       | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
@@ -474,7 +410,7 @@ let handle_trade_update json =
       { venue = "alpaca"
       ; symbol = ord.symbol
       ; side = (if side = Buy then "buy" else "sell")
-      ; amount = filled_qty
+      ; amount = ord.filled_qty
       ; fill_price = price
       ; value = fill_value
       ; fee
@@ -486,11 +422,7 @@ let handle_trade_update json =
   then Lwt.async (fun () -> Alpaca_balances.update_balances ())
 ;;
 
-let handle_message_str
-      ?(send_listen = fun () -> Lwt.return_unit)
-      ?(on_connected = fun () -> ())
-      content
-  =
+let handle_message_str content =
   let trimmed = String.trim content in
   if trimmed <> ""
   then (
@@ -523,22 +455,7 @@ let handle_message_str
                ~section
                "Alpaca Trading WS authorization status: %s (action: %s)"
                status
-               action;
-             if String.equal status "authorized"
-             then (
-               on_connected ();
-               ignore (send_listen ());
-               ignore
-                 (Lwt.async (fun () ->
-                    Lwt.catch
-                      (fun () -> bootstrap_open_orders ())
-                      (fun _ -> Lwt.return_unit))))
-             else if String.equal status "unauthorized"
-             then
-               Logging.error_f
-                 ~section
-                 "Alpaca Trading WS authentication failed: %s"
-                 (Yojson.Safe.to_string item)
+               action
            | "listening" ->
              let data = item |> member "data" in
              let streams =
@@ -609,19 +526,22 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Logging.debug ~section "Sending Alpaca Trading WS authentication...";
        Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ())
        >>= fun () ->
-       let send_listen () =
-         let listen_msg =
-           `Assoc
-             [ "action", `String "listen"
-             ; "data", `Assoc [ "streams", `List [ `String "trade_updates" ] ]
-             ]
-           |> Yojson.Safe.to_string
-         in
-         Logging.debug
-           ~section
-           "Sending Alpaca Trading WS listen request for trade_updates...";
-         Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:listen_msg ())
+       (* Request the trade_updates stream from the server. *)
+       let listen_msg =
+         `Assoc
+           [ "action", `String "listen"
+           ; "data", `Assoc [ "streams", `List [ `String "trade_updates" ] ]
+           ]
+         |> Yojson.Safe.to_string
        in
+       Logging.debug
+         ~section
+         "Sending Alpaca Trading WS listen request for trade_updates...";
+       Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:listen_msg ())
+       >>= fun () ->
+       on_connected ();
+       bootstrap_open_orders ()
+       >>= fun () ->
        let rec read_loop () =
          Websocket_lwt_unix.read conn
          >>= fun frame ->
@@ -644,7 +564,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
             Lwt.fail (Failure "Alpaca Trading WS received Close frame from server")
           | _ ->
             let content = String.trim frame.Websocket.Frame.content in
-            if content <> "" then handle_message_str ~send_listen ~on_connected content;
+            if content <> "" then handle_message_str content;
             Lwt.return_unit)
          >>= fun () -> read_loop ()
        in
