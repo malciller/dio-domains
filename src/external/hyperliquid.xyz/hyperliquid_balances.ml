@@ -37,7 +37,6 @@ module BalanceStore = struct
     ; mutex : Mutex.t
     ; total_balance : float Atomic.t
     ; trading_balance : float Atomic.t
-    ; staked_balance : float Atomic.t
     ; last_updated : float Atomic.t
     }
 
@@ -46,7 +45,6 @@ module BalanceStore = struct
     ; mutex = Mutex.create ()
     ; total_balance = Atomic.make 0.0
     ; trading_balance = Atomic.make 0.0
-    ; staked_balance = Atomic.make 0.0
     ; last_updated = Atomic.make 0.0
     }
   ;;
@@ -81,23 +79,14 @@ module BalanceStore = struct
         store.wallets
         0.0
     in
-    let staked =
-      Hashtbl.fold
-        (fun _ wallet acc ->
-           if wallet.wallet_type = "staking" then acc +. wallet.total else acc)
-        store.wallets
-        0.0
-    in
     Atomic.set store.total_balance total;
     Atomic.set store.trading_balance trading;
-    Atomic.set store.staked_balance staked;
     Atomic.set store.last_updated now;
     Mutex.unlock store.mutex
   ;;
 
   let get_balance store = Atomic.get store.trading_balance
   let get_total_balance store = Atomic.get store.total_balance
-  let get_staked_balance store = Atomic.get store.staked_balance
 
   (** Wall-clock timestamp of the last wallet update for this asset
      (0.0 = never updated). Used for balance-snapshot staleness. *)
@@ -141,11 +130,6 @@ let get_balance asset =
 let get_total_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_total_balance store
-;;
-
-let get_staked_balance asset =
-  let store = get_balance_store asset in
-  BalanceStore.get_staked_balance store
 ;;
 
 let notify_ready () =

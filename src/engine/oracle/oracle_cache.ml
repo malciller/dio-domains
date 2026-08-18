@@ -152,25 +152,11 @@ let unix_of_iso (date : string) : int64 = Int64.div (ms_of_iso date) 1000L
 (* ---- freshness / merge / delta policy ---- *)
 
 (** A cached history is current when its last bar covers today or yesterday
-    (or the last trading session for equity assets over weekends/Mondays). *)
-let is_fresh
-      ?(calendar_kind : Dio_exchange.Exchange_intf.Types.calendar_kind option)
-      ~(today : string)
-      (bars : Oracle_types.bar list)
-  =
-  let floor =
-    match calendar_kind with
-    | Some Dio_exchange.Exchange_intf.Types.Equity ->
-      let wday = Oracle_calendar.iso_wday today in
-      if wday = 0
-      then Oracle_calendar.add_days today (-2)
-      else if wday = 1
-      then Oracle_calendar.add_days today (-3)
-      else Oracle_calendar.add_days today (-1)
-    | _ -> Oracle_calendar.add_days today (-1)
-  in
+    (the in-progress daily bar may lag a day; the grid start price prefers
+    the live websocket bid anyway). *)
+let is_fresh ~(today : string) (bars : Oracle_types.bar list) =
   match List.rev bars with
-  | b :: _ -> String.compare b.date floor >= 0
+  | b :: _ -> String.compare b.date (Oracle_calendar.add_days today (-1)) >= 0
   | [] -> false
 ;;
 
@@ -223,7 +209,6 @@ let clean_bars (bars : Oracle_types.bar list) : Oracle_types.bar list =
       applies. *)
 let with_delta
       ?(dir = cache_dir)
-      ?(calendar_kind : Dio_exchange.Exchange_intf.Types.calendar_kind option)
       ?(complete_through : string option)
       ~(exchange : string)
       ~(symbol : string)
@@ -234,7 +219,7 @@ let with_delta
   =
   let cached = load_bars ~dir ~exchange ~symbol in
   let current =
-    is_fresh ?calendar_kind ~today cached
+    is_fresh ~today cached
     ||
     match complete_through with
     | Some end_date -> covers_through ~tolerance_days:7 ~date:end_date cached

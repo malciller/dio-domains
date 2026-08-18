@@ -343,10 +343,7 @@ module Hyperliquid_impl = struct
       if last > 0.0 then Some (Unix.gettimeofday () -. last) else None
   ;;
 
-  let get_quote_age_fast ~symbol:_ = fun () -> None
-  let get_fallback_active ~symbol:_ = false
   let get_total_balance ~asset = Hyperliquid_balances.get_total_balance asset
-  let get_staked_balance ~asset = Hyperliquid_balances.get_staked_balance asset
 
   let get_all_balances () =
     let assets = Hyperliquid_balances.get_all_assets () in
@@ -737,14 +734,9 @@ let poll_staking_balance () =
       (try
          let json = Yojson.Safe.from_string body_str in
          let open Yojson.Safe.Util in
-         (* delegatorSummary schema (see info-endpoint docs):
-            { "delegated": "...", "undelegated": "...",
-              "totalPendingWithdrawal": "...", "nPendingWithdrawals": 0 } *)
          let delegated = parse_json_float (member "delegated" json) in
-         let undelegated = parse_json_float (member "undelegated" json) in
-         let pending_withdrawal =
-           parse_json_float (member "totalPendingWithdrawal" json)
-         in
+         let pending_withdrawal = parse_json_float (member "pendingWithdrawal" json) in
+         let withdrawable = parse_json_float (member "withdrawable" json) in
          let store = Hyperliquid_balances.get_balance_store "HYPE" in
          Hyperliquid_balances.BalanceStore.update_wallet
            store
@@ -754,25 +746,23 @@ let poll_staking_balance () =
            "delegated";
          Hyperliquid_balances.BalanceStore.update_wallet
            store
-           ~available:undelegated
-           ~total:undelegated
-           "staking"
-           "undelegated";
-         Hyperliquid_balances.BalanceStore.update_wallet
-           store
            ~available:pending_withdrawal
            ~total:pending_withdrawal
            "staking"
            "pending_withdrawal";
+         Hyperliquid_balances.BalanceStore.update_wallet
+           store
+           ~available:withdrawable
+           ~total:withdrawable
+           "staking"
+           "withdrawable";
          Logging.debug_f
            ~section
-           "Updated Hyperliquid HYPE staking balance: delegated=%.6f, undelegated=%.6f, \
-            pendingWithdrawal=%.6f (total=%.6f, staked=%.6f)"
+           "Updated Hyperliquid HYPE staking balance: delegated=%.6f, \
+            pendingWithdrawal=%.6f, withdrawable=%.6f"
            delegated
-           undelegated
            pending_withdrawal
-           (Hyperliquid_balances.get_total_balance "HYPE")
-           (Hyperliquid_balances.get_staked_balance "HYPE");
+           withdrawable;
          Lwt.return_unit
        with
        | exn ->

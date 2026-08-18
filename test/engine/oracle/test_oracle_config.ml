@@ -18,7 +18,6 @@ let trading_config ?(exchange = "kraken") ?(symbol = "X") ?(asset_class = None) 
   ; hedge = false
   ; accumulation_buffer = 0.01, 0.01
   ; data_feed = None
-  ; finnhub = None
   ; asset_class
   }
 ;;

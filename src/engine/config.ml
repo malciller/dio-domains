@@ -16,9 +16,6 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
   ; accumulation_buffer : float * float
     (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
-  ; finnhub : Dio_strategies.Strategy_common.finnhub_fallback_config option
-    (** Finnhub fallback price source config for Alpaca equities; [None]
-        disables it. *)
   ; asset_class : string option
     (** Risk class for capital-oracle modeling (explicit from config.json). *)
   }
@@ -151,10 +148,6 @@ let known_trading_keys =
   ; "hedge"
   ; "accumulation_buffer"
   ; "data_feed"
-  ; "finnhub_fallback"
-  ; "stale_after_seconds"
-  ; "fallback_half_spread"
-  ; "fallback_max_divergence"
   ; "asset_class"
   ]
 ;;
@@ -371,31 +364,6 @@ let parse_config json =
          symbol;
        exit 1));
   let strategy = json |> member "strategy" |> to_string in
-  (* Finnhub fallback knobs are Alpaca-only (equities price fallback). *)
-  (match exch_id with
-   | Alpaca -> ()
-   | _ ->
-     let finnhub_keys =
-       [ "finnhub_fallback"
-       ; "stale_after_seconds"
-       ; "fallback_half_spread"
-       ; "fallback_max_divergence"
-       ]
-     in
-     let actual = json |> to_assoc |> List.map fst in
-     let bad = List.filter (fun k -> List.mem k finnhub_keys) actual in
-     if bad <> []
-     then (
-       List.iter
-         (fun k ->
-            Logging.critical_f
-              ~section
-              "Key '%s' is only valid for exchange 'alpaca' (found in %s/%s)"
-              k
-              exchange
-              symbol)
-         bad;
-       exit 1));
   (* Reject grid_interval when strategy is not Grid. *)
   if strategy <> "Grid"
   then (
@@ -415,35 +383,6 @@ let parse_config json =
   in
   let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
   let data_feed = json |> member "data_feed" |> to_string_option in
-  let finnhub =
-    if exch_id = Alpaca
-    then (
-      let enabled =
-        json |> member "finnhub_fallback" |> to_bool_option |> Option.value ~default:true
-      in
-      if not enabled
-      then None
-      else
-        Some
-          ({ stale_after_seconds =
-               json
-               |> member "stale_after_seconds"
-               |> to_float_option
-               |> Option.value ~default:30.0
-           ; half_spread =
-               json
-               |> member "fallback_half_spread"
-               |> to_float_option
-               |> Option.value ~default:0.001
-           ; max_divergence =
-               json
-               |> member "fallback_max_divergence"
-               |> to_float_option
-               |> Option.value ~default:0.10
-           }
-           : Dio_strategies.Strategy_common.finnhub_fallback_config))
-    else None
-  in
   let asset_class = json |> member "asset_class" |> to_string_option in
   { exchange
   ; symbol
@@ -460,7 +399,6 @@ let parse_config json =
   ; hedge
   ; accumulation_buffer = parse_accumulation_buffer json exchange symbol
   ; data_feed
-  ; finnhub
   ; asset_class
   }
 ;;

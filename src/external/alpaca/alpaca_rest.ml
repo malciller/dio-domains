@@ -194,9 +194,7 @@ let place_order
   let assoc = if mark_extended then ("extended_hours", `Bool true) :: assoc else assoc in
   let assoc =
     match limit_price with
-    | Some p ->
-      let p = Float.round (p *. 100.0) /. 100.0 in
-      ("limit_price", `String (Printf.sprintf "%.2f" p)) :: assoc
+    | Some p -> ("limit_price", `String (Printf.sprintf "%.4f" p)) :: assoc
     | None -> assoc
   in
   let assoc =
@@ -292,9 +290,7 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
   in
   let assoc =
     match limit_price with
-    | Some p ->
-      let p = Float.round (p *. 100.0) /. 100.0 in
-      ("limit_price", `String (Printf.sprintf "%.2f" p)) :: assoc
+    | Some p -> ("limit_price", `String (Printf.sprintf "%.4f" p)) :: assoc
     | None -> assoc
   in
   let assoc =
