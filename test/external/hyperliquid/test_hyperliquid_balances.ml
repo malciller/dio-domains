@@ -72,6 +72,54 @@ let test_has_balance_data () =
   Alcotest.(check bool) "no data initially" false has_before
 ;;
 
+let test_staking_balance_in_total_not_tradeable () =
+  let asset = "STAKETEST_COIN" in
+  let store = Hyperliquid.Balances.get_balance_store asset in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:10.0
+    ~total:10.0
+    "spot"
+    "account";
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:5.0
+    ~total:5.0
+    "staking"
+    "delegated";
+  Alcotest.(check (float 0.000001))
+    "total balance includes staked"
+    15.0
+    (Hyperliquid.Balances.get_total_balance asset);
+  Alcotest.(check (float 0.000001))
+    "tradeable balance excludes staked"
+    10.0
+    (Hyperliquid.Balances.get_balance asset);
+  Alcotest.(check (float 0.000001))
+    "staked balance reported separately"
+    5.0
+    (Hyperliquid.Balances.get_staked_balance asset)
+;;
+
+let test_staked_zero_without_staking () =
+  let asset = "NOSTAKE_COIN" in
+  let store = Hyperliquid.Balances.get_balance_store asset in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:3.0
+    ~total:3.0
+    "spot"
+    "account";
+  Alcotest.(check (float 0.000001))
+    "staked is zero when no staking wallet"
+    0.0
+    (Hyperliquid.Balances.get_staked_balance asset);
+  Alcotest.(check (float 0.000001))
+    "total equals spot"
+    3.0
+    (Hyperliquid.Balances.get_total_balance asset)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Balances"
@@ -81,6 +129,14 @@ let () =
         ; Alcotest.test_case "process_webData2" `Quick test_process_webData2
         ; Alcotest.test_case "get_balance_unknown" `Quick test_get_balance_unknown
         ; Alcotest.test_case "has_balance_data" `Quick test_has_balance_data
+        ; Alcotest.test_case
+            "staking_balance_in_total_not_tradeable"
+            `Quick
+            test_staking_balance_in_total_not_tradeable
+        ; Alcotest.test_case
+            "staked_zero_without_staking"
+            `Quick
+            test_staked_zero_without_staking
         ] )
     ]
 ;;
