@@ -211,10 +211,12 @@ let monitor_loop () =
                    | Some t -> current_time -. t <= 60.0
                    | None -> false
                  in
-                 (* Active ping/pong liveness for authenticated connections and Kraken orderbook *)
+                 (* Active ping/pong liveness for authenticated connections.
+                     The Kraken public orderbook feed does NOT respond to
+                     application-level pings — its liveness is governed
+                     exclusively by the passive data-heartbeat backstop. *)
                  if
                    String.equal conn.name "kraken_auth_ws"
-                   || String.equal conn.name "kraken_orderbook_ws"
                    || String.equal conn.name "hyperliquid_ws"
                    || String.equal conn.name "lighter_ws"
                    || String.equal conn.name "alpaca_data_ws"
@@ -241,37 +243,6 @@ let monitor_loop () =
                                 ~req_id
                                 ~timeout_ms:5000
                               >>= fun response ->
-                              if response.success
-                              then (
-                                Atomic.set conn.ping_failures 0;
-                                update_data_heartbeat conn;
-                                Lwt.return_unit)
-                              else (
-                                Logging.warn_f
-                                  ~section
-                                  "[%s] Ping failed: %s"
-                                  conn.name
-                                  (match response.error with
-                                   | Some e -> e
-                                   | None -> "unknown error");
-                                Atomic.incr conn.ping_failures;
-                                Lwt.return_unit))
-                           (fun exn ->
-                              Logging.warn_f
-                                ~section
-                                "[%s] Ping exception: %s"
-                                conn.name
-                                (Printexc.to_string exn);
-                              Atomic.incr conn.ping_failures;
-                              Lwt.return_unit)
-                       else if String.equal conn.name "kraken_orderbook_ws"
-                       then
-                         Lwt.catch
-                           (fun () ->
-                              Kraken.Kraken_orderbook_feed.send_ping
-                                ~req_id
-                                ~timeout_ms:5000
-                              >>= fun (response : Kraken.Kraken_common_types.ws_response) ->
                               if response.success
                               then (
                                 Atomic.set conn.ping_failures 0;
@@ -434,11 +405,12 @@ let monitor_loop () =
                          ping_failures;
                        set_state conn (Failed "ping timeout")));
                  (* Passive data-heartbeat backstop for ALL connected
-                     connections: a feed that stops producing data (regardless
-                     of ping-probe health) is failed after the silence
-                     threshold. For ping-healthy feeds the successful pings keep
-                     [last_data_received] fresh; for a feed with a broken probe
-                     this is what catches a genuinely dead connection. *)
+                      connections: a feed that stops producing data (regardless
+                      of ping-probe health) is failed after the silence
+                      threshold. For ping-healthy feeds the successful pings keep
+                      [last_data_received] fresh; for feeds without active ping
+                      probes (e.g. Kraken public orderbook) this is the sole
+                      liveness signal that catches a genuinely dead connection. *)
                  (match last_data_received with
                   | Some last_data when current_time -. last_data > 60.0 ->
                     if not (String.equal conn.name "ibkr_gateway")

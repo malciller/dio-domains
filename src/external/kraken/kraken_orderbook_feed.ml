@@ -6,27 +6,15 @@
 *)
 
 open Lwt.Infix
-open Kraken_common_types
 
 let section = "kraken_orderbook"
 
-module Response_table = Hashtbl.Make (struct
-    type t = int
-
-    let equal = Int.equal
-    let hash = Hashtbl.hash
-  end)
-
 type state_t =
   { mutable active_conn : Websocket_lwt_unix.conn option
-  ; responses : (ws_response Lwt.u * float) Response_table.t
   ; mutex : Lwt_mutex.t
   }
 
-let state =
-  { active_conn = None; responses = Response_table.create 8; mutex = Lwt_mutex.create () }
-;;
-
+let state = { active_conn = None; mutex = Lwt_mutex.create () }
 let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 let orderbook_depth = Kraken_common_types.default_orderbook_depth
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_orderbook
@@ -938,36 +926,6 @@ let handle_message message on_heartbeat =
        match channel, msg_type, method_type with
        | Some "heartbeat", _, _ -> Lwt.return (on_heartbeat ())
        | _, _, Some "heartbeat" -> Lwt.return (on_heartbeat ())
-       | _, _, Some "pong" ->
-         let req_id = member "req_id" json |> to_int_option in
-         let success = true in
-         (match req_id with
-          | Some rid ->
-            Lwt_mutex.with_lock state.mutex (fun () ->
-              match Response_table.find_opt state.responses rid with
-              | Some (u, _) ->
-                Response_table.remove state.responses rid;
-                let resp =
-                  { method_ = "pong"
-                  ; success
-                  ; req_id = Some rid
-                  ; time_in =
-                      member "time_in" json
-                      |> to_string_option
-                      |> Option.value ~default:""
-                  ; time_out =
-                      member "time_out" json
-                      |> to_string_option
-                      |> Option.value ~default:""
-                  ; result = None
-                  ; error = None
-                  ; warnings = None
-                  }
-                in
-                Lwt.wakeup_later u resp;
-                Lwt.return_unit
-              | None -> Lwt.return_unit)
-          | None -> Lwt.return_unit)
        | Some "book", Some "snapshot", _ ->
          let now = Unix.gettimeofday () in
          if !last_book_time > 0.0
@@ -1015,37 +973,6 @@ let handle_message message on_heartbeat =
          (Printexc.to_string exn)
          message;
        Lwt.return_unit)
-;;
-
-let send_ping ~req_id ~timeout_ms =
-  let send_time = Mtime_clock.now_ns () in
-  Lwt_mutex.with_lock state.mutex (fun () -> Lwt.return state.active_conn)
-  >>= function
-  | None -> Lwt.fail (Failure "Orderbook WebSocket not connected")
-  | Some conn ->
-    let msg = `Assoc [ "method", `String "ping"; "req_id", `Int req_id ] in
-    let msg_str = Yojson.Safe.to_string msg in
-    let waiter, wakener = Lwt.wait () in
-    Lwt_mutex.with_lock state.mutex (fun () ->
-      Response_table.replace state.responses req_id (wakener, Unix.gettimeofday ());
-      Lwt.return_unit)
-    >>= fun () ->
-    Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
-    >>= fun () ->
-    Lwt.pick
-      [ waiter
-      ; (Lwt_unix.sleep (float_of_int timeout_ms /. 1000.0)
-         >>= fun () ->
-         Lwt_mutex.with_lock state.mutex (fun () ->
-           Response_table.remove state.responses req_id;
-           Lwt.return_unit)
-         >>= fun () -> Lwt.fail (Failure "Ping timeout"))
-      ]
-    >>= fun response ->
-    Network_latency.record_ping
-      "kraken"
-      (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) send_time));
-    Lwt.return response
 ;;
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
