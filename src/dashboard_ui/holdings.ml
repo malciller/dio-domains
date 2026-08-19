@@ -248,10 +248,7 @@ let render_strategies ?(selected_index = None) w json =
         sell_orders
     in
     let accum_holding =
-      let res_base = strat |?> "reserved_base" |> to_float_d 0.0 in
-      if res_base > 0.0
-      then res_base +. staked_bal
-      else accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
+      accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
     in
     let accum_hold_value = accum_holding *. mid in
     let buy_dist_pct =
