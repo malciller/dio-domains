@@ -638,20 +638,29 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
 ;;
 
 let find_registered_symbol coin =
-  match Hyperliquid_instruments_feed.resolve_symbol coin with
+  (* Prefer a registered spot-pair store (e.g. "BTC/USDC") over the bare base
+     symbol (e.g. "BTC") when the coin is the base asset: Hyperliquid spot
+     fills carry the base coin name, and routing them to the perp/base store
+     would strand them in a store the domain worker never reads (the domain
+     reads the full "BASE/QUOTE" store). Only fall back to the resolved
+     perp symbol when no spot-pair store is registered for this coin. *)
+  let result = ref None in
+  let exact = ref None in
+  Mutex.lock initialization_mutex;
+  Hashtbl.iter
+    (fun registered_symbol _ ->
+       if String.starts_with ~prefix:(coin ^ "/") registered_symbol
+       then result := Some registered_symbol
+       else if registered_symbol = coin
+       then exact := Some registered_symbol)
+    stores;
+  Mutex.unlock initialization_mutex;
+  match !result with
   | Some symbol -> Some symbol
   | None ->
-    let result = ref None in
-    Mutex.lock initialization_mutex;
-    Hashtbl.iter
-      (fun registered_symbol _ ->
-         if registered_symbol = coin
-         then result := Some registered_symbol
-         else if String.starts_with ~prefix:(coin ^ "/") registered_symbol
-         then result := Some registered_symbol)
-      stores;
-    Mutex.unlock initialization_mutex;
-    !result
+    (match !exact with
+     | Some symbol -> Some symbol
+     | None -> Hyperliquid_instruments_feed.resolve_symbol coin)
 ;;
 
 (** Detect Hyperliquid-specific rejection status strings. The exchange uses
