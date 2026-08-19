@@ -69,13 +69,17 @@ let get_token () : string Lwt.t =
     Lwt.fail_with (Printf.sprintf "Kraken API HTTP error %d" status))
   else (
     let json = from_string body_str in
-    match Util.(member "error" json, member "result" json |> member "token") with
-    | `List (_ :: _ as errs), _ ->
+    let errors = Util.member "error" json in
+    match errors with
+    | `List (_ :: _ as errs) ->
       let msg = errs |> List.map to_string |> String.concat "; " in
       error_f ~section "API error: %s" msg;
       Lwt.fail_with ("Kraken API error: " ^ msg)
-    | (`Null | `List []), `String token -> Lwt.return token
     | _ ->
-      error_f ~section "Unexpected response format";
-      Lwt.fail_with "Invalid Kraken API response")
+      let result = Util.member "result" json in
+      (match Util.member "token" result with
+       | `String token -> Lwt.return token
+       | _ ->
+         error_f ~section "Unexpected response format: %s" (Yojson.Safe.to_string json);
+         Lwt.fail_with "Invalid Kraken API response"))
 ;;
