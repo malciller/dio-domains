@@ -567,11 +567,13 @@ let test_seed_initializes_state () =
 
 let test_seed_enables_accumulation_sells () =
   (* Hyperliquid accumulation sells: the reduced (sell_mult) sell only fires
-     while accumulated_profit >= rounding_diff*price + buffer. A fresh grid
-     (profit 0, large buffer) sells at FULL qty and retains nothing; a grid
-     seeded with the account's accumulated profit sells reduced and reserves
-     the rounding base each cycle - the live accumulator behavior the oracle
-     must model. *)
+      while accumulated_profit >= rounding_diff*price + buffer. A fresh grid
+      (profit 0, large buffer) sells at FULL qty; a grid seeded with the
+      account's accumulated profit sells reduced - the live accumulator
+      behavior the oracle must model. BOTH grids accrue reserved_base on
+      every buy fill ((1 - sell_mult) x net landed qty): retention is
+      unconditional per fill on accumulation venues, the profit seed only
+      decides whether the SELL itself is reduced. *)
   let c =
     cfg
       ~qty:0.5
@@ -619,7 +621,15 @@ let test_seed_enables_accumulation_sells () =
             ~ordering:Dio_strategies.Grid_core_types.Buy_first))
     [ fresh; seeded ];
   Alcotest.(check int) "fresh sells at full qty" 2 fresh.sell_fills;
-  Alcotest.(check (float 1e-9)) "fresh retains no base" 0.0 fresh.reserved_base;
+  Alcotest.(check bool)
+    "fresh accrues reserve on every buy fill"
+    (fresh.reserved_base > 0.0)
+    true;
+  (* Net-of-base-fee accrual: inc = qty*(1-fee)*(1-sell_mult) per fill. *)
+  Alcotest.(check bool)
+    "accrual is net of the base-side buy fee"
+    (fresh.reserved_base < float_of_int fresh.buy_fills *. 0.5 *. 0.001)
+    true;
   Alcotest.(check int) "seeded sells too" 2 seeded.sell_fills;
   Alcotest.(check bool)
     "seeded retains the rounding base (accumulation)"

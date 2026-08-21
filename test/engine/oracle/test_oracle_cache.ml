@@ -18,6 +18,30 @@ let with_tmp_dir f =
     (fun () -> f dir)
 ;;
 
+let test_save_creates_missing_parents () =
+  (* The cache dir chain (data/oracle_history/v2/<exchange>) may not exist
+     at all on a fresh checkout; save must mkdir -p the whole chain. *)
+  let base =
+    Filename.concat (Filename.get_temp_dir_name ()) "dio_oracle_cache_test_deep"
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      try Unix.system ("rm -rf " ^ Filename.quote base) |> ignore with
+      | _ -> ())
+    (fun () ->
+       let dir = Filename.concat base "oracle_history/v2/kraken" in
+       Dio_oracle.Oracle_cache.save_bars
+         ~dir
+         ~exchange:"kraken"
+         ~symbol:"XMR/USD"
+         [ mk_bar ~date:"2025-01-01" ~close:10.0 ~volume:1.0 ];
+       Alcotest.(check int)
+         "deep parents created, bar persisted"
+         1
+         (List.length
+            (Dio_oracle.Oracle_cache.load_bars ~dir ~exchange:"kraken" ~symbol:"XMR/USD")))
+;;
+
 let test_save_load_roundtrip () =
   with_tmp_dir (fun dir ->
     let bars =
@@ -350,6 +374,10 @@ let () =
     "oracle_cache"
     [ ( "persistence"
       , [ Alcotest.test_case "save/load roundtrip" `Quick test_save_load_roundtrip
+        ; Alcotest.test_case
+            "save creates missing parent dirs"
+            `Quick
+            test_save_creates_missing_parents
         ; Alcotest.test_case "date helpers" `Quick test_ms_of_iso
         ; Alcotest.test_case "freshness policy" `Quick test_is_fresh
         ; Alcotest.test_case "merge dedups + normalizes" `Quick test_merge_bars

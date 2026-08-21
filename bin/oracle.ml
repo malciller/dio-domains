@@ -92,18 +92,24 @@ type args =
   ; members : string list option
   ; kappa : int
   ; kappa_explicit : bool
-  ; target_survival : float
+  ; (* None = not passed on the CLI; resolved per asset from config.json's
+       oracle section (per-asset override > global > built-in default) by
+       [run_one]. *)
+    target_survival : float option
   ; fng : float option
-  ; fng_weight : float
-  ; range_weight : float
-  ; min_active_dsurv : float
-  ; qty_cap_mult : float
-  ; no_deep_history : bool
-  ; weight_by_sessions : bool
+  ; fng_weight : float option
+  ; range_weight : float option
+  ; min_active_dsurv : float option
+  ; qty_cap_mult : float option
+  ; no_deep_history : bool option
+  ; weight_by_sessions : bool option
   ; json : bool
   ; from_csv : string option
   ; from_json : string option
   ; max_capital : float option
+  ; surface_gi_steps : int
+  ; surface_qty_points : int
+  ; surface_scan_points : int
   }
 
 let usage = "Usage: dio-oracle [SYMBOL] [options]"
@@ -143,18 +149,21 @@ let parse_args () =
   let members = ref None in
   let kappa = ref 200 in
   let kappa_explicit = ref false in
-  let target_survival = ref 0.99 in
+  let target_survival = ref None in
   let fng = ref None in
-  let fng_weight = ref 0.5 in
-  let range_weight = ref 0.25 in
-  let min_active_dsurv = ref 0.0 in
-  let qty_cap_mult = ref 0.0 in
-  let no_deep_history = ref false in
-  let weight_by_sessions = ref true in
+  let fng_weight = ref None in
+  let range_weight = ref None in
+  let min_active_dsurv = ref None in
+  let qty_cap_mult = ref None in
+  let no_deep_history = ref None in
+  let weight_by_sessions = ref None in
   let json = ref false in
   let from_csv = ref "" in
   let from_json = ref "" in
   let max_capital = ref None in
+  let surface_gi_steps = ref 10 in
+  let surface_qty_points = ref 8 in
+  let surface_scan_points = ref 24 in
   let speclist =
     Arg.align
       [ ( "--exchange"
@@ -284,38 +293,56 @@ let parse_args () =
         , " class weight in the blend (default 200; a config.json per-class kappa wins \
            unless this is passed)" )
       ; ( "--target-survival"
-        , Arg.Float (fun f -> target_survival := f)
-        , " target blended survival for sizing (default 0.99)" )
+        , Arg.Float (fun f -> target_survival := Some f)
+        , " target blended survival for sizing (default from config.json oracle section, \
+           per-asset override first; else 0.99)" )
       ; ( "--fng"
         , Arg.Float (fun f -> fng := Some f)
         , " Fear & Greed override (0-100); default fetches the live index (crypto only; \
            equities use the survival model alone)" )
       ; ( "--fng-weight"
-        , Arg.Float (fun f -> fng_weight := f)
+        , Arg.Float (fun f -> fng_weight := Some f)
         , " kept for config compatibility; INERT in sizing (the grid interval and qty \
-           are survival-driven over the config ranges - no sentiment blend)" )
+           are survival-driven over the config ranges - no sentiment blend; default from \
+           config.json oracle section, else 0.5)" )
       ; ( "--range-weight"
-        , Arg.Float (fun f -> range_weight := f)
+        , Arg.Float (fun f -> range_weight := Some f)
         , " kept for config compatibility; INERT in sizing (see --fng-weight)" )
       ; ( "--min-active-dsurv"
-        , Arg.Float (fun f -> min_active_dsurv := f)
+        , Arg.Float (fun f -> min_active_dsurv := Some f)
         , " assets whose replayed D_surv stays below this are recommended inactive and \
-           their capital passes down (default 0.0 = fundable means active)" )
+           their capital passes down (default from config.json oracle section, else 0.0 \
+           = fundable means active)" )
       ; ( "--qty-cap-mult"
-        , Arg.Float (fun f -> qty_cap_mult := f)
-        , " the qty ceiling as a multiple of the config qty (default 0.0 = the qty never \
-           grows beyond the minimum): the order qty only grows - to deploy residual \
-           capital - while 100% replay survival holds, capped at config qty * mult" )
+        , Arg.Float (fun f -> qty_cap_mult := Some f)
+        , " the qty ceiling as a multiple of the config qty (default from config.json \
+           oracle section, per-asset override first; else 0.0 = the qty never grows \
+           beyond the minimum): the order qty only grows - to deploy residual capital - \
+           while 100% replay survival holds, capped at config qty * mult" )
       ; ( "--no-deep-history"
-        , Arg.Set no_deep_history
+        , Arg.Unit (fun () -> no_deep_history := Some true)
         , " disable the Yahoo deep-history extension (venue-feed bars only; the venue \
-           API caps some feeds at ~2 years)" )
+           API caps some feeds at ~2 years; default from config.json oracle section, \
+           else false)" )
       ; ( "--no-weight-by-sessions"
-        , Arg.Unit (fun () -> weight_by_sessions := false)
-        , " equal-weight each class member instead of by session count" )
+        , Arg.Unit (fun () -> weight_by_sessions := Some false)
+        , " equal-weight each class member instead of by session count (default from \
+           config.json oracle section, else true)" )
       ; ( "--max-capital"
         , Arg.Float (fun f -> max_capital := Some f)
         , " upper bound of the capital binary search (default 1e9)" )
+      ; ( "--surface-gi-steps"
+        , Arg.Int (fun i -> surface_gi_steps := i)
+        , " cash requirement surface: points along the config grid_interval range \
+           (default 10, corners included)" )
+      ; ( "--surface-qty-points"
+        , Arg.Int (fun i -> surface_qty_points := i)
+        , " cash requirement surface: points between the venue qty floor and config qty \
+           x qty_cap_mult, lot-rounded (default 8)" )
+      ; ( "--surface-scan-points"
+        , Arg.Int (fun i -> surface_scan_points := i)
+        , " cash requirement surface: empirical replay scan resolution per cell (default \
+           24; raise for tighter replay-verified boundaries)" )
       ; "--json", Arg.Set json, " emit JSON report"
       ; ( "--from-csv"
         , Arg.Set_string from_csv
@@ -372,6 +399,9 @@ let parse_args () =
   ; from_csv = (if !from_csv = "" then None else Some !from_csv)
   ; from_json = (if !from_json = "" then None else Some !from_json)
   ; max_capital = !max_capital
+  ; surface_gi_steps = !surface_gi_steps
+  ; surface_qty_points = !surface_qty_points
+  ; surface_scan_points = !surface_scan_points
   }
 ;;
 
@@ -410,7 +440,10 @@ let deepen_series (a : args) (series : Oracle_types.series)
   : (Oracle_types.series * int) Lwt.t
   =
   let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
-  Dio_oracle.Oracle_fetch.deepen_series ~no_deep_history:a.no_deep_history ~offline series
+  Dio_oracle.Oracle_fetch.deepen_series
+    ~no_deep_history:(Option.value a.no_deep_history ~default:false)
+    ~offline
+    series
 ;;
 
 (** Load the class member pool: explicit --members when online, config.json
@@ -433,7 +466,7 @@ let load_members
   in
   Dio_oracle.Oracle_fetch.load_members
     ?explicit_members:a.members
-    ~no_deep_history:a.no_deep_history
+    ~no_deep_history:(Option.value a.no_deep_history ~default:false)
     ~offline:(Option.is_some a.from_csv || Option.is_some a.from_json)
     ~exchange:a.exchange
     pool_members
@@ -561,6 +594,99 @@ let horizon_label_of (c_ : Oracle_types.historical_path_coverage) =
   c_.Oracle_types.horizon.Oracle_types.label
 ;;
 
+(** The cash requirement surface computed for one asset: per-horizon labels,
+    one row per (gi, qty) cell, and the wall time the sweep took. *)
+type cash_surface_data =
+  { labels : string list
+  ; rows : S.cash_cell list
+  ; elapsed_s : float
+  }
+
+(** Renders the cash requirement surface: at every swept (gi, qty)
+    configuration between the venue floors and the config ceilings, how much
+    capital clears the survival target on each horizon - closed-form static
+    plus the replay-verified empirical number. A fully-unreachable surface
+    collapses to a single explanatory line (every cell would print "-"). *)
+let cash_surface_block (a : args) ~(cs : cash_surface_data) (b : Buffer.t) =
+  let line fmt =
+    Printf.ksprintf
+      (fun s ->
+         Buffer.add_string b s;
+         Buffer.add_char b '\n')
+      fmt
+  in
+  let labels = cs.labels in
+  let rows = cs.rows in
+  let all_unreachable =
+    List.for_all
+      (fun (r : S.cash_cell) ->
+         Array.for_all (fun (x : Oracle_types.sizing_result) -> not x.reachable) r.static
+         && Array.for_all
+              (fun (x : Oracle_types.sizing_result) -> not x.reachable)
+              r.empirical)
+      rows
+  in
+  line "";
+  if all_unreachable
+  then
+    line
+      "Cash requirement surface: no (gi, qty) within bounds clears the target survival \
+       %.1f%% on any horizon - see the warnings above (e.g. immature history)"
+      (Option.value a.target_survival ~default:0.99 *. 100.0)
+  else (
+    line
+      "Cash requirement surface (%d gi x %d qty cells; min capital clearing target \
+       survival %.1f%% on each horizon; emp = replay-verified; computed in %.1fs):"
+      a.surface_gi_steps
+      a.surface_qty_points
+      (Option.value a.target_survival ~default:0.99 *. 100.0)
+      cs.elapsed_s;
+    let money v =
+      if v >= 1e6
+      then Printf.sprintf "$%.2fM" (v /. 1e6)
+      else if v >= 1000.0
+      then Printf.sprintf "$%.1fk" (v /. 1e3)
+      else Printf.sprintf "$%.0f" v
+    in
+    let cell (r : Oracle_types.sizing_result) =
+      if r.reachable then money r.value else "-"
+    in
+    let group cells =
+      String.concat " " (List.map (fun c -> Printf.sprintf "%8s" c) cells)
+    in
+    line
+      "     gi       qty   %s   %s"
+      (group (labels @ [ "ALL" ]))
+      (group (List.map (fun l -> "emp" ^ l) labels @ [ "empALL" ]));
+    line
+      "  emp boundaries are scan-refined at --surface-scan-points %d resolution; \
+       adjacent-cell jumps >2x indicate replay boundary noise - recheck with a higher \
+       value"
+      a.surface_scan_points;
+    List.iter
+      (fun (r : S.cash_cell) ->
+         let n_h = List.length labels in
+         let stat = List.init n_h (fun j -> cell r.static.(j)) in
+         let emp = List.init n_h (fun j -> cell r.empirical.(j)) in
+         let all_stat =
+           match S.combined_sizing r.static with
+           | Some x -> cell x
+           | None -> "-"
+         in
+         let all_emp =
+           match S.combined_sizing r.empirical with
+           | Some x -> cell x
+           | None -> "-"
+         in
+         line
+           "  %6.2f%% %10s   %s   %s"
+           r.gi
+           (Printf.sprintf "%.6g" r.qty)
+           (group (stat @ [ all_stat ]))
+           (group (emp @ [ all_emp ])))
+      rows)
+;;
+
 (** The engine's headline block for one asset: the recommended qty/gi, the
     deployed capital, the reserve passed down, and the verification coverage. *)
 let deployment_block
@@ -680,6 +806,14 @@ let deployment_block
       (if d.qty = 0.0 then "0.0" else Printf.sprintf "%.6g" d.qty)
       gi_lo
       gi_hi);
+  line
+    "    knobs (effective): target_survival %.2f   qty_cap_mult %.2f   min_active_dsurv \
+     %.2f   weight_by_sessions %b   no_deep_history %b"
+    (Option.value a.target_survival ~default:0.99)
+    (Option.value a.qty_cap_mult ~default:0.0)
+    (Option.value a.min_active_dsurv ~default:0.0)
+    (Option.value a.weight_by_sessions ~default:true)
+    (Option.value a.no_deep_history ~default:false);
   List.iter (fun (w : string) -> line "    warning: %s" w) d.warnings
 ;;
 
@@ -740,6 +874,7 @@ let report_text
       ~(gi_lo : float)
       ~(gi_hi : float)
       ~(deep_bars : int)
+      ~(cash_surface : cash_surface_data option)
       (grid : Dio_strategies.Grid_core.config)
       (members : Oracle_types.series list)
       (class_name : string)
@@ -868,7 +1003,9 @@ let report_text
             (pct c_.blended_coverage))
        coverages;
      line "";
-     line "Inverse sizing (target blended survival %.1f%%):" (a.target_survival *. 100.0);
+     line
+       "Inverse sizing (target blended survival %.1f%%):"
+       (Option.value a.target_survival ~default:0.99 *. 100.0);
      line
        "  %-7s %14s %8s %8s   %10s %8s"
        "horizon"
@@ -926,6 +1063,9 @@ let report_text
          "  * target not reached: no parameter within the search bounds clears it (the \
           required capital exceeds --max-capital, or the required qty is below \
           --qty-increment)");
+  (match cash_surface with
+   | Some cs -> cash_surface_block a ~cs b
+   | None -> ());
   Buffer.contents b
 ;;
 
@@ -938,6 +1078,7 @@ let report_json
       ~(gi_lo : float)
       ~(gi_hi : float)
       ~(deep_bars : int)
+      ~(cash_surface : cash_surface_data option)
       (grid : Dio_strategies.Grid_core.config)
       (asset : Oracle_types.series)
       (members : Oracle_types.series list)
@@ -1120,6 +1261,40 @@ let report_json
           ] )
     ; "replay", replay_j
     ; "sizing", `List (List.map sizing_j coverages)
+    ; ( "cash_surface"
+      , match cash_surface with
+        | None -> `Null
+        | Some cs ->
+          let sr (x : Oracle_types.sizing_result) =
+            `Assoc
+              [ "value", `Float x.value
+              ; "d_surv", `Float x.d_surv
+              ; "coverage", `Float x.coverage
+              ; "reachable", `Bool x.reachable
+              ]
+          in
+          let all_of arr =
+            match S.combined_sizing arr with
+            | Some x -> sr x
+            | None -> `Null
+          in
+          `Assoc
+            [ "horizons", `List (List.map (fun l -> `String l) cs.labels)
+            ; "elapsed_s", `Float cs.elapsed_s
+            ; ( "rows"
+              , `List
+                  (List.map
+                     (fun (r : S.cash_cell) ->
+                        `Assoc
+                          [ "gi", `Float r.gi
+                          ; "qty", `Float r.qty
+                          ; "static", `List (Array.to_list (Array.map sr r.static))
+                          ; "static_all", all_of r.static
+                          ; "empirical", `List (Array.to_list (Array.map sr r.empirical))
+                          ; "empirical_all", all_of r.empirical
+                          ])
+                     cs.rows) )
+            ] )
     ; ( "last_close"
       , `Float
           (if Array.length asset.bars = 0
@@ -1137,10 +1312,9 @@ let run_one
       (a : args)
       (classes : (string * Dio_engine.Config.class_pool) list)
       (task : Oracle_tasks.task)
+      ~(base_rc : Dio_oracle.Oracle_runtime.runtime_config)
       ~(pool : float)
       ~(fng : float option)
-      ~(fng_weight : float)
-      ~(min_active_dsurv : float)
       ~(index : int)
       ~(n_tasks : int)
   : Yojson.Safe.t option * float
@@ -1148,6 +1322,38 @@ let run_one
   let a =
     { a with symbol = task.Oracle_tasks.symbol; exchange = task.Oracle_tasks.exchange }
   in
+  (* Effective oracle knobs follow the live engine's resolution
+     (Oracle_runtime.resolve_for): explicit CLI flag > config.json per-asset
+     override ("venue/symbol" > "symbol") > global oracle section > built-in
+     default. Resolved values are stored back as [Some] so every downstream
+     consumer sees them. *)
+  let rc = Dio_oracle.Oracle_runtime.resolve_for base_rc ~exchange:a.exchange a.symbol in
+  let a =
+    { a with
+      target_survival = Some (Option.value a.target_survival ~default:rc.target_survival)
+    ; fng_weight = Some (Option.value a.fng_weight ~default:rc.fng_weight)
+    ; range_weight = Some (Option.value a.range_weight ~default:rc.range_weight)
+    ; min_active_dsurv =
+        Some (Option.value a.min_active_dsurv ~default:rc.min_active_dsurv)
+    ; qty_cap_mult = Some (Option.value a.qty_cap_mult ~default:rc.qty_cap_mult)
+    ; no_deep_history = Some (Option.value a.no_deep_history ~default:rc.no_deep_history)
+    ; weight_by_sessions =
+        Some (Option.value a.weight_by_sessions ~default:rc.weight_by_sessions)
+    ; horizons =
+        (match a.horizons with
+         | Some _ -> a.horizons
+         | None -> rc.horizons)
+    ; max_capital =
+        (match a.max_capital with
+         | Some _ -> a.max_capital
+         | None -> rc.max_capital)
+    }
+  in
+  let target_survival = Option.value a.target_survival ~default:0.99 in
+  let fng_weight = Option.value a.fng_weight ~default:0.5 in
+  let range_weight = Option.value a.range_weight ~default:0.25 in
+  let min_active_dsurv = Option.value a.min_active_dsurv ~default:0.0 in
+  let qty_cap_mult = Option.value a.qty_cap_mult ~default:0.0 in
   let account = account_of_task task in
   let calendar_kind = Oracle_tasks.calendar_kind_of_exchange a.exchange in
   let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
@@ -1282,7 +1488,7 @@ let run_one
     ; gap_tolerance
     ; classes = [ { Oracle.name = class_name; kappa = a.kappa; members } ]
     ; equity_sessions
-    ; weight_by_sessions = a.weight_by_sessions
+    ; weight_by_sessions = Option.value a.weight_by_sessions ~default:true
     }
   in
   let r = Oracle.analyze asset cfg in
@@ -1296,6 +1502,94 @@ let run_one
       ()
   in
   let models = List.map model horizons in
+  (* Cash requirement surface: a pool-independent sweep over (gi, qty)
+     between the venue floors and the config ceilings - at every swept
+     configuration, how much capital clears the survival target on each
+     horizon (static closed form + replay-verified empirical). Runs for
+     inactive assets too: it answers "what would funding this asset take",
+     which is exactly when the venue pool has already moved on. *)
+  let cash_surface =
+    let template = { grid with start_quote = 0.0 } in
+    let steps = max 1 a.surface_gi_steps in
+    let gis =
+      if steps = 1
+      then [ gi_hi ]
+      else
+        List.init steps (fun i ->
+          gi_lo +. ((gi_hi -. gi_lo) *. float_of_int i /. float_of_int (steps - 1)))
+    in
+    (* Venue order floor: the larger of the lot-rounded qty_min and the
+       smallest lot-aligned qty that clears the min notional. *)
+    let ceil_lot q =
+      if template.qty_increment > 0.0
+      then
+        Float.ceil ((q *. (1.0 /. template.qty_increment)) -. 1e-9)
+        /. (1.0 /. template.qty_increment)
+      else q
+    in
+    let q_floor =
+      if template.min_notional > 0.0 && template.start_price > 0.0
+      then
+        Float.max
+          template.qty_min
+          (ceil_lot (template.min_notional /. template.start_price))
+      else Float.max template.qty_min template.qty_increment
+    in
+    let q_floor = G.round_qty template q_floor in
+    (* Ceiling: the effective config qty grown by the resolved qty cap. *)
+    let q_hi =
+      G.round_qty
+        template
+        (if qty_cap_mult > 0.0 then template.qty *. qty_cap_mult else template.qty)
+    in
+    let q_hi = Float.max q_floor q_hi in
+    let qn = max 1 a.surface_qty_points in
+    let qtys =
+      if qn = 1 || q_hi <= q_floor
+      then [ q_hi ]
+      else (
+        let raw =
+          List.init qn (fun i ->
+            q_floor *. ((q_hi /. q_floor) ** (float_of_int i /. float_of_int (qn - 1))))
+        in
+        List.sort_uniq
+          compare
+          (List.map (fun q -> G.round_qty template q) ((q_floor :: raw) @ [ q_hi ])))
+    in
+    let cells =
+      List.concat_map
+        (fun gi ->
+           List.map (fun qty -> gi, qty, G.set_parameter (G.set_qty template qty) gi) qtys)
+        gis
+    in
+    (* stdout is block-buffered; flush it before the stderr progress lines so
+       captured output keeps report/log/report ordering readable. *)
+    flush stdout;
+    Logging.info_f
+      ~section:"oracle"
+      "cash surface (%s): sweeping %d (gi x qty) cells x %d horizons, replay-verified \
+       sizing - this is the slow part"
+      asset.symbol
+      (List.length cells)
+      (List.length models);
+    let t0 = Unix.gettimeofday () in
+    let rows =
+      S.surface_rows
+        ~empirical_scan_points:a.surface_scan_points
+        ?hi:a.max_capital
+        ~target_survival
+        ~models
+        cells
+    in
+    let elapsed_s = Unix.gettimeofday () -. t0 in
+    flush stdout;
+    Logging.info_f
+      ~section:"oracle"
+      "cash surface (%s): done in %.1fs"
+      asset.symbol
+      elapsed_s;
+    { labels = List.map (fun h -> h.Oracle_types.label) horizons; rows; elapsed_s }
+  in
   (* The engine's decision: qty, gi, active, deployed capital against this
      asset's share of the venue pool. *)
   (* The sizing replay starts from the strategy's accumulated state (base
@@ -1321,16 +1615,16 @@ let run_one
       ~lo:gi_lo
       ~hi:gi_hi
       ~models
-      ~target_survival:a.target_survival
+      ~target_survival
       ~pool
       ~fng
       ~fng_weight
-      ~range_weight:a.range_weight
+      ~range_weight
       ~min_active_dsurv
       ~use_fng:(calendar_kind = Oracle_types.Crypto)
       ~param_steps:10
       ~scan_points:24
-      ~qty_cap_mult:a.qty_cap_mult
+      ~qty_cap_mult
   in
   if not deployment.Oracle_types.active
   then
@@ -1345,6 +1639,7 @@ let run_one
              ~gi_lo
              ~gi_hi
              ~deep_bars
+             ~cash_surface:(Some cash_surface)
              grid
              asset
              members
@@ -1365,6 +1660,7 @@ let run_one
            ~gi_lo
            ~gi_hi
            ~deep_bars
+           ~cash_surface:(Some cash_surface)
            grid
            members
            class_name
@@ -1388,21 +1684,11 @@ let run_one
            let m = model h in
            let c_ = Oracle_replay.historical_path_coverage m ~d_surv:replay_out.d_surv in
            let capital_res =
-             S.find_min_capital
-               ~grid
-               ~model:m
-               ~target_survival:a.target_survival
-               ?hi:a.max_capital
-               ()
+             S.find_min_capital ~grid ~model:m ~target_survival ?hi:a.max_capital ()
            in
-           let qty_res = S.max_qty ~grid ~model:m ~target_survival:a.target_survival () in
+           let qty_res = S.max_qty ~grid ~model:m ~target_survival () in
            let empirical_res =
-             S.empirical_min_capital
-               ~grid
-               ~model:m
-               ~target_survival:a.target_survival
-               ?hi:a.max_capital
-               ()
+             S.empirical_min_capital ~grid ~model:m ~target_survival ?hi:a.max_capital ()
            in
            h, c_, capital_res, qty_res, empirical_res)
         horizons
@@ -1418,6 +1704,7 @@ let run_one
              ~gi_lo
              ~gi_hi
              ~deep_bars
+             ~cash_surface:(Some cash_surface)
              grid
              asset
              members
@@ -1438,6 +1725,7 @@ let run_one
            ~gi_lo
            ~gi_hi
            ~deep_bars
+           ~cash_surface:(Some cash_surface)
            grid
            members
            class_name
@@ -1990,6 +2278,12 @@ let run_portfolio (a : args) (tasks : Oracle_tasks.task list) : Yojson.Safe.t op
 let main () =
   let a = parse_args () in
   let config = Dio_engine.Config.read_config () in
+  (* The oracle section of config.json (global knobs + per-asset overrides)
+     drives the CLI defaults exactly as it drives the live engine; explicit
+     flags win over it. *)
+  let base_rc =
+    Option.value config.oracle ~default:(Dio_oracle.Oracle_runtime.default_config ())
+  in
   let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
   let tasks, unsupported =
     if a.portfolio && offline && a.symbol = ""
@@ -2071,10 +2365,9 @@ let main () =
                     a
                     config.classes
                     task
+                    ~base_rc
                     ~pool:pool_before
                     ~fng
-                    ~fng_weight:a.fng_weight
-                    ~min_active_dsurv:a.min_active_dsurv
                     ~index:(i + 1)
                     ~n_tasks
                 in

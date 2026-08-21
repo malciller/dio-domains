@@ -138,6 +138,24 @@ let effective_tif_and_extended
   tif_str, mark_extended
 ;;
 
+(* Alpaca equity tick rules: prices at or above $1.00 trade on penny
+   increments; sub-penny ($0.0001) precision is only valid below $1.00.
+   Out-of-band limit prices are rejected with HTTP 422 ("sub-penny increment
+   does not fulfill minimum pricing criteria"), so round to the venue-valid
+   tick at this submission boundary - grid ladders computed from finer price
+   increments then land within half a cent of the intended level instead of
+   failing outright. Alpaca accepts penny-precision prices on its crypto
+   pairs too, so one rule serves both. *)
+let round_limit_price (price : float) =
+  if Float.is_nan price || Float.is_infinite price
+  then price
+  else if price >= 1.0
+  then Float.round (price *. 100.0) /. 100.0
+  else Float.round (price *. 10000.0) /. 10000.0
+;;
+
+let limit_price_json (p : float) = `String (Printf.sprintf "%.4f" (round_limit_price p))
+
 let place_order
       ~symbol
       ~qty
@@ -194,7 +212,7 @@ let place_order
   let assoc = if mark_extended then ("extended_hours", `Bool true) :: assoc else assoc in
   let assoc =
     match limit_price with
-    | Some p -> ("limit_price", `String (Printf.sprintf "%.4f" p)) :: assoc
+    | Some p -> ("limit_price", limit_price_json p) :: assoc
     | None -> assoc
   in
   let assoc =
@@ -211,7 +229,7 @@ let place_order
     symbol
     qty
     (match limit_price with
-     | Some p -> Printf.sprintf "@ %.4f" p
+     | Some p -> Printf.sprintf "@ %.4f" (round_limit_price p)
      | None -> "MKT")
     tif_str
     (if mark_extended then ", extended_hours=true" else "");
@@ -290,7 +308,7 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
   in
   let assoc =
     match limit_price with
-    | Some p -> ("limit_price", `String (Printf.sprintf "%.4f" p)) :: assoc
+    | Some p -> ("limit_price", limit_price_json p) :: assoc
     | None -> assoc
   in
   let assoc =

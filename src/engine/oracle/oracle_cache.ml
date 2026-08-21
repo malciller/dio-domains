@@ -44,12 +44,29 @@ let cache_dir =
 (* Mutex guarding all file I/O (shared with other modules' threads). *)
 let file_mutex = Mutex.create ()
 
+(** mkdir -p: create [dir] and any missing parents; an existing component
+    is fine (idempotent, tolerates a racing writer). *)
+let mkdir_p (dir : string) =
+  let rec create path =
+    if not (Sys.file_exists path)
+    then (
+      create (Filename.dirname path);
+      try Unix.mkdir path 0o755 with
+      | Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+  in
+  create dir
+;;
+
 let ensure_dir ~(dir : string) =
   if not (Sys.file_exists dir)
   then (
-    try Sys.mkdir dir 0o755 with
-    | Sys_error msg ->
-      Logging.warn_f ~section "Could not create history dir %s: %s" dir msg)
+    try mkdir_p dir with
+    | Unix.Unix_error (errno, _, _) ->
+      Logging.warn_f
+        ~section
+        "Could not create history dir %s: %s"
+        dir
+        (Unix.error_message errno))
 ;;
 
 let sanitize (s : string) =
@@ -126,7 +143,7 @@ let save_bars
   then (
     let path = path_of ~dir ~exchange ~symbol in
     let tmp = path ^ ".tmp" in
-    ensure_dir ~dir;
+    (* mkdir_p creates the whole chain, exchange dir included. *)
     ensure_dir ~dir:(Filename.concat dir exchange);
     Mutex.lock file_mutex;
     Fun.protect

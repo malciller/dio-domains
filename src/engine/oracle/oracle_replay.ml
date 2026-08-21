@@ -543,28 +543,171 @@ module Sizing (M : Oracle_strategy.S) = struct
       else { parameter = "qty"; value = qty; d_surv; coverage; reachable = true })
   ;;
 
-  (** Empirical min capital (advisory): the smallest [start_quote] whose
-      actual path replay clears [target_survival] on the asset's own history.
 
-      The static sizing ([find_min_capital]) evaluates the closed-form worst
-      case - N consecutive buy steps with no intermediate sells - which is the
-      theoretical lower bound a path could hit, so it is structurally
-      pessimistic: real paths bounce, sells free quote, and the strategy
-      survives deeper than the static runway predicts. The empirical number
-      measures the "capital buffer" the static sizing pays for. Caveat: the
-      static runway is a pure geometric ladder, so when the venue's
-      min_notional binds (dynamic buy up-sizing), the replayed path can burn
-      capital faster per rung than the closed form - the empirical number may
-      then exceed the static one instead of landing below it.
+  (** Multi-horizon variant of [empirical_min_capital]: the smallest capital
+      per horizon whose actual path replay clears [target_survival].
 
-      Path-replay D_surv is NOT monotone in capital (intermediate sells shift
-      which ladder level exhausts the grid), so this cannot be a plain binary
-      search: it scans a log-spaced capital grid, then bisection-refines the
-      boundary cell of the first crossing under the local-monotonicity
-      assumption, and repeats the scan below the first hit at the same
-      resolution to bound non-monotone islands. Returns [reachable = false]
-      when even [hi] does not clear the target. Advisory only: the static
-      result remains the sizing recommendation. *)
+      A path replay is horizon-independent - the same replayed path yields one
+      d_surv, which each horizon's blend CDF scores separately - so the
+      log-spaced scan shares ONE replay per probed capital across all models
+      and the first crossings come from the same samples. Everything after the
+      shared scan (bisection refinement, the densified island re-scan below
+      the first hit) runs per horizon exactly as in the single-horizon
+      version; with a one-element model list the probe sequence is identical
+      to [empirical_min_capital]. The scan bracket stops at the largest
+      static requirement * 1.05 across models (or [hi] when any horizon is
+      statically unreachable), with the same rescan-to-[hi] fallback when a
+      horizon crosses nowhere inside the bracket. *)
+  let empirical_min_capitals
+        ?(scan_points = 96)
+        ?(hi = 1e9)
+        ~(grid : M.config)
+        ~(models : blend_model list)
+        ~(target_survival : float)
+        ()
+    : sizing_result array
+    =
+    let ms = Array.of_list models in
+    let n = Array.length ms in
+    if n = 0
+    then [||]
+    else (
+      let asset = ms.(0).asset in
+      (* One replay per probed capital; every horizon's blend CDF scores the
+         same replayed d_surv. *)
+      let covs_at capital =
+        let out = M.replay (M.set_start_quote grid capital) asset in
+        Array.map (fun m -> (blended_coverage m ~d_surv:out.d_surv).blended) ms
+      in
+      let cov_of j capital = (covs_at capital).(j) in
+      let statics =
+        Array.map (fun m -> find_min_capital ~grid ~model:m ~target_survival ~hi ()) ms
+      in
+      let c_min = M.cost_at grid ~qty:(M.design_qty grid) ~n_fills:1 in
+      let c_max =
+        Float.min
+          hi
+          (Array.fold_left
+             (fun acc s -> if s.reachable then Float.max acc (s.value *. 1.05) else acc)
+             hi
+             statics)
+      in
+      if c_max <= c_min
+      then statics
+      else (
+        let pts ~c_lo ~c_hi =
+          Array.init scan_points (fun i ->
+            c_lo *. ((c_hi /. c_lo) ** (float_of_int i /. float_of_int (scan_points - 1))))
+        in
+        (* Shared log-spaced scan over one bracket: every probe is replayed
+           once and scored against all horizons. *)
+        let scan ~c_lo ~c_hi =
+          let caps = pts ~c_lo ~c_hi in
+          let covs = Array.init n (fun _ -> Array.make scan_points 0.0) in
+          for i = 0 to scan_points - 1 do
+            let cs = covs_at caps.(i) in
+            for j = 0 to n - 1 do
+              covs.(j).(i) <- cs.(j)
+            done
+          done;
+          caps, covs
+        in
+        let idx_of_first_crossing cov =
+          let rec go i =
+            if i >= scan_points
+            then None
+            else if cov.(i) >= target_survival
+            then Some i
+            else go (i + 1)
+          in
+          go 0
+        in
+        (* Bisection-refine a bracket whose upper endpoint passes: keeps the
+           passing side, 40 iterations, exactly as the single-horizon version. *)
+        let refine_one j ~c_lo ~c_hi ~idx caps =
+          let lo_cap =
+            if idx = 0
+            then c_lo
+            else
+              c_lo
+              *. ((c_hi /. c_lo)
+                  ** (float_of_int (idx - 1) /. float_of_int (scan_points - 1)))
+          in
+          let rec bisect lo hi_ i =
+            if i = 0
+            then hi_
+            else (
+              let mid = (lo +. hi_) /. 2.0 in
+              if cov_of j mid >= target_survival
+              then bisect lo mid (i - 1)
+              else bisect mid hi_ (i - 1))
+          in
+          bisect lo_cap caps.(idx) 40
+        in
+        let caps, covs = scan ~c_lo:c_min ~c_hi:c_max in
+        (* Final assembly: one replay at the chosen boundary fills the
+           achieved d_surv/coverage (as the single-horizon version does). *)
+        let finish j best =
+          let out = M.replay (M.set_start_quote grid best) asset in
+          { parameter = "capital"
+          ; value = best
+          ; d_surv = out.d_surv
+          ; coverage = (blended_coverage ms.(j) ~d_surv:out.d_surv).blended
+          ; reachable = true
+          }
+        in
+        let results = Array.init n (fun _ -> ref None) in
+        for j = 0 to n - 1 do
+          match idx_of_first_crossing covs.(j) with
+          | None ->
+            (* No crossing in the bracket: when the bracket stopped short of
+               [hi], rescan the full range to the user's bound before giving
+               up (as the single-horizon version does). *)
+            if c_max < hi -. 1e-9
+            then (
+              let caps2, covs2 = scan ~c_lo:c_min ~c_hi:hi in
+              match idx_of_first_crossing covs2.(j) with
+              | Some idx ->
+                results.(j)
+                := Some (finish j (refine_one j ~c_lo:c_min ~c_hi:hi ~idx caps2))
+              | None -> ())
+            else ()
+          | Some idx ->
+            let r1 = refine_one j ~c_lo:c_min ~c_hi:c_max ~idx caps in
+            (* Densified re-scan strictly below the first hit bounds
+               non-monotone islands (a smaller capital that also clears). *)
+            let r2 =
+              let cap_island = caps.(idx) in
+              let caps2, covs2 = scan ~c_lo:c_min ~c_hi:cap_island in
+              match idx_of_first_crossing covs2.(j) with
+              | None -> None
+              | Some idx2 ->
+                Some (refine_one j ~c_lo:c_min ~c_hi:cap_island ~idx:idx2 caps2)
+            in
+            let best =
+              match r2 with
+              | Some v when v < r1 -> v
+              | _ -> r1
+            in
+            results.(j) := Some (finish j best)
+        done;
+        Array.map
+          (fun r ->
+             match !r with
+             | Some v -> v
+             | None ->
+               { parameter = "capital"
+               ; value = hi
+               ; d_surv = 1.0
+               ; coverage = 0.0
+               ; reachable = false
+               })
+          results))
+  ;;
+
+  (* Thin re-export of the multi-horizon inversion for the single-model
+     callers (CLI inverse-sizing table, tests): identical probe sequence,
+     identical result - see [empirical_min_capitals]. *)
   let empirical_min_capital
         ?(scan_points = 96)
         ?(hi = 1e9)
@@ -574,104 +717,67 @@ module Sizing (M : Oracle_strategy.S) = struct
         ()
     : sizing_result
     =
-    let coverage_at capital =
-      let cfg = M.set_start_quote grid capital in
-      let out = M.replay cfg model.asset in
-      (blended_coverage model ~d_surv:out.d_surv).blended
-    in
-    let c_min = M.cost_at grid ~qty:(M.design_qty grid) ~n_fills:1 in
-    let static = find_min_capital ~grid ~model ~target_survival ~hi () in
-    let c_max = if static.reachable then Float.min hi (static.value *. 1.05) else hi in
-    if c_max <= c_min
-    then static
-    else (
-      let pts ~c_lo ~c_hi =
-        Array.init scan_points (fun i ->
-          c_lo *. ((c_hi /. c_lo) ** (float_of_int i /. float_of_int (scan_points - 1))))
-      in
-      let first_crossing ~c_lo ~c_hi =
-        let arr = pts ~c_lo ~c_hi in
-        let rec go i =
-          if i >= Array.length arr
-          then None
-          else if coverage_at arr.(i) >= target_survival
-          then Some (i, arr.(i))
-          else go (i + 1)
-        in
-        go 0
-      in
-      let refine ~c_lo ~c_hi = function
-        | None -> None
-        | Some (idx, cap) ->
-          let lo_cap =
-            if idx = 0
-            then c_lo
-            else
-              c_lo
-              *. ((c_hi /. c_lo)
-                  ** (float_of_int (idx - 1) /. float_of_int (scan_points - 1)))
-          in
-          let rec bisect lo hi i =
-            if i = 0
-            then hi
-            else (
-              let mid = (lo +. hi) /. 2.0 in
-              if coverage_at mid >= target_survival
-              then bisect lo mid (i - 1)
-              else bisect mid hi (i - 1))
-          in
-          Some (bisect lo_cap cap 40)
-      in
-      let first = first_crossing ~c_lo:c_min ~c_hi:c_max in
-      let refined = refine ~c_lo:c_min ~c_hi:c_max first in
-      let refined =
-        match first with
-        | Some (_, cap) ->
-          (* Second, same-resolution pass below the first hit to bound
-             non-monotone islands (a smaller capital that also clears). *)
-          (match refine ~c_lo:c_min ~c_hi:cap (first_crossing ~c_lo:c_min ~c_hi:cap) with
-           | Some r2 ->
-             (match refined with
-              | Some r1 -> Some (Float.min r1 r2)
-              | None -> Some r2)
-           | None -> refined)
-        | None -> refined
-      in
-      match refined with
-      | None when c_max < hi -. 1e-9 ->
-        (* Static unreachable: rescan to the user's bound. *)
-        (match refine ~c_lo:c_min ~c_hi:hi (first_crossing ~c_lo:c_min ~c_hi:hi) with
-         | Some r ->
-           let out = M.replay (M.set_start_quote grid r) model.asset in
-           let coverage = (blended_coverage model ~d_surv:out.d_surv).blended in
-           { parameter = "capital"
-           ; value = r
-           ; d_surv = out.d_surv
-           ; coverage
-           ; reachable = true
-           }
-         | None ->
-           { parameter = "capital"
-           ; value = hi
-           ; d_surv = 1.0
-           ; coverage = 0.0
-           ; reachable = false
-           })
-      | Some r ->
-        let out = M.replay (M.set_start_quote grid r) model.asset in
-        let coverage = (blended_coverage model ~d_surv:out.d_surv).blended in
-        { parameter = "capital"
-        ; value = r
-        ; d_surv = out.d_surv
-        ; coverage
-        ; reachable = true
-        }
-      | None ->
-        { parameter = "capital"
-        ; value = hi
-        ; d_surv = 1.0
-        ; coverage = 0.0
-        ; reachable = false
-        })
+    (empirical_min_capitals ~scan_points ~hi ~grid ~models:[ model ] ~target_survival ()).(
+    0)
+  ;;
+
+  (** Rollup of one cell's per-horizon sizing results into the "clears every
+      horizon" number: the largest reachable requirement - or [None] when ANY
+      horizon cannot clear the target within the search bound (no finite
+      capital clears all horizons then). *)
+  let combined_sizing (rs : sizing_result array) : sizing_result option =
+    if
+      Array.exists (fun r -> not r.reachable) rs
+      || Array.exists (fun r -> Float.is_nan r.value) rs
+    then None
+    else if Array.length rs = 0
+    then None
+    else
+      Some
+        (Array.fold_left (fun acc r -> if r.value > acc.value then r else acc) rs.(0) rs)
+  ;;
+
+  (** One cash-requirement-surface row: the (gi, qty) cell identity plus the
+      static and empirical per-horizon minimum-capital inversions. *)
+  type cash_cell =
+    { gi : float
+    ; qty : float
+    ; static : sizing_result array
+    ; empirical : sizing_result array
+    }
+
+  (** Cash requirement sweep over pre-built grid variants: for each cell, the
+      closed-form static min-capital per horizon and the replay-verified
+      empirical min-capital per horizon. Cells are caller-built (gi x qty)
+      configs carrying their own venue gates; results preserve input order.
+      [empirical_scan_points] trades accuracy for runtime inside the dense
+      sweep (the single-grid inverse-sizing table keeps the default 96). *)
+  let surface_rows
+        ?(empirical_scan_points = 24)
+        ?hi
+        ~(target_survival : float)
+        ~(models : blend_model list)
+        (cells : (float * float * M.config) list)
+    : cash_cell list
+    =
+    List.map
+      (fun (gi, qty, grid) ->
+         let static =
+           Array.of_list
+             (List.map
+                (fun m -> find_min_capital ?hi ~grid ~model:m ~target_survival ())
+                models)
+         in
+         let empirical =
+           empirical_min_capitals
+             ~scan_points:empirical_scan_points
+             ?hi
+             ~grid
+             ~models
+             ~target_survival
+             ()
+         in
+         { gi; qty; static; empirical })
+      cells
   ;;
 end
