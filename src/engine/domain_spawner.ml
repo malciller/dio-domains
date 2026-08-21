@@ -320,7 +320,7 @@ let asset_domain_worker
        one-shot warning fires once the grace period elapses). When only one
        source is active and the other failed, a one-shot warning names the
        failed one. While gated the domain clears its execute flag and blocks
-       on the normal per-symbol [Exchange_wakeup.wait].
+       on the normal per-symbol [Exchange_wakeup.wait_since].
        [oracle_gate_deadline] is the startup window: how long both signals
        get before the gate proceeds on whichever single one is live; it is
        checked on wakeups, never polled. *)
@@ -483,6 +483,12 @@ let asset_domain_worker
     let publish_windows () =
       ignore (Latency_profiler.snapshot_and_reset prof_ob);
       ignore (Latency_profiler.snapshot_and_reset prof_exec);
+      (* P6: snapshot+reset this symbol's place/amend/cancel operation
+         profilers on the window cadence. Their per-op [report] calls were
+         removed from the order hot path (they logged mid-cycle whenever 100
+         samples had accumulated); the percentiles now surface here instead,
+         never inside a trading cycle. *)
+      Order_executor.snapshot_symbol_profilers asset_with_fees.symbol;
       (* The strategy window's execution count is set to the number of order
          actions this domain's strategy actually pushed in the window (place/
          amend/cancel), so the dashboard's STRAT/S column reports real
@@ -540,6 +546,15 @@ let asset_domain_worker
       let latency_this_cycle = !latency_active in
       if !cycle_count = 0 then Logging.debug_f ~section "First cycle for %s" key;
       incr cycle_count;
+      (* R1: capture the wakeup generation BEFORE reading any producer
+         state. Any signal that arrives from here until the [wait_since] at
+         the bottom of the loop bumps the generation past this baseline, so
+         the wait returns immediately instead of parking through data that
+         landed mid-cycle (the lost-wakeup race that could stall a quiet
+         symbol's domain indefinitely). *)
+      let wake_baseline =
+        Concurrency.Exchange_wakeup.get_generation ~symbol:asset_with_fees.symbol
+      in
       let cycle_events = ref 0 in
       let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
@@ -554,6 +569,14 @@ let asset_domain_worker
       (match !grid_strategy_asset_ref with
        | Some _ ->
          Dio_strategies.Suicide_grid.Strategy.drain_events asset_with_fees.symbol
+       | None -> ());
+      (* R2: drain MM lifecycle events queued by the supervisor REST path.
+         Same discipline as the grid queue above: all handler execution
+         happens on THIS domain thread, so MM state is never mutated
+         cross-thread against execute_strategy. *)
+      (match !mm_strategy_asset_ref with
+       | Some _ ->
+         Dio_strategies.Market_maker.Strategy.drain_events asset_with_fees.symbol
        | None -> ());
       (* === ORDERBOOK HOT PATH === *)
       let ob_pos = get_ob_pos_fn () in
@@ -1567,7 +1590,7 @@ let asset_domain_worker
           Dio_strategies.Suicide_grid.Strategy.flush_persistence asset_with_fees.symbol
         | None -> ());
       (* Record cycle work time before blocking. Captures active processing
-           latency only, excluding sleep time in Exchange_wakeup.wait.
+           latency only, excluding sleep time in Exchange_wakeup.wait_since.
            Only busy cycles (real book/exec/strategy work) are recorded: idle
            wakeups would otherwise pin cycle p50/p99 at 0us (F2). *)
       let cycle_busy = did_ob || did_exec || should_execute in
@@ -1597,10 +1620,16 @@ let asset_domain_worker
         last_window_time := now_flush;
         publish_windows ());
       (* Block until the next websocket frame signals new data or until data is ready.
-           Use cached has_exec_fn closure instead of Ex.has_execution_data to
-           avoid Hashtbl lookup on the hot blocking path. *)
+            Use cached has_exec_fn closure instead of Ex.has_execution_data to
+            avoid Hashtbl lookup on the hot blocking path.
+            R1: [wait_since] returns immediately if any producer signalled
+            while this cycle ran (generation > baseline), so a signal racing
+            the cycle can no longer be lost to the park. *)
       if (not !should_execute_strategy) || not (has_exec_fn ())
-      then Concurrency.Exchange_wakeup.wait ~symbol:asset_with_fees.symbol;
+      then
+        Concurrency.Exchange_wakeup.wait_since
+          ~symbol:asset_with_fees.symbol
+          ~since:wake_baseline;
       if !exec_ready && (not !latency_active) && !cycle_count - !exec_ready_cycle >= 10
       then (
         latency_active := true;
@@ -1725,7 +1754,7 @@ let stop_domain state =
      Dio_strategies.Suicide_grid.Strategy.cleanup_strategy_state symbol
    | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_strategy_state symbol
    | _ -> ());
-  (* Unblock workers in Exchange_wakeup.wait so they observe is_running=false
+  (* Unblock workers in Exchange_wakeup.wait_since so they observe is_running=false
      and exit the main loop. *)
   Concurrency.Exchange_wakeup.signal_all ();
   (match Atomic.get state.domain_handle with

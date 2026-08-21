@@ -6,7 +6,8 @@
     and non blocking access for low latency logic sequence consumers. *)
 
 let section = "lighter_orderbook"
-let ring_buffer_size = 16
+(* R3: raised from 16 to absorb bursts without lapping readers. *)
+let ring_buffer_size = 64
 
 (** Constant defining the maximum permitted depth of price levels retained per side of the order book.
     Imposes strict bounds on memory allocation and ensures structural alignment with downstream

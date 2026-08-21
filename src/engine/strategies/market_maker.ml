@@ -1597,6 +1597,123 @@ let set_startup_replay_done symbol =
   Mutex.unlock state.mutex
 ;;
 
+(** R2: per-symbol lock-free lifecycle event queue - the MM counterpart of
+    the grid's H3 queue. The Lwt supervisor thread (REST callbacks in
+    supervisor_orders.ml) enqueues lifecycle events instead of calling the
+    handlers directly; the symbol's domain worker drains the queue at the
+    top of every cycle. All handler execution therefore happens on the
+    domain thread, so [state.mutex] is never taken cross-thread against
+    [execute_strategy] (which mutates the same record without the mutex).
+    LockFreeQueue is MPSC-safe; enqueue signals Exchange_wakeup so an idle
+    domain wakes to drain promptly. *)
+type mm_lifecycle_event =
+  | Failed of
+      { now : float
+      ; side : order_side
+      ; reason : string
+      }
+  | Rejected of
+      { now : float
+      ; side : order_side
+      ; price : float
+      }
+  | Amended of
+      { now : float
+      ; old_id : string
+      ; new_id : string
+      ; side : order_side
+      ; price : float
+      }
+  | Amendment_skipped of
+      { now : float
+      ; order_id : string
+      ; side : order_side
+      ; price : float
+      }
+  | Amendment_failed of
+      { now : float
+      ; order_id : string
+      ; side : order_side
+      ; reason : string
+      }
+  | Cancel_cleanup of { order_id : string }
+
+module SymbolMap = Map.Make (String)
+
+(** Immutable per-symbol queue map published through one atomic cell:
+    lock-free reads on the hot path, CAS inserts on first use. *)
+let event_queues : mm_lifecycle_event LockFreeQueue.t SymbolMap.t Atomic.t =
+  Atomic.make SymbolMap.empty
+;;
+
+let get_event_queue symbol =
+  match SymbolMap.find_opt symbol (Atomic.get event_queues) with
+  | Some q -> q
+  | None ->
+    let rec insert () =
+      let current = Atomic.get event_queues in
+      match SymbolMap.find_opt symbol current with
+      | Some q -> q
+      | None ->
+        let q = Strategy_common.LockFreeQueue.create () in
+        if Atomic.compare_and_set event_queues current (SymbolMap.add symbol q current)
+        then q
+        else insert ()
+    in
+    insert ()
+;;
+
+(** Dropped-event counter for observability: a full ring previously lost
+    lifecycle events silently, leaving stuck inflight_* state until the
+    stale-pending cleanup rescued it. *)
+let dropped_events = Atomic.make 0
+
+(** Enqueue a lifecycle event from any thread (supervisor REST path). *)
+let enqueue_event symbol (ev : mm_lifecycle_event) =
+  (match Strategy_common.LockFreeQueue.write (get_event_queue symbol) ev with
+   | Some () -> ()
+   | None -> ignore (Atomic.fetch_and_add dropped_events 1));
+  Concurrency.Exchange_wakeup.signal ~symbol
+;;
+
+(** Dispatch one drained event to its handler. Runs on the domain thread;
+    handlers take state.mutex as before. *)
+let dispatch_event asset_symbol (ev : mm_lifecycle_event) =
+  match ev with
+  | Failed { now; side; reason } -> handle_order_failed ~now asset_symbol side reason
+  | Rejected { now; side; price } -> handle_order_rejected ~now asset_symbol side price
+  | Amended { now; old_id; new_id; side; price } ->
+    handle_order_amended ~now asset_symbol old_id new_id side price
+  | Amendment_skipped { now; order_id; side; price } ->
+    handle_order_amendment_skipped ~now asset_symbol order_id side price
+  | Amendment_failed { now; order_id; side; reason } ->
+    handle_order_amendment_failed ~now asset_symbol order_id side reason
+  | Cancel_cleanup { order_id } -> cleanup_pending_cancellation asset_symbol order_id
+;;
+
+(** Drain all queued lifecycle events for [symbol]. Called by the symbol's
+    domain worker at the top of every cycle. *)
+let drain_events symbol =
+  let q = get_event_queue symbol in
+  let rec loop () =
+    match Strategy_common.LockFreeQueue.read q with
+    | Some ev ->
+      dispatch_event symbol ev;
+      loop ()
+    | None -> ()
+  in
+  let dropped = Atomic.exchange dropped_events 0 in
+  if dropped > 0
+  then
+    Logging.warn_f
+      ~section
+      "[%s] %d MM lifecycle event(s) dropped (queue full); state self-heals via \
+       stale-pending cleanup"
+      symbol
+      dropped;
+  loop ()
+;;
+
 (** Public strategy module interface. *)
 module Strategy = struct
   type config = trading_config
@@ -1626,4 +1743,43 @@ module Strategy = struct
   let cleanup_strategy_state = cleanup_strategy_state
   let set_startup_replay_done = set_startup_replay_done
   let init = init
+
+  (* R2: lifecycle-event queue surface. Cross-thread callers (supervisor
+     REST callbacks) MUST use [enqueue_event]; the handle_* functions are
+     retained public for same-thread callers (the domain worker's WS exec
+     replay) and for unit tests. *)
+  type lifecycle_event = mm_lifecycle_event =
+    | Failed of
+        { now : float
+        ; side : order_side
+        ; reason : string
+        }
+    | Rejected of
+        { now : float
+        ; side : order_side
+        ; price : float
+        }
+    | Amended of
+        { now : float
+        ; old_id : string
+        ; new_id : string
+        ; side : order_side
+        ; price : float
+        }
+    | Amendment_skipped of
+        { now : float
+        ; order_id : string
+        ; side : order_side
+        ; price : float
+        }
+    | Amendment_failed of
+        { now : float
+        ; order_id : string
+        ; side : order_side
+        ; reason : string
+        }
+    | Cancel_cleanup of { order_id : string }
+
+  let enqueue_event = enqueue_event
+  let drain_events = drain_events
 end

@@ -1643,6 +1643,13 @@ let size_asset
     match snapshot with
     | None -> None
     | Some snapshot ->
+      (* Concurrency note: st.reserved_base / st.accumulated_profit are read
+         without the strategy mutex. Safe by the same argument as the
+         dashboard encoder (see dashboard_state.ml): word-sized immutable
+         boxed floats swapped wholesale, reader sees old-or-new, and the
+         oracle pass tolerates a snapshot a moment stale (the next pass
+         re-derives from fresh balances). Only the symbol's domain thread
+         writes these fields since the lifecycle event queues landed. *)
       let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
       let base_asset =
         match String.split_on_char '/' symbol with

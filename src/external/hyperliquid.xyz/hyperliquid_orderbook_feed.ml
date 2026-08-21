@@ -4,7 +4,10 @@
 open Lwt.Infix
 
 let section = "hyperliquid_orderbook"
-let ring_buffer_size = 16
+
+(* R3: raised from 16 - raw l2Book frames are large, but 16 slots let a
+   burst lap the dashboard reader in one tick; 64 absorbs typical bursts. *)
+let ring_buffer_size = 64
 
 type level =
   { price : float

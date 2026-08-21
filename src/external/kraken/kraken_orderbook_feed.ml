@@ -254,8 +254,31 @@ type decimals = int * int
 
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
-let ready_condition = Lwt_condition.create ()
+
+(* P5: frame parsing/dispatch runs on the Parse_worker domain, so nothing in
+   the dispatch path may touch Lwt primitives. The old [Lwt_condition]
+   ready signal became an Atomic flag polled by the startup waiter, and the
+   sequence-gap resubscribe trigger became a pending-queue drained by a
+   small Lwt watcher on the main domain. *)
 let resubscribe_symbol_ref : (string -> unit Lwt.t) option ref = ref None
+
+(** Symbols awaiting a resubscribe after a sequence gap/rollback. Appended
+    from the parse domain via CAS; drained by the Lwt watcher. *)
+let pending_resubscribes : string list Atomic.t = Atomic.make []
+
+let resubscribe_watcher_started = Atomic.make false
+
+let[@inline] request_resubscribe symbol =
+  let rec loop () =
+    let current = Atomic.get pending_resubscribes in
+    if List.mem symbol current
+    then ()
+    else if Atomic.compare_and_set pending_resubscribes current (symbol :: current)
+    then ()
+    else loop ()
+  in
+  loop ()
+;;
 
 (** M2: recompute the book checksum at most once per this many updates per
     symbol. The checksum rebuild does 2 extra fold+sort+array passes per tick;
@@ -350,12 +373,11 @@ let store_opt symbol = Hashtbl.find_opt stores symbol
 
 let notify_ready ~symbol store =
   if not (Atomic.get store.ready)
-  then (
+  then
+    (* P5: Atomic flag only - the startup waiter polls it, so this is safe
+       from the Parse_worker domain (the old Lwt_condition.broadcast was
+       not). *)
     Atomic.set store.ready true;
-    try Lwt_condition.broadcast ready_condition () with
-    | _ ->
-      (* Ignore all exceptions during broadcast - waiters may have been cancelled *)
-      ());
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
@@ -647,9 +669,8 @@ let process_orderbook_message ~reset json on_heartbeat =
                RingBuffer.clear store.buffer;
                Atomic.set store.has_snapshot false;
                Atomic.set store.last_sequence None;
-               Option.iter
-                 (fun f -> Lwt.async (fun () -> f symbol))
-                 !resubscribe_symbol_ref;
+               (* P5: domain-safe trigger - the Lwt watcher drains this. *)
+               request_resubscribe symbol;
                raise Exit (* Skip processing this entry *)
              | Some curr_seq, Some last_seq
                when Int64.compare curr_seq (Int64.add last_seq 1L) > 0 ->
@@ -667,9 +688,8 @@ let process_orderbook_message ~reset json on_heartbeat =
                RingBuffer.clear store.buffer;
                Atomic.set store.has_snapshot false;
                Atomic.set store.last_sequence None;
-               Option.iter
-                 (fun f -> Lwt.async (fun () -> f symbol))
-                 !resubscribe_symbol_ref;
+               (* P5: domain-safe trigger - the Lwt watcher drains this. *)
+               request_resubscribe symbol;
                raise Exit (* Skip processing this entry *)
              | _ -> ());
            let bids_json = member "bids" entry in
@@ -913,94 +933,120 @@ let trigger_orderbook_cleanup ~reason () =
     stalled book feed). *)
 let last_book_time = ref 0.0
 
+(* P5: the per-connection heartbeat closure, published so the Parse_worker
+   handler can invoke it from the parse domain (it is domain-safe: a mutex
+   and a timestamp update). One orderbook connection exists at a time. *)
+let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
+
+(** P5: synchronous dispatch of an already-parsed frame. DOMAIN-SAFE: no
+    Lwt primitives here - this runs on the Parse_worker domain. Sequence-gap
+    resubscribes go through the pending queue; readiness through Atomics;
+    logging/profiling/wakeups are all domain-safe. *)
+let handle_dispatch json on_heartbeat =
+  let open Yojson.Safe.Util in
+  let channel = member "channel" json |> to_string_option in
+  let msg_type = member "type" json |> to_string_option in
+  let method_type = member "method" json |> to_string_option in
+  match channel, msg_type, method_type with
+  | Some "heartbeat", _, _ -> on_heartbeat ()
+  | _, _, Some "heartbeat" -> on_heartbeat ()
+  | Some "book", Some "snapshot", _ ->
+    let now = Unix.gettimeofday () in
+    if !last_book_time > 0.0
+    then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
+    last_book_time := now;
+    ignore (process_orderbook_message ~reset:true json on_heartbeat)
+  | Some "book", Some "update", _ ->
+    let now = Unix.gettimeofday () in
+    if !last_book_time > 0.0
+    then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
+    last_book_time := now;
+    ignore (process_orderbook_message ~reset:false json on_heartbeat)
+  | _, _, Some "subscribe" ->
+    let success = member "success" json |> to_bool_option |> Option.value ~default:true in
+    if not success
+    then (
+      let err_msg =
+        member "error" json |> to_string_option |> Option.value ~default:"Unknown error"
+      in
+      Logging.error_f ~section "Kraken orderbook subscription failed: %s" err_msg)
+    else (
+      let result = member "result" json in
+      let symbol =
+        member "symbol" result |> to_string_option |> Option.value ~default:"unknown"
+      in
+      Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol)
+  | Some "status", _, _ -> Logging.debug_f ~section "Status message received"
+  | _ ->
+    Logging.info_f ~section "Unhandled orderbook payload: %s" (Yojson.Safe.to_string json)
+;;
+
+(** Parse-worker entry point: parse + dispatch on the parse domain. *)
+let () =
+  Concurrency.Parse_worker.register "kraken_ob" (fun message ->
+    try
+      let json = Yojson.Safe.from_string message in
+      let on_heartbeat =
+        match Atomic.get current_on_heartbeat with
+        | Some f -> f
+        | None -> fun () -> ()
+      in
+      handle_dispatch json on_heartbeat
+    with
+    | exn ->
+      Logging.error_f
+        ~section
+        "Error parsing message: %s - %s"
+        (Printexc.to_string exn)
+        message)
+;;
+
+(** Synchronous path: parse + dispatch inline on the calling thread.
+    Used as the overload fallback and by tests. *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
-  Lwt.catch
-    (fun () ->
-       let json = Yojson.Safe.from_string message in
-       on_heartbeat ();
-       let open Yojson.Safe.Util in
-       let channel = member "channel" json |> to_string_option in
-       let msg_type = member "type" json |> to_string_option in
-       let method_type = member "method" json |> to_string_option in
-       match channel, msg_type, method_type with
-       | Some "heartbeat", _, _ -> Lwt.return (on_heartbeat ())
-       | _, _, Some "heartbeat" -> Lwt.return (on_heartbeat ())
-       | Some "book", Some "snapshot", _ ->
-         let now = Unix.gettimeofday () in
-         if !last_book_time > 0.0
-         then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
-         last_book_time := now;
-         ignore (process_orderbook_message ~reset:true json on_heartbeat);
-         Lwt.return_unit
-       | Some "book", Some "update", _ ->
-         let now = Unix.gettimeofday () in
-         if !last_book_time > 0.0
-         then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
-         last_book_time := now;
-         ignore (process_orderbook_message ~reset:false json on_heartbeat);
-         Lwt.return_unit
-       | _, _, Some "subscribe" ->
-         let success =
-           member "success" json |> to_bool_option |> Option.value ~default:true
-         in
-         if not success
-         then (
-           let err_msg =
-             member "error" json
-             |> to_string_option
-             |> Option.value ~default:"Unknown error"
-           in
-           Logging.error_f ~section "Kraken orderbook subscription failed: %s" err_msg;
-           Lwt.return_unit)
-         else (
-           let result = member "result" json in
-           let symbol =
-             member "symbol" result |> to_string_option |> Option.value ~default:"unknown"
-           in
-           Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol;
-           Lwt.return_unit)
-       | Some "status", _, _ ->
-         Logging.debug_f ~section "Status message received";
-         Lwt.return_unit
-       | _ ->
-         Logging.info_f ~section "Unhandled orderbook payload: %s" message;
-         Lwt.return_unit)
-    (fun exn ->
-       Logging.error_f
-         ~section
-         "Error parsing message: %s - %s"
-         (Printexc.to_string exn)
-         message;
-       Lwt.return_unit)
+  try
+    let json = Yojson.Safe.from_string message in
+    on_heartbeat ();
+    handle_dispatch json on_heartbeat
+  with
+  | exn ->
+    Logging.error_f
+      ~section
+      "Error parsing message: %s - %s"
+      (Printexc.to_string exn)
+      message
+;;
+
+(** P5: asynchronous path used by the WS read loop. Tick accounting and the
+    heartbeat stay on the Lwt fiber; the JSON parse and dispatch move to the
+    Parse_worker domain. Falls back to the synchronous path when the worker
+    queue is full - Kraken book updates are deltas, so frames must never be
+    dropped (a lost delta desyncs the book until the next snapshot). *)
+let handle_message_async message on_heartbeat =
+  Concurrency.Tick_event_bus.publish_tick ();
+  Atomic.set current_on_heartbeat (Some on_heartbeat);
+  if not (Concurrency.Parse_worker.submit "kraken_ob" message)
+  then handle_message message on_heartbeat
 ;;
 
 let wait_for_orderbook_data_lwt symbols timeout_seconds =
   let start_time = Unix.gettimeofday () in
-  let timeout_ref = ref false in
   let rec wait_loop () =
     if List.for_all has_orderbook_data symbols
     then Lwt.return_true
     else (
       let elapsed = Unix.gettimeofday () -. start_time in
       if elapsed >= timeout_seconds
-      then Lwt.return_false
-      else if !timeout_ref
-      then Lwt.return_false
-      else
-        (* Block on condition broadcast; treat cancellation as timeout. *)
-        Lwt.catch
-          (fun () -> Lwt_condition.wait ready_condition >>= fun () -> wait_loop ())
-          (fun _ ->
-             timeout_ref := true;
-             Lwt.return_false))
+      then
+        Lwt.return_false
+        (* P5: poll the per-store ready flags instead of blocking on a
+           condition variable - readiness is now published from the
+           Parse_worker domain, which must not touch Lwt primitives. The
+           25ms poll only runs during startup gating (bounded by the
+           timeout), never on a hot path. *)
+      else Lwt_unix.sleep 0.025 >>= fun () -> wait_loop ())
   in
-  (* Background timer enforces hard timeout via shared ref. *)
-  Lwt.async (fun () ->
-    Lwt_unix.sleep timeout_seconds
-    >>= fun () ->
-    timeout_ref := true;
-    Lwt.return_unit);
   wait_loop ()
 ;;
 
@@ -1037,14 +1083,10 @@ let start_message_handler conn symbols on_failure on_heartbeat =
       on_failure "Connection closed by server";
       Lwt.return_unit
     | frame ->
-      Lwt.catch
-        (fun () -> handle_message frame.Websocket.Frame.content on_heartbeat)
-        (fun exn ->
-           Logging.error_f
-             ~section
-             "Error handling Kraken orderbook frame: %s"
-             (Printexc.to_string exn);
-           Lwt.return_unit)
+      (* P5: parse+dispatch run on the Parse_worker domain; this returns
+         immediately (no awaiting), keeping the WS read loop tight. *)
+      let () = handle_message_async frame.Websocket.Frame.content on_heartbeat in
+      Lwt.return_unit
   in
   Lwt_mutex.with_lock state.mutex (fun () ->
     state.active_conn <- Some conn;
@@ -1082,6 +1124,23 @@ let start_message_handler conn symbols on_failure on_heartbeat =
 
 let rec subscribe_symbols symbols =
   resubscribe_symbol_ref := Some (fun s -> resubscribe_symbol s);
+  (* P5: drain sequence-gap resubscribe requests raised on the Parse_worker
+     domain. The watcher runs on the Lwt main domain, where the Lwt-based
+     [resubscribe_symbol] is safe. Started once; 50ms poll on a path that
+     only fires when a feed degrades. *)
+  if not (Atomic.get resubscribe_watcher_started)
+  then (
+    Atomic.set resubscribe_watcher_started true;
+    let rec watcher () =
+      let pending = Atomic.get pending_resubscribes in
+      (match pending with
+       | [] -> ()
+       | _ ->
+         if Atomic.compare_and_set pending_resubscribes pending []
+         then List.iter (fun s -> Lwt.async (fun () -> resubscribe_symbol s)) pending);
+      Lwt_unix.sleep 0.05 >>= fun () -> watcher ()
+    in
+    Lwt.async watcher);
   fetch_decimals symbols
   >>= fun () ->
   List.iter

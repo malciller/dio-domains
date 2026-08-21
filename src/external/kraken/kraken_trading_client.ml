@@ -337,46 +337,60 @@ let reset_state conn ~notify_failure reason =
 let handle_frame frame ~expected_generation =
   Concurrency.Tick_event_bus.publish_tick ();
   notify_heartbeat ();
-  (* Parse the frame JSON, then atomically verify generation and response table membership. *)
-  (try
-     let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
-     let open Yojson.Safe.Util in
-     let method_opt = member "method" json |> to_string_option in
-     match method_opt with
-     | Some _ ->
-       let response = parse_ws_response json in
-       (match response.req_id with
-        | Some req_id ->
-          (* Atomically check generation match or pending req_id presence; only discard if neither holds. *)
-          Lwt_mutex.with_lock state.mutex (fun () ->
-            let current_gen = state.connection_generation in
-            let req_id_exists = Response_table.mem state.responses req_id in
-            (* Process if current generation matches or req_id is still pending (delayed response). *)
-            let should_process = expected_generation = current_gen || req_id_exists in
-            Lwt.return (should_process, req_id_exists, current_gen))
-          >>= fun (should_process, _, _) ->
-          if not should_process
-          then Lwt.return_unit
-          else
-            (* Resolve synchronously to prevent a timeout race. *)
-            resolve_response req_id response >>= fun () -> Lwt.return_unit
-        | None -> Lwt.return_unit)
-     | None ->
-       (match member "channel" json |> to_string_option with
-        | Some "heartbeat" -> Lwt.return_unit
-        | _ ->
-          RingBuffer.write message_buffer json;
-          Lwt_condition.broadcast message_condition ();
-          Lwt.return_unit)
-   with
-   | exn ->
-     Logging.error
-       ~section
-       (Printf.sprintf
-          "Failed to handle trading frame synchronously: %s"
-          (Printexc.to_string exn));
-     Lwt.return_unit)
-  >>= fun () -> Lwt.return_unit
+  let content = frame.Websocket.Frame.content in
+  (* P5: executions pushes are offloaded to the Parse_worker domain by a
+     raw-string prefix check BEFORE the central Yojson parse - the parse
+     was the expensive part. Safe: request/response frames (order
+     acks/rejects) always carry a "method" field and never match the
+     prefix, so an acknowledgement can never be misrouted to the worker.
+     On a full worker queue we fall through to the original inline path
+     (parse + message buffer), which preserves delivery at the cost of
+     temporarily losing the offload benefit. *)
+  if
+    String.starts_with ~prefix:"{\"channel\":\"executions" content
+    && Concurrency.Parse_worker.submit "kraken_exec" content
+  then Lwt.return_unit
+  else
+    (* Parse the frame JSON, then atomically verify generation and response table membership. *)
+    (try
+       let json = Yojson.Safe.from_string content in
+       let open Yojson.Safe.Util in
+       let method_opt = member "method" json |> to_string_option in
+       match method_opt with
+       | Some _ ->
+         let response = parse_ws_response json in
+         (match response.req_id with
+          | Some req_id ->
+            (* Atomically check generation match or pending req_id presence; only discard if neither holds. *)
+            Lwt_mutex.with_lock state.mutex (fun () ->
+              let current_gen = state.connection_generation in
+              let req_id_exists = Response_table.mem state.responses req_id in
+              (* Process if current generation matches or req_id is still pending (delayed response). *)
+              let should_process = expected_generation = current_gen || req_id_exists in
+              Lwt.return (should_process, req_id_exists, current_gen))
+            >>= fun (should_process, _, _) ->
+            if not should_process
+            then Lwt.return_unit
+            else
+              (* Resolve synchronously to prevent a timeout race. *)
+              resolve_response req_id response >>= fun () -> Lwt.return_unit
+          | None -> Lwt.return_unit)
+       | None ->
+         (match member "channel" json |> to_string_option with
+          | Some "heartbeat" -> Lwt.return_unit
+          | _ ->
+            RingBuffer.write message_buffer json;
+            Lwt_condition.broadcast message_condition ();
+            Lwt.return_unit)
+     with
+     | exn ->
+       Logging.error
+         ~section
+         (Printf.sprintf
+            "Failed to handle trading frame synchronously: %s"
+            (Printexc.to_string exn));
+       Lwt.return_unit)
+    >>= fun () -> Lwt.return_unit
 ;;
 
 (** Starts the WebSocket reader loop for a given connection generation.

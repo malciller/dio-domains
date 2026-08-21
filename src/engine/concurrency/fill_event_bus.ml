@@ -6,13 +6,17 @@
     iteration, identical to per-exchange execution ring buffers.
 
     Concurrency model:
-    - Writers: exchange execution feed threads (one per venue).
-      Access serialized by [write_mutex] since RingBuffer is single-writer.
-    - Readers: Lwt fibers in the main domain, woken by [fill_condition].
+    - Writers: exchange execution feed handlers - including code running
+      on the Parse_worker domain (P5) - serialized by [write_mutex] since
+      RingBuffer is single-writer.
+    - Readers: Lwt fibers in the main domain, polling [generation].
 
-    The ring buffer is bounded (capacity 256); the oldest fill is silently
-    evicted when full. This is acceptable because the Discord notifier
-    drains on each wakeup and rarely falls 256 fills behind. *)
+    Domain safety: publishing uses ONLY Mutex + Atomic primitives, so fills
+    may be published from any domain. Signalling is a monotonic generation
+    counter rather than an [Lwt_condition]: Lwt structures are single-
+    domain, so the previous broadcast was unsafe from non-Lwt contexts.
+    The consumer ([wait_for_fill]) polls the counter; its sole caller is
+    the Discord notifier, which is latency-insensitive. *)
 
 module RingBuffer = Ring_buffer.RingBuffer
 
@@ -30,15 +34,17 @@ type fill_event =
   ; trade_id : string (** Exchange trade/execution ID for deduplication. *)
   }
 
-(** Global fill event ring buffer. Capacity 256 provides ample headroom
-    for bursty grid strategies while bounding memory usage. *)
-let buffer : fill_event RingBuffer.t = RingBuffer.create 256
+(** Global fill event ring buffer. R3: raised from 256 - a burst of fills
+    (volatile market, mass take-profit triggers) could lap the Discord
+    consumer within one drain. 1024 slots x small records is ~200KB. *)
+let buffer : fill_event RingBuffer.t = RingBuffer.create 1024
 
-(** Mutex serializing writes from multiple exchange feed threads. *)
+(** Mutex serializing writes from multiple domains. *)
 let write_mutex = Mutex.create ()
 
-(** Lwt condition signaled after each write to wake the consumer fiber. *)
-let fill_condition : unit Lwt_condition.t = Lwt_condition.create ()
+(** Monotonic fill counter, bumped under [write_mutex] after each new
+    event. Replaces the former Lwt_condition broadcast. *)
+let generation = Atomic.make 0
 
 (** Bounded deduplication set for published fills.
     Prevents WebSocket reconnect replays from re-publishing fills that
@@ -49,8 +55,8 @@ let dedup_set : (string * string, unit) Hashtbl.t = Hashtbl.create dedup_cap
 let dedup_queue : (string * string) Queue.t = Queue.create ()
 
 (** Publish a fill event to the centralized buffer.
-    Thread-safe: acquires [write_mutex] for the ring buffer write,
-    then broadcasts [fill_condition] to wake Lwt consumers.
+    Domain-safe: acquires [write_mutex] for the dedup + ring buffer write,
+    then bumps [generation] to release polling consumers.
     Silently drops duplicate fills based on (order_id, trade_id). *)
 let publish_fill (event : fill_event) =
   let key = event.order_id, event.trade_id in
@@ -70,11 +76,8 @@ let publish_fill (event : fill_event) =
         Hashtbl.remove dedup_set oldest)
     done;
     RingBuffer.write buffer event;
-    Mutex.unlock write_mutex;
-    (* Broadcast is safe to call from any thread; Lwt_condition internally
-       handles cross-domain signaling via the Lwt scheduler. *)
-    try Lwt_condition.broadcast fill_condition () with
-    | _ -> ())
+    Atomic.set generation (Atomic.get generation + 1);
+    Mutex.unlock write_mutex)
 ;;
 
 (** Return the current write position. Consumers use this as their
@@ -85,9 +88,20 @@ let get_position () = RingBuffer.get_position buffer
     without allocating an intermediate list. Returns the new read position. *)
 let iter_since last_pos f = RingBuffer.iter_since buffer last_pos f
 
-(** Block until [fill_condition] is broadcast. Returns immediately if
-    a fill was published between the caller's last read and this call. *)
-let wait_for_fill () = Lwt_condition.wait fill_condition
+(** Resolve once a fill newer than the caller's snapshot has been
+    published. Polls the generation counter at 50ms: the sole consumer is
+    the Discord notifier, so event-driven wakeup buys nothing and the poll
+    keeps publishers domain-safe. Returns immediately if a fill was
+    published since the caller captured its position. *)
+let wait_for_fill ?(poll_interval = 0.05) () =
+  let g = Atomic.get generation in
+  let rec loop () =
+    if Atomic.get generation <> g
+    then Lwt.return_unit
+    else Lwt.bind (Lwt_unix.sleep poll_interval) loop
+  in
+  loop ()
+;;
 
 (** Read and sort the entire buffer returning the most recent fills first. *)
 let get_recent_fills () =

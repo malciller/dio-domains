@@ -31,17 +31,23 @@ let profilers : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
 
 let profilers_mutex = Mutex.create ()
 
-(* M10: memoize the last lookup so the common per-order path (same symbol +
+(* R4/P4: memoize the last lookup so the common per-order path (same symbol +
    operation repeated) skips the key sprintf and the profilers_mutex
-   acquisition entirely. *)
-let last_profiler_key = ref ""
-let last_profiler = ref None
+   acquisition entirely. The (symbol, operation, profiler) triple lives in
+   ONE atomic cell so a cross-domain reader can never observe a torn pair
+   (new key with stale profiler - the previous two-ref version
+   misattributed latency under concurrency). Comparisons are
+   allocation-free ([String.equal]). *)
+let last_profiler : (string * string * Latency_profiler.t) option Atomic.t =
+  Atomic.make None
+;;
 
 let get_profiler symbol operation =
-  let key = Printf.sprintf "%s:%s" symbol operation in
-  if key = !last_profiler_key
-  then Option.get !last_profiler
-  else (
+  match Atomic.get last_profiler with
+  | Some (sym, op, profiler) when String.equal sym symbol && String.equal op operation ->
+    profiler
+  | _ ->
+    let key = Printf.sprintf "%s:%s" symbol operation in
     Mutex.lock profilers_mutex;
     let profiler =
       match Hashtbl.find_opt profilers key with
@@ -79,9 +85,32 @@ let get_profiler symbol operation =
         p
     in
     Mutex.unlock profilers_mutex;
-    last_profiler_key := key;
-    last_profiler := Some profiler;
-    profiler)
+    Atomic.set last_profiler (Some (symbol, operation, profiler));
+    profiler
+;;
+
+(* P6: window-cadence snapshot+reset for this symbol's operation profilers.
+   Previously [report] ran INLINE after every place/amend/cancel once 100
+   samples accumulated - a sorting/logging spike attributed to trading
+   latency exactly when activity was highest. The domain worker now calls
+   this from its rolling-window publish (every latency_window_seconds), so
+   percentiles still reach the logs without ever running mid-hot-path. *)
+let snapshot_symbol_profilers symbol =
+  List.iter
+    (fun op ->
+       let profiler = get_profiler symbol op in
+       let snap = Latency_profiler.snapshot_and_reset profiler in
+       if snap.Latency_profiler.samples > 0
+       then
+         Logging.debug_f
+           ~section
+           "Latency [%s]: samples=%d p50=%s p99=%s overflow=%d"
+           snap.Latency_profiler.name
+           snap.Latency_profiler.samples
+           (Latency_profiler.format_us snap.Latency_profiler.p50)
+           (Latency_profiler.format_us snap.Latency_profiler.p99)
+           snap.Latency_profiler.overflow)
+    [ "place"; "amend"; "cancel" ]
 ;;
 
 (* Exchange interface module and type aliases. *)
@@ -358,7 +387,6 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
             let stop_time = Mtime_clock.now_ns () in
             let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
             Latency_profiler.record profiler span;
-            Latency_profiler.report ~sample_threshold:100 profiler;
             Lwt.return result)))
 ;;
 
@@ -520,7 +548,6 @@ let amend_order ~token ?retry_config (request : amend_request) =
              let stop_time = Mtime_clock.now_ns () in
              let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
              Latency_profiler.record profiler span;
-             Latency_profiler.report ~sample_threshold:100 profiler;
              (* Resolve the amend lifecycle with the exchange's verdict: a
                 same-id amend (Kraken) drops the entry; a replace
                 (Hyperliquid/Alpaca cancel+create) keeps the OLD id registered
@@ -590,7 +617,6 @@ let cancel_orders ~token ?retry_config (request : cancel_request) =
          let stop_time = Mtime_clock.now_ns () in
          let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
          Latency_profiler.record profiler span;
-         Latency_profiler.report ~sample_threshold:100 profiler;
          Lwt.return result))
 ;;
 

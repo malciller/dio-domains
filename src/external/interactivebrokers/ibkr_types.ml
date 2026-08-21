@@ -9,11 +9,14 @@ let section = "ibkr_types"
 (** Default queue capacity for the market data ticker Lwt stream. *)
 let default_ring_buffer_size_ticker = 100
 
-(** Default queue capacity for the Level 2 market depth Lwt stream. *)
-let default_ring_buffer_size_orderbook = 16
+(** Default queue capacity for the Level 2 market depth Lwt stream.
+    R3: raised from 16 to absorb bursts without lapping readers. *)
+let default_ring_buffer_size_orderbook = 64
 
-(** Default queue capacity for the order execution report Lwt stream. *)
-let default_ring_buffer_size_executions = 32
+(** Default queue capacity for the order execution report Lwt stream.
+    R3: raised from 32 - exec bursts (mass cancels, volatile fills)
+    previously lapped the domain consumer and dropped lifecycle events. *)
+let default_ring_buffer_size_executions = 512
 
 (** Maximum elapsed duration in seconds before an untracked open order is evicted from local state management. *)
 let default_stale_order_threshold_s = 86400.0 (* 24 hours *)

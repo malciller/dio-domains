@@ -136,6 +136,9 @@ module OrderUpdateEventBus = Event_bus.Make (struct
 (** Singleton order update event bus. *)
 let order_update_event_bus = OrderUpdateEventBus.create "order_update"
 
+(* P5: one-shot flag for the parse-domain skip warning above. *)
+let order_update_bus_warned = Atomic.make false
+
 (** Open order record. *)
 type open_order =
   { order_id : string
@@ -175,7 +178,11 @@ let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 (** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires global_orders_mutex. *)
 let order_to_symbol : (string, string * side) Hashtbl.t = Hashtbl.create 16
 (** FIFO queue for O(1) oldest-entry eviction. *)
+
+(** FIFO queue for O(1) oldest-entry eviction. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
+(** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
+
 (** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
 let order_to_symbol_cap : int ref = ref max_int
 
@@ -217,8 +224,10 @@ let global_orders_mutex = Mutex.create ()
 
 (** Mutex for symbol_stores table initialization. *)
 let initialization_mutex = Mutex.create ()
-
-let ready_condition = Lwt_condition.create ()
+(* P5: frame dispatch runs on the Parse_worker domain, so the dispatch path
+   must not touch Lwt primitives. The former [ready_condition]
+   (Lwt_condition) was removed: readiness is published via store.ready
+   Atomics from the parse domain and consumed by polling. *)
 
 (** Retrieves or lazily creates a per-symbol store. Wait-free on the hot path after initial creation. *)
 let get_symbol_store symbol =
@@ -246,16 +255,10 @@ let get_symbol_store symbol =
     store
 ;;
 
-(** Marks the store as ready and broadcasts to any waiting consumers. *)
-let notify_ready store =
-  if not (Atomic.get store.ready)
-  then (
-    Atomic.set store.ready true;
-    try Lwt_condition.broadcast ready_condition () with
-    | Invalid_argument _ ->
-      (* Ignored: waiters may have timed out or been cancelled. *)
-      ())
-;;
+(** Marks the store as ready. P5: Atomic flag only - the startup waiter
+    polls it, so this is safe from the Parse_worker domain (the former
+    Lwt_condition broadcast was not). *)
+let notify_ready store = if not (Atomic.get store.ready) then Atomic.set store.ready true
 
 let has_execution_data symbol =
   try
@@ -270,7 +273,11 @@ let has_execution_data_fast symbol =
   fun () -> Atomic.get store.ready
 ;;
 
-(** Blocks until execution data is available for all specified symbols or timeout elapses. *)
+(** Blocks until execution data is available for all specified symbols or timeout elapses.
+    P5: polls the per-store ready Atomics instead of waiting on a condition
+    variable - readiness is published from the Parse_worker domain, which
+    must not touch Lwt primitives. The poll only runs during startup
+    gating (bounded by the timeout), never on a hot path. *)
 let wait_for_execution_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
@@ -280,14 +287,7 @@ let wait_for_execution_data_lwt symbols timeout_seconds =
       let remaining = deadline -. Unix.gettimeofday () in
       if remaining <= 0.0
       then Lwt.return_false
-      else
-        Lwt.pick
-          [ (Lwt_condition.wait ready_condition >|= fun () -> `Again)
-          ; (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-          ]
-        >>= function
-        | `Again -> loop ()
-        | `Timeout -> Lwt.return (List.for_all has_execution_data symbols))
+      else Lwt_unix.sleep 0.025 >>= fun () -> loop ())
   in
   loop ()
 ;;
@@ -1083,8 +1083,24 @@ let handle_update json on_heartbeat =
            Atomic.set store.last_event_time event.timestamp;
            notify_ready store;
            Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
-           (* Publish to the order update event bus. *)
-           OrderUpdateEventBus.publish order_update_event_bus event;
+           (* Publish to the order update event bus. P5: this bus is backed
+              by Lwt streams (single-domain structures), so publishing from
+              the Parse_worker domain is only safe when nobody is
+              subscribed. It currently has zero subscribers anywhere in the
+              codebase; the guard skips it in that case and logs once if a
+              subscriber ever appears (at which point the consumer must be
+              migrated off the Lwt stream before relying on it here). *)
+           (match Atomic.get order_update_event_bus.subscribers with
+            | [] -> ()
+            | _ ->
+              if not (Atomic.get order_update_bus_warned)
+              then (
+                Atomic.set order_update_bus_warned true;
+                Logging.warn_f
+                  ~section
+                  "order_update_event_bus has subscribers but publishes are skipped on \
+                   the parse domain; migrate the consumer off the Lwt stream");
+              ());
            (* Publish complete fills to the centralized fill event bus for Discord notifications. *)
            if event.order_status = FilledStatus
            then (
@@ -1177,6 +1193,35 @@ let handle_message message on_heartbeat =
       message
 ;;
 
+(* P5: per-connection heartbeat closure, published so the Parse_worker
+   handler can invoke it from the parse domain (domain-safe: mutex +
+   timestamp update). One authenticated connection exists at a time. *)
+let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
+
+(** P5: parse-worker entry point. Executions pushes are intercepted in
+    Kraken_trading_client.handle_frame by a raw-string prefix check BEFORE
+    the central Yojson parse, so this handler owns both the parse and the
+    dispatch for the channel. [handle_message_json] is domain-safe: stores
+    under per-symbol mutexes, ring writes, Atomics, logging, wakeups. *)
+let () =
+  Concurrency.Parse_worker.register "kraken_exec" (fun message ->
+    let heartbeat =
+      match Atomic.get current_on_heartbeat with
+      | Some f -> f
+      | None -> fun () -> ()
+    in
+    try
+      let json = Yojson.Safe.from_string message in
+      handle_message_json json heartbeat
+    with
+    | exn ->
+      Logging.error_f
+        ~section
+        "Error parsing message: %s - %s"
+        (Printexc.to_string exn)
+        message)
+;;
+
 (** Deprecated. Superseded by the unified connection hub. Retained for interface compatibility. *)
 let start_message_handler _conn _token _on_failure _on_heartbeat = Lwt.return_unit
 
@@ -1185,6 +1230,10 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.debug
     ~section
     "Registering executions subscription on unified authenticated connection";
+  (* P5: publish the heartbeat closure for the parse-domain handler; frames
+     now bypass this module's buffer-drain loop entirely (they are
+     intercepted in Kraken_trading_client before reaching the buffer). *)
+  Atomic.set current_on_heartbeat (Some on_heartbeat);
   let subscribe_msg =
     `Assoc
       [ "method", `String "subscribe"
