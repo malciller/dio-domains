@@ -4,6 +4,8 @@ DIO is an OCaml trading engine for market making, grid trading, and capital mana
 
 The engine is organized as one OCaml domain per trading asset, a supervisor that owns connection lifecycle and health, a lock-free order executor, and a supervised event-driven oracle that re-sizes positions on every fill/cancel (microsecond decision path, no network wait).
 
+A live implementation is running at [diophantsolutions.com](https://diophantsolutions.com).
+
 > **Warning:** the auto-hedge strategy (Hyperliquid perp shorts) is experimental. Review `auto_hedger.ml` and test on testnet before risking real capital.
 
 ---
