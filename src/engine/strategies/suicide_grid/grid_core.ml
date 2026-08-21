@@ -59,8 +59,10 @@
    - pessimistic Buy_first ordering (max buys before any sell in a bar):
      oscillatory bars drain fees differently than live sequential execution;
      conservative by construction.
-   - capital_low clears on quote recovery (live requires a balance increase);
-     the recovery gate on sells is approximated by the profit/buffer check. *)
+   - capital_low clears on quote recovery (affordability-based, matching
+     live: a price drop that makes the same balance sufficient clears it,
+     no deposit required); the recovery gate on sells is approximated by
+     the profit/buffer check. *)
 
 open Grid_core_types
 
