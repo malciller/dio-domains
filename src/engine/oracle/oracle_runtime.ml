@@ -1270,7 +1270,15 @@ type account_fp =
         base, venue base). *)
   }
 
-let size_cache : (string, account_fp * decision list) Hashtbl.t = Hashtbl.create 8
+(** Cached per account: (fingerprint, decisions, first-buy gate token). The
+    token is [account_gate_token] evaluated with the SIZING-TIME pool and the
+    sizing-time first-buy costs; the reuse path re-evaluates it against the
+    current pool and LIVE costs (the anchor price is deliberately not part of
+    the fingerprint), so a gate that flipped in either dimension forces a
+    fresh sizing instead of reusing a stale ACTIVE/INACTIVE verdict. *)
+let size_cache : (string, account_fp * decision list * bool list) Hashtbl.t =
+  Hashtbl.create 8
+;;
 
 let account_fp_eq (a : account_fp) (b : account_fp) =
   a.af_analyses = b.af_analyses
@@ -2074,11 +2082,13 @@ let account_gate_inputs
     folds the assets in priority order, each consuming its sized [deployed]
     share (the pass-down), and reports whether each asset's first buy is
     fundable from its remaining budget. A committed resting buy exempts the
-    asset. Compared across two pool values (the cache's stored pool vs the
-    fresh pool) to detect a gate that flips within the sizing-cache pool
-    bucket: a flip must bypass the cache or the asset keeps a stale
-    ACTIVE/INACTIVE decision - the "capital returned but the strategy did not
-    resume" stall. *)
+    asset. The result is compared against the token STORED at sizing time to
+    detect any gate flip since then - in either dimension: a pool move inside
+    the 0.5% fingerprint bucket (a small capital return crossing an asset's
+    first-buy cost) or a first-buy COST move (the live anchor price fell so
+    the parked asset is now fundable). A flip must bypass the cache or the
+    asset keeps a stale ACTIVE/INACTIVE decision - the "capital returned but
+    the strategy did not resume" stall. *)
 let account_gate_token
       ~(pool : float)
       (gate_inputs : gate_input list)
@@ -2740,17 +2750,22 @@ let run_pass
                    pool
              in
              (* Cache reuse is gate-aware: reuse the cached decisions only
-                when no asset's first-buy gate flips between the pool they
-                were sized at and the current pool. A pool move inside the
-                0.5% fingerprint bucket can still cross an asset's first-buy
-                gate (a small capital return - a reclaim cancel, a deposit, a
-                sweep - that makes a parked priority asset fundable); reusing
-                the stale INACTIVE decision would leave the strategy paused on
-                available capital, which is exactly the "capital returned but
-                the strategy did not resume in priority order" stall. *)
+                 when no asset's first-buy gate has flipped since they were
+                 sized. The stored token was computed at sizing time (sizing
+                 pool + sizing costs); the fresh token uses the current pool
+                 and LIVE first-buy costs (account_gate_inputs re-anchors on
+                 top-of-book, which is deliberately NOT in the fingerprint).
+                 A difference in either dimension - a small capital return
+                 crossing an asset's first-buy cost inside the 0.5% pool
+                 bucket, or an anchor-price drop making a parked priority
+                 asset fundable - forces a fresh sizing; reusing the stale
+                 INACTIVE decision would leave the strategy paused on
+                 available capital, which is exactly the "capital returned
+                 but the strategy did not resume in priority order" stall. *)
              let reuse_entry =
                match Hashtbl.find_opt size_cache (account_id account) with
-               | Some (prev_fp, prev_decisions) when account_fp_eq prev_fp fp ->
+               | Some (prev_fp, prev_decisions, sized_gate) when account_fp_eq prev_fp fp
+                 ->
                  let deployed_of =
                    let m = Hashtbl.create 8 in
                    List.iter
@@ -2762,8 +2777,7 @@ let run_pass
                    account_gate_inputs account_tasks analyses ~decisions:prev_decisions
                  in
                  let same_gate =
-                   account_gate_token ~pool:prev_fp.af_pool gate_inputs ~deployed_of
-                   = account_gate_token ~pool gate_inputs ~deployed_of
+                   account_gate_token ~pool gate_inputs ~deployed_of = sized_gate
                  in
                  Some (prev_fp, prev_decisions, gate_inputs, same_gate)
                | _ -> None
@@ -2798,19 +2812,37 @@ let run_pass
                 Lwt.return_unit
               | _ ->
                 (* No cache entry, the fingerprint moved, or a first-buy gate
-                   flipped inside the bucket: re-size this account fresh. *)
+                    flipped since the cached sizing (pool or cost side):
+                    re-size this account fresh. *)
                 let before = List.length !decisions in
                 size_all ~venue_pool:pool ~snapshot:(Some snapshot) pool analyses
                 >|= fun surplus ->
                 let n = List.length !decisions - before in
                 let account_decisions = take n !decisions |> List.rev in
-                Hashtbl.replace size_cache (account_id account) (fp, account_decisions);
-                (* Apply the reclaim plan: the account's decisions just came off
-                    the head of [!decisions]; swap them for the patched ones. *)
-                let gate_inputs =
+                (* The account's gate inputs on its own fresh decisions: they
+                     feed the reclaim plan and are stamped (as a gate token)
+                     into the cache for later flip detection. *)
+                let gate_inputs_sized =
                   account_gate_inputs account_tasks analyses ~decisions:account_decisions
                 in
-                let reclaim = reclaim_plan gate_inputs in
+                (* Stamp the sizing-time gate token (this pool, these first-
+                      buy costs) so later passes can detect a flip in either
+                      dimension and bypass the cache. *)
+                let sized_gate =
+                  let m = Hashtbl.create 8 in
+                  List.iter
+                    (fun (d : decision) -> Hashtbl.replace m d.symbol d.deployed)
+                    account_decisions;
+                  account_gate_token ~pool gate_inputs_sized ~deployed_of:(fun s ->
+                    Option.value (Hashtbl.find_opt m s) ~default:0.0)
+                in
+                Hashtbl.replace
+                  size_cache
+                  (account_id account)
+                  (fp, account_decisions, sized_gate);
+                (* Apply the reclaim plan: the account's decisions just came off
+                     the head of [!decisions]; swap them for the patched ones. *)
+                let reclaim = reclaim_plan gate_inputs_sized in
                 log_reclaim reclaim;
                 let patched = apply_reclaim ~plan:reclaim account_decisions in
                 decisions := List.rev_append patched (drop n !decisions);

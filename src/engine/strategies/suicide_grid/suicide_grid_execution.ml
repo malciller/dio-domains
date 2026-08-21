@@ -172,12 +172,17 @@ let evaluate_capital_low_recovery
     let available_quote = quote_bal -. total_reserved in
     if state.capital_low && state.capital_low_at_balance < 0.0
     then state.capital_low_at_balance <- quote_bal;
+    (* M17: recovery is AFFORDABILITY-based, matching the replay model
+        (Grid_core clears as soon as the quote can fund the next buy) and
+        market_maker's flag handling. Gating the clear on a balance INCREASE
+        latched the pause forever when a falling price made the same balance
+        sufficient again ("capital regained the price needed" but no new
+        quote arrived) or when another asset's reclaim released reserved
+        quote - the strategy stayed paused on spendable capital. The stamp
+        below is for the log line only. *)
     if state.capital_low && available_quote < quote_needed_fast
     then ()
-    else if
-      state.capital_low
-      && state.capital_low_at_balance >= 0.0
-      && quote_bal > state.capital_low_at_balance
+    else if state.capital_low
     then (
       let was_at = state.capital_low_at_balance in
       state.capital_low <- false;
@@ -811,28 +816,51 @@ let evaluate_buy_leg
         let current_buy_price_rounded = state.cached_round_price current_buy_price in
         let min_move_threshold = get_min_move_threshold state.cached_price_increment in
         (* A sizing re-anchor (the capital oracle published a changed grid
-           interval - flagged by the domain worker on [force_buy_reanchor])
-           amends the resting buy to the new spacing in BOTH directions.
-           Normal trailing only moves the buy UP, so a widened grid interval
-           would otherwise leave the book running at the old, tighter spacing
-           (buy too close to the market, rungs not 2*gi apart) until the
-           market happens to rise. A qty-only oracle change does NOT re-anchor
-           the price: the grid adopts the new size (Alpaca qty mismatch
-           amend) or on the next placement, and the resting price only trails
-           up. *)
+            interval - flagged by the domain worker on [force_buy_reanchor])
+            used to amend the resting buy to the new spacing in BOTH
+            directions. M17: a downwards amendment is warranted ONLY by a
+            sell-spacing violation (see below); a widened grid interval no
+            longer snaps an otherwise-valid resting buy down to the market
+            rung - the ladder spacing is enforced where it matters (fresh
+            placements clamp below the closest sell; this leg corrects real
+            intrusions into a sell's restricted zone). A qty-only oracle
+            change does NOT re-anchor the price: the grid adopts the new size
+            (Alpaca qty mismatch amend) or on the next placement, and the
+            resting price only trails up. *)
         let reanchor_buy = state.force_buy_reanchor in
-        if target_buy_price > current_buy_price || qty_mismatch || reanchor_buy
+        (* M17: a re-anchor may move the resting buy DOWN only when the
+           resting price actually violates a ladder constraint - it sits
+           inside the restricted zone below the closest sell (above
+           sell - 2*gi of the SELL). A price already within one grid
+           interval of the reference does NOT warrant a downwards amendment
+           (there is nothing to correct: no sell is within 2*gi), and
+           snapping such an order down to the market rung on startup churned
+           validly-resting orders through cancel+create. Upward movement is
+           normal trailing; a qty-only fix keeps the price. *)
+        let trail_up = target_buy_price > current_buy_price in
+        let down_reanchor =
+          reanchor_buy && (not trail_up) && current_buy_price_rounded > exact_target
+        in
+        let reanchor_moves = trail_up || down_reanchor in
+        (* Nothing warranted (no trail-up, no sell-zone violation, no qty
+           fix): the re-anchor is satisfied price-wise - release the latch so
+           it cannot fire later out of context. *)
+        if reanchor_buy && (not reanchor_moves) && not qty_mismatch
+        then state.force_buy_reanchor <- false;
+        if reanchor_moves || qty_mismatch
         then (
           (* A qty-only mismatch (the oracle re-derived the size from a
              churning pool; the spacing is unchanged) corrects the QTY and
              keeps the resting PRICE - the buy only ever trails up, exactly
              like normal trailing. Only a target above the resting price (a
-             genuine trail-up) or a real gi re-anchor moves the price, and the
-             min-move deadband still applies. This stops the grid and the
-             oracle from fighting over the resting buy every pass (cancel+
-             create churn on Alpaca). *)
+             genuine trail-up) or a warranted downward correction moves the
+             price, and the min-move deadband still applies. This stops the
+             grid and the oracle from fighting over the resting buy every
+             pass (cancel+create churn on Alpaca). *)
           let effective_amend_price =
-            if qty_mismatch && not reanchor_buy
+            if down_reanchor
+            then exact_target
+            else if qty_mismatch && not reanchor_moves
             then Float.max current_buy_price target_buy_price
             else target_buy_price
           in
@@ -941,18 +969,24 @@ let evaluate_buy_leg
         in
         let min_move_threshold = get_min_move_threshold state.cached_price_increment in
         let current_buy_price_rounded = state.cached_round_price current_buy_price in
-        (* Sizing re-anchor (see the with-sell branch): amend the resting buy
-           to the oracle's target in both directions. *)
+        (* No resting sell on this symbol, so a downwards amendment has no
+            warrant at all: the re-anchor contributes nothing beyond normal
+            trail-up and qty fixing (see the with-sell branch). A resting buy
+            already within one grid interval of the reference is left alone. *)
         let reanchor_buy = state.force_buy_reanchor in
-        if target_buy_price > current_buy_price || qty_mismatch || reanchor_buy
+        let trail_up = target_buy_price > current_buy_price in
+        (* Nothing warranted: release the latch so the sizing counts as
+            adopted without moving the book. *)
+        if reanchor_buy && (not trail_up) && not qty_mismatch
+        then state.force_buy_reanchor <- false;
+        if trail_up || qty_mismatch
         then (
           (* A qty-only mismatch corrects the QTY and keeps the resting PRICE
-             (the buy only ever trails up, like normal trailing); only a
-             target above the resting price or a real gi re-anchor moves the
-             price, and the min-move deadband still applies (see the with-sell
-             branch). *)
+              (the buy only ever trails up, like normal trailing); only a
+              target above the resting price moves it, and the min-move
+              deadband still applies (see the with-sell branch). *)
           let effective_amend_price =
-            if qty_mismatch && not reanchor_buy
+            if qty_mismatch && not trail_up
             then Float.max current_buy_price target_buy_price
             else target_buy_price
           in

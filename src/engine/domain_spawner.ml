@@ -954,10 +954,11 @@ let asset_domain_worker
          let st = Dio_strategies.Suicide_grid.get_strategy_state asset_with_fees.symbol in
          (try st.grid_qty <- float_of_string qty_str with
           | Failure _ -> ());
-         (* Re-anchor any already-resting buy to the decision's spacing: an
-            order injected from the exchange (or placed under an earlier
-            sizing) can sit closer to the market than the oracle's gi allows,
-            and the buy-trailing leg never moves a buy DOWN on its own. *)
+         (* Re-check any already-resting buy against the decision's spacing:
+             the re-anchor amends DOWN only when the resting price actually
+             violates a ladder constraint (it sits inside a sell's 2*gi
+             restricted zone); an order already within one grid interval of
+             the market is left alone - it trails up as usual. *)
          st.force_buy_reanchor <- true;
          should_execute_strategy := true;
          Logging.debug_f
@@ -999,16 +1000,15 @@ let asset_domain_worker
            (try st.grid_qty <- float_of_string qty_str with
             | Failure _ -> ());
            (* A qty-only change (the pool churned) is adopted as the new size
-               WITHOUT forcing the resting buy to re-anchor: the grid's qty
-               mismatch amend (Alpaca) fixes the size while keeping the price
-               (the buy only ever trails up), and other venues take the new
-               size on the next placement. Forcing a price re-anchor on qty
-               drift is what made the grid and oracle fight over the resting
-               order every pass (cancel+create churn on Alpaca). Only a real
-               grid-interval change - a different ladder spacing - re-anchors
-               the resting buy (amend down included); otherwise a widened
-               interval would leave the book at the old tighter spacing until
-               the market happens to rise. *)
+                WITHOUT forcing the resting buy to re-anchor: the grid's qty
+                mismatch amend (Alpaca) fixes the size while keeping the price
+                (the buy only ever trails up), and other venues take the new
+                size on the next placement. Forcing a price re-anchor on qty
+                drift is what made the grid and oracle fight over the resting
+                order every pass (cancel+create churn on Alpaca). Only a real
+                grid-interval change - a different ladder spacing - re-checks
+                the resting buy; the amend-down itself stays gated on a real
+                sell-spacing violation in the strategy. *)
            if gi_changed then st.force_buy_reanchor <- true;
            should_execute_strategy := true;
            Logging.debug_f

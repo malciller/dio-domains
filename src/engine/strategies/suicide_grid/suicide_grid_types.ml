@@ -86,7 +86,10 @@ type strategy_state =
     (* set when quote balance is insufficient for next buy; pauses strategy *)
   ; mutable capital_low_logged : bool (* suppresses repeated capital-low log warnings *)
   ; mutable capital_low_at_balance : float
-    (* quote_bal snapshot when capital_low was set; clears only on balance increase; -1.0 = unstamped *)
+    (* quote_bal snapshot when capital_low was set (log context only); -1.0 =
+       unstamped. Recovery is affordability-based: the flag clears as soon as
+       available quote covers the next buy (a price drop or a released
+       reservation counts - no balance increase required). *)
   ; mutable last_buy_attempted_insufficient : bool
     (* true for the one cycle where a buy was placed despite a KNOWN local
        balance shortfall (balance snapshot stale): the resulting exchange
@@ -102,13 +105,16 @@ type strategy_state =
        placed, so the non-accrued inventory is sold as soon as the transient
        blocker clears. *)
   ; mutable force_buy_reanchor : bool
-    (* true when the sizing source (capital oracle) published a changed
-       qty/grid_interval: the buy-trailing leg then re-anchors the resting
-       buy to the new sizing target even when that means amending it DOWN
-       (normal trailing only moves the buy up, so a widening grid interval
-       would otherwise leave the book running at the old, tighter spacing).
-       Set by the domain worker on sizing change, cleared by the strategy
-       once the buy sits at the target. *)
+    (* true when the sizing source (capital oracle) materialized the strategy
+        or published a changed grid_interval: the buy-trailing leg then
+        re-checks the resting buy against the ladder constraints. It amends
+        DOWN only when the resting price actually violates one - it sits
+        inside the restricted zone below the closest resting sell (above
+        sell - 2*gi of the SELL); a price already within one grid interval of
+        the reference is left alone (no sell within 2*gi = nothing to
+        correct). Upward movement is normal trailing. Set by the domain
+        worker on sizing change, cleared by the strategy once the resting
+        price satisfies the constraints. *)
   ; mutable reserved_quote : float
     (* quote amount reserved by current open buy for this symbol *)
   ; mutable accumulated_profit : float
