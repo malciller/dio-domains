@@ -277,7 +277,15 @@ Health rules:
 
 ### Domains and wakeups
 
-Each active asset runs its own domain. Exchange feeds write into single-writer/multi-reader ring buffers; the strategy loop wakes through `Exchange_wakeup`, a per-symbol mutex + condition variable pair. Domains never busy-poll.
+Each active asset runs its own domain. Exchange feeds write into single-writer/multi-reader ring buffers; the strategy loop wakes through `Exchange_wakeup`, which keeps a monotonic per-symbol generation counter. Producers bump the counter after writing data; the domain captures it at cycle start and waits against that baseline at cycle end, so a signal landing mid-cycle makes the wait return immediately instead of parking through pending data (the classic check-then-sleep lost-wakeup race). The wait spins briefly on the lock-free counter before parking on the condition variable, absorbing near-simultaneous signals without a kernel round-trip. Quiet domains park normally; nothing busy-polls.
+
+Ring buffer cursors are absolute write positions, not slot indices: they stay valid across laps (a stalled reader resumes at the oldest surviving entry instead of aliasing to "empty") and across clears (resubscribes), and slots carry sequence numbers so a writer racing an iteration cannot cause duplicated or torn reads.
+
+Order lifecycle events from REST callbacks (acks, rejects, amend results) do not touch strategy state directly: they are pushed onto a per-symbol lock-free queue and drained by the symbol's own domain at the top of each cycle, so strategy state has exactly one writer thread.
+
+### Feed parsing
+
+High-rate frame parsing runs on a dedicated worker domain (`src/engine/concurrency/parse_worker.ml`) rather than the Lwt scheduler thread that multiplexes all venue sockets. Kraken's WebSocket client diverts executions and orderbook frames by raw-string prefix before any JSON parsing; the worker parses and dispatches them sequentially, preserving per-venue order. When the worker's queue fills, frames fall back to inline parsing - never dropped (Kraken book updates are deltas, so a dropped update would desync the local book). Hyperliquid's l2Book channel needs no offloading: its top-of-book is extracted by a zero-copy string scan into an Atomic snapshot, and the full-book JSON parse only happens on the dashboard cadence.
 
 ### Order executor
 
@@ -418,7 +426,7 @@ Where things live:
 | `src/engine/config.ml` | `config.json` schema and validation |
 | `src/engine/domain_spawner.ml` | Per-asset domains, strategy lifecycle, Fear-and-Greed trigger |
 | `src/engine/supervisor/` | Connection registry, health monitor, circuit breaker, feed orchestration |
-| `src/engine/concurrency/` | Ring buffers, event buses, exchange wakeups, Lwt helpers |
+| `src/engine/concurrency/` | Ring buffers, event buses, exchange wakeup generations, feed parse worker, fill event bus, Lwt helpers |
 | `src/engine/oracle/` | Oracle runtime, math, venues, tasks, loader |
 | `src/engine/strategies/` | `suicide_grid`, `market_maker`, `auto_hedger`, grid core |
 | `src/engine/latency_profiling/` | Rolling p50/p99/p999 network latency stats |
