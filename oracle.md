@@ -71,3 +71,20 @@ Global `oracle` section in `config.json` (see `config.json`): `target_survival`,
 7. **100% survivability first** — gi from survival search, qty grows only behind 100% survival, `qty_cap_mult` is a ceiling.
 8. **Verification funded with the actual pool** and seeded with accumulated state — "can THIS grid, as it runs, survive this history with the capital it's entitled to?"
 9. **Failure = last-known-good**; every fetch timeout-bounded; network never on the decision path.
+
+## Cash requirement surface
+
+Every per-asset report (active or inactive) ends with a cash requirement sweep: for
+each `(grid_interval, qty)` cell between the venue order floor and
+`config qty x qty_cap_mult`, how much capital clears `target_survival` on each
+horizon — once via the closed-form static runway and once replay-verified
+(`empirical_min_capitals`, fees + dynamic sizing). The `ALL` column is the worst
+horizon (`combined_sizing`: max over horizons; `-` when any horizon cannot clear
+the target within `--max-capital`). A path replay is horizon-independent, so the
+empirical scan shares ONE replay per probed capital across all horizons; the
+per-cell scan resolution is tunable via `--surface-scan-points` (default 24;
+the single-grid inverse-sizing table above it always uses 96). Axis density:
+`--surface-gi-steps` (default 10 over the config range) and
+`--surface-qty-points` (default 8, log-spaced, lot-rounded, corners exact).
+Pool-independent by construction: an asset that received $0 from the waterfall
+still reports what funding each configuration would have taken.

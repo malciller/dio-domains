@@ -472,11 +472,27 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                asset_symbol
                buy_fee_quote
                state.accumulated_profit);
-           if
-             Exchange.Types.exchange_of_string state.exchange_id = Alpaca && acc_qty > 0.0
+           (* All accumulation venues (Hyperliquid/Lighter/IBKR/Alpaca)
+               ACCRUE the base asset: reserved_base grows by the retained
+               (1 - sell_mult) slice of every buy fill, shrinking the
+               sellable inventory by the same amount so each cycle holds
+               back a slice instead of recycling 100% of it. Kraken's
+               retention is implicit in its sell_mult-sized sells and does
+               not reserve. *)
+           if persistence_accumulation_exchange state.exchange_id && acc_qty > 0.0
            then (
              let sell_mult = state.cached_sell_mult in
-             let base_increment = acc_qty -. (sell_mult *. acc_qty) in
+             (* Hyperliquid-like spot venues take the BUY fee out of the
+                 RECEIVED BASE token - only the net amount lands on the
+                 venue - so the accrual runs on the net landed qty, never
+                 the ordered qty (crediting gross would over-reserve base
+                 that does not exist). *)
+             let landed_qty =
+               if hl_like_spot_fee_exchange state.exchange_id && state.maker_fee > 0.0
+               then Float.max 0.0 (acc_qty -. (state.maker_fee *. acc_qty))
+               else acc_qty
+             in
+             let base_increment = landed_qty -. (sell_mult *. landed_qty) in
              if base_increment > 0.0
              then (
                state.reserved_base <- state.reserved_base +. base_increment;
@@ -492,12 +508,23 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                  state.reserved_base));
            if acc_qty > 0.0 && not state.startup_replay
            then (
-             state.anticipated_base_credit <- state.anticipated_base_credit +. acc_qty;
+             (* The anticipated credit mirrors what the venue actually
+                 credits: on Hyperliquid-like spot venues the buy fee is
+                 subtracted from the received BASE, so crediting the raw
+                 fill qty would overstate inventory by the fee on every
+                 fill - exactly the balance-vs-credit drift that lets a
+                 sell dip into reserved_base. *)
+             let credit_qty =
+               if hl_like_spot_fee_exchange state.exchange_id && state.maker_fee > 0.0
+               then Float.max 0.0 (acc_qty -. (state.maker_fee *. acc_qty))
+               else acc_qty
+             in
+             state.anticipated_base_credit <- state.anticipated_base_credit +. credit_qty;
              Logging.info_f
                ~section
                "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
                asset_symbol
-               acc_qty
+               credit_qty
                state.anticipated_base_credit
                order_id);
            (* A buy fill does not complete a sell placement: the sell's own

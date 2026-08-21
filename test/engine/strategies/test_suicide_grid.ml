@@ -304,6 +304,143 @@ let test_blocked_placement_sell_retries () =
   check bool "latch cleared after the sell is placed" false state.just_filled_buy
 ;;
 
+let test_hl_buy_fill_accrues_reserve () =
+  (* All accumulation venues (HL/Lighter/IBKR/Alpaca) reserve the retained
+      slice of every buy fill. Hyperliquid additionally takes the BUY fee
+      out of the RECEIVED BASE token, so both the accrual and the
+      anticipated credit run on the net landed qty: qty 0.5, maker_fee
+      0.0004 -> the venue credits 0.5*(1-0.0004) = 0.4998 base,
+      reserved_base grows by 0.4998*0.001 = 0.0004998, and the credit is
+      0.4998 - NOT the raw 0.5 fill qty (crediting gross would overstate
+      inventory by the fee on every fill and let sells dip into the
+      reserve). Kraken does not reserve: its retention is implicit in its
+      sell_mult-sized sells. *)
+  let symbol = "HL_ACCRUAL/BTC/USDC" in
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.5;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.999;
+  state.reserved_base <- 0.0;
+  state.anticipated_base_credit <- 0.0;
+  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Suicide_grid.Strategy.handle_order_filled
+    ~now:0.0
+    symbol
+    "hlacc1"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:62000.0
+    ~fill_qty:0.5
+    None;
+  let landed = 0.5 -. (0.0004 *. 0.5) in
+  let expected_reserve = landed *. (1.0 -. 0.999) in
+  check bool "hl buy fill accrues reserved base" true (state.reserved_base > 0.0);
+  check
+    bool
+    "hl accrual is the retained slice of the net landed base"
+    true
+    (abs_float (state.reserved_base -. expected_reserve) < 1e-9);
+  check
+    bool
+    "hl anticipated credit is net of the base-side buy fee"
+    true
+    (abs_float (state.anticipated_base_credit -. landed) < 1e-9);
+  (* Kraken control: no reservation on buy fills. *)
+  let kr_symbol = "KR_NOACCRUAL/XMR/USD" in
+  let kr_state = Dio_strategies.Suicide_grid.get_strategy_state kr_symbol in
+  kr_state.exchange_id <- "kraken";
+  kr_state.grid_qty <- 0.04;
+  kr_state.cached_sell_mult <- 0.999;
+  kr_state.reserved_base <- 0.0;
+  Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done kr_symbol;
+  Dio_strategies.Suicide_grid.Strategy.handle_order_filled
+    ~now:0.0
+    kr_symbol
+    "kracc1"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:390.0
+    ~fill_qty:0.04
+    None;
+  check bool "kraken buy fill does not reserve" true (kr_state.reserved_base = 0.0)
+;;
+
+let test_sub_minimum_qty_sell_places () =
+  (* Sells are NOT floored at the venue qty minimum - only the quote-notional
+     floor gates them (accrual sells sell_mult x qty and residual inventory
+     legitimately size below the lot minimum). Sellable inventory above
+     reserved rounds to 0.55 - far below the (deliberately impossible) 10
+     BTC venue qty floor - yet places because its notional clears the $1-
+     style floor; the old gate would have blocked it entirely. *)
+  let symbol = "SUBMINQTY/BTC/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.5;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.999;
+  (* Impossible base-quantity floor; the real gate is the notional one. *)
+  state.cached_venue_min_qty <- 10.0;
+  state.cached_venue_min_notional <- 1.0;
+  state.reserved_base <- 0.5;
+  state.accumulated_profit <- 1.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 62369.0;
+  state.last_buy_fill_qty <- Some 0.5;
+  let asset =
+    { Dio_strategies.Suicide_grid.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.5"
+    ; grid_interval = 0.75
+    ; sell_mult = "0.999"
+    ; strategy = "Grid"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    }
+  in
+  let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Suicide_grid.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Suicide_grid.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Suicide_grid.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:62369.0
+    ~ask_price:62370.0
+    ~asset_balance:1.05
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0;
+  let pushed = Dio_strategies.Suicide_grid.get_pending_orders 100 in
+  let sell_qty =
+    List.find_map
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         if
+           o.operation = Dio_strategies.Strategy_common.Place
+           && o.side = Dio_strategies.Strategy_common.Sell
+           && o.symbol = symbol
+         then Some o.qty
+         else None)
+      pushed
+  in
+  (* bal 1.05 + credit 0 - reserved 0.5 = 0.55 non-accrued inventory, lot-
+      rounded to sz_decimals 2. Placed despite being under the qty minimum. *)
+  check
+    (option (float 1e-9))
+    "sub-minimum qty sell places at full non-accrued inventory"
+    (Some 0.55)
+    sell_qty;
+  check bool "latch cleared after the sub-minimum sell placed" false state.just_filled_buy
+;;
+
 let test_balance_checking () =
   (* Test balance checking logic *)
   check
@@ -2678,6 +2815,14 @@ let () =
             "alpaca dollar notional floor gate"
             `Quick
             test_alpaca_dollar_floor_gate
+        ; test_case
+            "hl buy fill accrues reserved base (net of base fee)"
+            `Quick
+            test_hl_buy_fill_accrues_reserve
+        ; test_case
+            "sub-minimum qty sell places (notional is the only floor)"
+            `Quick
+            test_sub_minimum_qty_sell_places
         ; test_case
             "alpaca sell anchors on fill, not the ask"
             `Quick

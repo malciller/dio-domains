@@ -766,6 +766,141 @@ let test_empty_distribution_raises () =
   | Invalid_argument _ -> ()
 ;;
 
+(* ---- Cash requirement surface: multi-horizon empirical + sweep helpers ---- *)
+
+let model_of ~sessions series =
+  Dio_oracle.Oracle_replay.blend_model_of
+    ~horizon:
+      { Dio_oracle.Oracle_types.label = Printf.sprintf "%dd" sessions
+      ; sessions
+      ; calendar_days = sessions
+      }
+    ~asset:series
+    ~class_members:[ series ]
+    ~kappa:2
+    ~warmup:10
+    ()
+;;
+
+(* Deterministic declining history (enough bars for two horizon models). *)
+let declining_series () =
+  let n_bars = 240 in
+  let bars =
+    Array.init n_bars (fun i ->
+      let close = 100.0 *. (0.99 ** float_of_int i) in
+      bar ~high:(close *. 1.005) ~low:(close *. 0.995) ~close ())
+  in
+  series_of ~symbol:"CS" bars
+;;
+
+(* Drawdown then full recovery: the price ends above its ATH-scaled floor, so
+   the sizing reference funds the remaining drop to the floor (mid-range
+   d_cover) instead of the unrecovered-event overshoot branch. *)
+let round_trip_series () =
+  let n_down = 100
+  and n_up = 140 in
+  let bars =
+    Array.init (n_down + n_up) (fun i ->
+      let close =
+        if i < n_down
+        then 100.0 -. (45.0 *. float_of_int i /. float_of_int (n_down - 1))
+        else 55.0 +. (40.0 *. float_of_int (i - n_down + 1) /. float_of_int n_up)
+      in
+      bar ~high:(close *. 1.005) ~low:(close *. 0.995) ~close ())
+  in
+  series_of ~symbol:"RT" bars
+;;
+
+let test_empirical_all_matches_single () =
+  let c = cfg () in
+  let m = model_of ~sessions:30 (declining_series ()) in
+  let single = S.empirical_min_capital ~grid:c ~model:m ~target_survival:0.8 () in
+  let all = S.empirical_min_capitals ~grid:c ~models:[ m ] ~target_survival:0.8 () in
+  Alcotest.(check int) "one result per model" 1 (Array.length all);
+  Alcotest.(check bool) "reachable agrees" single.reachable all.(0).reachable;
+  near single.value all.(0).value;
+  near single.d_surv all.(0).d_surv;
+  near single.coverage all.(0).coverage
+;;
+
+let test_empirical_all_two_horizons () =
+  let c = cfg ~start_quote:50_000.0 () in
+  let s = declining_series () in
+  let ms = [ model_of ~sessions:30 s; model_of ~sessions:60 s ] in
+  let module Grid = Dio_oracle.Oracle_strategy.Grid in
+  let m_arr = Array.of_list ms in
+  let rs = S.empirical_min_capitals ~grid:c ~models:ms ~target_survival:0.8 () in
+  Alcotest.(check int) "one result per horizon" 2 (Array.length rs);
+  Array.iteri
+    (fun i (r : Dio_oracle.Oracle_types.sizing_result) ->
+       if r.reachable
+       then (
+         (* The refined boundary must itself clear the target on replay. *)
+         let out = Grid.replay (Grid.set_start_quote c r.value) s in
+         let cov =
+           (Dio_oracle.Oracle_replay.blended_coverage m_arr.(i) ~d_surv:out.d_surv)
+             .blended
+         in
+         Alcotest.(check bool)
+           (Printf.sprintf "h%d boundary clears target" (i + 1))
+           true
+           (cov >= 0.8)))
+    rs
+;;
+
+let sr ?(reachable = true) value =
+  { Dio_oracle.Oracle_types.parameter = "capital"
+  ; value
+  ; d_surv = 0.5
+  ; coverage = 0.9
+  ; reachable
+  }
+;;
+
+let test_combined_sizing_rollup () =
+  (match S.combined_sizing [| sr 100.0; sr 300.0; sr 200.0 |] with
+   | Some best -> near 300.0 best.value
+   | None -> Alcotest.fail "combined_sizing: expected a reachable rollup");
+  Alcotest.(check bool)
+    "any unreachable horizon -> None"
+    true
+    (S.combined_sizing [| sr 100.0; sr ~reachable:false 300.0 |] = None);
+  Alcotest.(check bool) "empty -> None" true (S.combined_sizing [||] = None)
+;;
+
+let test_surface_rows_order_and_lengths () =
+  (* A round-trip history (drawdown then recovery above the floor): sizing
+     reference d_cover then lands mid-range where the blend can clear the
+     target. A never-recovering decline funds only the floor overshoot, which
+     no window of that history survives - correctly flagged unreachable. *)
+  let ms =
+    [ model_of ~sessions:30 (round_trip_series ())
+    ; model_of ~sessions:60 (round_trip_series ())
+    ]
+  in
+  (* Ample budget: the declining fixture loses ~90% over its length, so the
+     default 10k quote cannot fund the static ladder at gi 0.5%. *)
+  let cells =
+    [ 0.5, 1.0, cfg ~start_quote:1_000_000.0 ~grid_interval_pct:0.5 ~qty:1.0 ()
+    ; 1.0, 2.0, cfg ~start_quote:1_000_000.0 ~grid_interval_pct:1.0 ~qty:2.0 ()
+    ]
+  in
+  let rows =
+    S.surface_rows ~empirical_scan_points:8 ~target_survival:0.7 ~models:ms cells
+  in
+  Alcotest.(check int) "row count" 2 (List.length rows);
+  match rows with
+  | [ a; b ] ->
+    near 0.5 a.S.gi;
+    near 1.0 a.S.qty;
+    near 1.0 b.S.gi;
+    near 2.0 b.S.qty;
+    Alcotest.(check int) "static width per model" 2 (Array.length a.S.static);
+    Alcotest.(check int) "empirical width per model" 2 (Array.length a.S.empirical);
+    Alcotest.(check bool) "static reachable at ample budget" true a.S.static.(0).reachable
+  | _ -> Alcotest.fail "surface_rows: unexpected row shape"
+;;
+
 let () =
   Alcotest.run
     "grid_core_synthetic"
@@ -822,6 +957,21 @@ let () =
             "default capital is viable"
             `Quick
             test_default_capital_is_viable
+        ] )
+    ; ( "cash surface"
+      , [ Alcotest.test_case
+            "empirical_all matches single"
+            `Quick
+            test_empirical_all_matches_single
+        ; Alcotest.test_case
+            "empirical_all two horizons"
+            `Quick
+            test_empirical_all_two_horizons
+        ; Alcotest.test_case "combined sizing rollup" `Quick test_combined_sizing_rollup
+        ; Alcotest.test_case
+            "surface rows order and lengths"
+            `Quick
+            test_surface_rows_order_and_lengths
         ] )
     ]
 ;;

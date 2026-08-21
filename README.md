@@ -336,7 +336,7 @@ dune exec dio-oracle -- AAPL --exchange alpaca --capital 5000 --target-survival 
 dune exec dio-oracle -- --portfolio --exchange kraken --capital 50000   # every class member
 ```
 
-All flags: `--exchange`, `--capital`, `--total-capital`, `--portfolio`, `--topology`, `--allocation`, `--split`, `--transfer`, `--positions-file`, `--save-positions`, `--qty`, `--gi`, `--fee`, `--sell-mult`, `--accumulation-buffer`, `--min-notional`, `--data-feed`, `--start-price`, `--price-increment`, `--qty-increment`, `--qty-min`, `--start`, `--end`, `--horizons`, `--thresholds`, `--percentiles`, `--gap-tolerance`, `--vol-window`, `--class`, `--members`, `--kappa`, `--target-survival`, `--fng`, `--min-active-dsurv`, `--qty-cap-mult`, `--no-deep-history`, `--no-weight-by-sessions`, `--max-capital`, `--json`.
+All flags: `--exchange`, `--capital`, `--total-capital`, `--portfolio`, `--topology`, `--allocation`, `--split`, `--transfer`, `--positions-file`, `--save-positions`, `--qty`, `--gi`, `--fee`, `--sell-mult`, `--accumulation-buffer`, `--min-notional`, `--data-feed`, `--start-price`, `--price-increment`, `--qty-increment`, `--qty-min`, `--start`, `--end`, `--horizons`, `--thresholds`, `--percentiles`, `--gap-tolerance`, `--vol-window`, `--class`, `--members`, `--kappa`, `--target-survival`, `--fng`, `--min-active-dsurv`, `--qty-cap-mult`, `--no-deep-history`, `--no-weight-by-sessions`, `--max-capital`, `--surface-gi-steps`, `--surface-qty-points`, `--surface-scan-points`, `--json`.
 
 Notes:
 

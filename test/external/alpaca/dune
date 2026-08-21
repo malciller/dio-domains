@@ -13,3 +13,7 @@
 (test
  (name test_alpaca_orderbook)
  (libraries dio.alpaca alcotest))
+
+(test
+ (name test_alpaca_rest)
+ (libraries dio.alpaca alcotest))

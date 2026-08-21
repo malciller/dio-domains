@@ -1075,11 +1075,13 @@ let evaluate_buy_leg
     NOT subtracted again - subtracting it double-counted the hold and
     understated the inventory below the floor, blocking the sell. Non-
     accumulation venues size by qty * sell_mult (Kraken), clamped to the
-    sellable inventory. The result must clear the VENUE MINIMUM
-    ([cached_venue_min_qty] and [cached_venue_min_notional]; Alpaca's minimum
-    is a dollar notional). The venue minimum is the exchange's minimum
-    accepted order size - entirely separate from the grid's configured order
-    [qty]. *)
+    sellable inventory. The result must clear the venue's QUOTE-NOTIONAL
+    minimum ([cached_venue_min_notional]; Alpaca's minimum is a dollar
+    notional, Hyperliquid's a 10 USDC spot floor). Sells are deliberately
+    NOT floored at [cached_venue_min_qty]: accrual sells (sell_mult x qty)
+    and residual inventory legitimately size below the lot minimum. The
+    notional minimum is the exchange's real reject threshold - entirely
+    separate from the grid's configured order [qty]. *)
 let evaluate_sell_leg
       ~persisted_reconcile
       ~state
@@ -1434,15 +1436,16 @@ let evaluate_sell_leg
     in
     if balance_ok
     then (
-      (* The VENUE-MINIMUM gate: the sell must clear the venue's minimum
-         accepted order size - the base-quantity floor [cached_venue_min_qty]
-         and (for quote-notional venues such as Alpaca/Hyperliquid) the
-         notional floor [cached_venue_min_notional]. The same gates the replay
-         enforces (grid_core). This is the exchange's minimum, NOT the grid's
-         configured order [qty]. *)
+      (* The NOTIONAL gate: sells are deliberately NOT floored at the venue's
+         base-quantity minimum - accrual sells (sell_mult x qty) and residual
+         non-accrued inventory legitimately size below it (e.g. 0.999 x
+         0.0005 BTC = 0.0004995 < the 0.0005 lot floor). Only the QUOTE-
+         NOTIONAL floor is enforced: that is the exchange's real reject
+         threshold for value-sized spot orders (Hyperliquid's 10 USDC spot
+         floor, Alpaca's $1 fractional minimum), and placing below it would
+         only spam guaranteed rejects through the retry latch. *)
       let venue_min_ok q =
-        q >= state.cached_venue_min_qty -. 1e-9
-        && q *. sell_price >= state.cached_venue_min_notional -. 1e-9
+        q > 0.0 && q *. sell_price >= state.cached_venue_min_notional -. 1e-9
       in
       if venue_min_ok effective_sell_qty
       then (
@@ -1476,10 +1479,9 @@ let evaluate_sell_leg
       else (
         Logging.debug_f
           ~section
-          "Sell order blocked for %s: no sellable inventory clears the venue minimum \
-           (venue_min_qty %.8f, venue_min_notional %.4f, sell_price %.4f, sellable %.8f)"
+          "Sell order blocked for %s: sellable inventory below the quote-notional \
+           minimum (venue_min_notional %.4f, sell_price %.4f, sellable %.8f)"
           asset.symbol
-          state.cached_venue_min_qty
           state.cached_venue_min_notional
           sell_price
           available;
