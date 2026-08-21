@@ -220,11 +220,11 @@ let test_feed_defaults () =
     Ibkr.Types.default_ring_buffer_size_ticker;
   Alcotest.(check int)
     "default_ring_buffer_size_orderbook"
-    16
+    64
     Ibkr.Types.default_ring_buffer_size_orderbook;
   Alcotest.(check int)
     "default_ring_buffer_size_executions"
-    32
+    512
     Ibkr.Types.default_ring_buffer_size_executions;
   Alcotest.(check int) "default_orderbook_depth" 10 Ibkr.Types.default_orderbook_depth;
   Alcotest.(check (float 0.1))

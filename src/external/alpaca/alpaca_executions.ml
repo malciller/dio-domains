@@ -126,7 +126,8 @@ module SymbolExecStore = struct
        Hashtbl.replace t.open_orders e.order_id oo
      | Filled | Canceled | Expired | Rejected -> Hashtbl.remove t.open_orders e.order_id);
     Mutex.unlock t.mutex;
-    Concurrency.Exchange_wakeup.signal_all ()
+    (* P2: per-symbol wakeup - only this symbol's domain consumes its exec events. *)
+    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
   let set_open_orders_snapshot t orders =
@@ -161,12 +162,13 @@ module SymbolExecStore = struct
       orders;
     Mutex.unlock t.mutex;
     Atomic.set t.initial_data_received true;
-    Concurrency.Exchange_wakeup.signal_all ()
+    (* P2: snapshot readiness is per-store; only this symbol's domain gates on it. *)
+    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
   let mark_ready t =
     Atomic.set t.initial_data_received true;
-    Concurrency.Exchange_wakeup.signal_all ()
+    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 end
 

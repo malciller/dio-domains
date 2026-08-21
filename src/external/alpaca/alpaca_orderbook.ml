@@ -106,7 +106,10 @@ module SymbolStore = struct
       cache
     in
     Atomic.set t.tob tob_cache;
-    Concurrency.Exchange_wakeup.signal_all ()
+    (* P2: wake only the domain trading this symbol. signal_all here woke
+       every configured asset per tick (O(N) futex wakes + N wasted cycles
+       on every quote). *)
+    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
   let push_trade t (tr : trade) =
@@ -115,7 +118,7 @@ module SymbolStore = struct
     t.trades_buffer.(idx) <- tr;
     t.trades_write_pos <- t.trades_write_pos + 1;
     Mutex.unlock t.mutex;
-    Concurrency.Exchange_wakeup.signal_all ()
+    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
   let get_recent_trades t count =

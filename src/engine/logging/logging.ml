@@ -475,16 +475,19 @@ let drain_async_queue () =
     let batch = Queue.create () in
     Queue.transfer async_queue batch;
     Mutex.unlock async_mutex;
-    (* Write the batch under output_mutex with per-message flush
-       so each log line appears promptly in the terminal. *)
+    (* Write the batch under output_mutex with ONE flush per batch: a
+       flush per line made an N-message burst cost N write syscalls plus N
+       flush syscalls on the drain thread. Batch-flush keeps lines equally
+       prompt (the whole batch lands in this drain iteration) at one
+       syscall each for writes and one flush total. *)
     Mutex.lock output_mutex;
     try
       Queue.iter
         (fun msg ->
            output_string !output_channel msg;
-           output_char !output_channel '\n';
-           flush !output_channel)
+           output_char !output_channel '\n')
         batch;
+      if not (Queue.is_empty batch) then flush !output_channel;
       Mutex.unlock output_mutex
     with
     | exn ->

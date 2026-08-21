@@ -178,7 +178,9 @@ let get_symbol_store symbol =
          | Some store -> store
          | None ->
            let store =
-             { events_buffer = RingBuffer.create 128
+             { events_buffer =
+               (* R3: raised from 128 - exec bursts previously dropped events. *)
+               RingBuffer.create 512
              ; open_orders = Hashtbl.create 32
              ; ready = Atomic.make (Atomic.get _startup_snapshot_done)
              ; orders_mutex = Mutex.create ()

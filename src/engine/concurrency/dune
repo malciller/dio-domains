@@ -8,4 +8,6 @@
   Tick_event_bus
   Exchange_wakeup
   Lwt_util
-  Fill_event_bus))
+  Fill_event_bus
+  Parse_worker)
+)

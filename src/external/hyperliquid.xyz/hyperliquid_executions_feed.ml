@@ -105,7 +105,12 @@ let order_index_mutex = Mutex.create ()
     All access requires holding order_index_mutex. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
 (** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
+
+(** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
+(** Adaptive capacity bound. Set to max_int (uncapped) during startup,
+    then locked to a bounded value after the initial snapshot completes. *)
+
 (** Adaptive capacity bound. Set to max_int (uncapped) during startup,
     then locked to a bounded value after the initial snapshot completes. *)
 let order_to_symbol_cap : int ref = ref max_int
@@ -175,7 +180,10 @@ let get_symbol_store symbol =
       | Some store -> store
       | None ->
         let store =
-          { events_buffer = RingBuffer.create 128
+          { events_buffer =
+              RingBuffer.create 512
+              (* R3: raised from 128 - exec bursts previously lapped the
+                 domain consumer, silently dropping lifecycle events. *)
           ; open_orders = Hashtbl.create 32
           ; ready = Atomic.make (Atomic.get _startup_snapshot_done)
           ; processed_tids = Hashtbl.create 32
