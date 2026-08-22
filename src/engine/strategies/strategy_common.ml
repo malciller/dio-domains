@@ -23,9 +23,6 @@ type trading_config =
   ; accumulation_buffer : float * float
     (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
-  ; asset_class : string option
-    (** Risk class for capital-oracle modeling (explicit from config.json;
-        required for dio-oracle runs). *)
   ; base_accumulation : bool
     (** Per-strategy opt-in to base-accumulation persistence (default true
         when absent from config.json; disabled means zero I/O). *)

@@ -16,7 +16,6 @@ let create_test_asset
       ?(hedge = false)
       ?(accumulation_buffer = 0.01, 0.01)
       ?(data_feed = None)
-      ?(asset_class = None)
       ()
   : Dio_strategies.Strategy_common.trading_config
   =
@@ -34,7 +33,6 @@ let create_test_asset
   ; hedge
   ; accumulation_buffer
   ; data_feed
-  ; asset_class
   ; base_accumulation = true
   ; sell_levels = true
   }

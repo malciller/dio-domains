@@ -22,8 +22,6 @@
   Jacobs_ladder_orders
   Jacobs_ladder_execution
   Jacobs_ladder_events
-  Grid_core
-  Grid_core_types
   Market_maker
   Fee_cache
   Auto_hedger))
