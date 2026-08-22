@@ -186,8 +186,8 @@ let asset_profiler_of symbol =
     | None ->
       let p =
         Latency_profiler.create
-          ~bucket_us:1_000
-          ~max_latency_us:60_000_000
+          ~bucket_us:1
+          ~max_latency_us:100_000
           ("oracle:asset:" ^ symbol)
       in
       Hashtbl.replace asset_profiler_cache symbol p;
@@ -216,10 +216,16 @@ let profiler_snapshots () =
 
 (** Per-asset oracle latency snapshots for the dashboard's per-domain rows. *)
 let asset_profiler_snapshots () =
-  Hashtbl.fold
-    (fun symbol prof acc -> (symbol, Latency_profiler.published_snapshot prof) :: acc)
-    asset_profiler_cache
-    []
+  Mutex.lock asset_profiler_mutex;
+  let snaps =
+    Hashtbl.fold
+      (fun symbol prof acc ->
+         (symbol, Latency_profiler.published_snapshot prof) :: acc)
+      asset_profiler_cache
+      []
+  in
+  Mutex.unlock asset_profiler_mutex;
+  snaps
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -268,7 +274,6 @@ let same_bars (a : Oracle_types.bar array) (b : Oracle_types.bar array) =
 let refresh_asset_history ~(offline : bool) ~(exchange : string) ~(symbol : string)
   : bool Lwt.t
   =
-  let started = Mtime_clock.now_ns () in
   Lwt.catch
     (fun () ->
        Oracle_pipeline.history_of ~offline ~exchange ~symbol
@@ -279,7 +284,6 @@ let refresh_asset_history ~(offline : bool) ~(exchange : string) ~(symbol : stri
          | None -> true
        in
        Hashtbl.replace history_cache (exchange, symbol) series;
-       record_asset_latency symbol (span_from started) (fun () -> "history");
        changed)
     (fun exn ->
        Logging.warn_f
@@ -288,7 +292,6 @@ let refresh_asset_history ~(offline : bool) ~(exchange : string) ~(symbol : stri
          exchange
          symbol
          (Printexc.to_string exn);
-       record_asset_latency symbol (span_from started) (fun () -> "error");
        Lwt.return false)
 ;;
 
@@ -758,6 +761,7 @@ let run_account_pass
     in
     List.iteri
       (fun _idx (t : Oracle_tasks.task) ->
+         let t_asset = Mtime_clock.now_ns () in
          let target_survival, min_active_dsurv, qty_cap_mult =
            effective_knobs ~config ~symbol:t.symbol
          in
@@ -775,6 +779,7 @@ let run_account_pass
             The asset joins the surface on the next pass, once the
             background refresh has delivered its history and balances. *)
          let skip_asset reason =
+           record_asset_latency t.symbol (span_from t_asset) (fun () -> reason);
            Logging.debug_f
              ~section
              "%s/%s: %s; no decision published this pass"
@@ -849,6 +854,10 @@ let run_account_pass
                  ; updated_at = Unix.gettimeofday ()
                  }
                in
+               record_asset_latency
+                 t.symbol
+                 (span_from t_asset)
+                 (fun () -> if d.active then "active" else "inactive");
                let need = d.buy_qty *. current in
                (* Funded strategies tie their next buy's quote; starved ones
                   pass capacity down untouched. *)
@@ -958,13 +967,19 @@ let run_pass
   >>= fun decision_lists ->
   publish ~on_publish (List.concat (List.rev decision_lists));
   Atomic.incr pass_count;
-  Latency_profiler.record (Lazy.force engine_profs).prof_pass (span_from started);
+  let pass_span = span_from started in
+  Latency_profiler.record (Lazy.force engine_profs).prof_pass pass_span;
+  let _ = Latency_profiler.snapshot_and_reset (Lazy.force engine_profs).prof_pass in
+  List.iter
+    (fun (t : Oracle_tasks.task) ->
+       ignore (Latency_profiler.snapshot_and_reset (asset_profiler_of t.symbol)))
+    tasks;
   Logging.debug_f
     ~section
     "pass %d done (%d assets, %.1fms)"
     (Atomic.get pass_count)
     (List.length tasks)
-    (Mtime.Span.to_float_ns (span_from started) /. 1e9 *. 1000.0);
+    (Mtime.Span.to_float_ns pass_span /. 1e9 *. 1000.0);
   Lwt.return ()
 ;;
 
@@ -985,6 +1000,7 @@ let refresh_once ~(offline : bool) ~(tasks : Oracle_tasks.task list) : unit Lwt.
        Lwt.return ())
     tasks
   >>= fun () ->
+  let t_bal = Mtime_clock.now_ns () in
   let accounts = group_by_account tasks |> List.map fst in
   Lwt_list.iter_s
     (fun account ->
@@ -997,9 +1013,12 @@ let refresh_once ~(offline : bool) ~(tasks : Oracle_tasks.task list) : unit Lwt.
        | Some task -> refresh_balance_of_task task)
     accounts
   >>= fun () ->
+  Latency_profiler.record (Lazy.force engine_profs).prof_balance (span_from t_bal);
   Atomic.incr refresh_generation;
   Atomic.set materialized_ref (Some { m_epoch = Atomic.get refresh_generation });
   Latency_profiler.record (Lazy.force engine_profs).prof_fetch (span_from started);
+  let _ = Latency_profiler.snapshot_and_reset (Lazy.force engine_profs).prof_balance in
+  let _ = Latency_profiler.snapshot_and_reset (Lazy.force engine_profs).prof_fetch in
   request_pass ();
   Lwt.return ()
 ;;
