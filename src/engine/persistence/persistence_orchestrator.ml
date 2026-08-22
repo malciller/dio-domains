@@ -51,38 +51,6 @@ type 'a t =
 
 let file_path t = Filename.concat (state_dir ()) t.filename
 
-(** Reads and parses the store's data file. Returns an empty assoc on missing
-    or unreadable files; on CORRUPT JSON the bad file is backed up as
-    <name>.corrupt.<ts> and an empty assoc is returned (the data is retained
-    on disk for manual recovery, never silently discarded). Must be called
-    under [t.file_mutex]. *)
-let read_file_unsafe t : Yojson.Basic.t =
-  let path = file_path t in
-  if Sys.file_exists path
-  then (
-    try
-      let tree = Yojson.Basic.from_file path in
-      t.file_tree <- Some tree;
-      tree
-    with
-    | Yojson.Json_error msg ->
-      let backup = Printf.sprintf "%s.corrupt.%d" path (int_of_float (Unix.time ())) in
-      Logging.warn_f
-        ~section
-        "Corrupt state file %s: %s; backing up to %s and starting fresh"
-        path
-        msg
-        backup;
-      (try Sys.rename path backup with
-       | Sys_error rename_msg ->
-         Logging.warn_f ~section "Could not back up corrupt file %s: %s" path rename_msg);
-      `Assoc []
-    | Sys_error msg ->
-      Logging.warn_f ~section "Cannot read state file %s: %s" path msg;
-      `Assoc [])
-  else `Assoc []
-;;
-
 (** Atomic write: temp file -> flush -> fsync -> rename. Keeps the in-memory
     tree mirror in sync so the next save serializes directly without re-reading
     the disk. Must be called under [t.file_mutex]. *)
@@ -98,11 +66,127 @@ let write_file_unsafe t tree =
        output_char oc '\n';
        flush oc;
        (* fsync the temp file before rename so a crash after rename cannot
-          leave a truncated/empty target (power-loss durability). *)
+         leave a truncated/empty target (power-loss durability). *)
        try Unix.fsync (Unix.descr_of_out_channel oc) with
        | _ -> ());
   Sys.rename tmp path;
   t.file_tree <- Some tree
+;;
+
+(** Extracts every [key : { balanced-object }] pair from [text], tolerating
+    garbage BETWEEN pairs: stray braces, commas, doubled documents, truncated
+    tails. Each candidate object is validated with the real JSON parser
+    before being accepted, and keys keep their LAST occurrence (latest-wins).
+    This exists because operators hand-edit these files, and the store must
+    not zero accruals over a syntax slip such as appending a second top-level
+    object instead of adding a key inside the existing one. *)
+let salvage_assoc (text : string) : (string * Yojson.Basic.t) list =
+  let len = String.length text in
+  let is_ws c = c = ' ' || c = '\n' || c = '\r' || c = '\t' in
+  let rec skip_string j =
+    if j >= len
+    then len
+    else (
+      match text.[j] with
+      | '\\' -> if j + 1 < len then skip_string (j + 2) else len
+      | '"' -> j
+      | _ -> skip_string (j + 1))
+  in
+  let rec match_brace j depth =
+    if j >= len
+    then None
+    else (
+      match text.[j] with
+      | '"' -> match_brace (skip_string j + 1) depth
+      | '{' -> match_brace (j + 1) (depth + 1)
+      | '}' -> if depth = 1 then Some j else match_brace (j + 1) (depth - 1)
+      | _ -> match_brace (j + 1) depth)
+  in
+  let results : (string, Yojson.Basic.t) Hashtbl.t = Hashtbl.create 8 in
+  let i = ref 0 in
+  while !i < len do
+    if text.[!i] = '"'
+    then (
+      match String.index_from_opt text (!i + 1) '"' with
+      | None -> i := len
+      | Some q ->
+        let key = String.sub text (!i + 1) (q - !i - 1) in
+        let j = ref (q + 1) in
+        while !j < len && (is_ws text.[!j] || text.[!j] = ':') do
+          incr j
+        done;
+        let close = if !j < len && text.[!j] = '{' then match_brace !j 0 else None in
+        (match close with
+         | None -> i := q + 1
+         | Some c ->
+           let obj_text = String.sub text !j (c - !j + 1) in
+           let parsed =
+             try Some (Yojson.Basic.from_string obj_text) with
+             | _ -> None
+           in
+           (match parsed with
+            | Some v -> Hashtbl.replace results key v
+            | None -> ());
+           i := c + 1))
+    else incr i
+  done;
+  List.rev (Hashtbl.fold (fun k v acc -> (k, v) :: acc) results [])
+;;
+
+(** Reads and parses the store's data file. Returns an empty assoc on missing
+    or unreadable files. On CORRUPT JSON a salvage pass first extracts every
+    well-formed key/object pair it can find (recovers the common hand-edit
+    mistake of appending a second top-level document); the cleaned merge is
+    written back immediately, and whatever cannot be salvaged stays in the
+    <name>.corrupt.<ts> backup - never silently discarded. Must be called
+    under [t.file_mutex]. *)
+let read_file_unsafe t : Yojson.Basic.t =
+  let path = file_path t in
+  if not (Sys.file_exists path)
+  then `Assoc []
+  else (
+    let text =
+      let ic = open_in_bin path in
+      Fun.protect
+        ~finally:(fun () -> close_in_noerr ic)
+        (fun () -> really_input_string ic (in_channel_length ic))
+    in
+    match Yojson.Basic.from_string text with
+    | tree ->
+      t.file_tree <- Some tree;
+      tree
+    | exception Yojson.Json_error msg ->
+      let salvaged = salvage_assoc text in
+      let backup = Printf.sprintf "%s.corrupt.%d" path (int_of_float (Unix.time ())) in
+      (try Sys.rename path backup with
+       | Sys_error rename_msg ->
+         Logging.warn_f ~section "Could not back up corrupt file %s: %s" path rename_msg);
+      let salvaged_tree = `Assoc salvaged in
+      if salvaged = []
+      then
+        Logging.warn_f
+          ~section
+          "Corrupt state file %s (%s); nothing salvageable; backed up to %s and starting \
+           fresh"
+          path
+          msg
+          backup
+      else (
+        Logging.warn_f
+          ~section
+          "Corrupt state file %s (%s); salvaged %d entr%s into memory; original backed \
+           up to %s"
+          path
+          msg
+          (List.length salvaged)
+          (if List.length salvaged = 1 then "y" else "ies")
+          backup;
+        write_file_unsafe t salvaged_tree);
+      t.file_tree <- Some salvaged_tree;
+      salvaged_tree
+    | exception Sys_error msg ->
+      Logging.warn_f ~section "Cannot read state file %s: %s" path msg;
+      `Assoc [])
 ;;
 
 (** Read-modify-write of one key's entry under file_mutex. *)
