@@ -2,11 +2,14 @@
 
 open Suicide_grid_types
 
+(* Kraken runs the same accumulation model as HL/Lighter/IBKR: profit-gated
+   accumulation sells, 1:1 sells, and an explicit reserved_base accrual on
+   every buy fill. *)
 let kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
-  ; use_accumulation_sells = false
-  ; sell_uses_mult = true
+  ; use_accumulation_sells = true
+  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = true
@@ -79,12 +82,6 @@ let get_exchange_config exchange =
   | Ibkr -> ibkr_config
   | Alpaca -> alpaca_config
   | Kraken | Custom _ -> kraken_config
-;;
-
-let[@inline always] persistence_accumulation_exchange id =
-  match Exchange.Types.exchange_of_string id with
-  | Hyperliquid | Lighter | Ibkr | Alpaca -> true
-  | Kraken | Custom _ -> false
 ;;
 
 let[@inline always] hl_like_spot_fee_exchange id =

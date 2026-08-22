@@ -114,17 +114,37 @@ let flush_persistence asset_symbol =
         , last_buy_fill_qty
         , last_sell_fill_qty
         , persisted_sell_levels ) ->
-      Dio_persistence.State_persistence.save_async
-        ~symbol:asset_symbol
-        ~reserved_base
-        ~accumulated_profit
-        ~last_fill_oid
-        ~last_buy_fill_price
-        ~last_sell_fill_price
-        ~last_buy_fill_qty
-        ~last_sell_fill_qty
-        ~persisted_sell_levels
-        ()
+      let key =
+        match state.persistence_key with
+        | Some k -> k
+        | None ->
+          (* Full key not registered yet; fall back to a symbol-only scan. *)
+          (match
+             Dio_persistence.Base_accumulation_store.resolve_key_for_symbol
+               ~symbol:asset_symbol
+           with
+           | Some k -> k
+           | None -> "migrated:" ^ asset_symbol)
+      in
+      if state.base_accumulation_enabled
+      then
+        Dio_persistence.Base_accumulation_store.save_async
+          ~key
+          { Dio_persistence.Base_accumulation_store.reserved_base
+          ; accumulated_profit
+          ; last_fill_oid
+          ; last_buy_fill_price
+          ; last_buy_fill_qty
+          ; last_sell_fill_price
+          ; last_sell_fill_qty
+          };
+      if state.sell_levels_enabled
+      then
+        Dio_persistence.Sell_levels_store.save_async
+          ~key
+          (List.map
+             (fun (price, qty) -> { Dio_persistence.Sell_levels_store.price; qty })
+             persisted_sell_levels)
     | None -> ())
 ;;
 
@@ -455,57 +475,39 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
          in
          if side = Buy
          then (
-           state.last_buy_fill_price <- Some fill_price;
-           state.last_buy_fill_qty <- Some acc_qty;
+           (* Route the buy-fill bookkeeping through the base-accumulation
+             store's pure decision logic (updates the last-buy reference for
+             the next sell's profitability check). *)
+           let updated =
+             Dio_persistence.Base_accumulation_store.apply_buy_fill
+               { Dio_persistence.Base_accumulation_store.reserved_base =
+                   state.reserved_base
+               ; accumulated_profit = state.accumulated_profit
+               ; last_fill_oid = state.last_fill_oid
+               ; last_buy_fill_price = state.last_buy_fill_price
+               ; last_buy_fill_qty = state.last_buy_fill_qty
+               ; last_sell_fill_price = state.last_sell_fill_price
+               ; last_sell_fill_qty = state.last_sell_fill_qty
+               }
+               ~price:fill_price
+               ~qty:acc_qty
+               ~oid:order_id
+           in
+           state.last_buy_fill_price
+           <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_price;
+           state.last_buy_fill_qty
+           <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_qty;
            state.last_sell_fill_price <- None;
            state.last_sell_fill_qty <- None;
-           if persistence_accumulation_exchange state.exchange_id
-           then state.persistence_dirty <- true;
-           if hl_like_spot_fee_exchange state.exchange_id && acc_qty > 0.0
-           then (
-             let buy_fee_quote = acc_qty *. fill_price *. state.maker_fee in
-             state.accumulated_profit <- state.accumulated_profit -. buy_fee_quote;
-             Logging.info_f
-               ~section
-               "Deducted buy fee from accumulated_profit for %s by %.6f (quote fee), now \
-                %.6f"
-               asset_symbol
-               buy_fee_quote
-               state.accumulated_profit);
-           (* All accumulation venues (Hyperliquid/Lighter/IBKR/Alpaca)
-               ACCRUE the base asset: reserved_base grows by the retained
-               (1 - sell_mult) slice of every buy fill, shrinking the
-               sellable inventory by the same amount so each cycle holds
-               back a slice instead of recycling 100% of it. Kraken's
-               retention is implicit in its sell_mult-sized sells and does
-               not reserve. *)
-           if persistence_accumulation_exchange state.exchange_id && acc_qty > 0.0
-           then (
-             let sell_mult = state.cached_sell_mult in
-             (* Hyperliquid-like spot venues take the BUY fee out of the
-                 RECEIVED BASE token - only the net amount lands on the
-                 venue - so the accrual runs on the net landed qty, never
-                 the ordered qty (crediting gross would over-reserve base
-                 that does not exist). *)
-             let landed_qty =
-               if hl_like_spot_fee_exchange state.exchange_id && state.maker_fee > 0.0
-               then Float.max 0.0 (acc_qty -. (state.maker_fee *. acc_qty))
-               else acc_qty
-             in
-             let base_increment = landed_qty -. (sell_mult *. landed_qty) in
-             if base_increment > 0.0
-             then (
-               state.reserved_base <- state.reserved_base +. base_increment;
-               state.persistence_dirty <- true;
-               Logging.info_f
-                 ~section
-                 "Reserving base for %s on buy fill %s: +%.8f (sell_mult %.4f, total \
-                  reserved_base now %.8f)"
-                 asset_symbol
-                 order_id
-                 base_increment
-                 sell_mult
-                 state.reserved_base));
+           (* Persistence dirty-marking follows the per-strategy config
+              opt-in (base_accumulation), not a hardcoded venue list - all
+              venues track identically now. *)
+           if state.base_accumulation_enabled then state.persistence_dirty <- true;
+           (* Spec-aligned buy fill: only the reference info for the next
+              sell's profitability check is updated (done above via
+              apply_buy_fill). The legacy per-fill slice retention into
+              reserved_base is gone - accumulation happens at sell-fill time
+              when the profit window exceeds the buffer (see below). *)
            if acc_qty > 0.0 && not state.startup_replay
            then (
              (* The anticipated credit mirrors what the venue actually
@@ -580,55 +582,69 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
               state.anticipated_base_credit
               <- Float.max 0.0 (state.anticipated_base_credit -. acc_qty);
             state.last_sell_fill_qty <- Some acc_qty;
-            let cost_basis =
-              match state.last_sell_fill_price with
-              | Some prev_sell when prev_sell > 0.0 && prev_sell < sell_fill_price ->
-                Some prev_sell
-              | _ ->
-                (match state.last_buy_fill_price with
-                 | Some buy_p when buy_p > 0.0 && buy_p < sell_fill_price -> Some buy_p
-                 | _ ->
-                   let grid_spread = 0.005 in
-                   Some (sell_fill_price /. (1.0 +. grid_spread)))
+            (* Spec-aligned sell fill: profit is measured against the LAST
+               BUY fill (single local buy/sell cycle pair). The legacy
+               prior-sell cost basis and grid-spread fallback are removed.
+               All fees (both legs) are folded into a single [fees] figure
+               passed to the store's pure decision logic, which:
+                 - accrues net profit into accumulated_profit when > 0,
+                 - when accumulated_profit > buffer (realtime F&G), adds
+                   oracle_qty * sell_mult to reserved_base and resets the
+                   accumulation window. *)
+            let store_t =
+              { Dio_persistence.Base_accumulation_store.reserved_base =
+                  state.reserved_base
+              ; accumulated_profit = state.accumulated_profit
+              ; last_fill_oid = state.last_fill_oid
+              ; last_buy_fill_price = state.last_buy_fill_price
+              ; last_buy_fill_qty = state.last_buy_fill_qty
+              ; last_sell_fill_price = state.last_sell_fill_price
+              ; last_sell_fill_qty = state.last_sell_fill_qty
+              }
             in
-            (match cost_basis with
-             | Some base_price when sell_fill_price > base_price ->
-               let qty = acc_qty in
-               let gross = (sell_fill_price -. base_price) *. qty in
-               let fees =
-                 if state.exchange_id = "ibkr"
-                 then
-                   ibkr_commission ~qty ~price:base_price
-                   +. ibkr_commission ~qty ~price:sell_fill_price
-                 else if hl_like_spot_fee_exchange state.exchange_id
-                 then sell_fill_price *. qty *. state.maker_fee
-                 else
-                   (sell_fill_price *. qty *. state.maker_fee)
-                   +. (base_price *. qty *. state.maker_fee)
-               in
-               let net_profit = gross -. fees in
-               if net_profit > 0.0
-               then (
-                 state.accumulated_profit <- state.accumulated_profit +. net_profit;
-                 Logging.debug_f
-                   ~section
-                   "Realized profit for %s: %.6f (gross %.6f - fees %.6f, sell@%.4f \
-                    base@%.4f x %.8f), accumulated: %.6f"
-                   asset_symbol
-                   net_profit
-                   gross
-                   fees
-                   sell_fill_price
-                   base_price
-                   qty
-                   state.accumulated_profit);
-               state.last_sell_fill_price <- Some sell_fill_price;
-               if state.open_sell_orders = [] && state.persisted_sell_levels = []
-               then state.last_buy_fill_price <- None
-             | _ ->
-               state.last_sell_fill_price <- Some sell_fill_price;
-               if state.open_sell_orders = [] && state.persisted_sell_levels = []
-               then state.last_buy_fill_price <- None)
+            let qty = acc_qty in
+            let fees =
+              if state.exchange_id = "ibkr"
+              then (
+                match state.last_buy_fill_price with
+                | Some bp ->
+                  ibkr_commission ~qty ~price:bp
+                  +. ibkr_commission ~qty ~price:sell_fill_price
+                | None -> 0.0)
+              else if hl_like_spot_fee_exchange state.exchange_id
+              then sell_fill_price *. qty *. state.maker_fee
+              else (
+                (* Both legs at maker fee, paired against the last buy ref. *)
+                match state.last_buy_fill_price with
+                | Some bp ->
+                  (sell_fill_price *. qty *. state.maker_fee)
+                  +. (bp *. qty *. state.maker_fee)
+                | None -> sell_fill_price *. qty *. state.maker_fee)
+            in
+            let updated =
+              Dio_persistence.Base_accumulation_store.apply_sell_fill
+                store_t
+                ~price:sell_fill_price
+                ~qty
+                ~oid:order_id
+                ~buffer:state.accumulation_buffer
+                ~sell_mult:state.cached_sell_mult
+                ~oracle_qty:state.grid_qty
+                ~fees
+                ()
+            in
+            state.reserved_base
+            <- updated.Dio_persistence.Base_accumulation_store.reserved_base;
+            state.accumulated_profit
+            <- updated.Dio_persistence.Base_accumulation_store.accumulated_profit;
+            state.last_fill_oid
+            <- updated.Dio_persistence.Base_accumulation_store.last_fill_oid;
+            state.last_sell_fill_price
+            <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_price;
+            state.last_sell_fill_qty
+            <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_qty;
+            if state.open_sell_orders = [] && state.persisted_sell_levels = []
+            then state.last_buy_fill_price <- None
           | Buy -> ());
          let should_update_oid =
            match state.last_fill_oid with
@@ -640,8 +656,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
            | None -> true
          in
          if should_update_oid then state.last_fill_oid <- Some order_id;
-         if persistence_accumulation_exchange state.exchange_id
-         then state.persistence_dirty <- true;
+         if state.base_accumulation_enabled then state.persistence_dirty <- true;
          (match side with
           | Buy -> state.inflight_buy <- false
           | Sell -> state.inflight_sell <- false);

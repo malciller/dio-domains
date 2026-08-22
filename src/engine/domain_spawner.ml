@@ -287,6 +287,8 @@ let asset_domain_worker
       ; maker_fee = asset_with_fees.maker_fee
       ; taker_fee = asset_with_fees.taker_fee
       ; accumulation_buffer = Option.value accumulation_buffer ~default:0.0
+      ; base_accumulation = asset_with_fees.base_accumulation
+      ; sell_levels_persistence = asset_with_fees.sell_levels
       }
     in
     let grid_strategy_asset_ref =

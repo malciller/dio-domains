@@ -114,7 +114,11 @@ let grid ?(min_notional = 0.0) ?(qty_min = 0.01) ?(gi = 1.0) ~(start_price : flo
   ; sell_mult = 1.0
   ; grid_interval_pct = gi
   ; maker_fee = 0.0004
-  ; accumulation_buffer = 0.0
+  ; accumulation_buffer = 100.0
+    (* A buffer far above the in-window profit: the spec's sell-fill reserve
+       never fires within a modeled window, isolating the survival-driven gi
+       selection (the reserve path itself is covered by the grid_core and
+       store tests). *)
   ; price_increment = 0.01
   ; qty_increment = 0.01
   ; qty_min

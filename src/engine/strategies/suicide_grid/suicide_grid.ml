@@ -35,6 +35,8 @@ type trading_config = Suicide_grid_types.trading_config =
   ; maker_fee : float option
   ; taker_fee : float option
   ; accumulation_buffer : float
+  ; base_accumulation : bool
+  ; sell_levels_persistence : bool
   }
 
 type strategy_state = Suicide_grid_types.strategy_state
@@ -48,10 +50,6 @@ let hyperliquid_config = Suicide_grid_config.hyperliquid_config
 let ibkr_config = Suicide_grid_config.ibkr_config
 let lighter_config = Suicide_grid_config.lighter_config
 let get_exchange_config = Suicide_grid_config.get_exchange_config
-
-let persistence_accumulation_exchange =
-  Suicide_grid_config.persistence_accumulation_exchange
-;;
 
 let hl_like_spot_fee_exchange = Suicide_grid_config.hl_like_spot_fee_exchange
 let ibkr_commission = Suicide_grid_config.ibkr_commission
@@ -256,19 +254,26 @@ module Strategy = struct
       if
         state.last_fill_oid = None
         && state.highest_startup_oid <> None
-        && Suicide_grid_config.persistence_accumulation_exchange state.exchange_id
+        && state.base_accumulation_enabled
       then (
         state.last_fill_oid <- state.highest_startup_oid;
-        Dio_persistence.State_persistence.save
-          ~symbol
-          ~reserved_base:state.reserved_base
-          ~accumulated_profit:state.accumulated_profit
-          ~last_fill_oid:state.last_fill_oid
-          ~last_buy_fill_price:state.last_buy_fill_price
-          ~last_sell_fill_price:state.last_sell_fill_price
-          ~last_buy_fill_qty:state.last_buy_fill_qty
-          ~last_sell_fill_qty:state.last_sell_fill_qty
-          ();
+        let key =
+          match state.persistence_key with
+          | Some k -> k
+          | None -> "migrated:" ^ symbol
+        in
+        if state.base_accumulation_enabled
+        then
+          Dio_persistence.Base_accumulation_store.save
+            ~key
+            { Dio_persistence.Base_accumulation_store.reserved_base = state.reserved_base
+            ; accumulated_profit = state.accumulated_profit
+            ; last_fill_oid = state.last_fill_oid
+            ; last_buy_fill_price = state.last_buy_fill_price
+            ; last_buy_fill_qty = state.last_buy_fill_qty
+            ; last_sell_fill_price = state.last_sell_fill_price
+            ; last_sell_fill_qty = state.last_sell_fill_qty
+            };
         Logging.info_f
           ~section
           "Bootstrapped initial state for %s (last_fill_oid=%s, reserved_base=%.8f, \

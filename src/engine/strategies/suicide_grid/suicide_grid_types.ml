@@ -54,6 +54,8 @@ type trading_config =
   ; maker_fee : float option
   ; taker_fee : float option
   ; accumulation_buffer : float
+  ; base_accumulation : bool (** opt-in to base-accumulation persistence *)
+  ; sell_levels_persistence : bool (** opt-in to pending-sell-level persistence *)
   }
 
 (** Mutable per-symbol strategy state. *)
@@ -149,6 +151,14 @@ type strategy_state =
     (* previous asset_bal value; used to detect balance feed updates *)
   ; mutable persistence_dirty : bool
     (* true when accumulation state changed; flushed by caller outside hotloop *)
+  ; mutable persistence_key : string option
+    (* "{strategy}:{symbol}:{venue}" store key, registered once the full
+       trading config (strategy name + venue) is known at strategy init.
+       None until then; hydration falls back to a symbol-segment scan. *)
+  ; mutable base_accumulation_enabled : bool
+    (* per-strategy opt-in flag from config.json; disabled means zero I/O *)
+  ; mutable sell_levels_enabled : bool
+    (* per-strategy opt-in flag from config.json; disabled means zero I/O *)
   ; mutable last_cycle_orders_hash : int (* tracks exchange state for 0-alloc diffing *)
   ; mutable last_cycle_buy_count : int
   ; mutable duplicate_key_buy : string
@@ -156,6 +166,10 @@ type strategy_state =
   ; mutable cached_round_price : float -> float
   ; mutable cached_price_increment : float
   ; mutable cached_qty_increment : float
+  ; mutable accumulation_buffer : float
+    (* realtime accumulation buffer (fear-and-greed resolved), refreshed each
+       execution cycle; used at sell-fill time for the spec's profit-window
+       reserve trigger *)
   ; mutable cached_venue_min_qty : float
     (* Venue MINIMUM accepted order quantity for [symbol] in base-asset units
        (e.g. 0.0005 BTC on Hyperliquid). The floor every sell must clear. This
@@ -179,8 +193,8 @@ type strategy_state =
 let default_kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
-  ; use_accumulation_sells = false
-  ; sell_uses_mult = true
+  ; use_accumulation_sells = true
+  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = true
@@ -199,29 +213,74 @@ let rec get_strategy_state asset_symbol =
   match Strategy_common.StringMap.find_opt asset_symbol map with
   | Some state -> state
   | None ->
+    (* Hydrate from the split persistence stores. STRICT opt-out: when a
+       subsystem is disabled for this symbol (per-strategy config flag via
+       the configured-strategy registry), the corresponding store is never
+       touched - zero reads, zero writes. When the full strategy key is not
+       known yet at first access (strategy name + venue arrive with the
+       trading config), fall back to a unique symbol-segment scan of the
+       store keys ("{strategy}:{symbol}:{venue}"). *)
+    let base_accumulation_on =
+      Dio_persistence.Persistence_orchestrator.base_accumulation_opted_in asset_symbol
+    in
+    let sell_levels_on =
+      Dio_persistence.Persistence_orchestrator.sell_levels_opted_in asset_symbol
+    in
+    let persisted_accumulation =
+      if base_accumulation_on
+      then (
+        match
+          Dio_persistence.Base_accumulation_store.resolve_key_for_symbol
+            ~symbol:asset_symbol
+        with
+        | Some key -> Some (Dio_persistence.Base_accumulation_store.load ~key)
+        | None -> None)
+      else None
+    in
     let persisted_reserved_base =
-      Dio_persistence.State_persistence.load_reserved_base ~symbol:asset_symbol
+      match persisted_accumulation with
+      | Some a -> a.Dio_persistence.Base_accumulation_store.reserved_base
+      | None -> 0.0
     in
     let persisted_accumulated_profit =
-      Dio_persistence.State_persistence.load_accumulated_profit ~symbol:asset_symbol
+      match persisted_accumulation with
+      | Some a -> a.Dio_persistence.Base_accumulation_store.accumulated_profit
+      | None -> 0.0
+    in
+    let opt f =
+      match persisted_accumulation with
+      | Some a -> f a
+      | None -> None
     in
     let persisted_last_fill_oid =
-      Dio_persistence.State_persistence.load_last_fill_oid ~symbol:asset_symbol
+      opt (fun a -> a.Dio_persistence.Base_accumulation_store.last_fill_oid)
     in
     let persisted_last_buy_fill_price =
-      Dio_persistence.State_persistence.load_last_buy_fill_price ~symbol:asset_symbol
+      opt (fun a -> a.Dio_persistence.Base_accumulation_store.last_buy_fill_price)
     in
     let persisted_last_sell_fill_price =
-      Dio_persistence.State_persistence.load_last_sell_fill_price ~symbol:asset_symbol
+      opt (fun a -> a.Dio_persistence.Base_accumulation_store.last_sell_fill_price)
     in
     let persisted_last_buy_fill_qty =
-      Dio_persistence.State_persistence.load_last_buy_fill_qty ~symbol:asset_symbol
+      opt (fun a -> a.Dio_persistence.Base_accumulation_store.last_buy_fill_qty)
     in
     let persisted_last_sell_fill_qty =
-      Dio_persistence.State_persistence.load_last_sell_fill_qty ~symbol:asset_symbol
+      opt (fun a -> a.Dio_persistence.Base_accumulation_store.last_sell_fill_qty)
     in
     let persisted_sell_levels =
-      Dio_persistence.State_persistence.load_persisted_sell_levels ~symbol:asset_symbol
+      if sell_levels_on
+      then (
+        match
+          Dio_persistence.Sell_levels_store.resolve_key_for_symbol ~symbol:asset_symbol
+        with
+        | Some key ->
+          List.map
+            (fun l ->
+               ( l.Dio_persistence.Sell_levels_store.price
+               , l.Dio_persistence.Sell_levels_store.qty ))
+            (Dio_persistence.Sell_levels_store.load ~key)
+        | None -> [])
+      else []
     in
     let new_state =
       { last_buy_order_price = None
@@ -265,6 +324,9 @@ let rec get_strategy_state asset_symbol =
       ; anticipated_base_credit = 0.0
       ; last_seen_asset_balance = 0.0
       ; persistence_dirty = false
+      ; persistence_key = None
+      ; base_accumulation_enabled = true
+      ; sell_levels_enabled = true
       ; last_cycle_orders_hash = 0
       ; last_cycle_buy_count = 0
       ; duplicate_key_buy = Printf.sprintf "%s|buy|grid" asset_symbol
@@ -272,6 +334,7 @@ let rec get_strategy_state asset_symbol =
       ; cached_round_price = Float.round
       ; cached_price_increment = 0.01
       ; cached_qty_increment = 0.01
+      ; accumulation_buffer = 0.0
       ; cached_venue_min_qty = 1.0
       ; cached_venue_min_notional = 0.0
       ; exchange_reserved_atomic = None

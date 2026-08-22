@@ -35,6 +35,8 @@ let create_test_asset
   ; accumulation_buffer
   ; data_feed
   ; asset_class
+  ; base_accumulation = true
+  ; sell_levels = true
   }
 ;;
 

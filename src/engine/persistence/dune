@@ -2,4 +2,4 @@
  (name dio_persistence)
  (public_name dio.persistence)
  (libraries yojson logging threads)
- (modules State_persistence))
+ (modules Persistence_orchestrator Base_accumulation_store Sell_levels_store))

@@ -18,6 +18,8 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
   ; data_feed : string option
   ; asset_class : string option
     (** Risk class for capital-oracle modeling (explicit from config.json). *)
+  ; base_accumulation : bool (** Per-strategy opt-in to base-accumulation persistence. *)
+  ; sell_levels : bool (** Per-strategy opt-in to pending-sell-level persistence. *)
   }
 
 type logging_config =
@@ -149,6 +151,8 @@ let known_trading_keys =
   ; "accumulation_buffer"
   ; "data_feed"
   ; "asset_class"
+  ; "base_accumulation"
+  ; "sell_levels"
   ]
 ;;
 
@@ -400,6 +404,10 @@ let parse_config json =
   ; accumulation_buffer = parse_accumulation_buffer json exchange symbol
   ; data_feed
   ; asset_class
+  ; base_accumulation =
+      json |> member "base_accumulation" |> to_bool_option |> Option.value ~default:true
+  ; sell_levels =
+      json |> member "sell_levels" |> to_bool_option |> Option.value ~default:false
   }
 ;;
 
