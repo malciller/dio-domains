@@ -502,6 +502,7 @@ let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
     ; "reason", `String d.reason
     ; "buy_qty", `Float d.buy_qty
     ; "sell_qty", `Float d.sell_qty
+    ; "qty", `Float d.buy_qty
     ; "grid_interval", `Float d.grid_interval
     ; "d_surv", `Float d.d_surv
     ; "regime", `String d.regime
