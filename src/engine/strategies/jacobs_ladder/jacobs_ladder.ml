@@ -16,7 +16,6 @@ type exchange_config = Jacobs_ladder_types.exchange_config =
   { time_in_force : string
   ; track_pending_sells : bool
   ; use_accumulation_sells : bool
-  ; sell_uses_mult : bool
   ; sell_failure_sets_asset_low : bool
   ; use_reserved_base_guard : bool
   ; asset_low_requires_balance_change : bool
@@ -50,7 +49,6 @@ let hyperliquid_config = Jacobs_ladder_config.hyperliquid_config
 let ibkr_config = Jacobs_ladder_config.ibkr_config
 let lighter_config = Jacobs_ladder_config.lighter_config
 let get_exchange_config = Jacobs_ladder_config.get_exchange_config
-
 let hl_like_spot_fee_exchange = Jacobs_ladder_config.hl_like_spot_fee_exchange
 let ibkr_commission = Jacobs_ladder_config.ibkr_commission
 let get_exchange_module = Jacobs_ladder_config.get_exchange_module
@@ -71,12 +69,6 @@ let atomic_check_and_reserve = Jacobs_ladder_reservation.atomic_check_and_reserv
 let can_place_buy_order = Jacobs_ladder_reservation.can_place_buy_order
 let can_place_sell_order = Jacobs_ladder_reservation.can_place_sell_order
 let amend_allowed = Jacobs_ladder_reservation.amend_allowed
-let compute_sell_qty = Jacobs_ladder_reservation.compute_sell_qty
-
-let accumulation_sell_allowed_on_recovery =
-  Jacobs_ladder_reservation.accumulation_sell_allowed_on_recovery
-;;
-
 let has_active_sell = Jacobs_ladder_reservation.has_active_sell
 let order_buffer = Jacobs_ladder_orders.order_buffer
 let get_order_buffer = Jacobs_ladder_orders.get_order_buffer

@@ -28,7 +28,6 @@ type exchange_config =
   { time_in_force : string (** TIF value for limit orders ("Alo" or "GTC") *)
   ; track_pending_sells : bool (** Add sell orders to pending_orders tracking *)
   ; use_accumulation_sells : bool (** Enable profit-gated accumulation sell path *)
-  ; sell_uses_mult : bool (** true: sell qty = qty * sell_mult; false: 1:1 sells *)
   ; sell_failure_sets_asset_low : bool
     (** Set asset_low on sell insufficient-balance rejection *)
   ; use_reserved_base_guard : bool
@@ -194,7 +193,6 @@ let default_kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
-  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = true

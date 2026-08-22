@@ -67,10 +67,8 @@ let identity_state () =
 let cfg ?(price_increment = 0.01) ?(qty_increment = 0.01) () =
   let open Dio_strategies.Grid_core in
   { qty = 1.0
-  ; sell_mult = 1.0
   ; grid_interval_pct = 1.0
   ; maker_fee = 0.0004
-  ; accumulation_buffer = 0.0
   ; price_increment
   ; qty_increment
   ; qty_min = 0.0

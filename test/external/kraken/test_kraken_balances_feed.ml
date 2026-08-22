@@ -127,6 +127,89 @@ let test_wait_for_balance_data () =
   Alcotest.(check bool) "succeeds with all data" true result3
 ;;
 
+
+let test_tradeable_balance_nets_open_order_holds () =
+  (* Kraken wallet snapshots report TOTAL balances; the tradeable figure the
+     strategies see must net out what is already locked in resting orders -
+     exactly like Hyperliquid's store (total - hold). Without this, sell
+     sizing reads inventory committed to a resting sell and the exchange
+     rejects with EOrder:Insufficient funds. Mirrors the XMR startup case:
+     0.08004 total, a resting sell of 0.04 -> tradeable 0.04004; and for a
+     quote asset, resting buys lock quote value. *)
+  let base = "XMR_HOLD_TEST" in
+  let quote = "USD_HOLD_TEST" in
+  let pair = base ^ "/" ^ quote in
+  let base_store = Kraken.Kraken_balances_feed.get_balance_store base in
+  let quote_store = Kraken.Kraken_balances_feed.get_balance_store quote in
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet
+    base_store
+    0.08004
+    "spot"
+    "main"
+    base;
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet
+    quote_store
+    100.0
+    "spot"
+    "main"
+    quote;
+  (* No orders yet: tradeable equals total. *)
+  Alcotest.(check (float 1e-6))
+    "no holds -> tradeable = total (base)"
+    0.08004
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:base);
+  Alcotest.(check (float 1e-6))
+    "no holds -> tradeable = total (quote)"
+    100.0
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:quote);
+  (* Inject a resting sell of 0.04 and a resting buy of 0.02 @ 420. *)
+  let mk_event side qty price =
+    { Kraken.Kraken_executions_feed.order_id = "hold-" ^ side ^ "-" ^ string_of_float qty
+    ; symbol = pair
+    ; exec_type = Kraken.Kraken_executions_feed.New
+    ; order_status = Kraken.Kraken_executions_feed.NewStatus
+    ; side =
+        (if side = "sell"
+         then Kraken.Kraken_executions_feed.Sell
+         else Kraken.Kraken_executions_feed.Buy)
+    ; order_qty = qty
+    ; cum_qty = 0.0
+    ; cum_cost = 0.0
+    ; avg_price = 0.0
+    ; limit_price = Some price
+    ; last_qty = None
+    ; last_price = None
+    ; fee = None
+    ; trade_id = None
+    ; order_userref = None
+    ; cl_ord_id = None
+    ; timestamp = Unix.gettimeofday ()
+    }
+  in
+  Kraken.Kraken_executions_feed.update_open_orders
+    (Kraken.Kraken_executions_feed.get_symbol_store pair)
+    (mk_event "sell" 0.04 462.13);
+  Kraken.Kraken_executions_feed.update_open_orders
+    (Kraken.Kraken_executions_feed.get_symbol_store pair)
+    (mk_event "buy" 0.02 420.0);
+  Alcotest.(check (float 1e-6))
+    "resting sell hold nets from tradeable base"
+    0.04004
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:base);
+  Alcotest.(check (float 1e-6))
+    "resting buy hold nets from tradeable quote"
+    91.6
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:quote);
+  (* Holds never drive tradeable negative. *)
+  Kraken.Kraken_executions_feed.update_open_orders
+    (Kraken.Kraken_executions_feed.get_symbol_store pair)
+    (mk_event "sell" 5.0 462.13);
+  Alcotest.(check (float 1e-6))
+    "holds clamp at zero, never negative"
+    0.0
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:base)
+;;
+
 let test_balance_data_structure () =
   (* Test balance_data record structure *)
   let test_data =
@@ -201,6 +284,12 @@ let () =
     ; ( "data structures"
       , [ Alcotest.test_case "balance data structure" `Quick test_balance_data_structure ]
       )
+    ; ( "tradeable balance"
+      , [ Alcotest.test_case
+            "open-order holds net out of tradeable balance"
+            `Quick
+            test_tradeable_balance_nets_open_order_holds
+        ] )
     ; ( "concurrency"
       , [ Alcotest.test_case
             "concurrent balance updates"

@@ -203,8 +203,11 @@ let test_normalize_drops_fabricated_placeholders () =
     Dio_oracle.Oracle_types.
       { symbol = "BTC/USDC"; calendar_kind = Crypto; bars = clean; gaps = [] }
   in
-  let p = Option.get (Dio_oracle.Oracle_math.peak_to_valley_stats_of series) in
-  Alcotest.(check bool) "no phantom 99% drawdown" true (p.max_drawdown < 0.05)
+  let refs =
+    Option.get (Dio_oracle.Oracle_core.references_of ~bars:series.bars)
+  in
+  (* The close-peak -> subsequent-low drawdown of the mild drift fixture. *)
+  Alcotest.(check bool) "no phantom 99% drawdown" true (refs.max_drawdown_pct < 0.05)
 ;;
 
 let test_normalize_keeps_carried_zero_volume () =

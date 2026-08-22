@@ -49,17 +49,15 @@ type halt_cause =
   ]
 
 (** Starting state for a grid that models an already-running strategy: the
-    account's current base holdings, base locked in resting sells, and the
-    accumulated profit buffer (the sell gate for accumulation venues). All
+    account's current base holdings and the base reserved by the persistence
+    layer (never sellable; clamps sells, is never grown inside a replay -
+    accrual happens on live fills through the base_accumulation store). All
     zeros = a fresh grid. The oracle seeds its sizing replays from the live
-    account/accumulated state so the survival verdict answers "can THIS grid,
-    as it actually runs, survive?" instead of "can a hypothetical fresh grid?" *)
+    account state so the survival verdict answers "can THIS grid, as it
+    actually runs, survive?" instead of "can a hypothetical fresh grid?" *)
 type seed =
   { initial_base : float
   ; initial_reserved_base : float
-  ; initial_accumulated_profit : float
   }
 
-let empty_seed =
-  { initial_base = 0.0; initial_reserved_base = 0.0; initial_accumulated_profit = 0.0 }
-;;
+let empty_seed = { initial_base = 0.0; initial_reserved_base = 0.0 }

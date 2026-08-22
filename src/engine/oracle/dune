@@ -1,6 +1,19 @@
 (library
  (name dio_oracle)
  (public_name dio.oracle)
+ (modules
+  oracle
+  oracle_types
+  oracle_calendar
+  oracle_cache
+  oracle_fetch
+  oracle_balances
+  oracle_fees
+  oracle_tasks
+  oracle_core
+  oracle_pipeline
+  oracle_pools
+  oracle_runtime)
  (libraries
   unix
   yojson

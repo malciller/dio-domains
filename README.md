@@ -39,11 +39,11 @@ On first start the engine loads `config.json` from the working directory, connec
 | --- | --- | --- |
 | `dio` | `bin/main.ml` | The engine itself |
 | `dio-dashboard` | `bin/dashboard.ml` | TUI dashboard, connects to the running engine |
-| `dio-oracle` | `bin/oracle.ml` | One-shot capital sizing CLI (see Capital Oracle) |
+| `dio-oracle` | `bin/oracle.ml` | Configuration-tuning CLI: prints the decision surface offline (see Capital Oracle) |
 
 ```sh
 dune exec dio-dashboard
-dune exec dio-oracle -- BTC/USD --exchange kraken
+dune exec dio-oracle -- --symbol BTC/USDC --quote 10000
 ```
 
 ---
@@ -57,12 +57,10 @@ The engine reads `config.json`. Top-level keys:
 | `logging_level` | `INFO` | One of `DEBUG`, `INFO`, `WARN`, `ERROR`, `CRITICAL` |
 | `logging_sections` | unset | Comma-separated section filters; unset means all sections |
 | `logging_width` | autodetect | Message column width; autodetected from terminal or `COLUMNS` |
-| `fng_check_threshold` | `1.5` | Percent price move that triggers a Fear-and-Greed re-evaluation of an active grid |
 | `cycle_mod` | `10000` | Legacy interval for periodic background work; unused by current strategies |
 | `latency_window_seconds` | `5.0` | Rolling window for network latency profiling stats |
 | `gc` | see table | OCaml GC tunables applied before the engine starts |
-| `classes` | unset | Risk classes used by the oracle |
-| `oracle` | see table | Capital oracle knobs (runtime, not the CLI) |
+| `oracle` | see table | Capital oracle knobs (runtime and tuning CLI) |
 | `trading` | required | One entry per instrument to trade |
 
 Unknown keys under `trading` cause the engine to exit at startup; the schema is strict on purpose.
@@ -86,15 +84,12 @@ Each element of `trading` configures one symbol on one exchange:
 
 ```json
 {
-  "symbol": "BTC/USD",
-  "exchange": "kraken",
-  "qty": 0.001,
-  "grid_interval": [0.004, 0.01],
-  "sell_mult": 0.6,
-  "strategy": "Ladder",
-  "maker_fee": null,
-  "taker_fee": null,
-  "asset_class": "Crypto"
+  "symbol": "BTC/USDC",
+  "exchange": "hyperliquid",
+  "qty": 0.01,
+  "grid_interval": [1.0, 5.0],
+  "strategy": "jacobs_ladder",
+  "maker_fee": null
 }
 ```
 
@@ -103,59 +98,34 @@ Each element of `trading` configures one symbol on one exchange:
 | `symbol` | all | Exchange symbol, e.g. `BTC/USD` (Kraken), `BTC` (Hyperliquid spot), `AAPL` (IBKR, Alpaca) |
 | `exchange` | all | `kraken`, `hyperliquid`, `lighter`, `ibkr`, or `alpaca` |
 | `qty` | all | Base order size in base currency |
-| `grid_interval` | Grid only | Price interval in quote currency (fraction of price); min and max bound the grid |
-| `sell_mult` | Grid | Multiplier applied to profit to decide how much base to keep vs sell (accumulation) |
+| `grid_interval` | jacobs_ladder | `[gi_min, gi_max]`: the hardened bounds (in %) the oracle's parameter search walks; the strategy never reads them |
 | `min_usd_balance` | MM only | Lower bound on account quote balance; MM halts below this |
 | `max_exposure` | MM only | Upper bound on quote exposure for one symbol; MM halts above this |
-| `strategy` | all | `Grid` or `MM` |
+| `strategy` | all | `jacobs_ladder` or `MM` |
 | `maker_fee`, `taker_fee` | all | Explicit fee overrides (fractions, e.g. `0.0016`); `null` means use venue default or live fee lookup |
 | `testnet` | HL, Lighter, IBKR, Alpaca | Route to sandbox/paper endpoints. Rejected for Kraken |
 | `hedge` | Hyperliquid only | Enable the experimental perp short auto-hedge. Rejected elsewhere |
-| `accumulation_buffer` | HL, Lighter, IBKR, Alpaca | `[min, max]` bounds on base reserved for accumulation. Rejected for Kraken |
+| `accumulation_buffer` | all | `[min, max]` bounds on base reserved for accumulation; resolved live from Fear & Greed (crypto venues) |
 | `data_feed` | Alpaca | `iex` (free, delayed) or `sip` (paid, real-time) |
-| `asset_class` | all | Must name a key in `classes` when the oracle is in use |
 
 Venue-specific restrictions are enforced at startup:
 
-- `testnet`, `hedge`, `accumulation_buffer`, and `data_feed` are rejected for Kraken.
+- `testnet`, `hedge`, and `data_feed` are rejected for Kraken.
 - `hedge` is Hyperliquid-only.
-- `grid_interval` is only meaningful for the Grid strategy.
 
-### Classes
+### Oracle
 
-The oracle needs to know which instruments belong to the same risk class so it can blend survival statistics across them.
-
-Legacy form (pooled history only):
-
-```json
-"classes": { "Crypto": ["BTC", "ETH"] }
-```
-
-Extended form (kappa = cross-asset prior weight):
-
-```json
-"classes": { "Crypto": { "members": ["BTC", "ETH"], "kappa": 1.0 } }
-```
-
-### Oracle (runtime)
-
-The runtime oracle runs inside the engine as a supervised module. Keys:
+The oracle runs inside the engine as a supervised module. The section is
+optional; every key falls back to the defaults below. Unknown keys are
+rejected at startup.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `target_survival` | `0.99` | Statistical survival target (probability the grid survives the drawn-down regime) |
-| `fng_weight` | `0.5` | Weight of the Fear-and-Greed component in the blended sizing signal |
-| `range_weight` | `0.25` | Weight of the price-range component in the blended sizing signal |
-| `min_active_dsurv` | `0.0` | Minimum drawdown-survival for an asset to stay active |
-| `qty_cap_mult` | `0.0` | Cap order size as a multiple of what the oracle would size; `0.0` disables |
-| `no_deep_history` | `false` | Skip the Yahoo deep-history extension |
-| `weight_by_sessions` | `true` | Weight blended statistics by number of sessions per asset |
-| `refresh_seconds` | `300.0` | Full history-refresh cadence and the pass loop's safety-net deadline (decisions are event-driven: fills/cancels re-size immediately) |
-| `poll_seconds` | `30.0` | Background refresher's authoritative balance-reconciliation cadence (the decision path never waits on it) |
-| `startup_wait_seconds` | `60.0` | Delay before the first analysis pass (lets feeds warm up) |
-| `horizons` | venue default | `[30; 90; 180; 365]` for crypto, `[21; 63; 126; 252]` for equities |
-| `max_capital` | unset | Cap on total capital the oracle will deploy |
-| `assets` | unset | Per-asset overrides for the keys above |
+| `qty_cap_mult` | `1.5` | Buy-size upper bound multiplier: the search sizes `buy_qty` within `[qty, qty * qty_cap_mult]` |
+| `target_survival` | `0.95` | Fraction of the historical max drawdown the runway covers: `runway_pct = max_drawdown_pct * target_survival`. Drives sizing only - never activity |
+| `min_active_dsurv` | `0.0` | Active gate: a strategy is active iff its replayed `d_surv >= min_active_dsurv`, subject to affordability |
+| `refresh_seconds` | `300.0` | Background fallback poll for history and balances (decisions are event-driven: fills/cancels re-resolve immediately) |
+| `assets` | unset | Per-symbol overrides keyed by symbol, each accepting `{ target_survival, min_active_dsurv, qty_cap_mult }` |
 
 ---
 
@@ -217,15 +187,24 @@ US equities, paper or live. `data_feed` selects `iex` (free, 15-minute delayed b
 
 ## Strategies
 
-### Grid
+### Grid (jacobs_ladder)
 
-The default strategy (`jacobs_ladder`). The grid places a resting buy ladder below the market and a sell ladder above. Order size and grid interval come from the oracle decision when one is available, or from `config.json` as a fallback.
+The default strategy. A pure executor: it buys price drops and sells the
+bought base to offset volatility drag, with every sizing and activity value
+coming from the oracle's decision record (`active`, `grid_interval`,
+`buy_qty`, `sell_qty`). There is no config fallback path - before an oracle
+decision exists for an asset the strategy places nothing.
 
-Accumulation: `sell_mult` below `1.0` reserves a fraction of realized base. Accumulation venues (Hyperliquid, Lighter, IBKR, Alpaca) keep the resting sell up until the reserved floor is cleared. Non-accumulation venues (Kraken, Alpaca when sell_mult is exactly `1.0`) up-size the sell to the full notional instead.
+- Buy side: exactly one resting buy below the current price, trailing upward.
+- Sell side: layered sells above the current price, one per filled buy, fill-
+  anchored at `buy_fill_price * (1 + grid_interval)`; never cancelled once
+  placed. Sells run even while inactive: they need inventory, not quote.
+- Balance model: the execution layer exposes `available_trading_balance`
+  (already net of reserved_base); sell size is the oracle's `sell_qty` -
+  the venue base pool minus reserved_base minus base tied in resting sells.
 
-Persistence: reserved base, accumulated profit, last fill IDs and prices, and sell levels are written atomically to `data/accumulated_state.json` so the grid can survive an engine restart.
-
-The grid halts buying when account capital falls below the config threshold (oracle-driven sizing) and resumes when the oracle or Fear-and-Greed signal recovers.
+Accrual lives in the persistence layer: profitable sell fills reserve base via
+`Base_accumulation_store`, which survives engine restarts.
 
 ### Market Maker (MM)
 
@@ -309,138 +288,87 @@ All exchange I/O funnels through `error_handling.ml`: callers classify errors (`
 
 ## Capital Oracle
 
-The oracle is a capital-survival sizing engine. For each asset it answers: "given this asset's real price history and the quote capital available on its exchange account, what order size and grid interval keep the grid ladder alive through the worst drawdowns this asset has actually experienced?"
+The oracle is a capital-survival sizing engine. For each asset it answers:
+"given this asset's all-time price history and the quote capital available on
+its venue, what order size and grid interval keep the ladder alive down the
+runway this asset has actually walked?"
 
-Mechanics (see `test/engine/oracle/oracle.md` for the full design):
+### Pipeline (one code path)
 
-- Maximum Fractional Drawdown (MFD) over a horizon `h`: how deep the price fell from the session-start close. `S_h(d) = P(MFD_h <= d)` is the survival function; `d` such that `S_h(d) = target_survival` is the governing drawdown.
-- The empirical distributions come from the asset's own history, blended with a risk-class prior (pooled histories of "similar" assets) using a kappa-weighted, volatility-normalized blend. At runtime the blended survival signal is itself blended with the Fear-and-Greed reading (`fng_weight`) and the price-range position (`range_weight`).
-- Sizing anchors to the all-time high. The ladder is sized so the grid survives the replayed history at the minimum order size, grows quantity behind 100% replay survival to deploy the pool, and falls back to stretch sizing when 100% survival is unreachable.
-- History comes from the venue adapter (`Exchange_intf.Oracle.Registry`), is disk-cached, and is extended with Yahoo daily history for crypto and equities unless `no_deep_history` is set. Missing data is never fabricated: gaps beyond tolerance invalidate the analysis, and the asset goes inactive rather than getting a garbage decision.
+- **History**: the asset's all-time merged daily series - the venue adapter's
+  bars (`Exchange_intf.Oracle.Registry`), disk-cached and delta-fetched,
+  extended BACKWARDS with Yahoo deep history for the same underlying. Venue
+  bars win on overlap; nothing is synthesized, there is no gap tolerance and
+  no minimum length.
+- **References**: `max_drawdown_pct` is the single worst peak-to-trough
+  percentage decline in the whole series (running peak of closes to the
+  deepest subsequent low - recovery is irrelevant), plus ATH/ATL from
+  intrabar extremes.
+- **Runway math**: `realized_dd = (ath - current) / ath`;
+  `runway_pct = max_drawdown_pct * target_survival`;
+  `floor_price = ath * (1 - runway_pct)`. Three regimes, evaluated in order:
+  *Normal* (`current > floor_price`: fund the remaining drop),
+  *Floor extension* (at/below the floor: funding extends down to ATL),
+  *Unprecedented lows* (at the deepest drawdown AND at/below ATL:
+  maximum conservatism). Aggressiveness = `realized_dd / max_drawdown_pct`
+  biases parameter selection toward tighter grids and larger sizes deeper in
+  the runway; it never overrides survival requirements or bounds.
+- **Survival replay**: a candidate `(grid_interval, buy_qty)` walks the
+  funded depth geometrically, paying each buy plus venue fees;
+  `d_surv` is the fraction of that depth survived before the quote runs out
+  (>= 1.0 means fully funded).
+- **Parameter search**: `buy_qty` within `[qty, qty * qty_cap_mult]`,
+  `grid_interval` within `[gi_min, gi_max]` (the strategy entry's bounds).
+  Branches, in order: *Unreachable* (no candidate meets the funded-depth
+  requirement -> conservative corner `qty` / `gi_max`); *Reachable* (largest
+  size at tightest spacing keeping `d_surv >= target_survival`,
+  aggressiveness-biased); *Surplus* (the aggressive corner exceeds the target
+  with quote left over -> `qty_max` / `gi_min`).
+- **Decision record**: exactly `{active, grid_interval, buy_qty, sell_qty}`,
+  raw floats, generated by exactly one code path. Values are emitted for
+  inactive strategies too, for visibility and immediate reactivation. All
+  normalization (tick/lot rounding, min notional) happens at the exchange
+  layer. Activity: `active <=> d_surv >= min_active_dsurv` subject to
+  affordability; sells always run (they need inventory, not quote).
+
+### Pooling, priority & cascades
+
+Pools are per venue: one quote pool shared by that venue's strategies, never
+crossing venues (two strategies may share one symbol on one venue).
+Allocation walks strategies in config presentation order (first = highest
+priority): each strategy sizes against the entire remaining availability, its
+next buy ties up `buy_qty * current`, unfundable strategies are skipped and
+capacity passes down - a lower-priority strategy is never starved while quote
+exists. When a higher-priority need cannot fit, the cancellation cascade
+cancels lower-priority resting buys - many lesser orders may be cancelled to
+satisfy one greater - until it fits; if no combination fits, resolution
+proceeds to the next-highest priority. Every cancelled strategy re-evaluates
+on that event and resumes iff quote covers its buy.
 
 ### Runtime behavior
 
-Inside the engine the oracle is a supervised module (`supervisor.ml` starts it like any other connection, registered as `oracle`). It heartbeats on every published pass plus a 10-second liveness ticker and auto-restarts if its loop dies. Each asset's analysis is bounded at 60 seconds and falls back to last-known-good. Decisions publish as: `active`, `qty`, `grid_interval` (`gi`), `d_surv`, `reason`, `reclaim_capital`, and the blend components. Capital is allocated in two phases across the venue account pool, with priority reclamation of capital from shrinking assets.
-
-The decision path is event-driven and network-free: a fill or cancel on any trading domain wakes the oracle immediately (one Atomic increment plus an Lwt-condition broadcast) and enqueues its pool delta (`notify_fill` / `notify_order_cancel`), which the pass applies to the account pool in process — decisions re-size in microseconds and never wait on a venue balance round-trip; the background refresher reconciles the authoritative balance on its own cadence. Only the affected domains are woken per pass (changed-only, per-symbol). On publish, domains adopt the new qty/gi via the lock-free snapshot.
-
-Dynamic re-evaluation: when the price moves more than `fng_check_threshold` percent from the grid baseline, the oracle re-checks the Fear-and-Greed signal and can shrink or grow the grid before the next scheduled pass. Equities are pure oracle; Fear-and-Greed applies only to crypto.
+Inside the engine the oracle is a supervised module (registered as `oracle`),
+heartbeated on every published pass plus a liveness ticker, auto-restarted by
+the health monitor. Decision computation is pure and in-memory (<10 ms p99):
+histories live in a cache refreshed on the background cadence, balances come
+from the websocket-fed live store or the last snapshot adjusted IN PROCESS by
+fill/cancel deltas, live prices read the in-process top of book. Event bursts
+coalesce into a single re-resolve; only domains whose decision changed are
+woken per pass.
 
 ### CLI (`dio-oracle`)
 
-`bin/oracle.ml` runs the same analysis pipeline once and prints a report:
+Runs the exact decision pipeline offline against configured assets and prints
+the decision surface - the four contract values plus diagnostics - without
+touching live balances:
 
 ```sh
-dune exec dio-oracle -- BTC/USD --exchange kraken
-dune exec dio-oracle -- AAPL --exchange alpaca --capital 5000 --target-survival 0.99
-dune exec dio-oracle -- --portfolio --exchange kraken --capital 50000   # every class member
+dune exec dio-oracle                          # every trading entry, table output
+dune exec dio-oracle -- --symbol BTC/USDC     # one asset
+dune exec dio-oracle -- --quote 50000 --base 0.5   # synthetic pool sizing
+dune exec dio-oracle -- --cache-only          # never touch the network
+dune exec dio-oracle -- --json                # machine-readable
 ```
 
-All flags: `--exchange`, `--capital`, `--total-capital`, `--portfolio`, `--topology`, `--allocation`, `--split`, `--transfer`, `--positions-file`, `--save-positions`, `--qty`, `--gi`, `--fee`, `--sell-mult`, `--accumulation-buffer`, `--min-notional`, `--data-feed`, `--start-price`, `--price-increment`, `--qty-increment`, `--qty-min`, `--start`, `--end`, `--horizons`, `--thresholds`, `--percentiles`, `--gap-tolerance`, `--vol-window`, `--class`, `--members`, `--kappa`, `--target-survival`, `--fng`, `--min-active-dsurv`, `--qty-cap-mult`, `--no-deep-history`, `--no-weight-by-sessions`, `--max-capital`, `--surface-gi-steps`, `--surface-qty-points`, `--surface-scan-points`, `--json`.
-
-Notes:
-
-- `--fng-weight` and `--range-weight` are accepted for config compatibility but do not affect CLI sizing; the CLI is survival-driven. The runtime oracle applies those weights.
-- `--from-csv` / `--from-json` load a single asset series from a file instead of the venue adapters, for offline analysis (see `test/engine/oracle/`). They do not combine with `--portfolio` or any topology/allocation option.
-- `--portfolio` with `--topology <file>` or `--allocation <split>` sizes every asset in a class; `--transfer "SESSION:FROM->TO=AMOUNT"` (repeatable) builds a manual portfolio transfer.
-- Venue adapters are registered at binary startup (force-reference in `bin/oracle.ml`), so the CLI supports any venue that implements `Exchange_intf.Oracle.S`.
-
----
-
-## Dashboard
-
-`dio-dashboard` is a full-screen TUI that talks to the running engine over a Unix domain socket.
-
-### Socket and protocol
-
-The engine listens on `/var/run/dio/dashboard.sock`, falling back to `/tmp/dio/dashboard.sock`. The client tries the fixed paths first, then scans `/tmp` for `dio-*.sock` newest-first, unlinks dead sockets, and honors `--socket` to override. Use `dune exec dio-dashboard -- --socket /path/to/custom.sock` for non-default setups.
-
-Wire protocol: 4-byte big-endian length-prefixed JSON frames. Client commands: `S` (snapshot), `W` (watch), `P` (ping), `Q` (close). In watch mode the server pushes a full state frame every 500 ms (about 2 updates per second). At most 5 clients may watch; clients that stop pinging are pruned after 8 seconds.
-
-### Layout
-
-- **KPI cards**: Portfolio (net worth + cash), System Engine (active/idle strategies, uptime, fill count, fill rate), Latency (oracle publish p50/p99; green under 5 s, yellow under 30 s, red at or above 30 s), Memory/GC (heap MB and live ratio).
-- **Live ticker**: every strategy with a mid price, grouped by base asset, with spread in basis points color-coded (<5 green, <20 yellow, <50 orange, >=50 red).
-- **Holdings table**: per symbol: strategy, state glyphs (`▶` running, `⏸` halted, `⏹` idle, `$` holding), prices, spreads, buy/sell levels with Δ and gauge bars, accumulated base/quote, and row flash when the market is near the buy or sell level.
-- **Recent fills**: a scrolling feed of the last 10 fills (the engine broadcasts the last 50; the UI ring keeps 10).
-- **Detail view** (Enter on a row): summary card with the oracle line (`ACTIVE/INACTIVE qty gi D_surv% reason`), an L2 orderbook sidebar (own orders in cyan for buys and magenta for sells, MID banner, recent Alpaca trades), and a 15-minute braille price chart with a LIVE NOW badge and pins at own order levels.
-- **Footer**: uptime, Fear-and-Greed reading colored green/yellow/red (>=60 / 40-60 / <40), and per-stream connectivity dots (green when a venue reports a valid top of book).
-
-Keys: `↑`/`↓` or `k`/`j` move, `Enter` opens the detail view, `←`/`→` or `h`/`l` switch latency pages (CORE: oracle, orderbook, strategy, execution, cycle; NETWORK: ws_ping, ws_feed, rest_request, signer, each with p50/p99/p999 and an EMA p99 sparkline), `+`/`-` zoom the chart (clamped), `Esc`/`b`/`Backspace` go back, `q`/`Q` quits.
-
----
-
-## Discord Notifications
-
-When `DISCORD_WEBHOOK_URL` is set, the engine posts fill notifications through a rate-limited client (token bucket, 5 tokens refilled every 400 ms, 2.5 messages/second ceiling) batching up to 10 fills per embed.
-
----
-
-## Deployment
-
-### Docker
-
-A multi-stage `Dockerfile` builds on `ocaml/opam:ubuntu-22.04-ocaml-5.2` and runs on `ubuntu:22.04`. It compiles `libsecp256k1` v0.7.1 with schnorrsig + recovery for the Hyperliquid signer, links jemalloc, runs as the non-root `dio` user, exposes port 8080, and `CMD ["dio"]`.
-
-```sh
-docker build -t dio .
-docker run --rm -v "$PWD/.env:/app/.env:ro" \
-  -v "$PWD/config.json:/app/config.json:ro" \
-  -v "$PWD/data:/app/data" \
-  -v dio-sock:/var/run/dio \
-  --env-file .env dio
-```
-
-The dashboard runs as a separate container sharing the `dio-sock` volume:
-
-```sh
-docker run --rm -it -v dio-sock:/var/run/dio dio dio-dashboard
-```
-
-### deploy.sh
-
-`deploy.sh` pushes the repo to a remote node, builds the amd64 image with `docker buildx`, and runs it with host networking, a read-only root filesystem, `tmpfs` for `/tmp`, the `dio-sock` and data volumes, and `.env` / `config.json` bind-mounted read-only.
-
-### Lighter relay proxy
-
-`proxy/cloudflare` is a Cloudflare Worker with a Durable Object that relays Lighter signed requests. Deploy with `wrangler` per its `wrangler.toml`; `LIGHTER_PROXY_URL` accepts a comma-separated pool of worker URLs so the client can fail over.
-
----
-
-## Development
-
-```sh
-dune build            # build everything
-dune runtest          # unit tests (engine, strategies, oracle)
-dune fmt              # format (ocamlformat)
-dune build @doc       # API docs
-```
-
-CI (`.github/workflows/ci.yml`) builds libsecp256k1, then runs `dune build @all` and `dune runtest` on OCaml 5.2.0 / Ubuntu 22.04.
-
-Where things live:
-
-| Path | Contents |
-| --- | --- |
-| `bin/main.ml` | Engine entry point, graceful shutdown, force-references all exchange modules |
-| `bin/dashboard.ml` | Dashboard TUI entry point (thin wrapper over `src/dashboard_ui/`) |
-| `bin/oracle.ml` | Oracle CLI entry point, module functors, force-references oracle adapters |
-| `src/engine/config.ml` | `config.json` schema and validation |
-| `src/engine/domain_spawner.ml` | Per-asset domains, strategy lifecycle, Fear-and-Greed trigger |
-| `src/engine/supervisor/` | Connection registry, health monitor, circuit breaker, feed orchestration |
-| `src/engine/concurrency/` | Ring buffers, event buses, exchange wakeup generations, feed parse worker, fill event bus, Lwt helpers |
-| `src/engine/oracle/` | Oracle runtime, math, venues, tasks, loader |
-| `src/engine/strategies/` | `jacobs_ladder`, `market_maker`, `auto_hedger`, grid core |
-| `src/engine/latency_profiling/` | Rolling p50/p99/p999 network latency stats |
-| `src/engine/error_handling/` | Error classification and retry/backoff |
-| `src/engine/logging/` | Async logger |
-| `src/engine/persistence/` | Atomic state persistence |
-| `src/engine/dashboard/` | UDS dashboard server and state broadcast |
-| `src/dashboard_ui/` | Notty TUI: ticker, holdings, KPI cards, latency pages, fills feed |
-| `src/external/exchange_intf.ml` | The exchange integration interface |
-| `src/external/kraken/`, `hyperliquid.xyz/`, `lighter.xyz/`, `interactivebrokers/`, `alpaca/` | Venue implementations |
-| `src/external/yahoo/`, `coinmarketcap/`, `discord/` | Shared clients (deep history, Fear-and-Greed, notifications) |
-| `test/` | Unit tests, oracle fixtures and design doc |
-| `proxy/cloudflare/` | Lighter relay worker |
-
-See `src/external/README.md` for how to add a new exchange.
+The oracle config section (`config.json`) drives both the runtime and this
+CLI; strategy entries carry the hardened bounds the search walks.

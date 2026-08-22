@@ -145,21 +145,24 @@ let asset_domain_worker
       Some resolved
   in
   let resolved_grid_interval = fng_grid_interval () in
-  (* Resolve accumulation_buffer via Fear & Greed (Hyperliquid, Lighter, IBKR
-     and Alpaca only). Same no-default rule: only a live F&G reading resolves
-     it; without one the grid does not place orders anyway. *)
+  (* Resolve accumulation_buffer via Fear & Greed - every venue: Kraken runs
+     the same persistence-layer reserved_base accrual as the rest (see
+     jacobs_ladder_config.kraken_config). Same no-default rule: only a live
+     F&G reading resolves it; without one the grid does not place orders
+     anyway. *)
   let fng_accumulation_buffer () =
     let exch_id =
       Dio_exchange.Exchange_intf.Types.exchange_of_string asset_with_fees.exchange
     in
     let is_accumulation_exch =
       match exch_id with
-      | Hyperliquid | Ibkr | Lighter | Alpaca -> true
-      | _ -> false
+      | Hyperliquid | Ibkr | Lighter | Alpaca | Kraken -> true
+      | Custom _ -> false
     in
     if
       is_accumulation_exch
-      && (asset_with_fees.strategy = "jacobs_ladder" || asset_with_fees.strategy = "Ladder")
+      && (asset_with_fees.strategy = "jacobs_ladder"
+          || asset_with_fees.strategy = "Ladder")
     then (
       match Fear_and_greed.get_cached () with
       | None -> None
@@ -240,21 +243,21 @@ let asset_domain_worker
          | Some d -> not d.active
          | None -> false)
     in
-    (* Reclaim cancel state (priority reclamation): a decision with
-       [reclaim_capital] asks this domain to cancel its resting buy(s) so the
-       committed capital returns to the account pool for a higher-priority
-       asset. The cancel is a network op that can fail silently (dispatch
-       dropped on a connection flap, exchange rejection, ring-buffer full), so
-       it is NOT issued every cycle - [reclaim_cancel_issued] latches it with
-       the timestamp [reclaim_cancel_at] - but it MUST be retried while the
-       reclaim decision persists and eligible buys still sit in the store.
-       The latch re-arms the moment the store no longer shows an eligible buy
-       (the cancel landed) OR the decision stops being a reclaim; see
-       [Dio_strategies.Jacobs_ladder.reclaim_step]. Without the retry, a single
-       failed cancel leaves the account permanently stuck: the reclaimed
-       asset stays paused (the oracle's plan only clears once the store's
-       committed value drops to zero) and the priority asset never resumes on
-       capital that was never actually released. *)
+    (* Cascade cancel state (cancellation cascade): a decision with
+       [cancel_resting_buys] asks this domain to cancel its resting buy(s)
+       so the committed capital returns to the venue pool for a
+       higher-priority strategy. The cancel is a network op that can fail
+       silently (dispatch dropped on a connection flap, exchange rejection,
+       ring-buffer full), so it is NOT issued every cycle -
+       [reclaim_cancel_issued] latches it with the timestamp
+       [reclaim_cancel_at] - but it MUST be retried while the cascade
+       decision persists and eligible buys still sit in the store. The latch
+       re-arms the moment the store no longer shows an eligible buy (the
+       cancel landed) OR the decision stops being a cascade; see
+       [Dio_strategies.Jacobs_ladder.reclaim_step]. Without the retry, a
+       single failed cancel leaves the pool permanently short: the starved
+       strategy stays paused and never resumes on capital that was never
+       actually released. *)
     let reclaim_cancel_issued = ref false in
     let reclaim_cancel_at = ref 0.0 in
     let reclaim_retry_seconds = 15.0 in
@@ -299,7 +302,7 @@ let asset_domain_worker
           ref
             (Some
                (grid_asset_of
-                  ~qty:(Printf.sprintf "%.8g" d.qty)
+                  ~qty:(Printf.sprintf "%.8g" d.buy_qty)
                   ~grid_interval:d.grid_interval
                   ()))
         | _, Some gi -> ref (Some (grid_asset_of ~grid_interval:gi ()))
@@ -334,11 +337,9 @@ let asset_domain_worker
         ~exchange:asset_with_fees.exchange
         ~symbol:asset_with_fees.symbol
     in
-    let oracle_startup_wait =
-      match config.oracle with
-      | Some o -> o.startup_wait_seconds
-      | None -> (Oracle_runtime.default_config ()).startup_wait_seconds
-    in
+    (* Startup gate window: gives the oracle's first history refresh + pass
+       a chance to publish before this domain starts trading. *)
+    let oracle_startup_wait = 120.0 in
     let oracle_gate_open = ref (not is_grid_strategy) in
     let oracle_gate_deadline = ref (Unix.gettimeofday () +. oracle_startup_wait) in
     let mm_strategy_asset_ref =
@@ -950,10 +951,12 @@ let asset_domain_worker
        | Some d, None when d.active ->
          (* First oracle decision after a no-signal startup (no F&G was
             available): materialize the grid strategy from the decision. *)
-         let qty_str = Printf.sprintf "%.8g" d.qty in
+         let qty_str = Printf.sprintf "%.8g" d.buy_qty in
          grid_strategy_asset_ref
          := Some (grid_asset_of ~qty:qty_str ~grid_interval:d.grid_interval ());
-         let st = Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol in
+         let st =
+           Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol
+         in
          (try st.grid_qty <- float_of_string qty_str with
           | Failure _ -> ());
          (* Re-check any already-resting buy against the decision's spacing:
@@ -969,7 +972,7 @@ let asset_domain_worker
             %.1f%%)"
            asset_with_fees.exchange
            asset_with_fees.symbol
-           d.qty
+           d.buy_qty
            d.grid_interval
            (d.d_surv *. 100.0)
        | Some d, Some asset when d.active ->
@@ -988,12 +991,12 @@ let asset_domain_worker
              try float_of_string asset.qty with
              | Failure _ -> 0.0
            in
-           abs_float (d.qty -. current_qty) > max (current_qty *. 0.001) 1e-9
+           abs_float (d.buy_qty -. current_qty) > max (current_qty *. 0.001) 1e-9
          in
          let gi_changed = abs_float (d.grid_interval -. asset.grid_interval) > 1e-12 in
          if qty_changed || gi_changed
          then (
-           let qty_str = Printf.sprintf "%.8g" d.qty in
+           let qty_str = Printf.sprintf "%.8g" d.buy_qty in
            let new_asset =
              { asset with qty = qty_str; grid_interval = d.grid_interval }
            in
@@ -1018,7 +1021,7 @@ let asset_domain_worker
              "[%s/%s] Capital oracle updated sizing: qty %.8g gi %.4f%% (D_surv %.1f%%)"
              asset.exchange
              asset.symbol
-             d.qty
+             d.buy_qty
              d.grid_interval
              (d.d_surv *. 100.0))
        | _ -> ());
@@ -1033,7 +1036,7 @@ let asset_domain_worker
             "[%s/%s] Capital oracle re-activated (qty %.8g gi %.4f%%); resuming orders"
             asset.exchange
             asset.symbol
-            d.qty
+            d.buy_qty
             d.grid_interval
         | Some d ->
           Logging.warn_f
@@ -1044,7 +1047,7 @@ let asset_domain_worker
             asset.symbol
             (if d.reason = "" then "capital reallocated" else d.reason)
             (d.d_surv *. 100.0)
-            d.qty
+            d.buy_qty
             d.grid_interval
         | None ->
           Logging.info_f
@@ -1076,9 +1079,11 @@ let asset_domain_worker
          ([request_pass]) so released capital is recognized promptly even if
          the exchange's WS cancel event is missed. *)
       (match oracle_decision with
-       | Some d when d.reclaim_capital ->
+       | Some d when d.cancel_resting_buys ->
          let now = Unix.gettimeofday () in
-         let st = Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol in
+         let st =
+           Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol
+         in
          Mutex.lock st.mutex;
          Fun.protect
            ~finally:(fun () -> Mutex.unlock st.mutex)
@@ -1156,12 +1161,11 @@ let asset_domain_worker
                 Oracle_runtime.request_pass ();
                 Logging.warn_f
                   ~section
-                  "[%s/%s] Capital oracle reclaim: canceling %d resting buy(s) to return \
-                   capital to %s"
+                  "[%s/%s] Capital oracle cancellation cascade: canceling %d resting \
+                   buy(s) to free quote for a higher-priority strategy"
                   asset_with_fees.exchange
                   asset_with_fees.symbol
                   !n
-                  d.reclaim_target
               | Dio_strategies.Jacobs_ladder.Reclaim_deferred -> ())
        | _ ->
          reclaim_cancel_issued := false;
@@ -1217,7 +1221,7 @@ let asset_domain_worker
             asset_with_fees.exchange
             asset_with_fees.symbol
             (if d.active then "ACTIVE" else "INACTIVE")
-            d.qty
+            d.buy_qty
             d.grid_interval
             (d.d_surv *. 100.0)
         | None
@@ -1241,10 +1245,10 @@ let asset_domain_worker
           (* Only F&G is active: warn once if the oracle failed to produce a
              decision for an asset it models (pass finished without one, or
              the startup window elapsed); plain info otherwise. The messages
-             distinguish the three real causes:
+             distinguish the real causes:
              - cold start: the gate opened on the startup deadline while the
-               oracle's first history refresh was still running (no
-               materialized state yet) - NOT an analysis failure;
+               oracle's first history refresh was still running (no history
+               yet) - NOT an analysis failure;
              - analysis failed: at least one real pass finished and this
                asset still has no decision;
              - startup window elapsed: no pass ever completed. *)
@@ -1254,28 +1258,27 @@ let asset_domain_worker
             | None ->
               Logging.warn_f
                 ~section
-                "[%s/%s] Capital-oracle first history refresh still in progress; sizing \
-                 from Fear & Greed only (startup deadline elapsed)"
+                "[%s/%s] Capital-oracle first history refresh still in progress; no \
+                 fallback sizing available"
                 asset_with_fees.exchange
                 asset_with_fees.symbol
             | Some _ when Oracle_runtime.first_pass_attempt_done () ->
               Logging.warn_f
                 ~section
                 "[%s/%s] Capital-oracle produced no decision for this asset (analysis \
-                 failed); sizing from Fear & Greed only"
+                 failed)"
                 asset_with_fees.exchange
                 asset_with_fees.symbol
             | Some _ ->
               Logging.warn_f
                 ~section
-                "[%s/%s] Capital-oracle never completed a pass (startup window elapsed); \
-                 sizing from Fear & Greed only"
+                "[%s/%s] Capital-oracle never completed a pass (startup window elapsed)"
                 asset_with_fees.exchange
                 asset_with_fees.symbol)
           else
             Logging.info_f
               ~section
-              "[%s/%s] Asset not modeled by the capital oracle; sizing from Fear & Greed"
+              "[%s/%s] Asset not modeled by the capital oracle"
               asset_with_fees.exchange
               asset_with_fees.symbol
         | None when fng_available ->
@@ -1430,14 +1433,10 @@ let asset_domain_worker
                sizing apply here - the fng side of the blend without the
                survival/range constraint, explicitly labeled as the fallback
                it is. *)
-            let lo, hi = asset_with_fees.grid_interval in
-            let fng_interval =
-              Fear_and_greed.grid_value_for_fng
-                ~grid_interval:asset_with_fees.grid_interval
-                ~fear_and_greed:current_fng
-            in
-            (* F&G owns accumulation_buffer in every crypto case: the oracle
-               does not size it. *)
+            (* F&G no longer sizes grid_interval anywhere: the oracle's
+               decision is the sole sizing source and there is NO fallback
+               path. F&G still manages accumulation_buffer, which the oracle
+               does not size. *)
             let update_accumulation_buffer () =
               let exch_id =
                 Dio_exchange.Exchange_intf.Types.exchange_of_string
@@ -1483,15 +1482,13 @@ let asset_domain_worker
                   buffer. *)
                Logging.info_f
                  ~section
-                 "[%s/%s] Fear & Greed updated to %.2f: oracle sizing gi %.4f%% (%s) · \
-                  qty %.6g (%s) · D_surv %.1f%%"
+                 "[%s/%s] Fear & Greed updated to %.2f: oracle sizing gi %.4f%% · qty \
+                  %.6g · D_surv %.1f%%"
                  asset_with_fees.exchange
                  asset_with_fees.symbol
                  current_fng
                  d.grid_interval
-                 d.gi_reason
-                 d.qty
-                 d.qty_reason
+                 d.buy_qty
                  (d.d_surv *. 100.0);
                update_accumulation_buffer ()
              | Some _ ->
@@ -1507,31 +1504,17 @@ let asset_domain_worker
                  asset_with_fees.symbol;
                update_accumulation_buffer ()
              | None ->
-               (* No capital-oracle decision: F&G-alone is the designed
-                  fallback. This is exactly the fng side the oracle would
-                  blend (same mapping over the same config range) minus the
-                  survival/range constraint only the oracle's analysis can
-                  compute - labeled as fallback so the two signals never read
-                  as fighting. *)
-               Logging.info_f
+               (* No capital-oracle decision yet: the strategy places
+                  NOTHING - there is no config/F&G fallback sizing path. The
+                  startup gate above already keeps orders quiet; this only
+                  refreshes the F&G-resolved accumulation buffer reference. *)
+               Logging.debug_f
                  ~section
-                 "[%s/%s] No capital-oracle decision; sizing grid_interval from Fear & \
-                  Greed only (fallback): %.4f%% (range %.4f-%.4f)"
+                 "[%s/%s] No capital-oracle decision yet; no fallback sizing (strategy \
+                  stays quiet until the oracle publishes)"
                  asset_with_fees.exchange
-                 asset_with_fees.symbol
-                 fng_interval
-                 lo
-                 hi;
-               update_accumulation_buffer ();
-               (match !grid_strategy_asset_ref with
-                | Some asset ->
-                  let new_asset =
-                    { asset with
-                      Dio_strategies.Jacobs_ladder.grid_interval = fng_interval
-                    }
-                  in
-                  grid_strategy_asset_ref := Some new_asset
-                | None -> ())));
+                 asset_with_fees.symbol;
+               update_accumulation_buffer ()));
         (* Compute wall-clock timestamp once per cycle for strategy use,
              eliminating Unix.time/gettimeofday syscalls inside the strategy. *)
         let now = Unix.gettimeofday () in

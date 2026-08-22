@@ -16,62 +16,19 @@
     "qty_cap_mult": 1.5,
     "target_survival": 0.95,
     "min_active_dsurv": 0.0,
-    "weight_by_sessions": true,
-    "no_deep_history": false,
     "refresh_seconds": 300.0,
     "assets": {
       "BTC/USDC": {
         "target_survival": 0.85,
-        "fng_weight": 0.5,
-        "range_weight": 0.25,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 3.0,
-        "no_deep_history": false,
-        "weight_by_sessions": true
+        "qty_cap_mult": 3.0
       },
       "HYPE/USDC": {
         "target_survival": 0.75,
-        "fng_weight": 0.5,
-        "range_weight": 0.25,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 2.5,
-        "no_deep_history": false,
-        "weight_by_sessions": true
+        "qty_cap_mult": 2.5
       }
     }
-  },
-  "classes": {
-    "crypto_core": [
-      "BTC/USD",
-      "ETH/USD"
-    ],
-    "crypto_alt": [
-      "SOL/USD",
-      "DOGE/USD",
-      "ADA/USD",
-      "HYPE/USD",
-      "XMR/USD",
-      "LINK/USD",
-      "AVAX/USD",
-      "DOT/USD",
-      "LTC/USD",
-      "XRP/USD",
-      "BNB/USD"
-    ],
-    "equity_etf": [
-      "SPY",
-      "QQQ",
-      "DIA",
-      "IWM",
-      "VTI"
-    ],
-    "equity_momentum": [
-      "NVDA",
-      "TSLA",
-      "AMD",
-      "META",
-      "NFLX"
-    ]
   },
   "trading": [
     {
@@ -90,8 +47,7 @@
       "strategy": "Ladder",
       "testnet": false,
       "hedge": false,
-      "sell_levels": false,
-      "asset_class": "crypto_core"
+      "sell_levels": false
     },
     {
       "symbol": "HYPE/USDC",
@@ -109,8 +65,7 @@
       "strategy": "Ladder",
       "testnet": false,
       "hedge": false,
-      "sell_levels": false,
-      "asset_class": "crypto_alt"
+      "sell_levels": false
     },
     {
       "symbol": "XMR/USD",
@@ -121,9 +76,12 @@
         5.0
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
       "strategy": "Ladder",
-      "sell_levels": false,
-      "asset_class": "crypto_alt"
+      "sell_levels": false
     },
     {
       "symbol": "ETH/USD",
@@ -134,9 +92,12 @@
         5.0
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
       "strategy": "Ladder",
-      "sell_levels": false,
-      "asset_class": "crypto_core"
+      "sell_levels": false
     },
     {
       "symbol": "SOL/USD",
@@ -147,9 +108,12 @@
         5.0
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
       "strategy": "Ladder",
-      "sell_levels": false,
-      "asset_class": "crypto_alt"
+      "sell_levels": false
     },
     {
       "symbol": "ADA/USD",
@@ -160,9 +124,12 @@
         10.0
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
       "strategy": "Ladder",
-      "sell_levels": false,
-      "asset_class": "crypto_alt"
+      "sell_levels": false
     },
     {
       "symbol": "SPCX",
@@ -173,11 +140,14 @@
         2.5
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
       "strategy": "Ladder",
       "testnet": true,
       "sell_levels": true,
-      "data_feed": "iex",
-      "asset_class": "equity_momentum"
+      "data_feed": "iex"
     },
     {
       "symbol": "QQQ",
@@ -188,11 +158,14 @@
         0.75
       ],
       "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
       "strategy": "Ladder",
       "testnet": true,
       "sell_levels": true,
-      "data_feed": "iex",
-      "asset_class": "equity_etf"
+      "data_feed": "iex"
     }
   ]
 }

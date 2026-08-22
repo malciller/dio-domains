@@ -208,21 +208,24 @@ let test_regular_session_default_whole () =
   Alcotest.(check bool) "regular whole no extended flag" false ext
 ;;
 
-let test_extended_session_gtc_downgraded () =
+(* No virtual-GTC: the requested TIF passes through in extended sessions
+   too; acceptance is the account's GTC-for-extended setting, not a silent
+   rewrite here. *)
+let test_extended_session_gtc_preserved () =
   let tif_str, ext = tif ~in_extended:true () in
-  Alcotest.(check string) "extended GTC downgraded to day" "day" tif_str;
+  Alcotest.(check string) "extended GTC preserved" "gtc" tif_str;
   Alcotest.(check bool) "extended GTC marked extended" true ext
 ;;
 
-let test_extended_session_ioc_downgraded () =
+let test_extended_session_ioc_preserved () =
   let tif_str, ext = tif ~in_extended:true ~time_in_force:(Some "IOC") () in
-  Alcotest.(check string) "extended IOC downgraded to day" "day" tif_str;
+  Alcotest.(check string) "extended IOC preserved" "ioc" tif_str;
   Alcotest.(check bool) "extended IOC marked extended" true ext
 ;;
 
-let test_extended_session_fok_downgraded () =
+let test_extended_session_fok_preserved () =
   let tif_str, ext = tif ~in_extended:true ~time_in_force:(Some "FOK") () in
-  Alcotest.(check string) "extended FOK downgraded to day" "day" tif_str;
+  Alcotest.(check string) "extended FOK preserved" "fok" tif_str;
   Alcotest.(check bool) "extended FOK marked extended" true ext
 ;;
 
@@ -304,17 +307,17 @@ let () =
             `Quick
             test_regular_session_default_whole
         ; Alcotest.test_case
-            "extended GTC downgraded"
+            "extended GTC preserved"
             `Quick
-            test_extended_session_gtc_downgraded
+            test_extended_session_gtc_preserved
         ; Alcotest.test_case
-            "extended IOC downgraded"
+            "extended IOC preserved"
             `Quick
-            test_extended_session_ioc_downgraded
+            test_extended_session_ioc_preserved
         ; Alcotest.test_case
-            "extended FOK downgraded"
+            "extended FOK preserved"
             `Quick
-            test_extended_session_fok_downgraded
+            test_extended_session_fok_preserved
         ; Alcotest.test_case "extended DAY" `Quick test_extended_session_day
         ; Alcotest.test_case
             "extended market order"

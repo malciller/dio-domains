@@ -104,8 +104,7 @@ let oracle_connect_fn
       (conn : Supervisor_types.supervised_connection)
       ~(config : Oracle_runtime.runtime_config)
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
-      ~(classes : (string * Oracle_runtime.class_pool) list)
-      ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
+            ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
       ()
   : unit Lwt.t
   =
@@ -124,7 +123,7 @@ let oracle_connect_fn
         liveness ())
   in
   Lwt.pick
-    [ Oracle_runtime.run_loop ~config ~trading ~classes ~on_publish (); liveness () ]
+    [ Oracle_runtime.run_loop ~config ~trading ~on_publish (); liveness () ]
   >>= fun () ->
   (* The loop ended: normal when either shutdown flag is set (the engine's
      supervisor shutdown sets both); abnormal otherwise - surface it as a
@@ -144,8 +143,7 @@ let oracle_connect_fn
 let start_oracle
       ~(config : Oracle_runtime.runtime_config)
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
-      ~(classes : (string * Oracle_runtime.class_pool) list)
-      ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
+            ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
       ()
   =
   let conn = register ~name:"oracle" ~connect_fn:None in
@@ -154,7 +152,6 @@ let start_oracle
       conn
       ~config
       ~trading
-      ~classes
       ~on_publish:(fun changed decisions ->
         (* Every published pass is a data heartbeat for the supervisor. *)
         update_data_heartbeat conn;

@@ -500,15 +500,13 @@ let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
     ; "symbol", `String d.symbol
     ; "active", `Bool d.active
     ; "reason", `String d.reason
-    ; "qty", `Float d.qty
+    ; "buy_qty", `Float d.buy_qty
+    ; "sell_qty", `Float d.sell_qty
     ; "grid_interval", `Float d.grid_interval
     ; "d_surv", `Float d.d_surv
-    ; "d_cover", `Float d.d_cover
-    ; "deployed", `Float d.deployed
-    ; "pool_share", `Float d.pool_share
-    ; "remainder", `Float d.remainder
-    ; "reclaim_capital", `Bool d.reclaim_capital
-    ; "reclaim_target", `String d.reclaim_target
+    ; "regime", `String d.regime
+    ; "branch", `String d.branch
+    ; "cancel_resting_buys", `Bool d.cancel_resting_buys
     ; "updated_at", `Float d.updated_at
     ]
 ;;

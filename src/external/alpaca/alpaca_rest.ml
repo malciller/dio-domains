@@ -92,20 +92,19 @@ let parse_order_json json =
 ;;
 
 (** Compute the effective time-in-force and extended-hours eligibility for an
-    order given the market session. Returns (tif_str, mark_extended).
+    order. Returns (tif_str, mark_extended).
 
-    Alpaca session rules for US equities:
-    - Regular hours (9:30 AM - 4:00 PM ET): GTC/IOC/FOK/DAY are accepted. The
-      requested TIF is preserved and no [extended_hours] flag is sent (IOC/FOK
-      cannot carry [extended_hours], and GTC + [extended_hours] requires account
-      enablement).
-    - Extended (pre/post-market) and overnight sessions: only [limit] orders are
-      accepted and only with TIF [day] (or [gtc] when GTC-for-extended is enabled
-      on the account). Every requested TIF is downgraded to [day] with
-      [extended_hours=true] so the order is accepted unconditionally, executes in
-      the current session, carries through the upcoming sessions, and cancels at
-      8:00 PM ET.
-    - Crypto (24/7) is never marked extended-hours eligible. *)
+    The requested time-in-force passes through HONESTLY - there is no
+    virtual-GTC downgrade. Fractional equity orders are forced to [day]
+    (a hard Alpaca constraint); everything else keeps the requested TIF,
+    defaulting to [gtc]. In extended sessions a [gtc] limit order requires
+    GTC-for-extended enablement on the Alpaca account - if it is not
+    enabled, the exchange rejects the request and that surfaces as an order
+    error instead of a silent 8:00 PM ET cancellation masquerading as GTC.
+
+    [mark_extended] only attaches the [extended_hours] flag: non-crypto
+    limit orders when extended trading is both configured and the market is
+    in an extended session. Crypto (24/7) is never marked eligible. *)
 let effective_tif_and_extended
       ~is_crypto
       ~is_fractional
@@ -123,9 +122,7 @@ let effective_tif_and_extended
     (not is_crypto) && use_extended && in_extended_session && type_str = "limit"
   in
   let tif_str =
-    if mark_extended
-    then "day"
-    else if is_fractional && not is_crypto
+    if is_fractional && not is_crypto
     then "day"
     else (
       match time_in_force with

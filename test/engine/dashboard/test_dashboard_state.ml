@@ -6,33 +6,15 @@ let make_decision () =
   { Dio_oracle.Oracle_runtime.exchange = "hyperliquid"
   ; symbol = "HYPE/USDC"
   ; active = false
-  ; reason = "pool 12.61 cannot fund the first buy at qty_min (needs 18.80)"
-  ; qty = 0.0
+  ; reason = "pool 12.61 cannot fund the first buy (needs 18.80)"
+  ; buy_qty = 0.0
+  ; sell_qty = 0.5
   ; grid_interval = 5.0
   ; d_surv = 0.0
-  ; d_gov = 0.4
-  ; d_cover = 0.6
-  ; governing_horizon = "180d"
-  ; deployed = 0.0
-  ; pool_share = 12.61
-  ; remainder = 12.61
-  ; reclaim_capital = false
-  ; reclaim_target = ""
-  ; range = None
-  ; p2v = None
-  ; parameter_components =
-      { Dio_oracle.Oracle_types.fng = Some 37.0
-      ; fng_parameter = None
-      ; survival_parameter = 5.0
-      ; resolved_parameter = 5.0
-      ; fng_weight = 0.5
-      ; range_parameter = None
-      ; range_weight = 0.25
-      }
-  ; gi_reason = "grid max 5.00% (100% survival unreachable at any gi)"
-  ; qty_reason = "minimum qty 0.5 (stretch: 100% survival unreachable)"
-  ; warnings = []
-  ; updated_at = 42.0
+  ; regime = "floor extension"
+  ; branch = "unreachable"
+  ; cancel_resting_buys = false
+  ; updated_at = 1700000000.0
   }
 ;;
 
@@ -56,23 +38,26 @@ let test_decision_fields () =
        (String.length s > 0 && String.contains s 'p')
        true
    | _ -> Alcotest.fail "missing reason");
-  (match field j "qty" with
-   | Some (`Float q) -> Alcotest.(check (float 1e-9)) "qty" 0.0 q
-   | _ -> Alcotest.fail "missing qty");
+  (match field j "buy_qty" with
+   | Some (`Float q) -> Alcotest.(check (float 1e-9)) "buy_qty" 0.0 q
+   | _ -> Alcotest.fail "missing buy_qty");
+  (match field j "sell_qty" with
+   | Some (`Float q) -> Alcotest.(check (float 1e-9)) "sell_qty" 0.5 q
+   | _ -> Alcotest.fail "missing sell_qty");
   (match field j "grid_interval" with
    | Some (`Float g) -> Alcotest.(check (float 1e-9)) "gi" 5.0 g
    | _ -> Alcotest.fail "missing grid_interval");
   (match field j "d_surv" with
    | Some (`Float d) -> Alcotest.(check (float 1e-9)) "d_surv" 0.0 d
    | _ -> Alcotest.fail "missing d_surv");
-  (match field j "pool_share" with
-   | Some (`Float p) -> Alcotest.(check (float 1e-9)) "pool_share" 12.61 p
-   | _ -> Alcotest.fail "missing pool_share");
-  (match field j "remainder" with
-   | Some (`Float r) -> Alcotest.(check (float 1e-9)) "remainder" 12.61 r
-   | _ -> Alcotest.fail "missing remainder");
+  (match field j "regime" with
+   | Some (`String r) -> Alcotest.(check string) "regime" "floor extension" r
+   | _ -> Alcotest.fail "missing regime");
+  (match field j "branch" with
+   | Some (`String b) -> Alcotest.(check string) "branch" "unreachable" b
+   | _ -> Alcotest.fail "missing branch");
   (match field j "updated_at" with
-   | Some (`Float t) -> Alcotest.(check (float 1e-9)) "updated_at" 42.0 t
+   | Some (`Float t) -> Alcotest.(check (float 1e-9)) "updated_at" 1700000000.0 t
    | _ -> Alcotest.fail "missing updated_at");
   match field j "exchange" with
   | Some (`String e) -> Alcotest.(check string) "exchange" "hyperliquid" e

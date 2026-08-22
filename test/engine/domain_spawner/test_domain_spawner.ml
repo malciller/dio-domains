@@ -53,7 +53,6 @@ let test_spawn_domains_basic () =
     ; gc = None
     ; oracle = None
     ; trading = assets
-    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
@@ -82,7 +81,6 @@ let test_spawn_domains_empty () =
     ; gc = None
     ; oracle = None
     ; trading = []
-    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }
@@ -174,7 +172,6 @@ let test_domain_error_handling () =
     ; gc = None
     ; oracle = None
     ; trading = [ failing_asset ]
-    ; classes = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
     }

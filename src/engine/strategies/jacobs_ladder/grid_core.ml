@@ -13,32 +13,22 @@
      construction). Exhaustion (capital_low) fires only when quote cannot fund
      the (up-sized) order; a qty_min failure with ample capital halts the grid
      as [`Not_placeable] instead.
-    - sell gate      = sell notional q_s * price >= min_notional. Sells are
-      deliberately NOT floored at qty_min - accrual sells (reduced by the
-      retained slice) and residual inventory size below the lot minimum
-      legitimately, and the live grid places them. Dynamic sell sizing:
-      Alpaca (1:1, non-accumulating) up-sizes the sell qty to ceil_lot(
-      min_notional / price) so the grid recovers safely; accumulation venues
-      (Kraken/HL/Lighter/IBKR) keep the resting sell (accumulate) while the
-      reduced sell clears the NOTIONAL floor, and fall back to the FULL fill
-      qty (no retention that cycle) when the reduced sell sits below
-      min_notional, so inventory is never stranded below the value floor.
+     - sell gate      = sell notional q_s * price >= min_notional. Sells are
+       deliberately NOT floored at qty_min - residual inventory sizes below
+       the lot minimum legitimately, and the live grid places them.
     - sell inventory  = sell-side base is NOT required to run the strategy:
       the grid needs only quote capital to place a buy order, and a sell order
       is only placed (and only fills) if the sellable inventory
-      base - reserved_base covers the (up-sized) quantity. An order that the
+      base - reserved_base covers the quantity. An order that the
       inventory cannot cover is skipped - never filled with phantom base - so
-      quote is reconciled (recovered) exactly on valid sell fills.
-   - sell qty per venue: Kraken/HL/Lighter/IBKR accumulation sells once
-     accumulated_profit >= rounding_diff*sell_price + buffer (and, when the
-     reduced sell's notional is below min_notional, the full fill qty - no
-     accrual that cycle); Alpaca 1:1. All five venues grow reserved_base by
-     the retained (1 - sell_mult) slice of every buy fill - on HL/Lighter
-     computed on the net landed base (the buy fee is taken out of the
-     received base token).
-   - at most one sell per bar; buys may ladder down as far as the bar low,
-     quote and the (dynamically sized) buy cost allow (worst-case intraday
-     fills).
+      quote is reconciled (recovered) exactly on valid fills.
+    - sell qty: every filled buy owes exactly one 1:1 sell of what it bought,
+      clamped to the sellable inventory (base - reserved_base). reserved_base
+      is a static seed input here: it grows on live fills through the
+      base_accumulation store (persistence), never inside a replay.
+    - at most one sell per bar; buys may ladder down as far as the bar low,
+      quote and the (dynamically sized) buy cost allow (worst-case intraday
+      fills).
    - capital_low (quote can't fund the next buy) pauses buying and clears when
      quote recovers; the FIRST occurrence is the survival event (halt_cause).
    - the resting buy trails the market UP: when a bar's close rises above the
@@ -59,10 +49,9 @@
    - pessimistic Buy_first ordering (max buys before any sell in a bar):
      oscillatory bars drain fees differently than live sequential execution;
      conservative by construction.
-   - capital_low clears on quote recovery (affordability-based, matching
-     live: a price drop that makes the same balance sufficient clears it,
-     no deposit required); the recovery gate on sells is approximated by
-     the profit/buffer check. *)
+    - capital_low clears on quote recovery (affordability-based, matching
+      live: a price drop that makes the same balance sufficient clears it,
+      no deposit required). *)
 
 open Grid_core_types
 
@@ -79,10 +68,8 @@ type cash_hook =
 
 type config =
   { qty : float
-  ; sell_mult : float
   ; grid_interval_pct : float
   ; maker_fee : float
-  ; accumulation_buffer : float
   ; price_increment : float
   ; qty_increment : float
   ; qty_min : float
@@ -102,7 +89,6 @@ type config =
 type state =
   { mutable quote : float
   ; mutable base : float
-  ; mutable accumulated_profit : float
   ; mutable reserved_base : float
   ; mutable resting_buy : float option
   ; mutable resting_sell : float option
@@ -140,25 +126,6 @@ let exchange_model_of_string = function
   | "ibkr" | "Ibkr" | "IBKR" -> Ibkr
   | "alpaca" | "Alpaca" -> Alpaca
   | s -> invalid_arg ("Grid_core.exchange_model_of_string: " ^ s)
-;;
-
-(* Per-venue flag mirroring Jacobs_ladder_config's use_accumulation_sells.
-   All venues run the aligned model: Kraken/HL/Lighter/IBKR accumulate
-   (profit-gated reduced sells); Alpaca sells 1:1. The old per-venue
-   sell-mult sizing flag is gone - retention is explicit via reserved_base
-   everywhere. *)
-let use_accumulation_sells (cfg : config) : bool =
-  match cfg.exchange_model with
-  | Alpaca -> false
-  | Kraken | Hyperliquid | Lighter | Ibkr -> true
-;;
-
-(* Mirrors Jacobs_ladder_config.hl_like_spot_fee_exchange: these spot venues
-   charge the BUY fee out of the RECEIVED BASE token (only the net amount
-   lands on the venue), so accrual math runs on the net landed qty. *)
-let hl_like_spot_fee : exchange_model -> bool = function
-  | Hyperliquid | Lighter -> true
-  | Kraken | Ibkr | Alpaca -> false
 ;;
 
 (* Rounding: prices to nearest tick (matches exchange round_to_incr), lots
@@ -264,7 +231,6 @@ let create ?(seed = empty_seed) cfg =
   let b = buy_level cfg ~ref:cfg.start_price in
   { quote = cfg.start_quote
   ; base = seed.initial_base
-  ; accumulated_profit = seed.initial_accumulated_profit
   ; reserved_base = seed.initial_reserved_base
   ; resting_buy = Some b
   ; resting_sell = None
@@ -276,30 +242,6 @@ let create ?(seed = empty_seed) cfg =
   ; buy_fills = 0
   ; sell_fills = 0
   }
-;;
-
-(** Sell quantity per venue. Returns (qty, required_profit); required_profit > 0
-    signals an accumulation (reduced) sell gated on accumulated_profit. *)
-let compute_sell_qty cfg ~state ~sell_price =
-  let accumulation rounded =
-    let rounding_diff = cfg.qty -. rounded in
-    let required = (rounding_diff *. sell_price) +. cfg.accumulation_buffer in
-    if state.accumulated_profit >= required && rounded > 0.0
-    then rounded, required
-    else cfg.qty, 0.0
-  in
-  if use_accumulation_sells cfg
-  then (
-    match cfg.exchange_model with
-    | Ibkr ->
-      (* Whole-share accumulation: sell qty-1 once profit clears the buffer. *)
-      accumulation (Float.max 0.0 (cfg.qty -. 1.0))
-    | _ ->
-      (* Kraken / Hyperliquid / Lighter. *)
-      accumulation (round_lot cfg (cfg.qty *. cfg.sell_mult)))
-  else
-    (* Alpaca: 1:1. *)
-    cfg.qty, 0.0
 ;;
 
 (** Advances the state machine through one bar. Returns fills in chronological
@@ -325,11 +267,10 @@ let on_bar cfg ~state ~bar ~ordering =
     match state.resting_buy with
     | Some b when can_place_buy cfg ~state ~price:b -> state.capital_low <- false
     | _ -> ());
-  (* Spec-aligned buy fill: only the reference info for the next sell's
-     profitability check is updated. The legacy per-fill slice retention
-     into reserved_base and the quote-side fee deduction are gone -
-     accumulation happens at sell-fill time when the profit window exceeds
-     the buffer (see process_sell). *)
+  (* Spec-aligned buy fill: only the reference info for the next sell level
+     is updated. The replay itself never reserves - accrual lives in the
+     persistence layer (Base_accumulation_store applies it on live sell
+     fills); reserved_base enters the model as an exogenous seed. *)
   let on_buy_fill _b _qty = state.buy_fills <- state.buy_fills + 1 in
   let process_buy () =
     let rec loop () =
@@ -377,33 +318,15 @@ let on_bar cfg ~state ~bar ~ordering =
   let process_sell () =
     match state.resting_sell with
     | Some s when bar.high >= s ->
-      let q_s0, required0 = compute_sell_qty cfg ~state ~sell_price:s in
       let available = Float.max 0.0 (state.base -. state.reserved_base) in
-      (* Notional-floor fallback: sells are NOT floored at qty_min (the live
-         grid places sub-lot-minimum accrual sells), so the reduced sell goes
-         out as sized UNLESS its notional is below min_notional - the one
-         floor the exchange actually rejects on. Only then does the grid fall
-         back to the FULL fill qty (no retention that cycle) when the full
-         qty clears the notional, so the fill's capital is recovered instead
-         of stranding below the value floor. *)
-      let q_s0 =
-        if
-          use_accumulation_sells cfg
-          && required0 > 0.0
-          && q_s0 *. s < cfg.min_notional -. 1e-9
-          && cfg.qty *. s >= cfg.min_notional -. 1e-9
-        then cfg.qty
-        else q_s0
-      in
-      (* Clamp to the sellable inventory AFTER up-sizing/fallback: an up-sized
-          quantity is only an order if the inventory covers it, so a floor
-          up-size can never sell phantom base. With no sellable inventory the
-          order is skipped (q_s = 0) and quote is only ever reconciled on
-          valid fills. *)
-      (* The intended sell is clamped to the sellable inventory: an order
-         that the inventory cannot cover is not placeable (the notional gate
-         then rejects it) - the grid never sells base it does not hold. *)
-      let q_s = Float.min q_s0 available in
+      (* Every filled buy owes exactly one 1:1 sell of what it bought, clamped
+         to the sellable inventory: an order that the inventory cannot cover
+         is not placeable (the notional gate then rejects it) - the grid never
+         sells base it does not hold, and quote is reconciled exactly on valid
+         fills. Sells are deliberately NOT floored at qty_min - residual
+         inventory legitimately sizes below the lot minimum; the one floor the
+         exchange actually rejects on is min_notional. *)
+      let q_s = Float.min cfg.qty available in
       if q_s > 0.0 && q_s *. s >= cfg.min_notional -. 1e-9
       then (
         state.resting_sell <- None;
@@ -413,21 +336,6 @@ let on_bar cfg ~state ~bar ~ordering =
         recover_quote cfg state proceeds;
         state.base <- Float.max 0.0 (state.base -. q_s);
         state.sell_fills <- state.sell_fills + 1;
-        (* Spec-aligned sell fill: profit is measured against the last BUY
-           fill, net of fees; when accumulated_profit exceeds the buffer,
-           reserve oracle_qty (the oracle-sized cfg.qty) * sell_mult of base
-           and reset the accumulation window. The legacy placement-time
-           profit deduction and slice retention are removed. *)
-        let profit =
-          match state.last_buy_fill_price with
-          | Some bp when bp > 0.0 && bp < s -> ((s -. bp) *. q_s) -. fee
-          | _ -> 0.0
-        in
-        if profit > 0.0 then state.accumulated_profit <- state.accumulated_profit +. profit;
-        if state.accumulated_profit > cfg.accumulation_buffer
-        then (
-          state.reserved_base <- state.reserved_base +. (cfg.qty *. cfg.sell_mult);
-          state.accumulated_profit <- 0.0);
         add { side = `Sell; price = s; qty = q_s; quote_delta = proceeds })
     | _ -> ()
   in
@@ -444,8 +352,8 @@ let on_bar cfg ~state ~bar ~ordering =
 (** Replays the grid over a bar series. `min_quote` is tracked after every fill
     (intra-bar trough), so ordering is observable. [seed] (optional) starts the
     grid from an existing account state instead of a fresh grid - the oracle
-    uses it to model the strategy as it actually runs (held base, resting-sell
-    reservations, accumulated profit). *)
+    uses it to model the strategy as it actually runs (held base, reserved
+    base). *)
 let replay ?seed cfg ~bars ~ordering =
   let state = create ?seed cfg in
   let n = Array.length bars in

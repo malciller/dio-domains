@@ -2,7 +2,6 @@
 
 let cfg
       ?(qty = 1.0)
-      ?(sell_mult = 1.0)
       ?(grid_interval_pct = 1.0)
       ?(price_increment = 1e-9)
       ?(qty_increment = 1e-9)
@@ -11,16 +10,13 @@ let cfg
       ?(start_price = 100.0)
       ?(start_quote = 10_000.0)
       ?(fee = 0.0)
-      ?(accumulation_buffer = 0.0)
       ?(model = Dio_strategies.Grid_core_types.Hyperliquid)
       ()
   =
   let open Dio_strategies.Grid_core in
   { qty
-  ; sell_mult
   ; grid_interval_pct
   ; maker_fee = fee
-  ; accumulation_buffer
   ; price_increment
   ; qty_increment
   ; qty_min
@@ -261,13 +257,7 @@ let test_min_notional_blocks_sub_floor_sell () =
      inventory is the full base. A sell whose notional sits below
      min_notional is NEVER filled with phantom base: with the floor above
      even the full-qty notional, the order is skipped entirely. *)
-  let c =
-    cfg
-      ~sell_mult:0.9
-      ~min_notional:101.0
-      ~model:Dio_strategies.Grid_core_types.Kraken
-      ()
-  in
+  let c = cfg ~min_notional:101.0 ~model:Dio_strategies.Grid_core_types.Kraken () in
   let st = Dio_strategies.Grid_core.create c in
   let _ =
     Dio_strategies.Grid_core.on_bar
@@ -290,16 +280,10 @@ let test_min_notional_blocks_sub_floor_sell () =
 
 let test_min_notional_full_sell_fills () =
   (* Same Kraken setup but with a low floor: the sell notional clears it.
-     Under the aligned model a buy fill reserves nothing, so the full
-     configured qty sells (profit gate unmet on the first cycle -> full qty
-     1.0, notional 99.99 well above the floor). *)
-  let c =
-    cfg
-      ~sell_mult:0.999
-      ~min_notional:0.05
-      ~model:Dio_strategies.Grid_core_types.Kraken
-      ()
-  in
+      Under the aligned model a buy fill reserves nothing, so the full
+      configured qty sells (1:1, qty 1.0, notional 99.99 well above the
+      floor). *)
+  let c = cfg ~min_notional:0.05 ~model:Dio_strategies.Grid_core_types.Kraken () in
   let st = Dio_strategies.Grid_core.create c in
   let _ =
     Dio_strategies.Grid_core.on_bar
@@ -451,66 +435,58 @@ let test_cash_hook_replay_tracks_pool () =
    and a sell order that the sellable base cannot cover is skipped - quote is
    only ever reconciled (recovered) on valid sell fills. *)
 
-let test_sell_skipped_without_inventory () =
-  (* Spec-aligned model with sell_mult 1.0 and buffer 0: a profitable sell
-     fill reserves the FULL batch (oracle_qty * sell_mult) and resets the
-     window, so reserved_base == base after the first cycle. The next buy
-     replenishes base, but the sellable inventory (base - reserved) is zero:
-     the sell level can be crossed - no sell order fills, no quote is
-     recovered, no phantom base is sold. Bars are crafted so the buy ladder
-     only fills a single level per buy bar. *)
-  let c =
-    cfg
-      ~qty:1.0
-      ~sell_mult:1.0
-      ~accumulation_buffer:0.0
-      ~model:Dio_strategies.Grid_core_types.Alpaca
-      ()
+let test_replay_never_reserves () =
+  (* Spec-aligned model: accrual lives in the persistence layer, so a replay
+      never grows reserved_base on its own - profitable cycles keep cycling.
+      Every filled buy owes exactly one 1:1 sell clamped to the sellable
+      inventory, and a seeded persistence reserve passes through untouched:
+      the seeded grid ends each cycle holding exactly its starting base more
+      than a fresh one. *)
+  let c = cfg ~qty:1.0 ~model:Dio_strategies.Grid_core_types.Alpaca () in
+  let fresh = Dio_strategies.Grid_core.create c in
+  let seed =
+    Dio_strategies.Grid_core_types.{ initial_base = 1.0; initial_reserved_base = 0.4 }
   in
-  let st = Dio_strategies.Grid_core.create c in
-  (* Cycle 1: buy fills (base 1.0), then the sell crosses and fills full
-     qty; the profit window breaches the zero buffer, reserving the batch. *)
-  let _ =
-    Dio_strategies.Grid_core.on_bar
-      c
-      ~state:st
-      ~bar:(bar ~low:98.5 ~high:98.6 ~close:98.5 ())
-      ~ordering:Dio_strategies.Grid_core_types.Buy_first
-  in
-  let _ =
-    Dio_strategies.Grid_core.on_bar
-      c
-      ~state:st
-      ~bar:(bar ~low:100.0 ~high:101.0 ~close:100.0 ())
-      ~ordering:Dio_strategies.Grid_core_types.Buy_first
-  in
-  Alcotest.(check int) "one buy" 1 st.buy_fills;
-  Alcotest.(check int) "one sell before reserve locks the batch" 1 st.sell_fills;
-  Alcotest.(check bool) "reserve captured the whole batch" (st.reserved_base >= 0.999) true;
-  (* Cycle 2: buy replenishes base to 1.0 while reserved stays 1.0 ->
-     sellable inventory is zero; the sell crossing is skipped. *)
-  let _ =
-    Dio_strategies.Grid_core.on_bar
-      c
-      ~state:st
-      ~bar:(bar ~low:98.5 ~high:98.6 ~close:98.5 ())
-      ~ordering:Dio_strategies.Grid_core_types.Buy_first
-  in
-  let fs =
-    Dio_strategies.Grid_core.on_bar
-      c
-      ~state:st
-      ~bar:(bar ~low:99.5 ~high:101.0 ~close:99.5 ())
-      ~ordering:Dio_strategies.Grid_core_types.Buy_first
-  in
-  Alcotest.(check int) "no second sell (no sellable inventory)" 1 st.sell_fills;
-  Alcotest.(check int) "no fills" 0 (List.length fs);
-  near 1.0 st.base;
-  (* the resting sell survives for a later inventory-covering crossing *)
-  Alcotest.(check bool) "sell order still resting" (st.resting_sell <> None) true
+  let seeded = Dio_strategies.Grid_core.create ~seed c in
+  List.iter
+    (fun st ->
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~low:98.5 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first);
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~high:101.0 ~low:100.0 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first);
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~low:98.5 ~high:98.6 ~close:98.5 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first);
+       ignore
+         (Dio_strategies.Grid_core.on_bar
+            c
+            ~state:st
+            ~bar:(bar ~low:99.5 ~high:101.0 ~close:99.5 ())
+            ~ordering:Dio_strategies.Grid_core_types.Buy_first))
+    [ fresh; seeded ];
+  Alcotest.(check int) "fresh cycles sell every rung" 2 fresh.sell_fills;
+  Alcotest.(check bool) "replay never reserves" (fresh.reserved_base = 0.0) true;
+  Alcotest.(check int) "seeded cycles too" 2 seeded.sell_fills;
+  Alcotest.(check (float 1e-9))
+    "seeded reserve passes through untouched"
+    0.4
+    seeded.reserved_base;
+  Alcotest.(check (float 1e-9))
+    "seeded retains exactly its starting base"
+    (fresh.base +. 1.0)
+    seeded.base
 ;;
-
-
 
 let test_sell_reconciliation_with_fee () =
   (* Capital reconciliation on valid sell fills with a fee: quote = start -
@@ -537,61 +513,36 @@ let test_sell_reconciliation_with_fee () =
 
 let test_seed_initializes_state () =
   (* The optional seed starts the grid from an existing account state: held
-     base, base locked in resting sells and the accumulated profit buffer -
-     the oracle models the strategy as it actually runs. *)
+     base and the persistence-layer reserve - the oracle models the strategy
+     as it actually runs. *)
   let c = cfg () in
   let st = Dio_strategies.Grid_core.create c in
   Alcotest.(check (float 1e-9)) "fresh base" 0.0 st.base;
   Alcotest.(check (float 1e-9)) "fresh reserved" 0.0 st.reserved_base;
-  Alcotest.(check (float 1e-9)) "fresh profit" 0.0 st.accumulated_profit;
   let seed =
     Dio_strategies.Grid_core_types.
-      { initial_base = 0.134293
-      ; initial_reserved_base = 0.02
-      ; initial_accumulated_profit = 22.3566
-      }
+      { initial_base = 0.134293; initial_reserved_base = 0.02 }
   in
   let st2 = Dio_strategies.Grid_core.create ~seed c in
   Alcotest.(check (float 1e-9)) "seeded base" seed.initial_base st2.base;
   Alcotest.(check (float 1e-9))
     "seeded reserved"
     seed.initial_reserved_base
-    st2.reserved_base;
-  Alcotest.(check (float 1e-9))
-    "seeded profit"
-    seed.initial_accumulated_profit
-    st2.accumulated_profit
+    st2.reserved_base
 ;;
 
-let test_seed_enables_accumulation_sells () =
-  (* Hyperliquid accumulation sells: the reduced (sell_mult) sell only fires
-      while accumulated_profit >= rounding_diff*price + buffer. A fresh grid
-      (profit 0, large buffer) sells at FULL qty; a grid seeded with the
-      account's accumulated profit sells reduced - the live accumulator
-      behavior the oracle must model. Spec-aligned reserve: a buy fill
-      reserves nothing; reserved_base grows only when the profit window
-      exceeds the buffer at sell-fill time (oracle_qty * sell_mult), after
-      which the window resets. The seed (profit 10 > buffer 5) breaches on
-      the first sell fill, reserving one batch. *)
-  let c =
-    cfg
-      ~qty:0.5
-      ~sell_mult:0.999
-      ~fee:0.0004
-      ~start_quote:10_000.0
-      ~accumulation_buffer:5.0
-      ()
-  in
+let test_reserved_base_clamps_sells () =
+  (* reserved_base is never sellable inside a replay: a grid seeded with a
+      reserve retains at least that much base across buy/sell cycles, while a
+      fresh grid sells everything it buys (1:1). *)
+  let c = cfg ~qty:0.5 ~fee:0.0004 ~start_quote:10_000.0 () in
   let fresh = Dio_strategies.Grid_core.create c in
   let seed =
-    Dio_strategies.Grid_core_types.
-      { initial_base = 0.0
-      ; initial_reserved_base = 0.0
-      ; initial_accumulated_profit = 10.0
-      }
+    Dio_strategies.Grid_core_types.{ initial_base = 0.5; initial_reserved_base = 0.25 }
   in
   let seeded = Dio_strategies.Grid_core.create ~seed c in
-  (* Two buy-dip / sell-rise cycles. *)
+  (* Two buy-dip / sell-rise cycles; the dips are shallow enough that each
+      buy bar fills exactly one ladder rung. *)
   List.iter
     (fun st ->
        ignore
@@ -604,43 +555,33 @@ let test_seed_enables_accumulation_sells () =
          (Dio_strategies.Grid_core.on_bar
             c
             ~state:st
-            ~bar:(bar ~high:101.0 ())
+            ~bar:(bar ~high:101.0 ~low:100.0 ~close:99.0 ())
             ~ordering:Dio_strategies.Grid_core_types.Buy_first);
        ignore
          (Dio_strategies.Grid_core.on_bar
             c
             ~state:st
-            ~bar:(bar ~low:97.0 ())
+            ~bar:(bar ~low:97.5 ~high:97.6 ~close:97.5 ())
             ~ordering:Dio_strategies.Grid_core_types.Buy_first);
        ignore
          (Dio_strategies.Grid_core.on_bar
             c
             ~state:st
-            ~bar:(bar ~high:100.0 ())
+            ~bar:(bar ~high:100.0 ~low:99.5 ())
             ~ordering:Dio_strategies.Grid_core_types.Buy_first))
     [ fresh; seeded ];
-  Alcotest.(check int) "fresh sells at full qty" 2 fresh.sell_fills;
-  (* Spec-aligned: no per-fill retention on buy fills. *)
-  Alcotest.(check bool)
-    "fresh reserves nothing (no buffer breach in-window)"
-    (fresh.reserved_base = 0.0)
-    true;
+  Alcotest.(check int) "fresh sells every bought rung" 2 fresh.sell_fills;
+  Alcotest.(check bool) "fresh holds nothing after 1:1 cycles" (fresh.base <= 1e-9) true;
   Alcotest.(check int) "seeded sells too" 2 seeded.sell_fills;
-  (* Seeded profit breaches the buffer on the first sell fill: one batch
-     (oracle_qty 0.5 * sell_mult 0.999) is reserved. *)
   Alcotest.(check bool)
-    "seeded reserves the breach batch"
-    (seeded.reserved_base > 0.0 && seeded.reserved_base < 0.5)
-    true;
-  Alcotest.(check bool)
-    "seeded grid holds more base than fresh"
-    (seeded.base > fresh.base)
+    "seeded keeps at least its reserve"
+    (seeded.base >= 0.25 -. 1e-9)
     true
 ;;
 
 let test_replay_with_seed () =
   (* The seed flows through the replay entry point. *)
-  let c = cfg ~accumulation_buffer:5.0 () in
+  let c = cfg ~qty:0.5 () in
   let bars =
     [| bar ~low:99.0 (); bar ~high:101.0 (); bar ~low:97.0 (); bar ~high:100.0 () |]
   in
@@ -653,11 +594,7 @@ let test_replay_with_seed () =
   let r_seeded =
     Dio_strategies.Grid_core.replay
       ~seed:
-        Dio_strategies.Grid_core_types.
-          { initial_base = 0.0
-          ; initial_reserved_base = 0.0
-          ; initial_accumulated_profit = 10.0
-          }
+        Dio_strategies.Grid_core_types.{ initial_base = 0.0; initial_reserved_base = 0.3 }
       c
       ~bars
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
@@ -711,10 +648,7 @@ let () =
             "cash hook replay tracks pool"
             `Quick
             test_cash_hook_replay_tracks_pool
-        ; Alcotest.test_case
-            "sell skipped without inventory"
-            `Quick
-            test_sell_skipped_without_inventory
+        ; Alcotest.test_case "replay never reserves" `Quick test_replay_never_reserves
         ; Alcotest.test_case
             "sell reconciliation with fee"
             `Quick
@@ -724,9 +658,9 @@ let () =
             `Quick
             test_seed_initializes_state
         ; Alcotest.test_case
-            "seed enables accumulation sells"
+            "reserved base clamps sells"
             `Quick
-            test_seed_enables_accumulation_sells
+            test_reserved_base_clamps_sells
         ; Alcotest.test_case "replay accepts the seed" `Quick test_replay_with_seed
         ] )
     ]
