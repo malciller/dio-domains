@@ -502,6 +502,18 @@ let () =
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
   Logging.set_width config.logging.width;
+  (* Register the configured strategies with the persistence layer, then run
+     the one-shot legacy migration: the flat symbol-keyed
+     accumulated_state.json is split into accumulation_state.json and
+     sell_levels_state.json under "{strategy}:{symbol}:{venue}" keys (auto-
+     mapped when exactly one configured strategy matches the symbol), and the
+     original file is renamed to accumulated_state.json.migrated.<ts>. *)
+  Dio_persistence.Persistence_orchestrator.register_configured_strategies
+    (List.map
+       (fun (t : Dio_engine.Config.trading_config) ->
+          t.strategy, t.symbol, t.exchange, t.base_accumulation, t.sell_levels)
+       config.trading);
+  Dio_persistence.Persistence_orchestrator.migrate_if_legacy ();
   (* Apply GC tuning parameters from config if specified. *)
   (match config.gc with
    | Some gc_cfg ->

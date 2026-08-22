@@ -1576,6 +1576,16 @@ let execute_strategy
   if state.exchange_id = ""
   then (
     state.exchange_id <- asset.exchange;
+    (* Register the full persistence store key and the per-strategy opt-in
+       flags now that strategy name + venue are known. *)
+    state.persistence_key
+    <- Some
+         (Dio_persistence.Base_accumulation_store.key_of
+            ~strategy:asset.strategy
+            ~symbol:asset.symbol
+            ~venue:asset.exchange);
+    state.base_accumulation_enabled <- asset.base_accumulation;
+    state.sell_levels_enabled <- asset.sell_levels_persistence;
     state.cached_ecfg <- get_exchange_config asset.exchange;
     state.cached_round_price <- get_round_price_fn asset.symbol asset.exchange;
     state.cached_price_increment <- get_price_increment asset.symbol asset.exchange;
@@ -1592,6 +1602,10 @@ let execute_strategy
     state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;
     state.exchange_reserved_atomic <- Some (get_exchange_reserved_atomic asset.exchange));
   let ecfg = state.cached_ecfg in
+  (* Realtime accumulation buffer (fear-and-greed resolved upstream);
+     refreshed every cycle so fill-time reserve decisions see the latest
+     value. *)
+  state.accumulation_buffer <- asset.accumulation_buffer;
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)

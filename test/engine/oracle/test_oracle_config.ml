@@ -19,6 +19,8 @@ let trading_config ?(exchange = "kraken") ?(symbol = "X") ?(asset_class = None) 
   ; accumulation_buffer = 0.01, 0.01
   ; data_feed = None
   ; asset_class
+  ; base_accumulation = true
+  ; sell_levels = true
   }
 ;;
 

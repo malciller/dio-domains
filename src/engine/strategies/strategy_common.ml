@@ -26,6 +26,12 @@ type trading_config =
   ; asset_class : string option
     (** Risk class for capital-oracle modeling (explicit from config.json;
         required for dio-oracle runs). *)
+  ; base_accumulation : bool
+    (** Per-strategy opt-in to base-accumulation persistence (default true
+        when absent from config.json; disabled means zero I/O). *)
+  ; sell_levels : bool
+    (** Per-strategy opt-in to pending-sell-level persistence (default true
+        when absent from config.json). *)
   }
 
 (** Integer userref tags for per-strategy order grouping on the exchange. *)

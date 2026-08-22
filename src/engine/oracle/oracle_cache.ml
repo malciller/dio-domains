@@ -6,7 +6,7 @@
    re-downloads the entire deep history. That is what made a pass take 20-30s
    and the per-asset ORACLE latency read 2-8s on the dashboard.
 
-   Established engine practice (same as Dio_persistence.State_persistence):
+   Established engine practice (same as the persistence orchestrator stores):
    persist state to disk under data/ (/app/data in Docker), write atomically,
    treat corrupt files as a fresh start, never let persistence fail the
    caller. History bars are immutable except the latest one, so each pass
@@ -32,7 +32,7 @@ open Lwt.Infix
 let section = "oracle_cache"
 
 (** Base directory for history files. Resolves to /app/data in Docker,
-    ./data locally - same convention as State_persistence. v2: raw bars +
+    ./data locally - same convention as the persistence stores. v2: raw bars +
     read-time normalization (v1 stored normalized series and could not
     self-heal after a rule change). *)
 let cache_dir =

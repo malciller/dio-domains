@@ -30,4 +30,6 @@
 
 (subdir engine/perf)
 
+(subdir engine/persistence)
+
 (subdir external/discord)

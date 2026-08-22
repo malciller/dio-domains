@@ -29,6 +29,7 @@ let cfg
       ?(start_price = 100.0)
       ?(start_quote = 10_000.0)
       ?(fee = 0.0)
+      ?(accumulation_buffer = 0.0)
       ?(model = Dio_strategies.Grid_core_types.Hyperliquid)
       ()
   =
@@ -37,7 +38,7 @@ let cfg
   ; sell_mult
   ; grid_interval_pct
   ; maker_fee = fee
-  ; accumulation_buffer = 0.0
+  ; accumulation_buffer
   ; price_increment = lot
   ; qty_increment = lot
   ; qty_min = 0.0
@@ -327,7 +328,9 @@ let test_scenario_h_fee_sensitivity () =
       Dio_strategies.Grid_core_types.{ high = s; low = b_; close = b_ })
   in
   let cycles = 300 in
-  let free = cfg ~grid_interval_pct:0.1 ~fee:0.0 ~start_quote:150.0 () in
+  (* A buffer far above the in-window profit isolates the fee/capital
+     mechanics being tested: the spec reserve-on-breach never fires here. *)
+  let free = cfg ~grid_interval_pct:0.1 ~fee:0.0 ~start_quote:150.0 ~accumulation_buffer:100.0 () in
   let res_free = replay free (mk_bars free ~cycles) in
   Alcotest.(check int) "zero-fee buys" cycles res_free.buy_fills;
   Alcotest.(check int) "zero-fee sells" cycles res_free.sell_fills;
@@ -336,7 +339,9 @@ let test_scenario_h_fee_sensitivity () =
     "zero-fee quote grows (positive grid carry)"
     (res_free.final_quote > 150.0)
     true;
-  let priced = cfg ~grid_interval_pct:0.1 ~fee:0.002 ~start_quote:150.0 () in
+  let priced =
+    cfg ~grid_interval_pct:0.1 ~fee:0.002 ~start_quote:150.0 ~accumulation_buffer:100.0 ()
+  in
   let res_priced = replay priced (mk_bars priced ~cycles) in
   Alcotest.(check bool) "fee grid drains to exhaustion" true res_priced.exhausted;
   Alcotest.(check bool)

@@ -256,13 +256,17 @@ let test_min_notional_dynamic_scaling () =
     true
 ;;
 
-let test_min_notional_upsizes_reduced_sell () =
-  (* Kraken sells qty * sell_mult = 0.05; with min_notional = 50 the reduced
-     sell notional 0.05 * 99.99 < 50, so the sell qty is up-sized to
-     ceil(50 / 99.99) and fills, letting the grid recover capital instead of
-     stranding base below the floor. *)
+let test_min_notional_blocks_sub_floor_sell () =
+  (* Spec-aligned model: a buy fill only updates references, so the sellable
+     inventory is the full base. A sell whose notional sits below
+     min_notional is NEVER filled with phantom base: with the floor above
+     even the full-qty notional, the order is skipped entirely. *)
   let c =
-    cfg ~sell_mult:0.05 ~min_notional:50.0 ~model:Dio_strategies.Grid_core_types.Kraken ()
+    cfg
+      ~sell_mult:0.9
+      ~min_notional:101.0
+      ~model:Dio_strategies.Grid_core_types.Kraken
+      ()
   in
   let st = Dio_strategies.Grid_core.create c in
   let _ =
@@ -279,21 +283,22 @@ let test_min_notional_upsizes_reduced_sell () =
       ~bar:(bar ~high:101.0 ())
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
-  Alcotest.(check int) "sell fills" 1 st.sell_fills;
-  Alcotest.(check int) "one fill" 1 (List.length fs);
-  let expected = Float.ceil ((50.0 /. 99.99 /. 1e-9) -. 1e-9) *. 1e-9 in
-  near expected (List.hd fs).qty;
-  Alcotest.(check bool)
-    "notional clears the floor"
-    ((List.hd fs).qty *. 99.99 >= 50.0)
-    true
+  (* Full-qty notional 1.0 * 99.99 = 99.99 < 101 -> skipped, never phantom. *)
+  Alcotest.(check int) "no sub-floor sell fills" 0 st.sell_fills;
+  Alcotest.(check int) "no fills" 0 (List.length fs)
 ;;
 
 let test_min_notional_full_sell_fills () =
-  (* Same Kraken setup but with a low floor: the reduced sell notional
-     0.05 * 99.99 >= 0.05 so it fills. *)
+  (* Same Kraken setup but with a low floor: the sell notional clears it.
+     Under the aligned model a buy fill reserves nothing, so the full
+     configured qty sells (profit gate unmet on the first cycle -> full qty
+     1.0, notional 99.99 well above the floor). *)
   let c =
-    cfg ~sell_mult:0.05 ~min_notional:0.05 ~model:Dio_strategies.Grid_core_types.Kraken ()
+    cfg
+      ~sell_mult:0.999
+      ~min_notional:0.05
+      ~model:Dio_strategies.Grid_core_types.Kraken
+      ()
   in
   let st = Dio_strategies.Grid_core.create c in
   let _ =
@@ -312,7 +317,7 @@ let test_min_notional_full_sell_fills () =
   in
   Alcotest.(check int) "sell fills" 1 st.sell_fills;
   Alcotest.(check int) "one fill" 1 (List.length fs);
-  near 0.05 (List.hd fs).qty
+  near 1.0 (List.hd fs).qty
 ;;
 
 let test_qty_min_blocks_under_min_qty () =
@@ -447,72 +452,65 @@ let test_cash_hook_replay_tracks_pool () =
    only ever reconciled (recovered) on valid sell fills. *)
 
 let test_sell_skipped_without_inventory () =
-  (* Alpaca 1:1 with sell_mult 0: every buy fully reserves its base, so the
-     sellable inventory is always zero. The sell level can be crossed forever
-     - no sell order is placed, no quote is recovered, no phantom base is
-     sold. *)
-  let c = cfg ~sell_mult:0.0 ~model:Dio_strategies.Grid_core_types.Alpaca () in
-  let st = Dio_strategies.Grid_core.create c in
-  let _ =
-    Dio_strategies.Grid_core.on_bar
-      c
-      ~state:st
-      ~bar:(bar ~low:99.0 ())
-      ~ordering:Dio_strategies.Grid_core_types.Buy_first
-  in
-  Alcotest.(check int) "one buy" 1 st.buy_fills;
-  let fs =
-    Dio_strategies.Grid_core.on_bar
-      c
-      ~state:st
-      ~bar:(bar ~high:200.0 ())
-      ~ordering:Dio_strategies.Grid_core_types.Buy_first
-  in
-  Alcotest.(check int) "no sells (no inventory)" 0 st.sell_fills;
-  Alcotest.(check int) "no fills" 0 (List.length fs);
-  (* quote consumed only by the buy; nothing recovered *)
-  near 9_901.0 st.quote;
-  near 1.0 st.base
-;;
-
-let test_upsell_bounded_by_inventory () =
-  (* Alpaca 1:1 with sell_mult 0.5 reserves half of every buy, so the
-     sellable inventory (base - reserved) is 0.5 while the $50 floor up-sizes
-     the intended 1.0 sell to 0.5001: the up-sized quantity exceeds the
-     inventory, the order is clamped and the notional gate rejects it - the
-     sell is SKIPPED instead of selling phantom base. *)
+  (* Spec-aligned model with sell_mult 1.0 and buffer 0: a profitable sell
+     fill reserves the FULL batch (oracle_qty * sell_mult) and resets the
+     window, so reserved_base == base after the first cycle. The next buy
+     replenishes base, but the sellable inventory (base - reserved) is zero:
+     the sell level can be crossed - no sell order fills, no quote is
+     recovered, no phantom base is sold. Bars are crafted so the buy ladder
+     only fills a single level per buy bar. *)
   let c =
     cfg
       ~qty:1.0
-      ~sell_mult:0.5
-      ~min_notional:50.0
+      ~sell_mult:1.0
+      ~accumulation_buffer:0.0
       ~model:Dio_strategies.Grid_core_types.Alpaca
       ()
   in
   let st = Dio_strategies.Grid_core.create c in
+  (* Cycle 1: buy fills (base 1.0), then the sell crosses and fills full
+     qty; the profit window breaches the zero buffer, reserving the batch. *)
   let _ =
     Dio_strategies.Grid_core.on_bar
       c
       ~state:st
-      ~bar:(bar ~low:99.0 ())
+      ~bar:(bar ~low:98.5 ~high:98.6 ~close:98.5 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:100.0 ~high:101.0 ~close:100.0 ())
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
   Alcotest.(check int) "one buy" 1 st.buy_fills;
+  Alcotest.(check int) "one sell before reserve locks the batch" 1 st.sell_fills;
+  Alcotest.(check bool) "reserve captured the whole batch" (st.reserved_base >= 0.999) true;
+  (* Cycle 2: buy replenishes base to 1.0 while reserved stays 1.0 ->
+     sellable inventory is zero; the sell crossing is skipped. *)
+  let _ =
+    Dio_strategies.Grid_core.on_bar
+      c
+      ~state:st
+      ~bar:(bar ~low:98.5 ~high:98.6 ~close:98.5 ())
+      ~ordering:Dio_strategies.Grid_core_types.Buy_first
+  in
   let fs =
     Dio_strategies.Grid_core.on_bar
       c
       ~state:st
-      ~bar:(bar ~high:200.0 ())
+      ~bar:(bar ~low:99.5 ~high:101.0 ~close:99.5 ())
       ~ordering:Dio_strategies.Grid_core_types.Buy_first
   in
-  (* upsized 0.5001 > sellable 0.5 -> clamped, notional 0.5*99.99 < 50 -> skip *)
-  Alcotest.(check int) "no sell fills (inventory cannot cover upsell)" 0 st.sell_fills;
+  Alcotest.(check int) "no second sell (no sellable inventory)" 1 st.sell_fills;
   Alcotest.(check int) "no fills" 0 (List.length fs);
-  Alcotest.(check bool) "no phantom recovery" (st.quote = 9_901.0) true;
-  Alcotest.(check bool) "base intact" (st.base = 1.0) true;
-  (* the resting sell remains for a later, inventory-covering crossing *)
+  near 1.0 st.base;
+  (* the resting sell survives for a later inventory-covering crossing *)
   Alcotest.(check bool) "sell order still resting" (st.resting_sell <> None) true
 ;;
+
+
 
 let test_sell_reconciliation_with_fee () =
   (* Capital reconciliation on valid sell fills with a fee: quote = start -
@@ -570,10 +568,11 @@ let test_seed_enables_accumulation_sells () =
       while accumulated_profit >= rounding_diff*price + buffer. A fresh grid
       (profit 0, large buffer) sells at FULL qty; a grid seeded with the
       account's accumulated profit sells reduced - the live accumulator
-      behavior the oracle must model. BOTH grids accrue reserved_base on
-      every buy fill ((1 - sell_mult) x net landed qty): retention is
-      unconditional per fill on accumulation venues, the profit seed only
-      decides whether the SELL itself is reduced. *)
+      behavior the oracle must model. Spec-aligned reserve: a buy fill
+      reserves nothing; reserved_base grows only when the profit window
+      exceeds the buffer at sell-fill time (oracle_qty * sell_mult), after
+      which the window resets. The seed (profit 10 > buffer 5) breaches on
+      the first sell fill, reserving one batch. *)
   let c =
     cfg
       ~qty:0.5
@@ -621,19 +620,17 @@ let test_seed_enables_accumulation_sells () =
             ~ordering:Dio_strategies.Grid_core_types.Buy_first))
     [ fresh; seeded ];
   Alcotest.(check int) "fresh sells at full qty" 2 fresh.sell_fills;
+  (* Spec-aligned: no per-fill retention on buy fills. *)
   Alcotest.(check bool)
-    "fresh accrues reserve on every buy fill"
-    (fresh.reserved_base > 0.0)
-    true;
-  (* Net-of-base-fee accrual: inc = qty*(1-fee)*(1-sell_mult) per fill. *)
-  Alcotest.(check bool)
-    "accrual is net of the base-side buy fee"
-    (fresh.reserved_base < float_of_int fresh.buy_fills *. 0.5 *. 0.001)
+    "fresh reserves nothing (no buffer breach in-window)"
+    (fresh.reserved_base = 0.0)
     true;
   Alcotest.(check int) "seeded sells too" 2 seeded.sell_fills;
+  (* Seeded profit breaches the buffer on the first sell fill: one batch
+     (oracle_qty 0.5 * sell_mult 0.999) is reserved. *)
   Alcotest.(check bool)
-    "seeded retains the rounding base (accumulation)"
-    (seeded.reserved_base > 0.0)
+    "seeded reserves the breach batch"
+    (seeded.reserved_base > 0.0 && seeded.reserved_base < 0.5)
     true;
   Alcotest.(check bool)
     "seeded grid holds more base than fresh"
@@ -687,9 +684,9 @@ let () =
             `Quick
             test_min_notional_dynamic_scaling
         ; Alcotest.test_case
-            "min notional upsizes reduced sell"
+            "min notional blocks sub-floor sell"
             `Quick
-            test_min_notional_upsizes_reduced_sell
+            test_min_notional_blocks_sub_floor_sell
         ; Alcotest.test_case
             "min notional allows full sell"
             `Quick
@@ -718,10 +715,6 @@ let () =
             "sell skipped without inventory"
             `Quick
             test_sell_skipped_without_inventory
-        ; Alcotest.test_case
-            "upsell bounded by inventory"
-            `Quick
-            test_upsell_bounded_by_inventory
         ; Alcotest.test_case
             "sell reconciliation with fee"
             `Quick

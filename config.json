@@ -90,6 +90,7 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false,
+      "sell_levels": false,
       "asset_class": "crypto_core"
     },
     {
@@ -108,6 +109,7 @@
       "strategy": "Grid",
       "testnet": false,
       "hedge": false,
+      "sell_levels": false,
       "asset_class": "crypto_alt"
     },
     {
@@ -120,6 +122,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
+      "sell_levels": false,
       "asset_class": "crypto_alt"
     },
     {
@@ -132,6 +135,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
+      "sell_levels": false,
       "asset_class": "crypto_core"
     },
     {
@@ -144,6 +148,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
+      "sell_levels": false,
       "asset_class": "crypto_alt"
     },
     {
@@ -156,6 +161,7 @@
       ],
       "sell_mult": "0.999",
       "strategy": "Grid",
+      "sell_levels": false,
       "asset_class": "crypto_alt"
     },
     {
@@ -169,6 +175,7 @@
       "sell_mult": "0.999",
       "strategy": "Grid",
       "testnet": true,
+      "sell_levels": true,
       "data_feed": "iex",
       "asset_class": "equity_momentum"
     },
@@ -183,6 +190,7 @@
       "sell_mult": "0.999",
       "strategy": "Grid",
       "testnet": true,
+      "sell_levels": true,
       "data_feed": "iex",
       "asset_class": "equity_etf"
     }

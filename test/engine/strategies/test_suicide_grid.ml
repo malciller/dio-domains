@@ -249,6 +249,8 @@ let test_blocked_placement_sell_retries () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
@@ -305,16 +307,15 @@ let test_blocked_placement_sell_retries () =
 ;;
 
 let test_hl_buy_fill_accrues_reserve () =
-  (* All accumulation venues (HL/Lighter/IBKR/Alpaca) reserve the retained
-      slice of every buy fill. Hyperliquid additionally takes the BUY fee
-      out of the RECEIVED BASE token, so both the accrual and the
-      anticipated credit run on the net landed qty: qty 0.5, maker_fee
-      0.0004 -> the venue credits 0.5*(1-0.0004) = 0.4998 base,
-      reserved_base grows by 0.4998*0.001 = 0.0004998, and the credit is
-      0.4998 - NOT the raw 0.5 fill qty (crediting gross would overstate
-      inventory by the fee on every fill and let sells dip into the
-      reserve). Kraken does not reserve: its retention is implicit in its
-      sell_mult-sized sells. *)
+  (* Spec-aligned buy fill: it ONLY updates the reference info for the next
+     sell's profitability check - reserved_base is never touched on a buy
+     fill (the legacy per-fill slice retention is removed; accumulation now
+     happens at sell-fill time when the profit window exceeds the buffer).
+     Hyperliquid additionally takes the BUY fee out of the RECEIVED BASE
+     token, so the anticipated credit runs on the net landed qty: qty 0.5,
+     maker_fee 0.0004 -> the venue credits 0.5*(1-0.0004) = 0.4998 base and
+     the credit is 0.4998 - NOT the raw 0.5 fill qty (crediting gross would
+     overstate inventory and let sells dip into the reserve). *)
   let symbol = "HL_ACCRUAL/BTC/USDC" in
   let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
@@ -333,20 +334,28 @@ let test_hl_buy_fill_accrues_reserve () =
     ~fill_qty:0.5
     None;
   let landed = 0.5 -. (0.0004 *. 0.5) in
-  let expected_reserve = landed *. (1.0 -. 0.999) in
-  check bool "hl buy fill accrues reserved base" true (state.reserved_base > 0.0);
   check
     bool
-    "hl accrual is the retained slice of the net landed base"
+    "hl buy fill does NOT reserve (reference update only)"
     true
-    (abs_float (state.reserved_base -. expected_reserve) < 1e-9);
+    (state.reserved_base = 0.0);
+  check
+    bool
+    "hl buy reference price recorded"
+    true
+    (state.last_buy_fill_price = Some 62000.0);
+  check
+    bool
+    "hl buy reference qty recorded"
+    true
+    (state.last_buy_fill_qty = Some 0.5);
   check
     bool
     "hl anticipated credit is net of the base-side buy fee"
     true
     (abs_float (state.anticipated_base_credit -. landed) < 1e-9);
-  (* Kraken control: no reservation on buy fills. *)
-  let kr_symbol = "KR_NOACCRUAL/XMR/USD" in
+  (* Kraken aligns identically: buy fill updates refs only, no reserve. *)
+  let kr_symbol = "KR_ACCRUAL/XMR/USD" in
   let kr_state = Dio_strategies.Suicide_grid.get_strategy_state kr_symbol in
   kr_state.exchange_id <- "kraken";
   kr_state.grid_qty <- 0.04;
@@ -361,7 +370,12 @@ let test_hl_buy_fill_accrues_reserve () =
     ~fill_price:390.0
     ~fill_qty:0.04
     None;
-  check bool "kraken buy fill does not reserve" true (kr_state.reserved_base = 0.0)
+  check bool "kraken buy fill does not reserve" true (kr_state.reserved_base = 0.0);
+  check
+    bool
+    "kraken buy reference recorded"
+    true
+    (kr_state.last_buy_fill_price = Some 390.0)
 ;;
 
 let test_sub_minimum_qty_sell_places () =
@@ -397,6 +411,8 @@ let test_sub_minimum_qty_sell_places () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
@@ -547,6 +563,9 @@ let test_accumulation_profit_tracking () =
   state.accumulated_profit <- 0.0;
   state.grid_qty <- 0.35;
   state.maker_fee <- 0.0004;
+  (* A buffer above the window so the spec reserve/reset does not fire here:
+     this test observes pure accumulation. *)
+  state.accumulation_buffer <- 5.0;
   (* Clear startup replay gate so fills are processed normally *)
   Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done symbol;
   (* Simulate buy fill: sets last_buy_fill_price *)
@@ -617,6 +636,8 @@ let test_accumulation_gated_sell_insufficient () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let sell_qty, is_accumulation_sell, required_profit =
@@ -677,6 +698,8 @@ let test_accumulation_gated_sell_sufficient () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let sell_qty, is_accumulation_sell, required_profit =
@@ -729,6 +752,8 @@ let test_accumulation_recovery_blocks_blind_sell () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let sell_qty, is_accumulation_sell, _required_profit =
@@ -798,6 +823,9 @@ let test_accumulation_full_lifecycle () =
   state.grid_qty <- 0.35;
   (* 0.35 asset *)
   state.maker_fee <- 0.0004;
+  (* Buffer above the ~0.644 USDC window so the spec reserve/reset does not
+     fire mid-test; the buffer-reserve path is covered by the store tests. *)
+  state.accumulation_buffer <- 2.0;
   (* Clear startup replay gate so fills are processed normally *)
   Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done symbol;
   let buy_price = 39.50 in
@@ -904,10 +932,14 @@ let test_accumulation_multi_strategy_isolation () =
   btc.grid_qty <- 0.0002;
   (* 0.0002 BTC (asset) *)
   btc.maker_fee <- 0.0004;
+  btc.accumulation_buffer <- 100.0;
   hype.accumulated_profit <- 0.0;
   hype.grid_qty <- 0.35;
   (* 0.35 HYPE (asset) *)
   hype.maker_fee <- 0.0004;
+  (* Buffers above each window keep the spec reserve/reset from firing: the
+     tests here observe pure accumulation + gating isolation. *)
+  hype.accumulation_buffer <- 5.0;
   (* Clear startup replay gate so fills are processed normally *)
   Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done btc_sym;
   Dio_strategies.Suicide_grid.Strategy.set_startup_replay_done hype_sym;
@@ -1045,6 +1077,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg_alpaca = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
@@ -1141,6 +1175,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg_kraken = Dio_strategies.Suicide_grid.get_exchange_config "kraken" in
@@ -1202,6 +1238,8 @@ let test_halted_path_still_places_sell () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
@@ -1295,6 +1333,8 @@ let test_sell_ack_releases_inflight_latch () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "kraken" in
@@ -1370,6 +1410,8 @@ let test_sell_retry_until_placed () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
@@ -1462,6 +1504,8 @@ let test_accumulation_sells_non_accrued_inventory () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
@@ -1547,6 +1591,8 @@ let test_nothing_placeable_clears_latch () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "hyperliquid" in
@@ -1608,6 +1654,8 @@ let test_kraken_partial_sell_clamp () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "kraken" in
@@ -1671,6 +1719,8 @@ let test_alpaca_dollar_floor_gate () =
     ; maker_fee = Some 0.0
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
@@ -1753,6 +1803,8 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
     ; maker_fee = Some 0.0
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = Dio_strategies.Suicide_grid.get_exchange_config "alpaca" in
@@ -1811,6 +1863,8 @@ let test_new_buy_respects_2x_gi_closest_sell () =
     ; maker_fee = Some 0.001
     ; taker_fee = Some 0.002
     ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let iter_open_orders _ = () in
@@ -1987,6 +2041,8 @@ let test_buy_placement_balance_guard () =
     ; maker_fee = Some 0.001
     ; taker_fee = Some 0.002
     ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let iter_open_orders
@@ -2111,6 +2167,8 @@ let test_reconcile_cross_boundary_tolerance () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = get_exchange_config "alpaca" in
@@ -2157,6 +2215,8 @@ let test_sync_open_orders_price_keyed_index () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let ecfg = get_exchange_config "alpaca" in
@@ -2230,6 +2290,8 @@ let test_sync_open_orders_reconcile_agreement () =
     ; maker_fee = Some 0.0004
     ; taker_fee = None
     ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let assert_split_matches name ~persisted ~sells =
@@ -2322,6 +2384,8 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty ~sell
     ; maker_fee = Some 0.0
     ; taker_fee = Some 0.0
     ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let iter_open_orders _ = () in
@@ -2446,6 +2510,8 @@ let test_buy_trail_fires_on_single_tick_move () =
     ; maker_fee = Some 0.0
     ; taker_fee = Some 0.0
     ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let iter_open_orders _ = () in
@@ -2506,6 +2572,8 @@ let test_buy_trail_2xgi_anchored_on_sell () =
     ; maker_fee = Some 0.0
     ; taker_fee = Some 0.0
     ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let iter_open_orders _ = () in
@@ -2569,6 +2637,8 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
       ; maker_fee = Some 0.0
       ; taker_fee = Some 0.0
       ; accumulation_buffer = 0.01
+      ; base_accumulation = true
+      ; sell_levels_persistence = true
       }
     in
     let iter_open_orders _ = () in
@@ -2639,6 +2709,8 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
     ; maker_fee = Some 0.0
     ; taker_fee = Some 0.0
     ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
     }
   in
   let iter_open_orders _ = () in

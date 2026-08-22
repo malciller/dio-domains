@@ -36,6 +36,8 @@ let default_trading_config (exchange : string) (symbol : string)
   ; accumulation_buffer = 0.01, 0.01
   ; data_feed = None
   ; asset_class = None
+  ; base_accumulation = true
+  ; sell_levels = true
   }
 ;;
 
