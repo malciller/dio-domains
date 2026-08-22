@@ -178,6 +178,62 @@ let test_sell_levels_round_trip_and_adopt () =
     Alcotest.(check int) "level removed" 2 (List.length (S.load ~key)))
 ;;
 
+let test_salvage_recovers_hand_edited_double_document () =
+  (* The exact prod corruption: a manual XMR entry appended as a SECOND
+     top-level document joined by a comma instead of being added as another
+     key inside the single object. The store must salvage every intact
+     key/object pair into memory, rewrite the live file as valid JSON, and
+     quarantine the original - never silently zero the accruals. *)
+  with_hermetic_dir (fun dir ->
+    let path = Filename.concat dir "accumulation_state.json" in
+    let oc = open_out path in
+    output_string oc {|
+{
+  "Ladder:XMR/USD:kraken": {
+   "reserved_base": 0.0,
+   "accumulated_profit": 0.0,
+   "last_fill_oid": "OUE37M-ABXQZ-FGK7BN",
+   "last_buy_fill_price": 410.2,
+   "last_buy_fill_qty": 0.04
+},
+{
+  "Ladder:BTC/USDC:hyperliquid": {
+    "reserved_base": 0.0006272989999999895,
+    "accumulated_profit": 5.626475816000456,
+    "last_fill_oid": "523036882052",
+    "last_buy_fill_price": 76703.0,
+    "last_buy_fill_qty": 0.0005,
+    "last_sell_fill_price": 77278.0,
+    "last_sell_fill_qty": 0.0005
+  }
+}
+|};
+    close_out oc;
+    let xmr = A.load ~key:"Ladder:XMR/USD:kraken" in
+    Alcotest.(check (option (float 1e-9)))
+      "salvaged XMR buy fill price"
+      (Some 410.2)
+      xmr.A.last_buy_fill_price;
+    Alcotest.(check (float 1e-12))
+      "salvaged XMR reserved_base"
+      0.0
+      xmr.A.reserved_base;
+    let btc = A.load ~key:"Ladder:BTC/USDC:hyperliquid" in
+    Alcotest.(check (float 1e-12))
+      "salvaged BTC accumulated_profit"
+      5.626475816000456
+      btc.A.accumulated_profit;
+    (* The cleaned merge was persisted: the live file parses again. *)
+    ignore (Yojson.Basic.from_file path);
+    let backup_exists =
+      List.exists
+        (fun f -> String.starts_with ~prefix:"accumulation_state.json.corrupt." f)
+        (Array.to_list (Sys.readdir dir))
+    in
+    Alcotest.(check bool) "original quarantined for audit" true backup_exists)
+
+;;
+
 (* -- Corrupt-file handling & legacy migration --------------------------- *)
 
 let test_corrupt_file_backed_up () =
@@ -265,7 +321,12 @@ let () =
       , [ "accumulation", `Quick, test_accumulation_round_trip
         ; "sell_levels adopt/remove", `Quick, test_sell_levels_round_trip_and_adopt
         ] )
-    ; "corruption", [ "backed up", `Quick, test_corrupt_file_backed_up ]
+    ; ( "corruption"
+      , [ ( "hand-edited double document salvaged"
+          , `Quick
+          , test_salvage_recovers_hand_edited_double_document )
+        ; "backed up", `Quick, test_corrupt_file_backed_up
+        ] )
     ; "migration", [ "legacy split", `Quick, test_legacy_migration_split ]
     ]
 ;;
