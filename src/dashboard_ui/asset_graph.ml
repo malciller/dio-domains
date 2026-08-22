@@ -187,7 +187,7 @@ let render_asset_detail w h asset_key json =
     (* Extract the strategy and order details for the summary card. *)
     let strat_json = if a.is_strategy then a.data |?> "strategy" else `Null in
     let stype =
-      if a.is_strategy then strat_json |?> "type" |> to_string_d "Grid" else "Balance"
+      if a.is_strategy then strat_json |?> "type" |> to_string_d "Ladder" else "Balance"
     in
     let last_buy_fill = strat_json |?> "last_buy_fill" |> to_float_d 0.0 in
     let last_sell_fill = strat_json |?> "last_sell_fill" |> to_float_d 0.0 in

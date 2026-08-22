@@ -1,8 +1,8 @@
 (* Contract tests: Grid_core level/rounding helpers must agree with the live
-   Suicide_grid implementation. *)
+   Jacobs_ladder implementation. *)
 
 let identity_state () =
-  let open Dio_strategies.Suicide_grid_types in
+  let open Dio_strategies.Jacobs_ladder_types in
   { last_buy_order_price = None
   ; last_buy_order_id = None
   ; open_sell_orders = []
@@ -89,7 +89,7 @@ let test_buy_level_matches_live () =
   let open Dio_strategies in
   List.iter
     (fun (price, gi) ->
-       let live = Suicide_grid_config.calculate_grid_price price gi false st in
+       let live = Jacobs_ladder_config.calculate_grid_price price gi false st in
        let core =
          Grid_core.buy_level
            ~ref:price
@@ -104,7 +104,7 @@ let test_sell_level_matches_live () =
   let open Dio_strategies in
   List.iter
     (fun (price, gi) ->
-       let live = Suicide_grid_config.calculate_grid_price price gi true st in
+       let live = Jacobs_ladder_config.calculate_grid_price price gi true st in
        let core =
          Grid_core.sell_level
            ~ref:price
@@ -129,13 +129,13 @@ let test_trail_buy_matches_live () =
 
 let test_min_move_matches_live () =
   let open Dio_strategies in
-  let live = Suicide_grid_config.get_min_move_threshold 0.01 in
+  let live = Jacobs_ladder_config.get_min_move_threshold 0.01 in
   let core = Grid_core.min_move_threshold (cfg ~price_increment:0.01 ()) 100.0 in
   near live core
 ;;
 
 let test_round_lot_matches_formula () =
-  (* Suicide_grid_config.round_qty is floor(qty*inv)/inv with inv = 1/incr;
+  (* Jacobs_ladder_config.round_qty is floor(qty*inv)/inv with inv = 1/incr;
      Grid_core.round_lot must reproduce the same formula. *)
   let open Dio_strategies in
   let c = cfg ~qty_increment:0.0005 () in

@@ -8,7 +8,7 @@ let strategy_json ?(oracle = `Null) ?(capital_low = false) ?(market_closed = fal
     [ "exchange", `String "hyperliquid"
     ; ( "strategy"
       , `Assoc
-          [ "type", `String "Grid"
+          [ "type", `String "Ladder"
           ; "capital_low", `Bool capital_low
           ; "market_is_closed", `Bool market_closed
           ] )

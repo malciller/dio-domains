@@ -1,10 +1,10 @@
-(* Suicide Grid - Strategy Execution Engine *)
+(* Jacobs Ladder - Strategy Execution Engine *)
 
 open Strategy_common
-open Suicide_grid_types
-open Suicide_grid_config
-open Suicide_grid_reservation
-open Suicide_grid_orders
+open Jacobs_ladder_types
+open Jacobs_ladder_config
+open Jacobs_ladder_reservation
+open Jacobs_ladder_orders
 
 (** M16: price-key helper (rounded price*10000 as int) shared by the
     persisted-sell matching in [sync_open_orders] and the reconcile threading
@@ -603,7 +603,7 @@ let evaluate_buy_leg
             asset.symbol
         else (
           let cancel_order =
-            create_cancel_order order_id asset.symbol Grid asset.exchange
+            create_cancel_order order_id asset.symbol Ladder asset.exchange
           in
           ignore (push_order ~now ~state cancel_order);
           Logging.info_f
@@ -922,7 +922,7 @@ let evaluate_buy_leg
                   qty
                   (Some effective_amend_price)
                   true
-                  Grid
+                  Ladder
                   asset.exchange
               in
               ignore (push_order ~now ~state order);
@@ -1045,7 +1045,7 @@ let evaluate_buy_leg
                   qty
                   (Some effective_amend_price)
                   true
-                  Grid
+                  Ladder
                   asset.exchange
               in
               ignore (push_order ~now ~state order);

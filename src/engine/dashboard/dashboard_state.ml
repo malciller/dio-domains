@@ -96,7 +96,7 @@ let json_of_domains () =
    dashboard on a full strategy cycle would trade a cosmetic race for a
    real stall. *)
 let json_of_grid_strategy exchange symbol =
-  let state = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   let exch = Exchange.Types.exchange_of_string exchange in
   let market_is_closed =
     match exch with
@@ -105,7 +105,7 @@ let json_of_grid_strategy exchange symbol =
     | _ -> false
   in
   `Assoc
-    [ "type", `String "Grid"
+    [ "type", `String "Ladder"
     ; "buy_price", json_of_float_opt state.last_buy_order_price
     ; "buy_qty", `Float state.grid_qty
     ; "buy_id", json_of_string_opt state.last_buy_order_id
@@ -586,7 +586,7 @@ let build_snapshot () =
       (fun (tc : Dio_engine.Config.trading_config) ->
          let strategy_json =
            match tc.strategy with
-           | "Grid" | "suicide_grid" -> json_of_grid_strategy tc.exchange tc.symbol
+           | "Ladder" | "jacobs_ladder" -> json_of_grid_strategy tc.exchange tc.symbol
            | "MM" -> json_of_mm_strategy tc.exchange tc.symbol
            | other -> `Assoc [ "type", `String other ]
          in

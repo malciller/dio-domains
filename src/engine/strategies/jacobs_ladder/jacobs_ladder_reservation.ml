@@ -1,8 +1,8 @@
-(* Suicide Grid - Capital Reservation & Accumulation Tracking *)
+(* Jacobs Ladder - Capital Reservation & Accumulation Tracking *)
 
 open Strategy_common
-open Suicide_grid_types
-open Suicide_grid_config
+open Jacobs_ladder_types
+open Jacobs_ladder_config
 
 (** Tracking total reserved quote per exchange to avoid O(N) strategy_states locking. *)
 let total_reserved_by_exchange =

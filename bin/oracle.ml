@@ -1598,7 +1598,7 @@ let run_one
      models the grid as it actually runs. The held base is seeded from the
      account balance snapshot in the live engine; the CLI has no snapshot at
      this point, so it seeds the persisted amounts only. *)
-  let st = Dio_strategies.Suicide_grid.get_strategy_state task.Oracle_tasks.symbol in
+  let st = Dio_strategies.Jacobs_ladder.get_strategy_state task.Oracle_tasks.symbol in
   let seed =
     Some
       { Dio_strategies.Grid_core_types.initial_base = 0.0

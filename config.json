@@ -87,7 +87,7 @@
         0.05,
         2.00
       ],
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "testnet": false,
       "hedge": false,
       "sell_levels": false,
@@ -106,7 +106,7 @@
         0.05,
         3.00
       ],
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "testnet": false,
       "hedge": false,
       "sell_levels": false,
@@ -121,7 +121,7 @@
         5.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "sell_levels": false,
       "asset_class": "crypto_alt"
     },
@@ -134,7 +134,7 @@
         5.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "sell_levels": false,
       "asset_class": "crypto_core"
     },
@@ -147,7 +147,7 @@
         5.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "sell_levels": false,
       "asset_class": "crypto_alt"
     },
@@ -160,7 +160,7 @@
         10.0
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "sell_levels": false,
       "asset_class": "crypto_alt"
     },
@@ -173,7 +173,7 @@
         2.5
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "testnet": true,
       "sell_levels": true,
       "data_feed": "iex",
@@ -188,7 +188,7 @@
         0.75
       ],
       "sell_mult": "0.999",
-      "strategy": "Grid",
+      "strategy": "Ladder",
       "testnet": true,
       "sell_levels": true,
       "data_feed": "iex",

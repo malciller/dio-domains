@@ -1,10 +1,10 @@
-(* Suicide Grid - Order Lifecycle Event Handlers & Persistence *)
+(* Jacobs Ladder - Order Lifecycle Event Handlers & Persistence *)
 
 open Strategy_common
-open Suicide_grid_types
-open Suicide_grid_config
-open Suicide_grid_reservation
-open Suicide_grid_orders
+open Jacobs_ladder_types
+open Jacobs_ladder_config
+open Jacobs_ladder_reservation
+open Jacobs_ladder_orders
 
 (* H3: per-symbol lock-free lifecycle event queue. The Lwt supervisor thread
    (REST callbacks, supervisor_orders.ml) enqueues lifecycle events instead of
@@ -933,7 +933,7 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
        if is_order_gone
        then (
          let cancel_order =
-           create_cancel_order order_id asset_symbol Grid state.exchange_id
+           create_cancel_order order_id asset_symbol Ladder state.exchange_id
          in
          ignore (push_order ~now ~state cancel_order);
          if side = Buy then state.inflight_cancel_buy <- true;

@@ -115,7 +115,7 @@ let test_apply_sell_fill_unprofitable () =
 
 let test_accumulation_round_trip () =
   with_hermetic_dir (fun _dir ->
-    let key = A.key_of ~strategy:"Grid" ~symbol:"BTC/USDC" ~venue:"hyperliquid" in
+    let key = A.key_of ~strategy:"Ladder" ~symbol:"BTC/USDC" ~venue:"hyperliquid" in
     let t =
       { A.reserved_base = 1.25
       ; accumulated_profit = 3.75
@@ -146,13 +146,13 @@ let test_accumulation_round_trip () =
       None
       loaded.A.last_sell_fill_price;
     (* Absent key loads defaults. *)
-    let missing = A.load ~key:"Grid:MISSING:kraken" in
+    let missing = A.load ~key:"Ladder:MISSING:kraken" in
     Alcotest.(check (float 1e-12)) "missing loads default" 0.0 missing.A.reserved_base)
 ;;
 
 let test_sell_levels_round_trip_and_adopt () =
   with_hermetic_dir (fun _dir ->
-    let key = S.key_of ~strategy:"Grid" ~symbol:"QQQ" ~venue:"alpaca" in
+    let key = S.key_of ~strategy:"Ladder" ~symbol:"QQQ" ~venue:"alpaca" in
     S.save_async ~key [ { S.price = 149.0; qty = 0.25 }; { S.price = 150.0; qty = 0.25 } ];
     (* save_async is drained by a background domain; poll briefly. *)
     let rec wait n =
@@ -188,7 +188,7 @@ let test_corrupt_file_backed_up () =
      close_out oc;
      (* load triggers the lazy read; the corrupt file must be backed up, not
         discarded, and the store must start fresh. *)
-     let t = A.load ~key:"Grid:X:kraken" in
+     let t = A.load ~key:"Ladder:X:kraken" in
      let entries = Array.to_list (Sys.readdir dir) in
      let backup_exists =
        List.exists (fun f -> String.starts_with ~prefix:"accumulation_state.json.corrupt." f)
@@ -222,7 +222,7 @@ let test_legacy_migration_split () =
     (* Exactly one configured strategy matches the symbol -> auto-mapped to
         the full strategy key. *)
     Dio_persistence.Persistence_orchestrator.register_configured_strategies
-      [ "Grid", "SPCX", "alpaca", true, true ];
+      [ "Ladder", "SPCX", "alpaca", true, true ];
     Dio_persistence.Persistence_orchestrator.migrate_if_legacy ();
     Alcotest.(check bool)
       "legacy file renamed away"
@@ -234,7 +234,7 @@ let test_legacy_migration_split () =
         (Sys.readdir dir)
     in
     Alcotest.(check bool) "renamed file retained" (renamed <> None) true;
-    let acc_key = A.key_of ~strategy:"Grid" ~symbol:"SPCX" ~venue:"alpaca" in
+    let acc_key = A.key_of ~strategy:"Ladder" ~symbol:"SPCX" ~venue:"alpaca" in
     let acc = A.load ~key:acc_key in
     Alcotest.(check (float 1e-12)) "migrated reserved_base" 0.016 acc.A.reserved_base;
     Alcotest.(check (float 1e-12))

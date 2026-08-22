@@ -88,7 +88,7 @@ let section = "oracle_deploy"
 (** F&G-resolved parameter on the config range: lo + (hi-lo)*fng/100. Fear
     (low fng) tightens the parameter (for the grid: densifies levels and
     accumulates base at depressed prices) - the contrarian convention the live
-    suicide_grid uses. *)
+    jacobs_ladder uses. *)
 let fng_parameter ~(lo : float) ~(hi : float) ~(fng : float) =
   Cmc.Fear_and_greed.grid_value_for_fng ~grid_interval:(lo, hi) ~fear_and_greed:fng
 ;;

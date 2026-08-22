@@ -7,7 +7,7 @@
  (libraries dio.strategies dio.engine alcotest))
 
 (test
- (name test_suicide_grid)
+ (name test_jacobs_ladder)
  (libraries dio.strategies dio.engine dio.hyperliquid alcotest))
 
 (test

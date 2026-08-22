@@ -66,12 +66,12 @@ let string_of_operation_type = function
 
 (** Discriminant for the strategy that produced an order. *)
 type strategy_id =
-  | Grid
+  | Ladder
   | MM
   | Hedger
 
 let string_of_strategy_id = function
-  | Grid -> "Grid"
+  | Ladder -> "Ladder"
   | MM -> "MM"
   | Hedger -> "Hedger"
 ;;

@@ -369,7 +369,7 @@ let parse_config json =
        exit 1));
   let strategy = json |> member "strategy" |> to_string in
   (* Reject grid_interval when strategy is not Grid. *)
-  if strategy <> "Grid"
+  if strategy <> "Ladder"
   then (
     let actual = json |> to_assoc |> List.map fst in
     if List.mem "grid_interval" actual

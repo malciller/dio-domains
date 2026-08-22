@@ -1658,7 +1658,7 @@ let size_asset
          oracle pass tolerates a snapshot a moment stale (the next pass
          re-derives from fresh balances). Only the symbol's domain thread
          writes these fields since the lifecycle event queues landed. *)
-      let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+      let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
       let base_asset =
         match String.split_on_char '/' symbol with
         | b :: _ -> b
@@ -2620,7 +2620,7 @@ let run_pass
             (snapshot : Oracle_balances.snapshot option)
         =
         let symbol = task.Oracle_tasks.symbol in
-        let st = Dio_strategies.Suicide_grid.get_strategy_state symbol in
+        let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
         let base =
           match snapshot with
           | None -> 0.0

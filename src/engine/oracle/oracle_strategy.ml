@@ -19,7 +19,7 @@
    (e.g. config.json's grid_interval [lo, hi]) into deploy_asset.
 
    The only implementation today is [Grid], backed by Grid_core (the pure
-   mirror of the live Suicide_grid semantics). Adding a second strategy model
+   mirror of the live Jacobs_ladder semantics). Adding a second strategy model
    is a matter of implementing this signature; the oracle (blend, sizing,
    deployment, allocation) is shared as-is. *)
 
@@ -93,7 +93,7 @@ module type S = sig
   val profit_proxy : config -> qty:float -> deployed:float -> float
 end
 
-(** The grid-ladder strategy model: the live Suicide_grid semantics as
+(** The grid-ladder strategy model: the live Jacobs_ladder semantics as
     replayed by Grid_core (see Grid_core for the documented simplifications).
     The tuned parameter is the grid interval in %, the funding function the
     geometric ladder with dynamic buy up-sizing, the replay the pessimistic

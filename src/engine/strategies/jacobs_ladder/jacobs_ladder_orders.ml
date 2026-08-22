@@ -1,8 +1,8 @@
-(* Suicide Grid - Order Construction & Buffer Management *)
+(* Jacobs Ladder - Order Construction & Buffer Management *)
 
 open Strategy_common
-open Suicide_grid_types
-open Suicide_grid_config
+open Jacobs_ladder_types
+open Jacobs_ladder_config
 
 (** Shared order ringbuffer across all strategy domains. *)
 let order_buffer = LockFreeQueue.create ()
@@ -65,9 +65,9 @@ let create_cancel_order order_id asset_symbol strategy exchange =
   }
 ;;
 
-(** Backwards-compatible order constructor. Delegates to create_place_order with Grid strategy. *)
+(** Backwards-compatible order constructor. Delegates to create_place_order with Ladder strategy. *)
 let create_order dup_key asset_symbol side qty price post_only exchange =
-  create_place_order dup_key asset_symbol side qty price post_only Grid exchange
+  create_place_order dup_key asset_symbol side qty price post_only Ladder exchange
 ;;
 
 (** Pushes an order to the ringbuffer. Returns true on success, false on duplicate or full buffer. *)

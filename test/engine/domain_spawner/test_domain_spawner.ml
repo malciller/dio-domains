@@ -15,7 +15,7 @@ let test_spawn_domains_basic () =
       ; sell_mult = "1.0"
       ; min_usd_balance = None
       ; max_exposure = None
-      ; strategy = "suicide_grid"
+      ; strategy = "jacobs_ladder"
       ; maker_fee = None
       ; taker_fee = None
       ; testnet = false
@@ -107,7 +107,7 @@ let test_fee_fetcher_integration () =
     ; sell_mult = "1.05"
     ; min_usd_balance = None
     ; max_exposure = None
-    ; strategy = "suicide_grid"
+    ; strategy = "jacobs_ladder"
     ; maker_fee = None
     ; taker_fee = None
     ; testnet = false
@@ -134,9 +134,9 @@ let test_fee_fetcher_integration () =
 let test_strategy_initialization () =
   (* Test that strategy modules are initialized without errors *)
   Alcotest.(check unit)
-    "suicide_grid init"
+    "jacobs_ladder init"
     ()
-    (Dio_strategies.Suicide_grid.Strategy.init ());
+    (Dio_strategies.Jacobs_ladder.Strategy.init ());
   Alcotest.(check unit)
     "market_maker init"
     ()

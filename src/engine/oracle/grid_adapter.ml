@@ -3,7 +3,7 @@
 
    Resolves exchange_model by exchange string, maker_fee, sell_mult,
    accumulation_buffer and the price/qty increments. Increments prefer the live
-   exchange registry (Suicide_grid_config get_price_increment /
+   exchange registry (Jacobs_ladder_config get_price_increment /
    get_qty_increment_val) and fall back to 0.01 when the registry is empty
    (offline CLI runs); the guide's Phase 2 flag: pass explicit increments from
    the CLI to override. start_price/start_quote/grid_interval are supplied by
@@ -24,17 +24,17 @@ let default_maker_fee = 0.001
 let exchange_model_of_string = Grid_core.exchange_model_of_string
 
 let price_increment_of (tc : Strategy_common.trading_config) =
-  try Suicide_grid_config.get_price_increment tc.symbol tc.exchange with
+  try Jacobs_ladder_config.get_price_increment tc.symbol tc.exchange with
   | _ -> default_price_increment
 ;;
 
 let qty_increment_of (tc : Strategy_common.trading_config) =
-  try Suicide_grid_config.get_qty_increment_val tc.symbol tc.exchange with
+  try Jacobs_ladder_config.get_qty_increment_val tc.symbol tc.exchange with
   | _ -> default_qty_increment
 ;;
 
 let qty_min_of (tc : Strategy_common.trading_config) =
-  try Suicide_grid_config.get_qty_min_val tc.symbol tc.exchange with
+  try Jacobs_ladder_config.get_qty_min_val tc.symbol tc.exchange with
   | _ -> 0.0
 ;;
 
