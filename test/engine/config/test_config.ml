@@ -1,6 +1,6 @@
 let test_parse_trading_config_valid () =
   let json_str =
-    {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002, "asset_class": "crypto_core"}|}
+    {|{"symbol": "BTC/USD", "exchange": "kraken", "qty": "0.001", "sell_mult": "1.1", "strategy": "market_maker", "maker_fee": 0.001, "taker_fee": 0.002}|}
   in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
@@ -10,8 +10,7 @@ let test_parse_trading_config_valid () =
   Alcotest.(check string) "sell_mult" "1.1" config.sell_mult;
   Alcotest.(check string) "strategy" "market_maker" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee" (Some 0.001) config.maker_fee;
-  Alcotest.(check (option (float 0.001))) "taker_fee" (Some 0.002) config.taker_fee;
-  Alcotest.(check (option string)) "asset_class" (Some "crypto_core") config.asset_class
+  Alcotest.(check (option (float 0.001))) "taker_fee" (Some 0.002) config.taker_fee
 ;;
 
 let test_parse_trading_config_defaults () =
@@ -29,7 +28,6 @@ let test_parse_trading_config_defaults () =
   Alcotest.(check string) "strategy" "Ladder" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee none" None config.taker_fee;
-  Alcotest.(check (option string)) "asset_class none" None config.asset_class;
   Alcotest.(check (option string)) "min_usd_balance none" None config.min_usd_balance;
   Alcotest.(check (option string)) "max_exposure none" None config.max_exposure
 ;;

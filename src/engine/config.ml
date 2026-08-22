@@ -16,8 +16,6 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
   ; accumulation_buffer : float * float
     (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
-  ; asset_class : string option
-    (** Risk class for capital-oracle modeling (explicit from config.json). *)
   ; base_accumulation : bool (** Per-strategy opt-in to base-accumulation persistence. *)
   ; sell_levels : bool (** Per-strategy opt-in to pending-sell-level persistence. *)
   }
@@ -66,15 +64,12 @@ let known_top_level_keys =
   ; "logging_width"
   ; "cycle_mod"
   ; "latency_window_seconds"
-  ; "engine"
   ; "trading"
   ; "gc"
   ; "oracle"
   ; "fng_check_threshold"
   ]
 ;;
-
-let known_engine_keys = []
 
 let known_gc_keys =
   [ "minor_heap_size"
@@ -112,7 +107,6 @@ let known_trading_keys =
   ; "hedge"
   ; "accumulation_buffer"
   ; "data_feed"
-  ; "asset_class"
   ; "base_accumulation"
   ; "sell_levels"
   ]
@@ -313,7 +307,6 @@ let parse_config json =
   in
   let hedge = json |> member "hedge" |> to_bool_option |> Option.value ~default:false in
   let data_feed = json |> member "data_feed" |> to_string_option in
-  let asset_class = json |> member "asset_class" |> to_string_option in
   { exchange
   ; symbol
   ; qty = json |> member "qty" |> to_string
@@ -329,7 +322,6 @@ let parse_config json =
   ; hedge
   ; accumulation_buffer = parse_accumulation_buffer json exchange symbol
   ; data_feed
-  ; asset_class
   ; base_accumulation =
       json |> member "base_accumulation" |> to_bool_option |> Option.value ~default:true
   ; sell_levels =
@@ -457,11 +449,6 @@ let read_config () : config =
     let json = Yojson.Basic.from_file "config.json" in
     let open Yojson.Basic.Util in
     if validate_keys ~context:"top-level" ~allowed:known_top_level_keys json then exit 1;
-    (match json |> member "engine" with
-     | `Null -> ()
-     | engine_json ->
-       if validate_keys ~context:"engine" ~allowed:known_engine_keys engine_json
-       then exit 1);
     let cycle_mod =
       json |> member "cycle_mod" |> to_int_option |> Option.value ~default:10000
     in
