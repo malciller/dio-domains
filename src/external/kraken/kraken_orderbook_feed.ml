@@ -73,7 +73,12 @@ let add_normalized_to_crc crc s =
 ;;
 
 type level =
-  { price : string
+  { price : string (** Canonical fixed-decimals rendering; used as the map key. *)
+  ; price_wire : string
+    (** Price exactly as received on the wire. Kraken's CRC32 checksum is
+        computed over wire strings (dots removed, leading zeros stripped,
+        trailing zeros preserved), NOT over a re-formatted value - padding or
+        rounding here changes the CRC and invalidates every check. *)
   ; size : string
   ; price_float : float
   ; size_float : float
@@ -241,8 +246,10 @@ type store =
     (** True after an initial snapshot has been received. Updates are rejected until set. *)
   ; last_sequence : int64 option Atomic.t
     (** Last processed sequence number. Used for gap and rollback detection. *)
-  ; mutable last_update : float
-    (** Unix timestamp of the most recent data write. Used for staleness pruning. *)
+  ; last_update_ns : int64 Atomic.t
+    (** Mtime_clock monotonic nanoseconds of the most recent data write.
+        Atomic because written by the parse domain and read by trading domains;
+        monotonic so staleness is immune to wall-clock (NTP) steps. *)
   ; mutable checksum_tick : int
     (** Increments per book update; the per-tick checksum recompute (2 extra
         fold+sort+array passes) runs only every [checksum_every_n] ticks;
@@ -267,6 +274,11 @@ let resubscribe_symbol_ref : (string -> unit Lwt.t) option ref = ref None
 let pending_resubscribes : string list Atomic.t = Atomic.make []
 
 let resubscribe_watcher_started = Atomic.make false
+
+(* Checksum-triggered resubscribe cooldown state. Written only from the parse
+   domain (single-threaded message processing), so no lock is required. *)
+let resubscribe_cooldown : (string, float) Hashtbl.t = Hashtbl.create 16
+let resubscribe_cooldown_s = Kraken_common_types.default_resubscribe_cooldown_s
 
 let[@inline] request_resubscribe symbol =
   let rec loop () =
@@ -326,8 +338,8 @@ let calculate_checksum symbol bids asks : int32 =
   let n_asks = min 10 (Array.length asks) in
   for i = 0 to n_asks - 1 do
     let lvl = asks.(i) in
-    let s_p = to_decimal_str ~trim_trailing:true ~dec:pd (`String lvl.price) in
-    let s_q = to_decimal_str ~trim_trailing:true (`String lvl.size) in
+    let s_p = to_decimal_str ~trim_trailing:false ~dec:pd (`String lvl.price_wire) in
+    let s_q = to_decimal_str ~trim_trailing:false (`String lvl.size) in
     crc := add_normalized_to_crc !crc s_p;
     crc := add_normalized_to_crc !crc s_q
   done;
@@ -335,8 +347,8 @@ let calculate_checksum symbol bids asks : int32 =
   let n_bids = min 10 (Array.length bids) in
   for i = 0 to n_bids - 1 do
     let lvl = bids.(i) in
-    let s_p = to_decimal_str ~trim_trailing:true ~dec:pd (`String lvl.price) in
-    let s_q = to_decimal_str ~trim_trailing:true (`String lvl.size) in
+    let s_p = to_decimal_str ~trim_trailing:false ~dec:pd (`String lvl.price_wire) in
+    let s_q = to_decimal_str ~trim_trailing:false (`String lvl.size) in
     crc := add_normalized_to_crc !crc s_p;
     crc := add_normalized_to_crc !crc s_q
   done;
@@ -361,7 +373,7 @@ let ensure_store symbol =
       ; ready = Atomic.make false
       ; has_snapshot = Atomic.make false
       ; last_sequence = Atomic.make None
-      ; last_update = Unix.time ()
+      ; last_update_ns = Atomic.make (Mtime_clock.now_ns ())
       ; checksum_tick = 0
       }
     in
@@ -431,8 +443,15 @@ let parse_level symbol price_json size_json =
       (try Hashtbl.find decimals_tbl symbol with
        | Not_found -> 8, 8)
   in
-  let price_str_raw = to_decimal_str ~dec:pd price_json in
-  let qty_str = to_decimal_str ~dec:ld size_json in
+  (* NO trailing-zero trimming: the checksum input must be the exchange's
+     fixed-decimal representation. The live v2 feed sends NUMBERS (not the
+     documented strings), so numeric fields are re-rendered at full pair/lot
+     precision - e.g. qty 5.1e-05 at lot_decimals=8 becomes "0.00005100",
+     whose normalization ("5100") matches Kraken's server-side CRC input.
+     Trimming would yield "51" and invalidate every checksum. String inputs
+     pass through verbatim either way. *)
+  let price_str_raw = to_decimal_str ~trim_trailing:false ~dec:pd price_json in
+  let qty_str = to_decimal_str ~trim_trailing:false ~dec:ld size_json in
   let price_float =
     try float_of_string price_str_raw with
     | _ -> 0.0
@@ -442,7 +461,13 @@ let parse_level symbol price_json size_json =
     | _ -> 0.0
   in
   let price_str = Printf.sprintf "%.*f" pd price_float in
-  Some { price = price_str; size = qty_str; price_float; size_float = qty_float }
+  Some
+    { price = price_str
+    ; price_wire = price_str_raw
+    ; size = qty_str
+    ; price_float
+    ; size_float = qty_float
+    }
 ;;
 
 (** Parses JSON levels and applies them directly to the store's Hashtbl to avoid intermediate list allocations. *)
@@ -696,18 +721,19 @@ let process_orderbook_message ~reset json on_heartbeat =
            let asks_json = member "asks" entry in
            parse_and_apply_levels symbol store.bids bids_json;
            parse_and_apply_levels symbol store.asks asks_json;
-           store.last_update <- Unix.time ();
-           (* Truncate hashtbls to limit memory usage.
-           We only truncate when size exceeds 2x depth to avoid doing it every tick. *)
-           if orderbook_depth = 1
-           then (
-             if Hashtbl.length store.bids > 10 then truncate_hashtbl store.bids true 1;
-             if Hashtbl.length store.asks > 10 then truncate_hashtbl store.asks false 1)
-           else (
-             if Hashtbl.length store.bids > orderbook_depth * 2
-             then truncate_hashtbl store.bids true orderbook_depth;
-             if Hashtbl.length store.asks > orderbook_depth * 2
-             then truncate_hashtbl store.asks false orderbook_depth);
+           Atomic.set store.last_update_ns (Mtime_clock.now_ns ());
+           (* Kraken v2 book contract: levels falling out of the subscribed
+               scope NEVER receive a qty:0 removal. Retaining anything beyond
+               [orderbook_depth] therefore accumulates stale ghosts that slide
+               back into the computed top-10 during removal cascades and
+               permanently desync checksum validation - verified live: 2x-depth
+               retention drifted BTC/ADA within ~20 updates while strict
+               depth truncation ran 14k+ validations with zero mismatches.
+               Truncate to the subscribed depth after every message. *)
+           if Hashtbl.length store.bids > orderbook_depth
+           then truncate_hashtbl store.bids true orderbook_depth;
+           if Hashtbl.length store.asks > orderbook_depth
+           then truncate_hashtbl store.asks false orderbook_depth;
            let orderbook = build_orderbook store symbol entry in
            (* Compute and verify CRC32 from current state using top 10 levels per side.
             If the configured depth is < 10, checksum validation is bypassed because
@@ -729,16 +755,41 @@ let process_orderbook_message ~reset json on_heartbeat =
                | Some received_checksum ->
                  if Int32.compare calculated_checksum received_checksum <> 0
                  then (
-                   Logging.debug_f
+                   (* Cooldown: a persistently failing validator must degrade
+                       to periodic heals, not hot-loop unsub/resub (observed as
+                       a storm when the checksum math itself was wrong). Only
+                       touched from the parse domain - no locking needed. *)
+                   let now = Unix.gettimeofday () in
+                   let last =
+                     match Hashtbl.find_opt resubscribe_cooldown symbol with
+                     | Some t -> t
+                     | None -> 0.0
+                   in
+                   Logging.warn_f
                      ~section
                      "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld \
-                      (0x%08lx)"
+                      (0x%08lx) - book desynced, requesting resubscribe"
                      symbol
                      received_checksum
                      received_checksum
                      calculated_checksum
                      calculated_checksum;
-                   true)
+                   Hashtbl.clear store.bids;
+                   Hashtbl.clear store.asks;
+                   RingBuffer.clear store.buffer;
+                   Atomic.set store.has_snapshot false;
+                   Atomic.set store.last_sequence None;
+                   if now -. last >= resubscribe_cooldown_s
+                   then (
+                     Hashtbl.replace resubscribe_cooldown symbol now;
+                     request_resubscribe symbol)
+                   else
+                     Logging.debug_f
+                       ~section
+                       "Resubscribe for %s suppressed by cooldown (%.1fs)"
+                       symbol
+                       (resubscribe_cooldown_s -. (now -. last));
+                   raise Exit)
                  else true
                | None -> true)
              else true
@@ -781,24 +832,48 @@ let[@inline always] get_latest_orderbook symbol =
   | None -> None
 ;;
 
-let[@inline always] get_best_bid_ask symbol =
-  match get_latest_orderbook symbol with
-  | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
-    let bid = bids.(0) in
-    let ask = asks.(0) in
-    Some (bid.price_float, bid.size_float, ask.price_float, ask.size_float)
+(** Max age of a ring-buffer frame before it is considered stale and rejected.
+    Without this guard a desynced/stalled feed serves its last frame forever,
+    making both the dashboard and the sizing loop act on a frozen price. *)
+let max_book_age = Kraken_common_types.default_max_book_age_s
+
+let max_book_age_ns = Int64.of_float (max_book_age *. 1e9)
+
+(* Monotonic clock: immune to wall-clock (NTP) steps. *)
+let[@inline always] book_age_ns store =
+  Int64.sub (Mtime_clock.now_ns ()) (Atomic.get store.last_update_ns)
+;;
+
+let[@inline always] fresh_frame store =
+  match RingBuffer.read_latest store.buffer with
+  | Some ({ bids; asks; _ } as ob)
+    when Array.length bids > 0
+         && Array.length asks > 0
+         && Int64.compare (book_age_ns store) max_book_age_ns <= 0 -> Some ob
   | _ -> None
+;;
+
+let[@inline always] get_best_bid_ask symbol =
+  match store_opt symbol with
+  | Some store ->
+    (match fresh_frame store with
+     | Some { bids; asks; _ } ->
+       let bid = bids.(0) in
+       let ask = asks.(0) in
+       Some (bid.price_float, bid.size_float, ask.price_float, ask.size_float)
+     | None -> None)
+  | None -> None
 ;;
 
 let[@inline always] get_best_bid_ask_fast symbol =
   let store = ensure_store symbol in
   fun () ->
-    match RingBuffer.read_latest store.buffer with
-    | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
+    match fresh_frame store with
+    | Some { bids; asks; _ } ->
       let bid = bids.(0) in
       let ask = asks.(0) in
       Some (bid.price_float, bid.size_float, ask.price_float, ask.size_float)
-    | _ -> None
+    | None -> None
 ;;
 
 (** Read all orderbook snapshots written since [last_pos]. Returns an empty list if the symbol is unknown. *)
@@ -858,23 +933,23 @@ let clear_all_stores () =
        Atomic.set store.ready false;
        Atomic.set store.has_snapshot false;
        Atomic.set store.last_sequence None;
-       store.last_update <- Unix.time ())
+       Atomic.set store.last_update_ns (Mtime_clock.now_ns ()))
     stores
 ;;
 
 (** Removes stores inactive for over 30 minutes and trims oversized price maps to [max_price_levels].
     Prevents unbounded memory growth from abandoned subscriptions or accumulated levels. *)
 let prune_stale_data () =
-  let now = Unix.gettimeofday () in
-  let stale_threshold = 30.0 *. 60.0 in
+  let now_ns = Mtime_clock.now_ns () in
+  let stale_threshold_ns = Int64.of_float (30.0 *. 60.0 *. 1e9) in
   let max_price_levels = 100 in
   let stores_to_remove = ref [] in
   let trimmed_stores = ref [] in
   let total_stores_before = Hashtbl.length stores in
   Hashtbl.iter
     (fun symbol store ->
-       let age = now -. store.last_update in
-       if age > stale_threshold
+       let age = Int64.sub now_ns (Atomic.get store.last_update_ns) in
+       if Int64.compare age stale_threshold_ns > 0
        then stores_to_remove := symbol :: !stores_to_remove
        else (
          let bids_count = Hashtbl.length store.bids in
@@ -1122,6 +1197,19 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   final_done_p
 ;;
 
+(* Per-symbol consecutive-failure counters for resubscribe backoff. Only
+   touched from Lwt fibers on the main domain, so no mutex is required. *)
+let resubscribe_attempts : (string, int) Hashtbl.t = Hashtbl.create 8
+
+let resubscribe_backoff_delay_s attempt =
+  let base = Kraken_common_types.default_resubscribe_backoff_base_s in
+  let cap = Kraken_common_types.default_resubscribe_backoff_cap_s in
+  let d = base *. (2. ** Float.of_int attempt) in
+  (* +-25% jitter so concurrent symbol retries don't synchronize. *)
+  let jitter = 0.75 +. Random.float 0.5 in
+  Float.min (d *. jitter) cap
+;;
+
 let rec subscribe_symbols symbols =
   resubscribe_symbol_ref := Some (fun s -> resubscribe_symbol s);
   (* P5: drain sequence-gap resubscribe requests raised on the Parse_worker
@@ -1137,7 +1225,15 @@ let rec subscribe_symbols symbols =
        | [] -> ()
        | _ ->
          if Atomic.compare_and_set pending_resubscribes pending []
-         then List.iter (fun s -> Lwt.async (fun () -> resubscribe_symbol s)) pending);
+         then
+           List.iter
+             (fun s ->
+                (* [resubscribe_with_retry] owns failure handling: backoff,
+                    jitter, bounded attempts. A dropped symbol here would stay
+                    snapshot-less forever, discarding all deltas. *)
+                Lwt.async (fun () -> resubscribe_with_retry s))
+             pending
+         else ());
       Lwt_unix.sleep 0.05 >>= fun () -> watcher ()
     in
     Lwt.async watcher);
@@ -1194,7 +1290,56 @@ and resubscribe_symbol symbol =
     Logging.info_f ~section "Unsubscribing %s before re-subscribing" symbol;
     Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
     >>= fun () -> Lwt_unix.sleep 0.1 >>= fun () -> subscribe_symbols [ symbol ]
-  | None -> Lwt.return_unit
+  | None ->
+    (* Gap fix: a missing connection is a failure, not a silent success.
+       Raising routes into [resubscribe_with_retry]'s backoff loop; if the
+       socket is truly dead the supervisor's reconnect path owns recovery
+       (it clears all stores and resubscribes every symbol). *)
+    failwith "orderbook WS not connected"
+
+(** Drives one resubscribe to completion with exponential backoff + jitter,
+    bounded by [default_max_resubscribe_attempts]. Success resets the counter;
+    exhausting attempts logs an error and stops - recovery is then owned by
+    the supervisor reconnect, which clears stores and resubscribes all
+    symbols. *)
+and resubscribe_with_retry symbol =
+  let max_attempts = Kraken_common_types.default_max_resubscribe_attempts in
+  let attempt =
+    match Hashtbl.find_opt resubscribe_attempts symbol with
+    | Some n -> n
+    | None -> 0
+  in
+  if attempt >= max_attempts
+  then (
+    Hashtbl.remove resubscribe_attempts symbol;
+    Logging.error_f
+      ~section
+      "Resubscribe for %s failed %d times - giving up until next sequence event or \
+       reconnect"
+      symbol
+      attempt;
+    Lwt.return_unit)
+  else
+    Lwt.catch
+      (fun () ->
+         resubscribe_symbol symbol
+         >>= fun () ->
+         Hashtbl.remove resubscribe_attempts symbol;
+         Logging.info_f ~section "Resubscribe for %s completed" symbol;
+         Lwt.return_unit)
+      (fun exn ->
+         let next = attempt + 1 in
+         Hashtbl.replace resubscribe_attempts symbol next;
+         let delay = resubscribe_backoff_delay_s attempt in
+         Logging.warn_f
+           ~section
+           "Resubscribe for %s failed (%s) - attempt %d/%d, retrying in %.1fs"
+           symbol
+           (Printexc.to_string exn)
+           next
+           max_attempts
+           delay;
+         Lwt_unix.sleep delay >>= fun () -> resubscribe_with_retry symbol)
 ;;
 
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =

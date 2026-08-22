@@ -37,3 +37,7 @@
 (test
  (name test_kraken_oracle)
  (libraries dio.kraken alcotest))
+
+(executable
+ (name debug_ws)
+ (libraries dio.kraken dio.logging lwt lwt.unix websocket-lwt-unix unix yojson mirage-crypto-rng.unix))
