@@ -6,11 +6,8 @@ module Types = Exchange.Types
 
 module Config = struct
   include Alpaca_types.Config
-
-  let set_testnet testnet =
-    Alpaca_types.Config.set_testnet testnet;
-    Alpaca_market_hours.paper_mode := testnet
-  ;;
+  (* Market hours no longer branch on account mode: live and paper follow the
+     same 24/5 calendar (see Alpaca_market_hours.is_market_open). *)
 end
 
 module Alpaca_impl = struct

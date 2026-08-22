@@ -65,30 +65,79 @@ let test_set_testnet_flips_is_paper () =
   restore_defaults ()
 ;;
 
-let test_set_testnet_flips_paper_mode () =
-  Alpaca.Module.Config.set_testnet false;
-  Alcotest.(check bool) "paper_mode false for live" false !Alpaca.Market_hours.paper_mode;
+(* ── market hours: the 24/5 calendar closes over the weekend in every mode ── *)
+
+(* Fixed UTC instants whose US/Eastern conversion is stable (August 2026,
+   EDT = UTC-4): Fri Aug 21, Sat Aug 22, Sun Aug 23, Wed Aug 26. The clock
+   seam makes the session boundaries deterministic regardless of when the
+   suite runs. *)
+let fri_1959_et = 1787356740.0
+let fri_2001_et = 1787356860.0
+let sat_noon_et = 1787414400.0
+let sun_1959_et = 1787529540.0
+let sun_2001_et = 1787529660.0
+let wed_0300_et = 1787727600.0
+
+let with_frozen_clock t f =
   Alpaca.Module.Config.set_testnet true;
-  Alcotest.(check bool) "paper_mode true for paper" true !Alpaca.Market_hours.paper_mode;
-  restore_defaults ()
+  Alpaca.Market_hours.now_override := Some t;
+  Fun.protect f ~finally:(fun () ->
+    Alpaca.Market_hours.now_override := None;
+    restore_defaults ())
 ;;
 
-let test_paper_market_open_24_7 () =
-  Alpaca.Module.Config.set_testnet true;
-  Alcotest.(check bool)
-    "paper market always open"
-    true
-    (Alpaca.Market_hours.is_market_open ());
-  restore_defaults ()
+let test_weekend_closed_in_paper_mode () =
+  with_frozen_clock sat_noon_et (fun () ->
+    Alcotest.(check bool)
+      "Saturday noon ET closed"
+      false
+      (Alpaca.Market_hours.is_market_open ());
+    let secs = Alpaca.Market_hours.seconds_until_next_open () in
+    (* Reopens Sunday 8:00 PM ET - 32 hours after Saturday noon ET. *)
+    Alcotest.(check (float 120.0))
+      "weekend reopen is Sunday 8 PM ET (~32h)"
+      (32.0 *. 3600.0)
+      secs)
 ;;
 
-let test_paper_seconds_until_next_open_zero () =
-  Alpaca.Module.Config.set_testnet true;
-  Alcotest.(check (float 0.001))
-    "paper never closes"
-    0.0
-    (Alpaca.Market_hours.seconds_until_next_open ());
-  restore_defaults ()
+let test_friday_close_boundary () =
+  with_frozen_clock fri_1959_et (fun () ->
+    Alcotest.(check bool)
+      "Friday 19:59 ET still open"
+      true
+      (Alpaca.Market_hours.is_market_open ()));
+  with_frozen_clock fri_2001_et (fun () ->
+    Alcotest.(check bool)
+      "Friday 20:01 ET closed for the weekend"
+      false
+      (Alpaca.Market_hours.is_market_open ()))
+;;
+
+let test_sunday_reopen_boundary () =
+  with_frozen_clock sun_1959_et (fun () ->
+    Alcotest.(check bool)
+      "Sunday 19:59 ET still closed"
+      false
+      (Alpaca.Market_hours.is_market_open ());
+    let secs = Alpaca.Market_hours.seconds_until_next_open () in
+    Alcotest.(check (float 30.0)) "reopens at Sunday 8:00 PM ET" 60.0 secs);
+  with_frozen_clock sun_2001_et (fun () ->
+    Alcotest.(check bool)
+      "Sunday 20:01 ET open (overnight)"
+      true
+      (Alpaca.Market_hours.is_market_open ());
+    Alcotest.(check (float 0.0))
+      "no reopen wait while open"
+      0.0
+      (Alpaca.Market_hours.seconds_until_next_open ()))
+;;
+
+let test_weekday_overnight_open () =
+  with_frozen_clock wed_0300_et (fun () ->
+    Alcotest.(check bool)
+      "Wednesday 03:00 ET open (24/5 overnight)"
+      true
+      (Alpaca.Market_hours.is_market_open ()))
 ;;
 
 (* ── effective_tif_and_extended (session-aware TIF) ──────────────────────── *)
@@ -223,15 +272,15 @@ let () =
         ; Alcotest.test_case "garbage normalizes to iex" `Quick test_set_data_feed_garbage
         ] )
     ; ( "set_testnet"
-      , [ Alcotest.test_case "flips is_paper" `Quick test_set_testnet_flips_is_paper
-        ; Alcotest.test_case "flips paper_mode" `Quick test_set_testnet_flips_paper_mode
-        ] )
+      , [ Alcotest.test_case "flips is_paper" `Quick test_set_testnet_flips_is_paper ] )
     ; ( "market hours"
-      , [ Alcotest.test_case "paper mode always open" `Quick test_paper_market_open_24_7
-        ; Alcotest.test_case
-            "paper mode never waits for open"
+      , [ Alcotest.test_case
+            "weekend closed in paper mode"
             `Quick
-            test_paper_seconds_until_next_open_zero
+            test_weekend_closed_in_paper_mode
+        ; Alcotest.test_case "Friday close boundary" `Quick test_friday_close_boundary
+        ; Alcotest.test_case "Sunday reopen boundary" `Quick test_sunday_reopen_boundary
+        ; Alcotest.test_case "weekday overnight open" `Quick test_weekday_overnight_open
         ] )
     ; ( "session TIF"
       , [ Alcotest.test_case "regular GTC" `Quick test_regular_session_gtc

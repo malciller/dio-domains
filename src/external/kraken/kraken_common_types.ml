@@ -30,6 +30,29 @@ let default_dynamic_assets_cap = 50
 (** Maximum age (seconds) before a cached balance entry is considered stale. *)
 let default_balance_staleness_threshold_s = 300.0
 
+(** Maximum age (seconds) of a cached orderbook frame before [get_best_bid_ask*]
+    rejects it as stale. Prevents trading and display on a frozen feed after a
+    desync or connection drop. *)
+let default_max_book_age_s = 10.0
+
+(** Base delay (seconds) for per-symbol orderbook resubscribe retries. Doubles
+    per consecutive failure with jitter, capped at
+    [default_resubscribe_backoff_cap_s]. *)
+let default_resubscribe_backoff_base_s = 0.5
+
+(** Upper bound (seconds) on a single resubscribe retry delay. *)
+let default_resubscribe_backoff_cap_s = 30.0
+
+(** Consecutive resubscribe failures tolerated before giving up on a symbol
+    until the next sequence event or full reconnect (which resubscribes all
+    symbols and clears stores). *)
+let default_max_resubscribe_attempts = 8
+
+(** Minimum seconds between checksum-triggered resubscribe requests for the
+    same symbol. Guards against an unsub/resub hot-loop when validation
+    persistently fails. *)
+let default_resubscribe_cooldown_s = 5.0
+
 (** Quote currencies permanently tracked by the balances feed regardless of configured trading pairs. *)
 let default_configured_currencies = [ "USD"; "EUR"; "USDT"; "USDC" ]
 

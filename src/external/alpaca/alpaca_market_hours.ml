@@ -1,15 +1,29 @@
 (** Provides US equity market hours evaluation logic for the Alpaca connection manager and order router.
 
     This module evaluates whether US equity markets are currently operating within the
-    extended trading session (4:00 AM - 8:00 PM ET) or regular session (9:30 AM - 4:00 PM ET).
-    It is used to handle after-hours order placement flags and market data management. *)
+    24/5 trading window (Sunday 8:00 PM ET - Friday 8:00 PM ET continuously, covering
+    the extended and overnight sessions) or regular session (9:30 AM - 4:00 PM ET).
+    Outside the 24/5 window - the entire weekend - Alpaca runs no session: orders
+    rest unfilled and the market-data feeds go dark, so the market is treated as
+    closed regardless of account mode. It is used to handle after-hours order
+    placement flags and market data management. *)
 
 let section = "alpaca_market_hours"
-let paper_mode = ref false
+
+(** Clock seam: when set (tests), overrides the wall clock used by every
+    time-based evaluation in this module, making the session schedule
+    deterministic. Production code must leave this unset. *)
+let now_override : float option ref = ref None
+
+let now () =
+  match !now_override with
+  | Some t -> t
+  | None -> Unix.gettimeofday ()
+;;
 
 (** Computes the current UTC offset for US Eastern Time, dynamically adjusting for Daylight Saving Time. *)
 let us_eastern_offset_hours () =
-  let t = Unix.gettimeofday () in
+  let t = now () in
   let tm = Unix.gmtime t in
   let march_1 =
     fst
@@ -80,7 +94,7 @@ let us_eastern_offset_hours () =
 
 (** Calculates current day of week, hour, and minute localized to US Eastern Time. *)
 let current_eastern_time () =
-  let t = Unix.gettimeofday () in
+  let t = now () in
   let offset = us_eastern_offset_hours () in
   let eastern_t = t +. (float_of_int offset *. 3600.0) in
   let tm = Unix.gmtime eastern_t in
@@ -131,32 +145,29 @@ let is_overnight_hours () =
 ;;
 
 (** Evaluates whether the current system time falls within the Alpaca trading schedule.
-    Paper accounts accept orders 24/7; live accounts trade on the 24/5 schedule
-    (Sunday 8:00 PM ET to Friday 8:00 PM ET continuously). *)
+    Both live and paper accounts follow the same 24/5 market calendar (Sunday 8:00 PM ET
+    to Friday 8:00 PM ET continuously): over the weekend Alpaca simulates no session -
+    orders rest unfilled and the market-data feeds are dark - so the market counts as
+    closed from Friday 8:00 PM ET until Sunday 8:00 PM ET regardless of account mode. *)
 let is_market_open () =
-  if !paper_mode
-  then true
-  else (
-    let wday, hour, _min = current_eastern_time () in
-    match wday with
-    | 0 -> hour >= 20
-    | 1 | 2 | 3 | 4 -> true
-    | 5 -> hour < 20
-    | _ -> false)
+  let wday, hour, _min = current_eastern_time () in
+  match wday with
+  | 0 -> hour >= 20
+  | 1 | 2 | 3 | 4 -> true
+  | 5 -> hour < 20
+  | _ -> false
 ;;
 
 (** Evaluates whether current system time is strictly within pre-market (4 AM - 9:30 AM), after-hours (4 PM - 8 PM), or overnight (8 PM - 4 AM). *)
 let is_extended_hours () = is_market_open () && not (is_regular_market_open ())
 
 (** Calculates seconds until next 24/5 market open (Sunday 8:00 PM ET).
-    Paper mode never closes, so this is always 0. *)
+    Returns 0.0 while the market is open. *)
 let seconds_until_next_open () =
-  if !paper_mode
-  then 0.0
-  else if is_market_open ()
+  if is_market_open ()
   then 0.0
   else (
-    let t = Unix.gettimeofday () in
+    let t = now () in
     let offset = us_eastern_offset_hours () in
     let eastern_t = t +. (float_of_int offset *. 3600.0) in
     let tm = Unix.gmtime eastern_t in
