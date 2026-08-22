@@ -2,7 +2,6 @@
 
 open Strategy_common
 open Jacobs_ladder_types
-open Jacobs_ladder_config
 
 (** Tracking total reserved quote per exchange to avoid O(N) strategy_states locking. *)
 let total_reserved_by_exchange =
@@ -123,48 +122,8 @@ let amend_allowed
 ;;
 
 (** Returns true if asset_balance >= asset_needed. *)
-let can_place_sell_order (_qty : float) (_sell_mult : float) asset_balance asset_needed =
+let can_place_sell_order (_qty : float) asset_balance asset_needed =
   asset_balance >= asset_needed
-;;
-
-(** Computes sell quantity and whether this is a profit-gated accumulation sell. *)
-let compute_sell_qty
-      ~ecfg
-      ~state
-      ~(asset : trading_config)
-      ~qty
-      ~sell_price
-      ~sell_mult
-      ~symbol
-      ~exchange
-  =
-  if ecfg.use_accumulation_sells
-  then (
-    let rounded_sell =
-      if exchange = "ibkr"
-      then max 0.0 (qty -. 1.0)
-      else round_qty (qty *. sell_mult) symbol exchange
-    in
-    let rounding_diff = qty -. rounded_sell in
-    let required_profit = (rounding_diff *. sell_price) +. asset.accumulation_buffer in
-    if required_profit > 0.0 && state.accumulated_profit >= required_profit
-    then rounded_sell, true, required_profit
-    else qty, false, required_profit)
-  else if ecfg.sell_uses_mult
-  then round_qty (qty *. sell_mult) symbol exchange, false, 0.0
-  else qty, false, 0.0
-;;
-
-(** After [asset_low] or [capital_low] clears, a new sell must pass the accumulation
-    buffer gate; do not fall back to a blind 1:1 sell on the recovery cycle. *)
-let accumulation_sell_allowed_on_recovery ~ecfg ~state ~is_accumulation_sell ~sell_qty =
-  if (not state.resuming_after_balance_flag) || not ecfg.use_accumulation_sells
-  then true
-  else if state.just_filled_buy
-  then true
-  else if is_accumulation_sell || sell_qty = 0.0
-  then true
-  else false
 ;;
 
 (** Returns true if a sell order placement is currently in-flight or registered

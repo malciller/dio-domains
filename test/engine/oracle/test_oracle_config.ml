@@ -169,23 +169,6 @@ let test_calendar_kind () =
      = Dio_oracle.Oracle_types.Crypto)
 ;;
 
-let test_min_notional_flows_into_config () =
-  (* The venue's min-notional default resolves through the oracle adapter
-     registry (tested per-venue in the adapter tests, e.g.
-     test/external/hyperliquid); here we verify the plumbing: an explicit
-     override reaches the Grid_core.config the adapter builds. *)
-  let tc = trading_config ~exchange:"hyperliquid" ~symbol:"BTC/USDC" () in
-  let grid =
-    Dio_oracle.Grid_adapter.of_trading_config
-      ~min_notional:10.0
-      tc
-      ~start_price:100.0
-      ~start_quote:1000.0
-      ~grid_interval_pct:1.0
-  in
-  Alcotest.(check (float 1e-9)) "min_notional = 10" 10.0 grid.min_notional
-;;
-
 let () =
   Alcotest.run
     "oracle-config"
@@ -216,11 +199,5 @@ let () =
         ; Alcotest.test_case "offline requires symbol" `Quick test_offline_requires_symbol
         ] )
     ; "calendar", [ Alcotest.test_case "exchange kinds" `Quick test_calendar_kind ]
-    ; ( "grid_adapter"
-      , [ Alcotest.test_case
-            "min_notional flows into config"
-            `Quick
-            test_min_notional_flows_into_config
-        ] )
     ]
 ;;

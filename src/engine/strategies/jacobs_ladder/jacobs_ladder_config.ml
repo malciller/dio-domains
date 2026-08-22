@@ -2,14 +2,13 @@
 
 open Jacobs_ladder_types
 
-(* Kraken runs the same accumulation model as HL/Lighter/IBKR: profit-gated
-   accumulation sells, 1:1 sells, and an explicit reserved_base accrual on
-   every buy fill. *)
+(* Kraken runs the same model as HL/Lighter/IBKR: 1:1 sells and a
+   persistence-layer reserved_base accrual on profitable sell fills
+   (Base_accumulation_store). *)
 let kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
-  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = true
@@ -23,7 +22,6 @@ let hyperliquid_config =
   { time_in_force = "Alo"
   ; track_pending_sells = false
   ; use_accumulation_sells = true
-  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = false
@@ -37,7 +35,6 @@ let ibkr_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
-  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = false
@@ -51,7 +48,6 @@ let lighter_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
-  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = false
@@ -65,7 +61,6 @@ let alpaca_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = false
-  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; asset_low_requires_balance_change = false

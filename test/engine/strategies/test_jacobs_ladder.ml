@@ -272,6 +272,7 @@ let test_blocked_placement_sell_retries () =
       ~ask_price:62370.0
       ~asset_balance:1.00112
       ~buy_attempted
+      ~oracle_halted:false
       ~ecfg
       ~locked_in_sells:0.0
   in
@@ -344,11 +345,7 @@ let test_hl_buy_fill_accrues_reserve () =
     "hl buy reference price recorded"
     true
     (state.last_buy_fill_price = Some 62000.0);
-  check
-    bool
-    "hl buy reference qty recorded"
-    true
-    (state.last_buy_fill_qty = Some 0.5);
+  check bool "hl buy reference qty recorded" true (state.last_buy_fill_qty = Some 0.5);
   check
     bool
     "hl anticipated credit is net of the base-side buy fee"
@@ -434,7 +431,8 @@ let test_sub_minimum_qty_sell_places () =
     ~asset_balance:1.05
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let sell_qty =
     List.find_map
@@ -473,12 +471,12 @@ let test_balance_checking () =
     bool
     "sufficient sell balance"
     true
-    (Dio_strategies.Jacobs_ladder.can_place_sell_order 0.001 1.0 1.0 0.001);
+    (Dio_strategies.Jacobs_ladder.can_place_sell_order 0.001 1.0 0.001);
   check
     bool
     "insufficient sell balance"
     false
-    (Dio_strategies.Jacobs_ladder.can_place_sell_order 0.001 1.0 0.0005 0.001)
+    (Dio_strategies.Jacobs_ladder.can_place_sell_order 0.001 0.0005 0.001)
 ;;
 
 let test_order_acknowledgment () =
@@ -607,201 +605,6 @@ let test_accumulation_profit_tracking () =
     (abs_float (state.accumulated_profit -. expected_net) < 0.0001)
 ;;
 
-let test_accumulation_gated_sell_insufficient () =
-  (* Test that when accumulated_profit is BELOW required_profit,
-     the sell qty falls back to 1:1 (qty, not rounded_sell).
-     
-     With qty=0.35, sell_mult=0.999, price=40.0:
-       rounded_sell = round_qty(0.35 * 0.999) = round_qty(0.34965) 
-       On Hyperliquid the lot size defaults to 0.01, so rounded_sell = 0.34
-       rounding_diff = 0.35 - 0.34 = 0.01
-       required_profit = 0.01 * 40.0 + 0.05 = 0.45
-     
-     With accumulated_profit = 0.10 (< 0.45), sell_qty should be 0.35 (1:1) *)
-  let symbol = "GATE_TEST/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
-  state.accumulated_profit <- 0.10;
-  let qty = 0.35 in
-  let sell_mult = 0.999 in
-  let sell_price = 40.0 in
-  let accumulation_buffer = 0.05 in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
-    ; symbol
-    ; qty = "0.35"
-    ; grid_interval = 1.0
-    ; sell_mult = "0.999"
-    ; strategy = "Ladder"
-    ; maker_fee = Some 0.0004
-    ; taker_fee = None
-    ; accumulation_buffer
-    ; base_accumulation = true
-    ; sell_levels_persistence = true
-    }
-  in
-  let sell_qty, is_accumulation_sell, required_profit =
-    Dio_strategies.Jacobs_ladder.compute_sell_qty
-      ~ecfg
-      ~state
-      ~asset
-      ~qty
-      ~sell_price
-      ~sell_mult
-      ~symbol
-      ~exchange:"hyperliquid"
-  in
-  check
-    bool
-    "not an accumulation sell when profit insufficient"
-    true
-    (not is_accumulation_sell);
-  check
-    bool
-    "sell qty falls back to 1:1 when profit insufficient"
-    true
-    (abs_float (sell_qty -. qty) < 0.0001);
-  (* Profit should NOT have been debited *)
-  check
-    bool
-    "profit unchanged"
-    true
-    (abs_float (state.accumulated_profit -. 0.10) < 0.0001);
-  (* Verify the threshold was meaningful *)
-  check
-    bool
-    "required_profit > accumulated"
-    true
-    (required_profit > state.accumulated_profit)
-;;
-
-let test_accumulation_gated_sell_sufficient () =
-  (* Test that when accumulated_profit >= required_profit,
-     the sell qty uses REDUCED amount (rounded_sell) and profit is debited.
-     
-     Same params as above but with accumulated_profit = 1.00 (> 0.45) *)
-  let symbol = "GATE_OK/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
-  state.accumulated_profit <- 1.00;
-  let qty = 0.35 in
-  let sell_mult = 0.999 in
-  let sell_price = 40.0 in
-  let accumulation_buffer = 0.05 in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
-    ; symbol
-    ; qty = "0.35"
-    ; grid_interval = 1.0
-    ; sell_mult = "0.999"
-    ; strategy = "Ladder"
-    ; maker_fee = Some 0.0004
-    ; taker_fee = None
-    ; accumulation_buffer
-    ; base_accumulation = true
-    ; sell_levels_persistence = true
-    }
-  in
-  let sell_qty, is_accumulation_sell, required_profit =
-    Dio_strategies.Jacobs_ladder.compute_sell_qty
-      ~ecfg
-      ~state
-      ~asset
-      ~qty
-      ~sell_price
-      ~sell_mult
-      ~symbol
-      ~exchange:"hyperliquid"
-  in
-  check bool "sell qty uses reduced amount" true (sell_qty < qty);
-  check bool "is accumulation sell" true is_accumulation_sell;
-  let rounded_sell =
-    Dio_strategies.Jacobs_ladder.round_qty (qty *. sell_mult) symbol "hyperliquid"
-  in
-  check
-    bool
-    "sell qty equals rounded_sell"
-    true
-    (abs_float (sell_qty -. rounded_sell) < 0.0001);
-  check
-    bool
-    "profit still above threshold"
-    true
-    (state.accumulated_profit >= required_profit)
-;;
-
-let test_accumulation_recovery_blocks_blind_sell () =
-  (* After asset_low/capital_low clears, a new sell must pass the accumulation buffer.
-     Normal cycles allow 1:1 fallback; recovery cycles do not. *)
-  let symbol = "RECOVERY_GATE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
-  state.accumulated_profit <- 0.10;
-  state.resuming_after_balance_flag <- true;
-  let qty = 0.35 in
-  let sell_mult = 0.999 in
-  let sell_price = 40.0 in
-  let accumulation_buffer = 0.05 in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
-    ; symbol
-    ; qty = "0.35"
-    ; grid_interval = 1.0
-    ; sell_mult = "0.999"
-    ; strategy = "Ladder"
-    ; maker_fee = Some 0.0004
-    ; taker_fee = None
-    ; accumulation_buffer
-    ; base_accumulation = true
-    ; sell_levels_persistence = true
-    }
-  in
-  let sell_qty, is_accumulation_sell, _required_profit =
-    Dio_strategies.Jacobs_ladder.compute_sell_qty
-      ~ecfg
-      ~state
-      ~asset
-      ~qty
-      ~sell_price
-      ~sell_mult
-      ~symbol
-      ~exchange:"hyperliquid"
-  in
-  check
-    bool
-    "recovery blocks 1:1 fallback sell"
-    true
-    (not
-       (Dio_strategies.Jacobs_ladder.accumulation_sell_allowed_on_recovery
-          ~ecfg
-          ~state
-          ~is_accumulation_sell
-          ~sell_qty));
-  state.resuming_after_balance_flag <- false;
-  check
-    bool
-    "normal cycle allows 1:1 fallback"
-    true
-    (Dio_strategies.Jacobs_ladder.accumulation_sell_allowed_on_recovery
-       ~ecfg
-       ~state
-       ~is_accumulation_sell
-       ~sell_qty)
-;;
-
-(* Helper: round qty using instrument feed directly.
-   Production code goes through Exchange.Registry -> Hyperliquid_impl -> Instruments_feed,
-   but the test binary may not link the exchange module. This calls the feed directly. *)
-let round_qty_hl qty sym =
-  let inc =
-    match Hyperliquid.Instruments_feed.get_qty_increment sym with
-    | Some v -> v
-    | None -> 0.01
-  in
-  let inv = 1.0 /. inc in
-  floor (qty *. inv) /. inv
-;;
-
 let test_accumulation_full_lifecycle () =
   (* End-to-end test with realistic HYPE/USDC lot sizing.
      HYPE sz_decimals=2 → lot=0.01 (asset)
@@ -832,9 +635,6 @@ let test_accumulation_full_lifecycle () =
   (* USDC per asset *)
   let sell_price = 39.90 in
   (* USDC per asset *)
-  let accumulation_buffer = 0.05 in
-  (* USDC *)
-  let sell_mult = 0.999 in
   (* Run 5 profitable buy→sell cycles *)
   for i = 1 to 5 do
     let buy_id = Printf.sprintf "buy_%d" i in
@@ -860,48 +660,7 @@ let test_accumulation_full_lifecycle () =
       None
   done;
   (* After 5 cycles: ~5 * 0.128884 ≈ 0.644 USDC accumulated *)
-  check bool "profit accumulated over 5 cycles" true (state.accumulated_profit > 0.0);
-  (* Test the gating decision *)
-  let qty = 0.35 in
-  (* asset *)
-  let rounded_sell = round_qty_hl (qty *. sell_mult) symbol in
-  (* rounded_sell = 0.34 (asset), rounding_diff = 0.01 (asset) *)
-  let rounding_diff = qty -. rounded_sell in
-  (* required_profit = 0.01 * 39.90 + 0.05 = 0.449 (USDC) *)
-  let required_profit = (rounding_diff *. sell_price) +. accumulation_buffer in
-  check
-    bool
-    "rounded_sell is 0.34 (asset)"
-    true
-    (abs_float (rounded_sell -. 0.34) < 0.0001);
-  check
-    bool
-    "rounding_diff is 0.01 (asset)"
-    true
-    (abs_float (rounding_diff -. 0.01) < 0.0001);
-  check
-    bool
-    "required_profit ≈ 0.449 (USDC)"
-    true
-    (abs_float (required_profit -. 0.449) < 0.01);
-  let profit_before = state.accumulated_profit in
-  let can_accumulate = profit_before >= required_profit in
-  let sell_qty =
-    if required_profit > 0.0 && state.accumulated_profit >= required_profit
-    then (
-      state.accumulated_profit <- state.accumulated_profit -. required_profit;
-      rounded_sell)
-    else qty
-  in
-  (* With 5 cycles (~0.644 USDC) vs required 0.449 USDC, gate should fire *)
-  check bool "lifecycle: enough profit to gate" true can_accumulate;
-  check bool "lifecycle: gated sell fires reduced qty 0.34 (asset)" true (sell_qty < qty);
-  check
-    bool
-    "lifecycle: sell qty = rounded_sell"
-    true
-    (abs_float (sell_qty -. rounded_sell) < 0.0001);
-  check bool "lifecycle: profit debited" true (state.accumulated_profit < profit_before)
+  check bool "profit accumulated over 5 cycles" true (state.accumulated_profit > 0.0)
 ;;
 
 let test_accumulation_multi_strategy_isolation () =
@@ -943,19 +702,6 @@ let test_accumulation_multi_strategy_isolation () =
   (* Clear startup replay gate so fills are processed normally *)
   Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done btc_sym;
   Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done hype_sym;
-  (* Verify lot sizes are correct *)
-  let btc_rounded = round_qty_hl (0.0002 *. 0.999) btc_sym in
-  let hype_rounded = round_qty_hl (0.35 *. 0.999) hype_sym in
-  check
-    bool
-    "BTC rounded_sell = 0.00019 (asset, lot=0.00001)"
-    true
-    (abs_float (btc_rounded -. 0.00019) < 0.000001);
-  check
-    bool
-    "HYPE rounded_sell = 0.34 (asset, lot=0.01)"
-    true
-    (abs_float (hype_rounded -. 0.34) < 0.0001);
   (* --- BTC cycles: buy@84000 → sell@84336 USDC (+0.4%) --- *)
   (* net = (84336 - 84000) * 0.0002 - fees = 0.0672 - 0.01345 ≈ 0.054 USDC per cycle *)
   for i = 1 to 30 do
@@ -1021,34 +767,6 @@ let test_accumulation_multi_strategy_isolation () =
     "BTC profit unchanged by HYPE fills"
     true
     (abs_float (btc.accumulated_profit -. btc_profit) < 0.0001);
-  (* --- Test independent gating decisions --- *)
-
-  (* HYPE: required = 0.01 * 39.90 + 0.05 = 0.449 USDC
-     5 cycles * 0.128884 ≈ 0.644 USDC → should gate *)
-  let hype_diff = 0.35 -. hype_rounded in
-  let hype_required = (hype_diff *. 39.90) +. 0.05 in
-  check
-    bool
-    "HYPE can gate (0.644 USDC >= 0.449 USDC)"
-    true
-    (hype.accumulated_profit >= hype_required);
-  (* BTC: required = 0.00001 * 84336 + 1.00 = 1.84336 USDC
-     30 cycles * 0.054 ≈ 1.62 USDC → should NOT gate yet *)
-  let btc_diff = 0.0002 -. btc_rounded in
-  let btc_required = (btc_diff *. 84336.0) +. 1.00 in
-  check
-    bool
-    "BTC cannot gate yet (1.62 USDC < 1.84 USDC)"
-    true
-    (btc.accumulated_profit < btc_required);
-  Printf.printf
-    "  BTC: accumulated=%.4f USDC, required=%.4f USDC, lot=0.00001\n"
-    btc.accumulated_profit
-    btc_required;
-  Printf.printf
-    "  HYPE: accumulated=%.4f USDC, required=%.4f USDC, lot=0.01\n"
-    hype.accumulated_profit
-    hype_required;
   (* --- Test reserved_quote (USDC) isolation --- *)
   btc.exchange_id <- "hyperliquid";
   hype.exchange_id <- "hyperliquid";
@@ -1094,7 +812,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ~asset_balance:3.0
     ~buy_attempted:false
     ~ecfg:ecfg_alpaca
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   (* Verify that a missing sell order from persisted stack was pushed to order buffer at target price 101.00 *)
   let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
   let popped = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
@@ -1121,7 +840,9 @@ let test_virtual_gtc_sell_grid_maintenance () =
        | None -> failwith "missing sell price")
     popped;
   (* Verify offline fill reconciliation: asset_balance is 0.0, so persisted levels must be pruned *)
-  let state_offline = Dio_strategies.Jacobs_ladder.get_strategy_state "OFFLINE_TEST/USD" in
+  let state_offline =
+    Dio_strategies.Jacobs_ladder.get_strategy_state "OFFLINE_TEST/USD"
+  in
   state_offline.persisted_sell_levels <- [ 105.00, 1.0 ];
   state_offline.open_sell_orders <- [];
   let asset_offline = { asset_alpaca with symbol = "OFFLINE_TEST/USD" } in
@@ -1136,7 +857,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ~asset_balance:0.0
     ~buy_attempted:false
     ~ecfg:ecfg_alpaca
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   check
     bool
     "offline fill pruned from persisted_sell_levels"
@@ -1196,7 +918,8 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ~asset_balance:1.0
     ~buy_attempted:false
     ~ecfg:ecfg_kraken
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   let kraken_popped = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
   check
     bool
@@ -1204,6 +927,168 @@ let test_virtual_gtc_sell_grid_maintenance () =
     true
     (Option.is_none kraken_popped)
 ;;
+
+
+
+let test_halted_ladders_second_sell_beside_resting_one () =
+  (* Kraken startup-inactive with a resting sell already on the book: the
+     free inventory must STILL sell - laddered as a second order beside the
+     resting one. The balance the domain passes is the NETTED tradeable
+     figure (open-order holds removed at the feed), so the inventory gate
+     must not subtract the resting-sell hold again: 0.04004 tradeable,
+     reserved 0 -> a sell of ~0.04004 goes out even though one sell rests. *)
+  let symbol = "LADDER2/XMR/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.grid_qty <- 0.05;
+  state.maker_fee <- 0.0026;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.0;
+  state.reserved_base <- 0.0;
+  state.open_sell_orders <- [ ("resting1", 462.13, 0.04) ];
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- None;
+  state.last_buy_fill_qty <- None;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    ; symbol
+    ; qty = "0.05"
+    ; grid_interval = 5.0
+    ; sell_mult = "0.999"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0026
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:422.67
+    ~ask_price:422.80
+    ~asset_balance:0.04004 (* netted tradeable; the resting sell's hold is NOT in here *)
+    ~buy_attempted:false
+    ~oracle_halted:true
+    ~ecfg
+    ~locked_in_sells:0.04;
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let placed =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  (match placed with
+   | None -> Alcotest.fail "expected a second inventory sell beside the resting one"
+   | Some o ->
+     Alcotest.(check bool)
+       "second sell sized by netted tradeable (~0.04004)"
+       (o.qty > 0.0399 && o.qty <= 0.0401)
+       true)
+
+let test_halted_startup_places_inventory_sell () =
+  (* Spec (sell side / activity gating): when the asset is FIRST placed
+     inactive - e.g. on startup, before any fill this session - the sell leg
+     must still check whether a placeable inventory sell exists and attempt
+     it: sells need inventory, not quote. No just_filled_buy, no
+     buy_attempted: the trigger is the halted state plus placeable
+     inventory, anchored at the bid when no buy-fill price is known. *)
+  let symbol = "STARTUP_SELL/XMR/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.grid_qty <- 0.05;
+  state.maker_fee <- 0.0026;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.0;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.persisted_sell_levels <- [];
+  (* Startup-inactive: no fills this session, no buy attempted. *)
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- None;
+  state.last_buy_fill_qty <- None;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    ; symbol
+    ; qty = "0.05"
+    ; grid_interval = 5.0
+    ; sell_mult = "0.999"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0026
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:170.0
+    ~ask_price:170.10
+    ~asset_balance:1.25
+    ~buy_attempted:false
+    ~oracle_halted:true
+    ~ecfg
+    ~locked_in_sells:0.0;
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let found =
+    List.exists
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  check bool
+    "startup-inactive places an inventory sell (XMR case)"
+    true found;
+  (* And with NO inventory there is no sell: the halt check requires a
+     placeable balance. *)
+  drain ();
+  state.open_sell_orders <- [];
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:101.0
+    ~asset
+    ~bid_price:170.0
+    ~ask_price:170.10
+    ~asset_balance:0.0
+    ~buy_attempted:false
+    ~oracle_halted:true
+    ~ecfg
+    ~locked_in_sells:0.0;
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  check bool "no inventory -> no halt-triggered sell" true (pushed = [])
 
 let test_halted_path_still_places_sell () =
   (* Feature B: when the capital oracle halts an asset (INACTIVE), the
@@ -1263,7 +1148,8 @@ let test_halted_path_still_places_sell () =
     ~asset_balance:0.5
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let found =
     List.exists
@@ -1358,7 +1244,8 @@ let test_sell_ack_releases_inflight_latch () =
     ~asset_balance:2.0
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:1.0;
+    ~locked_in_sells:1.0
+    ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let found =
     List.exists
@@ -1435,6 +1322,7 @@ let test_sell_retry_until_placed () =
       ~buy_attempted:false
       ~ecfg
       ~locked_in_sells:0.0
+      ~oracle_halted:false
   in
   (* Tick 1: the sell is on cooldown (a recent rejection latched it). *)
   Hashtbl.replace state.amend_cooldowns "place_Sell" (Unix.gettimeofday () +. 10.0);
@@ -1531,7 +1419,8 @@ let test_accumulation_sells_non_accrued_inventory () =
     ~asset_balance:1.00112
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.4;
+    ~locked_in_sells:0.4
+    ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let sell =
     List.find_opt
@@ -1614,7 +1503,8 @@ let test_nothing_placeable_clears_latch () =
     ~asset_balance:0.0003
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   check
     bool
     "no sell pushed with no sellable inventory"
@@ -1677,7 +1567,8 @@ let test_kraken_partial_sell_clamp () =
     ~asset_balance:0.7
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let sell =
     List.find_opt
@@ -1743,7 +1634,8 @@ let test_alpaca_dollar_floor_gate () =
     ~asset_balance:0.005
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   check
     bool
     "no sell below the dollar floor"
@@ -1761,7 +1653,8 @@ let test_alpaca_dollar_floor_gate () =
     ~asset_balance:0.5
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let found =
     List.exists
@@ -1828,7 +1721,8 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
     ~asset_balance:1.0
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
@@ -1890,7 +1784,7 @@ let test_new_buy_respects_2x_gi_closest_sell () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:(Some ("sell1", 100.40))
-       ~pending_buy_qty_from_scan:0.0);
+        );
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
@@ -2072,7 +1966,7 @@ let test_buy_placement_balance_guard () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:None
-       ~pending_buy_qty_from_scan:0.0);
+        );
   check bool "fresh insufficient: capital_low latched" true st.capital_low;
   check int "fresh insufficient: no order pushed" 0 (pending_count ());
   check
@@ -2101,7 +1995,7 @@ let test_buy_placement_balance_guard () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:None
-       ~pending_buy_qty_from_scan:0.0);
+        );
   check
     bool
     "stale insufficient: foreordained flag set"
@@ -2135,7 +2029,7 @@ let test_buy_placement_balance_guard () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:None
-       ~pending_buy_qty_from_scan:0.0);
+        );
   check
     bool
     "fresh sufficient: foreordained flag cleared"
@@ -2304,7 +2198,6 @@ let test_sync_open_orders_reconcile_agreement () =
         , _locked_in_buys
         , _locked_in_sells
         , _closest_sell
-        , _pending_buy_qty
         , open_levels
         , missing_levels )
       =
@@ -2361,7 +2254,7 @@ let test_sync_open_orders_reconcile_agreement () =
 
 (* ---- Buy-trailing: qty-only oracle re-sizes must honor the trailing rules - *)
 
-let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty ~sell_opt =
+let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty:_ ~sell_opt =
   let buy_id = symbol ^ "_buy" in
   let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   st.exchange_id <- "alpaca";
@@ -2406,65 +2299,11 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty ~sell
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:sell_opt
-       ~pending_buy_qty_from_scan:resting_qty);
+       );
   Dio_strategies.Jacobs_ladder.get_pending_orders 10
 ;;
 
-let test_qty_mismatch_keeps_resting_price_when_target_below () =
-  (* Alpaca qty-only re-size (oracle re-derived the size from a churning
-     pool; spacing unchanged) with the grid target BELOW the resting buy
-     (flat/falling market): the amend must fix the QTY and keep the resting
-     PRICE - the buy only ever trails up, so it must NOT be dragged down to
-     the grid target. *)
-  let pushed =
-    eval_buy_trail
-      ~symbol:"QTY_HOLD/USD"
-      ~grid_qty:2.0
-      ~bid:100.0
-      ~ask:100.5
-      ~resting_price:100.0
-      ~resting_qty:1.0
-      ~sell_opt:(Some ("sell1", 105.0))
-  in
-  match pushed with
-  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
-    check
-      bool
-      "qty-only amend pushed"
-      true
-      (o.operation = Dio_strategies.Strategy_common.Amend
-       && o.side = Dio_strategies.Strategy_common.Buy);
-    check (float 0.) "qty corrected to config" 2.0 o.qty;
-    check (option (float 0.)) "price kept at the resting price" (Some 100.0) o.price
-  | _ -> failwith "expected exactly one buy amend"
-;;
 
-let test_qty_mismatch_trails_price_up_when_target_above () =
-  (* Alpaca qty-only re-size where the grid target (bid - gi) is ABOVE the
-     resting buy: the amend trails the price up to the target AND applies the
-     new qty - identical to normal trailing. *)
-  let pushed =
-    eval_buy_trail
-      ~symbol:"QTY_TRAIL/USD"
-      ~grid_qty:2.0
-      ~bid:101.0
-      ~ask:101.5
-      ~resting_price:99.0
-      ~resting_qty:1.0
-      ~sell_opt:(Some ("sell1", 105.0))
-  in
-  match pushed with
-  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
-    check
-      bool
-      "trail-up amend pushed"
-      true
-      (o.operation = Dio_strategies.Strategy_common.Amend
-       && o.side = Dio_strategies.Strategy_common.Buy);
-    check (float 0.) "qty corrected to config" 2.0 o.qty;
-    check (option (float 0.)) "price trailed up to the grid target" (Some 100.0) o.price
-  | _ -> failwith "expected exactly one buy amend"
-;;
 
 let test_pure_trailing_no_amend_when_target_below () =
   (* No qty mismatch, market flat relative to the resting buy: the trailing
@@ -2532,7 +2371,7 @@ let test_buy_trail_fires_on_single_tick_move () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:(Some ("sell1", 105.0))
-       ~pending_buy_qty_from_scan:1.0);
+       );
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
@@ -2594,7 +2433,7 @@ let test_buy_trail_2xgi_anchored_on_sell () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:(Some ("sell1", 103.50))
-       ~pending_buy_qty_from_scan:1.0);
+       );
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
@@ -2659,7 +2498,7 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
          ~has_recent_amend_buy:false
          ~locked_in_buys:0.0
          ~closest_sell_order_initial:sell_opt
-         ~pending_buy_qty_from_scan:1.0);
+         );
     let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
     match pushed with
     | [ (o : Dio_strategies.Strategy_common.strategy_order) ] -> o.price
@@ -2740,7 +2579,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
          ~has_recent_amend_buy:false
          ~locked_in_buys:0.0
          ~closest_sell_order_initial:sell_opt
-         ~pending_buy_qty_from_scan:1.0);
+         );
     Dio_strategies.Jacobs_ladder.get_pending_orders 10
   in
   (* 1. Bid 101.50, sell 103.00 tracked: buy trails to bid - gi = 100.49,
@@ -2795,14 +2634,6 @@ let () =
         ] )
     ; ( "buy trailing"
       , [ test_case
-            "qty mismatch keeps resting price when target below"
-            `Quick
-            test_qty_mismatch_keeps_resting_price_when_target_below
-        ; test_case
-            "qty mismatch trails price up when target above"
-            `Quick
-            test_qty_mismatch_trails_price_up_when_target_above
-        ; test_case
             "pure trailing emits no amend when target below"
             `Quick
             test_pure_trailing_no_amend_when_target_below
@@ -2867,6 +2698,14 @@ let () =
             "blocked sell retries until placed (no replacement buy needed)"
             `Quick
             test_sell_retry_until_placed
+        ; test_case
+            "halted ladders a second sell beside a resting one"
+            `Quick
+            test_halted_ladders_second_sell_beside_resting_one
+        ; test_case
+            "startup-inactive places an inventory sell"
+            `Quick
+            test_halted_startup_places_inventory_sell
         ; test_case
             "blocked placement-triggered sell retries on the next tick"
             `Quick
@@ -2940,18 +2779,6 @@ let () =
             "profit tracking from sell fills"
             `Quick
             test_accumulation_profit_tracking
-        ; test_case
-            "gated sell - insufficient profit"
-            `Quick
-            test_accumulation_gated_sell_insufficient
-        ; test_case
-            "gated sell - sufficient profit"
-            `Quick
-            test_accumulation_gated_sell_sufficient
-        ; test_case
-            "recovery blocks blind 1:1 sell"
-            `Quick
-            test_accumulation_recovery_blocks_blind_sell
         ; test_case
             "full lifecycle (20 buy-sell cycles)"
             `Quick

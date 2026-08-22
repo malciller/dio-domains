@@ -254,12 +254,29 @@ module Kraken_impl = struct
 
   let get_top_of_book_fast ~symbol = Kraken_orderbook_feed.get_best_bid_ask_fast symbol
 
-  (** Returns the current tradeable balance for [asset] from the balances feed cache. *)
-  let get_tradeable_balance ~asset = Kraken_balances_feed.get_balance asset
+  (** Open-order holds for [asset]: base locked in resting sells plus quote
+      locked in resting buys. Kraken wallet snapshots report TOTAL balances
+      (unlike Hyperliquid's store, which nets the hold at ingestion), so the
+      tradeable figure is total minus these holds - without this, sell
+      sizing reads inventory that is already committed to a resting sell and
+      the exchange rejects with EOrder:Insufficient funds. *)
+  let open_order_holds asset =
+    Kraken_balances_feed.get_pending_sell_qty asset
+    +. Kraken_balances_feed.get_pending_buy_quote_value asset
+  ;;
+
+  (** Returns the current tradeable balance for [asset] from the balances
+      feed cache: trading wallets minus open-order holds. *)
+  let get_tradeable_balance ~asset =
+    Float.max 0.0 (Kraken_balances_feed.get_balance asset -. open_order_holds asset)
+  ;;
 
   let get_tradeable_balance_fast ~asset =
     let store = Kraken_balances_feed.get_balance_store asset in
-    fun () -> Kraken_balances_feed.BalanceStore.get_balance store
+    fun () ->
+      Float.max
+        0.0
+        (Kraken_balances_feed.BalanceStore.get_balance store -. open_order_holds asset)
   ;;
 
   (** Age of the balances-feed snapshot for [asset], or [None] before the

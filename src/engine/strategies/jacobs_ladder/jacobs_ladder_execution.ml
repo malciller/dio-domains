@@ -113,9 +113,7 @@ let evaluate_asset_low_recovery
       let delta = asset_bal -. state.last_seen_asset_balance in
       state.anticipated_base_credit <- max 0.0 (state.anticipated_base_credit -. delta));
     let qty_f = lot_qty in
-    let asset_needed_fast =
-      if ecfg.sell_uses_mult then qty_f *. state.cached_sell_mult else qty_f
-    in
+    let asset_needed_fast = qty_f in
     let locked_in_sells =
       if ecfg.use_reserved_base_guard
       then List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
@@ -301,8 +299,7 @@ let sync_open_orders
   state.open_sell_orders <- [];
   let best_buy_price = ref 0.0 in
   let best_buy_id = ref None in
-  let best_buy_qty = ref 0.0 in
-  let open_buy_count_from_scan = ref 0 in
+    let open_buy_count_from_scan = ref 0 in
   let has_recent_amend_buy = ref false in
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
@@ -354,8 +351,7 @@ let sync_open_orders
         if price > !best_buy_price && price > 0.0
         then (
           best_buy_price := price;
-          best_buy_id := Some oid;
-          best_buy_qty := qty);
+          best_buy_id := Some oid);
         match Hashtbl.find_opt state.amend_cooldowns oid with
         | Some expiry when now_time < expiry -> has_recent_amend_buy := true
         | _ -> ())
@@ -519,7 +515,6 @@ let sync_open_orders
   , !locked_in_buys
   , !locked_in_sells
   , !closest_sell_order
-  , !best_buy_qty
   , List.rev !open_levels_acc
   , List.rev !missing_levels_acc )
 ;;
@@ -543,7 +538,6 @@ let evaluate_buy_leg
       ~has_recent_amend_buy
       ~locked_in_buys
       ~closest_sell_order_initial
-      ~pending_buy_qty_from_scan
   =
   let buy_attempted = ref false in
   let buy_order_pending =
@@ -768,21 +762,6 @@ let evaluate_buy_leg
       (fun (oid, side, price, _) -> if side = Sell then update_closest_pending oid price)
       state.pending_orders;
     let closest_sell_order_val = !closest_sell_ref in
-    let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
-    (* A qty mismatch is judged with a RELATIVE tolerance (0.1% of the
-       config qty), not an absolute 1e-6: the capital oracle re-derives
-       the qty from the live pool every pass, and pool drift means
-       successive passes publish micro-different qtys (e.g. 0.03877239 ->
-       0.03877509 -> 0.03876709). An absolute 1e-6 tolerance treated each
-       micro change as a re-size and amended the resting buy every pass -
-       an Alpaca amend is a cancel+create, so this churned order ids and
-       raced fills/executions (stacking at grid levels). Only a material
-       (>0.1%) qty difference amends now; micro drift is left alone. *)
-    let qty_mismatch =
-      is_alpaca
-      && pending_buy_qty_from_scan > 0.0
-      && abs_float (pending_buy_qty_from_scan -. qty) > max (qty *. 0.001) 1e-6
-    in
     if closest_sell_order_val <> None
     then (
       match
@@ -842,61 +821,28 @@ let evaluate_buy_leg
           reanchor_buy && (not trail_up) && current_buy_price_rounded > exact_target
         in
         let reanchor_moves = trail_up || down_reanchor in
-        (* Nothing warranted (no trail-up, no sell-zone violation, no qty
-           fix): the re-anchor is satisfied price-wise - release the latch so
-           it cannot fire later out of context. *)
-        if reanchor_buy && (not reanchor_moves) && not qty_mismatch
+        (* Nothing warranted (no trail-up, no sell-zone violation): the
+           re-anchor is satisfied price-wise - release the latch so it cannot
+           fire later out of context. *)
+        if reanchor_buy && not reanchor_moves
         then state.force_buy_reanchor <- false;
-        if reanchor_moves || qty_mismatch
+        if reanchor_moves
         then (
-          (* A qty-only mismatch (the oracle re-derived the size from a
-             churning pool; the spacing is unchanged) corrects the QTY and
-             keeps the resting PRICE - the buy only ever trails up, exactly
-             like normal trailing. Only a target above the resting price (a
-             genuine trail-up) or a warranted downward correction moves the
-             price, and the min-move deadband still applies. This stops the
-             grid and the oracle from fighting over the resting buy every
-             pass (cancel+create churn on Alpaca). *)
           let effective_amend_price =
-            if down_reanchor
-            then exact_target
-            else if qty_mismatch && not reanchor_moves
-            then Float.max current_buy_price target_buy_price
-            else target_buy_price
+            if down_reanchor then exact_target else target_buy_price
           in
-          let effective_price_rounded = state.cached_round_price effective_amend_price in
           let effective_price_diff =
             state.cached_round_price
               (abs_float (effective_amend_price -. current_buy_price_rounded))
           in
-          let price_moves = effective_price_rounded <> current_buy_price_rounded in
           let allow =
-            if qty_mismatch
-            then (
-              let is_being_amended =
-                List.exists
-                  (fun (id, _, _, _) ->
-                     String.starts_with ~prefix:"pending_amend_" id
-                     && String.sub id 14 (String.length id - 14) = buy_order_id)
-                  state.pending_orders
-              in
-              let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
-              let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
-              (* A pure qty correction (price unchanged) is always worth
-                 sending; a qty correction that also trails the price up
-                 respects the min-move deadband like normal trailing. *)
-              (not is_being_amended)
-              && (not is_in_flight)
-              && (not is_on_cooldown)
-              && ((not price_moves) || effective_price_diff >= min_move_threshold))
-            else
-              amend_allowed
-                ~state
-                ~order_id:buy_order_id
-                ~target_price:effective_amend_price
-                ~current_price_rounded:current_buy_price_rounded
-                ~price_diff:effective_price_diff
-                ~min_move_threshold
+            amend_allowed
+              ~state
+              ~order_id:buy_order_id
+              ~target_price:effective_amend_price
+              ~current_price_rounded:current_buy_price_rounded
+              ~price_diff:effective_price_diff
+              ~min_move_threshold
           in
           if allow
           then (
@@ -928,20 +874,6 @@ let evaluate_buy_leg
               ignore (push_order ~now ~state order);
               state.last_buy_order_price <- Some effective_amend_price;
               state.force_buy_reanchor <- false;
-              if qty_mismatch
-              then
-                Logging.info_f
-                  ~section
-                  "Alpaca pending buy order %s qty (%.8f) differs from config (%.8f) - \
-                   amending to qty %.8f%s"
-                  buy_order_id
-                  pending_buy_qty_from_scan
-                  qty
-                  qty
-                  (if price_moves
-                   then
-                     Printf.sprintf " and trailing price up to %.4f" effective_amend_price
-                   else " (price unchanged)");
               ())
             else if not (Float.is_nan quote_balance)
             then
@@ -971,58 +903,29 @@ let evaluate_buy_leg
         let current_buy_price_rounded = state.cached_round_price current_buy_price in
         (* No resting sell on this symbol, so a downwards amendment has no
             warrant at all: the re-anchor contributes nothing beyond normal
-            trail-up and qty fixing (see the with-sell branch). A resting buy
-            already within one grid interval of the reference is left alone. *)
+            trail-up. A resting buy already within one grid interval of the
+            reference is left alone. *)
         let reanchor_buy = state.force_buy_reanchor in
         let trail_up = target_buy_price > current_buy_price in
         (* Nothing warranted: release the latch so the sizing counts as
             adopted without moving the book. *)
-        if reanchor_buy && (not trail_up) && not qty_mismatch
+        if reanchor_buy && not trail_up
         then state.force_buy_reanchor <- false;
-        if trail_up || qty_mismatch
+        if trail_up
         then (
-          (* A qty-only mismatch corrects the QTY and keeps the resting PRICE
-              (the buy only ever trails up, like normal trailing); only a
-              target above the resting price moves it, and the min-move
-              deadband still applies (see the with-sell branch). *)
-          let effective_amend_price =
-            if qty_mismatch && not trail_up
-            then Float.max current_buy_price target_buy_price
-            else target_buy_price
-          in
-          let effective_price_rounded = state.cached_round_price effective_amend_price in
+          let effective_amend_price = target_buy_price in
           let effective_price_diff =
             state.cached_round_price
               (abs_float (effective_amend_price -. current_buy_price_rounded))
           in
-          let price_moves = effective_price_rounded <> current_buy_price_rounded in
           let allow =
-            if qty_mismatch
-            then (
-              let is_being_amended =
-                List.exists
-                  (fun (id, _, _, _) ->
-                     String.starts_with ~prefix:"pending_amend_" id
-                     && String.sub id 14 (String.length id - 14) = buy_order_id)
-                  state.pending_orders
-              in
-              let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
-              let is_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_order_id in
-              (* A pure qty correction (price unchanged) is always worth
-                 sending; a qty correction that also trails the price up
-                 respects the min-move deadband like normal trailing. *)
-              (not is_being_amended)
-              && (not is_in_flight)
-              && (not is_on_cooldown)
-              && ((not price_moves) || effective_price_diff >= min_move_threshold))
-            else
-              amend_allowed
-                ~state
-                ~order_id:buy_order_id
-                ~target_price:effective_amend_price
-                ~current_price_rounded:current_buy_price_rounded
-                ~price_diff:effective_price_diff
-                ~min_move_threshold
+            amend_allowed
+              ~state
+              ~order_id:buy_order_id
+              ~target_price:effective_amend_price
+              ~current_price_rounded:current_buy_price_rounded
+              ~price_diff:effective_price_diff
+              ~min_move_threshold
           in
           if allow
           then (
@@ -1051,20 +954,6 @@ let evaluate_buy_leg
               ignore (push_order ~now ~state order);
               state.last_buy_order_price <- Some effective_amend_price;
               state.force_buy_reanchor <- false;
-              if qty_mismatch
-              then
-                Logging.info_f
-                  ~section
-                  "Alpaca pending buy order %s qty (%.8f) differs from config (%.8f) - \
-                   amending to qty %.8f%s"
-                  buy_order_id
-                  pending_buy_qty_from_scan
-                  qty
-                  qty
-                  (if price_moves
-                   then
-                     Printf.sprintf " and trailing price up to %.4f" effective_amend_price
-                   else " (price unchanged)");
               ())
             else if not (Float.is_nan quote_balance)
             then
@@ -1125,6 +1014,7 @@ let evaluate_sell_leg
       ~ask_price
       ~asset_balance
       ~buy_attempted
+      ~(oracle_halted : bool)
       ~ecfg
       ~locked_in_sells
   =
@@ -1209,6 +1099,23 @@ let evaluate_sell_leg
          state.last_sell_fill_price <- Some p)
       !pruned_missing);
   let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
+  (* Balance basis per venue: accumulation venues (Hyperliquid, Lighter,
+     IBKR, Kraken) report balances that ALREADY net out open-order holds -
+     Hyperliquid's store subtracts the hold at ingestion, and Kraken's
+     tradeable accessor derives holds from its executions feed on read - so
+     subtracting [locked_in_sells] again would double-count the resting-sell
+     hold and zero out real inventory. Non-accumulation venues (Alpaca cash)
+     report gross balances, so the hold is subtracted here. This MUST be the
+     same basis the sizing branch below uses ([available]), or the inventory
+     gate and the sizing disagree. *)
+  let is_accumulation_basis = ecfg.use_accumulation_sells in
+  let inventory_basis =
+    if Float.is_nan asset_balance
+    then 0.0
+    else if is_accumulation_basis
+    then asset_balance +. state.anticipated_base_credit -. state.reserved_base
+    else available_base
+  in
   (* Inventory gate for sell placement: available non-accrued inventory must
      cover the VENUE MINIMUM accepted order size. The venue minimum is the
      exchange's floor - entirely separate from the grid's configured order
@@ -1229,8 +1136,8 @@ let evaluate_sell_leg
   in
   let inventory_ok =
     if is_alpaca
-    then available_base *. base_ref_price >= state.cached_venue_min_notional -. 1e-9
-    else available_base >= state.cached_venue_min_qty -. 1e-9
+    then inventory_basis *. base_ref_price >= state.cached_venue_min_notional -. 1e-9
+    else inventory_basis >= state.cached_venue_min_qty -. 1e-9
   in
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells
@@ -1245,10 +1152,22 @@ let evaluate_sell_leg
           || (state.open_sell_orders = [] && Option.is_some state.last_buy_fill_price)))
     else false
   in
+  (* Oracle-inactive: buys are halted but the sell leg always runs (sells
+     need inventory, not quote). When the asset is first placed inactive,
+     check whether placeable inventory exists and attempt it - this is what
+     lets a startup with held base, or a cascading buy execution that
+     consumed all quote, resume trading as quickly as possible. An existing
+     resting sell does NOT suppress the check: free inventory ladders a
+     SECOND sell alongside it, and the sizing clamps to what is still
+     tradeable once that hold nets out of the balance. The block guards
+     below (NaN balance, cooldown, retry latch) keep this from spamming;
+     after placement the hold leaves the tradeable figure, so the next tick
+     naturally finds nothing left to sell. *)
+  let halt_inventory_check = oracle_halted && inventory_ok in
   let should_trigger_sell =
     if ecfg.remaintain_expired_sells
-    then missing_alpaca_sell_grid
-    else state.just_filled_buy || buy_attempted
+    then missing_alpaca_sell_grid || halt_inventory_check
+    else state.just_filled_buy || buy_attempted || halt_inventory_check
   in
   let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
   (* Hoisted outside the gated block so a placement-tick sell attempt that is
@@ -1270,7 +1189,6 @@ let evaluate_sell_leg
       | Some q when q > 0.0 -> q
       | _ -> venue_lot_qty state.grid_qty asset.exchange state
     in
-    let sell_mult = state.cached_sell_mult in
     (* Determine target price & qty for sell placement *)
     let target_sell_price_opt, target_sell_qty_override =
       if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
@@ -1333,25 +1251,14 @@ let evaluate_sell_leg
         then max raw_sell_price ask_price
         else raw_sell_price
     in
-    let sell_qty, _is_accumulation_sell, _required_profit =
+    (* Sell quantity: every filled buy owes exactly one 1:1 sell of what it
+       bought (the persisted replacement level restores its own qty). All
+       sizing beyond this is inventory clamping below - no profit gating, no
+       sell_mult sizing. *)
+    let sell_qty =
       match target_sell_qty_override with
-      | Some tq when ecfg.remaintain_expired_sells ->
-        let target_q =
-          if ecfg.sell_uses_mult
-          then Float.min tq (round_qty (qty *. sell_mult) asset.symbol asset.exchange)
-          else tq
-        in
-        target_q, false, 0.0
-      | _ ->
-        compute_sell_qty
-          ~ecfg
-          ~state
-          ~asset
-          ~qty
-          ~sell_price
-          ~sell_mult
-          ~symbol:asset.symbol
-          ~exchange:asset.exchange
+      | Some tq -> tq
+      | None -> qty
     in
     (* Non-accrued sellable inventory (the amount not accrued into
        reserved_base). On accumulation venues (Hyperliquid/Lighter/IBKR) the
@@ -1637,7 +1544,6 @@ let execute_strategy
              , locked_in_buys
              , locked_in_sells
              , closest_sell_order
-             , pending_buy_qty_from_scan
              , open_persisted_levels
              , missing_persisted_levels )
            =
@@ -1682,7 +1588,6 @@ let execute_strategy
                  ~has_recent_amend_buy
                  ~locked_in_buys
                  ~closest_sell_order_initial:closest_sell_order
-                 ~pending_buy_qty_from_scan
            in
            evaluate_sell_leg
              ~persisted_reconcile:(open_persisted_levels, missing_persisted_levels)
@@ -1693,6 +1598,7 @@ let execute_strategy
              ~ask_price
              ~asset_balance
              ~buy_attempted
+             ~oracle_halted
              ~ecfg
              ~locked_in_sells)))
 ;;

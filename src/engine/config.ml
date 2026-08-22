@@ -40,24 +40,11 @@ type gc_config =
   ; major_heap_increment : int
   }
 
-(** Risk-class member pool: member symbols plus an optional per-class blend
-    weight (kappa). *)
-type class_pool =
-  { members : string list
-  ; kappa : int option
-  }
-
 type config =
   { cycle_mod : int
   ; logging : logging_config
   ; gc : gc_config option
   ; trading : trading_config list
-  ; classes : (string * class_pool) list
-    (** Risk-class definitions (class name -> member pool) from the top-level
-        "classes" map; the class pools backing the kappa blend. The legacy
-        schema `"name": [syms]` parses with kappa = None; the extended schema
-        `"name": {"members": [syms], "kappa": N}` carries a per-class blend
-        weight. *)
   ; oracle : Dio_oracle.Oracle_runtime.runtime_config option
     (** Capital-oracle runtime knobs from the top-level "oracle" section;
         [None] means the engine runs the oracle's built-in defaults (see
@@ -82,7 +69,6 @@ let known_top_level_keys =
   ; "engine"
   ; "trading"
   ; "gc"
-  ; "classes"
   ; "oracle"
   ; "fng_check_threshold"
   ]
@@ -104,36 +90,12 @@ let known_gc_keys =
     runtime knobs). Every key is optional; absent keys fall back to
     Oracle_runtime.default_config. *)
 let known_oracle_keys =
-  [ "target_survival"
-  ; "fng_weight"
-  ; "range_weight"
-  ; "min_active_dsurv"
-  ; "qty_cap_mult"
-  ; "no_deep_history"
-  ; "weight_by_sessions"
-  ; "refresh_seconds"
-  ; "poll_seconds"
-  ; "horizons"
-  ; "max_capital"
-  ; "startup_wait_seconds"
-  ; "assets"
-  ]
+  [ "qty_cap_mult"; "target_survival"; "min_active_dsurv"; "refresh_seconds"; "assets" ]
 ;;
 
 (** Keys accepted inside each "oracle" -> "assets" entry (the per-asset
-    override layer): the sizing/blend/history knobs only. Cadence/machinery
-    knobs stay global. *)
-let known_oracle_asset_keys =
-  [ "target_survival"
-  ; "fng_weight"
-  ; "range_weight"
-  ; "min_active_dsurv"
-  ; "qty_cap_mult"
-  ; "no_deep_history"
-  ; "weight_by_sessions"
-  ; "horizons"
-  ]
-;;
+    override layer, keyed by symbol). *)
+let known_oracle_asset_keys = [ "target_survival"; "min_active_dsurv"; "qty_cap_mult" ]
 
 let known_trading_keys =
   [ "symbol"
@@ -276,37 +238,9 @@ let parse_accumulation_buffer json exchange symbol =
   | _ -> default
 ;;
 
-(** Parses the optional top-level "classes" object. Two schemas:
-    - legacy: class name -> [member symbols]
-    - extended: class name -> {"members": [...], "kappa": N (optional)}
-    Class pools for the capital-oracle kappa blend are read from here (no
-    hardcoded lists in code). Returns [] when the key is absent. *)
-let parse_classes json =
-  let open Yojson.Basic.Util in
-  match json |> member "classes" with
-  | `Assoc entries ->
-    List.map
-      (fun (name, value) ->
-         let pool =
-           match value with
-           | `List _ ->
-             (* Legacy schema: bare member symbol list, default kappa. *)
-             { members = value |> to_list |> List.map to_string; kappa = None }
-           | `Assoc _ ->
-             { members = value |> member "members" |> to_list |> List.map to_string
-             ; kappa = value |> member "kappa" |> to_int_option
-             }
-           | _ -> { members = []; kappa = None }
-         in
-         name, pool)
-      entries
-  | _ -> []
-;;
-
 (** Parses a single trading entry from the JSON "trading" array into a [trading_config].
-    Validates keys, enforces exchange-specific constraints (e.g. testnet/hedge/accumulation_buffer
-    are restricted to Hyperliquid), and restricts grid_interval to the Grid strategy. Exits on
-    schema violations. *)
+    Validates keys and enforces venue restrictions (testnet/hedge/data_feed are
+    venue-limited; accumulation_buffer is universal). Exits on schema violations. *)
 let parse_config json =
   if validate_keys ~context:"trading entry" ~allowed:known_trading_keys json then exit 1;
   let open Yojson.Basic.Util in
@@ -316,10 +250,13 @@ let parse_config json =
   in
   let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string exchange in
   (* Enforce that testnet and hedge are only valid for supported entries.
-     accumulation_buffer is valid for hyperliquid, ibkr, lighter, and alpaca. *)
+     accumulation_buffer is valid on EVERY venue: Kraken runs the same
+     persistence-layer reserved_base accrual as the other venues (see
+     jacobs_ladder_config.kraken_config), so its F&G-resolved reference
+     applies there too. *)
   (match exch_id with
-   | Hyperliquid | Ibkr | Lighter | Alpaca -> ()
-   | Kraken | Custom _ ->
+   | Hyperliquid | Ibkr | Lighter | Alpaca | Kraken -> ()
+   | Custom _ ->
      let restricted = [ "testnet"; "hedge"; "accumulation_buffer"; "data_feed" ] in
      let actual = json |> to_assoc |> List.map fst in
      let bad = List.filter (fun k -> List.mem k restricted) actual in
@@ -368,20 +305,9 @@ let parse_config json =
          symbol;
        exit 1));
   let strategy = json |> member "strategy" |> to_string in
-  (* Reject grid_interval when strategy is not Grid. *)
-  if strategy <> "Ladder"
-  then (
-    let actual = json |> to_assoc |> List.map fst in
-    if List.mem "grid_interval" actual
-    then (
-      Logging.critical_f
-        ~section
-        "Key 'grid_interval' is only valid for Grid strategy (found in %s/%s with \
-         strategy=%s)"
-        exchange
-        symbol
-        strategy;
-      exit 1));
+  (* grid_interval carries the hardened search bounds (gi_min, gi_max) the
+     oracle's parameter search walks; every oracle-driven strategy entry
+     provides them. *)
   let testnet =
     json |> member "testnet" |> to_bool_option |> Option.value ~default:false
   in
@@ -486,8 +412,8 @@ let parse_gc_config json : gc_config option =
 (** Parses the optional top-level "oracle" object into the capital-oracle
     runtime knobs. Returns [None] when the key is absent (the engine then uses
     Oracle_runtime.default_config). Exits on unknown sub-keys. Every value is
-    optional and falls back to the runtime defaults, so a minimal section like
-    {"qty_cap_mult": 0.0} is valid. *)
+    optional and falls back to the runtime defaults; "assets" entries are
+    keyed by symbol and override top-level defaults per field. *)
 let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
   let open Yojson.Basic.Util in
   match json |> member "oracle" with
@@ -495,65 +421,14 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
   | oracle_json ->
     if validate_keys ~context:"oracle" ~allowed:known_oracle_keys oracle_json then exit 1;
     let defaults = Dio_oracle.Oracle_runtime.default_config () in
+    let opt_float key default =
+      oracle_json |> member key |> to_float_option |> Option.value ~default
+    in
     Some
-      { target_survival =
-          oracle_json
-          |> member "target_survival"
-          |> to_float_option
-          |> Option.value ~default:defaults.target_survival
-      ; fng_weight =
-          oracle_json
-          |> member "fng_weight"
-          |> to_float_option
-          |> Option.value ~default:defaults.fng_weight
-      ; range_weight =
-          oracle_json
-          |> member "range_weight"
-          |> to_float_option
-          |> Option.value ~default:defaults.range_weight
-      ; min_active_dsurv =
-          oracle_json
-          |> member "min_active_dsurv"
-          |> to_float_option
-          |> Option.value ~default:defaults.min_active_dsurv
-      ; qty_cap_mult =
-          oracle_json
-          |> member "qty_cap_mult"
-          |> to_float_option
-          |> Option.value ~default:defaults.qty_cap_mult
-      ; no_deep_history =
-          oracle_json
-          |> member "no_deep_history"
-          |> to_bool_option
-          |> Option.value ~default:defaults.no_deep_history
-      ; weight_by_sessions =
-          oracle_json
-          |> member "weight_by_sessions"
-          |> to_bool_option
-          |> Option.value ~default:defaults.weight_by_sessions
-      ; refresh_seconds =
-          oracle_json
-          |> member "refresh_seconds"
-          |> to_float_option
-          |> Option.value ~default:defaults.refresh_seconds
-      ; poll_seconds =
-          oracle_json
-          |> member "poll_seconds"
-          |> to_float_option
-          |> Option.value ~default:defaults.poll_seconds
-      ; horizons =
-          (match oracle_json |> member "horizons" with
-           | `Null -> defaults.horizons
-           | horizons_json -> Some (horizons_json |> to_list |> List.map to_int))
-      ; max_capital =
-          (match oracle_json |> member "max_capital" with
-           | `Null -> defaults.max_capital
-           | v -> to_float_option v)
-      ; startup_wait_seconds =
-          oracle_json
-          |> member "startup_wait_seconds"
-          |> to_float_option
-          |> Option.value ~default:defaults.startup_wait_seconds
+      { target_survival = opt_float "target_survival" defaults.target_survival
+      ; min_active_dsurv = opt_float "min_active_dsurv" defaults.min_active_dsurv
+      ; qty_cap_mult = opt_float "qty_cap_mult" defaults.qty_cap_mult
+      ; refresh_seconds = opt_float "refresh_seconds" defaults.refresh_seconds
       ; assets =
           (match oracle_json |> member "assets" with
            | `Null -> defaults.assets
@@ -567,28 +442,16 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
                    ~allowed:known_oracle_asset_keys
                    entry
                then exit 1;
-               let opt key parse = entry |> member key |> parse in
+               let okey key = entry |> member key |> to_float_option in
                ( symbol
-               , ({ target_survival = opt "target_survival" to_float_option
-                  ; fng_weight = opt "fng_weight" to_float_option
-                  ; range_weight = opt "range_weight" to_float_option
-                  ; min_active_dsurv = opt "min_active_dsurv" to_float_option
-                  ; qty_cap_mult = opt "qty_cap_mult" to_float_option
-                  ; no_deep_history = opt "no_deep_history" to_bool_option
-                  ; weight_by_sessions = opt "weight_by_sessions" to_bool_option
-                  ; horizons =
-                      (match entry |> member "horizons" with
-                       | `Null -> None
-                       | horizons_json ->
-                         Some (horizons_json |> to_list |> List.map to_int))
+               , ({ target_survival = okey "target_survival"
+                  ; min_active_dsurv = okey "min_active_dsurv"
+                  ; qty_cap_mult = okey "qty_cap_mult"
                   }
                   : Dio_oracle.Oracle_runtime.asset_overrides) )))
       }
 ;;
 
-(** Reads config.json from the working directory and parses it into a [config] record.
-    Performs strict key validation at each nesting level, exiting on schema violations
-    or JSON parse errors. Falls back to defaults on filesystem errors. *)
 let read_config () : config =
   try
     let json = Yojson.Basic.from_file "config.json" in
@@ -606,7 +469,6 @@ let read_config () : config =
     let gc = parse_gc_config json in
     let oracle = parse_oracle_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
-    let classes = parse_classes json in
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_option |> Option.value ~default:1.5
     in
@@ -621,7 +483,6 @@ let read_config () : config =
     ; gc
     ; oracle
     ; trading
-    ; classes
     ; fng_check_threshold
     ; latency_window_seconds
     }
@@ -636,7 +497,6 @@ let read_config () : config =
     ; gc = None
     ; oracle = None
     ; trading = []
-    ; classes = []
     ; fng_check_threshold = 1.5
     ; latency_window_seconds = 5.0
     }

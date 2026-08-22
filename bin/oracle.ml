@@ -1,2432 +1,324 @@
-(* DIO Capital Oracle Report CLI.
+(* dio-oracle.exe - the configuration-tuning entrypoint.
 
-   dune exec dio-oracle -- BTC/USD --exchange kraken
-   dune exec dio-oracle -- AAPL --exchange alpaca --capital 5000 --target-survival 0.99
-   dune exec dio-oracle
+   Runs the exact oracle decision pipeline offline against the configured
+   assets and prints the decision surface: the four contract values
+   (active / grid_interval / buy_qty / sell_qty) plus internal diagnostics.
+   It never touches live balances: pools are synthetic, sized with --quote
+   per asset (and --base for sell sizing), so tuning is reproducible.
 
-   Values default from the config.json trading config (qty, grid_interval,
-   sell_mult, maker_fee, accumulation_buffer, data_feed); every value is
-   overridable from the CLI. With no SYMBOL, every asset in config.json's
-   "trading" list is analyzed on its own configured exchange. Offline mode via
-   --from-csv / --from-json loads a single asset series from a file instead of
-   the network and still requires a SYMBOL. Portfolio mode is enabled with
-   --portfolio or any topology/allocation option. *)
+   History comes from the same all-time merged pipeline as the live runtime
+   (venue bars + Yahoo deep history). With --cache-only no network is used:
+   only what the disk cache already holds. *)
 
-open Dio_oracle
+let usage =
+  {|dio-oracle [options]
 
-(* The strategy model this CLI runs: the grid ladder (the only model today).
-   The deployment engine and the generic sizing inversions are instantiated
-   over it, so the whole oracle pipeline is strategy-parameterized. *)
-module G = Oracle_strategy.Grid
-module D = Oracle_deploy.Engine (G)
-module S = Oracle_replay.Sizing (G)
-
-(* Force venue module initialization to trigger the top-level registration
-   side effects: the impl modules register BOTH the live-trading modules
-   (Exchange_intf.Registry) and the oracle data-venue adapters
-   (Exchange_intf.Oracle.Registry) - the same pattern as bin/main.ml, and the
-   reason this CLI (unlike the pure/offline test binaries) links the venue
-   libraries. Without it, OCaml's unit-level dead-code elimination would drop
-   the registrations and online mode would hit empty registries. *)
-let () = ignore Kraken.Kraken_module.Kraken_impl.name
-let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
-let () = ignore Alpaca.Module.Alpaca_impl.name
-let pct f = Printf.sprintf "%6.1f%%" (f *. 100.0)
-
-let string_contains haystack needle =
-  let hl = String.length haystack in
-  let nl = String.length needle in
-  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
-  nl > 0 && go 0
-;;
-
-let float_list_of_string s =
-  String.split_on_char ',' s |> List.map String.trim |> List.map float_of_string
-;;
-
-let int_list_of_string s =
-  String.split_on_char ',' s |> List.map String.trim |> List.map int_of_string
-;;
-
-let today_iso () =
-  let tm = Unix.localtime (Unix.time ()) in
-  Printf.sprintf
-    "%04d-%02d-%02d"
-    (tm.Unix.tm_year + 1900)
-    (tm.Unix.tm_mon + 1)
-    tm.Unix.tm_mday
+Options:
+  --symbol SYM    Analyze only SYM (default: every trading entry).
+  --quote FLOAT   Synthetic quote pool per asset (default 10000.0).
+  --base FLOAT    Synthetic base balance for sell sizing (default 0.0).
+  --cache-only    Use only disk-cached history; never touch the network.
+  --json          Emit machine-readable JSON instead of a table.
+  --help          This text.
+|}
 ;;
 
 type args =
-  { symbol : string
-  ; exchange : string
-  ; exchange_explicit : bool
-  ; capital : float option
-  ; portfolio : bool
-  ; topology : string option
-  ; total_capital : float option
-  ; split : string
-  ; allocations : string list
-  ; transfer_specs : string list
-  ; positions_file : string option
-  ; save_positions : string option
-  ; qty : float option
-  ; grid_interval : float option
-  ; fee : float option
-  ; sell_mult : float option
-  ; accumulation_buffer : float option
-  ; price_increment : float option
-  ; qty_increment : float option
-  ; qty_min : float option
-  ; min_notional : float option
-  ; data_feed : string option
-  ; start_price : float option
-  ; start_date : string option
-  ; end_date : string option
-  ; horizons : int list option
-  ; thresholds : float list option
-  ; percentiles : float list option
-  ; gap_tolerance : int option
-  ; vol_window : int option
-  ; class_name : string option
-  ; members : string list option
-  ; kappa : int
-  ; kappa_explicit : bool
-  ; (* None = not passed on the CLI; resolved per asset from config.json's
-       oracle section (per-asset override > global > built-in default) by
-       [run_one]. *)
-    target_survival : float option
-  ; fng : float option
-  ; fng_weight : float option
-  ; range_weight : float option
-  ; min_active_dsurv : float option
-  ; qty_cap_mult : float option
-  ; no_deep_history : bool option
-  ; weight_by_sessions : bool option
-  ; json : bool
-  ; from_csv : string option
-  ; from_json : string option
-  ; max_capital : float option
-  ; surface_gi_steps : int
-  ; surface_qty_points : int
-  ; surface_scan_points : int
+  { mutable symbol : string
+  ; mutable quote : float
+  ; mutable base : float
+  ; mutable cache_only : bool
+  ; mutable json : bool
   }
-
-let usage = "Usage: dio-oracle [SYMBOL] [options]"
 
 let parse_args () =
-  let symbol = ref "" in
-  let exchange = ref "kraken" in
-  let exchange_explicit = ref false in
-  let capital = ref None in
-  let portfolio = ref false in
-  let topology = ref None in
-  let total_capital = ref None in
-  let split = ref "equal" in
-  let allocations = ref [] in
-  let transfer_specs = ref [] in
-  let positions_file = ref None in
-  let save_positions = ref None in
-  let qty = ref None in
-  let grid_interval = ref None in
-  let fee = ref None in
-  let sell_mult = ref None in
-  let accumulation_buffer = ref None in
-  let price_increment = ref None in
-  let qty_increment = ref None in
-  let qty_min = ref None in
-  let min_notional = ref None in
-  let data_feed = ref "" in
-  let start_price = ref None in
-  let start_date = ref "" in
-  let end_date = ref "" in
-  let horizons = ref None in
-  let thresholds = ref None in
-  let percentiles = ref None in
-  let gap_tolerance = ref None in
-  let vol_window = ref None in
-  let class_name = ref "" in
-  let members = ref None in
-  let kappa = ref 200 in
-  let kappa_explicit = ref false in
-  let target_survival = ref None in
-  let fng = ref None in
-  let fng_weight = ref None in
-  let range_weight = ref None in
-  let min_active_dsurv = ref None in
-  let qty_cap_mult = ref None in
-  let no_deep_history = ref None in
-  let weight_by_sessions = ref None in
-  let json = ref false in
-  let from_csv = ref "" in
-  let from_json = ref "" in
-  let max_capital = ref None in
-  let surface_gi_steps = ref 10 in
-  let surface_qty_points = ref 8 in
-  let surface_scan_points = ref 24 in
-  let speclist =
-    Arg.align
-      [ ( "--exchange"
-        , Arg.Symbol
-            ( [ "kraken"; "alpaca"; "hyperliquid" ]
-            , fun s ->
-                exchange := s;
-                exchange_explicit := true )
-        , " kraken|alpaca|hyperliquid (default kraken; sets the calendar kind)" )
-      ; ( "--capital"
-        , Arg.Float (fun f -> capital := Some f)
-        , " venue-locked pool per venue account (override live balance; the engine \
-           allocates it down the config priority order)" )
-      ; ( "--portfolio"
-        , Arg.Set portfolio
-        , " run all requested assets as one shared portfolio (legacy mode)" )
-      ; ( "--topology"
-        , Arg.String
-            (fun path ->
-              topology := Some path;
-              portfolio := true)
-        , " portfolio topology JSON file" )
-      ; ( "--total-capital"
-        , Arg.Float (fun f -> total_capital := Some f)
-        , " total quote capital split equally per venue account (the engine allocates \
-           each venue pool down the config priority order)" )
-      ; ( "--split"
-        , Arg.Symbol
-            ( [ "equal"; "explicit" ]
-            , fun value ->
-                split := value;
-                portfolio := true )
-        , " portfolio fund split: equal or explicit allocations" )
-      ; ( "--allocation"
-        , Arg.String
-            (fun value ->
-              allocations := value :: !allocations;
-              portfolio := true)
-        , " repeat VENUE/SYMBOL=AMOUNT to fund a venue pool (summed per venue)" )
-      ; ( "--transfer"
-        , Arg.String
-            (fun value ->
-              transfer_specs := value :: !transfer_specs;
-              portfolio := true)
-        , " repeat SESSION:FROM->TO=AMOUNT for a manual portfolio transfer" )
-      ; ( "--positions-file"
-        , Arg.String
-            (fun path ->
-              positions_file := Some path;
-              portfolio := true)
-        , " load saved portfolio pool/base state" )
-      ; ( "--save-positions"
-        , Arg.String
-            (fun path ->
-              save_positions := Some path;
-              portfolio := true)
-        , " save final portfolio pool/base state" )
-      ; ( "--qty"
-        , Arg.Float (fun f -> qty := Some f)
-        , " order size (default from config.json)" )
-      ; ( "--gi"
-        , Arg.Float (fun f -> grid_interval := Some f)
-        , " grid interval %% (default max of config.json grid_interval)" )
-      ; ( "--fee"
-        , Arg.Float (fun f -> fee := Some f)
-        , " maker fee (default live exchange fee per asset; else config.json maker_fee)" )
-      ; ( "--sell-mult"
-        , Arg.Float (fun f -> sell_mult := Some f)
-        , " sell multiplier (default from config.json)" )
-      ; ( "--accumulation-buffer"
-        , Arg.Float (fun f -> accumulation_buffer := Some f)
-        , " quote accumulation buffer (default from config.json)" )
-      ; ( "--price-increment"
-        , Arg.Float (fun f -> price_increment := Some f)
-        , " price tick (default exchange registry / 0.01)" )
-      ; ( "--qty-increment"
-        , Arg.Float (fun f -> qty_increment := Some f)
-        , " lot size (default exchange registry / 0.01)" )
-      ; ( "--qty-min"
-        , Arg.Float (fun f -> qty_min := Some f)
-        , " venue minimum order quantity (default exchange registry / 0.0)" )
-      ; ( "--min-notional"
-        , Arg.Float (fun f -> min_notional := Some f)
-        , " venue minimum order notional in quote; hyperliquid defaults to 10.0 (USDC \
-           spot floor), others 0.0" )
-      ; ( "--data-feed"
-        , Arg.Set_string data_feed
-        , " alpaca feed iex|sip (default from config.json)" )
-      ; ( "--start-price"
-        , Arg.Float (fun f -> start_price := Some f)
-        , " grid start price (default last close)" )
-      ; ( "--start"
-        , Arg.Set_string start_date
-        , " start date YYYY-MM-DD for alpaca (default 2010-01-01)" )
-      ; ( "--end"
-        , Arg.Set_string end_date
-        , " end date YYYY-MM-DD for alpaca (default today)" )
-      ; ( "--horizons"
-        , Arg.String (fun s -> horizons := Some (int_list_of_string s))
-        , " comma horizon list in sessions (default 30,90,180,365 crypto / 21,63,126,252 \
-           equity)" )
-      ; ( "--thresholds"
-        , Arg.String (fun s -> thresholds := Some (float_list_of_string s))
-        , " comma drawdown thresholds in %% (default 5,10,20,30,40,50)" )
-      ; ( "--percentiles"
-        , Arg.String (fun s -> percentiles := Some (float_list_of_string s))
-        , " comma percentiles (default 50,75,90,95,99)" )
-      ; ( "--gap-tolerance"
-        , Arg.Int (fun i -> gap_tolerance := Some i)
-        , " max allowed missing sessions before refusing to analyze (default 5)" )
-      ; ( "--vol-window"
-        , Arg.Int (fun i -> vol_window := Some i)
-        , " rolling vol window for warmup (default 60)" )
-      ; ( "--class"
-        , Arg.Set_string class_name
-        , " risk class name (default from config.json asset_class)" )
-      ; ( "--members"
-        , Arg.String
-            (fun s ->
-              members := Some (String.split_on_char ',' s |> List.map String.trim))
-        , " comma member symbols for the class pool" )
-      ; ( "--kappa"
-        , Arg.Int
-            (fun i ->
-              kappa := i;
-              kappa_explicit := true)
-        , " class weight in the blend (default 200; a config.json per-class kappa wins \
-           unless this is passed)" )
-      ; ( "--target-survival"
-        , Arg.Float (fun f -> target_survival := Some f)
-        , " target blended survival for sizing (default from config.json oracle section, \
-           per-asset override first; else 0.99)" )
-      ; ( "--fng"
-        , Arg.Float (fun f -> fng := Some f)
-        , " Fear & Greed override (0-100); default fetches the live index (crypto only; \
-           equities use the survival model alone)" )
-      ; ( "--fng-weight"
-        , Arg.Float (fun f -> fng_weight := Some f)
-        , " kept for config compatibility; INERT in sizing (the grid interval and qty \
-           are survival-driven over the config ranges - no sentiment blend; default from \
-           config.json oracle section, else 0.5)" )
-      ; ( "--range-weight"
-        , Arg.Float (fun f -> range_weight := Some f)
-        , " kept for config compatibility; INERT in sizing (see --fng-weight)" )
-      ; ( "--min-active-dsurv"
-        , Arg.Float (fun f -> min_active_dsurv := Some f)
-        , " assets whose replayed D_surv stays below this are recommended inactive and \
-           their capital passes down (default from config.json oracle section, else 0.0 \
-           = fundable means active)" )
-      ; ( "--qty-cap-mult"
-        , Arg.Float (fun f -> qty_cap_mult := Some f)
-        , " the qty ceiling as a multiple of the config qty (default from config.json \
-           oracle section, per-asset override first; else 0.0 = the qty never grows \
-           beyond the minimum): the order qty only grows - to deploy residual capital - \
-           while 100% replay survival holds, capped at config qty * mult" )
-      ; ( "--no-deep-history"
-        , Arg.Unit (fun () -> no_deep_history := Some true)
-        , " disable the Yahoo deep-history extension (venue-feed bars only; the venue \
-           API caps some feeds at ~2 years; default from config.json oracle section, \
-           else false)" )
-      ; ( "--no-weight-by-sessions"
-        , Arg.Unit (fun () -> weight_by_sessions := Some false)
-        , " equal-weight each class member instead of by session count (default from \
-           config.json oracle section, else true)" )
-      ; ( "--max-capital"
-        , Arg.Float (fun f -> max_capital := Some f)
-        , " upper bound of the capital binary search (default 1e9)" )
-      ; ( "--surface-gi-steps"
-        , Arg.Int (fun i -> surface_gi_steps := i)
-        , " cash requirement surface: points along the config grid_interval range \
-           (default 10, corners included)" )
-      ; ( "--surface-qty-points"
-        , Arg.Int (fun i -> surface_qty_points := i)
-        , " cash requirement surface: points between the venue qty floor and config qty \
-           x qty_cap_mult, lot-rounded (default 8)" )
-      ; ( "--surface-scan-points"
-        , Arg.Int (fun i -> surface_scan_points := i)
-        , " cash requirement surface: empirical replay scan resolution per cell (default \
-           24; raise for tighter replay-verified boundaries)" )
-      ; "--json", Arg.Set json, " emit JSON report"
-      ; ( "--from-csv"
-        , Arg.Set_string from_csv
-        , " load the asset series from a CSV file (offline)" )
-      ; ( "--from-json"
-        , Arg.Set_string from_json
-        , " load the asset series from a JSON file (offline)" )
-      ]
+  let a =
+    { symbol = ""; quote = 10_000.0; base = 0.0; cache_only = false; json = false }
   in
-  Arg.parse speclist (fun s -> symbol := s) usage;
-  { symbol = !symbol
-  ; exchange = !exchange
-  ; exchange_explicit = !exchange_explicit
-  ; capital = !capital
-  ; portfolio = !portfolio
-  ; topology = !topology
-  ; total_capital = !total_capital
-  ; split = !split
-  ; allocations = List.rev !allocations
-  ; transfer_specs = List.rev !transfer_specs
-  ; positions_file = !positions_file
-  ; save_positions = !save_positions
-  ; qty = !qty
-  ; grid_interval = !grid_interval
-  ; fee = !fee
-  ; sell_mult = !sell_mult
-  ; accumulation_buffer = !accumulation_buffer
-  ; price_increment = !price_increment
-  ; qty_increment = !qty_increment
-  ; qty_min = !qty_min
-  ; min_notional = !min_notional
-  ; data_feed = (if !data_feed = "" then None else Some !data_feed)
-  ; start_price = !start_price
-  ; start_date = (if !start_date = "" then None else Some !start_date)
-  ; end_date = (if !end_date = "" then None else Some !end_date)
-  ; horizons = !horizons
-  ; thresholds = !thresholds
-  ; percentiles = !percentiles
-  ; gap_tolerance = !gap_tolerance
-  ; vol_window = !vol_window
-  ; class_name = (if !class_name = "" then None else Some !class_name)
-  ; members = !members
-  ; kappa = !kappa
-  ; kappa_explicit = !kappa_explicit
-  ; target_survival = !target_survival
-  ; fng = !fng
-  ; fng_weight = !fng_weight
-  ; range_weight = !range_weight
-  ; min_active_dsurv = !min_active_dsurv
-  ; qty_cap_mult = !qty_cap_mult
-  ; no_deep_history = !no_deep_history
-  ; weight_by_sessions = !weight_by_sessions
-  ; json = !json
-  ; from_csv = (if !from_csv = "" then None else Some !from_csv)
-  ; from_json = (if !from_json = "" then None else Some !from_json)
-  ; max_capital = !max_capital
-  ; surface_gi_steps = !surface_gi_steps
-  ; surface_qty_points = !surface_qty_points
-  ; surface_scan_points = !surface_scan_points
-  }
-;;
-
-(** Fetch one symbol's daily series through the shared registry-driven
-    pipeline (Oracle_fetch: venue adapter dispatch, disk cache, clean-series
-    normalization). An explicit --start-date bypasses the cache so the
-    requested window is fetched exactly. *)
-let fetch_series_for (a : args) ~(exchange : string) (symbol : string)
-  : Oracle_types.series Lwt.t
-  =
-  let offline =
-    Option.is_some a.from_csv
-    || Option.is_some a.from_json
-    || (exchange = "alpaca" && Option.is_some a.start_date)
+  let rec go = function
+    | [] -> ()
+    | "--help" :: _ | "-h" :: _ ->
+      print_endline usage;
+      exit 0
+    | "--symbol" :: v :: r ->
+      a.symbol <- v;
+      go r
+    | "--quote" :: v :: r ->
+      a.quote <- Float.of_string v;
+      go r
+    | "--base" :: v :: r ->
+      a.base <- Float.of_string v;
+      go r
+    | "--cache-only" :: r ->
+      a.cache_only <- true;
+      go r
+    | "--json" :: r ->
+      a.json <- true;
+      go r
+    | bad :: _ ->
+      Printf.eprintf "unknown argument: %s\n%s\n" bad usage;
+      exit 2
   in
-  Dio_oracle.Oracle_fetch.fetch_series_for
-    ~offline
-    ~exchange
-    ~symbol
-    ?feed:a.data_feed
-    ?start_date:a.start_date
-    ?end_date:a.end_date
-    ()
+  go (Array.to_list Sys.argv |> List.tl);
+  a
 ;;
 
-let fetch_series (a : args) (symbol : string) : Oracle_types.series Lwt.t =
-  fetch_series_for a ~exchange:a.exchange symbol
-;;
-
-(** Extend a venue series backward with the Yahoo deep history for the same
-    underlying asset (venue bars win on overlap; nothing is synthesized).
-    The deep history is disk-cached and delta-fetched like the venue series,
-    so repeated CLI runs only pull the days they do not have yet. Returns
-    the deepened series and the number of deep bars added. *)
-let deepen_series (a : args) (series : Oracle_types.series)
-  : (Oracle_types.series * int) Lwt.t
+(** Per-asset effective knobs: the engine config's "oracle" section with its
+    assets overrides keyed by symbol (same resolution as the live runtime). *)
+let knobs_for ~(config : Dio_engine.Config.config option) ~(symbol : string)
+  : float * float * float
   =
-  let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
-  Dio_oracle.Oracle_fetch.deepen_series
-    ~no_deep_history:(Option.value a.no_deep_history ~default:false)
-    ~offline
-    series
-;;
-
-(** Load the class member pool: explicit --members when online, config.json
-    "classes" members for the resolved class when online, otherwise the asset
-    alone (offline mode). Delegates to the shared pipeline (Oracle_fetch:
-    the member that IS the active asset uses the exchange; every other
-    member gathers its history PURELY from Yahoo - whitelisted, disk-cached,
-    delta through today). *)
-let load_members
-      (a : args)
-      (classes : (string * Dio_engine.Config.class_pool) list)
-      ~(class_name : string)
-      (asset : Oracle_types.series)
-  : Oracle_types.series list Lwt.t
-  =
-  let pool_members =
-    match List.assoc_opt class_name classes with
-    | Some pool when pool.members <> [] -> pool.members
-    | _ -> []
-  in
-  Dio_oracle.Oracle_fetch.load_members
-    ?explicit_members:a.members
-    ~no_deep_history:(Option.value a.no_deep_history ~default:false)
-    ~offline:(Option.is_some a.from_csv || Option.is_some a.from_json)
-    ~exchange:a.exchange
-    pool_members
-    ~class_name
-    asset
-    ~fetch_series:(fun symbol -> fetch_series a symbol)
-;;
-
-(** Per-run Fear & Greed: an explicit --fng wins; otherwise fetch the live
-    index (blocking, cached). [None] when no live reading was ever fetched
-    (missing key, timeout, HTTP error): the F&G cache holds genuinely fetched
-    values only, so a failed fetch is distinguishable from a neutral reading
-    and the deployment blends pure survival instead of a fabricated sentiment
-    value. Offline runs get None (the caller decides per calendar kind whether
-    F&G applies at all). *)
-let resolve_fng (a : args) =
-  match a.fng with
-  | Some f -> Some f
+  match config with
   | None ->
-    if Option.is_some a.from_csv || Option.is_some a.from_json
-    then None
-    else (
-      try
-        let _ = Cmc.Fear_and_greed.fetch_and_cache_sync () in
-        Cmc.Fear_and_greed.get_cached ()
-      with
-      | _ -> None)
+    let d = Dio_oracle.Oracle_runtime.default_config () in
+    d.target_survival, d.min_active_dsurv, d.qty_cap_mult
+  | Some c ->
+    let d =
+      match c.oracle with
+      | Some o -> o
+      | None -> Dio_oracle.Oracle_runtime.default_config ()
+    in
+    let ov =
+      match c.oracle with
+      | Some o ->
+        Option.map snd (List.find_opt (fun (s, _) -> String.equal s symbol) o.assets)
+      | None -> None
+    in
+    let get get_ov default = Option.value (Option.bind ov get_ov) ~default in
+    ( get (fun o -> o.target_survival) d.target_survival
+    , get (fun o -> o.min_active_dsurv) d.min_active_dsurv
+    , get (fun o -> o.qty_cap_mult) d.qty_cap_mult )
 ;;
 
-(** Venue account identity: venue + quote + testnet (capital is locked per
-    account; all of the account's assets draw from one pool). *)
-let account_of_task (task : Oracle_tasks.task) =
-  Oracle_topology.key
-    ~venue:task.exchange
-    ~symbol:task.symbol
-    ~testnet:task.config.testnet
-    ()
-;;
-
-let same_account
-      (left : Oracle_topology.instrument_key)
-      (right : Oracle_topology.instrument_key)
-  =
-  left.venue = right.venue && left.testnet = right.testnet && left.quote = right.quote
-;;
-
-let account_id (account : Oracle_topology.instrument_key) =
-  Printf.sprintf
-    "%s/%s%s"
-    account.venue
-    account.quote
-    (if account.testnet then "@testnet" else "")
-;;
-
-(** Tasks grouped by venue account, preserving config.json order (priority
-    order within each account). *)
-let group_by_account (tasks : Oracle_tasks.task list) =
-  let accounts = ref [] in
-  List.iter
-    (fun task ->
-       let account = account_of_task task in
-       if not (List.exists (fun a -> same_account a account) !accounts)
-       then accounts := account :: !accounts)
-    tasks;
-  let accounts = List.rev !accounts in
-  List.map
-    (fun account ->
-       ( account
-       , List.filter (fun task -> same_account account (account_of_task task)) tasks ))
-    accounts
-;;
-
-(** Venue-locked pools per account, mirroring the portfolio capital rules:
-    an explicit --capital is the pool for every account; --total-capital
-    splits equally per account; offline defaults to 1000 per account; online
-    with neither fetches each account's live available quote balance. *)
-let venue_pools (a : args) ~(offline : bool) (tasks : Oracle_tasks.task list)
-  : (Oracle_topology.instrument_key * float) list
-  =
-  let accounts = List.map fst (group_by_account tasks) in
-  let pool_for (account : Oracle_topology.instrument_key) =
-    match a.capital with
-    | Some capital -> capital
-    | None ->
-      (match a.total_capital with
-       | Some total ->
-         if accounts = [] then 0.0 else total /. float_of_int (List.length accounts)
-       | None when offline -> 1000.0
-       | None ->
-         let task =
-           match
-             List.find_opt
-               (fun (task : Oracle_tasks.task) ->
-                  same_account account (account_of_task task))
-               tasks
-           with
-           | Some task -> task
-           | None -> failwith "oracle: no task on venue account"
-         in
-         (match Lwt_main.run (Oracle_balances.fetch_task task) with
-          | Ok snapshot ->
-            let balance = Oracle_balances.available_quote snapshot ~quote:account.quote in
-            if balance < 0.0 then 0.0 else balance
-          | Error error ->
-            failwith
-              (Printf.sprintf
-                 "oracle: balance fetch failed for %s: %s"
-                 (account_id account)
-                 error)))
-  in
-  List.map (fun account -> account, pool_for account) accounts
-;;
-
-(** Per-horizon supporting analysis for one asset: the horizon, the
-    historical path coverage, the static minimum capital, the maximum
-    quantity, and the empirical minimum capital. *)
-type coverage_row =
-  Oracle_types.horizon
-  * Oracle_types.historical_path_coverage
-  * Oracle_types.sizing_result
-  * Oracle_types.sizing_result
-  * Oracle_types.sizing_result
-
-let horizon_label_of (c_ : Oracle_types.historical_path_coverage) =
-  c_.Oracle_types.horizon.Oracle_types.label
-;;
-
-(** The cash requirement surface computed for one asset: per-horizon labels,
-    one row per (gi, qty) cell, and the wall time the sweep took. *)
-type cash_surface_data =
-  { labels : string list
-  ; rows : S.cash_cell list
-  ; elapsed_s : float
+type row =
+  { exchange : string
+  ; symbol : string
+  ; outcome : Dio_oracle.Oracle_pipeline.outcome option
+  ; error : string
   }
 
-(** Renders the cash requirement surface: at every swept (gi, qty)
-    configuration between the venue floors and the config ceilings, how much
-    capital clears the survival target on each horizon - closed-form static
-    plus the replay-verified empirical number. A fully-unreachable surface
-    collapses to a single explanatory line (every cell would print "-"). *)
-let cash_surface_block (a : args) ~(cs : cash_surface_data) (b : Buffer.t) =
-  let line fmt =
-    Printf.ksprintf
-      (fun s ->
-         Buffer.add_string b s;
-         Buffer.add_char b '\n')
-      fmt
-  in
-  let labels = cs.labels in
-  let rows = cs.rows in
-  let all_unreachable =
-    List.for_all
-      (fun (r : S.cash_cell) ->
-         Array.for_all (fun (x : Oracle_types.sizing_result) -> not x.reachable) r.static
-         && Array.for_all
-              (fun (x : Oracle_types.sizing_result) -> not x.reachable)
-              r.empirical)
+let analyze_one
+      ~(args : args)
+      ~(config : Dio_engine.Config.config option)
+      (tc : Dio_strategies.Strategy_common.trading_config)
+  : row Lwt.t
+  =
+  let open Lwt.Infix in
+  let offline = args.cache_only in
+  Lwt.catch
+    (fun () ->
+       Dio_oracle.Oracle_pipeline.history_of
+         ~offline
+         ~exchange:tc.exchange
+         ~symbol:tc.symbol
+       >>= fun series ->
+       let current =
+         match Dio_oracle.Oracle_pipeline.current_price_of_series series with
+         | Some c when c > 0.0 -> c
+         | _ -> 0.0
+       in
+       if current <= 0.0
+       then
+         Lwt.return
+           { exchange = tc.exchange
+           ; symbol = tc.symbol
+           ; outcome = None
+           ; error = "no usable close in history"
+           }
+       else (
+         let target_survival, min_active_dsurv, qty_cap_mult =
+           knobs_for ~config ~symbol:tc.symbol
+         in
+         let qty_raw =
+           try Float.of_string tc.qty with
+           | _ -> 0.0
+         in
+         let bounds =
+           { Dio_oracle.Oracle_core.qty = Float.max 1e-12 qty_raw
+           ; qty_cap_mult = Float.max 1.0 qty_cap_mult
+           ; gi_min = fst tc.grid_interval
+           ; gi_max = snd tc.grid_interval
+           }
+         in
+         let maker =
+           match tc.maker_fee with
+           | Some f -> f
+           | None -> fst (Dio_oracle.Oracle_fees.venue_default_fees tc.exchange tc.symbol)
+         in
+         let fees =
+           { Dio_oracle.Oracle_core.maker_fee = maker; fee_in_base_buy = false }
+         in
+         let inputs : Dio_oracle.Oracle_pipeline.inputs =
+           { exchange = tc.exchange
+           ; symbol = tc.symbol
+           ; bars = series.bars
+           ; current_price = current
+           ; available_quote = args.quote
+           ; sell_qty = 0.0
+           ; bounds
+           ; target_survival
+           ; min_active_dsurv
+           ; fees
+           }
+         in
+         match Dio_oracle.Oracle_pipeline.decide ~inputs with
+         | None ->
+           Lwt.return
+             { exchange = tc.exchange
+             ; symbol = tc.symbol
+             ; outcome = None
+             ; error = "no references"
+             }
+         | Some o ->
+           Lwt.return
+             { exchange = tc.exchange; symbol = tc.symbol; outcome = Some o; error = "" }))
+    (fun exn ->
+       Lwt.return
+         { exchange = tc.exchange
+         ; symbol = tc.symbol
+         ; outcome = None
+         ; error = Printexc.to_string exn
+         })
+;;
+
+let string_of_outcome (o : Dio_oracle.Oracle_pipeline.outcome) =
+  Printf.sprintf
+    "%-18s %-11s d_surv %.3f | floor %12.6g ath %12.6g atl %12.6g mdd %5.1f%%"
+    (Dio_oracle.Oracle_runtime.string_of_regime o.runway.regime)
+    (Dio_oracle.Oracle_runtime.string_of_branch o.resolution.branch)
+    o.resolution.d_surv
+    o.runway.floor_price
+    o.refs.ath
+    o.refs.atl
+    (o.refs.max_drawdown_pct *. 100.0)
+;;
+
+let sell_qty_of_args (args : args) =
+  Dio_oracle.Oracle_pools.sell_qty_of
+    ~base_balance:args.base
+    ~reserved_base:0.0
+    ~resting_sell_base:0.0
+;;
+
+let print_table rows args =
+  Printf.printf
+    "synthetic pools: quote %.2f base %.6g (per asset)\n\n"
+    args.quote
+    args.base;
+  Printf.printf
+    " %-14s %-14s %-7s %10s %12s %12s  %s\n"
+    "EXCHANGE"
+    "SYMBOL"
+    "ACTIVE"
+    "GI%"
+    "BUY_QTY"
+    "SELL_QTY"
+    "DIAGNOSTICS";
+  List.iter
+    (fun (r : row) ->
+       match r.outcome with
+       | None ->
+         Printf.printf
+           " %-14s %-14s %-7s %10s %12s %12s  ERROR: %s\n"
+           r.exchange
+           r.symbol
+           "-"
+           "-"
+           "-"
+           "-"
+           r.error
+       | Some o ->
+         let d = o.decision in
+         Printf.printf
+           " %-14s %-14s %-7s %10.4f %12.6g %12.6g  %s\n"
+           r.exchange
+           r.symbol
+           (if d.active then "yes" else "no")
+           d.grid_interval
+           d.buy_qty
+           (sell_qty_of_args args)
+           (string_of_outcome o))
+    rows
+;;
+
+let print_json rows args =
+  let rows_json =
+    List.map
+      (fun (r : row) ->
+         let common = [ "exchange", `String r.exchange; "symbol", `String r.symbol ] in
+         match r.outcome with
+         | None -> `Assoc (common @ [ "error", `String r.error ])
+         | Some o ->
+           let d = o.decision in
+           `Assoc
+             (common
+              @ [ "active", `Bool d.active
+                ; "grid_interval", `Float d.grid_interval
+                ; "buy_qty", `Float d.buy_qty
+                ; "sell_qty", `Float (sell_qty_of_args args)
+                ; "d_surv", `Float o.resolution.d_surv
+                ; "regime", `String (Dio_oracle.Oracle_runtime.string_of_regime o.runway.regime)
+                ; "branch", `String (Dio_oracle.Oracle_runtime.string_of_branch o.resolution.branch)
+                ; "floor_price", `Float o.runway.floor_price
+                ; "ath", `Float o.refs.ath
+                ; "atl", `Float o.refs.atl
+                ; "max_drawdown_pct", `Float o.refs.max_drawdown_pct
+                ]))
       rows
   in
-  line "";
-  if all_unreachable
-  then
-    line
-      "Cash requirement surface: no (gi, qty) within bounds clears the target survival \
-       %.1f%% on any horizon - see the warnings above (e.g. immature history)"
-      (Option.value a.target_survival ~default:0.99 *. 100.0)
-  else (
-    line
-      "Cash requirement surface (%d gi x %d qty cells; min capital clearing target \
-       survival %.1f%% on each horizon; emp = replay-verified; computed in %.1fs):"
-      a.surface_gi_steps
-      a.surface_qty_points
-      (Option.value a.target_survival ~default:0.99 *. 100.0)
-      cs.elapsed_s;
-    let money v =
-      if v >= 1e6
-      then Printf.sprintf "$%.2fM" (v /. 1e6)
-      else if v >= 1000.0
-      then Printf.sprintf "$%.1fk" (v /. 1e3)
-      else Printf.sprintf "$%.0f" v
-    in
-    let cell (r : Oracle_types.sizing_result) =
-      if r.reachable then money r.value else "-"
-    in
-    let group cells =
-      String.concat " " (List.map (fun c -> Printf.sprintf "%8s" c) cells)
-    in
-    line
-      "     gi       qty   %s   %s"
-      (group (labels @ [ "ALL" ]))
-      (group (List.map (fun l -> "emp" ^ l) labels @ [ "empALL" ]));
-    line
-      "  emp boundaries are scan-refined at --surface-scan-points %d resolution; \
-       adjacent-cell jumps >2x indicate replay boundary noise - recheck with a higher \
-       value"
-      a.surface_scan_points;
-    List.iter
-      (fun (r : S.cash_cell) ->
-         let n_h = List.length labels in
-         let stat = List.init n_h (fun j -> cell r.static.(j)) in
-         let emp = List.init n_h (fun j -> cell r.empirical.(j)) in
-         let all_stat =
-           match S.combined_sizing r.static with
-           | Some x -> cell x
-           | None -> "-"
-         in
-         let all_emp =
-           match S.combined_sizing r.empirical with
-           | Some x -> cell x
-           | None -> "-"
-         in
-         line
-           "  %6.2f%% %10s   %s   %s"
-           r.gi
-           (Printf.sprintf "%.6g" r.qty)
-           (group (stat @ [ all_stat ]))
-           (group (emp @ [ all_emp ])))
-      rows)
+  print_endline (Yojson.Basic.to_string (`List rows_json))
 ;;
 
-(** The engine's headline block for one asset: the recommended qty/gi, the
-    deployed capital, the reserve passed down, and the verification coverage. *)
-let deployment_block
-      (a : args)
-      ~(account : Oracle_topology.instrument_key)
-      ~(venue_pool : float)
-      ~(deployment : Oracle_types.asset_deployment)
-      ~(index : int)
-      ~(n_tasks : int)
-      ~(gi_lo : float)
-      ~(gi_hi : float)
-      (b : Buffer.t)
-  =
-  let line fmt =
-    Printf.ksprintf
-      (fun s ->
-         Buffer.add_string b s;
-         Buffer.add_char b '\n')
-      fmt
-  in
-  let d = deployment in
-  if index = 1
-  then (
-    line "=== DIO Capital Oracle ===";
-    line
-      "Venue: %s   Pool: %.2f %s%s"
-      (account_id account)
-      venue_pool
-      account.quote
-      (match d.Oracle_types.parameter_components.Oracle_types.fng with
-       | Some fng -> Printf.sprintf "   F&G: %.0f (display only)" fng
-       | None -> "   (equity: oracle model only)");
-    line "");
-  line "  [%d/%d] %s" index n_tasks a.symbol;
-  if not d.active
-  then (
-    line "    INACTIVE: %s" d.reason;
-    line "    capital passes to the next asset");
-  if d.active
-  then (
-    let pc = d.parameter_components in
-    line
-      "    ACTIVE   qty %.4f   gi %.2f%%   (%s | %s)"
-      d.qty
-      pc.resolved_parameter
-      d.gi_reason
-      d.qty_reason;
-    line
-      "    governing %s   d_gov %s   D_surv %s (replay)   min quote DD %s"
-      d.governing_horizon
-      (pct d.d_gov)
-      (pct d.d_surv)
-      (pct d.min_quote_drawdown);
-    (match d.sizing with
-     | Some r ->
-       line
-         "    sizing reference: drop %s%s (floor $%.2f, ATH-anchored; worst event %s)"
-         (pct r.d_cover)
-         (if r.at_floor || r.outlier
-          then " [floor overshoot]"
-          else (
-            match r.floor_ref with
-            | Some _ -> ""
-            | None -> " [raw]"))
-         (match r.floor_ref with
-          | Some f -> f
-          | None -> 0.0)
-         (match d.p2v with
-          | Some p ->
-            Printf.sprintf
-              "%s (%s -> %s)%s"
-              (pct p.max_drawdown)
-              p.peak_date
-              p.valley_date
-              (if p.recovered then "" else " [not recovered]")
-          | None -> "none")
-     | None ->
-       line "    sizing reference: raw event drawdown (immature history or no drawdown)");
-    (match d.p2v with
-     | None -> line "    max drawdown (peak-to-valley): none (no drawdown in the history)"
-     | Some p ->
-       line
-         "    max drawdown (peak-to-valley): %s (peak %.2f on %s -> valley %.2f on %s)"
-         (pct p.max_drawdown)
-         p.peak
-         p.peak_date
-         p.valley
-         p.valley_date);
-    (match d.range with
-     | None -> ()
-     | Some r ->
-       line
-         "    range: ATH %.2f, low %.2f, price %.2f   d_from_ath %s   d_to_low %s   span \
-          %s   (context only)"
-         r.ath
-         r.all_time_low
-         r.price
-         (pct r.d_from_ath)
-         (pct r.d_to_low)
-         (pct r.range_span));
-    let reserve =
-      if d.remainder +. 1e-9 > 0.0
-      then Printf.sprintf "   reserve %.2f (passes to the next asset)" d.remainder
-      else ""
-    in
-    line "    deployed %.2f / share %.2f%s" d.deployed d.pool_share reserve;
-    let cov =
-      List.map
-        (fun (c : Oracle_types.deployment_coverage) ->
-           Printf.sprintf "%s %s" c.horizon_label (pct c.blended_coverage))
-        d.coverage
-      |> String.concat "  "
-    in
-    line "    coverage: %s" cov;
-    line
-      "    config: \"qty\": \"%s\"   \"grid_interval\": [%.2f, %.2f]"
-      (if d.qty = 0.0 then "0.0" else Printf.sprintf "%.6g" d.qty)
-      gi_lo
-      gi_hi);
-  line
-    "    knobs (effective): target_survival %.2f   qty_cap_mult %.2f   min_active_dsurv \
-     %.2f   weight_by_sessions %b   no_deep_history %b"
-    (Option.value a.target_survival ~default:0.99)
-    (Option.value a.qty_cap_mult ~default:0.0)
-    (Option.value a.min_active_dsurv ~default:0.0)
-    (Option.value a.weight_by_sessions ~default:true)
-    (Option.value a.no_deep_history ~default:false);
-  List.iter (fun (w : string) -> line "    warning: %s" w) d.warnings
-;;
+(* Force the venue adapter modules to link: each registers its oracle
+   adapter into Exchange_intf.ln as a side effect, and the fetch pipeline
+   dispatches purely through that registry. *)
+let () = ignore Kraken.Kraken_module.Kraken_impl.name
+let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
+let () = ignore Alpaca.Module.Alpaca_impl.name
 
-(** The gi tuning surface for one asset: each candidate interval's deployment
-    and whether it clears the target on the replayed path. *)
-let tuning_block ~(deployment : Oracle_types.asset_deployment) (b : Buffer.t) =
-  let line fmt =
-    Printf.ksprintf
-      (fun s ->
-         Buffer.add_string b s;
-         Buffer.add_char b '\n')
-      fmt
-  in
-  let d = deployment in
-  line "  Tuning surface (gi scan at the minimum order size; the 100%% survival target):";
-  line
-    "    %-7s %11s %12s %11s %11s %8s %9s"
-    "gi"
-    "qty"
-    "deployed"
-    "D_surv(s)"
-    "D_surv(r)"
-    "cov"
-    "profit";
-  List.iter
-    (fun (r : Oracle_types.deployment_row) ->
-       let cov =
-         List.fold_left
-           (fun acc (c : Oracle_types.deployment_coverage) ->
-              Float.min acc c.blended_coverage)
-           1.0
-           r.coverage
-       in
-       line
-         "    %-7s %11.5f %12.2f %11s %11s %8s %9.5f"
-         (Printf.sprintf "%.2f%%" r.parameter)
-         r.qty
-         r.deployed
-         (pct r.d_surv_static)
-         (pct r.d_surv_replay)
-         (if r.coverage = [] then "-" else pct cov)
-         r.profit_proxy)
-    d.tuning_rows;
-  line ""
-;;
-
-(** Human-readable report: the deployment headline (engine decision) followed
-    by the supporting per-asset analysis (MFD tables, replay, inverse
-    sizing). [replay_out]/[coverages] are the supporting replay data at the
-    deployment's sizing; absent when the asset is inactive. *)
-let report_text
-      (a : args)
-      ~(account : Oracle_topology.instrument_key)
-      ~(venue_pool : float)
-      ~(deployment : Oracle_types.asset_deployment)
-      ~(index : int)
-      ~(n_tasks : int)
-      ~(gi_lo : float)
-      ~(gi_hi : float)
-      ~(deep_bars : int)
-      ~(cash_surface : cash_surface_data option)
-      (grid : Dio_strategies.Grid_core.config)
-      (members : Oracle_types.series list)
-      (class_name : string)
-      (r : Oracle.result)
-      (replay_out : G.outcome option)
-      (coverages : coverage_row list)
-  =
-  let b = Buffer.create 4096 in
-  let line fmt =
-    Printf.ksprintf
-      (fun s ->
-         Buffer.add_string b s;
-         Buffer.add_char b '\n')
-      fmt
-  in
-  deployment_block a ~account ~venue_pool ~deployment ~index ~n_tasks ~gi_lo ~gi_hi b;
-  if deployment.Oracle_types.active then tuning_block ~deployment b;
-  line "Supporting analysis (asset-level):";
-  line
-    "Symbol: %s   Exchange: %s   Class: %s (%d members, kappa %d)"
-    a.symbol
-    a.exchange
-    class_name
-    (List.length members)
-    a.kappa;
-  line
-    "Bars: %d  (%s .. %s)   max gap: %d (tolerance %d)%s"
-    r.n_sessions
-    r.first_date
-    r.last_date
-    r.max_gap
-    (Option.value a.gap_tolerance ~default:5)
-    (if deep_bars > 0
-     then
-       Printf.sprintf
-         "   (of which %d deep-history bars from Yahoo for %s)"
-         deep_bars
-         a.symbol
-     else "");
-  line "";
-  line "MFD percentile tables (%s of max drawdown at each percentile):" "%";
-  line
-    "  columns: asset = linear-interp percentile of the asset's own MFD windows; class = \
-     weighted pooled percentile of the class members; blended = inverted z-blend CDF";
-  line
-    "  sample sizes: n = asset overlapping starts; asset_eff = the asset's own \
-     non-overlapping windows; class_eff = the pooled class effective sample size";
-  let class_tbls =
-    match r.class_estimates with
-    | c_ :: _ -> c_.Oracle_types.percentile_tables
-    | [] -> []
-  in
-  let blended_tbls =
-    List.map (fun bt -> bt.Oracle_types.table) r.blended_percentile_tables
-  in
-  let n = List.length r.percentile_tables in
-  for i = 0 to n - 1 do
-    let at = List.nth r.percentile_tables i in
-    let ct = if i < List.length class_tbls then List.nth class_tbls i else at in
-    let bt = if i < List.length blended_tbls then List.nth blended_tbls i else at in
-    let rows3 =
-      List.map2 (fun cr (ar, br) -> ar, cr, br) ct.rows (List.combine at.rows bt.rows)
-    in
-    let row =
-      List.map
-        (fun ( (ar : Oracle_types.percentile_row)
-             , (cr : Oracle_types.percentile_row)
-             , (br : Oracle_types.percentile_row) ) ->
-           Printf.sprintf
-             "P%g %s/%s/%s"
-             ar.percentile
-             (pct ar.mfd)
-             (pct cr.mfd)
-             (pct br.mfd))
-        rows3
-      |> String.concat "   "
-    in
-    line
-      "  %-7s n=%d asset_eff=%d class_eff=%d   %s"
-      at.horizon_label
-      at.n_starts
-      at.n_eff
-      ct.n_eff
-      row
-  done;
-  (match replay_out with
-   | None -> ()
-   | Some replay_out ->
-     line "";
-     line
-       "Grid replay (qty %.4f  gi %.2f%%  capital %.2f  fee %.3f%%):"
-       grid.qty
-       grid.grid_interval_pct
-       grid.start_quote
-       (grid.maker_fee *. 100.0);
-     line "  gates: qty_min %.4f  min_notional %.2f quote" grid.qty_min grid.min_notional;
-     line
-       "  D_surv = %s (%s)"
-       (pct replay_out.d_surv)
-       (if replay_out.exhausted then "capital low hit" else "never exhausted");
-     (match replay_out.halt_cause with
-      | None -> ()
-      | Some `Capital ->
-        line
-          "  halt cause: quote capital exhausted - the grid could no longer fund the \
-           (dynamically sized) next buy order"
-      | Some `Not_placeable ->
-        line
-          "  halt cause: parameter sizing - the required buy quantity stays below \
-           qty_min even after dynamic up-sizing; more capital cannot fix this");
-     line
-       "  fills: %d buy / %d sell   min quote drawdown %s"
-       replay_out.buy_fills
-       replay_out.sell_fills
-       (pct replay_out.min_quote_drawdown);
-     line "";
-     line "Historical path coverage at D_surv:";
-     line "  %-7s %10s %10s %10s" "horizon" "asset" "class" "blended";
-     List.iter
-       (fun ((_h, c_, _cap, _q, _emp) : coverage_row) ->
-          line
-            "  %-7s %10s %10s %10s"
-            (horizon_label_of c_)
-            (pct c_.asset_coverage)
-            (pct c_.class_coverage)
-            (pct c_.blended_coverage))
-       coverages;
-     line "";
-     line
-       "Inverse sizing (target blended survival %.1f%%):"
-       (Option.value a.target_survival ~default:0.99 *. 100.0);
-     line
-       "  %-7s %14s %8s %8s   %10s %8s"
-       "horizon"
-       "min-capital"
-       "cov"
-       "d_surv"
-       "max-qty"
-       "cov";
-     List.iter
-       (fun ((_h, c_, cap, q, _emp) : coverage_row) ->
-          let cov_str reachable v =
-            let s = pct v in
-            if reachable then s else s ^ " *"
-          in
-          line
-            "  %-7s %14.2f %8s %8s   %10.4f %8s"
-            (horizon_label_of c_)
-            cap.value
-            (cov_str cap.reachable cap.coverage)
-            (pct cap.d_surv)
-            q.value
-            (cov_str q.reachable q.coverage))
-       coverages;
-     line "";
-     line
-       "Empirical min capital (advisory, from actual path replay; the static sizing \
-        above is the safe recommendation):";
-     line "  %-7s %14s %8s %8s %10s" "horizon" "empirical" "cov" "d_surv" "buffer x";
-     List.iter
-       (fun ((_h, c_, cap, _q, emp) : coverage_row) ->
-          let cov_str reachable v =
-            let s = pct v in
-            if reachable then s else s ^ " *"
-          in
-          let buffer =
-            if emp.reachable && emp.value > 0.0 then cap.value /. emp.value else 0.0
-          in
-          line
-            "  %-7s %14.2f %8s %8s %10.2f"
-            (horizon_label_of c_)
-            emp.value
-            (cov_str emp.reachable emp.coverage)
-            (pct emp.d_surv)
-            buffer)
-       coverages;
-     let any_unreachable =
-       List.exists
-         (fun ((_h, _c_, cap, q, emp) : coverage_row) ->
-            (not cap.reachable) || (not q.reachable) || not emp.reachable)
-         coverages
+let () =
+  Logging.init ();
+  let args = parse_args () in
+  let offline = args.cache_only in
+  Lwt_main.run
+    (let open Lwt.Infix in
+     Lwt.return (Dio_oracle.Oracle_fees.load_dotenv ())
+     >>= fun () ->
+     let config = Dio_engine.Config.read_config () in
+     let tcs =
+       if args.symbol = ""
+       then config.trading
+       else
+         List.filter
+           (fun (tc : Dio_strategies.Strategy_common.trading_config) ->
+              String.lowercase_ascii tc.symbol = String.lowercase_ascii args.symbol)
+           config.trading
      in
-     if any_unreachable
-     then
-       line
-         "  * target not reached: no parameter within the search bounds clears it (the \
-          required capital exceeds --max-capital, or the required qty is below \
-          --qty-increment)");
-  (match cash_surface with
-   | Some cs -> cash_surface_block a ~cs b
-   | None -> ());
-  Buffer.contents b
-;;
-
-(** JSON report. *)
-let report_json
-      (a : args)
-      ~(account : Oracle_topology.instrument_key)
-      ~(venue_pool : float)
-      ~(deployment : Oracle_types.asset_deployment)
-      ~(gi_lo : float)
-      ~(gi_hi : float)
-      ~(deep_bars : int)
-      ~(cash_surface : cash_surface_data option)
-      (grid : Dio_strategies.Grid_core.config)
-      (asset : Oracle_types.series)
-      (members : Oracle_types.series list)
-      (class_name : string)
-      (r : Oracle.result)
-      (replay_out : G.outcome option)
-      (coverages : coverage_row list)
-  : Yojson.Safe.t
-  =
-  let gap_j (g : Oracle_types.gap) =
-    `Assoc
-      [ "after", `String g.after
-      ; "before", `String g.before
-      ; "missing_days", `Int g.missing_days
-      ]
-  in
-  let percentile_rows (t : Oracle_types.percentile_table) =
-    `Assoc
-      (("n_starts", `Int t.n_starts)
-       :: ("n_eff", `Int t.n_eff)
-       :: List.map
-            (fun (row : Oracle_types.percentile_row) ->
-               Printf.sprintf "p%g" row.percentile, `Float row.mfd)
-            t.rows)
-  in
-  let asset_tbls = List.map percentile_rows r.percentile_tables in
-  let sizing_j ((_h, c_, cap, q, emp) : coverage_row) =
-    `Assoc
-      [ "horizon", `String (horizon_label_of c_)
-      ; "asset_coverage", `Float c_.asset_coverage
-      ; "class_coverage", `Float c_.class_coverage
-      ; "blended_coverage", `Float c_.blended_coverage
-      ; "min_capital", `Float cap.value
-      ; "min_capital_d_surv", `Float cap.d_surv
-      ; "min_capital_coverage", `Float cap.coverage
-      ; "min_capital_reachable", `Bool cap.reachable
-      ; "max_qty", `Float q.value
-      ; "max_qty_coverage", `Float q.coverage
-      ; "max_qty_reachable", `Bool q.reachable
-      ; "empirical_min_capital", `Float emp.value
-      ; "empirical_min_capital_d_surv", `Float emp.d_surv
-      ; "empirical_min_capital_coverage", `Float emp.coverage
-      ; "empirical_min_capital_reachable", `Bool emp.reachable
-      ; ( "empirical_capital_buffer_ratio"
-        , `Float
-            (if emp.reachable && emp.value > 0.0 then cap.value /. emp.value else 0.0) )
-      ]
-  in
-  let coverage_j (c : Oracle_types.deployment_coverage) =
-    c.horizon_label, `Float c.blended_coverage
-  in
-  let row_j (r : Oracle_types.deployment_row) =
-    `Assoc
-      [ "gi", `Float r.parameter
-      ; "qty", `Float r.qty
-      ; "deployed", `Float r.deployed
-      ; "d_surv_static", `Float r.d_surv_static
-      ; "d_surv_replay", `Float r.d_surv_replay
-      ; "min_quote_drawdown", `Float r.min_quote_drawdown
-      ; "passed", `Bool r.passed
-      ; "profit_proxy", `Float r.profit_proxy
-      ; "coverage", `Assoc (List.map coverage_j r.coverage)
-      ]
-  in
-  let d = deployment in
-  let pc = d.parameter_components in
-  let deployment_j =
-    `Assoc
-      [ "active", `Bool d.active
-      ; "reason", `String d.reason
-      ; "pool_share", `Float d.pool_share
-      ; "deployed", `Float d.deployed
-      ; "remainder", `Float d.remainder
-      ; "governing_horizon", `String d.governing_horizon
-      ; "d_gov", `Float d.d_gov
-      ; "qty", `Float d.qty
-      ; "gi", `Float d.parameter
-      ; "fng", Option.fold ~none:`Null ~some:(fun f -> `Float f) pc.fng
-      ; "gi_fng", Option.fold ~none:`Null ~some:(fun g -> `Float g) pc.fng_parameter
-      ; "gi_survival", `Float pc.survival_parameter
-      ; "gi_range", Option.fold ~none:`Null ~some:(fun g -> `Float g) pc.range_parameter
-      ; "gi_resolved", `Float pc.resolved_parameter
-      ; "fng_weight", `Float pc.fng_weight
-      ; "range_weight", `Float pc.range_weight
-      ; ( "range"
-        , match d.range with
-          | None -> `Null
-          | Some r ->
-            `Assoc
-              [ "ath", `Float r.ath
-              ; "all_time_low", `Float r.all_time_low
-              ; "price", `Float r.price
-              ; "d_from_ath", `Float r.d_from_ath
-              ; "d_to_low", `Float r.d_to_low
-              ; "range_span", `Float r.range_span
-              ] )
-      ; ( "max_drawdown_p2v"
-        , match d.p2v with
-          | None -> `Null
-          | Some p ->
-            `Assoc
-              [ "drawdown", `Float p.max_drawdown
-              ; "peak", `Float p.peak
-              ; "peak_date", `String p.peak_date
-              ; "valley", `Float p.valley
-              ; "valley_date", `String p.valley_date
-              ] )
-      ; "d_surv", `Float d.d_surv
-      ; "min_quote_drawdown", `Float d.min_quote_drawdown
-      ; "coverage", `Assoc (List.map coverage_j d.coverage)
-      ; "warnings", `List (List.map (fun w -> `String w) d.warnings)
-      ; "tuning", `List (List.map row_j d.tuning_rows)
-      ; ( "config"
-        , `Assoc
-            [ "qty", `String (if d.qty = 0.0 then "0.0" else Printf.sprintf "%.6g" d.qty)
-            ; "grid_interval", `List [ `Float gi_lo; `Float gi_hi ]
-            ] )
-      ]
-  in
-  let replay_j =
-    match replay_out with
-    | None -> `Null
-    | Some replay_out ->
-      `Assoc
-        [ "d_surv", `Float replay_out.d_surv
-        ; "exhausted", `Bool replay_out.exhausted
-        ; "grid_halted", `Bool (replay_out.halt_cause <> None)
-        ; ( "halt_cause"
-          , match replay_out.halt_cause with
-            | None -> `Null
-            | Some `Capital -> `String "capital"
-            | Some `Not_placeable -> `String "not_placeable" )
-        ; "min_quote_drawdown", `Float replay_out.min_quote_drawdown
-        ; "buy_fills", `Int replay_out.buy_fills
-        ; "sell_fills", `Int replay_out.sell_fills
-        ]
-  in
-  `Assoc
-    [ "symbol", `String a.symbol
-    ; "exchange", `String a.exchange
-    ; "venue", `String (account_id account)
-    ; "venue_pool", `Float venue_pool
-    ; "deployment", deployment_j
-    ; "n_bars", `Int r.n_sessions
-    ; ( "history"
-      , `Assoc
-          [ "deep_bars", `Int deep_bars
-          ; "deep_source", `String "yahoo"
-          ; "venue_bars", `Int (max 0 (r.n_sessions - deep_bars))
-          ] )
-    ; "first_date", `String r.first_date
-    ; "last_date", `String r.last_date
-    ; "max_gap", `Int r.max_gap
-    ; "gaps", `List (List.map gap_j r.gaps)
-    ; ( "class"
-      , `Assoc
-          [ "name", `String class_name
-          ; "kappa", `Int a.kappa
-          ; "member_count", `Int (List.length members)
-          ] )
-    ; ( "percentiles"
-      , `Assoc
-          (List.map2
-             (fun (t : Oracle_types.percentile_table) j -> t.horizon_label, j)
-             r.percentile_tables
-             asset_tbls) )
-    ; ( "grid"
-      , `Assoc
-          [ "qty", `Float grid.qty
-          ; "sell_mult", `Float grid.sell_mult
-          ; "grid_interval_pct", `Float grid.grid_interval_pct
-          ; "maker_fee", `Float grid.maker_fee
-          ; "accumulation_buffer", `Float grid.accumulation_buffer
-          ; "price_increment", `Float grid.price_increment
-          ; "qty_increment", `Float grid.qty_increment
-          ; "qty_min", `Float grid.qty_min
-          ; "min_notional", `Float grid.min_notional
-          ; "start_price", `Float grid.start_price
-          ; "start_quote", `Float grid.start_quote
-          ] )
-    ; "replay", replay_j
-    ; "sizing", `List (List.map sizing_j coverages)
-    ; ( "cash_surface"
-      , match cash_surface with
-        | None -> `Null
-        | Some cs ->
-          let sr (x : Oracle_types.sizing_result) =
-            `Assoc
-              [ "value", `Float x.value
-              ; "d_surv", `Float x.d_surv
-              ; "coverage", `Float x.coverage
-              ; "reachable", `Bool x.reachable
-              ]
-          in
-          let all_of arr =
-            match S.combined_sizing arr with
-            | Some x -> sr x
-            | None -> `Null
-          in
-          `Assoc
-            [ "horizons", `List (List.map (fun l -> `String l) cs.labels)
-            ; "elapsed_s", `Float cs.elapsed_s
-            ; ( "rows"
-              , `List
-                  (List.map
-                     (fun (r : S.cash_cell) ->
-                        `Assoc
-                          [ "gi", `Float r.gi
-                          ; "qty", `Float r.qty
-                          ; "static", `List (Array.to_list (Array.map sr r.static))
-                          ; "static_all", all_of r.static
-                          ; "empirical", `List (Array.to_list (Array.map sr r.empirical))
-                          ; "empirical_all", all_of r.empirical
-                          ])
-                     cs.rows) )
-            ] )
-    ; ( "last_close"
-      , `Float
-          (if Array.length asset.bars = 0
-           then 0.0
-           else asset.bars.(Array.length asset.bars - 1).close) )
-    ]
-;;
-
-(** Run the full per-asset pipeline: the deployment engine's decision against
-    the venue pool share (threading the remaining pool back to the caller),
-    then the supporting analysis at the deployment's sizing. In text mode
-    prints the report and returns [None]; in JSON mode returns the report
-    value without printing. Returns the pool remaining after this asset. *)
-let run_one
-      (a : args)
-      (classes : (string * Dio_engine.Config.class_pool) list)
-      (task : Oracle_tasks.task)
-      ~(base_rc : Dio_oracle.Oracle_runtime.runtime_config)
-      ~(pool : float)
-      ~(fng : float option)
-      ~(index : int)
-      ~(n_tasks : int)
-  : Yojson.Safe.t option * float
-  =
-  let a =
-    { a with symbol = task.Oracle_tasks.symbol; exchange = task.Oracle_tasks.exchange }
-  in
-  (* Effective oracle knobs follow the live engine's resolution
-     (Oracle_runtime.resolve_for): explicit CLI flag > config.json per-asset
-     override ("venue/symbol" > "symbol") > global oracle section > built-in
-     default. Resolved values are stored back as [Some] so every downstream
-     consumer sees them. *)
-  let rc = Dio_oracle.Oracle_runtime.resolve_for base_rc ~exchange:a.exchange a.symbol in
-  let a =
-    { a with
-      target_survival = Some (Option.value a.target_survival ~default:rc.target_survival)
-    ; fng_weight = Some (Option.value a.fng_weight ~default:rc.fng_weight)
-    ; range_weight = Some (Option.value a.range_weight ~default:rc.range_weight)
-    ; min_active_dsurv =
-        Some (Option.value a.min_active_dsurv ~default:rc.min_active_dsurv)
-    ; qty_cap_mult = Some (Option.value a.qty_cap_mult ~default:rc.qty_cap_mult)
-    ; no_deep_history = Some (Option.value a.no_deep_history ~default:rc.no_deep_history)
-    ; weight_by_sessions =
-        Some (Option.value a.weight_by_sessions ~default:rc.weight_by_sessions)
-    ; horizons =
-        (match a.horizons with
-         | Some _ -> a.horizons
-         | None -> rc.horizons)
-    ; max_capital =
-        (match a.max_capital with
-         | Some _ -> a.max_capital
-         | None -> rc.max_capital)
-    }
-  in
-  let target_survival = Option.value a.target_survival ~default:0.99 in
-  let fng_weight = Option.value a.fng_weight ~default:0.5 in
-  let range_weight = Option.value a.range_weight ~default:0.25 in
-  let min_active_dsurv = Option.value a.min_active_dsurv ~default:0.0 in
-  let qty_cap_mult = Option.value a.qty_cap_mult ~default:0.0 in
-  let account = account_of_task task in
-  let calendar_kind = Oracle_tasks.calendar_kind_of_exchange a.exchange in
-  let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
-  let tc = task.Oracle_tasks.config in
-  let class_name =
-    match a.class_name, tc.asset_class with
-    | Some cl, _ -> cl
-    | None, Some cl -> cl
-    | None, None ->
-      failwith
-        (Printf.sprintf
-           "oracle: no risk class for %s/%s: set \"asset_class\" in its config.json \
-            trading entry or pass --class"
-           task.Oracle_tasks.exchange
-           task.Oracle_tasks.symbol)
-  in
-  (* Effective kappa: explicit --kappa > per-class kappa in config.json >
-     the 200 default. *)
-  let kappa =
-    if a.kappa_explicit
-    then a.kappa
-    else (
-      match List.assoc_opt class_name classes with
-      | Some pool -> Option.value pool.kappa ~default:200
-      | None -> 200)
-  in
-  let a = { a with kappa } in
-  let tc = Lwt_main.run (Oracle_fees.enrich tc ~offline) in
-  let asset =
-    match a.from_csv, a.from_json with
-    | Some path, _ -> Oracle_loader.load_csv_file ~symbol:a.symbol ~calendar_kind ~path
-    | _, Some path -> Oracle_loader.load_json_file ~symbol:a.symbol ~calendar_kind ~path
-    | None, None -> Lwt_main.run (fetch_series a a.symbol)
-  in
-  let asset, deep_bars = Lwt_main.run (deepen_series a asset) in
-  let members =
-    if offline then [ asset ] else Lwt_main.run (load_members a classes ~class_name asset)
-  in
-  let start_price =
-    Option.value
-      a.start_price
-      ~default:
-        (if Array.length asset.bars = 0
-         then 0.0
-         else asset.bars.(Array.length asset.bars - 1).close)
-  in
-  (* The config's gi range drives the deployment (the engine picks within it);
-     an explicit --gi fixes the range to that single value. *)
-  let gi_lo, gi_hi =
-    match a.grid_interval with
-    | Some g -> g, g
-    | None -> tc.grid_interval
-  in
-  let grid_interval_pct = gi_hi in
-  let grid =
-    Grid_adapter.of_trading_config tc ~start_price ~start_quote:0.0 ~grid_interval_pct
-  in
-  let grid =
-    { grid with
-      qty = Option.value a.qty ~default:grid.qty
-    ; sell_mult = Option.value a.sell_mult ~default:grid.sell_mult
-    ; maker_fee = Option.value a.fee ~default:grid.maker_fee
-    ; accumulation_buffer =
-        Option.value a.accumulation_buffer ~default:grid.accumulation_buffer
-    ; price_increment = Option.value a.price_increment ~default:grid.price_increment
-    ; qty_increment = Option.value a.qty_increment ~default:grid.qty_increment
-    ; qty_min = Option.value a.qty_min ~default:grid.qty_min
-    ; min_notional = Option.value a.min_notional ~default:grid.min_notional
-    }
-  in
-  let equity_sessions =
-    (* Equity venues resolve their session calendar through the registry
-       (Oracle_fetch.fetch_calendar_model); crypto venues get None. *)
-    let start = Option.value a.start_date ~default:"2010-01-01" in
-    let end_date = Option.value a.end_date ~default:(today_iso ()) in
-    match
-      Lwt_main.run
-        (Dio_oracle.Oracle_fetch.fetch_calendar_model
-           ~exchange:a.exchange
-           ~start_date:start
-           ~end_date
-           ())
-    with
-    | Some (model, _) -> Some model
-    | None -> None
-  in
-  let horizons =
-    match a.horizons with
-    | Some ns ->
-      List.map
-        (fun n ->
-           { Oracle_types.label = Oracle_types.horizon_label calendar_kind n
-           ; sessions = n
-           ; calendar_days = Oracle_types.calendar_days_of_sessions calendar_kind n
-           })
-        ns
-    | None -> (Oracle.default_config ~calendar_kind).horizons
-  in
-  let thresholds_pct = Option.value a.thresholds ~default:Oracle.default_thresholds_pct in
-  let percentiles = Option.value a.percentiles ~default:Oracle.default_percentiles in
-  let vol_window = Option.value a.vol_window ~default:60 in
-  let gap_tolerance = Option.value a.gap_tolerance ~default:5 in
-  (* Adapt the warmup to the history and the longest horizon, and drop the
-     horizons the history cannot support, so a short asset analyzes on what
-     fits instead of hard-failing (each horizon needs warmup + horizon + 2
-     bars; the vol window must shrink when the history is short). *)
-  let n_bars = Array.length asset.bars in
-  let max_h =
-    List.fold_left (fun acc (h : Oracle_types.horizon) -> max acc h.sessions) 0 horizons
-  in
-  (* The blend needs a real trailing-vol window: with fewer than two returns
-     the std is identically zero and every start gets filtered as "flat". *)
-  let warmup = max 2 (min vol_window (n_bars - max_h - 2)) in
-  let horizons =
-    List.filter
-      (fun (h : Oracle_types.horizon) -> n_bars >= warmup + h.sessions + 2)
-      horizons
-  in
-  if horizons = []
-  then
-    failwith
-      (Printf.sprintf
-         "history too short for the requested horizon/warmup (each horizon needs warmup \
-          + horizon + 2 bars; pass --vol-window and --horizons to fit the available \
-          data, or remove the asset from config.json trading): %d bars available"
-         n_bars);
-  let cfg =
-    { Oracle.horizons
-    ; thresholds_pct
-    ; percentiles
-    ; vol_window = warmup
-    ; gap_tolerance
-    ; classes = [ { Oracle.name = class_name; kappa = a.kappa; members } ]
-    ; equity_sessions
-    ; weight_by_sessions = Option.value a.weight_by_sessions ~default:true
-    }
-  in
-  let r = Oracle.analyze asset cfg in
-  let model h =
-    Oracle_replay.blend_model_of
-      ~horizon:h
-      ~asset
-      ~class_members:members
-      ~kappa:a.kappa
-      ~warmup
-      ()
-  in
-  let models = List.map model horizons in
-  (* Cash requirement surface: a pool-independent sweep over (gi, qty)
-     between the venue floors and the config ceilings - at every swept
-     configuration, how much capital clears the survival target on each
-     horizon (static closed form + replay-verified empirical). Runs for
-     inactive assets too: it answers "what would funding this asset take",
-     which is exactly when the venue pool has already moved on. *)
-  let cash_surface =
-    let template = { grid with start_quote = 0.0 } in
-    let steps = max 1 a.surface_gi_steps in
-    let gis =
-      if steps = 1
-      then [ gi_hi ]
-      else
-        List.init steps (fun i ->
-          gi_lo +. ((gi_hi -. gi_lo) *. float_of_int i /. float_of_int (steps - 1)))
-    in
-    (* Venue order floor: the larger of the lot-rounded qty_min and the
-       smallest lot-aligned qty that clears the min notional. *)
-    let ceil_lot q =
-      if template.qty_increment > 0.0
-      then
-        Float.ceil ((q *. (1.0 /. template.qty_increment)) -. 1e-9)
-        /. (1.0 /. template.qty_increment)
-      else q
-    in
-    let q_floor =
-      if template.min_notional > 0.0 && template.start_price > 0.0
-      then
-        Float.max
-          template.qty_min
-          (ceil_lot (template.min_notional /. template.start_price))
-      else Float.max template.qty_min template.qty_increment
-    in
-    let q_floor = G.round_qty template q_floor in
-    (* Ceiling: the effective config qty grown by the resolved qty cap. *)
-    let q_hi =
-      G.round_qty
-        template
-        (if qty_cap_mult > 0.0 then template.qty *. qty_cap_mult else template.qty)
-    in
-    let q_hi = Float.max q_floor q_hi in
-    let qn = max 1 a.surface_qty_points in
-    let qtys =
-      if qn = 1 || q_hi <= q_floor
-      then [ q_hi ]
-      else (
-        let raw =
-          List.init qn (fun i ->
-            q_floor *. ((q_hi /. q_floor) ** (float_of_int i /. float_of_int (qn - 1))))
-        in
-        List.sort_uniq
-          compare
-          (List.map (fun q -> G.round_qty template q) ((q_floor :: raw) @ [ q_hi ])))
-    in
-    let cells =
-      List.concat_map
-        (fun gi ->
-           List.map (fun qty -> gi, qty, G.set_parameter (G.set_qty template qty) gi) qtys)
-        gis
-    in
-    (* stdout is block-buffered; flush it before the stderr progress lines so
-       captured output keeps report/log/report ordering readable. *)
-    flush stdout;
-    Logging.info_f
-      ~section:"oracle"
-      "cash surface (%s): sweeping %d (gi x qty) cells x %d horizons, replay-verified \
-       sizing - this is the slow part"
-      asset.symbol
-      (List.length cells)
-      (List.length models);
-    let t0 = Unix.gettimeofday () in
-    let rows =
-      S.surface_rows
-        ~empirical_scan_points:a.surface_scan_points
-        ?hi:a.max_capital
-        ~target_survival
-        ~models
-        cells
-    in
-    let elapsed_s = Unix.gettimeofday () -. t0 in
-    flush stdout;
-    Logging.info_f
-      ~section:"oracle"
-      "cash surface (%s): done in %.1fs"
-      asset.symbol
-      elapsed_s;
-    { labels = List.map (fun h -> h.Oracle_types.label) horizons; rows; elapsed_s }
-  in
-  (* The engine's decision: qty, gi, active, deployed capital against this
-     asset's share of the venue pool. *)
-  (* The sizing replay starts from the strategy's accumulated state (base
-     locked in resting sells + the accumulated profit buffer, loaded from
-     accumulated_state.json via the strategy state) so the survival verdict
-     models the grid as it actually runs. The held base is seeded from the
-     account balance snapshot in the live engine; the CLI has no snapshot at
-     this point, so it seeds the persisted amounts only. *)
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state task.Oracle_tasks.symbol in
-  let seed =
-    Some
-      { Dio_strategies.Grid_core_types.initial_base = 0.0
-      ; initial_reserved_base = st.reserved_base
-      ; initial_accumulated_profit = st.accumulated_profit
-      }
-  in
-  let deployment =
-    D.deploy_asset
-      ~seed
-      ~has_committed_buy:false
-      ~asset
-      ~cfg:grid
-      ~lo:gi_lo
-      ~hi:gi_hi
-      ~models
-      ~target_survival
-      ~pool
-      ~fng
-      ~fng_weight
-      ~range_weight
-      ~min_active_dsurv
-      ~use_fng:(calendar_kind = Oracle_types.Crypto)
-      ~param_steps:10
-      ~scan_points:24
-      ~qty_cap_mult
-  in
-  if not deployment.Oracle_types.active
-  then
-    if a.json
-    then
-      ( Some
-          (report_json
-             a
-             ~account
-             ~venue_pool:pool
-             ~deployment
-             ~gi_lo
-             ~gi_hi
-             ~deep_bars
-             ~cash_surface:(Some cash_surface)
-             grid
-             asset
-             members
-             class_name
-             r
-             None
-             [])
-      , deployment.remainder )
-    else (
-      print_endline
-        (report_text
-           a
-           ~account
-           ~venue_pool:pool
-           ~deployment
-           ~index
-           ~n_tasks
-           ~gi_lo
-           ~gi_hi
-           ~deep_bars
-           ~cash_surface:(Some cash_surface)
-           grid
-           members
-           class_name
-           r
-           None
-           []);
-      None, deployment.remainder)
-  else (
-    (* Supporting analysis at the deployment's sizing. *)
-    let grid =
-      { grid with
-        qty = deployment.qty
-      ; grid_interval_pct = deployment.parameter
-      ; start_quote = deployment.deployed
-      }
-    in
-    let replay_out = G.replay grid asset in
-    let coverages =
-      List.map
-        (fun h ->
-           let m = model h in
-           let c_ = Oracle_replay.historical_path_coverage m ~d_surv:replay_out.d_surv in
-           let capital_res =
-             S.find_min_capital ~grid ~model:m ~target_survival ?hi:a.max_capital ()
-           in
-           let qty_res = S.max_qty ~grid ~model:m ~target_survival () in
-           let empirical_res =
-             S.empirical_min_capital ~grid ~model:m ~target_survival ?hi:a.max_capital ()
-           in
-           h, c_, capital_res, qty_res, empirical_res)
-        horizons
-    in
-    if a.json
-    then
-      ( Some
-          (report_json
-             a
-             ~account
-             ~venue_pool:pool
-             ~deployment
-             ~gi_lo
-             ~gi_hi
-             ~deep_bars
-             ~cash_surface:(Some cash_surface)
-             grid
-             asset
-             members
-             class_name
-             r
-             (Some replay_out)
-             coverages)
-      , deployment.remainder )
-    else (
-      print_endline
-        (report_text
-           a
-           ~account
-           ~venue_pool:pool
-           ~deployment
-           ~index
-           ~n_tasks
-           ~gi_lo
-           ~gi_hi
-           ~deep_bars
-           ~cash_surface:(Some cash_surface)
-           grid
-           members
-           class_name
-           r
-           (Some replay_out)
-           coverages);
-      None, deployment.remainder))
-;;
-
-type portfolio_node =
-  { spec : Oracle_topology.position_spec
-  ; task : Oracle_tasks.task
-  ; series : Oracle_types.series
-  ; initial_base : float
-  }
-
-let task_for_key (tasks : Oracle_tasks.task list) (key : Oracle_topology.instrument_key) =
-  match
-    List.find_opt
-      (fun (task : Oracle_tasks.task) ->
-         String.lowercase_ascii task.exchange = key.venue
-         && String.lowercase_ascii task.symbol = String.lowercase_ascii key.symbol
-         && task.config.testnet = key.testnet)
-      tasks
-  with
-  | Some task -> task
-  | None ->
-    let config = Oracle_tasks.default_trading_config key.venue key.symbol in
-    { Oracle_tasks.symbol = key.symbol
-    ; exchange = key.venue
-    ; config = { config with testnet = key.testnet }
-    }
-;;
-
-let portfolio_definition (a : args) (tasks : Oracle_tasks.task list) =
-  let definition : Oracle_topology.definition =
-    match a.topology with
-    | None -> Oracle_topology.definition_of_tasks tasks
-    | Some path ->
-      (match Oracle_topology.load path with
-       | Ok definition -> definition
-       | Error error -> failwith ("oracle: " ^ error))
-  in
-  let add_allocation (definition : Oracle_topology.definition) value =
-    match Oracle_topology.parse_allocation value with
-    | Error error -> failwith ("oracle: " ^ error)
-    | Ok allocation ->
-      let positions =
-        if
-          List.exists
-            (fun (position : Oracle_topology.position_spec) ->
-               Oracle_topology.equal_key position.key allocation.key)
-            definition.positions
-        then
-          List.map
-            (fun (position : Oracle_topology.position_spec) ->
-               if Oracle_topology.equal_key position.key allocation.key
-               then allocation
-               else position)
-            definition.positions
-        else allocation :: definition.positions
-      in
-      { definition with positions }
-  in
-  let definition = List.fold_left add_allocation definition a.allocations in
-  let add_transfer transfers value =
-    match Oracle_topology.parse_transfer value with
-    | Ok transfer -> transfer :: transfers
-    | Error error -> failwith ("oracle: " ^ error)
-  in
-  let definition =
-    { definition with
-      transfers = List.fold_left add_transfer definition.transfers a.transfer_specs
-    }
-  in
-  match Oracle_topology.validate definition with
-  | Ok () -> definition
-  | Error errors -> failwith ("oracle: invalid topology: " ^ String.concat "; " errors)
-;;
-
-let loaded_portfolio_state (a : args) =
-  match a.positions_file with
-  | None -> []
-  | Some path ->
-    (match Oracle_portfolio_state.load path with
-     | Ok positions -> positions
-     | Error error -> failwith ("oracle: " ^ error))
-;;
-
-let apply_saved_allocations
-      (definition : Oracle_topology.definition)
-      (saved : Oracle_portfolio_state.position list)
-  =
-  let positions =
-    List.map
-      (fun (position : Oracle_topology.position_spec) ->
-         if position.capital <> None
-         then position
-         else (
-           match
-             List.find_opt
-               (fun (saved_position : Oracle_portfolio_state.position) ->
-                  Oracle_topology.equal_key saved_position.key position.key)
-               saved
-           with
-           | Some saved_position -> { position with capital = Some saved_position.pool }
-           | None -> position))
-      definition.positions
-  in
-  { definition with positions }
-;;
-
-let saved_base_for key saved =
-  match
-    List.find_opt
-      (fun (position : Oracle_portfolio_state.position) ->
-         Oracle_topology.equal_key position.key key)
-      saved
-  with
-  | Some position -> position.base
-  | None -> 0.0
-;;
-
-let portfolio_series (a : args) (key : Oracle_topology.instrument_key) ~(offline : bool) =
-  if offline
-  then (
-    match a.from_csv, a.from_json with
-    | Some path, _ ->
-      Oracle_loader.load_csv_file
-        ~symbol:key.symbol
-        ~calendar_kind:(Oracle_tasks.calendar_kind_of_exchange key.venue)
-        ~path
-    | _, Some path ->
-      Oracle_loader.load_json_file
-        ~symbol:key.symbol
-        ~calendar_kind:(Oracle_tasks.calendar_kind_of_exchange key.venue)
-        ~path
-    | None, None ->
-      failwith "oracle: offline portfolio mode requires --from-csv or --from-json")
-  else Lwt_main.run (fetch_series_for a ~exchange:key.venue key.symbol)
-;;
-
-(* Capital assignment for the venue-pooled portfolio model.
-
-   The model's top level is the venue: each venue account (venue + quote +
-   testnet) owns one pool, and all of that venue's assets draw from it. The
-   per-asset share below is only accounting; the venue pool is the sum of its
-   assets' shares and is what the replay actually spends.
-
-   A venue pool resolves to:
-   - the sum of its explicit --allocation / topology capitals when any asset on
-     the venue is explicit,
-   - --total-capital split equally per venue (explicit venues keep their sums),
-   - --capital per venue,
-   - 1000.0 per venue offline,
-   - the venue's fetched available quote balance online.
-
-   Unspecified assets on a venue split the venue pool equally among
-   themselves. *)
-let portfolio_capitals (a : args) ~(offline : bool) (nodes : portfolio_node list)
-  : (portfolio_node * float) list
-  =
-  let same_account
-        (left : Oracle_topology.instrument_key)
-        (right : Oracle_topology.instrument_key)
-    =
-    left.venue = right.venue && left.testnet = right.testnet && left.quote = right.quote
-  in
-  let accounts =
-    List.fold_left
-      (fun acc (node : portfolio_node) ->
-         if List.exists (fun key -> same_account key node.spec.key) acc
-         then acc
-         else node.spec.key :: acc)
-      []
-      nodes
-  in
-  let explicit_total =
-    List.fold_left
-      (fun total (node : portfolio_node) ->
-         total +. Option.value node.spec.capital ~default:0.0)
-      0.0
-      nodes
-  in
-  let explicit_on account =
-    List.fold_left
-      (fun total (node : portfolio_node) ->
-         if same_account account node.spec.key
-         then total +. Option.value node.spec.capital ~default:0.0
-         else total)
-      0.0
-      nodes
-  in
-  let has_explicit account =
-    List.exists
-      (fun (node : portfolio_node) ->
-         node.spec.capital <> None && same_account account node.spec.key)
-      nodes
-  in
-  let unspecified_on account =
-    List.filter
-      (fun (node : portfolio_node) ->
-         node.spec.capital = None && same_account account node.spec.key)
-      nodes
-  in
-  if
-    a.split = "explicit"
-    && List.exists (fun (node : portfolio_node) -> node.spec.capital = None) nodes
-  then failwith "oracle: --split explicit requires a capital for every position";
-  (match a.total_capital with
-   | Some total when total < 0.0 || not (Float.is_finite total) ->
-     failwith "oracle: --total-capital must be finite and non-negative"
-   | Some total when total +. 1e-9 < explicit_total ->
-     failwith "oracle: explicit topology allocations exceed --total-capital"
-   | _ -> ());
-  (match a.capital with
-   | Some capital when capital < 0.0 || not (Float.is_finite capital) ->
-     failwith "oracle: --capital must be finite and non-negative"
-   | _ -> ());
-  let unspecified_accounts =
-    List.filter (fun account -> not (has_explicit account)) accounts
-  in
-  let venue_pool (account : Oracle_topology.instrument_key) =
-    if has_explicit account
-    then explicit_on account
-    else (
-      match a.total_capital with
-      | Some total ->
-        if unspecified_accounts = []
-        then 0.0
-        else (total -. explicit_total) /. float_of_int (List.length unspecified_accounts)
-      | None ->
-        (match a.capital with
-         | Some capital -> capital
-         | None when offline -> 1000.0
-         | None ->
-           let task =
-             match
-               List.find_opt
-                 (fun (node : portfolio_node) -> same_account account node.spec.key)
-                 nodes
-             with
-             | Some node -> node.task
-             | None -> failwith "oracle: no position on venue account"
-           in
-           (match Lwt_main.run (Oracle_balances.fetch_task task) with
-            | Ok snapshot -> Oracle_balances.available_quote snapshot ~quote:account.quote
-            | Error error -> failwith ("oracle: balance fetch failed: " ^ error))))
-  in
-  let capitals =
-    List.map
-      (fun (node : portfolio_node) ->
-         let account = node.spec.key in
-         let pool = venue_pool account in
-         let share =
-           if node.spec.capital <> None
-           then Option.value node.spec.capital ~default:0.0
-           else (
-             let unspecified = unspecified_on account in
-             let remaining = pool -. explicit_on account in
-             if remaining < 0.0 || unspecified = []
-             then 0.0
-             else remaining /. float_of_int (List.length unspecified))
-         in
-         if share < 0.0
-         then
-           failwith
-             ("oracle: insufficient "
-              ^ account.quote
-              ^ " balance for portfolio venue "
-              ^ account.venue);
-         node, share)
-      nodes
-  in
-  capitals
-;;
-
-let portfolio_grid (a : args) (node : portfolio_node) capital ~(offline : bool) =
-  let tc = Lwt_main.run (Oracle_fees.enrich node.task.config ~offline) in
-  let start_price =
-    Option.value
-      a.start_price
-      ~default:
-        (if Array.length node.series.bars = 0
-         then 0.0
-         else node.series.bars.(Array.length node.series.bars - 1).close)
-  in
-  let grid_interval_pct = Option.value a.grid_interval ~default:(snd tc.grid_interval) in
-  let grid =
-    Grid_adapter.of_trading_config tc ~start_price ~start_quote:capital ~grid_interval_pct
-  in
-  { grid with
-    qty = Option.value a.qty ~default:grid.qty
-  ; sell_mult = Option.value a.sell_mult ~default:grid.sell_mult
-  ; maker_fee = Option.value a.fee ~default:grid.maker_fee
-  ; accumulation_buffer =
-      Option.value a.accumulation_buffer ~default:grid.accumulation_buffer
-  ; price_increment = Option.value a.price_increment ~default:grid.price_increment
-  ; qty_increment = Option.value a.qty_increment ~default:grid.qty_increment
-  ; qty_min = Option.value a.qty_min ~default:grid.qty_min
-  ; min_notional = Option.value a.min_notional ~default:grid.min_notional
-  }
-;;
-
-let venue_id (v : Oracle_portfolio.venue_outcome) =
-  Printf.sprintf "%s/%s%s" v.venue v.quote (if v.testnet then "@testnet" else "")
-;;
-
-let venue_of_node (key : Oracle_topology.instrument_key) =
-  Printf.sprintf "%s/%s%s" key.venue key.quote (if key.testnet then "@testnet" else "")
-;;
-
-let report_portfolio_text
-      (definition : Oracle_topology.definition)
-      (nodes : (portfolio_node * float) list)
-      (result : Oracle_portfolio.result)
-  =
-  let b = Buffer.create 2048 in
-  let line fmt =
-    Printf.ksprintf
-      (fun value ->
-         Buffer.add_string b value;
-         Buffer.add_char b '\n')
-      fmt
-  in
-  line "=== DIO Capital Oracle Portfolio ===";
-  line
-    "Sessions: %d   exhausted: %b   first exhausted session: %s"
-    result.n_sessions
-    result.exhausted
-    (match result.first_exhausted_session with
-     | Some session -> string_of_int session
-     | None -> "none");
-  line
-    "Venues: %d   Positions: %d   Transfers: %d"
-    (List.length result.venues)
-    (List.length nodes)
-    (List.length definition.transfers);
-  List.iter
-    (fun (venue : Oracle_portfolio.venue_outcome) ->
-       line
-         "  %s  pool %.2f -> %.2f   min DD %s   D_surv %s   low %b   fills %d/%d   base \
-          %.6f   assets: %s"
-         (venue_id venue)
-         venue.initial_pool
-         venue.final_pool
-         (pct venue.pool_min_drawdown)
-         (pct venue.d_surv)
-         venue.capital_low
-         venue.buy_fills
-         venue.sell_fills
-         venue.final_base
-         (String.concat ", " venue.assets);
-       List.iter
-         (fun ((node, capital) : portfolio_node * float) ->
-            if venue_of_node node.spec.key = venue_id venue
-            then (
-              let outcome =
-                List.find
-                  (fun (value : Oracle_portfolio.position_outcome) ->
-                     value.venue = node.spec.key.venue
-                     && value.asset = node.spec.key.symbol)
-                  result.positions
-              in
-              line
-                "      %s  share %.2f  fills %d/%d  base %.6f"
-                (Oracle_topology.key_id node.spec.key)
-                capital
-                outcome.buy_fills
-                outcome.sell_fills
-                outcome.final_base))
-         nodes)
-    result.venues;
-  List.iter
-    (fun (transfer : Oracle_topology.transfer_spec) ->
-       line
-         "  transfer session %d: %s -> %s  %.2f"
-         transfer.session
-         (Oracle_topology.key_id transfer.from_key)
-         (Oracle_topology.key_id transfer.to_key)
-         transfer.amount)
-    definition.transfers;
-  Buffer.contents b
-;;
-
-let report_portfolio_json
-      (definition : Oracle_topology.definition)
-      (nodes : (portfolio_node * float) list)
-      (result : Oracle_portfolio.result)
-  : Yojson.Safe.t
-  =
-  let venue_json (venue : Oracle_portfolio.venue_outcome) =
-    `Assoc
-      [ "venue", `String venue.venue
-      ; "quote", `String venue.quote
-      ; "testnet", `Bool venue.testnet
-      ; "assets", `List (List.map (fun asset -> `String asset) venue.assets)
-      ; "initial_pool", `Float venue.initial_pool
-      ; "final_pool", `Float venue.final_pool
-      ; "pool_min_drawdown", `Float venue.pool_min_drawdown
-      ; "d_surv", `Float venue.d_surv
-      ; "capital_low", `Bool venue.capital_low
-      ; ( "first_exhausted_drawdown"
-        , Option.fold
-            ~none:`Null
-            ~some:(fun value -> `Float value)
-            venue.first_exhausted_drawdown )
-      ; ( "first_exhausted_session"
-        , Option.fold
-            ~none:`Null
-            ~some:(fun value -> `Int value)
-            venue.first_exhausted_session )
-      ; "buy_fills", `Int venue.buy_fills
-      ; "sell_fills", `Int venue.sell_fills
-      ; "final_base", `Float venue.final_base
-      ]
-  in
-  let outcome_json ((node, capital) : portfolio_node * float) =
-    let outcome =
-      List.find
-        (fun (value : Oracle_portfolio.position_outcome) ->
-           value.venue = node.spec.key.venue && value.asset = node.spec.key.symbol)
-        result.positions
-    in
-    `Assoc
-      [ "venue", `String node.spec.key.venue
-      ; "symbol", `String node.spec.key.symbol
-      ; "base", `String node.spec.key.base
-      ; "quote", `String node.spec.key.quote
-      ; "testnet", `Bool node.spec.key.testnet
-      ; "share", `Float capital
-      ; "buy_fills", `Int outcome.buy_fills
-      ; "sell_fills", `Int outcome.sell_fills
-      ; "final_base", `Float outcome.final_base
-      ]
-  in
-  `Assoc
-    [ "mode", `String "portfolio"
-    ; "n_sessions", `Int result.n_sessions
-    ; "exhausted", `Bool result.exhausted
-    ; ( "first_exhausted_session"
-      , Option.fold
-          ~none:`Null
-          ~some:(fun value -> `Int value)
-          result.first_exhausted_session )
-    ; "topology", Oracle_topology.to_json definition
-    ; "venues", `List (List.map venue_json result.venues)
-    ; "positions", `List (List.map outcome_json nodes)
-    ; "transfers", `List (List.map Oracle_topology.transfer_json definition.transfers)
-    ]
-;;
-
-let run_portfolio (a : args) (tasks : Oracle_tasks.task list) : Yojson.Safe.t option =
-  let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
-  let saved = loaded_portfolio_state a in
-  let definition =
-    portfolio_definition a tasks |> fun value -> apply_saved_allocations value saved
-  in
-  if definition.positions = [] then failwith "oracle: portfolio topology has no positions";
-  if offline && List.length definition.positions > 1
-  then failwith "oracle: offline portfolio mode supports one historical input file";
-  let nodes =
-    List.map
-      (fun (spec : Oracle_topology.position_spec) ->
-         let task = task_for_key tasks spec.key in
-         if not (Oracle_tasks.known_exchange task.exchange)
-         then failwith ("oracle: unsupported portfolio exchange " ^ task.exchange);
-         { spec
-         ; task
-         ; series = portfolio_series a spec.key ~offline
-         ; initial_base = saved_base_for spec.key saved
-         })
-      definition.positions
-  in
-  let node_tasks = List.map (fun (node : portfolio_node) -> node.task) nodes in
-  if not offline then Lwt_main.run (Oracle_venues.init node_tasks);
-  let capitals = portfolio_capitals a ~offline nodes in
-  let capital_by_key key =
-    match
-      List.find_opt
-        (fun ((node, _) : portfolio_node * float) ->
-           Oracle_topology.equal_key node.spec.key key)
-        capitals
-    with
-    | Some (_, capital) -> capital
-    | None -> failwith ("oracle: no capital allocation for " ^ Oracle_topology.key_id key)
-  in
-  let timeline =
-    Oracle_topology.timeline_of_series
-      (List.map (fun (node : portfolio_node) -> node.series) nodes)
-  in
-  let positions =
-    List.map
-      (fun (node : portfolio_node) ->
-         let capital = capital_by_key node.spec.key in
-         { Oracle_portfolio.venue = node.spec.key.venue
-         ; asset = node.spec.key.symbol
-         ; quote = node.spec.key.quote
-         ; testnet = node.spec.key.testnet
-         ; pool = capital
-         ; initial_base = node.initial_base
-         ; bars = Oracle_topology.align_series timeline node.series
-         ; subgrids = [ portfolio_grid a node capital ~offline ]
-         })
-      nodes
-  in
-  let transfers = List.map Oracle_topology.to_portfolio_transfer definition.transfers in
-  let result = Oracle_portfolio.simulate_aligned ~timeline ~positions ~transfers () in
-  let venue_of_key (key : Oracle_topology.instrument_key) =
-    List.find_opt
-      (fun (venue : Oracle_portfolio.venue_outcome) ->
-         venue.venue = key.venue && venue.quote = key.quote && venue.testnet = key.testnet)
-      result.venues
-  in
-  (match a.save_positions with
-   | None -> ()
-   | Some path ->
-     let saved_positions =
-       List.map
-         (fun (node : portfolio_node) ->
-            let outcome =
-              List.find
-                (fun (value : Oracle_portfolio.position_outcome) ->
-                   value.venue = node.spec.key.venue && value.asset = node.spec.key.symbol)
-                result.positions
-            in
-            let share =
-              match venue_of_key node.spec.key with
-              | Some venue when venue.assets <> [] ->
-                venue.final_pool /. float_of_int (List.length venue.assets)
-              | _ -> 0.0
-            in
-            { Oracle_portfolio_state.key = node.spec.key
-            ; pool = share
-            ; base = outcome.final_base
-            })
-         nodes
-     in
-     (try Oracle_portfolio_state.save path saved_positions with
-      | exn ->
-        failwith
-          (Printf.sprintf "oracle: cannot save positions: %s" (Printexc.to_string exn))));
-  if a.json
-  then Some (report_portfolio_json definition capitals result)
-  else (
-    print_endline (report_portfolio_text definition capitals result);
-    None)
-;;
-
-let main () =
-  let a = parse_args () in
-  let config = Dio_engine.Config.read_config () in
-  (* The oracle section of config.json (global knobs + per-asset overrides)
-     drives the CLI defaults exactly as it drives the live engine; explicit
-     flags win over it. *)
-  let base_rc =
-    Option.value config.oracle ~default:(Dio_oracle.Oracle_runtime.default_config ())
-  in
-  let offline = Option.is_some a.from_csv || Option.is_some a.from_json in
-  let tasks, unsupported =
-    if a.portfolio && offline && a.symbol = ""
-    then
-      (* Portfolio mode with a topology file never needs a positional SYMBOL:
-         positions come from the topology, and offline runs skip venue init.
-         Resolve the config trading list as the task pool. *)
-      Oracle_tasks.resolve_tasks
-        ~symbol:""
-        ~exchange:a.exchange
-        ~exchange_explicit:a.exchange_explicit
-        ~trading:config.trading
-        ~offline:false
-    else
-      Oracle_tasks.resolve_tasks
-        ~symbol:a.symbol
-        ~exchange:a.exchange
-        ~exchange_explicit:a.exchange_explicit
-        ~trading:config.trading
-        ~offline
-  in
-  (* Populate venue instrument metadata (ticks/lots) before any grid replay so
-     increments resolve from the real exchange, not the 0.01 fallback. *)
-  if not offline then Lwt_main.run (Oracle_venues.init tasks);
-  let warnings =
-    List.map
-      (fun (symbol, exchange) ->
-         Printf.sprintf
-           "unsupported exchange in config.json for capital oracle modeling: %s"
-           (if exchange = "" then symbol else Printf.sprintf "%s (%s)" symbol exchange))
-      unsupported
-  in
-  if tasks = [] && warnings = [] && not a.portfolio
-  then (
-    Printf.eprintf
-      "oracle: no SYMBOL given and config.json has no runnable trading assets (see --help)\n";
-    exit 1)
-  else if a.portfolio
-  then (
-    if not a.json then List.iter print_endline warnings;
-    let report = run_portfolio a tasks in
-    match report, a.json with
-    | Some report, true ->
-      let report =
-        if warnings = []
-        then report
+     if tcs = []
+     then Lwt.fail_with (Printf.sprintf "no trading entries match '%s'" args.symbol)
+     else
+       (* Warm real fees where the venue adapter provides them and we may use
+          the network; explicit config fees always win and stay untouched. *)
+       (if offline
+        then Lwt.return ()
         else
-          `Assoc
-            (("warnings", `List (List.map (fun w -> `String w) warnings))
-             ::
-             (match report with
-              | `Assoc fields -> fields
-              | other -> [ "portfolio", other ]))
-      in
-      print_endline (Yojson.Safe.to_string report)
-    | _ -> ())
-  else (
-    let fng = resolve_fng a in
-    let pools = venue_pools a ~offline tasks in
-    let pool_of account =
-      match List.find_opt (fun (acc, _) -> same_account acc account) pools with
-      | Some (_, p) -> p
-      | None -> 0.0
-    in
-    let failures = ref 0 in
-    let reports = ref [] in
-    if not a.json then List.iter print_endline warnings;
-    let grouped = group_by_account tasks in
-    List.iter
-      (fun (account, account_tasks) ->
-         let pool = ref (pool_of account) in
-         let n_tasks = List.length account_tasks in
-         List.iteri
-           (fun i task ->
-              let pool_before = !pool in
-              try
-                let report, remaining =
-                  run_one
-                    a
-                    config.classes
-                    task
-                    ~base_rc
-                    ~pool:pool_before
-                    ~fng
-                    ~index:(i + 1)
-                    ~n_tasks
-                in
-                pool := remaining;
-                match report with
-                | Some r -> reports := r :: !reports
-                | None -> ()
-              with
-              | exn ->
-                incr failures;
-                let msg = Printexc.to_string exn in
-                if
-                  string_contains msg "empty distribution"
-                  || string_contains msg "history too short"
-                then
-                  Printf.eprintf
-                    "oracle: '%s' (%s) skipped: history too short for the requested \
-                     horizon/warmup (each horizon needs warmup + horizon + 2 bars; pass \
-                     --vol-window and --horizons to fit the available data, or remove \
-                     the asset from config.json trading); capital stays in the venue \
-                     pool: %s\n"
-                    task.Oracle_tasks.symbol
-                    task.Oracle_tasks.exchange
-                    msg
-                else
-                  Printf.eprintf
-                    "oracle: '%s' (%s) failed: %s\n"
-                    task.Oracle_tasks.symbol
-                    task.Oracle_tasks.exchange
-                    msg
-              (* On failure the capital stays in the venue pool and passes
-                    to the next asset. *))
-           account_tasks;
-         if (not a.json) && account_tasks <> []
-         then
-           print_endline
-             (Printf.sprintf "  Surplus: %.2f %s (idle reserve)" !pool account.quote))
-      grouped;
-    let warn_j = `List (List.map (fun w -> `String w) warnings) in
-    let add_warnings (j : Yojson.Safe.t) =
-      if warnings = []
-      then j
-      else
-        `Assoc
-          (("warnings", warn_j)
-           ::
-           (match j with
-            | `Assoc l -> l
-            | other -> [ "assets", other ]))
-    in
-    let reports = List.rev !reports in
-    (match reports, a.json with
-     | [ r ], true -> print_endline (Yojson.Safe.to_string (add_warnings r))
-     | _ :: _ :: _, true ->
-       print_endline (Yojson.Safe.to_string (add_warnings (`List reports)))
-     | [], true when warnings <> [] ->
-       print_endline (Yojson.Safe.to_string (`Assoc [ "warnings", warn_j ]))
-     | _ -> ());
-    if !failures > 0 then exit 1)
+          Lwt_list.iter_s
+            (fun (tc : Dio_strategies.Strategy_common.trading_config) ->
+               if Option.is_none tc.maker_fee
+               then
+                 Lwt.catch
+                   (fun () ->
+                      Dio_oracle.Oracle_fees.resolved_fees
+                        ~exchange:tc.exchange
+                        ~symbol:tc.symbol
+                        ~testnet:tc.testnet
+                      >|= fun _ -> ())
+                   (fun _ -> Lwt.return ())
+               else Lwt.return ())
+            tcs)
+       >>= fun () ->
+       Lwt_list.map_s (analyze_one ~args ~config:(Some config)) tcs
+       >>= fun rows ->
+       if args.json then print_json rows args else print_table rows args;
+       Lwt.return ())
 ;;
-
-let () = main ()
