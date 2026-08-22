@@ -1,18 +1,18 @@
-(* Suicide Grid Strategy
+(* Jacobs Ladder Strategy
 
    Grid trading system with a single-buy, multi-sell order model.
-   Delegates to modular sub-components in suicide_grid/ for:
-   - Types & state management (Suicide_grid_types)
-   - Exchange configuration & precision helpers (Suicide_grid_config)
-   - Reservation & accumulation (Suicide_grid_reservation)
-   - Order construction & buffer dispatch (Suicide_grid_orders)
-   - Strategy execution loop (Suicide_grid_execution)
-   - Lifecycle event handlers (Suicide_grid_events) *)
+   Delegates to modular sub-components in jacobs_ladder/ for:
+   - Types & state management (Jacobs_ladder_types)
+   - Exchange configuration & precision helpers (Jacobs_ladder_config)
+   - Reservation & accumulation (Jacobs_ladder_reservation)
+   - Order construction & buffer dispatch (Jacobs_ladder_orders)
+   - Strategy execution loop (Jacobs_ladder_execution)
+   - Lifecycle event handlers (Jacobs_ladder_events) *)
 
 open Strategy_common
 
 (* Re-exported Types *)
-type exchange_config = Suicide_grid_types.exchange_config =
+type exchange_config = Jacobs_ladder_types.exchange_config =
   { time_in_force : string
   ; track_pending_sells : bool
   ; use_accumulation_sells : bool
@@ -25,7 +25,7 @@ type exchange_config = Suicide_grid_types.exchange_config =
   ; remaintain_expired_sells : bool
   }
 
-type trading_config = Suicide_grid_types.trading_config =
+type trading_config = Jacobs_ladder_types.trading_config =
   { exchange : string
   ; symbol : string
   ; qty : string
@@ -39,60 +39,60 @@ type trading_config = Suicide_grid_types.trading_config =
   ; sell_levels_persistence : bool
   }
 
-type strategy_state = Suicide_grid_types.strategy_state
+type strategy_state = Jacobs_ladder_types.strategy_state
 
 (* Re-exported Values & Functions *)
-let section = Suicide_grid_types.section
-let take = Suicide_grid_types.take
-let contains_fragment = Suicide_grid_types.contains_fragment
-let kraken_config = Suicide_grid_config.kraken_config
-let hyperliquid_config = Suicide_grid_config.hyperliquid_config
-let ibkr_config = Suicide_grid_config.ibkr_config
-let lighter_config = Suicide_grid_config.lighter_config
-let get_exchange_config = Suicide_grid_config.get_exchange_config
+let section = Jacobs_ladder_types.section
+let take = Jacobs_ladder_types.take
+let contains_fragment = Jacobs_ladder_types.contains_fragment
+let kraken_config = Jacobs_ladder_config.kraken_config
+let hyperliquid_config = Jacobs_ladder_config.hyperliquid_config
+let ibkr_config = Jacobs_ladder_config.ibkr_config
+let lighter_config = Jacobs_ladder_config.lighter_config
+let get_exchange_config = Jacobs_ladder_config.get_exchange_config
 
-let hl_like_spot_fee_exchange = Suicide_grid_config.hl_like_spot_fee_exchange
-let ibkr_commission = Suicide_grid_config.ibkr_commission
-let get_exchange_module = Suicide_grid_config.get_exchange_module
-let get_round_price_fn = Suicide_grid_config.get_round_price_fn
-let get_price_increment = Suicide_grid_config.get_price_increment
-let get_qty_increment_val = Suicide_grid_config.get_qty_increment_val
-let round_qty = Suicide_grid_config.round_qty
-let venue_lot_qty = Suicide_grid_config.venue_lot_qty
-let parse_config_float = Suicide_grid_config.parse_config_float
-let get_min_move_threshold = Suicide_grid_config.get_min_move_threshold
-let calculate_grid_price = Suicide_grid_config.calculate_grid_price
-let get_strategy_state = Suicide_grid_types.get_strategy_state
-let total_reserved_by_exchange = Suicide_grid_reservation.total_reserved_by_exchange
-let get_exchange_reserved_atomic = Suicide_grid_reservation.get_exchange_reserved_atomic
-let get_total_reserved_quote = Suicide_grid_reservation.get_total_reserved_quote
-let set_asset_reserved_quote = Suicide_grid_reservation.set_asset_reserved_quote
-let atomic_check_and_reserve = Suicide_grid_reservation.atomic_check_and_reserve
-let can_place_buy_order = Suicide_grid_reservation.can_place_buy_order
-let can_place_sell_order = Suicide_grid_reservation.can_place_sell_order
-let amend_allowed = Suicide_grid_reservation.amend_allowed
-let compute_sell_qty = Suicide_grid_reservation.compute_sell_qty
+let hl_like_spot_fee_exchange = Jacobs_ladder_config.hl_like_spot_fee_exchange
+let ibkr_commission = Jacobs_ladder_config.ibkr_commission
+let get_exchange_module = Jacobs_ladder_config.get_exchange_module
+let get_round_price_fn = Jacobs_ladder_config.get_round_price_fn
+let get_price_increment = Jacobs_ladder_config.get_price_increment
+let get_qty_increment_val = Jacobs_ladder_config.get_qty_increment_val
+let round_qty = Jacobs_ladder_config.round_qty
+let venue_lot_qty = Jacobs_ladder_config.venue_lot_qty
+let parse_config_float = Jacobs_ladder_config.parse_config_float
+let get_min_move_threshold = Jacobs_ladder_config.get_min_move_threshold
+let calculate_grid_price = Jacobs_ladder_config.calculate_grid_price
+let get_strategy_state = Jacobs_ladder_types.get_strategy_state
+let total_reserved_by_exchange = Jacobs_ladder_reservation.total_reserved_by_exchange
+let get_exchange_reserved_atomic = Jacobs_ladder_reservation.get_exchange_reserved_atomic
+let get_total_reserved_quote = Jacobs_ladder_reservation.get_total_reserved_quote
+let set_asset_reserved_quote = Jacobs_ladder_reservation.set_asset_reserved_quote
+let atomic_check_and_reserve = Jacobs_ladder_reservation.atomic_check_and_reserve
+let can_place_buy_order = Jacobs_ladder_reservation.can_place_buy_order
+let can_place_sell_order = Jacobs_ladder_reservation.can_place_sell_order
+let amend_allowed = Jacobs_ladder_reservation.amend_allowed
+let compute_sell_qty = Jacobs_ladder_reservation.compute_sell_qty
 
 let accumulation_sell_allowed_on_recovery =
-  Suicide_grid_reservation.accumulation_sell_allowed_on_recovery
+  Jacobs_ladder_reservation.accumulation_sell_allowed_on_recovery
 ;;
 
-let has_active_sell = Suicide_grid_reservation.has_active_sell
-let order_buffer = Suicide_grid_orders.order_buffer
-let get_order_buffer = Suicide_grid_orders.get_order_buffer
-let create_place_order = Suicide_grid_orders.create_place_order
-let create_amend_order = Suicide_grid_orders.create_amend_order
-let create_cancel_order = Suicide_grid_orders.create_cancel_order
-let create_order = Suicide_grid_orders.create_order
-let push_order = Suicide_grid_orders.push_order
-let sync_open_orders = Suicide_grid_execution.sync_open_orders
+let has_active_sell = Jacobs_ladder_reservation.has_active_sell
+let order_buffer = Jacobs_ladder_orders.order_buffer
+let get_order_buffer = Jacobs_ladder_orders.get_order_buffer
+let create_place_order = Jacobs_ladder_orders.create_place_order
+let create_amend_order = Jacobs_ladder_orders.create_amend_order
+let create_cancel_order = Jacobs_ladder_orders.create_cancel_order
+let create_order = Jacobs_ladder_orders.create_order
+let push_order = Jacobs_ladder_orders.push_order
+let sync_open_orders = Jacobs_ladder_execution.sync_open_orders
 
 let reconcile_persisted_sell_levels =
-  Suicide_grid_execution.reconcile_persisted_sell_levels
+  Jacobs_ladder_execution.reconcile_persisted_sell_levels
 ;;
 
-let evaluate_sell_leg = Suicide_grid_execution.evaluate_sell_leg
-let execute_strategy = Suicide_grid_execution.execute_strategy
+let evaluate_sell_leg = Jacobs_ladder_execution.evaluate_sell_leg
+let execute_strategy = Jacobs_ladder_execution.execute_strategy
 
 (* ------------------------------------------------------------------ *)
 (* Priority-reclamation step (pure decision).                          *)
@@ -150,18 +150,18 @@ let reclaim_step
   else Reclaim_rearm
 ;;
 
-let flush_persistence = Suicide_grid_events.flush_persistence
-let handle_order_acknowledged = Suicide_grid_events.handle_order_acknowledged
-let handle_order_failed = Suicide_grid_events.handle_order_failed
-let handle_order_rejected = Suicide_grid_events.handle_order_rejected
-let handle_order_filled = Suicide_grid_events.handle_order_filled
-let handle_order_cancelled = Suicide_grid_events.handle_order_cancelled
-let handle_order_amended = Suicide_grid_events.handle_order_amended
-let handle_order_amendment_skipped = Suicide_grid_events.handle_order_amendment_skipped
-let handle_order_amendment_failed = Suicide_grid_events.handle_order_amendment_failed
-let cleanup_pending_cancellation = Suicide_grid_events.cleanup_pending_cancellation
-let enqueue_event = Suicide_grid_events.enqueue_event
-let drain_events = Suicide_grid_events.drain_events
+let flush_persistence = Jacobs_ladder_events.flush_persistence
+let handle_order_acknowledged = Jacobs_ladder_events.handle_order_acknowledged
+let handle_order_failed = Jacobs_ladder_events.handle_order_failed
+let handle_order_rejected = Jacobs_ladder_events.handle_order_rejected
+let handle_order_filled = Jacobs_ladder_events.handle_order_filled
+let handle_order_cancelled = Jacobs_ladder_events.handle_order_cancelled
+let handle_order_amended = Jacobs_ladder_events.handle_order_amended
+let handle_order_amendment_skipped = Jacobs_ladder_events.handle_order_amendment_skipped
+let handle_order_amendment_failed = Jacobs_ladder_events.handle_order_amendment_failed
+let cleanup_pending_cancellation = Jacobs_ladder_events.cleanup_pending_cancellation
+let enqueue_event = Jacobs_ladder_events.enqueue_event
+let drain_events = Jacobs_ladder_events.drain_events
 
 (** Reads up to [max_orders] orders from the ringbuffer for processing. *)
 let get_pending_orders max_orders = LockFreeQueue.read_batch order_buffer max_orders
@@ -175,11 +175,11 @@ module Strategy = struct
 
   (** Cleans up strategy state for a symbol when domain stops. *)
   let rec cleanup_strategy_state symbol =
-    let map = Atomic.get Suicide_grid_types.strategy_states in
+    let map = Atomic.get Jacobs_ladder_types.strategy_states in
     if StringMap.mem symbol map
     then (
       let new_map = StringMap.remove symbol map in
-      if not (Atomic.compare_and_set Suicide_grid_types.strategy_states map new_map)
+      if not (Atomic.compare_and_set Jacobs_ladder_types.strategy_states map new_map)
       then cleanup_strategy_state symbol)
   ;;
 
@@ -201,7 +201,7 @@ module Strategy = struct
   let drain_events = drain_events
 
   (** Supervisor REST callbacks enqueue lifecycle events of this type. *)
-  type lifecycle_event = Suicide_grid_events.lifecycle_event =
+  type lifecycle_event = Jacobs_ladder_events.lifecycle_event =
     | Ack of
         { now : float
         ; order_id : string

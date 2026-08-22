@@ -15,13 +15,13 @@
   unix)
  (modules
   Strategy_common
-  Suicide_grid
-  Suicide_grid_types
-  Suicide_grid_config
-  Suicide_grid_reservation
-  Suicide_grid_orders
-  Suicide_grid_execution
-  Suicide_grid_events
+  Jacobs_ladder
+  Jacobs_ladder_types
+  Jacobs_ladder_config
+  Jacobs_ladder_reservation
+  Jacobs_ladder_orders
+  Jacobs_ladder_execution
+  Jacobs_ladder_events
   Grid_core
   Grid_core_types
   Market_maker

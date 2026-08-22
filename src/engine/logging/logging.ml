@@ -86,7 +86,7 @@ let ansi code = "\027[" ^ string_of_int code ^ "m"
 
 (* Per-section identity colors: a curated mapping for the sections that log
    most, so the heavily interleaved components (oracle_runtime, domain_spawner,
-   suicide_grid, order_processor, supervisor, main) are always mutually
+   jacobs_ladder, order_processor, supervisor, main) are always mutually
    distinct. The oracle_* family shares bright-yellow on purpose, so a block
    of oracle lines reads as one subsystem. Any unlisted section falls back to
    a stable hash into [section_color_palette]. *)
@@ -101,7 +101,7 @@ let section_color_overrides =
     ; "oracle_runtime", 93 (* bright yellow *)
     ; "oracle_replay", 93
     ; "oracle_yahoo", 93
-    ; "suicide_grid", 96 (* bright cyan *)
+    ; "jacobs_ladder", 96 (* bright cyan *)
     ; "order_processor", 34 (* blue *)
     ; "dashboard_server", 35 (* magenta *)
     ; "discord_notifier", 97 (* bright white *)

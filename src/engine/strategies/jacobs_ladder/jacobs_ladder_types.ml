@@ -1,6 +1,6 @@
-(* Suicide Grid - Core Types & State Registry *)
+(* Jacobs Ladder - Core Types & State Registry *)
 
-let section = "suicide_grid"
+let section = "jacobs_ladder"
 
 open Strategy_common
 module Exchange = Dio_exchange.Exchange_intf

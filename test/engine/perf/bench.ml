@@ -1,6 +1,6 @@
 module LP = Latency_profiler
 module SC = Dio_strategies.Strategy_common
-module SG = Dio_strategies.Suicide_grid
+module SG = Dio_strategies.Jacobs_ladder
 module FC = Dio_strategies.Fee_cache
 
 (* ── helpers ──────────────────────────────────────────────────────────────── *)
@@ -61,7 +61,7 @@ let bench_lockfreequeue () =
       0.001
       (Some 50000.0)
       true
-      SC.Grid
+      SC.Ladder
       "kraken"
   in
   let p = LP.create ~max_latency_us:100_000 name in
@@ -142,7 +142,7 @@ let bench_order_creation_place () =
             0.001
             (Some 50000.0)
             true
-            SC.Grid
+            SC.Ladder
             "kraken"
         in
         ()))
@@ -165,7 +165,7 @@ let bench_order_creation_amend () =
             0.001
             (Some 51000.0)
             true
-            SC.Grid
+            SC.Ladder
             "kraken"
         in
         ()))

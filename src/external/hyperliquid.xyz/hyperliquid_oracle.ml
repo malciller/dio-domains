@@ -485,7 +485,7 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
   match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
   | None | Some "" -> Lwt.return (Error "HYPERLIQUID_WALLET_ADDRESS is not set")
   | Some wallet ->
-    (* The suicide_grid strategy trades spot only, so the pool is the spot
+    (* The jacobs_ladder strategy trades spot only, so the pool is the spot
        wallet's USDC (and any other spot tokens) exclusively. The perpetual
        clearinghouse balance is deliberately not included: it is margin
        reserved for perp positions, not capital available to the spot grid. *)

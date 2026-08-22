@@ -63,7 +63,7 @@ let grid_callbacks : strategy_callbacks =
         | Some price ->
           (* H3: enqueue onto the per-symbol lifecycle queue; the domain thread
              drains it, so the strategy mutex is never taken cross-thread. *)
-          Dio_strategies.Suicide_grid.Strategy.enqueue_event
+          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
             order.symbol
             (Ack { now = Unix.gettimeofday (); order_id; side = order.side; price })
         | None -> ())
@@ -77,12 +77,12 @@ let grid_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
-        Dio_strategies.Suicide_grid.Strategy.enqueue_event
+        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
           order.symbol
           (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
         match order.price with
         | Some price ->
-          Dio_strategies.Suicide_grid.Strategy.enqueue_event
+          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
             order.symbol
             (Rejected { now = Unix.gettimeofday (); side = order.side; price })
         | None -> ())
@@ -98,7 +98,7 @@ let grid_callbacks : strategy_callbacks =
           new_order_id;
         match order.price with
         | Some price ->
-          Dio_strategies.Suicide_grid.Strategy.enqueue_event
+          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
             order.symbol
             (Amended
                { now = Unix.gettimeofday ()
@@ -116,7 +116,7 @@ let grid_callbacks : strategy_callbacks =
       (fun order target_order_id ->
         match order.price with
         | Some price ->
-          Dio_strategies.Suicide_grid.Strategy.enqueue_event
+          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
             order.symbol
             (Amendment_skipped
                { now = Unix.gettimeofday ()
@@ -138,7 +138,7 @@ let grid_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
-        Dio_strategies.Suicide_grid.Strategy.enqueue_event
+        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
           order.symbol
           (Amendment_failed
              { now = Unix.gettimeofday ()
@@ -149,12 +149,12 @@ let grid_callbacks : strategy_callbacks =
   ; on_cancel_ok =
       (fun order target_order_id ->
         Logging.info_f ~section "✓ Cancelled order: %s" target_order_id;
-        Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation
+        Dio_strategies.Jacobs_ladder.Strategy.cleanup_pending_cancellation
           order.symbol
           target_order_id)
   ; on_cancel_fail =
       (fun order target_order_id ->
-        Dio_strategies.Suicide_grid.Strategy.cleanup_pending_cancellation
+        Dio_strategies.Jacobs_ladder.Strategy.cleanup_pending_cancellation
           order.symbol
           target_order_id)
   }
@@ -302,7 +302,7 @@ let hedger_callbacks : strategy_callbacks =
     routing since MM batch handles both Grid and MM amend/cancel orders. *)
 let callbacks_for_strategy (order : strategy_order) =
   match order.strategy with
-  | Grid -> grid_callbacks
+  | Ladder -> grid_callbacks
   | MM -> mm_callbacks
   | Hedger -> hedger_callbacks
 ;;
@@ -597,7 +597,7 @@ let order_processing_loop () =
       in
       (* Drain ring buffers regardless of connection status to prevent backpressure *)
       let pending_grid_orders =
-        Dio_strategies.Suicide_grid.Strategy.get_pending_orders 100
+        Dio_strategies.Jacobs_ladder.Strategy.get_pending_orders 100
       in
       let pending_mm_orders =
         Dio_strategies.Market_maker.Strategy.get_pending_orders 100

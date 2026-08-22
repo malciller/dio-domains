@@ -376,7 +376,7 @@ let demo_format () =
       , "oracle_replay"
       , "only 3 independent 180-session windows for HYPE/USDC" )
     ; ( Logging.INFO
-      , "suicide_grid"
+      , "jacobs_ladder"
       , "Order cancellation for QQQ ignored for tracking reset" )
     ; ( Logging.INFO
       , "order_processor"

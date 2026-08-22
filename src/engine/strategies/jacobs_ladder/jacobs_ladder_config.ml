@@ -1,6 +1,6 @@
-(* Suicide Grid - Exchange Configuration & Dynamic Helpers *)
+(* Jacobs Ladder - Exchange Configuration & Dynamic Helpers *)
 
-open Suicide_grid_types
+open Jacobs_ladder_types
 
 (* Kraken runs the same accumulation model as HL/Lighter/IBKR: profit-gated
    accumulation sells, 1:1 sells, and an explicit reserved_base accrual on

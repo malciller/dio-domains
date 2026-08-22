@@ -202,7 +202,7 @@ let test_greedy_fallback_large_account () =
 
 (* The full reclaim lifecycle, driven exactly as the engine drives it:
    pass -> plan (oracle) interleaved with the domain's cancel step
-   (Dio_strategies.Suicide_grid.reclaim_step). This is the regression for
+   (Dio_strategies.Jacobs_ladder.reclaim_step). This is the regression for
    the stuck state: a single failed cancel used to leave the account
    permanently halted - the reclaimed asset stayed paused (the plan only
    cleared once the store's committed value dropped to zero) and the
@@ -218,7 +218,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
     ]
   in
   let step ~now ~issued ~issued_at ~eligible ~any_buy =
-    Dio_strategies.Suicide_grid.reclaim_step
+    Dio_strategies.Jacobs_ladder.reclaim_step
       ~now
       ~retry_seconds:15.0
       ~issued
@@ -239,7 +239,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
     "first attempt issues the cancel"
     true
     (step ~now:100.0 ~issued:false ~issued_at:0.0 ~eligible:1 ~any_buy:true
-     = Dio_strategies.Suicide_grid.Reclaim_cancel 1);
+     = Dio_strategies.Jacobs_ladder.Reclaim_cancel 1);
   (* Pass 2: nothing changed (the failed cancel left the store intact), so
      the plan persists and the decision stays reclaim. *)
   let p2 = plan (assets ()) in
@@ -254,7 +254,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
     "in-flight cancel deferred"
     true
     (step ~now:105.0 ~issued:true ~issued_at:100.0 ~eligible:1 ~any_buy:true
-     = Dio_strategies.Suicide_grid.Reclaim_deferred);
+     = Dio_strategies.Jacobs_ladder.Reclaim_deferred);
   (* ...but after the interval the cancel is RETRIED, and this time it lands:
      the store clears and the pool reflects the released capital. *)
   check
@@ -262,7 +262,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
     "stale failed cancel is retried"
     true
     (step ~now:116.0 ~issued:true ~issued_at:100.0 ~eligible:1 ~any_buy:true
-     = Dio_strategies.Suicide_grid.Reclaim_cancel 1);
+     = Dio_strategies.Jacobs_ladder.Reclaim_cancel 1);
   hype_committed := 0.0;
   pool := 33.87;
   check
@@ -270,7 +270,7 @@ let test_reclaim_lifecycle_retries_failed_cancel () =
     "clean store re-arms the latch"
     true
     (step ~now:116.5 ~issued:true ~issued_at:116.0 ~eligible:0 ~any_buy:false
-     = Dio_strategies.Suicide_grid.Reclaim_rearm);
+     = Dio_strategies.Jacobs_ladder.Reclaim_rearm);
   (* Pass 3: the plan clears (BTC is funded from the pool) and the priority
      asset re-activates - the account is no longer stuck. *)
   let p3 = plan (assets ()) in

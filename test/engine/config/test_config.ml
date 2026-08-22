@@ -15,7 +15,7 @@ let test_parse_trading_config_valid () =
 ;;
 
 let test_parse_trading_config_defaults () =
-  let json_str = {|{"symbol": "ETH/USD", "qty": "0.01", "strategy": "Grid"}|} in
+  let json_str = {|{"symbol": "ETH/USD", "qty": "0.01", "strategy": "Ladder"}|} in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
   Alcotest.(check string) "symbol" "ETH/USD" config.symbol;
@@ -26,7 +26,7 @@ let test_parse_trading_config_defaults () =
     (1.0, 1.0)
     config.grid_interval;
   Alcotest.(check string) "sell_mult default" "1.0" config.sell_mult;
-  Alcotest.(check string) "strategy" "Grid" config.strategy;
+  Alcotest.(check string) "strategy" "Ladder" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee none" None config.taker_fee;
   Alcotest.(check (option string)) "asset_class none" None config.asset_class;

@@ -4,7 +4,7 @@
    restarts on venues that drop orders due to time constraints. The store
    only loads/persists levels; reconciliation (fulfilled-vs-unfulfilled
    verification, replacement under contention, adoption of unknown exchange
-   orders) stays in the strategy/execution layer (suicide_grid_execution.ml).
+   orders) stays in the strategy/execution layer (jacobs_ladder_execution.ml).
 
    Compact [p; q] JSON list form is kept: it keeps the file small and the
    per-save serialization fast for large sell grids. Levels are stored sorted

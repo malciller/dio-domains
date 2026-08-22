@@ -25,7 +25,7 @@
    - Alpaca: static tick (0.01) / fractional lots - nothing to fetch.
 
    Offline mode (--from-csv / --from-json) skips every network call; the
-   caches stay empty and Suicide_grid_config logs a missing-metadata warning
+   caches stay empty and Jacobs_ladder_config logs a missing-metadata warning
    rather than silently defaulting. *)
 
 open Lwt.Infix

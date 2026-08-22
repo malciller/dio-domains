@@ -1,6 +1,6 @@
 (* Grid_core - pure, survival-grade DIO Grid buy/sell state machine.
 
-   Mirrors the live grid (Suicide_grid_execution):
+   Mirrors the live grid (Jacobs_ladder_execution):
    - buy level      = ref * (1 - gi/100), sell level = last_buy_fill * (1 + gi/100)
    - trailing buy   = min(ref*(1-gi/100), sell - 2*gi/100*ref)   [exact_target rule]
    - dynamic buy sizing: the quantity is up-sized per level so the order
@@ -142,7 +142,7 @@ let exchange_model_of_string = function
   | s -> invalid_arg ("Grid_core.exchange_model_of_string: " ^ s)
 ;;
 
-(* Per-venue flag mirroring Suicide_grid_config's use_accumulation_sells.
+(* Per-venue flag mirroring Jacobs_ladder_config's use_accumulation_sells.
    All venues run the aligned model: Kraken/HL/Lighter/IBKR accumulate
    (profit-gated reduced sells); Alpaca sells 1:1. The old per-venue
    sell-mult sizing flag is gone - retention is explicit via reserved_base
@@ -153,7 +153,7 @@ let use_accumulation_sells (cfg : config) : bool =
   | Kraken | Hyperliquid | Lighter | Ibkr -> true
 ;;
 
-(* Mirrors Suicide_grid_config.hl_like_spot_fee_exchange: these spot venues
+(* Mirrors Jacobs_ladder_config.hl_like_spot_fee_exchange: these spot venues
    charge the BUY fee out of the RECEIVED BASE token (only the net amount
    lands on the venue), so accrual math runs on the net landed qty. *)
 let hl_like_spot_fee : exchange_model -> bool = function
@@ -162,7 +162,7 @@ let hl_like_spot_fee : exchange_model -> bool = function
 ;;
 
 (* Rounding: prices to nearest tick (matches exchange round_to_incr), lots
-   floored (matches Suicide_grid_config.round_qty). *)
+   floored (matches Jacobs_ladder_config.round_qty). *)
 let round_price cfg p =
   let inv = 1.0 /. cfg.price_increment in
   Float.round (p *. inv) /. inv
@@ -181,7 +181,7 @@ let ceil_lot cfg q =
   Float.ceil ((q *. inv) -. 1e-9) /. inv
 ;;
 
-(* Level helpers. These must agree with Suicide_grid_config.calculate_grid_price
+(* Level helpers. These must agree with Jacobs_ladder_config.calculate_grid_price
    when that function is used with an identity rounding state (contract test). *)
 let buy_level cfg ~ref = round_price cfg (ref *. (1.0 -. (cfg.grid_interval_pct /. 100.0)))
 
@@ -190,7 +190,7 @@ let sell_level cfg ~ref =
 ;;
 
 (** Trailing buy target with a resting sell: the exact_target rule from
-    Suicide_grid_execution (double_grid_interval = bid * 2*gi/100). *)
+    Jacobs_ladder_execution (double_grid_interval = bid * 2*gi/100). *)
 let trail_buy_level cfg ~bid ~sell =
   let grid_buy = buy_level cfg ~ref:bid in
   let exact =
@@ -200,10 +200,10 @@ let trail_buy_level cfg ~bid ~sell =
 ;;
 
 (** Minimum price move required before trailing an amendment. Delegates to
-    the live [Suicide_grid_config.get_min_move_threshold] so the threshold
+    the live [Jacobs_ladder_config.get_min_move_threshold] so the threshold
     has a single source of truth (the exchange tick) - no duplicated formula. *)
 let min_move_threshold cfg _price =
-  Suicide_grid_config.get_min_move_threshold cfg.price_increment
+  Jacobs_ladder_config.get_min_move_threshold cfg.price_increment
 ;;
 
 (** Dynamic buy quantity at [price]: the base qty, up-sized (ceiling lot) so

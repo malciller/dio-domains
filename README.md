@@ -91,7 +91,7 @@ Each element of `trading` configures one symbol on one exchange:
   "qty": 0.001,
   "grid_interval": [0.004, 0.01],
   "sell_mult": 0.6,
-  "strategy": "Grid",
+  "strategy": "Ladder",
   "maker_fee": null,
   "taker_fee": null,
   "asset_class": "Crypto"
@@ -219,7 +219,7 @@ US equities, paper or live. `data_feed` selects `iex` (free, 15-minute delayed b
 
 ### Grid
 
-The default strategy (`suicide_grid`). The grid places a resting buy ladder below the market and a sell ladder above. Order size and grid interval come from the oracle decision when one is available, or from `config.json` as a fallback.
+The default strategy (`jacobs_ladder`). The grid places a resting buy ladder below the market and a sell ladder above. Order size and grid interval come from the oracle decision when one is available, or from `config.json` as a fallback.
 
 Accumulation: `sell_mult` below `1.0` reserves a fraction of realized base. Accumulation venues (Hyperliquid, Lighter, IBKR, Alpaca) keep the resting sell up until the reserved floor is cleared. Non-accumulation venues (Kraken, Alpaca when sell_mult is exactly `1.0`) up-size the sell to the full notional instead.
 
@@ -303,7 +303,7 @@ All exchange I/O funnels through `error_handling.ml`: callers classify errors (`
 
 ### Persistence
 
-`state_persistence.ml` writes `data/accumulated_state.json` atomically (temp file + rename, guarded by a mutex). Fields: `reserved_base`, `accumulated_profit`, `last_fill_oid`, `last_buy_fill_price`, `last_sell_fill_price`, `last_buy_fill_qty`, `last_sell_fill_qty`, `sell_levels`. Used by the suicide grid on Hyperliquid, Lighter, IBKR, and Alpaca. In Docker, mount `/app/data`.
+`state_persistence.ml` writes `data/accumulated_state.json` atomically (temp file + rename, guarded by a mutex). Fields: `reserved_base`, `accumulated_profit`, `last_fill_oid`, `last_buy_fill_price`, `last_sell_fill_price`, `last_buy_fill_qty`, `last_sell_fill_qty`, `sell_levels`. Used by the Jacobs ladder on Hyperliquid, Lighter, IBKR, and Alpaca. In Docker, mount `/app/data`.
 
 ---
 
@@ -430,7 +430,7 @@ Where things live:
 | `src/engine/supervisor/` | Connection registry, health monitor, circuit breaker, feed orchestration |
 | `src/engine/concurrency/` | Ring buffers, event buses, exchange wakeup generations, feed parse worker, fill event bus, Lwt helpers |
 | `src/engine/oracle/` | Oracle runtime, math, venues, tasks, loader |
-| `src/engine/strategies/` | `suicide_grid`, `market_maker`, `auto_hedger`, grid core |
+| `src/engine/strategies/` | `jacobs_ladder`, `market_maker`, `auto_hedger`, grid core |
 | `src/engine/latency_profiling/` | Rolling p50/p99/p999 network latency stats |
 | `src/engine/error_handling/` | Error classification and retry/backoff |
 | `src/engine/logging/` | Async logger |
