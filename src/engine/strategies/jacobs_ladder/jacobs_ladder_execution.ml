@@ -228,7 +228,8 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
              if String.starts_with ~prefix:"pending_amend_" order_id
              then (
                let target_oid = String.sub order_id 14 (String.length order_id - 14) in
-               ignore (InFlightAmendments.remove_in_flight_amendment target_oid))
+               ignore (InFlightAmendments.remove_in_flight_amendment target_oid);
+               if side = Buy then state.inflight_amend_buy <- false)
              else (
                let duplicate_key =
                  match side with
@@ -474,7 +475,7 @@ let sync_open_orders
       let best_price = !best_buy_price in
       let recent_amend =
         match Hashtbl.find_opt state.amend_cooldowns best_order_id with
-        | Some expiry -> now -. expiry < 5.0
+        | Some expiry -> now < expiry
         | None -> false
       in
       if not recent_amend
