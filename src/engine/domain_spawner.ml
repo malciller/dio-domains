@@ -71,7 +71,11 @@ let get_domain_profilers symbol =
     | None ->
       let p =
         { prof_ob = Latency_profiler.create (symbol ^ ":ob")
-        ; prof_exec = Latency_profiler.create (symbol ^ ":exec")
+        ; prof_exec =
+            Latency_profiler.create
+              ~bucket_us:10
+              ~max_latency_us:1_000_000
+              (symbol ^ ":exec")
         ; prof_strategy = Latency_profiler.create (symbol ^ ":strategy")
         ; prof_cycle =
             Latency_profiler.create
@@ -554,12 +558,13 @@ let asset_domain_worker
       let t2 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       if did_ob && latency_this_cycle
       then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
+      let was_exec_ready = !exec_ready in
       let current_pos = get_exec_pos_fn () in
       let did_exec = current_pos <> !exec_read_pos in
+      let event_count = ref 0 in
       if did_exec
       then (
         open_orders_dirty := true;
-        let event_count = ref 0 in
         let now_exec = Unix.gettimeofday () in
         let new_pos =
           Ex.iter_execution_events
@@ -758,8 +763,17 @@ let asset_domain_worker
         exec_read_pos := new_pos;
         exec_checked := true);
       let t3 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-      if did_exec && latency_this_cycle
-      then Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns (Int64.sub t3 t2));
+      if did_exec && latency_this_cycle && was_exec_ready && !event_count > 0
+      then (
+        let elapsed_ns = Int64.sub t3 t2 in
+        let per_event_ns =
+          if !event_count > 1
+          then Int64.div elapsed_ns (Int64.of_int !event_count)
+          else elapsed_ns
+        in
+        for _ = 1 to !event_count do
+          Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns per_event_ns)
+        done);
       (* Fallback gate for domains with no open orders: if no exec events
            arrived and the execution data is ready (snapshot ingested), open
            the gate so the strategy can place its initial order. *)
