@@ -286,6 +286,7 @@ let test_decision_activity_gating () =
       ~available_quote:100.0
       ~current:50.0
       ~min_active_dsurv:0.5
+      ()
   in
   Alcotest.(check bool) "active when gated and affordable" d.active true;
   near "grid_interval passes through raw" d.grid_interval 2.0;
@@ -299,6 +300,7 @@ let test_decision_activity_gating () =
       ~available_quote:100.0
       ~current:50.0
       ~min_active_dsurv:0.95
+      ()
   in
   Alcotest.(check bool) "inactive under the dsurv gate" d2.active false;
   Alcotest.(check bool) "inactive still emits parameters" (d2.buy_qty > 0.0) true;
@@ -310,8 +312,21 @@ let test_decision_activity_gating () =
       ~available_quote:50.0
       ~current:50.0
       ~min_active_dsurv:0.5
+      ()
   in
-  Alcotest.(check bool) "inactive when unaffordable" d3.active false
+  Alcotest.(check bool) "inactive when unaffordable" d3.active false;
+  (* Resting buy exists: active even if unaffordable for a new buy *)
+  let d4 =
+    Dio_oracle.Oracle_core.decision_of
+      ~resolution:res
+      ~sell_qty:0.5
+      ~available_quote:0.0
+      ~current:50.0
+      ~min_active_dsurv:0.95
+      ~has_resting_buy:true
+      ()
+  in
+  Alcotest.(check bool) "active when resting buy exists" d4.active true
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -363,6 +378,7 @@ let test_pipeline_decide () =
     ; target_survival = 0.8
     ; min_active_dsurv = 0.5
     ; fees = Dio_oracle.Oracle_core.default_fees
+    ; has_resting_buy = false
     }
   in
   match Dio_oracle.Oracle_pipeline.decide ~inputs with

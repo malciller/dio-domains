@@ -872,8 +872,16 @@ let asset_domain_worker
       in
       let oracle_halted =
         match oracle_decision with
-        | Some d -> not d.active
-        | None -> false
+        | Some d when not d.active ->
+          let has_open_buy =
+            Ex.fold_open_orders
+              ~symbol:asset_with_fees.symbol
+              ~init:false
+              ~f:(fun acc (o : Types.open_order) ->
+                acc || (o.side = Types.Buy && o.remaining_qty > 0.0))
+          in
+          not has_open_buy
+        | _ -> false
       in
       (match oracle_decision, !grid_strategy_asset_ref with
        | Some d, None when d.active ->

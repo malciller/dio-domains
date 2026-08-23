@@ -25,12 +25,33 @@ let oracle_inactive (data : Yojson.Basic.t) : bool =
 ;;
 
 (** Paused = the capital oracle says INACTIVE, or the grid's own capital-low
-    flag is set (or the market is closed, judged at render time). *)
+    flag is set (or the market is closed, judged at render time). If an open
+    resting buy order already exists, the strategy cannot be considered paused
+    by capital/oracle gates since the order is already placed and funded. *)
 let strategy_paused (data : Yojson.Basic.t) : bool =
   let strat = data |?> "strategy" in
-  oracle_inactive data
-  || strat |?> "capital_low" |> to_bool_d false
-  || strat |?> "market_is_closed" |> to_bool_d false
+  let market = data |?> "market" in
+  let has_resting_buy =
+    let strat_price = strat |?> "buy_price" |> to_float_d 0.0 in
+    if strat_price > 0.0
+    then true
+    else (
+      let open_buys =
+        market
+        |?> "buy_orders"
+        |> to_list_d
+        |> List.filter_map (fun o ->
+          let p = o |?> "price" |> to_float_d 0.0 in
+          if p > 0.0 then Some p else None)
+      in
+      open_buys <> [])
+  in
+  if has_resting_buy
+  then strat |?> "market_is_closed" |> to_bool_d false
+  else (
+    oracle_inactive data
+    || strat |?> "capital_low" |> to_bool_d false
+    || strat |?> "market_is_closed" |> to_bool_d false)
 ;;
 
 (** Accumulated quantity: the inventory held that is not committed to a
@@ -360,8 +381,11 @@ let render_strategies ?(selected_index = None) w json =
     let gauge_img = render_proximity_slider 17 execution_proximity_opt in
     let market_is_closed = strat |?> "market_is_closed" |> to_bool_d false in
     let oracle_paused = oracle_inactive data in
+    let has_resting_buy = buy_price > 0.0 in
     let status_str, status_attr =
-      if oracle_paused || cap_low || market_is_closed then "⏸", a_yellow else "▶", a_green
+      if (not has_resting_buy && (oracle_paused || cap_low)) || market_is_closed
+      then "⏸", a_yellow
+      else "▶", a_green
     in
     let exch_tag = exch_tag_of exchange in
     let spread_str = format_spread_bps bid ask in

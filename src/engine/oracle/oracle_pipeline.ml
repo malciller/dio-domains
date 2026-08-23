@@ -19,6 +19,7 @@ type inputs =
   ; target_survival : float
   ; min_active_dsurv : float
   ; fees : Oracle_core.fee_model
+  ; has_resting_buy : bool
   }
 
 (** Everything a pass learned, for logging/telemetry. *)
@@ -82,6 +83,8 @@ let decide ~(inputs : inputs) : outcome option =
         ~available_quote:inputs.available_quote
         ~current:inputs.current_price
         ~min_active_dsurv:inputs.min_active_dsurv
+        ~has_resting_buy:inputs.has_resting_buy
+        ()
     in
     Some { refs; runway; resolution; decision }
 ;;

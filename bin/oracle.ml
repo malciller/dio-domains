@@ -159,6 +159,7 @@ let analyze_one
            ; target_survival
            ; min_active_dsurv
            ; fees
+           ; has_resting_buy = false
            }
          in
          match Dio_oracle.Oracle_pipeline.decide ~inputs with
