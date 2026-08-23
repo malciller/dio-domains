@@ -115,7 +115,7 @@ let evaluate_asset_low_recovery
     let qty_f = lot_qty in
     let asset_needed_fast = qty_f in
     let locked_in_sells =
-      if ecfg.use_reserved_base_guard
+      if ecfg.use_reserved_base_guard && not ecfg.use_accumulation_sells
       then List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
       else 0.0
     in
@@ -1284,97 +1284,54 @@ let evaluate_sell_leg
            -. state.reserved_base
            -. locked_in_sells)
     in
+    let target_q = round_qty sell_qty asset.symbol asset.exchange in
     let effective_sell_qty, balance_ok =
-      if is_alpaca
-      then (
-        match target_sell_qty_override with
-        | Some tq ->
-          let rounded_tq = round_qty tq asset.symbol asset.exchange in
-          if available >= rounded_tq -. 1e-6 && rounded_tq > 0.0
-          then rounded_tq, true
-          else (
-            Logging.debug_f
-              ~section
-              "Sell order blocked for Alpaca %s: available %.8f < target_q %.8f"
-              asset.symbol
-              available
-              rounded_tq;
-            0.0, false)
-        | None ->
-          let sell_q = round_qty available asset.symbol asset.exchange in
-          if sell_q > 0.0
-          then sell_q, true
-          else (
-            Logging.debug_f
-              ~section
-              "Sell order blocked for Alpaca %s: available %.8f (bal %.8f + anticipated \
-               %.8f - reserved %.8f - locked_sells %.8f) <= 0"
-              asset.symbol
-              available
-              asset_bal
-              state.anticipated_base_credit
-              state.reserved_base
-              locked_in_sells;
-            0.0, false))
-      else if is_accumulation
-      then (
-        (* Accumulation venues: size the sell PURELY by the non-accrued
-           inventory (available balance - reserved_base), not by
-           round(qty * sell_mult). Sell all of it (lot-rounded down); the
-           venue-floor gate below decides whether the result is placeable. *)
-        let rounded = round_qty available asset.symbol asset.exchange in
-        if rounded > 0.0
-        then rounded, true
-        else (
-          Logging.debug_f
-            ~section
-            "Sell order blocked for %s: non-accrued inventory %.8f (bal %.8f + \
-             anticipated %.8f - reserved %.8f) rounds below one lot"
-            asset.symbol
-            available
-            asset_bal
-            state.anticipated_base_credit
-            state.reserved_base;
-          0.0, false))
-      else if ecfg.use_reserved_base_guard
+      if ecfg.use_reserved_base_guard
       then
-        if
-          (* Kraken: size strictly by qty * sell_mult, clamped to the sellable
-           inventory when short (partial fills / residual base). *)
-          available >= sell_qty
-        then sell_qty, true
+        if available >= target_q -. 1e-6 && target_q > 0.0
+        then target_q, true
         else if available > 0.0
         then (
           let rounded_avail = round_qty available asset.symbol asset.exchange in
           if rounded_avail > 0.0
-          then rounded_avail, true
-          else (
+          then (
             Logging.debug_f
               ~section
-              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
-               reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+              "Sell order clamped for %s: available %.8f (bal %.8f + anticipated %.8f - \
+               reserved %.8f) < target_q %.8f -> clamped to %.8f"
               asset.symbol
               available
               asset_bal
               state.anticipated_base_credit
               state.reserved_base
-              locked_in_sells
-              sell_qty;
+              target_q
+              rounded_avail;
+            rounded_avail, true)
+          else (
+            Logging.debug_f
+              ~section
+              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
+               reserved %.8f) rounds below one lot"
+              asset.symbol
+              available
+              asset_bal
+              state.anticipated_base_credit
+              state.reserved_base;
             0.0, false))
         else (
           Logging.debug_f
             ~section
             "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
-             reserved %.8f - locked_sells %.8f) < sell_qty %.8f"
+             reserved %.8f) <= 0"
             asset.symbol
             available
             asset_bal
             state.anticipated_base_credit
-            state.reserved_base
-            locked_in_sells
-            sell_qty;
+            state.reserved_base;
           0.0, false)
-      else sell_qty, true
+      else if target_q > 0.0
+      then target_q, true
+      else 0.0, false
     in
     if balance_ok
     then (
