@@ -1284,67 +1284,93 @@ let evaluate_sell_leg
            -. state.reserved_base
            -. locked_in_sells)
     in
+    let min_order_size =
+      if state.cached_qty_increment > 0.0
+      then state.cached_qty_increment
+      else 1e-8
+    in
     let target_q = round_qty sell_qty asset.symbol asset.exchange in
     let effective_sell_qty, balance_ok =
       if ecfg.use_reserved_base_guard
       then
+        let rounded_avail = round_qty available asset.symbol asset.exchange in
         if available >= target_q -. 1e-6 && target_q > 0.0
-        then target_q, true
-        else if available > 0.0
-        then (
-          let rounded_avail = round_qty available asset.symbol asset.exchange in
-          if rounded_avail > 0.0
+        then
+          if rounded_avail >= target_q && rounded_avail >= min_order_size -. 1e-9
+          then (
+            Logging.debug_f
+              ~section
+              "Sell order sized for %s: target_q %.8f + non-reserved surplus (available \
+               %.8f) -> sized to %.8f (min_order_size %.8f)"
+              asset.symbol
+              target_q
+              available
+              rounded_avail
+              min_order_size;
+            rounded_avail, true)
+          else if target_q >= min_order_size -. 1e-9
+          then target_q, true
+          else (
+            Logging.debug_f
+              ~section
+              "Sell order blocked for %s: target_q %.8f is below min_order_size %.8f"
+              asset.symbol
+              target_q
+              min_order_size;
+            0.0, false)
+        else if available >= min_order_size -. 1e-9
+        then
+          if rounded_avail >= min_order_size -. 1e-9 && rounded_avail > 0.0
           then (
             Logging.debug_f
               ~section
               "Sell order clamped for %s: available %.8f (bal %.8f + anticipated %.8f - \
-               reserved %.8f) < target_q %.8f -> clamped to %.8f"
+               reserved %.8f) < target_q %.8f -> clamped to %.8f (min_order_size %.8f)"
               asset.symbol
               available
               asset_bal
               state.anticipated_base_credit
               state.reserved_base
               target_q
-              rounded_avail;
+              rounded_avail
+              min_order_size;
             rounded_avail, true)
           else (
             Logging.debug_f
               ~section
               "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
-               reserved %.8f) rounds below one lot"
+               reserved %.8f) rounds below min_order_size %.8f"
               asset.symbol
               available
               asset_bal
               state.anticipated_base_credit
-              state.reserved_base;
-            0.0, false))
+              state.reserved_base
+              min_order_size;
+            0.0, false)
         else (
           Logging.debug_f
             ~section
             "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
-             reserved %.8f) <= 0"
+             reserved %.8f) is below min_order_size %.8f"
             asset.symbol
             available
             asset_bal
             state.anticipated_base_credit
-            state.reserved_base;
+            state.reserved_base
+            min_order_size;
           0.0, false)
-      else if target_q > 0.0
+      else if target_q >= min_order_size -. 1e-9 && target_q > 0.0
       then target_q, true
       else 0.0, false
     in
     if balance_ok
     then (
-      (* The NOTIONAL gate: sells are deliberately NOT floored at the venue's
-         base-quantity minimum - accrual sells (sell_mult x qty) and residual
-         non-accrued inventory legitimately size below it (e.g. 0.999 x
-         0.0005 BTC = 0.0004995 < the 0.0005 lot floor). Only the QUOTE-
-         NOTIONAL floor is enforced: that is the exchange's real reject
-         threshold for value-sized spot orders (Hyperliquid's 10 USDC spot
-         floor, Alpaca's $1 fractional minimum), and placing below it would
-         only spam guaranteed rejects through the retry latch. *)
+      (* The NOTIONAL gate: enforce both venue minimum quantity / increment
+         floor and venue quote-notional minimum floor. *)
       let venue_min_ok q =
-        q > 0.0 && q *. sell_price >= state.cached_venue_min_notional -. 1e-9
+        q >= min_order_size -. 1e-9
+        && (state.cached_venue_min_notional <= 0.0
+            || q *. sell_price >= state.cached_venue_min_notional -. 1e-9)
       in
       if venue_min_ok effective_sell_qty
       then (

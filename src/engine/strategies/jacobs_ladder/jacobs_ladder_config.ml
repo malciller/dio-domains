@@ -169,7 +169,7 @@ let get_qty_increment_val symbol exchange =
 let round_qty qty symbol exchange =
   let increment = get_qty_increment_val symbol exchange in
   let inv = 1.0 /. increment in
-  floor (qty *. inv) /. inv
+  floor ((qty *. inv) +. 1e-9) /. inv
 ;;
 
 (** Venue minimum accepted order QUANTITY for [symbol] in base-asset units,

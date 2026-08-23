@@ -446,11 +446,11 @@ let test_sub_minimum_qty_sell_places () =
       pushed
   in
   (* target_q is 0.5 (fill qty), and available is 1.05 - 0.5 = 0.55 >= 0.5.
-     Placed for target_q (0.5) despite being under the cached_venue_min_qty floor (10.0). *)
+     Placed for target_q + surplus (0.55) despite being under the cached_venue_min_qty floor (10.0). *)
   check
     (option (float 1e-9))
     "sub-minimum qty sell places at target sell qty"
-    (Some 0.5)
+    (Some 0.55)
     sell_qty;
   check bool "latch cleared after the sub-minimum sell placed" false state.just_filled_buy
 ;;
