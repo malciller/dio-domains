@@ -34,15 +34,15 @@
     {
       "symbol": "BTC/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.0005",
+      "qty": "0.0002",
       "grid_interval": [
-        0.25,
-        0.75
+        0.10,
+        0.35
       ],
       "sell_mult": "0.92",
       "accumulation_buffer": [
-        0.15,
-        0.75
+        0.08,
+        0.40
       ],
       "strategy": "Ladder",
       "testnet": false,
@@ -52,15 +52,15 @@
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.35",
+      "qty": "0.20",
       "grid_interval": [
-        0.75,
-        2.5
+        0.45,
+        1.40
       ],
       "sell_mult": "0.96",
       "accumulation_buffer": [
-        0.10,
-        1.50
+        0.06,
+        0.85
       ],
       "strategy": "Ladder",
       "testnet": false,

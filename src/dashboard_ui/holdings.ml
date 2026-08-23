@@ -254,10 +254,13 @@ let render_strategies ?(selected_index = None) w json =
         | [] -> 0.0
         | prices -> List.fold_left min (List.hd prices) prices)
     in
-    let sell_count = strat |?> "sell_count" |> to_int_d 0 in
     let sell_orders =
       let strat_sells = strat |?> "sell_orders" |> to_list_d in
       if strat_sells <> [] then strat_sells else market |?> "sell_orders" |> to_list_d
+    in
+    let sell_count =
+      let sc = strat |?> "sell_count" |> to_int_d 0 in
+      if sc > 0 then sc else List.length sell_orders
     in
     let unrealized_profit, pending_sell_qty =
       List.fold_left
@@ -566,7 +569,10 @@ let render_strategies ?(selected_index = None) w json =
     let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
     let hold_value = balance *. mid in
     let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
-    let sell_count = bal_json |?> "sell_count" |> to_int_d 0 in
+    let sell_count =
+      let sc = bal_json |?> "sell_count" |> to_int_d 0 in
+      if sc > 0 then sc else List.length sell_orders
+    in
     let unrealized_profit, pending_sell_qty =
       List.fold_left
         (fun (up, qty_acc) s ->
@@ -915,7 +921,10 @@ let render_strategies ?(selected_index = None) w json =
          let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
          let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
          let staked_bal = market |?> "staked_balance" |> to_float_d 0.0 in
-         let sell_orders = strat |?> "sell_orders" |> to_list_d in
+         let sell_orders =
+           let strat_sells = strat |?> "sell_orders" |> to_list_d in
+           if strat_sells <> [] then strat_sells else market |?> "sell_orders" |> to_list_d
+         in
          let strat_up, pending_sell_qty =
            List.fold_left
              (fun (a, q_acc) s ->
