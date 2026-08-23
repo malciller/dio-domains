@@ -140,11 +140,12 @@ let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0
     then (
       let accumulated_profit = t.accumulated_profit +. net_profit in
       if accumulated_profit > buffer
-      then
+      then (
+        let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
         { t with
-          reserved_base = t.reserved_base +. (oracle_qty *. sell_mult)
+          reserved_base = t.reserved_base +. accrued_base
         ; accumulated_profit = 0.0
-        }
+        })
       else { t with accumulated_profit })
     else t
   | _ -> t
