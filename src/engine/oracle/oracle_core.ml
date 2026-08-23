@@ -335,10 +335,14 @@ let decision_of
       ~(available_quote : float)
       ~(current : float)
       ~(min_active_dsurv : float)
+      ?(has_resting_buy = false)
+      ()
   : decision
   =
-  let affordable = available_quote >= (resolution.buy_qty *. current) -. 1e-9 in
-  { active = resolution.d_surv >= min_active_dsurv && affordable
+  let affordable =
+    has_resting_buy || available_quote >= (resolution.buy_qty *. current) -. 1e-9
+  in
+  { active = (resolution.d_surv >= min_active_dsurv || has_resting_buy) && affordable
   ; grid_interval = resolution.grid_interval
   ; buy_qty = resolution.buy_qty
   ; sell_qty

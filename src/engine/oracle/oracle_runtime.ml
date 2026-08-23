@@ -384,6 +384,15 @@ let committed_buy_value ~(exchange : string) ~(symbol : string) : float =
       else acc)
 ;;
 
+(** Whether one asset currently has a resting buy order on exchange. Zero network. *)
+let has_resting_buy ~(exchange : string) ~(symbol : string) : bool =
+  match Exchange.Registry.get exchange with
+  | None -> false
+  | Some (module Ex) ->
+    Ex.fold_open_orders ~symbol ~init:false ~f:(fun acc (o : Exchange.Types.open_order) ->
+      acc || (o.side = Exchange.Types.Buy && o.remaining_qty > 0.0))
+;;
+
 (** Base tied in resting sells for one asset (remaining qty sum). *)
 let resting_sell_base ~(exchange : string) ~(symbol : string) : float =
   match Exchange.Registry.get exchange with
@@ -802,17 +811,25 @@ let run_account_pass
                  ~symbol:t.symbol
                  ~fallback:fallback_close
              in
+             let resting_buy = has_resting_buy ~exchange:t.exchange ~symbol:t.symbol in
+             let committed_buy =
+               committed_buy_value ~exchange:t.exchange ~symbol:t.symbol
+             in
+             let effective_quote =
+               if resting_buy then !remaining +. committed_buy else !remaining
+             in
              let inputs : Oracle_pipeline.inputs =
                { exchange = t.exchange
                ; symbol = t.symbol
                ; bars = series.bars
                ; current_price = current
-               ; available_quote = !remaining
+               ; available_quote = effective_quote
                ; sell_qty = 0.0
                ; bounds
                ; target_survival
                ; min_active_dsurv
                ; fees = fees_now t
+               ; has_resting_buy = resting_buy
                }
              in
              match Oracle_pipeline.decide ~inputs with
@@ -860,8 +877,9 @@ let run_account_pass
                  (fun () -> if d.active then "active" else "inactive");
                let need = d.buy_qty *. current in
                (* Funded strategies tie their next buy's quote; starved ones
-                  pass capacity down untouched. *)
-               if d.active && need <= !remaining +. 1e-9
+                  pass capacity down untouched. Resting buys are already committed
+                  in the venue pool, so only fresh active placements consume free quote. *)
+               if d.active && (not resting_buy) && need <= !remaining +. 1e-9
                then remaining := !remaining -. need;
                built := (t, d, need, Some o) :: !built))
       tasks;
