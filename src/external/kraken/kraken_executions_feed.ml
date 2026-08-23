@@ -167,6 +167,8 @@ let write_execution_event buffer event = RingBuffer.write buffer event
 type symbol_store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
+  ; open_orders_cache : open_order list Atomic.t
+    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; last_event_time : float Atomic.t
   ; orders_mutex : Mutex.t
@@ -242,6 +244,7 @@ let get_symbol_store symbol =
         let s =
           { events_buffer = RingBuffer.create ring_buffer_size
           ; open_orders = Hashtbl.create 32
+          ; open_orders_cache = Atomic.make []
           ; ready = Atomic.make false
           ; last_event_time = Atomic.make 0.0
           ; orders_mutex = Mutex.create ()
@@ -253,6 +256,13 @@ let get_symbol_store symbol =
     in
     Mutex.unlock initialization_mutex;
     store
+;;
+
+(** Publishes an immutable snapshot of open_orders to the atomic cache.
+    Must be called by writers under store.orders_mutex. *)
+let[@inline] publish_open_orders_cache store =
+  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+  Atomic.set store.open_orders_cache snapshot
 ;;
 
 (** Marks the store as ready. P5: Atomic flag only - the startup waiter
@@ -294,58 +304,42 @@ let wait_for_execution_data_lwt symbols timeout_seconds =
 
 let wait_for_execution_data = wait_for_execution_data_lwt
 
-(** Returns the list of open orders for a symbol. Acquires store.orders_mutex. *)
+(** Returns the list of open orders for a symbol from the lock-free atomic cache. *)
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let orders = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Mutex.unlock store.orders_mutex;
-  orders
+  Atomic.get store.open_orders_cache
 ;;
 
-(** Fold over open orders for a symbol. Snapshots the open-order list under
-    [orders_mutex] (an O(n) hashtable walk that does not call [f]), releases
-    the lock, then runs the per-order callback work on the snapshot; the WS
-    feed writer never queues behind the domain's scan callbacks (H6). *)
+(** Fold over open orders for a symbol using the lock-free atomic snapshot.
+    Zero mutex contention on the hot path (H6). *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Mutex.unlock store.orders_mutex;
+  let snapshot = Atomic.get store.open_orders_cache in
   List.fold_left (fun acc order -> f acc order) init snapshot
 ;;
 
-(** Looks up a single open order by ID within a symbol store. *)
+(** Looks up a single open order by ID within a symbol store lock-free. *)
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let order_opt = Hashtbl.find_opt store.open_orders order_id in
-  Mutex.unlock store.orders_mutex;
-  order_opt
+  let orders = Atomic.get store.open_orders_cache in
+  List.find_opt (fun (o : open_order) -> o.order_id = order_id) orders
 ;;
 
-(** Returns true if the given order ID exists in the symbol's open orders. *)
+(** Returns true if the given order ID exists in the symbol's open orders cache. *)
 let[@inline always] has_open_order symbol order_id =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let exists = Hashtbl.mem store.open_orders order_id in
-  Mutex.unlock store.orders_mutex;
-  exists
+  let orders = Atomic.get store.open_orders_cache in
+  List.exists (fun (o : open_order) -> o.order_id = order_id) orders
 ;;
 
-(** Looks up an open order by ID across all symbols via the global order-to-symbol index. O(1) lookup; returns None if absent from cache. *)
+(** Looks up an open order by ID across all symbols via the global order-to-symbol index. O(1) lookup. *)
 let find_order_everywhere order_id =
   Mutex.lock global_orders_mutex;
   let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
   Mutex.unlock global_orders_mutex;
   match symbol_opt with
   | None -> None
-  | Some (symbol, _side) ->
-    let store = get_symbol_store symbol in
-    Mutex.lock store.orders_mutex;
-    let order = Hashtbl.find_opt store.open_orders order_id in
-    Mutex.unlock store.orders_mutex;
-    order
+  | Some (symbol, _side) -> get_open_order symbol order_id
 ;;
 
 (** Eagerly updates the cached limit price of an open order after a successful amend response, closing the stale-price window before the execution update arrives. No-op if the order is not tracked. *)
@@ -359,6 +353,7 @@ let update_open_order_price ~symbol ~order_id ~new_price =
        { order with limit_price = Some new_price; last_updated = Unix.gettimeofday () }
      in
      Hashtbl.replace store.open_orders order_id updated;
+     publish_open_orders_cache store;
      Logging.debug_f
        ~section
        "EAGER_PRICE_UPDATE %s [%s]: %s -> %.8f (qty=%.8f remaining=%.8f)"
@@ -449,28 +444,24 @@ let start_periodic_tasks () =
 
 let trigger_stale_order_cleanup ~reason:_ () = request_cleanup ()
 
-(** Returns the total count of open orders for a symbol. *)
+(** Returns the total count of open orders for a symbol lock-free. *)
 let[@inline always] count_open_orders symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let count = Hashtbl.length store.open_orders in
-  Mutex.unlock store.orders_mutex;
-  count
+  List.length (Atomic.get store.open_orders_cache)
 ;;
 
-(** Returns (buy_count, sell_count) of open orders for a symbol. *)
+(** Returns (buy_count, sell_count) of open orders for a symbol lock-free. *)
 let[@inline always] count_open_orders_by_side symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
+  let orders = Atomic.get store.open_orders_cache in
   let buys = ref 0 in
   let sells = ref 0 in
-  Hashtbl.iter
-    (fun _id order ->
+  List.iter
+    (fun (order : open_order) ->
        match order.side with
        | Buy -> incr buys
        | Sell -> incr sells)
-    store.open_orders;
-  Mutex.unlock store.orders_mutex;
+    orders;
   !buys, !sells
 ;;
 
@@ -598,6 +589,7 @@ let update_open_orders store (event : execution_event) =
     in
     Hashtbl.replace store.open_orders event.order_id order;
     needs_cleanup := (not was_tracked) && Hashtbl.length store.open_orders > 1000);
+  publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
   (* Detect and log price/qty overwrites on existing orders. *)
   (match prev_price_qty with
@@ -1036,7 +1028,10 @@ let handle_snapshot json on_heartbeat =
            let was_present =
              Mutex.lock store.orders_mutex;
              let exists = Hashtbl.mem store.open_orders order_id in
-             if exists then Hashtbl.remove store.open_orders order_id;
+             if exists
+             then (
+               Hashtbl.remove store.open_orders order_id;
+               publish_open_orders_cache store);
              Mutex.unlock store.orders_mutex;
              exists
            in

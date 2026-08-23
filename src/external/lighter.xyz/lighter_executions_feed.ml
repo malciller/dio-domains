@@ -62,6 +62,8 @@ module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 type store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
+  ; open_orders_cache : open_order list Atomic.t
+    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; orders_mutex : Mutex.t
   }
@@ -182,12 +184,20 @@ let get_symbol_store symbol =
                (* R3: raised from 128 - exec bursts previously dropped events. *)
                RingBuffer.create 512
              ; open_orders = Hashtbl.create 32
+             ; open_orders_cache = Atomic.make []
              ; ready = Atomic.make (Atomic.get _startup_snapshot_done)
              ; orders_mutex = Mutex.create ()
              }
            in
            Hashtbl.add stores symbol store;
            store)
+;;
+
+(** Publishes an immutable snapshot of open_orders to the atomic cache.
+    Must be called by writers under store.orders_mutex. *)
+let[@inline] publish_open_orders_cache store =
+  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+  Atomic.set store.open_orders_cache snapshot
 ;;
 
 let notify_ready store =
@@ -221,6 +231,7 @@ let update_orders_internal store (event : execution_event) =
        if is_terminal
        then (
          Hashtbl.remove store.open_orders event.order_id;
+         publish_open_orders_cache store;
          Mutex.lock initialization_mutex;
          Fun.protect
            ~finally:(fun () -> Mutex.unlock initialization_mutex)
@@ -250,6 +261,7 @@ let update_orders_internal store (event : execution_event) =
            }
          in
          Hashtbl.replace store.open_orders event.order_id order;
+         publish_open_orders_cache store;
          Mutex.lock initialization_mutex;
          Fun.protect
            ~finally:(fun () -> Mutex.unlock initialization_mutex)
@@ -261,32 +273,23 @@ let update_orders_internal store (event : execution_event) =
 
 (* --- Public query interface --- *)
 
+(** Lock-free read of a single open order by ID from the atomic cache. *)
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-    (fun () -> Hashtbl.find_opt store.open_orders order_id)
+  let orders = Atomic.get store.open_orders_cache in
+  List.find_opt (fun (o : open_order) -> o.order_id = order_id) orders
 ;;
 
+(** Lock-free read of all open orders for a symbol from the atomic cache. *)
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-    (fun () -> Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [])
+  Atomic.get store.open_orders_cache
 ;;
 
+(** Lock-free fold over open orders for a symbol from the atomic cache. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  (* Snapshot under the lock, process on the snapshot (H6): the WS writer
-     never queues behind the domain's per-order scan callbacks. *)
-  let snapshot =
-    Mutex.lock store.orders_mutex;
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-      (fun () -> Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [])
-  in
+  let snapshot = Atomic.get store.open_orders_cache in
   List.fold_left (fun acc order -> f acc order) init snapshot
 ;;
 
@@ -371,6 +374,7 @@ let clear_all_open_orders () =
             let count = Hashtbl.length store.open_orders in
             total_removed := !total_removed + count;
             Hashtbl.clear store.open_orders;
+            publish_open_orders_cache store;
             Atomic.set store.ready false))
     all_symbols;
   Mutex.lock initialization_mutex;
@@ -966,7 +970,8 @@ let cleanup_stale_orders () =
                  Fun.protect
                    ~finally:(fun () -> Mutex.unlock initialization_mutex)
                    (fun () -> Hashtbl.remove order_to_symbol oid))
-              !stale);
+              !stale;
+            if !stale <> [] then publish_open_orders_cache store);
        if !stale <> []
        then
          Logging.info_f

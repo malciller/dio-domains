@@ -808,29 +808,22 @@ let evaluate_buy_leg
             (Alpaca qty mismatch amend) or on the next placement, and the
             resting price only trails up. *)
         let reanchor_buy = state.force_buy_reanchor in
-        (* M17: a re-anchor may move the resting buy DOWN only when the
-           resting price actually violates a ladder constraint - it sits
-           inside the restricted zone below the closest sell (above
-           sell - 2*gi of the SELL). A price already within one grid
-           interval of the reference does NOT warrant a downwards amendment
-           (there is nothing to correct: no sell is within 2*gi), and
-           snapping such an order down to the market rung on startup churned
-           validly-resting orders through cancel+create. Upward movement is
-           normal trailing; a qty-only fix keeps the price. *)
+        (* Downward movement of the buy is initiated to correct an actual violation
+           of the 2x grid_interval restricted zone below the closest sell (above
+           sell - 2*gi). This clamp is price-independent and enforces the threshold
+           whenever a resting buy sits inside the restricted zone (e.g. after an
+           external upward amendment, book dislocation, or grid interval widening).
+           A resting buy already outside the restricted zone is never snapped down. *)
         let trail_up = target_buy_price > current_buy_price in
-        let down_reanchor =
-          reanchor_buy && (not trail_up) && current_buy_price_rounded > exact_target
-        in
-        let reanchor_moves = trail_up || down_reanchor in
-        (* Nothing warranted (no trail-up, no sell-zone violation): the
-           re-anchor is satisfied price-wise - release the latch so it cannot
-           fire later out of context. *)
-        if reanchor_buy && not reanchor_moves
+        let zone_violation = (not trail_up) && current_buy_price_rounded > exact_target in
+        let should_amend = trail_up || zone_violation in
+        (* Release reanchor latch if no action is needed. *)
+        if reanchor_buy && not should_amend
         then state.force_buy_reanchor <- false;
-        if reanchor_moves
+        if should_amend
         then (
           let effective_amend_price =
-            if down_reanchor then exact_target else target_buy_price
+            if zone_violation then exact_target else target_buy_price
           in
           let effective_price_diff =
             state.cached_round_price
