@@ -120,7 +120,7 @@ let evaluate_asset_low_recovery
       else 0.0
     in
     let available_asset =
-      asset_bal -. state.reserved_base +. state.anticipated_base_credit -. locked_in_sells
+      asset_bal -. state.reserved_base -. locked_in_sells
     in
     let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
     state.last_seen_asset_balance <- asset_bal;
@@ -139,13 +139,12 @@ let evaluate_asset_low_recovery
       ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
       Logging.info_f
         ~section
-        "Asset balance restored for %s (have %.8f, reserved %.8f, anticipated_credit \
-         %.8f, locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy \
+        "Asset balance restored for %s (have %.8f, reserved %.8f, \
+         locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy \
          placement"
         asset.symbol
         asset_bal
         state.reserved_base
-        state.anticipated_base_credit
         locked_in_sells
         available_asset
         asset_needed_fast))
@@ -1017,7 +1016,6 @@ let evaluate_sell_leg
     then 0.0
     else
       asset_balance
-      +. state.anticipated_base_credit
       -. state.reserved_base
       -. locked_in_sells
   in
@@ -1048,7 +1046,6 @@ let evaluate_sell_leg
         max
           0.0
           (asset_balance
-           +. state.anticipated_base_credit
            -. state.reserved_base
            -. locked_in_sells)
       in
@@ -1107,7 +1104,7 @@ let evaluate_sell_leg
     if Float.is_nan asset_balance
     then 0.0
     else if is_accumulation_basis
-    then asset_balance +. state.anticipated_base_credit -. state.reserved_base
+    then asset_balance -. state.reserved_base
     else available_base
   in
   (* Inventory gate for sell placement: available non-accrued inventory must
@@ -1268,12 +1265,11 @@ let evaluate_sell_leg
     let available =
       if is_accumulation
       then
-        Float.max 0.0 (asset_bal +. state.anticipated_base_credit -. state.reserved_base)
+        Float.max 0.0 (asset_bal -. state.reserved_base)
       else
         Float.max
           0.0
           (asset_bal
-           +. state.anticipated_base_credit
            -. state.reserved_base
            -. locked_in_sells)
     in
@@ -1317,12 +1313,11 @@ let evaluate_sell_leg
           then (
             Logging.debug_f
               ~section
-              "Sell order clamped for %s: available %.8f (bal %.8f + anticipated %.8f - \
+              "Sell order clamped for %s: available %.8f (bal %.8f - \
                reserved %.8f) < target_q %.8f -> clamped to %.8f (min_order_size %.8f)"
               asset.symbol
               available
               asset_bal
-              state.anticipated_base_credit
               state.reserved_base
               target_q
               rounded_avail
@@ -1331,24 +1326,22 @@ let evaluate_sell_leg
           else (
             Logging.debug_f
               ~section
-              "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
+              "Sell order blocked for %s: available %.8f (bal %.8f - \
                reserved %.8f) rounds below min_order_size %.8f"
               asset.symbol
               available
               asset_bal
-              state.anticipated_base_credit
               state.reserved_base
               min_order_size;
             0.0, false)
         else (
           Logging.debug_f
             ~section
-            "Sell order blocked for %s: available %.8f (bal %.8f + anticipated %.8f - \
+            "Sell order blocked for %s: available %.8f (bal %.8f - \
              reserved %.8f) is below min_order_size %.8f"
             asset.symbol
             available
             asset_bal
-            state.anticipated_base_credit
             state.reserved_base
             min_order_size;
           0.0, false)
