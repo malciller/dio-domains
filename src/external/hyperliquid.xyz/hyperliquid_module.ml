@@ -468,7 +468,7 @@ module Hyperliquid_impl = struct
              ; filled_qty = e.cum_qty
              ; avg_price = e.avg_price
              ; timestamp = e.timestamp
-             ; is_amended = false
+             ; is_amended = (e.exec_type = Hyperliquid_executions_feed.Amended)
              ; cl_ord_id = e.cl_ord_id
              })
       events
@@ -492,7 +492,7 @@ module Hyperliquid_impl = struct
              ; filled_qty = e.cum_qty
              ; avg_price = e.avg_price
              ; timestamp = e.timestamp
-             ; is_amended = false
+             ; is_amended = (e.exec_type = Hyperliquid_executions_feed.Amended)
              ; cl_ord_id = e.cl_ord_id
              })
   ;;

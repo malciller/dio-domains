@@ -59,6 +59,8 @@ module SymbolExecStore = struct
        full ring-buffer reads. *)
     ; write_pos : int Atomic.t
     ; open_orders : (string, open_order_internal) Hashtbl.t
+    ; open_orders_cache : open_order_internal list Atomic.t
+      (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
     ; initial_data_received : bool Atomic.t
     ; mutex : Mutex.t
     }
@@ -83,9 +85,15 @@ module SymbolExecStore = struct
     ; capacity
     ; write_pos = Atomic.make 0
     ; open_orders = Hashtbl.create 32
+    ; open_orders_cache = Atomic.make []
     ; initial_data_received = Atomic.make false
     ; mutex = Mutex.create ()
     }
+  ;;
+
+  let[@inline] publish_open_orders_cache t =
+    let snapshot = Hashtbl.fold (fun _ o acc -> o :: acc) t.open_orders [] in
+    Atomic.set t.open_orders_cache snapshot
   ;;
 
   let push_event t (e : execution_event_internal) =
@@ -125,6 +133,7 @@ module SymbolExecStore = struct
        in
        Hashtbl.replace t.open_orders e.order_id oo
      | Filled | Canceled | Expired | Rejected -> Hashtbl.remove t.open_orders e.order_id);
+    publish_open_orders_cache t;
     Mutex.unlock t.mutex;
     (* P2: per-symbol wakeup - only this symbol's domain consumes its exec events. *)
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
@@ -160,6 +169,7 @@ module SymbolExecStore = struct
          in
          Hashtbl.replace t.open_orders o.id oo)
       orders;
+    publish_open_orders_cache t;
     Mutex.unlock t.mutex;
     Atomic.set t.initial_data_received true;
     (* P2: snapshot readiness is per-store; only this symbol's domain gates on it. *)
@@ -202,10 +212,8 @@ let pong_condition = Lwt_condition.create ()
 let get_open_order symbol order_id =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
-    Mutex.lock store.mutex;
-    let res = Hashtbl.find_opt store.open_orders order_id in
-    Mutex.unlock store.mutex;
-    res
+    let orders = Atomic.get store.open_orders_cache in
+    List.find_opt (fun (o : open_order_internal) -> o.order_id = order_id) orders
   | None -> None
 ;;
 
@@ -213,18 +221,18 @@ let remove_open_order symbol order_id =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
     Mutex.lock store.mutex;
-    Hashtbl.remove store.open_orders order_id;
+    let existed = Hashtbl.mem store.open_orders order_id in
+    if existed
+    then (
+      Hashtbl.remove store.open_orders order_id;
+      SymbolExecStore.publish_open_orders_cache store);
     Mutex.unlock store.mutex
   | None -> ()
 ;;
 
 let get_open_orders symbol =
   match Hashtbl.find_opt stores symbol with
-  | Some store ->
-    Mutex.lock store.mutex;
-    let res = Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [] in
-    Mutex.unlock store.mutex;
-    res
+  | Some store -> Atomic.get store.open_orders_cache
   | None -> []
 ;;
 
@@ -287,14 +295,7 @@ let iter_execution_events symbol start_pos f =
 let fold_open_orders symbol ~init ~f =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
-    (* Snapshot under the lock, process on the snapshot (H6): the WS writer
-       never queues behind the domain's per-order scan callbacks. *)
-    let snapshot =
-      Mutex.lock store.mutex;
-      let orders = Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [] in
-      Mutex.unlock store.mutex;
-      orders
-    in
+    let snapshot = Atomic.get store.open_orders_cache in
     List.fold_left (fun acc o -> f acc o) init snapshot
   | None -> init
 ;;

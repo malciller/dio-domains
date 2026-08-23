@@ -37,6 +37,8 @@ type open_order =
 type symbol_store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
+  ; open_orders_cache : open_order list Atomic.t
+    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; orders_mutex : Mutex.t
   }
@@ -63,6 +65,7 @@ let get_symbol_store symbol =
           { events_buffer =
               RingBuffer.create Ibkr_types.default_ring_buffer_size_executions
           ; open_orders = Hashtbl.create 16
+          ; open_orders_cache = Atomic.make []
           ; ready = Atomic.make false
           ; orders_mutex = Mutex.create ()
           }
@@ -72,6 +75,13 @@ let get_symbol_store symbol =
     in
     Mutex.unlock initialization_mutex;
     store
+;;
+
+(** Publishes an immutable snapshot of open_orders to the atomic cache.
+    Must be called by writers under store.orders_mutex. *)
+let[@inline] publish_open_orders_cache store =
+  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+  Atomic.set store.open_orders_cache snapshot
 ;;
 
 let notify_ready store =
@@ -138,6 +148,7 @@ let update_open_orders symbol (event : execution_event) =
       ; oo_status = event.status
       ; oo_last_updated = event.timestamp
       });
+  publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
   RingBuffer.write store.events_buffer event;
   notify_ready store;
@@ -301,6 +312,7 @@ let handle_open_order fields =
       }
   in
   Hashtbl.replace store.open_orders (string_of_int order_id) oo;
+  publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
   Logging.debug_f
     ~section
@@ -318,12 +330,11 @@ let handle_open_order fields =
 (** Decodes and records execDetails messages signifying a realized discrete trade execution. Incorporates realized transaction price and volume into the cached state. *)
 let handle_exec_details fields =
   let _req_id, fields = Ibkr_codec.read_int fields in
-  let order_id, fields = Ibkr_codec.read_int fields in
-  (* Contract Parameter Deserialization Segment *)
-  let _con_id, fields = Ibkr_codec.read_int fields in
+  let _order_id, fields = Ibkr_codec.read_int fields in
+  let contract_id, fields = Ibkr_codec.read_int fields in
   let symbol, fields = Ibkr_codec.read_string fields in
   let _sec_type, fields = Ibkr_codec.read_string fields in
-  let _last_trade_date, fields = Ibkr_codec.read_string fields in
+  let _expiry, fields = Ibkr_codec.read_string fields in
   let _strike, fields = Ibkr_codec.read_float fields in
   let _right, fields = Ibkr_codec.read_string fields in
   let _multiplier, fields = Ibkr_codec.read_string fields in
@@ -331,46 +342,59 @@ let handle_exec_details fields =
   let _currency, fields = Ibkr_codec.read_string fields in
   let _local_symbol, fields = Ibkr_codec.read_string fields in
   let _trading_class, fields = Ibkr_codec.read_string fields in
-  (* Execution Parameter Deserialization Segment *)
-  let _exec_id, fields = Ibkr_codec.read_string fields in
-  let _time, fields = Ibkr_codec.read_string fields in
-  let _acct_number, fields = Ibkr_codec.read_string fields in
-  let _exchange_exec, fields = Ibkr_codec.read_string fields in
+  let exec_id, fields = Ibkr_codec.read_string fields in
+  let time, fields = Ibkr_codec.read_string fields in
+  let account, fields = Ibkr_codec.read_string fields in
+  let exec_exchange, fields = Ibkr_codec.read_string fields in
   let side, fields = Ibkr_codec.read_string fields in
   let shares, fields = Ibkr_codec.read_float fields in
   let price, fields = Ibkr_codec.read_float fields in
-  let _perm_id, fields = Ibkr_codec.read_int fields in
-  let _client_id, fields = Ibkr_codec.read_int fields in
+  let perm_id, fields = Ibkr_codec.read_int fields in
+  let client_id, fields = Ibkr_codec.read_int fields in
   let _liquidation, fields = Ibkr_codec.read_int fields in
   let cum_qty, fields = Ibkr_codec.read_float fields in
-  let avg_price, _fields = Ibkr_codec.read_float fields in
-  register_order ~order_id ~symbol;
-  let event =
-    { order_id = string_of_int order_id
+  let avg_price, _ = Ibkr_codec.read_float fields in
+  Logging.info_f
+    ~section
+    "Execution details: %s %s %.2f @ %.2f (order_id=%d, exec_id=%s, time=%s, account=%s)"
+    side
+    symbol
+    shares
+    price
+    perm_id
+    exec_id
+    time
+    account;
+  let event : execution_event =
+    { order_id = string_of_int perm_id
     ; symbol
     ; side = (if side = "BOT" then "BUY" else "SELL")
-    ; status = Ibkr_types.Submitted
-    ; (* The execDetails payload structurally lacks order status data. A submitted status is forced to facilitate further state machine evaluation. *)
-      filled_qty = cum_qty
+    ; status = Ibkr_types.Filled
+    ; filled_qty = cum_qty
     ; remaining_qty = 0.0
-    ; (* Accurate remainder derivation is deferred to subsequent orderStatus event integrations. *)
-      avg_fill_price = avg_price
+    ; avg_fill_price = avg_price
     ; last_fill_price = price
     ; last_fill_qty = shares
     ; timestamp = Unix.gettimeofday ()
     }
   in
   update_open_orders symbol event;
-  Logging.info_f
-    ~section
-    "Execution: order %d [%s] %s %.2f shares @ %.4f (cum: %.2f @ %.4f)"
-    order_id
-    symbol
-    (if side = "BOT" then "BUY" else "SELL")
-    shares
-    price
-    cum_qty
-    avg_price
+  let execution : Ibkr_types.execution =
+    { exec_id
+    ; exec_order_id = perm_id
+    ; exec_symbol = symbol
+    ; exec_side = side
+    ; exec_qty = shares
+    ; exec_price = price
+    ; exec_time = time
+    ; exec_account = account
+    ; exec_exchange
+    }
+  in
+  let _ = execution in
+  let _ = client_id in
+  let _ = contract_id in
+  ()
 ;;
 
 (** Injects the module specific execution decoders into the centralized connection message dispatcher. *)
@@ -384,6 +408,24 @@ let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_execution_data
     ~handler:handle_exec_details
+;;
+
+(** Triggers an asynchronous synchronization pass to request current discrete trade execution reports from the gateway. *)
+let request_executions conn =
+  Logging.info ~section "Requesting execution history snapshot";
+  Ibkr_connection.send
+    conn
+    [ string_of_int Ibkr_types.msg_req_executions
+    ; "1" (* version *)
+    ; "1" (* reqId *)
+    ; "" (* clientId *)
+    ; "" (* acctCode *)
+    ; "" (* time *)
+    ; "" (* symbol *)
+    ; "" (* secType *)
+    ; "" (* exchange *)
+    ; "" (* side *)
+    ]
 ;;
 
 (** Broadcasts an explicit reqOpenOrders directive to the active TCP connection. Instigates a gateway response containing the comprehensive initial snapshot of all active system orders. *)
@@ -404,31 +446,23 @@ let get_all_symbols () =
   symbols
 ;;
 
+(** Lock-free read of all open orders for a symbol from the atomic cache. *)
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let orders = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Mutex.unlock store.orders_mutex;
-  orders
+  Atomic.get store.open_orders_cache
 ;;
 
+(** Lock-free read of a single open order by ID from the atomic cache. *)
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let r = Hashtbl.find_opt store.open_orders order_id in
-  Mutex.unlock store.orders_mutex;
-  r
+  let orders = Atomic.get store.open_orders_cache in
+  List.find_opt (fun (o : open_order) -> o.oo_order_id = order_id) orders
 ;;
 
-(** Fold over open orders. Snapshots the open-order list under the per-symbol
-    mutex (hashtable walk without calling [f]), releases the lock, then runs
-    the per-order callback work on the snapshot; the WS feed writer never
-    queues behind the domain's scan callbacks (H6). *)
+(** Lock-free fold over open orders from the atomic cache. Zero mutex contention on domain hotpath. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Mutex.unlock store.orders_mutex;
+  let snapshot = Atomic.get store.open_orders_cache in
   List.fold_left (fun acc order -> f acc order) init snapshot
 ;;
 

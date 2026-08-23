@@ -81,6 +81,8 @@ let max_processed_tids = 256
 type store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
+  ; open_orders_cache : open_order list Atomic.t
+    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; processed_tids : (int64, float) Hashtbl.t
     (** trade_id to arrival_time mapping for deduplication. *)
@@ -185,6 +187,7 @@ let get_symbol_store symbol =
               (* R3: raised from 128 - exec bursts previously lapped the
                  domain consumer, silently dropping lifecycle events. *)
           ; open_orders = Hashtbl.create 32
+          ; open_orders_cache = Atomic.make []
           ; ready = Atomic.make (Atomic.get _startup_snapshot_done)
           ; processed_tids = Hashtbl.create 32
           ; processed_tids_queue = Queue.create ()
@@ -197,6 +200,13 @@ let get_symbol_store symbol =
     in
     Mutex.unlock initialization_mutex;
     store
+;;
+
+(** Publishes an immutable snapshot of open_orders to the atomic cache.
+    Must be called by writers under store.orders_mutex. *)
+let[@inline] publish_open_orders_cache store =
+  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
+  Atomic.set store.open_orders_cache snapshot
 ;;
 
 let notify_ready store =
@@ -215,12 +225,11 @@ let set_startup_snapshot_done () =
     Concurrency.Exchange_wakeup.signal_all ())
 ;;
 
+(** Lock-free read of a single open order by ID from the atomic cache. *)
 let[@inline always] get_open_order symbol order_id =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let order = Hashtbl.find_opt store.open_orders order_id in
-  Mutex.unlock store.orders_mutex;
-  order
+  let orders = Atomic.get store.open_orders_cache in
+  List.find_opt (fun (o : open_order) -> o.order_id = order_id) orders
 ;;
 
 let find_order_everywhere order_id =
@@ -229,32 +238,20 @@ let find_order_everywhere order_id =
   let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
   Mutex.unlock order_index_mutex;
   match symbol_opt with
-  | Some symbol ->
-    let store = get_symbol_store symbol in
-    Mutex.lock store.orders_mutex;
-    let order = Hashtbl.find_opt store.open_orders order_id in
-    Mutex.unlock store.orders_mutex;
-    order
+  | Some symbol -> get_open_order symbol order_id
   | None -> None
 ;;
 
+(** Lock-free read of open orders from the atomic cache. Zero mutex contention on domain hotpath. *)
 let[@inline always] get_open_orders symbol =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let orders = Hashtbl.fold (fun _ o acc -> o :: acc) store.open_orders [] in
-  Mutex.unlock store.orders_mutex;
-  orders
+  Atomic.get store.open_orders_cache
 ;;
 
-(** Fold over open orders. Snapshots the open-order list under the per-symbol
-    mutex (hashtable walk without calling [f]), releases the lock, then runs
-    the per-order callback work on the snapshot; the WS feed writer never
-    queues behind the domain's scan callbacks (H6). *)
+(** Lock-free fold over open orders from the atomic cache. Zero mutex contention on domain hotpath. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
-  Mutex.lock store.orders_mutex;
-  let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Mutex.unlock store.orders_mutex;
+  let snapshot = Atomic.get store.open_orders_cache in
   List.fold_left (fun acc order -> f acc order) init snapshot
 ;;
 
@@ -265,7 +262,10 @@ let remove_open_order ~symbol ~order_id =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
   let existed = Hashtbl.mem store.open_orders order_id in
-  if existed then Hashtbl.remove store.open_orders order_id;
+  if existed
+  then (
+    Hashtbl.remove store.open_orders order_id;
+    publish_open_orders_cache store);
   Mutex.unlock store.orders_mutex;
   (* Deferred global index and blacklist updates: outside orders_mutex
      to eliminate nested lock acquisition with order_index_mutex. *)
@@ -323,7 +323,10 @@ let cleanup_stale_orders () =
          let store = get_symbol_store _symbol in
          Mutex.lock store.orders_mutex;
          let removed = Hashtbl.mem store.open_orders order_id in
-         if removed then Hashtbl.remove store.open_orders order_id;
+         if removed
+         then (
+           Hashtbl.remove store.open_orders order_id;
+           publish_open_orders_cache store);
          Mutex.unlock store.orders_mutex;
          if removed
          then (
@@ -412,6 +415,7 @@ let clear_all_open_orders () =
        let count = Hashtbl.length store.open_orders in
        total_removed := !total_removed + count;
        Hashtbl.clear store.open_orders;
+       publish_open_orders_cache store;
        Mutex.unlock store.orders_mutex)
     all_symbols;
   (* Reset the global order_to_symbol index and its eviction queue. *)
@@ -589,6 +593,7 @@ let update_orders_internal ?user_ref store (event : execution_event) =
       in
       Hashtbl.replace store.open_orders event.order_id order;
       index_action := `Add (event.order_id, event.symbol));
+    publish_open_orders_cache store;
     Mutex.unlock store.orders_mutex;
     (* Deferred global order_to_symbol index update: outside orders_mutex
      to prevent nested locking with order_index_mutex. *)
@@ -748,20 +753,34 @@ let process_order_updates data_json =
              | s when is_rejection_status s -> RejectedStatus
              | s -> UnknownStatus s
            in
-           let exec_type =
-             match status with
-             | "open" -> New
-             | "filled" -> Filled
-             | "canceled" | "marginCanceled" -> Canceled
-             | "rejected" -> Rejected
-             | s when is_rejection_status s -> Rejected
-             | _ -> Unknown status
-           in
            let existing_order =
              Mutex.lock store.orders_mutex;
              let o = Hashtbl.find_opt store.open_orders order_id in
              Mutex.unlock store.orders_mutex;
              o
+           in
+           let is_amended =
+             match existing_order with
+             | Some prev ->
+               let price_changed =
+                 match prev.limit_price with
+                 | Some p -> abs_float (p -. price) > 1e-12
+                 | None -> price > 1e-12
+               in
+               let qty_changed = abs_float (prev.order_qty -. qty) > 1e-12 in
+               price_changed || qty_changed || status = "amended" || status = "modified"
+             | None -> status = "amended" || status = "modified"
+           in
+           let exec_type =
+             match status with
+             | "open" when is_amended -> Amended
+             | "open" -> New
+             | "amended" | "modified" -> Amended
+             | "filled" -> Filled
+             | "canceled" | "marginCanceled" -> Canceled
+             | "rejected" -> Rejected
+             | s when is_rejection_status s -> Rejected
+             | _ -> Unknown status
            in
            let new_cum_qty =
              match status with
@@ -850,14 +869,22 @@ let process_order_updates data_json =
                  order_id
                  symbol
                  status
-             | NewStatus ->
-               Logging.debug_f
-                 ~section
-                 "Order OPEN: %s [%s] %.8f @ %.2f"
-                 order_id
-                 symbol
-                 qty
-                 price
+              | NewStatus when is_amended ->
+                Logging.info_f
+                  ~section
+                  "Order AMENDED: %s [%s] %.8f @ %.4f"
+                  order_id
+                  symbol
+                  qty
+                  price
+              | NewStatus ->
+                Logging.debug_f
+                  ~section
+                  "Order OPEN: %s [%s] %.8f @ %.2f"
+                  order_id
+                  symbol
+                  qty
+                  price
              | _ -> ())
          | None -> ())
       orders

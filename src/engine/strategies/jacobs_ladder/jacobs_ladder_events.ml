@@ -782,17 +782,32 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
              state.last_buy_order_id <- Some new_order_id;
              state.last_buy_order_price <- Some price;
              if old_order_id = new_order_id
-             then ()
+             then
+               Logging.info_f
+                 ~section
+                 "Amended buy order price in tracking: %s @ %.4f for %s"
+                 old_order_id
+                 price
+                 asset_symbol
              else
                Logging.info_f
                  ~section
-                 "Amended buy order ID in tracking: %s -> %s @ %.2f for %s"
+                 "Amended buy order ID in tracking: %s -> %s @ %.4f for %s"
                  old_order_id
                  new_order_id
                  price
                  asset_symbol;
              state.inflight_amend_buy <- false
-           | _ -> state.inflight_amend_buy <- false)
+           | _ ->
+             state.last_buy_order_id <- Some new_order_id;
+             state.last_buy_order_price <- Some price;
+             Logging.info_f
+               ~section
+               "External buy order amendment in tracking: %s @ %.4f for %s"
+               new_order_id
+               price
+               asset_symbol;
+             state.inflight_amend_buy <- false)
         | Sell ->
           let original_sell_count = List.length state.open_sell_orders in
           let old_entry =
