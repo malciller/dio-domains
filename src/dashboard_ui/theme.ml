@@ -294,39 +294,39 @@ type theme_palette =
   }
 
 let make_theme
-    ~id
-    ~name
-    ~desc
-    ~accent_rgb
-    ~bg_rgb
-    ~c_bg
-    ~c_panel
-    ~c_section_bg
-    ~c_border
-    ~c_title
-    ~c_accent
-    ~c_label
-    ~c_text
-    ~c_bright
-    ~c_green
-    ~c_green_dark
-    ~c_red
-    ~c_yellow
-    ~c_cyan
-    ~c_dim
-    ~c_near_fill
-    ~c_near_sell
-    ~c_magenta
-    ~c_selected
-    ~c_exch_hl
-    ~c_exch_kr
-    ~c_exch_li
-    ~c_exch_ib
-    ~c_exch_alp
-    ~c_bps_tight
-    ~c_bps_norm
-    ~c_bps_wide
-    ~c_bps_xtrm
+      ~id
+      ~name
+      ~desc
+      ~accent_rgb
+      ~bg_rgb
+      ~c_bg
+      ~c_panel
+      ~c_section_bg
+      ~c_border
+      ~c_title
+      ~c_accent
+      ~c_label
+      ~c_text
+      ~c_bright
+      ~c_green
+      ~c_green_dark
+      ~c_red
+      ~c_yellow
+      ~c_cyan
+      ~c_dim
+      ~c_near_fill
+      ~c_near_sell
+      ~c_magenta
+      ~c_selected
+      ~c_exch_hl
+      ~c_exch_kr
+      ~c_exch_li
+      ~c_exch_ib
+      ~c_exch_alp
+      ~c_bps_tight
+      ~c_bps_norm
+      ~c_bps_wide
+      ~c_bps_xtrm
   =
   let a_label = A.(fg c_label ++ bg c_bg) in
   let a_text = A.(fg c_text ++ bg c_bg) in
@@ -932,6 +932,158 @@ let abyss =
     ~c_bps_xtrm:(A.rgb_888 ~r:255 ~g:75 ~b:114)
 ;;
 
+(* 15. Molten Ember *)
+let ember =
+  make_theme
+    ~id:"ember"
+    ~name:"Molten Ember"
+    ~desc:"Charred basalt with molten lava orange and glowing forge gold"
+    ~accent_rgb:(255, 90, 30)
+    ~bg_rgb:(22, 10, 8)
+    ~c_bg:(A.rgb_888 ~r:22 ~g:10 ~b:8)
+    ~c_panel:(A.rgb_888 ~r:16 ~g:7 ~b:6)
+    ~c_section_bg:(A.rgb_888 ~r:45 ~g:18 ~b:12)
+    ~c_border:(A.rgb_888 ~r:110 ~g:40 ~b:25)
+    ~c_title:(A.rgb_888 ~r:255 ~g:190 ~b:150)
+    ~c_accent:(A.rgb_888 ~r:255 ~g:90 ~b:30)
+    ~c_label:(A.rgb_888 ~r:140 ~g:85 ~b:70)
+    ~c_text:(A.rgb_888 ~r:240 ~g:205 ~b:185)
+    ~c_bright:(A.rgb_888 ~r:255 ~g:255 ~b:255)
+    ~c_green:(A.rgb_888 ~r:105 ~g:225 ~b:145)
+    ~c_green_dark:(A.rgb_888 ~r:35 ~g:130 ~b:65)
+    ~c_red:(A.rgb_888 ~r:255 ~g:70 ~b:60)
+    ~c_yellow:(A.rgb_888 ~r:255 ~g:200 ~b:80)
+    ~c_cyan:(A.rgb_888 ~r:95 ~g:210 ~b:210)
+    ~c_dim:(A.rgb_888 ~r:130 ~g:75 ~b:60)
+    ~c_near_fill:(A.rgb_888 ~r:55 ~g:28 ~b:15)
+    ~c_near_sell:(A.rgb_888 ~r:70 ~g:22 ~b:20)
+    ~c_magenta:(A.rgb_888 ~r:235 ~g:100 ~b:120)
+    ~c_selected:(A.rgb_888 ~r:70 ~g:30 ~b:22)
+    ~c_exch_hl:(A.rgb_888 ~r:105 ~g:225 ~b:145)
+    ~c_exch_kr:(A.rgb_888 ~r:255 ~g:90 ~b:30)
+    ~c_exch_li:(A.rgb_888 ~r:95 ~g:210 ~b:210)
+    ~c_exch_ib:(A.rgb_888 ~r:255 ~g:160 ~b:70)
+    ~c_exch_alp:(A.rgb_888 ~r:255 ~g:200 ~b:80)
+    ~c_bps_tight:(A.rgb_888 ~r:95 ~g:210 ~b:210)
+    ~c_bps_norm:(A.rgb_888 ~r:130 ~g:75 ~b:60)
+    ~c_bps_wide:(A.rgb_888 ~r:235 ~g:100 ~b:120)
+    ~c_bps_xtrm:(A.rgb_888 ~r:255 ~g:70 ~b:60)
+;;
+
+(* 16. Amber CRT *)
+let amber_crt =
+  make_theme
+    ~id:"amber-crt"
+    ~name:"Amber CRT"
+    ~desc:"Vintage amber phosphor monitor with warm monochrome glow"
+    ~accent_rgb:(255, 176, 0)
+    ~bg_rgb:(16, 11, 4)
+    ~c_bg:(A.rgb_888 ~r:16 ~g:11 ~b:4)
+    ~c_panel:(A.rgb_888 ~r:10 ~g:7 ~b:2)
+    ~c_section_bg:(A.rgb_888 ~r:34 ~g:24 ~b:8)
+    ~c_border:(A.rgb_888 ~r:105 ~g:70 ~b:18)
+    ~c_title:(A.rgb_888 ~r:255 ~g:204 ~b:92)
+    ~c_accent:(A.rgb_888 ~r:255 ~g:176 ~b:0)
+    ~c_label:(A.rgb_888 ~r:135 ~g:95 ~b:35)
+    ~c_text:(A.rgb_888 ~r:245 ~g:200 ~b:120)
+    ~c_bright:(A.rgb_888 ~r:255 ~g:236 ~b:180)
+    ~c_green:(A.rgb_888 ~r:170 ~g:225 ~b:115)
+    ~c_green_dark:(A.rgb_888 ~r:90 ~g:130 ~b:45)
+    ~c_red:(A.rgb_888 ~r:255 ~g:100 ~b:70)
+    ~c_yellow:(A.rgb_888 ~r:255 ~g:208 ~b:74)
+    ~c_cyan:(A.rgb_888 ~r:255 ~g:218 ~b:150)
+    ~c_dim:(A.rgb_888 ~r:125 ~g:88 ~b:32)
+    ~c_near_fill:(A.rgb_888 ~r:48 ~g:32 ~b:10)
+    ~c_near_sell:(A.rgb_888 ~r:62 ~g:26 ~b:12)
+    ~c_magenta:(A.rgb_888 ~r:255 ~g:150 ~b:90)
+    ~c_selected:(A.rgb_888 ~r:58 ~g:40 ~b:12)
+    ~c_exch_hl:(A.rgb_888 ~r:170 ~g:225 ~b:115)
+    ~c_exch_kr:(A.rgb_888 ~r:255 ~g:176 ~b:0)
+    ~c_exch_li:(A.rgb_888 ~r:255 ~g:218 ~b:150)
+    ~c_exch_ib:(A.rgb_888 ~r:255 ~g:140 ~b:60)
+    ~c_exch_alp:(A.rgb_888 ~r:255 ~g:208 ~b:74)
+    ~c_bps_tight:(A.rgb_888 ~r:255 ~g:218 ~b:150)
+    ~c_bps_norm:(A.rgb_888 ~r:125 ~g:88 ~b:32)
+    ~c_bps_wide:(A.rgb_888 ~r:255 ~g:150 ~b:90)
+    ~c_bps_xtrm:(A.rgb_888 ~r:255 ~g:100 ~b:70)
+;;
+
+(* 17. Paper Ledger (Light) *)
+let paper =
+  make_theme
+    ~id:"paper"
+    ~name:"Paper Ledger"
+    ~desc:"Light newsprint day mode with ink text and burnt sienna accents"
+    ~accent_rgb:(191, 87, 0)
+    ~bg_rgb:(245, 242, 232)
+    ~c_bg:(A.rgb_888 ~r:245 ~g:242 ~b:232)
+    ~c_panel:(A.rgb_888 ~r:236 ~g:232 ~b:220)
+    ~c_section_bg:(A.rgb_888 ~r:222 ~g:217 ~b:203)
+    ~c_border:(A.rgb_888 ~r:168 ~g:160 ~b:142)
+    ~c_title:(A.rgb_888 ~r:44 ~g:42 ~b:38)
+    ~c_accent:(A.rgb_888 ~r:191 ~g:87 ~b:0)
+    ~c_label:(A.rgb_888 ~r:128 ~g:122 ~b:108)
+    ~c_text:(A.rgb_888 ~r:66 ~g:63 ~b:56)
+    ~c_bright:(A.rgb_888 ~r:20 ~g:18 ~b:14)
+    ~c_green:(A.rgb_888 ~r:34 ~g:120 ~b:54)
+    ~c_green_dark:(A.rgb_888 ~r:24 ~g:90 ~b:40)
+    ~c_red:(A.rgb_888 ~r:178 ~g:34 ~b:34)
+    ~c_yellow:(A.rgb_888 ~r:146 ~g:104 ~b:10)
+    ~c_cyan:(A.rgb_888 ~r:9 ~g:110 ~b:124)
+    ~c_dim:(A.rgb_888 ~r:138 ~g:132 ~b:118)
+    ~c_near_fill:(A.rgb_888 ~r:214 ~g:226 ~b:208)
+    ~c_near_sell:(A.rgb_888 ~r:238 ~g:212 ~b:206)
+    ~c_magenta:(A.rgb_888 ~r:154 ~g:52 ~b:110)
+    ~c_selected:(A.rgb_888 ~r:208 ~g:202 ~b:184)
+    ~c_exch_hl:(A.rgb_888 ~r:34 ~g:120 ~b:54)
+    ~c_exch_kr:(A.rgb_888 ~r:154 ~g:52 ~b:110)
+    ~c_exch_li:(A.rgb_888 ~r:9 ~g:110 ~b:124)
+    ~c_exch_ib:(A.rgb_888 ~r:191 ~g:87 ~b:0)
+    ~c_exch_alp:(A.rgb_888 ~r:146 ~g:104 ~b:10)
+    ~c_bps_tight:(A.rgb_888 ~r:9 ~g:110 ~b:124)
+    ~c_bps_norm:(A.rgb_888 ~r:138 ~g:132 ~b:118)
+    ~c_bps_wide:(A.rgb_888 ~r:154 ~g:52 ~b:110)
+    ~c_bps_xtrm:(A.rgb_888 ~r:178 ~g:34 ~b:34)
+;;
+
+(* 18. Classic Terminal *)
+let classic_terminal =
+  make_theme
+    ~id:"classic-term"
+    ~name:"Classic Terminal"
+    ~desc:"Pure black DOS quote board with VGA-bright primary colors"
+    ~accent_rgb:(255, 170, 0)
+    ~bg_rgb:(0, 0, 0)
+    ~c_bg:(A.rgb_888 ~r:0 ~g:0 ~b:0)
+    ~c_panel:(A.rgb_888 ~r:10 ~g:10 ~b:10)
+    ~c_section_bg:(A.rgb_888 ~r:28 ~g:28 ~b:28)
+    ~c_border:(A.rgb_888 ~r:80 ~g:80 ~b:80)
+    ~c_title:(A.rgb_888 ~r:255 ~g:255 ~b:255)
+    ~c_accent:(A.rgb_888 ~r:255 ~g:170 ~b:0)
+    ~c_label:(A.rgb_888 ~r:128 ~g:128 ~b:128)
+    ~c_text:(A.rgb_888 ~r:208 ~g:208 ~b:208)
+    ~c_bright:(A.rgb_888 ~r:255 ~g:255 ~b:255)
+    ~c_green:(A.rgb_888 ~r:0 ~g:255 ~b:0)
+    ~c_green_dark:(A.rgb_888 ~r:0 ~g:140 ~b:0)
+    ~c_red:(A.rgb_888 ~r:255 ~g:51 ~b:51)
+    ~c_yellow:(A.rgb_888 ~r:255 ~g:255 ~b:0)
+    ~c_cyan:(A.rgb_888 ~r:0 ~g:255 ~b:255)
+    ~c_dim:(A.rgb_888 ~r:110 ~g:110 ~b:110)
+    ~c_near_fill:(A.rgb_888 ~r:0 ~g:60 ~b:30)
+    ~c_near_sell:(A.rgb_888 ~r:70 ~g:0 ~b:15)
+    ~c_magenta:(A.rgb_888 ~r:255 ~g:0 ~b:255)
+    ~c_selected:(A.rgb_888 ~r:50 ~g:50 ~b:50)
+    ~c_exch_hl:(A.rgb_888 ~r:0 ~g:255 ~b:0)
+    ~c_exch_kr:(A.rgb_888 ~r:255 ~g:170 ~b:0)
+    ~c_exch_li:(A.rgb_888 ~r:0 ~g:255 ~b:255)
+    ~c_exch_ib:(A.rgb_888 ~r:255 ~g:136 ~b:0)
+    ~c_exch_alp:(A.rgb_888 ~r:255 ~g:255 ~b:102)
+    ~c_bps_tight:(A.rgb_888 ~r:0 ~g:255 ~b:255)
+    ~c_bps_norm:(A.rgb_888 ~r:110 ~g:110 ~b:110)
+    ~c_bps_wide:(A.rgb_888 ~r:255 ~g:0 ~b:255)
+    ~c_bps_xtrm:(A.rgb_888 ~r:255 ~g:51 ~b:51)
+;;
+
 let all_themes_list =
   [ tokyo_night
   ; cyberpunk
@@ -947,22 +1099,23 @@ let all_themes_list =
   ; kanagawa
   ; synthwave84
   ; abyss
+  ; ember
+  ; amber_crt
+  ; paper
+  ; classic_terminal
   ]
 ;;
 
 let active_theme_ref = ref tokyo_night
-
 let current () = !active_theme_ref
-
 let all_themes () = all_themes_list
-
 let theme_count () = List.length all_themes_list
 
 let current_theme_index () =
   let rec find i = function
     | [] -> 0
     | (t : theme_palette) :: rest ->
-      if t.id = (!active_theme_ref).id then i else find (i + 1) rest
+      if t.id = !active_theme_ref.id then i else find (i + 1) rest
   in
   find 0 all_themes_list
 ;;
@@ -997,8 +1150,7 @@ let set_theme_by_id id =
     | None ->
       List.find_opt
         (fun (t : theme_palette) ->
-           normalize_theme_str t.id = id_norm
-           || normalize_theme_str t.name = id_norm)
+           normalize_theme_str t.id = id_norm || normalize_theme_str t.name = id_norm)
         all_themes_list
   in
   let match_opt =
@@ -1097,49 +1249,48 @@ let load_saved_theme ?(config_file = "config.json") () =
 
 (* Dynamic getters & top-level compatibility attributes *)
 
-let c_bg () = (!active_theme_ref).c_bg
-let c_panel () = (!active_theme_ref).c_panel
-let c_section_bg () = (!active_theme_ref).c_section_bg
-let c_border () = (!active_theme_ref).c_border
-let c_title () = (!active_theme_ref).c_title
-let c_accent () = (!active_theme_ref).c_accent
-let c_label () = (!active_theme_ref).c_label
-let c_text () = (!active_theme_ref).c_text
-let c_bright () = (!active_theme_ref).c_bright
-let c_green () = (!active_theme_ref).c_green
-let c_green_dark () = (!active_theme_ref).c_green_dark
-let c_red () = (!active_theme_ref).c_red
-let c_yellow () = (!active_theme_ref).c_yellow
-let c_cyan () = (!active_theme_ref).c_cyan
-let c_dim () = (!active_theme_ref).c_dim
-let c_near_fill () = (!active_theme_ref).c_near_fill
-let c_near_sell () = (!active_theme_ref).c_near_sell
-let c_magenta () = (!active_theme_ref).c_magenta
-let c_selected () = (!active_theme_ref).c_selected
-let c_exch_hl () = (!active_theme_ref).c_exch_hl
-let c_exch_kr () = (!active_theme_ref).c_exch_kr
-let c_exch_li () = (!active_theme_ref).c_exch_li
-let c_exch_ib () = (!active_theme_ref).c_exch_ib
-let c_exch_alp () = (!active_theme_ref).c_exch_alp
-
-let a_label () = (!active_theme_ref).a_label
-let a_text () = (!active_theme_ref).a_text
-let a_bright () = (!active_theme_ref).a_bright
-let a_green () = (!active_theme_ref).a_green
-let a_green_dark () = (!active_theme_ref).a_green_dark
-let a_red () = (!active_theme_ref).a_red
-let a_yellow () = (!active_theme_ref).a_yellow
-let a_cyan () = (!active_theme_ref).a_cyan
-let a_dim () = (!active_theme_ref).a_dim
-let a_border () = (!active_theme_ref).a_border
-let a_bps_tight () = (!active_theme_ref).a_bps_tight
-let a_bps_norm () = (!active_theme_ref).a_bps_norm
-let a_bps_wide () = (!active_theme_ref).a_bps_wide
-let a_bps_xtrm () = (!active_theme_ref).a_bps_xtrm
-let a_near_fill () = (!active_theme_ref).a_near_fill
-let a_near_fill_green () = (!active_theme_ref).a_near_fill_green
-let a_near_sell () = (!active_theme_ref).a_near_sell
-let a_near_sell_red () = (!active_theme_ref).a_near_sell_red
+let c_bg () = !active_theme_ref.c_bg
+let c_panel () = !active_theme_ref.c_panel
+let c_section_bg () = !active_theme_ref.c_section_bg
+let c_border () = !active_theme_ref.c_border
+let c_title () = !active_theme_ref.c_title
+let c_accent () = !active_theme_ref.c_accent
+let c_label () = !active_theme_ref.c_label
+let c_text () = !active_theme_ref.c_text
+let c_bright () = !active_theme_ref.c_bright
+let c_green () = !active_theme_ref.c_green
+let c_green_dark () = !active_theme_ref.c_green_dark
+let c_red () = !active_theme_ref.c_red
+let c_yellow () = !active_theme_ref.c_yellow
+let c_cyan () = !active_theme_ref.c_cyan
+let c_dim () = !active_theme_ref.c_dim
+let c_near_fill () = !active_theme_ref.c_near_fill
+let c_near_sell () = !active_theme_ref.c_near_sell
+let c_magenta () = !active_theme_ref.c_magenta
+let c_selected () = !active_theme_ref.c_selected
+let c_exch_hl () = !active_theme_ref.c_exch_hl
+let c_exch_kr () = !active_theme_ref.c_exch_kr
+let c_exch_li () = !active_theme_ref.c_exch_li
+let c_exch_ib () = !active_theme_ref.c_exch_ib
+let c_exch_alp () = !active_theme_ref.c_exch_alp
+let a_label () = !active_theme_ref.a_label
+let a_text () = !active_theme_ref.a_text
+let a_bright () = !active_theme_ref.a_bright
+let a_green () = !active_theme_ref.a_green
+let a_green_dark () = !active_theme_ref.a_green_dark
+let a_red () = !active_theme_ref.a_red
+let a_yellow () = !active_theme_ref.a_yellow
+let a_cyan () = !active_theme_ref.a_cyan
+let a_dim () = !active_theme_ref.a_dim
+let a_border () = !active_theme_ref.a_border
+let a_bps_tight () = !active_theme_ref.a_bps_tight
+let a_bps_norm () = !active_theme_ref.a_bps_norm
+let a_bps_wide () = !active_theme_ref.a_bps_wide
+let a_bps_xtrm () = !active_theme_ref.a_bps_xtrm
+let a_near_fill () = !active_theme_ref.a_near_fill
+let a_near_fill_green () = !active_theme_ref.a_near_fill_green
+let a_near_sell () = !active_theme_ref.a_near_sell
+let a_near_sell_red () = !active_theme_ref.a_near_sell_red
 
 (** Exchange-specific color for the SYMBOL column. *)
 let exch_sym_attr ?(dim = false) exchange =
@@ -1447,9 +1598,7 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
          in
          let id_img = I.string id_attr (Printf.sprintf "%-14s" theme_item.id) in
          let name_attr =
-           if is_cursor
-           then A.(fg t.c_cyan ++ bg row_bg)
-           else A.(fg t.c_dim ++ bg row_bg)
+           if is_cursor then A.(fg t.c_cyan ++ bg row_bg) else A.(fg t.c_dim ++ bg row_bg)
          in
          let name_img =
            I.string name_attr (Printf.sprintf "%-19s" ("(" ^ theme_item.name ^ ")"))
@@ -1524,4 +1673,3 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
   in
   padded
 ;;
-
