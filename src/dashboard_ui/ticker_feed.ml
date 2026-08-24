@@ -16,6 +16,7 @@ let group_tbl : (string, (Notty.attr * string * float * float * float) list) Has
 ;;
 
 let render_ticker w json =
+  let t = Theme.current () in
   let strats =
     match json |?> "strategies" with
     | `Assoc l -> l
@@ -117,7 +118,7 @@ let render_ticker w json =
              List.map
                (fun (asset, entries) ->
                   let asset_header =
-                    I.string A.(fg c_text ++ st bold) (Printf.sprintf " %s " asset)
+                    I.string A.(fg t.c_text ++ st bold) (Printf.sprintf " %s " asset)
                   in
                   let price_images =
                     List.map
@@ -126,25 +127,25 @@ let render_ticker w json =
                          let spread_str = format_spread_bps bid ask in
                          let spread_attr =
                            if bid <= 0.0 || ask <= 0.0
-                           then a_dim
+                           then t.a_dim
                            else (
                              let bps = (ask -. bid) /. ((bid +. ask) /. 2.0) *. 10000.0 in
                              if bps < 5.0
-                             then a_bps_tight
+                             then t.a_bps_tight
                              else if bps < 20.0
-                             then a_bps_norm
+                             then t.a_bps_norm
                              else if bps < 50.0
-                             then a_bps_wide
-                             else a_bps_xtrm)
+                             then t.a_bps_wide
+                             else t.a_bps_xtrm)
                          in
                          I.hcat
                            [ I.string sym_attr price_str
-                           ; I.string a_dim " "
+                           ; I.string t.a_dim " "
                            ; I.string spread_attr spread_str
                            ])
                       entries
                   in
-                  let spacing = I.string a_dim "  " in
+                  let spacing = I.string t.a_dim "  " in
                   let entries_combined =
                     List.fold_left
                       (fun acc ch ->
@@ -152,10 +153,10 @@ let render_ticker w json =
                       I.empty
                       price_images
                   in
-                  I.hcat [ asset_header; entries_combined; I.string a_text " " ])
+                  I.hcat [ asset_header; entries_combined; I.string t.a_text " " ])
                group
            in
-           let sub_separator = I.string A.(fg c_dim) " │ " in
+           let sub_separator = I.string A.(fg t.c_dim) " │ " in
            List.fold_left
              (fun acc img ->
                 if I.width acc = 0 then img else I.hcat [ acc; sub_separator; img ])
@@ -165,9 +166,9 @@ let render_ticker w json =
     in
     let chunks = Array.of_list chunks_list in
     let n = Array.length chunks in
-    let separator = I.string A.(fg c_accent ++ bg c_bg) "  ❖  " in
+    let separator = I.string A.(fg t.c_accent ++ bg t.c_bg) "  ❖  " in
     let sep_w = I.width separator in
-    let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ❖ LIVE TICKER ❖  " in
+    let feed_start = I.string A.(fg t.c_accent ++ bg t.c_bg) "  ❖ LIVE TICKER ❖  " in
     let feed_w = I.width feed_start in
     let max_w = w - 2 in
     let get_col_slice cols c =
@@ -230,5 +231,5 @@ let render_ticker w json =
         valid_slots
     in
     let padded = I.hsnap ~align:`Left w final_img in
-    I.(padded </> I.string A.(bg c_bg) (String.make w ' ')))
+    I.(padded </> I.string A.(bg t.c_bg) (String.make w ' ')))
 ;;

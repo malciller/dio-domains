@@ -88,8 +88,9 @@ let render_to_stdout_safe ~timeout_s draw =
 ;;
 
 let render_wait_screen w h msg =
+  let t = Theme.current () in
   let img =
-    I.string A.(fg c_yellow ++ bg c_bg) msg
+    I.string A.(fg t.c_yellow ++ bg t.c_bg) msg
     |> I.hsnap ~align:`Left w
     |> I.vsnap ~align:`Top h
   in
@@ -157,7 +158,9 @@ let assem_extract (assem : frame_assembler) : string option =
       Some frame))
 ;;
 
-let run () =
+let run ?(config_file = "config.json") () =
+  (* Load user's theme from config.json or disk if present *)
+  Theme.load_saved_theme ~config_file ();
   (* GC tuning for a lightweight single-domain render loop.
      Small minor heap enables frequent collections of short-lived
      frame data. Moderate compaction keeps the heap from fragmenting
@@ -193,6 +196,9 @@ let run () =
   let input_buf = Bytes.create 64 in
   let view_mode_ref = ref `MainView in
   let selected_index_ref = ref 0 in
+  let theme_modal_open = ref false in
+  let theme_cursor_idx = ref 0 in
+  let original_theme_id = ref "" in
   let find_asset_index key assets =
     let rec aux i = function
       | [] -> None
@@ -220,6 +226,7 @@ let run () =
           else parse (i + 1) (`Key_back :: acc)
         else (
           match ch with
+          | 't' | 'T' -> parse (i + 1) (`Key_theme :: acc)
           | 'q' | 'Q' -> parse (i + 1) (`Key_quit :: acc)
           | 'k' | 'K' -> parse (i + 1) (`Key_up :: acc)
           | 'j' | 'J' -> parse (i + 1) (`Key_down :: acc)
@@ -275,6 +282,7 @@ let run () =
      the dashboard keeps showing the cached last snapshot while it waits
      for the engine; it never blanks out. *)
   let draw_frame w h =
+    let t = Theme.current () in
     let draw buf =
       Buffer.add_string buf "\027[?2026h";
       Buffer.add_string buf "\027[H";
@@ -312,7 +320,18 @@ let run () =
         then I.hsnap ~align:`Middle w content_img
         else I.hsnap ~align:`Left w content_img
       in
-      let img = I.(content_img </> I.char A.(bg c_bg) ' ' w h) in
+      let img =
+        if !theme_modal_open
+        then (
+          let modal_overlay =
+            Theme.render_theme_modal
+              ~target_w:w
+              ~target_h:h
+              ~cursor_idx:!theme_cursor_idx
+          in
+          I.(modal_overlay </> content_img </> I.char A.(bg t.c_bg) ' ' w h))
+        else I.(content_img </> I.char A.(bg t.c_bg) ' ' w h)
+      in
       Render.to_buffer buf Cap.ansi (0, 0) (w, I.height img) img;
       Buffer.add_string buf "\027[J";
       Buffer.add_string buf "\027[?2026l"
@@ -419,62 +438,93 @@ let run () =
           let asset_count = List.length assets in
           List.iter
             (fun action ->
-               match !view_mode_ref with
-               | `MainView ->
-                 (match action with
-                  | `Key_quit -> quit := true
-                  | `Key_up ->
-                    if asset_count > 0
-                    then selected_index_ref := max 0 (!selected_index_ref - 1)
-                  | `Key_down ->
-                    if asset_count > 0
-                    then
-                      selected_index_ref := min (asset_count - 1) (!selected_index_ref + 1)
-                  | `Key_enter ->
-                    if asset_count > 0
-                    then (
-                      let idx = min (asset_count - 1) (max 0 !selected_index_ref) in
-                      let asset = List.nth assets idx in
-                      view_mode_ref := `DetailView asset.key)
-                  | `Key_back -> quit := true
-                  | `Key_left -> Latencies.prev_page ()
-                  | `Key_right -> Latencies.next_page ()
-                  | _ -> ())
-               | `DetailView curr_key ->
-                 (match action with
-                  | `Key_quit -> quit := true
-                  | `Key_back -> view_mode_ref := `MainView
-                  | `Key_up | `Key_left ->
-                    if asset_count > 0
-                    then (
-                      let curr_idx =
-                        match find_asset_index curr_key assets with
-                        | Some i -> i
-                        | None -> 0
-                      in
-                      let new_idx =
-                        if curr_idx > 0 then curr_idx - 1 else asset_count - 1
-                      in
-                      selected_index_ref := new_idx;
-                      let new_asset = List.nth assets new_idx in
-                      view_mode_ref := `DetailView new_asset.key)
-                  | `Key_down | `Key_right ->
-                    if asset_count > 0
-                    then (
-                      let curr_idx =
-                        match find_asset_index curr_key assets with
-                        | Some i -> i
-                        | None -> 0
-                      in
-                      let new_idx =
-                        if curr_idx < asset_count - 1 then curr_idx + 1 else 0
-                      in
-                      selected_index_ref := new_idx;
-                      let new_asset = List.nth assets new_idx in
-                      view_mode_ref := `DetailView new_asset.key)
-                  | `Key_zoom_in -> Asset_graph.zoom_in curr_key
-                  | `Key_zoom_out -> Asset_graph.zoom_out curr_key
-                  | _ -> ()))
+               if !theme_modal_open
+               then (
+                 let num_themes = Theme.theme_count () in
+                 match action with
+                 | `Key_up ->
+                   theme_cursor_idx := max 0 (!theme_cursor_idx - 1);
+                   Theme.set_theme_by_index !theme_cursor_idx
+                 | `Key_down ->
+                   theme_cursor_idx := min (num_themes - 1) (!theme_cursor_idx + 1);
+                   Theme.set_theme_by_index !theme_cursor_idx
+                 | `Key_enter ->
+                   Theme.set_theme_by_index !theme_cursor_idx;
+                   Theme.save_theme (Theme.current ()).id;
+                   theme_modal_open := false
+                 | `Key_theme | `Key_back ->
+                   (* Cancel and revert to original theme *)
+                   if !original_theme_id <> ""
+                   then ignore (Theme.set_theme_by_id !original_theme_id);
+                   theme_modal_open := false
+                 | `Key_quit ->
+                   theme_modal_open := false
+                 | _ -> ())
+               else (
+                 match !view_mode_ref with
+                 | `MainView ->
+                   (match action with
+                    | `Key_theme ->
+                      theme_modal_open := true;
+                      theme_cursor_idx := Theme.current_theme_index ();
+                      original_theme_id := (Theme.current ()).id
+                    | `Key_quit -> quit := true
+                    | `Key_up ->
+                      if asset_count > 0
+                      then selected_index_ref := max 0 (!selected_index_ref - 1)
+                    | `Key_down ->
+                      if asset_count > 0
+                      then
+                        selected_index_ref := min (asset_count - 1) (!selected_index_ref + 1)
+                    | `Key_enter ->
+                      if asset_count > 0
+                      then (
+                        let idx = min (asset_count - 1) (max 0 !selected_index_ref) in
+                        let asset = List.nth assets idx in
+                        view_mode_ref := `DetailView asset.key)
+                    | `Key_back -> quit := true
+                    | `Key_left -> Latencies.prev_page ()
+                    | `Key_right -> Latencies.next_page ()
+                    | _ -> ())
+                 | `DetailView curr_key ->
+                   (match action with
+                    | `Key_theme ->
+                      theme_modal_open := true;
+                      theme_cursor_idx := Theme.current_theme_index ();
+                      original_theme_id := (Theme.current ()).id
+                    | `Key_quit -> quit := true
+                    | `Key_back -> view_mode_ref := `MainView
+                    | `Key_up | `Key_left ->
+                      if asset_count > 0
+                      then (
+                        let curr_idx =
+                          match find_asset_index curr_key assets with
+                          | Some i -> i
+                          | None -> 0
+                        in
+                        let new_idx =
+                          if curr_idx > 0 then curr_idx - 1 else asset_count - 1
+                        in
+                        selected_index_ref := new_idx;
+                        let new_asset = List.nth assets new_idx in
+                        view_mode_ref := `DetailView new_asset.key)
+                    | `Key_down | `Key_right ->
+                      if asset_count > 0
+                      then (
+                        let curr_idx =
+                          match find_asset_index curr_key assets with
+                          | Some i -> i
+                          | None -> 0
+                        in
+                        let new_idx =
+                          if curr_idx < asset_count - 1 then curr_idx + 1 else 0
+                        in
+                        selected_index_ref := new_idx;
+                        let new_asset = List.nth assets new_idx in
+                        view_mode_ref := `DetailView new_asset.key)
+                    | `Key_zoom_in -> Asset_graph.zoom_in curr_key
+                    | `Key_zoom_out -> Asset_graph.zoom_out curr_key
+                    | _ -> ())))
             actions;
           dirty := true));
       if List.mem fd ready && not !quit

@@ -52,6 +52,8 @@ type config =
     (** Duration of each per-domain latency accumulation window before the
         histogram is snapshotted and reset. Shorter windows make the dashboard
         percentiles move faster but reduce sample counts per window. *)
+  ; theme : string option
+    (** Optional UI theme name for the terminal dashboard. *)
   }
 
 (** Logging section identifier for this module. *)
@@ -68,6 +70,7 @@ let known_top_level_keys =
   ; "gc"
   ; "oracle"
   ; "fng_check_threshold"
+  ; "theme"
   ]
 ;;
 
@@ -465,6 +468,7 @@ let read_config () : config =
       |> to_float_option
       |> Option.value ~default:5.0
     in
+    let theme = json |> member "theme" |> to_string_option in
     { cycle_mod
     ; logging
     ; gc
@@ -472,6 +476,7 @@ let read_config () : config =
     ; trading
     ; fng_check_threshold
     ; latency_window_seconds
+    ; theme
     }
   with
   | Yojson.Json_error msg ->
@@ -486,6 +491,7 @@ let read_config () : config =
     ; trading = []
     ; fng_check_threshold = 1.5
     ; latency_window_seconds = 5.0
+    ; theme = None
     }
 ;;
 

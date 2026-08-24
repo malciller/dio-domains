@@ -166,6 +166,19 @@ let get_selectable_assets json =
 ;;
 
 let render_strategies ?(selected_index = None) w json =
+  let t = Theme.current () in
+  let a_border = t.a_border in
+  let a_label = t.a_label in
+  let c_bg = t.c_bg in
+  let c_panel = t.c_panel in
+  let c_border = t.c_border in
+  let c_green = t.c_green in
+  let c_red = t.c_red in
+  let c_cyan = t.c_cyan in
+  let c_label = t.c_label in
+  let c_bright = t.c_bright in
+  let c_near_fill = t.c_near_fill in
+  let c_near_sell = t.c_near_sell in
   let now = Unix.gettimeofday () in
   let flash_on = fst (modf (now *. 1.5)) < 0.5 in
   let strats =
@@ -356,22 +369,22 @@ let render_strategies ?(selected_index = None) w json =
       then c_panel
       else c_bg
     in
-    let a_text = A.(Theme.a_text ++ bg bg_color) in
-    let a_green = A.(Theme.a_green ++ bg bg_color) in
-    let a_red = A.(Theme.a_red ++ bg bg_color) in
-    let a_yellow = A.(Theme.a_yellow ++ bg bg_color) in
-    let a_cyan = A.(Theme.a_cyan ++ bg bg_color) in
-    let a_dim = A.(Theme.a_dim ++ bg bg_color) in
-    let a_border = A.(Theme.a_border ++ bg bg_color) in
-    let a_border_outer = A.(Theme.a_border ++ bg c_bg) in
-    let a_bps_tight = A.(Theme.a_bps_tight ++ bg bg_color) in
-    let a_bps_norm = A.(Theme.a_bps_norm ++ bg bg_color) in
-    let a_bps_wide = A.(Theme.a_bps_wide ++ bg bg_color) in
-    let a_bps_xtrm = A.(Theme.a_bps_xtrm ++ bg bg_color) in
-    let a_near_fill_green = A.(Theme.a_near_fill_green ++ bg bg_color) in
-    let a_near_sell_red = A.(Theme.a_near_sell_red ++ bg bg_color) in
-    let a_near_fill = A.(Theme.a_near_fill ++ bg bg_color) in
-    let a_near_sell = A.(Theme.a_near_sell ++ bg bg_color) in
+    let a_text = A.(t.a_text ++ bg bg_color) in
+    let a_green = A.(t.a_green ++ bg bg_color) in
+    let a_red = A.(t.a_red ++ bg bg_color) in
+    let a_yellow = A.(t.a_yellow ++ bg bg_color) in
+    let a_cyan = A.(t.a_cyan ++ bg bg_color) in
+    let a_dim = A.(t.a_dim ++ bg bg_color) in
+    let a_border = A.(t.a_border ++ bg bg_color) in
+    let a_border_outer = A.(t.a_border ++ bg c_bg) in
+    let a_bps_tight = A.(t.a_bps_tight ++ bg bg_color) in
+    let a_bps_norm = A.(t.a_bps_norm ++ bg bg_color) in
+    let a_bps_wide = A.(t.a_bps_wide ++ bg bg_color) in
+    let a_bps_xtrm = A.(t.a_bps_xtrm ++ bg bg_color) in
+    let a_near_fill_green = A.(t.a_near_fill_green ++ bg bg_color) in
+    let a_near_sell_red = A.(t.a_near_sell_red ++ bg bg_color) in
+    let a_near_fill = A.(t.a_near_fill ++ bg bg_color) in
+    let a_near_sell = A.(t.a_near_sell ++ bg bg_color) in
     let exch_sym_attr ?dim exch = A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color) in
     let col w attr s = I.string attr (pad_right w s) in
     let col_right w attr s = I.string attr (pad_left w s) in
@@ -628,20 +641,20 @@ let render_strategies ?(selected_index = None) w json =
     let bg_color =
       if flash_sell then c_near_sell else if is_even then c_panel else c_bg
     in
-    let a_text = A.(Theme.a_text ++ bg bg_color) in
-    let a_green = A.(Theme.a_green ++ bg bg_color) in
-    let a_red = A.(Theme.a_red ++ bg bg_color) in
-    let a_yellow = A.(Theme.a_yellow ++ bg bg_color) in
-    let a_cyan = A.(Theme.a_cyan ++ bg bg_color) in
-    let a_dim = A.(Theme.a_dim ++ bg bg_color) in
-    let a_border = A.(Theme.a_border ++ bg bg_color) in
-    let a_border_outer = A.(Theme.a_border ++ bg c_bg) in
-    let a_bps_tight = A.(Theme.a_bps_tight ++ bg bg_color) in
-    let a_bps_norm = A.(Theme.a_bps_norm ++ bg bg_color) in
-    let a_bps_wide = A.(Theme.a_bps_wide ++ bg bg_color) in
-    let a_bps_xtrm = A.(Theme.a_bps_xtrm ++ bg bg_color) in
-    let a_near_sell = A.(Theme.a_near_sell ++ bg bg_color) in
-    let a_near_sell_red = A.(Theme.a_near_sell_red ++ bg bg_color) in
+    let a_text = A.(t.a_text ++ bg bg_color) in
+    let a_green = A.(t.a_green ++ bg bg_color) in
+    let a_red = A.(t.a_red ++ bg bg_color) in
+    let a_yellow = A.(t.a_yellow ++ bg bg_color) in
+    let a_cyan = A.(t.a_cyan ++ bg bg_color) in
+    let a_dim = A.(t.a_dim ++ bg bg_color) in
+    let a_border = A.(t.a_border ++ bg bg_color) in
+    let a_border_outer = A.(t.a_border ++ bg c_bg) in
+    let a_bps_tight = A.(t.a_bps_tight ++ bg bg_color) in
+    let a_bps_norm = A.(t.a_bps_norm ++ bg bg_color) in
+    let a_bps_wide = A.(t.a_bps_wide ++ bg bg_color) in
+    let a_bps_xtrm = A.(t.a_bps_xtrm ++ bg bg_color) in
+    let a_near_sell = A.(t.a_near_sell ++ bg bg_color) in
+    let a_near_sell_red = A.(t.a_near_sell_red ++ bg bg_color) in
     let exch_sym_attr ?dim exch = A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color) in
     let row_text = if flash_sell then a_near_sell else a_text in
     let sym_attr = if flash_sell then a_near_sell else exch_sym_attr ~dim:true exchange in

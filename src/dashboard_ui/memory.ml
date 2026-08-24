@@ -9,6 +9,7 @@ let max_seen_heap_ref = ref 0
 let pressure_blocks = [| "⠀"; "⡀"; "⣀"; "⣄"; "⣤"; "⣦"; "⣶"; "⣷"; "⣿" |]
 
 let render_memory w json =
+  let t = Theme.current () in
   let mem = json |?> "memory" in
   let title = section_title w "MEMORY & GC" in
   let heap = mem |?> "heap_mb" |> to_int_d 0 in
@@ -52,39 +53,39 @@ let render_memory w json =
     let s_bot = pressure_blocks.(b_idx) in
     let attr =
       if ratio <= 0.0
-      then A.(fg c_dim ++ bg c_bg)
+      then A.(fg t.c_dim ++ bg t.c_bg)
       else if ratio <= 1.0
-      then A.(fg c_green ++ bg c_bg)
+      then A.(fg t.c_green ++ bg t.c_bg)
       else if ratio <= 1.25
-      then A.(fg c_yellow ++ bg c_bg)
-      else A.(fg c_red ++ bg c_bg)
+      then A.(fg t.c_yellow ++ bg t.c_bg)
+      else A.(fg t.c_red ++ bg t.c_bg)
     in
     spark_imgs_top := I.string attr s_top :: !spark_imgs_top;
     spark_imgs_bot := I.string attr s_bot :: !spark_imgs_bot
   done;
   let row3 =
     I.hcat
-      ([ I.string a_border " │"; I.string a_dim "  PRESSURE "; I.string a_border "╭" ]
+      ([ I.string t.a_border " │"; I.string t.a_dim "  PRESSURE "; I.string t.a_border "╭" ]
        @ !spark_imgs_top
-       @ [ I.string a_border "╮" ])
+       @ [ I.string t.a_border "╮" ])
   in
   let row4 =
     I.hcat
-      ([ I.string a_border " │"; I.string a_dim "           "; I.string a_border "╰" ]
+      ([ I.string t.a_border " │"; I.string t.a_dim "           "; I.string t.a_border "╰" ]
        @ !spark_imgs_bot
-       @ [ I.string a_border "╯" ])
+       @ [ I.string t.a_border "╯" ])
   in
   let kv lbl v =
     I.hcat
-      [ I.string a_dim ("  " ^ lbl ^ " ")
-      ; I.string a_text (Printf.sprintf "%-10s" (add_commas v))
+      [ I.string t.a_dim ("  " ^ lbl ^ " ")
+      ; I.string t.a_text (Printf.sprintf "%-10s" (add_commas v))
       ]
   in
   let kv_bar lbl v ratio p_attr =
     I.hcat
-      [ I.string a_dim ("  " ^ lbl ^ " ")
-      ; I.string a_text (Printf.sprintf "%-10s" (add_commas v))
-      ; I.string a_dim " "
+      [ I.string t.a_dim ("  " ^ lbl ^ " ")
+      ; I.string t.a_text (Printf.sprintf "%-10s" (add_commas v))
+      ; I.string t.a_dim " "
       ; render_progress_bar 15 ratio p_attr
       ]
   in
@@ -95,15 +96,15 @@ let render_memory w json =
   in
   let row1 =
     I.hcat
-      [ I.string a_border " │"
-      ; kv_bar "HEAP" (Printf.sprintf "%dMB" heap) heap_ratio a_yellow
-      ; kv_bar "LIVE" (Printf.sprintf "%dKB" live) live_ratio a_green
+      [ I.string t.a_border " │"
+      ; kv_bar "HEAP" (Printf.sprintf "%dMB" heap) heap_ratio t.a_yellow
+      ; kv_bar "LIVE" (Printf.sprintf "%dKB" live) live_ratio t.a_green
       ; kv "FREE" (Printf.sprintf "%dKB" free)
       ]
   in
   let row2 =
     I.hcat
-      [ I.string a_border " │"
+      [ I.string t.a_border " │"
       ; kv "MAJOR" (string_of_int major)
       ; kv "MINOR" (string_of_int minor)
       ; kv "COMPACT" (string_of_int compact)
@@ -121,6 +122,7 @@ let render_memory w json =
 ;;
 
 let render_memory_card w json =
+  let t = Theme.current () in
   let mem = json |?> "memory" in
   let heap = mem |?> "heap_mb" |> to_int_d 0 in
   let live = mem |?> "live_kb" |> to_int_d 0 in
@@ -137,24 +139,24 @@ let render_memory_card w json =
   in
   let row1 =
     I.hcat
-      [ col 10 a_dim "HEAP"
-      ; col_right 10 a_yellow (Printf.sprintf "%dMB" heap)
-      ; I.string a_dim " "
-      ; render_progress_bar 12 heap_ratio a_yellow
+      [ col 10 t.a_dim "HEAP"
+      ; col_right 10 t.a_yellow (Printf.sprintf "%dMB" heap)
+      ; I.string t.a_dim " "
+      ; render_progress_bar 12 heap_ratio t.a_yellow
       ]
   in
   let row2 =
     I.hcat
-      [ col 10 a_dim "LIVE"
-      ; col_right 10 a_green (Printf.sprintf "%dKB" live)
-      ; I.string a_dim " "
-      ; render_progress_bar 12 live_ratio a_green
+      [ col 10 t.a_dim "LIVE"
+      ; col_right 10 t.a_green (Printf.sprintf "%dKB" live)
+      ; I.string t.a_dim " "
+      ; render_progress_bar 12 live_ratio t.a_green
       ]
   in
   let row3 =
     I.hcat
-      [ col 10 a_dim "GC COUNTS"
-      ; col_right 10 a_text (Printf.sprintf "maj:%d min:%d cmp:%d" major minor compact)
+      [ col 10 t.a_dim "GC COUNTS"
+      ; col_right 10 t.a_text (Printf.sprintf "maj:%d min:%d cmp:%d" major minor compact)
       ]
   in
   render_card w "MEMORY & GC" [ row1; row2; row3 ]

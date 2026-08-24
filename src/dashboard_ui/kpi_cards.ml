@@ -5,15 +5,16 @@ open Theme
     Renders top-row summary cards in a unified Btop/Terminal panel container. *)
 
 let render_card_row w cards =
+  let t = Theme.current () in
   let n = List.length cards in
   let inner_total = max 0 (w - 2 - (n * 2)) in
   let base_w = inner_total / n in
   let rem = inner_total mod n in
   let card_inner_w i = base_w + if i < rem then 1 else 0 in
-  let top_imgs = ref [ I.string A.(fg c_border ++ bg c_bg) " ╭" ] in
-  let bot_imgs = ref [ I.string A.(fg c_border ++ bg c_bg) " ╰" ] in
-  let body_row1_imgs = ref [ I.string A.(fg c_border ++ bg c_bg) " │" ] in
-  let body_row2_imgs = ref [ I.string A.(fg c_border ++ bg c_bg) " │" ] in
+  let top_imgs = ref [ I.string A.(fg t.c_border ++ bg t.c_bg) " ╭" ] in
+  let bot_imgs = ref [ I.string A.(fg t.c_border ++ bg t.c_bg) " ╰" ] in
+  let body_row1_imgs = ref [ I.string A.(fg t.c_border ++ bg t.c_bg) " │" ] in
+  let body_row2_imgs = ref [ I.string A.(fg t.c_border ++ bg t.c_bg) " │" ] in
   List.iteri
     (fun i (title, r1, r2) ->
        let iw = card_inner_w i in
@@ -21,33 +22,33 @@ let render_card_row w cards =
        (* Build the top bar piece for this card, spanning the title and
           the remaining dashes. *)
        let title_str = "── " ^ title ^ " " in
-       let title_img = I.string A.(fg c_title ++ bg c_bg ++ st bold) title_str in
+       let title_img = I.string A.(fg t.c_title ++ bg t.c_bg ++ st bold) title_str in
        let title_len = I.width title_img in
        let dash_count = max 0 (iw + 1 - title_len) in
        let dashes =
          I.string
-           A.(fg c_border ++ bg c_bg)
+           A.(fg t.c_border ++ bg t.c_bg)
            (String.concat "" (List.init dash_count (fun _ -> "─")))
        in
-       let div_top = I.string A.(fg c_border ++ bg c_bg) (if is_last then "╮" else "┬") in
+       let div_top = I.string A.(fg t.c_border ++ bg t.c_bg) (if is_last then "╮" else "┬") in
        top_imgs := !top_imgs @ [ title_img; dashes; div_top ];
        (* Build the two body rows for this card. *)
-       let div_mid = I.string A.(fg c_border ++ bg c_bg) "│" in
+       let div_mid = I.string A.(fg t.c_border ++ bg t.c_bg) "│" in
        let c_r1 =
-         I.hcat [ I.string A.(bg c_bg) " "; I.hsnap ~align:`Left iw r1; div_mid ]
+         I.hcat [ I.string A.(bg t.c_bg) " "; I.hsnap ~align:`Left iw r1; div_mid ]
        in
        let c_r2 =
-         I.hcat [ I.string A.(bg c_bg) " "; I.hsnap ~align:`Left iw r2; div_mid ]
+         I.hcat [ I.string A.(bg t.c_bg) " "; I.hsnap ~align:`Left iw r2; div_mid ]
        in
        body_row1_imgs := !body_row1_imgs @ [ c_r1 ];
        body_row2_imgs := !body_row2_imgs @ [ c_r2 ];
        (* Build the bottom bar piece for this card. *)
        let bot_dashes =
          I.string
-           A.(fg c_border ++ bg c_bg)
+           A.(fg t.c_border ++ bg t.c_bg)
            (String.concat "" (List.init (iw + 1) (fun _ -> "─")))
        in
-       let div_bot = I.string A.(fg c_border ++ bg c_bg) (if is_last then "╯" else "┴") in
+       let div_bot = I.string A.(fg t.c_border ++ bg t.c_bg) (if is_last then "╯" else "┴") in
        bot_imgs := !bot_imgs @ [ bot_dashes; div_bot ])
     cards;
   I.vcat
@@ -55,6 +56,7 @@ let render_card_row w cards =
 ;;
 
 let render_kpi_cards w json =
+  let t = Theme.current () in
   let strats =
     match json |?> "strategies" with
     | `Assoc l -> l
@@ -103,12 +105,12 @@ let render_kpi_cards w json =
   let total_hold_val = total_hold_strats +. total_hold_bals in
   let net_worth = total_hold_val +. total_quote_val in
   let c1_row1 =
-    I.hcat [ col 10 a_dim "NET WORTH"; col_right 12 a_bright (format_usd net_worth) ]
+    I.hcat [ col 10 t.a_dim "NET WORTH"; col_right 12 t.a_bright (format_usd net_worth) ]
   in
   (* The PORTFOLIO card shows cash on the second line: accumulated value
      already has its own slot in the HOLDINGS & STRATEGY summary bar. *)
   let c1_row2 =
-    I.hcat [ col 10 a_dim "CASH"; col_right 12 a_cyan (format_usd total_quote_val) ]
+    I.hcat [ col 10 t.a_dim "CASH"; col_right 12 t.a_cyan (format_usd total_quote_val) ]
   in
   let card1 = "PORTFOLIO", c1_row1, c1_row2 in
   let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
@@ -148,19 +150,19 @@ let render_kpi_cards w json =
   in
   let c2_row1 =
     I.hcat
-      [ col 10 a_dim "STRATEGIES"
+      [ col 10 t.a_dim "STRATEGIES"
       ; col_right
           20
-          a_green
+          t.a_green
           (Printf.sprintf "%d active / %d idle" strat_active strat_idle)
       ]
   in
   let c2_row2 =
     I.hcat
-      [ col 10 a_dim "UPTIME"
+      [ col 10 t.a_dim "UPTIME"
       ; col_right
           28
-          a_text
+          t.a_text
           (format_duration uptime
            ^ " │ "
            ^ string_of_int (List.length recent_fills)
@@ -199,25 +201,25 @@ let render_kpi_cards w json =
      (history fetches dominate); 5s+ warrants yellow, 30s+ red. *)
   let lat_attr p =
     if not oracle_fresh
-    then a_dim
+    then t.a_dim
     else if p > 30_000_000.0
-    then a_red
+    then t.a_red
     else if p > 5_000_000.0
-    then a_yellow
-    else a_green
+    then t.a_yellow
+    else t.a_green
   in
   (* Sub-microsecond readings render dark green (nanosecond-resolution);
      everything else keeps the severity color. *)
-  let latency_cell_attr p = if is_sub_us p then a_green_dark else lat_attr p in
+  let latency_cell_attr p = if is_sub_us p then t.a_green_dark else lat_attr p in
   let c3_row1 =
     I.hcat
-      [ col 10 a_dim "ORACLE P50"
+      [ col 10 t.a_dim "ORACLE P50"
       ; col_right 12 (latency_cell_attr oracle_p50) (format_latency_us oracle_p50)
       ]
   in
   let c3_row2 =
     I.hcat
-      [ col 10 a_dim "ORACLE P99"
+      [ col 10 t.a_dim "ORACLE P99"
       ; col_right 12 (latency_cell_attr oracle_p99) (format_latency_us oracle_p99)
       ]
   in
@@ -232,12 +234,12 @@ let render_kpi_cards w json =
   in
   let c4_row1 =
     I.hcat
-      [ col 10 a_dim "HEAP SIZE"; col_right 12 a_yellow (Printf.sprintf "%d MB" heap_mb) ]
+      [ col 10 t.a_dim "HEAP SIZE"; col_right 12 t.a_yellow (Printf.sprintf "%d MB" heap_mb) ]
   in
   let c4_row2 =
     I.hcat
-      [ col 10 a_dim "LIVE RATIO"
-      ; col_right 12 a_green (Printf.sprintf "%.1f%%" live_pct)
+      [ col 10 t.a_dim "LIVE RATIO"
+      ; col_right 12 t.a_green (Printf.sprintf "%.1f%%" live_pct)
       ]
   in
   let card4 = "MEMORY / GC", c4_row1, c4_row2 in
