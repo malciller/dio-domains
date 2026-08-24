@@ -1396,7 +1396,7 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
   let modal_w = min (target_w - 4) 68 in
   let inner_w = modal_w - 4 in
   (* Compute maximum number of themes visible on screen to fit vertically *)
-  let max_visible = max 3 (min total_themes ((target_h - 7) / 2)) in
+  let max_visible = max 5 (min total_themes (target_h - 7)) in
   let start_idx =
     if total_themes <= max_visible
     then 0
@@ -1445,13 +1445,15 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
            then A.(fg t.c_title ++ bg row_bg ++ st bold)
            else A.(fg t.c_text ++ bg row_bg ++ st bold)
          in
-         let id_img = I.string id_attr (Printf.sprintf "%-13s" theme_item.id) in
+         let id_img = I.string id_attr (Printf.sprintf "%-14s" theme_item.id) in
          let name_attr =
            if is_cursor
            then A.(fg t.c_cyan ++ bg row_bg)
            else A.(fg t.c_dim ++ bg row_bg)
          in
-         let name_img = I.string name_attr (Printf.sprintf "%-20s" ("(" ^ theme_item.name ^ ")")) in
+         let name_img =
+           I.string name_attr (Printf.sprintf "%-19s" ("(" ^ theme_item.name ^ ")"))
+         in
          let swatches =
            I.hcat
              [ I.string A.(fg theme_item.c_accent ++ bg row_bg) "■ "
@@ -1472,26 +1474,8 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
              ; I.string A.(fg t.c_border ++ bg t.c_panel) " │"
              ]
          in
-         let desc_str =
-           Printf.sprintf "       \"theme\": \"%s\"  ──  %s" theme_item.id theme_item.desc
-         in
-         let desc_attr =
-           if is_cursor
-           then A.(fg t.c_accent ++ bg row_bg)
-           else A.(fg t.c_dim ++ bg row_bg)
-         in
-         let desc_img = I.string desc_attr desc_str in
-         let desc_cropped = I.hsnap ~align:`Left inner_w desc_img in
-         let line2 =
-           I.hcat
-             [ I.string A.(fg t.c_border ++ bg t.c_panel) " │ "
-             ; desc_cropped
-             ; I.string A.(fg t.c_border ++ bg t.c_panel) " │"
-             ]
-         in
-         [ line1; line2 ])
+         line1)
       visible_themes
-    |> List.flatten
   in
   let div_row =
     I.hcat
