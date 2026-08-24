@@ -21,30 +21,35 @@ let () =
     ; ( "--theme"
       , Arg.String
           (fun s ->
-             let s_clean = String.trim (String.lowercase_ascii s) in
-             if s_clean = "list" || s_clean = "help"
-             then (
-               Printf.printf "Available dashboard themes:\n";
-               List.iter
-                 (fun (t : Dashboard_ui.Theme.theme_palette) ->
-                    Printf.printf "  %-16s %s\n" t.id t.name)
-                 (Dashboard_ui.Theme.all_themes ());
-               exit 0)
-             else theme_override := s_clean)
-      , " Select UI theme (e.g. tokyo-night, cyberpunk, nord, catppuccin, gruvbox, matrix, monokai, solarized, emerald, dracula, rose-pine, kanagawa, synthwave84, abyss, or 'list')" )
+            let s_clean = String.trim (String.lowercase_ascii s) in
+            if s_clean = "list" || s_clean = "help"
+            then (
+              Printf.printf "Available dashboard themes:\n";
+              List.iter
+                (fun (t : Dashboard_ui.Theme.theme_palette) ->
+                   Printf.printf "  %-16s %s\n" t.id t.name)
+                (Dashboard_ui.Theme.all_themes ());
+              exit 0)
+            else theme_override := s_clean)
+      , " Select UI theme (e.g. tokyo-night, cyberpunk, gruvbox, ember, amber-crt, \
+         paper, classic-term, or 'list' for all)" )
     ]
   in
-  Arg.parse speclist (fun _ -> ()) "dio-dashboard [--socket /tmp/dio-<pid>.sock] [--config config.json] [--theme <id>]";
+  Arg.parse
+    speclist
+    (fun _ -> ())
+    "dio-dashboard [--socket /tmp/dio-<pid>.sock] [--config config.json] [--theme <id>]";
   (* First load theme from config.json (or ~/.dio_theme) *)
   Dashboard_ui.Theme.load_saved_theme ~config_file:!config_file ();
   (* If explicit CLI --theme is passed, override and save *)
   if !theme_override <> ""
-  then (
+  then
     if not (Dashboard_ui.Theme.set_theme_by_id !theme_override)
     then (
-      Printf.eprintf "Unknown theme '%s'. Run with '--theme list' to see available themes.\n%!" !theme_override;
+      Printf.eprintf
+        "Unknown theme '%s'. Run with '--theme list' to see available themes.\n%!"
+        !theme_override;
       exit 1)
-    else
-      Dashboard_ui.Theme.save_theme !theme_override);
+    else Dashboard_ui.Theme.save_theme !theme_override;
   Dashboard_ui.App.run ~config_file:!config_file ()
 ;;
