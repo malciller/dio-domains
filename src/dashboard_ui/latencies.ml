@@ -167,33 +167,35 @@ let take_first n l =
     ◀ ▶ (bold cyan), inactive pages are dim, and the ←/→ hint marks the
     switch keys. *)
 let render_latency_title w =
-  let left = I.string A.(fg c_title ++ bg c_bg ++ st bold) " ╭── ENGINE LATENCY ── " in
+  let t = Theme.current () in
+  let left = I.string A.(fg t.c_title ++ bg t.c_bg ++ st bold) " ╭── ENGINE LATENCY ── " in
   let tabs =
     List.mapi
       (fun i p ->
          if i = current_page_index ()
-         then I.string A.(fg c_cyan ++ bg c_bg ++ st bold) (" ◀" ^ p.page_label ^ "▶ ")
-         else I.string a_dim ("  " ^ p.page_label ^ " "))
+         then I.string A.(fg t.c_cyan ++ bg t.c_bg ++ st bold) (" ◀" ^ p.page_label ^ "▶ ")
+         else I.string t.a_dim ("  " ^ p.page_label ^ " "))
       metric_pages
   in
-  let hint = I.string a_dim "←/→" in
-  let prefix = I.hcat (left :: (tabs @ [ hint; I.string A.(bg c_bg) " " ])) in
+  let hint = I.string t.a_dim "←/→" in
+  let prefix = I.hcat (left :: (tabs @ [ hint; I.string A.(bg t.c_bg) " " ])) in
   let len = I.width prefix in
   let pad_count = max 0 (w - len - 1) in
-  let left_rgb = 187, 154, 247 in
-  let right_rgb = 26, 27, 38 in
+  let left_rgb = t.accent_rgb in
+  let right_rgb = t.bg_rgb in
   let gradient_lines =
     List.init pad_count (fun i ->
       let ratio = float i /. float (max 1 (pad_count - 1)) in
       let fade = ratio *. ratio in
       let c = color_blend left_rgb right_rgb fade in
-      I.string A.(fg c ++ bg c_bg) "─")
+      I.string A.(fg c ++ bg t.c_bg) "─")
   in
-  let end_border = I.string A.(fg c_border ++ bg c_bg) "╮" in
+  let end_border = I.string A.(fg t.c_border ++ bg t.c_bg) "╮" in
   I.hcat ((prefix :: gradient_lines) @ [ end_border ])
 ;;
 
 let render_latencies w json =
+  let t = Theme.current () in
   let lats =
     match json |?> "latencies" with
     | `Assoc l -> l
@@ -240,22 +242,7 @@ let render_latencies w json =
   if active_lats = []
   then I.empty
   else (
-    (* Per-metric latency thresholds: (yellow_us, red_us).
-       These measure INTERNAL processing latency for the in-process stages
-       and end-to-end round trips for the network stages (code we control
-       plus the wire time to the venue):
-       - ticker/ob:  in-memory struct update from ring buffer; should be <5us
-       - strategy:   grid logic + mutex + order push; target <25us p50
-       - execution:  ringbuffer write + signal broadcast; short path
-       - oracle:     the capital-oracle per-asset pipeline (history fetch +
-                     survival analysis + sizing) for that domain's asset;
-                     fetches dominate, so seconds-scale is normal, 10s+ is a
-                     degraded fetch/analysis
-       - cycle:      full domain cycle (wake -> consume -> strategy -> exec)
-       - ws_ping:    venue websocket ping/pong round trip
-       - ws_feed:    time between venue feed messages
-       - rest_request: venue REST round trip (order/balance/quote endpoints)
-       - signer:     local signature generation *)
+    (* Per-metric latency thresholds: (yellow_us, red_us). *)
     let latency_thresholds label =
       match label with
       | "orderbook" -> 10.0, 30.0
@@ -280,14 +267,6 @@ let render_latencies w json =
         then 1 (* yellow *)
         else 0 (* green *))
     in
-    (* The active page's metric columns. The wide layout shows all of them;
-       narrow terminals show the first two so the section still fits. The
-       width the full set needs is fixed per page: the fixed columns
-       (domain + trend + exec rate, 45 total) plus n metric cells of 24
-       (each subsequent one has a 3-wide separator), i.e. 71 + 27*(n-1)
-       once the closing border is counted. The five-metric CORE table needs
-       ~179 columns but the four-metric NETWORK table only ~152, so compact
-       mode is gated on the active page's own width, not a global cutoff. *)
     let page = List.nth metric_pages (current_page_index ()) in
     let n_metrics = List.length page.metrics in
     let full_page_w = 71 + (27 * (n_metrics - 1)) in
@@ -298,60 +277,57 @@ let render_latencies w json =
        sub-headers on the second. *)
     let header_row1 =
       I.hcat
-        ([ I.string a_border " │  "
-         ; col 13 a_label ""
-         ; I.string a_border " │ "
-         ; col trend_col_w a_label (pad_right trend_col_w "   TREND   ")
-         ; I.string a_border " │ "
+        ([ I.string t.a_border " │  "
+         ; col 13 t.a_label ""
+         ; I.string t.a_border " │ "
+         ; col trend_col_w t.a_label (pad_right trend_col_w "   TREND   ")
+         ; I.string t.a_border " │ "
          ]
          @ List.mapi
              (fun i lbl ->
                 let len = String.length lbl in
                 let pad = (24 - len) / 2 in
                 let s = String.make pad ' ' ^ lbl in
-                let img = col 24 a_label s in
-                if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
+                let img = col 24 t.a_label s in
+                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
              page_labels
-         @ [ I.string a_border " │ "; col 7 a_label "STRAT/S" ])
+         @ [ I.string t.a_border " │ "; col 7 t.a_label "STRAT/S" ])
     in
     let header_row2 =
       I.hcat
-        ([ I.string a_border " │  "
-         ; col 13 a_label "DOMAIN"
-         ; I.string a_border " │ "
-           (* Truncate defensively: the trend column is 12 wide and a longer
-            label must never silently overrun the column (it would shift
-            every border to its right out of alignment). *)
-         ; col trend_col_w a_dim (truncate_string trend_col_w page.trend_label)
-         ; I.string a_border " │ "
+        ([ I.string t.a_border " │  "
+         ; col 13 t.a_label "DOMAIN"
+         ; I.string t.a_border " │ "
+         ; col trend_col_w t.a_dim (truncate_string trend_col_w page.trend_label)
+         ; I.string t.a_border " │ "
          ]
          @ List.mapi
              (fun i _lbl ->
                 let img =
                   I.hcat
-                    [ col_right metric_cell_w a_dim "p50"
-                    ; col_right metric_cell_w a_dim "p99"
-                    ; col_right metric_cell_w a_dim "p999"
+                    [ col_right metric_cell_w t.a_dim "p50"
+                    ; col_right metric_cell_w t.a_dim "p99"
+                    ; col_right metric_cell_w t.a_dim "p999"
                     ]
                 in
-                if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
+                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
              page_labels
-         @ [ I.string a_border " │ "; col 7 a_dim "  rate  " ])
+         @ [ I.string t.a_border " │ "; col 7 t.a_dim "  rate  " ])
     in
     let header = I.vcat [ close_row w header_row1; close_row w header_row2 ] in
     let rows =
       List.mapi
         (fun i (symbol, metrics) ->
-           let bg_color = if i mod 2 = 1 then c_panel else c_bg in
-           let a_text = A.(Theme.a_text ++ bg bg_color) in
-           let a_green = A.(Theme.a_green ++ bg bg_color) in
-           let a_green_dark = A.(Theme.a_green_dark ++ bg bg_color) in
-           let a_red = A.(Theme.a_red ++ bg bg_color) in
-           let a_yellow = A.(Theme.a_yellow ++ bg bg_color) in
-           let a_dim = A.(Theme.a_dim ++ bg bg_color) in
-           let a_border = A.(Theme.a_border ++ bg bg_color) in
-           let a_border_outer = A.(Theme.a_border ++ bg c_bg) in
-           let a_bright = A.(Theme.a_bright ++ bg bg_color) in
+           let bg_color = if i mod 2 = 1 then t.c_panel else t.c_bg in
+           let a_text = A.(t.a_text ++ bg bg_color) in
+           let a_green = A.(t.a_green ++ bg bg_color) in
+           let a_green_dark = A.(t.a_green_dark ++ bg bg_color) in
+           let a_red = A.(t.a_red ++ bg bg_color) in
+           let a_yellow = A.(t.a_yellow ++ bg bg_color) in
+           let a_dim = A.(t.a_dim ++ bg bg_color) in
+           let a_border = A.(t.a_border ++ bg bg_color) in
+           let a_border_outer = A.(t.a_border ++ bg t.c_bg) in
+           let a_bright = A.(t.a_bright ++ bg bg_color) in
            let exch_sym_attr ?dim exch =
              A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color)
            in
@@ -361,9 +337,6 @@ let render_latencies w json =
              | 0 -> a_green
              | _ -> a_dim
            in
-           (* Sub-microsecond cells (nanosecond-resolution readings) render
-              dark green so they stand apart from microsecond cells, which
-              keep the severity attribute. *)
            let latency_cell_attr sev f =
              if Theme.is_sub_us f then a_green_dark else sev
            in
@@ -409,8 +382,6 @@ let render_latencies w json =
                p50, p99, p999, samples
              | None -> 0.0, 0.0, 0.0, 0
            in
-           (* Compute the worst severity across the active page's metrics
-               for the health dot. *)
            let worst_sev =
              List.fold_left
                (fun worst label ->
@@ -424,15 +395,10 @@ let render_latencies w json =
              List.mapi
                (fun i label ->
                   let p50, p99, p999, samples = find_metric label in
-                  (* Distinguish an idle window (label present, zero samples)
-                      from a metric the engine never published ("--"). *)
                   let known = List.mem_assoc label mlist in
                   let img =
                     if samples > 0
                     then (
-                      (* Fresh window: remember the values so later idle
-                          windows can persist them, then render with the
-                          severity color for this window. *)
                       Hashtbl.replace last_vals (symbol ^ "\x00" ^ label) (p50, p99, p999);
                       let s50 = severity label p50 samples in
                       let s99 = max s50 (severity label p99 samples) in
@@ -454,8 +420,6 @@ let render_latencies w json =
                     else (
                       match last_value symbol label with
                       | Some (lp50, lp99, lp999) ->
-                        (* Stale: keep the last measured values on screen,
-                            dimmed, until a fresh window arrives. *)
                         I.hcat
                           [ col_right metric_cell_w a_dim (format_latency_us lp50)
                           ; col_right metric_cell_w a_dim (format_latency_us lp99)
@@ -472,13 +436,6 @@ let render_latencies w json =
                   if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
                page_cols
            in
-           (* Trend: the active page's primary metric. The CORE page keeps
-               the oracle's carefully tuned 10us scale (the per-asset profiler
-               measures only the analyze/sizing span - cache hits ~2-3us); the
-               network page scales to its crit threshold so a degraded reading
-               fills the bar. When the current window has no samples, the
-               trend keeps plotting the last measured p99 (dimmed) instead of
-               collapsing to a flat line. *)
            let _, trend_p99, _, trend_samples = find_metric page.trend_metric in
            let trend_p99, trend_stale =
              if trend_samples > 0
@@ -498,8 +455,6 @@ let render_latencies w json =
            in
            let exch = exch_of_symbol symbol in
            let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
-           (* Strategy activity rate from the current window (S2): executions
-                per second when the strategy ran, dim idle otherwise. *)
            let exec_s_cell =
              match List.assoc_opt "strategy" mlist with
              | Some data ->

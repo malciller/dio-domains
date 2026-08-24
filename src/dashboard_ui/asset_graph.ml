@@ -146,6 +146,27 @@ let record_all_prices json =
 ;;
 
 let render_asset_detail w h asset_key json =
+  let t = Theme.current () in
+  let a_border = t.a_border in
+  let a_label = t.a_label in
+  let a_dim = t.a_dim in
+  let a_text = t.a_text in
+  let a_bright = t.a_bright in
+  let a_green = t.a_green in
+  let a_red = t.a_red in
+  let a_yellow = t.a_yellow in
+  let a_cyan = t.a_cyan in
+  let c_bg = t.c_bg in
+  let c_border = t.c_border in
+  let c_title = t.c_title in
+  let c_accent = t.c_accent in
+  let c_green = t.c_green in
+  let c_yellow = t.c_yellow in
+  let c_cyan = t.c_cyan in
+  let c_dim = t.c_dim in
+  let c_text = t.c_text in
+  let c_bright = t.c_bright in
+  let c_magenta = t.c_magenta in
   let assets = Holdings.get_selectable_assets json in
   let asset_opt =
     if asset_key = ""

@@ -10,6 +10,7 @@ let capacity = 10
 let initialized = ref false
 
 let render_fills w json =
+  let t = Theme.current () in
   let engine_fills = json |?> "recent_fills" |> to_list_d in
   (* Merge engine fills into local_fills on every render cycle.
      On startup, the engine seeds historical fills into the ring buffer
@@ -74,21 +75,21 @@ let render_fills w json =
              else Printf.sprintf "%.1fh" (diff /. 3600.0)
            in
            let side_attr =
-             if side = "BUY" then A.(fg c_green ++ st bold) else A.(fg c_red ++ st bold)
+             if side = "BUY" then A.(fg t.c_green ++ st bold) else A.(fg t.c_red ++ st bold)
            in
            let sym_attr = exch_sym_attr (String.lowercase_ascii venue) in
            let amount_str = format_qty amount in
            I.hcat
-             [ I.string A.(fg c_dim) (time_str ^ " ago ")
+             [ I.string A.(fg t.c_dim) (time_str ^ " ago ")
              ; I.string sym_attr symbol
-             ; I.string A.(fg c_dim) " "
+             ; I.string A.(fg t.c_dim) " "
              ; I.string side_attr side
-             ; I.string A.(fg c_text) (" " ^ amount_str ^ " @ " ^ format_price price)
+             ; I.string A.(fg t.c_text) (" " ^ amount_str ^ " @ " ^ format_price price)
              ])
         fills
     in
-    let order_separator = I.string A.(fg c_dim ++ bg c_bg) "  •  " in
-    let feed_start = I.string A.(fg c_accent ++ bg c_bg) "  ◈ RECENT FILLS ◈  " in
+    let order_separator = I.string A.(fg t.c_dim ++ bg t.c_bg) "  •  " in
+    let feed_start = I.string A.(fg t.c_accent ++ bg t.c_bg) "  ◈ RECENT FILLS ◈  " in
     let max_w = w - 2 in
     let final_img =
       List.fold_left
@@ -103,10 +104,11 @@ let render_fills w json =
         chunks
     in
     let padded = I.hsnap ~align:`Left w final_img in
-    I.(padded </> I.string A.(bg c_bg) (String.make w ' ')))
+    I.(padded </> I.string A.(bg t.c_bg) (String.make w ' ')))
 ;;
 
 let render_fills_card w json =
+  let t = Theme.current () in
   let engine_fills = json |?> "recent_fills" |> to_list_d in
   let () =
     if not !initialized
@@ -143,7 +145,7 @@ let render_fills_card w json =
   in
   let fills = !local_fills in
   if fills = []
-  then render_card w "LIVE FILLS" [ I.string a_dim "No recent fills recorded" ]
+  then render_card w "LIVE FILLS" [ I.string t.a_dim "No recent fills recorded" ]
   else (
     let now = Unix.gettimeofday () in
     let fill_rows =
@@ -163,15 +165,15 @@ let render_fills_card w json =
              then Printf.sprintf "%.0fm" (diff /. 60.0)
              else Printf.sprintf "%.1fh" (diff /. 3600.0)
            in
-           let side_attr = if side = "BUY" then a_green else a_red in
+           let side_attr = if side = "BUY" then t.a_green else t.a_red in
            let sym_attr = exch_sym_attr (String.lowercase_ascii venue) in
            let amount_str = format_qty amount in
            I.hcat
-             [ col 6 a_dim (time_str ^ " ago")
+             [ col 6 t.a_dim (time_str ^ " ago")
              ; col 10 sym_attr (truncate_string 9 symbol)
              ; col 4 side_attr side
-             ; col_right 10 a_text amount_str
-             ; col_right 12 a_bright (format_price price)
+             ; col_right 10 t.a_text amount_str
+             ; col_right 12 t.a_bright (format_price price)
              ])
         fills
     in

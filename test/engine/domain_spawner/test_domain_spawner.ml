@@ -53,6 +53,7 @@ let test_spawn_domains_basic () =
     ; trading = assets
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
+    ; theme = None
     }
   in
   let _supervisor_thread =
@@ -81,6 +82,7 @@ let test_spawn_domains_empty () =
     ; trading = []
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
+    ; theme = None
     }
   in
   let _supervisor_thread =
@@ -170,6 +172,7 @@ let test_domain_error_handling () =
     ; trading = [ failing_asset ]
     ; latency_window_seconds = 5.0
     ; fng_check_threshold = 1.5
+    ; theme = None
     }
   in
   let _supervisor_thread =
