@@ -264,7 +264,7 @@ let json_to_float = function
 
 let parse_timestamp _str = Unix.gettimeofday ()
 
-let handle_message_str content =
+let handle_message_str ?on_auth_success ?on_auth_error content =
   let trimmed = String.trim content in
   if trimmed <> ""
   then (
@@ -371,16 +371,17 @@ let handle_message_str content =
              let close_p = j |> member "c" |> json_to_float in
              Logging.debug_f ~section "[%s] Bar close: %.2f" symbol close_p
            | "heartbeat" ->
-             (* Alpaca sends application-level heartbeats when no other data
-                 is flowing (e.g. quiet market). They keep the connection warm
-                 and are counted as feed frames, so the ws_feed gap metric
-                 stays honest during idle periods. *)
              Logging.debug ~section "Alpaca Market Data WS heartbeat"
            | "success" ->
              let msg =
                j |> member "msg" |> to_string_option |> Option.value ~default:""
              in
-             Logging.debug_f ~section "Alpaca Market Data WS status: %s" msg
+             Logging.info_f ~section "Alpaca Market Data WS status: %s" msg;
+             if msg = "authenticated"
+             then (
+               match on_auth_success with
+               | Some f -> f ()
+               | None -> ())
            | "subscription" ->
              let quotes =
                match j |> member "quotes" with
@@ -402,7 +403,10 @@ let handle_message_str content =
              let msg =
                j |> member "msg" |> to_string_option |> Option.value ~default:""
              in
-             Logging.error_f ~section "Alpaca Market Data WS error (%d): %s" code msg
+             Logging.error_f ~section "Alpaca Market Data WS error (%d): %s" code msg;
+             (match on_auth_error with
+              | Some f -> f code msg
+              | None -> ())
            | other ->
              Logging.debug_f
                ~section
@@ -517,41 +521,59 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        Logging.debug ~section "Sending Alpaca Market Data WS authentication...";
        Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ())
        >>= fun () ->
-       on_connected ();
-       (* Send any subscriptions requested before the connection was established. *)
-       send_subscription !active_subscriptions
-       >>= fun () ->
+       let authenticated = ref false in
+       let auth_failure_reason = ref None in
+       let on_auth_success () =
+         if not !authenticated
+         then (
+           authenticated := true;
+           on_connected ();
+           Lwt.async (fun () -> send_subscription !active_subscriptions))
+       in
+       let on_auth_error code msg =
+         let reason = Printf.sprintf "Alpaca Market Data WS error (%d): %s" code msg in
+         auth_failure_reason := Some reason;
+         Lwt.async (fun () ->
+           Lwt.catch
+             (fun () -> Websocket_lwt_unix.close_transport conn)
+             (fun _exn -> Lwt.return_unit))
+       in
        let rec read_loop () =
          Websocket_lwt_unix.read conn
          >>= fun frame ->
          on_heartbeat ();
-         (match frame.Websocket.Frame.opcode with
-          | Websocket.Frame.Opcode.Ping ->
-            let pong_frame =
-              Websocket.Frame.create
-                ~opcode:Websocket.Frame.Opcode.Pong
-                ~content:frame.Websocket.Frame.content
-                ()
-            in
-            Websocket_lwt_unix.write conn pong_frame
-          | Websocket.Frame.Opcode.Pong ->
-            (* Reply to our active [send_ping]; resolves any pending waiter. *)
-            last_pong_time := Unix.gettimeofday ();
-            Lwt_condition.broadcast pong_condition ();
-            Lwt.return_unit
-          | Websocket.Frame.Opcode.Close ->
-            Lwt.fail (Failure "Alpaca Market Data WS received Close frame from server")
-          | _ ->
-            let content = String.trim frame.Websocket.Frame.content in
-            if content <> ""
-            then (
-              (* Feed cadence: gap since the previous data frame on this venue. *)
-              let now = Unix.gettimeofday () in
-              if !last_frame_time > 0.0
-              then Network_latency.record_feed_s "alpaca" (now -. !last_frame_time);
-              last_frame_time := now;
-              handle_message_str content);
-            Lwt.return_unit)
+         (match !auth_failure_reason with
+          | Some reason -> Lwt.fail (Failure reason)
+          | None ->
+            (match frame.Websocket.Frame.opcode with
+             | Websocket.Frame.Opcode.Ping ->
+               let pong_frame =
+                 Websocket.Frame.create
+                   ~opcode:Websocket.Frame.Opcode.Pong
+                   ~content:frame.Websocket.Frame.content
+                   ()
+               in
+               Websocket_lwt_unix.write conn pong_frame
+             | Websocket.Frame.Opcode.Pong ->
+               (* Reply to our active [send_ping]; resolves any pending waiter. *)
+               last_pong_time := Unix.gettimeofday ();
+               Lwt_condition.broadcast pong_condition ();
+               Lwt.return_unit
+             | Websocket.Frame.Opcode.Close ->
+               Lwt.fail (Failure "Alpaca Market Data WS received Close frame from server")
+             | _ ->
+               let content = String.trim frame.Websocket.Frame.content in
+               if content <> ""
+               then (
+                 (* Feed cadence: gap since the previous data frame on this venue. *)
+                 let now = Unix.gettimeofday () in
+                 if !last_frame_time > 0.0
+                 then Network_latency.record_feed_s "alpaca" (now -. !last_frame_time);
+                 last_frame_time := now;
+                 handle_message_str ~on_auth_success ~on_auth_error content);
+               (match !auth_failure_reason with
+                | Some reason -> Lwt.fail (Failure reason)
+                | None -> Lwt.return_unit)))
          >>= fun () -> read_loop ()
        in
        (* Seamless session switching: while this incarnation is current, watch
@@ -578,7 +600,9 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                  (if want_overnight
                   then "overnight (v1beta1/overnight)"
                   else "regular (v2/" ^ !Alpaca_types.Config.data_feed ^ ")");
-               Websocket_lwt_unix.close_transport conn >>= fun () -> Lwt.return_unit)
+               Lwt.catch
+                 (fun () -> Websocket_lwt_unix.close_transport conn)
+                 (fun _exn -> Lwt.return_unit))
              else session_watcher ()
            | _ -> Lwt.return_unit)
        in
