@@ -6,7 +6,7 @@ open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
 
-(** M16: price-key helper (rounded price*10000 as int) shared by the
+(** price-key helper (rounded price*10000 as int) shared by the
     persisted-sell matching in [sync_open_orders] and the reconcile threading
     into [evaluate_sell_leg]. The int key keeps two within-tolerance prices in
     the same (or an adjacent) bucket without allocating a string per lookup. *)
@@ -14,7 +14,7 @@ let price_key p = int_of_float (Float.round (p *. 10000.0))
 
 (** Performs 1-to-1 multiset matching between persisted sell levels and open sell orders.
     Returns (open_levels, missing_levels).
-    M15: the previous implementation was O(n·m); for each persisted level it
+    the previous implementation was O(n·m); for each persisted level it
     linearly rescanned the open-order list and allocated a match array. This
     version buckets open orders by a tolerance-rounded price key (Hashtbl) and
     verifies the original tolerance before consuming a candidate, so matching
@@ -29,7 +29,7 @@ let price_key p = int_of_float (Float.round (p *. 10000.0))
     more than one rounded-decimal bucket), and the per-candidate tolerance
     check below preserves the original matching semantics exactly.
 
-    M16: this partition is now only the fallback for direct [evaluate_sell_leg]
+    this partition is now only the fallback for direct [evaluate_sell_leg]
     callers; the strategy hot path builds the same open/missing split during
     [sync_open_orders]' scan and threads it through, so the per-tick reconcile
     is O(m) instead of this O(n+m) re-partition. *)
@@ -92,7 +92,7 @@ let partition_persisted_sell_levels persisted open_orders =
 ;;
 
 (** Reconciles the persisted-sell grid (Alpaca offline fill recovery). Computed
-    once per execution and reused by the three persisted-sell branches (M15). *)
+    once per execution and reused by the three persisted-sell branches. *)
 let reconcile_persisted_sell_levels ~state =
   partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders
 ;;
@@ -169,7 +169,7 @@ let evaluate_capital_low_recovery
     let available_quote = quote_bal -. total_reserved in
     if state.capital_low && state.capital_low_at_balance < 0.0
     then state.capital_low_at_balance <- quote_bal;
-    (* M17: recovery is AFFORDABILITY-based, matching the replay model
+    (* recovery is AFFORDABILITY-based, matching the replay model
         (Grid_core clears as soon as the quote can fund the next buy) and
         market_maker's flag handling. Gating the clear on a balance INCREASE
         latched the pause forever when a falling price made the same balance
@@ -305,14 +305,14 @@ let sync_open_orders
   let locked_in_sells = ref 0.0 in
   let closest_sell_order = ref None in
   let matched_persisted_indices = Hashtbl.create 16 in
-  (* M15: index the persisted sell levels by a rounded price key so each open
+  (* index the persisted sell levels by a rounded price key so each open
      sell order's match lookup is O(1) instead of rescanning the whole list.
      The previous [List.iteri] scan was O(n·m) per strategy execution (n open
      sell orders x m persisted levels), the dominant cost for assets with
      large sell grids like SPCX's 42 open sells. Buckets store
      (index, price, qty) so a 1-to-1 match consumes the entry and the
      original tolerance check and qty-update semantics are preserved. *)
-  (* M16: matched persisted levels keyed by their price key -> count. Built
+  (* matched persisted levels keyed by their price key -> count. Built
      during the scan (each open sell consumes exactly one persisted level, so
      a multiset of per-price counts accumulates), the open/missing split for
      the virtual-GTC reconcile falls out in O(m) at the end of the scan
@@ -405,7 +405,7 @@ let sync_open_orders
           | Some (bk, idx, _existing_p, existing_q, remaining_bucket) ->
             Hashtbl.add matched_persisted_indices idx ();
             Hashtbl.replace persisted_idx bk remaining_bucket;
-            (* M16: count the persisted level (keyed by ITS price) as matched. *)
+            (* count the persisted level (keyed by ITS price) as matched. *)
             record_matched (price_key _existing_p);
             if abs_float (existing_q -. qty) > 1e-6
             then (
@@ -427,7 +427,7 @@ let sync_open_orders
                  (fun (p1, _) (p2, _) -> Float.compare p2 p1)
                  ((price, qty) :: state.persisted_sell_levels);
             state.persistence_dirty <- true;
-            (* M16: the adopted level was matched by this open sell by
+            (* the adopted level was matched by this open sell by
                construction - count it so the end-of-scan split keeps it on
                the open side. *)
             record_matched (price_key price);
@@ -492,7 +492,7 @@ let sync_open_orders
          in
          if not already_present then ())
       preserved_sells;
-  (* M16: split the final persisted list into open/missing by draining the
+  (* split the final persisted list into open/missing by draining the
      per-price-key match counts (multiset semantics - duplicate levels at the
      same price each consume one count, exactly mirroring
      [partition_persisted_sell_levels]' 1-to-1 matching). The result is what
@@ -797,7 +797,7 @@ let evaluate_buy_leg
         (* A sizing re-anchor (the capital oracle published a changed grid
             interval - flagged by the domain worker on [force_buy_reanchor])
             used to amend the resting buy to the new spacing in BOTH
-            directions. M17: a downwards amendment is warranted ONLY by a
+            directions. a downwards amendment is warranted ONLY by a
             sell-spacing violation (see below); a widened grid interval no
             longer snaps an otherwise-valid resting buy down to the market
             rung - the ladder spacing is enforced where it matters (fresh
@@ -970,7 +970,7 @@ let evaluate_buy_leg
 (** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell
     placement leg.
     [persisted_reconcile] is the (open_levels, missing_levels) split that
-    [sync_open_orders] computed during its open-order scan (M16), so the
+    [sync_open_orders] computed during its open-order scan , so the
     Alpaca virtual-GTC reconcile never re-partitions the persisted-vs-open
     multiset a second time per execution.
 
@@ -1019,7 +1019,7 @@ let evaluate_sell_leg
       -. state.reserved_base
       -. locked_in_sells
   in
-  (* M15: the persisted-sell grid is reconciled ONCE per execution and the
+  (* the persisted-sell grid is reconciled ONCE per execution and the
      result is reused by the three persisted-sell branches below. The
      previous code ran [reconcile_persisted_sell_levels] three times per
      strategy tick, each an O(n+m) price-keyed partition with string-key
@@ -1030,7 +1030,7 @@ let evaluate_sell_leg
      orders yields exactly [kept_missing] as the missing set, so the later
      branches reuse it instead of re-partitioning.
 
-     M16: [sync_open_orders] (the strategy hot path) already computed this
+     [sync_open_orders] (the strategy hot path) already computed this
      exact (open_levels, missing_levels) split during its scan - each open
      sell consumed one persisted level, so the missing set falls out in O(m)
      instead of this O(n+m) partition. Only direct [evaluate_sell_leg]

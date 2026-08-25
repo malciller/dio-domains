@@ -18,7 +18,7 @@ type pair_info =
 let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 128
 let cache_mutex = Mutex.create ()
 
-(* M16: lock-free reads. [published_cache] is a copy-on-write snapshot: the
+(* lock-free reads. [published_cache] is a copy-on-write snapshot: the
    single writer (WS init / initialize / register_test_instrument, all cold
    paths) mutates [pair_cache] under [cache_mutex] then republishes a fresh
    table with one [Atomic.set]. [lookup_info], called dozens of times per
@@ -179,7 +179,7 @@ let register_test_instrument ~symbol ~sz_decimals =
   publish_cache ()
 ;;
 
-(** Looks up instrument info by symbol. Lock-free (M16): reads the published
+(** Looks up instrument info by symbol. Lock-free : reads the published
     copy-on-write snapshot; one [Atomic.get] + Hashtbl.find, no mutex on the
     per-tick rounding path. Falls back to stripping the quote suffix (e.g.
     "BTC/USDC" to "BTC") to resolve perpetuals, which are cached under their
@@ -197,8 +197,10 @@ let lookup_info symbol =
      | [] -> None)
 ;;
 
-(** Returns the venue price increment. Hyperliquid quotes prices to 2 decimal
-    places, so the tick is 0.01 regardless of symbol. *)
+(** Coarse price increment used when no instrument context is available.
+    Per-symbol pricing actually follows Hyperliquid's 5-significant-figure
+    rule with a (max_decimals - sz_decimals) cap; see
+    [round_price_to_tick_for_symbol]. *)
 let get_price_increment _symbol = Some 0.01
 
 (** Fetch the perpetual + spot instrument metadata from the Hyperliquid REST

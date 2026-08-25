@@ -384,12 +384,6 @@ let initialize_symbols symbols : unit Lwt.t =
   fetch_from_rest symbols
 ;;
 
-(** Duplicate binding of [get_pair_info]; retained for link compatibility. *)
-let get_pair_info symbol : pair_info option Lwt.t =
-  Lwt_mutex.with_lock cache_mutex (fun () ->
-    Lwt.return (Hashtbl.find_opt pair_cache symbol))
-;;
-
 (** Returns [(price_precision, qty_precision)] for [symbol], or [None].
     Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
 let get_precision_info symbol : (int * int) option =

@@ -1,35 +1,33 @@
-(** Provides order lifecycle operations for the Interactive Brokers TWS API.
+(** Order lifecycle operations for the IBKR TWS API: placement,
+    modification, and cancellation.
 
-    This module handles the placement, modification, and cancellation of trading orders.
-    Rate limiting is explicitly omitted because the TWS API natively supports approximately
-    50 messages per second, which exceeds the throughput requirements of this application.
+    Rate limiting is omitted: TWS accepts ~50 messages/second, above this
+    application's throughput.
 
-    Orders are transmitted to the gateway using the placeOrder message protocol consisting of message ID 3.
-    Execution and status confirmations are received asynchronously via orderStatus and openOrder callbacks,
-    which are subsequently processed by the ibkr_executions_feed module. *)
+    Orders go out as placeOrder messages (msgId 3). Fills and status
+    arrive asynchronously via orderStatus/openOrder and are processed by
+    [Ibkr_executions_feed]. *)
 
 open Lwt.Infix
 
 let section = "ibkr_actions"
 
-(** Places a new order on the exchange and returns the internal sequence order ID assigned to it.
-    The function performs a cache resolution for the financial contract prior to message dispatch. *)
+(** Places a new order and returns the assigned order id. Resolves the
+    contract for [symbol] before sending. *)
 let place_order
       conn
       ~symbol
-      ~action (* Action specifies the transaction type, typically BUY or SELL *)
+      ~action (* BUY or SELL *)
       ~qty
-      ~order_type
-      (* Specifies the execution strategy, such as MKT for market or LMT for limit *)
+      ~order_type (* "MKT", "LMT", ... *)
       ?limit_price
       ?(tif = "DAY")
       ()
   =
-  (* Resolve the applicable contract definition using the provided symbol *)
   Ibkr_contracts.resolve conn ~symbol
   >>= fun contract ->
   let order_id = Ibkr_connection.get_next_order_id conn in
-  (* Register the association between the new order ID and the symbol to enable execution tracking *)
+  (* Map order id -> symbol for execution tracking. *)
   Ibkr_executions_feed.register_order ~order_id ~symbol;
   let order =
     match order_type with
@@ -54,21 +52,20 @@ let place_order
      | Some p -> Printf.sprintf " @ %.4f" p
      | None -> "")
     order_id;
-  (* Construct the binary format placeOrder outbound message buffer.
-     The sequence comprises msgId equals 3, orderId, the short form contract definition,
-     secIdType, secId, action, totalQty, orderType, lmtPrice, auxPrice, and tif fields. *)
+  (* placeOrder wire fields: msgId, orderId, short contract, secIdType,
+     secId, action, totalQty, orderType, lmtPrice, auxPrice, tif. *)
   let msg_fields =
     [ string_of_int Ibkr_types.msg_place_order; string_of_int order_id ]
     @ Ibkr_codec.encode_contract_short contract
-    @ [ ""; (* Empty secIdType parameter *) "" ] (* Empty secId parameter *)
+    @ [ ""; (* secIdType *) "" ] (* secId *)
     @ Ibkr_codec.encode_order order
     @ Ibkr_codec.encode_order_tail ()
   in
   Ibkr_connection.send conn msg_fields >|= fun () -> order_id
 ;;
 
-(** Modifies an active order residing on the exchange.
-    This operation utilizes the placeOrder message protocol with an existing orderId. *)
+(** Modifies an active order by re-sending placeOrder with the existing
+    [order_id]. *)
 let modify_order
       conn
       ~order_id
@@ -108,33 +105,28 @@ let modify_order
   let msg_fields =
     [ string_of_int Ibkr_types.msg_place_order; string_of_int order_id ]
     @ Ibkr_codec.encode_contract_short contract
-    @ [ ""; (* Empty secIdType parameter *) "" ] (* Empty secId parameter *)
+    @ [ ""; (* secIdType *) "" ] (* secId *)
     @ Ibkr_codec.encode_order order
     @ Ibkr_codec.encode_order_tail ()
   in
   Ibkr_connection.send conn msg_fields
 ;;
 
-(** Transmits a cancellation request for a specific order identified by its assigned order ID. *)
+(** Cancels the order with the given id. *)
 let cancel_order conn ~order_id =
   Logging.info_f ~section "Cancelling order %d" order_id;
   Ibkr_connection.send
     conn
     [ string_of_int Ibkr_types.msg_cancel_order
-    ; "1"
-    ; (* Message protocol version identifier *)
-      string_of_int order_id
-    ; "" (* Omitted manualCancelOrderTime parameter *)
+    ; "1" (* version *)
+    ; string_of_int order_id
+    ; "" (* manualCancelOrderTime *)
     ]
 ;;
 
-(** Initiates a global cancellation request to terminate all currently open orders residing on the gateway. *)
+(** Cancels all open orders at the gateway (reqGlobalCancel, msgId 58). *)
 let global_cancel conn =
   Logging.info_f ~section "Sending reqGlobalCancel to cancel all open orders";
-  Ibkr_connection.send
-    conn
-    [ "58"
-    ; (* Identifies the reqGlobalCancel message operation *)
-      "1" (* Message protocol version identifier *)
-    ]
+  Ibkr_connection.send conn [ "58"; "1" ]
 ;;
+(* msgId; version *)

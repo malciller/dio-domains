@@ -1,18 +1,17 @@
-(** Level 2 order book feed implementation routing reqMktDepth responses into ring buffers.
-
-    This module maintains sorted bid and ask array structures per symbol in memory.
-    It synchronously processes operations (insert, update, delete) on price levels
-    and writes point in time orderbook snapshots to lock free ring buffers. *)
+(** Level 2 order book feed: routes reqMktDepth updates into per-symbol
+    sorted bid/ask arrays and publishes snapshots to lock-free ring
+    buffers. Falls back to L1 tickPrice/tickSize for symbols without
+    depth data. *)
 
 let section = "ibkr_orderbook"
 
-(** Represents a consolidated price level within the order book containing the quote price and available liquidity size. *)
+(** One price level. *)
 type level =
   { price : float
   ; size : float
   }
 
-(** Complete point in time snapshot of the order book containing bidirectional depth and a timestamp for reconciliation. *)
+(** Order book snapshot with timestamp. *)
 type orderbook =
   { bids : level array
   ; asks : level array
@@ -21,7 +20,7 @@ type orderbook =
 
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** In-memory state structure maintaining the active ring buffer, thread-safe readiness flags, and mutable level arrays for a specific symbol. *)
+(** Per-symbol state: ring buffer, readiness flag, mutable level arrays. *)
 type store =
   { buffer : orderbook RingBuffer.t
   ; ready : bool Atomic.t
@@ -33,12 +32,12 @@ type store =
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 
-(** Global mapping linking Interactive Brokers request IDs to their corresponding instrument symbols for response routing. *)
+(** reqId -> symbol routing for market data responses. *)
 let req_id_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 32
 
 let next_req_id = Atomic.make 2000
 
-(** Clears stale request ID to symbol mappings. This function is invoked prior to socket reconnection to prevent orphaned state entries from accumulating across connection cycles. *)
+(** Clears reqId mappings; called before reconnecting. *)
 let clear_req_ids () = Hashtbl.clear req_id_to_symbol
 
 let ensure_store symbol =
@@ -68,7 +67,8 @@ let notify_ready store =
     | _ -> ())
 ;;
 
-(** Materializes the current bid and ask arrays into an immutable snapshot and flushes it to the designated ring buffer. Triggers internal readiness conditions and broadcasts to exchange sleepers. *)
+(** Copies the current levels into a snapshot, writes it to the ring
+    buffer, and signals readiness and exchange sleepers. *)
 let flush_orderbook symbol store =
   let ob =
     { bids = Array.copy store.bids
@@ -81,8 +81,9 @@ let flush_orderbook symbol store =
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
-(** Processes incoming updateMktDepth gateway messages.
-    Parses the binary string fields including version, request ID, absolute position, operation type, side, price, and size. Mutates the store arrays synchronously and triggers a ring buffer flush. *)
+(** updateMktDepth handler. Fields: version, reqId, position, operation,
+    side, price, size. Applies insert/update/delete to the level array
+    and flushes a snapshot. *)
 let handle_market_depth fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let req_id, fields = Ibkr_codec.read_int fields in
@@ -105,7 +106,8 @@ let handle_market_depth fields =
       flush_orderbook symbol store)
 ;;
 
-(** Processes incoming tickPrice messages for L1 fallback. Updates the top-of-book (0-th index) with quoted prices and triggers a ring buffer flush. *)
+(** tickPrice handler (L1 fallback). Updates the top-of-book quote and
+    flushes. *)
 let handle_tick_price fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let req_id, fields = Ibkr_codec.read_int fields in
@@ -143,7 +145,8 @@ let handle_tick_price fields =
       (* open *) || tick_type = 76 (* delayed open *)
       || tick_type = 37 (* mark price *)
     then (
-      (* During premarket or delayed-frozen conditions, bid/ask might be missing. We seed last/close price into both sides for zero-spread approximation. *)
+      (* Pre-market / delayed-frozen: seed last/close into both sides
+         as a zero-spread approximation when quotes are missing. *)
       if store.bids.(0).price = 0.0 && price > 0.0
       then (
         store.bids.(0) <- { price; size = store.bids.(0).size };
@@ -162,7 +165,8 @@ let handle_tick_price fields =
     if !updated then flush_orderbook symbol store
 ;;
 
-(** Processes incoming tickSize messages for L1 fallback. Updates the top-of-book (0-th index) with quoted liquidity sizes and triggers a ring buffer flush. *)
+(** tickSize handler (L1 fallback). Updates the top-of-book size and
+    flushes. *)
 let handle_tick_size fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let req_id, fields = Ibkr_codec.read_int fields in
@@ -192,7 +196,7 @@ let handle_tick_size fields =
     if !updated then flush_orderbook symbol store
 ;;
 
-(** Requests a one-off L1 top-of-book snapshot to explicitly fetch the delayed or frozen close price. *)
+(** One-off reqMktData snapshot to seed delayed/frozen close prices. *)
 let request_snapshot conn ~contract =
   let symbol = contract.Ibkr_types.symbol in
   let _store = ensure_store symbol in
@@ -220,9 +224,9 @@ let request_snapshot conn ~contract =
   Ibkr_connection.send conn msg_fields
 ;;
 
-(** Initiates a Level 2 order book subscription for the given symbol.
-    For standard equity assets (STK/ETF) routed through SMART, deep market data is unsupported.
-    In these unsupported cases, the module skips dispatching the gateway request and immediately marks the store as ready, as subsequent pipeline stages safely fall back to top of book ticker data. *)
+(** Subscribes to market data for [contract]. STK/ETF via SMART has no
+    L2 depth, so those get an L1 reqMktData ticker instead; other
+    security types get reqMktDepth. *)
 let subscribe conn ~contract =
   let symbol = contract.Ibkr_types.symbol in
   let _store = ensure_store symbol in
@@ -280,7 +284,7 @@ let subscribe conn ~contract =
     Ibkr_connection.send conn msg_fields)
 ;;
 
-(** Registers the incoming market depth message translation callbacks with the global socket dispatcher mapping. *)
+(** Registers the depth and tick handlers with the dispatcher. *)
 let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_market_depth
@@ -322,7 +326,7 @@ let[@inline always] get_current_position_fast symbol =
   fun () -> RingBuffer.get_position store.buffer
 ;;
 
-(** Pre-allocates memory footprint for orderbook stores across all requested symbols and primes the dispatcher message callbacks. *)
+(** Pre-creates stores for [symbols] and registers handlers. *)
 let initialize symbols =
   Logging.info_f
     ~section

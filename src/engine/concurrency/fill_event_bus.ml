@@ -6,10 +6,10 @@
     iteration, identical to per-exchange execution ring buffers.
 
     Concurrency model:
-    - Writers: exchange execution feed handlers - including code running
-      on the Parse_worker domain (P5) - serialized by [write_mutex] since
+- Writers: exchange execution feed handlers - including code running
+      on the Parse_worker domain- serialized by [write_mutex] since
       RingBuffer is single-writer.
-    - Readers: Lwt fibers in the main domain, polling [generation].
+- Readers: Lwt fibers in the main domain, polling [generation].
 
     Domain safety: publishing uses ONLY Mutex + Atomic primitives, so fills
     may be published from any domain. Signalling is a monotonic generation
@@ -34,9 +34,10 @@ type fill_event =
   ; trade_id : string (** Exchange trade/execution ID for deduplication. *)
   }
 
-(** Global fill event ring buffer. R3: raised from 256 - a burst of fills
-    (volatile market, mass take-profit triggers) could lap the Discord
-    consumer within one drain. 1024 slots x small records is ~200KB. *)
+(** Global fill event ring buffer. Sized for bursts: a volatile market or
+    mass take-profit trigger can produce more fills within one drain than
+    the Discord consumer keeps up with. 1024 slots x small records is
+    ~200KB. *)
 let buffer : fill_event RingBuffer.t = RingBuffer.create 1024
 
 (** Mutex serializing writes from multiple domains. *)

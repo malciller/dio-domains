@@ -14,14 +14,14 @@ let nonce_ms_multiplier = 1000.0
 let default_orderbook_depth = 10
 
 (** Ring buffer capacity (slot count) for the orderbook feed channel.
-    R3: raised from 16 - raw l2 frames are large, but 16 slots let a burst
-    lap a dashboard reader in one tick; 64 absorbs typical bursts. *)
+    16 slots let a burst lap a dashboard reader in one tick; 64 absorbs
+    typical bursts. *)
 let default_ring_buffer_size_orderbook = 64
 
 (** Ring buffer capacity (slot count) for the executions feed channel.
-    R3: raised from 32 - exec bursts (mass cancels on reconnect, volatile
-    fills) previously lapped the domain consumer, silently dropping
-    lifecycle events. 512 slots x small records is ~100KB per symbol. *)
+    Exec bursts (mass cancels on reconnect, volatile fills) previously
+    lapped the domain consumer, silently dropping lifecycle events.
+    512 slots x small records is ~100KB per symbol. *)
 let default_ring_buffer_size_executions = 512
 
 (** Upper bound on the number of dynamically discovered assets tracked by the balances feed. *)

@@ -1,27 +1,20 @@
-(** Modular networking component managing proxy routing for the Lighter exchange integration.
-    Handles the redirection of API requests and WebSocket streams through a distributed
-    edge network architecture to circumvent geographic access controls applied at the ingress layer.
-    
-    Deployment Protocol:
-      1. Initialize the edge infrastructure routing namespace from the repository root:
-           cd proxy/cloudflare && npx wrangler deploy
-      
-      2. Inject the routing pool definitions into the runtime environment:
-           export LIGHTER_PROXY_URL=https://lighter-proxy.<subdomain>.workers.dev
-    
-    If the LIGHTER_PROXY_URL parameter is populated, the routing engine enforces 
-    proxy utilization for all bidirectional traffic channels. The target infrastructure 
-    operates on localized persistent execution environments bound to valid jurisdictions.
-    
-    If left undefined, the module defaults to standard direct connectivity mechanisms.
-    In direct mode, WebSocket connections are synthesized with explicit read-only 
-    flags modifying the query parameters to bypass geographic ingress blocks. *)
+(** Proxy routing for Lighter API and WebSocket traffic through Cloudflare
+    Workers, bypassing geographic access restrictions at the exchange ingress.
+
+    Deployment:
+      cd proxy/cloudflare && npx wrangler deploy
+      export LIGHTER_PROXY_URL=https://lighter-proxy.<subdomain>.workers.dev
+
+    With [LIGHTER_PROXY_URL] set (comma separated pool), all traffic goes
+    through workers running in permitted jurisdictions. Without it, traffic
+    connects directly; in direct mode the public WebSocket appends
+    [readonly=true] to its query params to get past the geo block. *)
 
 let section = "lighter_proxy"
 let consecutive_proxy_failures = Atomic.make 0
 
-(** Synchronous operating system read sequence parsing key-value pairs from localized
-    environment definition files, circumventing the primary process configuration. *)
+(** Parses KEY=VALUE pairs from [.env]; fallback when the process environment
+    lacks a variable. *)
 let read_dotenv key =
   try
     let ic = open_in ".env" in
@@ -46,22 +39,21 @@ let read_dotenv key =
   | Sys_error _ -> None
 ;;
 
-(** Resolves targeted execution parameters by sequentially interrogating the
-    process environment space before falling back to localized file parsing logic. *)
+(** Returns the environment variable if set, else the [.env] value. *)
 let env_or_dotenv key =
   match Sys.getenv_opt key |> Option.map String.trim with
   | Some s when s <> "" -> Some s
   | _ -> read_dotenv key
 ;;
 
-(** Primary destination hostname mapped to the exchange's core execution network. *)
+(** Lighter mainnet hostname. *)
 let direct_hostname = "mainnet.zklighter.elliot.ai"
 
-(** Primary REST interface URL mapped to the exchange's core execution network. *)
+(** Lighter mainnet REST base URL. *)
 let direct_base_url = "https://mainnet.zklighter.elliot.ai"
 
-(** Instantiated pool of proxy endpoints extracted from the targeted environment
-    variable and tokenized utilizing delimiter processing logic. *)
+(** Proxy pool from [LIGHTER_PROXY_URL]: comma separated, trailing slashes
+    stripped. Empty when unset. *)
 let proxy_urls : string list =
   match env_or_dotenv "LIGHTER_PROXY_URL" with
   | Some s when s <> "" ->
@@ -96,9 +88,9 @@ let _do_log () =
 
 let current_proxy_index = Atomic.make 0
 
-(** Executes a circular state progression against the instantiated proxy pool index.
-    Triggered automatically by the connection manager upon intercepting localized
-    network failures to guarantee multi-account operational continuity sequences. *)
+(** Advances the proxy pool index round-robin and increments the failure
+    counter; called by the WS layer after connection failures so another
+    account's worker can take over. *)
 let rotate_proxy () =
   let len = List.length proxy_urls in
   if len > 1
@@ -120,30 +112,25 @@ let has_more_proxies () =
   if len <= 1 then false else Atomic.get consecutive_proxy_failures < len - 1
 ;;
 
-(** Resolves the current target connection URI mapped to the active execution state
-    of the proxy index sequence. Yields no value during direct connectivity modes. *)
+(** Current proxy URL, or None in direct mode. *)
 let proxy_url () =
   _do_log ();
   let len = List.length proxy_urls in
   if len = 0 then None else Some (List.nth proxy_urls (Atomic.get current_proxy_index))
 ;;
 
-(** Evaluates the initialization state of the proxy configuration pool to determine
-    if localized routing overrides are active within the current execution environment. *)
+(** True when a proxy pool is configured. *)
 let is_proxied () = List.length proxy_urls > 0
 
-(** Computes the definitive REST API endpoint resolution sequence.
-    Proxied paths dynamically map to specified edge environments.
-    Direct paths default to the core deterministic exchange endpoint. *)
+(** REST base URL: active proxy, else the direct mainnet endpoint. *)
 let api_base_url () =
   match proxy_url () with
   | Some url -> url
   | None -> direct_base_url
 ;;
 
-(** Computes the localized socket resolution parameters for authenticated streams.
-    Extracts explicit hostname patterns and standard encrypted port mappings from the
-    active proxy configuration or defaults to the primary exchange coordinates. *)
+(** (host, port) for the private/authenticated WS: from the current proxy,
+    else the direct mainnet endpoint on 443. *)
 let private_ws_connect_target () =
   match proxy_url () with
   | Some url ->
@@ -154,18 +141,15 @@ let private_ws_connect_target () =
   | None -> direct_hostname, 443
 ;;
 
-(** Computes the localized socket resolution parameters for unauthenticated pipelines.
-    Always maintains a direct routing topology bypassing the proxy architecture. *)
+(** (host, port) for the public WS: always direct, never proxied. *)
 let public_ws_connect_target () = direct_hostname, 443
 
-(** Synthesizes the finalized WebSocket pipeline URI for aggregated market data.
-    Enforces direct connectivity using specialized read-only query parameters
-    to ensure geographic routing restrictions are correctly averted. *)
+(** Public market data WS URL: direct, with [readonly=true] so the geo block
+    does not apply. *)
 let public_ws_url () = Printf.sprintf "wss://%s/stream?readonly=true" direct_hostname
 
-(** Synthesizes the finalized WebSocket pipeline URI for authenticated session states.
-    Automatically transitions between direct and proxied routing topologies based
-    on the initialized configuration parameters extracted at runtime. *)
+(** Authenticated WS URL: proxied host (with [sessionId=dio-private]) when a
+    proxy is configured, else direct. *)
 let private_ws_url () =
   match proxy_url () with
   | Some url ->

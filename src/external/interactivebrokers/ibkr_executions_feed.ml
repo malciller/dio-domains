@@ -1,16 +1,18 @@
-(** Provides order status and execution tracking through the ingestion of orderStatus, openOrder, and execDetails messages.
-    Explicit market data subscriptions are not required. The Interactive Brokers gateway automatically streams these execution events when orders are placed or modified. This module also initializes the target state by requesting open order snapshots through reqOpenOrders and reqExecutions during the system startup phase. *)
+(** Order status and execution tracking from orderStatus, openOrder, and
+    execDetails messages; no explicit market data subscription is needed,
+    TWS streams these automatically for orders placed by this client.
+    On startup the module requests an open-order snapshot via
+    reqOpenOrders (sent by the supervisor feeds) to prime state. *)
 
 let section = "ibkr_executions"
 
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Defines the canonical structure for an execution event, which encapsulates data for either a partial fill, full execution, or an order status transition. *)
+(** Execution event: a fill (partial or full) or an order status transition. *)
 type execution_event =
   { order_id : string
   ; symbol : string
-  ; side : string
-    (** Indicates the order direction, strictly normalized to "BUY" or "SELL". *)
+  ; side : string (** Normalized to "BUY" or "SELL". *)
   ; status : Ibkr_types.tws_order_status
   ; filled_qty : float
   ; remaining_qty : float
@@ -20,7 +22,7 @@ type execution_event =
   ; timestamp : float
   }
 
-(** Represents the materialized state of an active order within the Interactive Brokers system, tracking filled quantities, remaining allocations, and limit pricing parameters. *)
+(** Live state of one open order at IBKR. *)
 type open_order =
   { oo_order_id : string
   ; oo_symbol : string
@@ -33,7 +35,8 @@ type open_order =
   ; oo_last_updated : float
   }
 
-(** Defines the execution storage structure partitioned by asset symbol. It encapsulates a ring buffer for discrete execution events, a hashtable for tracking active orders, an atomic readiness flag, and a mutex for concurrency control over the internal state mutations. *)
+(** Per-symbol storage: event ring buffer, open-order table, atomic
+    snapshot cache, readiness flag, and mutex. *)
 type symbol_store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
@@ -47,7 +50,7 @@ let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 32
 let initialization_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
 
-(** A global mapping that correlates system order identifiers to their corresponding asset symbols, facilitating multi-symbol order tracking and execution routing. *)
+(** Order id -> symbol map used to route execution messages. *)
 let order_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 64
 
 let global_mutex = Mutex.create ()
@@ -92,14 +95,14 @@ let notify_ready store =
     | _ -> ())
 ;;
 
-(** Injects a new mapping into the global order correlation index, binding a local order identifier to its specific asset symbol. This operation is synchronized via the global index mutex. *)
+(** Maps [order_id] to [symbol] (mutex-guarded). *)
 let register_order ~order_id ~symbol =
   Mutex.lock global_mutex;
   Hashtbl.replace order_to_symbol order_id symbol;
   Mutex.unlock global_mutex
 ;;
 
-(** Queries the global correlation index to retrieve the asset symbol associated with a given order identifier. Secures access to the shared index using the global mutex. *)
+(** Symbol for [order_id], or [None]. *)
 let resolve_symbol order_id =
   Mutex.lock global_mutex;
   let r = Hashtbl.find_opt order_to_symbol order_id in
@@ -107,14 +110,16 @@ let resolve_symbol order_id =
   r
 ;;
 
-(** Purges an order identifier from the global correlation index. This lifecycle hook is executed exclusively when an order transitions to a terminal state, mitigating unbounded memory growth. *)
+(** Removes [order_id] from the map; call when the order reaches a
+    terminal state so long-running processes do not leak entries. *)
 let unregister_order ~order_id =
   Mutex.lock global_mutex;
   Hashtbl.remove order_to_symbol order_id;
   Mutex.unlock global_mutex
 ;;
 
-(** Processes an incoming execution event to mutate the tracked open order state for a given symbol. It evaluates the terminality conditions and either evicts the completed order from the localized datastore or updates the filled and remaining quantities. *)
+(** Applies an execution event to the tracked open-order state: removes
+    terminal or fully filled orders, otherwise updates fill quantities. *)
 let update_open_orders symbol (event : execution_event) =
   let store = get_symbol_store symbol in
   let is_terminal =
@@ -126,7 +131,8 @@ let update_open_orders symbol (event : execution_event) =
   if is_terminal || event.remaining_qty <= 0.0
   then (
     Hashtbl.remove store.open_orders event.order_id;
-    (* Purge the completed order allocation from the global tracking index to ensure stable memory utilization and prevent hash table collisions over extended runtimes. *)
+    (* Drop the id from the global id->symbol index so long-running
+       processes do not accumulate stale entries. *)
     try unregister_order ~order_id:(int_of_string event.order_id) with
     | _ -> ())
   else (
@@ -155,7 +161,8 @@ let update_open_orders symbol (event : execution_event) =
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
-(** Decodes and processes incoming orderStatus payloads from the Interactive Brokers gateway. Extracts critical execution metrics including fill quantities, remaining sizes, and average execution prices. The sequence of expected fields includes version, order identifier, categorical status, filled size, remaining size, and execution pricing parameters. *)
+(** orderStatus handler. Fields: orderId, status, filled, remaining,
+    avgFillPrice, permId, parentId, lastFillPrice, clientId, whyHeld. *)
 let handle_order_status fields =
   let order_id, fields = Ibkr_codec.read_int fields in
   let status_str, fields = Ibkr_codec.read_string fields in
@@ -173,19 +180,20 @@ let handle_order_status fields =
     let event =
       { order_id = string_of_int order_id
       ; symbol
-      ; side = ""
-      ; (* The orderStatus message omits the underlying side parameter. A temporary placeholder is utilized until the target side is retrieved from the cached open order state. *)
-        status
+      ; side =
+          ""
+          (* orderStatus carries no side; filled from the cached open
+           order below. *)
+      ; status
       ; filled_qty = filled
       ; remaining_qty = remaining
       ; avg_fill_price
       ; last_fill_price
-      ; last_fill_qty = 0.0
-      ; (* The discrete fill quantity is absent from the orderStatus payload and defaults to zero in this execution context. *)
-        timestamp = Unix.gettimeofday ()
+      ; last_fill_qty = 0.0 (* no per-fill quantity in orderStatus *)
+      ; timestamp = Unix.gettimeofday ()
       }
     in
-    (* Resolve the definitive order side by interrogating the cached state within the symbol specific localized store. *)
+    (* Recover the side from the per-symbol open-order store. *)
     let store = get_symbol_store symbol in
     Mutex.lock store.orders_mutex;
     let side =
@@ -205,7 +213,7 @@ let handle_order_status fields =
       filled
       remaining
       avg_fill_price;
-    (* Dispatch the terminal execution payload to the centralized event bus, facilitating multi-consumer telemetry propagation and external notification mechanisms. *)
+    (* Publish fills on the shared event bus. *)
     if status = Ibkr_types.Filled
     then (
       let fill_value = filled *. avg_fill_price in
@@ -230,7 +238,7 @@ let handle_order_status fields =
         ; order_id = string_of_int order_id
         ; trade_id =
             string_of_int order_id
-            (* The Interactive Brokers API lacks an explicit identifier for discrete trades. The canonical order identifier is appropriated for this purpose. *)
+            (* No per-trade id in the API; the order id stands in. *)
         })
   | None ->
     Logging.debug_f
@@ -240,10 +248,11 @@ let handle_order_status fields =
       status_str
 ;;
 
-(** Ingests and evaluates incoming openOrder payloads. This deserialization path is critical for obtaining structural order properties, such as the limit price and execution side, which are intrinsically absent from standard orderStatus messages. *)
+(** openOrder handler. Supplies fields orderStatus lacks (side, limit
+    price, quantity); most trailing fields are ignored. *)
 let handle_open_order fields =
   let order_id, fields = Ibkr_codec.read_int fields in
-  (* Contract Parameter Deserialization Segment *)
+  (* Contract fields *)
   let con_id, fields = Ibkr_codec.read_int fields in
   let symbol, fields = Ibkr_codec.read_string fields in
   let _sec_type, fields = Ibkr_codec.read_string fields in
@@ -255,7 +264,7 @@ let handle_open_order fields =
   let _currency, fields = Ibkr_codec.read_string fields in
   let _local_symbol, fields = Ibkr_codec.read_string fields in
   let _trading_class, fields = Ibkr_codec.read_string fields in
-  (* Order Parameter Deserialization Segment *)
+  (* Order fields *)
   let action, fields = Ibkr_codec.read_string fields in
   let total_qty, fields = Ibkr_codec.read_float fields in
   let order_type, fields = Ibkr_codec.read_string fields in
@@ -274,17 +283,15 @@ let handle_open_order fields =
   let _discretionary_amt, fields = Ibkr_codec.read_float fields in
   let _good_after_time, fields = Ibkr_codec.read_string fields in
   let _deprecated, fields = Ibkr_codec.read_string fields in
-  (* Bypass deprecated parameter block to maintain payload alignment. *)
+  (* Deprecated field, still read to preserve field alignment. *)
   let _fa_group, fields = Ibkr_codec.read_string fields in
   let _fa_method, fields = Ibkr_codec.read_string fields in
   let _fa_percentage, fields = Ibkr_codec.read_string fields in
   let _fa_profile, fields = Ibkr_codec.read_string fields in
   let _model_code, fields = Ibkr_codec.read_string fields in
   let _good_till_date, _fields = Ibkr_codec.read_string fields in
-  (* Only a subset of the openOrder payload is needed for telemetry, so deserialization
-     terminates early and skips the trailing parameters. *)
+  (* Only a subset of openOrder is needed; stop decoding here. *)
   ignore con_id;
-  (* Bind the retrieved order identifier to the localized symbol within the global tracking registry. *)
   register_order ~order_id ~symbol;
   let limit_price = if order_type = "LMT" then Some lmt_price else None in
   let store = get_symbol_store symbol in
@@ -327,7 +334,9 @@ let handle_open_order fields =
     order_type
 ;;
 
-(** Decodes and records execDetails messages signifying a realized discrete trade execution. Incorporates realized transaction price and volume into the cached state. *)
+(** execDetails handler: records a discrete fill. Fields follow the
+    contract block, then execId, time, account, exchange, side, shares,
+    price, permId, clientId, liquidation, cumQty, avgPrice. *)
 let handle_exec_details fields =
   let _req_id, fields = Ibkr_codec.read_int fields in
   let _order_id, fields = Ibkr_codec.read_int fields in
@@ -397,7 +406,8 @@ let handle_exec_details fields =
   ()
 ;;
 
-(** Injects the module specific execution decoders into the centralized connection message dispatcher. *)
+(** Registers the orderStatus/openOrder/execDetails handlers with the
+    dispatcher. *)
 let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_order_status
@@ -410,7 +420,9 @@ let register_handlers () =
     ~handler:handle_exec_details
 ;;
 
-(** Triggers an asynchronous synchronization pass to request current discrete trade execution reports from the gateway. *)
+(** Requests an execution history snapshot from the gateway. Unused by
+    the current startup sequence (open orders are requested instead);
+    kept for manual replay of the day's fills. *)
 let request_executions conn =
   Logging.info ~section "Requesting execution history snapshot";
   Ibkr_connection.send
@@ -428,7 +440,8 @@ let request_executions conn =
     ]
 ;;
 
-(** Broadcasts an explicit reqOpenOrders directive to the active TCP connection. Instigates a gateway response containing the comprehensive initial snapshot of all active system orders. *)
+(** Sends reqOpenOrders; TWS replies with a snapshot of active orders
+    followed by openOrderEnd. *)
 let request_open_orders conn =
   Logging.info ~section "Requesting open orders snapshot";
   Ibkr_connection.send
@@ -459,7 +472,7 @@ let[@inline always] get_open_order symbol order_id =
   List.find_opt (fun (o : open_order) -> o.oo_order_id = order_id) orders
 ;;
 
-(** Lock-free fold over open orders from the atomic cache. Zero mutex contention on domain hotpath. *)
+(** Lock-free fold over open orders from the atomic cache. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   let snapshot = Atomic.get store.open_orders_cache in
@@ -496,7 +509,9 @@ let[@inline always] has_execution_data_fast symbol =
   fun () -> Atomic.get store.ready
 ;;
 
-(** Iterates the shared registry and forcefully asserts the readiness constraint across all initialized symbol stores. This function is triggered by the openOrderEnd message, concluding the snapshot synchronization sequence. This logic averts initialization deadlocks initiated by the domain spawner waiting on inactive symbol executions. *)
+(** Marks every initialized symbol store ready. Called on openOrderEnd
+    after the startup snapshot, so waiters do not block on symbols that
+    simply have no executions yet. *)
 let mark_ready_all () =
   Hashtbl.iter
     (fun symbol store ->
@@ -510,7 +525,7 @@ let mark_ready_all () =
     symbol_stores
 ;;
 
-(** Allocates memory structures and primes localized symbol stores preceding the initialization of dispatch handlers and active execution telemetry streams. *)
+(** Pre-creates stores for [symbols] and registers handlers. *)
 let initialize symbols =
   Logging.info_f
     ~section

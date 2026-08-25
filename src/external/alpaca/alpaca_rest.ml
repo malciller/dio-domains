@@ -5,7 +5,7 @@ open Alpaca_types
 
 let section = "alpaca_rest"
 
-(** H7: Alpaca has no retry layer of its own (the executor now delegates all
+(** Alpaca has no retry layer of its own (the executor now delegates all
     retries to the exchange modules, a single policy). Connection-level HTTP
     exceptions are retried here with a short backoff so transient network
     failures don't fail the order; exchange-level rejections (HTTP 4xx) are

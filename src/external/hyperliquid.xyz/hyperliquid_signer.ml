@@ -148,7 +148,7 @@ let bs_sub_to_string bs ofs len =
   Bytes.to_string s
 ;;
 
-(** Hoisted signing context (M9): [Secp256k1.Context.create] is expensive;
+(** Hoisted signing context : [Secp256k1.Context.create] is expensive;
     create it once at module load and reuse it for every signature instead of
     allocating a fresh context per order. All signing runs on the Lwt
     scheduler, so the shared context is single-threaded in practice. *)

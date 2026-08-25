@@ -1,22 +1,17 @@
-(** Root namespace for the Interactive Brokers Trader Workstation API integration.
+(** Interactive Brokers TWS API integration: root namespace re-exporting
+    the specialized modules.
 
-    This module serves as the primary entry point and unifying interface for the external 
-    Interactive Brokers implementation. It encapsulates the core capabilities required to 
-    interface with the Trader Workstation and Gateway applications by re-exporting the 
-    underlying specialized modules.
-
-    The exported modules provide the following functional boundaries:
-    * Types: Core data structures representing orders, contracts, and market states.
-    * Codec: Wire protocol serialization and deserialization mechanisms.
-    * Connection: Transmission Control Protocol socket management and connection lifecycle handling.
-    * Dispatcher: Asynchronous message routing and request correlation components.
-    * Contracts: Instrument metadata and structural definitions for financial products.
-    * Orderbook_feed: Level 2 market data subscription and order book state management.
-    * Executions_feed: Trade execution tracking and order status monitoring.
-    * Balances: Account collateral state tracking and risk management data.
-    * Actions: Core business logic for routing orders and modifying market positions.
-    * Module: Dependency injection and trading engine integration components.
-    * Market_hours: Session state calculations and market schedule management. *)
+    * Types: orders, contracts, market state.
+    * Codec: wire format encode/decode.
+    * Connection: TCP socket and connection lifecycle.
+    * Dispatcher: message routing and request correlation.
+    * Contracts: symbol-to-contract resolution.
+    * Orderbook_feed: depth subscription and order book snapshots.
+    * Executions_feed: order status and fill tracking.
+    * Balances: account balances and positions.
+    * Actions: order placement, modification, cancellation.
+    * Module: [Exchange_intf.S] adapter and engine integration.
+    * Market_hours: US equity session state calculations. *)
 
 module Types = Ibkr_types
 module Codec = Ibkr_codec

@@ -1,15 +1,12 @@
-(** Provides the core US equity market hours evaluation logic for the Interactive Brokers connection manager.
+(** US equity market session state.
 
-    This module evaluates whether US equity markets are currently operating within the
-    extended trading session, spanning from pre-market open through after-hours close. This state
-    evaluation is critical for the supervisor component, which utilizes this status to suspend
-    connection and contract resolution attempts during market closures, thereby preventing
-    unnecessary overhead and gateway rejection cycles.
+    Reports whether the extended session (4:00 AM to 8:00 PM ET,
+    Monday-Friday) is open; the supervisor gates connection and contract
+    resolution attempts on this status so it does not spin against a
+    closed gateway.
 
-    The defined extended trading window is from 4:00 AM to 8:00 PM Eastern Time, Monday through Friday.
-    Note that specific exchange holidays are not independently tracked. In the event of a holiday closure,
-    the gateway will issue a single rejection, prompting the supervisor to automatically defer operations
-    until the subsequent valid trading window. *)
+    Exchange holidays are not tracked; on a holiday the gateway rejects
+    once and the supervisor defers until the next window. *)
 
 let section = "ibkr_market_hours"
 
@@ -18,10 +15,9 @@ let section = "ibkr_market_hours"
     pre-market or after-hours. Set by [Ibkr_module.Config.set_testnet]. *)
 let paper_mode = ref false
 
-(** Computes the current UTC offset for US Eastern Time, dynamically adjusting for Daylight Saving Time.
-    The Daylight Saving Time configuration (EDT, UTC-4) applies from 2:00 AM on the second Sunday in March
-    until 2:00 AM on the first Sunday in November. For all other periods, the standard time configuration 
-    (EST, UTC-5) is returned. *)
+(** Current US Eastern UTC offset: -4 (EDT) from 2:00 AM on the second
+    Sunday of March to 2:00 AM on the first Sunday of November, -5
+    (EST) otherwise. *)
 let us_eastern_offset_hours () =
   let t = Unix.gettimeofday () in
   let tm = Unix.gmtime t in
@@ -99,7 +95,7 @@ let us_eastern_offset_hours () =
   if t >= dst_start && t < dst_end then -4 else -5
 ;;
 
-(** Calculates the current day of the week, hour, and minute localized to US Eastern Time based on the current UTC timestamp and daylight saving adjustments. *)
+(** Current (wday, hour, minute) in US Eastern time. *)
 let current_eastern_time () =
   let t = Unix.gettimeofday () in
   let offset = us_eastern_offset_hours () in
@@ -108,16 +104,15 @@ let current_eastern_time () =
   tm.Unix.tm_wday, tm.Unix.tm_hour, tm.Unix.tm_min
 ;;
 
-(** Defines the operational hour and minute boundaries for the extended US equity trading session, spanning from 4:00 AM to 8:00 PM Eastern Time. *)
+(** Extended session bounds: 4:00 AM to 8:00 PM ET. *)
 let extended_open_hour = 4
 
 let extended_open_min = 0
 let extended_close_hour = 20
 let extended_close_min = 0
 
-(** Evaluates whether the current system time falls strictly within the US equity Regular Trading Hours (RTH) session.
-    Returns [true] between 9:30 AM and 4:00 PM Eastern Time on weekdays.
-    This precise window directs the dashboard UI to flag trading logic as active (▶) or paused (⏸). *)
+(** Regular trading hours: [true] between 9:30 AM and 4:00 PM ET on
+    weekdays. Drives the dashboard open/paused flag. *)
 let is_regular_market_open () =
   let wday, hour, min = current_eastern_time () in
   let is_weekday = wday >= 1 && wday <= 5 in
@@ -130,9 +125,8 @@ let is_regular_market_open () =
     time_mins >= open_mins && time_mins < close_mins)
 ;;
 
-(** Evaluates the current system time against the predefined US equity extended trading schedule.
-    Returns [true] if the current time resides within the 4:00 AM to 8:00 PM Eastern Time window on a weekday,
-    indicating that the Interactive Brokers gateway is expected to accept connection and routing requests. *)
+(** [true] within the 4:00 AM to 8:00 PM ET weekday window (extended
+    session), or RTH only when [paper_mode] is set. *)
 let is_market_open () =
   let wday, hour, min = current_eastern_time () in
   (* Monday=1 through Friday=5; Saturday=6, Sunday=0 *)
@@ -155,10 +149,10 @@ let is_market_open () =
       time_mins >= open_mins && time_mins < close_mins))
 ;;
 
-(** Calculates the precise duration in seconds until the commencement of the next valid trading session.
-    In paper mode, targets 9:30 AM ET (regular trading hours). In live mode, targets 4:00 AM ET (extended hours).
-    If the market is currently evaluated as open, this function returns 0.0. The calculation comprehensively accounts
-    for weekend rollovers and time zone offsets. *)
+(** Seconds until the next session open; 0.0 if the market is open now.
+    Targets 9:30 AM ET in paper mode, 4:00 AM ET otherwise. Handles
+    weekend rollover, but uses only the current UTC offset: a DST
+    transition inside the interval shifts the result by an hour. *)
 let seconds_until_next_open () =
   if is_market_open ()
   then 0.0
@@ -207,9 +201,8 @@ let seconds_until_next_open () =
     Float.max delta 1.0)
 ;;
 
-(** Generates an exact, human-readable string representation of the current US equity market session status.
-    This output is utilized by the telemetry and logging systems to provide clear operational context regarding
-    pre-market, regular, after-hours, or closed states. *)
+(** Human-readable session status (pre-market, regular, after-hours, or
+    closed) for logging and telemetry. *)
 let market_status_string () =
   let wday, hour, min = current_eastern_time () in
   let is_weekday = wday >= 1 && wday <= 5 in
@@ -234,9 +227,8 @@ let market_status_string () =
     else "open (regular hours)")
 ;;
 
-(** Dispatches an informational log entry detailing the current market session status and the calculated time
-    until the next trading window. This operation is typically invoked during system initialization and upon successful
-    reconnection cycles to establish the operational baseline. *)
+(** Logs the session status and time to next open; called at startup and
+    after reconnects. *)
 let log_market_status () =
   let status = market_status_string () in
   let secs = seconds_until_next_open () in

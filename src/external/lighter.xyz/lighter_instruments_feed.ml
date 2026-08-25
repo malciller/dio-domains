@@ -1,8 +1,8 @@
 (** Lighter instruments feed.
     Fetches market metadata from the [GET /api/v1/orderBookDetails] REST endpoint at startup,
     builds a bidirectional mapping between textual symbols and numeric market indices, and validates that all
-    user configured symbols exist on the Lighter exchange. This module provides price and quantity
-    precision rounding helpers required for formatting outbound order payloads. *)
+    user configured symbols exist on the Lighter exchange. Also provides price and quantity
+    precision rounding helpers for outbound order payloads. *)
 
 let section = "lighter_instruments_feed"
 let pair_cache : (string, Lighter_types.market_info) Hashtbl.t = Hashtbl.create 32
@@ -97,11 +97,10 @@ let fetch_and_initialize ~base_url ~required_symbols =
                        "Failed to parse market entry: %s"
                        (Printexc.to_string exn))
                 markets);
-         (* Discover spot markets dynamically utilizing the explorer API.
-         Spot markets are omitted from the orderBookDetails endpoint which is exclusive to perpetual futures, but
-         appear in the explorer's /api/markets endpoint with indices greater than or equal to 2048.
-         Register any market absent in the primary pair_cache, deriving precision parameters
-         from the corresponding perpetual contract (for example ETH/USDC derives from ETH, LIT/USDC derives from LIT). *)
+         (* Spot markets are absent from orderBookDetails (perps only) but
+          appear in the explorer's /api/markets with indices >= 2048. Register
+          any market missing from pair_cache, copying precision/mins from the
+          base perp contract (ETH/USDC derives from ETH, LIT/USDC from LIT). *)
          let%lwt () =
            Lwt.catch
              (fun () ->
@@ -126,10 +125,10 @@ let fetch_and_initialize ~base_url ~required_symbols =
                           try
                             let sym = member "symbol" entry |> to_string in
                             let mi = member "market_index" entry |> to_int in
-                            (* Restrict registration to markets not already populated in the primary pair_cache, isolating spot markets. *)
+                            (* Register only symbols missing from pair_cache, i.e. spot markets. *)
                             if not (Hashtbl.mem pair_cache sym)
                             then (
-                              (* Derive the base perpetual symbol from the composite spot symbol: "ETH/USDC" yields "ETH", "LIT/USDC" yields "LIT". *)
+                              (* Base perp symbol: "ETH/USDC" yields "ETH". *)
                               let perp_symbol =
                                 match String.split_on_char '/' sym with
                                 | base :: _ -> base
@@ -166,7 +165,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                                 mi
                                 perp_symbol)
                             else if
-                              (* Ensure the index_to_symbol mapping is populated for markets discovered earlier in the execution flow. *)
+                              (* Backfill index_to_symbol for markets registered earlier. *)
                               not (Hashtbl.mem index_to_symbol mi)
                             then Hashtbl.replace index_to_symbol mi sym
                           with
@@ -185,7 +184,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                   (Printexc.to_string exn);
                 Lwt.return_unit)
          in
-         (* Validate that all symbols specified in the required list exist in the populated cache. *)
+         (* Validate every required symbol exists in the populated cache. *)
          let missing =
            List.filter
              (fun sym ->
@@ -238,7 +237,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
   Lwt.pick [ fetch; timeout ]
 ;;
 
-(** Retrieve instrument metadata via a thread safe lookup utilizing the textual symbol. *)
+(** Thread-safe instrument metadata lookup by symbol. *)
 let lookup_info symbol =
   Mutex.lock cache_mutex;
   Fun.protect
@@ -246,14 +245,14 @@ let lookup_info symbol =
     (fun () -> Hashtbl.find_opt pair_cache symbol)
 ;;
 
-(** Resolve a textual symbol string to its underlying Lighter exchange integer market_index. *)
+(** Symbol to Lighter market index. *)
 let get_market_index ~symbol =
   match lookup_info symbol with
   | Some info -> Some info.market_index
   | None -> None
 ;;
 
-(** Resolve an integer exchange market_index back to its textual symbol string via a thread safe lookup. *)
+(** Market index to symbol (thread-safe). *)
 let get_symbol ~market_index =
   Mutex.lock cache_mutex;
   Fun.protect
@@ -261,7 +260,7 @@ let get_symbol ~market_index =
     (fun () -> Hashtbl.find_opt index_to_symbol market_index)
 ;;
 
-(** Retrieve the minimum allowable price increment for the specified [symbol] to satisfy exchange tick size constraints. *)
+(** Tick size for [symbol], derived from price decimals. *)
 let get_price_increment symbol =
   match lookup_info symbol with
   | Some info ->
@@ -269,7 +268,7 @@ let get_price_increment symbol =
   | None -> None
 ;;
 
-(** Retrieve the minimum allowable quantity increment for the specified [symbol] to satisfy exchange lot size constraints. *)
+(** Lot size for [symbol], derived from size decimals. *)
 let get_qty_increment symbol =
   match lookup_info symbol with
   | Some info ->
@@ -277,14 +276,14 @@ let get_qty_increment symbol =
   | None -> None
 ;;
 
-(** Retrieve the minimum permissible order quantity for the specified [symbol]. *)
+(** Minimum order quantity for [symbol]. *)
 let get_qty_min symbol =
   match lookup_info symbol with
   | Some info -> Some info.min_base_amount
   | None -> None
 ;;
 
-(** Apply rounding arithmetic to truncate a given price to the exchange's valid precision decimal places for the specified [symbol]. *)
+(** Round price to tick precision for [symbol]. *)
 let round_price_for_symbol symbol price =
   match lookup_info symbol with
   | Some info ->
@@ -292,14 +291,14 @@ let round_price_for_symbol symbol price =
   | None -> price
 ;;
 
-(** Apply rounding arithmetic to truncate a given quantity down to the exchange's valid precision decimal places for the specified [symbol]. *)
+(** Round qty down to lot precision for [symbol]. *)
 let round_qty_for_symbol symbol qty =
   match lookup_info symbol with
   | Some info -> Lighter_types.round_qty ~size_decimals:info.supported_size_decimals qty
   | None -> qty
 ;;
 
-(** Initialize the instrument cache with static mock data for testing environments or non live execution scenarios. *)
+(** Populate the cache with mock data for tests or non-live runs. *)
 let initialize symbols =
   Mutex.lock cache_mutex;
   Fun.protect

@@ -31,7 +31,7 @@ let profilers : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
 
 let profilers_mutex = Mutex.create ()
 
-(* R4/P4: memoize the last lookup so the common per-order path (same symbol +
+(* memoize the last lookup so the common per-order path (same symbol +
    operation repeated) skips the key sprintf and the profilers_mutex
    acquisition entirely. The (symbol, operation, profiler) triple lives in
    ONE atomic cell so a cross-domain reader can never observe a torn pair
@@ -89,7 +89,7 @@ let get_profiler symbol operation =
     profiler
 ;;
 
-(* P6: window-cadence snapshot+reset for this symbol's operation profilers.
+(* window-cadence snapshot+reset for this symbol's operation profilers.
    Previously [report] ran INLINE after every place/amend/cancel once 100
    samples accumulated - a sorting/logging spike attributed to trading
    latency exactly when activity was highest. The domain worker now calls
@@ -233,7 +233,7 @@ let is_connection_error exn_str =
 ;;
 
 (** Wraps [f] with exception handling, converting raised exceptions into
-    [Error] results. Retries are NOT applied here (H7: single retry policy):
+    [Error] results. Retries are NOT applied here (single retry policy):
     the executor already passes [retry_config] down to the exchange modules,
     which own retries via [Error_handling.retry_with_backoff]. A second retry
     layer here would double the sleep-on-error path (1s+2s twice). *)

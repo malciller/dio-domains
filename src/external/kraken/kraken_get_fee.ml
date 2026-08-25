@@ -46,8 +46,6 @@ let get_api_credentials_from_env () : (string * string) Lwt.t =
   Lwt.both (get_env "KRAKEN_API_KEY") (get_env "KRAKEN_API_SECRET")
 ;;
 
-(* TODO: Refactor into smaller subroutines. *)
-
 (** Fetches the fee schedule for [symbol] via the Kraken [/0/private/TradeVolume]
     endpoint. Constructs a signed POST request using HMAC authentication,
     parses the JSON response, and extracts maker/taker fee percentages from the

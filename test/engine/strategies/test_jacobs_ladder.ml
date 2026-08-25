@@ -666,13 +666,13 @@ let test_accumulation_full_lifecycle () =
 let test_accumulation_multi_strategy_isolation () =
   (* Test two strategies with different lot sizes running concurrently:
      
-     BTC/USDC — sz_decimals=5 (lot=0.00001 asset)
+     BTC/USDC: sz_decimals=5 (lot=0.00001 asset)
        qty=0.0002 (asset), price ~84000 USDC, buffer=1.00 USDC
        round_qty(0.0002 * 0.999) = round_qty(0.00019980) = 0.00019 (asset)
        rounding_diff = 0.0002 - 0.00019 = 0.00001 (asset)
        required = 0.00001 * 84336 + 1.00 = 1.84336 (USDC)
      
-     HYPE/USDC — sz_decimals=2 (lot=0.01 asset)
+     HYPE/USDC: sz_decimals=2 (lot=0.01 asset)
        qty=0.35 (asset), price ~40 USDC, buffer=0.05 USDC
        round_qty(0.35 * 0.999) = round_qty(0.34965) = 0.34 (asset)
        rounding_diff = 0.35 - 0.34 = 0.01 (asset)
@@ -2165,7 +2165,7 @@ let test_sync_open_orders_price_keyed_index () =
 ;;
 
 let test_sync_open_orders_reconcile_agreement () =
-  (* M16: sync_open_orders now computes the (open_levels, missing_levels)
+  (* sync_open_orders now computes the (open_levels, missing_levels)
      split during its scan (O(m), by draining per-price-key match counts) and
      threads it into evaluate_sell_leg, replacing the second O(n+m)
      partition_persisted_sell_levels pass. Verify the threaded split agrees

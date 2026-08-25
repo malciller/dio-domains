@@ -4,8 +4,6 @@ DIO is an OCaml trading engine for market making, grid trading, and capital mana
 
 The engine is organized as one OCaml domain per trading asset, a supervisor that owns connection lifecycle and health, a lock-free order executor, and a supervised event-driven oracle that re-sizes positions on every fill/cancel (microsecond decision path, no network wait).
 
-A live implementation is running at <a href="https://diophantsolutions.com" target="_blank" rel="noopener">diophantsolutions.com</a>.
-
 > **Warning:** the auto-hedge strategy (Hyperliquid perp shorts) is experimental. Review `auto_hedger.ml` and test on testnet before risking real capital.
 
 ---
@@ -31,7 +29,7 @@ Run:
 ./_build/default/bin/main.exe
 ```
 
-On first start the engine loads `config.json` from the working directory, connects the exchanges listed in `trading`, and lets each asset settle into its own trading domain. Logs go to stdout asynchronously (`HH:MM:SS.mmm LVL SECTION message`).
+On first start the engine loads `config.json` from the working directory, connects the exchanges listed in `trading`, and lets each asset settle into its own trading domain. Logs go to stderr asynchronously (`HH:MM:SS.mmm LVL SECTION message`).
 
 ### Binaries
 
@@ -62,6 +60,8 @@ The engine reads `config.json`. Top-level keys:
 | `gc` | see table | OCaml GC tunables applied before the engine starts |
 | `oracle` | see table | Capital oracle knobs (runtime and tuning CLI) |
 | `trading` | required | One entry per instrument to trade |
+| `fng_check_threshold` | `1.5` | Price move (percent) from baseline that re-triggers a Fear & Greed check |
+| `theme` | unset | Default dashboard theme id; overridable with `dio-dashboard --theme` |
 
 Unknown keys under `trading` cause the engine to exit at startup; the schema is strict on purpose.
 
@@ -101,12 +101,15 @@ Each element of `trading` configures one symbol on one exchange:
 | `grid_interval` | jacobs_ladder | `[gi_min, gi_max]`: the hardened bounds (in %) the oracle's parameter search walks; the strategy never reads them |
 | `min_usd_balance` | MM only | Lower bound on account quote balance; MM halts below this |
 | `max_exposure` | MM only | Upper bound on quote exposure for one symbol; MM halts above this |
-| `strategy` | all | `jacobs_ladder` or `MM` |
+| `strategy` | all | `jacobs_ladder` (aliases `Ladder`) or market making (`MM`, alias `market_maker`) |
 | `maker_fee`, `taker_fee` | all | Explicit fee overrides (fractions, e.g. `0.0016`); `null` means use venue default or live fee lookup |
 | `testnet` | HL, Lighter, IBKR, Alpaca | Route to sandbox/paper endpoints. Rejected for Kraken |
 | `hedge` | Hyperliquid only | Enable the experimental perp short auto-hedge. Rejected elsewhere |
 | `accumulation_buffer` | all | `[min, max]` retained quote profit buffer required before base accumulation; resolved live from Fear & Greed (crypto venues) |
 | `data_feed` | Alpaca | `iex` (free, delayed) or `sip` (paid, real-time) |
+| `sell_mult` | jacobs_ladder | Fraction of each ladder rung's qty sold per rung fill (`1.0` sells the full rung; smaller values accrue base) |
+| `base_accumulation` | all | Persist accumulated base and profit state for this entry (default `true`) |
+| `sell_levels` | jacobs_ladder | Persist pending sell levels for this entry (default `false`) |
 
 Venue-specific restrictions are enforced at startup:
 
@@ -286,7 +289,12 @@ All exchange I/O funnels through `error_handling.ml`: callers classify errors (`
 
 ### Persistence
 
-`state_persistence.ml` writes `data/accumulated_state.json` atomically (temp file + rename, guarded by a mutex). Fields: `reserved_base`, `accumulated_profit`, `last_fill_oid`, `last_buy_fill_price`, `last_sell_fill_price`, `last_buy_fill_qty`, `last_sell_fill_qty`, `sell_levels`. Used by the Jacobs ladder on Hyperliquid, Lighter, IBKR, and Alpaca. In Docker, mount `/app/data`.
+State lives in two JSON files under `data/`, written atomically (temp file + rename):
+
+- `accumulation_state.json` (`base_accumulation_store.ml`, orchestrated by `persistence_orchestrator.ml`): per `{strategy}:{symbol}:{venue}` key, fields `reserved_base`, `accumulated_profit`, `last_fill_oid`, `last_buy_fill_price`, `last_sell_fill_price`, `last_buy_fill_qty`, `last_sell_fill_qty`. Opt-in per trading entry via `base_accumulation`.
+- `sell_levels_state.json` (`sell_levels_store.ml`): pending sell levels for entries with `sell_levels: true`.
+
+On startup, a legacy flat `data/accumulated_state.json` is migrated into these files and renamed to `accumulated_state.json.migrated.<ts>`. Used by the Jacobs ladder on Hyperliquid, Lighter, IBKR, and Alpaca. In Docker, mount `/app/data`.
 
 ---
 

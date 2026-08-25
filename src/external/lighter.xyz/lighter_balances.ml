@@ -1,17 +1,18 @@
-(** Provides the centralized subsystem for tracking real-time asset balances originating from the Lighter exchange.
-    Base asset balances (ETH, etc.) are sourced from the [account_all_assets/{ACCOUNT_ID}] WS channel.
-    USDC balance handling depends on the account mode:
-    - Split accounts: USDC appears in the assets array of [account_all_assets] directly.
-    - Unified accounts: USDC is account-level collateral, sourced from [user_stats] WS channel
-      and seeded at startup via the REST /api/v1/account endpoint.
+(** Real-time balance tracking for Lighter.
 
-    Balance messages are dispatched synchronously from the WS frame handler in [lighter_ws.ml],
-    ensuring no messages are lost to bounded-stream backpressure. *)
+    Base assets (ETH, etc.) come from the [account_all_assets/{ACCOUNT_ID}] WS
+    channel. USDC depends on account mode: split accounts report USDC in the
+    assets array; unified accounts hold USDC as account-level collateral, read
+    from the [user_stats] channel and seeded at startup via REST
+    /api/v1/account.
+
+    Messages are processed synchronously from the WS frame handler in
+    [lighter_ws.ml], so nothing is lost to bounded-stream backpressure. *)
 
 let section = "lighter_balances"
 
-(** Implements an atomic representation of the balance metrics mapped to a specific digital asset. 
-    Maintains localized timestamps to ensure data freshness constraints can be evaluated by external system invariants. *)
+(** Per-asset balance snapshot; the last-update timestamp supports staleness
+    checks by callers. *)
 type balance_data =
   { asset : string
   ; balance : float
@@ -20,8 +21,8 @@ type balance_data =
   ; last_updated : float
   }
 
-(** Constructs an isolated, thread-safe memory partition for caching asset balances spanning disparate sub-accounts or wallet architectures.
-    Leverages OCaml mutex primitives alongside atomic variables for non-blocking read access to the aggregated balance figures. *)
+(** Thread-safe per-asset store: a wallets hashtable guarded by a mutex, with
+    the aggregate total exposed via atomics for lock-free reads. *)
 module BalanceStore = struct
   type wallet_balance =
     { balance : float
@@ -167,8 +168,7 @@ let subscribe_balance_updates () =
   subscription.stream, subscription.close
 ;;
 
-(* Execution handlers for propagating balance mutations across the internal
-   concurrent stores and outward to the subscription event bus. *)
+(* Update handlers: mutate the stores and publish to the event bus. *)
 let publish_balance_update storage_key balance =
   let store = get_balance_store storage_key in
   BalanceStore.update_wallet store balance "spot" "account";
@@ -183,9 +183,8 @@ let publish_balance_update storage_key balance =
     }
 ;;
 
-(** Evaluates and maps incoming JSON payloads routed from the [account_all] or [account_all_assets] channels.
-    This function traverses dynamic JSON schema structures to extract all asset allocations,
-    including USDC which reports balance directly in coin terms via the account_all_assets channel. *)
+(** Handles [account_all]/[account_all_assets] payloads: extracts account-level
+    USDC collateral (unified accounts) plus the per-asset balances map. *)
 let process_asset_balances json =
   let open Yojson.Safe.Util in
   let account_data =
@@ -374,7 +373,7 @@ let process_user_stats json =
         a))
 ;;
 
-(** Multiplexes demarshaled JSON frames from the WebSocket fabric into specialized processing functions based on the deterministic message type property. *)
+(** Routes WS frames to the balance processors by message type/channel. *)
 let process_market_data json =
   let open Yojson.Safe.Util in
   let msg_type =

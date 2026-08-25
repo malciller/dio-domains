@@ -103,7 +103,7 @@ let orchestrator =
     ~serialize:to_json
 ;;
 
-(* Pure decision logic — no I/O, unit-testable *)
+(* Pure decision logic: no I/O, unit-testable *)
 
 (** Buy fill: update the last-buy reference info for the next sell's
     profitability check. [oid] is accepted per the store contract; OID
