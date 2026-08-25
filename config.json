@@ -22,12 +22,12 @@
       "BTC/USDC": {
         "target_survival": 0.85,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 3.0
+        "qty_cap_mult": 7.5
       },
       "HYPE/USDC": {
         "target_survival": 0.75,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 2.5
+        "qty_cap_mult": 4.375
       }
     }
   },

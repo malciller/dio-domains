@@ -124,7 +124,11 @@ let monitor_loop () =
                      in
                      let delay =
                        if attempts <= 1
-                       then 0.0
+                       then (
+                         if String.equal conn.name "alpaca_data_ws"
+                            || String.equal conn.name "alpaca_trading_ws"
+                         then 2.0
+                         else 0.0)
                        else min max_delay (2.0 ** Float.of_int (attempts - 1))
                      in
                      (* Only reconnect after backoff elapses *)
@@ -365,7 +369,8 @@ let monitor_loop () =
                                   conn.name
                                   req_id;
                                 Atomic.incr conn.ping_failures;
-                                Lwt.return_unit))
+                                Lwt.return_unit)
+                           )
                            (fun exn ->
                               Logging.warn_f
                                 ~section
@@ -483,7 +488,7 @@ let monitor_non_active_assets () =
                    | Kraken -> "kraken_orderbook_ws"
                    | Hyperliquid -> "hyperliquid_ws"
                    | Ibkr -> "ibkr_gateway"
-                   | Alpaca -> "alpaca_trading_ws"
+                   | Alpaca -> "alpaca_data_ws"
                    | Lighter | Custom _ -> ""
                  in
                  let current_connected_time =
@@ -537,17 +542,27 @@ let monitor_non_active_assets () =
                         if (not is_configured) && not is_quote
                         then (
                           let target_key = exch_name ^ ":" ^ symbol in
+                          let has_valid_quote =
+                            match Ex.get_top_of_book ~symbol with
+                            | Some (bp, _, ap, _) -> bp > 0.0 || ap > 0.0
+                            | None -> false
+                          in
+                          let now = Unix.gettimeofday () in
                           let needs_sub =
-                            match Hashtbl.find_opt subscribed_symbols target_key with
-                            | None -> true
-                            | Some t -> t < current_connected_time
+                            if not has_valid_quote
+                            then (
+                              match Hashtbl.find_opt subscribed_symbols target_key with
+                              | None -> true
+                              | Some last_sub ->
+                                last_sub < current_connected_time || now -. last_sub >= 15.0)
+                            else (
+                              match Hashtbl.find_opt subscribed_symbols target_key with
+                              | None -> true
+                              | Some last_sub -> last_sub < current_connected_time)
                           in
                           if needs_sub
                           then (
-                            Hashtbl.replace
-                              subscribed_symbols
-                              target_key
-                              current_connected_time;
+                            Hashtbl.replace subscribed_symbols target_key now;
                             symbols_to_subscribe := symbol :: !symbols_to_subscribe)))
                      balances;
                  if !symbols_to_subscribe <> []

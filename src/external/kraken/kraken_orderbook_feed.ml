@@ -262,6 +262,30 @@ type decimals = int * int
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
 
+(** Persistent registry of all subscribed symbols (configured + dynamic).
+    Preserved across disconnects and resets so that dynamic subscriptions
+    re-subscribe automatically on connection restart. *)
+let all_subscribed_symbols : string list ref = ref []
+let subscribed_mutex = Mutex.create ()
+
+let get_all_subscribed_symbols () =
+  Mutex.lock subscribed_mutex;
+  let syms = !all_subscribed_symbols in
+  Mutex.unlock subscribed_mutex;
+  syms
+;;
+
+let add_subscribed_symbols symbols =
+  Mutex.lock subscribed_mutex;
+  let new_syms =
+    List.filter (fun s -> not (List.mem s !all_subscribed_symbols)) symbols
+  in
+  all_subscribed_symbols := !all_subscribed_symbols @ new_syms;
+  let total = !all_subscribed_symbols in
+  Mutex.unlock subscribed_mutex;
+  total
+;;
+
 (* P5: frame parsing/dispatch runs on the Parse_worker domain, so nothing in
    the dispatch path may touch Lwt primitives. The old [Lwt_condition]
    ready signal became an Atomic flag polled by the startup waiter, and the
@@ -1212,6 +1236,7 @@ let resubscribe_backoff_delay_s attempt =
 
 let rec subscribe_symbols symbols =
   resubscribe_symbol_ref := Some (fun s -> resubscribe_symbol s);
+  let _ = add_subscribed_symbols symbols in
   (* P5: drain sequence-gap resubscribe requests raised on the Parse_worker
      domain. The watcher runs on the Lwt main domain, where the Lwt-based
      [resubscribe_symbol] is safe. Started once; 50ms poll on a path that
@@ -1237,6 +1262,8 @@ let rec subscribe_symbols symbols =
       Lwt_unix.sleep 0.05 >>= fun () -> watcher ()
     in
     Lwt.async watcher);
+  Kraken_instruments_feed.fetch_from_rest symbols
+  >>= fun () ->
   fetch_decimals symbols
   >>= fun () ->
   List.iter
@@ -1268,7 +1295,9 @@ let rec subscribe_symbols symbols =
   | None ->
     Logging.warn_f
       ~section
-      "Cannot dynamically subscribe symbols, orderbook WS not connected";
+      "Registered %d symbols for dynamic subscription on next connect: %s"
+      (List.length symbols)
+      (String.concat ", " symbols);
     Lwt.return_unit
 
 and resubscribe_symbol symbol =
@@ -1343,6 +1372,7 @@ and resubscribe_with_retry symbol =
 ;;
 
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
+  let all_syms = add_subscribed_symbols symbols in
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
   Logging.debug_f ~section "Connecting to Kraken orderbook WebSocket...";
   Lwt_unix.getaddrinfo "ws.kraken.com" "443" [ Unix.AI_FAMILY Unix.PF_INET ]
@@ -1362,13 +1392,14 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   >>= fun () ->
   Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
   on_connected ();
-  start_message_handler conn symbols on_failure on_heartbeat
+  start_message_handler conn all_syms on_failure on_heartbeat
   >>= fun () ->
   Logging.debug_f ~section "Orderbook WebSocket connection closed";
   Lwt.return_unit
 ;;
 
 let initialize symbols =
+  let _ = add_subscribed_symbols symbols in
   Logging.debug_f
     ~section
     "Initializing orderbook feed for %d symbols"

@@ -50,7 +50,7 @@ opencode.json
 
 # Local OPAM switch
 _opam/
-
+out/
 # env file
 .env
 .DS_Store

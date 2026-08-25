@@ -658,7 +658,40 @@ let build_snapshot () =
                     || asset = quote
                     || asset = "USDe"
                   in
-                  let tob = Ex.get_top_of_book ~symbol in
+                  let tob =
+                    match Ex.get_top_of_book ~symbol with
+                    | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
+                      Some (b, bs, a, as_)
+                    | _ ->
+                      if is_quote
+                      then None
+                      else (
+                        List.find_map
+                          (fun other_exch ->
+                             if other_exch = exch_name
+                             then None
+                             else (
+                               match Exchange.Registry.get other_exch with
+                               | None -> None
+                               | Some (module OtherEx) ->
+                                 let other_quote =
+                                   match
+                                     Exchange.Types.exchange_of_string other_exch
+                                   with
+                                   | Hyperliquid | Lighter -> "USDC"
+                                   | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
+                                 in
+                                 let other_sym = asset ^ "/" ^ other_quote in
+                                 (match OtherEx.get_top_of_book ~symbol:other_sym with
+                                  | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
+                                    Some (b, bs, a, as_)
+                                  | _ ->
+                                    (match OtherEx.get_top_of_book ~symbol:asset with
+                                     | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
+                                       Some (b, bs, a, as_)
+                                     | _ -> None))))
+                          exchange_names)
+                  in
                   let bid_json, ask_json =
                     match tob with
                     | Some (b, _, a, _) -> `Float b, `Float a
