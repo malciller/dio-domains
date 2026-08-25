@@ -588,9 +588,10 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                All fees (both legs) are folded into a single [fees] figure
                passed to the store's pure decision logic, which:
                  - accrues net profit into accumulated_profit when > 0,
-                 - when accumulated_profit > buffer (realtime F&G), adds
-                   oracle_qty * sell_mult to reserved_base and resets the
-                   accumulation window. *)
+                 - when accumulated_profit >= base_cost + buffer (realtime F&G),
+                   adds oracle_qty * (1 - sell_mult) to reserved_base and
+                   debits accumulated_profit by base_cost, preserving the
+                   buffer and surplus profit in the quote ledger. *)
             let store_t =
               { Dio_persistence.Base_accumulation_store.reserved_base =
                   state.reserved_base

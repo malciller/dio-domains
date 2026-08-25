@@ -116,9 +116,11 @@ let apply_buy_fill t ~price ~qty ~oid =
 (** Sell fill: compare against the last buy fill for profitability.
     profit = (sell_price - last_buy_price) * paired qty; the optional [fees]
     (all-inclusive: both legs) are subtracted; if net profit > 0 it is added
-    to accumulated_profit. When accumulated_profit exceeds [buffer]
-    (realtime, fear-and-greed driven): reserved_base += oracle_qty *
-    sell_mult and the accumulation window resets (accumulated_profit <- 0).
+    to accumulated_profit. When accumulated_profit covers the acquisition
+    cost of the reserved base plus [buffer] (realtime, fear-and-greed driven):
+    reserved_base += oracle_qty * (1 - sell_mult) and accumulated_profit is
+    debited by the base cost (accumulated_profit <- accumulated_profit - base_cost),
+    preserving the buffer and surplus profit in the quote ledger.
     [fees] defaults to 0.0 so the pure spec formula holds exactly. *)
 let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0.0) () =
   let t =
@@ -139,12 +141,13 @@ let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0
     if net_profit > 0.0
     then (
       let accumulated_profit = t.accumulated_profit +. net_profit in
-      if accumulated_profit > buffer
+      let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
+      let base_cost = accrued_base *. buy_price in
+      if accrued_base > 0.0 && accumulated_profit >= base_cost +. buffer
       then (
-        let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
         { t with
           reserved_base = t.reserved_base +. accrued_base
-        ; accumulated_profit = 0.0
+        ; accumulated_profit = accumulated_profit -. base_cost
         })
       else { t with accumulated_profit })
     else t
