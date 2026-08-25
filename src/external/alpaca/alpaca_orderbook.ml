@@ -5,13 +5,13 @@ open Dio_exchange.Exchange_intf.Types
 
 let section = "alpaca_orderbook"
 
-(** The top-of-book comes exclusively from the WebSocket quote stream, like
-    every other exchange in this codebase: WS "q" messages on the
-    session-appropriate feed (regular v2 by day, v1beta1/overnight at night).
-    Trade prints are recorded for analytics only and NEVER publish a bid/ask.
-    There is no REST polling - when the WS is disconnected the store simply
-    holds the last real quote until the reconnect resubscription delivers a
-    fresh one. *)
+(** The top-of-book comes primarily from the WebSocket quote stream:
+    WS "q" messages on the session-appropriate feed (regular v2 by day,
+    v1beta1/overnight at night). When the active WS feed has no quotes (e.g.
+    during pre-market/after-hours on the free IEX feed when IEX is closed),
+    [get_best_bid_ask] falls back to the account position mark from
+    [Alpaca_balances.get_position_price]. Trade prints are recorded for
+    analytics only and never fabricate quotes. *)
 
 type quote =
   { bid_price : float
@@ -136,7 +136,12 @@ module SymbolStore = struct
 
   let get_best_bid_ask t =
     let c = Atomic.get t.tob in
-    if c.valid then Some (c.bid_px, c.bid_sz, c.ask_px, c.ask_sz) else None
+    if c.valid
+    then Some (c.bid_px, c.bid_sz, c.ask_px, c.ask_sz)
+    else (
+      match Alpaca_balances.get_position_price t.symbol with
+      | Some p when p > 0.0 -> Some (p, 0.0, p, 0.0)
+      | _ -> None)
   ;;
 
   let get_current_position t = (Atomic.get t.tob).pos
@@ -216,7 +221,10 @@ let last_frame_time = ref 0.0
 let get_best_bid_ask symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> SymbolStore.get_best_bid_ask store
-  | None -> None
+  | None ->
+    (match Alpaca_balances.get_position_price symbol with
+     | Some p when p > 0.0 -> Some (p, 0.0, p, 0.0)
+     | _ -> None)
 ;;
 
 let get_best_bid_ask_fast symbol =

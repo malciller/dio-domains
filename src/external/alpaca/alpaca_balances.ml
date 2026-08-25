@@ -13,6 +13,10 @@ let section = "alpaca_balances"
 let balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 
 let total_balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+
+(** Published position mark prices. Lock-free Atomic table for fallback TOB when WS quotes are quiet. *)
+let position_marks : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+
 let initial_data_received = Atomic.make false
 let last_update = Atomic.make 0.0 (* wall clock of the last successful poll *)
 
@@ -41,6 +45,17 @@ let get_total_balance asset =
      | _ -> 0.0)
 ;;
 
+let get_position_price asset =
+  let t = Atomic.get position_marks in
+  Hashtbl.find_opt t asset
+;;
+
+let get_position_price_fast asset =
+  fun () ->
+    let t = Atomic.get position_marks in
+    Hashtbl.find_opt t asset
+;;
+
 let get_all_balances () =
   let t = Atomic.get total_balances in
   Hashtbl.fold (fun k v acc -> (k, v) :: acc) t []
@@ -56,6 +71,7 @@ let update_balances () =
        observe a half-updated table. *)
     let new_balances = Hashtbl.create 16 in
     let new_total = Hashtbl.create 16 in
+    let new_marks = Hashtbl.create 16 in
     Hashtbl.replace new_balances "USD" acc.cash;
     Hashtbl.replace new_total "USD" acc.equity;
     Hashtbl.replace new_balances "USDC" acc.cash;
@@ -75,19 +91,16 @@ let update_balances () =
            ~section
            "Alpaca loaded %d active position(s)"
            (List.length positions);
-       (* NOTE: the positions-API [current_price] is deliberately NOT written
-          into the orderbook TOB store anymore. It is an account-API mark from
-          a different reference than the market-data feeds, and pushing it
-          unconditionally raced the WS quote/trade writers (a lagging or
-          cross-session price clobbered a fresh quote, which was the trigger
-          for the pre-market -> regular amendment loop). Real-time prices come
-          from the session-aware WS feed (regular + overnight); when that feed
-          is quiet the REST snapshot poll in Alpaca_orderbook takes over, so
-          nothing is lost. *)
+       (* Position mark prices are stored in [position_marks] as a fallback
+          price reference when the active WS quote stream is quiet (e.g. during
+          pre-market or after-hours on the free IEX feed when IEX is closed).
+          Live WS quotes in Alpaca_orderbook always take precedence when present. *)
        List.iter
          (fun (p : Alpaca_types.position_record) ->
             Hashtbl.replace new_balances p.symbol p.qty;
             Hashtbl.replace new_total p.symbol p.qty;
+            if p.current_price > 0.0
+            then Hashtbl.replace new_marks p.symbol p.current_price;
             Logging.debug_f
               ~section
               "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, current_price=%.2f, \
@@ -102,6 +115,7 @@ let update_balances () =
        Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err);
     Atomic.set balances new_balances;
     Atomic.set total_balances new_total;
+    Atomic.set position_marks new_marks;
     Atomic.set initial_data_received true;
     Atomic.set last_update (Unix.time ());
     Concurrency.Exchange_wakeup.signal_all ();
