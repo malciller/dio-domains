@@ -55,7 +55,7 @@ module SymbolExecStore = struct
     ; capacity : int
       (* write_pos/initial_data_received live in atomics: the WS writer is the
        single writer and the domain reads them lock-free via the _fast
-       closures (H2). The mutex still guards the open_orders Hashtbl and the
+       closures . The mutex still guards the open_orders Hashtbl and the
        full ring-buffer reads. *)
     ; write_pos : int Atomic.t
     ; open_orders : (string, open_order_internal) Hashtbl.t
@@ -135,7 +135,7 @@ module SymbolExecStore = struct
      | Filled | Canceled | Expired | Rejected -> Hashtbl.remove t.open_orders e.order_id);
     publish_open_orders_cache t;
     Mutex.unlock t.mutex;
-    (* P2: per-symbol wakeup - only this symbol's domain consumes its exec events. *)
+    (* per-symbol wakeup - only this symbol's domain consumes its exec events. *)
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
@@ -172,7 +172,7 @@ module SymbolExecStore = struct
     publish_open_orders_cache t;
     Mutex.unlock t.mutex;
     Atomic.set t.initial_data_received true;
-    (* P2: snapshot readiness is per-store; only this symbol's domain gates on it. *)
+    (* snapshot readiness is per-store; only this symbol's domain gates on it. *)
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 

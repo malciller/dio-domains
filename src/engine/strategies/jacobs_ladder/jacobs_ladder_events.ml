@@ -6,7 +6,7 @@ open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
 
-(* H3: per-symbol lock-free lifecycle event queue. The Lwt supervisor thread
+(* per-symbol lock-free lifecycle event queue. The Lwt supervisor thread
    (REST callbacks, supervisor_orders.ml) enqueues lifecycle events instead of
    calling the handlers directly; the domain worker drains the queue at the
    top of every cycle, so ALL handler execution happens on the domain thread.
@@ -1012,7 +1012,7 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
 (** No-op shim for pending cancellation cleanup. *)
 let cleanup_pending_cancellation _asset_symbol _order_id = ()
 
-(* H3: drain lifecycle events queued by the supervisor REST path and dispatch
+(* drain lifecycle events queued by the supervisor REST path and dispatch
    them to the handlers. Runs on the domain thread at the top of every cycle,
    so every handler invocation (REST- or WS-sourced) executes on the domain
    thread, so the strategy mutex is never shared across threads. *)

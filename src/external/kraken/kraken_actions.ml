@@ -143,7 +143,7 @@ let default_retry_config = Error_handling.default_retry_config
     Delegates to the centralized [Error_handling.is_retriable_error]. *)
 let is_retriable_error = Error_handling.is_retriable_error
 
-(** Places an order by transmitting the order payload, utilizing the retry handler. *)
+(** Places an order, retrying via [retry_config]. *)
 let place_order
       ~token
       ~order_type
@@ -187,9 +187,7 @@ let place_order
            (int_of_float (Unix.gettimeofday () *. 1000.0)))
   in
   let place_order_once () =
-    (* Submit the order request with a fresh request identifier. *)
     let req_id = next_req_id () in
-    (* Appends core parameters. *)
     let params =
       `Assoc
         [ "order_type", `String order_type
@@ -199,7 +197,6 @@ let place_order
         ; "token", `String token
         ]
     in
-    (* Appends optional parameters. *)
     let params =
       match limit_price with
       | Some price ->
@@ -323,7 +320,7 @@ let place_order
   Error_handling.retry_with_backoff ~section ~config ~f:place_order_once ()
 ;;
 
-(** Amends an existing order by transmitting the modification payload, utilizing the retry handler. *)
+(** Amends an order, retrying via [retry_config]. *)
 let amend_order
       ~token
       ~order_id
@@ -361,7 +358,6 @@ let amend_order
       | Some qty -> add_to_assoc params ("order_qty", `Float qty)
       | None -> params
     in
-    (* Appends optional parameters. *)
     let params =
       match cl_ord_id with
       | Some id -> add_to_assoc params ("cl_ord_id", `String id)
@@ -481,7 +477,7 @@ let amend_order
   Error_handling.retry_with_backoff ~section ~config ~f:amend_order_once ()
 ;;
 
-(** Cancels orders by transmitting one cancellation request per order, utilizing the retry handler.
+(** Cancels orders, one request per order, retried via [retry_config].
     Requests are sent in parallel, each carrying its own req_id so responses
     correlate per order. A single shared req_id would desync multi-frame
     responses, since [resolve_response] removes the waiter on the first frame,
@@ -513,7 +509,7 @@ let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
     in
     from_order_ids @ from_cl_ord_ids @ from_userrefs
   in
-  (* Execute all cancels in parallel (H8): each cancel carries its own req_id,
+  (* Execute all cancels in parallel: each cancel carries its own req_id,
      so response correlation is per-order; the shared-req_id desync concern
      only applies to a true batch cancel, which Kraken does not offer. The old
      sequential pipeline turned N cancels into N times the RTT on the domain's

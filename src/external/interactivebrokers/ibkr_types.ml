@@ -1,47 +1,48 @@
-(** Foundational type definitions and protocol constants for the Interactive Brokers TWS API integration.
-
-    This module establishes the core data structures including trading contracts, order specifications, execution reports, and market data tick types. These definitions provide a unified type system utilized across the codec, connection management, data feeds, and action execution subsystems to ensure consistent protocol mapping. *)
+(** Types and protocol constants for the IBKR TWS API: contracts,
+    orders, executions, and tick types, shared by the codec, connection,
+    feeds, and actions. *)
 
 let section = "ibkr_types"
 
 (* Subsystem configuration defaults *)
 
-(** Default queue capacity for the market data ticker Lwt stream. *)
+(** Legacy constant; no ticker stream in this adapter. Retained only
+    because the type tests pin its value. *)
 let default_ring_buffer_size_ticker = 100
 
-(** Default queue capacity for the Level 2 market depth Lwt stream.
-    R3: raised from 16 to absorb bursts without lapping readers. *)
+(** Order book ring buffer capacity: absorbs bursts without lapping
+    readers. *)
 let default_ring_buffer_size_orderbook = 64
 
-(** Default queue capacity for the order execution report Lwt stream.
-    R3: raised from 32 - exec bursts (mass cancels, volatile fills)
-    previously lapped the domain consumer and dropped lifecycle events. *)
+(** Execution report ring buffer capacity. Smaller sizes dropped
+    lifecycle events during bursts (mass cancels, volatile fills). *)
 let default_ring_buffer_size_executions = 512
 
-(** Maximum elapsed duration in seconds before an untracked open order is evicted from local state management. *)
+(** Age in seconds at which untracked open orders are evicted. *)
 let default_stale_order_threshold_s = 86400.0 (* 24 hours *)
 
-(** Default magnitude of granular price levels to maintain symmetrically for order book state construction. *)
+(** Price levels kept per side of the order book. *)
 let default_orderbook_depth = 10
 
-(** Base temporal delay in milliseconds applied prior to initiating a subsequent TCP socket reconnection attempt. *)
+(** Base delay before the first reconnect attempt. *)
 let default_reconnect_base_delay_ms = 1000.0
 
-(** Upper bound constraint in milliseconds for the exponential backoff calculation during sustained network severance. *)
+(** Cap for the reconnect exponential backoff. *)
 let default_reconnect_max_delay_ms = 30000.0
 
-(** Multiplicative coefficient applied to the reconnection interval following consecutive socket initialization failures. *)
+(** Backoff multiplier applied after each failed connect. *)
 let default_reconnect_backoff_factor = 2.0
 
 (* Protocol version specifications *)
 
-(** Floor protocol version required to ensure compatibility with modern TWS Gateway message framing architectures. *)
+(** Minimum TWS API version accepted during the handshake. *)
 let api_version_min = 100
 
-(** Ceiling protocol version specifying the maximum structural schema the internal codec is equipped to deserialize. *)
+(** Maximum TWS API version the codec is written against. *)
 let api_version_max = 176
 
-(** Numeric identifier allocating the TCP session endpoint. Value zero designates the primary administrative connection capable of intercepting global execution events. *)
+(** Client id 0 is the master session, which receives all execution
+    reports. *)
 let default_client_id = 0
 
 (* Client egress protocol message identifiers *)
@@ -87,9 +88,9 @@ let msg_in_tick_string = 46
 let msg_in_tick_generic = 45
 let msg_in_market_data_type = 58
 
-(* Market data tick type enumerations *)
+(* Market data tick types *)
 
-(** Realtime tick identifier constants mapping protocol integer codes to explicit market data field updates. *)
+(** Live tick type codes. *)
 let tick_bid = 1
 
 let tick_ask = 2
@@ -102,7 +103,7 @@ let tick_low = 7
 let tick_volume = 8
 let tick_close = 9
 
-(* Delayed market data derivations incorporating the standard numerical offset from live equivalents *)
+(* Delayed tick types: live code + 66 offset. *)
 let tick_delayed_bid = 66
 let tick_delayed_ask = 67
 let tick_delayed_last = 68
@@ -110,9 +111,9 @@ let tick_delayed_bid_size = 69
 let tick_delayed_ask_size = 70
 let tick_delayed_volume = 74
 
-(* Financial instrument contract definitions *)
+(* Contracts *)
 
-(** Structural representation of a tradable financial instrument requisite for routing orders and subscribing to data feeds. Exchange Traded Funds are classified under the STK security type. *)
+(** Tradable instrument. ETFs use secType STK. *)
 type contract =
   { con_id : int
   ; symbol : string
@@ -125,7 +126,7 @@ type contract =
   ; multiplier : string
   }
 
-(** Uninitialized contract instance utilized as a neutral allocation template prior to explicit variable assignment. *)
+(** Default contract: STK on SMART in USD, minTick 0.01. *)
 let empty_contract =
   { con_id = 0
   ; symbol = ""
@@ -139,31 +140,29 @@ let empty_contract =
   }
 ;;
 
-(** Constructs an elementary equities contract structure instantiated primarily for programmatic symbol resolution operations. *)
+(** STK contract for [symbol], for use with reqContractDetails. *)
 let make_stk_contract ~symbol =
   { empty_contract with symbol; sec_type = "STK"; exchange = "SMART"; currency = "USD" }
 ;;
 
-(* Execution routing order definitions *)
+(* Orders *)
 
-(** Data structure encapsulation for actionable trading directives transmitted to the broker matching engine. *)
+(** Outgoing order. *)
 type order =
   { order_id : int
-  ; action : string
-    (** Designates standard directional intent such as BUY or SELL operations. *)
+  ; action : string (** "BUY" or "SELL". *)
   ; total_qty : float
-  ; order_type : string
-    (** Execution schema categorization including MKT and LMT variations. *)
+  ; order_type : string (** "MKT", "LMT", ... *)
   ; lmt_price : float
-  ; tif : string (** Temporal validity constraint determining order lifespan mechanics. *)
+  ; tif : string (** Time in force: "DAY", "GTC", ... *)
   }
 
-(** Instantiates a parameterized market execution directive configured for immediate fulfillment at prevailing collateral rates. *)
+(** Market order, tif DAY. *)
 let make_market_order ~order_id ~action ~qty =
   { order_id; action; total_qty = qty; order_type = "MKT"; lmt_price = 0.0; tif = "DAY" }
 ;;
 
-(** Instantiates a parameterized limit execution directive constrained to fulfill exclusively at or exceeding the specified price bound. *)
+(** Limit order at [price], tif GTC. *)
 let make_limit_order ~order_id ~action ~qty ~price =
   { order_id
   ; action
@@ -174,9 +173,9 @@ let make_limit_order ~order_id ~action ~qty ~price =
   }
 ;;
 
-(* Post trade execution semantics *)
+(* Executions *)
 
-(** Structural mapping for granular fulfillment events denoting partial or complete clearing of associated order constraints. *)
+(** One fill report. *)
 type execution =
   { exec_id : string
   ; exec_order_id : int
@@ -189,9 +188,9 @@ type execution =
   ; exec_exchange : string
   }
 
-(* Lifecycle transition state enumerations *)
+(* Order status *)
 
-(** Formalized representations of permissible transition states detailing the real-time operational disposition of a routed order. *)
+(** TWS order lifecycle states. *)
 type tws_order_status =
   | PreSubmitted
   | Submitted
@@ -202,7 +201,8 @@ type tws_order_status =
   | ApiCancelled
   | Unknown_status of string
 
-(** Lexical parser translating raw string enumerations broadcasted by the protocol gateway into structured variant subtypes. *)
+(** Parses a TWS status string; unknown values log a warning and become
+    [Unknown_status]. *)
 let parse_tws_order_status = function
   | "PreSubmitted" -> PreSubmitted
   | "Submitted" -> Submitted
@@ -216,7 +216,7 @@ let parse_tws_order_status = function
     Unknown_status s
 ;;
 
-(** Normalization function aligning proprietary Interactive Brokers state transitions with the unified generalized exchange protocol interface. *)
+(** Maps TWS statuses onto the unified exchange status type. *)
 let to_exchange_order_status = function
   | PreSubmitted -> Dio_exchange.Exchange_intf.Types.Pending
   | Submitted -> Dio_exchange.Exchange_intf.Types.New

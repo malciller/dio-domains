@@ -172,7 +172,7 @@ let asset_domain_worker
     let latency_active = ref false in
     let exec_ready_cycle = ref 0 in
     let open_orders_dirty = ref true in
-    (* H5: the per-cycle oracle decision lookup is cached against the publish
+    (* the per-cycle oracle decision lookup is cached against the publish
        generation, so idle cycles (no new pass) do zero decision work. *)
     let oracle_gen_cached = ref (-1) in
     let oracle_decision_cached = ref None in
@@ -451,7 +451,7 @@ let asset_domain_worker
        so the dashboard never scans a histogram being mutated by this domain. *)
     let latency_window_seconds = config.latency_window_seconds in
     let last_window_time = ref (Unix.gettimeofday ()) in
-    (* M8: GC stats are sampled once per latency window (inside
+    (* GC stats are sampled once per latency window (inside
        [publish_windows]) instead of twice per busy cycle. [Gc.quick_stat]
        costs ~2µs; on the publish cadence it is negligible, per-cycle it
        would tax every busy domain cycle once profiling warms up. *)
@@ -462,7 +462,7 @@ let asset_domain_worker
     let publish_windows () =
       ignore (Latency_profiler.snapshot_and_reset prof_ob);
       ignore (Latency_profiler.snapshot_and_reset prof_exec);
-      (* P6: snapshot+reset this symbol's place/amend/cancel operation
+      (* snapshot+reset this symbol's place/amend/cancel operation
          profilers on the window cadence. Their per-op [report] calls were
          removed from the order hot path (they logged mid-cycle whenever 100
          samples had accumulated); the percentiles now surface here instead,
@@ -491,7 +491,7 @@ let asset_domain_worker
     (* Cache the equity market-hours evaluation (~1s TTL). The underlying check
        does gmtime+mktime+DST math per call (alpaca_market_hours.ml:11-105);
        evaluating it on every hot ibkr/alpaca cycle inflated the cycle latency
-       profile (F7). *)
+       profile. *)
     let mh_cache = ref (None : (float * bool) option) in    (* Cache strategy state references to avoid repeated mutex acquisition
           on the hot path. References are stable while is_running is true. *)
     let cached_grid_state =
@@ -509,7 +509,7 @@ let asset_domain_worker
       let latency_this_cycle = !latency_active in
       if !cycle_count = 0 then Logging.debug_f ~section "First cycle for %s" key;
       incr cycle_count;
-      (* R1: capture the wakeup generation BEFORE reading any producer
+      (* capture the wakeup generation BEFORE reading any producer
          state. Any signal that arrives from here until the [wait_since] at
          the bottom of the loop bumps the generation past this baseline, so
          the wait returns immediately instead of parking through data that
@@ -521,17 +521,17 @@ let asset_domain_worker
       let cycle_events = ref 0 in
       let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
-      (* M8: GC stats are window-scoped (sampled in [publish_windows]); the
+      (* GC stats are window-scoped (sampled in [publish_windows]); the
          per-cycle cause string reads the last window pair. No [Gc.quick_stat]
          on the per-tick path. *)
-      (* H3: drain lifecycle events queued by the supervisor REST path. All
+      (* drain lifecycle events queued by the supervisor REST path. All
          handler invocations (REST- and WS-sourced) now execute on THIS domain
          thread at the top of the cycle, so the strategy mutex is never
          contended across threads. Runs unconditionally; the queue is empty
          on the common cycle and the read is a lock-free CAS. *)
       if is_grid_strategy
       then Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol;
-      (* R2: drain MM lifecycle events queued by the supervisor REST path.
+      (* drain MM lifecycle events queued by the supervisor REST path.
          Same discipline as the grid queue above: all handler execution
          happens on THIS domain thread, so MM state is never mutated
          cross-thread against execute_strategy. *)
@@ -870,7 +870,7 @@ let asset_domain_worker
             never enters the execution block, so its re-activation must not
             depend on it. The oracle's qty/gi win over the F&G re-evaluation
             above (the oracle owns the sizing while it has a decision).
-            H5: the lookup is cached per generation; [decision_for] is only
+            the lookup is cached per generation; [decision_for] is only
             re-invoked (with its lowercase+hashtable cost) when the runtime
             published a new pass, so idle cycles do zero decision work. *)
       let oracle_decision =
@@ -1380,7 +1380,7 @@ let asset_domain_worker
         let now = Unix.gettimeofday () in
         (* Count this strategy invocation as an activity tick so the dashboard
              can report executions/sec and last-execution time even when the
-             window's latency sample count is zero (S2). *)
+             window's latency sample count is zero. *)
         Latency_profiler.tick_exec prof_strategy ~now;
         (match !grid_strategy_asset_ref, cached_grid_state with
          | Some asset, Some cs ->
@@ -1436,14 +1436,14 @@ let asset_domain_worker
       (* Record cycle work time before blocking. Captures active processing
            latency only, excluding sleep time in Exchange_wakeup.wait_since.
            Only busy cycles (real book/exec/strategy work) are recorded: idle
-           wakeups would otherwise pin cycle p50/p99 at 0us (F2). *)
+           wakeups would otherwise pin cycle p50/p99 at 0us. *)
       let cycle_busy = did_ob || did_exec || should_execute in
       let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
       if latency_this_cycle && cycle_busy
       then (
         let cause_thunk () =
           let alloc_diff = Gc.minor_words () -. alloc_start in
-          (* M8: GC stats are window-scoped; the cause string uses the last
+          (* GC stats are window-scoped; the cause string uses the last
              [publish_windows] pair, never a per-cycle [Gc.quick_stat]. *)
           let gc_str = Gc_monitor.diff_to_string !gc_start !gc_end in
           Printf.sprintf
@@ -1457,7 +1457,7 @@ let asset_domain_worker
         Latency_profiler.record_with_cause prof_cycle cycle_span cause_thunk);
       (* Roll the latency window on a fixed time cadence rather than a cycle
            count: at typical domain cycle rates the old cycle_mod gate (10000
-           cycles) accumulated minutes of samples before an abrupt wipe (F1). *)
+           cycles) accumulated minutes of samples before an abrupt wipe. *)
       let now_flush = Unix.gettimeofday () in
       if now_flush -. !last_window_time >= latency_window_seconds
       then (
@@ -1466,7 +1466,7 @@ let asset_domain_worker
       (* Block until the next websocket frame signals new data or until data is ready.
             Use cached has_exec_fn closure instead of Ex.has_execution_data to
             avoid Hashtbl lookup on the hot blocking path.
-            R1: [wait_since] returns immediately if any producer signalled
+            [wait_since] returns immediately if any producer signalled
             while this cycle ran (generation > baseline), so a signal racing
             the cycle can no longer be lost to the park. *)
       if (not !should_execute_strategy) || not (has_exec_fn ())
@@ -1758,7 +1758,7 @@ let clear_domain_registry () =
     via [Latency_profiler.published_snapshot], a lock-free [Atomic.get].
     No percentile scan runs against a histogram that the domain thread is
     concurrently mutating, which eliminates the torn-read race between the
-    dashboard and the domain writer (F4). *)
+    dashboard and the domain writer. *)
 let get_domain_profiler_snapshots () =
   Mutex.lock profiler_cache_mutex;
   let profiler_refs =

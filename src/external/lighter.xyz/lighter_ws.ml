@@ -1,19 +1,20 @@
-(** Lighter WebSocket client module.
-    Manages dual persistent connections for public market data and private authenticated endpoints, bypassing Cloudflare Durable Object message size constraints.
-    Public and private connections maintain independent state lifecycles. A failure on one connection isolatedly reconnects that specific socket without impacting the opposite connection. This architecture mitigates the high frequency reconnect cycles and complete order book rebuilds that previously occurred dynamically during single connection disruptions. *)
+(** Lighter WebSocket client: dual persistent connections (public market data,
+    private authenticated), routed through a Cloudflare Durable Object proxy.
+    Each side reconnects independently, so one failure no longer tears down
+    the other side or forces full order book rebuilds. *)
 
 open Lwt.Infix
 
 let section = "lighter_ws"
 
-(** Cached subscription state parameters for automated reconnection loops.
-    Populated initially by [subscribe_to_feeds] and leveraged by the isolated connection reconnection callbacks to restore channel subscriptions without external supervisor intervention. *)
+(** Subscription parameters cached by [subscribe_to_feeds] and replayed by the
+    per-connection reconnect loops. *)
 let subscribed_symbols : string list ref = ref []
 
 let subscribed_account_index : int ref = ref 0
 let subscribed_auth_token : string ref = ref ""
 
-(** Subscription handle returned to downstream consumers invoking [subscribe_market_data]. *)
+(** Subscription handle from [subscribe_market_data]. *)
 type subscription =
   { stream : Yojson.Safe.t Lwt_stream.t
   ; close : unit -> unit
@@ -60,24 +61,25 @@ let pushers : (Yojson.Safe.t option -> bool) list ref = ref []
 
 let pushers_mutex = Mutex.create ()
 
-(** Atomic counter tracking consecutive unacknowledged ping operations, monitored by the upper level supervisor. *)
+(** Consecutive failed ping count, polled by the supervisor. *)
 let ping_failures = Atomic.make 0
 
 let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
 
-(** Atomic boolean gating the dispatch of ping messages on the private connection until initial payload data is received, strictly confirming the Durable Object proxy upstream relay is functional. *)
+(** Gates pings on the private connection until the first inbound frame
+    proves the Durable Object relay is forwarding. *)
 let private_stream_confirmed = Atomic.make false
 
-(** Atomic diagnostic counters tracking specific message payload categorizations transmitted through the WebSocket endpoints. *)
+(** Diagnostic counters by message category. *)
 
 let msg_counter_orderbook = Atomic.make 0
 let msg_counter_account = Atomic.make 0
 let msg_counter_other = Atomic.make 0
 let msg_counter_total = Atomic.make 0
 
-(** Iterates and forcefully closes all active subscriber stream connections upon a complete disconnect event. *)
+(** Closes all subscriber streams; used on a full disconnect. *)
 let close_all_subscribers () =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
@@ -94,7 +96,7 @@ let close_all_subscribers () =
       ps)
 ;;
 
-(** Broadcasts a parsed Yojson message payload to all currently registered active subscribers via their respective stream push functions. *)
+(** Pushes a message to all subscribers and prunes dead pushers. *)
 let broadcast_message json =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
@@ -113,7 +115,8 @@ let broadcast_message json =
     Mutex.unlock pushers_mutex)
 ;;
 
-(** Instantiates a bounded Lwt stream to act as a receiver queue for incoming WebSocket message payloads. *)
+(** Creates a subscriber with a bounded stream. A push that would block (slow
+    consumer) or arrive after close returns false and closes the stream. *)
 let subscribe_market_data () =
   let stream, push_source = Lwt_stream.create_bounded 16 in
   let closed = Atomic.make false in
@@ -150,7 +153,8 @@ let subscribe_market_data () =
   { stream; close }
 ;;
 
-(** Serializes and transmits a Yojson payload over the specified active WebSocket connection state reference. *)
+(** Serializes and sends a JSON payload on the given connection under its
+    lock. *)
 let send_json_on state json label =
   Lwt_mutex.with_lock state.connection_mutex (fun () ->
     match !(state.active_connection) with
@@ -193,15 +197,13 @@ let subscribe_public_orderbook ~symbols =
     public_stream
 ;;
 
-(** Issues subscription commands routed appropriately between the public and private dual WebSocket connections.
-    Caches the provided subscription parameters in module level references to facilitate autonomous channel restoral by the isolated reconnection loops without requiring supervisor coordination. *)
+(** Subscribes orderbook channels (public) and account channels (private);
+    caches the parameters so reconnect loops can replay them. *)
 let subscribe_to_feeds ~symbols ~account_index ~auth_token =
   subscribed_symbols := symbols;
   subscribed_account_index := account_index;
   subscribed_auth_token := auth_token;
-  (* Dispatch subscription requests for the orderbook channels corresponding to each requested symbol over the public network connection *)
   let%lwt () = subscribe_public_orderbook ~symbols in
-  (* Dispatch subscription requests for the authenticated user and account specific channels over the private network connection *)
   let acct_str = string_of_int account_index in
   let private_commands =
     [ `Assoc
@@ -236,7 +238,8 @@ let subscribe_to_feeds ~symbols ~account_index ~auth_token =
   Lwt.return_unit
 ;;
 
-(** Formats and transmits a cryptographically signed transaction payload via the private authenticated WebSocket connection. *)
+(** Sends a signed tx over the private WS ([jsonapi/sendtx]). Currently
+    unused; orders go through REST in [lighter_actions.ml]. *)
 let send_tx_ws ~tx_type ~tx_info =
   let json =
     `Assoc
@@ -252,7 +255,7 @@ let send_tx_ws ~tx_type ~tx_info =
     ws_feed inter-message gap measurement. *)
 let last_feed_time = ref 0.0
 
-(** Parses and dispatches a single WebSocket frame payload based on the operation code and underlying business logic message type. *)
+(** Dispatches one WS frame by opcode and message type. *)
 let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
   | Websocket.Frame.Opcode.Text ->
@@ -266,7 +269,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
       if !last_feed_time > 0.0
       then Network_latency.record_feed_s "lighter" (now -. !last_feed_time);
       last_feed_time := now);
-    (* Flag the private stream as confirmed functional upon receiving the first valid arbitrary text frame *)
+    (* Any inbound text frame proves the private relay works. *)
     if state == private_state && not (Atomic.get private_stream_confirmed)
     then Atomic.set private_stream_confirmed true;
     (try
@@ -377,15 +380,17 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
       Atomic.set state.is_connected_ref false;
       Lwt.return_unit)
     >>= fun () ->
-    (* Intentionally avoid closing active subscriber streams. An isolated disconnect event on a specific connection must not terminate consumer interfaces, as the dedicated reconnection loop will independently reestablish the broken socket. *)
+    (* Keep subscriber streams open: the reconnect loop will restore this
+       socket, and consumers must not be torn down by one side's outage. *)
     signal_new_data ();
     Lwt.return_unit
   | _ -> Lwt.return_unit
 ;;
 
-(** Establishes a targeted WebSocket connection and blocks the asynchronous thread while continually reading incoming frames.
-    Evaluates to unit upon connection closure regardless of the underlying termination reason.
-    Specifically avoids invoking the global subscriber closure mechanism as isolated connection failures are mitigated by the concurrent autonomous reconnection loop provisioned in [connect_and_monitor]. *)
+(** Connects one side and reads frames until the transport dies. Raises on
+    failure so the [connect_and_monitor] loop can retry; never closes
+    subscriber streams (the other side stays unaffected). Rotates the proxy
+    on 5xx errors from the private connection. *)
 let rec connect_one
           ~state
           ~connect_target
@@ -425,7 +430,7 @@ let rec connect_one
        Lwt_mutex.with_lock state.connection_mutex (fun () ->
          state.active_connection := Some conn;
          Atomic.set state.is_connected_ref true;
-         (* Reset the private stream confirmation flag ensuring ping messages remain suppressed until arbitrary inbound data confirms the upstream network relay is operational. *)
+         (* Require fresh proof of the relay before pinging again. *)
          if state == private_state then Atomic.set private_stream_confirmed false;
          Lwt_condition.broadcast state.connected_wakeup ();
          Lwt.return_unit)
@@ -601,8 +606,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
   let pub_ready = Atomic.make false in
   let priv_ready = Atomic.make false in
   let both_ready_fired = Atomic.make false in
-  (* Trigger the connection callback exclusively when both the public and private connections achieve an active state.
-     The mechanism ensures idempotent invocation within a continuous session, firing strictly during the initial state transition to universal readiness. *)
+  (* Fire [on_connected] once per session, when both sides are up. *)
   let check_both_ready () =
     if Atomic.get pub_ready && Atomic.get priv_ready
     then
@@ -612,8 +616,9 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
         Lighter_proxy.reset_proxy_failures ();
         on_connected ())
   in
-  (* Implements a continuous autonomous reconnection loop assigned to a specific connection.
-     The sequence executes indefinitely upon transport disconnection. Isolated network instability events are resolved internally without escalating failure states to the central supervisor. The supervisor relies on passive heartbeat monitoring functionality to detect verified prolonged network outages. *)
+  (* Independent reconnect loop per side: retries every 0.5s forever and
+      handles recovery internally; the supervisor detects real outages via
+      heartbeats. *)
   let reconnect_loop
         ~state
         ~connect_target
@@ -631,7 +636,8 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
         "[%s] Disconnected: %s (reconnecting independently)"
         label
         msg;
-      (* Prevent escalation to the supervisor failure callback as the localized reconnection loop handles mitigation. Providing external failure notifications here creates race conditions against the internal recovery procedures and risks unintended duplication of monitoring threads generated by the supervisor. *)
+      (* Do not escalate to the supervisor here: its failure callback would
+         race this loop and can duplicate monitor threads. *)
       if not (Atomic.get other_ready_flag)
       then (
         Logging.error_f
@@ -675,7 +681,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
                 (Printexc.to_string exn);
               Lwt.return_unit)
          >>= fun () ->
-         (* The underlying connection has terminated. Execute a defined subsecond delay before initiating a new connection sequence. *)
+         (* Connection ended; brief backoff before the next attempt. *)
          Atomic.set ready_flag false;
          Atomic.set both_ready_fired false;
          Logging.debug_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
@@ -690,7 +696,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
         ~ready_flag:pub_ready
         ~other_ready_flag:priv_ready
         ~on_side_reconnected:(fun () ->
-          (* Execute lightweight reconnection logic strictly issuing subset subscriptions for orderbook channels corresponding to the cached instrument symbols data *)
+          (* Resubscribe only the cached orderbook channels. *)
           let symbols = !subscribed_symbols in
           if List.length symbols > 0
           then (
@@ -708,7 +714,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
         ~ready_flag:priv_ready
         ~other_ready_flag:pub_ready
         ~on_side_reconnected:(fun () ->
-          (* Execute comprehensive reconnection logic issuing full subscription requests for all authenticated private account channels *)
+          (* Resubscribe all authenticated account channels. *)
           let symbols = !subscribed_symbols in
           let account_index = !subscribed_account_index in
           let auth_token = !subscribed_auth_token in
@@ -778,7 +784,8 @@ let send_ping ~req_id:_ ~timeout_ms =
            ])
       (fun _ -> Lwt.return false)
   in
-  (* Suppress outbound ping frames targeting the private connection until the underlying data stream confirms bidirectional transit. The Durable Object proxy requires latency to verify its upstream network relay target. Issuing ping requests prior to confirmation yields false negative failure states. *)
+  (* Skip private pings until the relay is confirmed; earlier pings would
+      report false failures. *)
   let priv_p =
     if not (Atomic.get private_stream_confirmed)
     then Lwt.return true

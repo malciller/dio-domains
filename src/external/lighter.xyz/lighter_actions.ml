@@ -1,20 +1,24 @@
-(** Lighter order actions and dispatch mechanisms.
-    This module implements the primary interface for order execution on the Lighter exchange, utilizing a dual transport strategy. It prioritizes WebSocket based order dispatch via the [jsonapi/sendtx] message type when the connection is active. In scenarios where the WebSocket connection is degraded or unavailable, it automatically falls back to utilizing the REST interface at [POST /api/v1/sendTx]. Transaction signing is handled securely through the [lighter_signer.ml] Foreign Function Interface. All REST fallback requests are automatically routed through the configured LIGHTER_PROXY address to maintain architectural consistency. *)
+(** Order actions for Lighter: place/cancel/modify via signed transactions.
+    Dispatch goes through REST [POST /api/v1/sendTx] via the configured
+    LIGHTER_PROXY; signing happens in [lighter_signer.ml] over FFI. (The WS
+    [jsonapi/sendtx] path in [lighter_ws.ml] exists but is currently unused.) *)
 
 open Lwt.Infix
 
 let section = "lighter_actions"
 
-(** Atomic counter mechanism for generating unique client order identifiers.
-    This counter is required to produce a globally unique client order index for every order placement across all markets as mandated by the Lighter protocol. To prevent indexing collisions across process restarts and concurrent instance executions, the counter is securely initialized using the current system epoch time in milliseconds. *)
+(** Client order index counter. Lighter requires a unique client order index
+    per placement across all markets; seeded from epoch millis so restarts do
+    not collide with previously issued indices. *)
 let client_order_counter = Atomic.make (int_of_float (Unix.gettimeofday () *. 1000.0))
 
 let next_client_order_index () =
   Int64.of_int (Atomic.fetch_and_add client_order_counter 1)
 ;;
 
-(** Dispatches a signed transaction array over the REST protocol fallback.
-    This function constructs a multipart form data payload that adheres to the Lighter API specification. It accepts the raw transaction information produced by the Go signer, similar to the behavior observed in the Python SDK implementation. The required form data fields are the transaction type represented as an integer and the transaction info represented as a JSON string. *)
+(** Submits a signed transaction over REST as multipart form data, matching the
+    Python SDK: fields [tx_type] (integer) and [tx_info] (JSON string produced
+    by the Go signer). *)
 let send_tx ~tx_type ~tx_info =
   let url = Lighter_proxy.api_base_url () ^ "/api/v1/sendTx" in
   Logging.debug_f ~section "Sending tx via REST (type=%d, tx_info=%s)" tx_type tx_info;
@@ -58,7 +62,10 @@ let send_tx ~tx_type ~tx_info =
            "REST sendTx failed (status=%s): %s"
            (Cohttp.Code.string_of_status status)
            resp_str;
-         (* Implement non-blocking auto recovery sequence for cryptographic nonce desynchronization. Ghost modifications executed during periods of WebSocket disconnection will consume nonce values locally but may fail to confirm on the blockchain. This behavior causes the local counter state to diverge from the exchange state. By re-fetching the correct nonce directly from the exchange, subsequent order operations are protected from entering an invalid nonce recursive failure loop. *)
+         (* Auto-recovery for nonce desync: operations sent during WS outages
+             consume nonces locally but may never confirm on chain, diverging
+             the local counter from the exchange. Re-fetch the authoritative
+             nonce so later orders do not loop on invalid-nonce rejections. *)
          let lower = String.lowercase_ascii resp_str in
          if String.length lower > 0
          then
@@ -86,8 +93,9 @@ let send_tx ~tx_type ~tx_info =
        Lwt.return (Error err))
 ;;
 
-(** Executes a new order placement on the Lighter exchange.
-    This function converts standard system order parameters into the specific numerical formats required by the Lighter protocol and initiates the transaction signing process. It proactively injects the order into the local execution feed using the client order index as the temporary order identifier until the exchange confirms the formal order index. *)
+(** Places a new order: converts params to Lighter's integer formats, signs the
+    create-order tx, and pre-registers the order in the local execution feed
+    keyed by client order index until the exchange assigns its own order id. *)
 let place_order
       ~symbol
       ~is_buy
@@ -116,7 +124,9 @@ let place_order
        in
        let lighter_ot = Lighter_types.lighter_order_type_int order_type in
        let lighter_tif = Lighter_types.lighter_tif_int ~post_only tif in
-       (* Note that the Lighter protocol necessitates the use of Good Till Time semantics, as Good Till Cancelled logic is not natively supported. A constant value of negative one is passed to instruct the Go signer tool to automatically calculate and apply the default standard order expiration period, mirroring the implementation found in the Python SDK. *)
+       (* Lighter has no native GTC; expiry follows GTT semantics. Passing -1
+           tells the Go signer to compute the default order expiry, matching
+           the Python SDK. *)
        let expiry = Int64.of_int (-1) in
        let tx_info =
          Lighter_signer.sign_create_order
@@ -144,7 +154,8 @@ let place_order
             qty
             price
             market_index;
-          (* Proactively inject the new order record into the open orders state tracking container. The client index value is utilized as the temporary client order identifier until the WebSocket feed formally assigns and confirms the final sequence order index. *)
+          (* Pre-register the order under the client index; the WS feed later
+             confirms the exchange-assigned order index. *)
           let side =
             if is_buy then Lighter_executions_feed.Buy else Lighter_executions_feed.Sell
           in
@@ -170,8 +181,7 @@ let place_order
           Lwt.return (Error msg)))
 ;;
 
-(** Initiates the cancellation of a previously placed order on the Lighter exchange.
-    This function derives the required market index and specific order index, generates the requisite cryptographic signature for the cancellation request, and transmits the signed payload via the appropriate transaction channels. *)
+(** Cancels an order: resolves market/order indices, signs, and submits the tx. *)
 let cancel_order ~symbol ~order_id =
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None -> Lwt.return (Error (Printf.sprintf "Unknown symbol: %s" symbol))
@@ -189,8 +199,8 @@ let cancel_order ~symbol ~order_id =
        Lwt.return (Error msg))
 ;;
 
-(** Submits a modification request for an active order on the Lighter exchange.
-    This process recalculates the internal Lighter integer representations for both base amount and price, processes the transaction signature for the modification, and transmits the new parameters while preserving the original order identity. *)
+(** Modifies an order's qty/price: converts to Lighter integers, signs, and
+    submits while keeping the original order id. *)
 let modify_order ~symbol ~order_id ~new_qty ~new_price =
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None -> Lwt.return (Error (Printf.sprintf "Unknown symbol: %s" symbol))
@@ -238,8 +248,8 @@ let modify_order ~symbol ~order_id ~new_qty ~new_price =
           Lwt.return (Error msg)))
 ;;
 
-(** Triggers a mass cancellation sequence for all active orders associated with a specific market on the Lighter exchange.
-    The function identifies the target market index and constructs a specialized comprehensive cancellation transaction, thereby clearing the entire order book state for the specified symbol. *)
+(** Cancels all open orders in one market: resolves the market index and
+    submits a signed cancel-all tx. *)
 let cancel_all_orders ~symbol =
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None -> Lwt.return (Error (Printf.sprintf "Unknown symbol: %s" symbol))

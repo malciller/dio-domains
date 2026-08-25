@@ -6,8 +6,11 @@ open Lwt.Infix
 
 let section = "hyperliquid_actions"
 
-(** Maps an Exchange_intf order type and optional time-in-force to an order_type_wire.
-    FOK is not natively supported by Hyperliquid; it is mapped to IOC as a best-effort fallback. *)
+(** Maps an Exchange_intf order type to an order_type_wire.
+    Plain limit orders are always posted Alo (add-liquidity-only); the
+    caller's time-in-force is honored only by the catch-all branch, which
+    handles non-standard order types. FOK is not supported by the venue
+    and degrades to IOC. *)
 let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force option)
   : order_type_wire
   =
@@ -98,7 +101,7 @@ type amend_order_result =
   ; order_id : int64
   }
 
-(** Cached credentials (M9): environment reads are hoisted to a lazy cache.
+(** Cached credentials : environment reads are hoisted to a lazy cache.
     Env vars are static for the process lifetime, so per-order [getenv_opt]
     calls are pure overhead. Lazy so modules can load (and tests can run)
     without the env vars set; the first real order resolves them. *)
@@ -120,7 +123,7 @@ let cached_credentials : (string * string) Lazy.t =
 let get_credentials () = Lazy.force cached_credentials
 
 (** Monotonically increasing nonce derived from wall-clock milliseconds.
-    Lock-free (M9): a CAS loop on an Atomic counter replaces the per-order
+    Lock-free : a CAS loop on an Atomic counter replaces the per-order
     mutex; contention is a single compare-and-set retry. *)
 let last_nonce = Atomic.make 0L
 

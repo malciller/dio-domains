@@ -5,8 +5,8 @@ open Lwt.Infix
 
 let section = "hyperliquid_orderbook"
 
-(* R3: raised from 16 - raw l2Book frames are large, but 16 slots let a
-   burst lap the dashboard reader in one tick; 64 absorbs typical bursts. *)
+(* Raw l2Book frames are large, and 16 slots let a burst lap the dashboard
+   reader in one tick; 64 absorbs typical bursts. *)
 let ring_buffer_size = 64
 
 type level =
@@ -344,7 +344,7 @@ let process_raw_market_data msg =
            if ok
            then Atomic.set store.tob { bid_px; bid_sz; ask_px; ask_sz; tob_valid = true };
            (* Store the RAW message in the ring buffer. The full-book parse
-                (get_bids_asks) is deferred to read time (M3): the dashboard
+                (get_bids_asks) is deferred to read time : the dashboard
                 parses on its 0.5s cadence; the domain TOB path never parses
                 the full book. *)
            RingBuffer.write store.buffer msg;
@@ -360,7 +360,7 @@ let process_raw_market_data msg =
       | None -> ()))
 ;;
 
-(** Parse a raw l2Book message into an [orderbook] on demand (M3: the full
+(** Parse a raw l2Book message into an [orderbook] on demand (the full
     book is parsed lazily, only when a consumer reads the ring buffer). *)
 let[@inline always] parse_orderbook symbol msg =
   let bids, asks = get_bids_asks msg in
@@ -399,7 +399,7 @@ let[@inline always] get_best_bid_ask_fast symbol =
 ;;
 
 (** Returns all orderbook snapshots written since [last_pos], parsing the
-    raw messages lazily on read (M3). *)
+    raw messages lazily on read. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
@@ -408,7 +408,7 @@ let[@inline always] read_orderbook_events symbol last_pos =
 ;;
 
 (** Iterates [f] over orderbook snapshots since [last_pos], parsing each raw
-    message lazily on read (M3) and without intermediate list allocation.
+    message lazily on read  and without intermediate list allocation.
     Returns the new cursor position. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match Hashtbl.find_opt stores symbol with

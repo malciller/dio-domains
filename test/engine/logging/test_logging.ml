@@ -197,7 +197,7 @@ let visual_len s =
 let test_format_line_no_full_date () =
   Logging.set_colors false;
   let line = Logging.format_line Logging.INFO "main" "hello" in
-  (* Timestamp is compact HH:MM:SS.mmm — no YYYY-MM-DD prefix. *)
+  (* Timestamp is compact HH:MM:SS.mmm: no YYYY-MM-DD prefix. *)
   Alcotest.(check bool)
     "timestamp is time-only"
     true
@@ -222,7 +222,7 @@ let test_format_line_alignment () =
 ;;
 
 (* Regression: the message column must be the same before AND after a long
-   section name appears — it must never shift mid-stream. *)
+   section name appears: it must never shift mid-stream. *)
 let test_format_line_stable_column () =
   Logging.set_colors false;
   let a = Logging.format_line Logging.INFO "main" "alpha" in

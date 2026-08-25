@@ -18,8 +18,10 @@
    collisions). Equities are unambiguous (Yahoo QQQ is QQQ), so any equity
    symbol maps by identity.
 
-   The API caps a request at ~2000 points, so the history is walked forward
-   in ~35-month windows from the requested start. Pure [parse_*] functions
+   The history is walked forward in [window_seconds] strides from the
+   requested start. The stride is sized to cover a full listing-to-now
+   span in one request; the loop remains as a fallback for longer spans.
+   Pure [parse_*] functions
    are fixture-testable without network.
 
    This library lives in [dio.yahoo] (src/external/yahoo/): it is a leaf
@@ -31,7 +33,7 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 
 let section = "yahoo"
-let window_seconds = 1_100_000_000L (* ~35 months: ~1050 daily points per request *)
+let window_seconds = 1_100_000_000L (* ~35y: full listing-to-now span per request *)
 let day_seconds = 86_400L
 
 (* Yahoo throttles sustained bursts (and the crumbless chart API degrades to
@@ -418,9 +420,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                  beginning (the walk re-checks nothing before it). *)
             if bars <> []
             then
-              remember_empty
-                ~symbol
-                (Exchange.Types.add_days (unix_to_iso from_ms) (-1));
+              remember_empty ~symbol (Exchange.Types.add_days (unix_to_iso from_ms) (-1));
             let acc = List.rev_append bars acc in
             if Int64.compare to_ms end_epoch >= 0
             then Lwt.return (List.rev acc, skipped, empty_200)

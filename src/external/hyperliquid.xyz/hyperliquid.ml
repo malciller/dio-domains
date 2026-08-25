@@ -1,7 +1,7 @@
 (** Top-level namespace for the Hyperliquid exchange integration.
-    Re-exports all submodules for authentication, WebSocket connectivity,
+    Re-exports all submodules: authentication, WebSocket connectivity,
     order actions, market data feeds, fee queries, lifecycle management,
-    shared types, and state persistence. *)
+    and shared types. *)
 
 (** EIP-712 typed-data signing for Hyperliquid L1 actions. *)
 module Signer = Hyperliquid_signer
@@ -33,7 +33,6 @@ module Module = Hyperliquid_module
 (** Shared type definitions for Hyperliquid domain objects. *)
 module Types = Hyperliquid_types
 
-(** Persistent state, delegated to the engine-level module. *)
 (** Oracle data-venue adapter (historical candles, fees, spot balances,
     instruments for the capital oracle; implements
     [Exchange_intf.Oracle.S]). *)

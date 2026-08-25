@@ -1,17 +1,15 @@
-(** Lighter Exchange Level 2 order book feed processing module.
-    Responsible for managing WebSocket subscriptions to the order_book channels mapped by market index.
-    The module handles an initial full state snapshot upon channel subscription,
-    followed by processing continuous incremental price level deltas.
-    State representation utilizes per symbol lock free ring buffers to maintain thread safe
-    and non blocking access for low latency logic sequence consumers. *)
+(** Lighter L2 order book feed: subscribes to order_book channels by market
+    index, applies an initial snapshot followed by incremental deltas, and
+    publishes per-symbol depth snapshots to lock-free ring buffers for
+    low-latency readers. *)
 
 let section = "lighter_orderbook"
-(* R3: raised from 16 to absorb bursts without lapping readers. *)
+
+(* Sized to absorb bursts without lapping readers. *)
 let ring_buffer_size = 64
 
-(** Constant defining the maximum permitted depth of price levels retained per side of the order book.
-    Imposes strict bounds on memory allocation and ensures structural alignment with downstream
-    consumers that strictly require localized top of book liquidity evaluation. *)
+(** Max price levels retained per side; consumers only need top of book, and
+    the cap bounds memory. *)
 let max_depth = 10
 
 type level =
@@ -26,17 +24,15 @@ type orderbook =
   ; timestamp : float
   }
 
-(** Instantiation of a lock free Single Producer Single Consumer ring buffer
-    specialized for storing dense order book snapshot configurations. *)
+(** Lock-free SPSC ring buffer holding published book snapshots. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per symbol state store encapsulating the ring buffer implementation, 
-    an atomic readiness mechanism for synchronous initialization detection,
-    and a mutually exclusive protected local state representation for delta application. *)
+(** Per-symbol state: ring buffer, ready flag, and a mutex-guarded local book
+    used to apply deltas. *)
 type store =
   { buffer : orderbook RingBuffer.t
   ; ready : bool Atomic.t
-  ; (* Local mutable order book state utilized exclusively for sequential incremental update evaluations *)
+  ; (* Local book state, used only to evaluate sequential delta updates. *)
     mutable local_bids : (float * float) list
     (** Maintains strictly sorted descending sequence by price coordinate *)
   ; mutable local_asks : (float * float) list
@@ -57,14 +53,9 @@ let notify_ready store =
     | _ -> ())
 ;;
 
-(** Executes a single pass algorithmic substitution to merge incremental price level updates
-    into a systematically sorted linked list of existing price levels.
-    A received size value mapping to zero dictates explicit level removal,
-    whereas non zero sizing evaluates to either an overriding upsert or a novel insertion.
-    Because the input data structures maintain sorted invariances, updates mutating 
-    extant levels will reconstruct the antecedent prefix while safely sharing the tail allocation.
-    Novel price level insertions involve splicing the datum into sequence with an optimal 
-    linear bounds scan, thereby averting the overhead of a post insertion sorting pass. *)
+(** Merges one price level update into a sorted list. Size zero removes the
+    level; otherwise upserts or inserts in sort order (single pass, tail
+    shared on update, no resort needed). *)
 let apply_delta levels price size ~is_bid =
   if size = 0.0
   then List.filter (fun (p, _) -> p <> price) levels
@@ -92,10 +83,7 @@ let apply_delta levels price size ~is_bid =
     go [] levels)
 ;;
 
-(** Enforces structural truncation on a price sequence list to adhere to the defined maximum depth threshold.
-    Due to the guaranteed pre sorted nature of the sequences, applying a sequential bounding procedure
-    selectively preserves the highest priority liquidity layers while systematically dropping
-    extraneous low priority tail records. *)
+(** Keeps the first [max_depth] levels; input is already sorted best-first. *)
 let truncate_to_depth levels =
   let rec take n acc = function
     | _ when n <= 0 -> List.rev acc
@@ -105,10 +93,8 @@ let truncate_to_depth levels =
   if List.length levels <= max_depth then levels else take max_depth [] levels
 ;;
 
-(** Performs a conversion of the current local mutable list state into an immutable array snapshot,
-    publishing the finalized form directly into the lock free ring buffer construct.
-    Leverages initialization mechanisms coupled with optimized positional accessors 
-    to expressly circumvent intermediate list mapping allocations and prevent excessive garbage collector pressure. *)
+(** Converts the local lists to arrays and writes the snapshot to the ring
+    buffer. *)
 let flush_to_ring store symbol =
   let nb = min (List.length store.local_bids) max_depth in
   let na = min (List.length store.local_asks) max_depth in
@@ -154,12 +140,12 @@ let process_orderbook_snapshot ~market_index json =
     | None -> string_of_int market_index
   in
   try
-    (* The Lighter exchange API structure specifies payload nesting under the order_book key rather than the standard data key. *)
+    (* Lighter nests the payload under [order_book], not [data]. *)
     let ob_data = member "order_book" json in
     if ob_data = `Null
     then (
       if
-        (* Captures diagnostic telemetry on null order book structures for structural debugging. *)
+        (* Log null-payload diagnostics once for schema debugging. *)
         not (Atomic.exchange first_snapshot_logged true)
       then (
         let keys =
@@ -172,7 +158,7 @@ let process_orderbook_snapshot ~market_index json =
           symbol
           (String.concat ", " keys)))
     else (
-      (* Logs the non null schema structure for internal verification purposes. *)
+      (* Log top-level keys once on the first valid snapshot. *)
       if not (Atomic.exchange first_snapshot_logged true)
       then (
         let keys =
@@ -184,7 +170,8 @@ let process_orderbook_snapshot ~market_index json =
           "Orderbook snapshot keys for %s: [%s]"
           symbol
           (String.concat ", " keys));
-      (* Resolves polymorphic field names to gracefully support both the abbreviated and fully expanded JSON properties. *)
+      (* Accept both abbreviated ([b]/[a]) and full ([bids]/[asks]) field
+         names. *)
       let bids_json = get_list_field ob_data "b" "bids" in
       let asks_json = get_list_field ob_data "a" "asks" in
       let parse_level_opt level =
@@ -232,8 +219,8 @@ let process_orderbook_snapshot ~market_index json =
       (Printexc.to_string exn)
 ;;
 
-(** Systematically parses and applies an incoming order book delta update,
-    routing incremental price level mutations to the locally synchronized cache representation. *)
+(** Parses an incremental delta and applies it to the local book, then
+    republishes to the ring buffer. *)
 let process_orderbook_update ~market_index json =
   let open Yojson.Safe.Util in
   let symbol =
@@ -242,7 +229,7 @@ let process_orderbook_update ~market_index json =
     | None -> string_of_int market_index
   in
   try
-    (* The Lighter exchange API structure specifies payload nesting under the order_book key rather than the standard data key. *)
+    (* Lighter nests the payload under [order_book], not [data]. *)
     let ob_data = member "order_book" json in
     if ob_data = `Null
     then ()
@@ -342,25 +329,22 @@ let[@inline always] get_best_bid_ask_fast symbol =
   | None -> fun () -> None
 ;;
 
-(** Materializes a vector of all fully structured order book snapshots seamlessly appended
-    into the ring buffer subsequent to the specified logical cursor position. *)
+(** Snapshots written after ring buffer position [last_pos]. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 ;;
 
-(** Implements an algorithmic traversal applying the provided function across all order book
-    snapshots committed following the supplied logical cursor.
-    This operation inherently avoids allocating intermediate structures and
-    returns the incremented terminal cursor position upon completion. *)
+(** Applies [f] to each snapshot after [last_pos] without intermediate
+    allocations; returns the new cursor. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
   | None -> last_pos
 ;;
 
-(** Resolves the currently active write sequence cursor position for the ring buffer paired with the provided symbol. *)
+(** Current ring buffer write position for [symbol]. *)
 let[@inline always] get_current_position symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.get_position store.buffer

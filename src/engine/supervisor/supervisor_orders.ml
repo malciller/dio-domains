@@ -61,7 +61,7 @@ let grid_callbacks : strategy_callbacks =
           order_id;
         match order.price with
         | Some price ->
-          (* H3: enqueue onto the per-symbol lifecycle queue; the domain thread
+          (* enqueue onto the per-symbol lifecycle queue; the domain thread
              drains it, so the strategy mutex is never taken cross-thread. *)
           Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
             order.symbol
@@ -181,7 +181,7 @@ let mm_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
-        (* R2: enqueue instead of calling handlers directly on this Lwt
+        (* enqueue instead of calling handlers directly on this Lwt
            fiber - the symbol's domain thread drains and executes them, so
            MM state is never mutated cross-thread against execute_strategy. *)
         Dio_strategies.Market_maker.Strategy.enqueue_event

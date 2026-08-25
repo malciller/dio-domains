@@ -66,7 +66,7 @@ let test_round_price_for_symbol () =
   (* Idempotency *)
   let r2 = Lighter.Instruments_feed.round_price_for_symbol "RNDP" rounded in
   Alcotest.(check (float 0.000000001)) "idempotent" rounded r2;
-  (* Unknown symbol — passthrough *)
+  (* Unknown symbol: passthrough *)
   let pass = Lighter.Instruments_feed.round_price_for_symbol "UNKNOWN_RND" 123.456 in
   Alcotest.(check (float 0.000001)) "passthrough" 123.456 pass
 ;;

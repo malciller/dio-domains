@@ -217,7 +217,7 @@ let monitor_loop () =
                  in
                  (* Active ping/pong liveness for authenticated connections.
                      The Kraken public orderbook feed does NOT respond to
-                     application-level pings — its liveness is governed
+                     application-level pings: its liveness is governed
                      exclusively by the passive data-heartbeat backstop. *)
                  if
                    String.equal conn.name "kraken_auth_ws"

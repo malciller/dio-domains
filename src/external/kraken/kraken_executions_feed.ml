@@ -136,7 +136,7 @@ module OrderUpdateEventBus = Event_bus.Make (struct
 (** Singleton order update event bus. *)
 let order_update_event_bus = OrderUpdateEventBus.create "order_update"
 
-(* P5: one-shot flag for the parse-domain skip warning above. *)
+(* One-shot flag: emit the parse-domain skip warning once. *)
 let order_update_bus_warned = Atomic.make false
 
 (** Open order record. *)
@@ -179,11 +179,9 @@ let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
 (** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires global_orders_mutex. *)
 let order_to_symbol : (string, string * side) Hashtbl.t = Hashtbl.create 16
-(** FIFO queue for O(1) oldest-entry eviction. *)
 
 (** FIFO queue for O(1) oldest-entry eviction. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
-(** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
 
 (** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
 let order_to_symbol_cap : int ref = ref max_int
@@ -226,7 +224,7 @@ let global_orders_mutex = Mutex.create ()
 
 (** Mutex for symbol_stores table initialization. *)
 let initialization_mutex = Mutex.create ()
-(* P5: frame dispatch runs on the Parse_worker domain, so the dispatch path
+(* frame dispatch runs on the Parse_worker domain, so the dispatch path
    must not touch Lwt primitives. The former [ready_condition]
    (Lwt_condition) was removed: readiness is published via store.ready
    Atomics from the parse domain and consumed by polling. *)
@@ -265,7 +263,7 @@ let[@inline] publish_open_orders_cache store =
   Atomic.set store.open_orders_cache snapshot
 ;;
 
-(** Marks the store as ready. P5: Atomic flag only - the startup waiter
+(** Marks the store as ready. Atomic flag only - the startup waiter
     polls it, so this is safe from the Parse_worker domain (the former
     Lwt_condition broadcast was not). *)
 let notify_ready store = if not (Atomic.get store.ready) then Atomic.set store.ready true
@@ -284,7 +282,7 @@ let has_execution_data_fast symbol =
 ;;
 
 (** Blocks until execution data is available for all specified symbols or timeout elapses.
-    P5: polls the per-store ready Atomics instead of waiting on a condition
+    polls the per-store ready Atomics instead of waiting on a condition
     variable - readiness is published from the Parse_worker domain, which
     must not touch Lwt primitives. The poll only runs during startup
     gating (bounded by the timeout), never on a hot path. *)
@@ -311,7 +309,7 @@ let[@inline always] get_open_orders symbol =
 ;;
 
 (** Fold over open orders for a symbol using the lock-free atomic snapshot.
-    Zero mutex contention on the hot path (H6). *)
+    Zero mutex contention on the hot path. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   let snapshot = Atomic.get store.open_orders_cache in
@@ -1078,7 +1076,7 @@ let handle_update json on_heartbeat =
            Atomic.set store.last_event_time event.timestamp;
            notify_ready store;
            Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
-           (* Publish to the order update event bus. P5: this bus is backed
+           (* Publish to the order update event bus. this bus is backed
               by Lwt streams (single-domain structures), so publishing from
               the Parse_worker domain is only safe when nobody is
               subscribed. It currently has zero subscribers anywhere in the
@@ -1188,12 +1186,12 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(* P5: per-connection heartbeat closure, published so the Parse_worker
+(* per-connection heartbeat closure, published so the Parse_worker
    handler can invoke it from the parse domain (domain-safe: mutex +
    timestamp update). One authenticated connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
-(** P5: parse-worker entry point. Executions pushes are intercepted in
+(** parse-worker entry point. Executions pushes are intercepted in
     Kraken_trading_client.handle_frame by a raw-string prefix check BEFORE
     the central Yojson parse, so this handler owns both the parse and the
     dispatch for the channel. [handle_message_json] is domain-safe: stores
@@ -1225,7 +1223,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.debug
     ~section
     "Registering executions subscription on unified authenticated connection";
-  (* P5: publish the heartbeat closure for the parse-domain handler; frames
+  (* publish the heartbeat closure for the parse-domain handler; frames
      now bypass this module's buffer-drain loop entirely (they are
      intercepted in Kraken_trading_client before reaching the buffer). *)
   Atomic.set current_on_heartbeat (Some on_heartbeat);

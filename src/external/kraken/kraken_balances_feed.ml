@@ -61,7 +61,8 @@ module BalanceStore = struct
     ; mutex : Mutex.t
     ; total_balance : float Atomic.t
       (* Cached sum of all wallet balances for this asset. *)
-    ; trading_balance : float Atomic.t (* Cached sum of trading (non-earn) wallet balances. *)
+    ; trading_balance :
+        float Atomic.t (* Cached sum of trading (non-earn) wallet balances. *)
     ; last_updated : float Atomic.t
     }
 
@@ -152,6 +153,7 @@ module BalanceStore = struct
 
   (** Returns the trading balance for this asset. *)
   let get_balance store = Atomic.get store.trading_balance
+
   let get_total_balance store = Atomic.get store.total_balance
 
   (** Returns the wall-clock timestamp of the last wallet update for this
@@ -596,19 +598,16 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(** Base quantity locked in resting SELL orders across every pair whose base
-    is [asset] (e.g. "XMR" over "XMR/USD"). Mirrors Hyperliquid's [hold]
-    semantics: Kraken's wallet snapshots report TOTAL balances, so the
-    open-order hold must be subtracted to obtain the tradeable figure. *)
 (** Quote value locked in resting BUY orders across every pair priced in
     [quote_asset]: sum of remaining_qty x limit_price. A buy hold reduces
-    tradeable quote exactly like a sell hold reduces tradeable base. *)
+    tradeable quote exactly like a sell hold reduces tradeable base.
+    Kraken wallet snapshots report TOTAL balances, so these holds must be
+    subtracted to obtain the tradeable figure (Hyperliquid's store nets the
+    hold at ingestion; here it is derived on read). *)
 let[@warning "-32"] get_pending_buy_quote_value quote_asset =
   let suffix = "/" ^ quote_asset in
   let all_symbols = Kraken_executions_feed.get_all_symbols () in
-  let matching =
-    List.filter (fun sym -> String.ends_with ~suffix sym) all_symbols
-  in
+  let matching = List.filter (fun sym -> String.ends_with ~suffix sym) all_symbols in
   let open_orders =
     List.concat_map (fun symbol -> Kraken_executions_feed.get_open_orders symbol) matching
   in
@@ -622,7 +621,10 @@ let[@warning "-32"] get_pending_buy_quote_value quote_asset =
     open_orders
 ;;
 
-(** Calculates the total pending sell quantity across all symbols for the given base asset. *)
+(** Base quantity locked in resting SELL orders across every pair whose base
+    is [asset] (e.g. "XMR" over "XMR/USD"). Mirrors Hyperliquid's [hold]
+    semantics: Kraken's wallet snapshots report TOTAL balances, so the
+    open-order hold must be subtracted to obtain the tradeable figure. *)
 let get_pending_sell_qty base_asset =
   let prefix = base_asset ^ "/" in
   let all_symbols = Kraken_executions_feed.get_all_symbols () in
@@ -635,31 +637,6 @@ let get_pending_sell_qty base_asset =
        match o.side with
        | Kraken_executions_feed.Sell -> acc +. o.remaining_qty
        | Kraken_executions_feed.Buy -> acc)
-    0.0
-    open_orders
-;;
-
-(** Quote value locked in resting BUY orders across every pair priced in
-    [quote_asset]: sum of remaining_qty x limit_price. A buy hold reduces
-    tradeable quote exactly like a sell hold reduces tradeable base.
-    Kraken wallet snapshots report TOTAL balances, so these holds must be
-    subtracted to obtain the tradeable figure (Hyperliquid's store nets the
-    hold at ingestion; here it is derived on read). *)
-let[@warning "-32"] get_pending_buy_quote_value quote_asset =
-  let suffix = "/" ^ quote_asset in
-  let all_symbols = Kraken_executions_feed.get_all_symbols () in
-  let matching =
-    List.filter (fun sym -> String.ends_with ~suffix sym) all_symbols
-  in
-  let open_orders =
-    List.concat_map (fun symbol -> Kraken_executions_feed.get_open_orders symbol) matching
-  in
-  List.fold_left
-    (fun acc (o : Kraken_executions_feed.open_order) ->
-       match o.side with
-       | Kraken_executions_feed.Buy ->
-         acc +. (o.remaining_qty *. Option.value o.limit_price ~default:0.0)
-       | Kraken_executions_feed.Sell -> acc)
     0.0
     open_orders
 ;;

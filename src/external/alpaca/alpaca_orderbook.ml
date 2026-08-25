@@ -29,7 +29,7 @@ type trade =
   }
 
 module SymbolStore = struct
-  (** Single-writer atomic TOB cache (H2): the WS writer publishes a fresh
+  (** Single-writer atomic TOB cache : the WS writer publishes a fresh
       immutable record on every push, and readers do a single [Atomic.get]
       with no mutex. Position and best-bid/ask travel together so a reader
       can never observe a torn (mixed-generation) snapshot. *)
@@ -106,7 +106,7 @@ module SymbolStore = struct
       cache
     in
     Atomic.set t.tob tob_cache;
-    (* P2: wake only the domain trading this symbol. signal_all here woke
+    (* wake only the domain trading this symbol. signal_all here woke
        every configured asset per tick (O(N) futex wakes + N wasted cycles
        on every quote). *)
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol

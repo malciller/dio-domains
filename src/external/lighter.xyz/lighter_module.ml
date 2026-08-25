@@ -1,6 +1,6 @@
-(** Defines the implementation of Exchange_intf tailored specifically for the Lighter Layer 2 Decentralized Exchange.
-    This module serves as the primary integration point, coordinating Lighter specific WebSocket feeds, Foreign Function Interface signer operations, REST and WebSocket action endpoints,
-    and instrument metadata retrieval. It encapsulates these exchange specific mechanisms and exposes them through a uniform interface that can be natively consumed by trading strategies. *)
+(** [Exchange_intf] implementation for Lighter L2: wires the WebSocket feeds,
+    FFI signer, action endpoints, and instrument metadata behind the
+    venue-agnostic interface consumed by strategies. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -10,10 +10,10 @@ module Lighter_impl = struct
   let name = "lighter"
   let section = "lighter_module"
 
-  (* Cache storing fee structures per trading pair. The hashtable maps the string symbol identifier to a tuple representing the maker fee and taker fee coefficients. *)
+  (* symbol -> (maker_fee, taker_fee) cache. *)
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 
-  (* Utility functions for converting between Lighter specific internal representations and the agnostic Types representations. *)
+  (* Conversions between Lighter feed types and the agnostic [Types]. *)
   let status_of_lighter_status = function
     | Lighter_executions_feed.PendingStatus -> Types.Pending
     | Lighter_executions_feed.NewStatus -> Types.New
@@ -30,8 +30,8 @@ module Lighter_impl = struct
     | Lighter_executions_feed.Sell -> Types.Sell
   ;;
 
-  (** Constructs and transmits a new order placement request to the Lighter execution endpoint.
-      This function handles price and quantity sanitization, conforming the values to the instrument specific tick size and lot size constraints prior to dispatch. *)
+  (** Places an order; rounds price/qty to the instrument's tick and lot sizes
+      before submission. *)
   let place_order
         ~token:_
         ~order_type
@@ -60,7 +60,8 @@ module Lighter_impl = struct
       | None ->
         (match order_type with
          | Types.Market ->
-           (* Simulates a true market order by querying the current best bid and ask from the orderbook feed and applying a predefined slippage tolerance bound to ensure execution likelihood. *)
+           (* No true market orders: cross the spread with a 5% slippage
+               tolerance to maximize fill odds. *)
            (match Lighter_orderbook_feed.get_best_bid_ask symbol with
             | Some (bid, _, ask, _) -> if is_buy then ask *. 1.05 else bid *. 0.95
             | None ->
@@ -92,8 +93,8 @@ module Lighter_impl = struct
     | Error msg -> Error msg
   ;;
 
-  (** Transmits an in place modification request for an existing order identifier on the Lighter execution endpoint.
-      This operation adjusts the open quantity or limit price without requiring a separate cancellation and replacement cycle, thereby preserving queue priority. *)
+  (** Amends qty/price of an existing order in place, without a
+      cancel-and-replace cycle. *)
   let amend_order
         ~token:_
         ~order_id
@@ -120,7 +121,10 @@ module Lighter_impl = struct
     then Lwt.return (Error "Cannot amend: symbol unknown and order not found")
     else if Option.is_none existing
     then
-      (* Implements a protective guard mechanism that prevents enqueuing in place modifications if the live open order cache cannot resolve the target order due to a recent WebSocket disconnection. Returning an error forces the request through the standard amendment failure cooldown logic, preventing the system from continuously transmitting Layer 2 modify instructions against an untracked phantom order. *)
+      (* Reject amends for orders missing from the live cache (e.g. after a
+         WS reconnect): retrying against an untracked phantom order would
+         spam L2 modify txs; surfacing the error engages the upstream amend
+         failure cooldown instead. *)
       Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
     else (
       let new_qty =
@@ -148,8 +152,8 @@ module Lighter_impl = struct
       | Error msg -> Error msg)
   ;;
 
-  (** Initiates cancellation sequences for a specified collection of order identifiers.
-      This function maps over the provided list, resolving symbol endpoints dynamically and dispatching individual cancellation requests via the Lighter actions interface. *)
+  (** Cancels a list of orders, resolving each symbol from the executions feed
+      when not supplied. *)
   let cancel_orders
         ~token:_
         ?order_ids
@@ -170,7 +174,8 @@ module Lighter_impl = struct
       let results =
         Lwt_list.map_s
           (fun order_id ->
-             (* Attempts to resolve the base symbol identifier directly from the cancellation request parameters, falling back to a global lookup within the centralized executions feed if unprovided. *)
+             (* Use the given symbol, else look the order up in the
+                executions feed. *)
              let sym =
                match symbol with
                | Some s -> s
@@ -205,7 +210,7 @@ module Lighter_impl = struct
       if errors = [] then Ok successes else Error (String.concat "; " errors))
   ;;
 
-  (* Structural section designated for exposing read only market data accessors and synchronization points. *)
+  (* Read-only market data accessors. *)
 
   let subscribe_orderbook ~symbols = Lighter_ws.subscribe_public_orderbook ~symbols
   let get_top_of_book ~symbol = Lighter_orderbook_feed.get_best_bid_ask symbol
@@ -391,7 +396,7 @@ module Lighter_impl = struct
            })
   ;;
 
-  (** Provides a high performance, zero allocation iterator over the current best bid and ask levels from the underlying synchronized orderbook structure. *)
+  (** Iterates best bid/ask (price, size) per snapshot since [start_pos]. *)
   let iter_top_of_book_events ~symbol ~start_pos f =
     Lighter_orderbook_feed.iter_orderbook_events
       symbol
@@ -404,7 +409,7 @@ module Lighter_impl = struct
            f bid.price bid.size ask.price ask.size))
   ;;
 
-  (** Structural section providing functions to query base instrument specifications, including minimum quantities and tick increments, for price and size rounding logic. *)
+  (** Instrument spec queries: tick/lot increments, minimums, and rounding. *)
 
   let get_price_increment ~symbol = Lighter_instruments_feed.get_price_increment symbol
   let get_qty_increment ~symbol = Lighter_instruments_feed.get_qty_increment symbol
@@ -418,7 +423,7 @@ module Lighter_impl = struct
     match Hashtbl.find_opt fee_cache symbol with
     | Some (maker, taker) -> Some maker, Some taker
     | None ->
-      (* Retrieves the requisite fee structure from the synchronized instruments feed and populates the local fee cache to accelerate future lookups. *)
+      (* Cache miss: load fees from the instruments feed. *)
       (match Lighter_instruments_feed.lookup_info symbol with
        | Some info ->
          Hashtbl.replace fee_cache symbol (info.maker_fee, info.taker_fee);
@@ -427,7 +432,7 @@ module Lighter_impl = struct
   ;;
 end
 
-(** Defines the systematic initialization procedures required to establish the underlying WebSocket connections and requisite cryptographic resources before strategy execution can commence. *)
+(** Blocks until both Lighter WS connections are up. *)
 let wait_for_ws_connected () = Lighter_ws.wait_for_connected ()
 
 let initialize_signer () =
@@ -467,13 +472,15 @@ let initialize_signer () =
     Lwt.return_unit
 ;;
 
-(** Fetches the base instrument specifications for the stipulated symbol set utilizing the REST API, and injects the retrieved metadata into the synchronized instruments feed. *)
+(** Fetches instrument metadata over REST for [symbols] into the instruments
+    feed. *)
 let initialize_instruments ~symbols =
   let base_url = Lighter_proxy.api_base_url () in
   Lighter_instruments_feed.fetch_and_initialize ~base_url ~required_symbols:symbols
 ;;
 
-(** Executes a centralized REST request to retrieve all active open orders managed by the current indexed account, injecting the resultant payload into the executions feed to reconcile state after a connection anomaly. *)
+(** Pulls open orders for the account over REST and feeds them into the
+    executions feed to reconcile state after a reconnect. *)
 let fetch_open_orders () =
   let section = "lighter_startup" in
   let account_index =
@@ -485,7 +492,7 @@ let fetch_open_orders () =
   in
   let base_url = Lighter_proxy.api_base_url () in
   let token = Lighter_signer.get_auth_token () in
-  (* Constructs the specific uniform resource locator format required by the Lighter software development kit, appending the query parameters for account index and the generated authentication token. *)
+  (* accountActiveOrders takes account_index and auth token query params. *)
   let url =
     Printf.sprintf
       "%s/api/v1/accountActiveOrders?account_index=%d&auth=%s"
@@ -674,5 +681,5 @@ let fetch_balances () =
        Lwt.return_unit)
 ;;
 
-(* Dynamically registers the constructed Lighter implementation module with the global Exchange Registry upon module load execution. *)
+(* Register the implementation with the exchange registry at module load. *)
 let () = Exchange.Registry.register (module Lighter_impl)

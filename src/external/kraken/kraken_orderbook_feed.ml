@@ -286,7 +286,7 @@ let add_subscribed_symbols symbols =
   total
 ;;
 
-(* P5: frame parsing/dispatch runs on the Parse_worker domain, so nothing in
+(* frame parsing/dispatch runs on the Parse_worker domain, so nothing in
    the dispatch path may touch Lwt primitives. The old [Lwt_condition]
    ready signal became an Atomic flag polled by the startup waiter, and the
    sequence-gap resubscribe trigger became a pending-queue drained by a
@@ -316,7 +316,7 @@ let[@inline] request_resubscribe symbol =
   loop ()
 ;;
 
-(** M2: recompute the book checksum at most once per this many updates per
+(** recompute the book checksum at most once per this many updates per
     symbol. The checksum rebuild does 2 extra fold+sort+array passes per tick;
     every 10th update still validates constantly-changing books far more often
     than the exchange's drift window needs. *)
@@ -410,7 +410,7 @@ let store_opt symbol = Hashtbl.find_opt stores symbol
 let notify_ready ~symbol store =
   if not (Atomic.get store.ready)
   then
-    (* P5: Atomic flag only - the startup waiter polls it, so this is safe
+    (* Atomic flag only - the startup waiter polls it, so this is safe
        from the Parse_worker domain (the old Lwt_condition.broadcast was
        not). *)
     Atomic.set store.ready true;
@@ -718,7 +718,7 @@ let process_orderbook_message ~reset json on_heartbeat =
                RingBuffer.clear store.buffer;
                Atomic.set store.has_snapshot false;
                Atomic.set store.last_sequence None;
-               (* P5: domain-safe trigger - the Lwt watcher drains this. *)
+               (* domain-safe trigger - the Lwt watcher drains this. *)
                request_resubscribe symbol;
                raise Exit (* Skip processing this entry *)
              | Some curr_seq, Some last_seq
@@ -737,7 +737,7 @@ let process_orderbook_message ~reset json on_heartbeat =
                RingBuffer.clear store.buffer;
                Atomic.set store.has_snapshot false;
                Atomic.set store.last_sequence None;
-               (* P5: domain-safe trigger - the Lwt watcher drains this. *)
+               (* domain-safe trigger - the Lwt watcher drains this. *)
                request_resubscribe symbol;
                raise Exit (* Skip processing this entry *)
              | _ -> ());
@@ -762,7 +762,7 @@ let process_orderbook_message ~reset json on_heartbeat =
            (* Compute and verify CRC32 from current state using top 10 levels per side.
             If the configured depth is < 10, checksum validation is bypassed because
             the stored map lacks the requisite levels to evaluate the CRC.
-            M2: the checksum recompute (2 extra fold+sort+array passes) is throttled
+            the checksum recompute (2 extra fold+sort+array passes) is throttled
             to every [checksum_every_n] updates per symbol; the book is still built
             and written per tick, only the redundant CRC pass is slowed down. *)
            store.checksum_tick <- store.checksum_tick + 1;
@@ -1032,12 +1032,12 @@ let trigger_orderbook_cleanup ~reason () =
     stalled book feed). *)
 let last_book_time = ref 0.0
 
-(* P5: the per-connection heartbeat closure, published so the Parse_worker
+(* the per-connection heartbeat closure, published so the Parse_worker
    handler can invoke it from the parse domain (it is domain-safe: a mutex
    and a timestamp update). One orderbook connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
-(** P5: synchronous dispatch of an already-parsed frame. DOMAIN-SAFE: no
+(** synchronous dispatch of an already-parsed frame. DOMAIN-SAFE: no
     Lwt primitives here - this runs on the Parse_worker domain. Sequence-gap
     resubscribes go through the pending queue; readiness through Atomics;
     logging/profiling/wakeups are all domain-safe. *)
@@ -1117,7 +1117,7 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(** P5: asynchronous path used by the WS read loop. Tick accounting and the
+(** asynchronous path used by the WS read loop. Tick accounting and the
     heartbeat stay on the Lwt fiber; the JSON parse and dispatch move to the
     Parse_worker domain. Falls back to the synchronous path when the worker
     queue is full - Kraken book updates are deltas, so frames must never be
@@ -1139,7 +1139,7 @@ let wait_for_orderbook_data_lwt symbols timeout_seconds =
       if elapsed >= timeout_seconds
       then
         Lwt.return_false
-        (* P5: poll the per-store ready flags instead of blocking on a
+        (* poll the per-store ready flags instead of blocking on a
            condition variable - readiness is now published from the
            Parse_worker domain, which must not touch Lwt primitives. The
            25ms poll only runs during startup gating (bounded by the
@@ -1182,7 +1182,7 @@ let start_message_handler conn symbols on_failure on_heartbeat =
       on_failure "Connection closed by server";
       Lwt.return_unit
     | frame ->
-      (* P5: parse+dispatch run on the Parse_worker domain; this returns
+      (* parse+dispatch run on the Parse_worker domain; this returns
          immediately (no awaiting), keeping the WS read loop tight. *)
       let () = handle_message_async frame.Websocket.Frame.content on_heartbeat in
       Lwt.return_unit
@@ -1237,7 +1237,7 @@ let resubscribe_backoff_delay_s attempt =
 let rec subscribe_symbols symbols =
   resubscribe_symbol_ref := Some (fun s -> resubscribe_symbol s);
   let _ = add_subscribed_symbols symbols in
-  (* P5: drain sequence-gap resubscribe requests raised on the Parse_worker
+  (* drain sequence-gap resubscribe requests raised on the Parse_worker
      domain. The watcher runs on the Lwt main domain, where the Lwt-based
      [resubscribe_symbol] is safe. Started once; 50ms poll on a path that
      only fires when a feed degrades. *)

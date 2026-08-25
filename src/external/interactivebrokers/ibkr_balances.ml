@@ -1,41 +1,44 @@
-(** Account balance tracking mechanism utilizing the reqAccountUpdates directive from the Interactive Brokers API.
+(** Account balance tracking via the IB reqAccountUpdates directive.
 
-    This module maintains the programmatic state for both available and total cash balances, which provides the capacity to distinguish between settled operational funds and unsettled funds pending the standard clearance cycle.
+    Maintains available and total cash balances (settled vs unsettled
+    funds) plus portfolio positions pushed by updatePortfolio.
 
-    Detailed Interactive Brokers Workstation account parameters monitored:
-    * TotalCashBalance: Aggregate cash balance inclusive of pending settlement transactions.
-    * AvailableFunds: Liquid capital cleared for deployment in new trade executions.
-    * BuyingPower: Aggregate purchasing capacity adjusted against account margin requirements.
-    * NetLiquidation: Calculated net liquidation value of the portfolio.
-    * GrossPositionValue: Aggregate current market valuation across all outstanding positions.
-    * SettledCash: Cleared capital restricted strictly to completed settlement finalities.
-    * UnrealizedPnL: Unsecured profit and loss aggregated over all open positions.
-    * RealizedPnL: Secured profit and loss aggregated for the current active trading session.
-    * ExcessLiquidity: Available clearance cushion above the strict maintenance margin threshold. *)
+    Workstation account values tracked:
+    * TotalCashBalance: cash balance including pending settlement activity.
+    * AvailableFunds: liquid capital usable for new trades.
+    * BuyingPower: purchasing capacity after margin requirements.
+    * NetLiquidation: net liquidation value of the portfolio.
+    * GrossPositionValue: aggregate market value of all positions.
+    * SettledCash: cash with completed settlement only.
+    * UnrealizedPnL: mark-to-market PnL on open positions.
+    * RealizedPnL: closed-out PnL for the current session.
+    * ExcessLiquidity: cushion above maintenance margin. *)
 
 let section = "ibkr_balances"
 
-(** Primary memory store for account metrics mapping parameter identifiers to a tuple containing the floating point magnitude and currency designation string. *)
+(** Account values keyed by parameter name -> (value, currency). *)
 let account_values : (string, float * string) Hashtbl.t = Hashtbl.create 32
 
 let account_values_mutex = Mutex.create ()
 let ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
-(** Primary memory store for portfolio positions mapping the instrument symbol string to a tuple representing quantity, current market quotation, calculated market value, and volume weighted average cost. *)
+(** Positions keyed by symbol ->
+    (qty, market_price, market_value, avg_cost). *)
 let positions : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 32
 
 let positions_mutex = Mutex.create ()
 
-(** Dispatch handler for the updateAccountValue network callback.
-    Expected data structure fields: protocol version, parameter key, numeric value, currency denomination string, and target account identifier. *)
+(** updateAccountValue handler.
+    Fields: version, key, value, currency, account id. *)
 let handle_account_value fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let key, fields = Ibkr_codec.read_string fields in
   let value, fields = Ibkr_codec.read_float fields in
   let currency, fields = Ibkr_codec.read_string fields in
   let _account, _fields = Ibkr_codec.read_string fields in
-  (* Index payload using a currency qualified string key to support multiple currency environments, while preserving the baseline key index for default USD queries. *)
+  (* Currency-qualified key alongside the bare key so multi-currency
+     accounts do not collide; USD queries use the bare key. *)
   Mutex.lock account_values_mutex;
   Hashtbl.replace account_values key (value, currency);
   if currency <> ""
@@ -46,7 +49,8 @@ let handle_account_value fields =
     Atomic.set ready true;
     try Lwt_condition.broadcast ready_condition () with
     | _ -> ());
-  (* Emit telemetry regarding significant account balance parametric shifts at the informational severity level. *)
+  (* Log every key at debug level; balances update frequently and are not
+     worth info-level noise. *)
   match key with
   | "TotalCashBalance"
   | "AvailableFunds"
@@ -58,8 +62,11 @@ let handle_account_value fields =
   | _ -> Logging.debug_f ~section "Account %s = %.2f %s" key value currency
 ;;
 
-(** Dispatch handler for the updatePortfolio network callback delivering position level modifications.
-    Expected data structure fields: protocol version, contract identifier, primary symbol string, security classification type, expiration or last trade indicator, strike price, option right classification, contract multiplier, primary venue exchange, currency denomination, localized symbol designation, proprietary trading class, net position quantity, current market quotation, calculated market value, volume weighted average cost, unsecured profit and loss, secured profit and loss, and target account identifier. *)
+(** updatePortfolio handler.
+    Fields: version, contract id, symbol, sec type, expiry, strike, right,
+    multiplier, primary exchange, currency, local symbol, trading class,
+    position, market price, market value, avg cost, unrealized PnL,
+    realized PnL, account id. *)
 let handle_portfolio_value fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let _con_id, fields = Ibkr_codec.read_int fields in
@@ -98,7 +105,7 @@ let handle_portfolio_value fields =
       realized_pnl
 ;;
 
-(** Execute registration sequence for ingress payload handlers and initialize subscriptions for account level metrics. *)
+(** Registers account/portfolio handlers. *)
 let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_account_value
@@ -108,23 +115,21 @@ let register_handlers () =
     ~handler:handle_portfolio_value
 ;;
 
-(** Transmit subscription request payload for account state parameter updates targeted at the specified account identifier string. *)
+(** Subscribes to account updates for [account_id]. *)
 let subscribe conn ~account_id =
   Logging.info_f ~section "Subscribing to account updates for %s" account_id;
   Ibkr_connection.send
     conn
     [ string_of_int Ibkr_types.msg_req_account_updates
     ; "2"
-    ; (* Protocol structure version *)
+    ; (* version *)
       "1"
-    ; (* Subscription boolean flag equivalent to true *)
+    ; (* subscribe = true *)
       account_id
     ]
 ;;
 
-(* Public structural access procedures *)
-
-(** Access specific account parameter value by string key index. Resolves to a zero component float magnitude if the parameter is not present in the primary memory store. *)
+(** Account value by key; 0.0 when absent. *)
 let[@inline always] get_account_value key =
   Mutex.lock account_values_mutex;
   let r =
@@ -136,31 +141,31 @@ let[@inline always] get_account_value key =
   r
 ;;
 
-(** Retrieve aggregate cash balance including pending settlement allocations. *)
+(** Total cash including pending settlement. *)
 let get_total_cash () = get_account_value "TotalCashBalance"
 
-(** Retrieve cleared liquid capital available for immediate deployment in trade executions. This parameter determines the absolute upper bound for direct asset acquisition configurations. *)
+(** Funds available for new trades; caps direct asset purchases. *)
 let get_available_funds () = get_account_value "AvailableFunds"
 
-(** Retrieve cleared cash parameter filtering out any pending settlement transaction allocations. *)
+(** Cash with settlement complete. *)
 let get_settled_cash () = get_account_value "SettledCash"
 
-(** Retrieve aggregate purchasing capacity adjusted against account margin requirements. *)
+(** Purchasing capacity after margin requirements. *)
 let get_buying_power () = get_account_value "BuyingPower"
 
-(** Retrieve the calculated net liquidation valuation of the comprehensive portfolio. *)
+(** Net liquidation value of the portfolio. *)
 let get_net_liquidation () = get_account_value "NetLiquidation"
 
-(** Retrieve the unsecured profit and loss parametric dimension aggregated across all positional allocations. *)
+(** Mark-to-market PnL on open positions. *)
 let get_unrealized_pnl () = get_account_value "UnrealizedPnL"
 
-(** Interrogate the balance query interface for a specific normalized asset designation.
-    Translates fundamental system nomenclature into respective Interactive Brokers Workstation metric keys:
-    * USD translates to AvailableFunds which defines deployable operational capital.
-    * TOTAL_CASH translates to TotalCashBalance.
-    * SETTLED translates to SettledCash.
-    * NET_LIQ translates to NetLiquidation.
-    * Unmapped parameters execute a direct key lookup against the primary account values memory store. *)
+(** Maps an asset name to a balance query:
+    * USD -> AvailableFunds (deployable capital)
+    * TOTAL_CASH -> TotalCashBalance
+    * SETTLED -> SettledCash
+    * NET_LIQ -> NetLiquidation
+    Other names fall back to the positions table (equities), then to a
+    raw account-value key lookup. *)
 let get_balance ~asset =
   match asset with
   | "USD" -> get_available_funds ()
@@ -169,8 +174,8 @@ let get_balance ~asset =
   | "NET_LIQ" -> get_net_liquidation ()
   | "BUYING_POWER" -> get_buying_power ()
   | symbol ->
-    (* For equity instruments, query the positions memory store populated via the updatePortfolio callback mechanism.
-         Implement a secondary fallback to the account values memory store for unmapped operational parameters. *)
+    (* Equities: look up the positions table first, then account values
+         as a fallback for unmapped keys. *)
     Mutex.lock positions_mutex;
     let r = Hashtbl.find_opt positions symbol in
     Mutex.unlock positions_mutex;
@@ -179,13 +184,16 @@ let get_balance ~asset =
      | None -> get_account_value symbol)
 ;;
 
-(** Construct an aggregated balance payload formatted for compatibility with the supervisor inactive asset monitoring sequence. Interactive Brokers account states leverage internal parametric keys rather than tradable external asset designations. This interface strictly surfaces the USD identifier mapped to AvailableFunds metrics. Component positions are independently tracked via the updatePortfolio mechanism. *)
+(** Balance summary for supervisor asset monitoring. IBKR accounts are keyed
+    by internal parameter names rather than tradable assets, so this
+    surfaces only USD (mapped to AvailableFunds); individual positions are
+    tracked via updatePortfolio. *)
 let get_all_balances () =
   let usd = get_available_funds () in
   if usd > 0.0 then [ "USD", usd ] else []
 ;;
 
-(** Access the internal position parameters for a provided symbol string, returning an unwrapped tuple representing the numeric quantity, current market quotation, calculated market value, and volume weighted average cost parameters. *)
+(** Position tuple (qty, market price, market value, avg cost) for [symbol]. *)
 let get_position ~symbol =
   Mutex.lock positions_mutex;
   let r = Hashtbl.find_opt positions symbol in
@@ -193,7 +201,7 @@ let get_position ~symbol =
   r
 ;;
 
-(** Execute the structural module initialization sequence and mount required network dispatch payload listener targets. *)
+(** Registers handlers; safe to call once at startup. *)
 let initialize () =
   register_handlers ();
   Logging.info ~section "Balances module initialized"

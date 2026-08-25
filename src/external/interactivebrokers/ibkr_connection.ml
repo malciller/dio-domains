@@ -1,22 +1,16 @@
-(** Advanced TCP socket multiplexer allocated for Interactive Brokers Gateway communication.
+(** TCP transport for the IB Gateway connection.
 
-    Administrates the low level Unix transport layer including TCP binding operations, the
-    synchronous TWS API initialization handshake protocol, binary payload framing mechanics,
-    and automatic socket recovery loops parameterized with exponential backoff logic during
-    unexpected daemon restarts.
-
-    Implements a strict single writer and single reader cooperative concurrent design
-    leveraging the Lwt threading engine. The stream consumption loop inherently runs as localized
-    background Lwt async threads, routing the demultiplexed field vectors into the system
-    event registry callback target. *)
+    Owns the Unix socket, the TWS handshake, length-prefixed frame
+    reading/writing, and reconnection with exponential backoff.
+    Single writer, single reader under Lwt; the reader loop runs in the
+    background and feeds decoded field lists to a callback. *)
 
 open Lwt.Infix
 
 let section = "ibkr_connection"
 
-(** Primary state container for the Interactive Brokers TCP connection.
-    Encapsulates socket descriptors, IO channels, protocol version metrics,
-    and mutual exclusion primitives for thread safe transmission. *)
+(** Connection state: socket, IO channels, negotiated server version,
+    order id counter, and the write mutex. *)
 type t =
   { mutable socket : Lwt_unix.file_descr option
   ; mutable ic : Lwt_io.input_channel option
@@ -31,9 +25,8 @@ type t =
   ; write_mutex : Lwt_mutex.t
   }
 
-(** Initializes an unlinked connection data structure.
-    Prepares the struct with the specified target IP address, port configuration,
-    and client identification integer prior to socket allocation. *)
+(** Builds a connection record for [host]:[port] with the given client
+    id; no socket is opened. *)
 let create ~host ~port ~client_id =
   { socket = None
   ; ic = None
@@ -49,41 +42,39 @@ let create ~host ~port ~client_id =
   }
 ;;
 
-(** Evaluates the boolean connection status indicator.
-    Returns true strictly when the TCP socket is actively bound and the TWS handshake is complete. *)
+(** Connection status: true once the TCP socket is bound and the TWS
+    handshake is complete. *)
 let is_connected t = t.connected
 
-(** Retrieves and atomically increments the local order sequence generator.
-    The starting integer is initially supplied by the callback during the handshake sequence. *)
+(** Returns the next order id, incrementing the local counter.
+    The starting value is supplied by TWS during the handshake. Single
+    threaded use only: no synchronization here. *)
 let get_next_order_id t =
   let id = t.next_order_id in
   t.next_order_id <- id + 1;
   id
 ;;
 
-(** Retrieves the alphanumeric account identifier cached from the managed accounts response message. *)
+(** Account id cached from the managedAccounts message. *)
 let get_account_id t = t.account_id
 
-(** Returns the TWS API server version integer dictated by the server during the initial protocol negotiation. *)
+(** Server version negotiated during the handshake. *)
 let get_server_version t = t.server_version
 
 (* ---- Low-level IO ---- *)
 
-(** Static 4 byte buffer allocated for consuming message length prefixes.
-    Designed to prevent constant byte string allocations on high frequency message reception.
-    Thread safety relies entirely on the strictly sequential Lwt read stream. *)
+(** Shared 4-byte buffer for length prefixes. Safe because reads are
+    strictly sequential on the Lwt stream. *)
 let length_buf = Bytes.create 4
 
-(** Mutable referenced buffer designated for reading the raw message payloads.
-    Functions as a memory pool to minimize garbage collection latency, reallocating
-    only when incoming payload frames exceed the current byte array capacity.
-    Memory safety is ensured because decode_fields performs eager string copies. *)
+(** Growable payload buffer, reallocated when a frame exceeds capacity.
+    Safe because [decode_fields] copies eagerly. *)
 let msg_buf = ref (Bytes.create 4096)
 
-(** Block on the asynchronous input channel until the exact byte count is deposited into the buffer. *)
+(** Reads exactly [n] bytes into [buf]. *)
 let read_bytes_into ic buf n = Lwt_io.read_into_exactly ic buf 0 n
 
-(** Consumes exactly four bytes from the input stream to construct the big endian integer payload size. *)
+(** Reads the 4-byte big-endian length prefix. *)
 let read_length ic =
   read_bytes_into ic length_buf 4
   >|= fun () ->
@@ -93,22 +84,22 @@ let read_length ic =
   lor Bytes.get_uint8 length_buf 3
 ;;
 
-(** Orchestrates the reading of a length prefixed frame followed by the payload extraction.
-    Interacts with the reusable payload buffer to prevent allocation spikes before passing to the codec. *)
+(** Reads one length-prefixed frame into the reusable buffer and decodes
+    it. Rejects lengths outside (0, 1_000_000]. *)
 let read_message ic =
   read_length ic
   >>= fun len ->
   if len <= 0 || len > 1_000_000
   then Lwt.fail_with (Printf.sprintf "Invalid message length: %d" len)
   else (
-    (* Perform dynamic reallocation if the payload exceeds buffer capacity *)
+    (* Grow the payload buffer if needed *)
     if Bytes.length !msg_buf < len then msg_buf := Bytes.create (len * 2);
     read_bytes_into ic !msg_buf len
     >|= fun () -> Ibkr_codec.decode_fields (Bytes.sub_string !msg_buf 0 len))
 ;;
 
-(** Dispatches raw byte sequences to the outbound stream socket.
-    Implements a strict mutual exclusion lock to guarantee that interleaved writes do not corrupt the frame. *)
+(** Writes raw bytes under the write mutex so frames are not
+    interleaved. No-op with an error log when disconnected. *)
 let write_raw t bytes =
   match t.oc with
   | Some oc ->
@@ -120,15 +111,15 @@ let write_raw t bytes =
     Lwt.return_unit
 ;;
 
-(** Serializes a list of string fields into a null delimited byte sequence and executes an asynchronous locked write. *)
+(** Encodes [fields] and writes the frame. *)
 let send t (fields : string list) = write_raw t (Ibkr_codec.encode_fields fields)
 
 (* ---- Handshake ---- *)
 
-(** Executes the synchronous TWS API connection authentication protocol.
-    Step 1. Transmits the API header and the supported minimum and maximum version range.
-    Step 2. Awaits the server response containing the negotiated version and system time.
-    Step 3. Transmits the startApi payload including the configured integer client identifier. *)
+(** TWS handshake:
+    1. Send "API\0" plus supported version range.
+    2. Receive server version and connection time.
+    3. Send startApi with the client id. *)
 let handshake t =
   let ic =
     match t.ic with
@@ -142,8 +133,7 @@ let handshake t =
   in
   write_raw t handshake_bytes
   >>= fun () ->
-  (* Extract server details where the version integer and connection time string
-     constitute the first two null delimited sections inside the length prefixed envelope. *)
+  (* First two fields in the response envelope: version, connection time. *)
   read_message ic
   >>= fun fields ->
   let server_version, fields = Ibkr_codec.read_int fields in
@@ -156,9 +146,8 @@ let handshake t =
     connection_time;
   let start_api_fields =
     [ string_of_int Ibkr_types.msg_start_api
-    ; "2"
-    ; (* version *)
-      string_of_int t.client_id
+    ; "2" (* version *)
+    ; string_of_int t.client_id
     ; "" (* optionalCapabilities *)
     ]
   in
@@ -167,8 +156,9 @@ let handshake t =
 
 (* ---- Connection lifecycle ---- *)
 
-(** Initiates the TCP socket binding sequence and proceeds with the synchronous API handshake protocol.
-    Note that this function explicitly avoids spawning the continuous reader thread, which must be invoked independently. *)
+(** Connects the socket and runs the handshake. Does not start the
+    reader loop; call [start_reader] separately. On failure the socket is
+    closed and the exception re-raised. *)
 let connect t =
   Logging.info_f
     ~section
@@ -203,8 +193,8 @@ let connect t =
        Lwt.fail exn)
 ;;
 
-(** Triggers a graceful teardown of the network connections.
-    Flags the session boolean false and instructs the input output channels and socket descriptors to terminate inline. *)
+(** Closes the IO channels and socket and marks the connection down.
+    Channel/socket cleanup errors are swallowed. *)
 let disconnect t =
   t.connected <- false;
   let close_ic =
@@ -231,14 +221,18 @@ let disconnect t =
   Lwt.join [ close_ic; close_oc; close_fd ]
 ;;
 
-(** Spawns the central background consumer stream for incoming socket data.
-    Decodes packets and transfers them directly to the provided message callback router.
-    Gracefully exits on socket exhaustion or internal error states, terminating via the disconnect subroutine.
+(** Background reader loop. Decodes each frame and invokes [on_message]
+    with the message id and remaining fields; handler exceptions are
+    logged, not fatal. On EOF, EBADF, or a closed channel the loop ends
+    quietly; on other errors it logs and ends. In both cases it clears
+    [t.connected] and invokes the caller-supplied [on_disconnect]; it
+    never calls [disconnect].
 
-    Crucially depends on Lwt async delegation to isolate each processing step, thus severing
-    the consecutive promise linkage pattern prescribed in the Lwt utilities module.
-    Failing to break this promise sequence would inevitably result in severe Forward node leakage
-    for every message ingested throughout the runtime. *)
+    Per-message handlers run under [Lwt.async] so they are not chained
+    onto the stream-consumption promise. Chaining them would make the
+    reader await every handler before pulling the next frame and retain
+    one pending promise per message for as long as the reader promise is
+    awaited. *)
 let start_reader t ~on_message ~on_disconnect =
   match t.ic with
   | None -> Logging.error ~section "Cannot start reader: not connected"
@@ -293,8 +287,8 @@ let start_reader t ~on_message ~on_disconnect =
            Lwt.return_unit))
 ;;
 
-(** Executes the connection initialization with exponential backoff fault tolerance.
-    Continuously loops until the maximum attempt threshold is breached or a stable TCP port is acquired. *)
+(** Retries [connect] with exponential backoff until it succeeds or
+    [max_attempts] is exhausted, then fails. *)
 let connect_with_retry t ~max_attempts =
   let base_delay = Ibkr_types.default_reconnect_base_delay_ms /. 1000.0 in
   let max_delay = Ibkr_types.default_reconnect_max_delay_ms /. 1000.0 in

@@ -230,7 +230,7 @@ let percentile t p =
 ;;
 
 (** [percentiles5 t] computes p50/p90/p95/p99/p999 in a SINGLE cumulative pass
-    over the histogram instead of five independent scans (M7: the oracle
+    over the histogram instead of five independent scans (the oracle
     profilers are 60k-100k buckets, so five scans cost ~0.5-5ms per window).
     The sub-microsecond nanosecond tier is scanned first, then the fine
     one-microsecond tier, then the coarse buckets; each target is captured

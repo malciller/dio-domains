@@ -107,7 +107,7 @@ let extended_close_hour = 20
 let extended_close_min = 0
 
 (** Evaluates whether the current system time falls within Regular Trading Hours (9:30 AM - 4:00 PM ET).
-    Cached with a 1s TTL (M4): the full evaluation does multiple gmtime/mktime DST
+    Cached with a 1s TTL : the full evaluation does multiple gmtime/mktime DST
     calculations (~10-100µs); the WS feed handler calls this on every trade
     message, so the cache keeps it off the per-tick path while still tracking
     the session boundary. *)

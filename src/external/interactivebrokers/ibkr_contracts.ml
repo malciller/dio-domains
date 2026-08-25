@@ -1,22 +1,24 @@
-(** Implements financial instrument symbol to complete trading contract resolution utilizing the reqContractDetails message vector.
-
-    Maintains a thread safe cache of resolved Interactive Brokers contracts ensuring that subsequent identical symbol queries execute with O(1) time complexity. Exchange traded funds are specifically modeled utilizing security type STK, the SMART routing exchange, and USD currency settings. *)
+(** Resolves symbols to IBKR contracts via reqContractDetails, with a
+    mutex-guarded cache so repeated symbol lookups are O(1).
+    ETFs are modeled as secType STK on SMART in USD. *)
 
 open Lwt.Infix
 
 let section = "ibkr_contracts"
 
-(** Hash map storing resolved symbol strings mapped to their comprehensive Ibkr_types.contract structures. *)
+(** Resolved contracts keyed by symbol; guarded by [cache_mutex]. *)
 let cache : (string, Ibkr_types.contract) Hashtbl.t = Hashtbl.create 32
 
 let cache_mutex = Mutex.create ()
 
-(** Atomic integer utilized for generating unique request identifiers during reqContractDetails network dispatches. *)
+(** Request id counter for reqContractDetails. *)
 let next_req_id = Atomic.make 9000
 
-(** Transmits a reqContractDetails invocation for the specified symbol across the given active connection and blocks asynchronously pending the server response. The resultant contract structure is persisted into memory cache for expediting future identical requests. Provides the fully initialized contract payload inclusive of conId and trading attributes such as minTick. *)
+(** Sends reqContractDetails for [symbol] and waits (up to 10s) for the
+    response. Caches the result on success. The returned contract
+    includes conId, minTick, and trading attributes. *)
 let resolve conn ~symbol =
-  (* Inspect memory cache prior to network transmission *)
+  (* Check cache before hitting the wire. *)
   Mutex.lock cache_mutex;
   let cached = Hashtbl.find_opt cache symbol in
   Mutex.unlock cache_mutex;
@@ -27,15 +29,16 @@ let resolve conn ~symbol =
   | None ->
     let req_id = Atomic.fetch_and_add next_req_id 1 in
     Logging.info_f ~section "Resolving contract for %s (reqId=%d)" symbol req_id;
-    (* Mutable reference accumulating inbound parsed contract metadata *)
     let result = ref None in
-    (* Establish a callback router index correlated to the generated request identifier *)
+    (* Register a reqId-correlated handler for the response. *)
     let condition =
       Ibkr_dispatcher.register_req_handler
         ~req_id
         ~on_data:(fun fields ->
-          (* Parsing logic predicated on server version 176 and greater omitting the initial version specifier.
-             Sequential field decoding maps to reqId, symbol, secType, lastTradeDate, strike, right, exchange, currency, localSymbol, marketName, tradingClass, conId, minTick, multiplier respectively. *)
+          (* Server version >= 176 omits the leading version field.
+             Field order: reqId, symbol, secType, lastTradeDate, strike,
+             right, exchange, currency, localSymbol, marketName,
+             tradingClass, conId, minTick, multiplier. *)
           let _req_id, fields = Ibkr_codec.read_int fields in
           let symbol_resp, fields = Ibkr_codec.read_string fields in
           let sec_type, fields = Ibkr_codec.read_string fields in
@@ -73,22 +76,22 @@ let resolve conn ~symbol =
         ~on_end:(fun () ->
           Logging.debug_f ~section "Contract details end for reqId=%d" req_id)
     in
-    (* Formulate and stream out the reqContractDetails wire format array.
-         Protocol message sequence corresponds to msgId 9, version 8, reqId, trailing contract definition, includeExpired, secIdType, secId, concluding with issuerId mandated for protocol versions 176 and above. *)
+    (* reqContractDetails fields: msgId 9, version 8, reqId, contract,
+       includeExpired, secIdType, secId, issuerId (required for server
+       version >= 176). *)
     let lookup_contract = Ibkr_types.make_stk_contract ~symbol in
     let msg_fields =
       [ string_of_int Ibkr_types.msg_req_contract_details
-      ; "8"
-      ; (* Hardcoded protocol payload version *)
-        string_of_int req_id
+      ; "8" (* message version *)
+      ; string_of_int req_id
       ]
       @ Ibkr_codec.encode_contract lookup_contract
-      @ [ ""; (* Blank secIdType specification *) ""; (* Blank secId attribute *) "" ]
-      (* Blank issuerId attribute strictly required for server version 176 and higher *)
+      @ [ ""; (* secIdType *) ""; (* secId *) "" ]
+      (* issuerId *)
     in
     Ibkr_connection.send conn msg_fields
     >>= fun () ->
-    (* Asynchronously yield execution context awaiting server callback activation paired with an absolute duration timeout *)
+    (* Wait for the response condition, with a 10s timeout. *)
     Lwt.pick
       [ (Lwt_condition.wait condition >|= fun () -> `Done)
       ; (Lwt_unix.sleep 10.0 >|= fun () -> `Timeout)
@@ -109,7 +112,7 @@ let resolve conn ~symbol =
        failwith (Printf.sprintf "No contract data received: %s" symbol))
 ;;
 
-(** Synchronously retrieves an associated contract from the memory cache mapping substituting None if unpopulated. *)
+(** Cached contract for [symbol], or [None]. *)
 let get_cached ~symbol =
   Mutex.lock cache_mutex;
   let r = Hashtbl.find_opt cache symbol in
@@ -117,7 +120,8 @@ let get_cached ~symbol =
   r
 ;;
 
-(** Computes and extracts a tuple encapsulating the price and quantity decimal point precision requirements sourced directly from the resolved cached contract. The price precision bounds are mathematically extrapolated utilizing the contract min_tick attribute. *)
+(** (price_decimals, qty_decimals) for [symbol]; price decimals derive
+    from minTick. *)
 let get_precision ~symbol =
   match get_cached ~symbol with
   | Some c ->
@@ -133,7 +137,7 @@ let get_precision ~symbol =
       else 4
     in
     Some (price_dec, 0)
-    (* Quantity precision is zero because fractional shares are unsupported
+    (* Quantity precision is zero: fractional shares are unsupported
        for the ETF contracts this module routes. *)
   | None -> None
 ;;

@@ -338,7 +338,7 @@ let handle_frame frame ~expected_generation =
   Concurrency.Tick_event_bus.publish_tick ();
   notify_heartbeat ();
   let content = frame.Websocket.Frame.content in
-  (* P5: executions pushes are offloaded to the Parse_worker domain by a
+  (* executions pushes are offloaded to the Parse_worker domain by a
      raw-string prefix check BEFORE the central Yojson parse - the parse
      was the expensive part. Safe: request/response frames (order
      acks/rejects) always carry a "method" field and never match the

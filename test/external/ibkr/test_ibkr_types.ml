@@ -198,7 +198,7 @@ let test_tick_type_constants () =
   Alcotest.(check int) "tick_last_size" 5 Ibkr.Types.tick_last_size;
   Alcotest.(check int) "tick_volume" 8 Ibkr.Types.tick_volume;
   Alcotest.(check int) "tick_close" 9 Ibkr.Types.tick_close;
-  (* Delayed tick types — offset +65 from live *)
+  (* Delayed tick types: offset +65 from live *)
   Alcotest.(check int) "tick_delayed_bid" 66 Ibkr.Types.tick_delayed_bid;
   Alcotest.(check int) "tick_delayed_ask" 67 Ibkr.Types.tick_delayed_ask;
   Alcotest.(check int) "tick_delayed_last" 68 Ibkr.Types.tick_delayed_last;

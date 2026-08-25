@@ -53,7 +53,7 @@ type strategy_state =
   ; mutable startup_replay : bool
     (** true during startup; suppresses logging/metrics if needed *)
   ; mutable cached_qty : float
-    (** parsed [asset.qty]; avoids float_of_string on every execution (M14) *)
+    (** parsed [asset.qty]; avoids float_of_string on every execution  *)
   ; mutex : Mutex.t (** guards concurrent access from callback handlers *)
   }
 
@@ -459,7 +459,7 @@ let execute_strategy
     | Some s -> s
     | None -> get_strategy_state asset.symbol
   in
-  (* M14: parse asset.qty once per strategy lifetime; the config string is
+  (* parse asset.qty once per strategy lifetime; the config string is
      immutable, so cached_qty replaces float_of_string on every cycle. *)
   if state.cached_qty <= 0.0
   then
@@ -1589,7 +1589,7 @@ let set_startup_replay_done symbol =
   Mutex.unlock state.mutex
 ;;
 
-(** R2: per-symbol lock-free lifecycle event queue - the MM counterpart of
+(** per-symbol lock-free lifecycle event queue - the MM counterpart of
     the grid's H3 queue. The Lwt supervisor thread (REST callbacks in
     supervisor_orders.ml) enqueues lifecycle events instead of calling the
     handlers directly; the symbol's domain worker drains the queue at the
@@ -1736,7 +1736,7 @@ module Strategy = struct
   let set_startup_replay_done = set_startup_replay_done
   let init = init
 
-  (* R2: lifecycle-event queue surface. Cross-thread callers (supervisor
+  (* lifecycle-event queue surface. Cross-thread callers (supervisor
      REST callbacks) MUST use [enqueue_event]; the handle_* functions are
      retained public for same-thread callers (the domain worker's WS exec
      replay) and for unit tests. *)
