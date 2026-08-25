@@ -105,7 +105,7 @@ Each element of `trading` configures one symbol on one exchange:
 | `maker_fee`, `taker_fee` | all | Explicit fee overrides (fractions, e.g. `0.0016`); `null` means use venue default or live fee lookup |
 | `testnet` | HL, Lighter, IBKR, Alpaca | Route to sandbox/paper endpoints. Rejected for Kraken |
 | `hedge` | Hyperliquid only | Enable the experimental perp short auto-hedge. Rejected elsewhere |
-| `accumulation_buffer` | all | `[min, max]` bounds on base reserved for accumulation; resolved live from Fear & Greed (crypto venues) |
+| `accumulation_buffer` | all | `[min, max]` retained quote profit buffer required before base accumulation; resolved live from Fear & Greed (crypto venues) |
 | `data_feed` | Alpaca | `iex` (free, delayed) or `sip` (paid, real-time) |
 
 Venue-specific restrictions are enforced at startup:
@@ -204,7 +204,11 @@ decision exists for an asset the strategy places nothing.
   the venue base pool minus reserved_base minus base tied in resting sells.
 
 Accrual lives in the persistence layer: profitable sell fills reserve base via
-`Base_accumulation_store`, which survives engine restarts.
+`Base_accumulation_store`, which survives engine restarts. Base accumulation is
+pre-funded out of realized quote earnings: base is reserved only when
+accumulated net profit covers the acquisition cost of the withheld base plus the
+configured `accumulation_buffer`, and accumulated profit is debited by that
+acquisition cost upon reservation, preventing quote balance bleed.
 
 ### Market Maker (MM)
 

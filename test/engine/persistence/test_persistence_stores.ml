@@ -51,8 +51,11 @@ let test_apply_buy_fill () =
 
 let test_apply_sell_fill_profit_and_reserve () =
   let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
-  (* Profitable sell: profit = (110 - 100) * 0.5 = 5.0 > buffer 2.0 -> reserve
-     oracle_qty * (1.0 - sell_mult) = 1.0 * (1.0 - 0.8) = 0.2 and reset the window. *)
+  (* Profitable sell: profit = (110 - 100) * 0.5 = 5.0.
+     oracle_qty = 0.1, sell_mult = 0.8 -> accrued_base = 0.1 * (1.0 - 0.8) = 0.02.
+     base_cost = 0.02 * 100.0 = 2.0.
+     With buffer 2.0, threshold = base_cost + buffer = 4.0.
+     Since profit 5.0 >= 4.0 -> reserve 0.02 base and debit profit by cost (5.0 - 2.0 = 3.0). *)
   let t =
     A.apply_sell_fill
       t
@@ -61,11 +64,11 @@ let test_apply_sell_fill_profit_and_reserve () =
       ~oid:"o2"
       ~buffer:2.0
       ~sell_mult:0.8
-      ~oracle_qty:1.0
+      ~oracle_qty:0.1
       ()
   in
-  Alcotest.(check (float 1e-12)) "reserved_base accrued" 0.2 t.A.reserved_base;
-  Alcotest.(check (float 1e-12)) "accumulated_profit reset" 0.0 t.A.accumulated_profit;
+  Alcotest.(check (float 1e-12)) "reserved_base accrued" 0.02 t.A.reserved_base;
+  Alcotest.(check (float 1e-12)) "accumulated_profit debited" 3.0 t.A.accumulated_profit;
   Alcotest.(check (option (float 1e-12)))
     "sell price recorded"
     (Some 110.0)
@@ -86,8 +89,8 @@ let test_apply_sell_fill_below_buffer () =
       ~qty:0.5
       ~oid:"o2"
       ~buffer:2.0
-      ~sell_mult:2.0
-      ~oracle_qty:1.0
+      ~sell_mult:0.8
+      ~oracle_qty:0.1
       ()
   in
   Alcotest.(check (float 1e-12)) "no reservation under buffer" 0.0 t.A.reserved_base;
