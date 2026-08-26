@@ -15,6 +15,7 @@ proxy/cloudflare/node_modules/
 *.cmxa
 *.log
 *.sh
+!dio-dash.sh
 *.csv
 *.txt
 *.html
