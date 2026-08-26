@@ -497,8 +497,6 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
            <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_price;
            state.last_buy_fill_qty
            <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_qty;
-           state.last_sell_fill_price <- None;
-           state.last_sell_fill_qty <- None;
            (* Persistence dirty-marking follows the per-strategy config
               opt-in (base_accumulation), not a hardcoded venue list - all
               venues track identically now. *)
@@ -643,9 +641,7 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
             state.last_sell_fill_price
             <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_price;
             state.last_sell_fill_qty
-            <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_qty;
-            if state.open_sell_orders = [] && state.persisted_sell_levels = []
-            then state.last_buy_fill_price <- None
+            <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_qty
           | Buy -> ());
          let should_update_oid =
            match state.last_fill_oid with
