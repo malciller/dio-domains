@@ -245,7 +245,7 @@ let monitor_loop () =
                            (fun () ->
                               Kraken.Kraken_trading_client.send_ping
                                 ~req_id
-                                ~timeout_ms:5000
+                                ~timeout_ms:10000
                               >>= fun response ->
                               if response.success
                               then (
