@@ -1037,6 +1037,25 @@ let last_book_time = ref 0.0
    and a timestamp update). One orderbook connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
+let extract_symbol_opt json =
+  let open Yojson.Safe.Util in
+  match member "symbol" json with
+  | `String s -> Some s
+  | _ ->
+    (match member "result" json with
+     | `Assoc _ as result ->
+       (match member "symbol" result with
+        | `String s -> Some s
+        | _ -> None)
+     | _ ->
+       (match member "params" json with
+        | `Assoc _ as params ->
+          (match member "symbol" params with
+           | `String s -> Some s
+           | _ -> None)
+        | _ -> None))
+;;
+
 (** synchronous dispatch of an already-parsed frame. DOMAIN-SAFE: no
     Lwt primitives here - this runs on the Parse_worker domain. Sequence-gap
     resubscribes go through the pending queue; readiness through Atomics;
@@ -1063,18 +1082,39 @@ let handle_dispatch json on_heartbeat =
     ignore (process_orderbook_message ~reset:false json on_heartbeat)
   | _, _, Some "subscribe" ->
     let success = member "success" json |> to_bool_option |> Option.value ~default:true in
+    let symbol_opt = extract_symbol_opt json in
+    let symbol = Option.value symbol_opt ~default:"unknown" in
     if not success
     then (
       let err_msg =
         member "error" json |> to_string_option |> Option.value ~default:"Unknown error"
       in
-      Logging.error_f ~section "Kraken orderbook subscription failed: %s" err_msg)
+      Logging.error_f ~section "Kraken orderbook subscription failed for %s: %s" symbol err_msg;
+      if String.equal err_msg "Already subscribed"
+      then (
+        match symbol_opt with
+        | Some sym ->
+          (match store_opt sym with
+           | Some store when not (Atomic.get store.has_snapshot) ->
+             Logging.warn_f
+               ~section
+               "Kraken is already subscribed to %s but local store has no snapshot; requesting resubscribe"
+               sym;
+             request_resubscribe sym
+           | _ -> ())
+        | None -> ()))
+    else
+      Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol
+  | _, _, Some "unsubscribe" ->
+    let success = member "success" json |> to_bool_option |> Option.value ~default:true in
+    let symbol = extract_symbol_opt json |> Option.value ~default:"unknown" in
+    if success
+    then Logging.debug_f ~section "Unsubscribed from %s orderbook feed" symbol
     else (
-      let result = member "result" json in
-      let symbol =
-        member "symbol" result |> to_string_option |> Option.value ~default:"unknown"
+      let err_msg =
+        member "error" json |> to_string_option |> Option.value ~default:"Unknown error"
       in
-      Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol)
+      Logging.warn_f ~section "Kraken orderbook unsubscription failed for %s: %s" symbol err_msg)
   | Some "status", _, _ -> Logging.debug_f ~section "Status message received"
   | _ ->
     Logging.info_f ~section "Unhandled orderbook payload: %s" (Yojson.Safe.to_string json)
@@ -1176,11 +1216,23 @@ let start_message_handler conn symbols on_failure on_heartbeat =
           | End_of_file -> Lwt.return_none
           | exn -> Lwt.fail exn))
   in
+  let failed = ref false in
+  let notify_failure reason =
+    if not !failed
+    then (
+      failed := true;
+      Lwt_mutex.with_lock state.mutex (fun () ->
+        if state.active_conn = Some conn then state.active_conn <- None;
+        Lwt.return_unit)
+      >>= fun () ->
+      on_failure reason;
+      Lwt.return_unit)
+    else Lwt.return_unit
+  in
   let process_frame = function
     | { Websocket.Frame.opcode = Websocket.Frame.Opcode.Close; _ } ->
       Logging.warn ~section "Orderbook WebSocket closed by server";
-      on_failure "Connection closed by server";
-      Lwt.return_unit
+      notify_failure "Connection closed by server"
     | frame ->
       (* parse+dispatch run on the Parse_worker domain; this returns
          immediately (no awaiting), keeping the WS read loop tight. *)
@@ -1202,21 +1254,18 @@ let start_message_handler conn symbols on_failure on_heartbeat =
              ~section
              "Orderbook WebSocket error during read: %s"
              (Printexc.to_string exn);
-           on_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn));
-           Lwt.return_unit)
+           notify_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn)))
   in
   let final_done_p =
     done_p
     >>= fun () ->
-    Lwt_mutex.with_lock state.mutex (fun () ->
-      state.active_conn <- None;
-      Lwt.return_unit)
-    >>= fun () ->
-    Logging.warn
-      ~section
-      "Orderbook WebSocket connection closed unexpectedly (End_of_file)";
-    on_failure "Connection closed unexpectedly (End_of_file)";
-    Lwt.return_unit
+    if not !failed
+    then (
+      Logging.warn
+        ~section
+        "Orderbook WebSocket connection closed unexpectedly (End_of_file)";
+      notify_failure "Connection closed unexpectedly (End_of_file)")
+    else Lwt.return_unit
   in
   final_done_p
 ;;
@@ -1262,9 +1311,19 @@ let rec subscribe_symbols symbols =
       Lwt_unix.sleep 0.05 >>= fun () -> watcher ()
     in
     Lwt.async watcher);
-  Kraken_instruments_feed.fetch_from_rest symbols
-  >>= fun () ->
-  fetch_decimals symbols
+  let missing_meta =
+    List.filter
+      (fun symbol ->
+         match Kraken_instruments_feed.get_precision_info symbol with
+         | Some _ -> false
+         | None -> true)
+      symbols
+  in
+  (if missing_meta <> []
+   then
+     Kraken_instruments_feed.fetch_from_rest missing_meta
+     >>= fun () -> fetch_decimals missing_meta
+   else Lwt.return_unit)
   >>= fun () ->
   List.iter
     (fun symbol ->
@@ -1318,7 +1377,9 @@ and resubscribe_symbol symbol =
     let msg_str = Yojson.Safe.to_string unsub_msg in
     Logging.info_f ~section "Unsubscribing %s before re-subscribing" symbol;
     Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
-    >>= fun () -> Lwt_unix.sleep 0.1 >>= fun () -> subscribe_symbols [ symbol ]
+    >>= fun () ->
+    Lwt_unix.sleep 0.25
+    >>= fun () -> subscribe_symbols [ symbol ]
   | None ->
     (* Gap fix: a missing connection is a failure, not a silent success.
        Raising routes into [resubscribe_with_retry]'s backoff loop; if the
