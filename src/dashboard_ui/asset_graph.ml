@@ -374,7 +374,7 @@ let render_asset_detail w h asset_key json =
             | `Float q -> q
             | _ -> oracle |?> "qty" |> to_float_d 0.0
           in
-          let o_sell_qty = oracle |?> "sell_qty" |> to_float_d 0.0 in
+          let o_mdd = oracle |?> "max_drawdown_pct" |> to_float_d 0.0 in
           let o_gi = oracle |?> "grid_interval" |> to_float_d 0.0 in
           let o_dsurv = oracle |?> "d_surv" |> to_float_d 0.0 in
           let o_reason = oracle |?> "reason" |> to_string_d "" in
@@ -393,8 +393,8 @@ let render_asset_detail w h asset_key json =
             ; I.string a_label "Buy Qty: "
             ; I.string a_cyan (if o_buy_qty > 0.0 then format_qty o_buy_qty ^ " " ^ a.asset else "--")
             ; I.string a_dim " │ "
-            ; I.string a_label "Sell Qty: "
-            ; I.string a_cyan (if o_sell_qty > 0.0 then format_qty o_sell_qty ^ " " ^ a.asset else "--")
+            ; I.string a_label "MDD: "
+            ; I.string a_cyan (if o_mdd > 0.0 then Printf.sprintf "%.1f%%" (o_mdd *. 100.0) else "--")
             ; I.string a_dim " │ "
             ; I.string a_label "D_surv: "
             ; I.string a_bright (Printf.sprintf "%.1f%%" (o_dsurv *. 100.0))

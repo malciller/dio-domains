@@ -9,6 +9,7 @@ let make_decision () =
   ; reason = "pool 12.61 cannot fund the first buy (needs 18.80)"
   ; buy_qty = 0.0
   ; sell_qty = 0.5
+  ; max_drawdown_pct = 0.85
   ; grid_interval = 5.0
   ; d_surv = 0.0
   ; regime = "floor extension"

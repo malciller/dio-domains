@@ -239,7 +239,7 @@ let resolve
       ~(bounds : bounds)
       ~(quote : float)
       ~(fees : fee_model)
-      ~(target_survival : float)
+      ~target_survival:(_ : float)
       ?(resolution = search_resolution)
       ()
   : resolution
@@ -276,7 +276,7 @@ let resolve
             qty_min +. ((qty_max -. qty_min) *. float_of_int j /. (n -. 1.0))
           in
           let dsv = ds gi_v buy_qty in
-          if dsv >= target_survival
+          if dsv >= 1.0
           then (
             let qty_norm = (buy_qty -. qty_min) /. (qty_max -. qty_min) in
             let tight_norm = (gi_hi -. gi_v) /. Float.max 1e-12 (gi_hi -. gi_lo) in

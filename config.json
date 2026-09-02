@@ -53,10 +53,10 @@
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.20",
+      "qty": "0.15",
       "grid_interval": [
-        0.45,
-        1.40
+        0.3,
+        0.95
       ],
       "sell_mult": "0.96",
       "accumulation_buffer": [
