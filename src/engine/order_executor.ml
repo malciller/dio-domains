@@ -25,68 +25,29 @@ module InFlightOrders = Dio_strategies.Strategy_common.InFlightOrders
 (** Mutex-guarded hashtable of in-flight amendment keys for duplicate detection. *)
 module InFlightAmendments = Dio_strategies.Strategy_common.InFlightAmendments
 
-(** Per-symbol, per-operation latency profiler cache.
-    Keyed by ["symbol:operation"]. Capped at 64 entries; see [get_profiler]. *)
-let profilers : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
+module StringMap = Map.Make (String)
 
+let profilers : Latency_profiler.t StringMap.t Atomic.t = Atomic.make StringMap.empty
 let profilers_mutex = Mutex.create ()
 
-(* memoize the last lookup so the common per-order path (same symbol +
-   operation repeated) skips the key sprintf and the profilers_mutex
-   acquisition entirely. The (symbol, operation, profiler) triple lives in
-   ONE atomic cell so a cross-domain reader can never observe a torn pair
-   (new key with stale profiler - the previous two-ref version
-   misattributed latency under concurrency). Comparisons are
-   allocation-free ([String.equal]). *)
-let last_profiler : (string * string * Latency_profiler.t) option Atomic.t =
-  Atomic.make None
-;;
-
 let get_profiler symbol operation =
-  match Atomic.get last_profiler with
-  | Some (sym, op, profiler) when String.equal sym symbol && String.equal op operation ->
-    profiler
-  | _ ->
-    let key = Printf.sprintf "%s:%s" symbol operation in
+  let key = symbol ^ ":" ^ operation in
+  let current = Atomic.get profilers in
+  match StringMap.find_opt key current with
+  | Some p -> p
+  | None ->
     Mutex.lock profilers_mutex;
-    let profiler =
-      match Hashtbl.find_opt profilers key with
+    let map = Atomic.get profilers in
+    let p =
+      match StringMap.find_opt key map with
       | Some p -> p
       | None ->
-        (* Evict the entry with the lowest sample count to keep table size
-             at most 64. Guards against unbounded growth from symbol churn. *)
-        if Hashtbl.length profilers >= 64
-        then (
-          let min_key =
-            Hashtbl.fold
-              (fun k p best ->
-                 let count =
-                   match Latency_profiler.snapshot p with
-                   | Some snap -> snap.Latency_profiler.samples
-                   | None -> 0
-                 in
-                 match best with
-                 | None -> Some (k, count)
-                 | Some (_, s) when count < s -> Some (k, count)
-                 | some -> some)
-              profilers
-              None
-          in
-          Option.iter
-            (fun (k, _) ->
-               Logging.warn_f
-                 ~section
-                 "profilers table at capacity (64); evicting stale entry '%s'"
-                 k;
-               Hashtbl.remove profilers k)
-            min_key);
         let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
-        Hashtbl.replace profilers key p;
+        Atomic.set profilers (StringMap.add key p map);
         p
     in
     Mutex.unlock profilers_mutex;
-    Atomic.set last_profiler (Some (symbol, operation, profiler));
-    profiler
+    p
 ;;
 
 (* window-cadence snapshot+reset for this symbol's operation profilers.
@@ -304,14 +265,6 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
   if Atomic.get shutdown_requested
   then Lwt.return (Error "Order placement cancelled due to shutdown")
   else (
-    (* Trim stale in-flight entries before each placement attempt. *)
-    let _drift, trimmed = InFlightOrders.cleanup () in
-    if trimmed > 0
-    then
-      Logging.debug_f
-        ~section
-        "InFlightOrders registry cleaned up: removed %d stale entries"
-        trimmed;
     with_error_handling ~operation_name:"place_order" (fun () ->
       match validate_order_request request with
       | Error err ->
@@ -401,14 +354,6 @@ let amend_order ~token ?retry_config (request : amend_request) =
   if Atomic.get shutdown_requested
   then Lwt.return (Error "Order amendment cancelled due to shutdown")
   else (
-    (* Trim stale in-flight amendment entries before each attempt. *)
-    let _drift, trimmed = InFlightAmendments.cleanup () in
-    if trimmed > 0
-    then
-      Logging.debug_f
-        ~section
-        "InFlightAmendments registry cleaned up: removed %d stale entries"
-        trimmed;
     with_error_handling ~operation_name:"amend_order" (fun () ->
       match validate_amend_request request with
       | Error err ->
@@ -584,14 +529,6 @@ let cancel_orders ~token ?retry_config (request : cancel_request) =
          Logging.error_f ~section "%s" e;
          Lwt.return (Error e)
        | Ok (module Ex) ->
-         (* Trim stale in-flight entries before each cancellation attempt. *)
-         let _drift, trimmed = InFlightOrders.cleanup () in
-         if trimmed > 0
-         then
-           Logging.debug_f
-             ~section
-             "InFlightOrders registry cleaned up: removed %d stale entries"
-             trimmed;
          let order_count =
            List.length (Option.value request.order_ids ~default:[])
            + List.length (Option.value request.cl_ord_ids ~default:[])
@@ -628,6 +565,36 @@ let close () : unit Lwt.t =
   Lwt.join [ Kraken.Kraken_trading_client.close (); Hyperliquid.Ws.close () ]
 ;;
 
-(** No-op initialization. Reserved for future setup (e.g., exchange
-    pre-connection, cache warming). *)
-let init : unit Lwt.t = Lwt.return_unit
+let periodic_cleanup_started = Atomic.make false
+
+(** Background periodic cleanup for in-flight orders and amendments registries.
+    Offloads 64-shard iteration from the critical order submission path. *)
+let start_periodic_inflight_cleanup () =
+  if Atomic.compare_and_set periodic_cleanup_started false true
+  then
+    Lwt.async (fun () ->
+      let rec loop () =
+        Lwt_unix.sleep 15.0
+        >>= fun () ->
+        if Atomic.get shutdown_requested
+        then Lwt.return_unit
+        else (
+          let _drift1, trimmed1 = InFlightOrders.cleanup () in
+          let _drift2, trimmed2 = InFlightAmendments.cleanup () in
+          if trimmed1 > 0 || trimmed2 > 0
+          then
+            Logging.debug_f
+              ~section
+              "Periodic in-flight cleanup: removed %d orders, %d amendments"
+              trimmed1
+              trimmed2;
+          loop ())
+      in
+      loop ())
+;;
+
+(** Initializes the order executor, starting background periodic in-flight cleanup. *)
+let init : unit Lwt.t =
+  start_periodic_inflight_cleanup ();
+  Lwt.return_unit
+;;

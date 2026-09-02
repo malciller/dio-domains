@@ -140,6 +140,9 @@ type strategy_state =
   ; mutable exchange_id : string (* cached exchange name; used for persistence routing *)
   ; mutable startup_replay : bool
     (* true during startup fill replay; suppresses profit calculation *)
+  ; matched_persisted_indices : (int, unit) Hashtbl.t
+  ; matched_level_counts : (int, int) Hashtbl.t
+  ; persisted_idx : (int, (int * float * float) list) Hashtbl.t
   ; mutable last_fill_oid : string option
     (* OID of last profit-credited fill; replay resumption point *)
   ; mutable highest_startup_oid : string option
@@ -317,6 +320,9 @@ let rec get_strategy_state asset_symbol =
       ; maker_fee = 0.0
       ; exchange_id = ""
       ; startup_replay = true
+      ; matched_persisted_indices = Hashtbl.create 16
+      ; matched_level_counts = Hashtbl.create 16
+      ; persisted_idx = Hashtbl.create 16
       ; last_fill_oid = persisted_last_fill_oid
       ; highest_startup_oid = None
       ; anticipated_base_credit = 0.0

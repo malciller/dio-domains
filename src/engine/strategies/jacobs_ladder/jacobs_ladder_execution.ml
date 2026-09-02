@@ -304,7 +304,8 @@ let sync_open_orders
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
   let closest_sell_order = ref None in
-  let matched_persisted_indices = Hashtbl.create 16 in
+  let matched_persisted_indices = state.matched_persisted_indices in
+  Hashtbl.clear matched_persisted_indices;
   (* index the persisted sell levels by a rounded price key so each open
      sell order's match lookup is O(1) instead of rescanning the whole list.
      The previous [List.iteri] scan was O(n·m) per strategy execution (n open
@@ -318,8 +319,9 @@ let sync_open_orders
      the virtual-GTC reconcile falls out in O(m) at the end of the scan
      instead of re-partitioning the whole persisted-vs-open multiset
      ([partition_persisted_sell_levels]) a second time per execution. *)
-  let matched_level_counts : (int, int) Hashtbl.t = Hashtbl.create 16 in
-  let persisted_idx : (int, (int * float * float) list) Hashtbl.t = Hashtbl.create 16 in
+  let matched_level_counts = state.matched_level_counts in
+  Hashtbl.clear matched_level_counts;
+  let persisted_idx = state.persisted_idx in
   let build_persisted_idx () =
     Hashtbl.reset persisted_idx;
     List.iteri
@@ -1519,15 +1521,17 @@ let execute_strategy
            =
            sync_open_orders ~state ~now ~asset ~bid_price ~lot_qty ~iter_open_orders ~ecfg
          in
-         state.maker_fee
-         <- (match asset.maker_fee with
-             | Some f -> f
-             | None ->
-               (match
-                  Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol
-                with
-                | Some cached -> cached
-                | None -> 0.0));
+         if state.maker_fee <= 0.0 || cycle land 0x3ff = 0
+         then
+           state.maker_fee
+           <- (match asset.maker_fee with
+               | Some f -> f
+               | None ->
+                 (match
+                    Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol
+                  with
+                  | Some cached -> cached
+                  | None -> 0.0));
          let is_stale =
            ecfg.check_stale_balance
            && (Float.is_nan asset_balance || Float.is_nan quote_balance)
