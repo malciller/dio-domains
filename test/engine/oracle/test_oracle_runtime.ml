@@ -12,6 +12,7 @@ let make_decision ~active ?(buy_qty = 1.0) ?(symbol = "X/USD") () =
   ; reason = ""
   ; buy_qty
   ; sell_qty = 0.5
+  ; max_drawdown_pct = 0.8
   ; grid_interval = 1.0
   ; d_surv = 0.99
   ; regime = "normal"
